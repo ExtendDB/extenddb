@@ -102,19 +102,26 @@ implicitly denied.
   context resolves the key to a value: evaluate normally. (2) The context
   resolves it as absent the same way the service would: IAM absent-key
   semantics apply, including that a negated operator on an absent single-valued
-  key matches. (3) The service always populates the key but the context cannot
-  resolve it: the statement fails closed whatever the operator, so a `Deny`
+  key matches. (3) An `aws:` global key the service may populate but the context
+  cannot resolve: the statement fails closed whatever the operator, so a `Deny`
   blocks and an `Allow` does not grant, rather than the key being treated as
-  absent (which would let a negated operator spuriously match). The
-  `AssumeRoleContext` resolves `aws:PrincipalArn`, `aws:PrincipalAccount`,
-  `aws:PrincipalTag/*` (tag key matched case-insensitively), `aws:RequestTag/*`,
-  `aws:TagKeys` and `sts:ExternalId`; the always-populated global keys it does
-  not resolve (`aws:PrincipalOrgID`, `aws:PrincipalOrgPaths`,
-  `aws:PrincipalType`, `aws:userid`, `aws:username`, `aws:SourceIp`,
-  `aws:SecureTransport`, `aws:CurrentTime`, `aws:EpochTime`,
-  `aws:RequestedRegion`, `aws:UserAgent`) are case 3. Conditionally-present keys
-  such as `aws:MultiFactorAuthPresent` are absent for ExtendDB's caller model
-  and keep absent-key semantics.
+  absent (which would let a negated operator spuriously match). Both contexts
+  resolve every global key ExtendDB has the data for: `aws:SecureTransport`
+  (from the listener TLS state), `aws:RequestedRegion` (the server region),
+  `aws:CurrentTime` and `aws:EpochTime` (the request time), `aws:PrincipalType`,
+  `aws:username` (for a user caller), `aws:ViaAWSService`,
+  `aws:PrincipalIsAWSService`, `aws:PrincipalArn`, `aws:PrincipalAccount`, the
+  tag keys (`aws:PrincipalTag/*`, `aws:RequestTag/*`, `aws:ResourceTag/*` on the
+  identity path, `dynamodb:ResourceTag/*`, each matched case-insensitively on
+  the key), `sts:ExternalId` and `aws:TagKeys`. Keys that are legitimately
+  absent for ExtendDB's callers keep absent-key semantics; these are an
+  allowlist that includes `aws:MultiFactorAuthPresent`, `aws:TokenIssueTime`,
+  the VPC, federation and source-service keys, and `aws:username` on a role
+  session. Any other unresolved `aws:` global key (for example
+  `aws:PrincipalOrgID`, `aws:PrincipalOrgPaths`, `aws:userid`, `aws:SourceIp`,
+  `aws:UserAgent`) is case 3 and fails closed; the allowlist, rather than a
+  denylist of keys the service populates, is what the evaluator maintains, so a
+  key AWS adds later fails closed rather than silently granting.
 - **Follow-up:** the decision logic was factored into a store-free
   `trust_decision` helper (with `action_permitted`, `deny_statement_blocks`,
   `allow_statement_grants` and `effect_of`) so the

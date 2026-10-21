@@ -350,19 +350,20 @@ in-account caller on the strength of the trust policy by itself.
 
 What a trust-policy `Deny` does not do:
 
-- A statement whose `Condition` uses a condition key ExtendDB does not resolve,
-  or an operator it does not implement, fails closed: a `Deny` blocks assumption
-  and an `Allow` grants nothing, rather than the key being treated as absent.
-  ExtendDB resolves these trust-policy keys: `aws:PrincipalTag/<key>` (tag key
-  matched case-insensitively), `sts:ExternalId`, `aws:PrincipalArn`,
-  `aws:PrincipalAccount`, `aws:RequestTag/<key>` and `aws:TagKeys` (from the
-  passed session tags). It does not evaluate these global keys that STS
-  populates, so a statement depending on one fails closed: `aws:PrincipalOrgID`,
-  `aws:PrincipalOrgPaths`, `aws:PrincipalType`, `aws:userid`, `aws:username`,
-  `aws:SourceIp`, `aws:SecureTransport`, `aws:CurrentTime`, `aws:EpochTime`,
-  `aws:RequestedRegion` and `aws:UserAgent`. The practical effect: a common
-  organization-scoped trust policy (`Allow` gated on `aws:PrincipalOrgID`, or a
-  `Deny` outside the org) is refused on ExtendDB rather than silently granted.
+- A statement whose `Condition` uses an `aws:` global key ExtendDB cannot
+  resolve, or an operator it does not implement, fails closed: a `Deny` blocks
+  assumption and an `Allow` grants nothing, rather than the key being treated as
+  absent. ExtendDB resolves these trust-policy keys: `aws:PrincipalTag/<key>`
+  (tag key matched case-insensitively), `sts:ExternalId`, `aws:PrincipalArn`,
+  `aws:PrincipalAccount`, `aws:RequestTag/<key>`, `aws:TagKeys` (from the passed
+  session tags), `aws:SecureTransport`, `aws:RequestedRegion`, `aws:CurrentTime`,
+  `aws:EpochTime`, `aws:PrincipalType`, `aws:username` (for a user caller),
+  `aws:ViaAWSService` and `aws:PrincipalIsAWSService`. Keys that are absent for
+  ExtendDB's callers (for example `aws:MultiFactorAuthPresent`, the VPC,
+  federation and source-service keys, and `aws:username` for a role session)
+  keep absent-key semantics. An `aws:` global key ExtendDB does not resolve (for
+  example `aws:PrincipalOrgID`, `aws:PrincipalOrgPaths`, `aws:userid`,
+  `aws:SourceIp`, `aws:UserAgent`) causes a statement using it to fail closed.
   The operators `IpAddress`, `NotIpAddress` and `BinaryEquals` are accepted at
   role creation (IAM accepts them) but are not evaluated, so a statement using
   one also fails closed. Write a conditional trust statement only on the
@@ -433,12 +434,15 @@ as trust policies. A condition key the request resolves is evaluated normally. A
 key that is genuinely absent follows IAM absent-key semantics, including that a
 negated operator (`StringNotEquals`, `StringNotLike`, `ArnNotEquals`) on an
 absent single-valued key matches, so a `Deny` gated on one applies when the
-caller omits the key. A global key the service always populates but ExtendDB
-does not resolve (`aws:PrincipalOrgID`, `aws:SourceIp`, `aws:PrincipalType`,
-`aws:userid`, and the others listed for trust policies above) fails closed: a
-`Deny` on it blocks and an `Allow` on it does not grant. ExtendDB resolves
-`aws:PrincipalArn`, `aws:PrincipalAccount`, `aws:PrincipalTag/<key>` (tag key
-case-insensitive) and `dynamodb:ResourceTag/<key>` on a data-plane request.
+caller omits the key. An `aws:` global key ExtendDB cannot resolve (for example
+`aws:PrincipalOrgID`, `aws:PrincipalOrgPaths`, `aws:userid`, `aws:SourceIp`,
+`aws:UserAgent`) fails closed: a `Deny` on it blocks and an `Allow` on it does
+not grant. ExtendDB resolves `aws:PrincipalArn`, `aws:PrincipalAccount`,
+`aws:PrincipalType`, `aws:username` (for a user caller), `aws:SecureTransport`,
+`aws:RequestedRegion`, `aws:CurrentTime`, `aws:EpochTime`, `aws:ViaAWSService`,
+`aws:PrincipalIsAWSService`, `aws:PrincipalTag/<key>`, `aws:ResourceTag/<key>`
+and `dynamodb:ResourceTag/<key>` (tag keys matched case-insensitively) on a
+data-plane request.
 
 ### Permissions Boundaries
 
