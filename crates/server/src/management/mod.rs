@@ -12,6 +12,9 @@ mod account;
 pub(crate) use account::generate_account_id;
 mod admin;
 mod assume_role;
+/// Shared with the web console so both write surfaces validate a trust
+/// policy the same way.
+pub(crate) use assume_role::validate_trust_policy;
 pub(crate) mod auth;
 pub mod cache_invalidate;
 mod cache_metrics;
