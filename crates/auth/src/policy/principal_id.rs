@@ -103,9 +103,7 @@ pub fn userid_for_caller_arn(caller_arn: &str) -> Option<String> {
     if let Some(user_name) = resource.strip_prefix("user/") {
         Some(user_unique_id(account, user_name))
     } else if let Some(rest) = resource.strip_prefix("assumed-role/") {
-        let mut it = rest.splitn(2, '/');
-        let role = it.next()?;
-        let session = it.next()?;
+        let (role, session) = rest.split_once('/')?;
         Some(role_session_userid(account, role, session))
     } else {
         None
@@ -121,7 +119,10 @@ mod tests {
         let id = user_unique_id("123456789012", "alice");
         assert!(id.starts_with("AIDA"), "{id}");
         assert_eq!(id.len(), 4 + BODY_LEN);
-        assert!(id.bytes().all(|b| BASE32.contains(&b) || b"AIDA".contains(&b)));
+        assert!(
+            id.bytes()
+                .all(|b| BASE32.contains(&b) || b"AIDA".contains(&b))
+        );
     }
 
     #[test]
