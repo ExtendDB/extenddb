@@ -1276,6 +1276,18 @@ class TestTrustPolicyDeny:
 
     # -- Resolved request-wide keys on the trust path (T8) ------------------
 
+    def test_keyname_unicode_longs_securetransport_resolves(self):
+        # aws:SecureTran[long-s]port folds to securetransport=true under
+        # Unicode case folding, so the positive gate grants. ASCII-only folding
+        # would read the key absent and the Allow would not grant.
+        user, arn = self._caller()
+        try:
+            trust = _trust(_stmt("Allow", {"AWS": arn},
+                                 condition={"Bool": {"aws:SecureTran\u017fport": "true"}}))
+            assert self._assume(trust, arn) == ALLOW
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
     def test_tls_guard_does_not_block_over_tls(self):
         # Allow, plus Deny if Bool aws:SecureTransport=false. The call is over
         # TLS so SecureTransport is true, the deny does not fire, assumption is

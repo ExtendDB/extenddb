@@ -798,6 +798,46 @@ class TestConditionKeyNameCaseInsensitive(_TaggedTableBase):
             {"StringEquals": {"aws:principaltype": "User"}})) == "DENY"
 
 
+class TestConditionKeyNameUnicodeFold(_TaggedTableBase):
+    """Condition key NAMES and tag keys resolve under Unicode full case
+    folding on the identity path, matching the live service. A key spelled with
+    the long s (U+017F) or the Kelvin sign (U+212A) folds to its ASCII twin; a
+    case-sensitive or ASCII-only fold would read it as absent and flip the
+    outcome."""
+
+    LS = "\u017f"   # long s -> s
+    KV = "\u212a"   # Kelvin -> k
+
+    def test_longs_securetransport_resolves(self, table):
+        # aws:SecureTran[s]port folds to securetransport=true; the positive gate
+        # grants.
+        assert self._get(table, self._allow_get_if(
+            {"Bool": {f"aws:SecureTran{self.LS}port": "true"}})) == "ALLOW"
+
+    def test_longs_securetransport_negated_allow_does_not_overgrant(self, table):
+        # Allow if StringNotEquals aws:SecureTran[s]port=true. The key folds and
+        # resolves to true, so NotEquals is false and the Allow does not grant.
+        # ASCII-only folding would read the key as absent, the negated-absent
+        # rule would fire, and the request would be granted (the bypass).
+        assert self._get(table, self._allow_get_if(
+            {"StringNotEquals": {f"aws:SecureTran{self.LS}port": "true"}})) == "DENY"
+
+    def test_kelvin_leadingkeys_match_grants(self, table):
+        # dynamodb:Leading[k]eys folds to leadingkeys=[k1]; ForAllValues against
+        # [k1] holds, the Allow grants.
+        assert self._get(table, self._allow_get_if(
+            {"ForAllValues:StringEquals": {f"dynamodb:Leading{self.KV}eys": ["k1"]}})) == "ALLOW"
+
+    def test_kelvin_leadingkeys_nonmatch_does_not_overgrant(self, table):
+        # Allow if ForAllValues:StringEquals dynamodb:Leading[k]eys=[zzz] on
+        # GetItem pk=k1. The key folds to leadingkeys=[k1], which is not zzz, so
+        # ForAllValues fails and the Allow does not grant. ASCII-only folding
+        # would read the key absent, ForAllValues would be vacuously true, and
+        # the request would be granted (the bypass).
+        assert self._get(table, self._allow_get_if(
+            {"ForAllValues:StringEquals": {f"dynamodb:Leading{self.KV}eys": ["zzz"]}})) == "DENY"
+
+
 # ---------------------------------------------------------------------------
 # aws:TokenIssueTime (role sessions) and aws:userid across recreate
 # ---------------------------------------------------------------------------

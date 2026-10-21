@@ -46,34 +46,36 @@ pub trait ConditionContext {
 }
 
 /// Look up a tag map by key, case-insensitively on the key.
-///
 /// AWS resolves tag condition keys (`aws:PrincipalTag/<k>`, `aws:RequestTag/<k>`,
 /// `aws:ResourceTag/<k>`, `dynamodb:ResourceTag/<k>`) without regard to the case
-/// of `<k>`; a tag stored as `Team` is matched by a policy naming `team`. Tag
-/// values stay case-sensitive. IAM forbids two tag keys that differ only in
-/// case, so a case-insensitive match is unambiguous.
-fn ci_tag_lookup<'a>(map: &'a HashMap<String, String>, tag_key: &str) -> Option<Vec<&'a str>> {
+/// of `<k>`, under Unicode full case folding; a tag stored as `Team` is matched
+/// by a policy naming `team`, and `cla\u{00df}` matches `class`. Tag values stay
+/// case-sensitive. IAM forbids two tag keys that differ only in case, so a
+/// case-insensitive match is unambiguous.
+///
+/// `folded_tag_key` is already case-folded by the caller; each stored key is
+/// folded before comparison.
+fn ci_tag_lookup<'a>(
+    map: &'a HashMap<String, String>,
+    folded_tag_key: &str,
+) -> Option<Vec<&'a str>> {
     map.iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(tag_key))
+        .find(|(k, _)| super::casefold::case_fold(k) == folded_tag_key)
         .map(|(_, v)| vec![v.as_str()])
 }
 
-/// Strip `prefix` from the front of `s` case-insensitively, returning the
-/// remainder (the tag sub-key) when it matches.
+/// Strip `prefix` from the front of an already case-folded key, returning the
+/// remainder (the folded tag sub-key) when it matches.
 ///
 /// The live service resolves a condition key name without regard to case,
 /// including the tag prefix (`aws:PrincipalTag/`, `aws:RequestTag/`,
-/// `aws:ResourceTag/`, `dynamodb:ResourceTag/`), so `aws:principaltag/team` and
-/// `aws:PrincipalTag/team` resolve the same tag. The remainder is returned with
-/// its original case; `ci_tag_lookup` then matches the tag sub-key
-/// case-insensitively.
-fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    let head = s.get(..prefix.len())?;
-    if head.eq_ignore_ascii_case(prefix) {
-        s.get(prefix.len()..)
-    } else {
-        None
-    }
+/// `aws:ResourceTag/`, `dynamodb:ResourceTag/`), under Unicode full case
+/// folding. The caller folds the whole key first, so `prefix` is given in its
+/// folded (lower-case ASCII) form and a plain prefix match suffices. The
+/// returned sub-key is the folded form, which `ci_tag_lookup` compares against
+/// each folded stored key.
+fn strip_folded_prefix<'a>(folded_key: &'a str, folded_prefix: &str) -> Option<&'a str> {
+    folded_key.strip_prefix(folded_prefix)
 }
 
 /// Documented AWS global condition keys the live service populates for a
@@ -107,9 +109,10 @@ const FAIL_CLOSED_GLOBAL_KEYS: &[&str] = &[];
 /// matches, which is what the live service does for a key it does not populate.
 #[must_use]
 pub fn aws_key_is_unresolvable(key: &str) -> bool {
+    let folded = super::casefold::case_fold(key);
     FAIL_CLOSED_GLOBAL_KEYS
         .iter()
-        .any(|k| k.eq_ignore_ascii_case(key))
+        .any(|k| super::casefold::case_fold(k) == folded)
 }
 
 /// The request time as the pair (`aws:CurrentTime` as RFC 3339 UTC,
@@ -282,22 +285,24 @@ impl RequestContext {
 
 impl ConditionContext for RequestContext {
     fn resolve_key(&self, key: &str) -> Option<Vec<&str>> {
-        // Condition key names are resolved case-insensitively, matching the
-        // live service: `aws:securetransport` and `AWS:SecureTransport` resolve
-        // the same as `aws:SecureTransport`, and `aws:principaltag/team` the
-        // same as `aws:PrincipalTag/team`. The tag prefix is matched
-        // case-insensitively here; the tag sub-key is folded by `ci_tag_lookup`.
-        if let Some(tag_key) = strip_prefix_ci(key, "aws:PrincipalTag/") {
+        // Condition key names are resolved under Unicode full case folding,
+        // matching the live service: `aws:securetransport`, `AWS:SecureTransport`
+        // and `aws:SecureTran\u{017f}port` resolve the same, and
+        // `aws:principaltag/team` the same as `aws:PrincipalTag/team`. Fold the
+        // whole key once; the tag prefix is matched in its folded form and the
+        // folded sub-key is compared against each folded stored tag key.
+        let folded = super::casefold::case_fold(key);
+        if let Some(tag_key) = strip_folded_prefix(&folded, "aws:principaltag/") {
             ci_tag_lookup(&self.principal_tags, tag_key)
-        } else if let Some(tag_key) = strip_prefix_ci(key, "aws:ResourceTag/") {
+        } else if let Some(tag_key) = strip_folded_prefix(&folded, "aws:resourcetag/") {
             // The service evaluates resource tags as aws:ResourceTag/*. ExtendDB
             // resolves them from the same resource-tag map it uses for
-            // dynamodb:ResourceTag/*, case-insensitively on the key.
+            // dynamodb:ResourceTag/*, case-folded on the key.
             ci_tag_lookup(&self.resource_tags, tag_key)
-        } else if let Some(tag_key) = strip_prefix_ci(key, "dynamodb:ResourceTag/") {
+        } else if let Some(tag_key) = strip_folded_prefix(&folded, "dynamodb:resourcetag/") {
             ci_tag_lookup(&self.resource_tags, tag_key)
         } else {
-            match key.to_ascii_lowercase().as_str() {
+            match folded.as_str() {
                 "dynamodb:leadingkeys" => self
                     .leading_keys
                     .as_ref()
@@ -353,10 +358,10 @@ impl ConditionContext for RequestContext {
         // Per the AWS DynamoDB service authorization reference these keys are
         // `ArrayOfString` (multivalued); all other DynamoDB keys and tag keys are
         // single-valued. Verified against real AWS IAM (BR-7085). Key names are
-        // matched case-insensitively, matching the service.
-        let lower = key.to_ascii_lowercase();
+        // matched under Unicode full case folding, matching the service.
+        let folded = super::casefold::case_fold(key);
         matches!(
-            lower.as_str(),
+            folded.as_str(),
             "dynamodb:leadingkeys" | "dynamodb:attributes"
         )
     }
@@ -428,14 +433,15 @@ pub struct AssumeRoleContext {
 
 impl ConditionContext for AssumeRoleContext {
     fn resolve_key(&self, key: &str) -> Option<Vec<&str>> {
-        // Condition key names are resolved case-insensitively, matching the
-        // live service, including the tag prefixes.
-        if let Some(tag_key) = strip_prefix_ci(key, "aws:PrincipalTag/") {
+        // Condition key names are resolved under Unicode full case folding,
+        // matching the live service, including the tag prefixes.
+        let folded = super::casefold::case_fold(key);
+        if let Some(tag_key) = strip_folded_prefix(&folded, "aws:principaltag/") {
             ci_tag_lookup(&self.principal_tags, tag_key)
-        } else if let Some(tag_key) = strip_prefix_ci(key, "aws:RequestTag/") {
+        } else if let Some(tag_key) = strip_folded_prefix(&folded, "aws:requesttag/") {
             ci_tag_lookup(&self.request_tags, tag_key)
         } else {
-            match key.to_ascii_lowercase().as_str() {
+            match folded.as_str() {
                 "sts:externalid" => self.external_id.as_deref().map(|v| vec![v]),
                 "aws:principalarn" => Some(vec![self.principal_arn.as_str()]),
                 "aws:principalaccount" => self.principal_account.as_deref().map(|v| vec![v]),
@@ -471,8 +477,8 @@ impl ConditionContext for AssumeRoleContext {
         // `aws:TagKeys` is the set of session-tag keys (`ArrayOfString`); every
         // other trust-policy key (`aws:PrincipalTag/*`, `aws:RequestTag/*`,
         // `sts:ExternalId`, `aws:PrincipalArn`, `aws:PrincipalAccount`) is
-        // single-valued. Matched case-insensitively, like the service.
-        key.eq_ignore_ascii_case("aws:TagKeys")
+        // single-valued. Matched under Unicode full case folding, like the service.
+        super::casefold::case_fold(key) == "aws:tagkeys"
     }
 
     fn is_unresolvable_key(&self, key: &str) -> bool {
@@ -714,6 +720,72 @@ mod tests {
         assert_eq!(
             ctx.resolve_key("dynamodb:resourcetag/env"),
             Some(vec!["prod"])
+        );
+    }
+
+    #[test]
+    fn request_context_key_name_unicode_case_folds() {
+        // The service resolves a key name under Unicode full case folding.
+        // Long s and Kelvin and the st ligature and sharp s fold to their ASCII
+        // twins; the dotless and dotted i do NOT fold to i, matching the service
+        // (measured).
+        let ctx = RequestContext::build(
+            HashMap::from([("class".to_owned(), "x".to_owned())]),
+            HashMap::new(),
+            false,
+            RequestParams {
+                secure_transport: true,
+                principal_type: Some("User".to_owned()),
+                region: Some("us-east-1".to_owned()),
+                leading_keys: Some(vec!["k1".to_owned()]),
+                ..Default::default()
+            },
+        );
+        // long s (U+017F) in aws:SecureTran[s]port.
+        assert_eq!(
+            ctx.resolve_key("aws:SecureTran\u{017f}port"),
+            Some(vec!["true"])
+        );
+        // st ligature (U+FB05) in aws:Reque[st]edRegion.
+        assert_eq!(
+            ctx.resolve_key("aws:Reque\u{fb05}edRegion"),
+            Some(vec!["us-east-1"])
+        );
+        // Kelvin sign (U+212A) in dynamodb:Leading[k]eys.
+        assert!(ctx.is_multivalued_key("dynamodb:Leading\u{212a}eys"));
+        assert_eq!(
+            ctx.resolve_key("dynamodb:Leading\u{212a}eys"),
+            Some(vec!["k1"])
+        );
+        // sharp s (U+00DF) folds to ss in a tag key: cla[ß] matches stored class.
+        assert_eq!(
+            ctx.resolve_key("aws:PrincipalTag/cla\u{00df}"),
+            Some(vec!["x"])
+        );
+        // dotless i (U+0131) does NOT fold to i: the key reads absent.
+        assert_eq!(ctx.resolve_key("aws:Pr\u{0131}ncipalType"), None);
+        // dotted I (U+0130) does NOT fold to i either.
+        assert_eq!(ctx.resolve_key("aws:Pr\u{0130}ncipalType"), None);
+    }
+
+    #[test]
+    fn assume_role_context_key_name_unicode_case_folds() {
+        let ctx = ar_ctx(
+            HashMap::from([("class".to_owned(), "x".to_owned())]),
+            Some("ext-123".to_owned()),
+            HashMap::new(),
+        );
+        // sts:External[s->ſ]... long s in externalId: sts:External[ı]d would NOT
+        // fold; use the st-ligature-free long s in a resolvable spot.
+        assert_eq!(
+            ctx.resolve_key("sts:External\u{0131}d"),
+            None,
+            "dotless i must not fold to i"
+        );
+        // Tag key folds: cla[ß] -> class.
+        assert_eq!(
+            ctx.resolve_key("aws:PrincipalTag/cla\u{00df}"),
+            Some(vec!["x"])
         );
     }
 
