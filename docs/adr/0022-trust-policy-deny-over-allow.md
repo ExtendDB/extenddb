@@ -97,31 +97,43 @@ implicitly denied.
   bare `"*"` principal, a missing `Principal`, and so on) starts getting a 400
   at role creation. Existing stored roles are never re-validated, so no stored
   role is locked out at evaluation.
-- **Condition-key resolution (three cases).** A condition key falls into one of
-  three cases, in both trust-policy and identity-policy evaluation. (1) The
-  context resolves the key to a value: evaluate normally. (2) The context
-  resolves it as absent the same way the service would: IAM absent-key
-  semantics apply, including that a negated operator on an absent single-valued
-  key matches. (3) An `aws:` global key the service may populate but the context
+- **Condition-key resolution.** A condition key falls into one of three cases,
+  in both trust-policy and identity-policy evaluation. (1) The context resolves
+  the key to a value: evaluate normally. (2) The context resolves it as absent
+  the same way the service would: IAM absent-key semantics apply, including that
+  a negated operator on an absent single-valued key matches. (3) A documented
+  global key the service populates for one of ExtendDB's callers but the context
   cannot resolve: the statement fails closed whatever the operator, so a `Deny`
   blocks and an `Allow` does not grant, rather than the key being treated as
-  absent (which would let a negated operator spuriously match). Both contexts
-  resolve every global key ExtendDB has the data for: `aws:SecureTransport`
-  (from the listener TLS state), `aws:RequestedRegion` (the server region),
-  `aws:CurrentTime` and `aws:EpochTime` (the request time), `aws:PrincipalType`,
-  `aws:username` (for a user caller), `aws:ViaAWSService`,
-  `aws:PrincipalIsAWSService`, `aws:PrincipalArn`, `aws:PrincipalAccount`, the
-  tag keys (`aws:PrincipalTag/*`, `aws:RequestTag/*`, `aws:ResourceTag/*` on the
-  identity path, `dynamodb:ResourceTag/*`, each matched case-insensitively on
-  the key), `sts:ExternalId` and `aws:TagKeys`. Keys that are legitimately
-  absent for ExtendDB's callers keep absent-key semantics; these are an
-  allowlist that includes `aws:MultiFactorAuthPresent`, `aws:TokenIssueTime`,
-  the VPC, federation and source-service keys, and `aws:username` on a role
-  session. Any other unresolved `aws:` global key (for example
-  `aws:PrincipalOrgID`, `aws:PrincipalOrgPaths`, `aws:userid`, `aws:SourceIp`,
-  `aws:UserAgent`) is case 3 and fails closed; the allowlist, rather than a
-  denylist of keys the service populates, is what the evaluator maintains, so a
-  key AWS adds later fails closed rather than silently granting.
+  absent (which would let a negated operator spuriously match). ExtendDB resolves
+  every global key the service populates for a signed IAM-user or assumed-role
+  request, or an `AssumeRole` call, so case 3 is empty: the resolved set is
+  `aws:SecureTransport` (listener TLS state), `aws:RequestedRegion` (server
+  region), `aws:CurrentTime` and `aws:EpochTime` (request time),
+  `aws:PrincipalType`, `aws:username` (user caller), `aws:userid`
+  (`AIDA...` for a user, `<role-id>:<session-name>` for a role session),
+  `aws:PrincipalArn`, `aws:PrincipalAccount`, `aws:ResourceAccount`,
+  `aws:SourceIp` (connection peer address, evaluated with `IpAddress` and
+  `NotIpAddress` as IPv4 and IPv6 CIDR membership), `aws:UserAgent` (the
+  `User-Agent` header), `aws:ViaAWSService` and `aws:PrincipalIsAWSService`
+  (both false for a direct caller), the tag keys (`aws:PrincipalTag/*`,
+  `aws:RequestTag/*`, `aws:ResourceTag/*` on the identity path,
+  `dynamodb:ResourceTag/*`, each matched case-insensitively on the key),
+  `sts:ExternalId` and `aws:TagKeys`. Every other `aws:` global key is absent,
+  which is what the service does for a key it does not populate for this caller
+  and for a key it does not recognize: the organization keys
+  (`aws:PrincipalOrgID`, `aws:PrincipalOrgPaths`, and the resource and source
+  organization keys), because an ExtendDB account is a standalone AWS account
+  where IAM leaves them unset; the VPC-endpoint, federation, MFA,
+  service-principal and cross-service keys, which the service does not populate
+  for a direct IAM-user or assumed-role caller over a public endpoint; and any
+  unknown or future `aws:` key. The evaluator keeps an explicit (currently
+  empty) fail-closed list, so a future global key the service begins populating
+  before ExtendDB resolves it can be made to fail closed by listing it, rather
+  than silently granting through a negated operator. `aws:SourceIp` and
+  `aws:UserAgent` come from the connection and the `User-Agent` header; behind a
+  proxy the peer address is used and `X-Forwarded-For` is never trusted. The
+  full classified key list is in the admin guide.
 - **Follow-up:** the decision logic was factored into a store-free
   `trust_decision` helper (with `action_permitted`, `deny_statement_blocks`,
   `allow_statement_grants` and `effect_of`) so the
