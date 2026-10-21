@@ -438,12 +438,12 @@ class TestRoleSessionTagCondition:
             self.mgmt.delete_role(self.account_id, role)
 
 
-class TestUnresolvableGlobalKey:
-    """Identity policies gated on a global key the service populates but
-    ExtendDB cannot resolve (for example aws:PrincipalOrgID). Such a statement
-    fails closed: a Deny blocks and an Allow does not grant, whatever the
-    operator, so a negated operator cannot spuriously grant. A key ExtendDB does
-    resolve (aws:PrincipalArn) evaluates normally.
+class TestOrganizationKeysAbsent:
+    """Identity policies gated on an organization key (for example
+    aws:PrincipalOrgID). An ExtendDB account is a standalone AWS account, so
+    IAM leaves these keys absent and absent-key semantics apply: a positive
+    operator does not match, and a negated operator on an absent single-valued
+    key matches. A key ExtendDB resolves (aws:PrincipalArn) evaluates normally.
     """
 
     @pytest.fixture(autouse=True)
@@ -474,7 +474,7 @@ class TestUnresolvableGlobalKey:
         client.put_item(TableName=table, Item={"pk": {"S": "k1"}, "data": {"S": "v1"}})
         return client, table
 
-    def test_deny_on_unresolvable_orgid_blocks_fail_closed(self):
+    def test_deny_on_absent_orgid_does_not_block(self):
         admin_client, table = self._admin_table()
         user = f"urk-deny-{uuid.uuid4().hex[:8]}"
         ak, sk = _create_user_with_key(self.mgmt, self.account_id, user)
@@ -488,16 +488,17 @@ class TestUnresolvableGlobalKey:
         assert resp.status_code == 204
         client = _make_client(self.endpoint, ak, sk, self.region)
         try:
-            with pytest.raises(ClientError) as exc:
-                client.get_item(TableName=table, Key={"pk": {"S": "k1"}})
-            assert exc.value.response["Error"]["Code"] == "AccessDeniedException"
-            # The Deny names only GetItem, so PutItem still succeeds.
-            client.put_item(TableName=table, Item={"pk": {"S": "k2"}, "data": {"S": "v2"}})
+            # An ExtendDB account is a standalone AWS account, so
+            # aws:PrincipalOrgID is absent; StringEquals on an absent key does
+            # not match, so the Deny is inert and GetItem is allowed. Matches
+            # live IAM for a standalone account.
+            out = client.get_item(TableName=table, Key={"pk": {"S": "k1"}})
+            assert out["Item"]["data"]["S"] == "v1"
         finally:
             admin_client.delete_table(TableName=table)
             self.mgmt.delete_user(self.account_id, user)
 
-    def test_negated_allow_on_unresolvable_orgid_does_not_grant(self):
+    def test_negated_allow_on_absent_orgid_grants(self):
         admin_client, table = self._admin_table()
         user = f"urk-neg-{uuid.uuid4().hex[:8]}"
         ak, sk = _create_user_with_key(self.mgmt, self.account_id, user)
@@ -510,9 +511,11 @@ class TestUnresolvableGlobalKey:
         assert resp.status_code == 204
         client = _make_client(self.endpoint, ak, sk, self.region)
         try:
-            with pytest.raises(ClientError) as exc:
-                client.get_item(TableName=table, Key={"pk": {"S": "k1"}})
-            assert exc.value.response["Error"]["Code"] == "AccessDeniedException"
+            # Org key absent for a standalone account; a negated operator on an
+            # absent single-valued key matches, so the Allow grants. Matches live
+            # IAM for a standalone account.
+            out = client.get_item(TableName=table, Key={"pk": {"S": "k1"}})
+            assert out["Item"]["data"]["S"] == "v1"
         finally:
             admin_client.delete_table(TableName=table)
             self.mgmt.delete_user(self.account_id, user)
@@ -671,16 +674,78 @@ class TestServicePopulatedGlobalKeys(_TaggedTableBase):
         assert self._get(table, self._allow_get_if(
             {"BoolIfExists": {"aws:MultiFactorAuthPresent": "false"}})) == "ALLOW"
 
-    def test_unknown_key_negated_allow_fails_closed(self, table):
-        # An unknown aws: key is unresolvable, so the Allow does not grant even
-        # under a negated operator. ExtendDB denies here while live DynamoDB
-        # allows (treating the key as absent); this is the deliberate
-        # fail-closed over-denial recorded in the report's open questions.
+    def test_unknown_key_negated_allow_grants(self, table):
+        # An unknown aws: key is absent, as on the service, so the negated
+        # operator matches an absent single-valued key and the Allow grants.
+        # Live DynamoDB: ALLOW. (Round two failed closed and denied here; this
+        # row changes from DENY to ALLOW under the revised rule.)
         assert self._get(table, self._allow_get_if(
-            {"StringNotEquals": {"aws:NoSuchGlobalKey": "x"}})) == "DENY"
+            {"StringNotEquals": {"aws:NoSuchGlobalKey": "x"}})) == "ALLOW"
 
-    def test_unknown_key_deny_fails_closed(self, table):
-        # A Deny gated on an unknown aws: key fails closed and blocks. Live
-        # DynamoDB also denies here (the negated-absent rule applies the Deny).
+    def test_unknown_key_deny_negated_blocks(self, table):
+        # A Deny gated on StringNotEquals of an unknown aws: key: the key is
+        # absent, the negated operator matches, so the Deny applies and blocks.
+        # Live DynamoDB also denies here.
         assert self._get(table, self._allow_all_deny_get_if(
             {"StringNotEquals": {"aws:NoSuchGlobalKey": "x"}})) == "DENY"
+
+
+class TestRound3GlobalKeys(_TaggedTableBase):
+    """Round three keys on the identity path: aws:userid, aws:SourceIp,
+    aws:UserAgent, aws:ResourceAccount, and the organization keys absent for a
+    standalone account. Every expected outcome was measured live."""
+
+    def test_userid_present_denies_null_true(self, table):
+        # aws:userid is populated, so Null true is false and the Allow does not
+        # grant.
+        assert self._get(table, self._allow_get_if(
+            {"Null": {"aws:userid": "true"}})) == "DENY"
+
+    def test_userid_like_aida_grants(self, table):
+        # A user's aws:userid begins with AIDA.
+        assert self._get(table, self._allow_get_if(
+            {"StringLike": {"aws:userid": "AIDA*"}})) == "ALLOW"
+
+    def test_sourceip_loopback_grants(self, table):
+        # The test client connects over the IPv4 loopback, so aws:SourceIp is
+        # 127.0.0.1 and IpAddress on the loopback grants.
+        assert self._get(table, self._allow_get_if(
+            {"IpAddress": {"aws:SourceIp": "127.0.0.1/32"}})) == "ALLOW"
+
+    def test_sourceip_other_range_denies(self, table):
+        assert self._get(table, self._allow_get_if(
+            {"IpAddress": {"aws:SourceIp": "10.0.0.0/8"}})) == "DENY"
+
+    def test_sourceip_notipaddress_loopback_does_not_grant(self, table):
+        # NotIpAddress excludes the caller's own loopback address, so the Allow
+        # does not grant.
+        assert self._get(table, self._allow_get_if(
+            {"NotIpAddress": {"aws:SourceIp": "127.0.0.1/32"}})) == "DENY"
+
+    def test_useragent_stringlike_grants(self, table):
+        # The boto3 client's User-Agent contains Botocore.
+        assert self._get(table, self._allow_get_if(
+            {"StringLike": {"aws:UserAgent": "*Botocore*"}})) == "ALLOW"
+
+    def test_useragent_stringlike_no_match_denies(self, table):
+        assert self._get(table, self._allow_get_if(
+            {"StringLike": {"aws:UserAgent": "*ZZZNoSuchAgentZZZ*"}})) == "DENY"
+
+    def test_resourceaccount_eq_grants(self, table):
+        # aws:ResourceAccount is the table owner account.
+        assert self._get(table, self._allow_get_if(
+            {"StringEquals": {"aws:ResourceAccount": self.account_id}})) == "ALLOW"
+
+    def test_resourceaccount_present_denies_null_true(self, table):
+        assert self._get(table, self._allow_get_if(
+            {"Null": {"aws:ResourceAccount": "true"}})) == "DENY"
+
+    def test_principalorgid_absent_null_true_grants(self, table):
+        # Standalone account: the organization key is absent, so Null true
+        # grants.
+        assert self._get(table, self._allow_get_if(
+            {"Null": {"aws:PrincipalOrgID": "true"}})) == "ALLOW"
+
+    def test_principalorgid_negated_allow_grants(self, table):
+        assert self._get(table, self._allow_get_if(
+            {"StringNotEquals": {"aws:PrincipalOrgID": "o-example1"}})) == "ALLOW"

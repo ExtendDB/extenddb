@@ -1031,9 +1031,11 @@ class TestTrustPolicyDeny:
 
     # -- Case 3: a key STS populates but ExtendDB cannot resolve (fail closed)
 
-    def test_deny_on_unresolvable_org_key_fails_closed(self):
-        # A Deny gated on aws:PrincipalOrgID, which ExtendDB cannot resolve,
-        # fails closed and blocks. This matches IAM when the key would match.
+    def test_deny_on_absent_org_key_does_not_block(self):
+        # An ExtendDB account is a standalone AWS account, so aws:PrincipalOrgID
+        # is absent; StringEquals on an absent key does not match, so the Deny is
+        # inert and assumption is allowed. Matches live IAM for a standalone
+        # account.
         user, arn = self._caller()
         try:
             trust = _trust(
@@ -1041,14 +1043,14 @@ class TestTrustPolicyDeny:
                 _stmt("Deny", {"AWS": "*"},
                       condition={"StringEquals": {"aws:PrincipalOrgID": "o-example1"}}),
             )
-            assert self._assume(trust, arn) == DENY
+            assert self._assume(trust, arn) == ALLOW
         finally:
             self.mgmt.delete_user(self.account_id, user)
 
-    def test_allow_gate_on_unresolvable_org_key_does_not_grant(self):
-        # An Allow gated solely on aws:PrincipalOrgID does not grant, because the
-        # key is unresolvable. ExtendDB denies where IAM would allow; this is the
-        # documented fail-closed divergence for keys ExtendDB does not evaluate.
+    def test_allow_gate_on_absent_org_key_does_not_grant(self):
+        # An Allow gated solely on aws:PrincipalOrgID does not grant: the key is
+        # absent for a standalone account, so the positive operator does not
+        # match. Matches live IAM for a standalone account.
         user, arn = self._caller()
         try:
             trust = _trust(_stmt("Allow", {"AWS": "*"},
@@ -1057,10 +1059,10 @@ class TestTrustPolicyDeny:
         finally:
             self.mgmt.delete_user(self.account_id, user)
 
-    def test_deny_negated_on_unresolvable_org_key_fails_closed(self):
-        # StringNotEquals on an unresolvable key must not spuriously grant via
-        # the negated-absent rule: the Deny fails closed and blocks (ExtendDB
-        # over-denies here relative to IAM, the documented safe direction).
+    def test_deny_negated_on_absent_org_key_blocks(self):
+        # StringNotEquals on an absent organization key matches (the negated
+        # operator on an absent single-valued key), so the Deny applies and
+        # blocks. Matches live IAM for a standalone account.
         user, arn = self._caller()
         try:
             trust = _trust(
@@ -1068,6 +1070,80 @@ class TestTrustPolicyDeny:
                 _stmt("Deny", {"AWS": "*"},
                       condition={"StringNotEquals": {"aws:PrincipalOrgID": "o-example1"}}),
             )
+            assert self._assume(trust, arn) == DENY
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    # -- Round three keys on the trust path (measured live) --
+
+    def test_sourceip_loopback_grants(self):
+        # The AssumeRole call arrives over the IPv4 loopback, so aws:SourceIp is
+        # 127.0.0.1 and IpAddress on the loopback grants.
+        user, arn = self._caller()
+        try:
+            trust = _trust(_stmt("Allow", {"AWS": arn},
+                                 condition={"IpAddress": {"aws:SourceIp": "127.0.0.1/32"}}))
+            assert self._assume(trust, arn) == ALLOW
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_sourceip_other_range_does_not_grant(self):
+        user, arn = self._caller()
+        try:
+            trust = _trust(_stmt("Allow", {"AWS": arn},
+                                 condition={"IpAddress": {"aws:SourceIp": "10.0.0.0/8"}}))
+            assert self._assume(trust, arn) == DENY
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_notipaddress_deny_blocks_caller_outside_range(self):
+        # Deny unless the caller is inside 10.0.0.0/8. The loopback caller is
+        # outside it, so NotIpAddress matches and the Deny blocks.
+        user, arn = self._caller()
+        try:
+            trust = _trust(
+                _stmt("Allow", {"AWS": arn}),
+                _stmt("Deny", {"AWS": "*"},
+                      condition={"NotIpAddress": {"aws:SourceIp": "10.0.0.0/8"}}),
+            )
+            assert self._assume(trust, arn) == DENY
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_useragent_stringlike_grants(self):
+        # The management client's User-Agent is python-requests.
+        user, arn = self._caller()
+        try:
+            trust = _trust(_stmt("Allow", {"AWS": arn},
+                                 condition={"StringLike": {"aws:UserAgent": "*requests*"}}))
+            assert self._assume(trust, arn) == ALLOW
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_useragent_stringlike_no_match_does_not_grant(self):
+        user, arn = self._caller()
+        try:
+            trust = _trust(_stmt("Allow", {"AWS": arn},
+                                 condition={"StringLike": {"aws:UserAgent": "*ZZZNoSuchAgentZZZ*"}}))
+            assert self._assume(trust, arn) == DENY
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_userid_like_aida_grants(self):
+        # The caller is an IAM user, so aws:userid begins with AIDA.
+        user, arn = self._caller()
+        try:
+            trust = _trust(_stmt("Allow", {"AWS": arn},
+                                 condition={"StringLike": {"aws:userid": "AIDA*"}}))
+            assert self._assume(trust, arn) == ALLOW
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_userid_present_null_true_does_not_grant(self):
+        user, arn = self._caller()
+        try:
+            trust = _trust(_stmt("Allow", {"AWS": arn},
+                                 condition={"Null": {"aws:userid": "true"}}))
             assert self._assume(trust, arn) == DENY
         finally:
             self.mgmt.delete_user(self.account_id, user)
