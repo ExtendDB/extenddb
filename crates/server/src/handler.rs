@@ -121,7 +121,7 @@ pub(crate) async fn handle_request(
         // aws:SourceIp is the connection peer address; aws:UserAgent is the
         // User-Agent header. Behind a proxy only the peer address is trusted,
         // never an X-Forwarded-For header.
-        let source_ip = peer_addr.ip().to_string();
+        let source_ip = crate::authorization::condition_source_ip(&peer_addr);
         let user_agent = headers
             .get("user-agent")
             .and_then(|v| v.to_str().ok())

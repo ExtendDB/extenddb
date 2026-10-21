@@ -333,3 +333,38 @@ async fn fetch_session_data_and_tags(
     }
     Ok((session_policy, tags, token_issue_time))
 }
+
+/// The value of `aws:SourceIp` for a request that arrived from `peer`.
+///
+/// An IPv4 client that reaches a dual-stack (`::`) listener appears as the
+/// IPv4-mapped IPv6 address `::ffff:a.b.c.d`. The service evaluates such a
+/// client as its IPv4 address, so an IPv4 CIDR in `IpAddress` or `NotIpAddress`
+/// matches it. The mapped form is converted back to IPv4 here; any other
+/// address is returned as is.
+pub(crate) fn condition_source_ip(peer: &std::net::SocketAddr) -> String {
+    peer.ip().to_canonical().to_string()
+}
+
+#[cfg(test)]
+mod source_ip_tests {
+    use super::condition_source_ip;
+    use std::net::SocketAddr;
+
+    #[test]
+    fn ipv4_mapped_peer_is_evaluated_as_ipv4() {
+        let mapped: SocketAddr = "[::ffff:127.0.0.1]:443".parse().unwrap();
+        assert_eq!(condition_source_ip(&mapped), "127.0.0.1");
+        let mapped_private: SocketAddr = "[::ffff:10.1.2.3]:443".parse().unwrap();
+        assert_eq!(condition_source_ip(&mapped_private), "10.1.2.3");
+    }
+
+    #[test]
+    fn other_peers_are_unchanged() {
+        let v4: SocketAddr = "10.1.2.3:443".parse().unwrap();
+        assert_eq!(condition_source_ip(&v4), "10.1.2.3");
+        let v6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        assert_eq!(condition_source_ip(&v6), "2001:db8::1");
+        let loopback6: SocketAddr = "[::1]:443".parse().unwrap();
+        assert_eq!(condition_source_ip(&loopback6), "::1");
+    }
+}

@@ -69,7 +69,7 @@ pub async fn assume_role(
     body: axum::body::Bytes,
 ) -> Response {
     // Authenticate via Basic auth — admin only.
-    let source_ip = addr.ip().to_string();
+    let source_ip = crate::authorization::condition_source_ip(&addr);
     if let Err(e) = authenticate_admin(
         &headers,
         &*state.catalog_store,
