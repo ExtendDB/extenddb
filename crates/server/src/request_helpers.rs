@@ -162,7 +162,9 @@ pub(crate) async fn authorize_request(
         // in a BatchWriteItem each return ValidationException, including to a
         // principal with no permissions (measured 2026-10-21). Checking first
         // also bounds the tables read and the policies evaluated below by those
-        // limits instead of by the body size.
+        // limits instead of by the body size. A TransactWriteItems item can name
+        // up to four sub-operations here, each on its own table, before the
+        // handler rejects it, so a transaction reads at most 400 tables.
         extenddb_engine::check_request_item_counts(operation, input)?;
 
         // Read each distinct table's key info from storage, not the cache, and

@@ -14,7 +14,11 @@
 //! 2026-10-21). Checking first also bounds the work authorization does per
 //! request: at most 100 tables and 100 keys for `BatchGetItem`, 25 tables and
 //! 25 requests for `BatchWriteItem`, and 100 items for a transaction, instead of
-//! a number set by the body size. Both paths run [`check_batch_counts`] and
+//! a number set by the body size. Authorization walks every sub-operation of a
+//! `TransactWriteItems` item before the handler's one-operation rule rejects an
+//! item with several, so a transaction reads at most 400 tables (100 items, four
+//! sub-operations each) and evaluates at most 400 targets. Both paths run
+//! [`check_batch_counts`] and
 //! [`check_transact_count`], so they apply the checks in one order and return
 //! the same text.
 
