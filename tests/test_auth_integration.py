@@ -1198,6 +1198,82 @@ class TestTrustPolicyDeny:
         finally:
             self.mgmt.delete_user(self.account_id, user)
 
+    # -- Condition key NAMES are resolved case-insensitively ----------
+
+    def test_keyname_case_insensitive_principaltype_lowercase_grants(self):
+        # aws:principaltype (lower) resolves like aws:PrincipalType; the caller
+        # is a user, so the gated Allow grants. Matches live STS.
+        user, arn = self._caller()
+        try:
+            trust = _trust(_stmt("Allow", {"AWS": arn},
+                                 condition={"StringEquals": {"aws:principaltype": "User"}}))
+            assert self._assume(trust, arn) == ALLOW
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_keyname_case_insensitive_principaltype_deny_lowercase_blocks(self):
+        # A Deny gated on a miscased key must still be enforced: aws:principaltype
+        # resolves to User, so the Deny applies. A case-sensitive lookup would
+        # drop the Deny and grant.
+        user, arn = self._caller()
+        try:
+            trust = _trust(
+                _stmt("Allow", {"AWS": "*"}),
+                _stmt("Deny", {"AWS": arn},
+                      condition={"StringEquals": {"aws:principaltype": "User"}}),
+            )
+            assert self._assume(trust, arn) == DENY
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_keyname_case_insensitive_securetransport_lowercase_guard(self):
+        # aws:securetransport (lower) resolves to true over TLS, so the Deny on
+        # =false is inert and the Allow grants.
+        user, arn = self._caller()
+        try:
+            trust = _trust(
+                _stmt("Allow", {"AWS": arn}),
+                _stmt("Deny", {"AWS": "*"},
+                      condition={"Bool": {"aws:securetransport": "false"}}),
+            )
+            assert self._assume(trust, arn) == ALLOW
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_keyname_case_insensitive_principaltag_prefix_lowercase(self):
+        # The tag prefix aws:principaltag/ (lower) resolves like aws:PrincipalTag/.
+        user, arn = self._caller(tags={"Team": "contractors"})
+        try:
+            trust = _trust(_stmt("Allow", {"AWS": arn},
+                                 condition={"StringEquals": {"aws:principaltag/team": "contractors"}}))
+            assert self._assume(trust, arn) == ALLOW
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_keyname_case_insensitive_externalid_lowercase(self):
+        # sts:externalid (lower) resolves like sts:ExternalId. Deny unless the
+        # external id equals secret; with the matching id the Deny is inert.
+        user, arn = self._caller()
+        try:
+            trust = _trust(
+                _stmt("Allow", {"AWS": arn}),
+                _stmt("Deny", {"AWS": arn},
+                      condition={"StringNotEquals": {"sts:externalid": "secret"}}),
+            )
+            role = f"bbr-{uuid.uuid4().hex[:8]}"
+            resp = self.mgmt.create_role(self.account_id, role, trust)
+            assert resp.status_code == 201, resp.text
+            try:
+                with_id = self.mgmt.assume_role(
+                    self.account_id, role, arn, "bb-session", external_id="secret")
+                assert with_id.status_code == ALLOW, with_id.text
+                no_id = self.mgmt.assume_role(self.account_id, role, arn, "bb-session")
+                assert no_id.status_code == DENY, no_id.text
+            finally:
+                self.mgmt.delete_role(self.account_id, role)
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
     # -- Resolved request-wide keys on the trust path (T8) ------------------
 
     def test_tls_guard_does_not_block_over_tls(self):

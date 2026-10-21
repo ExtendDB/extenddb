@@ -753,6 +753,51 @@ class TestRound3GlobalKeys(_TaggedTableBase):
             {"StringNotEquals": {"aws:PrincipalOrgID": "o-example1"}})) == "ALLOW"
 
 
+class TestConditionKeyNameCaseInsensitive(_TaggedTableBase):
+    """Condition key NAMES resolve case-insensitively on the identity path,
+    matching the live service. A miscased key resolves the same value as its
+    canonical form; a case-sensitive lookup would read it as absent and flip the
+    outcome."""
+
+    def test_principaltype_lowercase_key_allows(self, table):
+        # aws:principaltype resolves to User like aws:PrincipalType.
+        assert self._get(table, self._allow_get_if(
+            {"StringEquals": {"aws:principaltype": "User"}})) == "ALLOW"
+
+    def test_securetransport_lowercase_key_deny_guard_allows(self, table):
+        # aws:securetransport resolves to true over TLS, so the Deny is inert.
+        assert self._get(table, self._allow_all_deny_get_if(
+            {"Bool": {"aws:securetransport": "false"}})) == "ALLOW"
+
+    def test_sourceip_lowercase_key_grants(self, table):
+        # aws:sourceip resolves like aws:SourceIp; 0.0.0.0/0 matches any caller.
+        assert self._get(table, self._allow_get_if(
+            {"IpAddress": {"aws:sourceip": "0.0.0.0/0"}})) == "ALLOW"
+
+    def test_leadingkeys_lowercase_key_grants(self, table):
+        # dynamodb:leadingkeys resolves like dynamodb:LeadingKeys; the GetItem
+        # key is k1.
+        assert self._get(table, self._allow_get_if(
+            {"ForAllValues:StringEquals": {"dynamodb:leadingkeys": ["k1"]}})) == "ALLOW"
+
+    def test_resourcetag_lowercase_prefix_grants(self, table):
+        # The tag prefix aws:resourcetag/ (lower) resolves like aws:ResourceTag/;
+        # the table is tagged env=prod.
+        assert self._get(table, self._allow_get_if(
+            {"StringEquals": {"aws:resourcetag/env": "prod"}})) == "ALLOW"
+
+    def test_dynamodb_resourcetag_lowercase_prefix_grants(self, table):
+        assert self._get(table, self._allow_get_if(
+            {"StringEquals": {"dynamodb:resourcetag/env": "prod"}})) == "ALLOW"
+
+    def test_principaltype_deny_lowercase_key_blocks(self, table):
+        # A Deny gated on a miscased key must still be enforced. aws:principaltype
+        # resolves to User, so the Deny applies and blocks. A case-sensitive
+        # lookup would read the key as absent, drop the Deny, and grant.
+        assert self._get(table, self._allow_all_deny_get_if(
+            {"StringEquals": {"aws:principaltype": "User"}})) == "DENY"
+
+
 # ---------------------------------------------------------------------------
 # aws:TokenIssueTime (role sessions) and aws:userid across recreate
 # ---------------------------------------------------------------------------

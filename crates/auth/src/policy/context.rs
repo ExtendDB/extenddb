@@ -58,6 +58,24 @@ fn ci_tag_lookup<'a>(map: &'a HashMap<String, String>, tag_key: &str) -> Option<
         .map(|(_, v)| vec![v.as_str()])
 }
 
+/// Strip `prefix` from the front of `s` case-insensitively, returning the
+/// remainder (the tag sub-key) when it matches.
+///
+/// The live service resolves a condition key name without regard to case,
+/// including the tag prefix (`aws:PrincipalTag/`, `aws:RequestTag/`,
+/// `aws:ResourceTag/`, `dynamodb:ResourceTag/`), so `aws:principaltag/team` and
+/// `aws:PrincipalTag/team` resolve the same tag. The remainder is returned with
+/// its original case; `ci_tag_lookup` then matches the tag sub-key
+/// case-insensitively.
+fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = s.get(..prefix.len())?;
+    if head.eq_ignore_ascii_case(prefix) {
+        s.get(prefix.len()..)
+    } else {
+        None
+    }
+}
+
 /// Documented AWS global condition keys the live service populates for a
 /// request from one of ExtendDB's callers but that this build cannot resolve to
 /// the value the service would have. A statement using one fails closed: a
@@ -89,7 +107,9 @@ const FAIL_CLOSED_GLOBAL_KEYS: &[&str] = &[];
 /// matches, which is what the live service does for a key it does not populate.
 #[must_use]
 pub fn aws_key_is_unresolvable(key: &str) -> bool {
-    FAIL_CLOSED_GLOBAL_KEYS.contains(&key)
+    FAIL_CLOSED_GLOBAL_KEYS
+        .iter()
+        .any(|k| k.eq_ignore_ascii_case(key))
 }
 
 /// The request time as the pair (`aws:CurrentTime` as RFC 3339 UTC,
@@ -252,58 +272,63 @@ impl RequestContext {
 
 impl ConditionContext for RequestContext {
     fn resolve_key(&self, key: &str) -> Option<Vec<&str>> {
-        if let Some(tag_key) = key.strip_prefix("aws:PrincipalTag/") {
+        // Condition key names are resolved case-insensitively, matching the
+        // live service: `aws:securetransport` and `AWS:SecureTransport` resolve
+        // the same as `aws:SecureTransport`, and `aws:principaltag/team` the
+        // same as `aws:PrincipalTag/team`. The tag prefix is matched
+        // case-insensitively here; the tag sub-key is folded by `ci_tag_lookup`.
+        if let Some(tag_key) = strip_prefix_ci(key, "aws:PrincipalTag/") {
             ci_tag_lookup(&self.principal_tags, tag_key)
-        } else if let Some(tag_key) = key.strip_prefix("aws:ResourceTag/") {
+        } else if let Some(tag_key) = strip_prefix_ci(key, "aws:ResourceTag/") {
             // The service evaluates resource tags as aws:ResourceTag/*. ExtendDB
             // resolves them from the same resource-tag map it uses for
             // dynamodb:ResourceTag/*, case-insensitively on the key.
             ci_tag_lookup(&self.resource_tags, tag_key)
-        } else if let Some(tag_key) = key.strip_prefix("dynamodb:ResourceTag/") {
+        } else if let Some(tag_key) = strip_prefix_ci(key, "dynamodb:ResourceTag/") {
             ci_tag_lookup(&self.resource_tags, tag_key)
         } else {
-            match key {
-                "dynamodb:LeadingKeys" => self
+            match key.to_ascii_lowercase().as_str() {
+                "dynamodb:leadingkeys" => self
                     .leading_keys
                     .as_ref()
                     .map(|v| v.iter().map(std::string::String::as_str).collect()),
-                "dynamodb:Attributes" => self
+                "dynamodb:attributes" => self
                     .attributes
                     .as_ref()
                     .map(|v| v.iter().map(std::string::String::as_str).collect()),
-                "dynamodb:Select" => self.select.as_deref().map(|v| vec![v]),
-                "dynamodb:ReturnValues" => self.return_values.as_deref().map(|v| vec![v]),
-                "dynamodb:ReturnConsumedCapacity" => {
+                "dynamodb:select" => self.select.as_deref().map(|v| vec![v]),
+                "dynamodb:returnvalues" => self.return_values.as_deref().map(|v| vec![v]),
+                "dynamodb:returnconsumedcapacity" => {
                     self.return_consumed_capacity.as_deref().map(|v| vec![v])
                 }
-                "dynamodb:FullTableScan" => self
+                "dynamodb:fulltablescan" => self
                     .full_table_scan
                     .map(|v| vec![if v { "true" } else { "false" }]),
-                "dynamodb:EnclosingOperation" => {
+                "dynamodb:enclosingoperation" => {
                     self.enclosing_operation.as_deref().map(|v| vec![v])
                 }
-                "aws:PrincipalArn" => self.principal_arn.as_deref().map(|v| vec![v]),
-                "aws:PrincipalAccount" => self.principal_account.as_deref().map(|v| vec![v]),
-                "aws:RequestedRegion" => self.region.as_deref().map(|v| vec![v]),
-                "aws:SecureTransport" => Some(vec![if self.secure_transport {
+                "aws:principalarn" => self.principal_arn.as_deref().map(|v| vec![v]),
+                "aws:principalaccount" => self.principal_account.as_deref().map(|v| vec![v]),
+                "aws:requestedregion" => self.region.as_deref().map(|v| vec![v]),
+                "aws:securetransport" => Some(vec![if self.secure_transport {
                     "true"
                 } else {
                     "false"
                 }]),
-                "aws:CurrentTime" => Some(vec![self.current_time.as_str()]),
-                "aws:EpochTime" => Some(vec![self.epoch_time.as_str()]),
-                "aws:PrincipalType" => self.principal_type.as_deref().map(|v| vec![v]),
+                "aws:currenttime" => Some(vec![self.current_time.as_str()]),
+                "aws:epochtime" => Some(vec![self.epoch_time.as_str()]),
+                "aws:principaltype" => self.principal_type.as_deref().map(|v| vec![v]),
                 "aws:username" => self.username.as_deref().map(|v| vec![v]),
-                "aws:SourceIp" => self.source_ip.as_deref().map(|v| vec![v]),
-                "aws:UserAgent" => self.user_agent.as_deref().map(|v| vec![v]),
+                "aws:sourceip" => self.source_ip.as_deref().map(|v| vec![v]),
+                "aws:useragent" => self.user_agent.as_deref().map(|v| vec![v]),
                 "aws:userid" => self.userid.as_deref().map(|v| vec![v]),
-                "aws:ResourceAccount" => self.resource_account.as_deref().map(|v| vec![v]),
-                "aws:TokenIssueTime" => self.token_issue_time.as_deref().map(|v| vec![v]),
+                "aws:resourceaccount" => self.resource_account.as_deref().map(|v| vec![v]),
+                "aws:tokenissuetime" => self.token_issue_time.as_deref().map(|v| vec![v]),
                 // ExtendDB is not an AWS service calling on a principal's behalf,
                 // so these are always false, matching the service for a direct
                 // caller.
-                "aws:ViaAWSService" => Some(vec!["false"]),
-                "aws:PrincipalIsAWSService" => Some(vec!["false"]),
+                "aws:viaawsservice" => Some(vec!["false"]),
+                "aws:principalisawsservice" => Some(vec!["false"]),
                 _ => None,
             }
         }
@@ -312,8 +337,13 @@ impl ConditionContext for RequestContext {
     fn is_multivalued_key(&self, key: &str) -> bool {
         // Per the AWS DynamoDB service authorization reference these keys are
         // `ArrayOfString` (multivalued); all other DynamoDB keys and tag keys are
-        // single-valued. Verified against real AWS IAM (BR-7085).
-        matches!(key, "dynamodb:LeadingKeys" | "dynamodb:Attributes")
+        // single-valued. Verified against real AWS IAM (BR-7085). Key names are
+        // matched case-insensitively, matching the service.
+        let lower = key.to_ascii_lowercase();
+        matches!(
+            lower.as_str(),
+            "dynamodb:leadingkeys" | "dynamodb:attributes"
+        )
     }
 
     fn is_unresolvable_key(&self, key: &str) -> bool {
@@ -383,32 +413,34 @@ pub struct AssumeRoleContext {
 
 impl ConditionContext for AssumeRoleContext {
     fn resolve_key(&self, key: &str) -> Option<Vec<&str>> {
-        if let Some(tag_key) = key.strip_prefix("aws:PrincipalTag/") {
+        // Condition key names are resolved case-insensitively, matching the
+        // live service, including the tag prefixes.
+        if let Some(tag_key) = strip_prefix_ci(key, "aws:PrincipalTag/") {
             ci_tag_lookup(&self.principal_tags, tag_key)
-        } else if let Some(tag_key) = key.strip_prefix("aws:RequestTag/") {
+        } else if let Some(tag_key) = strip_prefix_ci(key, "aws:RequestTag/") {
             ci_tag_lookup(&self.request_tags, tag_key)
         } else {
-            match key {
-                "sts:ExternalId" => self.external_id.as_deref().map(|v| vec![v]),
-                "aws:PrincipalArn" => Some(vec![self.principal_arn.as_str()]),
-                "aws:PrincipalAccount" => self.principal_account.as_deref().map(|v| vec![v]),
-                "aws:RequestedRegion" => self.region.as_deref().map(|v| vec![v]),
-                "aws:SecureTransport" => Some(vec![if self.secure_transport {
+            match key.to_ascii_lowercase().as_str() {
+                "sts:externalid" => self.external_id.as_deref().map(|v| vec![v]),
+                "aws:principalarn" => Some(vec![self.principal_arn.as_str()]),
+                "aws:principalaccount" => self.principal_account.as_deref().map(|v| vec![v]),
+                "aws:requestedregion" => self.region.as_deref().map(|v| vec![v]),
+                "aws:securetransport" => Some(vec![if self.secure_transport {
                     "true"
                 } else {
                     "false"
                 }]),
-                "aws:CurrentTime" => Some(vec![self.current_time.as_str()]),
-                "aws:EpochTime" => Some(vec![self.epoch_time.as_str()]),
-                "aws:PrincipalType" => self.principal_type.as_deref().map(|v| vec![v]),
+                "aws:currenttime" => Some(vec![self.current_time.as_str()]),
+                "aws:epochtime" => Some(vec![self.epoch_time.as_str()]),
+                "aws:principaltype" => self.principal_type.as_deref().map(|v| vec![v]),
                 "aws:username" => self.username.as_deref().map(|v| vec![v]),
-                "aws:SourceIp" => self.source_ip.as_deref().map(|v| vec![v]),
-                "aws:UserAgent" => self.user_agent.as_deref().map(|v| vec![v]),
+                "aws:sourceip" => self.source_ip.as_deref().map(|v| vec![v]),
+                "aws:useragent" => self.user_agent.as_deref().map(|v| vec![v]),
                 "aws:userid" => self.userid.as_deref().map(|v| vec![v]),
-                "aws:ResourceAccount" => self.resource_account.as_deref().map(|v| vec![v]),
-                "aws:ViaAWSService" => Some(vec!["false"]),
-                "aws:PrincipalIsAWSService" => Some(vec!["false"]),
-                "aws:TagKeys" => {
+                "aws:resourceaccount" => self.resource_account.as_deref().map(|v| vec![v]),
+                "aws:viaawsservice" => Some(vec!["false"]),
+                "aws:principalisawsservice" => Some(vec!["false"]),
+                "aws:tagkeys" => {
                     if self.request_tags.is_empty() {
                         None
                     } else {
@@ -424,8 +456,8 @@ impl ConditionContext for AssumeRoleContext {
         // `aws:TagKeys` is the set of session-tag keys (`ArrayOfString`); every
         // other trust-policy key (`aws:PrincipalTag/*`, `aws:RequestTag/*`,
         // `sts:ExternalId`, `aws:PrincipalArn`, `aws:PrincipalAccount`) is
-        // single-valued.
-        key == "aws:TagKeys"
+        // single-valued. Matched case-insensitively, like the service.
+        key.eq_ignore_ascii_case("aws:TagKeys")
     }
 
     fn is_unresolvable_key(&self, key: &str) -> bool {
@@ -595,6 +627,64 @@ mod tests {
             Some(vec!["contractors"])
         );
         assert_eq!(ctx.resolve_key("aws:RequestTag/env"), Some(vec!["prod"]));
+    }
+
+    #[test]
+    fn request_context_key_name_is_case_insensitive() {
+        // The service resolves a condition key NAME regardless of case,
+        // including the `aws:` prefix and the tag prefix. A miscased key must
+        // resolve to the same value as its canonical form.
+        let ctx = RequestContext::build(
+            HashMap::from([("Team".to_owned(), "contractors".to_owned())]),
+            HashMap::from([("Env".to_owned(), "prod".to_owned())]),
+            false,
+            RequestParams {
+                source_ip: Some("203.0.113.9".to_owned()),
+                secure_transport: true,
+                principal_type: Some("User".to_owned()),
+                leading_keys: Some(vec!["k1".to_owned()]),
+                attributes: Some(vec!["pk".to_owned()]),
+                ..Default::default()
+            },
+        );
+        // Global keys in lower case and with an upper-cased prefix.
+        assert_eq!(ctx.resolve_key("aws:securetransport"), Some(vec!["true"]));
+        assert_eq!(ctx.resolve_key("AWS:SecureTransport"), Some(vec!["true"]));
+        assert_eq!(ctx.resolve_key("aws:principaltype"), Some(vec!["User"]));
+        assert_eq!(ctx.resolve_key("aws:sourceip"), Some(vec!["203.0.113.9"]));
+        // dynamodb: keys in lower case, single- and multi-valued.
+        assert_eq!(ctx.resolve_key("dynamodb:leadingkeys"), Some(vec!["k1"]));
+        assert_eq!(ctx.resolve_key("dynamodb:attributes"), Some(vec!["pk"]));
+        assert!(ctx.is_multivalued_key("dynamodb:leadingkeys"));
+        assert!(ctx.is_multivalued_key("DYNAMODB:Attributes"));
+        // Tag prefixes in lower/upper case; the sub-key case is already folded.
+        assert_eq!(
+            ctx.resolve_key("aws:principaltag/team"),
+            Some(vec!["contractors"])
+        );
+        assert_eq!(ctx.resolve_key("aws:resourcetag/ENV"), Some(vec!["prod"]));
+        assert_eq!(
+            ctx.resolve_key("dynamodb:resourcetag/env"),
+            Some(vec!["prod"])
+        );
+    }
+
+    #[test]
+    fn assume_role_context_key_name_is_case_insensitive() {
+        let ctx = ar_ctx(
+            HashMap::from([("Team".to_owned(), "contractors".to_owned())]),
+            Some("ext-123".to_owned()),
+            HashMap::from([("env".to_owned(), "prod".to_owned())]),
+        );
+        assert_eq!(ctx.resolve_key("sts:externalid"), Some(vec!["ext-123"]));
+        assert_eq!(ctx.resolve_key("STS:ExternalId"), Some(vec!["ext-123"]));
+        assert_eq!(
+            ctx.resolve_key("aws:principalarn"),
+            Some(vec!["arn:aws:iam::123456789012:user/alice"])
+        );
+        assert_eq!(ctx.resolve_key("aws:requesttag/env"), Some(vec!["prod"]));
+        assert_eq!(ctx.resolve_key("aws:tagkeys"), Some(vec!["env"]));
+        assert!(ctx.is_multivalued_key("aws:tagkeys"));
     }
 
     #[test]
