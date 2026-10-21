@@ -279,11 +279,25 @@ pub(crate) fn validate_iam_tags(tags: &[(String, String)]) -> Result<(), String>
 /// One character of IAM's tag grammar: a Unicode letter or number, an ASCII
 /// space, or one of `_ . : / = + - @`. Combining marks and other punctuation
 /// are excluded, matching the service's `[\p{L}\p{Z}\p{N}_.:/=+\-@]`.
+/// Whether `c` is admissible in an IAM tag key or value.
+///
+/// IAM's tag grammar is `[\p{L}\p{Z}\p{N}_.:/=+\-@]`: any Unicode Letter
+/// (Lu, Ll, Lt, Lm, Lo), Number (Nd, Nl, No) or Separator (Zs, Zl, Zp), plus the
+/// listed symbols. These are Unicode general categories, matched here through
+/// `general_category_group`, not `char::is_alphabetic` / `char::is_numeric`:
+/// `is_alphabetic` is the Alphabetic property, a superset of `\p{L}` that admits
+/// Other_Alphabetic combining marks such as U+0345 (category Mn) that IAM
+/// rejects, and an ASCII-space-only separator check rejects the `\p{Z}`
+/// separators (U+00A0, U+2002, U+3000 and the rest) that IAM accepts.
 fn is_iam_tag_char(c: char) -> bool {
-    c.is_alphabetic()
-        || c.is_numeric()
-        || c == ' '
-        || matches!(c, '_' | '.' | ':' | '/' | '=' | '+' | '-' | '@')
+    use unicode_properties::{GeneralCategoryGroup, UnicodeGeneralCategory};
+    matches!(c, '_' | '.' | ':' | '/' | '=' | '+' | '-' | '@')
+        || matches!(
+            c.general_category_group(),
+            GeneralCategoryGroup::Letter
+                | GeneralCategoryGroup::Number
+                | GeneralCategoryGroup::Separator
+        )
 }
 
 /// Validate admin name: 1-64 chars, alphanumeric, hyphens, or underscores.
@@ -323,6 +337,37 @@ mod tag_validation_tests {
         assert!(validate_iam_tags(&t(&"k".repeat(129), "prod")).is_err()); // key too long
         assert!(validate_iam_tags(&t("team", &"v".repeat(257))).is_err()); // value too long
         assert!(validate_iam_tags(&t("team", "v\u{0301}")).is_err()); // combining mark in value
+    }
+
+    #[test]
+    fn tag_charset_matches_unicode_general_categories() {
+        // Separators (Zs, Zl, Zp) are accepted, matching live IAM.
+        for sep in [
+            '\u{00a0}', // no-break space (Zs)
+            '\u{2002}', // en space (Zs)
+            '\u{2003}', // em space (Zs)
+            '\u{3000}', // ideographic space (Zs)
+            '\u{2028}', // line separator (Zl)
+            '\u{2029}', // paragraph separator (Zp)
+            '\u{202f}', // narrow no-break space (Zs)
+        ] {
+            let k = format!("a{sep}b");
+            assert!(validate_iam_tags(&t(&k, "v")).is_ok(), "sep {sep:?} key");
+            assert!(validate_iam_tags(&t("k", &k)).is_ok(), "sep {sep:?} value");
+        }
+        // Numbers beyond Nd: Nl and No are accepted.
+        assert!(validate_iam_tags(&t("a\u{2160}b", "v")).is_ok()); // roman numeral one (Nl)
+        assert!(validate_iam_tags(&t("a\u{00b2}b", "v")).is_ok()); // superscript two (No)
+        assert!(validate_iam_tags(&t("a\u{00bd}b", "v")).is_ok()); // vulgar fraction half (No)
+        // Marks (Mn) are rejected even when Alphabetic (Other_Alphabetic),
+        // matching live IAM.
+        assert!(validate_iam_tags(&t("a\u{0345}b", "v")).is_err()); // ypogegrammeni (Mn, Other_Alphabetic)
+        assert!(validate_iam_tags(&t("a\u{0301}b", "v")).is_err()); // combining acute (Mn)
+        assert!(validate_iam_tags(&t("k", "v\u{0345}")).is_err()); // in a value too
+        // Symbols are rejected: an emoji (So).
+        assert!(validate_iam_tags(&t("a\u{1f600}b", "v")).is_err());
+        // Control: ASCII space (Zs) still accepted.
+        assert!(validate_iam_tags(&t("a b", "v")).is_ok());
     }
 
     #[test]
