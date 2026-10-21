@@ -649,3 +649,68 @@ async fn creating_gsi_refuses_reads_and_reports_backfilling() {
 
     s.cleanup().await;
 }
+
+/// Finding 2. A crash during GSI creation leaves the index CREATING with a half
+/// built or missing data table and no path out. The reconciler rebuilds it: it
+/// drops whatever was left, backfills from the base table, drains the queue and
+/// flips the index to ACTIVE, then releases the hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn creating_gsi_is_reconciled_after_a_crash() {
+    if base_conn().is_none() {
+        return skip();
+    }
+    let s = scratch().await;
+    let tid = create_base_table(&s, "gsi_reconcile").await;
+    // Seed base rows carrying g1, the state a creation would backfill from.
+    sqlx::query(&format!(
+        "INSERT INTO \"_ddb_{tid}\" (pk, item_data) \
+         SELECT 'k'||g, jsonb_build_object( \
+             'pk', jsonb_build_object('S', 'k'||g), \
+             'g1', jsonb_build_object('S', 'g'||(g % 11))) \
+         FROM generate_series(0, 199) g"
+    ))
+    .execute(&s.db)
+    .await
+    .expect("seed the base rows");
+
+    // The state a crash right after the catalog commit leaves: a CREATING row and
+    // a hold, with no index data table yet.
+    let iid = insert_creating_gsi(&s.db, &tid, "gsi_slow").await;
+    sqlx::query("INSERT INTO vector_index_holds (table_id, index_id) VALUES ($1, $2)")
+        .bind(&tid)
+        .bind(&iid)
+        .execute(&s.db)
+        .await
+        .expect("insert the hold left by the crash");
+
+    let n = s
+        .engine
+        .reconcile_incomplete_indexes()
+        .await
+        .expect("reconcile the incomplete GSI");
+    assert_eq!(n, 1, "the reconciler should have rebuilt exactly one GSI");
+
+    let status: String = sqlx::query_scalar(
+        "SELECT index_status FROM indexes WHERE table_id = $1 AND index_id = $2",
+    )
+    .bind(&tid)
+    .bind(&iid)
+    .fetch_one(&s.db)
+    .await
+    .expect("read the index status");
+    assert_eq!(status, "ACTIVE", "the GSI should be ACTIVE after reconcile");
+
+    let base = base_projection(&s.db, &tid).await;
+    let index = index_rows(&s.db, &iid).await;
+    assert_eq!(
+        base, index,
+        "the rebuilt index does not equal the base projection"
+    );
+
+    assert_eq!(
+        hold_count(&s.db, &tid).await,
+        0,
+        "the hold should be released after reconcile"
+    );
+    s.cleanup().await;
+}

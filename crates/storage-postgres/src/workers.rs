@@ -242,6 +242,12 @@ pub(crate) async fn vector_stuck_build_worker(
             ),
             Err(e) => tracing::error!("stuck vector build sweep failed: {e}"),
         }
+        // A GSI left CREATING by a crash lives in the `indexes` catalog, which the
+        // vector sweep never looks at. Rebuild it here too; ownership is taken per
+        // index, so a live creation is never rebuilt under it.
+        if let Err(e) = engine.reconcile_incomplete_indexes().await {
+            tracing::error!("stuck GSI reconcile failed: {e}");
+        }
     }
 }
 
