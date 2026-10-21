@@ -1720,9 +1720,11 @@ mod tests {
             "ForAllValues:stringequals",
             "StringEqualsifexists",
         ] {
-            rejected(json!({"Statement": [{"Effect": "Deny", "Principal": {"AWS": CALLER},
+            rejected(
+                json!({"Statement": [{"Effect": "Deny", "Principal": {"AWS": CALLER},
                 "Action": "sts:AssumeRole",
-                "Condition": {op: {"aws:PrincipalType": "User"}}}]}));
+                "Condition": {op: {"aws:PrincipalType": "User"}}}]}),
+            );
         }
     }
 
