@@ -163,6 +163,7 @@ pub async fn assume_role(
         &trust_policy,
         caller_arn,
         request.external_id.as_deref(),
+        &request.session_name,
         has_session_tags,
         request_tags,
         &state.region,
@@ -315,6 +316,7 @@ async fn evaluate_trust_policy(
     trust_policy: &Value,
     caller_arn: &str,
     external_id: Option<&str>,
+    session_name: &str,
     has_session_tags: bool,
     request_tags: std::collections::HashMap<String, String>,
     region: &str,
@@ -334,6 +336,9 @@ async fn evaluate_trust_policy(
     let context = AssumeRoleContext {
         principal_tags,
         external_id: external_id.map(String::from),
+        // sts:RoleSessionName is the session name on the AssumeRole call; STS
+        // populates it for every call.
+        session_name: Some(session_name.to_owned()),
         principal_arn: caller_arn.to_owned(),
         principal_account: caller_account(caller_arn).map(ToOwned::to_owned),
         request_tags,
@@ -951,6 +956,7 @@ mod tests {
         AssumeRoleContext {
             principal_tags,
             external_id,
+            session_name: Some("bb-session".to_owned()),
             principal_arn: CALLER.to_owned(),
             principal_account: Some(ACCT.to_owned()),
             request_tags,
@@ -1290,6 +1296,35 @@ mod tests {
             "Action": "sts:AssumeRole",
             "Condition": {"StringEquals": {"aws:userid": expected}}})];
         assert!(trust_decision(&stmts, CALLER, &ctx, false));
+    }
+
+    #[test]
+    fn trust_rolesessionname_resolves_from_session_name() {
+        // mk_ctx sets session_name = "bb-session". A Deny gated on the matching
+        // session name blocks; a non-matching name does not. An Allow gated on
+        // the matching name grants.
+        let ctx = ctx();
+        let deny_match = vec![
+            allow_alice(),
+            json!({"Effect": "Deny", "Principal": {"AWS": CALLER}, "Action": "sts:AssumeRole",
+                "Condition": {"StringEquals": {"sts:RoleSessionName": "bb-session"}}}),
+        ];
+        assert!(!trust_decision(&deny_match, CALLER, &ctx, false));
+        let deny_other = vec![
+            allow_alice(),
+            json!({"Effect": "Deny", "Principal": {"AWS": CALLER}, "Action": "sts:AssumeRole",
+                "Condition": {"StringEquals": {"sts:RoleSessionName": "other"}}}),
+        ];
+        assert!(trust_decision(&deny_other, CALLER, &ctx, false));
+        let allow_gate = vec![json!({"Effect": "Allow", "Principal": {"AWS": CALLER},
+            "Action": "sts:AssumeRole",
+            "Condition": {"StringEquals": {"sts:RoleSessionName": "bb-session"}}})];
+        assert!(trust_decision(&allow_gate, CALLER, &ctx, false));
+        // Case-folded key name resolves too.
+        let allow_folded = vec![json!({"Effect": "Allow", "Principal": {"AWS": CALLER},
+            "Action": "sts:AssumeRole",
+            "Condition": {"StringEquals": {"sts:rolesessionname": "bb-session"}}})];
+        assert!(trust_decision(&allow_folded, CALLER, &ctx, false));
     }
 
     // ---- resolved keys: PrincipalArn / PrincipalAccount -------------------

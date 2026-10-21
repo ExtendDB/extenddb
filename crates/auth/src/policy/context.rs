@@ -394,6 +394,9 @@ pub struct AssumeRoleContext {
     pub principal_tags: HashMap<String, String>,
     /// The external ID provided in the `AssumeRole` call (if any).
     pub external_id: Option<String>,
+    /// The session name provided on the `AssumeRole` call
+    /// (`sts:RoleSessionName`). STS populates this for every `AssumeRole`.
+    pub session_name: Option<String>,
     /// The caller ARN (`aws:PrincipalArn`).
     pub principal_arn: String,
     /// The caller's account id (`aws:PrincipalAccount`), the account field of
@@ -443,6 +446,7 @@ impl ConditionContext for AssumeRoleContext {
         } else {
             match folded.as_str() {
                 "sts:externalid" => self.external_id.as_deref().map(|v| vec![v]),
+                "sts:rolesessionname" => self.session_name.as_deref().map(|v| vec![v]),
                 "aws:principalarn" => Some(vec![self.principal_arn.as_str()]),
                 "aws:principalaccount" => self.principal_account.as_deref().map(|v| vec![v]),
                 "aws:requestedregion" => self.region.as_deref().map(|v| vec![v]),
@@ -506,6 +510,7 @@ mod tests {
         AssumeRoleContext {
             principal_tags,
             external_id,
+            session_name: Some("probe".to_owned()),
             principal_arn: "arn:aws:iam::123456789012:user/alice".to_owned(),
             principal_account: Some("123456789012".to_owned()),
             request_tags,

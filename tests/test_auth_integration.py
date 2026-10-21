@@ -1288,6 +1288,42 @@ class TestTrustPolicyDeny:
         finally:
             self.mgmt.delete_user(self.account_id, user)
 
+    def test_rolesessionname_deny_blocks_matching_session(self):
+        # _assume uses session name "bb-session". A Deny gated on
+        # sts:RoleSessionName=bb-session must block. Before the fix the key was
+        # absent and the Deny was dropped (assume granted).
+        user, arn = self._caller()
+        try:
+            trust = _trust(
+                _stmt("Allow", {"AWS": arn}),
+                _stmt("Deny", {"AWS": arn},
+                      condition={"StringEquals": {"sts:RoleSessionName": "bb-session"}}),
+            )
+            assert self._assume(trust, arn) == DENY
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_rolesessionname_deny_other_does_not_block(self):
+        user, arn = self._caller()
+        try:
+            trust = _trust(
+                _stmt("Allow", {"AWS": arn}),
+                _stmt("Deny", {"AWS": arn},
+                      condition={"StringEquals": {"sts:RoleSessionName": "other-name"}}),
+            )
+            assert self._assume(trust, arn) == ALLOW
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_rolesessionname_allow_gate_grants_matching_session(self):
+        user, arn = self._caller()
+        try:
+            trust = _trust(_stmt("Allow", {"AWS": arn},
+                                 condition={"StringEquals": {"sts:RoleSessionName": "bb-session"}}))
+            assert self._assume(trust, arn) == ALLOW
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
     def test_tls_guard_does_not_block_over_tls(self):
         # Allow, plus Deny if Bool aws:SecureTransport=false. The call is over
         # TLS so SecureTransport is true, the deny does not fire, assumption is
