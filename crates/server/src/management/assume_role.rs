@@ -1709,6 +1709,24 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_miscased_condition_operators() {
+        // The live service treats operator names, set qualifiers and the
+        // IfExists suffix as case-sensitive and rejects a miscased one at the
+        // trust write (measured); ExtendDB matches.
+        for op in [
+            "stringequals",
+            "bool",
+            "forallvalues:StringEquals",
+            "ForAllValues:stringequals",
+            "StringEqualsifexists",
+        ] {
+            rejected(json!({"Statement": [{"Effect": "Deny", "Principal": {"AWS": CALLER},
+                "Action": "sts:AssumeRole",
+                "Condition": {op: {"aws:PrincipalType": "User"}}}]}));
+        }
+    }
+
+    #[test]
     fn validate_rejects_condition_not_object() {
         rejected(
             json!({"Statement": [{"Effect": "Deny", "Principal": {"AWS": CALLER}, "Action": "sts:AssumeRole",

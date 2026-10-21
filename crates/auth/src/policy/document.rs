@@ -633,4 +633,48 @@ mod tests {
             "Condition":{"IpAddress":{"aws:SourceIp":["10.0.0.0/8","2001:db8::/32"]}}}]}"#;
         assert!(PolicyDocument::from_json(json).is_ok());
     }
+
+    #[test]
+    fn reject_miscased_operator_names() {
+        // The live service treats operator names, set qualifiers and the
+        // IfExists suffix as case-sensitive and rejects a miscased one with
+        // MalformedPolicyDocument (measured). ExtendDB rejects the same
+        // at parse (identity-policy write and read).
+        for op in [
+            "stringequals",
+            "STRINGEQUALS",
+            "bool",
+            "forallvalues:StringEquals",
+            "ForAllValues:stringequals",
+            "StringEqualsifexists",
+            "StringEqualsIfexists",
+        ] {
+            let json = format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow",
+                "Action":"dynamodb:GetItem","Resource":"*",
+                "Condition":{{"{op}":{{"aws:PrincipalType":"User"}}}}}}]}}"#
+            );
+            assert!(
+                PolicyDocument::from_json(&json).is_err(),
+                "miscased operator {op} must be rejected"
+            );
+        }
+        // Canonical operators, qualifier and suffix are accepted.
+        for op in [
+            "StringEquals",
+            "Bool",
+            "ForAllValues:StringEquals",
+            "StringEqualsIfExists",
+        ] {
+            let json = format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow",
+                "Action":"dynamodb:GetItem","Resource":"*",
+                "Condition":{{"{op}":{{"aws:PrincipalType":"User"}}}}}}]}}"#
+            );
+            assert!(
+                PolicyDocument::from_json(&json).is_ok(),
+                "canonical operator {op} must be accepted"
+            );
+        }
+    }
 }
