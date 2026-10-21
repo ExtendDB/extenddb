@@ -204,6 +204,9 @@ async fn check_role_authorization(
     params.resource_account = Some(account_id.to_owned());
     // aws:TokenIssueTime for a role session is the session's issue time.
     params.token_issue_time = token_issue_time;
+    // A role session is assumed without MFA, so aws:MultiFactorAuthPresent is
+    // present and false, matching the service. An IAM user leaves it absent.
+    params.multi_factor_auth_present = Some(false);
     let context = RequestContext::build(principal_tags, (*resource_tags).clone(), is_scan, params);
 
     // Convert the Arc<Vec<...>> to a slice for the evaluator. We materialize

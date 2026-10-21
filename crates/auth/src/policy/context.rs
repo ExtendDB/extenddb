@@ -173,6 +173,11 @@ pub struct RequestParams {
     /// a role-session caller. `None` for an IAM user, where the service leaves
     /// the key absent.
     pub token_issue_time: Option<String>,
+    /// Whether the caller authenticated with MFA (`aws:MultiFactorAuthPresent`).
+    /// The service populates this for a role session (`false` for a session
+    /// assumed without MFA) and leaves it absent for an IAM user with long-term
+    /// keys. `Some(false)` for a role session, `None` for an IAM user.
+    pub multi_factor_auth_present: Option<bool>,
 }
 
 /// Context for evaluating conditions on `DynamoDB` operations.
@@ -223,6 +228,10 @@ pub struct RequestContext {
     /// The session issue time (`aws:TokenIssueTime`) for a role-session caller;
     /// `None` for an IAM user (absent key).
     pub token_issue_time: Option<String>,
+    /// Whether the caller authenticated with MFA (`aws:MultiFactorAuthPresent`):
+    /// `Some(false)` for a role session assumed without MFA, `None` for an IAM
+    /// user (absent key), matching the service.
+    pub multi_factor_auth_present: Option<bool>,
     /// The request time formatted for `aws:CurrentTime` (RFC 3339 UTC).
     pub current_time: String,
     /// The request time formatted for `aws:EpochTime` (whole seconds).
@@ -264,6 +273,7 @@ impl RequestContext {
             userid: params.userid,
             resource_account: params.resource_account,
             token_issue_time: params.token_issue_time,
+            multi_factor_auth_present: params.multi_factor_auth_present,
             current_time,
             epoch_time,
         }
@@ -324,6 +334,11 @@ impl ConditionContext for RequestContext {
                 "aws:userid" => self.userid.as_deref().map(|v| vec![v]),
                 "aws:resourceaccount" => self.resource_account.as_deref().map(|v| vec![v]),
                 "aws:tokenissuetime" => self.token_issue_time.as_deref().map(|v| vec![v]),
+                // Populated for a role session (false for a session assumed
+                // without MFA), absent for an IAM user, matching the service.
+                "aws:multifactorauthpresent" => self
+                    .multi_factor_auth_present
+                    .map(|v| vec![if v { "true" } else { "false" }]),
                 // ExtendDB is not an AWS service calling on a principal's behalf,
                 // so these are always false, matching the service for a direct
                 // caller.
@@ -587,6 +602,39 @@ mod tests {
             ctx.resolve_key("dynamodb:ResourceTag/Team"),
             Some(vec!["Alpha"])
         );
+    }
+
+    #[test]
+    fn request_context_mfa_present_for_role_session_absent_for_user() {
+        // A role session carries aws:MultiFactorAuthPresent = false (assumed
+        // without MFA); an IAM user leaves it absent (standard absent-key
+        // semantics, not fail-closed).
+        let role_ctx = RequestContext::build(
+            HashMap::new(),
+            HashMap::new(),
+            false,
+            RequestParams {
+                multi_factor_auth_present: Some(false),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            role_ctx.resolve_key("aws:MultiFactorAuthPresent"),
+            Some(vec!["false"])
+        );
+        // Case-insensitive on the key name too.
+        assert_eq!(
+            role_ctx.resolve_key("aws:multifactorauthpresent"),
+            Some(vec!["false"])
+        );
+        let user_ctx = RequestContext::build(
+            HashMap::new(),
+            HashMap::new(),
+            false,
+            RequestParams::default(),
+        );
+        assert_eq!(user_ctx.resolve_key("aws:MultiFactorAuthPresent"), None);
+        assert!(!user_ctx.is_unresolvable_key("aws:MultiFactorAuthPresent"));
     }
 
     #[test]

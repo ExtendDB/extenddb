@@ -1009,3 +1009,75 @@ class TestUserIdRecreate(_TaggedTableBase):
         finally:
             self.mgmt.delete_role(self.account_id, role)
             self.mgmt.delete_user(self.account_id, caller)
+
+
+class TestMultiFactorAuthPresentRoleSession(_TaggedTableBase):
+    """aws:MultiFactorAuthPresent is present and false for a role session
+    assumed without MFA, and absent for an IAM user. Measured live against
+    STS/DynamoDB (role session DENY, user ALLOW on the deny-without-MFA guard)."""
+
+    def _role_session_get(self, table: str, policy: dict) -> str:
+        user = f"mfa-caller-{uuid.uuid4().hex[:8]}"
+        role = f"mfa-role-{uuid.uuid4().hex[:8]}"
+        assert self.mgmt.create_user(self.account_id, user, "TestPass123!").status_code == 201
+        caller_arn = f"arn:aws:iam::{self.account_id}:user/{user}"
+        trust = {"Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Principal": {"AWS": caller_arn},
+            "Action": "sts:AssumeRole"}]}
+        assert self.mgmt.create_role(self.account_id, role, trust).status_code == 201
+        assert self.mgmt.put_role_policy(self.account_id, role, "p", policy).status_code == 204
+        try:
+            resp = self.mgmt.assume_role(self.account_id, role, caller_arn, "sess1")
+            assert resp.status_code == 201, resp.text
+            creds = resp.json()
+            client = boto3.client(
+                "dynamodb", endpoint_url=self.endpoint,
+                aws_access_key_id=creds["access_key_id"],
+                aws_secret_access_key=creds["secret_access_key"],
+                aws_session_token=creds["session_token"],
+                region_name=self.region,
+                config=BotoConfig(retries={"max_attempts": 0}),
+                verify=not self.endpoint.startswith("https://"))
+            try:
+                client.get_item(TableName=table, Key={"pk": {"S": "k1"}})
+                return "ALLOW"
+            except ClientError as exc:
+                assert exc.response["Error"]["Code"] == "AccessDeniedException", exc.response["Error"]
+                return "DENY"
+        finally:
+            self.mgmt.delete_role(self.account_id, role)
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_role_session_deny_without_mfa_blocks(self, table):
+        # aws:MultiFactorAuthPresent=false is present for a role session, so the
+        # Deny fires. Live: DENY.
+        policy = {"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "dynamodb:GetItem", "Resource": "*"},
+            {"Effect": "Deny", "Action": "dynamodb:GetItem", "Resource": "*",
+             "Condition": {"Bool": {"aws:MultiFactorAuthPresent": "false"}}}]}
+        assert self._role_session_get(table, policy) == "DENY"
+
+    def test_role_session_mfa_present_null_false_grants(self, table):
+        # The key is present for a role session, so Null false grants.
+        policy = {"Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Action": "dynamodb:GetItem", "Resource": "*",
+            "Condition": {"Null": {"aws:MultiFactorAuthPresent": "false"}}}]}
+        assert self._role_session_get(table, policy) == "ALLOW"
+
+    def test_role_session_require_mfa_true_denies(self, table):
+        # The session is non-MFA (false), so a require-true guard does not grant.
+        policy = {"Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Action": "dynamodb:GetItem", "Resource": "*",
+            "Condition": {"Bool": {"aws:MultiFactorAuthPresent": "true"}}}]}
+        assert self._role_session_get(table, policy) == "DENY"
+
+    def test_user_deny_without_mfa_is_inert(self, table):
+        # An IAM user leaves aws:MultiFactorAuthPresent absent, so the Deny on
+        # Bool=false is inert and the request is allowed. Live: ALLOW.
+        assert self._get(table, self._allow_all_deny_get_if(
+            {"Bool": {"aws:MultiFactorAuthPresent": "false"}})) == "ALLOW"
+
+    def test_user_mfa_absent_null_true_grants(self, table):
+        # The key is absent for an IAM user, so Null true grants.
+        assert self._get(table, self._allow_get_if(
+            {"Null": {"aws:MultiFactorAuthPresent": "true"}})) == "ALLOW"
