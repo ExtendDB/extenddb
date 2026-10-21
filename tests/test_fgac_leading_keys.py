@@ -43,6 +43,7 @@ REQ-TEST-001, REQ-TEST-004, REQ-AUTH-002
 from __future__ import annotations
 
 import os
+import time
 import uuid
 from typing import Any
 
@@ -759,3 +760,364 @@ class TestLeadingKeys:
             c.transact_get_items(TransactItems=[
                 {"Get": {"TableName": num_table, "Key": {"pk": {"N": "1E1"}}}}])
         assert _denied(e)
+
+    # -- Authorization and the engine agree on the queried partition --------
+    #
+    # Each Query shape below is sent as the table owner, as a principal fenced
+    # to the partition the shape names and as a principal fenced to a value no
+    # item has. The owner's result shows which partition the engine executed.
+    # The fenced principal must get the same rows, and the other principal must
+    # be denied, so a shape where authorization and the engine read a different
+    # partition key (or authorization reads none) fails here. The engine side is
+    # the server's own Query path, not a copy of it.
+    #
+    # Measured against live DynamoDB on 2026-10-21 with the same shapes on
+    # tables with the same key schemas: every accepted shape returned the named
+    # partition to the owner and to the fenced principal and was denied to the
+    # other principal. Every rejected shape returned ValidationException to the
+    # owner and to the fenced principal. To the other principal the service
+    # returned ValidationException, except where QUERY_REJECTED_OTHER_CODE
+    # names a different code. For the shapes in that map ExtendDB returns the
+    # other of the two codes, so the test asserts only that no data is
+    # returned.
+
+    QUERY_ACCEPTED = [
+        ("pk eq placeholder", "main", {"KeyConditionExpression": "pk = :v",
+                                       "ExpressionAttributeValues": {":v": {"S": "alice"}}},
+         "pk", "alice"),
+        ("hash name ref", "main", {"KeyConditionExpression": "#p = :v",
+                                   "ExpressionAttributeNames": {"#p": "pk"},
+                                   "ExpressionAttributeValues": {":v": {"S": "alice"}}},
+         "pk", "alice"),
+        ("single parens", "main", {"KeyConditionExpression": "(pk = :v)",
+                                   "ExpressionAttributeValues": {":v": {"S": "alice"}}},
+         "pk", "alice"),
+        ("pk and sk eq", "main", {"KeyConditionExpression": "pk = :v AND sk = :s",
+                                  "ExpressionAttributeValues": {":v": {"S": "alice"},
+                                                                ":s": {"S": "x"}}},
+         "pk", "alice"),
+        ("sk before pk", "main", {"KeyConditionExpression": "sk = :s AND pk = :v",
+                                  "ExpressionAttributeValues": {":v": {"S": "alice"},
+                                                                ":s": {"S": "x"}}},
+         "pk", "alice"),
+        ("no spaces", "main", {"KeyConditionExpression": "pk=:v",
+                               "ExpressionAttributeValues": {":v": {"S": "alice"}}},
+         "pk", "alice"),
+        ("extra spaces", "main", {"KeyConditionExpression": "pk   =   :v",
+                                  "ExpressionAttributeValues": {":v": {"S": "alice"}}},
+         "pk", "alice"),
+        ("begins_with sk", "main", {"KeyConditionExpression": "pk = :v AND begins_with(sk, :p)",
+                                    "ExpressionAttributeValues": {":v": {"S": "alice"},
+                                                                  ":p": {"S": "x"}}},
+         "pk", "alice"),
+        ("between sk", "main", {"KeyConditionExpression": "pk = :v AND sk BETWEEN :lo AND :hi",
+                                "ExpressionAttributeValues": {":v": {"S": "alice"},
+                                                              ":lo": {"S": "a"},
+                                                              ":hi": {"S": "z"}}},
+         "pk", "alice"),
+        ("both name refs", "main", {"KeyConditionExpression": "#p = :v AND #s = :s",
+                                    "ExpressionAttributeNames": {"#p": "pk", "#s": "sk"},
+                                    "ExpressionAttributeValues": {":v": {"S": "alice"},
+                                                                  ":s": {"S": "x"}}},
+         "pk", "alice"),
+        ("lowercase and", "main", {"KeyConditionExpression": "pk = :v and sk = :s",
+                                   "ExpressionAttributeValues": {":v": {"S": "alice"},
+                                                                 ":s": {"S": "x"}}},
+         "pk", "alice"),
+        ("parenthesized clauses", "main", {"KeyConditionExpression": "(pk = :v) AND (sk = :s)",
+                                           "ExpressionAttributeValues": {":v": {"S": "alice"},
+                                                                         ":s": {"S": "x"}}},
+         "pk", "alice"),
+        ("number key", "num", {"KeyConditionExpression": "pk = :v",
+                               "ExpressionAttributeValues": {":v": {"N": "10"}}},
+         "pk", "10"),
+        ("legacy eq", "main", {"KeyConditions": {
+            "pk": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "alice"}]}}},
+         "pk", "alice"),
+        ("legacy eq with sk", "main", {"KeyConditions": {
+            "pk": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "alice"}]},
+            "sk": {"ComparisonOperator": "BEGINS_WITH", "AttributeValueList": [{"S": "x"}]}}},
+         "pk", "alice"),
+        ("lsi base pk", "main", {"IndexName": "lsi1", "KeyConditionExpression": "pk = :v",
+                                 "ExpressionAttributeValues": {":v": {"S": "alice"}}},
+         "pk", "alice"),
+        ("gsi index pk", "main", {"IndexName": "gsi1", "KeyConditionExpression": "gpk = :v",
+                                  "ExpressionAttributeValues": {":v": {"S": G_OWN}}},
+         "gpk", G_OWN),
+        ("multi hash gsi", "mh", {"IndexName": "gsi2",
+                                  "KeyConditionExpression": "g1 = :a AND g2 = :b",
+                                  "ExpressionAttributeValues": {":a": {"S": "alice"},
+                                                                ":b": {"S": "blue"}}},
+         "g1", "alice"),
+        ("multi hash gsi swapped", "mh", {"IndexName": "gsi2",
+                                          "KeyConditionExpression": "g2 = :b AND g1 = :a",
+                                          "ExpressionAttributeValues": {":a": {"S": "alice"},
+                                                                        ":b": {"S": "blue"}}},
+         "g1", "alice"),
+    ]
+
+    QUERY_REJECTED = [
+        ("non-eq pk", "main", {"KeyConditionExpression": "pk > :v",
+                               "ExpressionAttributeValues": {":v": {"S": "alice"}}}),
+        ("malformed", "main", {"KeyConditionExpression": "pk :: :v",
+                               "ExpressionAttributeValues": {":v": {"S": "alice"}}}),
+        ("sk only", "main", {"KeyConditionExpression": "sk = :s",
+                             "ExpressionAttributeValues": {":s": {"S": "x"}}}),
+        ("unresolved name", "main", {"KeyConditionExpression": "#p = :v",
+                                     "ExpressionAttributeValues": {":v": {"S": "alice"}}}),
+        ("legacy non-eq pk", "main", {"KeyConditions": {
+            "pk": {"ComparisonOperator": "LE", "AttributeValueList": [{"S": "alice"}]}}}),
+        ("legacy begins_with pk", "main", {"KeyConditions": {
+            "pk": {"ComparisonOperator": "BEGINS_WITH",
+                   "AttributeValueList": [{"S": "alice"}]}}}),
+        ("multi hash gsi missing g2", "mh", {"IndexName": "gsi2",
+                                             "KeyConditionExpression": "g1 = :a",
+                                             "ExpressionAttributeValues": {":a": {"S": "alice"}}}),
+    ]
+
+    # Rejected shapes where the service and ExtendDB return different error
+    # codes to the principal fenced away from the value. The value is the code
+    # the service returned.
+    QUERY_REJECTED_OTHER_CODE = {
+        "non-eq pk": "AccessDeniedException",
+        "legacy non-eq pk": "AccessDeniedException",
+        "legacy begins_with pk": "AccessDeniedException",
+        "multi hash gsi missing g2": "ValidationException",
+    }
+
+    def _fence_policy(self, values: list[str], tables: list[str]) -> dict:
+        resources = []
+        for t in tables:
+            arn = f"arn:aws:dynamodb:{self.region}:{self.account_id}:table/{t}"
+            resources += [arn, arn + "/index/*"]
+        return {
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": "dynamodb:*",
+                "Resource": resources,
+                "Condition": {"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": values}},
+            }],
+        }
+
+    def test_query_shapes_authorize_the_partition_the_engine_reads(
+            self, table, num_table, mh_table):
+        tables = {"main": table, "num": num_table, "mh": mh_table}
+        owner = self._user_client([("full", ALLOW_ALL)])
+        fenced = self._user_client([("lk", self._fence_policy(
+            [OWN, G_OWN, "10"], list(tables.values())))])
+        other = self._user_client([("lk", self._fence_policy(
+            ["nobody"], list(tables.values())))])
+
+        def call(client, table_key, kwargs):
+            try:
+                return client.query(TableName=tables[table_key], **kwargs), None
+            except ClientError as exc:
+                return None, exc.response["Error"]["Code"]
+
+        # Secondary indexes are eventually consistent: wait until the owner
+        # sees the seeded rows through each index before comparing results.
+        for label, table_key, kwargs, _attr, _value in self.QUERY_ACCEPTED:
+            if "IndexName" not in kwargs:
+                continue
+            deadline = time.monotonic() + 30
+            while True:
+                got, err = call(owner, table_key, kwargs)
+                if err is not None or got["Count"] > 0 or time.monotonic() > deadline:
+                    break
+                time.sleep(0.25)
+
+        failures = []
+        for label, table_key, kwargs, attr, value in self.QUERY_ACCEPTED:
+            got, err = call(owner, table_key, kwargs)
+            if err is not None:
+                failures.append(f"{label}: owner got {err}")
+                continue
+            parts = {next(iter(it[attr].values())) for it in got["Items"]}
+            if parts != {value}:
+                failures.append(f"{label}: engine read partitions {parts}, expected {{{value!r}}}")
+            got_f, err_f = call(fenced, table_key, kwargs)
+            if err_f is not None or got_f["Count"] != got["Count"]:
+                failures.append(f"{label}: fenced principal got {err_f or got_f['Count']}, "
+                                f"owner got {got['Count']} rows")
+            _, err_o = call(other, table_key, kwargs)
+            if err_o != "AccessDeniedException":
+                failures.append(f"{label}: other principal got {err_o or 'rows'}, expected denial")
+
+        for label, table_key, kwargs in self.QUERY_REJECTED:
+            for who, client in (("owner", owner), ("fenced", fenced)):
+                _, err = call(client, table_key, kwargs)
+                if err != "ValidationException":
+                    failures.append(f"{label}: {who} got {err or 'rows'}, expected ValidationException")
+            _, err_o = call(other, table_key, kwargs)
+            if label in self.QUERY_REJECTED_OTHER_CODE:
+                if err_o not in ("AccessDeniedException", "ValidationException"):
+                    failures.append(f"{label}: other principal got {err_o or 'rows'}")
+            elif err_o != "ValidationException":
+                failures.append(f"{label}: other principal got {err_o or 'rows'}, "
+                                "expected ValidationException")
+
+        assert not failures, "\n".join(failures)
+
+    # -- A table read while it is CREATING ----------------------------------
+    #
+    # A request sent while a table is CREATING finds no table. Before the fix,
+    # authorization read the table key info through a cache that keeps a
+    # missing table for its negative TTL (5 seconds by default), while the
+    # batch and transaction handlers read storage. One such request during
+    # CREATING left authorization seeing no table, and so no LeadingKeys, for
+    # the rest of the TTL after the table became ACTIVE, while the engine saw
+    # the table and ran the request. On DynamoDB a request on an ACTIVE table is
+    # always evaluated against its partition key.
+
+    def test_batch_and_transaction_fenced_once_a_created_table_is_active(self):
+        owner = self._user_client([("full", ALLOW_ALL)])
+        table = None
+        fenced = None
+        for _ in range(3):
+            name = f"lk-c-{uuid.uuid4().hex[:8]}"
+            fenced = self._user_client([("lk", self._fence_policy([OWN], [name]))])
+            owner.create_table(
+                TableName=name,
+                AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"},
+                                      {"AttributeName": "sk", "AttributeType": "S"}],
+                KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"},
+                           {"AttributeName": "sk", "KeyType": "RANGE"}],
+                BillingMode="PAY_PER_REQUEST",
+            )
+            hit = []
+            for send in (
+                lambda: fenced.batch_write_item(RequestItems={name: [
+                    {"PutRequest": {"Item": self._key(OWN)}}]}),
+                lambda: fenced.get_item(TableName=name, Key=self._key(OWN)),
+            ):
+                try:
+                    send()
+                except ClientError as exc:
+                    hit.append(exc.response["Error"]["Code"] == "ResourceNotFoundException")
+            wait_for_active(owner, name)
+            if hit and all(hit) and len(hit) == 2:
+                table = name
+                break
+            owner.delete_table(TableName=name)
+        if table is None:
+            pytest.skip("the table was ACTIVE before a request could reach it while CREATING")
+
+        try:
+            other_key = self._key(OTHER)
+            denied = {
+                "BatchWriteItem": lambda: fenced.batch_write_item(RequestItems={table: [
+                    {"PutRequest": {"Item": other_key}}]}),
+                "BatchGetItem": lambda: fenced.batch_get_item(RequestItems={table: {
+                    "Keys": [other_key]}}),
+                "TransactGetItems": lambda: fenced.transact_get_items(TransactItems=[
+                    {"Get": {"TableName": table, "Key": other_key}}]),
+                "TransactWriteItems": lambda: fenced.transact_write_items(TransactItems=[
+                    {"Put": {"TableName": table, "Item": other_key}}]),
+            }
+            failures = []
+            for op, send in denied.items():
+                try:
+                    send()
+                    failures.append(f"{op} on the other partition was served")
+                except ClientError as exc:
+                    if exc.response["Error"]["Code"] != "AccessDeniedException":
+                        failures.append(f"{op} on the other partition got "
+                                        f"{exc.response['Error']['Code']}")
+            # The fenced principal's own partition works on the batch and
+            # transaction paths as soon as the table is ACTIVE.
+            own_key = self._key(OWN)
+            for op, send in {
+                "BatchWriteItem": lambda: fenced.batch_write_item(RequestItems={table: [
+                    {"PutRequest": {"Item": own_key}}]}),
+                "BatchGetItem": lambda: fenced.batch_get_item(RequestItems={table: {
+                    "Keys": [own_key]}}),
+                "TransactGetItems": lambda: fenced.transact_get_items(TransactItems=[
+                    {"Get": {"TableName": table, "Key": own_key}}]),
+            }.items():
+                try:
+                    send()
+                except ClientError as exc:
+                    failures.append(f"{op} on the own partition got "
+                                    f"{exc.response['Error']['Code']}")
+            # The single-item operations never return the other partition. The
+            # owner seeds it through BatchWriteItem, which reads the catalog.
+            owner.batch_write_item(RequestItems={table: [
+                {"PutRequest": {"Item": {**other_key, "data": {"S": "other"}}}}]})
+            for op, send in {
+                "GetItem": lambda: fenced.get_item(TableName=table, Key=other_key),
+                "Query": lambda: fenced.query(
+                    TableName=table, KeyConditionExpression="pk = :v",
+                    ExpressionAttributeValues={":v": {"S": OTHER}}),
+            }.items():
+                try:
+                    resp = send()
+                    if resp.get("Item") or resp.get("Items"):
+                        failures.append(f"{op} returned the other partition")
+                except ClientError:
+                    pass
+            assert not failures, "\n".join(failures)
+        finally:
+            try:
+                owner.delete_table(TableName=table)
+                wait_for_deleted(owner, table)
+            except Exception:
+                pass
+
+    # -- Oversized batch and transaction requests ---------------------------
+    #
+    # Measured against live DynamoDB on 2026-10-21: a TransactWriteItems or
+    # TransactGetItems with 101 items, a BatchWriteItem with 26 requests on one
+    # table or across two, and a BatchGetItem with 101 keys on one table or
+    # across two each returned ValidationException to a principal with no
+    # policy, to a principal whose LeadingKeys fence excluded every key, to one
+    # whose fence included them and to the owner. The size check comes before
+    # authorization.
+
+    def test_oversized_requests_fail_validation_before_authorization(self, table, num_table):
+        no_policy = self._user_client([])
+        fenced_out = self._user_client([("lk", self._fence_policy(
+            ["nobody"], [table, num_table]))])
+        other_key = self._key(OTHER)
+        cases = {
+            "TransactWriteItems": lambda c: c.transact_write_items(TransactItems=[
+                {"ConditionCheck": {"TableName": table,
+                                    "Key": {"pk": {"S": OTHER}, "sk": {"S": f"o{i}"}},
+                                    "ConditionExpression": "attribute_exists(pk)"}}
+                for i in range(101)]),
+            "TransactGetItems": lambda c: c.transact_get_items(TransactItems=[
+                {"Get": {"TableName": table,
+                         "Key": {"pk": {"S": OTHER}, "sk": {"S": f"o{i}"}}}}
+                for i in range(101)]),
+            "BatchWriteItem one table": lambda c: c.batch_write_item(RequestItems={table: [
+                {"PutRequest": {"Item": {"pk": {"S": OTHER}, "sk": {"S": f"o{i}"}}}}
+                for i in range(26)]}),
+            "BatchWriteItem two tables": lambda c: c.batch_write_item(RequestItems={
+                table: [{"PutRequest": {"Item": {"pk": {"S": OTHER}, "sk": {"S": f"o{i}"}}}}
+                        for i in range(13)],
+                num_table: [{"PutRequest": {"Item": {"pk": {"N": str(1000 + i)}}}}
+                            for i in range(13)]}),
+            "BatchGetItem one table": lambda c: c.batch_get_item(RequestItems={table: {
+                "Keys": [{"pk": {"S": OTHER}, "sk": {"S": f"o{i}"}} for i in range(101)]}}),
+            "BatchGetItem two tables": lambda c: c.batch_get_item(RequestItems={
+                table: {"Keys": [{"pk": {"S": OTHER}, "sk": {"S": f"o{i}"}}
+                                 for i in range(60)]},
+                num_table: {"Keys": [{"pk": {"N": str(1000 + i)}} for i in range(41)]}}),
+        }
+        failures = []
+        for label, send in cases.items():
+            for who, client in (("no policy", no_policy), ("fenced out", fenced_out)):
+                try:
+                    send(client)
+                    failures.append(f"{label} as {who} was served")
+                except ClientError as exc:
+                    if exc.response["Error"]["Code"] != "ValidationException":
+                        failures.append(f"{label} as {who} got "
+                                        f"{exc.response['Error']['Code']}")
+        # Control: a request within the limits is still refused to both.
+        for who, client in (("no policy", no_policy), ("fenced out", fenced_out)):
+            with pytest.raises(ClientError) as e:
+                client.transact_get_items(TransactItems=[
+                    {"Get": {"TableName": table, "Key": other_key}}])
+            assert _denied(e), who
+        assert not failures, "\n".join(failures)
