@@ -49,6 +49,12 @@ pub struct ManagementState {
     /// Concrete `TableKeyInfo` cache handle, used by the auth-cache-metrics
     /// endpoint. Same instance is held in `auth_cache.table_key_info`.
     pub table_key_info_cache: Arc<crate::CachedTableKeyInfoStore>,
+    /// Server region, resolved into `aws:RequestedRegion` during trust policy
+    /// evaluation.
+    pub region: Arc<str>,
+    /// Whether the listener serves TLS, resolved into `aws:SecureTransport`
+    /// during trust policy evaluation.
+    pub secure_transport: bool,
 }
 
 /// Build the management API router.

@@ -115,7 +115,11 @@ pub(crate) async fn authorize_request(
                 &action_op,
                 &resource_arn,
                 false,
-                extenddb_auth::policy::context::RequestParams::default(),
+                extenddb_auth::policy::context::RequestParams {
+                    region: Some(state.region.to_string()),
+                    secure_transport: state.tls_enabled,
+                    ..Default::default()
+                },
             )
             .await?;
         }
@@ -143,6 +147,8 @@ pub(crate) async fn authorize_request(
             .get("ReturnConsumedCapacity")
             .and_then(|v| v.as_str())
             .map(ToOwned::to_owned),
+        region: Some(state.region.to_string()),
+        secure_transport: state.tls_enabled,
         ..Default::default()
     };
     authorization::check_authorization(

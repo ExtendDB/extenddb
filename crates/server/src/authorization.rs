@@ -111,6 +111,8 @@ async fn check_user_authorization(
     let mut params = params;
     params.principal_arn = Some(format!("arn:aws:iam::{account_id}:user/{user_name}"));
     params.principal_account = Some(account_id.to_owned());
+    params.principal_type = Some("User".to_owned());
+    params.username = Some(user_name.to_owned());
     let context = RequestContext::build(
         (*principal_tags).clone(),
         (*resource_tags).clone(),
@@ -168,6 +170,9 @@ async fn check_role_authorization(
         "arn:aws:sts::{account_id}:assumed-role/{role_name}/{session_name}"
     ));
     params.principal_account = Some(account_id.to_owned());
+    // A role session's principal type is AssumedRole; the service does not
+    // populate aws:username for it, so username stays None (absent).
+    params.principal_type = Some("AssumedRole".to_owned());
     let context = RequestContext::build(principal_tags, (*resource_tags).clone(), is_scan, params);
 
     // Convert the Arc<Vec<...>> to a slice for the evaluator. We materialize

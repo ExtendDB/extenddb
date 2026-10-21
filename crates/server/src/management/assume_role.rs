@@ -159,6 +159,8 @@ pub async fn assume_role(
         request.external_id.as_deref(),
         has_session_tags,
         request_tags,
+        &state.region,
+        state.secure_transport,
         &*state.catalog_store,
     )
     .await
@@ -305,6 +307,8 @@ async fn evaluate_trust_policy(
     external_id: Option<&str>,
     has_session_tags: bool,
     request_tags: std::collections::HashMap<String, String>,
+    region: &str,
+    secure_transport: bool,
     store: &dyn extenddb_storage::CatalogStore,
 ) -> bool {
     let Some(statements) = statements_vec(trust_policy) else {
@@ -312,15 +316,43 @@ async fn evaluate_trust_policy(
     };
 
     let principal_tags = fetch_caller_tags(caller_arn, store).await;
+    let (current_time, epoch_time) = extenddb_auth::policy::context::request_time_strings();
     let context = AssumeRoleContext {
         principal_tags,
         external_id: external_id.map(String::from),
         principal_arn: caller_arn.to_owned(),
         principal_account: caller_account(caller_arn).map(ToOwned::to_owned),
         request_tags,
+        region: Some(region.to_owned()),
+        secure_transport,
+        principal_type: caller_principal_type(caller_arn).map(ToOwned::to_owned),
+        username: caller_username(caller_arn).map(ToOwned::to_owned),
+        current_time,
+        epoch_time,
     };
 
     trust_decision(&statements, caller_arn, &context, has_session_tags)
+}
+
+/// The `aws:PrincipalType` for a caller ARN: `User` for an IAM user ARN,
+/// `AssumedRole` for an assumed-role ARN. `None` for any other form, which then
+/// fails closed if a trust policy conditions on `aws:PrincipalType`. Measured
+/// live: an IAM user caller is `User`, a role session is `AssumedRole`.
+fn caller_principal_type(caller_arn: &str) -> Option<&'static str> {
+    let resource = caller_arn.splitn(6, ':').nth(5)?;
+    if resource.starts_with("user/") {
+        Some("User")
+    } else if resource.starts_with("assumed-role/") {
+        Some("AssumedRole")
+    } else {
+        None
+    }
+}
+
+/// The `aws:username` for a caller ARN: the user name for an IAM user ARN;
+/// `None` otherwise (the service does not populate it for a role session).
+fn caller_username(caller_arn: &str) -> Option<&str> {
+    caller_arn.splitn(6, ':').nth(5)?.strip_prefix("user/")
 }
 
 /// The statements of a policy document as an owned list. `Statement` may be a
@@ -855,50 +887,52 @@ mod tests {
     const CALLER: &str = "arn:aws:iam::123456789012:user/alice";
     const BOB: &str = "arn:aws:iam::123456789012:user/bob";
 
-    fn ctx() -> AssumeRoleContext {
+    fn mk_ctx(
+        principal_tags: HashMap<String, String>,
+        external_id: Option<String>,
+        request_tags: HashMap<String, String>,
+    ) -> AssumeRoleContext {
         AssumeRoleContext {
-            principal_tags: HashMap::new(),
-            external_id: None,
+            principal_tags,
+            external_id,
             principal_arn: CALLER.to_owned(),
             principal_account: Some(ACCT.to_owned()),
-            request_tags: HashMap::new(),
+            request_tags,
+            region: Some("us-east-1".to_owned()),
+            secure_transport: true,
+            principal_type: Some("User".to_owned()),
+            username: Some("alice".to_owned()),
+            current_time: "2026-01-01T00:00:00Z".to_owned(),
+            epoch_time: "1767225600".to_owned(),
         }
+    }
+
+    fn ctx() -> AssumeRoleContext {
+        mk_ctx(HashMap::new(), None, HashMap::new())
     }
 
     fn ctx_ext(id: &str) -> AssumeRoleContext {
-        AssumeRoleContext {
-            principal_tags: HashMap::new(),
-            external_id: Some(id.to_owned()),
-            principal_arn: CALLER.to_owned(),
-            principal_account: Some(ACCT.to_owned()),
-            request_tags: HashMap::new(),
-        }
+        mk_ctx(HashMap::new(), Some(id.to_owned()), HashMap::new())
     }
 
     fn ctx_with_tags(tags: &[(&str, &str)]) -> AssumeRoleContext {
-        AssumeRoleContext {
-            principal_tags: tags
-                .iter()
+        mk_ctx(
+            tags.iter()
                 .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
                 .collect(),
-            external_id: None,
-            principal_arn: CALLER.to_owned(),
-            principal_account: Some(ACCT.to_owned()),
-            request_tags: HashMap::new(),
-        }
+            None,
+            HashMap::new(),
+        )
     }
 
     fn ctx_with_request_tags(tags: &[(&str, &str)]) -> AssumeRoleContext {
-        AssumeRoleContext {
-            principal_tags: HashMap::new(),
-            external_id: None,
-            principal_arn: CALLER.to_owned(),
-            principal_account: Some(ACCT.to_owned()),
-            request_tags: tags
-                .iter()
+        mk_ctx(
+            HashMap::new(),
+            None,
+            tags.iter()
                 .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
                 .collect(),
-        }
+        )
     }
 
     /// Allow alice to assume (sts:AssumeRole).
@@ -1533,5 +1567,54 @@ mod tests {
             json!({"Statement": [{"Effect": "Deny", "Principal": {"AWS": CALLER}, "Action": "sts:AssumeRole",
             "Condition": {"StringEquals": "contractors"}}]}),
         );
+    }
+
+    // ---- resolved request-wide keys on the trust path --------------------
+
+    #[test]
+    fn trust_tls_guard_does_not_block_over_tls() {
+        // T8: Allow alice, Deny * if Bool aws:SecureTransport=false. The call is
+        // over TLS, so SecureTransport is true, the deny does not fire, and the
+        // allow grants. Matches live STS (ALLOW).
+        let stmts = vec![
+            allow_alice(),
+            json!({"Effect": "Deny", "Principal": {"AWS": "*"}, "Action": "sts:AssumeRole",
+                "Condition": {"Bool": {"aws:SecureTransport": "false"}}}),
+        ];
+        assert!(trust_decision(&stmts, CALLER, &ctx(), false));
+    }
+
+    #[test]
+    fn trust_secure_transport_true_grants() {
+        let stmts = vec![json!({"Effect": "Allow", "Principal": {"AWS": CALLER},
+            "Action": "sts:AssumeRole",
+            "Condition": {"Bool": {"aws:SecureTransport": "true"}}})];
+        assert!(trust_decision(&stmts, CALLER, &ctx(), false));
+    }
+
+    #[test]
+    fn trust_principal_type_user_grants_and_assumedrole_does_not() {
+        // The caller is an IAM user, so PrincipalType=User grants and
+        // PrincipalType=AssumedRole does not. Matches live STS.
+        let user_gate = vec![json!({"Effect": "Allow", "Principal": {"AWS": CALLER},
+            "Action": "sts:AssumeRole",
+            "Condition": {"StringEquals": {"aws:PrincipalType": "User"}}})];
+        assert!(trust_decision(&user_gate, CALLER, &ctx(), false));
+        let role_gate = vec![json!({"Effect": "Allow", "Principal": {"AWS": CALLER},
+            "Action": "sts:AssumeRole",
+            "Condition": {"StringEquals": {"aws:PrincipalType": "AssumedRole"}}})];
+        assert!(!trust_decision(&role_gate, CALLER, &ctx(), false));
+    }
+
+    #[test]
+    fn caller_principal_type_and_username_derivation() {
+        assert_eq!(caller_principal_type(CALLER), Some("User"));
+        assert_eq!(caller_username(CALLER), Some("alice"));
+        let role = "arn:aws:sts::123456789012:assumed-role/app-role/session-1";
+        assert_eq!(caller_principal_type(role), Some("AssumedRole"));
+        assert_eq!(caller_username(role), None);
+        let root = "arn:aws:iam::123456789012:root";
+        assert_eq!(caller_principal_type(root), None);
+        assert_eq!(caller_username(root), None);
     }
 }
