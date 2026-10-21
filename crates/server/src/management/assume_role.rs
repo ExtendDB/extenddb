@@ -301,6 +301,7 @@ async fn generate_and_store_session(
 /// malformed stored `Deny` cannot silently grant assumption. Documents are
 /// validated at write time (`validate_trust_policy`), so a well-formed store
 /// does not reach the fail-closed path in normal operation.
+#[allow(clippy::too_many_arguments)]
 async fn evaluate_trust_policy(
     trust_policy: &Value,
     caller_arn: &str,
