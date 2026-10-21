@@ -330,7 +330,8 @@ impl AuthorizationStore for CassandraCatalogStore {
                 )
                 .ok()
                 .and_then(|dt| {
-                    dt.format(&time::format_description::well_known::Rfc3339).ok()
+                    dt.format(&time::format_description::well_known::Rfc3339)
+                        .ok()
                 }),
             }))
         })
@@ -511,9 +512,16 @@ impl AuthorizationStore for CassandraCatalogStore {
             )
             .await?;
             Ok(rows.first().and_then(|row| {
-                crate::cassandra_util::get_timestamp::<OpError>(row, "created_at", "fetch_user_created_at")
-                    .ok()
-                    .and_then(|dt| dt.format(&time::format_description::well_known::Rfc3339).ok())
+                crate::cassandra_util::get_timestamp::<OpError>(
+                    row,
+                    "created_at",
+                    "fetch_user_created_at",
+                )
+                .ok()
+                .and_then(|dt| {
+                    dt.format(&time::format_description::well_known::Rfc3339)
+                        .ok()
+                })
             }))
         })
     }
@@ -540,9 +548,16 @@ impl AuthorizationStore for CassandraCatalogStore {
             )
             .await?;
             Ok(rows.first().and_then(|row| {
-                crate::cassandra_util::get_timestamp::<OpError>(row, "created_at", "fetch_role_created_at")
-                    .ok()
-                    .and_then(|dt| dt.format(&time::format_description::well_known::Rfc3339).ok())
+                crate::cassandra_util::get_timestamp::<OpError>(
+                    row,
+                    "created_at",
+                    "fetch_role_created_at",
+                )
+                .ok()
+                .and_then(|dt| {
+                    dt.format(&time::format_description::well_known::Rfc3339)
+                        .ok()
+                })
             }))
         })
     }

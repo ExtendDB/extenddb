@@ -193,9 +193,10 @@ impl AuthorizationStore for SqliteCatalogStore {
             Ok(Some(SessionData {
                 session_policy,
                 session_tags,
-                created_at: parse_timestamp(&created_at)
-                    .ok()
-                    .and_then(|dt| dt.format(&time::format_description::well_known::Rfc3339).ok()),
+                created_at: parse_timestamp(&created_at).ok().and_then(|dt| {
+                    dt.format(&time::format_description::well_known::Rfc3339)
+                        .ok()
+                }),
             }))
         })
     }
@@ -270,9 +271,10 @@ impl AuthorizationStore for SqliteCatalogStore {
             .await
             .map_err(|e| db_err("fetch_user_created_at", e))?;
             Ok(row.and_then(|(ts,)| {
-                parse_timestamp(&ts)
-                    .ok()
-                    .and_then(|dt| dt.format(&time::format_description::well_known::Rfc3339).ok())
+                parse_timestamp(&ts).ok().and_then(|dt| {
+                    dt.format(&time::format_description::well_known::Rfc3339)
+                        .ok()
+                })
             }))
         })
     }
@@ -294,9 +296,10 @@ impl AuthorizationStore for SqliteCatalogStore {
             .await
             .map_err(|e| db_err("fetch_role_created_at", e))?;
             Ok(row.and_then(|(ts,)| {
-                parse_timestamp(&ts)
-                    .ok()
-                    .and_then(|dt| dt.format(&time::format_description::well_known::Rfc3339).ok())
+                parse_timestamp(&ts).ok().and_then(|dt| {
+                    dt.format(&time::format_description::well_known::Rfc3339)
+                        .ok()
+                })
             }))
         })
     }

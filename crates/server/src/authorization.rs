@@ -117,7 +117,10 @@ async fn check_user_authorization(
     params.userid = Some(extenddb_auth::policy::principal_id::user_unique_id(
         account_id,
         user_name,
-        created_at.as_deref().map(String::as_str).unwrap_or_default(),
+        created_at
+            .as_deref()
+            .map(String::as_str)
+            .unwrap_or_default(),
     ));
     // The target table's owner account. ExtendDB builds the resource ARN with
     // the caller's account, so the resource account is that account.
@@ -167,7 +170,13 @@ async fn check_role_authorization(
 ) -> Result<(), DynamoDbError> {
     let action = format!("dynamodb:{operation}");
 
-    let (identity_policies, boundary, (session_policy, principal_tags, token_issue_time), resource_tags, role_created_at) = tokio::try_join!(
+    let (
+        identity_policies,
+        boundary,
+        (session_policy, principal_tags, token_issue_time),
+        resource_tags,
+        role_created_at,
+    ) = tokio::try_join!(
         wrap_policies(cache.fetch_role_policies(account_id, role_name)),
         wrap_boundary(cache.fetch_role_boundary(account_id, role_name)),
         fetch_session_data_and_tags(cache, account_id, role_name, session_name),
@@ -187,7 +196,10 @@ async fn check_role_authorization(
         account_id,
         role_name,
         session_name,
-        role_created_at.as_deref().map(String::as_str).unwrap_or_default(),
+        role_created_at
+            .as_deref()
+            .map(String::as_str)
+            .unwrap_or_default(),
     ));
     params.resource_account = Some(account_id.to_owned());
     // aws:TokenIssueTime for a role session is the session's issue time.

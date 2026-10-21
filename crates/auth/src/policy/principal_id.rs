@@ -72,7 +72,10 @@ fn id_body(parts: &[&str]) -> String {
 /// same name gets a different id, as IAM issues a new unique id each time.
 #[must_use]
 pub fn user_unique_id(account_id: &str, user_name: &str, created_at: &str) -> String {
-    format!("AIDA{}", id_body(&["user", account_id, user_name, created_at]))
+    format!(
+        "AIDA{}",
+        id_body(&["user", account_id, user_name, created_at])
+    )
 }
 
 /// A role's unique id, an `AROA...` string. Used as the first half of a role
@@ -80,7 +83,10 @@ pub fn user_unique_id(account_id: &str, user_name: &str, created_at: &str) -> St
 /// recreated role gets a new id.
 #[must_use]
 pub fn role_unique_id(account_id: &str, role_name: &str, created_at: &str) -> String {
-    format!("AROA{}", id_body(&["role", account_id, role_name, created_at]))
+    format!(
+        "AROA{}",
+        id_body(&["role", account_id, role_name, created_at])
+    )
 }
 
 /// The `aws:userid` value for a role session: `<role-id>:<session-name>`.
@@ -211,7 +217,12 @@ mod tests {
                 "arn:aws:sts::123456789012:assumed-role/app-role/sess-1",
                 Some(T1)
             ),
-            Some(role_session_userid("123456789012", "app-role", "sess-1", T1))
+            Some(role_session_userid(
+                "123456789012",
+                "app-role",
+                "sess-1",
+                T1
+            ))
         );
         assert_eq!(
             userid_for_caller_arn("arn:aws:iam::123456789012:root", Some(T1)),
