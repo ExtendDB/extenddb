@@ -28,6 +28,8 @@ adaptation when switching between ExtendDB and the real service.
 | Role chaining | Supported | Not implemented |
 | SourceIdentity, TransitiveTagKeys | Supported | Not implemented |
 | Resource policies | Supported | Not implemented (deferred) |
+| Table ARN as `TableName` | Accepted; the request acts on that table | Authorized against that table, then the request fails with `ResourceNotFoundException` |
+| AccessDenied message for an ARN outside this deployment (caller with no policy) | Names the ARN as supplied; an ARN in another account gets `Access is denied` | Names the ARN rewritten to this deployment's partition, service, region and account; an ARN in another account gets the full `is not authorized to perform` message. The decision is the same. |
 
 ## Import and Export
 
