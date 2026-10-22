@@ -44,10 +44,9 @@ fn build_pagination_where(
     sk_info_val: Option<(&str, ScalarAttributeType)>,
     base_sk_info: &Option<(String, ScalarAttributeType)>,
     is_index: bool,
-    is_lsi: bool,
     forward: bool,
 ) -> String {
-    let cols = order_by_columns(sk_info_val, base_sk_info.as_ref(), is_index, is_lsi);
+    let cols = order_by_columns(sk_info_val, base_sk_info.as_ref(), is_index);
     if cols.is_empty() {
         return String::new();
     }
@@ -68,20 +67,21 @@ fn build_pagination_where(
 /// ordered by the primary key clause the caller writes.
 ///
 /// - Base table with a sort key: the sort key.
-/// - LSI: the index sort key, then the base sort key (every row shares the
-///   queried partition key, so the base sort key alone identifies a row).
-/// - GSI with a sort key: the index sort key, then the FULL base primary key.
-///   Rows in a GSI partition are unique on (index SK, base PK, base SK), not
-///   on (index SK, base SK): many base partitions can project the same index
-///   SK and the same base SK, and comparing base SK alone made a page-two
-///   query return nothing whenever the rows sharing an index SK also shared a
-///   base SK.
+/// - Index with a sort key (GSI or LSI): the index sort key, then the FULL
+///   base primary key. Rows in a GSI partition are unique on (index SK, base
+///   PK, base SK), not on (index SK, base SK): many base partitions can
+///   project the same index SK and the same base SK, and comparing base SK
+///   alone made a page-two query return nothing whenever the rows sharing an
+///   index SK also shared a base SK. In an LSI partition `base_pk` equals the
+///   queried `pk` on every row, so it does not change the order, but it keeps
+///   the `ORDER BY` identical to the ordering index `(pk, sk, base_pk,
+///   base_sk)`. Without it the index serves only the index SK and PostgreSQL
+///   sorts the rows that share one on every page.
 /// - Hash-only index: the full base primary key.
 fn order_by_columns(
     sk_info_val: Option<(&str, ScalarAttributeType)>,
     base_sk_info: Option<&(String, ScalarAttributeType)>,
     is_index: bool,
-    is_lsi: bool,
 ) -> Vec<String> {
     let collated = |col: &str, t: ScalarAttributeType| {
         if t == ScalarAttributeType::S {
@@ -97,9 +97,7 @@ fn order_by_columns(
         if !is_index {
             return cols;
         }
-        if !is_lsi {
-            cols.push("base_pk COLLATE \"C\"".to_owned());
-        }
+        cols.push("base_pk COLLATE \"C\"".to_owned());
         cols.extend(base_sk);
     } else if is_index {
         cols.push("base_pk COLLATE \"C\"".to_owned());
@@ -226,7 +224,6 @@ impl PostgresEngine {
                 sk_info_val,
                 &base_sk_info,
                 index_name.is_some(),
-                is_lsi,
                 forward,
             );
             sql.push_str(&pagination_sql);
@@ -237,12 +234,7 @@ impl PostgresEngine {
         // of the forward one (as DynamoDB's is) and the cursor predicate above
         // is a row comparison the key index can seek on. String columns carry
         // COLLATE "C" for DynamoDB's UTF-8 byte order.
-        let order_cols = order_by_columns(
-            sk_info_val,
-            base_sk_info.as_ref(),
-            index_name.is_some(),
-            is_lsi,
-        );
+        let order_cols = order_by_columns(sk_info_val, base_sk_info.as_ref(), index_name.is_some());
         if !order_cols.is_empty() {
             let dir = if forward { "ASC" } else { "DESC" };
             let ordered = order_cols
@@ -266,19 +258,29 @@ impl PostgresEngine {
             {
                 // Index that has its own SK, with a base-table tie-breaker. The
                 // index SK is bound separately (see execute_query_sql); the binds
-                // here supply the tie-breaker.
+                // here supply the full base primary key.
                 //
-                // An LSI needs the base SK alone, because every row shares the
-                // queried partition key. A GSI needs the full base primary key,
-                // because rows sharing an index SK can come from different base
-                // partitions and can also share a base SK.
+                // A GSI takes the base partition key from the start key, because
+                // rows sharing an index SK can come from different base
+                // partitions and can also share a base SK. An LSI binds the
+                // queried partition key, which every row of the partition
+                // carries as its base_pk. base_pk then compares equal on every
+                // row, and only the base SK separates a row from the cursor.
+                // The statement does not read the start key's partition key:
+                // the bind keeps the page inside the queried partition.
+                // DynamoDB refuses a start key that names another partition
+                // with a ValidationException; that check belongs to request
+                // validation, not to this statement.
                 let base_sk = start_key
                     .get(base_sk_name.as_str())
                     .map(|v| parse_sk(v, base_sk_type))
                     .transpose()?;
                 if is_lsi {
                     match base_sk {
-                        Some(sk) => PaginationBinds::BaseSkOnly { sk },
+                        Some(sk) => PaginationBinds::BasePkAndSk {
+                            pk_text: pk_text.clone(),
+                            sk,
+                        },
                         None => PaginationBinds::None,
                     }
                 } else {
@@ -611,11 +613,11 @@ mod tests {
     #[test]
     fn base_table_cursor_is_a_single_comparison() {
         assert_eq!(
-            build_pagination_where(3, Some(("sk", S)), &None, false, false, true),
+            build_pagination_where(3, Some(("sk", S)), &None, false, true),
             " AND sk_s COLLATE \"C\" > $3"
         );
         assert_eq!(
-            build_pagination_where(3, Some(("sk", N)), &None, false, false, false),
+            build_pagination_where(3, Some(("sk", N)), &None, false, false),
             " AND sk_n < $3"
         );
     }
@@ -623,7 +625,7 @@ mod tests {
     #[test]
     fn forward_gsi_cursor_is_a_row_comparison_over_the_full_base_key() {
         assert_eq!(
-            build_pagination_where(3, Some(("gsk", S)), &base_s(), true, false, true),
+            build_pagination_where(3, Some(("gsk", S)), &base_s(), true, true),
             " AND (sk_s COLLATE \"C\", base_pk COLLATE \"C\", base_sk_s COLLATE \"C\") > ($3, $4, $5)"
         );
         // Numeric index sort key with a numeric base sort key: no collation on either.
@@ -633,7 +635,6 @@ mod tests {
                 Some(("gsk", N)),
                 &Some(("bsk".to_owned(), N)),
                 true,
-                false,
                 true
             ),
             " AND (sk_n, base_pk COLLATE \"C\", base_sk_n) > ($3, $4, $5)"
@@ -646,7 +647,7 @@ mod tests {
         // the exact mirror of its forward one, including among items sharing
         // an index sort key (measured 2026-09-17).
         assert_eq!(
-            build_pagination_where(3, Some(("gsk", S)), &base_s(), true, false, false),
+            build_pagination_where(3, Some(("gsk", S)), &base_s(), true, false),
             " AND (sk_s COLLATE \"C\", base_pk COLLATE \"C\", base_sk_s COLLATE \"C\") < ($3, $4, $5)"
         );
     }
@@ -654,41 +655,49 @@ mod tests {
     #[test]
     fn gsi_on_a_hash_only_base_table_uses_base_pk_as_the_tie_breaker() {
         assert_eq!(
-            build_pagination_where(3, Some(("gsk", S)), &None, true, false, true),
+            build_pagination_where(3, Some(("gsk", S)), &None, true, true),
             " AND (sk_s COLLATE \"C\", base_pk COLLATE \"C\") > ($3, $4)"
         );
         assert_eq!(
-            build_pagination_where(3, Some(("gsk", S)), &None, true, false, false),
+            build_pagination_where(3, Some(("gsk", S)), &None, true, false),
             " AND (sk_s COLLATE \"C\", base_pk COLLATE \"C\") < ($3, $4)"
         );
     }
 
     #[test]
-    fn lsi_cursor_is_a_row_comparison_in_both_directions() {
+    fn lsi_cursor_compares_the_ordering_index_columns_in_both_directions() {
+        // The ordering index is (pk, sk, base_pk, base_sk). An LSI cursor and
+        // ORDER BY that skip base_pk leave PostgreSQL an index that orders the
+        // index sort key only, so it sorts every group of rows sharing one.
         assert_eq!(
-            build_pagination_where(3, Some(("lsk", S)), &base_s(), true, true, true),
-            " AND (sk_s COLLATE \"C\", base_sk_s COLLATE \"C\") > ($3, $4)"
+            build_pagination_where(3, Some(("lsk", S)), &base_s(), true, true),
+            " AND (sk_s COLLATE \"C\", base_pk COLLATE \"C\", base_sk_s COLLATE \"C\") > ($3, $4, $5)"
         );
         assert_eq!(
-            build_pagination_where(3, Some(("lsk", S)), &base_s(), true, true, false),
-            " AND (sk_s COLLATE \"C\", base_sk_s COLLATE \"C\") < ($3, $4)"
+            build_pagination_where(3, Some(("lsk", S)), &base_s(), true, false),
+            " AND (sk_s COLLATE \"C\", base_pk COLLATE \"C\", base_sk_s COLLATE \"C\") < ($3, $4, $5)"
+        );
+        assert_eq!(
+            order_by_columns(Some(("lsk", N)), Some(&("bsk".to_owned(), S)), true),
+            vec![
+                "sk_n".to_owned(),
+                "base_pk COLLATE \"C\"".to_owned(),
+                "base_sk_s COLLATE \"C\"".to_owned()
+            ]
         );
     }
 
     #[test]
     fn hash_only_index_cursor_is_a_row_comparison_over_the_base_key() {
         assert_eq!(
-            build_pagination_where(3, None, &base_s(), true, false, true),
+            build_pagination_where(3, None, &base_s(), true, true),
             " AND (base_pk COLLATE \"C\", base_sk_s COLLATE \"C\") > ($3, $4)"
         );
         assert_eq!(
-            build_pagination_where(3, None, &None, true, false, true),
+            build_pagination_where(3, None, &None, true, true),
             " AND base_pk COLLATE \"C\" > $3"
         );
-        assert_eq!(
-            build_pagination_where(3, None, &None, false, false, true),
-            ""
-        );
+        assert_eq!(build_pagination_where(3, None, &None, false, true), "");
     }
 
     #[test]
@@ -698,15 +707,15 @@ mod tests {
         // after (p5, p4) asked for keys above p4, returned p5 again, and
         // then ended with p0..p3 never delivered.
         assert_eq!(
-            build_pagination_where(3, None, &None, true, false, false),
+            build_pagination_where(3, None, &None, true, false),
             " AND base_pk COLLATE \"C\" < $3"
         );
         assert_eq!(
-            build_pagination_where(3, None, &base_s(), true, false, false),
+            build_pagination_where(3, None, &base_s(), true, false),
             " AND (base_pk COLLATE \"C\", base_sk_s COLLATE \"C\") < ($3, $4)"
         );
         assert_eq!(
-            build_pagination_where(3, None, &Some(("bsk".to_owned(), N)), true, false, false),
+            build_pagination_where(3, None, &Some(("bsk".to_owned(), N)), true, false),
             " AND (base_pk COLLATE \"C\", base_sk_n) < ($3, $4)"
         );
     }
@@ -719,21 +728,20 @@ mod tests {
             Option<(&'a str, ScalarAttributeType)>,
             Option<(String, ScalarAttributeType)>,
             bool,
-            bool,
         );
         let shapes: [Shape<'_>; 7] = [
-            (Some(("sk", S)), None, false, false),
-            (Some(("gsk", S)), base_s(), true, false),
-            (Some(("gsk", N)), Some(("bsk".to_owned(), N)), true, false),
-            (Some(("gsk", S)), None, true, false),
-            (Some(("lsk", S)), base_s(), true, true),
-            (None, base_s(), true, false),
-            (None, None, true, false),
+            (Some(("sk", S)), None, false),
+            (Some(("gsk", S)), base_s(), true),
+            (Some(("gsk", N)), Some(("bsk".to_owned(), N)), true),
+            (Some(("gsk", S)), None, true),
+            (Some(("lsk", S)), base_s(), true),
+            (None, base_s(), true),
+            (None, None, true),
         ];
-        for (sk, base, is_index, is_lsi) in shapes {
-            let cols = order_by_columns(sk, base.as_ref(), is_index, is_lsi);
-            let fwd = build_pagination_where(1, sk, &base, is_index, is_lsi, true);
-            let rev = build_pagination_where(1, sk, &base, is_index, is_lsi, false);
+        for (sk, base, is_index) in shapes {
+            let cols = order_by_columns(sk, base.as_ref(), is_index);
+            let fwd = build_pagination_where(1, sk, &base, is_index, true);
+            let rev = build_pagination_where(1, sk, &base, is_index, false);
             let params = (1..=cols.len())
                 .map(|i| format!("${i}"))
                 .collect::<Vec<_>>();
@@ -756,6 +764,6 @@ mod tests {
                 "reverse {sk:?} {base:?}"
             );
         }
-        assert!(order_by_columns(None, None, false, false).is_empty());
+        assert!(order_by_columns(None, None, false).is_empty());
     }
 }

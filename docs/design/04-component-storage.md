@@ -728,6 +728,25 @@ WHERE pk = $gsi_pk
                 OR (base_pk = $base_pk AND base_sk_n > $base_sk))))
 ```
 
+**LSI Query:** an LSI cursor compares the same three columns as a GSI cursor,
+the index sort key, then `base_pk`, then the base sort key, and the `ORDER BY`
+lists them in the same order and direction. Every row of an LSI partition
+stores the queried partition key as `base_pk`, and the cursor binds the queried
+partition key for it, so `base_pk` compares equal on every row and the order
+and page boundaries are those of the index sort key and the base sort key.
+Including `base_pk` makes the `ORDER BY` match the ordering index
+`(pk, sk_s, base_pk, base_sk_n)` after the fixed `pk`, so the index can return
+the page in order without a sort step. With `(sk_s, base_sk_n)` alone the index
+orders `sk_s` only, and the database sorts the rows that share an index sort
+key value. PostgreSQL adds an Incremental Sort when the key condition leaves
+several index sort key values and a Sort when an equality on the index sort key
+leaves one; SQLite adds a temporary B-tree.
+```sql
+WHERE pk = $lsi_pk
+  AND (sk_s COLLATE "C", base_pk COLLATE "C", base_sk_n) > ($lsi_sk, $lsi_pk, $base_sk)
+ORDER BY sk_s COLLATE "C" ASC, base_pk COLLATE "C" ASC, base_sk_n ASC
+```
+
 For GSI queries, the pagination key includes both the GSI key attributes and the base table primary key (needed to
 uniquely identify the position, since GSI keys are not unique). This is why the GSI PostgreSQL table includes `base_pk`
 and `base_sk_*` as actual columns.
