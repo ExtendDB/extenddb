@@ -1066,7 +1066,7 @@ mod tests {
                 let c = canonical("us-east-1", "964157134968", rid);
                 assert!(
                     c.starts_with("arn:aws:dynamodb:us-east-1:964157134968:table/"),
-                    "canonical did not pin deployment fields for {input}: {c}"
+                    "canonical did not pin deployment fields for {input}"
                 );
             }
         }
