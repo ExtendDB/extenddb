@@ -125,6 +125,36 @@ impl MongoEngine {
         input: CreateTableInput,
         defer_active: bool,
     ) -> Result<TableDescription, StorageError> {
+        self.create_table_impl_inner(account_id, input, defer_active, None)
+            .await
+    }
+
+    /// Create a restore target with provenance present in its first catalog
+    /// document, so backup deletion cannot observe an ownerless target.
+    pub(crate) async fn create_table_for_restore(
+        &self,
+        account_id: &str,
+        input: CreateTableInput,
+        backup_arn: &str,
+        restore_at: bson::DateTime,
+        restore_operation_id: &str,
+    ) -> Result<TableDescription, StorageError> {
+        self.create_table_impl_inner(
+            account_id,
+            input,
+            true,
+            Some((backup_arn, restore_at, restore_operation_id)),
+        )
+        .await
+    }
+
+    async fn create_table_impl_inner(
+        &self,
+        account_id: &str,
+        input: CreateTableInput,
+        defer_active: bool,
+        restore: Option<(&str, bson::DateTime, &str)>,
+    ) -> Result<TableDescription, StorageError> {
         Self::validate_account_id(account_id)?;
 
         let table_id = uuid::Uuid::new_v4().to_string();
@@ -211,7 +241,7 @@ impl MongoEngine {
             )
         };
 
-        let table_doc = doc! {
+        let mut table_doc = doc! {
             "_id": { "account_id": account_id, "table_name": &input.table_name },
             "key_schema": key_schema_bson,
             "attribute_definitions": attr_defs_bson,
@@ -232,6 +262,11 @@ impl MongoEngine {
             "sse_specification": sse_spec_bson,
             "on_demand_throughput": on_demand_bson,
         };
+        if let Some((backup_arn, restore_at, restore_operation_id)) = restore {
+            table_doc.insert("restore_source_backup_arn", backup_arn);
+            table_doc.insert("restore_date_time", restore_at);
+            table_doc.insert("restore_operation_id", restore_operation_id);
+        }
 
         let tables_coll = self.catalog_db.collection::<Document>("tables");
         tables_coll.insert_one(table_doc).await.map_err(|e| {
@@ -544,6 +579,17 @@ impl MongoEngine {
             return Err(StorageError::DeletionProtected(input.table_name.clone()));
         }
 
+        // Restore targets have no ordinary timed CREATING transition: the
+        // restore worker owns the name until the item and index copy completes.
+        // Deleting one mid-copy can leave orphaned physical collections, so
+        // match the SQL backends and DynamoDB by refusing it while CREATING.
+        if desc.table_status == TableStatus::Creating && desc.restore_summary.is_some() {
+            return Err(StorageError::IndexesInUse(format!(
+                "Attempt to change a resource which is still in use: Table is being restored: {}",
+                input.table_name
+            )));
+        }
+
         // Mark as DELETING
         let tables_coll = self.catalog_db.collection::<Document>("tables");
         tables_coll
@@ -721,12 +767,17 @@ impl MongoEngine {
         // Build update document
         let mut update_doc = Document::new();
 
+        let clear_provisioned_throughput =
+            matches!(input.billing_mode, Some(BillingMode::PayPerRequest));
         if let Some(billing_mode) = &input.billing_mode {
             let billing_str = match billing_mode {
                 BillingMode::Provisioned => "PROVISIONED",
                 BillingMode::PayPerRequest => "PAY_PER_REQUEST",
             };
             update_doc.insert("billing_mode", billing_str);
+            if clear_provisioned_throughput {
+                update_doc.insert("provisioned_throughput", bson::Bson::Null);
+            }
         }
 
         if let Some(pt) = &input.provisioned_throughput {
@@ -799,6 +850,27 @@ impl MongoEngine {
                 .update_one(
                     doc! { "_id": { "account_id": account_id, "table_name": &input.table_name } },
                     doc! { "$set": &update_doc },
+                )
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+        }
+
+        if clear_provisioned_throughput {
+            let table_doc = tables_coll
+                .find_one(doc! {
+                    "_id": { "account_id": account_id, "table_name": &input.table_name },
+                })
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?
+                .ok_or_else(|| StorageError::TableNotFound(input.table_name.clone()))?;
+            let table_id = table_doc
+                .get_str("table_id")
+                .map_err(|_| StorageError::Internal("missing table_id".to_owned()))?;
+            self.catalog_db
+                .collection::<Document>("indexes")
+                .update_many(
+                    doc! { "_id.table_id": table_id, "index_type": "GSI" },
+                    doc! { "$set": { "provisioned_throughput": bson::Bson::Null } },
                 )
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -1209,6 +1281,17 @@ impl MongoEngine {
         &self,
         doc: &Document,
     ) -> Result<TableDescription, StorageError> {
+        self.doc_to_table_description_in(doc, None).await
+    }
+
+    /// Build the description from a `tables` document. When `session` is a
+    /// snapshot session (see `snapshot_engine`), the index documents are read
+    /// through it so they come from the same snapshot as `doc`.
+    pub(crate) async fn doc_to_table_description_in(
+        &self,
+        doc: &Document,
+        session: Option<&mut mongodb::ClientSession>,
+    ) -> Result<TableDescription, StorageError> {
         let id_doc = doc
             .get_document("_id")
             .map_err(|_| StorageError::Internal("missing _id".to_string()))?;
@@ -1313,14 +1396,34 @@ impl MongoEngine {
         // Fetch indexes
         let indexes_coll = self.catalog_db.collection::<Document>("indexes");
         use futures::TryStreamExt;
-        let index_cursor = indexes_coll
-            .find(doc! { "_id.table_id": &table_id })
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-        let index_docs: Vec<Document> = index_cursor
-            .try_collect()
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let index_filter = doc! { "_id.table_id": &table_id };
+        let index_docs: Vec<Document> = match session {
+            Some(session) => {
+                let mut cursor = indexes_coll
+                    .find(index_filter)
+                    .read_concern(mongodb::options::ReadConcern::snapshot())
+                    .session(&mut *session)
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                let mut docs = Vec::new();
+                while let Some(d) = cursor
+                    .next(&mut *session)
+                    .await
+                    .transpose()
+                    .map_err(|e| StorageError::Internal(e.to_string()))?
+                {
+                    docs.push(d);
+                }
+                docs
+            }
+            None => indexes_coll
+                .find(index_filter)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?
+                .try_collect()
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?,
+        };
 
         let mut gsis = Vec::new();
         let mut lsis = Vec::new();
@@ -1371,7 +1474,17 @@ impl MongoEngine {
                             number_of_decreases_today: 0,
                             last_increase_date_time: None,
                             last_decrease_date_time: None,
-                        });
+                        })
+                        // The service reports ProvisionedThroughput on every
+                        // index, 0/0 for an on-demand table, and so does the
+                        // PostgreSQL backend.
+                        .or(Some(ProvisionedThroughputDescription {
+                            read_capacity_units: 0,
+                            write_capacity_units: 0,
+                            number_of_decreases_today: 0,
+                            last_increase_date_time: None,
+                            last_decrease_date_time: None,
+                        }));
 
                     gsis.push(GsiDescription {
                         index_name: idx_name,
@@ -1439,6 +1552,20 @@ impl MongoEngine {
         let on_demand_throughput: Option<OnDemandThroughput> = doc
             .get("on_demand_throughput")
             .and_then(|b| bson::from_bson(b.clone()).ok());
+        // Set on a table created by RestoreTableFromBackup; in progress until
+        // the table is ACTIVE (the restore's index backfill runs while it is
+        // CREATING).
+        #[allow(clippy::cast_precision_loss)]
+        let restore_summary = doc.get_str("restore_source_backup_arn").ok().map(|arn| {
+            extenddb_core::types::RestoreSummary {
+                source_backup_arn: Some(arn.to_owned()),
+                restore_date_time: doc
+                    .get_datetime("restore_date_time")
+                    .map(|d| d.timestamp_millis() as f64 / 1000.0)
+                    .unwrap_or(0.0),
+                restore_in_progress: table_status == TableStatus::Creating,
+            }
+        });
 
         Ok(TableDescription {
             table_name,
@@ -1462,6 +1589,7 @@ impl MongoEngine {
             sse_description,
             table_class_summary,
             on_demand_throughput,
+            restore_summary,
             // Fields for features this backend does not implement, vector
             // indexes today, take their defaults. Adding one to
             // TableDescription then does not break this build.
@@ -1540,7 +1668,10 @@ impl MongoEngine {
 
     /// Drop a physical collection, treating an already-missing namespace as
     /// successful so lifecycle retries can continue their cleanup.
-    async fn drop_collection_if_exists(&self, coll_name: &str) -> Result<(), StorageError> {
+    pub(crate) async fn drop_collection_if_exists(
+        &self,
+        coll_name: &str,
+    ) -> Result<(), StorageError> {
         match self.data_db.collection::<Document>(coll_name).drop().await {
             Ok(()) => {}
             Err(e) if matches!(*e.kind, mongodb::error::ErrorKind::Command(ref c) if c.code == 26) =>
@@ -1553,7 +1684,10 @@ impl MongoEngine {
 
     /// Drop all physical secondary-index collections for a table before its
     /// catalog index documents are removed.
-    async fn drop_index_collections_for_table(&self, table_id: &str) -> Result<(), StorageError> {
+    pub(crate) async fn drop_index_collections_for_table(
+        &self,
+        table_id: &str,
+    ) -> Result<(), StorageError> {
         use futures::TryStreamExt;
 
         let indexes_coll = self.catalog_db.collection::<Document>("indexes");

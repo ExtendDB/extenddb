@@ -90,6 +90,7 @@ async fn apply_migrations(
     println!("  Current version: {current_display}");
 
     let expected = bootstrap.expected_catalog_version();
+    refuse_newer_catalog(current.as_deref(), &expected)?;
     let catalog_pending = current.as_deref() != Some(expected.as_str());
 
     // Data migrations are tracked in the data database's own ledger, separate
@@ -209,4 +210,47 @@ async fn apply_migrations(
     println!("Catalog version: {current_display} -> {new_display}");
 
     Ok(())
+}
+
+/// A catalog written by a newer binary is not a pending upgrade. The runners
+/// write the compiled version after every walk, so letting an older binary
+/// "migrate" it would stamp the older version onto the newer schema and let
+/// that binary start against tables it does not understand.
+fn refuse_newer_catalog(current: Option<&str>, expected: &str) -> anyhow::Result<()> {
+    use extenddb_core::version::CatalogVersion;
+    let (Some(current), Ok(expected_v)) = (current, expected.parse::<CatalogVersion>()) else {
+        return Ok(());
+    };
+    // A malformed stored version is reported by the migration itself.
+    let Ok(current_v) = current.parse::<CatalogVersion>() else {
+        return Ok(());
+    };
+    if current_v > expected_v {
+        anyhow::bail!(
+            "catalog version {current} is newer than this binary's {expected}. \
+             extenddb migrate does not downgrade a catalog; run a binary that \
+             expects {current} or later."
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod newer_catalog_tests {
+    use super::refuse_newer_catalog;
+
+    #[test]
+    fn older_or_equal_or_absent_is_allowed() {
+        assert!(refuse_newer_catalog(None, "0.0.4").is_ok());
+        assert!(refuse_newer_catalog(Some("0.0.3"), "0.0.4").is_ok());
+        assert!(refuse_newer_catalog(Some("0.0.4"), "0.0.4").is_ok());
+        assert!(refuse_newer_catalog(Some("garbage"), "0.0.4").is_ok());
+    }
+
+    #[test]
+    fn newer_is_refused() {
+        let err = refuse_newer_catalog(Some("0.0.5"), "0.0.4").expect_err("newer catalog");
+        assert!(err.to_string().contains("does not downgrade"), "{err}");
+        assert!(refuse_newer_catalog(Some("0.1.0"), "0.0.4").is_err());
+    }
 }

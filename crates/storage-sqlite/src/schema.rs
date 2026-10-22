@@ -27,7 +27,7 @@ use sqlx::SqlitePool;
 /// Compiled-in catalog version. Single source of truth for the SQLite backend;
 /// mirrors the PostgreSQL backend's `CATALOG_VERSION`.
 pub const CATALOG_VERSION: extenddb_core::version::CatalogVersion =
-    extenddb_core::version::CatalogVersion::new(0, 0, 3);
+    extenddb_core::version::CatalogVersion::new(0, 0, 4);
 
 /// Complete catalog schema, applied once on a fresh database.
 ///
@@ -365,8 +365,10 @@ CREATE TABLE IF NOT EXISTS backups (
 
 CREATE INDEX IF NOT EXISTS idx_backups_table ON backups (account_id, table_name);
 
--- Backup items.
+-- Backup items. `id` is the stable restore cursor: unlike an implicit rowid,
+-- an INTEGER PRIMARY KEY value is not renumbered by VACUUM.
 CREATE TABLE IF NOT EXISTS backup_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     backup_arn TEXT NOT NULL REFERENCES backups(backup_arn) ON DELETE CASCADE,
     pk TEXT NOT NULL,
     sk TEXT,
@@ -374,6 +376,26 @@ CREATE TABLE IF NOT EXISTS backup_items (
 );
 
 CREATE INDEX IF NOT EXISTS idx_backup_items_arn ON backup_items (backup_arn);
+
+-- A backup's table definition beyond its keys: secondary indexes, billing
+-- mode and throughput, table class, encryption (catalog 0.0.4). JSON in the
+-- wire's shape behind a version marker; see
+-- `extenddb_storage::backup_definition`. A backup taken before 0.0.4 has no
+-- row and restores as before.
+CREATE TABLE IF NOT EXISTS backup_definitions (
+    backup_arn TEXT PRIMARY KEY REFERENCES backups(backup_arn) ON DELETE CASCADE,
+    definition TEXT NOT NULL
+);
+
+-- Which backup a restored table came from, and when (catalog 0.0.4): reported
+-- by DescribeTable as RestoreSummary, and used to refuse DeleteBackup while the
+-- restore is running. Not a foreign key to backups, which may be deleted later.
+CREATE TABLE IF NOT EXISTS table_restores (
+    table_id TEXT PRIMARY KEY REFERENCES tables(table_id) ON DELETE CASCADE,
+    source_backup_arn TEXT NOT NULL,
+    restore_date_time TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_table_restores_backup ON table_restores (source_backup_arn);
 
 -- Continuous backups / PITR status.
 CREATE TABLE IF NOT EXISTS continuous_backups (
@@ -426,7 +448,7 @@ INSERT OR IGNORE INTO seq_counters (name, value)
 -- never advance, so a migration could add objects and still leave the server
 -- refusing to start on a version mismatch. Must stay in step with
 -- `CATALOG_VERSION` above; they are checked against each other in a test.
-INSERT INTO settings (key, value) VALUES ('catalog_version', '0.0.3')
+INSERT INTO settings (key, value) VALUES ('catalog_version', '0.0.4')
     ON CONFLICT(key) DO UPDATE SET value = excluded.value;
 INSERT OR IGNORE INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0.25');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('index_propagation_delay_ms', '10');
@@ -436,10 +458,96 @@ INSERT OR IGNORE INTO settings (key, value) VALUES ('index_propagation_delay_ms'
 ///
 /// Idempotent: every statement uses `IF NOT EXISTS` / `INSERT OR IGNORE`.
 pub async fn apply(pool: &SqlitePool) -> OpResult<()> {
+    // The schema's last statement stamps the compiled version. Never stamp an
+    // older version onto a catalog a newer binary has already upgraded: that
+    // binary's startup gate would keep passing and this one's would start
+    // passing against tables it does not know. `extenddb migrate` refuses such
+    // a catalog before getting here; this guards every other caller.
+    if table_exists(pool, "settings").await? {
+        let stored: Option<(String,)> =
+            sqlx::query_as("SELECT value FROM settings WHERE key = 'catalog_version'")
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| OpError::Internal(format!("read catalog_version: {e}")))?;
+        if let Some((stored,)) = stored
+            && let Ok(stored_v) = stored.parse::<extenddb_core::version::CatalogVersion>()
+            && stored_v > CATALOG_VERSION
+        {
+            return Err(OpError::Internal(format!(
+                "catalog version {stored} is newer than this binary's {CATALOG_VERSION}; \
+                 not downgrading it"
+            )));
+        }
+    }
+    // Catalog 0.0.4 originally created backup_items without a stable cursor.
+    // Rebuild it before SCHEMA_SQL stamps 0.0.4, including databases that an
+    // earlier 0.0.4-in-progress binary already stamped. SQLite cannot add an
+    // INTEGER PRIMARY KEY with ALTER TABLE.
+    migrate_backup_items(pool).await?;
     sqlx::raw_sql(SCHEMA_SQL)
         .execute(pool)
         .await
         .map_err(|e| OpError::Internal(format!("apply catalog schema: {e}")))?;
+    Ok(())
+}
+
+async fn migrate_backup_items(pool: &SqlitePool) -> OpResult<()> {
+    if !table_exists(pool, "backup_items").await? {
+        return Ok(());
+    }
+    let has_id: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('backup_items') WHERE name = 'id')",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| OpError::Internal(format!("inspect backup_items columns: {e}")))?;
+    if has_id {
+        return Ok(());
+    }
+
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| OpError::Internal(format!("begin backup_items migration: {e}")))?;
+    sqlx::query("DROP TABLE IF EXISTS backup_items_new")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| OpError::Internal(format!("remove stale backup_items_new: {e}")))?;
+    sqlx::query(
+        "CREATE TABLE backup_items_new (\
+         id INTEGER PRIMARY KEY AUTOINCREMENT, \
+         backup_arn TEXT NOT NULL REFERENCES backups(backup_arn) ON DELETE CASCADE, \
+         pk TEXT NOT NULL, sk TEXT, item_data TEXT NOT NULL)",
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| OpError::Internal(format!("create backup_items_new: {e}")))?;
+    sqlx::query(
+        "INSERT INTO backup_items_new (backup_arn, pk, sk, item_data) \
+         SELECT backup_arn, pk, sk, item_data FROM backup_items ORDER BY rowid",
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| OpError::Internal(format!("copy backup_items: {e}")))?;
+    sqlx::query("DROP INDEX IF EXISTS idx_backup_items_arn")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| OpError::Internal(format!("drop old backup_items index: {e}")))?;
+    sqlx::query("DROP TABLE backup_items")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| OpError::Internal(format!("drop old backup_items: {e}")))?;
+    sqlx::query("ALTER TABLE backup_items_new RENAME TO backup_items")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| OpError::Internal(format!("rename backup_items_new: {e}")))?;
+    sqlx::query("CREATE INDEX idx_backup_items_arn ON backup_items (backup_arn)")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| OpError::Internal(format!("recreate backup_items index: {e}")))?;
+    tx.commit()
+        .await
+        .map_err(|e| OpError::Internal(format!("commit backup_items migration: {e}")))?;
     Ok(())
 }
 
@@ -485,5 +593,94 @@ mod tests {
                 .contains("INSERT OR IGNORE INTO settings (key, value) VALUES ('catalog_version'"),
             "catalog_version must not be seeded with INSERT OR IGNORE"
         );
+    }
+}
+
+#[cfg(test)]
+mod apply_tests {
+    use super::{CATALOG_VERSION, apply};
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    #[tokio::test]
+    async fn a_newer_catalog_is_not_stamped_down() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        apply(&pool).await.expect("fresh apply");
+        let newer = format!("{}.{}.{}", 0, 0, 999);
+        sqlx::query("UPDATE settings SET value = ? WHERE key = 'catalog_version'")
+            .bind(&newer)
+            .execute(&pool)
+            .await
+            .expect("stamp newer");
+        let err = apply(&pool).await.expect_err("re-apply on a newer catalog");
+        assert!(
+            format!("{err:?}").contains("newer than this binary"),
+            "{err:?}"
+        );
+        let (stored,): (String,) =
+            sqlx::query_as("SELECT value FROM settings WHERE key = 'catalog_version'")
+                .fetch_one(&pool)
+                .await
+                .expect("read");
+        assert_eq!(stored, newer, "stored version must be untouched");
+        assert!(stored != CATALOG_VERSION.to_string());
+    }
+
+    #[tokio::test]
+    async fn backup_items_migration_is_idempotent_and_preserves_row_order() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        sqlx::raw_sql(
+            "CREATE TABLE backups (\
+                 backup_arn TEXT PRIMARY KEY, account_id TEXT NOT NULL, table_name TEXT NOT NULL); \
+             CREATE TABLE backup_items (\
+                 backup_arn TEXT NOT NULL REFERENCES backups(backup_arn) ON DELETE CASCADE, \
+                 pk TEXT NOT NULL, sk TEXT, item_data TEXT NOT NULL); \
+             CREATE INDEX idx_backup_items_arn ON backup_items (backup_arn); \
+             INSERT INTO backups (backup_arn, account_id, table_name) VALUES ('a', '0', 't'); \
+             INSERT INTO backup_items (backup_arn, pk, sk, item_data) VALUES \
+                 ('a', 'z', NULL, 'first'), \
+                 ('a', 'a', NULL, 'second'), \
+                 ('a', 'm', NULL, 'third');",
+        )
+        .execute(&pool)
+        .await
+        .expect("old schema");
+
+        apply(&pool).await.expect("first migration");
+        let rows: Vec<(i64, String, String)> =
+            sqlx::query_as("SELECT id, pk, item_data FROM backup_items ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .expect("migrated rows");
+        assert_eq!(
+            rows,
+            vec![
+                (1, "z".to_owned(), "first".to_owned()),
+                (2, "a".to_owned(), "second".to_owned()),
+                (3, "m".to_owned(), "third".to_owned()),
+            ]
+        );
+
+        apply(&pool).await.expect("second migration");
+        let after: Vec<(i64, String, String)> =
+            sqlx::query_as("SELECT id, pk, item_data FROM backup_items ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .expect("rows after second apply");
+        assert_eq!(after, rows);
+        let primary_key: i64 = sqlx::query_scalar(
+            "SELECT pk FROM pragma_table_info('backup_items') WHERE name = 'id'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("id column");
+        assert_eq!(primary_key, 1);
     }
 }

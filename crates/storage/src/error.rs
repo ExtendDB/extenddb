@@ -51,6 +51,10 @@ pub enum StorageError {
     /// measured 2026-08-13).
     #[error("{0}")]
     LimitExceeded(String),
+    /// A backup an in-progress restore is still reading. Maps to
+    /// `BackupInUseException`.
+    #[error("{0}")]
+    BackupInUse(String),
     /// A failure that is expected to succeed on retry: I/O errors, pool
     /// timeouts, SQLITE_BUSY / SQLITE_LOCKED. Exists so queue workers can tell
     /// "this row can never be applied" (drop it, or the whole queue stalls)
@@ -59,6 +63,12 @@ pub enum StorageError {
     /// and the worker dropped claimed rows on transient errors.
     #[error("{0}")]
     Transient(String),
+    /// The backend discarded a consistent snapshot before the reader drained
+    /// it (MongoDB `SnapshotTooOld`, a PostgreSQL snapshot conflict on a hot
+    /// standby). The operation that held it must restart from the beginning;
+    /// nothing read so far may be combined with a fresh snapshot.
+    #[error("snapshot expired: {0}")]
+    SnapshotExpired(String),
     #[error(
         "Catalog version mismatch: expected {expected}, found {found}. Run 'extenddb migrate' to update."
     )]

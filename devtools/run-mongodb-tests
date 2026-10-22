@@ -18,6 +18,11 @@
 #                      (default: /tmp/run-mongodb-tests-<ts>)
 #   --keep             Do not tear down the mongo container / server
 #                      on exit (useful for post-run inspection)
+#   --mongo-only       Start the replica set, print its URI, and exit without
+#                      writing a config or starting extenddb; implies --keep.
+#                      For tests that talk to MongoDB directly (the storage
+#                      crate's snapshot tests). Tear down with
+#                      docker rm -f extenddb-runtests-mongo-<port>.
 #   -h, --help         Show this help
 #
 # Arguments after `--` are passed to `devtools/run-tests` verbatim.
@@ -48,6 +53,7 @@ BIND_PORT=18443
 MONGO_PORT=27021
 OUTPUT_DIR=""
 KEEP=false
+MONGO_ONLY=false
 RUN_TESTS_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -56,8 +62,9 @@ while [[ $# -gt 0 ]]; do
         --mongo-port) MONGO_PORT="$2"; shift 2 ;;
         --output)     OUTPUT_DIR="$2"; shift 2 ;;
         --keep)       KEEP=true; shift ;;
+        --mongo-only) MONGO_ONLY=true; KEEP=true; shift ;;
         --)           shift; RUN_TESTS_ARGS=("$@"); break ;;
-        -h|--help)    sed -n '5,35p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)    sed -n '5,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)            echo "error: unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -73,7 +80,10 @@ fi
 if [[ -z "$OUTPUT_DIR" ]]; then
     OUTPUT_DIR="/tmp/run-mongodb-tests-${MONGO_PORT}-$(date +%Y%m%d-%H%M%S)-$$"
 fi
-mkdir -p "$OUTPUT_DIR"
+# --mongo-only writes nothing, so it creates no directory.
+if ! $MONGO_ONLY; then
+    mkdir -p "$OUTPUT_DIR"
+fi
 
 CONFIG="$OUTPUT_DIR/extenddb.toml"
 SERVER_LOG="$OUTPUT_DIR/server.log"
@@ -85,7 +95,7 @@ BINARY="./target/release/extenddb"
 # compiled only by the `mongodb-test-hooks` feature.
 export EXTENDDB_TEST_MONGODB_TEST_HOOKS=1
 
-if [[ ! -x "$BINARY" ]]; then
+if ! $MONGO_ONLY && [[ ! -x "$BINARY" ]]; then
     echo "error: $BINARY not found. Build first: cargo build --release --no-default-features --features mongodb-test-hooks" >&2
     exit 1
 fi
@@ -94,7 +104,7 @@ fi
 # capability before starting Docker or ExtendDB so a plain `mongodb` binary
 # fails with the build error instead of timing out while waiting for a gate
 # that was compiled out.
-if ! "$BINARY" version 2>/dev/null | grep -q '^test-hooks enabled$'; then
+if ! $MONGO_ONLY && ! "$BINARY" version 2>/dev/null | grep -q '^test-hooks enabled$'; then
     echo "error: $BINARY does not include MongoDB test hooks; rebuild with:" >&2
     echo "  cargo build --release --no-default-features --features mongodb-test-hooks" >&2
     exit 1
@@ -110,6 +120,10 @@ TMP_CANON=$(realpath /tmp)
 # ---------------------------------------------------------------------------
 
 cleanup() {
+    if $MONGO_ONLY; then
+        echo "  mongo container:      $CONTAINER_NAME (port $MONGO_PORT); tear down with: docker rm -f $CONTAINER_NAME"
+        return
+    fi
     if $KEEP; then
         echo ""
         echo "=== --keep set; leaving mongo + extenddb running ==="
@@ -161,6 +175,16 @@ for i in $(seq 1 30); do
     fi
     sleep 1
 done
+if [[ "$state" != "PRIMARY" ]]; then
+    echo "error: replica set did not elect a PRIMARY" >&2
+    exit 1
+fi
+
+if $MONGO_ONLY; then
+    echo ""
+    echo "EXTENDDB_TEST_MONGODB_URI=mongodb://127.0.0.1:$MONGO_PORT/?directConnection=true"
+    exit 0
+fi
 
 # ---------------------------------------------------------------------------
 # Initialize extenddb

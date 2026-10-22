@@ -130,11 +130,127 @@ pub(crate) async fn handle_delete_backup(
     serialize_output(&json!({ "BackupDescription": desc }))
 }
 
+const UNSUPPORTED_RESTORE_TABLE_OVERRIDE_FIELDS: [&str; 5] = [
+    "GlobalSecondaryIndexOverride",
+    "LocalSecondaryIndexOverride",
+    "SSESpecificationOverride",
+    "OnDemandThroughputOverride",
+    "VectorIndexOverride",
+];
+
+#[derive(Debug, Clone, PartialEq)]
+struct RestoreTableOverrides {
+    billing_mode: Option<extenddb_core::types::BillingMode>,
+    provisioned_throughput: Option<extenddb_core::types::ProvisionedThroughput>,
+}
+
+impl RestoreTableOverrides {
+    fn is_empty(&self) -> bool {
+        self.billing_mode.is_none() && self.provisioned_throughput.is_none()
+    }
+
+    fn effective_billing_mode(
+        &self,
+        source_billing_mode: Option<&str>,
+    ) -> extenddb_core::types::BillingMode {
+        self.billing_mode.unwrap_or_else(|| {
+            if source_billing_mode == Some("PAY_PER_REQUEST") {
+                extenddb_core::types::BillingMode::PayPerRequest
+            } else {
+                extenddb_core::types::BillingMode::Provisioned
+            }
+        })
+    }
+
+    /// The rules that depend only on the request itself: a PROVISIONED
+    /// override needs a throughput, and a throughput must be well formed.
+    /// Checked before anything is read from storage.
+    fn validate_shape(&self) -> Result<(), DynamoDbError> {
+        use extenddb_core::types::BillingMode;
+
+        if matches!(self.billing_mode, Some(BillingMode::Provisioned))
+            && self.provisioned_throughput.is_none()
+        {
+            return Err(DynamoDbError::ValidationException(
+                "One or more parameter values were invalid: ProvisionedThroughputOverride must \
+                 be specified when BillingModeOverride is PROVISIONED"
+                    .to_owned(),
+            ));
+        }
+
+        if let Some(throughput) = &self.provisioned_throughput {
+            let input = extenddb_core::types::CreateTableInput {
+                billing_mode: Some(BillingMode::Provisioned),
+                provisioned_throughput: Some(throughput.clone()),
+                ..Default::default()
+            };
+            extenddb_core::validation::validate_provisioned_throughput(&input)?;
+        }
+        Ok(())
+    }
+
+    /// The rule that needs the backup's own billing mode: a throughput
+    /// override is only meaningful if the restored table is PROVISIONED.
+    fn validate_for_source(&self, source_billing_mode: Option<&str>) -> Result<(), DynamoDbError> {
+        use extenddb_core::types::BillingMode;
+
+        if self.provisioned_throughput.is_some()
+            && self.effective_billing_mode(source_billing_mode) == BillingMode::PayPerRequest
+        {
+            return Err(DynamoDbError::ValidationException(
+                "One or more parameter values were invalid: ProvisionedThroughputOverride can \
+                 only be specified with BillingModeOverride PROVISIONED"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn parse_restore_table_overrides(body: &Value) -> Result<RestoreTableOverrides, DynamoDbError> {
+    crate::validate_enum_fields(
+        body,
+        &[crate::EnumField {
+            json_name: "BillingModeOverride",
+            valid: &["PROVISIONED", "PAY_PER_REQUEST"],
+            clause: crate::EnumClause::Named("billingModeOverride"),
+        }],
+    )?;
+
+    for field in UNSUPPORTED_RESTORE_TABLE_OVERRIDE_FIELDS {
+        if body.get(field).is_some() {
+            return Err(DynamoDbError::ValidationException(format!(
+                "RestoreTableFromBackup does not support {field} on ExtendDB"
+            )));
+        }
+    }
+
+    let billing_mode = body
+        .get("BillingModeOverride")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(crate::deserialize_error)?;
+    let provisioned_throughput = body
+        .get("ProvisionedThroughputOverride")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(crate::deserialize_error)?;
+
+    Ok(RestoreTableOverrides {
+        billing_mode,
+        provisioned_throughput,
+    })
+}
+
 /// Handle `RestoreTableFromBackup`.
 pub(crate) async fn handle_restore_table_from_backup(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
+    let overrides = parse_restore_table_overrides(&body)?;
+
     let target_table_name = body
         .get("TargetTableName")
         .and_then(|v| v.as_str())
@@ -145,27 +261,71 @@ pub(crate) async fn handle_restore_table_from_backup(
                     .to_owned(),
             )
         })?;
+    extenddb_core::validation::validate_table_name(target_table_name, &ctx.limits)?;
     let backup_arn = backup_arn_field(&body, &ctx.account_id)?;
 
+    // Rules that need nothing from the backup come first, so a malformed
+    // request is refused before any storage read and before a missing backup
+    // can take precedence over the request's own error.
+    overrides.validate_shape()?;
+    let source_billing_mode = if overrides.is_empty() {
+        None
+    } else {
+        ctx.storage
+            .describe_backup(&ctx.account_id, &backup_arn)
+            .await
+            .map_err(storage_err_to_dynamo)?
+            .source_table_details
+            .billing_mode
+    };
+    overrides.validate_for_source(source_billing_mode.as_deref())?;
+    let effective_billing_mode = overrides.effective_billing_mode(source_billing_mode.as_deref());
+
+    let storage_overrides = extenddb_storage::RestoreTableOverrides {
+        billing_mode: overrides.billing_mode,
+        provisioned_throughput: overrides.provisioned_throughput.clone(),
+    };
     let mut desc = ctx
         .storage
-        .restore_table_from_backup(&ctx.account_id, target_table_name, &backup_arn)
+        .restore_table_from_backup(
+            &ctx.account_id,
+            target_table_name,
+            &backup_arn,
+            storage_overrides,
+        )
         .await
         .map_err(storage_err_to_dynamo)?;
+
+    if effective_billing_mode == extenddb_core::types::BillingMode::PayPerRequest
+        && !overrides.is_empty()
+    {
+        // Backends may retain catalog capacity fields while creating an
+        // on-demand restore target. The response must expose normalized zero
+        // values, and subsequent backups normalize retained values before storage.
+        desc.provisioned_throughput = Default::default();
+        for index in desc.global_secondary_indexes.iter_mut().flatten() {
+            index.provisioned_throughput = Some(Default::default());
+        }
+    }
 
     // The restore response's TableDescription reports where the data came
     // from and that the restore is under way: SourceBackupArn and
     // RestoreInProgress: true, pinned by the ground-truth runs of 2026-08-24
-    // (us-east-1 and eu-west-2). Set here rather than in each backend because
-    // the summary is response metadata about this call, not table state the
-    // backends persist.
+    // (us-east-1 and eu-west-2). The service returns the table CREATING with
+    // the restore in progress; the backends report CREATING here too, whatever
+    // the copy has reached. The time is the backend's own record where it
+    // keeps one, so the response and later DescribeTable calls agree.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or_default();
+    let restore_date_time = desc
+        .restore_summary
+        .as_ref()
+        .map_or(now, |r| r.restore_date_time);
     desc.restore_summary = Some(extenddb_core::types::RestoreSummary {
         source_backup_arn: Some(backup_arn.clone()),
-        restore_date_time: now,
+        restore_date_time,
         restore_in_progress: true,
     });
 
@@ -274,6 +434,13 @@ fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> DynamoDbEr
         extenddb_storage::error::StorageError::TableAlreadyExists(msg) => {
             DynamoDbError::ResourceInUseException(msg)
         }
+        extenddb_storage::error::StorageError::TableNotActive(msg)
+        | extenddb_storage::error::StorageError::IndexesInUse(msg) => {
+            DynamoDbError::ResourceInUseException(msg)
+        }
+        extenddb_storage::error::StorageError::NoOpUpdate(msg) => {
+            DynamoDbError::ValidationException(msg)
+        }
         extenddb_storage::error::StorageError::Validation(msg) => {
             // A missing (or deleted) backup surfaces from the backend as a
             // Validation error carrying "Backup not found"; DynamoDB reports
@@ -292,6 +459,12 @@ fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> DynamoDbEr
         extenddb_storage::error::StorageError::Unsupported(msg) => {
             DynamoDbError::ValidationException(msg)
         }
+        extenddb_storage::error::StorageError::LimitExceeded(msg) => {
+            DynamoDbError::LimitExceededException(msg)
+        }
+        extenddb_storage::error::StorageError::BackupInUse(msg) => {
+            DynamoDbError::BackupInUseException(msg)
+        }
         other => {
             tracing::error!(internal_error = %other, "backup storage error");
             DynamoDbError::InternalServerError("Internal server error".to_owned())
@@ -301,10 +474,11 @@ fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> DynamoDbEr
 
 #[cfg(test)]
 mod tests {
-    use super::{backup_arn_field, storage_err_to_dynamo};
+    use super::{backup_arn_field, parse_restore_table_overrides, storage_err_to_dynamo};
     use extenddb_core::error::DynamoDbError;
+    use extenddb_core::types::{BillingMode, ProvisionedThroughput};
     use extenddb_storage::error::StorageError;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     const ACCOUNT: &str = "123456789012";
 
@@ -382,6 +556,161 @@ mod tests {
             matches!(err, DynamoDbError::ValidationException(_)),
             "expected ValidationException, got {err:?}"
         );
+    }
+
+    #[test]
+    fn restore_request_without_overrides_is_accepted() {
+        let body = json!({
+            "TargetTableName": "MusicRestored",
+            "BackupArn": arn(ACCOUNT),
+        });
+        assert!(parse_restore_table_overrides(&body).unwrap().is_empty());
+    }
+
+    fn throughput(read: i64, write: i64) -> ProvisionedThroughput {
+        ProvisionedThroughput {
+            read_capacity_units: read,
+            write_capacity_units: write,
+        }
+    }
+
+    #[test]
+    fn provisioned_override_with_throughput_is_accepted() {
+        let overrides = parse_restore_table_overrides(&json!({
+            "BillingModeOverride": "PROVISIONED",
+            "ProvisionedThroughputOverride": {
+                "ReadCapacityUnits": 5,
+                "WriteCapacityUnits": 5,
+            },
+        }))
+        .unwrap();
+        overrides
+            .validate_for_source(Some("PAY_PER_REQUEST"))
+            .unwrap();
+
+        assert_eq!(overrides.billing_mode, Some(BillingMode::Provisioned));
+        assert_eq!(overrides.provisioned_throughput, Some(throughput(5, 5)));
+    }
+
+    #[test]
+    fn provisioned_override_without_throughput_is_refused() {
+        let overrides = parse_restore_table_overrides(&json!({
+            "BillingModeOverride": "PROVISIONED",
+        }))
+        .unwrap();
+        let err = overrides.validate_shape().unwrap_err();
+        assert!(matches!(err, DynamoDbError::ValidationException(_)));
+    }
+
+    #[test]
+    fn throughput_override_under_pay_per_request_is_refused() {
+        let overrides = parse_restore_table_overrides(&json!({
+            "BillingModeOverride": "PAY_PER_REQUEST",
+            "ProvisionedThroughputOverride": {
+                "ReadCapacityUnits": 5,
+                "WriteCapacityUnits": 5,
+            },
+        }))
+        .unwrap();
+        let err = overrides
+            .validate_for_source(Some("PROVISIONED"))
+            .unwrap_err();
+        match err {
+            DynamoDbError::ValidationException(message) => assert!(message.contains(
+                "ProvisionedThroughputOverride can only be specified with \
+                     BillingModeOverride PROVISIONED"
+            )),
+            other => panic!("expected ValidationException, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_provisioned_throughput_override_matches_create_table() {
+        let expected = "One or more parameter values were invalid: ReadCapacityUnits and \
+                        WriteCapacityUnits must both be greater than or equal to 1 for table";
+        for (read, write) in [(0, 5), (5, 0), (-1, 5), (5, -1)] {
+            let overrides = parse_restore_table_overrides(&json!({
+                "BillingModeOverride": "PROVISIONED",
+                "ProvisionedThroughputOverride": {
+                    "ReadCapacityUnits": read,
+                    "WriteCapacityUnits": write,
+                },
+            }))
+            .unwrap();
+            let err = overrides.validate_shape().unwrap_err();
+            match err {
+                DynamoDbError::ValidationException(message) => assert_eq!(message, expected),
+                other => panic!("expected ValidationException, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn missing_provisioned_throughput_override_member_matches_create_table() {
+        for (member, body) in [
+            (
+                "ReadCapacityUnits",
+                json!({
+                    "BillingModeOverride": "PROVISIONED",
+                    "ProvisionedThroughputOverride": { "WriteCapacityUnits": 5 },
+                }),
+            ),
+            (
+                "WriteCapacityUnits",
+                json!({
+                    "BillingModeOverride": "PROVISIONED",
+                    "ProvisionedThroughputOverride": { "ReadCapacityUnits": 5 },
+                }),
+            ),
+        ] {
+            let err = parse_restore_table_overrides(&body).unwrap_err();
+            match err {
+                DynamoDbError::SerializationException(message) => {
+                    assert!(
+                        message.contains(&format!("missing field `{member}`")),
+                        "{message}"
+                    );
+                }
+                other => panic!("expected SerializationException, got {other:?}"),
+            }
+        }
+    }
+
+    fn assert_restore_override_rejected(field: &str) {
+        let mut body = json!({
+            "TargetTableName": "MusicRestored",
+            "BackupArn": arn(ACCOUNT),
+        });
+        body[field] = Value::Null;
+        let err = parse_restore_table_overrides(&body).unwrap_err();
+        match err {
+            DynamoDbError::ValidationException(message) => assert_eq!(
+                message,
+                format!("RestoreTableFromBackup does not support {field} on ExtendDB")
+            ),
+            other => panic!("expected ValidationException for {field}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn index_and_sse_overrides_remain_refused() {
+        for field in [
+            "GlobalSecondaryIndexOverride",
+            "LocalSecondaryIndexOverride",
+            "SSESpecificationOverride",
+        ] {
+            assert_restore_override_rejected(field);
+        }
+    }
+
+    #[test]
+    fn on_demand_throughput_override_is_refused() {
+        assert_restore_override_rejected("OnDemandThroughputOverride");
+    }
+
+    #[test]
+    fn vector_index_override_is_refused() {
+        assert_restore_override_rejected("VectorIndexOverride");
     }
 
     #[test]
