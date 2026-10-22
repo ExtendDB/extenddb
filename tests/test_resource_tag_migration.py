@@ -413,3 +413,162 @@ def test_resource_tag_migration_wire(deployment):
     assert "extenddb migrate --yes" in (refused.stdout + refused.stderr), (
         refused.stdout + refused.stderr
     )
+
+
+def _sqlite_marker(sqlite_path: str) -> list:
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        return conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (MIGRATION_MARKER_KEY,)
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def _sqlite_policy(sqlite_path: str, policy_name: str) -> dict:
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        row = conn.execute(
+            "SELECT policy_document FROM iam_policies WHERE policy_name = ?",
+            (policy_name,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return json.loads(row[0])
+
+
+def _sqlite_set_policy(sqlite_path: str, policy_name: str, document: dict) -> None:
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        conn.execute(
+            "UPDATE iam_policies SET policy_document = ? WHERE policy_name = ?",
+            (json.dumps(document), policy_name),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_resource_tag_migration_collisions(deployment):
+    """Both resource-tag forms on one tag key in one operator block.
+
+    Same values: both forms resolved from the same table tags before the
+    upgrade, so the two conditions are one condition. migrate drops the
+    dynamodb: key and the Deny keeps applying.
+
+    Different values: the two cannot share one JSON key. migrate leaves the
+    policy unchanged, exits non-zero and does not record the marker, so serve
+    keeps refusing the catalog until the policy is fixed and migrate is run
+    again. Recording the marker here would change the decision: under
+    StringNotEquals the dynamodb: half, now absent, always matches.
+    """
+    from management_helpers import ManagementClient
+
+    endpoint = deployment["endpoint"]
+    server = deployment["server"]
+    sqlite_path = deployment["sqlite_path"]
+    region = "us-east-1"
+
+    server.start()
+    mgmt = ManagementClient(endpoint, deployment["admin_user"], deployment["admin_pw"])
+    account_id = f"{uuid.uuid4().int % 10**12:012d}"
+    assert mgmt.create_account(account_id, "collide").status_code == 201
+
+    assert mgmt.create_user(account_id, "fulladmin", "TestPass123!").status_code == 201
+    creds = mgmt.create_access_key(account_id, "fulladmin").json()
+    assert mgmt.put_user_policy(
+        account_id, "fulladmin", "full",
+        {"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "dynamodb:*", "Resource": "*"}]},
+    ).status_code == 204
+
+    # Same-value duplicate on a Deny.
+    assert mgmt.create_user(account_id, "hedged", "TestPass123!").status_code == 201
+    hedged = mgmt.create_access_key(account_id, "hedged").json()
+    assert mgmt.put_user_policy(account_id, "hedged", "hedged-same", {
+        "Version": "2012-10-17",
+        "Statement": [
+            {"Effect": "Allow", "Action": "dynamodb:GetItem", "Resource": "*"},
+            {"Effect": "Deny", "Action": "dynamodb:GetItem", "Resource": "*",
+             "Condition": {"StringEquals": {
+                 "aws:ResourceTag/env": "prod",
+                 "dynamodb:ResourceTag/env": "prod",
+             }}},
+        ],
+    }).status_code == 204
+
+    # Different values, which cannot be merged.
+    assert mgmt.create_user(account_id, "split", "TestPass123!").status_code == 201
+    split_doc = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {"Effect": "Allow", "Action": "dynamodb:GetItem", "Resource": "*",
+             "Condition": {"StringNotEquals": {
+                 "aws:ResourceTag/env": "dev",
+                 "dynamodb:ResourceTag/env": "test",
+             }}},
+        ],
+    }
+    assert mgmt.put_user_policy(account_id, "split", "hedged-split", split_doc).status_code == 204
+
+    admin_client = _client(endpoint, creds["access_key_id"], creds["secret_access_key"], region)
+    table = f"wire-{uuid.uuid4().hex[:8]}"
+    admin_client.create_table(
+        TableName=table,
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        BillingMode="PAY_PER_REQUEST",
+        Tags=[{"Key": "env", "Value": "prod"}],
+    )
+    from conftest import wait_for_active
+    wait_for_active(admin_client, table)
+    admin_client.put_item(TableName=table, Item={"pk": {"S": "k1"}})
+    server.stop()
+
+    # Simulate a catalog created before the migration existed.
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        conn.execute("DELETE FROM settings WHERE key = ?", (MIGRATION_MARKER_KEY,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    applied = _run("migrate", "--yes", "--config", deployment["config"])
+    out = applied.stdout + applied.stderr
+    assert applied.returncode != 0, out
+    assert "NEEDS ATTENTION" in out, out
+    attention = [line for line in out.splitlines() if "NEEDS ATTENTION" in line]
+    assert any("hedged-split" in line for line in attention), out
+    assert not any("hedged-same" in line for line in attention), out
+    assert _sqlite_marker(sqlite_path) == []
+    # The different-value policy is unchanged; the same-value one keeps only
+    # the aws: key.
+    assert _sqlite_policy(sqlite_path, "hedged-split") == split_doc
+    same = _sqlite_policy(sqlite_path, "hedged-same")
+    assert same["Statement"][1]["Condition"] == {
+        "StringEquals": {"aws:ResourceTag/env": "prod"}
+    }
+
+    refused = _run("serve", "--config", deployment["config"], "--foreground", timeout=60)
+    assert refused.returncode != 0
+    assert "extenddb migrate --yes" in (refused.stdout + refused.stderr), (
+        refused.stdout + refused.stderr
+    )
+
+    # Fix the different-value policy by hand (keep the aws: form) and run
+    # migrate again: it completes and records the marker.
+    fixed = json.loads(json.dumps(split_doc))
+    del fixed["Statement"][0]["Condition"]["StringNotEquals"]["dynamodb:ResourceTag/env"]
+    _sqlite_set_policy(sqlite_path, "hedged-split", fixed)
+    again = _run("migrate", "--yes", "--config", deployment["config"])
+    assert again.returncode == 0, again.stdout + again.stderr
+    assert _sqlite_marker(sqlite_path) != []
+
+    # The same-value Deny still applies after the upgrade.
+    server.start()
+    hedged_client = _client(
+        endpoint, hedged["access_key_id"], hedged["secret_access_key"], region
+    )
+    with pytest.raises(ClientError) as exc:
+        hedged_client.get_item(TableName=table, Key={"pk": {"S": "k1"}})
+    assert exc.value.response["Error"]["Code"] == "AccessDeniedException"

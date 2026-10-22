@@ -240,6 +240,13 @@ async fn apply_migrations(
                 rtag_detect.errors
             ));
         }
+        if !rtag_detect.needs_attention.is_empty() {
+            what.push(format!(
+                "{} policy(ies) listed as NEEDS ATTENTION, which must be fixed by hand before \
+                 the migration can complete",
+                rtag_detect.needs_attention.len()
+            ));
+        }
         anyhow::bail!(
             "--yes is required to apply migrations. Pending: {}.",
             what.join("; ")
@@ -300,6 +307,20 @@ async fn apply_migrations(
             "resource-tag migration incomplete: {} policy lookup(s) failed. \
              Re-run `extenddb migrate --yes` to finish; the migration marker was not recorded.",
             rtag_applied.errors
+        );
+    }
+    // A policy left unchanged because both resource-tag forms name the same
+    // tag key in one operator block is not migrated. Recording the marker
+    // would let serve evaluate it with the dynamodb: half absent, which can
+    // turn a Deny off. Withhold the marker so serve keeps refusing until the
+    // policy is fixed by hand and migrate is run again.
+    if !rtag_applied.needs_attention.is_empty() {
+        anyhow::bail!(
+            "resource-tag migration incomplete: {} policy(ies) above name both \
+             aws:ResourceTag/<key> and dynamodb:ResourceTag/<key> for the same key in one \
+             condition operator and were left unchanged. Remove one of the two forms from \
+             each, then re-run `extenddb migrate --yes`; the migration marker was not recorded.",
+            rtag_applied.needs_attention.len()
         );
     }
     // Record the completion marker only after a clean rewrite. serve reads this

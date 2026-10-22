@@ -127,8 +127,7 @@ fn rewrite_operator_block(
         rewrite_variables_in_json(value, rewrites);
     }
 
-    // Collect the condition-key renames, detecting collisions against keys
-    // already present in this same block (original or another rename).
+    // Collect the condition-key renames.
     let mut renames: Vec<(String, String)> = Vec::new();
     for key in block.keys() {
         if let Some(rest) = strip_prefix_ci(key, DYNAMODB_PREFIX) {
@@ -138,13 +137,35 @@ fn rewrite_operator_block(
     if renames.is_empty() {
         return;
     }
-    for (_old, new_key) in &renames {
-        if block.contains_key(new_key) || renames.iter().filter(|(_, n)| n == new_key).count() > 1 {
-            *collision = true;
-            return;
+    // A rename onto a key the block already has (an aws:ResourceTag key, or
+    // an earlier rename) is a duplicate when the two values are equal: both
+    // prefixes resolve from the same table tags, so the two conditions are
+    // the same condition and the dynamodb: one is dropped. Different values
+    // cannot share one JSON key, so the block is a collision.
+    let mut moves: Vec<(String, String)> = Vec::new();
+    let mut drops: Vec<String> = Vec::new();
+    for (old_key, new_key) in &renames {
+        let value = &block[old_key];
+        let existing = block.get(new_key).or_else(|| {
+            moves
+                .iter()
+                .find(|(_, n)| n == new_key)
+                .map(|(o, _)| &block[o])
+        });
+        match existing {
+            Some(v) if v == value => drops.push(old_key.clone()),
+            Some(_) => {
+                *collision = true;
+                return;
+            }
+            None => moves.push((old_key.clone(), new_key.clone())),
         }
     }
-    for (old_key, new_key) in renames {
+    for old_key in drops {
+        block.remove(&old_key);
+        *rewrites += 1;
+    }
+    for (old_key, new_key) in moves {
         if let Some(value) = block.remove(&old_key) {
             block.insert(new_key, value);
             *rewrites += 1;
@@ -665,7 +686,7 @@ mod tests {
         let doc = stmt_cond(json!({
             "StringEquals": {
                 "aws:ResourceTag/env": "prod",
-                "dynamodb:ResourceTag/env": "prod"
+                "dynamodb:ResourceTag/env": "dev"
             }
         }));
         let out = rewrite_policy_document(&doc);
@@ -675,6 +696,77 @@ mod tests {
         assert_eq!(
             out.document, doc,
             "collision must leave the policy untouched"
+        );
+    }
+
+    #[test]
+    fn same_value_duplicate_drops_the_dynamodb_key() {
+        // Both prefixes resolved from the same table tags, so the two
+        // conditions are one condition; the dynamodb: key is dropped.
+        let doc = stmt_cond(json!({
+            "StringEquals": {
+                "aws:ResourceTag/env": "prod",
+                "dynamodb:ResourceTag/env": "prod"
+            }
+        }));
+        let out = rewrite_policy_document(&doc);
+        assert!(!out.collision);
+        assert_eq!(out.rewrites, 1);
+        assert_eq!(
+            out.document,
+            stmt_cond(json!({"StringEquals": {"aws:ResourceTag/env": "prod"}}))
+        );
+    }
+
+    #[test]
+    fn two_dynamodb_spellings_of_one_key() {
+        // Same value: one aws: key remains.
+        let same = stmt_cond(json!({
+            "StringEquals": {
+                "dynamodb:ResourceTag/env": "prod",
+                "DynamoDB:resourcetag/env": "prod"
+            }
+        }));
+        let out = rewrite_policy_document(&same);
+        assert!(!out.collision);
+        assert_eq!(out.rewrites, 2);
+        assert_eq!(
+            out.document,
+            stmt_cond(json!({"StringEquals": {"aws:ResourceTag/env": "prod"}}))
+        );
+        // Different values: a collision, left unchanged.
+        let different = stmt_cond(json!({
+            "StringEquals": {
+                "dynamodb:ResourceTag/env": "prod",
+                "DynamoDB:resourcetag/env": "dev"
+            }
+        }));
+        let out = rewrite_policy_document(&different);
+        assert!(out.collision);
+        assert_eq!(out.document, different);
+    }
+
+    #[test]
+    fn text_outside_condition_blocks_is_never_rewritten() {
+        let doc = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Sid": "dynamodbResourceTagenv",
+                "Effect": "Allow",
+                "Action": "dynamodb:ResourceTag/env",
+                "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/dynamodb:ResourceTag/env",
+                "Condition": {"StringEquals": {"dynamodb:ResourceTag/env": "prod"}}
+            }]
+        });
+        let out = rewrite_policy_document(&doc);
+        assert_eq!(out.rewrites, 1);
+        let stmt = &out.document["Statement"][0];
+        assert_eq!(stmt["Sid"], doc["Statement"][0]["Sid"]);
+        assert_eq!(stmt["Action"], doc["Statement"][0]["Action"]);
+        assert_eq!(stmt["Resource"], doc["Statement"][0]["Resource"]);
+        assert_eq!(
+            stmt["Condition"],
+            json!({"StringEquals": {"aws:ResourceTag/env": "prod"}})
         );
     }
 

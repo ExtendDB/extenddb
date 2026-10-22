@@ -1878,9 +1878,16 @@ impl ManagementStore for MongoCatalogStore {
                 let Some(policy_bson) = d.get("session_policy") else {
                     continue;
                 };
-                // A session policy that does not convert is a corrupt row; skip
-                // it rather than failing the whole migration.
+                // A session policy that does not convert is a corrupt row. It
+                // cannot be evaluated under either key form, so no decision
+                // depends on the migration; report it and carry on.
                 let Ok(policy) = bson::from_bson::<serde_json::Value>(policy_bson.clone()) else {
+                    tracing::warn!(
+                        account_id = d.get_str("account_id").unwrap_or_default(),
+                        role_name = d.get_str("role_name").unwrap_or_default(),
+                        session_name = d.get_str("session_name").unwrap_or_default(),
+                        "stored session policy does not parse; skipped by the resource-tag migration"
+                    );
                     continue;
                 };
                 if let (Ok(session_token), Ok(account_id), Ok(role_name), Ok(session_name)) = (

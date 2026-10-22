@@ -323,16 +323,23 @@ impl CassandraCatalogStore {
         let mut out = Vec::new();
         for (session_token, account_id, role_name, session_name, policy) in raw {
             let Some(text) = policy else { continue };
-            // A session policy that does not parse is a corrupt row; skip it
-            // rather than failing the whole migration.
-            if let Ok(policy) = serde_json::from_str::<serde_json::Value>(&text) {
-                out.push(extenddb_storage::management_store::SessionPolicyEntry {
+            // A session policy that does not parse is a corrupt row. It
+            // cannot be evaluated under either key form, so no decision
+            // depends on the migration; report it and carry on.
+            match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(policy) => out.push(extenddb_storage::management_store::SessionPolicyEntry {
                     session_token,
                     account_id,
                     role_name,
                     session_name,
                     policy,
-                });
+                }),
+                Err(_) => tracing::warn!(
+                    account_id = %account_id,
+                    role_name = %role_name,
+                    session_name = %session_name,
+                    "stored session policy does not parse; skipped by the resource-tag migration"
+                ),
             }
         }
         Ok(out)
