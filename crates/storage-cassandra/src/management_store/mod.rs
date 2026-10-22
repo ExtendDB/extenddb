@@ -591,7 +591,10 @@ impl extenddb_storage::management_store::ManagementStore for CassandraCatalogSto
     ) -> BoxFuture<'_, OpResult<()>> {
         let session_token = session_token.to_string();
         let document = document.clone();
-        Box::pin(async move { self.update_session_policy_impl(&session_token, &document).await })
+        Box::pin(async move {
+            self.update_session_policy_impl(&session_token, &document)
+                .await
+        })
     }
 
     // ── Caller tags ────────────────────────────────────────────────

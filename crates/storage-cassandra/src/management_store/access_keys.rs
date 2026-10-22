@@ -289,17 +289,34 @@ impl CassandraCatalogStore {
             crate::cassandra_util::map_rows(
                 rows,
                 |row| {
-                    let session_token =
-                        crate::cassandra_util::get_column(row, "session_token", "list_session_policies")?;
-                    let account_id =
-                        crate::cassandra_util::get_column(row, "account_id", "list_session_policies")?;
-                    let role_name =
-                        crate::cassandra_util::get_column(row, "role_name", "list_session_policies")?;
-                    let session_name =
-                        crate::cassandra_util::get_column(row, "session_name", "list_session_policies")?;
-                    let session_policy: Option<String> =
-                        row.get_r_by_name("session_policy").ok();
-                    Ok((session_token, account_id, role_name, session_name, session_policy))
+                    let session_token = crate::cassandra_util::get_column(
+                        row,
+                        "session_token",
+                        "list_session_policies",
+                    )?;
+                    let account_id = crate::cassandra_util::get_column(
+                        row,
+                        "account_id",
+                        "list_session_policies",
+                    )?;
+                    let role_name = crate::cassandra_util::get_column(
+                        row,
+                        "role_name",
+                        "list_session_policies",
+                    )?;
+                    let session_name = crate::cassandra_util::get_column(
+                        row,
+                        "session_name",
+                        "list_session_policies",
+                    )?;
+                    let session_policy: Option<String> = row.get_r_by_name("session_policy").ok();
+                    Ok((
+                        session_token,
+                        account_id,
+                        role_name,
+                        session_name,
+                        session_policy,
+                    ))
                 },
                 "list_session_policies",
             )?;

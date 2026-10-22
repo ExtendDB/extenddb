@@ -224,7 +224,9 @@ pub fn backend() -> extenddb_storage::Backend {
                         extenddb_storage::management_store_factory::ManagementStoreError::ConnectionFailed,
                     )?;
                 Ok(Box::new(catalog_store)
-                    as Box<dyn extenddb_storage::management_store::ManagementStore>)
+                    as Box<
+                        dyn extenddb_storage::management_store::ManagementStore,
+                    >)
             })
         },
         diagnostics_store: |connection_string| {

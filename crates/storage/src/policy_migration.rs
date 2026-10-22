@@ -31,7 +31,8 @@ const AWS_PREFIX: &str = "aws:ResourceTag/";
 /// ASCII-case-insensitive prefix strip, returning the untouched remainder.
 fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     let head = s.get(..prefix.len())?;
-    head.eq_ignore_ascii_case(prefix).then(|| &s[prefix.len()..])
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &s[prefix.len()..])
 }
 
 /// Outcome of rewriting one policy document.
@@ -370,7 +371,13 @@ async fn migrate_inline(
             record_outcome(report, account_id, &principal, &policy_name, &document)
             && apply
             && store
-                .put_policy(account_id, principal_type, principal_name, &policy_name, &new_doc)
+                .put_policy(
+                    account_id,
+                    principal_type,
+                    principal_name,
+                    &policy_name,
+                    &new_doc,
+                )
                 .await
                 .is_err()
         {
@@ -493,7 +500,10 @@ mod tests {
         let out = rewrite_policy_document(&doc);
         assert!(out.changed());
         assert_eq!(out.rewrites, 1);
-        assert_eq!(out.document, stmt_cond(json!({"StringEquals": {"aws:ResourceTag/env": "prod"}})));
+        assert_eq!(
+            out.document,
+            stmt_cond(json!({"StringEquals": {"aws:ResourceTag/env": "prod"}}))
+        );
     }
 
     #[test]
@@ -520,8 +530,9 @@ mod tests {
 
     #[test]
     fn for_all_values_key_rewritten() {
-        let doc =
-            stmt_cond(json!({"ForAllValues:StringEquals": {"dynamodb:ResourceTag/team": ["a", "b"]}}));
+        let doc = stmt_cond(
+            json!({"ForAllValues:StringEquals": {"dynamodb:ResourceTag/team": ["a", "b"]}}),
+        );
         let out = rewrite_policy_document(&doc);
         assert_eq!(out.rewrites, 1);
         assert_eq!(
@@ -661,7 +672,10 @@ mod tests {
         assert!(out.collision);
         assert!(!out.changed());
         assert_eq!(out.rewrites, 0);
-        assert_eq!(out.document, doc, "collision must leave the policy untouched");
+        assert_eq!(
+            out.document, doc,
+            "collision must leave the policy untouched"
+        );
     }
 
     #[test]
@@ -703,7 +717,8 @@ mod tests {
         let out = rewrite_policy_document(&doc);
         assert_eq!(out.rewrites, 1);
         assert_eq!(
-            out.document.pointer("/Statement/Condition/StringEquals")
+            out.document
+                .pointer("/Statement/Condition/StringEquals")
                 .and_then(|v| v.as_object())
                 .map(|m| m.contains_key("aws:ResourceTag/env")),
             Some(true)
@@ -814,7 +829,10 @@ mod tests {
         let (key, val) = map.iter().next().expect("one condition key");
         let values = match val {
             Value::String(s) => vec![s.clone()],
-            Value::Array(a) => a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect(),
+            Value::Array(a) => a
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect(),
             _ => vec![],
         };
         (op.clone(), key.clone(), values)

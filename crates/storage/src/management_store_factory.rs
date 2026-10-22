@@ -23,7 +23,10 @@ impl std::fmt::Display for ManagementStoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BackendNotInstalled => {
-                write!(f, "no storage backend installed (set_backend was not called)")
+                write!(
+                    f,
+                    "no storage backend installed (set_backend was not called)"
+                )
             }
             Self::ConnectionFailed(msg) => write!(f, "Failed to connect: {msg}"),
         }
@@ -46,7 +49,6 @@ pub type ManagementStoreFactory =
 pub async fn create_management_store(
     connection_string: &str,
 ) -> Result<Box<dyn ManagementStore>, ManagementStoreError> {
-    let backend =
-        crate::backend::try_backend().ok_or(ManagementStoreError::BackendNotInstalled)?;
+    let backend = crate::backend::try_backend().ok_or(ManagementStoreError::BackendNotInstalled)?;
     (backend.management_store)(connection_string).await
 }

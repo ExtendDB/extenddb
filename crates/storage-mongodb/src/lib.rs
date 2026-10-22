@@ -222,7 +222,9 @@ pub fn backend() -> extenddb_storage::Backend {
                         )
                     })?;
                 Ok(Box::new(MongoCatalogStore::new(client))
-                    as Box<dyn extenddb_storage::management_store::ManagementStore>)
+                    as Box<
+                        dyn extenddb_storage::management_store::ManagementStore,
+                    >)
             })
         },
         diagnostics_store: |connection_string| {

@@ -659,10 +659,7 @@ mod tests {
             false,
             RequestParams::default(),
         );
-        assert_eq!(
-            ctx.resolve_key("aws:ResourceTag/Team"),
-            Some(vec!["Alpha"])
-        );
+        assert_eq!(ctx.resolve_key("aws:ResourceTag/Team"), Some(vec!["Alpha"]));
         // dynamodb:ResourceTag/* is absent, as on the live service, so it keeps
         // absent-key semantics (StringEquals never matches, StringNotEquals
         // matches) and never fails closed.

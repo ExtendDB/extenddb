@@ -203,9 +203,7 @@ impl PostgresCatalogStore {
     /// List stored session policies for the resource-tag migration.
     pub(crate) async fn list_session_policies_impl(
         &self,
-    ) -> OpResult<
-        Vec<extenddb_storage::management_store::SessionPolicyEntry>,
-    > {
+    ) -> OpResult<Vec<extenddb_storage::management_store::SessionPolicyEntry>> {
         let rows: Vec<(String, String, String, String, serde_json::Value)> = sqlx::query_as(
             "SELECT session_token, account_id, role_name, session_name, session_policy \
              FROM iam_sessions WHERE session_policy IS NOT NULL",

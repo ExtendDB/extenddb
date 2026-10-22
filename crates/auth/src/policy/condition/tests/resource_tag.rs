@@ -53,12 +53,20 @@ fn bare_string_equals_aws_matches_dynamodb_absent() {
     let ctx = ctx_env_prod();
     // aws:ResourceTag/env resolves to "prod" and matches.
     assert!(evaluate_condition(
-        &cond(bare(ConditionOperator::StringEquals), "aws:ResourceTag/env", &["prod"]),
+        &cond(
+            bare(ConditionOperator::StringEquals),
+            "aws:ResourceTag/env",
+            &["prod"]
+        ),
         &ctx
     ));
     // dynamodb:ResourceTag/env is absent: a positive bare operator never matches.
     assert!(!evaluate_condition(
-        &cond(bare(ConditionOperator::StringEquals), "dynamodb:ResourceTag/env", &["prod"]),
+        &cond(
+            bare(ConditionOperator::StringEquals),
+            "dynamodb:ResourceTag/env",
+            &["prod"]
+        ),
         &ctx
     ));
 }
@@ -70,13 +78,21 @@ fn bare_string_not_equals_dynamodb_absent_matches() {
     let ctx = ctx_env_prod();
     // aws:ResourceTag/env resolves to "prod": StringNotEquals "prod" is false.
     assert!(!evaluate_condition(
-        &cond(bare(ConditionOperator::StringNotEquals), "aws:ResourceTag/env", &["prod"]),
+        &cond(
+            bare(ConditionOperator::StringNotEquals),
+            "aws:ResourceTag/env",
+            &["prod"]
+        ),
         &ctx
     ));
     // dynamodb:ResourceTag/env is absent: a negated bare operator matches
     // (absent-key semantics), it never fails closed.
     assert!(evaluate_condition(
-        &cond(bare(ConditionOperator::StringNotEquals), "dynamodb:ResourceTag/env", &["prod"]),
+        &cond(
+            bare(ConditionOperator::StringNotEquals),
+            "dynamodb:ResourceTag/env",
+            &["prod"]
+        ),
         &ctx
     ));
 }
@@ -88,13 +104,21 @@ fn if_exists_dynamodb_absent_passes_aws_present_evaluates() {
     let ctx = ctx_env_prod();
     // IfExists passes when the key is absent: dynamodb:ResourceTag/env absent.
     assert!(evaluate_condition(
-        &cond(if_exists(ConditionOperator::StringEquals), "dynamodb:ResourceTag/env", &["dev"]),
+        &cond(
+            if_exists(ConditionOperator::StringEquals),
+            "dynamodb:ResourceTag/env",
+            &["dev"]
+        ),
         &ctx
     ));
     // aws:ResourceTag/env is present ("prod"), so IfExists evaluates the base
     // operator: StringEquals "dev" does not match.
     assert!(!evaluate_condition(
-        &cond(if_exists(ConditionOperator::StringEquals), "aws:ResourceTag/env", &["dev"]),
+        &cond(
+            if_exists(ConditionOperator::StringEquals),
+            "aws:ResourceTag/env",
+            &["dev"]
+        ),
         &ctx
     ));
 }
@@ -106,12 +130,20 @@ fn for_all_values_dynamodb_absent_vacuously_true() {
     let ctx = ctx_env_prod();
     // Absent key: ForAllValues is vacuously true.
     assert!(evaluate_condition(
-        &cond(for_all(ConditionOperator::StringEquals), "dynamodb:ResourceTag/env", &["dev"]),
+        &cond(
+            for_all(ConditionOperator::StringEquals),
+            "dynamodb:ResourceTag/env",
+            &["dev"]
+        ),
         &ctx
     ));
     // Present aws key with a non-matching value: not all values match.
     assert!(!evaluate_condition(
-        &cond(for_all(ConditionOperator::StringEquals), "aws:ResourceTag/env", &["dev"]),
+        &cond(
+            for_all(ConditionOperator::StringEquals),
+            "aws:ResourceTag/env",
+            &["dev"]
+        ),
         &ctx
     ));
 }
@@ -123,12 +155,20 @@ fn for_any_value_dynamodb_absent_false_aws_present_matches() {
     let ctx = ctx_env_prod();
     // Absent key: ForAnyValue is false.
     assert!(!evaluate_condition(
-        &cond(for_any(ConditionOperator::StringEquals), "dynamodb:ResourceTag/env", &["prod"]),
+        &cond(
+            for_any(ConditionOperator::StringEquals),
+            "dynamodb:ResourceTag/env",
+            &["prod"]
+        ),
         &ctx
     ));
     // Present aws key with a matching value: at least one value matches.
     assert!(evaluate_condition(
-        &cond(for_any(ConditionOperator::StringEquals), "aws:ResourceTag/env", &["prod"]),
+        &cond(
+            for_any(ConditionOperator::StringEquals),
+            "aws:ResourceTag/env",
+            &["prod"]
+        ),
         &ctx
     ));
 }
@@ -140,7 +180,11 @@ fn null_true_matches_absent_dynamodb_not_present_aws() {
     let ctx = ctx_env_prod();
     // Null:true means "key is absent": true for dynamodb, false for aws.
     assert!(evaluate_condition(
-        &cond(ConditionOperator::Null, "dynamodb:ResourceTag/env", &["true"]),
+        &cond(
+            ConditionOperator::Null,
+            "dynamodb:ResourceTag/env",
+            &["true"]
+        ),
         &ctx
     ));
     assert!(!evaluate_condition(
@@ -158,7 +202,11 @@ fn null_false_matches_present_aws_not_absent_dynamodb() {
         &ctx
     ));
     assert!(!evaluate_condition(
-        &cond(ConditionOperator::Null, "dynamodb:ResourceTag/env", &["false"]),
+        &cond(
+            ConditionOperator::Null,
+            "dynamodb:ResourceTag/env",
+            &["false"]
+        ),
         &ctx
     ));
 }
@@ -180,12 +228,13 @@ fn dynamodb_prefix_absent_in_any_case() {
         );
     }
     // aws:ResourceTag resolves in any case.
-    for key in ["aws:ResourceTag/env", "aws:resourcetag/env", "AWS:RESOURCETAG/env"] {
+    for key in [
+        "aws:ResourceTag/env",
+        "aws:resourcetag/env",
+        "AWS:RESOURCETAG/env",
+    ] {
         assert!(
-            evaluate_condition(
-                &cond(ConditionOperator::StringEquals, key, &["prod"]),
-                &ctx
-            ),
+            evaluate_condition(&cond(ConditionOperator::StringEquals, key, &["prod"]), &ctx),
             "{key} should resolve to prod"
         );
     }

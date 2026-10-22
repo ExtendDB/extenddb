@@ -746,9 +746,13 @@ mod migration_tests {
         s.set_user_boundary("111111111111", "alice", &policy("dynamodb:ResourceTag/env"))
             .await
             .unwrap();
-        s.create_role("111111111111", "r1", &json!({"Version": "2012-10-17", "Statement": []}))
-            .await
-            .unwrap();
+        s.create_role(
+            "111111111111",
+            "r1",
+            &json!({"Version": "2012-10-17", "Statement": []}),
+        )
+        .await
+        .unwrap();
         s.store_session(
             "tok-1",
             "AKIAEXAMPLE000000001",
@@ -769,11 +773,19 @@ mod migration_tests {
         assert_eq!(detect.rewritten.len(), 3, "inline + boundary + session");
         assert!(detect.needs_attention.is_empty());
         // Still on the old key.
-        let before = s.list_policies("111111111111", "user", "alice").await.unwrap();
+        let before = s
+            .list_policies("111111111111", "user", "alice")
+            .await
+            .unwrap();
         let p1_before = before.iter().find(|(n, ..)| n == "p1").unwrap();
         assert!(
-            p1_before.1.pointer("/Statement/0/Condition/StringEquals").unwrap()
-                .as_object().unwrap().contains_key("dynamodb:ResourceTag/env")
+            p1_before
+                .1
+                .pointer("/Statement/0/Condition/StringEquals")
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("dynamodb:ResourceTag/env")
         );
 
         // Apply mode writes.
@@ -781,22 +793,43 @@ mod migration_tests {
         assert_eq!(applied.errors, 0);
         assert_eq!(applied.rewritten.len(), 3);
 
-        let after = s.list_policies("111111111111", "user", "alice").await.unwrap();
+        let after = s
+            .list_policies("111111111111", "user", "alice")
+            .await
+            .unwrap();
         let p1_after = after.iter().find(|(n, ..)| n == "p1").unwrap();
         assert!(
-            p1_after.1.pointer("/Statement/0/Condition/StringEquals").unwrap()
-                .as_object().unwrap().contains_key("aws:ResourceTag/env")
+            p1_after
+                .1
+                .pointer("/Statement/0/Condition/StringEquals")
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("aws:ResourceTag/env")
         );
-        let boundary = s.get_user_boundary("111111111111", "alice").await.unwrap().unwrap();
+        let boundary = s
+            .get_user_boundary("111111111111", "alice")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(
-            boundary.pointer("/Statement/0/Condition/StringEquals").unwrap()
-                .as_object().unwrap().contains_key("aws:ResourceTag/env")
+            boundary
+                .pointer("/Statement/0/Condition/StringEquals")
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("aws:ResourceTag/env")
         );
         let sessions = s.list_session_policies().await.unwrap();
         assert_eq!(sessions.len(), 1);
         assert!(
-            sessions[0].policy.pointer("/Statement/0/Condition/StringEquals").unwrap()
-                .as_object().unwrap().contains_key("aws:ResourceTag/env")
+            sessions[0]
+                .policy
+                .pointer("/Statement/0/Condition/StringEquals")
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("aws:ResourceTag/env")
         );
 
         // Idempotent: a second pass changes nothing.
@@ -822,7 +855,9 @@ mod migration_tests {
                 }}
             }]
         });
-        s.put_policy("222222222222", "user", "bob", "p", &collide).await.unwrap();
+        s.put_policy("222222222222", "user", "bob", "p", &collide)
+            .await
+            .unwrap();
 
         let report = migrate_resource_tag_condition_keys(&s, true).await;
         assert_eq!(report.errors, 0);
@@ -830,7 +865,10 @@ mod migration_tests {
         assert_eq!(report.needs_attention.len(), 1);
         assert_eq!(report.needs_attention[0].principal, "user/bob");
         // Unchanged on disk.
-        let stored = s.list_policies("222222222222", "user", "bob").await.unwrap();
+        let stored = s
+            .list_policies("222222222222", "user", "bob")
+            .await
+            .unwrap();
         let p = stored.iter().find(|(n, ..)| n == "p").unwrap();
         assert_eq!(p.1, collide);
     }

@@ -494,7 +494,9 @@ mod tests {
     #[test]
     fn the_schema_seeds_the_resource_tag_migration_marker() {
         assert!(
-            SCHEMA_SQL.contains("INSERT OR IGNORE INTO settings (key, value) VALUES ('resource_tag_migration'"),
+            SCHEMA_SQL.contains(
+                "INSERT OR IGNORE INTO settings (key, value) VALUES ('resource_tag_migration'"
+            ),
             "schema must seed the resource_tag_migration marker on a fresh catalog"
         );
     }

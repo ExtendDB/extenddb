@@ -67,8 +67,12 @@ pub async fn run(args: MigrateArgs) -> anyhow::Result<()> {
         .acquire_migration_lock()
         .await
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    let result = apply_migrations(bootstrap.as_ref(), &args, app_config.storage.connection_config())
-        .await;
+    let result = apply_migrations(
+        bootstrap.as_ref(),
+        &args,
+        app_config.storage.connection_config(),
+    )
+    .await;
     if let Err(e) = bootstrap.release_migration_lock().await {
         tracing::warn!("Failed to release migration lock: {e:?}");
     }
@@ -274,9 +278,11 @@ async fn apply_migrations(
     // non-zero count migrate reports it, does NOT record the completion
     // marker, and exits non-zero, so the next run finishes the rewrite. No
     // policy body is logged.
-    let rtag_applied =
-        extenddb_storage::policy_migration::migrate_resource_tag_condition_keys(mgmt.as_ref(), true)
-            .await;
+    let rtag_applied = extenddb_storage::policy_migration::migrate_resource_tag_condition_keys(
+        mgmt.as_ref(),
+        true,
+    )
+    .await;
     for r in &rtag_applied.rewritten {
         println!(
             "  Rewrote resource-tag keys: account {} {} policy {} ({} key(s))",
