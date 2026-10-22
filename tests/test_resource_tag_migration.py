@@ -52,6 +52,30 @@ from lifecycle_helpers import EXTENDDB_BINARY
 
 MIGRATION_MARKER_KEY = "resource_tag_migration"
 
+# This test stands up its own deployment, so it must not inherit admin
+# credentials or an endpoint from an outer harness (devtools/run-tests and the
+# SQLite job export EXTENDDB_ADMIN_USER / EXTENDDB_ADMIN_PASSWORD /
+# EXTENDDB_TEST_ENDPOINT for the already-running server). With those set, `init`
+# would adopt the ambient admin credential and print no generated password, and
+# the test could not authenticate to its own server. Scrub them for every
+# subprocess this test launches.
+_AMBIENT_KEYS = (
+    "EXTENDDB_ADMIN_USER",
+    "EXTENDDB_ADMIN_PASSWORD",
+    "EXTENDDB_TEST_ENDPOINT",
+    "REQUESTS_CA_BUNDLE",
+    "SSL_CERT_FILE",
+    "CURL_CA_BUNDLE",
+    "AWS_CA_BUNDLE",
+)
+
+
+def _clean_env() -> dict:
+    env = os.environ.copy()
+    for k in _AMBIENT_KEYS:
+        env.pop(k, None)
+    return env
+
 
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -66,7 +90,7 @@ def _run(*args, timeout=60, env=None):
         text=True,
         timeout=timeout,
         stdin=subprocess.DEVNULL,
-        env=env,
+        env=env if env is not None else _clean_env(),
     )
 
 
@@ -132,6 +156,7 @@ class _Server:
             stdout=log,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
+            env=_clean_env(),
         )
         if not wait_healthy:
             return

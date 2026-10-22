@@ -91,7 +91,7 @@ def _create_user_with_key(mgmt: ManagementClient, account_id: str,
 # ---------------------------------------------------------------------------
 
 class TestResourceTagCondition:
-    """Policies with dynamodb:ResourceTag/* conditions."""
+    """Policies with aws:ResourceTag/* conditions."""
 
     @pytest.fixture(autouse=True)
     def setup(self, auth_env, mgmt, account_id, region):
@@ -130,7 +130,7 @@ class TestResourceTagCondition:
                     "Resource": "*",
                     "Condition": {
                         "StringEquals": {
-                            "dynamodb:ResourceTag/Env": "dev",
+                            "aws:ResourceTag/Env": "dev",
                         },
                     },
                 }],
@@ -206,7 +206,7 @@ class TestResourceTagCondition:
                     "Resource": "*",
                     "Condition": {
                         "StringEquals": {
-                            "dynamodb:ResourceTag/Env": "dev",
+                            "aws:ResourceTag/Env": "dev",
                         },
                     },
                 }],
@@ -692,6 +692,48 @@ class TestServicePopulatedGlobalKeys(_TaggedTableBase):
             {"StringNotEquals": {"aws:NoSuchGlobalKey": "x"}})) == "DENY"
 
 
+class TestResourceTagConditionKeyForms(_TaggedTableBase):
+    """Resource tags evaluate only as aws:ResourceTag/*, matching live DynamoDB.
+    aws:ResourceTag/env resolves to the table's tag value; dynamodb:ResourceTag/env
+    is absent and keeps IAM absent-key semantics. Table is tagged env=prod. Every
+    expected outcome was measured live on 2026-10-21."""
+
+    def test_aws_resourcetag_eq_grants(self, table):
+        # aws:ResourceTag/env resolves to prod, so StringEquals matches. Live: ALLOW.
+        assert self._get(table, self._allow_get_if(
+            {"StringEquals": {"aws:ResourceTag/env": "prod"}})) == "ALLOW"
+
+    def test_aws_resourcetag_ne_denies(self, table):
+        # aws:ResourceTag/env resolves to prod, so StringNotEquals is false and the
+        # Allow does not grant. Live: DENY.
+        assert self._get(table, self._allow_get_if(
+            {"StringNotEquals": {"aws:ResourceTag/env": "prod"}})) == "DENY"
+
+    def test_aws_resourcetag_deny_eq_blocks(self, table):
+        # A Deny gated on StringEquals aws:ResourceTag/env=prod fires on the prod
+        # table. Live: DENY.
+        assert self._get(table, self._allow_all_deny_get_if(
+            {"StringEquals": {"aws:ResourceTag/env": "prod"}})) == "DENY"
+
+    def test_dynamodb_resourcetag_eq_denies_absent_key(self, table):
+        # dynamodb:ResourceTag/env is absent, so StringEquals never matches and the
+        # Allow does not grant. Live: DENY.
+        assert self._get(table, self._allow_get_if(
+            {"StringEquals": {"dynamodb:ResourceTag/env": "prod"}})) == "DENY"
+
+    def test_dynamodb_resourcetag_ne_grants_absent_key(self, table):
+        # dynamodb:ResourceTag/env is absent, so StringNotEquals on an absent
+        # single-valued key matches and the Allow grants. Live: ALLOW.
+        assert self._get(table, self._allow_get_if(
+            {"StringNotEquals": {"dynamodb:ResourceTag/env": "prod"}})) == "ALLOW"
+
+    def test_dynamodb_resourcetag_deny_eq_does_not_block_absent_key(self, table):
+        # A Deny gated on StringEquals dynamodb:ResourceTag/env=prod does not fire,
+        # because the key is absent, so the base Allow stands. Live: ALLOW.
+        assert self._get(table, self._allow_all_deny_get_if(
+            {"StringEquals": {"dynamodb:ResourceTag/env": "prod"}})) == "ALLOW"
+
+
 class TestRound3GlobalKeys(_TaggedTableBase):
     """Round three keys on the identity path: aws:userid, aws:SourceIp,
     aws:UserAgent, aws:ResourceAccount, and the organization keys absent for a
@@ -786,9 +828,11 @@ class TestConditionKeyNameCaseInsensitive(_TaggedTableBase):
         assert self._get(table, self._allow_get_if(
             {"StringEquals": {"aws:resourcetag/env": "prod"}})) == "ALLOW"
 
-    def test_dynamodb_resourcetag_lowercase_prefix_grants(self, table):
+    def test_dynamodb_resourcetag_lowercase_prefix_is_absent(self, table):
+        # dynamodb:ResourceTag/* is absent in any case, as on DynamoDB, so a
+        # positive operator on it never matches and the Allow does not grant.
         assert self._get(table, self._allow_get_if(
-            {"StringEquals": {"dynamodb:resourcetag/env": "prod"}})) == "ALLOW"
+            {"StringEquals": {"dynamodb:resourcetag/env": "prod"}})) == "DENY"
 
     def test_principaltype_deny_lowercase_key_blocks(self, table):
         # A Deny gated on a miscased key must still be enforced. aws:principaltype
