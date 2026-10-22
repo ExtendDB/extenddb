@@ -106,6 +106,20 @@ pub fn backend() -> extenddb_storage::Backend {
                     >)
             })
         },
+        management_store: |connection_string| {
+            let connection_string = connection_string.to_string();
+            Box::pin(async move {
+                let pool = sqlx::PgPool::connect(&connection_string)
+                    .await
+                    .map_err(|e| {
+                        extenddb_storage::management_store_factory::ManagementStoreError::ConnectionFailed(
+                            e.to_string(),
+                        )
+                    })?;
+                Ok(Box::new(PostgresCatalogStore::new(pool))
+                    as Box<dyn extenddb_storage::management_store::ManagementStore>)
+            })
+        },
         diagnostics_store: |connection_string| {
             let connection_string = connection_string.to_string();
             Box::pin(async move {

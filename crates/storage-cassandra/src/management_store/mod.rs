@@ -576,6 +576,24 @@ impl extenddb_storage::management_store::ManagementStore for CassandraCatalogSto
         })
     }
 
+    // ── Session policies (resource-tag migration) ─────────────────
+
+    fn list_session_policies(
+        &self,
+    ) -> BoxFuture<'_, OpResult<Vec<extenddb_storage::management_store::SessionPolicyEntry>>> {
+        Box::pin(async move { self.list_session_policies_impl().await })
+    }
+
+    fn update_session_policy(
+        &self,
+        session_token: &str,
+        document: &serde_json::Value,
+    ) -> BoxFuture<'_, OpResult<()>> {
+        let session_token = session_token.to_string();
+        let document = document.clone();
+        Box::pin(async move { self.update_session_policy_impl(&session_token, &document).await })
+    }
+
     // ── Caller tags ────────────────────────────────────────────────
 
     fn fetch_caller_tags(
