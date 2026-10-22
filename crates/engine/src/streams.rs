@@ -422,7 +422,8 @@ mod tests {
     #[test]
     fn classify_current_token_is_stream() {
         let stream = "arn:aws:dynamodb:us-east-1:1:table/T/stream/2026-10-20T16:17:40.188";
-        let enc = super::encode_shard_iterator("shardId-1", "AFTER_SEQUENCE_NUMBER", "42", 1000, stream);
+        let enc =
+            super::encode_shard_iterator("shardId-1", "AFTER_SEQUENCE_NUMBER", "42", 1000, stream);
         match super::classify_shard_iterator(&enc) {
             super::ShardIteratorClass::Stream(arn) => assert_eq!(arn, stream),
             other => panic!("expected Stream, got {other:?}"),

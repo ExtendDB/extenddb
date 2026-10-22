@@ -170,23 +170,20 @@ pub(crate) async fn authorize_request(
     // did not issue the same way whatever the caller's policy (measured
     // 2026-10-20).
     if operation == "GetRecords" {
-        let resource_arn = match authz_resource::getrecords_resource(
-            input,
-            &state.region,
-            account_id,
-        ) {
-            authz_resource::GetRecordsResource::Stream(arn) => arn,
-            authz_resource::GetRecordsResource::Expired => {
-                return Err(DynamoDbError::ExpiredIteratorException(
-                    extenddb_engine::SHARD_ITERATOR_EXPIRED_MESSAGE.to_owned(),
-                ));
-            }
-            authz_resource::GetRecordsResource::Invalid => {
-                return Err(DynamoDbError::ValidationException(
-                    "Invalid ShardIterator".to_owned(),
-                ));
-            }
-        };
+        let resource_arn =
+            match authz_resource::getrecords_resource(input, &state.region, account_id) {
+                authz_resource::GetRecordsResource::Stream(arn) => arn,
+                authz_resource::GetRecordsResource::Expired => {
+                    return Err(DynamoDbError::ExpiredIteratorException(
+                        extenddb_engine::SHARD_ITERATOR_EXPIRED_MESSAGE.to_owned(),
+                    ));
+                }
+                authz_resource::GetRecordsResource::Invalid => {
+                    return Err(DynamoDbError::ValidationException(
+                        "Invalid ShardIterator".to_owned(),
+                    ));
+                }
+            };
         authorization::check_authorization(
             state.authz_cache.as_ref(),
             identity,

@@ -122,7 +122,10 @@ mod tests {
     fn fields_requires_arn_prefix_and_five_fields() {
         assert_eq!(fields("banana"), None);
         // A leading field other than `arn` has no `arn:` prefix.
-        assert_eq!(fields("xrn:aws:dynamodb:us-east-1:1:table/T/stream/x"), None);
+        assert_eq!(
+            fields("xrn:aws:dynamodb:us-east-1:1:table/T/stream/x"),
+            None
+        );
         // An empty leading field (`:aws:...`) has no `arn:` prefix either.
         assert_eq!(fields(":aws:dynamodb:us-east-1:1:table/T"), None);
         assert_eq!(fields("arn:aws:dynamodb:us-east-1"), None);
@@ -173,7 +176,10 @@ mod tests {
 
     #[test]
     fn trailing_slash_is_bare_table_and_empty_id_is_empty() {
-        assert_eq!(parse("arn:aws:dynamodb:us-east-1:1:table/T/").unwrap().sub, None);
+        assert_eq!(
+            parse("arn:aws:dynamodb:us-east-1:1:table/T/").unwrap().sub,
+            None
+        );
         assert_eq!(
             parse("arn:aws:dynamodb:us-east-1:1:table/T/stream/")
                 .unwrap()

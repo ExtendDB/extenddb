@@ -140,9 +140,12 @@ fn canonical_resource(arn: &str, region: &str, account_id: &str) -> String {
 fn tag_resource_arn(arn: &str, region: &str, account_id: &str) -> String {
     match parse_resource_identity(arn) {
         Some(rid @ ResourceId { sub: None, .. })
-        | Some(rid @ ResourceId { sub: Some(Sub::Stream(_)), .. }) => {
-            canonical(region, account_id, &rid)
-        }
+        | Some(
+            rid @ ResourceId {
+                sub: Some(Sub::Stream(_)),
+                ..
+            },
+        ) => canonical(region, account_id, &rid),
         // A foreign-service ARN (or, defensively, an index/backup the shape
         // check already rejected): authorization denies it.
         _ => arn.to_owned(),
@@ -172,22 +175,21 @@ impl ArnKind {
 fn require_arn_kind(arn: &str, kind: ArnKind) -> Result<(), DynamoDbError> {
     let ok = matches!(
         (parse_resource_identity(arn), kind),
-        (
-            Some(ResourceId { sub: None, .. }),
-            ArnKind::Table
-        ) | (
-            Some(ResourceId {
-                sub: Some(Sub::Stream(_)),
-                ..
-            }),
-            ArnKind::Stream
-        ) | (
-            Some(ResourceId {
-                sub: Some(Sub::Backup(_)),
-                ..
-            }),
-            ArnKind::Backup
-        )
+        (Some(ResourceId { sub: None, .. }), ArnKind::Table)
+            | (
+                Some(ResourceId {
+                    sub: Some(Sub::Stream(_)),
+                    ..
+                }),
+                ArnKind::Stream
+            )
+            | (
+                Some(ResourceId {
+                    sub: Some(Sub::Backup(_)),
+                    ..
+                }),
+                ArnKind::Backup
+            )
     );
     if ok {
         Ok(())
@@ -209,10 +211,7 @@ fn require_arn_kind(arn: &str, kind: ArnKind) -> Result<(), DynamoDbError> {
 /// empty field is left to the normal path. Tag operations keep their own
 /// measured shape check (`validate_tag_resource_arn_shape`); `GetRecords` is
 /// handled through its iterator by [`getrecords_resource`].
-pub(crate) fn validate_operation_arns(
-    operation: &str,
-    input: &Value,
-) -> Result<(), DynamoDbError> {
+pub(crate) fn validate_operation_arns(operation: &str, input: &Value) -> Result<(), DynamoDbError> {
     let present = |key: &str| {
         input
             .get(key)
@@ -1014,7 +1013,13 @@ mod tests {
                     assert_eq!(&t, table, "stream table mismatch for {input}");
                     assert_eq!(&l, label, "stream label mismatch for {input}");
                 }
-                (Some(arn::TableResource { sub: Some(SubResource::Stream(_)), .. }), Err(_)) => {
+                (
+                    Some(arn::TableResource {
+                        sub: Some(SubResource::Stream(_)),
+                        ..
+                    }),
+                    Err(_),
+                ) => {
                     panic!("shared parser accepted stream but engine rejected it: {input}")
                 }
                 (_, Ok(_)) => panic!("engine resolved a non-stream input as a stream: {input}"),
@@ -1025,10 +1030,7 @@ mod tests {
             // yields a bare table (no sub-resource); a repeated `table/` segment
             // or any sub-resource is refused, so it cannot read a different
             // table than authorization canonicalized.
-            let export_ok = matches!(
-                core,
-                Some(arn::TableResource { sub: None, .. })
-            );
+            let export_ok = matches!(core, Some(arn::TableResource { sub: None, .. }));
             if input == "arn:aws:dynamodb:us-east-1:1:table/allowed/stream/table/secret" {
                 assert!(!export_ok, "export must refuse the A1 bypass ARN");
             }
@@ -1146,7 +1148,10 @@ mod tests {
             resource_tag_lookup_arn("arn:aws:dynamodb:us-east-1:1:table/bb/backup/01-ab"),
             None
         );
-        assert_eq!(resource_tag_lookup_arn("arn:aws:dynamodb:us-east-1:1:table/*"), None);
+        assert_eq!(
+            resource_tag_lookup_arn("arn:aws:dynamodb:us-east-1:1:table/*"),
+            None
+        );
     }
 
     #[test]

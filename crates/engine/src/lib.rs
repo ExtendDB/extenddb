@@ -56,10 +56,8 @@ pub use put_item::handle_put_item;
 pub use query::handle_query;
 pub use scan::handle_scan;
 pub use search_vectors::handle_search_vectors;
+pub use streams::{SHARD_ITERATOR_EXPIRED_MESSAGE, ShardIteratorClass, classify_shard_iterator};
 pub use streams::{ShardIterator, decode_shard_iterator, encode_shard_iterator};
-pub use streams::{
-    SHARD_ITERATOR_EXPIRED_MESSAGE, ShardIteratorClass, classify_shard_iterator,
-};
 pub use streams::{
     handle_describe_stream, handle_get_records, handle_get_shard_iterator, handle_list_streams,
 };

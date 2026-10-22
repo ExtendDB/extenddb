@@ -399,7 +399,9 @@ async fn wait_for_table_active(
 /// the engine-side half of the same check.
 fn extract_table_name_from_arn(arn: &str) -> Result<String, DynamoDbError> {
     match extenddb_core::arn::parse(arn) {
-        Some(extenddb_core::arn::TableResource { table, sub: None, .. }) => Ok(table),
+        Some(extenddb_core::arn::TableResource {
+            table, sub: None, ..
+        }) => Ok(table),
         _ => Err(DynamoDbError::ValidationException(format!(
             "Invalid TableArn: {arn}"
         ))),
@@ -452,4 +454,3 @@ mod export_arn_tests {
         }
     }
 }
-
