@@ -712,8 +712,12 @@ impl CassandraEngine {
                 )
                 .await
                 .map_err(prepare_read_error_reason)?;
-                super::index::check_update_index_keys_not_empty(&item, &indexes)
-                    .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+                super::index::check_update_index_keys(
+                    &item,
+                    &indexes,
+                    &key_info.attribute_definitions,
+                )
+                .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
 
                 // For new items, check partition_max_delete_timestamp
                 if existing.is_none() {
