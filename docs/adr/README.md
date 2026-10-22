@@ -48,3 +48,4 @@ decision, write a new ADR.
 | [0019](0019-cassandra-logical-backup-restore.md) | Cassandra: logical backup and restore | Accepted |
 | [0020](0020-cassandra-occ-update-item.md) | Cassandra: optimistic concurrency control for UpdateItem and PutItem | Accepted |
 | [0021](0021-cassandra-lwt-delete-atomicity-gap.md) | Cassandra: LWT delete atomicity gap and required worker/saga pattern | Accepted |
+| [0022](0022-trust-policy-deny-over-allow.md) | Role trust-policy evaluation follows IAM Deny-over-Allow order | Accepted |

@@ -1840,6 +1840,7 @@ impl ManagementStore for MongoCatalogStore {
                 "role_name": &role_name,
                 "session_name": &session_name,
                 "expires_at": expires_bson,
+                "created_at": now_bson(),
             };
 
             if let Some(ref tags) = session_tags {

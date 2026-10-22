@@ -64,6 +64,8 @@ pub(crate) async fn authorize_request(
     input: &Value,
     operation: &str,
     account_id: &str,
+    source_ip: Option<&str>,
+    user_agent: Option<&str>,
 ) -> Result<Option<extenddb_core::types::TableKeyInfo>, DynamoDbError> {
     let table_name = extract_table_name(input);
 
@@ -111,6 +113,16 @@ pub(crate) async fn authorize_request(
     if state.dev_mode {
         return Ok(engine_key_info(key_info));
     }
+
+    // Request-level condition keys every evaluation below carries: the
+    // deployment region, aws:SecureTransport, aws:SourceIp and aws:UserAgent.
+    let base_params = || extenddb_auth::policy::context::RequestParams {
+        region: Some(state.region.to_string()),
+        secure_transport: state.tls_enabled,
+        source_ip: source_ip.map(ToOwned::to_owned),
+        user_agent: user_agent.map(ToOwned::to_owned),
+        ..Default::default()
+    };
 
     // DescribeEndpoints needs a signed request (SigV4 verification already ran
     // upstream) but no IAM permission, as on DynamoDB: a caller with no policy,
@@ -160,7 +172,7 @@ pub(crate) async fn authorize_request(
             "GetRecords",
             &resource_arn,
             false,
-            extenddb_auth::policy::context::RequestParams::default(),
+            base_params(),
         )
         .await?;
         return Ok(None);
@@ -189,7 +201,7 @@ pub(crate) async fn authorize_request(
                 &action_op,
                 &resource_arn,
                 false,
-                extenddb_auth::policy::context::RequestParams::default(),
+                base_params(),
             )
             .await?;
         }
@@ -225,7 +237,7 @@ pub(crate) async fn authorize_request(
                 .get("ReturnConsumedCapacity")
                 .and_then(|v| v.as_str())
                 .map(ToOwned::to_owned),
-            ..Default::default()
+            ..base_params()
         };
         let (action, resource_arn) = &targets[0];
         authorization::check_authorization(
@@ -239,7 +251,8 @@ pub(crate) async fn authorize_request(
         .await?;
     } else {
         // Multi-permission operations (restore). Each pair is authorized with
-        // default params; a Deny on any required resource fails the request.
+        // the request-level params; a Deny on any required resource fails the
+        // request.
         for (action, resource_arn) in &targets {
             authorization::check_authorization(
                 state.authz_cache.as_ref(),
@@ -247,7 +260,7 @@ pub(crate) async fn authorize_request(
                 action,
                 resource_arn,
                 false,
-                extenddb_auth::policy::context::RequestParams::default(),
+                base_params(),
             )
             .await?;
         }

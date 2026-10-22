@@ -7,7 +7,7 @@
 //! session policy → identity allow → implicit deny. This is the same algorithm
 //! used by real AWS IAM, supporting IBAC, RBAC, and ABAC patterns.
 
-use super::condition::evaluate_condition;
+use super::condition::{ConditionMatch, evaluate_statement_conditions};
 use super::context::ConditionContext;
 use super::document::{ActionMatch, Effect, PolicyDocument, ResourceMatch, Statement};
 use super::matcher::{arn_match, wildcard_match_ignore_case};
@@ -101,7 +101,7 @@ pub fn explicit_deny_matches_arc(
                 stmt.effect == Effect::Deny
                     && action_matches(stmt, action)
                     && resource_matches(stmt, resource_arn)
-                    && conditions_match(stmt, context)
+                    && deny_conditions_apply(stmt, context)
             })
         })
 }
@@ -130,7 +130,7 @@ where
             if stmt.effect == Effect::Deny
                 && action_matches(stmt, action)
                 && resource_matches(stmt, resource_arn)
-                && conditions_match(stmt, context)
+                && deny_conditions_apply(stmt, context)
             {
                 return AuthzDecision::Deny;
             }
@@ -143,7 +143,7 @@ where
             stmt.effect == Effect::Allow
                 && action_matches(stmt, action)
                 && resource_matches(stmt, resource_arn)
-                && conditions_match(stmt, context)
+                && allow_conditions_grant(stmt, context)
         });
         if !boundary_allows {
             return AuthzDecision::Deny;
@@ -156,7 +156,7 @@ where
             stmt.effect == Effect::Allow
                 && action_matches(stmt, action)
                 && resource_matches(stmt, resource_arn)
-                && conditions_match(stmt, context)
+                && allow_conditions_grant(stmt, context)
         });
         if !session_allows {
             return AuthzDecision::Deny;
@@ -169,7 +169,7 @@ where
             if stmt.effect == Effect::Allow
                 && action_matches(stmt, action)
                 && resource_matches(stmt, resource_arn)
-                && conditions_match(stmt, context)
+                && allow_conditions_grant(stmt, context)
             {
                 return AuthzDecision::Allow;
             }
@@ -205,12 +205,28 @@ fn resource_matches(statement: &Statement, request_resource: &str) -> bool {
     }
 }
 
-/// Check if all conditions in the statement are satisfied.
-fn conditions_match(statement: &Statement, context: &impl ConditionContext) -> bool {
-    statement
-        .conditions
-        .iter()
-        .all(|c| evaluate_condition(c, context))
+/// Outcome of a statement's `Condition` block, three-valued.
+fn statement_conditions(statement: &Statement, context: &impl ConditionContext) -> ConditionMatch {
+    evaluate_statement_conditions(&statement.conditions, context)
+}
+
+/// Whether a `Deny` applies: its conditions match, or depend on a key the
+/// service populates but the context cannot resolve (fail closed, so the Deny
+/// blocks rather than being silently dropped).
+fn deny_conditions_apply(statement: &Statement, context: &impl ConditionContext) -> bool {
+    matches!(
+        statement_conditions(statement, context),
+        ConditionMatch::Match | ConditionMatch::Unresolvable
+    )
+}
+
+/// Whether an `Allow` grants: its conditions definitely match. An unresolvable
+/// key does not grant (fail closed).
+fn allow_conditions_grant(statement: &Statement, context: &impl ConditionContext) -> bool {
+    matches!(
+        statement_conditions(statement, context),
+        ConditionMatch::Match
+    )
 }
 
 #[cfg(test)]
