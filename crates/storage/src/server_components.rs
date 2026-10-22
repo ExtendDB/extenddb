@@ -86,7 +86,7 @@ impl std::fmt::Display for BackendError {
 impl std::error::Error for BackendError {}
 
 /// Options for server-component creation, beyond the storage config itself.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct ServerComponentsOptions {
     /// Bootstrap the catalog at serve time when it is not initialized,
@@ -95,6 +95,19 @@ pub struct ServerComponentsOptions {
     /// Backends whose bootstrap requires operator input ignore this and fail
     /// as usual; backends with a self-contained bootstrap (SQLite) honor it.
     pub bootstrap_if_uninitialized: bool,
+    /// The item size limit the storage layer applies to the finished item of
+    /// an update, standalone or transacted. Comes from `limits.max_item_size_bytes`
+    /// so the storage layer and the engine's put path enforce one figure.
+    pub max_item_size_bytes: usize,
+}
+
+impl Default for ServerComponentsOptions {
+    fn default() -> Self {
+        Self {
+            bootstrap_if_uninitialized: false,
+            max_item_size_bytes: extenddb_core::limits::LimitsConfig::default().max_item_size_bytes,
+        }
+    }
 }
 
 /// Factory function type for creating server components.

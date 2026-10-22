@@ -72,7 +72,9 @@ impl SqliteEngine {
             &key_info.attribute_definitions,
         )
         .map_err(|e| StorageError::Validation(e.to_string()))?;
-        validation::validate_item_size(&item, self.max_item_size_bytes)
+        // Size the update the way the service does: what the statement writes
+        // plus a fixed cost per clause, against the item limit.
+        validation::validate_update_item_size(&item, actions, maps, self.max_item_size_bytes)
             .map_err(|e| StorageError::Validation(e.to_string()))?;
         // Secondary-index key validation on the post-update item, matching the
         // TransactWriteItems update path: a wrong-typed index key attribute or
@@ -80,8 +82,15 @@ impl SqliteEngine {
         // rather than silently producing a malformed / unmatchable index row.
         if !indexes.is_empty() {
             let idx_refs = index_key_refs(&indexes);
-            validation::validate_index_key_types(&item, &idx_refs, &key_info.attribute_definitions)
-                .map_err(|e| StorageError::Validation(e.to_string()))?;
+            // Literal operands were checked by the engine ahead of the condition;
+            // a value computed from the existing item is only known now and
+            // carries the service's computed-value wording.
+            validation::validate_index_key_types_after_update(
+                &item,
+                &idx_refs,
+                &key_info.attribute_definitions,
+            )
+            .map_err(|e| StorageError::Validation(e.to_string()))?;
             validation::validate_index_key_not_empty(
                 &item,
                 &idx_refs,

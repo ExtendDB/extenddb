@@ -137,7 +137,7 @@ pub async fn handle_update_item(
         input.expected.as_ref().map_or(0, HashMap::len),
     )?;
 
-    let (condition, maps) = resolve_condition(
+    let (condition, mut maps) = resolve_condition(
         input.condition_expression.as_deref(),
         effective_expr_names.as_ref(),
         effective_expr_values.as_ref(),
@@ -145,6 +145,9 @@ pub async fn handle_update_item(
         input.conditional_operator,
         &ctx.limits,
     )?;
+    // The storage layer sizes a desugared legacy update against the item limit
+    // the way the service sizes `AttributeUpdates`, not an expression.
+    maps.legacy_attribute_updates = input.attribute_updates.is_some();
 
     // No UpdateExpression and no AttributeUpdates: no-op upsert.
     // Some("") still errors via parse_update_expr.
@@ -226,6 +229,30 @@ pub async fn handle_update_item(
 
     // Validate that no update action targets a key attribute (REQ-DATA-003)
     validate_no_key_updates(&actions, &key_info, &maps)?;
+
+    // A literal operand assigned to a secondary-index key must carry the key's
+    // declared type. DynamoDB checks this on the statement itself, ahead of
+    // the condition and ahead of applying any action, so it is reported even
+    // when the condition would fail or another action could not be applied.
+    // A value computed from the existing item is checked by the storage layer
+    // on the written item instead.
+    {
+        let idx_refs: Vec<extenddb_core::validation::IndexKeyRef<'_>> = key_info
+            .global_secondary_indexes
+            .iter()
+            .chain(key_info.local_secondary_indexes.iter())
+            .map(|idx| extenddb_core::validation::IndexKeyRef {
+                index_name: &idx.index_name,
+                key_schema: &idx.key_schema,
+            })
+            .collect();
+        extenddb_core::validation::validate_index_key_literal_operands(
+            &actions,
+            &idx_refs,
+            &key_info.attribute_definitions,
+            &maps,
+        )?;
+    }
 
     let return_old = matches!(
         input.return_values,

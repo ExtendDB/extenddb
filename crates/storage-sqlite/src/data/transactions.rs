@@ -100,6 +100,30 @@ impl SqliteEngine {
                 .await?;
         }
 
+        // Key checks first, for every member, before any row is read or
+        // locked. They need only the request and the table metadata, and a
+        // fault among them decides the request under the service's precedence
+        // (a wrong-typed key on any member, else an empty index key on any
+        // member), so a decided request never waits on a later member's row.
+        {
+            let mut key_reasons: Vec<CancellationReason> =
+                vec![CancellationReason::none(); ops.len()];
+            let mut any_key_fault = false;
+            for (i, op) in ops.iter().enumerate() {
+                let indexes = &table_indexes[op_table_name(op)];
+                if let Err(r) = transact_op_key_checks(op, indexes) {
+                    any_key_fault = true;
+                    key_reasons[i] = r;
+                }
+            }
+            if any_key_fault {
+                return Err(match CancellationReason::resolve_key_faults(key_reasons) {
+                    Ok(reasons) => StorageError::TransactionCanceled(reasons),
+                    Err(message) => StorageError::Validation(message),
+                });
+            }
+        }
+
         let mut reasons: Vec<CancellationReason> = Vec::with_capacity(ops.len());
         let mut op_items: Vec<(Option<Item>, Option<Item>)> = Vec::with_capacity(ops.len());
         let mut any_failed = false;
@@ -124,19 +148,18 @@ impl SqliteEngine {
                     any_failed = true;
                     reasons.push(r);
                 }
-                Err(TxnOpError::Validation(msg)) => {
-                    // Up-front input validation (e.g. empty secondary-index key):
-                    // abort the whole transaction with a top-level
-                    // ValidationException, not a per-item cancellation reason.
-                    return Err(StorageError::Validation(msg));
-                }
                 Err(TxnOpError::Storage(e)) => return Err(e),
             }
         }
 
         if any_failed {
-            // Dropping `tx` without commit rolls back all writes.
-            return Err(StorageError::TransactionCanceled(reasons));
+            // Dropping `tx` without commit rolls back all writes. Key faults
+            // left the members as internal reasons; the shared resolver applies
+            // the service's cross-member precedence.
+            return Err(match CancellationReason::resolve_key_faults(reasons) {
+                Ok(reasons) => StorageError::TransactionCanceled(reasons),
+                Err(message) => StorageError::Validation(message),
+            });
         }
 
         // Capture stream records after all writes are staged.
@@ -252,9 +275,6 @@ fn op_key_info<'a>(op: &'a TransactWriteOp<'_>) -> &'a extenddb_core::types::Tab
 
 enum TxnOpError {
     Cancel(CancellationReason),
-    /// Up-front input validation failure — aborts the whole transaction with a
-    /// top-level `ValidationException` (not a per-item cancellation reason).
-    Validation(String),
     Storage(StorageError),
 }
 
@@ -268,6 +288,67 @@ pub(crate) fn index_key_refs(indexes: &[IndexMeta]) -> Vec<validation::IndexKeyR
             key_schema: &idx.key_schema,
         })
         .collect()
+}
+
+/// The key checks a transaction member can fail before any row is read or
+/// locked: the table key's shape and types, and the secondary-index keys the
+/// member supplies in the request itself (a Put item's attributes, an Update
+/// statement's literal operands). Faults carry the internal reasons that
+/// `CancellationReason::resolve_key_faults` ranks. Values computed from the
+/// existing item are checked later, once the row is read.
+fn transact_op_key_checks(
+    op: &TransactWriteOp<'_>,
+    indexes: &[IndexMeta],
+) -> Result<(), CancellationReason> {
+    match op {
+        TransactWriteOp::Put { key_info, item, .. } => {
+            validation::validate_item_keys(
+                item,
+                &key_info.key_schema,
+                &key_info.attribute_definitions,
+            )
+            .map_err(|e| CancellationReason::key_type_mismatch(e.to_string()))?;
+            let idx_refs = index_key_refs(indexes);
+            validation::validate_index_key_types(item, &idx_refs, &key_info.attribute_definitions)
+                .map_err(|e| CancellationReason::key_type_mismatch(e.to_string()))?;
+            validation::validate_index_key_not_empty(
+                item,
+                &idx_refs,
+                validation::SecondaryIndexEmptyContext::Item,
+            )
+            .map_err(|e| CancellationReason::index_key_empty_abort(e.to_string()))
+        }
+        TransactWriteOp::Update {
+            key_info,
+            key,
+            actions,
+            maps,
+            ..
+        } => {
+            validation::validate_batch_key_only(
+                key,
+                &key_info.key_schema,
+                &key_info.attribute_definitions,
+            )
+            .map_err(|e| CancellationReason::key_type_mismatch(e.to_string()))?;
+            validation::validate_index_key_literal_operands(
+                actions,
+                &index_key_refs(indexes),
+                &key_info.attribute_definitions,
+                maps,
+            )
+            .map_err(|e| CancellationReason::key_type_mismatch(e.to_string()))
+        }
+        TransactWriteOp::Delete { key_info, key, .. }
+        | TransactWriteOp::ConditionCheck { key_info, key, .. } => {
+            validation::validate_batch_key_only(
+                key,
+                &key_info.key_schema,
+                &key_info.attribute_definitions,
+            )
+            .map_err(|e| CancellationReason::key_type_mismatch(e.to_string()))
+        }
+    }
 }
 
 /// Execute one transact-write op, returning `(old, new)` images for stream
@@ -288,26 +369,9 @@ async fn execute_transact_write_op(
             return_values_on_ccf,
             ..
         } => {
-            validation::validate_item_keys(
-                item,
-                &key_info.key_schema,
-                &key_info.attribute_definitions,
-            )
-            .map_err(|e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())))?;
-            // Secondary-index key faults split by kind: a type mismatch is a
-            // per-item cancellation reason; an empty index key is up-front input
-            // validation (a top-level ValidationException).
-            let idx_refs = index_key_refs(indexes);
-            validation::validate_index_key_types(item, &idx_refs, &key_info.attribute_definitions)
-                .map_err(|e| {
-                    TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))
-                })?;
-            validation::validate_index_key_not_empty(
-                item,
-                &idx_refs,
-                validation::SecondaryIndexEmptyContext::Item,
-            )
-            .map_err(|e| TxnOpError::Validation(e.to_string()))?;
+            // Key checks ran in the pre-pass; repeated so the arm stays
+            // correct if called on its own.
+            transact_op_key_checks(op, indexes).map_err(TxnOpError::Cancel)?;
             let existing = fetch_item_for_update(tx, key_info, item)
                 .await
                 .map_err(TxnOpError::Storage)?;
@@ -350,7 +414,9 @@ async fn execute_transact_write_op(
                 &key_info.key_schema,
                 &key_info.attribute_definitions,
             )
-            .map_err(|e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())))?;
+            .map_err(|e| {
+                TxnOpError::Cancel(CancellationReason::key_type_mismatch(e.to_string()))
+            })?;
             let existing = fetch_item_for_update(tx, key_info, key)
                 .await
                 .map_err(TxnOpError::Storage)?;
@@ -389,12 +455,8 @@ async fn execute_transact_write_op(
             return_values_on_ccf,
             ..
         } => {
-            validation::validate_batch_key_only(
-                key,
-                &key_info.key_schema,
-                &key_info.attribute_definitions,
-            )
-            .map_err(|e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())))?;
+            transact_op_key_checks(op, indexes).map_err(TxnOpError::Cancel)?;
+            let idx_refs = index_key_refs(indexes);
             let existing = fetch_item_for_update(tx, key_info, key)
                 .await
                 .map_err(TxnOpError::Storage)?;
@@ -415,23 +477,31 @@ async fn execute_transact_write_op(
                 &key_info.attribute_definitions,
             )
             .map_err(|e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())))?;
-            validation::validate_item_size(&item, max_item_size_bytes).map_err(|e| {
-                TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))
+            // A transacted Update is sized on the finished item, with the update
+            // wording in the cancellation reason.
+            validation::validate_transact_update_item_size(&item, max_item_size_bytes).map_err(
+                |e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())),
+            )?;
+            // Secondary-index keys on the written item: a value computed from
+            // the existing item (an attribute reference, the fallback of
+            // if_not_exists) of the wrong type, reported with the service's
+            // computed-value wording, and a key left empty.
+            validation::validate_index_key_types_after_update(
+                &item,
+                &idx_refs,
+                &key_info.attribute_definitions,
+            )
+            .map_err(|e| {
+                TxnOpError::Cancel(CancellationReason::key_type_mismatch(e.to_string()))
             })?;
-            // Secondary-index key validation on the post-update item: a type
-            // mismatch is a cancellation reason; setting an index key to an
-            // empty value is a top-level ValidationException.
-            let idx_refs = index_key_refs(indexes);
-            validation::validate_index_key_types(&item, &idx_refs, &key_info.attribute_definitions)
-                .map_err(|e| {
-                    TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))
-                })?;
             validation::validate_index_key_not_empty(
                 &item,
                 &idx_refs,
                 validation::SecondaryIndexEmptyContext::UpdateExpression,
             )
-            .map_err(|e| TxnOpError::Validation(e.to_string()))?;
+            .map_err(|e| {
+                TxnOpError::Cancel(CancellationReason::index_key_empty_abort(e.to_string()))
+            })?;
             upsert_item_in_tx(tx, key_info, &item)
                 .await
                 .map_err(TxnOpError::Storage)?;
@@ -462,7 +532,9 @@ async fn execute_transact_write_op(
                 &key_info.key_schema,
                 &key_info.attribute_definitions,
             )
-            .map_err(|e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())))?;
+            .map_err(|e| {
+                TxnOpError::Cancel(CancellationReason::key_type_mismatch(e.to_string()))
+            })?;
             let existing = fetch_item_for_update(tx, key_info, key)
                 .await
                 .map_err(TxnOpError::Storage)?;

@@ -86,6 +86,38 @@ adaptation when switching between ExtendDB and the real service.
 | `SearchVectors` result order for equal distances | Measured unstable: three identical searches returned tied rows in three different orders, and a top-k that truncates a tie group keeps an arbitrary subset of it | Deterministic on both backends, by different means. **PostgreSQL** sorts explicitly on the base table's full primary key after the score, so the order is a property of the query. **SQLite** issues no `ORDER BY` and resolves ties by scan order through a stable top-k, so its order is a property of the plan rather than something the query guarantees. Either way a client re-issuing an identical search sees the same order, which is stricter than the service rather than divergent in outcome. Do not rely on the two backends agreeing on which subset of a truncated tie group they keep. |
 | Vector indexes on the MongoDB backend | Vector indexes and `SearchVectors` are available | Not supported at all. That backend provides no vector search implementation, so the engine's capability gate refuses `CreateTable` and `UpdateTable` carrying `VectorIndexes` and every `SearchVectors` request, with the same capability message a PostgreSQL deployment without pgvector returns. Every other vector row in this document describes the PostgreSQL and SQLite backends. |
 | Multi-part base table keys | Not supported | Preview extension (opt-in via `enable_multipart_keys` setting). Standard single/composite keys work identically. |
+| Index key validation on `UpdateItem` and transaction writes | A secondary-index key attribute must carry its declared scalar type and may not be empty. On `UpdateItem` a literal operand of the wrong type (`SET k = :v`, `ADD`, `DELETE`, `list_append` of literals) is refused on the statement, ahead of the `ConditionExpression`, naming the attribute and the index; a value computed from the item (an attribute reference, the fallback of `if_not_exists`) is refused after the condition passes with the message "The update expression attempted to update the secondary index key to unsupported type"; a key left empty is refused after the condition passes with the update-expression wording. In `TransactWriteItems` a wrong-typed key (table or index) on any member cancels the transaction with the first such member's `ValidationError` in position and `None` elsewhere; otherwise an empty index key on any member is a top-level `ValidationException`; otherwise members report their own conditions. On a `Put` member both checks come ahead of the member's condition. (Measured on the service.) | Matches on every backend. Two known shared differences: an empty index key supplied through the legacy `AttributeUpdates` parameter is reported with the update-expression wording where the service uses the `PutItem` wording naming the index; and a request whose own value exceeds 400 KB is refused for size by the service before any index-key check, where ExtendDB reports the index-key fault first. |
+
+## Item Size
+
+ExtendDB enforces the 400 KB (409,600-byte) item-size limit. This section is the
+single reference for how an item and an update are sized; `docs/dynamodb-limits.md`
+records the limit and points here. Every figure was measured against the service
+in us-east-1 on 2026-10-19.
+
+How an item is sized: its attribute names plus its values. A string or binary
+value costs its byte length. A number costs `1 + ceil(integer significant digits
+/ 2) + ceil(fraction significant digits / 2)`, plus one for a sign, the two
+halves rounded up separately, so `1.5` is 3 bytes and `3.14159` is 5. A list
+costs 3 bytes plus one per element; a map costs 3 bytes plus, per entry, the
+entry name, its value, and one more.
+
+How a standalone `UpdateItem` is sized: by the statement, not the finished item.
+A base of 3; 18 per `SET` or `ADD` clause; a skeleton of the written paths (each
+map level 3 bytes plus one per named entry, each list level 3 bytes plus one per
+element, untouched siblings left out) whose `SET` or `ADD` leaves carry their
+value-placeholder bytes; one more per clause written through a list index; 26
+plus the name length per function call; 34 per `+` and 37 per `-`; and 15 plus
+the name per document path operand (14 for a nested attribute, 15 for an index).
+`REMOVE` and `DELETE` cost their path skeleton only. The legacy `AttributeUpdates`
+form costs 3 plus the name and finished value of each attribute it names that
+remains. The key and untouched attributes are left out. Both the statement figure
+and the finished item are checked against the limit, and a breach refuses with
+`Item size to update has exceeded the maximum allowed size`.
+
+| Area | DynamoDB | ExtendDB |
+|------|----------|------|
+| `UpdateItem` item-size accounting | In 31 of 33 commercial regions a standalone `UpdateItem` is sized by the statement (the rule above). At a one-byte key the largest finished item it can produce is 409,581 bytes. Two regions (`eu-south-2`, `me-central-1`) size an `UpdateItem` on the finished item, like a `PutItem`. | PostgreSQL and SQLite follow the 31-region statement rule. A transacted `Update` is sized on the finished item on both, as on the service. Cassandra sizes every update on the finished item against a fixed 409,600 bytes; MongoDB applies no item-size limit on updates. |
 
 ## Capacity and Throttling
 

@@ -153,6 +153,28 @@ impl CassandraEngine {
                 .map_err(|e| StorageError::Validation(e.to_string()))?;
             validation::validate_item_size(&item, MAX_ITEM_SIZE_BYTES)
                 .map_err(|e| StorageError::Validation(e.to_string()))?;
+            // Secondary-index keys on the written item, once the condition has
+            // passed and the statement is applied. Literal operands were
+            // checked by the engine ahead of the condition; what remains here
+            // is a value computed from the existing item (an attribute
+            // reference, the fallback of if_not_exists) of the wrong type, and
+            // a key left empty. Without this the value reaches the index row
+            // write and the malformed row breaks later writes to the same item.
+            if !indexes.is_empty() {
+                let idx_refs = super::index::index_key_refs(&indexes);
+                validation::validate_index_key_types_after_update(
+                    &item,
+                    &idx_refs,
+                    &key_info.attribute_definitions,
+                )
+                .map_err(|e| StorageError::Validation(e.to_string()))?;
+                validation::validate_index_key_not_empty(
+                    &item,
+                    &idx_refs,
+                    validation::SecondaryIndexEmptyContext::UpdateExpression,
+                )
+                .map_err(|e| StorageError::Validation(e.to_string()))?;
+            }
 
             let new_item = if return_new { Some(item.clone()) } else { None };
 
