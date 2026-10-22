@@ -771,7 +771,7 @@ class TestArnKindValidationMessages:
         s = self._ddb(ALLOW_ALL, "dynamodbstreams")
         self._assert_validation(
             lambda: s.get_shard_iterator(
-                StreamArn=self._tarn(), ShardId="shardId-0", ShardIteratorType="TRIM_HORIZON"),
+                StreamArn=self._tarn(), ShardId="shardId-00000000000000000000-00000001", ShardIteratorType="TRIM_HORIZON"),
             "Invalid StreamArn")
 
     # -- backup ops: strict, 'Invalid Backup ARN' before authz --
