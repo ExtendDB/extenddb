@@ -241,6 +241,12 @@ effect where it was previously bypassed.
 - **Index reads and resource tags.** An index Query or Scan evaluates the base
   table's resource tags, because an index inherits its table's tags. An ABAC
   `Deny` or `Allow` conditioned on the table's tags now applies to its indexes.
+- **ListStreams, ListBackups, and resource tags.** ListStreams and ListBackups
+  with a TableName are authorized against the table's `stream/*` or `backup/*`
+  sub-resource, which carries no resource tags, as on DynamoDB. Before this
+  release they evaluated the table's tags. A condition on `aws:ResourceTag/*`
+  for these calls now evaluates as for an absent key: `StringEquals` no longer
+  matches, and a negated operator or `Null` true now does.
 - **DescribeLimits and DescribeEndpoints.** DescribeLimits is authorized against
   `*`, not `table/*`, so a grant or `Deny` scoped to `table/*` no longer applies
   to it; scope its statement to `*`. DescribeEndpoints is not evaluated against

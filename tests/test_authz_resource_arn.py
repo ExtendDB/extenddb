@@ -450,6 +450,8 @@ class TestExplicitDenyOnResourceArn:
             admin.untag_resource(ResourceArn=tbl, TagKeys=["ttk"])
 
     def test_backup_operations_see_no_resource_tags(self, table):
+        # Pins the measured behaviour; the branch before the fix also read no
+        # tags here, because nothing can be stored under a backup ARN.
         admin = self._ddb(ALLOW_ALL)
         tbl, backup = table["table_arn"], table["backup_arn"]
         admin.tag_resource(ResourceArn=tbl, Tags=[{"Key": "btk", "Value": "v"}])
