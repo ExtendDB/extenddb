@@ -971,7 +971,7 @@ pub(crate) mod tests {
         user_group_policies: Mutex<HashMap<PrincipalKey, Vec<String>>>,
         user_boundary: Mutex<HashMap<PrincipalKey, Option<String>>>,
         user_tags: Mutex<HashMap<PrincipalKey, TagPairs>>,
-        role_policies: Mutex<HashMap<PrincipalKey, Vec<String>>>,
+        pub(crate) role_policies: Mutex<HashMap<PrincipalKey, Vec<String>>>,
         role_boundary: Mutex<HashMap<PrincipalKey, Option<String>>>,
         role_tags: Mutex<HashMap<PrincipalKey, TagPairs>>,
         session_data: Mutex<HashMap<SessionKey, Option<SessionData>>>,

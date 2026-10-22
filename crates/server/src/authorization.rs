@@ -470,7 +470,7 @@ mod tests {
 
 #[cfg(test)]
 mod resource_tag_tests {
-    use super::{check_user_authorization, fetch_authz_resource_tags};
+    use super::{check_role_authorization, check_user_authorization, fetch_authz_resource_tags};
     use crate::authz_cache::CachedAuthzStore;
     use crate::authz_cache::tests::{CountingAuthzStore, fast_authz_cfg};
     use extenddb_auth::policy::context::RequestParams;
@@ -485,17 +485,22 @@ mod resource_tag_tests {
     const BACKUP: &str =
         "arn:aws:dynamodb:us-east-1:123456789012:table/t/backup/01792513080555-82c5bd04";
 
-    /// A user allowed DescribeTable, DescribeStream and DescribeBackup only when
-    /// `aws:ResourceTag/k` is `v`, with the table, the stream and the backup
-    /// ARN all carrying `k=v` in the store.
+    const POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+        "Action":["dynamodb:DescribeTable","dynamodb:DescribeStream","dynamodb:DescribeBackup"],
+        "Resource":"*","Condition":{"StringEquals":{"aws:ResourceTag/k":"v"}}}]}"#;
+
+    /// User `u` and role `r` are allowed DescribeTable, DescribeStream and
+    /// DescribeBackup only when `aws:ResourceTag/k` is `v`, with the table, the
+    /// stream and the backup ARN all carrying `k=v` in the store.
     fn store() -> Arc<CountingAuthzStore> {
         let s = CountingAuthzStore::default();
-        let policy = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
-            "Action":["dynamodb:DescribeTable","dynamodb:DescribeStream","dynamodb:DescribeBackup"],
-            "Resource":"*","Condition":{"StringEquals":{"aws:ResourceTag/k":"v"}}}]}"#;
         s.user_policies.lock().unwrap().insert(
             (ACCOUNT.to_owned(), "u".to_owned()),
-            vec![policy.to_owned()],
+            vec![POLICY.to_owned()],
+        );
+        s.role_policies.lock().unwrap().insert(
+            (ACCOUNT.to_owned(), "r".to_owned()),
+            vec![POLICY.to_owned()],
         );
         for arn in [TABLE, STREAM, BACKUP] {
             s.resource_tags
@@ -532,6 +537,36 @@ mod resource_tag_tests {
             assert!(
                 matches!(
                     check(&cache, op, arn).await,
+                    Err(DynamoDbError::AccessDeniedException(_))
+                ),
+                "{op} on {arn}"
+            );
+        }
+        assert_eq!(inner.resource_tags_calls.load(Ordering::SeqCst), fetched);
+    }
+
+    #[tokio::test]
+    async fn role_session_stream_and_backup_operations_read_no_resource_tags() {
+        let inner = store();
+        let cache = CachedAuthzStore::new(inner.clone(), fast_authz_cfg());
+        let role = |op: &'static str, arn: &'static str| {
+            check_role_authorization(
+                &cache,
+                ACCOUNT,
+                "r",
+                "s",
+                op,
+                arn,
+                false,
+                RequestParams::default(),
+            )
+        };
+        assert!(role("DescribeTable", TABLE).await.is_ok());
+        let fetched = inner.resource_tags_calls.load(Ordering::SeqCst);
+        for (op, arn) in [("DescribeStream", STREAM), ("DescribeBackup", BACKUP)] {
+            assert!(
+                matches!(
+                    role(op, arn).await,
                     Err(DynamoDbError::AccessDeniedException(_))
                 ),
                 "{op} on {arn}"
