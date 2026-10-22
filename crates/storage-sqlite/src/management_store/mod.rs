@@ -591,9 +591,10 @@ impl ManagementStore for SqliteCatalogStore {
         let account_id = account_id.to_owned();
         let resource = resource.to_owned();
         Box::pin(async move {
-            // Resolve the principal kind and name from the ARN resource part.
-            if let Some(rest) = resource.split(":user/").nth(1) {
-                let user_name = rest.trim_end_matches('/');
+            // The server passes the ARN resource part, e.g. `user/<name>`,
+            // `role/<name>`, or `assumed-role/<role>/<session>`. Match the same
+            // prefixes the other backends use so caller tags resolve on SQLite.
+            if let Some(user_name) = resource.strip_prefix("user/") {
                 return sqlx::query_as(
                     "SELECT tag_key, tag_value FROM iam_user_tags \
                      WHERE account_id = ? AND user_name = ? ORDER BY tag_key",
@@ -610,12 +611,14 @@ impl ManagementStore for SqliteCatalogStore {
 
             // assumed-role/RoleName/SessionName or role/RoleName → role tags.
             let role_name = resource
-                .split(":assumed-role/")
-                .nth(1)
-                .or_else(|| resource.split(":role/").nth(1))
+                .strip_prefix("assumed-role/")
+                .or_else(|| resource.strip_prefix("role/"))
                 .map(|rest| rest.split('/').next().unwrap_or(rest));
 
             if let Some(role_name) = role_name {
+                if role_name.is_empty() {
+                    return Ok(Vec::new());
+                }
                 return sqlx::query_as(
                     "SELECT tag_key, tag_value FROM iam_role_tags \
                      WHERE account_id = ? AND role_name = ? ORDER BY tag_key",

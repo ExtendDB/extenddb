@@ -102,6 +102,8 @@ pub(crate) async fn authorize_request(
     input: &Value,
     operation: &str,
     account_id: &str,
+    source_ip: Option<&str>,
+    user_agent: Option<&str>,
 ) -> Result<extenddb_engine::AuthorizedKeyInfo, DynamoDbError> {
     let table_name = extract_table_name(input);
     let mut authorized_key_info = extenddb_engine::AuthorizedKeyInfo::new();
@@ -192,7 +194,13 @@ pub(crate) async fn authorize_request(
                 operation,
                 &resource_arn,
                 false,
-                extenddb_auth::policy::context::RequestParams::default(),
+                extenddb_auth::policy::context::RequestParams {
+                    region: Some(state.region.to_string()),
+                    secure_transport: state.tls_enabled,
+                    source_ip: source_ip.map(ToOwned::to_owned),
+                    user_agent: user_agent.map(ToOwned::to_owned),
+                    ..Default::default()
+                },
             )
             .await?;
         } else {
@@ -201,6 +209,10 @@ pub(crate) async fn authorize_request(
                     build_resource_arn(&state.region, account_id, Some(&target.table));
                 let params = extenddb_auth::policy::context::RequestParams {
                     leading_keys: target.leading_keys,
+                    region: Some(state.region.to_string()),
+                    secure_transport: state.tls_enabled,
+                    source_ip: source_ip.map(ToOwned::to_owned),
+                    user_agent: user_agent.map(ToOwned::to_owned),
                     ..Default::default()
                 };
                 authorization::check_authorization(
@@ -243,6 +255,10 @@ pub(crate) async fn authorize_request(
             .get("ReturnConsumedCapacity")
             .and_then(|v| v.as_str())
             .map(ToOwned::to_owned),
+        region: Some(state.region.to_string()),
+        secure_transport: state.tls_enabled,
+        source_ip: source_ip.map(ToOwned::to_owned),
+        user_agent: user_agent.map(ToOwned::to_owned),
         ..Default::default()
     };
     authorization::check_authorization(

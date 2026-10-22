@@ -178,6 +178,9 @@ pub async fn apply(
                 .await;
             auth_cache.invalidate_user_tags(account_id, user_name).await;
             auth_cache
+                .invalidate_user_created_at(account_id, user_name)
+                .await;
+            auth_cache
                 .invalidate_principal_credentials(account_id, user_name)
                 .await;
             vec![
@@ -185,6 +188,7 @@ pub async fn apply(
                 "user_group_policies",
                 "user_boundary",
                 "user_tags",
+                "user_created_at",
                 "principal_credentials",
             ]
         }
@@ -202,6 +206,9 @@ pub async fn apply(
                 .invalidate_role_sessions(account_id, role_name)
                 .await;
             auth_cache
+                .invalidate_role_created_at(account_id, role_name)
+                .await;
+            auth_cache
                 .invalidate_principal_credentials(account_id, role_name)
                 .await;
             vec![
@@ -209,6 +216,7 @@ pub async fn apply(
                 "role_boundary",
                 "role_tags",
                 "role_sessions",
+                "role_created_at",
                 "principal_credentials",
             ]
         }

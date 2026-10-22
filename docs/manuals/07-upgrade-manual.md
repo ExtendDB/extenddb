@@ -329,6 +329,100 @@ The same applies to `dynamodb:LeadingKeys`. Audit existing policies with
 `extenddb manage list-user-policies` / `list-role-policies` and update any that use bare
 operators on these keys. No catalog migration is required for this change.
 
+### IAM: `aws:TokenIssueTime` on MongoDB role sessions created before the upgrade
+
+**What changed.** ExtendDB now resolves `aws:TokenIssueTime` for a role session from
+the session's recorded creation time. On the MongoDB backend the session store did not
+record a creation time before this release.
+
+**Who is affected.** MongoDB deployments only. A role session established before the
+upgrade has no stored creation time, so `aws:TokenIssueTime` is absent for that session
+until it expires and is re-established. The three SQL and the Cassandra backends already
+recorded the session creation time and are not affected.
+
+**Impact.** The direction is over-deny only and self-heals: a policy that gates on
+`aws:TokenIssueTime` (a presence check or a `Date` comparison) denies a pre-upgrade
+MongoDB session that it would grant, and resolves correctly once the session is
+re-established. No catalog migration is required; new sessions record the creation time
+automatically.
+
+### IAM: a malformed CIDR in an identity policy is rejected at write
+
+**What changed.** A condition value for `IpAddress` or `NotIpAddress` that is not a
+valid CIDR or address (for example `10.0.0.0/33`, `999.0.0.0/8`, `not-a-cidr`,
+`10.0.0.0/`) is now rejected when an identity policy or a permissions boundary is
+written, with a `MalformedPolicyDocument`-class error, matching the service. Before
+this release the value was accepted and the statement silently did nothing (an
+`IpAddress` or `NotIpAddress` `Deny` never blocked).
+
+**Who is affected.** Any deployment that stored an identity policy or permissions
+boundary with a malformed CIDR. New writes with a malformed value now fail. A policy
+already stored with a malformed value evaluates fail closed: it no longer parses, so the
+request is denied rather than the statement being ignored. Audit stored policies with
+`extenddb manage list-user-policies` / `list-role-policies` and correct any malformed CIDR
+before upgrading so a legitimate request is not denied.
+
+**What a stored malformed-CIDR policy does after upgrade.** The failure is
+whole-document and scoped to the principal that owns the policy. Every request by
+that principal is denied until the policy is corrected, including a request that a
+different, valid policy of the same principal would allow (the malformed document
+fails the request closed before the valid policy can grant). The caller receives
+`AccessDeniedException` with the message "Not authorized to perform this action
+(policy evaluation error)", not a server error: a parse failure on the authorization
+path is mapped to a deny, not to `InternalServerError`. A different principal whose
+policies are all well formed is unaffected.
+
+**Trust policies are unchanged.** The live service accepts a malformed CIDR in a trust
+policy at write and drops the statement at evaluation; ExtendDB matches this, so a trust
+policy is not rejected for a malformed CIDR. No catalog migration is required.
+
+### IAM: condition key names and tag keys, and more CIDR forms
+
+**Condition key names and tag keys fold under Unicode on the request path.** A
+stored identity policy whose condition key name or tag key contains a non-ASCII
+letter that folds to a resolvable key (for example the long s folding to `s`, the
+st ligature to `st`, or the sharp s to `ss`) now resolves that key on a DynamoDB
+request, matching the service. For such a stored policy a `Deny` gated on the
+Unicode-spelled key now applies where it previously did not, and a negated `Allow`
+gated on it no longer grants. A policy using only ASCII key names is unaffected.
+The trust (`AssumeRole`) path matches key names and tag keys ASCII-case only and
+does not fold, as the service does; a trust policy whose condition key name or tag
+key contains a non-ASCII letter has that key read as absent on the trust path.
+
+**Tag keys that fold to the same string resolve deterministically.** If a
+principal carries two tag keys that fold to the same string (for example `mass`
+and `ma\u{00df}`), `aws:PrincipalTag/<key>` now resolves to the byte-exact stored
+key, then to the smallest fold-matching key by code point, every time, rather
+than at random. A policy naming one of the keys exactly is unaffected.
+
+**Tag write rules match the service.** `TagUser`, `TagRole` and `AssumeRole`
+session tags now reject a tag key or value outside IAM's grammar
+`[\p{L}\p{Z}\p{N}_.:/=+\-@]`: any Unicode Letter (Lu, Ll, Lt, Lm, Lo), Number
+(Nd, Nl, No) or Separator (Zs, Zl, Zp) by general category, plus the listed
+symbols. A combining mark (such as U+0345, category Mn), `#`, `!` and other
+punctuation, a key over 128 or value over 256 characters, the reserved `aws:`
+key prefix, and two keys that differ only in ASCII case are all rejected. Only
+the tags named in a given request are validated, so a tag already stored that
+the new rule would reject stays in place and keeps evaluating, and does not
+block setting other tags on the same principal; it is rejected only when a later
+request includes it again. Live IAM behaves the same way: a tag request
+validates only its own tags.
+
+**Policy Sid charset.** A policy `Sid` is now accepted only when it is empty or
+entirely ASCII letters and digits, on both the trust write (`CreateRole`) and
+the identity-policy write (`PutUserPolicy`), matching the service, which rejects
+any other `Sid` (a hyphen, underscore, space, dot or non-ASCII character) with
+`MalformedPolicyDocument`. The `Sid` is a statement label and does not affect
+evaluation, so a policy already stored with a non-conforming `Sid` keeps
+evaluating unchanged; only a new write is checked.
+
+**More CIDR forms.** `IpAddress`/`NotIpAddress` now accept a leading-zero octet
+and read it as decimal (`010.0.0.0/8` is `10.0.0.0/8`, not octal), matching the
+service, and reject an IPv4-mapped IPv6 literal (`::ffff:a.b.c.d`) at the identity
+and boundary write (the service rejects it; accepting it would store an
+`IpAddress` `Deny` that silently never matched). No catalog migration is required
+for any of these changes.
+
 ---
 
 ## License

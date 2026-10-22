@@ -124,7 +124,7 @@ In-memory stale-while-revalidate caches eliminate the per-request catalog roundt
 | `negative_ttl_seconds` | `5` | Negative-cache TTL for "not found" results. |
 | `max_entries` | `10000` | Per-cache LRU cap. |
 
-Statistics are exposed at `/management/auth-cache-metrics` (JSON, admin-authenticated). The per-cache `pass_through` flag distinguishes "cache disabled" from "cache cold."
+Statistics are exposed at `/management/auth-cache-metrics` (JSON, admin-authenticated). The per-cache `pass_through` flag distinguishes "cache disabled" from "cache cold." The report includes every authorization sub-cache, among them the two principal creation-time caches (`user_created_at`, `role_created_at`) consulted on each user and role-session request to derive `aws:userid` and `aws:TokenIssueTime`.
 
 **Invalidation timing**:
 
@@ -323,6 +323,62 @@ Access key prefixes: `AKIAEXTENDDB` (long-lived), `ASIAEXTENDDB` (temporary/Assu
     delete-role --account-id 123456789012 --role-name data-reader
 ```
 
+#### What a trust-policy Deny matches
+
+A role's trust policy decides who may assume the role. It is evaluated in IAM
+order: a matching explicit `Deny` blocks assumption before any `Allow` is
+considered, and with no matching `Allow` assumption is implicitly denied. The
+decision is made for each STS action the call exercises: `sts:AssumeRole`
+always, and `sts:TagSession` as well when the call passes session tags. Passing
+session tags to a role whose trust policy does not allow `sts:TagSession` is
+denied. ExtendDB does not implement source identity, so `sts:SetSourceIdentity`
+is never part of the decision.
+
+A statement matches when its `Principal` matches the caller, its `Action` (or
+`NotAction`) covers the action, and all `Condition` blocks pass. `Effect` is
+compared case-insensitively (`"deny"` works). A `Principal` matches on an exact
+ARN, a list of ARNs, `{"AWS": "*"}`, a bare account id, or an account root ARN
+(`arn:aws:iam::<account>:root`); the last two match every caller in that
+account, for both `Allow` and `Deny`.
+
+Principal ARNs are matched case-sensitively: a `Deny` naming `user/Alice` does
+not block a caller asserted as `user/alice`. Assume authorizes on the trust
+policy alone. The endpoint is admin-only and the admin asserts the caller ARN;
+unlike IAM, ExtendDB does not also evaluate the caller's identity policy for
+`sts:AssumeRole`, so a role that trusts an account root grants assumption to an
+in-account caller on the strength of the trust policy by itself.
+
+What a trust-policy `Deny` does not do:
+
+- A statement whose `Condition` uses an operator ExtendDB does not implement
+  fails closed: a `Deny` blocks assumption and an `Allow` grants nothing, rather
+  than the operator being ignored. ExtendDB resolves every global key STS
+  populates for an `AssumeRole` call, so no documented key fails closed:
+  `aws:PrincipalTag/<key>` (tag key matched case-insensitively), `sts:ExternalId`,
+  `aws:PrincipalArn`, `aws:PrincipalAccount`, `aws:ResourceAccount`,
+  `aws:RequestTag/<key>`, `aws:TagKeys` (from the passed session tags),
+  `aws:SecureTransport`, `aws:RequestedRegion`, `aws:CurrentTime`, `aws:EpochTime`,
+  `aws:PrincipalType`, `aws:username` (for a user caller), `aws:userid`
+  (`AIDA...` for a user, `<role-id>:<session-name>` for a role session),
+  `aws:SourceIp` (the `AssumeRole` connection peer address), `aws:UserAgent` (the
+  `User-Agent` header), `aws:ViaAWSService` and `aws:PrincipalIsAWSService`. The
+  organization keys (`aws:PrincipalOrgID`, `aws:PrincipalOrgPaths`) and every
+  other `aws:` global key the service does not populate for a direct caller (the
+  VPC, federation, MFA and source-service keys) are absent, as on a standalone
+  AWS account, and keep absent-key semantics. `IpAddress` and `NotIpAddress` are
+  evaluated as IPv4 and IPv6 CIDR membership; `BinaryEquals` is accepted at role
+  creation (IAM accepts it) but is not evaluated, so a statement using it fails
+  closed. See the classified key list below.
+- `NotPrincipal` is not allowed in a trust policy and is rejected when the role
+  is created.
+- A `Resource` field is not allowed in a trust policy and is rejected at create.
+- An `Action` outside the STS trust set (`sts:AssumeRole`, `sts:TagSession`,
+  `sts:SetSourceIdentity`), including `sts:*`, is rejected at create.
+- A bare `"*"` principal string, or a wildcard inside a principal ARN
+  (`user/dev-*`), is rejected at create. A principal naming a user or role that
+  does not exist is accepted; the statement simply matches no caller (an `Allow`
+  on it grants nothing, a `Deny` on it blocks no one).
+
 ### Policies
 
 Inline policies can be attached to users, groups, and roles:
@@ -370,6 +426,107 @@ Inline policies can be attached to users, groups, and roles:
       }]
     }'
 ```
+
+#### Condition keys in identity policies
+
+Identity-policy conditions on DynamoDB requests follow the same rule as trust
+policies. A condition key the request resolves is evaluated normally. A key that
+is absent follows IAM absent-key semantics, including that a negated operator
+(`StringNotEquals`, `StringNotLike`, `ArnNotEquals`, `NotIpAddress`) on an
+absent single-valued key matches, so a `Deny` gated on one applies when the
+caller omits the key. ExtendDB resolves `aws:PrincipalArn`, `aws:PrincipalAccount`,
+`aws:ResourceAccount`, `aws:PrincipalType`, `aws:username` (for a user caller),
+`aws:userid`, `aws:SourceIp`, `aws:UserAgent`, `aws:SecureTransport`,
+`aws:RequestedRegion`, `aws:CurrentTime`, `aws:EpochTime`, `aws:ViaAWSService`,
+`aws:PrincipalIsAWSService`, `aws:PrincipalTag/<key>`, `aws:ResourceTag/<key>`
+and `dynamodb:ResourceTag/<key>` (tag keys matched case-insensitively) on a
+data-plane request. Every other `aws:` global key is absent, which is what the
+service does for a key it does not populate for this caller and for an unknown
+key.
+
+#### Global condition key resolution
+
+The complete list of AWS global condition keys, classified by how ExtendDB
+resolves each for its callers (a signed IAM-user or assumed-role DynamoDB
+request, or an `AssumeRole` call). ExtendDB behaves as a standalone AWS account
+reached directly over its endpoint.
+
+Resolved (evaluated against the request value):
+
+- `aws:PrincipalArn`, `aws:PrincipalAccount`, `aws:PrincipalType`,
+  `aws:username` (user caller only), `aws:userid`.
+- `aws:ResourceAccount`.
+- `aws:SourceIp` (connection peer address; `IpAddress` and `NotIpAddress` do
+  IPv4 and IPv6 CIDR membership). This is the address of the TCP connection the
+  request arrived on. Behind a reverse proxy or load balancer that is the
+  proxy's address for every caller, and ExtendDB does not read `X-Forwarded-For`
+  (the header is caller-supplied and spoofable), so an `aws:SourceIp` condition
+  is meaningful only when clients connect to ExtendDB directly.
+- `aws:UserAgent` (`User-Agent` header).
+- `aws:SecureTransport`, `aws:RequestedRegion`, `aws:CurrentTime`,
+  `aws:EpochTime`.
+- `aws:ViaAWSService` and `aws:PrincipalIsAWSService` (both false for a direct
+  caller).
+- `aws:PrincipalTag/<key>`, `aws:RequestTag/<key>` (trust path),
+  `aws:ResourceTag/<key>`, `dynamodb:ResourceTag/<key>`, `aws:TagKeys`,
+  `sts:ExternalId` (trust path).
+- Role-session only (absent for an IAM user, matching the service):
+  `aws:TokenIssueTime` (the session issue time) and
+  `aws:MultiFactorAuthPresent` (`false` for a session assumed without MFA).
+
+Absent (keep IAM absent-key semantics, as the service leaves them unset for
+this caller):
+
+- Organization keys: `aws:PrincipalOrgID`, `aws:PrincipalOrgPaths`,
+  `aws:ResourceOrgID`, `aws:ResourceOrgPaths`, `aws:SourceOrgID`,
+  `aws:SourceOrgPaths` (a standalone account has no organization). An ExtendDB
+  account belongs to no organization, so a condition on an organization key
+  behaves as it does for a standalone AWS account: the key is absent, a `Deny`
+  that tests `aws:PrincipalOrgID` with a positive operator does not match (and
+  so does not block), and a negated operator on it matches. Do not carry an
+  organization-scoped `Deny` over from AWS expecting it to block on ExtendDB.
+- Role-session and federation keys ExtendDB does not model:
+  `aws:MultiFactorAuthAge`, `aws:FederatedProvider`,
+  `aws:SourceIdentity`, `aws:AssumedRoot`, `aws:SignInSessionArn`.
+  (`aws:TokenIssueTime` and `aws:MultiFactorAuthPresent` are resolved for a
+  role session; see the resolved list above.)
+- Network keys for VPC endpoints: `aws:SourceVpc`, `aws:SourceVpcArn`,
+  `aws:SourceVpce`, `aws:VpcSourceIp`, `aws:VpceAccount`, `aws:VpceOrgID`,
+  `aws:VpceOrgPaths`, `aws:Ec2InstanceSourceVpc`,
+  `aws:Ec2InstanceSourcePrivateIPv4`.
+- Service-principal and cross-service keys: `aws:PrincipalServiceName`,
+  `aws:PrincipalServiceNamesList`, `aws:SourceAccount`, `aws:SourceArn`,
+  `aws:CalledVia`, `aws:CalledViaFirst`, `aws:CalledViaLast`, `aws:referer`,
+  and the service-prefixed keys (`ec2:`, `glue:`, `codebuild:`, `lambda:`,
+  `ssm:`, `identitystore:`).
+- Any `aws:` key AWS defines that is not in the resolved set, and any unknown
+  `aws:` key, which the service also treats as absent.
+
+Fail closed (a statement using one does not evaluate): none. The resolved and
+absent sets cover every documented global key for ExtendDB's callers. The
+evaluator keeps an explicit, currently empty, fail-closed list so a future
+global key the service begins populating before ExtendDB resolves it can be
+added rather than silently granting through a negated operator. An operator the
+evaluator does not implement (for example `BinaryEquals`) still fails closed.
+
+`aws:TokenIssueTime` is populated by the service for a role session and absent
+for an IAM user. ExtendDB resolves it for a role session from the session issue
+time and leaves it absent for an IAM user, matching the service. A policy that
+gates on its presence or compares it with a `Date` operator behaves as it does
+on AWS for a role session. This resolution is on the DynamoDB request path; in a
+trust policy evaluated during `AssumeRole` the key is absent, as it is on the
+service for an `AssumeRole` caller using long-term credentials.
+
+`aws:MultiFactorAuthPresent` is populated by the service for a role session
+(`false` for a session assumed without MFA) and absent for an IAM user with
+long-term keys. ExtendDB resolves it to `false` for a role session and leaves it
+absent for an IAM user, so the common deny-without-MFA guard
+(`Deny if Bool aws:MultiFactorAuthPresent=false`) applies to a role session and
+is inert for an IAM user, matching the service. `aws:MultiFactorAuthAge` stays
+absent, as the service leaves it unset for a non-MFA session. Like
+`aws:TokenIssueTime`, `aws:MultiFactorAuthPresent` is resolved on the DynamoDB
+request path only; in a trust policy it is absent, as on the service for an
+`AssumeRole` caller using long-term credentials.
 
 ### Permissions Boundaries
 

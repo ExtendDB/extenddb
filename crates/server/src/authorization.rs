@@ -85,14 +85,15 @@ async fn check_user_authorization(
 ) -> Result<(), DynamoDbError> {
     let action = format!("dynamodb:{operation}");
 
-    // Fetch all 5 authz inputs concurrently — they are independent cache
+    // Fetch all authz inputs concurrently; they are independent cache
     // lookups (or DB queries, on cold start). All come back pre-parsed.
-    let (user_policies, group_policies, boundary, principal_tags, resource_tags) = tokio::try_join!(
+    let (user_policies, group_policies, boundary, principal_tags, resource_tags, created_at) = tokio::try_join!(
         wrap_policies(cache.fetch_user_policies(account_id, user_name)),
         wrap_policies(cache.fetch_user_group_policies(account_id, user_name)),
         wrap_boundary(cache.fetch_user_boundary(account_id, user_name)),
         wrap_tags(cache.fetch_user_tags(account_id, user_name)),
         wrap_tags(cache.fetch_resource_tags(resource_arn)),
+        wrap_created_at(cache.fetch_user_created_at(account_id, user_name)),
     )?;
 
     // Combine identity policies. Each side is an `Arc<Vec<Arc<PolicyDocument>>>`;
@@ -108,6 +109,22 @@ async fn check_user_authorization(
     // so we deref through the Arc and clone once. This is the only place
     // where the tag map allocation is unavoidable; future iterations could
     // change RequestContext to hold Arc<HashMap<...>> for true zero-copy.
+    let mut params = params;
+    params.principal_arn = Some(format!("arn:aws:iam::{account_id}:user/{user_name}"));
+    params.principal_account = Some(account_id.to_owned());
+    params.principal_type = Some("User".to_owned());
+    params.username = Some(user_name.to_owned());
+    params.userid = Some(extenddb_auth::policy::principal_id::user_unique_id(
+        account_id,
+        user_name,
+        created_at
+            .as_deref()
+            .map(String::as_str)
+            .unwrap_or_default(),
+    ));
+    // The target table's owner account. ExtendDB builds the resource ARN with
+    // the caller's account, so the resource account is that account.
+    params.resource_account = Some(account_id.to_owned());
     let context = RequestContext::build(
         (*principal_tags).clone(),
         (*resource_tags).clone(),
@@ -153,13 +170,43 @@ async fn check_role_authorization(
 ) -> Result<(), DynamoDbError> {
     let action = format!("dynamodb:{operation}");
 
-    let (identity_policies, boundary, (session_policy, principal_tags), resource_tags) = tokio::try_join!(
+    let (
+        identity_policies,
+        boundary,
+        (session_policy, principal_tags, token_issue_time),
+        resource_tags,
+        role_created_at,
+    ) = tokio::try_join!(
         wrap_policies(cache.fetch_role_policies(account_id, role_name)),
         wrap_boundary(cache.fetch_role_boundary(account_id, role_name)),
         fetch_session_data_and_tags(cache, account_id, role_name, session_name),
         wrap_tags(cache.fetch_resource_tags(resource_arn)),
+        wrap_created_at(cache.fetch_role_created_at(account_id, role_name)),
     )?;
 
+    let mut params = params;
+    params.principal_arn = Some(format!(
+        "arn:aws:sts::{account_id}:assumed-role/{role_name}/{session_name}"
+    ));
+    params.principal_account = Some(account_id.to_owned());
+    // A role session's principal type is AssumedRole; the service does not
+    // populate aws:username for it, so username stays None (absent).
+    params.principal_type = Some("AssumedRole".to_owned());
+    params.userid = Some(extenddb_auth::policy::principal_id::role_session_userid(
+        account_id,
+        role_name,
+        session_name,
+        role_created_at
+            .as_deref()
+            .map(String::as_str)
+            .unwrap_or_default(),
+    ));
+    params.resource_account = Some(account_id.to_owned());
+    // aws:TokenIssueTime for a role session is the session's issue time.
+    params.token_issue_time = token_issue_time;
+    // A role session is assumed without MFA, so aws:MultiFactorAuthPresent is
+    // present and false, matching the service. An IAM user leaves it absent.
+    params.multi_factor_auth_present = Some(false);
     let context = RequestContext::build(principal_tags, (*resource_tags).clone(), is_scan, params);
 
     // Convert the Arc<Vec<...>> to a slice for the evaluator. We materialize
@@ -240,6 +287,14 @@ async fn wrap_tags(
     fut.await.map_err(op_err_to_dynamo)
 }
 
+async fn wrap_created_at(
+    fut: impl std::future::Future<
+        Output = extenddb_storage::management_store::OpResult<Option<std::sync::Arc<String>>>,
+    >,
+) -> Result<Option<std::sync::Arc<String>>, DynamoDbError> {
+    fut.await.map_err(op_err_to_dynamo)
+}
+
 async fn fetch_session_data_and_tags(
     cache: &CachedAuthzStore,
     account_id: &str,
@@ -249,6 +304,7 @@ async fn fetch_session_data_and_tags(
     (
         Option<std::sync::Arc<extenddb_auth::policy::document::PolicyDocument>>,
         HashMap<String, String>,
+        Option<String>,
     ),
     DynamoDbError,
 > {
@@ -268,13 +324,50 @@ async fn fetch_session_data_and_tags(
     // is absent — acceptable; merging into-place is the simplest semantics.
     let mut tags: HashMap<String, String> = (*role_tags).clone();
     let mut session_policy = None;
+    let mut token_issue_time = None;
     if let Some(data) = session_data {
         session_policy = data.session_policy.clone();
+        token_issue_time = data.token_issue_time.clone();
         // Merge session tags (session wins on conflict). The session_data
         // value is shared via Arc; iterate borrowed and clone-on-insert.
         for (k, v) in &data.session_tags {
             tags.insert(k.clone(), v.clone());
         }
     }
-    Ok((session_policy, tags))
+    Ok((session_policy, tags, token_issue_time))
+}
+
+/// The value of `aws:SourceIp` for a request that arrived from `peer`.
+///
+/// An IPv4 client that reaches a dual-stack (`::`) listener appears as the
+/// IPv4-mapped IPv6 address `::ffff:a.b.c.d`. The service evaluates such a
+/// client as its IPv4 address, so an IPv4 CIDR in `IpAddress` or `NotIpAddress`
+/// matches it. The mapped form is converted back to IPv4 here; any other
+/// address is returned as is.
+pub(crate) fn condition_source_ip(peer: &std::net::SocketAddr) -> String {
+    peer.ip().to_canonical().to_string()
+}
+
+#[cfg(test)]
+mod source_ip_tests {
+    use super::condition_source_ip;
+    use std::net::SocketAddr;
+
+    #[test]
+    fn ipv4_mapped_peer_is_evaluated_as_ipv4() {
+        let mapped: SocketAddr = "[::ffff:127.0.0.1]:443".parse().unwrap();
+        assert_eq!(condition_source_ip(&mapped), "127.0.0.1");
+        let mapped_private: SocketAddr = "[::ffff:10.1.2.3]:443".parse().unwrap();
+        assert_eq!(condition_source_ip(&mapped_private), "10.1.2.3");
+    }
+
+    #[test]
+    fn other_peers_are_unchanged() {
+        let v4: SocketAddr = "10.1.2.3:443".parse().unwrap();
+        assert_eq!(condition_source_ip(&v4), "10.1.2.3");
+        let v6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        assert_eq!(condition_source_ip(&v6), "2001:db8::1");
+        let loopback6: SocketAddr = "[::1]:443".parse().unwrap();
+        assert_eq!(condition_source_ip(&loopback6), "::1");
+    }
 }
