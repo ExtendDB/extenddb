@@ -346,6 +346,37 @@ for any of these changes.
 
 ---
 
+### v0.1.14: IAM resource tags evaluate only as `aws:ResourceTag/`
+
+**What changed.** ExtendDB now resolves resource tags only as `aws:ResourceTag/<key>`, matching the live service. `dynamodb:ResourceTag/<key>` is left absent (the live service never populates it). Before v0.1.14, ExtendDB filled `dynamodb:ResourceTag/<key>` from the target table's tags, so a condition on that key evaluated against the tag value instead of being treated as absent. `aws:ResourceTag/<key>` is unaffected and keeps resolving from the table's tags, case-insensitively on the key.
+
+**Who is affected.** Any deployment with an IAM policy that uses a `dynamodb:ResourceTag/` condition key or a `${dynamodb:ResourceTag/...}` policy variable: inline user, group and role policies, user and role permissions boundaries, and session policies. A policy that uses `aws:ResourceTag/` is not affected. Role trust policies are not affected: the AssumeRole path never resolved `dynamodb:ResourceTag/`, so a trust policy that names it behaved then as it does now.
+
+**Migration is required.** `extenddb serve` refuses to start on a catalog that has not been migrated, with an error that names `extenddb migrate --yes`. Run `extenddb migrate --yes` once per deployment before starting the new binary. The migration rewrites every stored `dynamodb:ResourceTag/<key>` condition key and `${dynamodb:ResourceTag/...}` policy variable to the `aws:ResourceTag/` form, keeping the operator, the tag key and the value unchanged. The rewrite preserves each policy's decision, because `aws:ResourceTag/` resolves from the same table tags the old `dynamodb:ResourceTag/` key read. A freshly initialised deployment needs no migrate step; its catalog is already recorded as migrated.
+
+**What `migrate` prints.** Without `--yes`, `migrate` lists each policy it would rewrite, one line per policy with the account, the principal, the policy name and the number of condition keys, and writes nothing. With `--yes`, it rewrites and records that the migration is complete. It runs on every `migrate`, so an interrupted run is finished by the next one. If a policy lookup fails, `migrate` reports the count of failures, exits non-zero, and does not record completion, so a later run retries the rewrite. Policy bodies are never printed.
+
+**Collision case.** If one operator block in a policy already holds both `aws:ResourceTag/<key>` and `dynamodb:ResourceTag/<key>` for the same tag key, the two cannot share one JSON object after the rewrite. `migrate` leaves that policy unchanged and lists it for manual attention with the account, the principal and the policy name. Resolve it by hand: decide which form the policy should keep, remove the other, and re-run `migrate --yes`.
+
+**What each statement shape does for a policy that was not migrated.** An operator who writes a policy by hand after the upgrade, for example from an old template, needs to know that the `dynamodb:ResourceTag/` form has no effect. With the key absent, standard IAM absent-key semantics apply:
+
+| Statement shape on `dynamodb:ResourceTag/env` | Outcome for an unmigrated policy |
+|---|---|
+| `StringEquals` (bare positive) | Never matches; an `Allow` stops granting, a `Deny` stops blocking |
+| `StringNotEquals` (bare negated) | Always matches on the absent single-valued key; an `Allow` grants, a `Deny` blocks |
+| `StringEqualsIfExists` | Passes (the key is absent), so the statement applies on the key alone |
+| `ForAllValues:StringEquals` | Vacuously true on the absent key, so the statement applies on the key alone |
+| `ForAnyValue:StringEquals` | False on the absent key, so an `Allow` does not grant |
+| `Null` with value `true` | Matches (the key is absent) |
+| `Null` with value `false` | Does not match (the key is absent) |
+| `${dynamodb:ResourceTag/env}` policy variable in a value | Does not expand; the literal text `${dynamodb:ResourceTag/env}` is compared, which no request value equals |
+
+To get the intended behaviour, write the condition on `aws:ResourceTag/<key>`.
+
+**Sessions issued before the migration.** Session policies are stored in the catalog, so `migrate` rewrites them along with the identity policies. A session issued before the upgrade keeps the policy it was issued with until the migration runs. Because `serve` refuses an unmigrated catalog, the window is the time between the upgrade and the `migrate --yes` run; after that the session's stored policy is in the `aws:ResourceTag/` form. Re-issue any session you want on the new form immediately rather than waiting for it to expire, which can be up to 12 hours.
+
+---
+
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.

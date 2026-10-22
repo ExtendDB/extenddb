@@ -108,7 +108,7 @@ Set operators and `IfExists` can be combined: `ForAllValues:StringEqualsIfExists
 | Key | Type | Description |
 |-----|------|-------------|
 | `aws:PrincipalTag/<key>` | String | Tag on the authenticated principal (user or role) |
-| `dynamodb:ResourceTag/<key>` | String | Tag on the target DynamoDB table |
+| `aws:ResourceTag/<key>` | String | Tag on the target DynamoDB table |
 | `dynamodb:LeadingKeys` | Multi-valued string | Partition key values being accessed |
 | `dynamodb:Attributes` | Multi-valued string | Attribute names being read or written |
 | `dynamodb:Select` | String | The `Select` parameter value |
@@ -127,7 +127,7 @@ extenddb supports the same access control patterns as real AWS IAM:
 
 **Role-Based Access Control (RBAC)**: Create IAM groups with policies, add users to groups. Users inherit group policies. Create IAM roles for cross-account or service-to-service access.
 
-**Attribute-Based Access Control (ABAC)**: Use `aws:PrincipalTag/*` and `dynamodb:ResourceTag/*` condition keys to make access decisions based on tags. Example: allow users tagged `Department=Engineering` to access tables tagged `Department=Engineering`.
+**Attribute-Based Access Control (ABAC)**: Use `aws:PrincipalTag/*` and `aws:ResourceTag/*` condition keys to make access decisions based on tags. Example: allow users tagged `Department=Engineering` to access tables tagged `Department=Engineering`.
 
 **Fine-Grained Access Control (FGAC)**: Use `dynamodb:LeadingKeys` to restrict access to specific partition key values. Use `dynamodb:Attributes` to restrict which attributes can be read or written. Example: allow a user to access only items where the partition key matches their user ID.
 

@@ -144,7 +144,7 @@ pub enum AuthzDecision {
 pub struct RequestContext {
     /// aws:PrincipalTag/* — from the authenticated identity's tags.
     pub principal_tags: HashMap<String, String>,
-    /// dynamodb:ResourceTag/* — from the target table's tags.
+    /// aws:ResourceTag/*, from the target table's tags.
     pub resource_tags: HashMap<String, String>,
     /// dynamodb:LeadingKeys — partition key values being accessed.
     /// `None` for table-level operations (CreateTable, DeleteTable, etc.)
@@ -600,7 +600,7 @@ impl RequestContext {
     fn resolve_key_inner(&self, key: &str) -> Option<Vec<&str>> {
         if let Some(tag_key) = key.strip_prefix("aws:PrincipalTag/") {
             self.principal_tags.get(tag_key).map(|v| vec![v.as_str()])
-        } else if let Some(tag_key) = key.strip_prefix("dynamodb:ResourceTag/") {
+        } else if let Some(tag_key) = key.strip_prefix("aws:ResourceTag/") {
             self.resource_tags.get(tag_key).map(|v| vec![v.as_str()])
         } else {
             match key {
