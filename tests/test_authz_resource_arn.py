@@ -385,6 +385,84 @@ class TestExplicitDenyOnResourceArn:
         self._assert_validation(lambda: d.list_tags_of_resource(
             ResourceArn=table["index_arn"]), self._INDEX_MSG)
 
+    # -- tag operations on a backup ARN: not a DynamoDB resource, every principal
+    # Measured live with a real backup ARN and with a short backup id.
+
+    def test_tag_ops_on_backup_arn_rejected(self, table):
+        arn = table["backup_arn"]
+        msg = f"Provided Arn is not a DynamoDB resource arn: {arn}"
+        noperm = {"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "dynamodb:ListTables", "Resource": "*"}]}
+        for policy in (ALLOW_ALL, noperm):
+            d = self._ddb(policy)
+            self._assert_validation(lambda: d.tag_resource(
+                ResourceArn=arn, Tags=[{"Key": "k", "Value": "v"}]), msg)
+            self._assert_validation(lambda: d.untag_resource(ResourceArn=arn, TagKeys=["k"]), msg)
+            self._assert_validation(lambda: d.list_tags_of_resource(ResourceArn=arn), msg)
+
+    # -- resource tags on stream and backup operations, measured live --
+    # The service evaluates aws:ResourceTag only for a table, and for an index
+    # through its base table. A stream holds a tag set of its own, but neither
+    # the stream's tags nor the table's reach an operation on the stream, and a
+    # backup operation sees none of the source table's tags. A StringEquals on
+    # the tag never matches there and a Null test is true.
+
+    def _abac_user(self, actions: list, key: str, null: bool = False):
+        cond = ({"Null": {f"aws:ResourceTag/{key}": "true"}} if null
+                else {"StringEquals": {f"aws:ResourceTag/{key}": "v"}})
+        policy = {"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": actions, "Resource": "*", "Condition": cond}]}
+        ak, sk = _user_with_policy(self.mgmt, self.account_id, policy)
+        return (_client(self.endpoint, ak, sk, self.region),
+                _client(self.endpoint, ak, sk, self.region, "dynamodbstreams"))
+
+    def test_stream_operations_see_no_resource_tags(self, table):
+        admin = self._ddb(ALLOW_ALL)
+        stream, tbl = table["stream_arn"], table["table_arn"]
+        admin.tag_resource(ResourceArn=stream, Tags=[{"Key": "stk", "Value": "v"}])
+        admin.tag_resource(ResourceArn=tbl, Tags=[{"Key": "ttk", "Value": "v"}])
+        try:
+            # The stream and its table hold separate tag sets.
+            stream_tags = admin.list_tags_of_resource(ResourceArn=stream)["Tags"]
+            table_tags = admin.list_tags_of_resource(ResourceArn=tbl)["Tags"]
+            assert {"Key": "stk", "Value": "v"} in stream_tags
+            assert {"Key": "ttk", "Value": "v"} not in stream_tags
+            assert {"Key": "ttk", "Value": "v"} in table_tags
+            assert {"Key": "stk", "Value": "v"} not in table_tags
+
+            actions = ["dynamodb:DescribeStream", "dynamodb:GetShardIterator",
+                       "dynamodb:ListTagsOfResource"]
+            for key in ("stk", "ttk"):
+                d, s = self._abac_user(actions, key)
+                self._assert_denied(lambda: s.describe_stream(StreamArn=stream))
+                self._assert_denied(lambda: d.list_tags_of_resource(ResourceArn=stream))
+            # Control: the table-tag condition is in force for the table itself.
+            d, _ = self._abac_user(actions, "ttk")
+            d.list_tags_of_resource(ResourceArn=tbl)  # must not raise
+
+            # The tag is absent on the stream, so a Null test matches.
+            d, s = self._abac_user(actions, "stk", null=True)
+            shard = s.describe_stream(StreamArn=stream)["StreamDescription"]["Shards"][0]["ShardId"]
+            s.get_shard_iterator(StreamArn=stream, ShardId=shard, ShardIteratorType="TRIM_HORIZON")
+            d.list_tags_of_resource(ResourceArn=stream)
+        finally:
+            admin.untag_resource(ResourceArn=stream, TagKeys=["stk"])
+            admin.untag_resource(ResourceArn=tbl, TagKeys=["ttk"])
+
+    def test_backup_operations_see_no_resource_tags(self, table):
+        admin = self._ddb(ALLOW_ALL)
+        tbl, backup = table["table_arn"], table["backup_arn"]
+        admin.tag_resource(ResourceArn=tbl, Tags=[{"Key": "btk", "Value": "v"}])
+        try:
+            actions = ["dynamodb:DescribeBackup", "dynamodb:ListTagsOfResource"]
+            d, _ = self._abac_user(actions, "btk")
+            self._assert_denied(lambda: d.describe_backup(BackupArn=backup))
+            d.list_tags_of_resource(ResourceArn=tbl)  # control: must not raise
+            d, _ = self._abac_user(actions, "btk", null=True)
+            d.describe_backup(BackupArn=backup)  # must not raise
+        finally:
+            admin.untag_resource(ResourceArn=tbl, TagKeys=["btk"])
+
     # -- TagResource ResourceArn error ordering, measured live, every row --
     # ValidationException before authorization (every principal) for a malformed
     # or non-table/stream ARN; for an admin, a table ARN with a wrong partition,

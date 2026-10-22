@@ -267,27 +267,38 @@ pub(crate) fn validate_operation_arns(operation: &str, input: &Value) -> Result<
     Ok(())
 }
 
-/// When the authorized resource is an index ARN, the ARN the resource tags are
-/// stored under: the base table ARN. Returns `None` for any other resource, so
-/// the caller looks tags up under the resource ARN unchanged.
+/// The ARN to look resource tags up under for authorization, or `None` when
+/// the authorized resource carries no tags, so `aws:ResourceTag/*` is absent.
 ///
-/// Secondary indexes inherit their table's tags (DynamoDB developer guide,
-/// attribute-based-access-control), but nothing is stored under an index ARN,
-/// so `aws:ResourceTag/*` and `dynamodb:ResourceTag/*` would be absent for an
-/// index `Query` or `Scan` and an ABAC Deny or Allow on the table's tags would
-/// not apply to its indexes. Streams carry their own tags and are left
-/// unchanged (see the report's Unmeasured section for backups).
+/// Measured against DynamoDB:
+///
+/// | Authorized resource | Tags the request sees |
+/// |---|---|
+/// | Table ARN | the table's tags |
+/// | Index ARN | the base table's tags (indexes inherit them) |
+/// | Stream ARN | none, even when the stream or its table is tagged |
+/// | Backup ARN | none, even when the source table is tagged |
+///
+/// A stream holds a tag set of its own (`TagResource` on the stream ARN), but
+/// the service does not evaluate it, or the table's, for an operation on the
+/// stream: `StringEquals aws:ResourceTag/k` does not match and `Null` is true.
+/// Every other resource (an export, a foreign-service ARN, `*`) also gets no
+/// tags; nothing taggable is stored under one.
 pub(crate) fn resource_tag_lookup_arn(resource_arn: &str) -> Option<String> {
     let f = extenddb_core::arn::fields(resource_arn)?;
-    match parse_resource_identity(resource_arn) {
-        Some(ResourceId {
+    match parse_resource_identity(resource_arn)? {
+        ResourceId { sub: None, .. } => Some(resource_arn.to_owned()),
+        ResourceId {
             table,
             sub: Some(Sub::Index(_)),
-        }) => Some(format!(
+        } => Some(format!(
             "arn:{}:{}:{}:{}:table/{table}",
             f.partition, f.service, f.region, f.account
         )),
-        _ => None,
+        ResourceId {
+            sub: Some(Sub::Stream(_) | Sub::Backup(_)),
+            ..
+        } => None,
     }
 }
 
@@ -388,6 +399,15 @@ pub(crate) fn validate_tag_resource_arn_shape(arn: &str) -> Result<(), DynamoDbE
             sub: None | Some(Sub::Stream(_)),
             ..
         }) => Ok(()),
+        // A backup ARN is not a taggable resource kind (measured live, with a
+        // real backup ARN and a short backup id).
+        Some(ResourceId {
+            sub: Some(Sub::Backup(_)),
+            ..
+        }) => Err(DynamoDbError::ValidationException(format!(
+            "One or more parameter values were invalid: Provided Arn is not a \
+             DynamoDB resource arn: {arn}"
+        ))),
         Some(_) => Err(DynamoDbError::ValidationException(format!(
             "One or more parameter values were invalid: Invalid resource arn \
              provided, only table or stream is accepted. Provided resource arn: {arn}"
@@ -896,20 +916,29 @@ mod tests {
 
     #[test]
     fn tag_resource_arn_shape_rejects_index_and_backup() {
-        // Tags are accepted only on a table or a stream; an index or backup
-        // sub-resource is rejected with the service's message.
-        for arn in [
-            "arn:aws:dynamodb:us-east-1:964157134968:table/bb/index/gsi1",
+        // Tags are accepted only on a table or a stream. An index is rejected
+        // as not a table or stream; a backup is not a DynamoDB resource arn.
+        // Both measured live.
+        let index = "arn:aws:dynamodb:us-east-1:964157134968:table/bb/index/gsi1";
+        assert!(matches!(
+            validate_tag_resource_arn_shape(index),
+            Err(DynamoDbError::ValidationException(ref m))
+                if m.contains("only table or stream is accepted") && m.contains(index)
+        ));
+        for backup in [
+            "arn:aws:dynamodb:us-east-1:964157134968:table/bb/backup/01792513080555-82c5bd04",
             "arn:aws:dynamodb:us-east-1:964157134968:table/bb/backup/01-ab",
         ] {
             assert!(
                 matches!(
-                    validate_tag_resource_arn_shape(arn),
+                    validate_tag_resource_arn_shape(backup),
                     Err(DynamoDbError::ValidationException(ref m))
-                        if m.contains("only table or stream is accepted")
-                            && m.contains(arn)
+                        if m == &format!(
+                            "One or more parameter values were invalid: Provided Arn is not a \
+                             DynamoDB resource arn: {backup}"
+                        )
                 ),
-                "expected ValidationException for {arn}"
+                "expected not-a-DynamoDB-resource for {backup}"
             );
         }
         // A table ARN and a stream ARN pass the shape check.
@@ -1181,31 +1210,28 @@ mod tests {
     }
 
     #[test]
-    fn resource_tag_lookup_arn_maps_index_to_base_table_only() {
+    fn resource_tag_lookup_arn_reads_tags_only_for_tables_and_indexes() {
+        // A table ARN is looked up under itself.
+        assert_eq!(
+            resource_tag_lookup_arn("arn:aws:dynamodb:us-east-1:1:table/bb").as_deref(),
+            Some("arn:aws:dynamodb:us-east-1:1:table/bb")
+        );
         // An index ARN resolves its tags under the base table ARN.
         assert_eq!(
             resource_tag_lookup_arn("arn:aws:dynamodb:us-east-1:1:table/bb/index/gsi1").as_deref(),
             Some("arn:aws:dynamodb:us-east-1:1:table/bb")
         );
-        // A table, stream, or backup ARN is looked up unchanged (None).
-        assert_eq!(
-            resource_tag_lookup_arn("arn:aws:dynamodb:us-east-1:1:table/bb"),
-            None
-        );
-        assert_eq!(
-            resource_tag_lookup_arn(
-                "arn:aws:dynamodb:us-east-1:1:table/bb/stream/2026-10-20T16:17:40.188"
-            ),
-            None
-        );
-        assert_eq!(
-            resource_tag_lookup_arn("arn:aws:dynamodb:us-east-1:1:table/bb/backup/01-ab"),
-            None
-        );
-        assert_eq!(
-            resource_tag_lookup_arn("arn:aws:dynamodb:us-east-1:1:table/*"),
-            None
-        );
+        // A stream, backup, export, foreign-service or wildcard resource has no
+        // tags for authorization (None), even though a stream can be tagged.
+        for arn in [
+            "arn:aws:dynamodb:us-east-1:1:table/bb/stream/2026-10-20T16:17:40.188",
+            "arn:aws:dynamodb:us-east-1:1:table/bb/backup/01792513080555-82c5bd04",
+            "arn:aws:dynamodb:us-east-1:1:table/bb/export/01761100000000-abcd1234",
+            "arn:aws:s3:::bucket",
+            "*",
+        ] {
+            assert_eq!(resource_tag_lookup_arn(arn), None, "{arn}");
+        }
     }
 
     #[test]

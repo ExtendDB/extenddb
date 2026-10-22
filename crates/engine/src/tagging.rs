@@ -16,6 +16,14 @@ use crate::serialize_output;
 /// True for a `table/...` resource whose sub-resource is anything other than a
 /// stream (an index, a backup, or an unknown kind). Tags are accepted only on a
 /// table or a stream.
+/// True for a table ARN naming a backup, export, or import. The service reports
+/// these as not a `DynamoDB` resource ARN on a tag operation (measured live).
+fn tag_subresource_not_dynamodb_resource(resource: &str) -> bool {
+    resource
+        .strip_prefix("table/")
+        .is_some_and(|tail| matches!(tail.split('/').nth(1), Some("backup" | "export" | "import")))
+}
+
 fn tag_subresource_not_table_or_stream(resource: &str) -> bool {
     let Some(tail) = resource.strip_prefix("table/") else {
         return false;
@@ -47,6 +55,7 @@ fn extract_table_name_from_arn(arn: &str) -> Option<&str> {
 /// | Does not start with `arn:` | `ValidationException` (ARNs must start with `arn:`) |
 /// | `DynamoDB` ARN whose resource is not a table | `ValidationException` (not a `DynamoDB` resource arn) |
 /// | Non-`DynamoDB`-service ARN whose resource is not a table | `AccessDeniedException` |
+/// | Table ARN naming a backup, export, or import | `ValidationException` (not a `DynamoDB` resource arn) |
 /// | Table ARN naming an index or other sub-resource | `ValidationException` (only table or stream is accepted) |
 /// | Account differs from the caller's | `AccessDeniedException` |
 /// | Table ARN with a different partition, service, or region | `ValidationException` (invalid `TableArn`) |
@@ -93,6 +102,13 @@ async fn validate_resource_arn(arn: &str, ctx: &OperationContext) -> Result<(), 
         return Err(DynamoDbError::AccessDeniedException(
             "Access is denied".to_owned(),
         ));
+    }
+
+    if tag_subresource_not_dynamodb_resource(resource) {
+        return Err(DynamoDbError::ValidationException(format!(
+            "One or more parameter values were invalid: \
+             Provided Arn is not a DynamoDB resource arn: {arn}"
+        )));
     }
 
     // Tags are accepted only on a table or a stream; an index or other
@@ -243,4 +259,32 @@ pub async fn handle_list_tags_of_resource(
         next_token: None, // All tags returned in one page.
     };
     serialize_output(&output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{tag_subresource_not_dynamodb_resource, tag_subresource_not_table_or_stream};
+
+    #[test]
+    fn tag_subresource_classification() {
+        for r in [
+            "table/t/backup/01-ab",
+            "table/t/export/01-ab",
+            "table/t/import/01-ab",
+        ] {
+            assert!(tag_subresource_not_dynamodb_resource(r), "{r}");
+        }
+        for r in [
+            "table/t",
+            "table/t/stream/2026-10-20T16:17:40.188",
+            "table/t/index/g",
+        ] {
+            assert!(!tag_subresource_not_dynamodb_resource(r), "{r}");
+        }
+        assert!(tag_subresource_not_table_or_stream("table/t/index/g"));
+        assert!(!tag_subresource_not_table_or_stream("table/t"));
+        assert!(!tag_subresource_not_table_or_stream(
+            "table/t/stream/2026-10-20T16:17:40.188"
+        ));
+    }
 }

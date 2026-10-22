@@ -87,13 +87,11 @@ async fn check_user_authorization(
 ) -> Result<(), DynamoDbError> {
     let action = format!("dynamodb:{operation}");
 
-    // Resource tags are stored under the table ARN. When the authorized
-    // resource is an index ARN, look its tags up under the base table so an
-    // index Query or Scan sees the table's tags (indexes inherit them), rather
-    // than an empty tag set that an ABAC Deny or Allow on the table's tags would
-    // miss. Other resources (streams, backups) are looked up unchanged.
+    // Resource tags apply only to a table, and to an index through its base
+    // table (indexes inherit the table's tags). A stream, backup or any other
+    // resource has none, so `aws:ResourceTag/*` is absent there, as on the
+    // service (see `resource_tag_lookup_arn`).
     let tag_arn = crate::authz_resource::resource_tag_lookup_arn(resource_arn);
-    let tag_lookup: &str = tag_arn.as_deref().unwrap_or(resource_arn);
 
     // Fetch all authz inputs concurrently; they are independent cache
     // lookups (or DB queries, on cold start). All come back pre-parsed.
@@ -102,7 +100,7 @@ async fn check_user_authorization(
         wrap_policies(cache.fetch_user_group_policies(account_id, user_name)),
         wrap_boundary(cache.fetch_user_boundary(account_id, user_name)),
         wrap_tags(cache.fetch_user_tags(account_id, user_name)),
-        wrap_tags(cache.fetch_resource_tags(tag_lookup)),
+        wrap_tags(fetch_authz_resource_tags(cache, tag_arn.as_deref())),
         wrap_created_at(cache.fetch_user_created_at(account_id, user_name)),
     )?;
 
@@ -191,9 +189,8 @@ async fn check_role_authorization(
 ) -> Result<(), DynamoDbError> {
     let action = format!("dynamodb:{operation}");
 
-    // Look index ARN tags up under the base table (see the user path).
+    // Resource tags for a table or index only (see the user path).
     let tag_arn = crate::authz_resource::resource_tag_lookup_arn(resource_arn);
-    let tag_lookup: &str = tag_arn.as_deref().unwrap_or(resource_arn);
 
     let (
         identity_policies,
@@ -205,7 +202,7 @@ async fn check_role_authorization(
         wrap_policies(cache.fetch_role_policies(account_id, role_name)),
         wrap_boundary(cache.fetch_role_boundary(account_id, role_name)),
         fetch_session_data_and_tags(cache, account_id, role_name, session_name),
-        wrap_tags(cache.fetch_resource_tags(tag_lookup)),
+        wrap_tags(fetch_authz_resource_tags(cache, tag_arn.as_deref())),
         wrap_created_at(cache.fetch_role_created_at(account_id, role_name)),
     )?;
 
@@ -338,6 +335,18 @@ async fn wrap_boundary(
 ) -> Result<Option<std::sync::Arc<extenddb_auth::policy::document::PolicyDocument>>, DynamoDbError>
 {
     fut.await.map_err(op_err_to_dynamo)
+}
+
+/// The resource tags for authorization: those stored under `tag_arn`, or an
+/// empty set when the resource carries none (`tag_arn` is `None`).
+async fn fetch_authz_resource_tags(
+    cache: &CachedAuthzStore,
+    tag_arn: Option<&str>,
+) -> extenddb_storage::management_store::OpResult<TagMap> {
+    match tag_arn {
+        Some(arn) => cache.fetch_resource_tags(arn).await,
+        None => Ok(TagMap::default()),
+    }
 }
 
 async fn wrap_tags(
