@@ -549,6 +549,8 @@ DynamoDB. The `Resource` element of a policy is matched field by field, and a
 | RestoreTableFromBackup | the backup ARN, plus Scan, Query, GetItem, PutItem, UpdateItem, DeleteItem and BatchWriteItem on the target `table/<name>` |
 | RestoreTableToPointInTime | the source `table/<name>`, plus the same item actions on the target `table/<name>` |
 | ListTables | `table/*` |
+| DescribeLimits | `*` |
+| DescribeEndpoints | not authorized (signed request, no IAM permission) |
 
 A policy that names another partition, service, region, or account in a
 resource ARN it supplies (for example on a stream or backup operation) cannot
@@ -566,6 +568,22 @@ upgrading:
   `table/<name>` no longer allows reads of that table's indexes. Grant
   `table/<name>/index/<index>` or `table/<name>/index/*` as needed. This
   matches DynamoDB.
+- **Fencing a whole table with a Deny.** Index reads, `ListStreams` with a
+  TableName, and `ListBackups` with a TableName are authorized against a
+  sub-resource ARN (`table/<name>/index/*`, `table/<name>/stream/*`,
+  `table/<name>/backup/*`), not the bare `table/<name>`. A `Deny` written only
+  on `table/<name>` therefore does not cover them. An operator who means to
+  fence a whole table adds `table/<name>/*` to the `Deny` alongside
+  `table/<name>`.
+- **Index reads and resource tags.** An index Query or Scan evaluates the base
+  table's resource tags (`aws:ResourceTag/*` and `dynamodb:ResourceTag/*`),
+  because a secondary index inherits the tags of its table. An ABAC `Deny` or
+  `Allow` conditioned on the table's tags applies to its indexes.
+- **DescribeLimits and DescribeEndpoints.** DescribeLimits is authorized against
+  `*`, not `table/*`, so a grant or a `Deny` scoped to `table/*` no longer
+  applies to it; scope its statement to `*`. DescribeEndpoints is not evaluated
+  against IAM at all (it needs a signed request but no permission), so a `Deny`
+  on it does not block it, matching DynamoDB.
 - **Streams.** A policy whose resource is `table/<name>/stream/*` now matches
   concrete stream ARNs (the stream label contains `:`, which the resource
   wildcard now spans). A Deny on a specific stream ARN, or on a tag, backup, or
@@ -573,10 +591,15 @@ upgrading:
 - **GetRecords.** GetRecords is authorized against the stream its shard iterator
   reads, so a principal needs `dynamodb:GetRecords` on that stream. A shard
   iterator issued by a build before this change does not identify its stream;
-  after upgrade, GetRecords on such an iterator returns `ValidationException`
-  with the message `Invalid ShardIterator`, which is what DynamoDB returns for
-  any iterator it did not issue. The client calls GetShardIterator again. Shard
-  iterators expire after 15 minutes, so the window is short.
+  after upgrade, GetRecords on such an iterator returns
+  `ExpiredIteratorException` with the expiry message, so a stream client renews
+  it by calling GetShardIterator rather than failing on a non-retryable error.
+  This matters during the upgrade itself: a consumer reading when the server
+  restarts holds a pre-upgrade iterator, and its iterator chain renews cleanly
+  instead of stalling. A token that does not decode at all still returns
+  `ValidationException` with the message `Invalid ShardIterator`, which is what
+  DynamoDB returns for an iterator it did not issue. Shard iterators expire after
+  15 minutes.
 - **Restores.** A restore writes items into its target table, so
   RestoreTableFromBackup and RestoreTableToPointInTime require the item write
   and read actions on the target table in addition to the restore action. A

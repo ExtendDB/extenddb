@@ -218,6 +218,46 @@ Catalog upgrades change the schema; behavior changes alter how the running serve
 interprets existing data or configuration. Review these before upgrading a live
 deployment, even when no catalog migration is required.
 
+### IAM: operations authorize against their specific resource ARN
+
+**What changed.** Every operation is now authorized against the specific resource
+it acts on, resolved through one parser shared by authorization and the engine,
+rather than a `table/*` wildcard or the raw request string. A `Deny` or a narrow
+`Allow` written against a specific table, index, stream, or backup now takes
+effect where it was previously bypassed.
+
+**Who is affected and what to change** (no catalog migration is required):
+
+- **Index reads need an index grant.** Query and Scan with an `IndexName` are
+  authorized against `table/<name>/index/<index>`. A policy granting only
+  `table/<name>` no longer allows that table's index reads; grant
+  `table/<name>/index/<index>` or `table/<name>/index/*`.
+- **Fencing a whole table with a Deny.** Index reads, `ListStreams` with a
+  TableName, and `ListBackups` with a TableName are authorized against a
+  sub-resource ARN (`table/<name>/index/*`, `table/<name>/stream/*`,
+  `table/<name>/backup/*`), not the bare `table/<name>`. A `Deny` on
+  `table/<name>` does not cover them: add `table/<name>/*` to the `Deny`
+  alongside `table/<name>` to fence the whole table.
+- **Index reads and resource tags.** An index Query or Scan evaluates the base
+  table's resource tags, because an index inherits its table's tags. An ABAC
+  `Deny` or `Allow` conditioned on the table's tags now applies to its indexes.
+- **DescribeLimits and DescribeEndpoints.** DescribeLimits is authorized against
+  `*`, not `table/*`, so a grant or `Deny` scoped to `table/*` no longer applies
+  to it; scope its statement to `*`. DescribeEndpoints is not evaluated against
+  IAM at all, so a `Deny` on it does not block it.
+- **GetRecords across the upgrade.** A shard iterator issued before this release
+  does not identify its stream. GetRecords on such an iterator now returns
+  `ExpiredIteratorException` with the expiry message, so a consumer reading when
+  the server restarts renews its iterator by calling GetShardIterator instead of
+  failing on a non-retryable `ValidationException`. A token that does not decode
+  at all still returns `ValidationException` `Invalid ShardIterator`.
+- **Restores.** RestoreTableFromBackup and RestoreTableToPointInTime require the
+  item read and write actions on the target table in addition to the restore
+  action, because a restore writes into the target.
+- **Export.** `ExportTableToPointInTime` requires `TableArn` to be exactly a
+  table ARN. An ARN carrying a sub-resource or an extra `table/` segment is
+  rejected with `ValidationException` before authorization.
+
 ### v0.1.6 — IAM: bare operators on multivalued condition keys are no-ops (BR-7085)
 
 **What changed.** A **bare** condition operator (no `ForAnyValue:` / `ForAllValues:`

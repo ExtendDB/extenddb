@@ -34,8 +34,8 @@ fn backup_arn_field(body: &Value, account_id: &str) -> Result<String, DynamoDbEr
         })?;
 
     // Field 4 of a colon-delimited ARN is the account id, read through the one
-    // shared ARN parser. An ARN naming another account — or one malformed enough
-    // to have no account in that position — is denied before the backend
+    // shared ARN parser. An ARN naming another account, or one malformed enough
+    // to have no account in that position, is denied before the backend
     // resolves it, matching DynamoDB's authorize-first behavior.
     let arn_account = extenddb_core::arn::fields(backup_arn).map(|f| f.account);
     if arn_account != Some(account_id) {

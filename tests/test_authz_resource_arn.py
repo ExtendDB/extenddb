@@ -233,18 +233,41 @@ class TestExplicitDenyOnResourceArn:
             ShardIteratorType="TRIM_HORIZON")["ShardIterator"]
         self._assert_denied(lambda: s.get_records(ShardIterator=it))
 
-    def test_getrecords_iterator_naming_no_stream_is_invalid(self, table):
-        # DynamoDB answers a shard iterator it did not issue with
-        # ValidationException "Invalid ShardIterator" before authorization,
+    def test_getrecords_preupgrade_iterator_is_expired_not_invalid(self, table):
+        # A shard iterator from a build before the stream ARN was carried in the
+        # token decodes to exactly four fields (shard, type, seq, timestamp) with
+        # no stream ARN. Before, GetRecords answered it with the non-retryable
+        # ValidationException "Invalid ShardIterator", so a consumer reading
+        # across the upgrade failed hard and its iterator chain renewed into the
+        # same error on every call. It is now answered with
+        # ExpiredIteratorException before authorization, whatever the caller's
+        # policy, so the consumer renews its iterator instead.
+        now = int(time.time())
+        old_token = base64.standard_b64encode(
+            f"shardId-00000000000000000000-00000001|TRIM_HORIZON||{now}".encode()
+        ).decode()
+        stream_wildcard = f"arn:aws:dynamodb:{self.region}:{self.account_id}:table/*/stream/*"
+        policies = [
+            ALLOW_ALL,
+            {"Version": "2012-10-17", "Statement": [
+                {"Effect": "Allow", "Action": "dynamodb:ListTables", "Resource": "*"}]},
+            _allow_all_deny("GetRecords", stream_wildcard),
+        ]
+        for policy in policies:
+            s = self._ddb(policy, "dynamodbstreams")
+            with pytest.raises(ClientError) as exc:
+                s.get_records(ShardIterator=old_token)
+            err = exc.value.response["Error"]
+            assert err["Code"] == "ExpiredIteratorException", (policy, err)
+            assert "shard iterator has expired" in err.get("Message", ""), (policy, err)
+
+    def test_getrecords_undecodable_iterator_is_invalid(self, table):
+        # A token that does not decode (random base64, or a non-base64 string)
+        # stays ValidationException "Invalid ShardIterator" before authorization,
         # whatever the caller's policy (measured 2026-10-20 for an allow-all
         # principal, a principal allowed only ListTables, and one with an
-        # explicit Deny on GetRecords for every stream). An iterator that names
-        # no stream (a token from a build before the stream ARN was carried, a
-        # random base64 string, or plain text) gets the same answer.
-        now = int(time.time())
+        # explicit Deny on GetRecords for every stream).
         tokens = [
-            base64.standard_b64encode(
-                f"shardId-00000000000000000000-00000001|TRIM_HORIZON||{now}".encode()).decode(),
             base64.standard_b64encode(uuid.uuid4().bytes * 8).decode(),
             "not-a-real-iterator-" + "x" * 40,
         ]
@@ -559,3 +582,131 @@ class TestExplicitDenyOnResourceArn:
             endpoints = c.describe_endpoints()["Endpoints"]
             assert len(endpoints) == 1, endpoints
             assert endpoints[0]["Address"], endpoints
+
+
+def _deny_tag(actions: list[str], key: str, value: str = "secret") -> dict:
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {"Effect": "Allow", "Action": "dynamodb:*", "Resource": "*"},
+            {
+                "Effect": "Deny",
+                "Action": [f"dynamodb:{a}" for a in actions],
+                "Resource": "*",
+                "Condition": {"StringEquals": {key: value}},
+            },
+        ],
+    }
+
+
+def _abac_allow_tag(actions: list[str], key: str, region: str, account_id: str,
+                    value: str = "secret") -> dict:
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": [f"dynamodb:{a}" for a in actions],
+                "Resource": f"arn:aws:dynamodb:{region}:{account_id}:table/*",
+                "Condition": {"StringEquals": {key: value}},
+            }
+        ],
+    }
+
+
+@pytest.fixture(scope="module")
+def tagged_table(auth_env, mgmt, account_id, region):
+    """A table with a GSI, one item, and a resource tag classification=secret."""
+    endpoint = auth_env[0]
+    ak, sk = _user_with_policy(mgmt, account_id, ALLOW_ALL)
+    admin = _client(endpoint, ak, sk, region)
+    name = f"t{uuid.uuid4().hex[:8]}"
+    admin.create_table(
+        TableName=name,
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "g1pk", "AttributeType": "S"},
+        ],
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        GlobalSecondaryIndexes=[{
+            "IndexName": "gsi1",
+            "KeySchema": [{"AttributeName": "g1pk", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "ALL"},
+        }],
+        BillingMode="PAY_PER_REQUEST",
+        Tags=[{"Key": "classification", "Value": "secret"}],
+    )
+    wait_for_active(admin, name)
+    admin.put_item(TableName=name, Item={"pk": {"S": "p1"}, "g1pk": {"S": "g1"}})
+    desc = admin.describe_table(TableName=name)["Table"]
+    return {"name": name, "table_arn": desc["TableArn"],
+            "index_arn": desc["TableArn"] + "/index/gsi1"}
+
+
+class TestIndexResourceTagAuthorization:
+    """A secondary index inherits its table's tags for authorization.
+
+    Resource tags are stored under the table ARN. An index Query or Scan is
+    authorized against the index ARN, so looking tags up by that exact ARN found
+    nothing: an ABAC Deny on the table's tags did not reach the index (the index
+    read returned the same items the base-table read was denied), and an ABAC
+    Allow conditioned on the table's tags refused every index read. Both key
+    forms the service resolves (aws:ResourceTag and dynamodb:ResourceTag) are
+    exercised. The DynamoDB developer guide states indexes inherit the tags you
+    add to the table.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup(self, auth_env, mgmt, account_id, region):
+        self.endpoint = auth_env[0]
+        self.mgmt = mgmt
+        self.account_id = account_id
+        self.region = region
+
+    def _ddb(self, policy: dict):
+        ak, sk = _user_with_policy(self.mgmt, self.account_id, policy)
+        return _client(self.endpoint, ak, sk, self.region)
+
+    def _base_query(self, d, name):
+        return d.query(TableName=name, KeyConditionExpression="pk = :p",
+                       ExpressionAttributeValues={":p": {"S": "p1"}})
+
+    def _index_query(self, d, name):
+        return d.query(TableName=name, IndexName="gsi1",
+                       KeyConditionExpression="g1pk = :g",
+                       ExpressionAttributeValues={":g": {"S": "g1"}})
+
+    def _index_scan(self, d, name):
+        return d.scan(TableName=name, IndexName="gsi1")
+
+    def _denied(self, fn):
+        with pytest.raises(ClientError) as exc:
+            fn()
+        assert exc.value.response["Error"]["Code"] == "AccessDeniedException", (
+            exc.value.response["Error"]
+        )
+
+    @pytest.mark.parametrize("key", ["aws:ResourceTag/classification",
+                                     "dynamodb:ResourceTag/classification"])
+    def test_abac_deny_on_table_tag_reaches_index(self, tagged_table, key):
+        # Allow * with a Deny on Query/Scan when the resource tag
+        # classification=secret. The base-table Query is denied (the tag
+        # resolves on the table); the index Query and index Scan must be denied
+        # too, because the index inherits the table's tag. Before, the index
+        # read saw an empty tag set and returned the items.
+        d = self._ddb(_deny_tag(["Query", "Scan"], key))
+        self._denied(lambda: self._base_query(d, tagged_table["name"]))
+        self._denied(lambda: self._index_query(d, tagged_table["name"]))
+        self._denied(lambda: self._index_scan(d, tagged_table["name"]))
+
+    @pytest.mark.parametrize("key", ["aws:ResourceTag/classification",
+                                     "dynamodb:ResourceTag/classification"])
+    def test_abac_allow_conditioned_on_table_tag_grants_index(self, tagged_table, key):
+        # An Allow on Query/Scan for table/* conditioned on the resource tag
+        # classification=secret grants the base-table Query and must also grant
+        # the index Query and Scan, because the index inherits the table's tag.
+        # Before, the index read saw an empty tag set and was refused.
+        d = self._ddb(_abac_allow_tag(["Query", "Scan"], key, self.region, self.account_id))
+        self._base_query(d, tagged_table["name"])
+        self._index_query(d, tagged_table["name"])
+        self._index_scan(d, tagged_table["name"])

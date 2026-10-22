@@ -28,7 +28,7 @@ adaptation when switching between ExtendDB and the real service.
 | Role chaining | Supported | Not implemented |
 | SourceIdentity, TransitiveTagKeys | Supported | Not implemented |
 | Resource policies | Supported | Not implemented (deferred) |
-| Resource-level authorization | Per-resource ARN (table, index, stream, backup) | Matches: table and item operations use the table ARN, Query and Scan with an IndexName use the index ARN, stream operations use the stream ARN, backup operations use the backup ARN, and the tag operations use the supplied ResourceArn. A policy granting only `table/<name>` does not allow that table's index reads, as on DynamoDB. |
+| Resource-level authorization | Per-resource ARN (table, index, stream, backup) | Matches; no known difference. Each operation authorizes against its specific resource ARN, and a sub-resource (index, stream, backup) is authorized against its own ARN rather than the bare table. |
 
 ## Import and Export
 
