@@ -12,7 +12,8 @@ write any partition through those operations. These tests pin the enforced
 behaviour.
 
 Every expected outcome here was measured against live DynamoDB and IAM on
-2026-10-20. The assertions are identical whatever backend the suite targets; a
+2026-10-20 or 2026-10-21; each test that uses a 2026-10-21 measurement says
+so. The assertions are identical whatever backend the suite targets; a
 difference is a bug (REQ-TEST-004).
 
 Measured model:
@@ -970,8 +971,15 @@ class TestLeadingKeys:
     # batch and transaction handlers read storage. One such request during
     # CREATING left authorization seeing no table, and so no LeadingKeys, for
     # the rest of the TTL after the table became ACTIVE, while the engine saw
-    # the table and ran the request. On DynamoDB a request on an ACTIVE table is
-    # always evaluated against its partition key.
+    # the table and ran the request.
+    #
+    # Measured against live DynamoDB on 2026-10-21: after DescribeTable
+    # reported ACTIVE, the four operations returned ResourceNotFoundException
+    # for 2 to 4 seconds on both partitions, then were denied on the other
+    # partition and served on the principal's own. The other partition was
+    # never served. The test accepts ResourceNotFoundException for up to 15
+    # seconds after ACTIVE, and fails if the other partition is served at any
+    # point.
 
     def test_batch_and_transaction_fenced_once_a_created_table_is_active(self):
         owner = self._user_client([("full", ALLOW_ALL)])
@@ -1019,16 +1027,29 @@ class TestLeadingKeys:
                     {"Put": {"TableName": table, "Item": other_key}}]),
             }
             failures = []
+
+            def settle(send):
+                # The response once the table is visible on the data plane:
+                # "ok", or the error code other than ResourceNotFoundException.
+                deadline = time.monotonic() + 15
+                while True:
+                    try:
+                        send()
+                        return "ok"
+                    except ClientError as exc:
+                        code = exc.response["Error"]["Code"]
+                        if code != "ResourceNotFoundException" or time.monotonic() > deadline:
+                            return code
+                    time.sleep(0.25)
+
             for op, send in denied.items():
-                try:
-                    send()
+                got = settle(send)
+                if got == "ok":
                     failures.append(f"{op} on the other partition was served")
-                except ClientError as exc:
-                    if exc.response["Error"]["Code"] != "AccessDeniedException":
-                        failures.append(f"{op} on the other partition got "
-                                        f"{exc.response['Error']['Code']}")
-            # The fenced principal's own partition works on the batch and
-            # transaction paths as soon as the table is ACTIVE.
+                elif got != "AccessDeniedException":
+                    failures.append(f"{op} on the other partition got {got}")
+            # The fenced principal's own partition is served on the batch and
+            # transaction paths once the table is visible.
             own_key = self._key(OWN)
             for op, send in {
                 "BatchWriteItem": lambda: fenced.batch_write_item(RequestItems={table: [
@@ -1038,11 +1059,9 @@ class TestLeadingKeys:
                 "TransactGetItems": lambda: fenced.transact_get_items(TransactItems=[
                     {"Get": {"TableName": table, "Key": own_key}}]),
             }.items():
-                try:
-                    send()
-                except ClientError as exc:
-                    failures.append(f"{op} on the own partition got "
-                                    f"{exc.response['Error']['Code']}")
+                got = settle(send)
+                if got != "ok":
+                    failures.append(f"{op} on the own partition got {got}")
             # The single-item operations never return the other partition. The
             # owner seeds it through BatchWriteItem, which reads the catalog.
             owner.batch_write_item(RequestItems={table: [

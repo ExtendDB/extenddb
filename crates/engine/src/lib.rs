@@ -351,7 +351,8 @@ pub struct OperationContext {
     /// The `TableKeyInfo` the auth layer read for this request (P118
     /// optimization #2). Populated for single-table item operations, `Query`,
     /// `Scan`, and the batch and transaction operations; empty for table-level
-    /// operations and when authorization is skipped (developer mode).
+    /// operations. In developer mode authorization is skipped after the
+    /// single-table read, so only a single-table operation has an entry.
     pub authorized_key_info: AuthorizedKeyInfo,
     /// Auth/authz cache handles. Used by control-plane and tagging operations
     /// to issue write-through cache invalidations after the underlying state
