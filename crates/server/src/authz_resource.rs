@@ -368,7 +368,7 @@ pub(crate) fn table_resource_arn(value: &str, region: &str, account_id: &str) ->
 }
 
 /// Account-wide table wildcard, for operations with no specific resource.
-fn table_wildcard(region: &str, account_id: &str) -> String {
+pub(crate) fn table_wildcard(region: &str, account_id: &str) -> String {
     format!("arn:{PARTITION}:{SERVICE}:{region}:{account_id}:table/*")
 }
 

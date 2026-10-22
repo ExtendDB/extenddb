@@ -430,6 +430,7 @@ INSERT INTO settings (key, value) VALUES ('catalog_version', '0.0.3')
     ON CONFLICT(key) DO UPDATE SET value = excluded.value;
 INSERT OR IGNORE INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0.25');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('index_propagation_delay_ms', '10');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('resource_tag_migration', 'applied');
 "#;
 
 /// Apply the full catalog schema to a fresh (or existing) database.
@@ -484,6 +485,39 @@ mod tests {
             !SCHEMA_SQL
                 .contains("INSERT OR IGNORE INTO settings (key, value) VALUES ('catalog_version'"),
             "catalog_version must not be seeded with INSERT OR IGNORE"
+        );
+    }
+
+    /// A fresh catalog seeds the resource-tag migration marker, so a
+    /// newly-initialised deployment serves without a separate migrate step.
+    /// An older catalog that lacks it is caught by the server's startup guard.
+    #[test]
+    fn the_schema_seeds_the_resource_tag_migration_marker() {
+        assert!(
+            SCHEMA_SQL.contains(
+                "INSERT OR IGNORE INTO settings (key, value) VALUES ('resource_tag_migration'"
+            ),
+            "schema must seed the resource_tag_migration marker on a fresh catalog"
+        );
+    }
+
+    #[tokio::test]
+    async fn applying_the_schema_records_the_marker_row() {
+        use sqlx::sqlite::SqlitePoolOptions;
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        super::apply(&pool).await.unwrap();
+        let value: Option<(String,)> =
+            sqlx::query_as("SELECT value FROM settings WHERE key = 'resource_tag_migration'")
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            value.map(|(v,)| v).as_deref(),
+            Some(extenddb_core::settings_keys::RESOURCE_TAG_MIGRATION_DONE)
         );
     }
 }

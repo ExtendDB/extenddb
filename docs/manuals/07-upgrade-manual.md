@@ -218,6 +218,85 @@ Catalog upgrades change the schema; behavior changes alter how the running serve
 interprets existing data or configuration. Review these before upgrading a live
 deployment, even when no catalog migration is required.
 
+### v0.1.14 LeadingKeys now enforced on Query, batch and transaction operations
+
+**What changed.** `dynamodb:LeadingKeys` is now evaluated on `Query`,
+`BatchGetItem`, `BatchWriteItem`, `TransactGetItems` and `TransactWriteItems`.
+Before this release those five operations carried no LeadingKeys value, so a
+`ForAllValues:StringEquals dynamodb:LeadingKeys` condition on them was satisfied
+vacuously and a principal fenced to its own partition could read or write any
+partition through them. The item operations (`GetItem`, `PutItem`, `UpdateItem`,
+`DeleteItem`) already enforced the key; they change only for a numeric (`N`)
+partition key, which is now normalized (see below). Before this release the
+item operations compared the number exactly as the request spelled it.
+
+Details of how the key is bound, matching DynamoDB:
+
+- A `Query` on the base table or a local secondary index binds LeadingKeys to
+  the partition key value in the key condition (an LSI shares the base table's
+  partition key).
+- A `Query` on a global secondary index binds LeadingKeys to the queried
+  index's partition key value (its first HASH attribute), not the base table's.
+- `BatchGetItem` and `BatchWriteItem` are authorized per table over the set of
+  keys that table receives; `TransactGetItems` and `TransactWriteItems` are
+  authorized per item. A `ForAnyValue` condition therefore passes a mixed batch
+  but not a mixed transaction.
+- `Scan` and `SearchVectors` carry no LeadingKeys, because they target no single
+  partition. A `ForAllValues` condition does not fence them (it is satisfied
+  vacuously); fence a full-table read with `ForAnyValue:StringEquals` or a
+  `Null` guard (`"Null": {"dynamodb:LeadingKeys": "false"}`) on the statement.
+- A numeric (`N`) partition key is written into LeadingKeys the way the
+  service writes it, which depends on the operation. `GetItem`, `PutItem`,
+  `UpdateItem`, `DeleteItem`, `Query` and `BatchGetItem` use the normalized
+  number, so `10`, `010`, `10.0` and `1E1` all compare as `"10"`.
+  `BatchWriteItem`, `TransactGetItems` and `TransactWriteItems` keep the scale
+  the request was written with, as Java's `BigDecimal` prints it: `010` and
+  `1.0E1` compare as `"10"`, `10.0` as `"10.0"` and `1E1` as `"1E+1"`. The
+  policy value is matched as written. Under a fence of `["10"]`, a client that
+  sends `10.0` or `1E1` is allowed on the first group and denied on the second,
+  as on DynamoDB.
+- A request outside the count limits of the batch and transaction operations
+  returns `ValidationException` before any policy is evaluated, as on DynamoDB:
+  a `TransactWriteItems` or `TransactGetItems` with no items or more than 100,
+  a `BatchGetItem` or `BatchWriteItem` with an empty `RequestItems` or a table
+  with no keys or requests, a `BatchGetItem` with more than 100 tables or keys
+  and a `BatchWriteItem` with more than 25 tables or requests. Before this
+  release a principal without permission on the table received
+  `AccessDeniedException` for each of these requests except an empty
+  `TransactItems` or `RequestItems`.
+
+**Who is affected.** Any deployment with a principal whose policy fences
+`dynamodb:LeadingKeys` with `ForAllValues:StringEquals` and whose Query, batch or
+transaction requests previously crossed its own partition. After upgrade those
+cross-partition requests return `AccessDeniedException`. Own-partition access is
+unchanged, except for numeric partition keys.
+
+A principal with a numeric LeadingKeys fence sees a change on the item
+operations even if it never uses Query, batch or transactions. Under a fence of
+`["10"]`, a `GetItem` on `010`, `10.0` or `1E1` was denied and is now allowed.
+Under a fence written in a non-canonical form, such as `["010"]` or `["1E1"]`,
+a request spelled the same way was allowed and is now denied: the policy value
+is matched as written and no request is normalized to it.
+
+**Migration.** No catalog migration is required. Before upgrading, audit
+LeadingKeys policies with `extenddb manage list-user-policies` /
+`list-role-policies` and confirm:
+
+- A fence intended to cover reads and writes names the partition values the
+  principal legitimately uses on Query, batch and transaction, not only item
+  operations.
+- Any policy relying on `Scan` or `SearchVectors` being fenced by a
+  `ForAllValues` LeadingKeys condition is rewritten to `ForAnyValue` or adds a
+  `Null` guard, since neither operation is fenced by `ForAllValues`.
+- A numeric LeadingKeys value is written in the form each operation compares
+  (see the numeric partition key item above). A fence of `["10"]` covers every
+  spelling of 10 on the item operations, Query and BatchGetItem, and the
+  spellings `10`, `010`, `+10` and `1.0E1` on batch writes and transactions. A
+  fence value written as `010`, `10.0` or `1E1` matches nothing on the item
+  operations, Query and BatchGetItem; rewrite it as `10`.
+
+---
+
 ### IAM: operations authorize against their specific resource ARN
 
 **What changed.** Every operation is now authorized against the specific resource
@@ -263,6 +342,8 @@ effect where it was previously bypassed.
 - **Export.** `ExportTableToPointInTime` requires `TableArn` to be exactly a
   table ARN. An ARN carrying a sub-resource or an extra `table/` segment is
   rejected with `ValidationException` before authorization.
+
+---
 
 ### v0.1.6 — IAM: bare operators on multivalued condition keys are no-ops (BR-7085)
 
@@ -389,6 +470,37 @@ service, and reject an IPv4-mapped IPv6 literal (`::ffff:a.b.c.d`) at the identi
 and boundary write (the service rejects it; accepting it would store an
 `IpAddress` `Deny` that silently never matched). No catalog migration is required
 for any of these changes.
+
+---
+
+### v0.1.14: IAM resource tags evaluate only as `aws:ResourceTag/`
+
+**What changed.** ExtendDB now resolves resource tags only as `aws:ResourceTag/<key>`, matching the live service. `dynamodb:ResourceTag/<key>` is left absent (the live service never populates it). Before v0.1.14, ExtendDB filled `dynamodb:ResourceTag/<key>` from the target table's tags, so a condition on that key evaluated against the tag value instead of being treated as absent. `aws:ResourceTag/<key>` is unaffected and keeps resolving from the table's tags, case-insensitively on the key.
+
+**Who is affected.** Any deployment with an IAM policy that uses a `dynamodb:ResourceTag/` condition key or a `${dynamodb:ResourceTag/...}` policy variable: inline user, group and role policies, user and role permissions boundaries, and session policies. A policy that uses `aws:ResourceTag/` is not affected. Role trust policies are not affected: the AssumeRole path never resolved `dynamodb:ResourceTag/`, so a trust policy that names it behaved then as it does now.
+
+**Migration is required.** `extenddb serve` refuses to start on a catalog that has not been migrated, with an error that names `extenddb migrate --yes`. Run `extenddb migrate --yes` once per deployment before starting the new binary. On PostgreSQL, `migrate` connects as the admin user, so pass `--pg-user <admin>` and set `EXTENDDB_PG_PASSWORD`, as for `init`. The migration rewrites every stored `dynamodb:ResourceTag/<key>` condition key and `${dynamodb:ResourceTag/...}` policy variable to the `aws:ResourceTag/` form, keeping the operator, the tag key and the value unchanged. The rewrite preserves each policy's decision, because `aws:ResourceTag/` resolves from the same table tags the old `dynamodb:ResourceTag/` key read. The one difference is a `${dynamodb:ResourceTag/<key>}` policy variable on a table without that tag: neither form expands, and the literal text in the comparison changes from `${dynamodb:ResourceTag/<key>}` to `${aws:ResourceTag/<key>}`. The decision changes only for a request value equal to one of those literals. A freshly initialised deployment needs no migrate step; its catalog is already recorded as migrated.
+
+**What `migrate` prints.** Without `--yes`, `migrate` lists each policy it would rewrite, one line per policy with the account, the principal, the policy name and the number of condition keys, and writes nothing. With `--yes`, it rewrites and records that the migration is complete. It runs on every `migrate`, so an interrupted run is finished by the next one. If a policy lookup fails, or a policy needs attention (below), `migrate` reports it, exits non-zero, and does not record completion, so a later run retries. Policy bodies are never printed.
+
+**Both forms on one key.** If one operator block in a policy holds both `aws:ResourceTag/<key>` and `dynamodb:ResourceTag/<key>` for the same tag key with the same value, the two were one condition before the upgrade, and `migrate` drops the `dynamodb:` key. With different values they cannot share one JSON key. `migrate` then leaves the policy unchanged, lists it as `NEEDS ATTENTION` with the account, the principal and the policy name, exits non-zero, and does not record the migration as complete, so `serve` keeps refusing the catalog. Fix the policy with the previous version still serving the catalog (keep one of the two forms), then run `migrate --yes` with the new binary. A session policy that does not parse is reported in the log and skipped; it cannot be evaluated under either form.
+
+**What each statement shape does for a policy that was not migrated.** An operator who writes a policy by hand after the upgrade, for example from an old template, needs to know that the `dynamodb:ResourceTag/` form has no effect. With the key absent, standard IAM absent-key semantics apply:
+
+| Statement shape on `dynamodb:ResourceTag/env` | Outcome for an unmigrated policy |
+|---|---|
+| `StringEquals` (bare positive) | Never matches; an `Allow` stops granting, a `Deny` stops blocking |
+| `StringNotEquals` (bare negated) | Always matches on the absent single-valued key; an `Allow` grants, a `Deny` blocks |
+| `StringEqualsIfExists` | Passes (the key is absent), so the statement applies on the key alone |
+| `ForAllValues:StringEquals` | Vacuously true on the absent key, so the statement applies on the key alone |
+| `ForAnyValue:StringEquals` | False on the absent key, so an `Allow` does not grant |
+| `Null` with value `true` | Matches (the key is absent) |
+| `Null` with value `false` | Does not match (the key is absent) |
+| `${dynamodb:ResourceTag/env}` policy variable in a value | Does not expand; the literal text `${dynamodb:ResourceTag/env}` is compared, which no request value equals |
+
+To get the intended behaviour, write the condition on `aws:ResourceTag/<key>`.
+
+**Sessions issued before the migration.** Session policies are stored in the catalog, so `migrate` rewrites them along with the identity policies. A session issued before the upgrade is evaluated with its rewritten policy once `migrate --yes` has run, and it does not need to be issued again. The new binary does not serve an unmigrated catalog, so no request is evaluated against the old policy text under the new rules.
 
 ---
 

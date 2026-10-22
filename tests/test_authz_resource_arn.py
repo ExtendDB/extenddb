@@ -730,10 +730,10 @@ class TestIndexResourceTagAuthorization:
     authorized against the index ARN, so looking tags up by that exact ARN found
     nothing: an ABAC Deny on the table's tags did not reach the index (the index
     read returned the same items the base-table read was denied), and an ABAC
-    Allow conditioned on the table's tags refused every index read. Both key
-    forms the service resolves (aws:ResourceTag and dynamodb:ResourceTag) are
-    exercised. The DynamoDB developer guide states indexes inherit the tags you
-    add to the table.
+    Allow conditioned on the table's tags refused every index read. The key is
+    aws:ResourceTag, the only form the service resolves; dynamodb:ResourceTag is
+    absent for every resource (see test_abac.py). The DynamoDB developer guide
+    states indexes inherit the tags you add to the table.
     """
 
     @pytest.fixture(autouse=True)
@@ -766,8 +766,7 @@ class TestIndexResourceTagAuthorization:
             exc.value.response["Error"]
         )
 
-    @pytest.mark.parametrize("key", ["aws:ResourceTag/classification",
-                                     "dynamodb:ResourceTag/classification"])
+    @pytest.mark.parametrize("key", ["aws:ResourceTag/classification"])
     def test_abac_deny_on_table_tag_reaches_index(self, tagged_table, key):
         # Allow * with a Deny on Query/Scan when the resource tag
         # classification=secret. The base-table Query is denied (the tag
@@ -779,8 +778,7 @@ class TestIndexResourceTagAuthorization:
         self._denied(lambda: self._index_query(d, tagged_table["name"]))
         self._denied(lambda: self._index_scan(d, tagged_table["name"]))
 
-    @pytest.mark.parametrize("key", ["aws:ResourceTag/classification",
-                                     "dynamodb:ResourceTag/classification"])
+    @pytest.mark.parametrize("key", ["aws:ResourceTag/classification"])
     def test_abac_allow_conditioned_on_table_tag_grants_index(self, tagged_table, key):
         # An Allow on Query/Scan for table/* conditioned on the resource tag
         # classification=secret grants the base-table Query and must also grant

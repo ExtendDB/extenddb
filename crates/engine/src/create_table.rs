@@ -110,7 +110,16 @@ pub async fn handle_create_table(
     serialize_output(&output)
 }
 
-pub(crate) fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> DynamoDbError {
+/// Map a storage-layer error to its `DynamoDB` wire error.
+///
+/// Exposed so the server's authorization path classifies a key-info lookup
+/// fault the same way the engine classifies the identical fault on the data
+/// path: a transient or connection error becomes `ServiceUnavailable`, the
+/// catalog and backend-internal errors become `InternalServerError`, and a
+/// not-active table becomes `ResourceInUseException`. Without a single mapper
+/// the same database hiccup returned different wire errors depending on which
+/// layer hit it first.
+pub fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> DynamoDbError {
     use extenddb_storage::error::StorageError;
     match e {
         StorageError::TableNotFound(name) => DynamoDbError::ResourceNotFoundException(

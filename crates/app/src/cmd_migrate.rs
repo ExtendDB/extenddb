@@ -37,10 +37,10 @@ pub async fn run(args: MigrateArgs) -> anyhow::Result<()> {
             args.config,
         );
     }
-    // Load the config for validation only: migrate drives the bootstrapper from
-    // the config path directly, but a malformed config should fail here rather
-    // than midway through a migration.
-    config::load(&args.config)?;
+    // Load the config for validation and to reach the catalog for the policy
+    // rewrite: migrate drives the schema steps through the bootstrapper, but a
+    // malformed config should fail here rather than midway through a migration.
+    let app_config = config::load(&args.config)?;
 
     println!("=== extenddb migrate ===");
     println!("Config:           {}", args.config);
@@ -67,7 +67,12 @@ pub async fn run(args: MigrateArgs) -> anyhow::Result<()> {
         .acquire_migration_lock()
         .await
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    let result = apply_migrations(bootstrap.as_ref(), &args).await;
+    let result = apply_migrations(
+        bootstrap.as_ref(),
+        &args,
+        app_config.storage.connection_config(),
+    )
+    .await;
     if let Err(e) = bootstrap.release_migration_lock().await {
         tracing::warn!("Failed to release migration lock: {e:?}");
     }
@@ -79,6 +84,7 @@ pub async fn run(args: MigrateArgs) -> anyhow::Result<()> {
 async fn apply_migrations(
     bootstrap: &dyn extenddb_storage::bootstrapper::Bootstrapper,
     args: &MigrateArgs,
+    connection: &str,
 ) -> anyhow::Result<()> {
     // Show current catalog version.
     println!("--- Checking current catalog version...");
@@ -131,20 +137,75 @@ async fn apply_migrations(
         }
     }
 
-    if !catalog_pending && data_pending.is_empty() && !repair_pending {
+    // Detect stored policies that still name a dynamodb:ResourceTag condition
+    // key. Detection is read-only and runs on every migrate (like the repair
+    // above), so an interrupted run is finished by the next. The catalog is
+    // reached through a catalog-only management store, not the bootstrapper's
+    // schema connection.
+    println!("--- Checking resource-tag condition keys...");
+    let mgmt = extenddb_storage::management_store_factory::create_management_store(connection)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let settings = extenddb_storage::settings_store::create_settings_store(connection)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let rtag_detect = extenddb_storage::policy_migration::migrate_resource_tag_condition_keys(
+        mgmt.as_ref(),
+        false,
+    )
+    .await;
+    let marker_present = settings
+        .get_setting(extenddb_core::settings_keys::RESOURCE_TAG_MIGRATION)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?
+        .is_some();
+    if rtag_detect.rewritten.is_empty() && rtag_detect.needs_attention.is_empty() {
+        println!("  No dynamodb:ResourceTag condition keys found.");
+    } else {
+        for r in &rtag_detect.rewritten {
+            println!(
+                "  Rewrite: account {} {} policy {} ({} key(s))",
+                r.account_id, r.principal, r.policy_name, r.rewrites
+            );
+        }
+        for n in &rtag_detect.needs_attention {
+            println!(
+                "  NEEDS ATTENTION: account {} {} policy {} (aws:ResourceTag and \
+                 dynamodb:ResourceTag forms collide; left unchanged)",
+                n.account_id, n.principal, n.policy_name
+            );
+        }
+    }
+    if rtag_detect.errors > 0 {
+        println!(
+            "  WARNING: {} policy lookup(s) failed during detection.",
+            rtag_detect.errors
+        );
+    }
+    let rtag_pending = !rtag_detect.rewritten.is_empty() || rtag_detect.errors > 0;
+    // A catalog with no marker must have one written, even when there is
+    // nothing to rewrite, so that serve will start.
+    let marker_pending = !marker_present;
+
+    if !catalog_pending
+        && data_pending.is_empty()
+        && !repair_pending
+        && !rtag_pending
+        && !marker_pending
+    {
         println!();
-        if detected.needs_attention.is_empty() {
+        if detected.needs_attention.is_empty() && rtag_detect.needs_attention.is_empty() {
             println!(
                 "Everything is up to date (catalog version {expected}). No migrations needed."
             );
         } else {
             // Nothing is automatically applicable, but saying "everything is up
             // to date" straight after a NEEDS ATTENTION line would be
-            // contradictory: those tables require a human.
+            // contradictory: those items require a human.
             println!(
                 "No migrations needed (catalog version {expected}), but {} item(s) above \
                  need manual attention.",
-                detected.needs_attention.len()
+                detected.needs_attention.len() + rtag_detect.needs_attention.len()
             );
         }
         return Ok(());
@@ -162,6 +223,28 @@ async fn apply_migrations(
             what.push(format!(
                 "table key metadata repairs [{}]",
                 detected.repaired.join("; ")
+            ));
+        }
+        if !rtag_detect.rewritten.is_empty() {
+            what.push(format!(
+                "resource-tag condition-key rewrites [{} policy(ies)]",
+                rtag_detect.rewritten.len()
+            ));
+        }
+        if marker_pending {
+            what.push("record the resource-tag migration marker".to_owned());
+        }
+        if rtag_detect.errors > 0 {
+            what.push(format!(
+                "{} policy lookup(s) that failed and must be retried",
+                rtag_detect.errors
+            ));
+        }
+        if !rtag_detect.needs_attention.is_empty() {
+            what.push(format!(
+                "{} policy(ies) listed as NEEDS ATTENTION, which must be fixed by hand before \
+                 the migration can complete",
+                rtag_detect.needs_attention.len()
             ));
         }
         anyhow::bail!(
@@ -196,6 +279,59 @@ async fn apply_migrations(
             println!("  Restored sort key definition: {line}");
         }
     }
+
+    // Rewrite stored policies from dynamodb:ResourceTag to aws:ResourceTag,
+    // after the schema migrations. Every storage error is counted; on a
+    // non-zero count migrate reports it, does NOT record the completion
+    // marker, and exits non-zero, so the next run finishes the rewrite. No
+    // policy body is logged.
+    let rtag_applied = extenddb_storage::policy_migration::migrate_resource_tag_condition_keys(
+        mgmt.as_ref(),
+        true,
+    )
+    .await;
+    for r in &rtag_applied.rewritten {
+        println!(
+            "  Rewrote resource-tag keys: account {} {} policy {} ({} key(s))",
+            r.account_id, r.principal, r.policy_name, r.rewrites
+        );
+    }
+    for n in &rtag_applied.needs_attention {
+        println!(
+            "  NEEDS ATTENTION: account {} {} policy {} left unchanged (collision)",
+            n.account_id, n.principal, n.policy_name
+        );
+    }
+    if rtag_applied.errors > 0 {
+        anyhow::bail!(
+            "resource-tag migration incomplete: {} policy lookup(s) failed. \
+             Re-run `extenddb migrate --yes` to finish; the migration marker was not recorded.",
+            rtag_applied.errors
+        );
+    }
+    // A policy left unchanged because both resource-tag forms name the same
+    // tag key in one operator block is not migrated. Recording the marker
+    // would let serve evaluate it with the dynamodb: half absent, which can
+    // turn a Deny off. Withhold the marker so serve keeps refusing until the
+    // policy is fixed by hand and migrate is run again.
+    if !rtag_applied.needs_attention.is_empty() {
+        anyhow::bail!(
+            "resource-tag migration incomplete: {} policy(ies) above name both \
+             aws:ResourceTag/<key> and dynamodb:ResourceTag/<key> for the same key in one \
+             condition operator and were left unchanged. Remove one of the two forms from \
+             each, then re-run `extenddb migrate --yes`; the migration marker was not recorded.",
+            rtag_applied.needs_attention.len()
+        );
+    }
+    // Record the completion marker only after a clean rewrite. serve reads this
+    // row and refuses to start without it.
+    settings
+        .set_setting(
+            extenddb_core::settings_keys::RESOURCE_TAG_MIGRATION,
+            extenddb_core::settings_keys::RESOURCE_TAG_MIGRATION_DONE,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
     // Read new catalog version.
     let new = bootstrap

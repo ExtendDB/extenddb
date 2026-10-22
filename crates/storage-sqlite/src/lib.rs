@@ -88,6 +88,7 @@ pub fn backend() -> extenddb_storage::Backend {
         storage_config: config::deserialize_config,
         operations: &operations::SqliteOperationsEngine,
         settings_store: sqlite_settings_store_factory,
+        management_store: sqlite_management_store_factory,
         diagnostics_store: sqlite_diagnostics_store_factory,
         server_components: sqlite_server_components_factory,
     }
@@ -95,7 +96,8 @@ pub fn backend() -> extenddb_storage::Backend {
 
 use extenddb_storage::diagnostics::DiagnosticsStore;
 use extenddb_storage::diagnostics_store::DiagnosticsStoreError;
-use extenddb_storage::management_store::SettingsStore;
+use extenddb_storage::management_store::{ManagementStore, SettingsStore};
+use extenddb_storage::management_store_factory::ManagementStoreError;
 use extenddb_storage::settings_store::SettingsStoreError;
 
 use crate::sqlite_util::sqlite_url;
@@ -151,6 +153,20 @@ fn sqlite_settings_store_factory(
             .await
             .map_err(|e| SettingsStoreError::ConnectionFailed(e.to_string()))?;
         Ok(Box::new(SqliteCatalogStore::new(pool)) as Box<dyn SettingsStore>)
+    })
+}
+
+// ── Management store factory ───────────────────────────────────────────
+
+fn sqlite_management_store_factory(
+    connection_string: &str,
+) -> futures::future::BoxFuture<'static, Result<Box<dyn ManagementStore>, ManagementStoreError>> {
+    let connection_string = connection_string.to_owned();
+    Box::pin(async move {
+        let pool = catalog_pool(&connection_string)
+            .await
+            .map_err(|e| ManagementStoreError::ConnectionFailed(e.to_string()))?;
+        Ok(Box::new(SqliteCatalogStore::new(pool)) as Box<dyn ManagementStore>)
     })
 }
 

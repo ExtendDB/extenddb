@@ -438,8 +438,8 @@ caller omits the key. ExtendDB resolves `aws:PrincipalArn`, `aws:PrincipalAccoun
 `aws:ResourceAccount`, `aws:PrincipalType`, `aws:username` (for a user caller),
 `aws:userid`, `aws:SourceIp`, `aws:UserAgent`, `aws:SecureTransport`,
 `aws:RequestedRegion`, `aws:CurrentTime`, `aws:EpochTime`, `aws:ViaAWSService`,
-`aws:PrincipalIsAWSService`, `aws:PrincipalTag/<key>`, `aws:ResourceTag/<key>`
-and `dynamodb:ResourceTag/<key>` (tag keys matched case-insensitively) on a
+`aws:PrincipalIsAWSService`, `aws:PrincipalTag/<key>` and `aws:ResourceTag/<key>`
+(tag keys matched case-insensitively) on a
 data-plane request. Every other `aws:` global key is absent, which is what the
 service does for a key it does not populate for this caller and for an unknown
 key.
@@ -468,7 +468,7 @@ Resolved (evaluated against the request value):
 - `aws:ViaAWSService` and `aws:PrincipalIsAWSService` (both false for a direct
   caller).
 - `aws:PrincipalTag/<key>`, `aws:RequestTag/<key>` (trust path),
-  `aws:ResourceTag/<key>`, `dynamodb:ResourceTag/<key>`, `aws:TagKeys`,
+  `aws:ResourceTag/<key>`, `aws:TagKeys`,
   `sts:ExternalId` (trust path).
 - Role-session only (absent for an IAM user, matching the service):
   `aws:TokenIssueTime` (the session issue time) and
@@ -576,7 +576,8 @@ upgrading:
   fence a whole table adds `table/<name>/*` to the `Deny` alongside
   `table/<name>`.
 - **Index reads and resource tags.** An index Query or Scan evaluates the base
-  table's resource tags (`aws:ResourceTag/*` and `dynamodb:ResourceTag/*`),
+  table's resource tags (`aws:ResourceTag/*`; `dynamodb:ResourceTag/*` is
+  absent for every resource),
   because a secondary index inherits the tags of its table. An ABAC `Deny` or
   `Allow` conditioned on the table's tags applies to its indexes.
 - **Streams, backups, and resource tags.** An operation on a stream ARN

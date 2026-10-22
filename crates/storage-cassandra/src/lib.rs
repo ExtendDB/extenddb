@@ -215,6 +215,20 @@ pub fn backend() -> extenddb_storage::Backend {
                     >)
             })
         },
+        management_store: |connection_string| {
+            let connection_string = connection_string.to_string();
+            Box::pin(async move {
+                let catalog_store = make_catalog_store_from_connection_string(&connection_string)
+                    .await
+                    .map_err(
+                        extenddb_storage::management_store_factory::ManagementStoreError::ConnectionFailed,
+                    )?;
+                Ok(Box::new(catalog_store)
+                    as Box<
+                        dyn extenddb_storage::management_store::ManagementStore,
+                    >)
+            })
+        },
         diagnostics_store: |connection_string| {
             let connection_string = connection_string.to_string();
             Box::pin(async move {

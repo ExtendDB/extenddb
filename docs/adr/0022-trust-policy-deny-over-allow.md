@@ -118,7 +118,7 @@ implicitly denied.
   `User-Agent` header), `aws:ViaAWSService` and `aws:PrincipalIsAWSService`
   (both false for a direct caller), the tag keys (`aws:PrincipalTag/*`,
   `aws:RequestTag/*`, `aws:ResourceTag/*` on the identity path,
-  `dynamodb:ResourceTag/*`, each matched case-insensitively on the key),
+  each matched case-insensitively on the key),
   `sts:ExternalId` and `aws:TagKeys`, and, for a role-session caller only,
   `aws:TokenIssueTime` (the session issue time) and `aws:MultiFactorAuthPresent`
   (`false` for a session assumed without MFA), both absent for an IAM user.

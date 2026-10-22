@@ -361,7 +361,7 @@ Full set from v2.0 §6.5: StringEquals, StringLike, NumericEquals, DateEquals, B
 ### 8.3 DynamoDB Condition Keys
 
 - `aws:PrincipalTag/*` — from authenticated identity's tags
-- `dynamodb:ResourceTag/*` — from target table's tags
+- `aws:ResourceTag/*`, from target table's tags
 - `dynamodb:LeadingKeys` — partition key values being accessed
 - `dynamodb:Attributes` — attribute names being read/written
 - `dynamodb:Select`, `dynamodb:ReturnValues`, `dynamodb:ReturnConsumedCapacity`
