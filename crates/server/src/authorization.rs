@@ -87,6 +87,14 @@ async fn check_user_authorization(
 ) -> Result<(), DynamoDbError> {
     let action = format!("dynamodb:{operation}");
 
+    // Resource tags are stored under the table ARN. When the authorized
+    // resource is an index ARN, look its tags up under the base table so an
+    // index Query or Scan sees the table's tags (indexes inherit them), rather
+    // than an empty tag set that an ABAC Deny or Allow on the table's tags would
+    // miss. Other resources (streams, backups) are looked up unchanged.
+    let tag_arn = crate::authz_resource::resource_tag_lookup_arn(resource_arn);
+    let tag_lookup: &str = tag_arn.as_deref().unwrap_or(resource_arn);
+
     // Fetch all authz inputs concurrently; they are independent cache
     // lookups (or DB queries, on cold start). All come back pre-parsed.
     let (user_policies, group_policies, boundary, principal_tags, resource_tags, created_at) = tokio::try_join!(
@@ -94,7 +102,7 @@ async fn check_user_authorization(
         wrap_policies(cache.fetch_user_group_policies(account_id, user_name)),
         wrap_boundary(cache.fetch_user_boundary(account_id, user_name)),
         wrap_tags(cache.fetch_user_tags(account_id, user_name)),
-        wrap_tags(cache.fetch_resource_tags(resource_arn)),
+        wrap_tags(cache.fetch_resource_tags(tag_lookup)),
         wrap_created_at(cache.fetch_user_created_at(account_id, user_name)),
     )?;
 
@@ -183,6 +191,10 @@ async fn check_role_authorization(
 ) -> Result<(), DynamoDbError> {
     let action = format!("dynamodb:{operation}");
 
+    // Look index ARN tags up under the base table (see the user path).
+    let tag_arn = crate::authz_resource::resource_tag_lookup_arn(resource_arn);
+    let tag_lookup: &str = tag_arn.as_deref().unwrap_or(resource_arn);
+
     let (
         identity_policies,
         boundary,
@@ -193,7 +205,7 @@ async fn check_role_authorization(
         wrap_policies(cache.fetch_role_policies(account_id, role_name)),
         wrap_boundary(cache.fetch_role_boundary(account_id, role_name)),
         fetch_session_data_and_tags(cache, account_id, role_name, session_name),
-        wrap_tags(cache.fetch_resource_tags(resource_arn)),
+        wrap_tags(cache.fetch_resource_tags(tag_lookup)),
         wrap_created_at(cache.fetch_role_created_at(account_id, role_name)),
     )?;
 

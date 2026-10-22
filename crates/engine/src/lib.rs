@@ -58,6 +58,9 @@ pub use scan::handle_scan;
 pub use search_vectors::handle_search_vectors;
 pub use streams::{ShardIterator, decode_shard_iterator, encode_shard_iterator};
 pub use streams::{
+    SHARD_ITERATOR_EXPIRED_MESSAGE, ShardIteratorClass, classify_shard_iterator,
+};
+pub use streams::{
     handle_describe_stream, handle_get_records, handle_get_shard_iterator, handle_list_streams,
 };
 pub use tagging::{handle_list_tags_of_resource, handle_tag_resource, handle_untag_resource};

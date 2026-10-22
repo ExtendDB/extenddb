@@ -78,60 +78,29 @@ struct ResourceId {
 }
 
 /// Extract the resource identity (table name and optional sub-resource) from a
-/// `DynamoDB` ARN. Returns `None` for anything that is not a `table/...`
-/// resource. The partition, service, region, and account are intentionally
-/// ignored: only the resource identity is trusted from the input.
-///
-/// Stream labels contain `:` (e.g. `.../stream/2026-10-20T16:17:40.188`), so the
-/// resource portion is taken as everything after the fifth `:`.
+/// `DynamoDB` ARN, through the one shared parser ([`extenddb_core::arn::parse`]).
+/// Returns `None` for anything that is not a `table/...` resource. The
+/// partition, service, region, and account are intentionally ignored here: only
+/// the resource identity is trusted from the input, and authorization
+/// canonicalizes those fields to this deployment.
 fn parse_resource_identity(arn: &str) -> Option<ResourceId> {
-    let rest = arn.strip_prefix("arn:")?;
-    // partition : service : region : account : resource(may contain ':')
-    let mut it = rest.splitn(5, ':');
-    let _partition = it.next()?;
-    let _service = it.next()?;
-    let _region = it.next()?;
-    let _account = it.next()?;
-    let resource = it.next()?;
-
-    let tail = resource.strip_prefix("table/")?;
-    // `tail` is `<table>[/<kind>/<id...>]`. Table names contain no `/`. A
-    // trailing slash with nothing after it (`table/T/`) is treated as the bare
-    // table, matching the engine tag handler. An empty sub-resource id
-    // (`table/T/stream/`) is kept as an empty id, matching the engine stream
-    // parser, so an input the engine accepts is never authorized verbatim here.
-    let mut segs = tail.split('/');
-    let table = segs.next()?;
-    if table.is_empty() {
-        return None;
-    }
-    let sub = match segs.next() {
-        None | Some("") => None,
-        Some(kind) => {
-            let id = segs.collect::<Vec<&str>>().join("/");
-            match kind {
-                "index" => Some(Sub::Index(id)),
-                "stream" => Some(Sub::Stream(id)),
-                "backup" => Some(Sub::Backup(id)),
-                // An unrecognized sub-resource kind is not a nameable resource.
-                _ => return None,
-            }
-        }
-    };
+    let r = extenddb_core::arn::parse(arn)?;
+    let sub = r.sub.map(|s| match s {
+        extenddb_core::arn::SubResource::Index(i) => Sub::Index(i),
+        extenddb_core::arn::SubResource::Stream(s) => Sub::Stream(s),
+        extenddb_core::arn::SubResource::Backup(b) => Sub::Backup(b),
+    });
     Some(ResourceId {
-        table: table.to_owned(),
+        table: r.table,
         sub,
     })
 }
 
-/// Split an ARN into its (partition, service, region, account, resource)
-/// fields, ignoring nothing: the resource keeps any `:` and `/` it contains.
-/// Returns `None` when the string is not shaped like an ARN with five
-/// colon-separated fields after the `arn:` prefix.
-fn arn_fields(arn: &str) -> Option<(&str, &str, &str, &str, &str)> {
-    let rest = arn.strip_prefix("arn:")?;
-    let mut it = rest.splitn(5, ':');
-    Some((it.next()?, it.next()?, it.next()?, it.next()?, it.next()?))
+/// Split an ARN into its five fields through the one shared parser. Returns
+/// `None` when the string is not shaped like an ARN with five colon-separated
+/// fields after the `arn:` prefix.
+fn arn_fields(arn: &str) -> Option<extenddb_core::arn::ArnFields<'_>> {
+    extenddb_core::arn::fields(arn)
 }
 
 /// Build a canonical ARN for this deployment from a resource identity.
@@ -148,14 +117,203 @@ fn canonical(region: &str, account_id: &str, rid: &ResourceId) -> String {
     }
 }
 
-/// The canonical ARN for the resource a client-supplied ARN names, or the raw
-/// string when it does not name a `DynamoDB` `table/...` resource. The raw
-/// string lets an `Allow` on `*` reach the engine's own validation while never
-/// producing a `table/*` fallback that a specific Deny would miss.
-fn canonical_or_raw(arn: &str, region: &str, account_id: &str) -> String {
+/// The canonical ARN for a resource field that [`validate_operation_arns`] has
+/// already confirmed parses to the expected kind before authorization. The
+/// `unwrap_or_else` raw branch is a fail-closed default that the
+/// pre-authorization validation makes unreachable in request handling: it never
+/// produces a `table/*` wildcard a specific Deny would miss, and an input that
+/// does not parse is refused with ValidationException before this is reached.
+fn canonical_resource(arn: &str, region: &str, account_id: &str) -> String {
     match parse_resource_identity(arn) {
         Some(rid) => canonical(region, account_id, &rid),
         None => arn.to_owned(),
+    }
+}
+
+/// The resource ARN a tag operation authorizes against.
+///
+/// `validate_tag_resource_arn_shape` has already run: the value is a table ARN,
+/// a stream ARN, or a foreign-service ARN (an index, a backup, or a non-table
+/// `DynamoDB` ARN is rejected before authorization). A table or stream ARN is
+/// canonicalized to this deployment; a foreign-service ARN is left verbatim so
+/// authorization denies it, matching the service (measured, arn-1 table).
+fn tag_resource_arn(arn: &str, region: &str, account_id: &str) -> String {
+    match parse_resource_identity(arn) {
+        Some(rid @ ResourceId { sub: None, .. })
+        | Some(rid @ ResourceId { sub: Some(Sub::Stream(_)), .. }) => {
+            canonical(region, account_id, &rid)
+        }
+        // A foreign-service ARN (or, defensively, an index/backup the shape
+        // check already rejected): authorization denies it.
+        _ => arn.to_owned(),
+    }
+}
+
+/// The resource kind an ARN-bearing request field must name.
+#[derive(Clone, Copy)]
+enum ArnKind {
+    Table,
+    Stream,
+    Backup,
+}
+
+impl ArnKind {
+    fn field(self) -> &'static str {
+        match self {
+            ArnKind::Table => "TableArn",
+            ArnKind::Stream => "StreamArn",
+            ArnKind::Backup => "BackupArn",
+        }
+    }
+}
+
+/// Refuse, with ValidationException before the IAM decision, an ARN field whose
+/// value does not parse to the expected resource kind.
+fn require_arn_kind(arn: &str, kind: ArnKind) -> Result<(), DynamoDbError> {
+    let ok = matches!(
+        (parse_resource_identity(arn), kind),
+        (
+            Some(ResourceId { sub: None, .. }),
+            ArnKind::Table
+        ) | (
+            Some(ResourceId {
+                sub: Some(Sub::Stream(_)),
+                ..
+            }),
+            ArnKind::Stream
+        ) | (
+            Some(ResourceId {
+                sub: Some(Sub::Backup(_)),
+                ..
+            }),
+            ArnKind::Backup
+        )
+    );
+    if ok {
+        Ok(())
+    } else {
+        // The exact message DynamoDB returns for each field is unmeasured (see
+        // the report's Unmeasured section); the parent changes it in one place
+        // here. A single predictable ValidationException before the IAM
+        // decision is the safe behaviour.
+        Err(DynamoDbError::ValidationException(format!(
+            "Invalid {}: {arn}",
+            kind.field()
+        )))
+    }
+}
+
+/// Validate every ARN-bearing field an operation carries to the resource kind
+/// the operation takes, before the IAM decision, so authorization and the
+/// engine never resolve different resources from the same field. An absent or
+/// empty field is left to the normal path. Tag operations keep their own
+/// measured shape check (`validate_tag_resource_arn_shape`); `GetRecords` is
+/// handled through its iterator by [`getrecords_resource`].
+pub(crate) fn validate_operation_arns(
+    operation: &str,
+    input: &Value,
+) -> Result<(), DynamoDbError> {
+    let present = |key: &str| {
+        input
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+    };
+    match operation {
+        "DescribeStream" | "GetShardIterator" => {
+            if let Some(arn) = present("StreamArn") {
+                require_arn_kind(arn, ArnKind::Stream)?;
+            }
+        }
+        "DescribeBackup" | "DeleteBackup" | "RestoreTableFromBackup" => {
+            if let Some(arn) = present("BackupArn") {
+                require_arn_kind(arn, ArnKind::Backup)?;
+            }
+        }
+        // Export names its source table in TableArn, which must be exactly a
+        // table ARN: a sub-resource or an appended segment would let the engine
+        // resolve a different table than authorization checked.
+        "ExportTableToPointInTime" => {
+            if let Some(arn) = present("TableArn") {
+                require_arn_kind(arn, ArnKind::Table)?;
+            }
+        }
+        // SourceTableArn, when given as an ARN, must be a bare table ARN.
+        // SourceTableName is a bare name and is left to the normal path.
+        "RestoreTableToPointInTime" => {
+            if let Some(arn) = present("SourceTableArn") {
+                require_arn_kind(arn, ArnKind::Table)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// When the authorized resource is an index ARN, the ARN the resource tags are
+/// stored under: the base table ARN. Returns `None` for any other resource, so
+/// the caller looks tags up under the resource ARN unchanged.
+///
+/// Secondary indexes inherit their table's tags (DynamoDB developer guide,
+/// attribute-based-access-control), but nothing is stored under an index ARN,
+/// so `aws:ResourceTag/*` and `dynamodb:ResourceTag/*` would be absent for an
+/// index `Query` or `Scan` and an ABAC Deny or Allow on the table's tags would
+/// not apply to its indexes. Streams carry their own tags and are left
+/// unchanged (see the report's Unmeasured section for backups).
+pub(crate) fn resource_tag_lookup_arn(resource_arn: &str) -> Option<String> {
+    let f = extenddb_core::arn::fields(resource_arn)?;
+    match parse_resource_identity(resource_arn) {
+        Some(ResourceId {
+            table,
+            sub: Some(Sub::Index(_)),
+        }) => Some(format!(
+            "arn:{}:{}:{}:{}:table/{table}",
+            f.partition, f.service, f.region, f.account
+        )),
+        _ => None,
+    }
+}
+
+/// How `GetRecords` must answer its shard iterator, with the stream resource
+/// already canonicalized for authorization.
+pub(crate) enum GetRecordsResource {
+    /// Authorize against this canonical stream ARN.
+    Stream(String),
+    /// A pre-upgrade iterator: answer ExpiredIteratorException before authz.
+    Expired,
+    /// Answer "Invalid ShardIterator" ValidationException before authz.
+    Invalid,
+}
+
+/// Resolve the stream resource a `GetRecords` request authorizes against from
+/// its shard iterator, classifying a pre-upgrade or undecodable token.
+///
+/// The iterator is decoded once by the engine
+/// ([`extenddb_engine::classify_shard_iterator`]). A current token's stream ARN
+/// is canonicalized through the shared parser; a decoded stream ARN that does
+/// not parse to a stream is refused as Invalid rather than authorized verbatim,
+/// so no respelled or forged stream ARN is served.
+pub(crate) fn getrecords_resource(
+    input: &Value,
+    region: &str,
+    account_id: &str,
+) -> GetRecordsResource {
+    let token = input
+        .get("ShardIterator")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match extenddb_engine::classify_shard_iterator(token) {
+        extenddb_engine::ShardIteratorClass::Stream(arn) => match parse_resource_identity(&arn) {
+            Some(
+                rid @ ResourceId {
+                    sub: Some(Sub::Stream(_)),
+                    ..
+                },
+            ) => GetRecordsResource::Stream(canonical(region, account_id, &rid)),
+            _ => GetRecordsResource::Invalid,
+        },
+        extenddb_engine::ShardIteratorClass::Expired => GetRecordsResource::Expired,
+        extenddb_engine::ShardIteratorClass::Invalid => GetRecordsResource::Invalid,
     }
 }
 
@@ -221,7 +379,7 @@ pub(crate) fn validate_tag_resource_arn_shape(arn: &str) -> Result<(), DynamoDbE
             // Not a table/... resource. A DynamoDB-service ARN is reported as
             // not a DynamoDB resource; a foreign-service ARN is left to
             // authorization, which denies it (measured live).
-            if arn_fields(arn).map(|f| f.1) == Some(SERVICE) {
+            if arn_fields(arn).map(|f| f.service) == Some(SERVICE) {
                 Err(DynamoDbError::ValidationException(format!(
                     "One or more parameter values were invalid: Provided Arn is not a \
                      DynamoDB resource arn: {arn}"
@@ -233,22 +391,7 @@ pub(crate) fn validate_tag_resource_arn_shape(arn: &str) -> Result<(), DynamoDbE
     }
 }
 
-/// The canonical stream ARN a GetRecords request reads, decoded from its shard
-/// iterator token. Returns `None` when the iterator field is absent, does not
-/// decode, or carries no stream ARN (a token issued by a build before the
-/// stream ARN was carried, or a forged token); `authorize_request` then answers
-/// with the service's "Invalid ShardIterator" ValidationException.
-pub(crate) fn getrecords_stream_resource(
-    input: &Value,
-    region: &str,
-    account_id: &str,
-) -> Option<String> {
-    let token = input.get("ShardIterator").and_then(Value::as_str)?;
-    let decoded = extenddb_engine::decode_shard_iterator(token)?;
-    let stream_arn = decoded.stream_arn?;
-    Some(canonical_or_raw(&stream_arn, region, account_id))
-}
-
+/// A string request field, owned, or `None` when absent or not a string.
 fn str_field(input: &Value, key: &str) -> Option<String> {
     input
         .get(key)
@@ -272,14 +415,15 @@ pub(crate) fn authz_targets(
     let one = |resource: String| vec![(operation.to_owned(), resource)];
 
     match operation {
-        // Resource lives in ResourceArn (a table or stream ARN).
-        "TagResource" | "UntagResource" | "ListTagsOfResource" => one(canonical_or_raw(
+        // Resource lives in ResourceArn (a table or stream ARN; a foreign ARN
+        // passes the shape check and is denied by authorization).
+        "TagResource" | "UntagResource" | "ListTagsOfResource" => one(tag_resource_arn(
             &str_field(input, "ResourceArn").unwrap_or_default(),
             region,
             account_id,
         )),
-        // Resource lives in StreamArn.
-        "DescribeStream" | "GetShardIterator" => one(canonical_or_raw(
+        // Resource lives in StreamArn, validated to a stream before authz.
+        "DescribeStream" | "GetShardIterator" => one(canonical_resource(
             &str_field(input, "StreamArn").unwrap_or_default(),
             region,
             account_id,
@@ -305,8 +449,8 @@ pub(crate) fn authz_targets(
             };
             one(res)
         }
-        // Resource lives in BackupArn.
-        "DescribeBackup" | "DeleteBackup" => one(canonical_or_raw(
+        // Resource lives in BackupArn, validated to a backup before authz.
+        "DescribeBackup" | "DeleteBackup" => one(canonical_resource(
             &str_field(input, "BackupArn").unwrap_or_default(),
             region,
             account_id,
@@ -358,7 +502,7 @@ pub(crate) fn authz_targets(
         "RestoreTableFromBackup" => {
             let mut v = vec![(
                 operation.to_owned(),
-                canonical_or_raw(
+                canonical_resource(
                     &str_field(input, "BackupArn").unwrap_or_default(),
                     region,
                     account_id,
@@ -439,11 +583,11 @@ fn table_name_only(value: &str) -> String {
 /// ARN is returned unchanged, so the lookup finds no table and the engine
 /// handles the request exactly as it would without this helper.
 pub(crate) fn key_lookup_name(value: &str, region: &str, account_id: &str) -> String {
-    if let Some((partition, service, arn_region, account, _)) = arn_fields(value)
-        && partition == PARTITION
-        && service == SERVICE
-        && arn_region == region
-        && account == account_id
+    if let Some(f) = arn_fields(value)
+        && f.partition == PARTITION
+        && f.service == SERVICE
+        && f.region == region
+        && f.account == account_id
         && let Some(rid) = parse_resource_identity(value)
         && rid.sub.is_none()
     {
@@ -791,135 +935,260 @@ mod tests {
         );
     }
 
-    // Differential corpus: every stream ARN the engine's parser accepts must be
-    // canonicalized by the authorization parser to the same table and label.
-    // If the engine accepted an input the authz parser rejected,
-    // `canonical_or_raw` would authorize the raw string and a Deny on the real
-    // resource would be skipped. The engine stream parser is the storage crate's
-    // `parse_stream_arn`.
+    // One differential corpus for every entry point that turns an ARN into a
+    // resource identity. All of them now route through the single shared parser
+    // `extenddb_core::arn`: authorization (`parse_resource_identity`), the
+    // export table resolver and both tagging parsers (`extenddb_core::arn`
+    // directly), the backup account split (`extenddb_core::arn::fields`), and
+    // the engine stream resolver (`extenddb_storage::util::parse_stream_arn`).
+    // The corpus asserts they agree on (table, sub-resource) or all refuse, so
+    // no respelling exists that one layer resolves and another does not. This is
+    // the property whose absence let the A2 bypass (`xrn:` authorized as the raw
+    // string, served as the real stream) and the A1 bypass (export reading a
+    // different table than authorization checked) happen.
     #[test]
-    fn authz_parser_canonicalizes_every_engine_accepted_stream_arn() {
+    fn every_arn_entry_point_agrees_or_all_refuse() {
+        use extenddb_core::arn::{self, SubResource};
         use extenddb_storage::util::parse_stream_arn;
+
+        // Inputs spanning: non-`arn` prefixes, empty fields, repeated `table/`
+        // segments, appended sub-resources on every kind, unknown kinds,
+        // trailing slashes, empty ids, foreign partition/service/region/account,
+        // colons in stream labels, and `/` inside ids.
         let corpus = [
-            "arn:aws:dynamodb:us-east-1:123:table/T/stream/2026-10-20T16:17:40.188",
-            // respelled partition, service, region, account
-            "arn:aws-cn:dynamodb:us-east-1:123:table/T/stream/2026-10-20T16:17:40.188",
-            "arn:aws:s3:us-east-1:123:table/T/stream/2026-10-20T16:17:40.188",
-            "arn:aws:dynamodb:eu-west-1:123:table/T/stream/2026-10-20T16:17:40.188",
-            "arn:aws:dynamodb:us-east-1:999999999999:table/T/stream/2026-10-20T16:17:40.188",
-            // extra path segments and a label containing '/'
-            "arn:aws:dynamodb:us-east-1:123:table/T/stream/a/b",
-            // trailing slash, empty label
-            "arn:aws:dynamodb:us-east-1:123:table/T/stream/",
-            // uppercase resource type and leading whitespace (engine rejects)
-            "arn:aws:dynamodb:us-east-1:123:Table/T/stream/x",
-            "arn:aws:dynamodb:us-east-1:123: table/T/stream/x",
-            // not a stream at all
-            "arn:aws:dynamodb:us-east-1:123:table/T",
             "banana",
+            "xrn:aws:dynamodb:us-east-1:1:table/T/stream/2026-10-20T16:17:40.188",
+            ":aws:dynamodb:us-east-1:1:table/T",
+            "arn:aws::us-east-1:1:table/T",
+            "arn:aws:dynamodb::1:table/T",
+            "arn:aws:dynamodb:us-east-1::table/T",
+            "arn:aws:dynamodb:us-east-1:1:table/T",
+            "arn:aws:dynamodb:us-east-1:1:table/allowed/stream/table/secret",
+            "arn:aws:dynamodb:us-east-1:1:table/a/table/b",
+            "arn:aws:dynamodb:us-east-1:1:table/T/index/gsi1",
+            "arn:aws:dynamodb:us-east-1:1:table/T/index/gsi1/extra",
+            "arn:aws:dynamodb:us-east-1:1:table/T/stream/2026-10-20T16:17:40.188",
+            "arn:aws:dynamodb:us-east-1:1:table/T/stream/a/b",
+            "arn:aws:dynamodb:us-east-1:1:table/T/backup/01-ab",
+            "arn:aws:dynamodb:us-east-1:1:table/T/weird/x",
+            "arn:aws:dynamodb:us-east-1:1:table/",
+            "arn:aws:dynamodb:us-east-1:1:table/T/",
+            "arn:aws:dynamodb:us-east-1:1:table/T/stream/",
+            "arn:aws-cn:dynamodb:us-east-1:1:table/T/stream/2026-10-20T16:17:40.188",
+            "arn:aws:s3:us-east-1:1:table/T/stream/2026-10-20T16:17:40.188",
+            "arn:aws:dynamodb:eu-west-1:1:table/T/backup/01-ab",
+            "arn:aws:dynamodb:us-east-1:999999999999:table/T",
         ];
+
         for input in corpus {
-            if let Ok((table, label)) = parse_stream_arn(input) {
-                let rid = parse_resource_identity(input).unwrap_or_else(|| {
-                    panic!("engine accepted {input} but authz parser rejected it")
-                });
-                assert_eq!(rid.table, table, "table mismatch for {input}");
-                assert_eq!(
-                    rid.sub,
-                    Some(Sub::Stream(label.clone())),
-                    "label mismatch for {input}"
-                );
-                assert_eq!(
-                    canonical("us-east-1", "964157134968", &rid),
-                    format!("arn:aws:dynamodb:us-east-1:964157134968:table/{table}/stream/{label}"),
-                    "canonical mismatch for {input}"
+            let core = arn::parse(input);
+
+            // Authorization's parser wraps the shared parser: they agree on
+            // (table, sub-resource) for every input.
+            let authz = parse_resource_identity(input);
+            match (&core, &authz) {
+                (None, None) => {}
+                (Some(c), Some(a)) => {
+                    assert_eq!(a.table, c.table, "authz table mismatch for {input}");
+                    let want_sub = c.sub.clone().map(|s| match s {
+                        SubResource::Index(i) => Sub::Index(i),
+                        SubResource::Stream(s) => Sub::Stream(s),
+                        SubResource::Backup(b) => Sub::Backup(b),
+                    });
+                    assert_eq!(a.sub, want_sub, "authz sub mismatch for {input}");
+                }
+                _ => panic!("authz and core parser disagree on {input}"),
+            }
+
+            // The engine stream resolver accepts an input iff the shared parser
+            // yields a stream, with the same table and label.
+            match (&core, parse_stream_arn(input)) {
+                (
+                    Some(arn::TableResource {
+                        table,
+                        sub: Some(SubResource::Stream(label)),
+                        ..
+                    }),
+                    Ok((t, l)),
+                ) => {
+                    assert_eq!(&t, table, "stream table mismatch for {input}");
+                    assert_eq!(&l, label, "stream label mismatch for {input}");
+                }
+                (Some(arn::TableResource { sub: Some(SubResource::Stream(_)), .. }), Err(_)) => {
+                    panic!("shared parser accepted stream but engine rejected it: {input}")
+                }
+                (_, Ok(_)) => panic!("engine resolved a non-stream input as a stream: {input}"),
+                (_, Err(_)) => {}
+            }
+
+            // The export table resolver accepts an input iff the shared parser
+            // yields a bare table (no sub-resource); a repeated `table/` segment
+            // or any sub-resource is refused, so it cannot read a different
+            // table than authorization canonicalized.
+            let export_ok = matches!(
+                core,
+                Some(arn::TableResource { sub: None, .. })
+            );
+            if input == "arn:aws:dynamodb:us-east-1:1:table/allowed/stream/table/secret" {
+                assert!(!export_ok, "export must refuse the A1 bypass ARN");
+            }
+
+            // Canonicalization closes the respelling bypass: every parseable
+            // resource maps to this deployment's partition, service, region, and
+            // account, so a Deny on the real resource is always evaluated
+            // against the real resource.
+            if let Some(rid) = &authz {
+                let c = canonical("us-east-1", "964157134968", rid);
+                assert!(
+                    c.starts_with("arn:aws:dynamodb:us-east-1:964157134968:table/"),
+                    "canonical did not pin deployment fields for {input}: {c}"
                 );
             }
         }
+
+        // The two bypass inputs that motivated this round, stated explicitly.
+        // `xrn:` is refused everywhere (A2): authorization rejects it and the
+        // engine stream resolver rejects it, so it is never authorized as the
+        // raw string nor served.
+        assert!(parse_resource_identity("xrn:aws:dynamodb:us-east-1:1:table/T/stream/x").is_none());
+        assert!(parse_stream_arn("xrn:aws:dynamodb:us-east-1:1:table/T/stream/x").is_err());
+
+        // The export A1 input parses as a STREAM (table `allowed`, label
+        // `table/secret`): under the old code authorization canonicalized it to
+        // table `allowed` while the engine's `rsplit_once("table/")` exported
+        // `secret`. It is not a bare table, so export now refuses it before
+        // authorization, and the engine export resolver refuses it too.
+        let a1 = "arn:aws:dynamodb:us-east-1:1:table/allowed/stream/table/secret";
+        assert!(!matches!(
+            arn::parse(a1),
+            Some(arn::TableResource { sub: None, .. })
+        ));
+        assert!(matches!(
+            validate_operation_arns("ExportTableToPointInTime", &json!({ "TableArn": a1 })),
+            Err(DynamoDbError::ValidationException(_))
+        ));
     }
 
-    // Backup and table ARNs: the engine's backup resolver does not parse the
-    // ARN into components; it reads the account field (field 4) and the backend
-    // matches the whole stored ARN exactly (WHERE backup_arn = ? AND account_id
-    // = ?). So the bypass is closed by two things, not by a shared parser: this
-    // layer canonicalizes the partition, service, region, and account before a
-    // Deny is evaluated, and the backend matches the exact stored ARN. This test
-    // pins the canonicalization half for backup and table ARNs: every respelling
-    // of a backup or table ARN resolves to the same table and sub-resource and
-    // canonicalizes to this deployment's ARN, so a Deny on the real resource is
-    // always evaluated against the real resource.
     #[test]
-    fn authz_parser_canonicalizes_backup_and_table_arns() {
-        let region = "us-east-1";
-        let account = "964157134968";
-        // (input, expected table, expected sub)
-        let cases = [
-            // backup ARN, exact and respelled in each field the engine ignores
-            (
-                "arn:aws:dynamodb:us-east-1:964157134968:table/bb/backup/01-ab",
-                "bb",
-                Some(Sub::Backup("01-ab".to_owned())),
-            ),
-            (
-                "arn:aws-cn:dynamodb:us-east-1:964157134968:table/bb/backup/01-ab",
-                "bb",
-                Some(Sub::Backup("01-ab".to_owned())),
-            ),
-            (
-                "arn:aws:s3:us-east-1:964157134968:table/bb/backup/01-ab",
-                "bb",
-                Some(Sub::Backup("01-ab".to_owned())),
-            ),
-            (
-                "arn:aws:dynamodb:eu-west-1:964157134968:table/bb/backup/01-ab",
-                "bb",
-                Some(Sub::Backup("01-ab".to_owned())),
-            ),
-            (
-                "arn:aws:dynamodb:us-east-1:111111111111:table/bb/backup/01-ab",
-                "bb",
-                Some(Sub::Backup("01-ab".to_owned())),
-            ),
-            // table ARN, exact and respelled
-            (
-                "arn:aws:dynamodb:us-east-1:964157134968:table/bb",
-                "bb",
-                None,
-            ),
-            (
-                "arn:aws-cn:dynamodb:eu-west-1:111111111111:table/bb",
-                "bb",
-                None,
-            ),
-        ];
-        for (input, table, sub) in cases {
-            let rid = parse_resource_identity(input)
-                .unwrap_or_else(|| panic!("authz parser rejected {input}"));
-            assert_eq!(rid.table, table, "table mismatch for {input}");
-            assert_eq!(rid.sub, sub, "sub mismatch for {input}");
-            let want = match &sub {
-                Some(Sub::Backup(b)) => {
-                    format!("arn:aws:dynamodb:{region}:{account}:table/{table}/backup/{b}")
-                }
-                None => format!("arn:aws:dynamodb:{region}:{account}:table/{table}"),
-                _ => unreachable!(),
-            };
-            assert_eq!(
-                canonical(region, account, &rid),
-                want,
-                "canonical mismatch for {input}"
-            );
-        }
-        // The engine backup resolver reads only the account field (ARN field 4)
-        // and denies a mismatch; canonicalization here uses the deployment's
-        // account, so a respelled account cannot resolve to another account's
-        // backup while evading a Deny on the real one.
+    fn validate_operation_arns_refuses_wrong_kind_before_authz() {
+        let bad = |op: &str, input: Value| {
+            matches!(
+                validate_operation_arns(op, &input),
+                Err(DynamoDbError::ValidationException(_))
+            )
+        };
+        let ok = |op: &str, input: Value| validate_operation_arns(op, &input).is_ok();
+
+        // Export: a sub-resource or a repeated segment on TableArn is refused
+        // (A1); an exact table ARN passes.
+        assert!(bad(
+            "ExportTableToPointInTime",
+            json!({ "TableArn": "arn:aws:dynamodb:us-east-1:1:table/allowed/stream/table/secret" })
+        ));
+        assert!(bad(
+            "ExportTableToPointInTime",
+            json!({ "TableArn": "arn:aws:dynamodb:us-east-1:1:table/t/index/g" })
+        ));
+        assert!(ok(
+            "ExportTableToPointInTime",
+            json!({ "TableArn": "arn:aws:dynamodb:us-east-1:1:table/t" })
+        ));
+
+        // Stream reads: a non-`arn` prefix or a non-stream resource is refused
+        // (A2); a stream ARN passes.
+        assert!(bad(
+            "DescribeStream",
+            json!({ "StreamArn": "xrn:aws:dynamodb:us-east-1:1:table/t/stream/x" })
+        ));
+        assert!(bad(
+            "GetShardIterator",
+            json!({ "StreamArn": "arn:aws:dynamodb:us-east-1:1:table/t" })
+        ));
+        assert!(ok(
+            "DescribeStream",
+            json!({ "StreamArn": "arn:aws:dynamodb:us-east-1:1:table/t/stream/2026-10-20T16:17:40.188" })
+        ));
+
+        // Backup ops: a table ARN where a backup ARN is required is refused.
+        assert!(bad(
+            "DescribeBackup",
+            json!({ "BackupArn": "arn:aws:dynamodb:us-east-1:1:table/t" })
+        ));
+        assert!(ok(
+            "DeleteBackup",
+            json!({ "BackupArn": "arn:aws:dynamodb:us-east-1:1:table/t/backup/01-ab" })
+        ));
+
+        // An absent or empty field is left to the normal path.
+        assert!(ok("ExportTableToPointInTime", json!({})));
+        assert!(ok("DescribeStream", json!({ "StreamArn": "" })));
+    }
+
+    #[test]
+    fn resource_tag_lookup_arn_maps_index_to_base_table_only() {
+        // An index ARN resolves its tags under the base table ARN.
         assert_eq!(
-            "arn:aws:dynamodb:us-east-1:111111111111:table/bb/backup/01-ab"
-                .split(':')
-                .nth(4),
-            Some("111111111111")
+            resource_tag_lookup_arn("arn:aws:dynamodb:us-east-1:1:table/bb/index/gsi1").as_deref(),
+            Some("arn:aws:dynamodb:us-east-1:1:table/bb")
         );
+        // A table, stream, or backup ARN is looked up unchanged (None).
+        assert_eq!(
+            resource_tag_lookup_arn("arn:aws:dynamodb:us-east-1:1:table/bb"),
+            None
+        );
+        assert_eq!(
+            resource_tag_lookup_arn(
+                "arn:aws:dynamodb:us-east-1:1:table/bb/stream/2026-10-20T16:17:40.188"
+            ),
+            None
+        );
+        assert_eq!(
+            resource_tag_lookup_arn("arn:aws:dynamodb:us-east-1:1:table/bb/backup/01-ab"),
+            None
+        );
+        assert_eq!(resource_tag_lookup_arn("arn:aws:dynamodb:us-east-1:1:table/*"), None);
+    }
+
+    #[test]
+    fn getrecords_resource_classifies_and_canonicalizes() {
+        // A current token authorizes against its canonical stream ARN.
+        let stream = "arn:aws:dynamodb:us-east-1:1:table/T/stream/2026-10-20T16:17:40.188";
+        let tok = extenddb_engine::encode_shard_iterator(
+            "shardId-1",
+            "AFTER_SEQUENCE_NUMBER",
+            "42",
+            1000,
+            stream,
+        );
+        match getrecords_resource(&json!({ "ShardIterator": tok }), R, A) {
+            GetRecordsResource::Stream(arn) => assert_eq!(
+                arn,
+                "arn:aws:dynamodb:us-east-1:964157134968:table/T/stream/2026-10-20T16:17:40.188"
+            ),
+            _ => panic!("expected Stream"),
+        }
+        // A token that carries no stream ARN but a parseable timestamp is the
+        // pre-upgrade shape; it is Expired.
+        let old = extenddb_engine::encode_shard_iterator(
+            "shardId-2",
+            "AFTER_SEQUENCE_NUMBER",
+            "7",
+            1000,
+            "",
+        );
+        assert!(matches!(
+            getrecords_resource(&json!({ "ShardIterator": old }), R, A),
+            GetRecordsResource::Expired
+        ));
+        // Garbage and an absent iterator are Invalid.
+        assert!(matches!(
+            getrecords_resource(&json!({ "ShardIterator": "!!!" }), R, A),
+            GetRecordsResource::Invalid
+        ));
+        assert!(matches!(
+            getrecords_resource(&json!({}), R, A),
+            GetRecordsResource::Invalid
+        ));
     }
 }
 

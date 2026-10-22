@@ -61,20 +61,21 @@ pub fn table_arn(region: &str, account_id: &str, table_name: &str) -> String {
 ///
 /// Stream ARNs contain ISO 8601 timestamps with colons in the stream label,
 /// e.g. `arn:aws:dynamodb:us-east-1:<account-id>:table/T/stream/2026-04-08T08:40:22`.
-/// We use `splitn(6, ':')` so the 6th element preserves everything after the 5th
-/// colon delimiter, including colons within the stream label.
+/// Parsing goes through [`extenddb_core::arn::parse`], the one parser shared
+/// with request validation and authorization, so a string the engine resolves
+/// to a stream is exactly a string authorization canonicalizes to the same
+/// stream. A missing `arn:` prefix, fewer than five fields, or a resource that
+/// is not `table/<name>/stream/<label>` is rejected.
 pub fn parse_stream_arn(arn: &str) -> Result<(String, String), StorageError> {
-    let segments: Vec<&str> = arn.splitn(6, ':').collect();
-    let resource = segments
-        .get(5)
-        .ok_or_else(|| StorageError::Validation(format!("Invalid stream ARN: {arn}")))?;
-    let parts: Vec<&str> = resource.splitn(4, '/').collect();
-    if parts.len() == 4 && parts[0] == "table" && parts[2] == "stream" {
-        Ok((parts[1].to_owned(), parts[3].to_owned()))
-    } else {
-        Err(StorageError::Validation(format!(
+    match extenddb_core::arn::parse(arn) {
+        Some(extenddb_core::arn::TableResource {
+            table,
+            sub: Some(extenddb_core::arn::SubResource::Stream(label)),
+            ..
+        }) => Ok((table, label)),
+        _ => Err(StorageError::Validation(format!(
             "Invalid stream ARN format: {arn}"
-        )))
+        ))),
     }
 }
 

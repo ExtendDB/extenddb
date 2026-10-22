@@ -13,33 +13,6 @@ use crate::OperationContext;
 use crate::sanitize_storage_error;
 use crate::serialize_output;
 
-/// Split a `DynamoDB` resource ARN into `(region, account, resource)`.
-///
-/// Expected format: `arn:aws:dynamodb:{region}:{account}:table/{name}[/...]`
-fn split_dynamodb_arn(arn: &str) -> Option<(&str, &str, &str)> {
-    let rest = arn.strip_prefix("arn:aws:dynamodb:")?;
-    let mut parts = rest.splitn(3, ':');
-    let region = parts.next()?;
-    let account = parts.next()?;
-    let resource = parts.next()?;
-    Some((region, account, resource))
-}
-
-/// Split any ARN into `(partition, service, region, account, resource)`. The
-/// resource keeps any `:` and `/` it contains. Returns `None` when the string
-/// does not have the five colon-separated fields after the `arn:` prefix.
-fn arn_fields(arn: &str) -> Option<(&str, &str, &str, &str, &str)> {
-    let rest = arn.strip_prefix("arn:")?;
-    let mut parts = rest.splitn(5, ':');
-    Some((
-        parts.next()?,
-        parts.next()?,
-        parts.next()?,
-        parts.next()?,
-        parts.next()?,
-    ))
-}
-
 /// True for a `table/...` resource whose sub-resource is anything other than a
 /// stream (an index, a backup, or an unknown kind). Tags are accepted only on a
 /// table or a stream.
@@ -52,13 +25,15 @@ fn tag_subresource_not_table_or_stream(resource: &str) -> bool {
     !matches!(segs.next(), None | Some("") | Some("stream"))
 }
 
-/// Extract the table name from a `DynamoDB` table ARN.
+/// Extract the table name from a `DynamoDB` table ARN, using the one shared
+/// resource parser ([`extenddb_core::arn::fields`]) so this layer splits an ARN
+/// the same way authorization and the engine stream resolver do.
 ///
 /// Expected format: `arn:aws:dynamodb:{region}:{account}:table/{name}[/...]`
 fn extract_table_name_from_arn(arn: &str) -> Option<&str> {
-    let (_, _, resource) = split_dynamodb_arn(arn)?;
+    let resource = extenddb_core::arn::fields(arn)?.resource;
     let table_name = resource.strip_prefix("table/")?;
-    // Strip any sub-resource (e.g. /index/foo, /stream/label)
+    // Strip any sub-resource (e.g. /index/foo, /stream/label).
     Some(table_name.split('/').next().unwrap_or(table_name))
 }
 
@@ -91,7 +66,14 @@ async fn validate_resource_arn(arn: &str, ctx: &OperationContext) -> Result<(), 
 
     // A string that is not shaped like an ARN (fewer than the five
     // colon-separated fields) is denied rather than reported as malformed.
-    let Some((partition, service, region, account, resource)) = arn_fields(arn) else {
+    let Some(extenddb_core::arn::ArnFields {
+        partition,
+        service,
+        region,
+        account,
+        resource,
+    }) = extenddb_core::arn::fields(arn)
+    else {
         return Err(DynamoDbError::AccessDeniedException(
             "Access is denied".to_owned(),
         ));

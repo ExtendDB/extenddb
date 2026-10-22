@@ -164,6 +164,13 @@ pub async fn handle_get_shard_iterator(
 /// Shard iterator expiration: 15 minutes (900 seconds), matching real `DynamoDB`.
 const SHARD_ITERATOR_EXPIRY_SECS: u64 = 900;
 
+/// The message `DynamoDB` returns for an expired shard iterator. Shared so the
+/// authorization layer answers a pre-upgrade iterator with the same text the
+/// engine uses when a current iterator ages out.
+pub const SHARD_ITERATOR_EXPIRED_MESSAGE: &str = "The shard iterator has expired and can no longer be \
+     used to retrieve stream records. A new shard iterator \
+     must be obtained by calling GetShardIterator.";
+
 /// A decoded shard iterator token.
 ///
 /// The token is base64 of `shard_id|type|seq|created_at|stream_arn`, joined by
@@ -214,6 +221,45 @@ pub fn decode_shard_iterator(encoded: &str) -> Option<ShardIterator> {
     })
 }
 
+/// How `GetRecords` must answer a shard iterator, decided before authorization.
+#[derive(Debug)]
+pub enum ShardIteratorClass {
+    /// A current-format token carrying the stream ARN it reads.
+    Stream(String),
+    /// A token issued by a build before the stream ARN was carried in the
+    /// token: it decodes to exactly the four pre-upgrade fields with a
+    /// parseable timestamp and no stream ARN. Answered with
+    /// `ExpiredIteratorException` so a stream client renews it, rather than the
+    /// non-retryable "Invalid ShardIterator" that would break every consumer
+    /// reading across the upgrade.
+    Expired,
+    /// A token that does not decode, or decodes to neither of the above.
+    Invalid,
+}
+
+/// Classify a `GetRecords` shard iterator for the authorization layer, before
+/// the resource is authorized.
+///
+/// A current token carries its stream ARN. A token with no stream ARN but the
+/// four pre-upgrade fields and a parseable timestamp is an old-format iterator
+/// ([`ShardIteratorClass::Expired`]). Anything that does not decode, or decodes
+/// to fewer fields or an unparseable timestamp, is
+/// [`ShardIteratorClass::Invalid`].
+#[must_use]
+pub fn classify_shard_iterator(token: &str) -> ShardIteratorClass {
+    match decode_shard_iterator(token) {
+        None => ShardIteratorClass::Invalid,
+        Some(it) => match it.stream_arn {
+            Some(arn) => ShardIteratorClass::Stream(arn),
+            // No stream ARN: an old-format token carries the four pre-upgrade
+            // fields with a parseable timestamp (created_at present); a shorter
+            // or unparseable token stays Invalid.
+            None if it.created_at.is_some() => ShardIteratorClass::Expired,
+            None => ShardIteratorClass::Invalid,
+        },
+    }
+}
+
 /// Handle `GetRecords`.
 ///
 /// Decodes the shard iterator, checks expiration, reads records, and returns
@@ -242,10 +288,7 @@ pub async fn handle_get_records(
             .as_secs();
         if now.saturating_sub(created_at) > SHARD_ITERATOR_EXPIRY_SECS {
             return Err(DynamoDbError::ExpiredIteratorException(
-                "The shard iterator has expired and can no longer be \
-                     used to retrieve stream records. A new shard iterator \
-                     must be obtained by calling GetShardIterator."
-                    .to_owned(),
+                SHARD_ITERATOR_EXPIRED_MESSAGE.to_owned(),
             ));
         }
     }
@@ -370,5 +413,50 @@ mod tests {
 
         // Garbage does not decode.
         assert!(super::decode_shard_iterator("!!!not base64!!!").is_none());
+    }
+
+    fn b64(s: &str) -> String {
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, s)
+    }
+
+    #[test]
+    fn classify_current_token_is_stream() {
+        let stream = "arn:aws:dynamodb:us-east-1:1:table/T/stream/2026-10-20T16:17:40.188";
+        let enc = super::encode_shard_iterator("shardId-1", "AFTER_SEQUENCE_NUMBER", "42", 1000, stream);
+        match super::classify_shard_iterator(&enc) {
+            super::ShardIteratorClass::Stream(arn) => assert_eq!(arn, stream),
+            other => panic!("expected Stream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_old_format_four_fields_is_expired() {
+        // Four pre-upgrade fields with a parseable timestamp, no stream ARN.
+        let old = b64("shardId-2|AFTER_SEQUENCE_NUMBER|7|1000");
+        assert!(matches!(
+            super::classify_shard_iterator(&old),
+            super::ShardIteratorClass::Expired
+        ));
+    }
+
+    #[test]
+    fn classify_undecodable_or_short_or_unparseable_is_invalid() {
+        // Not base64.
+        assert!(matches!(
+            super::classify_shard_iterator("!!!not base64!!!"),
+            super::ShardIteratorClass::Invalid
+        ));
+        // Three fields: decodes but is not the old four-field shape.
+        let three = b64("shardId-3|AFTER_SEQUENCE_NUMBER|7");
+        assert!(matches!(
+            super::classify_shard_iterator(&three),
+            super::ShardIteratorClass::Invalid
+        ));
+        // Four fields but an unparseable timestamp.
+        let bad_ts = b64("shardId-4|AFTER_SEQUENCE_NUMBER|7|notanumber");
+        assert!(matches!(
+            super::classify_shard_iterator(&bad_ts),
+            super::ShardIteratorClass::Invalid
+        ));
     }
 }
