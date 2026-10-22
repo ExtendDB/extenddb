@@ -41,7 +41,7 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 | Maximum item size | 400 KB (409,600 bytes) | Enforced | `LimitsConfig::max_item_size_bytes`, validated on PutItem and post-UpdateItem |
 | Partition key size | 1–2,048 bytes | Enforced | `validate_key_sizes`, `LimitsConfig::max_partition_key_size_bytes`            |
 | Sort key size | 1–1,024 bytes | Enforced | `validate_key_sizes`, `LimitsConfig::max_sort_key_size_bytes`                 |
-| Attribute name size | 1–64 KB (65,535 bytes) | Partial | `validate_attribute_name_sizes`, `LimitsConfig::max_attribute_name_bytes`; top-level names and nested map keys at every depth, on PutItem, BatchWriteItem.PutRequest, TransactWriteItems.Put, and ImportTable. Not enforced on UpdateItem or TransactWriteItems.Update at any level. |
+| Attribute name size | 1 to 65,535 bytes (64 KB) | Enforced | `validate_attribute_name_sizes`, `validate_expression_attribute_name_sizes`, `validate_attribute_updates_name_sizes`, `LimitsConfig::max_attribute_name_bytes`; UTF-8 bytes, top-level names and map keys at every depth. PutItem, BatchWriteItem.PutRequest, TransactWriteItems.Put and ImportTable check the item. PutItem, UpdateItem, DeleteItem and every TransactWriteItems member (Put, Update, Delete, ConditionCheck) check every `ExpressionAttributeNames` value and every map key inside every `ExpressionAttributeValues` value; UpdateItem also checks the names and values of `AttributeUpdates`. PutItem and UpdateItem report the name ahead of the table lookup; UpdateItem also reports it ahead of the condition and the index-key checks. TransactWriteItems checks every member, and BatchWriteItem every PutRequest, before any table lookup, so neither a missing table (in any member) nor a PutRequest item missing its key is reported first; a transaction fails as a whole with a top-level ValidationException. With an over-limit name in both expression maps, UpdateItem reports the `ExpressionAttributeNames` placeholder and a transacted Update or Put reports the `ExpressionAttributeValues` placeholder; a transacted Put with a long item name and a long `ExpressionAttributeNames` value reports the placeholder, a standalone PutItem the item. The message depends on the request form (`AttributeNameRequestForm`): PutItem, UpdateItem and DeleteItem answer `1 validation error detected: Attribute name is too large, must be less than 65536 bytes`, followed by ` for key #n` when the name came through `ExpressionAttributeNames`; a TransactWriteItems member answers `ExpressionAttributeNames contains invalid value: Attribute name is too large, must be less than 65536 bytes for key #n`, or `ExpressionAttributeValues contains invalid value: ... for key :v` for a map key inside a value; TransactWriteItems.Put and BatchWriteItem.PutRequest answer `Attribute name is too large, must be less than 65536 bytes` for a name in the item. |
 | Attribute nesting depth | 32 levels | Enforced | `validate_item_nesting_depth`, applied on PutItem, UpdateItem, BatchWriteItem.PutRequest, TransactWriteItems.Put, ImportTable |
 | Number of attributes per item | No practical limit | Enforced | ExtendDB has no per-item attribute count limit                                |
 
@@ -151,7 +151,7 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 |----------|----------|---------|--------------|-----|
 | Throughput | 5 | 0 | 1 | 2 |
 | Tables | 4 | 0 | 0 | 0 |
-| Items | 5 | 1 | 0 | 0 |
+| Items | 6 | 0 | 0 | 0 |
 | Secondary Indexes | 4 | 0 | 2 | 0 |
 | Query/Scan | 2 | 0 | 5 | 0 |
 | Batch Operations | 3 | 0 | 2 | 0 |
@@ -161,7 +161,7 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 | Import/Export/Backup | 0 | 0 | 0 | 8 |
 | Global Tables | 0 | 0 | 0 | 2 |
 | Contributor Insights | 0 | 0 | 0 | 1 |
-| **Total** | **28** | **1** | **17** | **14** |
+| **Total** | **29** | **0** | **17** | **14** |
 
 ### Unenforced Limits Requiring Tracking
 
