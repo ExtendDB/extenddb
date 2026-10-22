@@ -164,12 +164,12 @@ pub async fn handle_get_shard_iterator(
 /// Shard iterator expiration: 15 minutes (900 seconds), matching real `DynamoDB`.
 const SHARD_ITERATOR_EXPIRY_SECS: u64 = 900;
 
-/// The message `DynamoDB` returns for an expired shard iterator. Shared so the
+/// The message `DynamoDB` returns for an expired shard iterator (measured live,
+/// `live-r2/iter-live.json`: an iterator 990 seconds old returns
+/// `ExpiredIteratorException` with exactly this text). Shared so the
 /// authorization layer answers a pre-upgrade iterator with the same text the
-/// engine uses when a current iterator ages out.
-pub const SHARD_ITERATOR_EXPIRED_MESSAGE: &str = "The shard iterator has expired and can no longer be \
-     used to retrieve stream records. A new shard iterator \
-     must be obtained by calling GetShardIterator.";
+/// engine uses when a current iterator ages out, so both match the service.
+pub const SHARD_ITERATOR_EXPIRED_MESSAGE: &str = "Shard iterator has expired";
 
 /// A decoded shard iterator token.
 ///

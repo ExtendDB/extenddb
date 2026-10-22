@@ -259,7 +259,7 @@ class TestExplicitDenyOnResourceArn:
                 s.get_records(ShardIterator=old_token)
             err = exc.value.response["Error"]
             assert err["Code"] == "ExpiredIteratorException", (policy, err)
-            assert "shard iterator has expired" in err.get("Message", ""), (policy, err)
+            assert err.get("Message") == "Shard iterator has expired", (policy, err)
 
     def test_getrecords_undecodable_iterator_is_invalid(self, table):
         # A token that does not decode (random base64, or a non-base64 string)
@@ -710,3 +710,122 @@ class TestIndexResourceTagAuthorization:
         self._base_query(d, tagged_table["name"])
         self._index_query(d, tagged_table["name"])
         self._index_scan(d, tagged_table["name"])
+
+
+class TestArnKindValidationMessages:
+    """ARN-field validation before the IAM decision, measured on live DynamoDB
+    (security-2026-10-20/bounty/live-r2/arn-kinds-live.json).
+
+    Stream and backup fields are validated strictly before authorization: a
+    table ARN, an xrn: ARN, or an empty partition gives ValidationException
+    'Invalid StreamArn' / 'Invalid Backup ARN', for a no-permissions principal
+    and an admin alike. An export TableArn is validated loosely: only an
+    unparseable value is refused before authorization ('tableArn is not a valid
+    ARN'); a well-formed stream ARN of the wrong kind is authorized against that
+    stream ARN (a no-permissions principal is denied naming it) and the export
+    handler then refuses it ('Invalid Request: Table ARN is invalid.').
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup(self, auth_env, mgmt, account_id, region):
+        self.endpoint = auth_env[0]
+        self.mgmt = mgmt
+        self.account_id = account_id
+        self.region = region
+
+    def _ddb(self, policy: dict, service: str = "dynamodb"):
+        ak, sk = _user_with_policy(self.mgmt, self.account_id, policy)
+        return _client(self.endpoint, ak, sk, self.region, service)
+
+    def _tarn(self, name: str = "t") -> str:
+        return f"arn:aws:dynamodb:{self.region}:{self.account_id}:table/{name}"
+
+    def _assert_validation(self, fn, msg: str):
+        with pytest.raises(ClientError) as exc:
+            fn()
+        err = exc.value.response["Error"]
+        assert err["Code"] == "ValidationException", err
+        assert err.get("Message") == msg, err
+
+    def _assert_denied(self, fn):
+        with pytest.raises(ClientError) as exc:
+            fn()
+        assert exc.value.response["Error"]["Code"] == "AccessDeniedException", (
+            exc.value.response["Error"]
+        )
+
+    # -- stream reads: strict, 'Invalid StreamArn' before authz --
+
+    def test_describe_stream_wrong_kind_is_invalid_streamarn(self):
+        for policy in (ALLOW_ALL, {"Version": "2012-10-17", "Statement": []}):
+            s = self._ddb(policy, "dynamodbstreams")
+            for arn in [
+                self._tarn(),  # a table ARN
+                "xrn:aws:dynamodb:" + self.region + ":" + self.account_id + ":table/t/stream/x",
+                "arn::dynamodb:" + self.region + ":" + self.account_id + ":table/t/stream/x",
+            ]:
+                self._assert_validation(
+                    lambda a=arn, c=s: c.describe_stream(StreamArn=a), "Invalid StreamArn")
+
+    def test_get_shard_iterator_table_arn_is_invalid_streamarn(self):
+        s = self._ddb(ALLOW_ALL, "dynamodbstreams")
+        self._assert_validation(
+            lambda: s.get_shard_iterator(
+                StreamArn=self._tarn(), ShardId="shardId-0", ShardIteratorType="TRIM_HORIZON"),
+            "Invalid StreamArn")
+
+    # -- backup ops: strict, 'Invalid Backup ARN' before authz --
+
+    def test_describe_backup_wrong_kind_is_invalid_backup_arn(self):
+        for policy in (ALLOW_ALL, {"Version": "2012-10-17", "Statement": []}):
+            d = self._ddb(policy)
+            for arn in [
+                self._tarn(),
+                "xrn:aws:dynamodb:" + self.region + ":" + self.account_id + ":table/t/backup/01-ab",
+            ]:
+                self._assert_validation(
+                    lambda a=arn, c=d: c.describe_backup(BackupArn=a), "Invalid Backup ARN")
+
+    def test_delete_backup_table_arn_is_invalid_backup_arn(self):
+        d = self._ddb(ALLOW_ALL)
+        self._assert_validation(
+            lambda: d.delete_backup(BackupArn=self._tarn()), "Invalid Backup ARN")
+
+    # -- export: unparseable refused before authz; well-formed wrong-kind after --
+
+    def test_export_unparseable_tablearn_is_refused_before_authz(self):
+        # Refused for a no-permissions principal and an admin alike, before the
+        # IAM decision. Includes the A1 bypass ARN (repeated table/ segment).
+        for arn in [
+            self._tarn("allowed") + "/stream/table/secret",  # A1 bypass
+            self._tarn("a") + "/index/table/b",
+            "table/x",
+            "xrn:aws:dynamodb:" + self.region + ":" + self.account_id + ":table/t",
+        ]:
+            for policy in (ALLOW_ALL, {"Version": "2012-10-17", "Statement": []}):
+                d = self._ddb(policy)
+                self._assert_validation(
+                    lambda a=arn, c=d: c.export_table_to_point_in_time(
+                        TableArn=a, S3Bucket="b"),
+                    "One or more parameter values were invalid: tableArn is not a valid ARN")
+
+    def test_export_wellformed_stream_arn_is_authorized_then_refused(self):
+        # A well-formed stream ARN of the wrong kind is NOT refused before
+        # authorization: authorization runs against the stream ARN as given.
+        stream = self._tarn("t") + "/stream/2026-01-01T00:00:00.000"
+        # No-permissions principal: authorization ran, so AccessDenied (not a
+        # pre-authz ValidationException). The exact 'Invalid Request: Table ARN
+        # is invalid.' message the handler returns to an authorized principal is
+        # covered by the extract_table_name_from_arn unit test; the export
+        # handler's "export disabled" guard can mask it on a server without
+        # export paths configured, so the admin branch here only confirms the
+        # request passed authorization (a ValidationException, never an
+        # AccessDeniedException).
+        noperm = self._ddb({"Version": "2012-10-17", "Statement": []})
+        self._assert_denied(
+            lambda: noperm.export_table_to_point_in_time(TableArn=stream, S3Bucket="b"))
+        admin = self._ddb(ALLOW_ALL)
+        with pytest.raises(ClientError) as exc:
+            admin.export_table_to_point_in_time(TableArn=stream, S3Bucket="b")
+        assert exc.value.response["Error"]["Code"] == "ValidationException", (
+            exc.value.response["Error"])

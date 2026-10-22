@@ -152,65 +152,77 @@ fn tag_resource_arn(arn: &str, region: &str, account_id: &str) -> String {
     }
 }
 
-/// The resource kind an ARN-bearing request field must name.
+/// The resource kind a strictly validated ARN-bearing request field must name.
+/// Only stream and backup fields are validated before authorization; an export
+/// `TableArn` is checked only for parseability (see `validate_operation_arns`).
 #[derive(Clone, Copy)]
 enum ArnKind {
-    Table,
     Stream,
     Backup,
 }
 
-impl ArnKind {
-    fn field(self) -> &'static str {
-        match self {
-            ArnKind::Table => "TableArn",
-            ArnKind::Stream => "StreamArn",
-            ArnKind::Backup => "BackupArn",
-        }
-    }
-}
+/// Messages DynamoDB returns, before the IAM decision, for a request field
+/// whose ARN is not a valid resource ARN of the kind the field requires
+/// (measured live, `live-r2/arn-kinds-live.json`).
+const INVALID_STREAM_ARN_MESSAGE: &str = "Invalid StreamArn";
+const INVALID_BACKUP_ARN_MESSAGE: &str = "Invalid Backup ARN";
+const INVALID_EXPORT_TABLE_ARN_MESSAGE: &str =
+    "One or more parameter values were invalid: tableArn is not a valid ARN";
 
-/// Refuse, with ValidationException before the IAM decision, an ARN field whose
-/// value does not parse to the expected resource kind.
-fn require_arn_kind(arn: &str, kind: ArnKind) -> Result<(), DynamoDbError> {
-    let ok = matches!(
+/// True when `arn` is a well-formed DynamoDB resource ARN of `kind`: it parses
+/// to that kind and its partition, service, region, and account are all
+/// non-empty. The field checks catch an empty-partition ARN
+/// (`arn::dynamodb:...`), which the service rejects with `Invalid StreamArn`.
+fn arn_is_kind(arn: &str, kind: ArnKind) -> bool {
+    let Some(f) = extenddb_core::arn::fields(arn) else {
+        return false;
+    };
+    if f.partition.is_empty() || f.service.is_empty() || f.region.is_empty() || f.account.is_empty()
+    {
+        return false;
+    }
+    matches!(
         (parse_resource_identity(arn), kind),
-        (Some(ResourceId { sub: None, .. }), ArnKind::Table)
-            | (
-                Some(ResourceId {
-                    sub: Some(Sub::Stream(_)),
-                    ..
-                }),
-                ArnKind::Stream
-            )
-            | (
-                Some(ResourceId {
-                    sub: Some(Sub::Backup(_)),
-                    ..
-                }),
-                ArnKind::Backup
-            )
-    );
-    if ok {
-        Ok(())
-    } else {
-        // The exact message DynamoDB returns for each field is unmeasured (see
-        // the report's Unmeasured section); the parent changes it in one place
-        // here. A single predictable ValidationException before the IAM
-        // decision is the safe behaviour.
-        Err(DynamoDbError::ValidationException(format!(
-            "Invalid {}: {arn}",
-            kind.field()
-        )))
-    }
+        (
+            Some(ResourceId {
+                sub: Some(Sub::Stream(_)),
+                ..
+            }),
+            ArnKind::Stream
+        ) | (
+            Some(ResourceId {
+                sub: Some(Sub::Backup(_)),
+                ..
+            }),
+            ArnKind::Backup
+        )
+    )
 }
 
-/// Validate every ARN-bearing field an operation carries to the resource kind
-/// the operation takes, before the IAM decision, so authorization and the
-/// engine never resolve different resources from the same field. An absent or
-/// empty field is left to the normal path. Tag operations keep their own
-/// measured shape check (`validate_tag_resource_arn_shape`); `GetRecords` is
-/// handled through its iterator by [`getrecords_resource`].
+/// Validate ARN-bearing fields before the IAM decision, matching the service
+/// (measured live, `live-r2/arn-kinds-live.json`).
+///
+/// The two field families differ, as the service does:
+///
+/// - `StreamArn` (DescribeStream, GetShardIterator) and `BackupArn`
+///   (DescribeBackup, DeleteBackup) are validated strictly: a value that is not
+///   a well-formed stream (resp. backup) ARN of the correct kind, including a
+///   table ARN, an `xrn:` ARN, or an empty partition, is refused before
+///   authorization with `Invalid StreamArn` (resp. `Invalid Backup ARN`).
+/// - An export `TableArn` is validated loosely: only an UNPARSEABLE value (a
+///   repeated `table/` segment such as `.../table/a/stream/table/b`, a bare
+///   `table/x`, or an `xrn:` ARN) is refused before authorization, with
+///   `tableArn is not a valid ARN`. A well-formed DynamoDB ARN of the wrong
+///   kind (a real stream or index ARN) is NOT refused here: it is authorized
+///   against its canonical form (preserving its kind, so authorization and the
+///   engine agree on the resource) and the export handler then refuses it with
+///   `Invalid Request: Table ARN is invalid.`
+///
+/// `RestoreTableFromBackup` and `RestoreTableToPointInTime` carry no pre-authz
+/// ARN check: a wrong-kind source is authorized first (so a no-permissions
+/// principal is denied) and the engine refuses it afterwards. Tag operations
+/// keep their own measured shape check (`validate_tag_resource_arn_shape`);
+/// `GetRecords` is handled through its iterator by [`getrecords_resource`].
 pub(crate) fn validate_operation_arns(operation: &str, input: &Value) -> Result<(), DynamoDbError> {
     let present = |key: &str| {
         input
@@ -220,28 +232,34 @@ pub(crate) fn validate_operation_arns(operation: &str, input: &Value) -> Result<
     };
     match operation {
         "DescribeStream" | "GetShardIterator" => {
-            if let Some(arn) = present("StreamArn") {
-                require_arn_kind(arn, ArnKind::Stream)?;
+            if let Some(arn) = present("StreamArn")
+                && !arn_is_kind(arn, ArnKind::Stream)
+            {
+                return Err(DynamoDbError::ValidationException(
+                    INVALID_STREAM_ARN_MESSAGE.to_owned(),
+                ));
             }
         }
-        "DescribeBackup" | "DeleteBackup" | "RestoreTableFromBackup" => {
-            if let Some(arn) = present("BackupArn") {
-                require_arn_kind(arn, ArnKind::Backup)?;
+        "DescribeBackup" | "DeleteBackup" => {
+            if let Some(arn) = present("BackupArn")
+                && !arn_is_kind(arn, ArnKind::Backup)
+            {
+                return Err(DynamoDbError::ValidationException(
+                    INVALID_BACKUP_ARN_MESSAGE.to_owned(),
+                ));
             }
         }
-        // Export names its source table in TableArn, which must be exactly a
-        // table ARN: a sub-resource or an appended segment would let the engine
-        // resolve a different table than authorization checked.
+        // Export: refuse only an unparseable TableArn here. A well-formed ARN of
+        // the wrong kind goes through authorization against its canonical form
+        // and is refused by the export handler, so authorization never runs
+        // against a different table than the engine would read.
         "ExportTableToPointInTime" => {
-            if let Some(arn) = present("TableArn") {
-                require_arn_kind(arn, ArnKind::Table)?;
-            }
-        }
-        // SourceTableArn, when given as an ARN, must be a bare table ARN.
-        // SourceTableName is a bare name and is left to the normal path.
-        "RestoreTableToPointInTime" => {
-            if let Some(arn) = present("SourceTableArn") {
-                require_arn_kind(arn, ArnKind::Table)?;
+            if let Some(arn) = present("TableArn")
+                && extenddb_core::arn::parse(arn).is_none()
+            {
+                return Err(DynamoDbError::ValidationException(
+                    INVALID_EXPORT_TABLE_ARN_MESSAGE.to_owned(),
+                ));
             }
         }
         _ => {}
@@ -479,8 +497,13 @@ pub(crate) fn authz_targets(
             };
             one(res)
         }
-        // Export names the source table via TableArn.
-        "ExportTableToPointInTime" => one(table_resource_arn(
+        // Export names its source in TableArn. Authorize against the canonical
+        // form of the ARN as given, preserving its kind: a well-formed stream or
+        // index ARN is authorized against that stream/index ARN (the service
+        // does the same, measured live), and the export handler then refuses a
+        // non-table ARN. Unparseable TableArns were already refused before
+        // authorization by `validate_operation_arns`.
+        "ExportTableToPointInTime" => one(canonical_resource(
             &str_field(input, "TableArn").unwrap_or_default(),
             region,
             account_id,
@@ -1055,75 +1078,106 @@ mod tests {
         assert!(parse_resource_identity("xrn:aws:dynamodb:us-east-1:1:table/T/stream/x").is_none());
         assert!(parse_stream_arn("xrn:aws:dynamodb:us-east-1:1:table/T/stream/x").is_err());
 
-        // The export A1 input parses as a STREAM (table `allowed`, label
-        // `table/secret`): under the old code authorization canonicalized it to
+        // The export A1 bypass input `.../table/allowed/stream/table/secret` is
+        // a repeated `table/` segment, so it does not parse (the id would
+        // contain `/`). Under the old code authorization canonicalized it to
         // table `allowed` while the engine's `rsplit_once("table/")` exported
-        // `secret`. It is not a bare table, so export now refuses it before
-        // authorization, and the engine export resolver refuses it too.
+        // `secret`. It is now unparseable, so export refuses it before
+        // authorization with the service's "not a valid ARN" message.
         let a1 = "arn:aws:dynamodb:us-east-1:1:table/allowed/stream/table/secret";
-        assert!(!matches!(
-            arn::parse(a1),
-            Some(arn::TableResource { sub: None, .. })
-        ));
+        assert!(arn::parse(a1).is_none());
         assert!(matches!(
             validate_operation_arns("ExportTableToPointInTime", &json!({ "TableArn": a1 })),
-            Err(DynamoDbError::ValidationException(_))
+            Err(DynamoDbError::ValidationException(ref m)) if m == INVALID_EXPORT_TABLE_ARN_MESSAGE
         ));
     }
 
     #[test]
-    fn validate_operation_arns_refuses_wrong_kind_before_authz() {
-        let bad = |op: &str, input: Value| {
-            matches!(
-                validate_operation_arns(op, &input),
-                Err(DynamoDbError::ValidationException(_))
-            )
+    fn validate_operation_arns_matches_measured_live_behaviour() {
+        let err_msg = |op: &str, input: Value| match validate_operation_arns(op, &input) {
+            Err(DynamoDbError::ValidationException(m)) => Some(m),
+            Ok(()) => None,
+            other => panic!("unexpected {other:?}"),
         };
-        let ok = |op: &str, input: Value| validate_operation_arns(op, &input).is_ok();
 
-        // Export: a sub-resource or a repeated segment on TableArn is refused
-        // (A1); an exact table ARN passes.
-        assert!(bad(
-            "ExportTableToPointInTime",
-            json!({ "TableArn": "arn:aws:dynamodb:us-east-1:1:table/allowed/stream/table/secret" })
-        ));
-        assert!(bad(
-            "ExportTableToPointInTime",
-            json!({ "TableArn": "arn:aws:dynamodb:us-east-1:1:table/t/index/g" })
-        ));
-        assert!(ok(
-            "ExportTableToPointInTime",
-            json!({ "TableArn": "arn:aws:dynamodb:us-east-1:1:table/t" })
-        ));
+        // Export: only an UNPARSEABLE TableArn is refused before authz, with the
+        // "tableArn is not a valid ARN" message (repeated table/ segments, a
+        // bare name, an xrn: ARN). A well-formed stream or index ARN is NOT
+        // refused here: it is authorized against its canonical form and the
+        // export handler refuses it afterwards.
+        for arn in [
+            "arn:aws:dynamodb:us-east-1:1:table/a/stream/table/b",
+            "arn:aws:dynamodb:us-east-1:1:table/a/index/table/b",
+            "table/x",
+            "xrn:aws:dynamodb:us-east-1:1:table/t",
+        ] {
+            assert_eq!(
+                err_msg("ExportTableToPointInTime", json!({ "TableArn": arn })).as_deref(),
+                Some(INVALID_EXPORT_TABLE_ARN_MESSAGE),
+                "export should refuse unparseable {arn} before authz"
+            );
+        }
+        for arn in [
+            "arn:aws:dynamodb:us-east-1:1:table/t",
+            "arn:aws:dynamodb:us-east-1:1:table/t/stream/2026-10-20T16:17:40.188",
+            "arn:aws:dynamodb:us-east-1:1:table/t/index/g",
+        ] {
+            assert_eq!(
+                err_msg("ExportTableToPointInTime", json!({ "TableArn": arn })),
+                None,
+                "export should NOT refuse well-formed {arn} before authz"
+            );
+        }
 
-        // Stream reads: a non-`arn` prefix or a non-stream resource is refused
-        // (A2); a stream ARN passes.
-        assert!(bad(
-            "DescribeStream",
-            json!({ "StreamArn": "xrn:aws:dynamodb:us-east-1:1:table/t/stream/x" })
-        ));
-        assert!(bad(
-            "GetShardIterator",
-            json!({ "StreamArn": "arn:aws:dynamodb:us-east-1:1:table/t" })
-        ));
-        assert!(ok(
-            "DescribeStream",
-            json!({ "StreamArn": "arn:aws:dynamodb:us-east-1:1:table/t/stream/2026-10-20T16:17:40.188" })
-        ));
+        // Stream reads: a table ARN, an xrn: ARN, and an empty partition are all
+        // refused before authz with exactly "Invalid StreamArn"; a stream ARN
+        // passes.
+        for arn in [
+            "arn:aws:dynamodb:us-east-1:1:table/t",
+            "xrn:aws:dynamodb:us-east-1:1:table/t/stream/x",
+            "arn::dynamodb:us-east-1:1:table/t/stream/x",
+        ] {
+            for op in ["DescribeStream", "GetShardIterator"] {
+                assert_eq!(
+                    err_msg(op, json!({ "StreamArn": arn })).as_deref(),
+                    Some(INVALID_STREAM_ARN_MESSAGE),
+                    "{op} should refuse {arn}"
+                );
+            }
+        }
+        assert_eq!(
+            err_msg(
+                "DescribeStream",
+                json!({ "StreamArn": "arn:aws:dynamodb:us-east-1:1:table/t/stream/2026-10-20T16:17:40.188" })
+            ),
+            None
+        );
 
-        // Backup ops: a table ARN where a backup ARN is required is refused.
-        assert!(bad(
-            "DescribeBackup",
-            json!({ "BackupArn": "arn:aws:dynamodb:us-east-1:1:table/t" })
-        ));
-        assert!(ok(
-            "DeleteBackup",
-            json!({ "BackupArn": "arn:aws:dynamodb:us-east-1:1:table/t/backup/01-ab" })
-        ));
+        // Backup ops: a table ARN and an xrn: ARN are refused before authz with
+        // exactly "Invalid Backup ARN"; a backup ARN passes.
+        for arn in [
+            "arn:aws:dynamodb:us-east-1:1:table/t",
+            "xrn:aws:dynamodb:us-east-1:1:table/t/backup/01-ab",
+        ] {
+            for op in ["DescribeBackup", "DeleteBackup"] {
+                assert_eq!(
+                    err_msg(op, json!({ "BackupArn": arn })).as_deref(),
+                    Some(INVALID_BACKUP_ARN_MESSAGE),
+                    "{op} should refuse {arn}"
+                );
+            }
+        }
+        assert_eq!(
+            err_msg(
+                "DeleteBackup",
+                json!({ "BackupArn": "arn:aws:dynamodb:us-east-1:1:table/t/backup/01-ab" })
+            ),
+            None
+        );
 
         // An absent or empty field is left to the normal path.
-        assert!(ok("ExportTableToPointInTime", json!({})));
-        assert!(ok("DescribeStream", json!({ "StreamArn": "" })));
+        assert_eq!(err_msg("ExportTableToPointInTime", json!({})), None);
+        assert_eq!(err_msg("DescribeStream", json!({ "StreamArn": "" })), None);
     }
 
     #[test]

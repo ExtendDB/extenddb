@@ -70,48 +70,59 @@ pub fn fields(arn: &str) -> Option<ArnFields<'_>> {
 /// Parse an ARN that names a `DynamoDB` table resource.
 ///
 /// Returns `Some` only for
-/// `arn:<partition>:<service>:<region>:<account>:table/<name>[/<kind>/<id...>]`
+/// `arn:<partition>:<service>:<region>:<account>:table/<name>` or
+/// `arn:<partition>:<service>:<region>:<account>:table/<name>/<kind>/<id>`
 /// with a non-empty table name and, when a sub-resource is present, a known
-/// kind (`index`, `stream`, or `backup`). Returns `None` for a missing `arn:`
-/// prefix, fewer than five fields, a resource that is not `table/...`, an empty
-/// table name, or an unknown sub-resource kind.
-///
-/// A trailing slash directly after the table (`table/T/`) is the bare table. An
-/// empty sub-resource id (`table/T/stream/`) is kept as an empty id, and a
-/// sub-resource id may itself contain `/` (`table/T/stream/a/b` has id `a/b`),
-/// so the set of streams this accepts is exactly the set the engine stream
-/// resolver accepts.
+/// kind (`index`, `stream`, or `backup`). The resource must split into exactly
+/// one segment (bare table) or three (table, kind, id); any other shape is
+/// `None`. Returns `None` for a missing `arn:` prefix, fewer than five fields,
+/// a resource that is not `table/...`, an empty table name, an unknown
+/// sub-resource kind, a trailing slash (`table/T/`), an empty sub-resource id
+/// (`table/T/stream/`), a repeated `table/` segment
+/// (`table/a/stream/table/b`), or an id that itself contains `/`
+/// (`table/T/stream/a/b`). Real stream labels, index names, and backup ids
+/// carry no `/`, so this is the service's notion of a well-formed resource ARN.
 #[must_use]
 pub fn parse(arn: &str) -> Option<TableResource> {
     let f = fields(arn)?;
     let tail = f.resource.strip_prefix("table/")?;
-    // `tail` is `<table>[/<kind>/<id...>]`. Table names contain no `/`.
-    let mut segs = tail.split('/');
-    let table = segs.next()?;
-    if table.is_empty() {
-        return None;
-    }
-    let sub = match segs.next() {
-        None | Some("") => None,
-        Some(kind) => {
-            let id = segs.collect::<Vec<&str>>().join("/");
-            match kind {
-                "index" => Some(SubResource::Index(id)),
-                "stream" => Some(SubResource::Stream(id)),
-                "backup" => Some(SubResource::Backup(id)),
+    // `tail` is `<table>` or `<table>/<kind>/<id>`. Table names, kinds, and ids
+    // contain no `/`, so the resource splits into exactly 1 segment (a bare
+    // table) or 3 (table, kind, id). Any other count, including a repeated
+    // `table/` segment or an id that itself contains `/`, is not a well-formed
+    // DynamoDB resource ARN and is rejected. Real stream labels are timestamps,
+    // index names and backup ids carry no `/`, so nothing legitimate is lost,
+    // and the engine stream resolver (built on this) rejects exactly what the
+    // service treats as malformed.
+    let segs: Vec<&str> = tail.split('/').collect();
+    match segs.as_slice() {
+        [table] if !table.is_empty() => Some(TableResource {
+            partition: f.partition.to_owned(),
+            service: f.service.to_owned(),
+            region: f.region.to_owned(),
+            account: f.account.to_owned(),
+            table: (*table).to_owned(),
+            sub: None,
+        }),
+        [table, kind, id] if !table.is_empty() && !id.is_empty() => {
+            let sub = match *kind {
+                "index" => SubResource::Index((*id).to_owned()),
+                "stream" => SubResource::Stream((*id).to_owned()),
+                "backup" => SubResource::Backup((*id).to_owned()),
                 // An unrecognized sub-resource kind is not a nameable resource.
                 _ => return None,
-            }
+            };
+            Some(TableResource {
+                partition: f.partition.to_owned(),
+                service: f.service.to_owned(),
+                region: f.region.to_owned(),
+                account: f.account.to_owned(),
+                table: (*table).to_owned(),
+                sub: Some(sub),
+            })
         }
-    };
-    Some(TableResource {
-        partition: f.partition.to_owned(),
-        service: f.service.to_owned(),
-        region: f.region.to_owned(),
-        account: f.account.to_owned(),
-        table: table.to_owned(),
-        sub,
-    })
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -175,26 +186,23 @@ mod tests {
     }
 
     #[test]
-    fn trailing_slash_is_bare_table_and_empty_id_is_empty() {
+    fn trailing_slash_empty_id_and_inner_slashes_are_rejected() {
+        // A trailing slash, an empty sub-resource id, a repeated table/
+        // segment, and an id containing '/' are all malformed: the resource
+        // must split into exactly one or three non-empty-table segments.
+        assert_eq!(parse("arn:aws:dynamodb:us-east-1:1:table/T/"), None);
+        assert_eq!(parse("arn:aws:dynamodb:us-east-1:1:table/T/stream/"), None);
         assert_eq!(
-            parse("arn:aws:dynamodb:us-east-1:1:table/T/").unwrap().sub,
+            parse("arn:aws:dynamodb:us-east-1:1:table/T/stream/a/b"),
             None
         );
         assert_eq!(
-            parse("arn:aws:dynamodb:us-east-1:1:table/T/stream/")
-                .unwrap()
-                .sub,
-            Some(SubResource::Stream(String::new()))
+            parse("arn:aws:dynamodb:us-east-1:1:table/a/stream/table/b"),
+            None
         );
-    }
-
-    #[test]
-    fn sub_resource_id_keeps_inner_slashes() {
         assert_eq!(
-            parse("arn:aws:dynamodb:us-east-1:1:table/T/stream/a/b")
-                .unwrap()
-                .sub,
-            Some(SubResource::Stream("a/b".into()))
+            parse("arn:aws:dynamodb:us-east-1:1:table/a/index/table/b"),
+            None
         );
     }
 

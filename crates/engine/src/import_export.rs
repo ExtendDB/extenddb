@@ -391,22 +391,25 @@ async fn wait_for_table_active(
 /// parser so the engine reads the same table authorization checked.
 ///
 /// `ExportTableToPointInTime` names its source in `TableArn`, which must be
-/// exactly a table ARN: `arn:<partition>:dynamodb:<region>:<account>:table/<name>`
-/// with no sub-resource. An ARN carrying a stream, index, backup, or any extra
-/// segment (`.../table/allowed/stream/table/secret`) is refused with
-/// `ValidationException` rather than resolved to a different table than the one
-/// authorized. Authorization refuses the same inputs before this runs; this is
-/// the engine-side half of the same check.
+/// exactly a table ARN. A well-formed DynamoDB ARN of the wrong kind (a stream,
+/// index, or backup ARN) reaches here after authorization and is refused with
+/// the service's message (measured live, `live-r2/arn-kinds-live.json`). An
+/// unparseable `TableArn` is refused earlier, before authorization, by
+/// `authz_resource::validate_operation_arns`.
 fn extract_table_name_from_arn(arn: &str) -> Result<String, DynamoDbError> {
     match extenddb_core::arn::parse(arn) {
         Some(extenddb_core::arn::TableResource {
             table, sub: None, ..
         }) => Ok(table),
-        _ => Err(DynamoDbError::ValidationException(format!(
-            "Invalid TableArn: {arn}"
-        ))),
+        _ => Err(DynamoDbError::ValidationException(
+            INVALID_TABLE_ARN_REQUEST_MESSAGE.to_owned(),
+        )),
     }
 }
+
+/// The message DynamoDB returns for an export `TableArn` (or a restore source
+/// ARN) that is a well-formed ARN of the wrong resource kind (measured live).
+const INVALID_TABLE_ARN_REQUEST_MESSAGE: &str = "Invalid Request: Table ARN is invalid.";
 
 fn epoch_seconds() -> f64 {
     SystemTime::now()
@@ -417,7 +420,8 @@ fn epoch_seconds() -> f64 {
 
 #[cfg(test)]
 mod export_arn_tests {
-    use super::extract_table_name_from_arn;
+    use super::{INVALID_TABLE_ARN_REQUEST_MESSAGE, extract_table_name_from_arn};
+    use extenddb_core::error::DynamoDbError;
 
     #[test]
     fn exact_table_arn_resolves_to_table_name() {
@@ -425,32 +429,29 @@ mod export_arn_tests {
             extract_table_name_from_arn("arn:aws:dynamodb:us-east-1:1:table/orders").unwrap(),
             "orders"
         );
-        // A trailing slash is the bare table.
-        assert_eq!(
-            extract_table_name_from_arn("arn:aws:dynamodb:us-east-1:1:table/orders/").unwrap(),
-            "orders"
-        );
     }
 
     #[test]
-    fn sub_resource_or_repeated_segment_is_refused() {
-        // The A1 bypass ARN: the old resolver took whatever followed the last
-        // `table/` (`secret`) while authorization checked the first (`allowed`).
-        // It is now refused before the engine reads any table.
+    fn non_bare_table_arn_is_refused_with_the_measured_message() {
+        // A well-formed stream, index, or backup ARN reaches the handler after
+        // authorization and is refused with the service's message. A trailing
+        // slash and the A1 bypass ARN do not parse and are refused earlier, but
+        // the handler refuses them too if reached.
         for arn in [
-            "arn:aws:dynamodb:us-east-1:1:table/allowed/stream/table/secret",
-            "arn:aws:dynamodb:us-east-1:1:table/allowed/index/table/secret",
-            "arn:aws:dynamodb:us-east-1:1:x/table/secret",
             "arn:aws:dynamodb:us-east-1:1:table/orders/stream/2026-10-20T16:17:40.188",
             "arn:aws:dynamodb:us-east-1:1:table/orders/index/gsi1",
             "arn:aws:dynamodb:us-east-1:1:table/orders/backup/01-ab",
+            "arn:aws:dynamodb:us-east-1:1:table/allowed/stream/table/secret",
+            "arn:aws:dynamodb:us-east-1:1:table/orders/",
             "banana",
             "xrn:aws:dynamodb:us-east-1:1:table/orders",
         ] {
-            assert!(
-                extract_table_name_from_arn(arn).is_err(),
-                "expected refusal for {arn}"
-            );
+            match extract_table_name_from_arn(arn) {
+                Err(DynamoDbError::ValidationException(m)) => {
+                    assert_eq!(m, INVALID_TABLE_ARN_REQUEST_MESSAGE, "for {arn}");
+                }
+                other => panic!("expected ValidationException for {arn}, got {other:?}"),
+            }
         }
     }
 }
