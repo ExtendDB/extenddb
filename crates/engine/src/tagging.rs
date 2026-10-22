@@ -13,9 +13,6 @@ use crate::OperationContext;
 use crate::sanitize_storage_error;
 use crate::serialize_output;
 
-/// True for a `table/...` resource whose sub-resource is anything other than a
-/// stream (an index, a backup, or an unknown kind). Tags are accepted only on a
-/// table or a stream.
 /// True for a table ARN naming a backup, export, or import. The service reports
 /// these as not a `DynamoDB` resource ARN on a tag operation (measured live).
 fn tag_subresource_not_dynamodb_resource(resource: &str) -> bool {
@@ -24,6 +21,10 @@ fn tag_subresource_not_dynamodb_resource(resource: &str) -> bool {
         .is_some_and(|tail| matches!(tail.split('/').nth(1), Some("backup" | "export" | "import")))
 }
 
+/// True for a `table/...` resource whose sub-resource is anything other than a
+/// stream (an index or an unknown kind; a backup, export or import is refused
+/// earlier by `tag_subresource_not_dynamodb_resource`). Tags are accepted only
+/// on a table or a stream.
 fn tag_subresource_not_table_or_stream(resource: &str) -> bool {
     let Some(tail) = resource.strip_prefix("table/") else {
         return false;

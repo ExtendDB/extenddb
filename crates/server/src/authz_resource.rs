@@ -283,7 +283,9 @@ pub(crate) fn validate_operation_arns(operation: &str, input: &Value) -> Result<
 /// the service does not evaluate it, or the table's, for an operation on the
 /// stream: `StringEquals aws:ResourceTag/k` does not match and `Null` is true.
 /// Every other resource (an export, a foreign-service ARN, `*`) also gets no
-/// tags; nothing taggable is stored under one.
+/// tags; nothing taggable is stored under one. A table wildcard such as
+/// `table/*` (ListTables) returns `Some`, and reads no tags because
+/// `CachedAuthzStore::fetch_resource_tags` short-circuits a `/*` ARN.
 pub(crate) fn resource_tag_lookup_arn(resource_arn: &str) -> Option<String> {
     let f = extenddb_core::arn::fields(resource_arn)?;
     match parse_resource_identity(resource_arn)? {
@@ -1220,6 +1222,11 @@ mod tests {
         assert_eq!(
             resource_tag_lookup_arn("arn:aws:dynamodb:us-east-1:1:table/bb/index/gsi1").as_deref(),
             Some("arn:aws:dynamodb:us-east-1:1:table/bb")
+        );
+        // A table wildcard is looked up as given; the cache returns no tags.
+        assert_eq!(
+            resource_tag_lookup_arn("arn:aws:dynamodb:us-east-1:1:table/*").as_deref(),
+            Some("arn:aws:dynamodb:us-east-1:1:table/*")
         );
         // A stream, backup, export, foreign-service or wildcard resource has no
         // tags for authorization (None), even though a stream can be tagged.

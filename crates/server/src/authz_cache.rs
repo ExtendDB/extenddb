@@ -939,7 +939,7 @@ fn parse_document(s: &str) -> OpResult<Arc<PolicyDocument>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -956,7 +956,7 @@ mod tests {
 
     /// Counts calls per method so tests can assert the cache prevents repeats.
     #[derive(Default)]
-    struct CountingAuthzStore {
+    pub(crate) struct CountingAuthzStore {
         user_policies_calls: AtomicUsize,
         user_group_policies_calls: AtomicUsize,
         user_boundary_calls: AtomicUsize,
@@ -965,9 +965,9 @@ mod tests {
         role_boundary_calls: AtomicUsize,
         role_tags_calls: AtomicUsize,
         session_data_calls: AtomicUsize,
-        resource_tags_calls: AtomicUsize,
+        pub(crate) resource_tags_calls: AtomicUsize,
 
-        user_policies: Mutex<HashMap<PrincipalKey, Vec<String>>>,
+        pub(crate) user_policies: Mutex<HashMap<PrincipalKey, Vec<String>>>,
         user_group_policies: Mutex<HashMap<PrincipalKey, Vec<String>>>,
         user_boundary: Mutex<HashMap<PrincipalKey, Option<String>>>,
         user_tags: Mutex<HashMap<PrincipalKey, TagPairs>>,
@@ -975,7 +975,7 @@ mod tests {
         role_boundary: Mutex<HashMap<PrincipalKey, Option<String>>>,
         role_tags: Mutex<HashMap<PrincipalKey, TagPairs>>,
         session_data: Mutex<HashMap<SessionKey, Option<SessionData>>>,
-        resource_tags: Mutex<HashMap<String, TagPairs>>,
+        pub(crate) resource_tags: Mutex<HashMap<String, TagPairs>>,
     }
 
     impl AuthorizationStore for CountingAuthzStore {
@@ -1151,7 +1151,7 @@ mod tests {
         }
     }
 
-    fn fast_authz_cfg() -> AuthzCacheConfig {
+    pub(crate) fn fast_authz_cfg() -> AuthzCacheConfig {
         let base = SwrCacheConfig {
             ttl: Duration::from_millis(200),
             soft_ttl: Duration::from_millis(50),
