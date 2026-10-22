@@ -747,13 +747,6 @@ class TestArnKindValidationMessages:
         assert err["Code"] == "ValidationException", err
         assert err.get("Message") == msg, err
 
-    def _assert_denied(self, fn):
-        with pytest.raises(ClientError) as exc:
-            fn()
-        assert exc.value.response["Error"]["Code"] == "AccessDeniedException", (
-            exc.value.response["Error"]
-        )
-
     # -- stream reads: strict, 'Invalid StreamArn' before authz --
 
     def test_describe_stream_wrong_kind_is_invalid_streamarn(self):
@@ -811,19 +804,43 @@ class TestArnKindValidationMessages:
 
     def test_export_wellformed_stream_arn_is_authorized_then_refused(self):
         # A well-formed stream ARN of the wrong kind is NOT refused before
-        # authorization: authorization runs against the stream ARN as given.
+        # authorization: authorization runs against the stream ARN as given,
+        # not against the table it belongs to (measured live: a no-permissions
+        # principal's AccessDenied names the stream ARN).
         stream = self._tarn("t") + "/stream/2026-01-01T00:00:00.000"
-        # No-permissions principal: authorization ran, so AccessDenied (not a
-        # pre-authz ValidationException). The exact 'Invalid Request: Table ARN
-        # is invalid.' message the handler returns to an authorized principal is
-        # covered by the extract_table_name_from_arn unit test; the export
-        # handler's "export disabled" guard can mask it on a server without
-        # export paths configured, so the admin branch here only confirms the
-        # request passed authorization (a ValidationException, never an
-        # AccessDeniedException).
+
+        # No-permissions principal: denied, and the denial names the stream
+        # ARN. An authorization that dropped the stream sub-resource would name
+        # the bare table ARN instead.
         noperm = self._ddb({"Version": "2012-10-17", "Statement": []})
-        self._assert_denied(
-            lambda: noperm.export_table_to_point_in_time(TableArn=stream, S3Bucket="b"))
+        with pytest.raises(ClientError) as exc:
+            noperm.export_table_to_point_in_time(TableArn=stream, S3Bucket="b")
+        err = exc.value.response["Error"]
+        assert err["Code"] == "AccessDeniedException", err
+        assert f"on resource: {stream} because" in err.get("Message", ""), err
+
+        # An Allow on the bare table ARN does not cover the stream ARN, so the
+        # export is denied. An authorization against the bare table would let
+        # it through to the handler.
+        table_only = self._ddb({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": "dynamodb:ExportTableToPointInTime",
+                "Resource": self._tarn("t"),
+            }],
+        })
+        with pytest.raises(ClientError) as exc:
+            table_only.export_table_to_point_in_time(TableArn=stream, S3Bucket="b")
+        err = exc.value.response["Error"]
+        assert err["Code"] == "AccessDeniedException", err
+        assert f"on resource: {stream} because" in err.get("Message", ""), err
+
+        # An authorized principal passes authorization and the handler refuses
+        # the request with a ValidationException. The handler's own 'Invalid
+        # Request: Table ARN is invalid.' message is covered by the
+        # extract_table_name_from_arn unit test, because this server has no
+        # export paths configured and its 'export disabled' check runs first.
         admin = self._ddb(ALLOW_ALL)
         with pytest.raises(ClientError) as exc:
             admin.export_table_to_point_in_time(TableArn=stream, S3Bucket="b")
