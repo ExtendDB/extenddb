@@ -64,4 +64,5 @@ fn cond(op: ConditionOperator, key: &str, values: Vec<&str>) -> Condition {
 
 mod multivalued;
 mod operators;
+mod resource_tag;
 mod three_case;

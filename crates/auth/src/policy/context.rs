@@ -75,7 +75,7 @@ fn tag_lookup<'a>(
 }
 
 /// Strip a tag prefix (`aws:PrincipalTag/`, `aws:RequestTag/`,
-/// `aws:ResourceTag/`, `dynamodb:ResourceTag/`) from the front of `key`
+/// `aws:ResourceTag/`) from the front of `key`
 /// ASCII-case-insensitively, returning the original (un-normalized) tag sub-key.
 ///
 /// The prefix is ASCII, so the service (and ExtendDB) match it without regard to
@@ -203,7 +203,7 @@ pub struct RequestParams {
 pub struct RequestContext {
     /// Tags on the authenticated principal (`aws:PrincipalTag/*`).
     pub principal_tags: HashMap<String, String>,
-    /// Tags on the target resource (`dynamodb:ResourceTag/*`).
+    /// Tags on the target resource, resolved as `aws:ResourceTag/*`.
     pub resource_tags: HashMap<String, String>,
     /// Partition key values being accessed.
     pub leading_keys: Option<Vec<String>>,
@@ -305,11 +305,11 @@ impl ConditionContext for RequestContext {
         if let Some(sub) = strip_prefix_ci(key, "aws:PrincipalTag/") {
             tag_lookup(&self.principal_tags, sub, super::casefold::case_fold)
         } else if let Some(sub) = strip_prefix_ci(key, "aws:ResourceTag/") {
-            // The service evaluates resource tags as aws:ResourceTag/*. ExtendDB
-            // resolves them from the same resource-tag map it uses for
-            // dynamodb:ResourceTag/*.
-            tag_lookup(&self.resource_tags, sub, super::casefold::case_fold)
-        } else if let Some(sub) = strip_prefix_ci(key, "dynamodb:ResourceTag/") {
+            // The service evaluates resource tags only as aws:ResourceTag/*,
+            // resolved from the resource-tag map. dynamodb:ResourceTag/* is
+            // left absent (it falls through to the match below and resolves to
+            // None), matching the live service, which does not populate that
+            // key.
             tag_lookup(&self.resource_tags, sub, super::casefold::case_fold)
         } else {
             match super::casefold::case_fold(key).as_str() {
@@ -660,9 +660,14 @@ mod tests {
             RequestParams::default(),
         );
         assert_eq!(
-            ctx.resolve_key("dynamodb:ResourceTag/Team"),
+            ctx.resolve_key("aws:ResourceTag/Team"),
             Some(vec!["Alpha"])
         );
+        // dynamodb:ResourceTag/* is absent, as on the live service, so it keeps
+        // absent-key semantics (StringEquals never matches, StringNotEquals
+        // matches) and never fails closed.
+        assert_eq!(ctx.resolve_key("dynamodb:ResourceTag/Team"), None);
+        assert!(!ctx.is_unresolvable_key("dynamodb:ResourceTag/Team"));
     }
 
     #[test]
@@ -716,10 +721,7 @@ mod tests {
             ctx.resolve_key("aws:PrincipalTag/TEAM"),
             Some(vec!["contractors"])
         );
-        assert_eq!(
-            ctx.resolve_key("dynamodb:ResourceTag/env"),
-            Some(vec!["Prod"])
-        );
+        assert_eq!(ctx.resolve_key("aws:ResourceTag/env"), Some(vec!["Prod"]));
         // The value is not case-folded, only the key.
         assert_eq!(ctx.resolve_key("aws:PrincipalTag/missing"), None);
     }
@@ -772,10 +774,8 @@ mod tests {
             Some(vec!["contractors"])
         );
         assert_eq!(ctx.resolve_key("aws:resourcetag/ENV"), Some(vec!["prod"]));
-        assert_eq!(
-            ctx.resolve_key("dynamodb:resourcetag/env"),
-            Some(vec!["prod"])
-        );
+        // dynamodb:ResourceTag/* is absent in any case, as on the service.
+        assert_eq!(ctx.resolve_key("dynamodb:resourcetag/env"), None);
     }
 
     #[test]
