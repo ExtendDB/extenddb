@@ -579,6 +579,13 @@ upgrading:
   table's resource tags (`aws:ResourceTag/*` and `dynamodb:ResourceTag/*`),
   because a secondary index inherits the tags of its table. An ABAC `Deny` or
   `Allow` conditioned on the table's tags applies to its indexes.
+- **Streams, backups, and resource tags.** An operation on a stream ARN
+  (DescribeStream, GetShardIterator, GetRecords, and a tag operation on the
+  stream) and an operation on a backup ARN evaluate no resource tags, as on
+  DynamoDB: `aws:ResourceTag/*` is absent. A stream holds a tag set of its own,
+  separate from its table's, but neither set is evaluated for the stream's
+  operations, so an `Allow` conditioned on a tag does not grant them and a
+  `Null` test on the key is true. A backup ARN cannot be tagged.
 - **DescribeLimits and DescribeEndpoints.** DescribeLimits is authorized against
   `*`, not `table/*`, so a grant or a `Deny` scoped to `table/*` no longer
   applies to it; scope its statement to `*`. DescribeEndpoints is not evaluated
