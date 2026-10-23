@@ -304,7 +304,7 @@ impl StreamEngine for PostgresEngine {
             let (ks_json, _ad_json, stream_spec_json, table_status, table_id) =
                 row.ok_or_else(|| {
                     StorageError::TableNotFound(format!(
-                        "Requested resource not found: Stream: {stream_arn} not found."
+                        "Requested resource not found: Stream: {stream_arn} not found"
                     ))
                 })?;
 
@@ -576,7 +576,7 @@ impl StreamEngine for PostgresEngine {
 
             let Some(table_id) = table_id else {
                 return Err(StorageError::TableNotFound(format!(
-                    "Requested resource not found: Stream: {stream_arn} not found."
+                    "Requested resource not found: Stream: {stream_arn} not found"
                 )));
             };
 
@@ -590,7 +590,7 @@ impl StreamEngine for PostgresEngine {
 
             if exists.is_none() {
                 return Err(StorageError::TableNotFound(format!(
-                    "Requested resource not found: Stream: {stream_arn} not found."
+                    "Requested resource not found: Stream: {stream_arn} not found"
                 )));
             }
             Ok(())

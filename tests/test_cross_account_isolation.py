@@ -518,17 +518,18 @@ class TestStreamAccountScoping:
         assert err["Message"] == "Shard iterator has expired", err
         assert get_records_error(old_format(missing_shard)) == err
 
-        # A token in the current format that names account A's stream ARN.
-        # Authorization pins the stream ARN to account B, and the engine looks
-        # the stream up in account B, where it does not exist, so the request
-        # fails the same way for a real and a made-up shard.
+        # A token in the current format that names account A's stream ARN. The
+        # server issues tokens only for the caller's own account, so this one
+        # was not issued by it: it is refused as an invalid iterator before
+        # authorization, the same way for a real and a made-up shard, and the
+        # stream ARN it carries is never rewritten to account B.
         def current_format(shard_id: str) -> str:
             return base64.b64encode(
                 f"{shard_id}|AFTER_SEQUENCE_NUMBER||{int(time.time())}|{arn}".encode()
             ).decode()
 
         err = get_records_error(current_format(target_shard))
-        assert err["Code"] == "ResourceNotFoundException", err
+        assert err == {"Code": "ValidationException", "Message": "Invalid ShardIterator"}, err
         assert get_records_error(current_format(missing_shard)) == err
 
         # An iterator that does not decode gets DynamoDB's verbatim answer.
