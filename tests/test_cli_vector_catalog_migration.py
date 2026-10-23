@@ -37,6 +37,9 @@ BACKUP_DEFINITIONS_MIGRATION = "003_backup_definitions.sql"
 # Moves the version for the stored string encoding; changes no schema. A 0.0.2
 # deployment has none of these three recorded.
 ENCODING_MIGRATION = "004_control_chars_encoding.sql"
+# The data code migration that rewrites stored rows into the escaped encoding.
+# Recorded in the data database's own `schema_history`, not the catalog's.
+ENCODING_DATA_MIGRATION = "004_escape_control_chars"
 
 # The version the binary expects, written by the last catalog migration. Every
 # current-version assertion reads it from here so the next bump is one edit.
@@ -86,6 +89,38 @@ def _backup_definitions_table_exists(cli_env):
     return _catalog_query(
         cli_env, "SELECT to_regclass('public.backup_definitions') IS NOT NULL"
     )
+
+
+def _data_conn(cli_env):
+    """The data database `init` creates beside the catalog (`<name>_catalog`)."""
+    import psycopg2
+
+    data_db = cli_env["db_name"][: -len("_catalog")]
+    return psycopg2.connect(PG_ADMIN_CONN + "/" + data_db)
+
+
+def _forget_data_migration(cli_env, name):
+    """Remove a data code migration's ledger row, as a deployment from before
+    that migration has it."""
+    conn = _data_conn(cli_env)
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM schema_history WHERE filename = %s", (name,))
+    finally:
+        conn.close()
+
+
+def _data_migration_recorded(cli_env, name):
+    conn = _data_conn(cli_env)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM schema_history WHERE filename = %s", (name,)
+            )
+            return cur.fetchone()[0] == 1
+    finally:
+        conn.close()
 
 
 def _init(cli_env):
@@ -212,6 +247,49 @@ class TestVectorCatalogMigration:
         again_output = again.stdout + again.stderr
         assert again.returncode == 0, again_output
         assert "up to date" in again_output.lower(), again_output
+
+    def test_migrate_applies_the_pending_string_encoding_data_migration(self, cli_env):
+        """The 0.1.14 upgrade: `004_escape_control_chars` pending in the data ledger.
+
+        The data code migration rewrites stored rows, so migrate refuses to run it
+        while any other session holds the catalog or data database. The command
+        itself opens catalog stores for the resource-tag step before that check;
+        those sessions must carry the migrate application name or the check
+        counts them as foreign and every upgrade is refused.
+
+        A fresh init records the data migration, so the ledger row is removed
+        here, with the catalog rolled back, to reproduce an upgrade from the
+        release before it.
+        """
+        _init(cli_env)
+        _patch_config_port(cli_env["config_path"], cli_env["port"])
+        _roll_catalog_back_to_pre_vector(cli_env)
+        _forget_data_migration(cli_env, ENCODING_DATA_MIGRATION)
+
+        pending = _run_extenddb(
+            "migrate", *_pg_args(), config=cli_env["config_path"], check=False
+        )
+        pending_output = pending.stdout + pending.stderr
+        assert pending.returncode == 3, pending_output
+        assert ENCODING_DATA_MIGRATION in pending_output, pending_output
+
+        applied = _run_extenddb(
+            "migrate", "--yes", *_pg_args(), config=cli_env["config_path"], check=False
+        )
+        output = applied.stdout + applied.stderr
+        assert applied.returncode == 0, output
+        assert "other connection(s) hold" not in output, output
+        assert f"Applying {ENCODING_DATA_MIGRATION}" in output, output
+        assert _catalog_version(cli_env) == CURRENT_CATALOG_VERSION
+        assert _data_migration_recorded(cli_env, ENCODING_DATA_MIGRATION) is True
+
+        served = _run_extenddb("serve", config=cli_env["config_path"])
+        assert served.returncode == 0, served.stdout + served.stderr
+        try:
+            assert _wait_for_server(cli_env["port"]), "upgraded deployment did not serve"
+        finally:
+            _run_extenddb("stop", config=cli_env["config_path"], check=False)
+            time.sleep(1)
 
     def test_migrate_survives_an_applied_but_unrecorded_migration(self, cli_env):
         """A replay of the vector migration must succeed, not block the deployment.
