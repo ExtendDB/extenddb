@@ -156,7 +156,12 @@ impl MongoEngine {
         let deletion_protection = input.deletion_protection_enabled.unwrap_or(false);
 
         let now = time::OffsetDateTime::now_utc();
-        let creation_epoch = now.unix_timestamp() as f64;
+        // Keep the sub-second part. bson::DateTime stores milliseconds, and
+        // the transaction ConsumedCapacity order sorts tables by this value,
+        // so whole seconds make two tables created in the same second tie and
+        // fall back to name order, which the service does not do.
+        let creation_millis = now.unix_timestamp() * 1000 + i64::from(now.millisecond());
+        let creation_epoch = creation_millis as f64 / 1000.0;
 
         // Build the table metadata document
         let key_schema_bson =
@@ -243,7 +248,7 @@ impl MongoEngine {
             "stream_specification": stream_bson.unwrap_or(bson::Bson::Null),
             "table_status": table_status,
             "status_transition_at": status_transition_at,
-            "creation_date_time": bson::DateTime::from_millis((creation_epoch * 1000.0) as i64),
+            "creation_date_time": bson::DateTime::from_millis(creation_millis),
             "table_size_bytes": 0_i64,
             "item_count": 0_i64,
             "table_arn": &table_arn_val,
