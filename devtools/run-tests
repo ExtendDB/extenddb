@@ -120,7 +120,7 @@ while [[ $# -gt 0 ]]; do
         --filter)         FILTER="$2"; shift 2 ;;
         --catalog-check)  RUN_CATALOG_CHECK=true; shift ;;
         --config)         CONFIG_PATH="$2"; shift 2 ;;
-        --backend)        BACKEND="$2"; shift 2 ;;
+        --backend)        BACKEND="$2"; BACKEND_GIVEN=1; shift 2 ;;
         --parallel)
             # --parallel (no argument) or --parallel=N
             PARALLEL="auto"; shift
@@ -141,10 +141,13 @@ case "$BACKEND" in
         exit 1
         ;;
 esac
-# Expose the backend to the test suite so a test whose expectation is
-# backend-specific can gate itself (e.g. item-size rules enforced only on the
-# PostgreSQL and SQLite storage layers).
-export EXTENDDB_TEST_BACKEND="$BACKEND"
+# Tests that depend on the backend (tests/test_ttl.py, and the update-size
+# classes in tests/test_item_size_at_limit.py that apply only to the PostgreSQL
+# and SQLite storage layers) read this rather than guess from a config file.
+# Only exported when --backend was given: the SQLite CI leg runs without it.
+if [[ -n "${BACKEND_GIVEN:-}" ]]; then
+    export EXTENDDB_TEST_BACKEND="$BACKEND"
+fi
 
 # --- Validate: target flag required ---
 if [[ -z "$TARGET" ]]; then

@@ -134,11 +134,101 @@ pub type ServerComponentsFactory =
 /// Calls the factory of the [`Backend`](crate::Backend) installed via
 /// [`set_backend`](crate::set_backend). Returns `BackendNotInstalled` if no
 /// backend has been installed.
+///
+/// A `region` the `BackupArn` parser would refuse is logged at warn first
+/// ([`crate::config::server_region_warning`]): the server still starts, but
+/// the operator is told its own backup ARNs will not resolve.
 pub async fn create_server_components(
     config: &(dyn StorageConfig + 'static),
     region: &str,
     options: ServerComponentsOptions,
 ) -> Result<ServerComponents, BackendError> {
+    if let Some(warning) = crate::config::server_region_warning(region) {
+        tracing::warn!("{}", warning.log_message());
+    }
     let backend = crate::backend::try_backend().ok_or(BackendError::BackendNotInstalled)?;
     (backend.server_components)(config, region, options).await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fmt::Write as _;
+    use std::sync::{Arc, Mutex};
+
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Level, Subscriber};
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+    use super::*;
+
+    /// Collects the message of every warn-level event.
+    #[derive(Default)]
+    struct Warnings(Arc<Mutex<Vec<String>>>);
+
+    struct Message(String);
+
+    impl Visit for Message {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                let _ = write!(self.0, "{value:?}");
+            }
+        }
+    }
+
+    impl<S: Subscriber> Layer<S> for Warnings {
+        fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
+            if *event.metadata().level() == Level::WARN {
+                let mut message = Message(String::new());
+                event.record(&mut message);
+                self.0.lock().unwrap().push(message.0);
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct NoConfig;
+
+    impl StorageConfig for NoConfig {
+        fn connection_config(&self) -> &str {
+            ""
+        }
+        fn max_connections(&self) -> u32 {
+            1
+        }
+        fn max_catalog_connections(&self) -> u32 {
+            1
+        }
+        fn clone_box(&self) -> Box<dyn StorageConfig> {
+            Box::new(NoConfig)
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// No backend is installed in this crate's tests, so the call fails
+    /// after the region check; the warning is what is under test.
+    async fn warnings_for(region: &str) -> Vec<String> {
+        let warnings = Warnings::default();
+        let collected = Arc::clone(&warnings.0);
+        let subscriber = tracing_subscriber::registry().with(warnings);
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let result =
+            create_server_components(&NoConfig, region, ServerComponentsOptions::default()).await;
+        assert!(matches!(result, Err(BackendError::BackendNotInstalled)));
+        collected.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn a_region_outside_the_backup_arn_class_is_warned_about_at_startup() {
+        let warnings = warnings_for("LOCAL").await;
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("server.region"), "{warnings:?}");
+        assert!(warnings[0].contains("LOCAL"), "{warnings:?}");
+        assert!(
+            warnings[0].contains("BackupArn is not valid"),
+            "{warnings:?}"
+        );
+        assert!(warnings_for("us-east-1").await.is_empty());
+    }
 }

@@ -40,3 +40,6 @@ rustls = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 daemonize = { workspace = true }
 libc = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }

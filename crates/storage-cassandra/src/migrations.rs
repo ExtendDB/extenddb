@@ -62,6 +62,10 @@ pub(crate) const CATALOG_MIGRATIONS: &[(&str, &str)] = &[
         "V004__ttl_backfill_cursor.cql",
         include_str!("../migrations/catalog/V004__ttl_backfill_cursor.cql"),
     ),
+    (
+        "V005__backup_definitions_and_restore_registration.cql",
+        include_str!("../migrations/catalog/V005__backup_definitions_and_restore_registration.cql"),
+    ),
 ];
 
 /// Embedded data migration files, applied in order.
@@ -181,12 +185,7 @@ async fn is_migration_applied(
     keyspace: &str,
     filename: &str,
 ) -> OpResult<bool> {
-    // Extract version from filename (V001__description.cql)
-    let version: i32 = filename
-        .strip_prefix("V")
-        .and_then(|s| s.split("__").next())
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| OpError::Internal(format!("Invalid migration filename: {filename}")))?;
+    let version = migration_version(filename)?;
 
     let check_cql = format!("SELECT version FROM {keyspace}.schema_history WHERE version = ?");
 
@@ -224,11 +223,7 @@ async fn record_migration(
     filename: &str,
 ) -> OpResult<()> {
     // Extract version and description from filename
-    let version: i32 = filename
-        .strip_prefix("V")
-        .and_then(|s| s.split("__").next())
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| OpError::Internal(format!("Invalid migration filename: {filename}")))?;
+    let version = migration_version(filename)?;
 
     let description = filename
         .split("__")
@@ -246,4 +241,69 @@ async fn record_migration(
         .map_err(|e| OpError::Internal(format!("Record migration: {e}")))?;
 
     Ok(())
+}
+
+/// The version a migration file records in `schema_history`: the integer of
+/// its `V###__` prefix (`V001__initial_schema.cql` -> 1).
+fn migration_version(filename: &str) -> OpResult<i32> {
+    filename
+        .strip_prefix("V")
+        .and_then(|s| s.split("__").next())
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| OpError::Internal(format!("Invalid migration filename: {filename}")))
+}
+
+/// The catalog migration files this binary carries that the catalog's
+/// `schema_history` does not record, in order. Unlike the runner's per-file
+/// check, a failed read is an error, not "pending".
+pub(crate) async fn pending_catalog_migrations(
+    session: &Arc<CassandraSession>,
+    catalog_keyspace: &str,
+) -> Result<Vec<&'static str>, extenddb_storage::error::StorageError> {
+    use extenddb_storage::error::StorageError;
+    let rows = crate::cassandra_util::query_rows::<StorageError>(
+        session,
+        &format!("SELECT version FROM {catalog_keyspace}.schema_history"),
+        cdrs_tokio::query_values!(),
+        "pending_catalog_migrations",
+    )
+    .await?;
+    let mut recorded = std::collections::BTreeSet::new();
+    for row in &rows {
+        let version: i32 =
+            crate::cassandra_util::get_column(row, "version", "pending_catalog_migrations")?;
+        recorded.insert(version);
+    }
+    let mut pending = Vec::new();
+    for (filename, _sql) in CATALOG_MIGRATIONS {
+        let version = migration_version(filename).map_err(|e| match e {
+            OpError::Validation(m)
+            | OpError::AlreadyExists(m)
+            | OpError::NotFound(m)
+            | OpError::HasDependents(m)
+            | OpError::Internal(m) => StorageError::Internal(m),
+        })?;
+        if !recorded.contains(&version) {
+            pending.push(*filename);
+        }
+    }
+    Ok(pending)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn every_migration_file_has_a_distinct_version() {
+        let mut seen = std::collections::BTreeSet::new();
+        for (filename, _) in super::CATALOG_MIGRATIONS {
+            let v = super::migration_version(filename).expect(filename);
+            assert!(seen.insert(v), "{filename}: version {v} repeated");
+        }
+        assert_eq!(
+            super::migration_version("V005__backup_definitions_and_restore_registration.cql")
+                .expect("V005"),
+            5
+        );
+        assert!(super::migration_version("005_x.cql").is_err());
+    }
 }
