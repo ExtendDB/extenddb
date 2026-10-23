@@ -210,3 +210,4 @@ CREATE TABLE IF NOT EXISTS iam_permissions_boundaries (
 -- Seed settings
 INSERT INTO settings (key, value) VALUES ('catalog_version', '0.0.1');
 INSERT INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0.25');
+INSERT INTO settings (key, value) VALUES ('resource_tag_migration', 'applied');

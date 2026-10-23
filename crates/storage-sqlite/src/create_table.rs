@@ -19,8 +19,16 @@ use extenddb_core::types::{
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{index_arn, stream_arn, table_arn};
 
-use crate::sqlite_util::{format_timestamp, is_unique_violation};
+use crate::sqlite_util::{format_epoch_seconds, format_timestamp, is_unique_violation};
 use crate::store::SqliteEngine;
+
+/// What a restore records about itself when its target is created.
+pub(crate) struct RestoreRegistration<'a> {
+    pub backup_arn: &'a str,
+    pub source_table_arn: &'a str,
+    /// Epoch seconds: the source backup's creation time.
+    pub restore_date_time: f64,
+}
 
 impl SqliteEngine {
     /// Create a table. When `defer_active` is set (the restore path), the row
@@ -34,6 +42,30 @@ impl SqliteEngine {
         account_id: &str,
         input: CreateTableInput,
         defer_active: bool,
+    ) -> Result<TableDescription, StorageError> {
+        self.create_table_impl_inner(account_id, input, defer_active, None)
+            .await
+    }
+
+    /// Create a restore target and register the restore (source backup,
+    /// source table ARN, restore time) in the write transaction that also
+    /// re-checks the backup is AVAILABLE and owned by `account_id`.
+    pub(crate) async fn create_table_for_restore(
+        &self,
+        account_id: &str,
+        input: CreateTableInput,
+        registration: &RestoreRegistration<'_>,
+    ) -> Result<TableDescription, StorageError> {
+        self.create_table_impl_inner(account_id, input, true, Some(registration))
+            .await
+    }
+
+    async fn create_table_impl_inner(
+        &self,
+        account_id: &str,
+        input: CreateTableInput,
+        defer_active: bool,
+        restore: Option<&RestoreRegistration<'_>>,
     ) -> Result<TableDescription, StorageError> {
         Self::validate_account_id(account_id)?;
         // D1: every writer holds the engine write lock. This method runs two
@@ -116,7 +148,63 @@ impl SqliteEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        sqlx::query(
+        if let Some(RestoreRegistration { backup_arn, .. }) = restore {
+            // A restore into a name that is itself a CREATING restore target
+            // is refused as such before the backup is checked, so a second
+            // restore of the same backup into the same name is
+            // TableBeingRestored (the service answers TableInUseException),
+            // not BackupInUse, as on PostgreSQL and Cassandra.
+            let target_in_progress: Option<String> = sqlx::query_scalar(
+                "SELECT r.source_backup_arn FROM tables t \
+                 JOIN table_restores r ON r.table_id = t.table_id \
+                 WHERE t.account_id = ? AND t.table_name = ? AND t.table_status = 'CREATING'",
+            )
+            .bind(account_id)
+            .bind(&input.table_name)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            if let Some(source_backup_arn) = target_in_progress {
+                return Err(StorageError::TableBeingRestored {
+                    table_name: input.table_name.clone(),
+                    backup_arn: source_backup_arn,
+                });
+            }
+            let available: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM backups WHERE backup_arn = ? \
+                 AND account_id = ? AND backup_status = 'AVAILABLE')",
+            )
+            .bind(backup_arn)
+            .bind(account_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            if !available {
+                return Err(StorageError::Validation(format!(
+                    "Backup not found: {backup_arn}"
+                )));
+            }
+            // One restore of a backup at a time, as the service: while a
+            // target restored from it is CREATING the backup is in use. Same
+            // predicate as DeleteBackup's, in the same kind of write
+            // transaction under the write lock, so two simultaneous restores
+            // cannot both pass.
+            let restoring: Option<String> = sqlx::query_scalar(
+                "SELECT t.table_name FROM table_restores r JOIN tables t ON t.table_id = r.table_id \
+                 WHERE r.source_backup_arn = ? AND t.table_status = 'CREATING' LIMIT 1",
+            )
+            .bind(backup_arn)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            if let Some(table) = restoring {
+                return Err(StorageError::BackupInUse(format!(
+                    "Backup is being used to restore table {table}: {backup_arn}"
+                )));
+            }
+        }
+
+        let inserted = sqlx::query(
             "INSERT INTO tables \
              (account_id, table_name, key_schema, attribute_definitions, billing_mode, \
               provisioned_throughput, stream_specification, table_status, creation_date_time, \
@@ -141,14 +229,52 @@ impl SqliteEngine {
         .bind(&sse_json)
         .bind(&on_demand_json)
         .execute(&mut *tx)
-        .await
-        .map_err(|e| {
-            if is_unique_violation(&e) {
-                StorageError::TableAlreadyExists(input.table_name.clone())
-            } else {
-                StorageError::Internal(e.to_string())
+        .await;
+        if let Err(e) = inserted {
+            if !is_unique_violation(&e) {
+                return Err(StorageError::Internal(e.to_string()));
             }
-        })?;
+            // A restore into a name that is itself a CREATING restore target
+            // is refused as such, naming that target's source backup (the
+            // service answers TableInUseException); any other taken name is
+            // TableAlreadyExists.
+            if restore.is_some() {
+                let existing: Option<(String, Option<String>)> = sqlx::query_as(
+                    "SELECT t.table_status, r.source_backup_arn FROM tables t \
+                     LEFT JOIN table_restores r ON r.table_id = t.table_id \
+                     WHERE t.account_id = ? AND t.table_name = ?",
+                )
+                .bind(account_id)
+                .bind(&input.table_name)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+                if let Some((status, Some(source_backup_arn))) = existing
+                    && status == "CREATING"
+                {
+                    return Err(StorageError::TableBeingRestored {
+                        table_name: input.table_name.clone(),
+                        backup_arn: source_backup_arn,
+                    });
+                }
+            }
+            return Err(StorageError::TableAlreadyExists(input.table_name.clone()));
+        }
+
+        if let Some(registration) = restore {
+            sqlx::query(
+                "INSERT INTO table_restores \
+                 (table_id, source_backup_arn, source_table_arn, restore_date_time) \
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(&table_id)
+            .bind(registration.backup_arn)
+            .bind(registration.source_table_arn)
+            .bind(format_epoch_seconds(registration.restore_date_time))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        }
 
         // GSI / LSI metadata.
         let mut gsi_ids: Vec<String> = Vec::new();

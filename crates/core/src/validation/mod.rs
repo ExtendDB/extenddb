@@ -104,13 +104,100 @@ pub fn validate_create_table(
     validate_attribute_definitions(input)?;
     validate_provisioned_throughput(input)?;
     validate_gsi_provisioned_throughput(input)?;
+    validate_gsi_throughput_minimum(input)?;
     validate_gsi_count(input, limits)?;
     validate_lsi_count(input, limits)?;
     validate_lsi_requires_range_key(input)?;
     validate_unique_index_names(input)?;
     validate_index_projections(input)?;
+    validate_projected_attribute_total(projected_non_key_attribute_count(
+        input
+            .global_secondary_indexes
+            .iter()
+            .flatten()
+            .map(|i| &i.projection)
+            .chain(
+                input
+                    .local_secondary_indexes
+                    .iter()
+                    .flatten()
+                    .map(|i| &i.projection),
+            ),
+    ))?;
     validate_vector_indexes(input)?;
     validate_stream_specification(input)?;
+    Ok(())
+}
+
+/// Most `NonKeyAttributes` a table may project across all of its global and
+/// local secondary indexes (the documented DynamoDB limit). An attribute
+/// projected into two indexes counts twice.
+pub const MAX_PROJECTED_NON_KEY_ATTRIBUTES: usize = 100;
+
+/// The number of `NonKeyAttributes` the given projections name, counted the
+/// way [`MAX_PROJECTED_NON_KEY_ATTRIBUTES`] counts them.
+pub fn projected_non_key_attribute_count<'a>(
+    projections: impl IntoIterator<Item = &'a crate::types::Projection>,
+) -> usize {
+    projections
+        .into_iter()
+        .map(|p| p.non_key_attributes.as_ref().map_or(0, Vec::len))
+        .sum()
+}
+
+/// Refuse a table whose secondary indexes project more than
+/// [`MAX_PROJECTED_NON_KEY_ATTRIBUTES`] non-key attributes in total. Used by
+/// CreateTable (and so by RestoreTableFromBackup, which validates its target
+/// as a CreateTable) and by UpdateTable's GSI creation. The service's exact
+/// text for this case was not captured.
+///
+/// # Errors
+///
+/// `ValidationException` when `projected` exceeds the limit.
+pub fn validate_projected_attribute_total(projected: usize) -> Result<(), DynamoDbError> {
+    if projected > MAX_PROJECTED_NON_KEY_ATTRIBUTES {
+        return Err(DynamoDbError::ValidationException(format!(
+            "One or more parameter values were invalid: Number of projected attributes in all \
+             indexes exceeds limit of {MAX_PROJECTED_NON_KEY_ATTRIBUTES}, projected: {projected}"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse a GSI throughput below 1 read or write unit, when one is given.
+/// Used by CreateTable for a PROVISIONED table and by UpdateTable's GSI
+/// creation. A PROVISIONED GSI given no throughput is accepted here, as
+/// before; the service's exact text for this case was not captured.
+///
+/// # Errors
+///
+/// `ValidationException` naming the index.
+pub fn validate_index_throughput_minimum(
+    index_name: &str,
+    throughput: Option<&crate::types::ProvisionedThroughput>,
+) -> Result<(), DynamoDbError> {
+    match throughput {
+        Some(t) if t.read_capacity_units < 1 || t.write_capacity_units < 1 => {
+            Err(DynamoDbError::ValidationException(format!(
+                "One or more parameter values were invalid: ReadCapacityUnits and \
+                 WriteCapacityUnits must both be greater than or equal to 1 for index: \
+                 {index_name}"
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// [`validate_index_throughput_minimum`] for every GSI of a PROVISIONED
+/// table. A PAY_PER_REQUEST table's GSIs may carry no throughput at all,
+/// which [`validate_gsi_provisioned_throughput`] checks.
+fn validate_gsi_throughput_minimum(input: &CreateTableInput) -> Result<(), DynamoDbError> {
+    if input.billing_mode.unwrap_or(BillingMode::Provisioned) == BillingMode::PayPerRequest {
+        return Ok(());
+    }
+    for gsi in input.global_secondary_indexes.iter().flatten() {
+        validate_index_throughput_minimum(&gsi.index_name, gsi.provisioned_throughput.as_ref())?;
+    }
     Ok(())
 }
 
@@ -886,7 +973,14 @@ fn format_attr_defs(defs: &[AttributeDefinition]) -> String {
         .join(", ")
 }
 
-fn validate_provisioned_throughput(input: &CreateTableInput) -> Result<(), DynamoDbError> {
+/// Validate table-level throughput against the effective billing mode.
+///
+/// # Errors
+///
+/// Returns [`DynamoDbError::ValidationException`] when required provisioned
+/// throughput is absent or invalid, or when throughput is supplied for an
+/// on-demand table.
+pub fn validate_provisioned_throughput(input: &CreateTableInput) -> Result<(), DynamoDbError> {
     let billing = input.billing_mode.unwrap_or(BillingMode::Provisioned);
     match billing {
         BillingMode::Provisioned => {
@@ -2578,6 +2672,99 @@ mod tests {
         assert!(
             err.to_string().contains("Size of attribute name"),
             "unexpected error: {err}"
+        );
+    }
+
+    fn provisioned_with_gsi(gsi_throughput: Option<(i64, i64)>) -> CreateTableInput {
+        let mut input = base_input(
+            vec![make_ks("pk", KeyType::Hash)],
+            vec![
+                make_ad("pk", ScalarAttributeType::S),
+                make_ad("gsi_pk", ScalarAttributeType::S),
+            ],
+        );
+        input.billing_mode = Some(BillingMode::Provisioned);
+        input.provisioned_throughput = Some(crate::types::ProvisionedThroughput {
+            read_capacity_units: 5,
+            write_capacity_units: 5,
+        });
+        input.global_secondary_indexes = Some(vec![GsiInput {
+            index_name: "my-gsi".to_owned(),
+            key_schema: vec![make_ks("gsi_pk", KeyType::Hash)],
+            projection: Projection {
+                projection_type: ProjectionType::All,
+                non_key_attributes: None,
+            },
+            provisioned_throughput: gsi_throughput.map(|(read, write)| {
+                crate::types::ProvisionedThroughput {
+                    read_capacity_units: read,
+                    write_capacity_units: write,
+                }
+            }),
+        }]);
+        input
+    }
+
+    #[test]
+    fn gsi_throughput_below_one_is_rejected_on_provisioned() {
+        let limits = LimitsConfig::default();
+        for pt in [(0, 0), (0, 5), (5, 0), (-1, 5), (5, -1)] {
+            let err = validate_create_table(&provisioned_with_gsi(Some(pt)), &limits).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "One or more parameter values were invalid: ReadCapacityUnits and \
+                 WriteCapacityUnits must both be greater than or equal to 1 for index: my-gsi",
+                "{pt:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gsi_throughput_of_one_or_none_is_accepted_on_provisioned() {
+        let limits = LimitsConfig::default();
+        assert!(validate_create_table(&provisioned_with_gsi(Some((1, 1))), &limits).is_ok());
+        // Accepted as before; RestoreTableFromBackup gives such an index the
+        // table's throughput.
+        assert!(validate_create_table(&provisioned_with_gsi(None), &limits).is_ok());
+    }
+
+    #[test]
+    fn more_than_one_hundred_projected_attributes_are_rejected() {
+        let limits = LimitsConfig::default();
+        let include = |range: std::ops::Range<usize>| Projection {
+            projection_type: ProjectionType::Include,
+            non_key_attributes: Some(range.map(|i| format!("a{i}")).collect()),
+        };
+        let mut input = base_input(
+            vec![make_ks("pk", KeyType::Hash), make_ks("sk", KeyType::Range)],
+            vec![
+                make_ad("pk", ScalarAttributeType::S),
+                make_ad("sk", ScalarAttributeType::S),
+                make_ad("gsi_pk", ScalarAttributeType::S),
+                make_ad("lsk", ScalarAttributeType::S),
+            ],
+        );
+        let with = |input: &mut CreateTableInput, gsi_end: usize, lsi_end: usize| {
+            input.global_secondary_indexes = Some(vec![GsiInput {
+                index_name: "my-gsi".to_owned(),
+                key_schema: vec![make_ks("gsi_pk", KeyType::Hash)],
+                projection: include(0..gsi_end),
+                provisioned_throughput: None,
+            }]);
+            input.local_secondary_indexes = Some(vec![crate::types::LsiInput {
+                index_name: "my-lsi".to_owned(),
+                key_schema: vec![make_ks("pk", KeyType::Hash), make_ks("lsk", KeyType::Range)],
+                projection: include(gsi_end..lsi_end),
+            }]);
+        };
+        with(&mut input, 60, 100);
+        assert!(validate_create_table(&input, &limits).is_ok());
+        with(&mut input, 60, 101);
+        let err = validate_create_table(&input, &limits).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("exceeds limit of 100, projected: 101"),
+            "{err}"
         );
     }
 

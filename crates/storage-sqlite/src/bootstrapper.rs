@@ -168,14 +168,30 @@ impl Bootstrapper for SqliteBootstrapper {
     }
 
     async fn run_data_migrations(&self) -> OpResult<()> {
-        Ok(()) // Single file — schema applied in run_catalog_migrations.
+        // Catalog and data share one file, so the schema itself is applied in
+        // run_catalog_migrations. What remains here are the table-shape steps
+        // an already-0.0.4 catalog may still need (an earlier 0.0.4 build's
+        // backup_items / table_restores), which `migrate` skips
+        // run_catalog_migrations for because the version already matches.
+        if !self.is_catalog_initialized().await? {
+            return Ok(());
+        }
+        let pool = self.pool().await?;
+        schema::apply_shape_migrations(&pool).await
     }
 
     async fn pending_data_migrations(&self) -> OpResult<Vec<String>> {
-        // SQLite applies its complete schema in run_catalog_migrations (a single
-        // file), so there are no separately-tracked data migrations that can be
-        // pending.
-        Ok(Vec::new())
+        // No migration files: the complete schema is applied in
+        // run_catalog_migrations. Reported here instead are the table rebuilds
+        // and column additions that applying it would perform, so that
+        // `migrate`'s dry run names them (the backup_items rebuild copies every
+        // backup row in one write transaction) and so that `migrate --yes`
+        // runs them on a catalog already stamped 0.0.4.
+        if !self.is_catalog_initialized().await? {
+            return Ok(Vec::new());
+        }
+        let pool = self.pool().await?;
+        schema::pending_shape_migrations(&pool).await
     }
 
     async fn record_data_connection(&self) -> OpResult<()> {
@@ -607,5 +623,72 @@ mod lock_tests {
         bootstrap.drop_databases("unused").await.expect("destroy");
         assert!(!db.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod migrate_report_tests {
+    use super::SqliteBootstrapper;
+    use extenddb_storage::bootstrapper::Bootstrapper;
+
+    /// `extenddb migrate`'s dry run prints `pending_data_migrations`. On a
+    /// 0.0.3 database it names the backup_items rebuild with its row count,
+    /// `run_data_migrations` performs it even when the catalog version
+    /// already matches (an earlier 0.0.4 build), and then nothing is pending.
+    #[tokio::test]
+    async fn the_dry_run_names_the_backup_items_rebuild() {
+        let target = std::env::var_os("CARGO_TARGET_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target")
+            });
+        let path = target.join(format!("migrate-report-{}.sqlite", uuid::Uuid::new_v4()));
+        let bootstrap = SqliteBootstrapper::new(path.to_string_lossy().into_owned());
+        assert!(
+            bootstrap
+                .pending_data_migrations()
+                .await
+                .expect("no database yet")
+                .is_empty()
+        );
+        {
+            let pool = bootstrap.pool().await.expect("pool");
+            sqlx::raw_sql(include_str!("../testdata/schema_0_0_3.sql"))
+                .execute(&pool)
+                .await
+                .expect("0.0.3 schema");
+            // Stamped as an earlier 0.0.4 build left it: version current,
+            // backup_items still without its cursor column.
+            sqlx::raw_sql(
+                "INSERT INTO backups (backup_arn, backup_name, table_id, table_name, account_id, \
+                 key_schema, attribute_definitions) VALUES ('a', 'b', 't', 't', '0', '[]', '[]'); \
+                 INSERT INTO backup_items (backup_arn, pk, sk, item_data) VALUES \
+                     ('a', '', NULL, '{}'), ('a', '', NULL, '{}'); \
+                 UPDATE settings SET value = '0.0.4' WHERE key = 'catalog_version';",
+            )
+            .execute(&pool)
+            .await
+            .expect("rows");
+            pool.close().await;
+        }
+        assert_eq!(
+            bootstrap.read_catalog_version().await.expect("version"),
+            Some(bootstrap.expected_catalog_version())
+        );
+        assert_eq!(
+            bootstrap.pending_data_migrations().await.expect("pending"),
+            vec!["rebuild backup_items (2 rows)".to_owned()]
+        );
+        bootstrap.run_data_migrations().await.expect("apply");
+        assert!(
+            bootstrap
+                .pending_data_migrations()
+                .await
+                .expect("pending after")
+                .is_empty()
+        );
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 }

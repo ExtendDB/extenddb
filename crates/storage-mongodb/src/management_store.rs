@@ -10,7 +10,8 @@ use mongodb::options::{FindOptions, UpdateOptions};
 
 use extenddb_storage::management_store::{
     AccessKeyCreated, AccountDetail, AdminEntry, GroupDetail, GroupListEntry, ManagementStore,
-    MetricsRow, OpError, OpResult, RoleDetail, RoleListEntry, UserDetail, UserListEntry,
+    MetricsRow, OpError, OpResult, RoleDetail, RoleListEntry, SessionPolicyEntry, UserDetail,
+    UserListEntry,
 };
 
 use crate::catalog_store::MongoCatalogStore;
@@ -1852,6 +1853,78 @@ impl ManagementStore for MongoCatalogStore {
 
             coll.insert_one(session_doc).await.map_err(|e| {
                 tracing::error!("store_session failed: {e}");
+                OpError::Internal("Database error".to_owned())
+            })?;
+            Ok(())
+        })
+    }
+
+    fn list_session_policies(&self) -> BoxFuture<'_, OpResult<Vec<SessionPolicyEntry>>> {
+        Box::pin(async move {
+            let coll = self.catalog_db().collection::<Document>("iam_sessions");
+            let cursor = coll
+                .find(doc! { "session_policy": { "$exists": true } })
+                .await
+                .map_err(|e| {
+                    tracing::error!("list_session_policies: {e}");
+                    OpError::Internal("Database error".to_owned())
+                })?;
+            let docs: Vec<Document> = cursor.try_collect().await.map_err(|e| {
+                tracing::error!("list_session_policies cursor: {e}");
+                OpError::Internal("Database error".to_owned())
+            })?;
+            let mut out = Vec::new();
+            for d in docs {
+                let Some(policy_bson) = d.get("session_policy") else {
+                    continue;
+                };
+                // A session policy that does not convert is a corrupt row. It
+                // cannot be evaluated under either key form, so no decision
+                // depends on the migration; report it and carry on.
+                let Ok(policy) = bson::from_bson::<serde_json::Value>(policy_bson.clone()) else {
+                    tracing::warn!(
+                        account_id = d.get_str("account_id").unwrap_or_default(),
+                        role_name = d.get_str("role_name").unwrap_or_default(),
+                        session_name = d.get_str("session_name").unwrap_or_default(),
+                        "stored session policy does not parse; skipped by the resource-tag migration"
+                    );
+                    continue;
+                };
+                if let (Ok(session_token), Ok(account_id), Ok(role_name), Ok(session_name)) = (
+                    d.get_str("session_token"),
+                    d.get_str("account_id"),
+                    d.get_str("role_name"),
+                    d.get_str("session_name"),
+                ) {
+                    out.push(SessionPolicyEntry {
+                        session_token: session_token.to_owned(),
+                        account_id: account_id.to_owned(),
+                        role_name: role_name.to_owned(),
+                        session_name: session_name.to_owned(),
+                        policy,
+                    });
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    fn update_session_policy(
+        &self,
+        session_token: &str,
+        document: &serde_json::Value,
+    ) -> BoxFuture<'_, OpResult<()>> {
+        let session_token = session_token.to_owned();
+        let policy_bson = bson::to_bson(document).unwrap_or(bson::Bson::Null);
+        Box::pin(async move {
+            let coll = self.catalog_db().collection::<Document>("iam_sessions");
+            coll.update_one(
+                doc! { "session_token": &session_token },
+                doc! { "$set": { "session_policy": policy_bson } },
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!("update_session_policy: {e}");
                 OpError::Internal("Database error".to_owned())
             })?;
             Ok(())

@@ -4,8 +4,10 @@
 //! Wildcard and ARN matching for IAM policy evaluation.
 //!
 //! `wildcard_match` supports `*` (zero or more characters) and `?` (exactly one
-//! character). `arn_match` splits on `:` and matches each segment independently,
-//! with `*` in a segment matching any value for that segment.
+//! character). `arn_match` splits an ARN into its first five fields plus the
+//! resource field (everything after the fifth `:`) as one field, and matches
+//! each field with `wildcard_match`, so `*` and `?` in the resource field span
+//! `:` and `/`.
 
 /// Match a pattern against a value. Supports `*` and `?` wildcards.
 /// Comparison is case-sensitive.
@@ -87,11 +89,16 @@ fn wildcard_match_impl(p: &[u8], v: &[u8], ignore_case: bool) -> bool {
     pi == plen
 }
 
-/// Match an ARN pattern against an ARN value.
+/// Match an ARN pattern against an ARN value, the way IAM does.
 ///
-/// ARN matching is segment-aware: each colon-separated segment is matched
-/// independently using `wildcard_match`. Both pattern and value must have
-/// the same number of segments (6 for standard ARNs).
+/// The ARN is split into its first five fields (`arn`, partition, service,
+/// region, account) plus the resource field (everything after the fifth `:`)
+/// as a single field. Each field is matched with `wildcard_match`, so `*` and
+/// `?` in the resource field span `:` and `/`. This matters for stream ARNs,
+/// whose label contains `:` (for example
+/// `.../stream/2026-04-08T08:40:22.123`), and for sub-resources separated by
+/// `/` such as `.../index/<name>` and `.../stream/<label>`. Both sides must
+/// have the same number of fields.
 ///
 /// # Examples
 ///
@@ -102,8 +109,8 @@ fn wildcard_match_impl(p: &[u8], v: &[u8], ignore_case: bool) -> bool {
 ///     "arn:aws:dynamodb:us-east-1:123456789012:table/Users"
 /// ));
 /// assert!(arn_match(
-///     "arn:aws:dynamodb:*:*:table/User*",
-///     "arn:aws:dynamodb:us-east-1:123456789012:table/Users"
+///     "arn:aws:dynamodb:*:*:table/T/stream/*",
+///     "arn:aws:dynamodb:us-east-1:123456789012:table/T/stream/2026-04-08T08:40:22.123"
 /// ));
 /// ```
 #[must_use]
@@ -113,16 +120,18 @@ pub fn arn_match(pattern: &str, value: &str) -> bool {
         return true;
     }
 
-    let p_segments: Vec<&str> = pattern.split(':').collect();
-    let v_segments: Vec<&str> = value.split(':').collect();
+    // Split into at most six fields so the resource field (index 5) keeps its
+    // own `:` and `/`; wildcards in it then span those characters.
+    let p_fields: Vec<&str> = pattern.splitn(6, ':').collect();
+    let v_fields: Vec<&str> = value.splitn(6, ':').collect();
 
-    if p_segments.len() != v_segments.len() {
+    if p_fields.len() != v_fields.len() {
         return false;
     }
 
-    p_segments
+    p_fields
         .iter()
-        .zip(v_segments.iter())
+        .zip(v_fields.iter())
         .all(|(p, v)| wildcard_match(p, v))
 }
 
@@ -400,6 +409,57 @@ mod tests {
         assert!(!arn_match(
             "arn:aws:dynamodb:*:*:table/Orders",
             "arn:aws:dynamodb:us-east-1:123:table/Users"
+        ));
+    }
+
+    #[test]
+    fn arn_wildcard_stream_label_spans_colons() {
+        // A stream label contains ':'. A trailing '*' on the label must match
+        // across those colons.
+        let value = "arn:aws:dynamodb:us-east-1:123:table/T/stream/2026-10-20T16:17:40.188";
+        assert!(arn_match(
+            "arn:aws:dynamodb:us-east-1:123:table/T/stream/*",
+            value
+        ));
+        assert!(arn_match("arn:aws:dynamodb:*:*:table/T/stream/*", value));
+    }
+
+    #[test]
+    fn arn_exact_stream_label_matches() {
+        let value = "arn:aws:dynamodb:us-east-1:123:table/T/stream/2026-10-20T16:17:40.188";
+        assert!(arn_match(value, value));
+    }
+
+    #[test]
+    fn arn_resource_wildcard_spans_slash() {
+        // 'table/T/*' matches any sub-resource of T (index or stream).
+        assert!(arn_match(
+            "arn:aws:dynamodb:*:*:table/T/*",
+            "arn:aws:dynamodb:us-east-1:123:table/T/index/gsi1"
+        ));
+        assert!(arn_match(
+            "arn:aws:dynamodb:*:*:table/T/*",
+            "arn:aws:dynamodb:us-east-1:123:table/T/stream/2026-10-20T16:17:40.188"
+        ));
+    }
+
+    #[test]
+    fn arn_stream_wildcard_does_not_match_other_table() {
+        assert!(!arn_match(
+            "arn:aws:dynamodb:*:*:table/T/stream/*",
+            "arn:aws:dynamodb:us-east-1:123:table/Other/stream/2026-10-20T16:17:40.188"
+        ));
+    }
+
+    #[test]
+    fn arn_resource_field_count_is_fixed_at_six() {
+        // A value with extra ':' only in the resource still has six fields and
+        // matches an exact pattern field for field.
+        let value = "arn:aws:dynamodb:us-east-1:123:table/T/stream/a:b:c";
+        assert!(arn_match(value, value));
+        assert!(arn_match(
+            "arn:aws:dynamodb:us-east-1:123:table/T/stream/*",
+            value
         ));
     }
 

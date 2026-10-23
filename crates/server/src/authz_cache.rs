@@ -330,9 +330,17 @@ impl CachedAuthzStore {
             .await
     }
 
-    /// Fetch resource tags as a flat map. Empty for wildcard resources.
+    /// Fetch resource tags as a flat map. Empty for wildcard resources, and
+    /// for backups.
+    ///
+    /// `DynamoDB` backups carry no tags: the service's authorization reference
+    /// lists no `aws:ResourceTag` key for the `backup` resource, so a
+    /// tag condition never matches one. `TagResource` refuses backup ARNs, but
+    /// tags written under one by an earlier build may still be stored; they
+    /// are never read here, so the decision does not depend on them. Uses the
+    /// same predicate as the tagging refusal.
     pub async fn fetch_resource_tags(&self, arn: &str) -> OpResult<TagMap> {
-        if arn.ends_with("/*") {
+        if arn.ends_with("/*") || extenddb_storage::util::is_backup_resource_arn(arn) {
             return Ok(Arc::new(HashMap::new()));
         }
         Ok(self
@@ -939,7 +947,7 @@ fn parse_document(s: &str) -> OpResult<Arc<PolicyDocument>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -956,7 +964,7 @@ mod tests {
 
     /// Counts calls per method so tests can assert the cache prevents repeats.
     #[derive(Default)]
-    struct CountingAuthzStore {
+    pub(crate) struct CountingAuthzStore {
         user_policies_calls: AtomicUsize,
         user_group_policies_calls: AtomicUsize,
         user_boundary_calls: AtomicUsize,
@@ -965,17 +973,17 @@ mod tests {
         role_boundary_calls: AtomicUsize,
         role_tags_calls: AtomicUsize,
         session_data_calls: AtomicUsize,
-        resource_tags_calls: AtomicUsize,
+        pub(crate) resource_tags_calls: AtomicUsize,
 
-        user_policies: Mutex<HashMap<PrincipalKey, Vec<String>>>,
+        pub(crate) user_policies: Mutex<HashMap<PrincipalKey, Vec<String>>>,
         user_group_policies: Mutex<HashMap<PrincipalKey, Vec<String>>>,
         user_boundary: Mutex<HashMap<PrincipalKey, Option<String>>>,
         user_tags: Mutex<HashMap<PrincipalKey, TagPairs>>,
-        role_policies: Mutex<HashMap<PrincipalKey, Vec<String>>>,
+        pub(crate) role_policies: Mutex<HashMap<PrincipalKey, Vec<String>>>,
         role_boundary: Mutex<HashMap<PrincipalKey, Option<String>>>,
         role_tags: Mutex<HashMap<PrincipalKey, TagPairs>>,
         session_data: Mutex<HashMap<SessionKey, Option<SessionData>>>,
-        resource_tags: Mutex<HashMap<String, TagPairs>>,
+        pub(crate) resource_tags: Mutex<HashMap<String, TagPairs>>,
     }
 
     impl AuthorizationStore for CountingAuthzStore {
@@ -1151,7 +1159,7 @@ mod tests {
         }
     }
 
-    fn fast_authz_cfg() -> AuthzCacheConfig {
+    pub(crate) fn fast_authz_cfg() -> AuthzCacheConfig {
         let base = SwrCacheConfig {
             ttl: Duration::from_millis(200),
             soft_ttl: Duration::from_millis(50),
@@ -1268,6 +1276,39 @@ mod tests {
             0,
             "wildcard resource ARN must short-circuit before any DB call"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn resource_tags_of_a_backup_are_never_read() {
+        let inner = Arc::new(CountingAuthzStore::default());
+        let cache = CachedAuthzStore::new(inner.clone(), fast_authz_cfg());
+        let p = "arn:aws:dynamodb:us-east-1:1:table/Music";
+        for arn in [
+            format!("{p}/backup/01791976431438-73d8d5bc"),
+            format!("{p}/backup/1489602797149-x"),
+            format!("{p}/backup/1/x"),
+            format!("{p}/backup"),
+        ] {
+            inner
+                .resource_tags
+                .lock()
+                .unwrap()
+                .insert(arn.clone(), vec![("classification".into(), "dev".into())]);
+            assert!(
+                cache.fetch_resource_tags(&arn).await.unwrap().is_empty(),
+                "{arn}"
+            );
+        }
+        assert_eq!(inner.resource_tags_calls.load(Ordering::SeqCst), 0);
+        // Liveness: a table's stored tags are read.
+        inner
+            .resource_tags
+            .lock()
+            .unwrap()
+            .insert(p.to_owned(), vec![("classification".into(), "dev".into())]);
+        let tags = cache.fetch_resource_tags(p).await.unwrap();
+        assert_eq!(tags.get("classification").map(String::as_str), Some("dev"));
+        assert_eq!(inner.resource_tags_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

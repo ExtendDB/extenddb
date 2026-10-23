@@ -90,7 +90,7 @@ These settings require a server restart to take effect.
 |-----|---------|-------------|
 | `bind_addr` | `127.0.0.1` | Network interface to bind |
 | `port` | `18443` | HTTP port |
-| `region` | `us-east-1` | AWS region for ARN generation |
+| `region` | `us-east-1` | AWS region for ARN generation. Baked into every backup ARN the server issues, so it must stay within `[a-z0-9-]` (a value outside that class makes the server's own backup ARNs "not valid"; the server logs a warning at startup). A backup ARN of the caller's account in another region is resolved in the server's region first, then as written; see the upgrade manual before changing this on a deployment with backups |
 
 #### [storage]
 
@@ -105,6 +105,17 @@ These settings require a server restart to take effect.
 | `connection_string` | `postgresql://extenddb:extenddb-local-dev@localhost:5432/extenddb_catalog` | Catalog database connection string |
 | `pool_size` | `20` | Maximum concurrent database connections (minimum: 10) |
 | `catalog_pool_size` | (= `pool_size`) | Maximum connections for management/authz pool (minimum: 10) |
+
+Restores on PostgreSQL are bounded per server process: at most 4 per account and at most half of `pool_size` in total (after its minimum of 10 is applied, capped at 16; 10 with the default `pool_size` of 20). A restore that cannot get both within 30 seconds is refused with `LimitExceededException`. Each running restore holds one connection from this pool for its whole copy, plus one dedicated connection outside the pool for its lock.
+
+`RestoreTableFromBackup` on PostgreSQL holds a session-level advisory lock for the whole copy, so ExtendDB must reach the catalog database directly or through a session-mode pooler. Behind a transaction-mode pooler (for example PgBouncer with `pool_mode = transaction`) restore locks are not released and the abandoned-restore sweep can remove a restore that is still running; do not run restores through one.
+
+#### [storage.sqlite]
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `path` | `extenddb.sqlite` | Database file (`init --sqlite-path` writes it); `:memory:` for an ephemeral database |
+| `pool_size` | `10` | Maximum connections. Writes are serialized by the engine whatever the size. A file database raises `pool_size = 1` to 2 and logs it at info (`SQLite pool_size 1 raised to 2 for a file-backed database: ...`), because a backup holds one reader connection for its whole duration while its batches write through another. Use 3 or more so a running backup does not contend with ordinary requests for connections |
 
 #### [auth]
 
@@ -438,8 +449,8 @@ caller omits the key. ExtendDB resolves `aws:PrincipalArn`, `aws:PrincipalAccoun
 `aws:ResourceAccount`, `aws:PrincipalType`, `aws:username` (for a user caller),
 `aws:userid`, `aws:SourceIp`, `aws:UserAgent`, `aws:SecureTransport`,
 `aws:RequestedRegion`, `aws:CurrentTime`, `aws:EpochTime`, `aws:ViaAWSService`,
-`aws:PrincipalIsAWSService`, `aws:PrincipalTag/<key>`, `aws:ResourceTag/<key>`
-and `dynamodb:ResourceTag/<key>` (tag keys matched case-insensitively) on a
+`aws:PrincipalIsAWSService`, `aws:PrincipalTag/<key>` and `aws:ResourceTag/<key>`
+(tag keys matched case-insensitively) on a
 data-plane request. Every other `aws:` global key is absent, which is what the
 service does for a key it does not populate for this caller and for an unknown
 key.
@@ -468,7 +479,7 @@ Resolved (evaluated against the request value):
 - `aws:ViaAWSService` and `aws:PrincipalIsAWSService` (both false for a direct
   caller).
 - `aws:PrincipalTag/<key>`, `aws:RequestTag/<key>` (trust path),
-  `aws:ResourceTag/<key>`, `dynamodb:ResourceTag/<key>`, `aws:TagKeys`,
+  `aws:ResourceTag/<key>`, `aws:TagKeys`,
   `sts:ExternalId` (trust path).
 - Role-session only (absent for an IAM user, matching the service):
   `aws:TokenIssueTime` (the session issue time) and
@@ -527,6 +538,198 @@ absent, as the service leaves it unset for a non-MFA session. Like
 `aws:TokenIssueTime`, `aws:MultiFactorAuthPresent` is resolved on the DynamoDB
 request path only; in a trust policy it is absent, as on the service for an
 `AssumeRole` caller using long-term credentials.
+
+### Resource-level authorization
+
+Every operation is authorized against the specific resource ARN, matching
+DynamoDB. The `Resource` element of a policy is matched field by field, and a
+`*` or `?` in the resource part of the ARN spans the `:` and `/` inside it.
+
+| Operation | Resource ARN authorized |
+|-----------|-------------------------|
+| Item and table operations (GetItem, PutItem, Query and Scan on the base table, CreateTable, UpdateTable, DescribeTable, and so on) | `table/<name>` |
+| Query and Scan with an `IndexName` | `table/<name>/index/<index>` |
+| TagResource, UntagResource, ListTagsOfResource | the `ResourceArn` (a table or stream ARN) |
+| DescribeStream, GetShardIterator | the `StreamArn` |
+| GetRecords | the stream the shard iterator reads |
+| ListStreams | `table/<name>/stream/*` when a table is named, else `table/*/stream/*` |
+| DescribeBackup, DeleteBackup | the `BackupArn` |
+| CreateBackup, DescribeContinuousBackups, UpdateContinuousBackups | `table/<name>` |
+| ExportTableToPointInTime | the source `table/<name>` |
+| ImportTable | the new `table/<name>` |
+| RestoreTableFromBackup | the backup ARN, plus Scan, Query, GetItem, PutItem, UpdateItem, DeleteItem and BatchWriteItem on the target `table/<name>` |
+| RestoreTableToPointInTime | the source `table/<name>`, plus the same item actions on the target `table/<name>` |
+| ListTables | `table/*` |
+| DescribeLimits | `*` |
+| DescribeEndpoints | not authorized (signed request, no IAM permission) |
+
+A policy that names another partition, service, region, or account in a
+resource ARN it supplies (for example on a stream or backup operation) cannot
+evade a Deny written against the real resource: the resource is resolved in this
+deployment's account regardless of those fields.
+
+#### Compatibility notes
+
+Earlier builds authorized several of these operations against
+`table/*` instead of the specific resource. Review existing policies before
+upgrading:
+
+- **Index reads.** Query and Scan with an `IndexName` are authorized against
+  `table/<name>/index/<index>`. A policy that granted a principal only
+  `table/<name>` no longer allows reads of that table's indexes. Grant
+  `table/<name>/index/<index>` or `table/<name>/index/*` as needed. This
+  matches DynamoDB.
+- **Fencing a whole table with a Deny.** Index reads, `ListStreams` with a
+  TableName, and `ListBackups` with a TableName are authorized against a
+  sub-resource ARN (`table/<name>/index/*`, `table/<name>/stream/*`,
+  `table/<name>/backup/*`), not the bare `table/<name>`. A `Deny` written only
+  on `table/<name>` therefore does not cover them. An operator who means to
+  fence a whole table adds `table/<name>/*` to the `Deny` alongside
+  `table/<name>`.
+- **Index reads and resource tags.** An index Query or Scan evaluates the base
+  table's resource tags (`aws:ResourceTag/*`; `dynamodb:ResourceTag/*` is
+  absent for every resource),
+  because a secondary index inherits the tags of its table. An ABAC `Deny` or
+  `Allow` conditioned on the table's tags applies to its indexes.
+- **Streams, backups, and resource tags.** An operation on a stream ARN
+  (DescribeStream, GetShardIterator, GetRecords, and a tag operation on the
+  stream) and an operation on a backup ARN evaluate no resource tags, as on
+  DynamoDB: `aws:ResourceTag/*` and `dynamodb:ResourceTag/*` are absent. A
+  stream holds a tag set of its own, separate from its table's, but neither set
+  is evaluated for the stream's operations. A condition on the key evaluates as
+  for an absent key: `StringEquals` and `StringLike` do not match, while a
+  negated operator, an `IfExists` form, `ForAllValues`, and `Null` true do. A
+  backup ARN cannot be tagged.
+- **DescribeLimits and DescribeEndpoints.** DescribeLimits is authorized against
+  `*`, not `table/*`, so a grant or a `Deny` scoped to `table/*` no longer
+  applies to it; scope its statement to `*`. DescribeEndpoints is not evaluated
+  against IAM at all (it needs a signed request but no permission), so a `Deny`
+  on it does not block it, matching DynamoDB.
+- **Streams.** A policy whose resource is `table/<name>/stream/*` now matches
+  concrete stream ARNs (the stream label contains `:`, which the resource
+  wildcard now spans). A Deny on a specific stream ARN, or on a tag, backup, or
+  index ARN, now takes effect where before it was bypassed.
+- **GetRecords.** GetRecords is authorized against the stream its shard iterator
+  reads, so a principal needs `dynamodb:GetRecords` on that stream. A shard
+  iterator issued by a build before this change does not identify its stream;
+  after upgrade, GetRecords on such an iterator returns
+  `ExpiredIteratorException` with the expiry message, so a stream client renews
+  it by calling GetShardIterator rather than failing on a non-retryable error.
+  This matters during the upgrade itself: a consumer reading when the server
+  restarts holds a pre-upgrade iterator, and its iterator chain renews cleanly
+  instead of stalling. A token that does not decode at all still returns
+  `ValidationException` with the message `Invalid ShardIterator`, which is what
+  DynamoDB returns for an iterator it did not issue. Shard iterators expire after
+  15 minutes.
+- **Restores.** A restore writes items into its target table, so
+  RestoreTableFromBackup and RestoreTableToPointInTime require the item write
+  and read actions on the target table in addition to the restore action. A
+  principal that could previously restore with only the restore permission now
+  also needs those actions on the target table name.
+- **Denial messages.** An AccessDeniedException now ends with the clause the
+  service uses: "with an explicit deny in an identity-based policy" when an
+  explicit Deny matched the request, or "because no identity-based policy allows
+  the <action> action" otherwise. Earlier builds returned the common prefix with
+  no trailing clause and did not distinguish the two cases. The error code is
+  unchanged, so a client that checks the code or the substring "is not
+  authorized to perform" is unaffected; tooling that matched the full message
+  text verbatim will see the new clause.
+
+#### Backup and restore permissions
+
+The backup operations are authorized against the resources in the table
+above (measured on DynamoDB, 2026-10-20). In summary, each pair must be allowed:
+
+| Operation | Action and resource |
+|---|---|
+| `CreateBackup` | `dynamodb:CreateBackup` on `arn:aws:dynamodb:<region>:<account>:table/<TableName>` |
+| `DescribeBackup`, `DeleteBackup` | that action on the backup ARN, `.../table/<TableName>/backup/<id>` |
+| `ListBackups` | `dynamodb:ListBackups` on `.../table/*/backup/*`, or on `.../table/<TableName>/backup/*` when `TableName` is given |
+| `RestoreTableFromBackup` | `dynamodb:RestoreTableFromBackup` on the backup ARN, and `dynamodb:Scan`, `dynamodb:Query`, `dynamodb:GetItem`, `dynamodb:PutItem`, `dynamodb:UpdateItem`, `dynamodb:DeleteItem`, and `dynamodb:BatchWriteItem` on `.../table/<TargetTableName>`. `dynamodb:RestoreTableFromBackup` is not evaluated on the target table |
+
+A `*` in a `Resource` crosses `/`, so `Resource: "arn:aws:dynamodb:*:*:table/*"`
+(or `"*"`) covers tables and their backups alike. A table's own ARN,
+`table/Orders`, does not cover `table/Orders/backup/...`; use
+`table/Orders/backup/*` for its backups. A policy that lets a user take, list
+and restore the backups of one table into a fixed set of names:
+
+```bash
+./target/release/extenddb manage --user admin --password <pw> \
+    put-user-policy --account-id 123456789012 \
+    --user-name backup-operator \
+    --policy-name OrdersBackups \
+    --policy-document '{
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Effect": "Allow",
+          "Action": "dynamodb:CreateBackup",
+          "Resource": "arn:aws:dynamodb:*:123456789012:table/Orders"
+        },
+        {
+          "Effect": "Allow",
+          "Action": ["dynamodb:ListBackups", "dynamodb:DescribeBackup",
+                     "dynamodb:DeleteBackup", "dynamodb:RestoreTableFromBackup"],
+          "Resource": "arn:aws:dynamodb:*:123456789012:table/Orders/backup/*"
+        },
+        {
+          "Effect": "Allow",
+          "Action": ["dynamodb:Scan", "dynamodb:Query", "dynamodb:UpdateItem",
+                     "dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:DeleteItem",
+                     "dynamodb:BatchWriteItem"],
+          "Resource": "arn:aws:dynamodb:*:123456789012:table/Orders-restored-*"
+        }
+      ]
+    }'
+```
+
+With this policy `ListBackups` must carry `TableName: Orders` (the unfiltered
+list is `table/*/backup/*`, which the second statement does not cover), and a
+restore into any name other than `Orders-restored-*` is refused naming the
+first item action denied (`dynamodb:Scan on resource: ...table/<target>`).
+
+A backup ARN is evaluated as the backup it names in this deployment: the
+table and backup id from the request, in the server's region and the
+caller's account, whatever region or account the caller wrote (see the
+paragraph above the compatibility notes). A statement that names a backup ARN
+should therefore spell the server's region, or use `*` in the region field as
+the example does. The engine resolves a `BackupArn` of the caller's account
+under the server's region first and, if that names no backup, under the ARN as
+written (a backup created under an earlier `server.region`; see the upgrade
+manual); both are the same backup identity, which is what was evaluated. A
+`CreateBackup` whose `TableName` is the table's ARN is evaluated on the
+`table/<name>` the ARN names.
+
+The seven item-action evaluations on the restore target read the target
+table's resource tags: a target that does not exist has none, so an
+`aws:ResourceTag/<key>` condition on those actions does not grant the
+restore; a target that exists is evaluated with its tags, and a restore the
+condition then allows, and that is otherwise valid, fails with
+`TableAlreadyExistsException` (`TableInUseException` for a `CREATING` restore
+target). Every
+DynamoDB condition key (`dynamodb:LeadingKeys`, `dynamodb:Attributes`,
+`dynamodb:Select`, `dynamodb:ReturnValues`, `dynamodb:ReturnConsumedCapacity`,
+`dynamodb:FullTableScan`, `dynamodb:EnclosingOperation`) is absent in these
+seven evaluations, so `ForAllValues:*` and `Null: true` conditions pass and
+bare `StringEquals` and `Bool` conditions fail. In particular an `Allow` of
+the item actions conditioned on `ForAllValues:StringEquals
+dynamodb:LeadingKeys` (the row-level pattern in the troubleshooting guide)
+grants a restore of every item in the backup into any table the statement's
+`Resource` covers, and an `Allow` of `dynamodb:Scan` conditioned on
+`Bool dynamodb:FullTableScan: false` blocks every restore, while a `Deny` of
+`dynamodb:Scan` conditioned on `Bool dynamodb:FullTableScan: true` blocks
+none. Grant the item actions for restores on target names of their own, as
+the example does. The keys the service sets in these evaluations were not
+measured.
+
+The request-level keys (`aws:SourceIp`, `aws:UserAgent`, `aws:SecureTransport`,
+`aws:RequestedRegion`, and the principal keys above) are evaluated on every
+backup and restore evaluation, as on any other request.
+
+These resources have been evaluated since v0.1.14; the compatibility notes
+above say what earlier builds evaluated. A `Deny` of
+`dynamodb:RestoreTableFromBackup` on a table does not block restores into it;
+deny `dynamodb:PutItem` on it instead.
 
 ### Permissions Boundaries
 
@@ -703,10 +906,10 @@ Check that PostgreSQL is running and the connection string in `extenddb.toml` is
 
 <!-- version-literal-ok: the block below is an example mismatch error; 1.0.0 is the value found on disk, not a version claim -->
 ```
-Error: catalog version mismatch: found 1.0.0, expected 0.0.3
+Error: catalog version mismatch: found 1.0.0, expected 0.0.4
 ```
 
-Run `extenddb migrate --config extenddb.toml` to upgrade the catalog schema. The check is exact equality in both directions, so this also appears when a binary meets a catalog a newer build already migrated; in that case upgrade the binary rather than the catalog. See the Upgrade Manual for the version history and the stop / migrate / start sequence.
+Run `extenddb migrate --config extenddb.toml` to upgrade the catalog schema. The check is exact equality in both directions, so this also appears when a binary meets a catalog a newer build already migrated; in that case upgrade the binary rather than the catalog. `extenddb migrate` refuses a catalog newer than the binary (`catalog version X is newer than this binary's Y`) instead of stamping the older version onto it. See the Upgrade Manual for the version history and the stop / migrate / start sequence.
 
 ### Authentication Errors
 

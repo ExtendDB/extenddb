@@ -247,12 +247,12 @@ fn string_not_like_multiple_policy_values_no_match() {
 #[test]
 fn policy_variable_expansion_principal_tag() {
     let ctx = TestContext::new()
-        .with("dynamodb:ResourceTag/Team", vec!["Alpha"])
+        .with("aws:ResourceTag/Team", vec!["Alpha"])
         .with("aws:PrincipalTag/Team", vec!["Alpha"]);
     assert!(evaluate_condition(
         &cond(
             ConditionOperator::StringEquals,
-            "dynamodb:ResourceTag/Team",
+            "aws:ResourceTag/Team",
             vec!["${aws:PrincipalTag/Team}"]
         ),
         &ctx
@@ -262,12 +262,12 @@ fn policy_variable_expansion_principal_tag() {
 #[test]
 fn policy_variable_expansion_mismatch() {
     let ctx = TestContext::new()
-        .with("dynamodb:ResourceTag/Team", vec!["Beta"])
+        .with("aws:ResourceTag/Team", vec!["Beta"])
         .with("aws:PrincipalTag/Team", vec!["Alpha"]);
     assert!(!evaluate_condition(
         &cond(
             ConditionOperator::StringEquals,
-            "dynamodb:ResourceTag/Team",
+            "aws:ResourceTag/Team",
             vec!["${aws:PrincipalTag/Team}"]
         ),
         &ctx

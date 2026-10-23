@@ -216,6 +216,13 @@ export EXTENDDB_ADMIN_USER=admin
 export EXTENDDB_ADMIN_PASSWORD="$ADMIN_PASSWORD"
 export EXTENDDB_CONFIG="$CONFIG"
 export TMPDIR="$TMP_CANON"
+# The backup/restore fidelity tests' large backup (60,000 items by default)
+# drives enough requests through one driver connection that cdrs-tokio's
+# stream ids wrap while a slow request (a DROP TABLE under load) is still
+# outstanding; the driver then closes the connection on "Unmatched stream id"
+# and does not reconnect to the single node, and every later request fails.
+# 10,000 items still keep the restore copy running past the response.
+export EXTENDDB_TEST_BACKUP_ITEMS="${EXTENDDB_TEST_BACKUP_ITEMS:-10000}"
 
 RC=0
 devtools/run-tests --extenddb --backend cassandra --config "$CONFIG" "${RUN_TESTS_ARGS[@]}" || RC=$?

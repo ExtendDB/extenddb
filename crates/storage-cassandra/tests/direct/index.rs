@@ -846,3 +846,54 @@ async fn test_async_gsi_worker_skips_dropped_index() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
+
+/// UpdateTimeToLive enabling TTL on a table whose GSI propagates
+/// asynchronously is a `Validation` refusal (the engine answers it with
+/// ValidationException, not a 5xx), naming the table, the index and its
+/// delay, and changes nothing. With the same GSI synchronous, TTL is enabled
+/// (liveness: the refusal is about the asynchronous GSI, not TTL itself).
+#[tokio::test]
+async fn test_ttl_on_a_table_with_an_async_gsi_is_refused_as_a_validation_error() {
+    use extenddb_core::types::TimeToLiveStatus;
+    use extenddb_storage::MetadataEngine as _;
+    use extenddb_storage::error::StorageError;
+
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let config = test_config();
+    let engine = CassandraEngine::new(&config, "us-east-1").await.unwrap();
+    let table = crate::helpers::TestTable::with_gsi(&engine, "TtlAsyncGsi", "GsiIdx", "gpk").await;
+    set_gsi_delay(&engine, &table.key_info.table_id, "GsiIdx", 50).await;
+    let account = table.key_info.account_id.clone();
+    let name = table.key_info.table_name.clone();
+    for _ in 0..50 {
+        engine.process_control_plane_transitions().await.unwrap();
+        let desc = engine.describe_ttl(&account, &name).await;
+        if desc.is_ok() {
+            match engine.update_ttl(&account, &name, "expires_at", true).await {
+                Err(StorageError::TableNotActive(_)) => {}
+                Err(StorageError::Validation(msg)) => {
+                    assert!(
+                        msg.contains(&name) && msg.contains("GsiIdx") && msg.contains("50 ms"),
+                        "{msg}"
+                    );
+                    let after = engine.describe_ttl(&account, &name).await.unwrap();
+                    assert_eq!(after.time_to_live_status, TimeToLiveStatus::Disabled);
+
+                    set_gsi_delay(&engine, &table.key_info.table_id, "GsiIdx", 0).await;
+                    engine
+                        .update_ttl(&account, &name, "expires_at", true)
+                        .await
+                        .expect("TTL with a synchronous GSI is enabled");
+                    let enabled = engine.describe_ttl(&account, &name).await.unwrap();
+                    assert_ne!(enabled.time_to_live_status, TimeToLiveStatus::Disabled);
+                    return;
+                }
+                other => panic!("expected a Validation refusal, got {other:?}"),
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("table {name} never became ACTIVE");
+}

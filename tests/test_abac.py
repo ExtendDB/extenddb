@@ -91,7 +91,7 @@ def _create_user_with_key(mgmt: ManagementClient, account_id: str,
 # ---------------------------------------------------------------------------
 
 class TestResourceTagCondition:
-    """Policies with dynamodb:ResourceTag/* conditions."""
+    """Policies with aws:ResourceTag/* conditions."""
 
     @pytest.fixture(autouse=True)
     def setup(self, auth_env, mgmt, account_id, region):
@@ -130,7 +130,7 @@ class TestResourceTagCondition:
                     "Resource": "*",
                     "Condition": {
                         "StringEquals": {
-                            "dynamodb:ResourceTag/Env": "dev",
+                            "aws:ResourceTag/Env": "dev",
                         },
                     },
                 }],
@@ -206,7 +206,7 @@ class TestResourceTagCondition:
                     "Resource": "*",
                     "Condition": {
                         "StringEquals": {
-                            "dynamodb:ResourceTag/Env": "dev",
+                            "aws:ResourceTag/Env": "dev",
                         },
                     },
                 }],
@@ -692,6 +692,48 @@ class TestServicePopulatedGlobalKeys(_TaggedTableBase):
             {"StringNotEquals": {"aws:NoSuchGlobalKey": "x"}})) == "DENY"
 
 
+class TestResourceTagConditionKeyForms(_TaggedTableBase):
+    """Resource tags evaluate only as aws:ResourceTag/*, matching live DynamoDB.
+    aws:ResourceTag/env resolves to the table's tag value; dynamodb:ResourceTag/env
+    is absent and keeps IAM absent-key semantics. Table is tagged env=prod. Every
+    expected outcome was measured live on 2026-10-21."""
+
+    def test_aws_resourcetag_eq_grants(self, table):
+        # aws:ResourceTag/env resolves to prod, so StringEquals matches. Live: ALLOW.
+        assert self._get(table, self._allow_get_if(
+            {"StringEquals": {"aws:ResourceTag/env": "prod"}})) == "ALLOW"
+
+    def test_aws_resourcetag_ne_denies(self, table):
+        # aws:ResourceTag/env resolves to prod, so StringNotEquals is false and the
+        # Allow does not grant. Live: DENY.
+        assert self._get(table, self._allow_get_if(
+            {"StringNotEquals": {"aws:ResourceTag/env": "prod"}})) == "DENY"
+
+    def test_aws_resourcetag_deny_eq_blocks(self, table):
+        # A Deny gated on StringEquals aws:ResourceTag/env=prod fires on the prod
+        # table. Live: DENY.
+        assert self._get(table, self._allow_all_deny_get_if(
+            {"StringEquals": {"aws:ResourceTag/env": "prod"}})) == "DENY"
+
+    def test_dynamodb_resourcetag_eq_denies_absent_key(self, table):
+        # dynamodb:ResourceTag/env is absent, so StringEquals never matches and the
+        # Allow does not grant. Live: DENY.
+        assert self._get(table, self._allow_get_if(
+            {"StringEquals": {"dynamodb:ResourceTag/env": "prod"}})) == "DENY"
+
+    def test_dynamodb_resourcetag_ne_grants_absent_key(self, table):
+        # dynamodb:ResourceTag/env is absent, so StringNotEquals on an absent
+        # single-valued key matches and the Allow grants. Live: ALLOW.
+        assert self._get(table, self._allow_get_if(
+            {"StringNotEquals": {"dynamodb:ResourceTag/env": "prod"}})) == "ALLOW"
+
+    def test_dynamodb_resourcetag_deny_eq_does_not_block_absent_key(self, table):
+        # A Deny gated on StringEquals dynamodb:ResourceTag/env=prod does not fire,
+        # because the key is absent, so the base Allow stands. Live: ALLOW.
+        assert self._get(table, self._allow_all_deny_get_if(
+            {"StringEquals": {"dynamodb:ResourceTag/env": "prod"}})) == "ALLOW"
+
+
 class TestRound3GlobalKeys(_TaggedTableBase):
     """Round three keys on the identity path: aws:userid, aws:SourceIp,
     aws:UserAgent, aws:ResourceAccount, and the organization keys absent for a
@@ -786,9 +828,11 @@ class TestConditionKeyNameCaseInsensitive(_TaggedTableBase):
         assert self._get(table, self._allow_get_if(
             {"StringEquals": {"aws:resourcetag/env": "prod"}})) == "ALLOW"
 
-    def test_dynamodb_resourcetag_lowercase_prefix_grants(self, table):
+    def test_dynamodb_resourcetag_lowercase_prefix_is_absent(self, table):
+        # dynamodb:ResourceTag/* is absent in any case, as on DynamoDB, so a
+        # positive operator on it never matches and the Allow does not grant.
         assert self._get(table, self._allow_get_if(
-            {"StringEquals": {"dynamodb:resourcetag/env": "prod"}})) == "ALLOW"
+            {"StringEquals": {"dynamodb:resourcetag/env": "prod"}})) == "DENY"
 
     def test_principaltype_deny_lowercase_key_blocks(self, table):
         # A Deny gated on a miscased key must still be enforced. aws:principaltype
@@ -1270,3 +1314,147 @@ class TestMalformedCidrRejection:
             assert resp.status_code == 400, resp.text
         finally:
             self.mgmt.delete_user(self.account_id, user)
+
+
+# ---------------------------------------------------------------------------
+# Backups carry no resource tags
+# ---------------------------------------------------------------------------
+
+class TestBackupResourceTags:
+    """A caller allowed TagResource cannot satisfy a tag condition on a backup.
+
+    DescribeBackup, DeleteBackup and RestoreTableFromBackup are authorized on
+    the backup ARN. The service does not tag backups (TagResource takes table
+    and stream ARNs; the backup resource has no ResourceTag condition key), so
+    TagResource, UntagResource and ListTagsOfResource refuse a backup ARN, and
+    an ``aws:ResourceTag`` condition never matches a backup.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup(self, auth_env, mgmt, account_id, region):
+        self.endpoint = auth_env[0]
+        self.mgmt = mgmt
+        self.account_id = account_id
+        self.region = region
+
+    def _code(self, call) -> str:
+        with pytest.raises(ClientError) as exc_info:
+            call()
+        return exc_info.value.response["Error"]["Code"]
+
+    def test_tagging_a_backup_is_refused_and_grants_nothing(self):
+        user = f"bkp-tag-{uuid.uuid4().hex[:8]}"
+        ak, sk = _create_user_with_key(self.mgmt, self.account_id, user)
+        admin = f"adm-{uuid.uuid4().hex[:8]}"
+        admin_ak, admin_sk = _create_user_with_key(
+            self.mgmt, self.account_id, admin
+        )
+        resp = self.mgmt.put_user_policy(
+            self.account_id, admin, "full",
+            {"Version": "2012-10-17", "Statement": [{
+                "Effect": "Allow", "Action": "dynamodb:*", "Resource": "*",
+            }]},
+        )
+        assert resp.status_code == 204
+        # A policy that grants DescribeBackup only on resources tagged
+        # classification=dev, and the tagging actions on table/*.
+        resp = self.mgmt.put_user_policy(
+            self.account_id, user, "bkp-tag-policy",
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": ["dynamodb:DescribeBackup",
+                                   "dynamodb:DescribeTable"],
+                        "Resource": "*",
+                        "Condition": {"StringEquals": {
+                            "aws:ResourceTag/classification": "dev",
+                        }},
+                    },
+                    {
+                        "Effect": "Allow",
+                        "Action": ["dynamodb:TagResource",
+                                   "dynamodb:UntagResource",
+                                   "dynamodb:ListTagsOfResource"],
+                        "Resource": "arn:aws:dynamodb:*:*:table/*",
+                    },
+                ],
+            },
+        )
+        assert resp.status_code == 204
+
+        admin_client = _make_client(
+            self.endpoint, admin_ak, admin_sk, self.region
+        )
+        user_client = _make_client(self.endpoint, ak, sk, self.region)
+        table = f"abac-bkp-{uuid.uuid4().hex[:8]}"
+        backup_arn = None
+        dev = [{"Key": "classification", "Value": "dev"}]
+        try:
+            admin_client.create_table(
+                TableName=table,
+                AttributeDefinitions=[
+                    {"AttributeName": "pk", "AttributeType": "S"}
+                ],
+                KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+                BillingMode="PAY_PER_REQUEST",
+            )
+            wait_for_active(admin_client, table)
+            table_arn = admin_client.describe_table(
+                TableName=table)["Table"]["TableArn"]
+            backup_arn = admin_client.create_backup(
+                TableName=table, BackupName="abac-backup",
+            )["BackupDetails"]["BackupArn"]
+
+            def describe_backup():
+                return user_client.describe_backup(BackupArn=backup_arn)
+
+            assert self._code(describe_backup) == "AccessDeniedException"
+
+            # The step that used to succeed and turn the next call into Allow.
+            assert self._code(lambda: user_client.tag_resource(
+                ResourceArn=backup_arn, Tags=dev,
+            )) == "ValidationException"
+            assert self._code(describe_backup) == "AccessDeniedException"
+
+            # The other tagging operations refuse the backup ARN too, and so
+            # does a caller allowed dynamodb:* (nothing is stored).
+            assert self._code(lambda: user_client.untag_resource(
+                ResourceArn=backup_arn, TagKeys=["classification"],
+            )) == "ValidationException"
+            assert self._code(lambda: user_client.list_tags_of_resource(
+                ResourceArn=backup_arn,
+            )) == "ValidationException"
+            assert self._code(lambda: admin_client.tag_resource(
+                ResourceArn=backup_arn, Tags=dev,
+            )) == "ValidationException"
+            assert self._code(describe_backup) == "AccessDeniedException"
+
+            # Liveness: the same user and policy can tag the table, and the
+            # tag condition then allows DescribeTable on it. A backup does not
+            # take its table's tags.
+            assert self._code(lambda: user_client.describe_table(
+                TableName=table)) == "AccessDeniedException"
+            user_client.tag_resource(ResourceArn=table_arn, Tags=dev)
+            assert user_client.list_tags_of_resource(
+                ResourceArn=table_arn)["Tags"] == dev
+            user_client.describe_table(TableName=table)
+            assert self._code(describe_backup) == "AccessDeniedException"
+            # And the admin can still read the backup it made.
+            assert admin_client.describe_backup(BackupArn=backup_arn)[
+                "BackupDescription"]["BackupDetails"]["BackupArn"] == backup_arn
+        finally:
+            if backup_arn is not None:
+                try:
+                    admin_client.delete_backup(BackupArn=backup_arn)
+                except Exception:
+                    pass
+            try:
+                admin_client.delete_table(TableName=table)
+            except Exception:
+                pass
+            else:
+                wait_for_deleted(admin_client, table)
+            self.mgmt.delete_user(self.account_id, user)
+            self.mgmt.delete_user(self.account_id, admin)

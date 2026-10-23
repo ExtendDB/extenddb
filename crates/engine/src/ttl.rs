@@ -216,6 +216,10 @@ fn validate_ttl_attribute_name(name: &str) -> Result<(), DynamoDbError> {
 
 fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
     match e {
+        // A backend's refusal of the request (the Cassandra backend refuses
+        // TTL on a table with an asynchronously propagated GSI): a client
+        // error, which SDKs do not retry.
+        StorageError::Validation(msg) => DynamoDbError::ValidationException(msg),
         StorageError::TableNotFound(_name) => {
             DynamoDbError::ResourceNotFoundException("Requested resource not found".to_string())
         }
@@ -277,6 +281,20 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_backend_validation_refusal_is_a_validation_exception() {
+        let msg = "Time to Live cannot be enabled on table t: index g is asynchronous";
+        match storage_to_dynamo(StorageError::Validation(msg.to_owned())) {
+            DynamoDbError::ValidationException(m) => assert_eq!(m, msg),
+            other => panic!("expected ValidationException, got {other:?}"),
+        }
+        // Liveness: a fault is still an internal error.
+        assert!(matches!(
+            storage_to_dynamo(StorageError::Internal("boom".to_owned())),
+            DynamoDbError::InternalServerError(_)
+        ));
     }
 
     #[test]
