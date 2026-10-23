@@ -14,6 +14,7 @@ use serde_json::Value;
 
 use crate::OperationContext;
 use crate::serialize_output;
+use crate::streams_iterator_params as iterator_params;
 
 /// Handle `DescribeStream`.
 ///
@@ -75,6 +76,11 @@ pub async fn handle_list_streams(
 ///
 /// Encodes the shard ID and starting position into a base64 iterator token.
 ///
+/// Validation runs in the service's order, measured 2026-10-23 (us-east-1):
+/// the `ShardIteratorType` enum, then `Timestamp` presence or absence for the
+/// type, then `SequenceNumber` presence or absence for the type, then the
+/// future check, then stream and shard existence.
+///
 /// # Errors
 ///
 /// Returns [`DynamoDbError::ResourceNotFoundException`] if the stream/shard does not exist.
@@ -83,8 +89,36 @@ pub async fn handle_get_shard_iterator(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
-    let input: GetShardIteratorInput = serde_json::from_value(body)
-        .map_err(|e| DynamoDbError::SerializationException(e.to_string()))?;
+    // The service renders both ShardIteratorType violations without the
+    // offending value (measured 2026-10-23): a missing member is "Member must
+    // not be null", a bad member lists the set in this order.
+    let type_value = body.get("ShardIteratorType");
+    if type_value.is_none_or(serde_json::Value::is_null) {
+        return Err(DynamoDbError::ValidationException(
+            "1 validation error detected: Value at 'shardIteratorType' failed to satisfy \
+             constraint: Member must not be null"
+                .to_owned(),
+        ));
+    }
+    crate::validate_enum_fields(
+        &body,
+        &[crate::EnumField {
+            json_name: "ShardIteratorType",
+            valid: &[
+                "AFTER_SEQUENCE_NUMBER",
+                "LATEST",
+                "AT_TIMESTAMP",
+                "AT_SEQUENCE_NUMBER",
+                "TRIM_HORIZON",
+            ],
+            clause: crate::EnumClause::Bare(iterator_params::SHARD_ITERATOR_TYPE_ENUM_CLAUSE),
+        }],
+    )?;
+    iterator_params::check_timestamp_shape(&body)?;
+    let input: GetShardIteratorInput =
+        serde_json::from_value(body).map_err(crate::deserialize_error)?;
+
+    let at_timestamp_ms = iterator_params::validate_iterator_parameters(&input)?;
 
     // Validate the stream and shard exist before issuing an iterator.
     ctx.storage
@@ -92,6 +126,7 @@ pub async fn handle_get_shard_iterator(
         .await
         .map_err(storage_to_dynamo)?;
 
+    let width = ctx.storage.sequence_number_width();
     let seq = match input.shard_iterator_type {
         ShardIteratorType::TrimHorizon => String::new(),
         ShardIteratorType::Latest => {
@@ -104,33 +139,18 @@ pub async fn handle_get_shard_iterator(
                 .unwrap_or_default()
         }
         ShardIteratorType::AtSequenceNumber => {
-            // Convert to AFTER_SEQUENCE_NUMBER by subtracting 1, so the
-            // exclusive "after" semantics produce inclusive "at" behavior.
-            let raw = input.sequence_number.clone().ok_or_else(|| {
-                DynamoDbError::ValidationException(
-                    "SequenceNumber is required for AT_SEQUENCE_NUMBER iterator type".to_owned(),
-                )
-            })?;
-            let n = raw.parse::<u128>().map_err(|_| {
-                DynamoDbError::ValidationException("Invalid SequenceNumber".to_owned())
-            })?;
-            // n == 0: sequence 0 is the first possible record, so "at 0"
-            // means "read from the beginning" — same as TRIM_HORIZON.
-            if n > 0 {
-                // Pad to the backend's stored width so lexicographic order
-                // matches numeric order against stored sequence numbers.
-                let width = ctx.storage.sequence_number_width();
-                format!("{:0>width$}", n - 1)
-            } else {
-                String::new()
-            }
+            let raw = input.sequence_number.as_deref().unwrap_or_default();
+            iterator_params::at_sequence_to_after(raw, width)?
         }
-        ShardIteratorType::AfterSequenceNumber => {
-            input.sequence_number.clone().ok_or_else(|| {
-                DynamoDbError::ValidationException(
-                    "SequenceNumber is required for AFTER_SEQUENCE_NUMBER iterator type".to_owned(),
-                )
-            })?
+        ShardIteratorType::AfterSequenceNumber => input.sequence_number.clone().unwrap_or_default(),
+        ShardIteratorType::AtTimestamp => {
+            resolve_at_timestamp(
+                ctx.storage.as_ref(),
+                &input.shard_id,
+                at_timestamp_ms.unwrap_or_default(),
+                width,
+            )
+            .await?
         }
     };
 
@@ -140,8 +160,8 @@ pub async fn handle_get_shard_iterator(
     let type_str = "AFTER_SEQUENCE_NUMBER";
 
     // Encode creation timestamp (seconds since epoch) for 15-minute expiration.
-    // unwrap_or_default: returns epoch 0 if system clock is before 1970 — safe
-    // because the iterator would just expire immediately on the next GetRecords.
+    // unwrap_or_default: returns epoch 0 if the system clock is before 1970,
+    // which only makes the iterator expire on the next GetRecords.
     let created_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -159,6 +179,33 @@ pub async fn handle_get_shard_iterator(
         shard_iterator: Some(encoded),
     };
     serialize_output(&output)
+}
+
+/// The AFTER position for an `AT_TIMESTAMP` request: at the first record
+/// created at or after `at_ms`, or after the newest record when none
+/// qualifies (the service's tip-plus-one resolution).
+///
+/// The tip is read before the seek. If the seek then finds nothing, the
+/// iterator starts after that tip, and a record landing between the two
+/// reads is still ahead of it. The other order would skip such a record.
+pub(crate) async fn resolve_at_timestamp(
+    storage: &dyn extenddb_storage::StreamEngine,
+    shard_id: &str,
+    at_ms: i64,
+    width: usize,
+) -> Result<String, DynamoDbError> {
+    let tip = storage
+        .latest_sequence_number(shard_id)
+        .await
+        .map_err(storage_to_dynamo)?;
+    let first = storage
+        .first_sequence_number_at_or_after(shard_id, at_ms)
+        .await
+        .map_err(storage_to_dynamo)?;
+    match first {
+        Some(first) => iterator_params::at_sequence_to_after(&first, width),
+        None => Ok(tip.unwrap_or_default()),
+    }
 }
 
 /// Shard iterator expiration: 15 minutes (900 seconds), matching real `DynamoDB`.
@@ -362,32 +409,6 @@ fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
 
 #[cfg(test)]
 mod tests {
-    /// AT_SEQUENCE_NUMBER converts to AFTER by subtracting 1 and padding to
-    /// the backend's stored width. Verify that an unpadded client input is
-    /// normalised correctly for both the 21-digit (postgres/sqlite/mongodb)
-    /// and 23-digit (cassandra) cases, and that the edge case n=0 maps to
-    /// TRIM_HORIZON (empty string).
-    #[test]
-    fn at_sequence_number_padding() {
-        let cases: &[(&str, usize, &str)] = &[
-            ("5", 21, "000000000000000000004"),
-            ("000000000000000000005", 21, "000000000000000000004"),
-            ("5", 23, "00000000000000000000004"),
-            ("00000000000000000000005", 23, "00000000000000000000004"),
-            ("0", 21, ""),
-            ("1", 21, "000000000000000000000"),
-        ];
-        for (input, width, expected) in cases {
-            let n: u128 = input.parse().unwrap();
-            let result = if n > 0 {
-                format!("{:0>width$}", n - 1)
-            } else {
-                String::new()
-            };
-            assert_eq!(&result, expected, "input={input} width={width}");
-        }
-    }
-
     #[test]
     fn shard_iterator_round_trip_backward_compat_and_fail_closed() {
         let stream = "arn:aws:dynamodb:us-east-1:1:table/T/stream/2026-10-20T16:17:40.188";
