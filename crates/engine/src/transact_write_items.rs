@@ -11,6 +11,7 @@ use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::storage_err_to_dynamo;
 use crate::expression_helpers::build_expression_maps;
+use crate::per_table_capacity::PerTableCapacity;
 use crate::request_limits;
 use crate::serialize_output;
 use crate::stream_capture;
@@ -196,15 +197,16 @@ pub async fn handle_transact_write_items(
                 extenddb_core::types::ReturnConsumedCapacity::None => None,
                 rcc => {
                     let indexes = rcc == extenddb_core::types::ReturnConsumedCapacity::Indexes;
-                    let mut per_table_rcu = capacity_helpers::PerTableCapacity::default();
+                    let mut per_table_rcu = PerTableCapacity::default();
                     for op in &prepared {
                         let rcu =
                             capacity_helpers::read_capacity_units(op.write_bytes(), true) * 2.0;
-                        per_table_rcu.add(op.table_name(), rcu);
+                        per_table_rcu.add(op.key_info(), rcu);
                     }
                     Some(
                         per_table_rcu
-                            .iter()
+                            .ordered()
+                            .into_iter()
                             .map(|(t, cu)| {
                                 extenddb_core::types::ConsumedCapacity::transact_replay_read(
                                     t, cu, indexes,
@@ -233,12 +235,12 @@ pub async fn handle_transact_write_items(
     // Stream records are now captured atomically within the storage transaction.
 
     // Per-item WCU: round each item individually, then sum (M-1).
-    let mut per_table_wcu = capacity_helpers::PerTableCapacity::default();
+    let mut per_table_wcu = PerTableCapacity::default();
     let wcu: f64 = prepared
         .iter()
         .map(|op| {
             let item_wcu = capacity_helpers::write_capacity_units(op.write_bytes()) * 2.0; // transactions cost 2x
-            per_table_wcu.add(op.table_name(), item_wcu);
+            per_table_wcu.add(op.key_info(), item_wcu);
             item_wcu
         })
         .sum();
@@ -250,7 +252,7 @@ pub async fn handle_transact_write_items(
     // only for now.
     let consumed_capacity = capacity_helpers::transact_write_capacity(
         input.return_consumed_capacity,
-        per_table_wcu.iter(),
+        per_table_wcu.ordered().into_iter(),
     );
 
     // Collect ItemCollectionMetrics per table for write operations. When SIZE

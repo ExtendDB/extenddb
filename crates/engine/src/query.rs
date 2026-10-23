@@ -349,6 +349,7 @@ pub async fn handle_query(
             local_secondary_indexes: key_info.local_secondary_indexes.clone(),
             stream_specification: None, // Queries don't capture stream records
             vector_indexes: key_info.vector_indexes.clone(),
+            creation_date_time: key_info.creation_date_time,
         }
     } else {
         key_info.clone()

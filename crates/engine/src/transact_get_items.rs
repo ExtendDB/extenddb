@@ -21,6 +21,7 @@ use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::storage_err_to_dynamo;
 use crate::expression_helpers::build_expression_maps;
+use crate::per_table_capacity::PerTableCapacity;
 use crate::request_limits;
 use crate::serialize_output;
 use crate::{DispatchMetrics, DispatchResult};
@@ -160,17 +161,17 @@ pub async fn handle_transact_get_items(
     // Capacity metering: RCU rounded per item, then summed (M-1).
     // Capacity metering: TransactGetItems costs 2 RCU per item (transactions
     // double the read cost). Missing items still cost 2 RCU.
-    let mut per_table_rcu = capacity_helpers::PerTableCapacity::default();
+    let mut per_table_rcu = PerTableCapacity::default();
     let rcu: f64 = items
         .iter()
-        .zip(input.transact_items.iter())
-        .map(|(opt, tgi)| {
+        .zip(key_infos.iter())
+        .map(|(opt, ki)| {
             let base_rcu = match opt {
                 Some(item) => capacity_helpers::read_capacity_units(item_size_bytes(item), true),
                 None => 1.0, // minimum 1 RCU for missing item
             };
             let txn_rcu = base_rcu * 2.0; // transactions cost 2x
-            per_table_rcu.add(&tgi.get.table_name, txn_rcu);
+            per_table_rcu.add(ki, txn_rcu);
             txn_rcu
         })
         .sum();
@@ -196,7 +197,7 @@ pub async fn handle_transact_get_items(
 
     let consumed_capacity = capacity_helpers::transact_read_capacity(
         input.return_consumed_capacity,
-        per_table_rcu.iter(),
+        per_table_rcu.ordered().into_iter(),
     );
 
     let output = TransactGetItemsOutput {

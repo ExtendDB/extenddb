@@ -58,11 +58,16 @@ pub(crate) enum PreparedOp {
 impl PreparedOp {
     /// The table name for this operation.
     pub(crate) fn table_name(&self) -> &str {
+        &self.key_info().table_name
+    }
+
+    /// The table this operation targets.
+    pub(crate) fn key_info(&self) -> &TableKeyInfo {
         match self {
             Self::Put { key_info, .. }
             | Self::Delete { key_info, .. }
             | Self::Update { key_info, .. }
-            | Self::ConditionCheck { key_info, .. } => &key_info.table_name,
+            | Self::ConditionCheck { key_info, .. } => key_info,
         }
     }
 
