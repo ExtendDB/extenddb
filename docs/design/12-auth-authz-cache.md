@@ -341,7 +341,9 @@ auth, admin user). The response shape is:
     "role_boundary":       { … },
     "role_tags":           { … },
     "session_data":        { … },
-    "resource_tags":       { … }
+    "resource_tags":       { … },
+    "user_created_at":     { … },
+    "role_created_at":     { … }
   }
 }
 ```

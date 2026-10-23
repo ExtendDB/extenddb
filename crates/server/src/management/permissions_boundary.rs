@@ -95,6 +95,23 @@ async fn set_boundary(
             .into_response();
     }
 
+    // Strict parse-on-write: reject a document the policy evaluator cannot
+    // parse, including a malformed CIDR in an IpAddress/NotIpAddress condition.
+    // The live service validates a managed/boundary policy at write and rejects
+    // a malformed CIDR with MalformedPolicyDocument.
+    {
+        let json_str = document.to_string();
+        if let Err(e) =
+            extenddb_auth::policy::document::PolicyDocument::from_json_for_write(&json_str)
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid permissions boundary document: {e}"),
+            )
+                .into_response();
+        }
+    }
+
     let result = match principal_type {
         "user" => {
             state

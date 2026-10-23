@@ -9,11 +9,41 @@ use extenddb_storage::error::StorageError;
 
 use crate::CassandraEngine;
 
+/// Who is deleting a table, which decides what the delete refuses.
+#[derive(Clone, Copy)]
+pub(crate) enum DeleteTableCaller<'a> {
+    /// DeleteTable: refuses a deletion-protected table and a restore target
+    /// still being restored.
+    Client,
+    /// The restore copy or the abandoned-restore sweep removing a restore
+    /// target. Deletes only the incarnation with this `table_id`, so a target
+    /// that was already removed and whose name was reused is left alone.
+    RestoreCleanup { table_id: &'a str },
+}
+
+/// The refusal for DeleteTable on a table being restored. Same text as the
+/// MongoDB backend's.
+pub(crate) fn table_being_restored(table_name: &str) -> StorageError {
+    StorageError::IndexesInUse(format!(
+        "Attempt to change a resource which is still in use: Table is being restored: {table_name}"
+    ))
+}
+
 impl CassandraEngine {
     pub(crate) async fn delete_table_impl(
         &self,
         account_id: &str,
         input: DeleteTableInput,
+    ) -> Result<TableDescription, StorageError> {
+        self.delete_table_as(account_id, input, DeleteTableCaller::Client)
+            .await
+    }
+
+    pub(crate) async fn delete_table_as(
+        &self,
+        account_id: &str,
+        input: DeleteTableInput,
+        caller: DeleteTableCaller<'_>,
     ) -> Result<TableDescription, StorageError> {
         let catalog_keyspace = self.catalog_keyspace();
 
@@ -43,21 +73,42 @@ impl CassandraEngine {
             .first()
             .ok_or_else(|| StorageError::TableNotFound(input.table_name.clone()))?;
 
-        // Check deletion protection
-        let deletion_protection: bool = table_row
-            .get_r_by_name("deletion_protection_enabled")
-            .unwrap_or(false);
-
-        if deletion_protection {
-            let table_arn: String = table_row
-                .get_r_by_name("table_arn")
-                .map_err(|e| StorageError::Internal(format!("Parse table_arn: {e}")))?;
-            return Err(StorageError::DeletionProtected(table_arn));
-        }
-
         let table_id: String = table_row
             .get_r_by_name("table_id")
             .map_err(|e| StorageError::Internal(format!("Parse table_id: {e}")))?;
+
+        match caller {
+            DeleteTableCaller::Client => {
+                // Check deletion protection
+                let deletion_protection: bool = table_row
+                    .get_r_by_name("deletion_protection_enabled")
+                    .unwrap_or(false);
+
+                if deletion_protection {
+                    let table_arn: String = table_row
+                        .get_r_by_name("table_arn")
+                        .map_err(|e| StorageError::Internal(format!("Parse table_arn: {e}")))?;
+                    return Err(StorageError::DeletionProtected(table_arn));
+                }
+
+                // A restore target is owned by its copy until the copy
+                // activates it (or the sweep removes it). Deleting it mid-copy
+                // would race the copy's writes into dropped tables.
+                let status: Option<String> = table_row.get_by_name("table_status").ok().flatten();
+                let restoring_from: Option<String> = table_row
+                    .get_by_name("restore_source_backup_arn")
+                    .ok()
+                    .flatten();
+                if status.as_deref() == Some("CREATING") && restoring_from.is_some() {
+                    return Err(table_being_restored(&input.table_name));
+                }
+            }
+            DeleteTableCaller::RestoreCleanup { table_id: expected } => {
+                if table_id != expected {
+                    return Err(StorageError::TableNotFound(input.table_name.clone()));
+                }
+            }
+        }
 
         // Fetch indexes for response
         let index_query = format!("SELECT * FROM {catalog_keyspace}.indexes WHERE table_id = ?");
@@ -140,12 +191,12 @@ impl CassandraEngine {
         // Delete table catalog entry — LWT to avoid mixing plain/LWT writes on
         // a row created with IF NOT EXISTS. See ADR-0021.
         let delete_table_query = format!(
-            "DELETE FROM {catalog_keyspace}.tables WHERE account_id = ? AND table_name = ? IF EXISTS"
+            "DELETE FROM {catalog_keyspace}.tables WHERE account_id = ? AND table_name = ? IF table_id = ?"
         );
         crate::cassandra_util::query_lwt(
             &self.session,
             &delete_table_query,
-            cdrs_tokio::query_values!(account_id, input.table_name.as_str()),
+            cdrs_tokio::query_values!(account_id, input.table_name.as_str(), table_id.as_str()),
         )
         .await
         .map_err(|e| StorageError::Internal(format!("Delete table: {e}")))?;
