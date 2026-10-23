@@ -79,8 +79,7 @@ fn record_and_query_segments() {
     let c = MetricsCollector::new();
     c.record_segments(
         "GetItem",
-        Some("T"),
-        LatencySegments {
+        &LatencySegments {
             auth_us: 100.0,
             authz_us: 200.0,
             throttle_us: 50.0,
@@ -91,8 +90,7 @@ fn record_and_query_segments() {
     );
     c.record_segments(
         "GetItem",
-        Some("T"),
-        LatencySegments {
+        &LatencySegments {
             auth_us: 200.0,
             authz_us: 300.0,
             throttle_us: 50.0,
@@ -114,14 +112,17 @@ fn record_and_query_segments() {
 }
 
 #[test]
-fn prune_removes_old_segments() {
+fn prune_leaves_segments_alone_and_the_ring_ages_them_out() {
     use crate::metrics::types::LatencySegments;
+    use std::time::Duration;
 
     let c = MetricsCollector::new();
+    let Ok(epoch) = c.segments.read().map(|s| s.epoch()) else {
+        panic!("segments lock poisoned");
+    };
     c.record_segments(
         "PutItem",
-        None,
-        LatencySegments {
+        &LatencySegments {
             auth_us: 10.0,
             authz_us: 20.0,
             throttle_us: 5.0,
@@ -136,6 +137,11 @@ fn prune_removes_old_segments() {
     let segs = c.query_segments(TimeWindow::AllTime);
     assert_eq!(segs.len(), 1);
     assert_eq!(segs[0].count, 1);
+
+    // A day later the bucket has left the ring without any prune call.
+    let later = epoch + Duration::from_secs(1441 * 60);
+    assert!(c.query_segments_at(TimeWindow::AllTime, later).is_empty());
+    assert!(c.query_segments_at(TimeWindow::LastDay, later).is_empty());
 }
 
 #[test]
@@ -145,8 +151,7 @@ fn segments_multiple_operations() {
     let c = MetricsCollector::new();
     c.record_segments(
         "GetItem",
-        Some("T"),
-        LatencySegments {
+        &LatencySegments {
             auth_us: 100.0,
             authz_us: 200.0,
             throttle_us: 50.0,
@@ -157,8 +162,7 @@ fn segments_multiple_operations() {
     );
     c.record_segments(
         "PutItem",
-        Some("T"),
-        LatencySegments {
+        &LatencySegments {
             auth_us: 120.0,
             authz_us: 220.0,
             throttle_us: 60.0,

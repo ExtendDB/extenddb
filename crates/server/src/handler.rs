@@ -323,8 +323,7 @@ pub(crate) async fn handle_request(
     state.metrics.record_request_count(&operation);
     state.metrics.record_segments(
         &operation,
-        table_name.as_deref(),
-        extenddb_core::metrics::LatencySegments {
+        &extenddb_core::metrics::LatencySegments {
             auth_us,
             authz_us,
             throttle_us,
