@@ -809,15 +809,12 @@ impl MongoEngine {
         {
             let (fast_filter, took_fast) = match mongo_update {
                 NativeUpdate::Doc(d) => {
-                    let opts = mongodb::options::FindOneAndUpdateOptions::builder()
-                        .upsert(true)
-                        .return_document(ReturnDocument::After)
-                        .build();
-                    let result = coll
-                        .find_one_and_update(key_filter.clone(), d)
-                        .with_options(opts)
-                        .await
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    // The upsert's insert branch must write the document
+                    // `item_to_document` would write (issue #436); see
+                    // `update_create::upsert_native_update`.
+                    let result = self
+                        .upsert_native_update(&coll, &key_filter, d, key, key_info)
+                        .await?;
                     (Some(result), true)
                 }
                 NativeUpdate::Pipeline {
@@ -994,11 +991,20 @@ impl MongoEngine {
                     let opts = mongodb::options::ReplaceOptions::builder()
                         .upsert(true)
                         .build();
-                    coll.replace_one(key_filter.clone(), new_doc)
+                    // A duplicate-key error here means another writer
+                    // created the item after the find_one above. Run the
+                    // transaction again so that it reads that item and
+                    // applies the update to it.
+                    match coll
+                        .replace_one(key_filter.clone(), new_doc)
                         .with_options(opts)
                         .session(&mut session)
                         .await
-                        .map_err(TxErr::from)?;
+                    {
+                        Ok(_) => {}
+                        Err(e) if is_duplicate_key(&e) => return Err(TxErr::Transient),
+                        Err(e) => return Err(TxErr::from(e)),
+                    }
                 }
 
                 self.sync_indexes_in_session(
@@ -4056,6 +4062,16 @@ fn project_item(
         }
     }
 }
+
+#[path = "data_engine_key_repair.rs"]
+pub(crate) mod key_repair;
+
+#[path = "data_engine_update_create.rs"]
+mod update_create;
+
+#[cfg(test)]
+#[path = "data_engine_live_tests.rs"]
+mod live_tests;
 
 #[cfg(test)]
 mod tests {

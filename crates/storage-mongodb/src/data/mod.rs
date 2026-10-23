@@ -5,6 +5,8 @@
 //!
 //! Contains document conversion, collection naming, and key extraction utilities.
 
+pub mod key_fields;
+
 use bson::{Document, doc};
 
 #[cfg(test)]

@@ -18,6 +18,10 @@
 #                      (default: /tmp/run-mongodb-tests-<ts>)
 #   --keep             Do not tear down the mongo container / server
 #                      on exit (useful for post-run inspection)
+#   --rust-live        Also run the Rust live tests of the storage-mongodb
+#                      crate against this runner's replica set. They are
+#                      `#[ignore]`d, because they need a replica set, and
+#                      they are the only tests of the startup key repair.
 #   -h, --help         Show this help
 #
 # Arguments after `--` are passed to `devtools/run-tests` verbatim.
@@ -27,6 +31,7 @@
 #   devtools/run-mongodb-tests
 #   devtools/run-mongodb-tests -- --pytest --filter test_put_item
 #   devtools/run-mongodb-tests --keep -- --pytest --filter test_rfc0003
+#   devtools/run-mongodb-tests --rust-live -- --rust --rust-integration
 #
 # Prerequisites:
 #   - Docker running
@@ -48,6 +53,7 @@ BIND_PORT=18443
 MONGO_PORT=27021
 OUTPUT_DIR=""
 KEEP=false
+RUST_LIVE=false
 RUN_TESTS_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -56,8 +62,9 @@ while [[ $# -gt 0 ]]; do
         --mongo-port) MONGO_PORT="$2"; shift 2 ;;
         --output)     OUTPUT_DIR="$2"; shift 2 ;;
         --keep)       KEEP=true; shift ;;
+        --rust-live)  RUST_LIVE=true; shift ;;
         --)           shift; RUN_TESTS_ARGS=("$@"); break ;;
-        -h|--help)    sed -n '5,35p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)    sed -n '5,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)            echo "error: unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -278,7 +285,29 @@ export EXTENDDB_CONFIG="$CONFIG"
 # tempfiles land in an allowed location on both Linux and macOS.
 export TMPDIR="$TMP_CANON"
 
+# The Rust live tests in crates/storage-mongodb connect to the replica set
+# directly, rather than through the server, so they read its URI from here.
+export EXTENDDB_TEST_MONGODB_URI="mongodb://localhost:$MONGO_PORT/?replicaSet=rs0&directConnection=true"
+
 RC=0
 devtools/run-tests --extenddb --backend mongodb --config "$CONFIG" "${RUN_TESTS_ARGS[@]}" || RC=$?
+
+# The live tests of the storage-mongodb crate are `#[ignore]`d, so
+# `cargo test` does not run them: they need the replica set this runner
+# started. They are the only tests of the startup key repair, which is why
+# they run here rather than in the plain `cargo test --workspace` job. Each
+# one works in its own pair of databases and drops them at the end, so they
+# do not touch the served instance's catalog or data.
+if $RUST_LIVE; then
+    echo ""
+    echo "=== MongoDB live Rust tests (storage-mongodb, --ignored) ==="
+    if cargo test -p extenddb-storage-mongodb --lib -- \
+        --ignored --test-threads=1 data_engine::live_tests::; then
+        echo "  ✓ MongoDB live Rust tests passed"
+    else
+        echo "  ✗ MongoDB live Rust tests failed"
+        RC=1
+    fi
+fi
 
 exit $RC
