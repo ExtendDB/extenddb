@@ -556,6 +556,97 @@ async fn live_repair_rewrites_a_document_stored_with_no_item_data() {
     finish(engine).await;
 }
 
+/// Insert `count` documents in the pre-fix shape directly, one per key
+/// `u0..u<count>`, with no key attribute in `item_data`. The upsert path in
+/// `store_without_key` is one round trip per document, which is too slow for
+/// the counts the batched repair needs.
+async fn store_many_without_key(engine: &MongoEngine, key_info: &TableKeyInfo, count: usize) {
+    let coll = engine
+        .data_db
+        .collection::<Document>(&data_collection_name(&key_info.table_id));
+    let docs: Vec<Document> = (0..count)
+        .map(|i| {
+            doc! {
+                "_id": bson::oid::ObjectId::new(),
+                "pk": format!("u{i}"),
+                "item_data": { "w": { "S": format!("value-{i}") } },
+                "_v": 1_i64,
+            }
+        })
+        .collect();
+    coll.insert_many(docs).await.expect("plant");
+}
+
+/// A repair pass that spans more than one batch rebuilds every document. The
+/// batch is 500 documents, so 1,100 crosses two boundaries and ends with a
+/// partial batch. Every key reads back with its value, none is duplicated,
+/// and a second pass finds nothing.
+#[tokio::test]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_repair_spans_more_than_one_batch() {
+    const COUNT: usize = 1_100;
+    let engine = scratch_engine().await;
+    let key_info = table(&engine, "repair-batches", false);
+    store_many_without_key(&engine, &key_info, COUNT).await;
+
+    let mut summary = KeyRepairSummary::default();
+    engine
+        .repair_table(
+            &key_info.table_id,
+            &key_info.key_schema,
+            &key_info.attribute_definitions,
+            &mut summary,
+        )
+        .await
+        .expect("repair");
+    assert_eq!(
+        summary,
+        KeyRepairSummary {
+            tables_scanned: 0,
+            documents_repaired: COUNT as u64,
+            documents_failed: 0,
+        }
+    );
+
+    let coll = engine
+        .data_db
+        .collection::<Document>(&data_collection_name(&key_info.table_id));
+    assert_eq!(
+        coll.count_documents(doc! {}).await.expect("count"),
+        COUNT as u64,
+        "no document was duplicated or lost"
+    );
+    assert_eq!(
+        coll.count_documents(doc! { "_id": { "$type": "objectId" } })
+            .await
+            .expect("count"),
+        0,
+        "every document carries its key text as _id"
+    );
+    for i in [0_usize, 499, 500, 999, 1_000, COUNT - 1] {
+        let mut key = Item::new();
+        key.insert("pk".to_owned(), s(&format!("u{i}")));
+        assert_eq!(
+            engine.get_item_impl(&key_info, &key).await.expect("get"),
+            Some(with(key.clone(), "w", s(&format!("value-{i}")))),
+            "key u{i} reads back"
+        );
+    }
+
+    let mut again = KeyRepairSummary::default();
+    engine
+        .repair_table(
+            &key_info.table_id,
+            &key_info.key_schema,
+            &key_info.attribute_definitions,
+            &mut again,
+        )
+        .await
+        .expect("second repair");
+    assert!(again.is_clean(), "nothing left to repair: {again}");
+    finish(engine).await;
+}
+
 /// The whole-catalog entry point finds the table through its catalog row.
 #[tokio::test]
 #[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
