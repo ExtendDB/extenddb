@@ -299,7 +299,7 @@ Configuration precedence: CLI flags > environment variables > config file > defa
 
 ## DynamoDB Streams
 
-extenddb implements DynamoDB Streams for change data capture. Stream records are captured atomically with the data writes that produce them. Both the DynamoDB API and Streams API are served on the same port.
+extenddb implements DynamoDB Streams for change data capture. On the PostgreSQL and SQLite backends, stream records are captured atomically with the data writes that produce them, inside the same transaction. On the Cassandra backend this holds for ordinary writes but not for conditional writes: a conditional put applies the item with a lightweight transaction and then writes the stream record in a separate logged batch, so a failure between the two can leave the item written with no stream record. Both the DynamoDB API and Streams API are served on the same port.
 
 Supported operations: `ListStreams`, `DescribeStream`, `GetShardIterator`, `GetRecords`.
 

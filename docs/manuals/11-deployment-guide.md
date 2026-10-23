@@ -164,6 +164,12 @@ pool_size = 20
 Use `sslmode=require` (or `verify-full` with a CA certificate) for encrypted
 database connections.
 
+The Cassandra backend cannot encrypt its connection today: the driver is
+compiled without TLS, so credentials and item data cross the network in clear
+text and there is no config option to turn encryption on. Run ExtendDB and the
+Cassandra cluster on a trusted, isolated network; do not route Cassandra traffic
+over an untrusted network.
+
 ### Managed PostgreSQL services
 
 ExtendDB works with any PostgreSQL 14+ service:
@@ -194,7 +200,7 @@ extenddb init \
 
 - [ ] TLS is enabled by default. Verify it is not disabled in `extenddb.toml`
 - [ ] Replace the self-signed certificate with a CA-signed certificate
-- [ ] Encrypt the connection to the storage backend. For PostgreSQL, use `sslmode=require` or `sslmode=verify-full` in the connection string
+- [ ] Encrypt the connection to the storage backend. For PostgreSQL, use `sslmode=require` or `sslmode=verify-full` in the connection string. The Cassandra backend cannot encrypt its connection — place ExtendDB and the Cassandra cluster on a trusted, isolated network instead
 
 ### Network
 

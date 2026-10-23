@@ -169,44 +169,57 @@ Use `:memory:` (in the config, the environment variable, or `init
 
 ExtendDB can run against an Apache Cassandra cluster. The Cassandra backend is
 experimental; see [Cassandra setup](cassandra-setup.md) for its current
-limitations. Select it at init time with `--backend cassandra`:
+limitations and the full walkthrough. Select it at init time with
+`--backend cassandra`:
 
 ```bash
-./target/release/extenddb init --backend cassandra
+./target/release/extenddb init \
+    --backend cassandra \
+    --cassandra-contact-points 127.0.0.1:9042 \
+    --cassandra-user cassandra \
+    --cassandra-pass cassandra
 ```
 
-For a local single-node cluster with authentication disabled, this needs no
-other flags. init uses development defaults: it contacts `localhost:9042`,
-creates keyspaces under the prefix `extenddb`, and sets a replication factor of
-1. It connects without authentication, which matches a stock Cassandra node
-(the default `AllowAllAuthenticator`). If the node has authentication enabled
-(for example `PasswordAuthenticator`), pass `--cassandra-user` and
-`--cassandra-pass`. init writes a `[storage.cassandra]` section to the config:
+The node must run `PasswordAuthenticator`. `init` always creates its
+application role with a password, so it fails against a stock node using the
+default `AllowAllAuthenticator` — there is no credential-free path. Pass the
+Cassandra admin credentials with `--cassandra-user` / `--cassandra-pass`; `init`
+uses them to create the keyspaces and the application role. `init` writes a
+`[storage.cassandra]` section to the config, with the application credentials
+commented out:
 
 ```toml
 [storage.cassandra]
-contact_points = ["localhost:9042"]
+contact_points = ["127.0.0.1:9042"]
 # username = "cassandra"          # Application user
 # password = "cassandra-password" # Application password
 keyspace_prefix = "extenddb"
-replication_factor = 1           # Single node (use 3+ for production)
-datacenter = "datacenter1"
+replication_factor = 1           # init always writes 1; edit for production
+datacenter = "datacenter1"       # must be datacenter1 (hardcoded by init)
 max_connections = 10
 ```
+
+Before starting the server, uncomment `username` and `password` and set them to
+the application role `init` created — by default `extenddb` /
+`extenddb-local-dev`. With them commented out, `serve` cannot authenticate and
+times out.
 
 To override a default, pass the matching flag at init time:
 
 - `--cassandra-contact-points host1:9042,host2:9042` — one or more contact
   points for a remote or multi-node cluster.
-- `--cassandra-user` and `--cassandra-pass` — admin credentials, if the cluster
-  requires authentication to create the keyspaces and the application role.
+- `--cassandra-user` and `--cassandra-pass` — the admin credentials `init` uses
+  to create the keyspaces and the application role (required).
+- `--extenddb-user` and `--extenddb-pass` — override the application role's name
+  and password (default `extenddb` / `extenddb-local-dev`).
 - `--keyspace-prefix myapp` — a different keyspace prefix, so one cluster can
   host more than one deployment.
-- `--replication-factor 3` — a higher replication factor for a multi-node
-  cluster.
 
-For replication strategy, datacenter topology, authentication, and production
-tuning, see `docs/cassandra-setup.md`.
+For a higher replication factor, edit `replication_factor` in the config after
+`init` (there is no init flag for it today). The datacenter must be
+`datacenter1`. For replication strategy, datacenter topology, authentication,
+authorization, and the fact that connections are unencrypted, see
+`docs/cassandra-setup.md`.
 
 ### Generating a self-signed certificate manually
 

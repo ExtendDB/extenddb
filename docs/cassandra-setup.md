@@ -60,12 +60,11 @@ They mirror `devtools/cassandra-node`, which the project uses for its own tests.
 
 The node now listens on `127.0.0.1:9042` with password authentication enabled.
 
-> **Note:** Password authentication is optional for a purely local node. If you
-> skip step 3, the node runs with the default `AllowAllAuthenticator` (no
-> authentication), and you can run `extenddb init --backend cassandra` with no
-> credential flags. The steps above enable authentication because production
-> clusters require it, and testing against an authenticated node locally avoids
-> surprises later.
+> **Password authentication is required.** `extenddb init` always creates its
+> application role with `CREATE ROLE ... WITH PASSWORD`, which Cassandra accepts
+> only when the node runs `PasswordAuthenticator`. Against a stock node using the
+> default `AllowAllAuthenticator`, `init` fails at the role step with
+> `CassandraRoleManager doesn't support PASSWORD`. Do not skip step 3.
 
 ## Connection Details
 
@@ -108,16 +107,20 @@ application role:
     --config extenddb.toml
 ```
 
-If your node runs without authentication (you skipped step 3 above), omit the
-credential flags:
+The node must run `PasswordAuthenticator` (step 3). `init` always creates its
+application role with a password, so it fails against an unauthenticated
+(`AllowAllAuthenticator`) node — there is no credential-free path.
 
-```bash
-./target/release/extenddb init --backend cassandra --config extenddb.toml
-```
+> **Authorizer.** Run the node with `AllowAllAuthorizer` (the default). `init`
+> creates the application role but grants it no permissions, so under
+> `CassandraAuthorizer` the server later fails to start with
+> `User extenddb has no SELECT permission ...`. Until `init` issues the grants,
+> only `AllowAllAuthorizer` works.
 
 init creates:
 - The catalog keyspace (`extenddb_catalog` by default)
-- The application role ExtendDB uses at serve time
+- The application role ExtendDB uses at serve time (named `extenddb` by
+  default; override with `--extenddb-user` / `--extenddb-pass`)
 - Admin user credentials (printed to stdout once — save them)
 - A self-signed TLS certificate at `~/.extenddb/tls/cert.pem`
 - The config file `extenddb.toml`
@@ -129,7 +132,8 @@ Per-account keyspaces are created later, when accounts are added.
 
 ## Config Mapping
 
-init writes a `[storage.cassandra]` section to `extenddb.toml`:
+init writes a `[storage.cassandra]` section to `extenddb.toml`. It writes the
+application credentials **commented out**, with placeholder values:
 
 ```toml
 [storage]
@@ -145,23 +149,50 @@ datacenter = "datacenter1"
 max_connections = 10
 ```
 
+> **You must set `username` and `password` before starting the server.** On an
+> authenticated node, `serve` with these two fields commented out fails with
+> `Connection timeout after 10s`. Uncomment them and set them to the
+> application role `init` created — by default user `extenddb` with password
+> `extenddb-local-dev` (or whatever you passed to `--extenddb-user` /
+> `--extenddb-pass`), **not** the placeholder values above:
+
+```toml
+[storage.cassandra]
+contact_points = ["127.0.0.1:9042"]
+username = "extenddb"
+password = "extenddb-local-dev"
+# ...
+```
+
 Fields:
 
 - `contact_points` — one or more `host:port` entries. One reachable node is
   enough; the driver discovers the rest of the cluster.
 - `username` / `password` — the application credentials ExtendDB uses at serve
-  time. Omit both for an unauthenticated node.
+  time. Required against any authenticated node (which `init` requires anyway).
 - `keyspace_prefix` — prefix for this deployment's keyspaces (default
   `extenddb`).
-- `replication_factor` — keyspace replication factor. `1` suits a single local
-  node; use 3 or more in production.
-- `datacenter` — the local datacenter name for `NetworkTopologyStrategy`
-  (default `datacenter1`, which matches a stock single-node cluster).
+- `replication_factor` — keyspace replication factor. `init` always writes `1`,
+  regardless of the cluster. For a multi-node cluster, edit this to 3 or more
+  **after** `init`; keyspaces created later (per account) use the config value.
+  Existing keyspaces are not altered retroactively.
+- `datacenter` — the local datacenter name for `NetworkTopologyStrategy`. `init`
+  always writes `datacenter1` and has no flag to change it, and the keyspaces it
+  creates reference `datacenter1`, so the cluster's local datacenter must be
+  named `datacenter1`. A node started with a different datacenter name (for
+  example `CASSANDRA_DC=dc1`) fails keyspace creation with
+  `Unrecognized strategy option {datacenter1} ... for keyspace extenddb_catalog`.
 - `max_connections` — maximum connections per host.
 
-Edit these values in `extenddb.toml`. Unlike the PostgreSQL and MongoDB
-backends, the Cassandra backend has no single connection-string field; set
-`contact_points` and the other fields directly in the config section above.
+Edit these values in `extenddb.toml` after `init`. Unlike the PostgreSQL and
+MongoDB backends, the Cassandra backend has no single connection-string field;
+set `contact_points` and the other fields directly in the config section above.
+
+> **Connections are not encrypted.** The Cassandra backend connects over plain
+> TCP — the driver is built without TLS — so credentials and item data cross the
+> network in clear text. Run ExtendDB and Cassandra on a trusted network (for
+> example a private subnet or an encrypted overlay); do not send Cassandra
+> traffic across an untrusted network.
 
 ## Starting the Server
 
@@ -215,9 +246,13 @@ section covers only what is specific to Cassandra.
 
 ### Keyspace replication
 
-Set `replication_factor` to 3 or more for a multi-node cluster, and set
-`datacenter` to your cluster's local datacenter name. ExtendDB creates its
-keyspaces with `NetworkTopologyStrategy` using these values.
+Set `replication_factor` to 3 or more for a multi-node cluster. `init` always
+writes `1`, so edit the config after `init`; keyspaces created afterward (per
+account) use the value in the config. The `datacenter` must be `datacenter1`:
+`init` hardcodes that name into the keyspace definitions and provides no flag to
+change it, so your cluster's local datacenter has to be named `datacenter1`
+until that is configurable. ExtendDB creates its keyspaces with
+`NetworkTopologyStrategy` using these values.
 
 ```toml
 [storage.cassandra]
@@ -226,17 +261,30 @@ username = "extenddb"
 password = "<application-password>"
 keyspace_prefix = "extenddb"
 replication_factor = 3
-datacenter = "dc1"
+datacenter = "datacenter1"   # must be datacenter1 (hardcoded by init)
 max_connections = 10
 ```
 
 ### Authentication
 
-Run the cluster with authentication enabled (`PasswordAuthenticator` or
-stronger), and give ExtendDB a dedicated application role rather than the
-`cassandra` superuser. Supply its credentials through `username` and `password`.
-ExtendDB connects without authentication when both are absent, so confirm they
-are set for any cluster that is not fully trusted.
+Run the cluster with authentication enabled — `init` requires
+`PasswordAuthenticator` or stronger, since it creates its application role with
+a password. Give ExtendDB a dedicated application role rather than the
+`cassandra` superuser, and supply its credentials through `username` and
+`password`; both are required.
+
+Use `AllowAllAuthorizer` for now. `init` creates the application role but grants
+it no permissions, so `CassandraAuthorizer` makes `serve` fail with
+`User <role> has no SELECT permission ...`. Until `init` issues the grants a
+role needs, authorization must be left open at the Cassandra layer.
+
+### Connection encryption
+
+The Cassandra backend connects over plain TCP; the driver is compiled without
+TLS, so credentials and item data travel in clear text. There is no config
+option to enable encryption today. Deploy ExtendDB and the Cassandra cluster on
+a trusted, isolated network, and do not route Cassandra traffic over an
+untrusted network.
 
 ### Known Limitations
 
