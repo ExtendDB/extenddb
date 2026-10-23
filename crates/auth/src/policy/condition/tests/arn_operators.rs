@@ -198,6 +198,7 @@ fn arn_equals_wildcard_in_each_field() {
         assert!(single(ArnEquals, p), "ArnEquals {p}");
         assert!(single(ArnLike, p), "ArnLike {p}");
         assert!(!single(ArnNotEquals, p), "ArnNotEquals {p}");
+        assert!(!single(ArnNotLike, p), "ArnNotLike {p}");
     }
 }
 
@@ -300,6 +301,7 @@ fn arn_equals_is_case_sensitive_in_every_field() {
         assert!(!single(ArnEquals, p), "ArnEquals {p}");
         assert!(!single(ArnLike, p), "ArnLike {p}");
         assert!(single(ArnNotEquals, p), "ArnNotEquals {p}");
+        assert!(single(ArnNotLike, p), "ArnNotLike {p}");
     }
 }
 
@@ -360,4 +362,167 @@ fn arn_equals_any_of_several_wildcard_values() {
         ),
         &ctx
     ));
+}
+
+// --- rows measured on 2026-10-23 14:10 UTC (simulate-custom-policy) ---
+
+/// Multi-valued key holding `[V, notanarn]`.
+fn multi_malformed(op: ConditionOperator, pattern: &str) -> bool {
+    let ctx = TestContext::new().with("dynamodb:LeadingKeys", vec![V, "notanarn"]);
+    evaluate_condition(&cond(op, "dynamodb:LeadingKeys", vec![pattern]), &ctx)
+}
+
+/// A multi-valued key with one value that is not an ARN fails every Arn
+/// operator in every set form, whether or not the pattern matches the
+/// well-formed value: 20 rows, all implicitDeny.
+#[test]
+fn arn_operators_multivalued_with_non_arn_value_never_match() {
+    for op in [ArnEquals, ArnNotEquals, ArnLike, ArnNotLike] {
+        assert!(!multi_malformed(op.clone(), TABLE_STAR), "bare {op:?}");
+        assert!(
+            !multi_malformed(for_any(op.clone()), TABLE_STAR),
+            "ForAnyValue {op:?} table/*"
+        );
+        assert!(
+            !multi_malformed(for_all(op.clone()), TABLE_STAR),
+            "ForAllValues {op:?} table/*"
+        );
+        assert!(
+            !multi_malformed(for_any(op.clone()), Z_STAR),
+            "ForAnyValue {op:?} table/Z*"
+        );
+        assert!(
+            !multi_malformed(for_all(op.clone()), Z_STAR),
+            "ForAllValues {op:?} table/Z*"
+        );
+    }
+}
+
+/// The set-level rule does not reach non-Arn operators: `StringLike` over the
+/// same set still evaluates per value.
+#[test]
+fn string_operators_over_set_with_non_arn_value_are_unchanged() {
+    let ctx = TestContext::new().with("dynamodb:LeadingKeys", vec![V, "notanarn"]);
+    let any = for_any(ConditionOperator::StringLike);
+    assert!(evaluate_condition(
+        &cond(any, "dynamodb:LeadingKeys", vec![TABLE_STAR]),
+        &ctx
+    ));
+    let all = for_all(ConditionOperator::StringNotLike);
+    assert!(evaluate_condition(
+        &cond(all, "dynamodb:LeadingKeys", vec![Z_STAR]),
+        &ctx
+    ));
+}
+
+/// Rows v-empty and v-space: an empty or whitespace value fails all four.
+#[test]
+fn arn_operators_empty_and_whitespace_value_match_neither() {
+    for v in ["", "  "] {
+        for op in [ArnEquals, ArnNotEquals, ArnLike, ArnNotLike] {
+            assert!(!single_value(op.clone(), TABLE_STAR, v), "{op:?} {v:?}");
+        }
+    }
+}
+
+/// Rows v6-noarn-prefix, v6-noarn-prefix-anypattern and v6-upper-arn-prefix:
+/// a six-field value whose first field is not `arn` is compared as an ARN.
+/// The positive operators fail on the first field; the negative ones hold.
+#[test]
+fn arn_operators_six_field_value_without_arn_prefix_fails_positive_only() {
+    let all_star = "arn:*:*:*:*:*";
+    let rows = [
+        (
+            "xyz:aws:dynamodb:us-east-1:123456789012:table/Tother",
+            TABLE_STAR,
+        ),
+        (
+            "xyz:aws:dynamodb:us-east-1:123456789012:table/Tother",
+            all_star,
+        ),
+        (
+            "ARN:aws:dynamodb:us-east-1:123456789012:table/Tother",
+            TABLE_STAR,
+        ),
+    ];
+    for (v, p) in rows {
+        assert!(!single_value(ArnEquals, p, v), "ArnEquals {p} {v}");
+        assert!(!single_value(ArnLike, p, v), "ArnLike {p} {v}");
+        assert!(single_value(ArnNotEquals, p, v), "ArnNotEquals {p} {v}");
+        assert!(single_value(ArnNotLike, p, v), "ArnNotLike {p} {v}");
+    }
+}
+
+/// Rows v7-vs-p6-exact, v7-vs-p6-star and v6-vs-p7-exact: a colon in the
+/// resource stays in the resource field, so `table/*` matches
+/// `table/Tother:extra` and an exact pattern does not; a seven-field pattern
+/// does not match a six-field value.
+#[test]
+fn arn_operators_seven_field_value_or_pattern() {
+    let extra = "arn:aws:dynamodb:us-east-1:123456789012:table/Tother:extra";
+    // (pattern, value, positive result)
+    let rows = [
+        (V, extra, false),
+        (TABLE_STAR, extra, true),
+        (extra, V, false),
+    ];
+    for (p, v, positive) in rows {
+        assert_eq!(single_value(ArnEquals, p, v), positive, "ArnEquals {p} {v}");
+        assert_eq!(single_value(ArnLike, p, v), positive, "ArnLike {p} {v}");
+        assert_eq!(
+            single_value(ArnNotEquals, p, v),
+            !positive,
+            "ArnNotEquals {p} {v}"
+        );
+        assert_eq!(
+            single_value(ArnNotLike, p, v),
+            !positive,
+            "ArnNotLike {p} {v}"
+        );
+    }
+}
+
+/// Rows v-empty-partition, v-empty-service, v-empty-resource and
+/// v-empty-region-account: `*` matches an empty field, so `arn:*:*:*:*:*`
+/// matches a six-field value with empty fields and the negatives fail.
+#[test]
+fn arn_operators_empty_fields_match_star() {
+    let all_star = "arn:*:*:*:*:*";
+    let values = [
+        "arn::dynamodb:us-east-1:123456789012:table/Tother",
+        "arn:aws::us-east-1:123456789012:table/Tother",
+        "arn:aws:dynamodb:us-east-1:123456789012:",
+        "arn:aws:dynamodb:::table/Tother",
+    ];
+    for v in values {
+        assert!(single_value(ArnEquals, all_star, v), "ArnEquals {v}");
+        assert!(single_value(ArnLike, all_star, v), "ArnLike {v}");
+        assert!(!single_value(ArnNotEquals, all_star, v), "ArnNotEquals {v}");
+        assert!(!single_value(ArnNotLike, all_star, v), "ArnNotLike {v}");
+    }
+}
+
+/// Rows ifexists-malformed: `IfExists` with a present value that is not an
+/// ARN fails all four operators.
+#[test]
+fn arn_operators_if_exists_present_non_arn_value_match_neither() {
+    for op in [ArnEquals, ArnNotEquals, ArnLike, ArnNotLike] {
+        assert!(
+            !single_value(if_exists(op.clone()), TABLE_STAR, "notanarn"),
+            "{op:?}"
+        );
+    }
+}
+
+/// Rows neg-7field-pattern and neg-index-table-star for the negative
+/// operators: a seven-field pattern does not match V, so the negatives hold;
+/// `table/*` matches an index ARN, so they fail.
+#[test]
+fn arn_not_operators_seven_field_pattern_and_index_value() {
+    let seven = "arn:aws:dynamodb:us-east-1:123456789012:table/Tother:extra";
+    let idx = "arn:aws:dynamodb:us-east-1:123456789012:table/T/index/I";
+    for op in [ArnNotEquals, ArnNotLike] {
+        assert!(single(op.clone(), seven), "{op:?} seven-field pattern");
+        assert!(!single_value(op.clone(), TABLE_STAR, idx), "{op:?} index");
+    }
 }
