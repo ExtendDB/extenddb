@@ -574,6 +574,7 @@ impl CassandraEngine {
                         write_capacity_units: pt.write_capacity_units,
                     }
                 }),
+                warm_throughput: None,
             })
             .collect();
         let local_secondary_indexes = table

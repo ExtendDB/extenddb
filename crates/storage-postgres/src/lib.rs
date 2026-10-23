@@ -31,6 +31,7 @@ mod ttl_worker;
 mod update_table;
 mod vector;
 mod vector_search;
+mod warm_throughput;
 mod worker_store;
 mod workers;
 

@@ -48,21 +48,21 @@ fn key(id: &str, sort: Option<&str>) -> Item {
     key
 }
 
-fn ks(name: &str, key_type: KeyType) -> KeySchemaElement {
+pub(crate) fn ks(name: &str, key_type: KeyType) -> KeySchemaElement {
     KeySchemaElement {
         attribute_name: name.to_owned(),
         key_type,
     }
 }
 
-fn attr(name: &str, attribute_type: ScalarAttributeType) -> AttributeDefinition {
+pub(crate) fn attr(name: &str, attribute_type: ScalarAttributeType) -> AttributeDefinition {
     AttributeDefinition {
         attribute_name: name.to_owned(),
         attribute_type,
     }
 }
 
-async fn activate_tables(engine: &CassandraEngine) {
+pub(crate) async fn activate_tables(engine: &CassandraEngine) {
     tokio::time::sleep(Duration::from_millis(350)).await;
     engine
         .process_control_plane_transitions()
@@ -113,7 +113,11 @@ async fn put_all(engine: &CassandraEngine, key_info: &TableKeyInfo, items: Vec<I
     }
 }
 
-async fn describe(engine: &CassandraEngine, account_id: &str, name: &str) -> TableDescription {
+pub(crate) async fn describe(
+    engine: &CassandraEngine,
+    account_id: &str,
+    name: &str,
+) -> TableDescription {
     engine
         .describe_table(
             account_id,
@@ -657,6 +661,7 @@ async fn test_restore_reproduces_gsi_and_lsi_contents() {
                     non_key_attributes: Some(vec!["value".to_owned()]),
                 },
                 provisioned_throughput: None,
+                warm_throughput: None,
             }]),
             local_secondary_indexes: Some(vec![LsiInput {
                 index_name: "ByLocal".to_owned(),
@@ -1360,6 +1365,7 @@ async fn test_backup_without_definition_restores_as_legacy() {
                     non_key_attributes: None,
                 },
                 provisioned_throughput: None,
+                warm_throughput: None,
             }]),
             ..Default::default()
         },
@@ -1571,22 +1577,38 @@ async fn test_restore_of_deleted_backup_is_not_found() {
 
 // ── Isolated catalogs (own keyspace prefix) ────────────────────────────────
 
-/// Catalog migrations V001-V004: the catalog shape before V005 added
-/// `backups_by_arn.definition/active_restores` and `tables.restore_*`.
-const CATALOG_THROUGH_V004: &[&str] = &[
+/// The catalog migration files in order, so a test can build the catalog
+/// shape of an earlier release by applying the first N statement by
+/// statement, as the runner does.
+pub(crate) const CATALOG_MIGRATION_FILES: &[&str] = &[
     include_str!("../../migrations/catalog/V001__initial_schema.cql"),
     include_str!("../../migrations/catalog/V002__backup_restore.cql"),
     include_str!("../../migrations/catalog/V003__account_scoped_idempotency.cql"),
     include_str!("../../migrations/catalog/V004__ttl_backfill_cursor.cql"),
+    include_str!("../../migrations/catalog/V005__backup_definitions_and_restore_registration.cql"),
 ];
 
 /// An engine on its own keyspace prefix (so its sweeps and workers touch no
 /// other test's tables) with one provisioned account. With `through_v004`
 /// the catalog has run only catalog migrations V001-V004, as a catalog not
 /// yet migrated by `extenddb migrate --yes`; otherwise every migration.
-async fn isolated_engine(
+pub(crate) async fn isolated_engine(
     tag: &str,
     through_v004: bool,
+) -> (
+    std::sync::Arc<CassandraEngine>,
+    String,
+    crate::helpers::DropKeyspacesOnDrop,
+) {
+    isolated_engine_through(tag, if through_v004 { Some(4) } else { None }).await
+}
+
+/// [`isolated_engine`] with the catalog at the shape after the first
+/// `through` catalog migrations (recorded in `schema_history` as the runner
+/// records them), or fully migrated when `None`.
+pub(crate) async fn isolated_engine_through(
+    tag: &str,
+    through: Option<usize>,
 ) -> (
     std::sync::Arc<CassandraEngine>,
     String,
@@ -1609,26 +1631,29 @@ async fn isolated_engine(
             .await
             .unwrap();
     }
-    if through_v004 {
+    if let Some(through) = through {
         // Statement by statement, as the migration runner does, recording
-        // versions 1-4 in schema_history as the runner did for a 0.0.3 catalog.
+        // the applied versions in schema_history as the runner did.
         session.query(format!("USE {catalog_ks}")).await.unwrap();
-        for file in CATALOG_THROUGH_V004 {
+        for file in &CATALOG_MIGRATION_FILES[..through] {
             for statement in file.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-                session.query(statement).await.expect("V001-V004 statement");
+                session
+                    .query(statement)
+                    .await
+                    .expect("earlier catalog statement");
             }
         }
-        for version in 1..=4_i32 {
+        for version in 1..=i32::try_from(through).expect("small") {
             session
                 .query_with_values(
                     format!(
                         "INSERT INTO {catalog_ks}.schema_history (version, description, applied_at) \
-                         VALUES (?, 'through_v004', toTimestamp(now()))"
+                         VALUES (?, 'earlier_release', toTimestamp(now()))"
                     ),
                     cdrs_tokio::query_values!(version),
                 )
                 .await
-                .expect("record V001-V004");
+                .expect("record earlier catalog versions");
         }
     } else {
         extenddb_storage_cassandra::migrations::run_catalog_migrations(&session, &catalog_ks)
@@ -1651,8 +1676,8 @@ async fn isolated_engine(
     (engine, account_id, drop_keyspaces)
 }
 
-/// The columns catalog migration V005 adds are absent from `keyspace`.
-async fn assert_catalog_lacks_v005(engine: &CassandraEngine, keyspace: &str) {
+/// The column names of every table in `keyspace`.
+pub(crate) async fn catalog_columns(engine: &CassandraEngine, keyspace: &str) -> Vec<String> {
     let rows = extenddb_storage_cassandra::cassandra_util::query_rows::<StorageError>(
         &engine.session_arc(),
         "SELECT column_name FROM system_schema.columns WHERE keyspace_name = ?",
@@ -1672,6 +1697,12 @@ async fn assert_catalog_lacks_v005(engine: &CassandraEngine, keyspace: &str) {
             .unwrap()
         })
         .collect();
+    columns
+}
+
+/// The columns catalog migration V005 adds are absent from `keyspace`.
+async fn assert_catalog_lacks_v005(engine: &CassandraEngine, keyspace: &str) {
+    let columns = catalog_columns(engine, keyspace).await;
     assert!(columns.iter().any(|c| c == "table_status"), "{columns:?}");
     for v005 in [
         "restore_source_backup_arn",
@@ -1713,6 +1744,7 @@ async fn test_table_operations_work_on_a_catalog_without_v005() {
                         non_key_attributes: None,
                     },
                     provisioned_throughput: None,
+                    warm_throughput: None,
                 }]),
                 ..Default::default()
             },
@@ -1979,6 +2011,7 @@ async fn test_restore_heartbeat_runs_during_target_ddl() {
                 non_key_attributes: None,
             },
             provisioned_throughput: None,
+            warm_throughput: None,
         });
         lsis.push(LsiInput {
             index_name: format!("L{i}"),

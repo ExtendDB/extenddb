@@ -12,7 +12,9 @@ use extenddb_core::types::{
     AttributeDefinition, BillingMode, KeySchemaElement, TableDescription, UpdateTableInput,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::effective_attribute_definitions;
+use extenddb_storage::util::{
+    effective_attribute_definitions, warm_throughput_record_for_create, warm_throughput_record_json,
+};
 
 use crate::CassandraEngine;
 use crate::cassandra_util::query_optional;
@@ -151,6 +153,59 @@ impl CassandraEngine {
             add_update!("on_demand_throughput", odt_json.as_str());
         }
 
+        // WarmThroughput on the table and on updated indexes: stored as sent,
+        // nothing acts on it. Validated by the engine against the current values.
+        //
+        // A request with a BillingMode and a WarmThroughput is the one the
+        // engine builds for a switch to PAY_PER_REQUEST (a client cannot send
+        // both). It must not fail on a catalog that has not run V006, where
+        // the column is absent: the switch is skipped past the warm throughput
+        // and the reported value still follows the on-demand minimum at read
+        // time. A request that names WarmThroughput on its own fails there, as
+        // documented.
+        let warm_json = match &input.warm_throughput {
+            Some(spec) => {
+                match self
+                    .merged_table_warm_throughput(account_id, &input.table_name, spec)
+                    .await
+                {
+                    Ok(json) => Some(json),
+                    Err(e) if input.billing_mode.is_some() => {
+                        tracing::warn!(
+                            "update_table: warm throughput not stored with the billing mode \
+                             change (catalog migration V006 not applied?): {e}"
+                        );
+                        None
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            None => None,
+        };
+        if let Some(json) = warm_json.as_deref() {
+            add_update!("warm_throughput", json);
+        }
+        for update in input.global_secondary_index_updates.iter().flatten() {
+            if let Some(action) = &update.update
+                && let Some(spec) = &action.warm_throughput
+            {
+                let json = self
+                    .merged_index_warm_throughput(&table_id, &action.index_name, spec)
+                    .await?;
+                add_index_op!(
+                    format!(
+                        "UPDATE {catalog_ks}.indexes SET warm_throughput = ? \
+                         WHERE table_id = ? AND index_name = ?"
+                    ),
+                    QueryValues::SimpleValues(vec![
+                        Value::from(json.as_str()),
+                        Value::from(table_id.as_str()),
+                        Value::from(action.index_name.as_str()),
+                    ])
+                );
+            }
+        }
+
         // Stream specification: add to batch, then handle shard init separately
         // (init_stream_shards writes to a different keyspace and does its own batch).
         let mut needs_shard_init = false;
@@ -272,21 +327,35 @@ impl CassandraEngine {
                         .map_err(|e| StorageError::Internal(e.to_string()))?
                         .unwrap_or_default();
 
+                    let mut index_values = vec![
+                        Value::from(table_id.as_str()),
+                        Value::from(create.index_name.as_str()),
+                        Value::from(index_id.as_str()),
+                        Value::from(idx_ks_json.as_str()),
+                        Value::from(proj_json.as_str()),
+                        Value::from(pt_json.as_str()),
+                    ];
+                    // WarmThroughput named only when sent, as in create_table.
+                    let gsi_warm = warm_throughput_record_for_create(
+                        create.warm_throughput.as_ref(),
+                        self.control_plane_delay_secs().await,
+                    );
+                    let (warm_column, warm_placeholder) = match gsi_warm.as_ref() {
+                        Some(record) => {
+                            index_values
+                                .push(Value::from(warm_throughput_record_json(record)?.as_str()));
+                            (", warm_throughput", ", ?")
+                        }
+                        None => ("", ""),
+                    };
                     add_index_op!(
                         format!(
                             "INSERT INTO {catalog_ks}.indexes \
                              (table_id, index_name, index_id, index_type, key_schema, \
-                              projection, index_status, provisioned_throughput) \
-                             VALUES (?, ?, ?, 'GSI', ?, ?, 'CREATING', ?)"
+                              projection, index_status, provisioned_throughput{warm_column}) \
+                             VALUES (?, ?, ?, 'GSI', ?, ?, 'CREATING', ?{warm_placeholder})"
                         ),
-                        QueryValues::SimpleValues(vec![
-                            Value::from(table_id.as_str()),
-                            Value::from(create.index_name.as_str()),
-                            Value::from(index_id.as_str()),
-                            Value::from(idx_ks_json.as_str()),
-                            Value::from(proj_json.as_str()),
-                            Value::from(pt_json.as_str()),
-                        ])
+                        QueryValues::SimpleValues(index_values)
                     );
                     gsi_creates.push((index_id, create.index_name.clone()));
                     surviving_index_key_schemas.push(create.key_schema.clone());

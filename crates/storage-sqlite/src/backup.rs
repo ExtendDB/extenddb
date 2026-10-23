@@ -210,6 +210,7 @@ impl SqliteEngine {
                     key_schema,
                     projection,
                     provisioned_throughput: throughput_from_catalog(ipt.as_ref()),
+                    warm_throughput: None,
                 });
             }
         }
@@ -2163,12 +2164,17 @@ mod restore_tests {
             .expect("old backup item");
         }
 
-        // The dry run names the rebuild, with the row count.
+        // The dry run names the rebuild, with the row count, and the two
+        // WarmThroughput columns the 0.0.3 schema predates.
         assert_eq!(
             crate::schema::pending_shape_migrations(&engine.pool)
                 .await
                 .expect("pending"),
-            vec!["rebuild backup_items (3 rows)".to_owned()]
+            vec![
+                "rebuild backup_items (3 rows)".to_owned(),
+                "add tables.warm_throughput".to_owned(),
+                "add indexes.warm_throughput".to_owned(),
+            ]
         );
         let (log_guard, logs) = crate::schema::log_capture::capture();
         crate::schema::apply(&engine.pool).await.expect("migrate");
