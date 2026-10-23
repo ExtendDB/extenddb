@@ -85,7 +85,7 @@ pub async fn handle_scan(
     // runs ahead of every expression check (measured 2026-10-14: a Scan with
     // an undefined filter value and Limit 0 reports the limit; with Segment
     // and no TotalSegments it reports TotalSegments).
-    // Validate Segment/TotalSegments — DynamoDB returns different messages per direction
+    // Validate Segment/TotalSegments. DynamoDB returns a different message per direction
     match (input.segment, input.total_segments) {
         (Some(_), None) => {
             return Err(DynamoDbError::ValidationException(

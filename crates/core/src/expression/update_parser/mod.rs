@@ -390,7 +390,7 @@ fn parse_delete_actions(
     Ok(())
 }
 
-/// Parse a value for ADD/DELETE — only placeholders are valid.
+/// Parse a value for ADD/DELETE. Only placeholders are valid.
 fn parse_add_delete_value(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbError> {
     if *pos >= tokens.len() {
         return Err(validation_err(
