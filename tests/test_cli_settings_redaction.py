@@ -23,7 +23,7 @@ import subprocess
 
 import pytest
 
-from lifecycle_helpers import PG_CONN, _init_args, _run_extenddb
+from lifecycle_helpers import PG_CONN, _init_args, _patch_config_port, _run_extenddb
 
 MASK = "••••••••"
 ADMIN_PASSWORD = "TestPass1!"
@@ -137,6 +137,9 @@ class TestSettingsRedactionPostgres:
         if "this binary is built with" in res.stderr:
             pytest.skip("extenddb binary was not built with the PostgreSQL backend")
         assert res.returncode == 0, res.stderr
+        # `init` writes the default port; move it to this fixture's port so
+        # nothing in this deployment's config points at the shared server.
+        _patch_config_port(cli_env["config_path"], cli_env["port"])
         return cli_env
 
     def test_list_and_get_mask_key_and_connection_string(self, pg_deployment):
