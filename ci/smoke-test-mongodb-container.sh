@@ -151,6 +151,9 @@ docker exec "$APP_CONTAINER" /bin/sh -ec '
     test "$(stat -c %a /var/lib/extenddb/.extenddb/tls/key.pem)" = 600
 '
 
+docker run --rm --user 0:0 --entrypoint /bin/sh "$EXTENDDB_MONGODB_IMAGE" \
+    -ec 'test -z "$(find / -xdev -type f -perm /6000 -print -quit)"'
+
 echo "=== Provisioning API credentials and exercising DynamoDB operations ==="
 export EXTENDDB_PASSWORD="$EXTENDDB_ADMIN_PASSWORD"
 docker exec -e EXTENDDB_PASSWORD "$APP_CONTAINER" \

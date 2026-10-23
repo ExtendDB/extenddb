@@ -11,6 +11,7 @@ use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::storage_err_to_dynamo;
 use crate::expression_helpers::{build_expression_maps, parse_optional_condition};
+use crate::request_limits;
 use crate::serialize_output;
 use crate::stream_capture;
 use crate::transact_write_helpers::{
@@ -26,9 +27,6 @@ use extenddb_core::validation::{
     validate_attribute_name_sizes, validate_attribute_values_nesting_depth,
     validate_item_nesting_depth, validate_item_size, validate_key_not_empty,
 };
-
-/// Maximum number of items in a single `TransactWriteItems` request.
-const MAX_TRANSACT_WRITE_ITEMS: usize = 100;
 
 /// Handle a `TransactWriteItems` request.
 ///
@@ -55,23 +53,9 @@ pub async fn handle_transact_write_items(
         .map(|t| compute_fingerprint(&body, t))
         .unwrap_or_default();
 
-    if input.transact_items.is_empty() {
-        return Err(DynamoDbError::ValidationException(
-            "1 validation error detected: Value '[]' at 'transactItems' failed to satisfy constraint: Member must have length greater than or equal to 1".to_owned(),
-        ));
-    }
-
-    if input.transact_items.len() > MAX_TRANSACT_WRITE_ITEMS {
-        let items_repr = input
-            .transact_items
-            .iter()
-            .map(|_| "TransactWriteItem")
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(DynamoDbError::ValidationException(format!(
-            "1 validation error detected: Value '[{items_repr}]' at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to 100"
-        )));
-    }
+    // At least one and at most 100 items. The server runs the same check
+    // before authorization.
+    request_limits::check_transact_count(input.transact_items.len(), "TransactWriteItem")?;
 
     // Validate each item has exactly one operation
     for (i, twi) in input.transact_items.iter().enumerate() {
@@ -364,8 +348,7 @@ async fn prepare_write_op(
 ) -> Result<PreparedOp, DynamoDbError> {
     if let Some(put) = &twi.put {
         let key_info = ctx
-            .storage
-            .table_key_info(&ctx.account_id, &put.table_name)
+            .table_key_info_uncached(&put.table_name)
             .await
             .map_err(storage_err_to_dynamo)?;
         validate_item_nesting_depth(&put.item)?;
@@ -418,8 +401,7 @@ async fn prepare_write_op(
 
     if let Some(del) = &twi.delete {
         let key_info = ctx
-            .storage
-            .table_key_info(&ctx.account_id, &del.table_name)
+            .table_key_info_uncached(&del.table_name)
             .await
             .map_err(storage_err_to_dynamo)?;
         // Empty or oversize key values are up-front input validation in
@@ -470,8 +452,7 @@ async fn prepare_write_op(
 
     if let Some(upd) = &twi.update {
         let key_info = ctx
-            .storage
-            .table_key_info(&ctx.account_id, &upd.table_name)
+            .table_key_info_uncached(&upd.table_name)
             .await
             .map_err(storage_err_to_dynamo)?;
         // Empty or oversize key values are up-front input validation in
@@ -541,8 +522,7 @@ async fn prepare_write_op(
 
     if let Some(cc) = &twi.condition_check {
         let key_info = ctx
-            .storage
-            .table_key_info(&ctx.account_id, &cc.table_name)
+            .table_key_info_uncached(&cc.table_name)
             .await
             .map_err(storage_err_to_dynamo)?;
         // Empty or oversize key values are up-front input validation in

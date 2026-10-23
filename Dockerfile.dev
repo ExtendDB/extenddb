@@ -29,6 +29,7 @@ RUN test -n "${VCS_REF}" \
  && test "${BUILD_DATE}" != unknown \
  && EXTENDDB_GIT_HASH="${VCS_REF}" \
     EXTENDDB_BUILD_TIME="${BUILD_DATE}" \
+    AWS_LC_SYS_USE_SYSTEM=0 \
     cargo build --locked --profile release-slim \
       -p extenddb --no-default-features --features sqlite,dev-mode \
  && install -d -m 0700 /state
