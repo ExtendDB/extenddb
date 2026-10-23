@@ -368,37 +368,53 @@ def empty_table(dynamodb_client):
     dynamodb_client.delete_table(TableName=name)
 
 
+LEGACY_TYPE = (
+    "One or more parameter values were invalid: ComparisonOperator {} is not valid for {} AttributeValue type"
+)
+KC_ABSENT = {"pk": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "absent"}]}}
+
+
 class TestLegacyFilterOperandType:
     """The legacy QueryFilter and ScanFilter parameters are checked at request
-    time too: on an empty table, where no row is evaluated, BEGINS_WITH with a
-    number and an ordering comparison with a boolean are refused. Only the
-    error code is asserted here; the service's message text for the legacy
-    parameters has not been captured."""
+    time too: on an empty table, where no row is evaluated, an operator given
+    a value of a type it does not take is refused with the service's message
+    (measured against Amazon DynamoDB on 2026-10-23). The value named is the
+    first one of a type the operator does not take."""
 
-    def test_scan_filter_begins_with_number_rejected_on_empty_table(self, dynamodb_client, empty_table):
+    @pytest.mark.parametrize(
+        ("operator", "values", "named_type"),
+        [
+            ("BEGINS_WITH", [{"N": "1"}], "N"),
+            ("LT", [{"BOOL": True}], "BOOL"),
+            ("GT", [{"BOOL": True}], "BOOL"),
+            ("BETWEEN", [{"L": []}, {"N": "1"}], "L"),
+        ],
+    )
+    def test_scan_filter_refuses_with_the_service_message(self, dynamodb_client, empty_table, operator, values, named_type):
         with pytest.raises(ClientError) as ei:
             dynamodb_client.scan(
                 TableName=empty_table,
-                ScanFilter={"pk": {"ComparisonOperator": "BEGINS_WITH", "AttributeValueList": [{"N": "1"}]}},
+                ScanFilter={"f": {"ComparisonOperator": operator, "AttributeValueList": values}},
             )
         assert _err(ei)["Code"] == "ValidationException"
+        assert _err(ei)["Message"] == LEGACY_TYPE.format(operator, named_type)
 
-    def test_scan_filter_ordering_boolean_rejected_on_empty_table(self, dynamodb_client, empty_table):
-        with pytest.raises(ClientError) as ei:
-            dynamodb_client.scan(
-                TableName=empty_table,
-                ScanFilter={"n": {"ComparisonOperator": "LT", "AttributeValueList": [{"BOOL": True}]}},
-            )
-        assert _err(ei)["Code"] == "ValidationException"
-
-    def test_query_filter_begins_with_number_rejected_on_empty_table(self, dynamodb_client, empty_table):
+    @pytest.mark.parametrize(
+        ("operator", "values", "named_type"),
+        [
+            ("BEGINS_WITH", [{"N": "1"}], "N"),
+            ("GT", [{"BOOL": True}], "BOOL"),
+        ],
+    )
+    def test_query_filter_refuses_with_the_service_message(self, dynamodb_client, empty_table, operator, values, named_type):
         with pytest.raises(ClientError) as ei:
             dynamodb_client.query(
                 TableName=empty_table,
-                KeyConditions={"pk": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "absent"}]}},
-                QueryFilter={"s": {"ComparisonOperator": "BEGINS_WITH", "AttributeValueList": [{"N": "1"}]}},
+                KeyConditions=KC_ABSENT,
+                QueryFilter={"f": {"ComparisonOperator": operator, "AttributeValueList": values}},
             )
         assert _err(ei)["Code"] == "ValidationException"
+        assert _err(ei)["Message"] == LEGACY_TYPE.format(operator, named_type)
 
     def test_scan_filter_begins_with_string_accepted(self, dynamodb_client, empty_table):
         resp = dynamodb_client.scan(

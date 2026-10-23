@@ -147,6 +147,7 @@ The same on all four backends.
 | Provisioned throughput | Token bucket per table/partition | Token bucket per table/partition, matching DynamoDB's burst and refill behavior |
 | On-demand capacity | Automatic scaling | Fixed initial burst capacity (4000 WCU / 12000 RCU), no auto-scaling |
 | Throttling | Always on; throttles requests that exceed provisioned/burst capacity. No setting to disable | Configurable via `throttling_enabled` runtime setting (default: `true`) |
+| Order of `ConsumedCapacity` entries in `TransactGetItems` and `TransactWriteItems` responses | Undocumented. Measured 2026-10-23 with two tables: the same table came first whether it was named first or second in the request (a request naming `bb-w-M3-2`, `bb-w-M3-1`, `bb-w-M3-2` and one naming `bb-w-M3-1`, `bb-w-M3-2`, `bb-w-M3-1` both returned `bb-w-M3-1` before `bb-w-M3-2`), so the order does not follow the request; it is consistent with the table name order, which is not confirmed | One entry per table in the order the tables first appear in the request, on every backend. A client that reads the array by position works against ExtendDB and may not against DynamoDB; look entries up by `TableName` |
 
 ## Operations Not Implemented
 

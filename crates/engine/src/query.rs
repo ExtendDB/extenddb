@@ -153,13 +153,13 @@ pub async fn handle_query(
     // types), the KeyConditionExpression (syntax, then references), the
     // ProjectionExpression (syntax, then references and overlap), then unused
     // names and values. A missing table is reported after all of these.
-    // A legacy QueryFilter skips the parser, so its operand types are checked
-    // separately, still before any row is read.
+    // A legacy QueryFilter skips the parser; desugar_filter checks each
+    // ComparisonOperator against its value types with the service's message,
+    // still before any row is read.
     let (filter, filter_maps) =
         if let Some(qf) = input.query_filter.as_ref().filter(|qf| !qf.is_empty()) {
             let cond_op = input.conditional_operator.unwrap_or_default();
             let (expr, fmaps) = desugar_filter(qf, cond_op)?;
-            crate::expression_helpers::check_legacy_filter_operand_types(&expr, &fmaps)?;
             (Some(expr), Some(fmaps))
         } else {
             match input.filter_expression.as_deref() {

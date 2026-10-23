@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{
     CompareOp, Expr, ExpressionMaps, KeyCondition, PathElement, SortKeyCondition,
+    attribute_type_code,
 };
 use extenddb_core::types::{AttributeValue, Condition, ConditionalOperator};
 
@@ -208,12 +209,54 @@ pub fn desugar_filter(
     Ok((combined, maps))
 }
 
+/// Refuse a legacy `ComparisonOperator` whose `AttributeValueList` holds a
+/// value of a type the operator does not take, with the service's message,
+/// before the condition is desugared and before any row is read.
+///
+/// The service checks this at request time, on an empty table too (measured
+/// 2026-10-23: `BEGINS_WITH` with `N`, `LT` and `GT` with `BOOL`, and
+/// `BETWEEN` with `L` then `N`, which names the `L`). `EQ` and `NE` take every
+/// type; `NULL` and `NOT_NULL` take no value; `BEGINS_WITH` takes `S` and `B`;
+/// the ordering operators, `BETWEEN`, `IN`, `CONTAINS` and `NOT_CONTAINS` take
+/// `S`, `N` and `B`. The first value of a type the operator does not take is
+/// the one named.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` with the text
+/// `One or more parameter values were invalid: ComparisonOperator <op> is not
+/// valid for <type> AttributeValue type`.
+pub fn check_legacy_operand_types(
+    operator: &str,
+    values: &[AttributeValue],
+) -> Result<(), DynamoDbError> {
+    let allowed = |v: &AttributeValue| match operator {
+        "EQ" | "NE" | "NULL" | "NOT_NULL" => true,
+        "BEGINS_WITH" => matches!(v, AttributeValue::S(_) | AttributeValue::B(_)),
+        "LE" | "LT" | "GE" | "GT" | "BETWEEN" | "IN" | "CONTAINS" | "NOT_CONTAINS" => {
+            matches!(
+                v,
+                AttributeValue::S(_) | AttributeValue::N(_) | AttributeValue::B(_)
+            )
+        }
+        _ => true,
+    };
+    match values.iter().find(|v| !allowed(v)) {
+        Some(bad) => Err(DynamoDbError::ValidationException(format!(
+            "One or more parameter values were invalid: ComparisonOperator {operator} is not valid for {} AttributeValue type",
+            attribute_type_code(bad)
+        ))),
+        None => Ok(()),
+    }
+}
+
 fn desugar_one_filter_condition(
     path: &Expr,
     cond: &Condition,
     values: &mut HashMap<String, AttributeValue>,
     counter: &mut u32,
 ) -> Result<Expr, DynamoDbError> {
+    check_legacy_operand_types(&cond.comparison_operator, &cond.attribute_value_list)?;
     match cond.comparison_operator.as_str() {
         "EQ" | "NE" | "LE" | "LT" | "GE" | "GT" => {
             if cond.attribute_value_list.len() != 1 {
@@ -331,5 +374,73 @@ fn desugar_one_filter_condition(
         other => Err(DynamoDbError::ValidationException(format!(
             "Unsupported filter operator: {other}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(op: &str, values: &[AttributeValue]) -> Option<String> {
+        match check_legacy_operand_types(op, values) {
+            Ok(()) => None,
+            Err(DynamoDbError::ValidationException(m)) => Some(m),
+            Err(other) => panic!("unexpected error {other:?}"),
+        }
+    }
+
+    fn refusal(op: &str, ty: &str) -> String {
+        format!(
+            "One or more parameter values were invalid: ComparisonOperator {op} is not valid for {ty} AttributeValue type"
+        )
+    }
+
+    #[test]
+    fn measured_rows_carry_the_service_message() {
+        let n = AttributeValue::N("1".to_owned());
+        let b = AttributeValue::Bool(true);
+        let l = AttributeValue::L(Vec::new());
+        assert_eq!(
+            msg("BEGINS_WITH", std::slice::from_ref(&n)),
+            Some(refusal("BEGINS_WITH", "N"))
+        );
+        assert_eq!(
+            msg("LT", std::slice::from_ref(&b)),
+            Some(refusal("LT", "BOOL"))
+        );
+        assert_eq!(msg("GT", &[b]), Some(refusal("GT", "BOOL")));
+        assert_eq!(msg("BETWEEN", &[l, n]), Some(refusal("BETWEEN", "L")));
+    }
+
+    #[test]
+    fn accepted_types_pass() {
+        let s = AttributeValue::S("p".to_owned());
+        let n = AttributeValue::N("1".to_owned());
+        let bin = AttributeValue::B(vec![1]);
+        assert_eq!(msg("BEGINS_WITH", std::slice::from_ref(&s)), None);
+        assert_eq!(msg("BEGINS_WITH", std::slice::from_ref(&bin)), None);
+        assert_eq!(msg("BETWEEN", &[n.clone(), n.clone()]), None);
+        assert_eq!(msg("IN", &[s.clone(), n.clone(), bin]), None);
+        assert_eq!(msg("EQ", &[AttributeValue::L(Vec::new())]), None);
+        assert_eq!(msg("NE", &[AttributeValue::Bool(false)]), None);
+        assert_eq!(msg("NULL", &[]), None);
+        assert_eq!(msg("CONTAINS", &[n]), None);
+    }
+
+    #[test]
+    fn desugar_filter_refuses_before_desugaring() {
+        let mut filter = HashMap::new();
+        filter.insert(
+            "f".to_owned(),
+            Condition {
+                comparison_operator: "BEGINS_WITH".to_owned(),
+                attribute_value_list: vec![AttributeValue::N("1".to_owned())],
+            },
+        );
+        let err = desugar_filter(&filter, ConditionalOperator::And).unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(m) if *m == refusal("BEGINS_WITH", "N")),
+            "{err:?}"
+        );
     }
 }
