@@ -574,11 +574,10 @@ impl MongoEngine {
             }
         }
 
-        // Retry ceiling exhausted. RFC-0003 §4.3 requires
-        // `TransactionConflictException` when a single-item write can't
-        // serialize against concurrent activity — never a bare 500.
-        Err(StorageError::TransactionConflict(
-            "PutItem: too many concurrent write conflicts, giving up".to_owned(),
+        // Retry ceiling exhausted: see `write_conflict::retry_budget_exhausted`.
+        Err(crate::write_conflict::retry_budget_exhausted(
+            "PutItem",
+            TRANSIENT_RETRY_ATTEMPTS,
         ))
     }
 
@@ -749,8 +748,9 @@ impl MongoEngine {
             }
         }
 
-        Err(StorageError::TransactionConflict(
-            "DeleteItem: too many concurrent write conflicts, giving up".to_owned(),
+        Err(crate::write_conflict::retry_budget_exhausted(
+            "DeleteItem",
+            TRANSIENT_RETRY_ATTEMPTS,
         ))
     }
 
@@ -1872,14 +1872,14 @@ impl MongoEngine {
             .find(doc! { "_id.table_id": &key_info.table_id })
             .session(&mut *session)
             .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            .map_err(crate::write_conflict::transaction_error)?;
 
         let mut found_any = false;
         while let Some(idx_doc) = cursor
             .next(session)
             .await
             .transpose()
-            .map_err(|e| StorageError::Internal(e.to_string()))?
+            .map_err(crate::write_conflict::transaction_error)?
         {
             found_any = true;
             let index_id = match idx_doc.get_str("index_id") {
@@ -1927,7 +1927,7 @@ impl MongoEngine {
                     .delete_one(old_filter)
                     .session(&mut *session)
                     .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    .map_err(crate::write_conflict::transaction_error)?;
             }
 
             if let Some(new) = new_item
@@ -1955,7 +1955,7 @@ impl MongoEngine {
                     .with_options(opts)
                     .session(&mut *session)
                     .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    .map_err(crate::write_conflict::transaction_error)?;
             }
         }
 
@@ -2083,7 +2083,7 @@ impl MongoEngine {
             })
             .session(&mut *session)
             .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            .map_err(crate::write_conflict::transaction_error)?;
 
         Ok(())
     }
@@ -2502,7 +2502,7 @@ impl MongoEngine {
                     &mut *session,
                 )
                 .await
-                .map_err(TransactOpError::Storage)?;
+                .map_err(TransactOpError::from)?;
                 if let Some(capture) = stream {
                     self.write_stream_inline_in_session(
                         key_info,
@@ -2512,7 +2512,7 @@ impl MongoEngine {
                         &mut *session,
                     )
                     .await
-                    .map_err(TransactOpError::Storage)?;
+                    .map_err(TransactOpError::from)?;
                 }
 
                 Ok(())
@@ -2588,7 +2588,7 @@ impl MongoEngine {
                     &mut *session,
                 )
                 .await
-                .map_err(TransactOpError::Storage)?;
+                .map_err(TransactOpError::from)?;
                 if let Some(capture) = stream {
                     // DDB semantics: a delete on a non-existent key is a
                     // no-op, and no stream record is emitted. Guard on
@@ -2602,7 +2602,7 @@ impl MongoEngine {
                             &mut *session,
                         )
                         .await
-                        .map_err(TransactOpError::Storage)?;
+                        .map_err(TransactOpError::from)?;
                     }
                 }
 
@@ -2732,7 +2732,7 @@ impl MongoEngine {
                     &mut *session,
                 )
                 .await
-                .map_err(TransactOpError::Storage)?;
+                .map_err(TransactOpError::from)?;
                 if let Some(capture) = stream {
                     let old_for_stream = if is_creating {
                         None
@@ -2747,7 +2747,7 @@ impl MongoEngine {
                         &mut *session,
                     )
                     .await
-                    .map_err(TransactOpError::Storage)?;
+                    .map_err(TransactOpError::from)?;
                 }
 
                 Ok(())
@@ -3536,8 +3536,14 @@ impl From<mongodb::error::Error> for TxErr {
 }
 
 impl From<StorageError> for TxErr {
+    /// A `Transient` error from a helper that ran inside the transaction
+    /// (`write_conflict::transaction_error`) re-runs the body like a
+    /// conflict on the data collection; everything else ends the operation.
     fn from(e: StorageError) -> Self {
-        TxErr::Fatal(e)
+        match e {
+            StorageError::Transient(_) => TxErr::Transient,
+            e => TxErr::Fatal(e),
+        }
     }
 }
 
@@ -3555,7 +3561,7 @@ impl From<StorageError> for TxErr {
 /// UnknownTransactionCommitResult label, under which the commit may
 /// already have applied. Commit errors are classified by
 /// `classify_commit_error` instead.
-fn is_transient_write_conflict(e: &mongodb::error::Error) -> bool {
+pub(crate) fn is_transient_write_conflict(e: &mongodb::error::Error) -> bool {
     if e.contains_label(mongodb::error::TRANSIENT_TRANSACTION_ERROR) {
         return true;
     }
@@ -3631,7 +3637,7 @@ fn is_duplicate_key(e: &mongodb::error::Error) -> bool {
 /// route to a labeled error, which the test hook and the classifier unit
 /// tests both need.
 #[cfg(any(test, feature = "test-hooks"))]
-fn synthetic_error_with_labels(message: &str, labels: &[&str]) -> mongodb::error::Error {
+pub(crate) fn synthetic_error_with_labels(message: &str, labels: &[&str]) -> mongodb::error::Error {
     let wc: mongodb::error::WriteConcernError = bson::from_document(doc! {
         "code": 64,
         "codeName": "WriteConcernTimeout",
@@ -3673,8 +3679,13 @@ impl From<mongodb::error::Error> for TransactOpError {
 }
 
 impl From<StorageError> for TransactOpError {
+    /// Same rule as `TxErr`: a `Transient` error raised by a helper inside
+    /// the transaction re-runs the whole transaction.
     fn from(e: StorageError) -> Self {
-        TransactOpError::Storage(e)
+        match e {
+            StorageError::Transient(_) => TransactOpError::Transient,
+            e => TransactOpError::Storage(e),
+        }
     }
 }
 

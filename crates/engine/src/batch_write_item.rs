@@ -18,6 +18,8 @@ use extenddb_core::validation::{
     validate_item_nesting_depth, validate_item_size, validate_key_sizes,
 };
 
+use extenddb_storage::error::StorageError;
+
 use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::storage_err_to_dynamo;
@@ -79,7 +81,19 @@ pub async fn handle_batch_write_item(
     let mut per_table_gsi: HashMap<String, HashMap<String, f64>> = HashMap::new();
     let mut per_table_lsi: HashMap<String, HashMap<String, f64>> = HashMap::new();
 
-    for (table_name, reqs) in &input.request_items {
+    // Requests the batch did not apply: a write that failed because the
+    // backend could not apply it now, after an earlier request committed,
+    // and every request after it. Amazon DynamoDB tolerates the failure of
+    // individual requests in a batch and reports them in UnprocessedItems
+    // for the client to replay; the whole batch fails only when nothing was
+    // applied. Answering an error after a committed write would report that
+    // write as failed.
+    let mut unprocessed: HashMap<String, Vec<WriteRequest>> = HashMap::new();
+    let mut applied = 0usize;
+    let tables: Vec<(&String, &Vec<WriteRequest>)> = input.request_items.iter().collect();
+
+    'tables: for (table_index, (table_name, reqs)) in tables.iter().enumerate() {
+        let table_name = *table_name;
         let key_info = ctx
             .table_key_info_uncached(table_name)
             .await
@@ -90,8 +104,15 @@ pub async fn handle_batch_write_item(
 
         let view_type = stream_capture::stream_view_type(&key_info);
 
-        for wr in reqs {
-            if let Some(put) = &wr.put_request {
+        for (request_index, wr) in reqs.iter().enumerate() {
+            let stream = view_type.map(|vt| extenddb_storage::StreamCapture {
+                view_type: vt,
+                user_identity: None,
+                region: ctx.region.clone(),
+            });
+            let need_old_for_stream = stream.is_some();
+
+            let (item_or_key, item_wcu, written) = if let Some(put) = &wr.put_request {
                 validate_batch_item_keys(
                     &put.item,
                     &key_info.key_schema,
@@ -107,24 +128,8 @@ pub async fn handle_batch_write_item(
                     &key_info.attribute_definitions,
                 )?;
 
-                collect_icm_if_needed(
-                    input.return_item_collection_metrics,
-                    &key_info,
-                    &put.item,
-                    table_name,
-                    &mut all_icm,
-                );
-
-                let stream = view_type.map(|vt| extenddb_storage::StreamCapture {
-                    view_type: vt,
-                    user_identity: None,
-                    region: ctx.region.clone(),
-                });
-                let need_old_for_stream = stream.is_some();
                 let item_wcu = capacity_helpers::write_capacity_units(item_size_bytes(&put.item));
-                total_wcu += item_wcu;
-                *per_table_wcu.entry(table_name.clone()).or_default() += item_wcu;
-                let old_item = ctx
+                let written = ctx
                     .storage
                     .put_item(
                         &key_info,
@@ -134,24 +139,12 @@ pub async fn handle_batch_write_item(
                         &empty_maps,
                         stream.as_ref(),
                     )
-                    .await
-                    .map_err(storage_err_to_dynamo)?;
-                if want_index_cc {
-                    let (gsi, lsi) = capacity_helpers::index_write_units(
-                        old_item.as_ref(),
-                        Some(&put.item),
-                        false,
-                        &key_info,
-                    );
-                    let g = per_table_gsi.entry(table_name.clone()).or_default();
-                    for (name, cu) in gsi {
-                        *g.entry(name).or_default() += cu;
-                    }
-                    let l = per_table_lsi.entry(table_name.clone()).or_default();
-                    for (name, cu) in lsi {
-                        *l.entry(name).or_default() += cu;
-                    }
-                }
+                    .await;
+                (
+                    &put.item,
+                    item_wcu,
+                    written.map(|old| (old, Some(&put.item))),
+                )
             } else if let Some(del) = &wr.delete_request {
                 validate_batch_key_only(
                     &del.key,
@@ -159,26 +152,10 @@ pub async fn handle_batch_write_item(
                     &key_info.attribute_definitions,
                 )?;
 
-                collect_icm_if_needed(
-                    input.return_item_collection_metrics,
-                    &key_info,
-                    &del.key,
-                    table_name,
-                    &mut all_icm,
-                );
-
-                let stream = view_type.map(|vt| extenddb_storage::StreamCapture {
-                    view_type: vt,
-                    user_identity: None,
-                    region: ctx.region.clone(),
-                });
-                let need_old_for_stream = stream.is_some();
                 // TODO(fidelity): DynamoDB charges WCU based on old item size for deletes,
                 // but old item size is not available here. Using key size as lower bound.
                 let item_wcu = capacity_helpers::write_capacity_units(item_size_bytes(&del.key));
-                total_wcu += item_wcu;
-                *per_table_wcu.entry(table_name.clone()).or_default() += item_wcu;
-                let old_item = ctx
+                let written = ctx
                     .storage
                     .delete_item(
                         &key_info,
@@ -188,23 +165,51 @@ pub async fn handle_batch_write_item(
                         &empty_maps,
                         stream.as_ref(),
                     )
-                    .await
-                    .map_err(storage_err_to_dynamo)?;
-                if want_index_cc {
-                    let (gsi, lsi) = capacity_helpers::index_write_units(
-                        old_item.as_ref(),
-                        None,
-                        false,
-                        &key_info,
+                    .await;
+                (&del.key, item_wcu, written.map(|old| (old, None)))
+            } else {
+                // Rejected by the validation above.
+                continue;
+            };
+
+            let (old_item, new_item) = match written {
+                Ok(outcome) => outcome,
+                Err(e) if applied > 0 && is_deferrable(&e) => {
+                    tracing::warn!(
+                        table = %table_name,
+                        error = %e,
+                        "BatchWriteItem: write not applied after {applied} committed; the rest of the batch is reported in UnprocessedItems"
                     );
-                    let g = per_table_gsi.entry(table_name.clone()).or_default();
-                    for (name, cu) in gsi {
-                        *g.entry(name).or_default() += cu;
-                    }
-                    let l = per_table_lsi.entry(table_name.clone()).or_default();
-                    for (name, cu) in lsi {
-                        *l.entry(name).or_default() += cu;
-                    }
+                    unprocessed = remaining_requests(&tables, table_index, request_index);
+                    break 'tables;
+                }
+                Err(e) => return Err(storage_err_to_dynamo(e)),
+            };
+            applied += 1;
+
+            collect_icm_if_needed(
+                input.return_item_collection_metrics,
+                &key_info,
+                item_or_key,
+                table_name,
+                &mut all_icm,
+            );
+            total_wcu += item_wcu;
+            *per_table_wcu.entry(table_name.clone()).or_default() += item_wcu;
+            if want_index_cc {
+                let (gsi, lsi) = capacity_helpers::index_write_units(
+                    old_item.as_ref(),
+                    new_item,
+                    false,
+                    &key_info,
+                );
+                let g = per_table_gsi.entry(table_name.clone()).or_default();
+                for (name, cu) in gsi {
+                    *g.entry(name).or_default() += cu;
+                }
+                let l = per_table_lsi.entry(table_name.clone()).or_default();
+                for (name, cu) in lsi {
+                    *l.entry(name).or_default() += cu;
                 }
             }
         }
@@ -241,7 +246,7 @@ pub async fn handle_batch_write_item(
     let wcu = total_wcu;
 
     let output = BatchWriteItemOutput {
-        unprocessed_items: HashMap::new(),
+        unprocessed_items: unprocessed,
         consumed_capacity,
         item_collection_metrics: if all_icm.is_empty() {
             None
@@ -257,6 +262,44 @@ pub async fn handle_batch_write_item(
             ..Default::default()
         },
     })
+}
+
+/// Whether a failed write leaves the rest of the batch for the client to
+/// replay instead of failing the batch.
+///
+/// These are the errors a replay may clear: the backend could not apply the
+/// request now (a write that lost every retry against concurrent writers, a
+/// transient or connection failure, an internal failure). Amazon DynamoDB
+/// lists throttling and internal processing failures as the causes of
+/// UnprocessedItems. A fault in the request itself (validation, a missing
+/// table, a condition) fails the batch as before.
+fn is_deferrable(e: &StorageError) -> bool {
+    matches!(
+        e,
+        StorageError::TransactionConflict(_)
+            | StorageError::Transient(_)
+            | StorageError::Connection(_)
+            | StorageError::Internal(_)
+    )
+}
+
+/// The requests from `tables[table_index][request_index]` on, in batch order:
+/// the request that was not applied and every request after it, in its table
+/// and in the tables that follow.
+fn remaining_requests(
+    tables: &[(&String, &Vec<WriteRequest>)],
+    table_index: usize,
+    request_index: usize,
+) -> HashMap<String, Vec<WriteRequest>> {
+    let mut out: HashMap<String, Vec<WriteRequest>> = HashMap::new();
+    for (i, (table_name, reqs)) in tables.iter().enumerate().skip(table_index) {
+        let from = if i == table_index { request_index } else { 0 };
+        let rest = &reqs[from..];
+        if !rest.is_empty() {
+            out.insert((*table_name).clone(), rest.to_vec());
+        }
+    }
+    out
 }
 
 /// Validate that no two write requests in the same table target the same key.
@@ -306,5 +349,84 @@ fn collect_icm_if_needed(
         capacity_helpers::item_metrics(ricm, &key_info.key_schema, item_or_key, key_info.has_lsi)
     {
         all_icm.entry(table_name.to_owned()).or_default().push(m);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use extenddb_core::types::{AttributeValue, DeleteRequest, PutRequest};
+
+    fn put(pk: &str) -> WriteRequest {
+        let mut item = Item::new();
+        item.insert("pk".to_owned(), AttributeValue::S(pk.to_owned()));
+        WriteRequest {
+            put_request: Some(PutRequest { item }),
+            delete_request: None,
+        }
+    }
+
+    fn delete(pk: &str) -> WriteRequest {
+        let mut key = Item::new();
+        key.insert("pk".to_owned(), AttributeValue::S(pk.to_owned()));
+        WriteRequest {
+            put_request: None,
+            delete_request: Some(DeleteRequest { key }),
+        }
+    }
+
+    fn pks(reqs: &[WriteRequest]) -> Vec<String> {
+        reqs.iter()
+            .map(|wr| {
+                let item = wr
+                    .put_request
+                    .as_ref()
+                    .map(|p| &p.item)
+                    .or(wr.delete_request.as_ref().map(|d| &d.key))
+                    .expect("one of put or delete");
+                match item.get("pk") {
+                    Some(AttributeValue::S(s)) => s.clone(),
+                    other => panic!("unexpected key {other:?}"),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn remaining_requests_start_at_the_failed_request_and_cover_later_tables() {
+        let t1 = "t1".to_owned();
+        let t2 = "t2".to_owned();
+        let r1 = vec![put("a"), delete("b"), put("c")];
+        let r2 = vec![put("d")];
+        let tables = vec![(&t1, &r1), (&t2, &r2)];
+
+        let rest = remaining_requests(&tables, 0, 1);
+        assert_eq!(pks(&rest["t1"]), ["b", "c"]);
+        assert_eq!(pks(&rest["t2"]), ["d"]);
+
+        // Failed on the last request of the last table: only that request.
+        let rest = remaining_requests(&tables, 1, 0);
+        assert!(!rest.contains_key("t1"));
+        assert_eq!(pks(&rest["t2"]), ["d"]);
+
+        // Failed on the last request of an earlier table: no entry for that
+        // table's later requests, which do not exist.
+        let rest = remaining_requests(&tables, 0, 2);
+        assert_eq!(pks(&rest["t1"]), ["c"]);
+        assert_eq!(pks(&rest["t2"]), ["d"]);
+    }
+
+    #[test]
+    fn only_errors_a_replay_may_clear_are_deferred() {
+        assert!(is_deferrable(&StorageError::TransactionConflict(
+            String::new()
+        )));
+        assert!(is_deferrable(&StorageError::Transient(String::new())));
+        assert!(is_deferrable(&StorageError::Connection(String::new())));
+        assert!(is_deferrable(&StorageError::Internal(String::new())));
+        assert!(!is_deferrable(&StorageError::Validation(String::new())));
+        assert!(!is_deferrable(&StorageError::TableNotFound(String::new())));
+        assert!(!is_deferrable(&StorageError::ConditionFailed(None)));
+        assert!(!is_deferrable(&StorageError::LimitExceeded(String::new())));
     }
 }
