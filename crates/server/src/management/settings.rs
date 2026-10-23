@@ -15,19 +15,9 @@ use super::ManagementState;
 use super::auth::authenticate_admin;
 use super::ops_settings;
 
-/// Keys whose values must be redacted in API responses.
-const REDACTED_KEYS: &[&str] = &[
-    "connection_string",
-    "encryption_key",
-    "password",
-    "secret",
-    "token",
-];
-
-fn should_redact(key: &str) -> bool {
-    let lower = key.to_lowercase();
-    REDACTED_KEYS.iter().any(|&pattern| lower.contains(pattern))
-}
+// Redaction patterns live in one place, `extenddb_config::should_redact`, so
+// the API, the console and the `settings` CLI mask the same keys.
+use extenddb_config::should_redact;
 
 #[derive(Serialize)]
 struct SettingEntry {

@@ -5,7 +5,10 @@
 //!
 //! This is an infrastructure command for direct DB access when the server is
 //! down. Validation logic is shared with the management API via `ops::KNOWN_KEYS`
-//! and `ops::READONLY_KEYS`.
+//! and `ops::READONLY_KEYS`. Secret values (the encryption key, connection
+//! strings carrying a password) are masked the same way the management API
+//! masks them, through `extenddb_config::should_redact`; `get --show-secret`
+//! prints the stored value.
 
 use clap::{Args, Subcommand};
 
@@ -15,6 +18,10 @@ use extenddb_config as config;
 
 // Re-use validation constants from the ops layer.
 use extenddb_server::management::ops_settings::{KNOWN_KEYS, READONLY_KEYS};
+
+/// The mask printed in place of a secret value, identical to the management
+/// API and console mask.
+const MASK: &str = "••••••••";
 
 #[derive(Args)]
 pub struct SettingsArgs {
@@ -28,10 +35,17 @@ pub struct SettingsArgs {
 
 #[derive(Subcommand)]
 enum SettingsAction {
-    /// List all settings
+    /// List all settings. Secret values (encryption key, connection strings,
+    /// passwords, tokens) are masked.
     List,
-    /// Get a single setting
-    Get { key: String },
+    /// Get a single setting. A secret value is masked unless --show-secret is
+    /// given.
+    Get {
+        key: String,
+        /// Print the stored value of a secret setting instead of the mask.
+        #[arg(long)]
+        show_secret: bool,
+    },
     /// Set a setting value
     Set { key: String, value: String },
 }
@@ -54,9 +68,27 @@ pub async fn run(args: SettingsArgs) -> anyhow::Result<()> {
 
     match args.action {
         SettingsAction::List => list(store.as_ref()).await,
-        SettingsAction::Get { key } => get(store.as_ref(), &key).await,
+        SettingsAction::Get { key, show_secret } => get(store.as_ref(), &key, show_secret).await,
         SettingsAction::Set { key, value } => set(store.as_ref(), &key, &value).await,
     }
+}
+
+/// The value to print for `key`: the mask when the key is a secret and the
+/// caller did not ask for it, else the stored value.
+fn display_value<'a>(key: &str, value: &'a str, show_secret: bool) -> &'a str {
+    if !show_secret && config::should_redact(key) {
+        MASK
+    } else {
+        value
+    }
+}
+
+/// Format the `settings list` output, one `key = value` line per row with
+/// secrets masked.
+fn format_list(rows: &[(String, String)]) -> String {
+    rows.iter()
+        .map(|(k, v)| format!("{k} = {}\n", display_value(k, v, false)))
+        .collect()
 }
 
 async fn list(store: &dyn SettingsStore) -> anyhow::Result<()> {
@@ -68,21 +100,19 @@ async fn list(store: &dyn SettingsStore) -> anyhow::Result<()> {
     if rows.is_empty() {
         println!("No settings found.");
     } else {
-        for (k, v) in &rows {
-            println!("{k} = {v}");
-        }
+        print!("{}", format_list(&rows));
     }
     Ok(())
 }
 
-async fn get(store: &dyn SettingsStore, key: &str) -> anyhow::Result<()> {
+async fn get(store: &dyn SettingsStore, key: &str, show_secret: bool) -> anyhow::Result<()> {
     let value = store
         .get_setting(key)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to get setting: {e:?}"))?;
 
     if let Some(v) = value {
-        println!("{v}");
+        println!("{}", display_value(key, &v, show_secret));
     } else {
         eprintln!("Setting '{key}' not found.");
         std::process::exit(1);
@@ -126,4 +156,69 @@ async fn set(store: &dyn SettingsStore, key: &str, value: &str) -> anyhow::Resul
     );
     println!("{key} = {value}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    const CONN: &str = "postgresql://extenddb:apppassword@127.0.0.1:5432/extenddb";
+
+    #[test]
+    fn list_masks_encryption_key_and_connection_string() {
+        let rows = vec![
+            ("catalog_version".to_owned(), "42".to_owned()),
+            ("encryption_key".to_owned(), KEY.to_owned()),
+            (
+                "data_database_connection_string".to_owned(),
+                CONN.to_owned(),
+            ),
+            ("log_level".to_owned(), "info".to_owned()),
+        ];
+        let out = format_list(&rows);
+        assert_eq!(
+            out,
+            format!(
+                "catalog_version = 42\nencryption_key = {MASK}\n\
+                 data_database_connection_string = {MASK}\nlog_level = info\n"
+            )
+        );
+        assert!(!out.contains(KEY));
+        assert!(!out.contains("apppassword"));
+    }
+
+    #[test]
+    fn get_masks_secret_by_default() {
+        assert_eq!(display_value("encryption_key", KEY, false), MASK);
+        assert_eq!(
+            display_value("data_database_connection_string", CONN, false),
+            MASK
+        );
+        assert_eq!(display_value("ENCRYPTION_KEY", KEY, false), MASK);
+    }
+
+    #[test]
+    fn get_show_secret_prints_stored_value() {
+        assert_eq!(display_value("encryption_key", KEY, true), KEY);
+        assert_eq!(
+            display_value("data_database_connection_string", CONN, true),
+            CONN
+        );
+    }
+
+    #[test]
+    fn non_secret_values_print_unchanged() {
+        assert_eq!(display_value("log_level", "info", false), "info");
+        assert_eq!(display_value("log_level", "info", true), "info");
+        assert_eq!(display_value("catalog_version", "42", false), "42");
+    }
+
+    #[test]
+    fn mask_matches_management_api_mask() {
+        // The management API prints the same eight-bullet mask; the two
+        // surfaces must agree so a copied value is recognisable as masked.
+        assert_eq!(MASK, "••••••••");
+        assert_eq!(MASK.chars().count(), 8);
+    }
 }

@@ -1,14 +1,15 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
-//! Configuration display and redaction helpers for the console settings page.
+//! Configuration display and redaction helpers for the console settings page,
+//! the management settings API and the `extenddb settings` CLI.
 
 use crate::AppConfig;
 
 /// Keys whose values must be redacted in configuration displays.
 ///
-/// The single source of truth for redaction patterns. Consumers (including the
-/// console settings page) call [`should_redact`] rather than keeping their own
-/// copy of this list.
+/// The single source of truth for redaction patterns. Consumers (the console
+/// settings page, the management settings API and the `settings` CLI) call
+/// [`should_redact`] rather than keeping their own copy of this list.
 const REDACTED_CONFIG_KEYS: &[&str] = &[
     "connection_string",
     "encryption_key",

@@ -191,12 +191,27 @@ Managed via `extenddb settings set`. Changes take effect within 30 seconds witho
 | `vector_allocation_phase_delay_ms` | `0` | **Test-oriented.** Milliseconds to hold a new vector index in the resource-allocation phase (`CREATING` with `Backfilling: false`) before the scan starts. Zero in production. Without it the phase lasts only from the `UpdateTable` transaction, which inserts the row as `CREATING` with `Backfilling: false`, until the detached build task flips the flag, which is a window no client can time reliably rather than one that cannot exist. |
 
 ```bash
-# View current settings
+# View all settings
+./target/release/extenddb settings --config extenddb.toml list
+
+# View one setting
 ./target/release/extenddb settings --config extenddb.toml get log_level
 
 # Change a setting
 ./target/release/extenddb settings --config extenddb.toml set log_level debug
 ```
+
+`list` and `get` mask secret values (`encryption_key`, and any key whose name
+contains `connection_string`, `password`, `secret` or `token`) as `••••••••`,
+the same mask the management API and the console print. To print the stored
+value of a secret setting, pass `--show-secret` to `get`:
+
+```bash
+./target/release/extenddb settings --config extenddb.toml get --show-secret encryption_key
+```
+
+The value is written to standard output in full, so keep it out of shell
+history, CI logs and pasted transcripts.
 
 ## IAM Management
 
