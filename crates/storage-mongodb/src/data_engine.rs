@@ -3568,8 +3568,8 @@ pub(crate) struct GsiBackfillProgress {
 /// in total on average and 12.8 s at worst, plus the attempts' own round
 /// trips, before the write gives up. Against a transaction another session
 /// holds open, where an attempt waits out MongoDB's lock timeout, a put that
-/// loses all 1,000 attempts returns in about 10 s, under the SDKs' request
-/// timeouts.
+/// loses all 1,000 attempts returned in 9.5 to 12.7 s over six runs on a
+/// shared host, under the SDKs' request timeouts.
 ///
 /// This budget sizes the contention retry loops only: the put, delete,
 /// update, transact and GSI backfill loops, which re-run their transaction
@@ -4329,6 +4329,10 @@ mod tests {
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         let data_db = client.database(&format!("extenddb_test_{suffix}"));
         let catalog_db = client.database(&format!("extenddb_test_{suffix}_catalog"));
+        // The four restore and liveness fields as `MongoEngine::new` sets
+        // them, with the slot count derived from the driver's default pool
+        // (10), as in backup_live_tests.rs.
+        let slots = crate::backup_engine::restore_server_slot_count(10);
         let engine = MongoEngine {
             client: client.clone(),
             catalog_db: catalog_db.clone(),
@@ -4336,6 +4340,10 @@ mod tests {
             region: "us-east-1".to_owned(),
             gsi_cache: Default::default(),
             tx_read_concern: mongodb::options::ReadConcern::snapshot(),
+            backup_liveness: crate::backup_engine::BackupLiveness::default(),
+            restore_server_slot_count: slots,
+            restore_server_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(slots)),
+            restore_account_slots: crate::backup_engine::RestoreAccountSlots::default(),
         };
         let outcome = std::panic::AssertUnwindSafe(body(engine, data_db.clone()))
             .catch_unwind()
@@ -4701,7 +4709,8 @@ mod tests {
             // The sleeps alone come to about 6.4 s on average and 12.8 s at
             // worst. Each attempt against a document a transaction holds also
             // waits out MongoDB's lock timeout, so the wall time measured here
-            // runs to about 10 s. The bound asserted is the one a caller
+            // ran 9.5 to 12.7 s on a shared host. The bound asserted is the
+            // one a caller
             // cares about: the write answers inside a client's read timeout.
             println!("the put lost every attempt and answered in {elapsed:?}");
             assert!(
