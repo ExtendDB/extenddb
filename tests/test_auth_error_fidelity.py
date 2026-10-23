@@ -329,6 +329,27 @@ class TestRequestChecks:
             "Credential should be scoped to correct service: 'dynamodb'. "
         )
 
+    def test_unknown_key_with_another_region_reports_the_scope(self):
+        # Measured against the service on 2026-10-23: the scope is checked
+        # before the access key is looked up, so an unknown key scoped to
+        # another region gets the scope message, not the invalid-key error.
+        other = "us-west-2" if self.region != "us-west-2" else "us-east-1"
+        body_bytes = json.dumps({}).encode("utf-8")
+        aws_req = AWSRequest(
+            method="POST",
+            url=self.url,
+            data=body_bytes,
+            headers={
+                "X-Amz-Target": "DynamoDB_20120810.ListTables",
+                "Content-Type": "application/x-amz-json-1.0",
+            },
+        )
+        SigV4Auth(Credentials("AKIAEXAMPLEEXAMPLE01", "x" * 40, None), "dynamodb", other).add_auth(aws_req)
+        resp = requests.post(self.url, data=body_bytes, headers=dict(aws_req.headers), verify=self.endpoint_url is None)
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["__type"].endswith("InvalidSignatureException"), resp.text
+        assert resp.json()["message"] == "Credential should be scoped to a valid region. "
+
     def test_duplicate_host_header_is_refused(self):
         # The service's front end refuses a request with two host headers
         # before it reaches signing (400, connection closed).
