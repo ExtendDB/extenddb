@@ -11,8 +11,9 @@
 //! with `$setOnInsert`: [`insert_only_key_fields`] builds that document.
 //!
 //! Before that was done, such an upsert stored a document with a generated
-//! ObjectId `_id` and no key attributes in `item_data` (issue #436).
-//! [`repaired_document`] rebuilds a document of that shape into the shape
+//! ObjectId `_id` and no key attributes in `item_data` (issue #436), and for
+//! a REMOVE-only update no `item_data` at all.
+//! [`repaired_document`] rebuilds a document of either shape into the shape
 //! `item_to_document` writes, reading the key values back from the top-level
 //! `pk` and `sk_*` fields.
 
@@ -68,6 +69,12 @@ pub fn is_stored_without_key(doc: &Document) -> bool {
 /// `item_to_document` writes: the same `item_data` with the key attributes
 /// added, `_id` as the key text, and `_v` carried over.
 ///
+/// A document with no `item_data` at all rebuilds into the key-only item.
+/// That is the shape the pre-fix upsert stored for a REMOVE-only creating
+/// UpdateItem, where the filter supplied `pk` and `sk_*`, the `$unset`
+/// contributed nothing and the `$inc` gave `_v`; it is also what the fixed
+/// fast path now writes for the same request.
+///
 /// The key values come from the top-level `pk` text and `sk_s`/`sk_n`/`sk_b`
 /// field, typed by `attribute_definitions`. A document whose top-level key
 /// fields are missing or of the wrong type is an error; the caller leaves it
@@ -77,7 +84,11 @@ pub fn repaired_document(
     key_schema: &[KeySchemaElement],
     attribute_definitions: &[AttributeDefinition],
 ) -> Result<Document, StorageError> {
-    let mut item = document_to_item(doc)?;
+    let mut item = if doc.contains_key("item_data") {
+        document_to_item(doc)?
+    } else {
+        Item::new()
+    };
 
     let pk_name = key_schema
         .iter()
@@ -312,6 +323,40 @@ mod tests {
                 "{sk_type:?} sort key item"
             );
         }
+    }
+
+    #[test]
+    fn repair_rebuilds_a_document_with_no_item_data_as_the_key_only_item() {
+        let (schema, defs) = hash_schema();
+        let bad = doc! {
+            "_id": bson::oid::ObjectId::new(),
+            "pk": "u1",
+            "_v": 1_i64,
+        };
+        assert!(is_stored_without_key(&bad));
+        let repaired = repaired_document(&bad, &schema, &defs).expect("repair");
+        let want_item = item(&[("pk", AttributeValue::S("u1".to_owned()))]);
+        let mut want = item_to_document(&want_item, &schema, &defs).expect("document");
+        want.insert("_v", 1_i64);
+        assert_eq!(repaired, want);
+        assert_eq!(document_to_item(&repaired).expect("item"), want_item);
+    }
+
+    #[test]
+    fn repair_rebuilds_a_range_key_document_with_no_item_data() {
+        let (schema, defs) = range_schema(ScalarAttributeType::S);
+        let want_item = item(&[
+            ("pk", AttributeValue::S("u1".to_owned())),
+            ("sk", AttributeValue::S("s1".to_owned())),
+        ]);
+        let want = item_to_document(&want_item, &schema, &defs).expect("document");
+        let bad = doc! {
+            "_id": bson::oid::ObjectId::new(),
+            "pk": "u1",
+            "sk_s": "s1",
+        };
+        let repaired = repaired_document(&bad, &schema, &defs).expect("repair");
+        assert_eq!(repaired, want);
     }
 
     #[test]

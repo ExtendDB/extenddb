@@ -346,22 +346,31 @@ async fn live_creating_update_that_always_loses_on_id_answers_transaction_confli
 }
 
 /// Store a document the way the fast path did before the fix: an upsert whose
-/// filter is the key and whose update sets one attribute. MongoDB copies the
-/// filter's `pk` and `sk_*` fields, generates an ObjectId `_id`, and writes
-/// no key attribute into `item_data`.
-async fn store_without_key(engine: &MongoEngine, key_info: &TableKeyInfo, key: &Item, w: &str) {
+/// filter is the key and whose update sets one attribute, or, when `w` is
+/// `None`, removes one. MongoDB copies the filter's `pk` and `sk_*` fields,
+/// generates an ObjectId `_id`, and writes no key attribute into `item_data`.
+/// The `None` form is main's REMOVE-only creating update: `$unset`
+/// contributes nothing to the inserted document, so it has no `item_data` at
+/// all.
+async fn store_without_key(
+    engine: &MongoEngine,
+    key_info: &TableKeyInfo,
+    key: &Item,
+    w: Option<&str>,
+) {
     let coll = engine
         .data_db
         .collection::<Document>(&data_collection_name(&key_info.table_id));
     let filter =
         pk_filter(key, &key_info.key_schema, &key_info.attribute_definitions).expect("filter");
-    coll.find_one_and_update(
-        filter,
-        doc! { "$set": { "item_data.w": { "S": w } }, "$inc": { "_v": 1_i64 } },
-    )
-    .upsert(true)
-    .await
-    .expect("upsert");
+    let update = match w {
+        Some(w) => doc! { "$set": { "item_data.w": { "S": w } }, "$inc": { "_v": 1_i64 } },
+        None => doc! { "$unset": { "item_data.w": "" }, "$inc": { "_v": 1_i64 } },
+    };
+    coll.find_one_and_update(filter, update)
+        .upsert(true)
+        .await
+        .expect("upsert");
 }
 
 /// The repair rewrites a document stored without its key into the document
@@ -376,8 +385,8 @@ async fn live_repair_rewrites_documents_stored_without_their_key() {
         let table_id = format!("repair-{}", if range { "range" } else { "hash" });
         let key_info = table(&engine, &table_id, range);
         let key = item_key(range);
-        store_without_key(&engine, &key_info, &key, "upd").await;
-        store_without_key(&engine, &key_info, &key, "upd2").await;
+        store_without_key(&engine, &key_info, &key, Some("upd")).await;
+        store_without_key(&engine, &key_info, &key, Some("upd2")).await;
         let bad = stored(&engine, &key_info, &key).await;
         assert!(
             bad.get_object_id("_id").is_ok(),
@@ -466,6 +475,87 @@ async fn live_repair_rewrites_documents_stored_without_their_key() {
     finish(engine).await;
 }
 
+/// A pre-fix document with no `item_data` at all, which is what main's fast
+/// path stored for a REMOVE-only creating UpdateItem, reads as an internal
+/// error before the repair and as the key-only item after it. The repaired
+/// document is the one the fixed fast path writes for the same request, and a
+/// PutItem on the key then succeeds.
+#[tokio::test]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_repair_rewrites_a_document_stored_with_no_item_data() {
+    let engine = scratch_engine().await;
+    for range in [false, true] {
+        let table_id = format!("repair-noitem-{}", if range { "range" } else { "hash" });
+        let key_info = table(&engine, &table_id, range);
+        let key = item_key(range);
+        store_without_key(&engine, &key_info, &key, None).await;
+
+        let bad = stored(&engine, &key_info, &key).await;
+        assert!(
+            bad.get_object_id("_id").is_ok(),
+            "{table_id}: the pre-fix shape has an ObjectId _id"
+        );
+        assert!(
+            !bad.contains_key("item_data"),
+            "{table_id}: a REMOVE-only creating update stored no item_data: {bad:?}"
+        );
+        assert!(
+            engine.get_item_impl(&key_info, &key).await.is_err(),
+            "{table_id}: the key reads as an error until the repair runs"
+        );
+
+        let mut summary = KeyRepairSummary::default();
+        engine
+            .repair_table(
+                &table_id,
+                &key_info.key_schema,
+                &key_info.attribute_definitions,
+                &mut summary,
+            )
+            .await
+            .expect("repair");
+        assert_eq!(
+            summary,
+            KeyRepairSummary {
+                tables_scanned: 0,
+                documents_repaired: 1,
+                documents_failed: 0,
+            },
+            "{table_id}"
+        );
+
+        assert_eq!(
+            stored(&engine, &key_info, &key).await,
+            expected_document(&key, &key_info, 1),
+            "{table_id}: repaired into the key-only item"
+        );
+        assert_eq!(
+            engine.get_item_impl(&key_info, &key).await.expect("get"),
+            Some(key.clone()),
+            "{table_id}: the key reads back"
+        );
+
+        let put = with(key.clone(), "w", s("put"));
+        let old = engine
+            .put_item_impl(
+                &key_info,
+                put.clone(),
+                true,
+                None,
+                &ExpressionMaps::default(),
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{table_id}: put after repair: {e:?}"));
+        assert_eq!(
+            old,
+            Some(key.clone()),
+            "{table_id}: put returns the repaired key-only item"
+        );
+    }
+    finish(engine).await;
+}
+
 /// The whole-catalog entry point finds the table through its catalog row.
 #[tokio::test]
 #[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
@@ -485,7 +575,7 @@ async fn live_repair_reads_the_key_schema_from_the_catalog() {
         .await
         .expect("catalog row");
     let key = item_key(false);
-    store_without_key(&engine, &key_info, &key, "upd").await;
+    store_without_key(&engine, &key_info, &key, Some("upd")).await;
 
     let summary = engine
         .repair_items_stored_without_key()
