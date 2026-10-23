@@ -383,7 +383,7 @@ fn transact_op_table_id<'a>(op: &'a TransactWriteOp<'_>) -> &'a str {
 /// cancellation reasons (BLOCKER #3 fix).
 /// Build [`validation::IndexKeyRef`] views over the table's indexes for
 /// secondary-index key validation.
-fn index_key_refs(indexes: &[IndexMeta]) -> Vec<validation::IndexKeyRef<'_>> {
+pub(crate) fn index_key_refs(indexes: &[IndexMeta]) -> Vec<validation::IndexKeyRef<'_>> {
     indexes
         .iter()
         .map(|idx| validation::IndexKeyRef {
@@ -625,10 +625,12 @@ async fn execute_transact_write_op(
                 .map_err(|e| {
                     TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))
                 })?;
-                // Validate post-update item size
-                validation::validate_item_size(&item, max_item_size_bytes).map_err(|e| {
-                    TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))
-                })?;
+                // A transacted Update is sized on the finished item, with the
+                // update wording in the cancellation reason.
+                validation::validate_transact_update_item_size(&item, max_item_size_bytes)
+                    .map_err(|e| {
+                        TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))
+                    })?;
                 // Secondary-index key validation on the post-update item: a type
                 // mismatch is a cancellation reason; setting an index key to an
                 // empty value is a top-level ValidationException.

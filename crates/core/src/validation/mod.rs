@@ -1878,6 +1878,257 @@ pub fn validate_item_size(item: &Item, max_bytes: usize) -> Result<(), DynamoDbE
     Ok(())
 }
 
+/// The wording the service uses when an update, standalone or transacted, would
+/// exceed the item size limit.
+pub const ITEM_SIZE_TO_UPDATE_EXCEEDED: &str =
+    "Item size to update has exceeded the maximum allowed size";
+
+/// Fixed cost the service charges an `UpdateItem` statement, before its clauses.
+pub const UPDATE_STATEMENT_BASE_COST: usize = 3;
+/// Fixed cost per `SET` or `ADD` clause, on top of the written path and operands.
+pub const UPDATE_SET_CLAUSE_COST: usize = 18;
+/// Fixed cost of a function call in a `SET` operand, plus the function name's length.
+pub const UPDATE_FUNCTION_COST: usize = 26;
+/// Fixed cost of a `+` in a `SET` operand (26 plus the length of "addition").
+pub const UPDATE_ADDITION_COST: usize = 34;
+/// Fixed cost of a `-` in a `SET` operand (26 plus the length of "subtraction").
+pub const UPDATE_SUBTRACTION_COST: usize = 37;
+/// Cost of the first element of a document path used as a function or arithmetic
+/// operand, plus the attribute name's length. The attribute's stored value is not
+/// charged.
+pub const UPDATE_PATH_OPERAND_FIRST_COST: usize = 15;
+/// Cost of a later attribute element of such a path, plus the name's length.
+pub const UPDATE_PATH_OPERAND_NESTED_COST: usize = 14;
+/// Cost of a list index element of such a path.
+pub const UPDATE_PATH_OPERAND_INDEX_COST: usize = 15;
+/// Extra cost of a clause whose target path ends in a list index.
+pub const UPDATE_LIST_INDEX_TARGET_COST: usize = 1;
+
+/// Size a standalone `UpdateItem` the way the service does.
+///
+/// Measured against the service (us-east-1, 2026-10-19) by accept/refuse pairs
+/// either side of the item limit, for whole-attribute and document-path
+/// targets, aliases, one to three clauses on the same or different attributes,
+/// `if_not_exists`, `list_append`, nested functions, arithmetic, `ADD`,
+/// `REMOVE`, `DELETE`, and the legacy `AttributeUpdates` form. The figure the
+/// limit applies to is:
+///
+/// * a base of 3;
+/// * 18 per `SET` or `ADD` clause, nothing per `REMOVE` or `DELETE`;
+/// * the size of a skeleton item holding only the written paths: each map
+///   entry its name plus one, each map or list 3, each list element one more,
+///   siblings the statement does not touch left out. A `SET` or `ADD` leaf is
+///   charged the sizes of the clause's value placeholders; a `REMOVE` or
+///   `DELETE` leaf is charged nothing, and the `DELETE` operand is not charged;
+/// * one more for a clause whose target path ends in a list index;
+/// * for operands inside a `SET` value: 26 plus the name length per function
+///   call, 34 per `+` and 37 per `-`, and for a document path 15 plus the
+///   name for its first element, 14 plus the name for a later attribute, 15
+///   for an index, with the attribute's stored value not charged.
+///
+/// The legacy `AttributeUpdates` form is charged 3 plus, for each attribute
+/// it names that is present afterwards, the name and the finished value's
+/// bytes; an attribute it removes costs nothing.
+///
+/// The key and untouched attributes are left out, so at a short key the largest
+/// finished item an update can produce sits below the limit, and a long key or
+/// an untouched attribute buys the headroom back up to the limit itself, which
+/// the finished item never exceeds.
+///
+/// `finished` is the whole finished item; `actions` are the statement's clauses
+/// with `#name` placeholders still in place, resolved here through `maps`.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` with the update wording when
+/// either the statement figure or the finished item exceeds `max_bytes`.
+pub fn validate_update_item_size(
+    finished: &Item,
+    actions: &[crate::expression::UpdateAction],
+    maps: &crate::expression::ExpressionMaps,
+    max_bytes: usize,
+) -> Result<(), DynamoDbError> {
+    let statement = if maps.legacy_attribute_updates {
+        legacy_update_statement_size(finished, actions, maps)?
+    } else {
+        update_statement_size(actions, maps)?
+    };
+    if statement > max_bytes || item_size_bytes(finished) > max_bytes {
+        return Err(DynamoDbError::ValidationException(
+            ITEM_SIZE_TO_UPDATE_EXCEEDED.to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// The bytes the service charges the operand expression of a `SET` clause:
+/// value placeholders at their size, function calls, arithmetic operators and
+/// document paths at their fixed costs.
+fn update_operand_size(
+    expr: &crate::expression::Expr,
+    maps: &crate::expression::ExpressionMaps,
+) -> Result<usize, DynamoDbError> {
+    use crate::expression::{Expr, PathElement, resolve_element_name};
+    Ok(match expr {
+        Expr::Placeholder(name) => maps
+            .values
+            .get(name)
+            .map_or(0, crate::types::attribute_value_size),
+        Expr::Path(elements) => {
+            let mut bytes = 0;
+            for (i, element) in elements.iter().enumerate() {
+                bytes += match element {
+                    PathElement::Index(_) => UPDATE_PATH_OPERAND_INDEX_COST,
+                    PathElement::Attribute(_) => {
+                        let name = resolve_element_name(element, maps)?;
+                        name.len()
+                            + if i == 0 {
+                                UPDATE_PATH_OPERAND_FIRST_COST
+                            } else {
+                                UPDATE_PATH_OPERAND_NESTED_COST
+                            }
+                    }
+                };
+            }
+            bytes
+        }
+        Expr::Function { name, args } => {
+            let mut bytes = UPDATE_FUNCTION_COST + name.len();
+            for arg in args {
+                bytes += update_operand_size(arg, maps)?;
+            }
+            bytes
+        }
+        Expr::Arithmetic { left, op, right } => {
+            let operator = match op {
+                crate::expression::ArithOp::Add => UPDATE_ADDITION_COST,
+                crate::expression::ArithOp::Sub => UPDATE_SUBTRACTION_COST,
+            };
+            operator + update_operand_size(left, maps)? + update_operand_size(right, maps)?
+        }
+        _ => 0,
+    })
+}
+
+/// A written path as a tree: map entries by name, list elements by index.
+#[derive(Default)]
+struct WrittenNode {
+    leaf_bytes: usize,
+    entries: std::collections::BTreeMap<String, WrittenNode>,
+    elements: std::collections::BTreeMap<usize, WrittenNode>,
+}
+
+fn written_node_size(node: &WrittenNode) -> usize {
+    let maps: usize = if node.entries.is_empty() {
+        0
+    } else {
+        3 + node
+            .entries
+            .iter()
+            .map(|(name, child)| name.len() + written_node_size(child) + 1)
+            .sum::<usize>()
+    };
+    let lists: usize = if node.elements.is_empty() {
+        0
+    } else {
+        3 + node
+            .elements
+            .values()
+            .map(|child| written_node_size(child) + 1)
+            .sum::<usize>()
+    };
+    node.leaf_bytes + maps + lists
+}
+
+/// Build the skeleton the statement writes and size it with the clause costs.
+fn update_statement_size(
+    actions: &[crate::expression::UpdateAction],
+    maps: &crate::expression::ExpressionMaps,
+) -> Result<usize, DynamoDbError> {
+    use crate::expression::{PathElement, UpdateAction, resolve_element_name};
+    let mut root = WrittenNode::default();
+    let mut bytes = UPDATE_STATEMENT_BASE_COST;
+    for action in actions {
+        let (path, leaf) = match action {
+            UpdateAction::Set { path, value } | UpdateAction::Add { path, value } => {
+                bytes += UPDATE_SET_CLAUSE_COST;
+                (path, update_operand_size(value, maps)?)
+            }
+            UpdateAction::Remove { path } | UpdateAction::Delete { path, .. } => (path, 0),
+        };
+        if matches!(path.last(), Some(PathElement::Index(_))) {
+            bytes += UPDATE_LIST_INDEX_TARGET_COST;
+        }
+        let mut node = &mut root;
+        for element in path {
+            node = match element {
+                PathElement::Index(i) => node.elements.entry(*i).or_default(),
+                PathElement::Attribute(_) => {
+                    let name = resolve_element_name(element, maps)?;
+                    node.entries.entry(name.into_owned()).or_default()
+                }
+            };
+        }
+        node.leaf_bytes += leaf;
+    }
+    // The item itself is a map whose 3 bytes the base already covers.
+    Ok(bytes + written_node_size(&root).saturating_sub(3))
+}
+
+/// The legacy `AttributeUpdates` form: 3 plus, for each named attribute still
+/// present in the finished item, its name and finished value bytes. Nothing per
+/// action, no entry byte, nothing for an attribute the update removed.
+fn legacy_update_statement_size(
+    finished: &Item,
+    actions: &[crate::expression::UpdateAction],
+    maps: &crate::expression::ExpressionMaps,
+) -> Result<usize, DynamoDbError> {
+    use crate::expression::{UpdateAction, resolve_element_name};
+    let mut names: Vec<String> = Vec::new();
+    for action in actions {
+        let path = match action {
+            UpdateAction::Set { path, .. }
+            | UpdateAction::Add { path, .. }
+            | UpdateAction::Remove { path }
+            | UpdateAction::Delete { path, .. } => path,
+        };
+        if let Some(first) = path.first() {
+            let name = resolve_element_name(first, maps)?;
+            if !names.iter().any(|n| n == name.as_ref()) {
+                names.push(name.into_owned());
+            }
+        }
+    }
+    Ok(UPDATE_STATEMENT_BASE_COST
+        + names
+            .iter()
+            .filter_map(|name| finished.get(name).map(|value| (name, value)))
+            .map(|(name, value)| name.len() + crate::types::attribute_value_size(value))
+            .sum::<usize>())
+}
+
+/// Size a transacted `Update` the way the service does: the finished item
+/// against the limit, with the update wording. Measured against the service
+/// (us-east-1, 2026-10-19): a transacted Update accepts a finished item of
+/// exactly the limit and cancels one byte over with this wording, so the
+/// statement-sized rule of a standalone `UpdateItem` does not apply.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` with the update wording when the
+/// finished item exceeds `max_bytes`.
+pub fn validate_transact_update_item_size(
+    finished: &Item,
+    max_bytes: usize,
+) -> Result<(), DynamoDbError> {
+    if item_size_bytes(finished) > max_bytes {
+        return Err(DynamoDbError::ValidationException(
+            ITEM_SIZE_TO_UPDATE_EXCEEDED.to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Validate all number values in an item are within `DynamoDB` limits.
 pub fn validate_item_numbers(item: &Item) -> Result<(), DynamoDbError> {
     for value in item.values() {
@@ -3801,5 +4052,119 @@ mod tests {
     fn test_conditional_operator_absent_is_ok() {
         assert!(validate_conditional_operator_usage(false, 0).is_ok());
         assert!(validate_conditional_operator_usage(false, 1).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod update_size_tests {
+    //! Direct unit tests for the UpdateItem statement sizer. The byte figures
+    //! are the ones measured against the service in us-east-1 on 2026-10-19 and
+    //! exercised end to end by tests/test_item_size_at_limit.py; these assert
+    //! the same numbers at the function boundary so a developer can run them
+    //! with `cargo test` and no server.
+
+    use std::collections::HashMap;
+
+    use super::{
+        ITEM_SIZE_TO_UPDATE_EXCEEDED, legacy_update_statement_size, update_statement_size,
+        validate_update_item_size,
+    };
+    use crate::expression::{ExpressionMaps, UpdateAction, parse_update, tokenize};
+    use crate::types::{AttributeValue, Item};
+
+    fn s(v: &str) -> AttributeValue {
+        AttributeValue::S(v.to_owned())
+    }
+
+    /// Parse an update expression into actions plus a maps table whose values
+    /// are keyed as the parser keys them (the `:name` placeholder without its
+    /// colon).
+    fn build(expr: &str, values: &[(&str, AttributeValue)]) -> (Vec<UpdateAction>, ExpressionMaps) {
+        let actions = parse_update(&tokenize(expr).unwrap()).unwrap();
+        let mut map = HashMap::new();
+        for (name, value) in values {
+            map.insert((*name).to_owned(), value.clone());
+        }
+        (actions, ExpressionMaps::new(HashMap::new(), map))
+    }
+
+    fn statement(expr: &str, values: &[(&str, AttributeValue)]) -> usize {
+        let (actions, maps) = build(expr, values);
+        update_statement_size(&actions, &maps).unwrap()
+    }
+
+    #[test]
+    fn single_set_is_base_clause_path_and_value() {
+        // 3 base + 18 clause + the written path `p` (name 1, two container
+        // bytes) + the 4-byte value.
+        assert_eq!(statement("SET p = :v", &[("v", s("wxyz"))]), 27);
+    }
+
+    #[test]
+    fn two_set_clauses_each_cost_their_clause_and_path() {
+        assert_eq!(
+            statement("SET a = :v, b = :w", &[("v", s("wxyz")), ("w", s("y"))]),
+            48,
+        );
+    }
+
+    #[test]
+    fn a_nested_path_sizes_each_level_once() {
+        assert_eq!(statement("SET m.a = :v", &[("v", s("wxyz"))]), 32);
+    }
+
+    #[test]
+    fn a_list_index_target_adds_one_byte() {
+        // `p[1]` writes the attribute `p` (name 1, two container bytes) holding
+        // a one-element list (three container bytes, one per element) with the
+        // 4-byte value, plus 18 clause and 1 for writing through a list index:
+        // 3 + 18 + 1 + 10 = 32. One byte more than the same write to `p[0]`'s
+        // plain attribute would be without the list, which is the list-index
+        // target byte.
+        assert_eq!(statement("SET p[1] = :v", &[("v", s("wxyz"))]), 32);
+    }
+
+    #[test]
+    fn remove_costs_its_path_skeleton_only() {
+        // No clause cost for REMOVE: 3 base + the path `p`.
+        assert_eq!(statement("REMOVE p", &[]), 5);
+    }
+
+    #[test]
+    fn statement_over_the_limit_is_refused_with_the_update_wording() {
+        // SET p = :v with a ten-byte value is a 33-byte statement; the finished
+        // item ({p: 10 bytes}) is smaller, so the statement figure binds.
+        let (actions, maps) = build("SET p = :v", &[("v", s("0123456789"))]);
+        let mut finished = Item::new();
+        finished.insert("p".to_owned(), s("0123456789"));
+
+        assert!(validate_update_item_size(&finished, &actions, &maps, 33).is_ok());
+        let err = validate_update_item_size(&finished, &actions, &maps, 32).unwrap_err();
+        assert_eq!(err.to_string(), ITEM_SIZE_TO_UPDATE_EXCEEDED);
+    }
+
+    #[test]
+    fn an_oversized_finished_item_is_refused_even_when_the_statement_fits() {
+        // A small statement (REMOVE q, 7 bytes) cannot rescue a finished item
+        // that is itself over the limit.
+        let (actions, maps) = build("REMOVE q", &[]);
+        let mut finished = Item::new();
+        finished.insert("p".to_owned(), s("0123456789"));
+        assert!(validate_update_item_size(&finished, &actions, &maps, 5).is_err());
+    }
+
+    #[test]
+    fn legacy_attribute_updates_size_the_finished_value_not_the_statement() {
+        // The legacy form charges 3 plus the name and finished value of each
+        // attribute it names that remains in the item.
+        let (actions, mut maps) = build("SET p = :v", &[("v", s("wxyz"))]);
+        maps.legacy_attribute_updates = true;
+        let mut finished = Item::new();
+        finished.insert("p".to_owned(), s("wxyz"));
+        // 3 base + name `p` (1) + value (4) = 8.
+        assert_eq!(
+            legacy_update_statement_size(&finished, &actions, &maps).unwrap(),
+            8
+        );
     }
 }
