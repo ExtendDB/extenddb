@@ -10,11 +10,13 @@
 
 pub(crate) mod authorization;
 pub mod authz_cache;
+pub(crate) mod authz_resource;
 pub mod console;
 pub mod dev_credentials;
 mod handler;
 mod import_export_paths;
 pub mod key_info_cache;
+mod leading_keys;
 pub mod management;
 mod metrics_endpoint;
 pub mod rate_limit;
@@ -126,6 +128,7 @@ pub async fn start_server(
     let metrics_for_console = state.metrics.clone();
     let authz_cache_for_mgmt = state.authz_cache.clone();
     let table_key_info_cache_for_mgmt = state.table_key_info_cache.clone();
+    let mgmt_region = state.region.clone();
     let version_info = state.version_info.clone();
     let docs_store = state.docs_store.clone();
     let listen_url = {
@@ -173,6 +176,8 @@ pub async fn start_server(
             auth_cache: auth_cache_for_mgmt,
             authz_cache: authz_cache_for_mgmt,
             table_key_info_cache: table_key_info_cache_for_mgmt,
+            region: mgmt_region,
+            secure_transport: tls_enabled,
         });
         let mgmt_router = management::router().with_state(mgmt_state);
         app = app.nest("/management", mgmt_router);

@@ -431,6 +431,28 @@ class TestConsoleRoles:
 
         resp = self.console.get(f"/accounts/{self.account_id}")
         assert role not in resp.text
+
+    @pytest.mark.parametrize("statement", [
+        # The service refuses each of these trust policies at CreateRole
+        # (MalformedPolicyDocument); the management API refuses them too.
+        {"Effect": "Allow", "Principal": "*", "Action": "sts:AssumeRole"},
+        {"Effect": "Allow", "Principal": {"AWS": "ACCOUNT_ROOT"}, "Action": "*"},
+        {"Effect": "Allow", "Principal": {"AWS": "ACCOUNT_ROOT"},
+         "Action": "sts:AssumeRole", "Resource": "*"},
+    ], ids=["bare-star-principal", "star-action", "resource-field"])
+    def test_create_role_rejects_trust_policy_the_service_refuses(self, statement):
+        role = f"bad-{uuid.uuid4().hex[:8]}"
+        stmt = json.loads(json.dumps(statement).replace(
+            "ACCOUNT_ROOT", f"arn:aws:iam::{self.account_id}:root"))
+        resp = self.console.post(f"/accounts/{self.account_id}/roles/new", {
+            "role_name": role,
+            "trust_policy": json.dumps({"Version": "2012-10-17", "Statement": [stmt]}),
+        })
+        # The form is re-rendered with an error instead of redirecting.
+        assert resp.status_code == 200
+        assert "Invalid trust policy" in resp.text
+        resp = self.console.get(f"/accounts/{self.account_id}")
+        assert role not in resp.text
 # ---------------------------------------------------------------------------
 # Policy CRUD
 # ---------------------------------------------------------------------------
@@ -458,6 +480,33 @@ class TestConsolePolicies:
                 "Resource": "*",
             }],
         })
+
+    def test_user_policy_rejects_document_the_service_refuses(self):
+        # A malformed CIDR and a non-alphanumeric Sid are each refused by the
+        # service at PutUserPolicy and by the management API.
+        user = f"pv-{uuid.uuid4().hex[:8]}"
+        self.console.post(f"/accounts/{self.account_id}/users/new", {
+            "user_name": user,
+            "password": "TestPass123!",
+        })
+        bad_docs = [
+            {"Version": "2012-10-17", "Statement": [{
+                "Effect": "Allow", "Action": "dynamodb:GetItem", "Resource": "*",
+                "Condition": {"IpAddress": {"aws:SourceIp": "10.0.0.0/33"}}}]},
+            {"Version": "2012-10-17", "Statement": [{
+                "Sid": "Allow-Read", "Effect": "Allow",
+                "Action": "dynamodb:GetItem", "Resource": "*"}]},
+        ]
+        for i, doc in enumerate(bad_docs):
+            policy = f"bad{i}-{uuid.uuid4().hex[:6]}"
+            resp = self.console.post(
+                f"/accounts/{self.account_id}/users/{user}/policies/new",
+                {"policy_name": policy, "policy_document": json.dumps(doc)},
+            )
+            assert resp.status_code == 200
+            assert "Invalid policy document" in resp.text
+            resp = self.console.get(f"/accounts/{self.account_id}/users/{user}")
+            assert policy not in resp.text
 
     def test_user_policy_crud(self):
         user = f"pu-{uuid.uuid4().hex[:8]}"

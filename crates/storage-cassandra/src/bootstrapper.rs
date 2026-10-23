@@ -233,9 +233,16 @@ impl CassandraBootstrapper {
         };
         cassandra_config.ensure_cached_connection_string();
 
+        // The message alone, not `{e:?}`, which nested the variant name into it.
         Self::new(&cassandra_config, bootstrap_config)
             .await
-            .map_err(|e| StorageError::Internal(format!("{e:?}")))
+            .map_err(|e| match e {
+                OpError::Validation(m)
+                | OpError::AlreadyExists(m)
+                | OpError::NotFound(m)
+                | OpError::HasDependents(m)
+                | OpError::Internal(m) => StorageError::Internal(m),
+            })
     }
 }
 
@@ -677,18 +684,36 @@ impl Bootstrapper for CassandraBootstrapper {
     }
 
     fn generate_backend_config_section(&self) -> String {
-        Self::backend_config_section(&self.catalog_connection_url(), &self.keyspace_prefix)
+        Self::backend_config_section(
+            &self.catalog_connection_url(),
+            &self.keyspace_prefix,
+            &self.config.app_user,
+            &self.config.app_password,
+        )
     }
 }
 
 impl CassandraBootstrapper {
     /// Pure helper so the output can be tested without a live Cassandra connection.
-    fn backend_config_section(contact_point: &str, keyspace_prefix: &str) -> String {
+    ///
+    /// Writes the application role `ensure_app_user` created or verified, so
+    /// `serve` logs in as it: a node with `PasswordAuthenticator` refuses a
+    /// connection without credentials. The values are TOML-quoted (a role
+    /// that already existed keeps whatever password the operator supplied).
+    /// `write_config` makes the file 0600.
+    fn backend_config_section(
+        contact_point: &str,
+        keyspace_prefix: &str,
+        app_user: &str,
+        app_password: &str,
+    ) -> String {
+        let user = toml::Value::String(app_user.to_owned());
+        let password = toml::Value::String(app_password.to_owned());
         format!(
             r#"[storage.cassandra]
 contact_points = ["{contact_point}"]
-# username = "cassandra"          # Application user
-# password = "cassandra-password" # Application password
+username = {user}               # Application role
+password = {password}
 keyspace_prefix = "{keyspace_prefix}"
 replication_factor = 1           # Single node (use 3+ for production)
 datacenter = "datacenter1"
@@ -703,8 +728,12 @@ mod tests {
 
     #[test]
     fn backend_config_section_uses_actual_keyspace_prefix() {
-        let section =
-            CassandraBootstrapper::backend_config_section("cassandra-node-1:9042", "mycompany");
+        let section = CassandraBootstrapper::backend_config_section(
+            "cassandra-node-1:9042",
+            "mycompany",
+            "extenddb",
+            "pw",
+        );
         assert!(
             section.contains("keyspace_prefix = \"mycompany\""),
             "config must use the supplied prefix, got:\n{section}"
@@ -714,5 +743,37 @@ mod tests {
             "config must not contain hardcoded 'extenddb' prefix, got:\n{section}"
         );
         assert!(section.contains("contact_points = [\"cassandra-node-1:9042\"]"));
+    }
+
+    /// `init` once left `username`/`password` commented out, so `serve`
+    /// connected without credentials and a `PasswordAuthenticator` node
+    /// refused it. The section must parse into the config `serve` reads,
+    /// carrying the application role, including a password with TOML-special
+    /// characters (a pre-existing role's password is not validated).
+    #[test]
+    fn backend_config_section_carries_the_application_role() {
+        for password in ["extenddb-local-dev", r#"a"b\c 'd' #e"#, ""] {
+            let section = CassandraBootstrapper::backend_config_section(
+                "127.0.0.1:9042",
+                "pfx",
+                "app_role",
+                password,
+            );
+            let doc: toml::Value = toml::from_str(&section).expect("section parses");
+            let config: crate::config::CassandraStorageConfig = doc
+                .get("storage")
+                .and_then(|s| s.get("cassandra"))
+                .expect("storage.cassandra")
+                .clone()
+                .try_into()
+                .expect("section is a CassandraStorageConfig");
+            // No message: the section holds the password.
+            assert_eq!(config.username.as_deref(), Some("app_role"));
+            assert!(
+                config.password.as_deref() == Some(password),
+                "password not carried"
+            );
+            assert_eq!(config.keyspace_prefix, "pfx");
+        }
     }
 }

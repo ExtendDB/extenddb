@@ -109,13 +109,89 @@ pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext
             Some(vals) => evaluate_single_value_condition(inner, &vals, &expanded_values),
         },
         other => match context_values {
-            None => false,
+            // A negated operator on an absent single-valued key evaluates true
+            // in AWS IAM: the key has no value, so it cannot equal the policy
+            // value, so "not equals" holds. This makes a Deny gated on
+            // StringNotEquals apply when the caller omits the key (the
+            // confused-deputy guard). Measured on live IAM/STS and DynamoDB.
+            // Bare operators on multivalued keys
+            // never match, present or absent (BR-7085), so the rule is scoped
+            // to single-valued keys.
+            None => is_negative_operator(other) && !is_multivalued,
             // Bare operator on a multivalued key never matches (BR-7085). This is
             // fail-safe: a bare Deny becomes a no-op (matching AWS, which forces the
             // author to use ForAnyValue:), and a bare Allow allowlist stops granting.
             Some(_) if is_multivalued => false,
             Some(vals) => evaluate_single_value_condition(other, &vals, &expanded_values),
         },
+    }
+}
+
+/// Three-valued outcome of evaluating a statement's condition block.
+///
+/// A condition key falls into one of three cases, and each is treated
+/// differently:
+/// 1. The context resolves the key to a value: evaluate normally.
+/// 2. The context resolves the key as absent in the same way the service would
+///    have it absent: IAM absent-key semantics apply (including the rule that a
+///    negated operator on an absent single-valued key matches).
+/// 3. The service would populate the key but this context cannot resolve it
+///    (`is_unresolvable_key`): the statement fails closed whatever the operator.
+///    A `Deny` that depends on it blocks; an `Allow` that depends on it does not
+///    grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionMatch {
+    /// All conditions are satisfied; the statement applies.
+    Match,
+    /// A condition is not satisfied; the statement does not apply.
+    NoMatch,
+    /// A condition depends on a key the service populates but this context
+    /// cannot resolve. The statement fails closed.
+    Unresolvable,
+}
+
+/// Evaluate one condition three-valued.
+///
+/// Returns [`ConditionMatch::Unresolvable`] when the key is unresolved and the
+/// context reports it as service-populated (case 3). Otherwise returns `Match`
+/// or `NoMatch` from the ordinary evaluation, so cases 1 and 2 are unchanged.
+pub fn evaluate_condition_match(
+    condition: &Condition,
+    context: &impl ConditionContext,
+) -> ConditionMatch {
+    if context.resolve_key(&condition.key).is_none() && context.is_unresolvable_key(&condition.key)
+    {
+        return ConditionMatch::Unresolvable;
+    }
+    if evaluate_condition(condition, context) {
+        ConditionMatch::Match
+    } else {
+        ConditionMatch::NoMatch
+    }
+}
+
+/// Evaluate a statement's whole condition block (all conditions are ANDed).
+///
+/// `NoMatch` dominates: if any condition is definitely not satisfied the
+/// statement does not apply, even if another condition is unresolvable. Failing
+/// that, any unresolvable condition makes the block `Unresolvable` (fail
+/// closed). Otherwise every condition matched.
+pub fn evaluate_statement_conditions(
+    conditions: &[Condition],
+    context: &impl ConditionContext,
+) -> ConditionMatch {
+    let mut any_unresolvable = false;
+    for condition in conditions {
+        match evaluate_condition_match(condition, context) {
+            ConditionMatch::Match => {}
+            ConditionMatch::NoMatch => return ConditionMatch::NoMatch,
+            ConditionMatch::Unresolvable => any_unresolvable = true,
+        }
+    }
+    if any_unresolvable {
+        ConditionMatch::Unresolvable
+    } else {
+        ConditionMatch::Match
     }
 }
 
@@ -208,11 +284,13 @@ fn is_negative_operator(op: &ConditionOperator) -> bool {
     matches!(
         op,
         ConditionOperator::StringNotEquals
+            | ConditionOperator::StringNotEqualsIgnoreCase
             | ConditionOperator::NumericNotEquals
             | ConditionOperator::DateNotEquals
             | ConditionOperator::StringNotLike
             | ConditionOperator::ArnNotEquals
             | ConditionOperator::ArnNotLike
+            | ConditionOperator::NotIpAddress
     )
 }
 
@@ -230,6 +308,9 @@ fn compare_single(op: &ConditionOperator, context_value: &str, policy_value: &st
         ConditionOperator::StringNotEquals => context_value != policy_value,
         ConditionOperator::StringEqualsIgnoreCase => {
             context_value.eq_ignore_ascii_case(policy_value)
+        }
+        ConditionOperator::StringNotEqualsIgnoreCase => {
+            !context_value.eq_ignore_ascii_case(policy_value)
         }
         ConditionOperator::StringLike => wildcard_match(policy_value, context_value),
         ConditionOperator::StringNotLike => !wildcard_match(policy_value, context_value),
@@ -268,6 +349,17 @@ fn compare_single(op: &ConditionOperator, context_value: &str, policy_value: &st
         ConditionOperator::ArnNotEquals => context_value != policy_value,
         ConditionOperator::ArnLike => super::matcher::arn_match(policy_value, context_value),
         ConditionOperator::ArnNotLike => !super::matcher::arn_match(policy_value, context_value),
+        // IpAddress matches only when the caller address and the policy range
+        // are the same family and the address is in the range. NotIpAddress
+        // matches only when they are the same family and the address is not in
+        // the range. A family mismatch or a malformed value makes both false,
+        // matching the live service.
+        ConditionOperator::IpAddress => {
+            super::matcher::ip_in_cidr(policy_value, context_value) == Some(true)
+        }
+        ConditionOperator::NotIpAddress => {
+            super::matcher::ip_in_cidr(policy_value, context_value) == Some(false)
+        }
         // Null, ForAllValues, ForAnyValue, IfExists handled by caller
         _ => false,
     }

@@ -308,6 +308,26 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     let cred_store = components.credential_store;
     let runtime_hooks = components.runtime_hooks;
 
+    // Resource-tag migration guard. ExtendDB evaluates resource tags only as
+    // aws:ResourceTag/* and leaves dynamodb:ResourceTag/* absent, so a catalog
+    // whose stored policies still name the dynamodb: form must be rewritten by
+    // `extenddb migrate --yes` before this binary serves it. `migrate`, `init`
+    // and every fresh-catalog bootstrap record a settings marker; refuse to
+    // start when it is missing. One settings-row read, no policy scan.
+    if catalog_store
+        .get_setting(extenddb_core::settings_keys::RESOURCE_TAG_MIGRATION)
+        .await
+        .map_err(|e| anyhow::anyhow!("reading the resource-tag migration marker: {e:?}"))?
+        .is_none()
+    {
+        anyhow::bail!(
+            "this catalog has not had the resource-tag condition-key migration applied. \
+             Run `extenddb migrate --yes` before starting the server. It rewrites stored \
+             policies from dynamodb:ResourceTag to aws:ResourceTag, which this build \
+             evaluates, and records a marker the server checks at startup."
+        );
+    }
+
     // Dev mode: seed the credentials the SDK may sign with and verify against
     // them (see `dev_credentials` for the vending contract). Seeded here so it
     // works for both file-backed and bootstrap-on-serve (in-memory)

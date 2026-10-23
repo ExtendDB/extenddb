@@ -25,6 +25,11 @@ pub type CassandraSession = Session<
 /// Cassandra storage engine.
 ///
 /// Implements ExtendDB storage traits using Apache Cassandra as the backend.
+///
+/// `Clone` shares every handle (session, caches, notifiers, clocks): a clone
+/// is the same engine, which is what a detached task such as the restore copy
+/// needs to outlive the request that started it.
+#[derive(Clone)]
 pub struct CassandraEngine {
     /// Cassandra session (connection pool)
     pub(crate) session: Arc<CassandraSession>,
@@ -91,6 +96,19 @@ pub struct CassandraEngine {
     /// a restart merely restarts the traversal from the front.
     pub(crate) ttl_repair_scan_cursors:
         Arc<std::sync::Mutex<std::collections::HashMap<(String, i32), uuid::Uuid>>>,
+
+    /// Identifies this engine instance as the owner of the restore copies it
+    /// runs (`tables.restore_owner`). Random per process start, so a restore
+    /// left behind by a crashed process is never mistaken for a live one.
+    pub(crate) restore_owner: uuid::Uuid,
+
+    /// Set once `schema_history` was seen to record every catalog migration
+    /// this binary carries; until then each CreateBackup, DeleteBackup and
+    /// RestoreTableFromBackup re-reads it (see `require_migrated_catalog`), so
+    /// a `migrate --yes` run while the server is up takes effect without a
+    /// restart. Never cleared: migrations are not undone under a running
+    /// server.
+    pub(crate) catalog_migrated: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Cap on concurrently in-flight detached TTL claim releases.
@@ -132,6 +150,8 @@ impl CassandraEngine {
             ttl_repair_scan_cursors: Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            restore_owner: uuid::Uuid::new_v4(),
+            catalog_migrated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 

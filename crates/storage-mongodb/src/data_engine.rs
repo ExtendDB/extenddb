@@ -4763,6 +4763,10 @@ mod tests {
             region: "us-east-1".to_owned(),
             gsi_cache: Default::default(),
             tx_read_concern: mongodb::options::ReadConcern::snapshot(),
+            backup_liveness: Default::default(),
+            restore_server_slot_count: 1,
+            restore_server_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            restore_account_slots: Default::default(),
         };
         let base_coll = engine.data_db.collection::<Document>("base");
         let key_schema = vec![KeySchemaElement {

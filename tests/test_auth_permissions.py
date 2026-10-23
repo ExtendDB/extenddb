@@ -1122,7 +1122,7 @@ class TestDenyAllServiceOperations:
         return creds["access_key_id"], creds["secret_access_key"]
 
     def test_explicit_deny_all_service_operations(self):
-        """Deny with 'dynamodb:*' blocks all operations even with a separate Allow."""
+        """Deny with 'dynamodb:*' blocks every authorized operation even with a separate Allow."""
         user = f"u-{uuid.uuid4().hex[:8]}"
         ak, sk = self._user_with_key(user)
         self.mgmt.put_user_policy(self.account_id, user, "allow-all", _full_policy())
@@ -1136,9 +1136,10 @@ class TestDenyAllServiceOperations:
                 client.list_tables()
             assert exc.value.response["Error"]["Code"] == "AccessDeniedException"
 
-            with pytest.raises(ClientError) as exc:
-                client.describe_endpoints()
-            assert exc.value.response["Error"]["Code"] == "AccessDeniedException"
+            # DescribeEndpoints needs a signed request but no IAM permission,
+            # so a Deny on dynamodb:* does not block it (measured on DynamoDB
+            # 2026-10-20).
+            client.describe_endpoints()
         finally:
             self.mgmt.delete_user(self.account_id, user)
 
@@ -1263,4 +1264,341 @@ class TestResourceLevelPermissions:
                 except Exception:
                     pass
             self.mgmt.delete_user(self.account_id, admin)
+            self.mgmt.delete_user(self.account_id, user)
+
+
+# ---------------------------------------------------------------------------
+# Backup and restore authorization (the service's resources and actions)
+# ---------------------------------------------------------------------------
+
+RESTORE_TARGET_ACTIONS = [
+    "dynamodb:Scan", "dynamodb:Query", "dynamodb:UpdateItem",
+    "dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:DeleteItem",
+    "dynamodb:BatchWriteItem",
+]
+
+
+class TestBackupAuthorization:
+    """ListBackups and RestoreTableFromBackup are authorized as the service
+    does it (measured 2026-10-20): ListBackups on ``table/*/backup/*`` or
+    ``table/<TableName>/backup/*``; a restore on the backup ARN under
+    ``dynamodb:RestoreTableFromBackup`` and on the target table under the
+    seven item actions it depends on, never under RestoreTableFromBackup.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup(self, auth_env, mgmt, account_id, region):
+        self.endpoint = auth_env[0]
+        self.mgmt = mgmt
+        self.account_id = account_id
+        self.region = region
+
+    def _user_with_key(self, name):
+        resp = self.mgmt.create_user(self.account_id, name, "Pass123!")
+        assert resp.status_code == 201, resp.text
+        resp = self.mgmt.create_access_key(self.account_id, name)
+        assert resp.status_code == 201, resp.text
+        creds = resp.json()
+        return creds["access_key_id"], creds["secret_access_key"]
+
+    def _set_policy(self, user, statements):
+        resp = self.mgmt.put_user_policy(self.account_id, user, "p", {
+            "Version": "2012-10-17", "Statement": statements,
+        })
+        assert resp.status_code == 204, resp.text
+
+    def _table_arn(self, name):
+        return f"arn:aws:dynamodb:*:{self.account_id}:table/{name}"
+
+    @staticmethod
+    def _denied(call):
+        with pytest.raises(ClientError) as exc:
+            call()
+        err = exc.value.response["Error"]
+        assert err["Code"] == "AccessDeniedException", err
+        return err.get("Message", "")
+
+    def _assert_denied_on(self, msg, action, resource_tail):
+        """The message names the first (action, resource) pair denied."""
+        assert f"is not authorized to perform: dynamodb:{action} on resource: " \
+            f"arn:aws:dynamodb:" in msg, msg
+        # The resource ends the message, or is followed by the reason the
+        # evaluator gives ("because no identity-based policy allows ...",
+        # "with an explicit deny ...").
+        resource = f":{self.account_id}:{resource_tail}"
+        assert msg.endswith(resource) or f"{resource} " in msg, \
+            (msg, resource_tail)
+
+    @pytest.fixture
+    def source_backup(self):
+        """An admin, a source table with one item, and a backup of it.
+
+        Yields ``(admin_client, table, backup_arn)``; tears them down, with
+        any table named in ``self.created`` by the test.
+        """
+        admin = f"adm-{uuid.uuid4().hex[:8]}"
+        admin_ak, admin_sk = self._user_with_key(admin)
+        self.mgmt.put_user_policy(self.account_id, admin, "full", _full_policy())
+        admin_client = _make_client(self.endpoint, admin_ak, admin_sk, self.region)
+        table = f"bk-src-{uuid.uuid4().hex[:8]}"
+        self.created = []
+        backup_arn = None
+        try:
+            admin_client.create_table(
+                TableName=table,
+                AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+                KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+                BillingMode="PAY_PER_REQUEST",
+            )
+            wait_for_active(admin_client, table)
+            admin_client.put_item(TableName=table, Item={"pk": {"S": "a"}})
+            backup_arn = admin_client.create_backup(
+                TableName=table, BackupName="authz",
+            )["BackupDetails"]["BackupArn"]
+            yield admin_client, table, backup_arn
+        finally:
+            for t in self.created:
+                try:
+                    wait_for_active(admin_client, t)
+                except Exception:
+                    pass
+            if backup_arn is not None:
+                try:
+                    admin_client.delete_backup(BackupArn=backup_arn)
+                except Exception:
+                    pass
+            for t in [table, *self.created]:
+                try:
+                    admin_client.delete_table(TableName=t)
+                except Exception:
+                    continue
+                try:
+                    wait_for_deleted(admin_client, t)
+                except Exception:
+                    pass
+            self.mgmt.delete_user(self.account_id, admin)
+
+    def test_list_backups_is_authorized_on_the_backup_wildcard(self, source_backup):
+        """``table/<T>/backup/*`` lists T's backups and nothing else; the
+        table's own ARN lists nothing (shipped builds evaluated the filtered
+        list on ``table/<T>``, so it used to); ``table/*`` lists everything."""
+        _, table, backup_arn = source_backup
+        other = f"bk-other-{uuid.uuid4().hex[:8]}"
+        user = f"u-{uuid.uuid4().hex[:8]}"
+        ak, sk = self._user_with_key(user)
+        client = _make_client(self.endpoint, ak, sk, self.region)
+        try:
+            # Scoped to one table's backups.
+            self._set_policy(user, [{
+                "Effect": "Allow", "Action": "dynamodb:ListBackups",
+                "Resource": self._table_arn(f"{table}/backup/*"),
+            }])
+            arns = [s["BackupArn"] for s in
+                    client.list_backups(TableName=table)["BackupSummaries"]]
+            assert backup_arn in arns, arns
+            msg = self._denied(lambda: client.list_backups())
+            self._assert_denied_on(msg, "ListBackups", "table/*/backup/*")
+            msg = self._denied(lambda: client.list_backups(TableName=other))
+            self._assert_denied_on(msg, "ListBackups", f"table/{other}/backup/*")
+
+            # The table's own ARN does not cover its backups.
+            self._set_policy(user, [{
+                "Effect": "Allow", "Action": "dynamodb:ListBackups",
+                "Resource": self._table_arn(table),
+            }])
+            msg = self._denied(lambda: client.list_backups(TableName=table))
+            self._assert_denied_on(msg, "ListBackups", f"table/{table}/backup/*")
+            self._denied(lambda: client.list_backups())
+
+            # table/* covers the filtered and the unfiltered list.
+            self._set_policy(user, [{
+                "Effect": "Allow", "Action": "dynamodb:ListBackups",
+                "Resource": "arn:aws:dynamodb:*:*:table/*",
+            }])
+            assert backup_arn in [
+                s["BackupArn"] for s in client.list_backups()["BackupSummaries"]]
+            assert backup_arn in [
+                s["BackupArn"] for s in
+                client.list_backups(TableName=table)["BackupSummaries"]]
+            # A Deny on one table's backups denies only the list filtered to it.
+            self._set_policy(user, [
+                {"Effect": "Allow", "Action": "dynamodb:ListBackups",
+                 "Resource": "*"},
+                {"Effect": "Deny", "Action": "dynamodb:ListBackups",
+                 "Resource": self._table_arn(f"{table}/backup/*")},
+            ])
+            self._denied(lambda: client.list_backups(TableName=table))
+            client.list_backups(TableName=other)
+            assert backup_arn in [
+                s["BackupArn"] for s in client.list_backups()["BackupSummaries"]]
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_restore_needs_the_item_actions_on_the_target(self, source_backup):
+        """RestoreTableFromBackup on the backup plus the seven item
+        actions on the target, each required; RestoreTableFromBackup on the
+        target is neither required nor evaluated."""
+        admin_client, table, backup_arn = source_backup
+        user = f"u-{uuid.uuid4().hex[:8]}"
+        ak, sk = self._user_with_key(user)
+        client = _make_client(self.endpoint, ak, sk, self.region)
+        t1, t2, t3, t4 = (f"bk-rst-{uuid.uuid4().hex[:8]}" for _ in range(4))
+
+        def restore(target):
+            return client.restore_table_from_backup(
+                TargetTableName=target, BackupArn=backup_arn)
+
+        def nothing_created(target):
+            with pytest.raises(ClientError) as exc:
+                admin_client.describe_table(TableName=target)
+            assert exc.value.response["Error"]["Code"] == \
+                "ResourceNotFoundException"
+
+        try:
+            # What used to suffice: RestoreTableFromBackup on everything.
+            self._set_policy(user, [{
+                "Effect": "Allow", "Action": "dynamodb:RestoreTableFromBackup",
+                "Resource": "*",
+            }])
+            msg = self._denied(lambda: restore(t1))
+            self._assert_denied_on(msg, "Scan", f"table/{t1}")
+            nothing_created(t1)
+
+            # Six of the seven item actions on the target (and the restore
+            # action on it, which does not stand in): the missing one is named.
+            self._set_policy(user, [
+                {"Effect": "Allow", "Action": "dynamodb:RestoreTableFromBackup",
+                 "Resource": backup_arn},
+                {"Effect": "Allow",
+                 "Action": [a for a in RESTORE_TARGET_ACTIONS
+                            if a != "dynamodb:BatchWriteItem"]
+                 + ["dynamodb:RestoreTableFromBackup"],
+                 "Resource": self._table_arn(t1)},
+            ])
+            msg = self._denied(lambda: restore(t1))
+            self._assert_denied_on(msg, "BatchWriteItem", f"table/{t1}")
+            nothing_created(t1)
+
+            # All seven on t1: the restore runs; t2 is not covered.
+            self._set_policy(user, [
+                {"Effect": "Allow", "Action": "dynamodb:RestoreTableFromBackup",
+                 "Resource": backup_arn},
+                {"Effect": "Allow", "Action": RESTORE_TARGET_ACTIONS,
+                 "Resource": self._table_arn(t1)},
+            ])
+            desc = restore(t1)["TableDescription"]
+            self.created.append(t1)
+            assert desc["TableName"] == t1
+            assert desc["TableStatus"] in ("CREATING", "ACTIVE")
+            msg = self._denied(lambda: restore(t2))
+            self._assert_denied_on(msg, "Scan", f"table/{t2}")
+            nothing_created(t2)
+            wait_for_active(admin_client, t1)
+            assert admin_client.get_item(
+                TableName=t1, Key={"pk": {"S": "a"}})["Item"] == {"pk": {"S": "a"}}
+
+            # Deny RestoreTableFromBackup on the target: not evaluated there,
+            # the restore runs.
+            self._set_policy(user, [
+                {"Effect": "Allow", "Action": "dynamodb:*", "Resource": "*"},
+                {"Effect": "Deny", "Action": "dynamodb:RestoreTableFromBackup",
+                 "Resource": self._table_arn(t2)},
+            ])
+            assert restore(t2)["TableDescription"]["TableName"] == t2
+            self.created.append(t2)
+            wait_for_active(admin_client, t2)
+
+            # Deny one item action on the target: refused, naming it.
+            self._set_policy(user, [
+                {"Effect": "Allow", "Action": "dynamodb:*", "Resource": "*"},
+                {"Effect": "Deny", "Action": "dynamodb:PutItem",
+                 "Resource": self._table_arn(t3)},
+            ])
+            msg = self._denied(lambda: restore(t3))
+            self._assert_denied_on(msg, "PutItem", f"table/{t3}")
+            nothing_created(t3)
+            # ...and the same Deny on another table does not touch t4.
+            assert restore(t4)["TableDescription"]["TableName"] == t4
+            self.created.append(t4)
+
+            # The backup itself is still required under the restore action.
+            self._set_policy(user, [
+                {"Effect": "Allow", "Action": "dynamodb:*", "Resource": "*"},
+                {"Effect": "Deny", "Action": "dynamodb:RestoreTableFromBackup",
+                 "Resource": backup_arn},
+            ])
+            msg = self._denied(lambda: restore(t3))
+            assert f"on resource: {backup_arn}" in msg, msg
+            assert "dynamodb:RestoreTableFromBackup on resource:" in msg, msg
+            nothing_created(t3)
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_an_existing_target_is_evaluated_with_its_tags(self, source_backup):
+        """The seven item actions on ``table/<TargetTableName>`` read that
+        ARN's resource tags. A target that exists is evaluated with its tags:
+        a tag-conditioned Allow passes authorization and the restore then
+        fails ``TableAlreadyExistsException``; without the tag it fails
+        ``AccessDeniedException`` naming the first item action. A target
+        that does not exist has no tags, so the same Allow denies it."""
+        admin_client, table, backup_arn = source_backup
+        user = f"u-{uuid.uuid4().hex[:8]}"
+        ak, sk = self._user_with_key(user)
+        client = _make_client(self.endpoint, ak, sk, self.region)
+        existing = f"bk-tgt-{uuid.uuid4().hex[:8]}"
+        missing = f"bk-tgt-{uuid.uuid4().hex[:8]}"
+        self.created.append(existing)
+        admin_client.create_table(
+            TableName=existing,
+            AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        wait_for_active(admin_client, existing)
+        existing_arn = admin_client.describe_table(
+            TableName=existing)["Table"]["TableArn"]
+
+        def restore(target):
+            return client.restore_table_from_backup(
+                TargetTableName=target, BackupArn=backup_arn)
+
+        try:
+            self._set_policy(user, [
+                {"Effect": "Allow", "Action": "dynamodb:RestoreTableFromBackup",
+                 "Resource": backup_arn},
+                {"Effect": "Allow", "Action": RESTORE_TARGET_ACTIONS,
+                 "Resource": "*",
+                 "Condition": {"StringEquals": {
+                     "aws:ResourceTag/classification": "restorable"}}},
+            ])
+            # The existing target has no such tag: denied on the first item
+            # action, and the table is untouched.
+            msg = self._denied(lambda: restore(existing))
+            self._assert_denied_on(msg, "Scan", f"table/{existing}")
+            # Tagged: authorization passes on its tags and the restore fails
+            # because the name exists.
+            admin_client.tag_resource(
+                ResourceArn=existing_arn,
+                Tags=[{"Key": "classification", "Value": "restorable"}],
+            )
+            with pytest.raises(ClientError) as exc:
+                restore(existing)
+            assert exc.value.response["Error"]["Code"] == \
+                "TableAlreadyExistsException", exc.value.response["Error"]
+            assert admin_client.describe_table(
+                TableName=existing)["Table"]["TableStatus"] == "ACTIVE"
+            # A name that does not exist has no tags: denied, nothing created.
+            msg = self._denied(lambda: restore(missing))
+            self._assert_denied_on(msg, "Scan", f"table/{missing}")
+            with pytest.raises(ClientError) as exc:
+                admin_client.describe_table(TableName=missing)
+            assert exc.value.response["Error"]["Code"] == \
+                "ResourceNotFoundException"
+            # The tag is read on each request: once removed, the existing
+            # target is denied again.
+            admin_client.untag_resource(
+                ResourceArn=existing_arn, TagKeys=["classification"])
+            msg = self._denied(lambda: restore(existing))
+            self._assert_denied_on(msg, "Scan", f"table/{existing}")
+        finally:
             self.mgmt.delete_user(self.account_id, user)
