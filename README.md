@@ -181,7 +181,7 @@ extenddb healthcheck --config extenddb.toml    # Probe /health (exit 0 healthy, 
 extenddb verify --config extenddb.toml         # Validate deployment
 extenddb migrate --config extenddb.toml        # Apply schema migrations
 extenddb destroy --config extenddb.toml        # Tear down deployment
-extenddb settings --config extenddb.toml list  # List runtime settings
+extenddb settings --config extenddb.toml list  # List runtime settings (secrets masked)
 extenddb manage --user admin --password <pw> <subcommand>  # IAM management
 ```
 
