@@ -727,6 +727,8 @@ pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext
             match context_values {
                 None => true,  // ForAllValues with absent key is vacuously true
                                // (same result whether or not IfExists is present)
+                // An Arn operator over a set with a value that is not an ARN is false
+                Some(vals) if arn_operator_sees_non_arn(base_op, &vals) => false,
                 Some(vals) => vals.iter().all(|cv| {
                     condition.values.iter().any(|pv| compare_single(base_op, cv, pv))
                 })
@@ -737,6 +739,7 @@ pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext
             let (absent_passes, base_op) = unwrap_if_exists(inner);
             match context_values {
                 None => absent_passes,  // false normally, true if IfExists
+                Some(vals) if arn_operator_sees_non_arn(base_op, &vals) => false,
                 Some(vals) => vals.iter().any(|cv| {
                     condition.values.iter().any(|pv| compare_single(base_op, cv, pv))
                 })
@@ -768,6 +771,14 @@ fn unwrap_if_exists(op: &ConditionOperator) -> (bool, &ConditionOperator) {
         ConditionOperator::IfExists(base) => (true, base),
         other => (false, other),
     }
+}
+
+/// Helper: true when `op` is an Arn operator and any context value is not an
+/// ARN (`is_arn`). IAM evaluates the condition as false for the whole set in
+/// that case, in the bare, ForAnyValue and ForAllValues forms (measured with
+/// simulate-custom-policy on the values [V, "notanarn"]).
+fn arn_operator_sees_non_arn(op: &ConditionOperator, context_values: &[&str]) -> bool {
+    is_arn_operator(op) && !context_values.iter().all(|cv| is_arn(cv))
 }
 
 /// Evaluate a non-set, non-IfExists condition operator against a single-valued key.
@@ -815,10 +826,14 @@ fn compare_single(op: &ConditionOperator, context_value: &str, policy_value: &st
             compare_dates(op, context_value, policy_value),
         ConditionOperator::Bool =>
             context_value.eq_ignore_ascii_case(policy_value),
-        ConditionOperator::ArnEquals => context_value == policy_value,
-        ConditionOperator::ArnNotEquals => context_value != policy_value,
-        ConditionOperator::ArnLike => arn_match(policy_value, context_value),
-        ConditionOperator::ArnNotLike => !arn_match(policy_value, context_value),
+        // IAM evaluates ArnEquals as ArnLike and ArnNotEquals as ArnNotLike:
+        // `*` and `?` match in every ARN field, and a context value that is
+        // not an ARN matches neither operator (measured with
+        // simulate-custom-policy).
+        ConditionOperator::ArnEquals | ConditionOperator::ArnLike =>
+            is_arn(context_value) && arn_match(policy_value, context_value),
+        ConditionOperator::ArnNotEquals | ConditionOperator::ArnNotLike =>
+            is_arn(context_value) && !arn_match(policy_value, context_value),
         // Null, ForAllValues, ForAnyValue, IfExists are handled by the caller
         _ => false,
     }

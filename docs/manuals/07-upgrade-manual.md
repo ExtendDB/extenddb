@@ -633,6 +633,19 @@ To get the intended behaviour, write the condition on `aws:ResourceTag/<key>`.
 
 **Sessions issued before the migration.** Session policies are stored in the catalog, so `migrate` rewrites them along with the identity policies. A session issued before the upgrade is evaluated with its rewritten policy once `migrate --yes` has run, and it does not need to be issued again. The new binary does not serve an unmigrated catalog, so no request is evaluated against the old policy text under the new rules.
 
+### IAM: `ArnEquals` and `ArnNotEquals` honour wildcards
+
+**What changed.** `ArnEquals` and `ArnNotEquals` now match `*` and `?` in each ARN field, as `ArnLike` and `ArnNotLike` already did and as IAM evaluates all four. Before this release the two Equals operators compared strings exactly. An Arn condition over a context value that is not an ARN (fewer than six `:`-separated fields) is now false under every operator, including `ArnNotEquals` and `ArnNotLike`, and in `ForAnyValue:` and `ForAllValues:` forms it is false when any value in the set is not an ARN. No catalog migration is required.
+
+**Who is affected.** A policy whose `ArnEquals` or `ArnNotEquals` value contains `*` or `?`, in an identity policy, a permissions boundary or a role trust policy:
+
+- A `Deny` with a wildcarded `ArnEquals` now blocks the callers it names, and an `Allow` gated on one now grants to them.
+- A `Deny` with a wildcarded `ArnNotEquals` now exempts the callers the wildcard matches; before, it applied to every caller.
+- A bare `*` value now matches every ARN. An `Allow` gated on `ArnEquals: "*"` grants to every caller, and a `Deny` gated on `ArnNotEquals: "*"` no longer applies. IAM refuses a policy with a bare `*` Arn value, so a policy copied from AWS cannot contain one, but ExtendDB accepts it at write. Replace either shape before upgrading if you wrote it by hand.
+- An Arn operator over a key whose value is not an ARN, such as `aws:ResourceTag/<key>`, is now false, so a `Deny` written that way no longer applies.
+
+A policy whose Arn values are literal ARNs evaluates as before.
+
 ---
 
 ## License

@@ -135,6 +135,20 @@ pub fn arn_match(pattern: &str, value: &str) -> bool {
         .all(|(p, v)| wildcard_match(p, v))
 }
 
+/// Whether a condition context value has the shape of an ARN: six
+/// `:`-separated fields, the resource field keeping any further `:`.
+///
+/// The Arn condition operators apply this to the context value before
+/// comparing. IAM treats a value that does not parse as an ARN as matching
+/// neither the positive nor the negative operator: measured with
+/// simulate-custom-policy for the values `notanarn`, `arn:aws:dynamodb` and a
+/// five-field `arn:aws:dynamodb:us-east-1:table/T`, ArnEquals, ArnNotEquals,
+/// ArnLike and ArnNotLike all evaluated false.
+#[must_use]
+pub fn is_arn(value: &str) -> bool {
+    value.splitn(6, ':').count() == 6
+}
+
 /// Whether `addr` falls inside the CIDR `cidr`, for the `IpAddress` and
 /// `NotIpAddress` condition operators.
 ///
