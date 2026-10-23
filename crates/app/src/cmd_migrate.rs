@@ -16,6 +16,8 @@ use extenddb_config as config;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::management_store::OpError;
 
+use crate::migrate_connection::with_migrate_application_name;
+
 /// Exit status of a preview (`migrate` without `--yes`) that found work to do.
 /// Distinct from 1 so a script can tell "pending" from "failed".
 pub const EXIT_PENDING: u8 = 3;
@@ -114,7 +116,8 @@ pub async fn run(args: MigrateArgs) -> anyhow::Result<u8> {
     // Serialize concurrent migrators, such as several replicas starting at
     // once, so they don't race each other applying schema changes.
     bootstrap.acquire_migration_lock().await.map_err(op_err)?;
-    let result = match CatalogResourceTagStep::open(app_config.storage.connection_config()).await {
+    let catalog_connection = with_migrate_application_name(app_config.storage.connection_config());
+    let result = match CatalogResourceTagStep::open(&catalog_connection).await {
         Ok(rtag) => apply_migrations(bootstrap.as_ref(), &args, &rtag).await,
         Err(e) => Err(e),
     };
@@ -301,6 +304,15 @@ async fn apply_migrations(
         );
         return Ok(EXIT_PENDING);
     }
+
+    // A migration that rewrites rows in place needs every other session off
+    // the databases it touches. Check before the first write, so a refusal
+    // leaves the catalog version where it was and an older binary can still be
+    // restarted.
+    bootstrap
+        .check_exclusive_access_for_pending_migrations()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
     if catalog_pending {
         bootstrap.run_catalog_migrations().await.map_err(op_err)?;

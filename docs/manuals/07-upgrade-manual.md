@@ -4,9 +4,9 @@
 
 ## Current Status
 
-Catalog 0.0.4 is current. **Every existing PostgreSQL, SQLite, and Cassandra deployment must run `extenddb migrate`** to reach it. PostgreSQL and SQLite servers refuse to start against a catalog version they were not built for; a Cassandra server starts anyway and serves tables and items, but CreateBackup, RestoreTableFromBackup, and DeleteBackup are refused with a `ValidationException` naming `extenddb migrate --yes` until the catalog is migrated (see [Cassandra](#cassandra)). MongoDB's catalog version does not change in this release.
+Catalog 0.0.5 is current on PostgreSQL; catalog 0.0.4 is current on SQLite and Cassandra. **Every existing PostgreSQL, SQLite, and Cassandra deployment must run `extenddb migrate`** to reach it. PostgreSQL and SQLite servers refuse to start against a catalog version they were not built for; a Cassandra server starts anyway and serves tables and items, but CreateBackup, RestoreTableFromBackup, and DeleteBackup are refused with a `ValidationException` naming `extenddb migrate --yes` until the catalog is migrated (see [Cassandra](#cassandra)). MongoDB's catalog version does not change in this release.
 
-See [Catalog 0.0.4](#catalog-004-current) below for what changes and the exact sequence. <!-- version-literal-ok: names the current version and the history below -->
+On PostgreSQL the 0.0.5 upgrade changes no schema; it accompanies the data migration `004_escape_control_chars`, which changes how strings are stored, and it has an ordering requirement the earlier upgrades did not have: every server must be stopped before `extenddb migrate --yes` runs. See [Catalog 0.0.5](#catalog-005-current) and [004_escape_control_chars](#004_escape_control_chars) below for what changes and the exact sequence, and [Catalog 0.0.4](#catalog-004) for the backup definition tables. <!-- version-literal-ok: names the current version and the history below -->
 
 ## How Catalog Upgrades Work
 
@@ -15,9 +15,10 @@ See [Catalog 0.0.4](#catalog-004-current) below for what changes and the exact s
 Migrations are SQL files in `crates/storage-postgres/migrations/`, applied in filename order:
 
 ```
-001_schema.sql            ← the complete initial schema
-002_vector_indexes.sql    ← vector index metadata, catalog 0.0.3 <!-- version-literal-ok: history -->
-003_backup_definitions.sql ← backup table definitions, catalog 0.0.4
+001_schema.sql                   ← the complete initial schema
+002_vector_indexes.sql           ← vector index metadata, catalog 0.0.3 <!-- version-literal-ok: history -->
+003_backup_definitions.sql       ← backup table definitions, catalog 0.0.4
+004_control_chars_encoding.sql   ← stored string encoding marker, catalog 0.0.5
 ```
 
 The `schema_history` table tracks which files have been applied. When `extenddb migrate` runs, it:
@@ -202,7 +203,25 @@ To discard data written after the upgrade as well, restore `<data-db>` from its 
 
 ## Version History
 
-### Catalog 0.0.4 (Current)
+### Catalog 0.0.5 (Current)
+
+PostgreSQL only; SQLite, Cassandra, and MongoDB keep their versions. Changes no schema. The version moves because the stored form of strings changed: from this release, every string in the data database and in the catalog's `backup_items` is written through an order-preserving escape (U+0000 as U+0001 U+0001, U+0001 as U+0001 U+0002), so that U+0000, which DynamoDB accepts anywhere in a string, can be stored. The data migration [004_escape_control_chars](#004_escape_control_chars) re-encodes rows written before the escape existed.
+
+A binary from an earlier release reads escaped rows as literal data and reports nothing wrong. The catalog version check at startup is the one check such a binary performs, so moving the version is what makes it refuse a migrated deployment. The two checks together close both directions: a 0.0.4 binary refuses a 0.0.5 catalog, and a 0.0.5 binary refuses a data database that does not record `004_escape_control_chars`.
+
+Upgrade sequence (the order matters; see the data migration section for why):
+
+```bash
+extenddb stop --config extenddb.toml        # every server that uses this data database
+extenddb migrate --yes --config extenddb.toml
+extenddb serve --config extenddb.toml
+```
+
+Run `extenddb migrate` without `--yes` first to see what is pending; it reports `catalog 0.0.4 -> 0.0.5` and `data migrations [004_escape_control_chars]` and changes nothing. With `--yes`, the command first checks that no other session holds the catalog or the data database and refuses before writing anything if one does, so the catalog version stays at 0.0.4 and the stopped servers can be restarted on the old binary while the operator sorts it out.
+
+Rolling back after the upgrade means restoring both databases from the backups taken before it. A 0.0.4 binary refuses the migrated catalog; pointing it at a migrated data database with a restored 0.0.4 catalog would serve escaped strings as data.
+
+### Catalog 0.0.4
 
 Adds the table definition a backup records and the registration of a running restore:
 
@@ -310,6 +329,71 @@ During the upgrade the migration also attempts to install the pgvector extension
 Complete schema: accounts, tables, indexes, tags, streams, IAM (users, groups, roles, policies, access keys, sessions, permissions boundaries), idempotency tokens, metrics, login attempts, backups, continuous backups, TTL support, settings.
 
 The first release, so all 0.0.2 deployments were fresh installs.
+
+---
+
+## Data Migrations
+
+Some changes rewrite rows in the data database rather than the catalog schema. These are
+implemented in Rust (`DATA_CODE_MIGRATIONS` in `crates/storage-postgres/src/migrations.rs`),
+tracked in the data database's own `schema_history` table, and applied once by
+`extenddb migrate --yes`. Running `extenddb migrate` without `--yes` lists them as pending
+and changes nothing.
+
+### 004_escape_control_chars
+
+Strings are stored through an order-preserving escape so that U+0000, which DynamoDB
+accepts anywhere a string appears, can be held in PostgreSQL `TEXT` and `jsonb` columns:
+U+0000 is stored as U+0001 U+0001, and U+0001 as U+0001 U+0002. Rows written before the
+escape existed hold their strings raw, and a raw U+0001 in such a row could be misread by
+the decoder. This migration re-encodes those rows.
+
+What it rewrites: every data table and index table (the text key columns and the
+`item_data` document), vector index tables, `gsi_pending`, `stream_records`, and
+`backup_items`. Only rows that contain U+0001 are touched; a database with none is left as
+it is, apart from the `schema_history` row.
+
+The migration scans every data and index table once (each row's `jsonb` document is
+rendered to text to find candidates), so on a large deployment it takes time proportional
+to the size of the data. It processes one table per transaction and keeps a per-table
+progress marker in `data_code_migration_progress`, so an interrupted run resumes with the
+tables that are not yet done and never rewrites a table twice.
+
+Order of operations. A server built with the escape refuses to start on a data database
+that does not record this migration, with a message naming it, because rows the new build
+writes are indistinguishable from legacy rows to the migration (both can contain U+0001) and
+would be rewritten by it. Upgrade a PostgreSQL deployment in this order:
+
+1. Stop every ExtendDB server that uses the data database. A server from an earlier release
+   still writing during the migration would leave unescaped rows behind.
+2. Run `extenddb migrate --yes` with the new binary.
+3. Start the new servers.
+
+A fresh `extenddb init` records the migration, so new deployments start without this step.
+A rolling deployment that mixes the two releases against one data database is not
+supported for this release: the new server will not start until the migration has run,
+and the old server must be stopped before it runs.
+
+`extenddb migrate --yes` refuses to run this migration while any other session is connected
+to the data database or, when the catalog is a separate database, to the catalog database
+(`backup_items` lives there), and lists them, because a server still writing during the
+rewrite would leave rows in the wrong encoding. The check runs before the command writes
+anything, so a refusal leaves the catalog version at 0.0.4. If the only other connections
+are idle ones held by a connection pooler, set `EXTENDDB_MIGRATE_IGNORE_CONNECTIONS=1` to
+skip that check.
+
+A server from an earlier release refuses to start against a migrated deployment because
+the migration moves the catalog version to 0.0.5 (see [Catalog 0.0.5](#catalog-005-current)).
+Do not downgrade past this release without restoring both databases from backups taken
+before the migration: a 0.0.4 binary given a restored 0.0.4 catalog and a migrated data
+database would read escaped rows as literal data.
+
+MongoDB. The MongoDB backend applies the same escape to BSON field names (attribute
+names and map keys) and has no migration and no startup check. Field names written by
+an earlier release are stored raw. A name containing a lone U+0001 reads back unchanged,
+as do all string values and all key strings; a name containing U+0001 immediately
+followed by U+0001 or U+0002 reads back with that pair decoded as U+0000 or U+0001.
+Deployments whose attribute names never contain U+0001 are unaffected.
 
 ---
 

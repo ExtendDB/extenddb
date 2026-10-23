@@ -13,9 +13,11 @@ use extenddb_core::types::{
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::SortKeyValue;
-use extenddb_storage::util::{composite_pk_to_text, parse_sk, sk_column, sk_column_n};
+use extenddb_storage::util::{sk_column, sk_column_n};
 
-use super::{all_sort_key_info, index_table_name};
+use super::key_text::{composite_pk_to_text, parse_sk};
+
+use super::{all_sort_key_info, index_table_name, item_to_json};
 use crate::gsi_queue::{GsiApplyContext, GsiIndexDef, enqueue_gsi_pending};
 
 /// Map a `sqlx` error to `StorageError`, preserving the SQLSTATE code in the
@@ -420,9 +422,7 @@ pub(crate) async fn insert_index_rows_multi(
         for &(sk_name, sk_type) in base_sks {
             query = bind_index_sk(query, idx_table, item, sk_name, sk_type)?;
         }
-        query = query.bind(
-            serde_json::to_value(projected).map_err(|e| StorageError::Internal(e.to_string()))?,
-        );
+        query = query.bind(item_to_json(projected)?);
     }
 
     query.execute(&mut **tx).await.map_err(db_error)?;
