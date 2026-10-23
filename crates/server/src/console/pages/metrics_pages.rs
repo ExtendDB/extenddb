@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 
 use crate::console::ConsoleState;
@@ -78,4 +78,47 @@ pub async fn metrics_page(State(state): State<Arc<ConsoleState>>, headers: Heade
         &session.csrf_token,
     ))
     .into_response()
+}
+
+/// GET /console/metrics-data — session-authed JSON metrics for the dashboard.
+///
+/// Returns the same payload as the top-level `/metrics` (per-table
+/// CloudWatch-style dimensions), but is gated by a console **session** instead
+/// of admin Basic auth, so the browser dashboard can fetch it with its session
+/// cookie. Both routes require authentication while preserving the per-table
+/// dashboard.
+pub async fn metrics_data(
+    State(state): State<Arc<ConsoleState>>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<extenddb_core::metrics::MetricsQuery>,
+) -> Response {
+    // Require a valid console session (same gate as the dashboard page).
+    if let Err(redirect) = require_session(&headers, &state).await {
+        return redirect;
+    }
+
+    match crate::metrics_endpoint::query_metrics_from_store(state.catalog_store.as_ref(), &params)
+        .await
+    {
+        Ok(mut response) => {
+            // Enrich with in-memory latency segments (not persisted to DB) —
+            // mirrors the top-level `/metrics` handler.
+            let window = params
+                .window
+                .unwrap_or(extenddb_core::metrics::TimeWindow::Last5Minutes);
+            let seg_metrics = state.metrics.clone();
+            response.segments =
+                tokio::task::spawn_blocking(move || seg_metrics.query_segments(window))
+                    .await
+                    .unwrap_or_default();
+            axum::Json(serde_json::to_value(response).unwrap_or_default()).into_response()
+        }
+        Err(msg) => {
+            let body = serde_json::json!({
+                "__type": "ValidationException",
+                "message": msg,
+            });
+            (StatusCode::BAD_REQUEST, axum::Json(body)).into_response()
+        }
+    }
 }

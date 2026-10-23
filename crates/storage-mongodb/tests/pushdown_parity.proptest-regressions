@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 786e25608dd3707c250764c4ed74630a114a629ebbef777a12f98670ef693a98 # shrinks to item = {}, expr_pair = (Or(Function { name: "contains", args: [Path([Attribute("a")]), Placeholder(":v0")] }, Function { name: "attribute_exists", args: [Path([Attribute("a")])] }), [S("")])
+cc ba22175a8084a07e6dc59ba349772e95cdcce6902424574c1083700f364ba6e9 # shrinks to item = {"c": B([0])}, expr_pair = (Compare { left: Path([Attribute("c")]), op: Eq, right: Placeholder(":v0") }, [B([])])

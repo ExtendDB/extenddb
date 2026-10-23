@@ -7,12 +7,15 @@
 //! It defines the Virtual `DynamoDB` type system, request/response envelopes,
 //! validation logic, and error types shared across all other crates.
 
+pub mod arn;
 pub mod error;
 pub mod expression;
 pub mod limits;
 pub mod metrics;
 pub mod serde_helpers;
+pub mod settings_keys;
 pub mod throttle;
 pub mod types;
 pub mod validation;
+pub mod vector_capacity;
 pub mod version;

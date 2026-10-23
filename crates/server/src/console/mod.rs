@@ -51,6 +51,10 @@ pub struct ConsoleState {
     /// console-driven mutations leave stale entries in the cache for up
     /// to `auth.cache.ttl_seconds`.
     pub auth_cache: extenddb_auth::AuthCacheRegistry,
+    /// In-memory metrics collector, used to enrich the session-authed
+    /// `/console/metrics-data` response with latency segments (same data the
+    /// top-level `/metrics` handler adds).
+    pub metrics: Arc<extenddb_core::metrics::MetricsCollector>,
 }
 
 /// Build the console router.
@@ -68,6 +72,10 @@ pub fn router() -> Router<Arc<ConsoleState>> {
         .route("/", get(pages::dashboard))
         // Metrics
         .route("/metrics", get(pages::metrics_page))
+        // Metrics data (JSON) — session-authed backend for the dashboard's
+        // client-side charts. Replaces the browser fetch of the top-level
+        // `/metrics` (now Basic-auth only, for Prometheus).
+        .route("/metrics-data", get(pages::metrics_data))
         // Settings (read-only, admin-only)
         .route("/settings", get(pages::settings_page))
         // Cache (admin-only break-glass invalidation).

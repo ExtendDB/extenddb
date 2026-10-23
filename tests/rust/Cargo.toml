@@ -24,7 +24,9 @@ aws-config = { version = "1", default-features = false, features = ["behavior-ve
 aws-credential-types = "1"
 aws-smithy-types = "1"
 aws-smithy-runtime-api = "1"
+aws-sigv4 = "1"
 aws-smithy-http-client = { version = "1", features = ["rustls-ring"] }
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }
 reqwest = { version = "0.12.15", features = ["rustls-tls", "json"], default-features = false }
+serde_json = "1"

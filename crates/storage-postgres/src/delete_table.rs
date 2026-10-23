@@ -47,6 +47,29 @@ impl PostgresEngine {
             return Err(StorageError::DeletionProtected(row.table_arn.clone()));
         }
 
+        // A restore target (CREATING with no scheduled transition) is being
+        // filled by RestoreTableFromBackup. The service refuses to delete a
+        // table it is still creating, and deleting this one would make the
+        // restore fail part-way; refuse until the restore finishes. An
+        // abandoned target is removed by the restore sweep, not here.
+        if row.table_status == "CREATING" {
+            let restoring: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM tables WHERE table_id = $1 \
+                 AND table_status = 'CREATING' AND status_transition_at IS NULL)",
+            )
+            .bind(&row.table_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            if restoring {
+                return Err(StorageError::IndexesInUse(format!(
+                    "Attempt to change a resource which is still in use: Table is being \
+                     restored: {}",
+                    row.table_name
+                )));
+            }
+        }
+
         // Fetch indexes for the response description.
         let index_rows: Vec<IndexRow> = sqlx::query_as(
             r"SELECT index_name, index_id, index_type, key_schema, projection,
@@ -57,6 +80,17 @@ impl PostgresEngine {
         .fetch_all(&mut *tx)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        // Vector index ids, read while the rows still exist. Deleting the table
+        // row cascades them away, and each id names a data table that has to be
+        // dropped afterwards: the same ordering the GSI path uses, and for the same
+        // reason.
+        let vector_index_ids: Vec<String> =
+            sqlx::query_scalar("SELECT index_id FROM vector_indexes WHERE table_id = $1")
+                .bind(&row.table_id)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         // H-5 (delete): synchronous control-plane shortcut when delay < 1s.
         // When control_plane_delay_seconds is small, the poller may not run
@@ -75,6 +109,11 @@ impl PostgresEngine {
         if delay_secs < 1.0 {
             // Synchronous delete: remove tags, catalog row, and data tables inline.
             // Note: deleting the tables row cascades to indexes and stream rows via FK CASCADE.
+            // Vector index rows cascade the same way, through
+            // vector_indexes_table_id_fkey, so a table with vector indexes needs
+            // no extra catalog cleanup. Their data tables do need dropping, and
+            // the cascade takes away the rows that name them, which is why the
+            // index ids are collected BEFORE the catalog row goes.
             sqlx::query("DELETE FROM tags WHERE resource_arn = $1")
                 .bind(&row.table_arn)
                 .execute(&mut *tx)
@@ -100,6 +139,16 @@ impl PostgresEngine {
             for idx_id in &index_ids {
                 Self::drop_index_data_table(&mut data_tx, idx_id).await?;
             }
+            for index_id in &vector_index_ids {
+                Self::drop_vector_data_table(&mut data_tx, index_id).await?;
+            }
+            // Holds go with the table. A hold for a table that no longer exists
+            // would block claims for a table id that can never be released.
+            sqlx::query("DELETE FROM vector_index_holds WHERE table_id = $1")
+                .bind(&row.table_id)
+                .execute(&mut *data_tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
             Self::drop_data_table(&mut data_tx, &row.table_id).await?;
 
             // Drop any still-pending GSI propagation rows for this table in the

@@ -291,6 +291,35 @@ class TestListTablesOrder:
         our_tables = [t for t in collected if t.startswith(prefix)]
         assert our_tables == sorted(our_tables)
 
+    def test_list_tables_pages_in_byte_order_without_skipping(
+        self, create_and_cleanup_table, dynamodb_client
+    ):
+        """Names are ordered by UTF-8 byte value and every name lands on one page.
+
+        `a_z` sorts before `ab` in byte order (`_` is 0x5F, `b` is 0x62) but
+        after it under a locale collation such as en_US.utf8, which ignores
+        punctuation at the first level. A backend whose page filter and page
+        order use different collations skips `ab`. Measured against the
+        service 2026-09-16: order [a_z, ab], both returned, with Limit=1.
+        """
+        prefix = f"extenddb-order-{uuid.uuid4().hex[:4]}"
+        names = [f"{prefix}-a_z", f"{prefix}-ab"]
+        for name in names:
+            create_and_cleanup_table(name)
+
+        collected: list[str] = []
+        kwargs: dict = {"Limit": 1}
+        while True:
+            result = dynamodb_client.list_tables(**kwargs)
+            collected.extend(result["TableNames"])
+            if "LastEvaluatedTableName" not in result:
+                break
+            kwargs["ExclusiveStartTableName"] = result["LastEvaluatedTableName"]
+
+        our_tables = [t for t in collected if t.startswith(prefix)]
+        assert our_tables == names
+        assert collected == sorted(collected, key=lambda s: s.encode("utf-8"))
+
 
 # ---------------------------------------------------------------------------
 # UpdateTable validation

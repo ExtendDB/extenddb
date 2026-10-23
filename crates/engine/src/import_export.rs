@@ -12,7 +12,9 @@ use serde_json::Value;
 
 use crate::OperationContext;
 use crate::create_table::storage_err_to_dynamo;
-use crate::import_export_io::{read_items, validate_path, validate_path_parent};
+use crate::import_export_io::{
+    ensure_account_dirs, read_items, validate_path, validate_path_parent,
+};
 use crate::serialize_output;
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::types::{
@@ -49,6 +51,32 @@ pub async fn handle_import_table(
     let start_time = epoch_seconds();
     let tcp = &input.table_creation_parameters;
 
+    // Validate and canonicalize the source path before creating anything. Files
+    // are namespaced per account, so a caller can only read beneath its own
+    // subtree of a root. Validating first means a refused import leaves no
+    // orphaned destination table behind.
+    let source_path = validate_path(&input.file_source.path, &ctx.import_paths, &ctx.account_id)?;
+
+    tracing::info!(
+        account_id = %ctx.account_id,
+        operation = "ImportTable",
+        table_name = %tcp.table_name,
+        resolved_path = %source_path.display(),
+        "import/export file access"
+    );
+
+    // Check file size against limit.
+    let file_meta = std::fs::metadata(&source_path).map_err(|_| {
+        DynamoDbError::ValidationException("Cannot read source file metadata".to_owned())
+    })?;
+    if file_meta.len() > ctx.limits.max_import_file_bytes {
+        return Err(DynamoDbError::ValidationException(format!(
+            "Import file size ({} bytes) exceeds maximum ({} bytes)",
+            file_meta.len(),
+            ctx.limits.max_import_file_bytes
+        )));
+    }
+
     let create_input = create_table_input_from_params(tcp);
 
     let table_desc = ctx
@@ -75,21 +103,6 @@ pub async fn handle_import_table(
         .table_key_info(&ctx.account_id, &tcp.table_name)
         .await
         .map_err(storage_err_to_dynamo)?;
-
-    // Validate and canonicalize the source path.
-    let source_path = validate_path(&input.file_source.path, &ctx.import_paths)?;
-
-    // Check file size against limit.
-    let file_meta = std::fs::metadata(&source_path).map_err(|_| {
-        DynamoDbError::ValidationException("Cannot read source file metadata".to_owned())
-    })?;
-    if file_meta.len() > ctx.limits.max_import_file_bytes {
-        return Err(DynamoDbError::ValidationException(format!(
-            "Import file size ({} bytes) exceeds maximum ({} bytes)",
-            file_meta.len(),
-            ctx.limits.max_import_file_bytes
-        )));
-    }
 
     // Read items using spawn_blocking to avoid blocking the async runtime.
     let format = input.input_format;
@@ -213,20 +226,50 @@ pub async fn handle_export_table(
         .await
         .map_err(storage_err_to_dynamo)?;
 
+    // Export files are namespaced per account. The account's subtree has to
+    // exist before the output path can be canonicalized and jailed, so create
+    // it first; this is idempotent and keeps the first export for a new account
+    // from failing on a missing parent directory.
+    ensure_account_dirs(&ctx.export_paths, &ctx.account_id)?;
+
     let output_path = validate_path_parent(
         input
             .resolve_file_path()
             .map_err(|e| DynamoDbError::ValidationException(e.to_owned()))?,
         &ctx.export_paths,
+        &ctx.account_id,
     )?;
     if let Some(parent) = output_path.parent() {
         tokio::fs::create_dir_all(parent).await.map_err(|_| {
             DynamoDbError::ValidationException("Cannot create output directory".to_owned())
         })?;
     }
-    let mut file = tokio::fs::File::create(&output_path)
+
+    tracing::info!(
+        account_id = %ctx.account_id,
+        operation = "ExportTableToPointInTime",
+        table_name = %table_name,
+        resolved_path = %output_path.display(),
+        "import/export file access"
+    );
+
+    // `create_new` refuses to write when anything already exists at the path,
+    // so an export cannot truncate a file it did not create. It also refuses an
+    // existing symlink, including a dangling one, rather than following it.
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&output_path)
         .await
-        .map_err(|_| DynamoDbError::ValidationException("Cannot create export file".to_owned()))?;
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                DynamoDbError::ValidationException(
+                    "Export file already exists; choose a different FilePath".to_owned(),
+                )
+            } else {
+                DynamoDbError::ValidationException("Cannot create export file".to_owned())
+            }
+        })?;
 
     let mut item_count: i64 = 0;
     let max_export_items = ctx.limits.max_export_item_count;
@@ -301,9 +344,13 @@ fn create_table_input_from_params(tcp: &TableCreationParameters) -> CreateTableI
         attribute_definitions: tcp.attribute_definitions.clone(),
         key_schema: tcp.key_schema.clone(),
         billing_mode: tcp.billing_mode,
+        // ImportTable's TableCreationParameters has no TableThroughputMode
+        // member; nothing to resolve.
+        table_throughput_mode: None,
         provisioned_throughput: tcp.provisioned_throughput.clone(),
         global_secondary_indexes: tcp.global_secondary_indexes.clone(),
         local_secondary_indexes: None,
+        vector_indexes: None,
         stream_specification: None,
         sse_specification: None,
         tags: None,
@@ -340,15 +387,71 @@ async fn wait_for_table_active(
     )))
 }
 
+/// Resolve the table an export `TableArn` names, using the one shared resource
+/// parser so the engine reads the same table authorization checked.
+///
+/// `ExportTableToPointInTime` names its source in `TableArn`, which must be
+/// exactly a table ARN. A well-formed DynamoDB ARN of the wrong kind (a stream,
+/// index, or backup ARN) reaches here after authorization and is refused with
+/// the service's message (measured live, `live-r2/arn-kinds-live.json`). An
+/// unparseable `TableArn` is refused earlier, before authorization, by
+/// `authz_resource::validate_operation_arns`.
 fn extract_table_name_from_arn(arn: &str) -> Result<String, DynamoDbError> {
-    arn.rsplit_once("table/")
-        .map(|(_, name)| name.to_owned())
-        .ok_or_else(|| DynamoDbError::ValidationException(format!("Invalid table ARN: {arn}")))
+    match extenddb_core::arn::parse(arn) {
+        Some(extenddb_core::arn::TableResource {
+            table, sub: None, ..
+        }) => Ok(table),
+        _ => Err(DynamoDbError::ValidationException(
+            INVALID_TABLE_ARN_REQUEST_MESSAGE.to_owned(),
+        )),
+    }
 }
+
+/// The message DynamoDB returns for an export `TableArn` (or a restore source
+/// ARN) that is a well-formed ARN of the wrong resource kind (measured live).
+const INVALID_TABLE_ARN_REQUEST_MESSAGE: &str = "Invalid Request: Table ARN is invalid.";
 
 fn epoch_seconds() -> f64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+}
+
+#[cfg(test)]
+mod export_arn_tests {
+    use super::{INVALID_TABLE_ARN_REQUEST_MESSAGE, extract_table_name_from_arn};
+    use extenddb_core::error::DynamoDbError;
+
+    #[test]
+    fn exact_table_arn_resolves_to_table_name() {
+        assert_eq!(
+            extract_table_name_from_arn("arn:aws:dynamodb:us-east-1:1:table/orders").unwrap(),
+            "orders"
+        );
+    }
+
+    #[test]
+    fn non_bare_table_arn_is_refused_with_the_measured_message() {
+        // A well-formed stream, index, or backup ARN reaches the handler after
+        // authorization and is refused with the service's message. A trailing
+        // slash and the A1 bypass ARN do not parse and are refused earlier, but
+        // the handler refuses them too if reached.
+        for arn in [
+            "arn:aws:dynamodb:us-east-1:1:table/orders/stream/2026-10-20T16:17:40.188",
+            "arn:aws:dynamodb:us-east-1:1:table/orders/index/gsi1",
+            "arn:aws:dynamodb:us-east-1:1:table/orders/backup/01-ab",
+            "arn:aws:dynamodb:us-east-1:1:table/allowed/stream/table/secret",
+            "arn:aws:dynamodb:us-east-1:1:table/orders/",
+            "banana",
+            "xrn:aws:dynamodb:us-east-1:1:table/orders",
+        ] {
+            match extract_table_name_from_arn(arn) {
+                Err(DynamoDbError::ValidationException(m)) => {
+                    assert_eq!(m, INVALID_TABLE_ARN_REQUEST_MESSAGE, "for {arn}");
+                }
+                other => panic!("expected ValidationException for {arn}, got {other:?}"),
+            }
+        }
+    }
 }

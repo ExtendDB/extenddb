@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Stale-while-revalidate (SWR) cache primitive used by the auth and storage layers.
+//! Stale-while-revalidate (SWR) cache primitive used by the auth and server layers.
 //!
 //! See `docs/design/12-auth-authz-cache.md` for the full design rationale.
 //!

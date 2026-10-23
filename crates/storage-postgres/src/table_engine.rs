@@ -22,7 +22,7 @@ impl TableEngine for PostgresEngine {
         input: CreateTableInput,
     ) -> BoxFuture<'_, Result<TableDescription, StorageError>> {
         let account_id = account_id.to_string();
-        Box::pin(async move { self.create_table_impl(&account_id, input).await })
+        Box::pin(async move { self.create_table_impl(&account_id, input, false).await })
     }
 
     // H-5: Set status to DELETING with a scheduled transition to removal,
@@ -62,7 +62,7 @@ impl TableEngine for PostgresEngine {
 
             let rows: Vec<(String,)> = if let Some(ref start) = input.exclusive_start_table_name {
                 sqlx::query_as(
-                    "SELECT table_name FROM tables WHERE account_id = $1 AND table_name > $2 ORDER BY table_name COLLATE \"C\" LIMIT $3",
+                    "SELECT table_name FROM tables WHERE account_id = $1 AND table_name COLLATE \"C\" > $2 ORDER BY table_name COLLATE \"C\" LIMIT $3",
                 )
                 .bind(&account_id)
                 .bind(start)

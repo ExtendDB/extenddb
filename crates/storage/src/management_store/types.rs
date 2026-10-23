@@ -23,6 +23,20 @@ pub enum OpError {
 /// Result alias for management operations.
 pub type OpResult<T> = Result<T, OpError>;
 
+/// A stored session's policy, returned by
+/// [`super::ManagementStore::list_session_policies`] for the policy migration.
+///
+/// Only sessions that carry a session policy are returned. Carries the identity
+/// needed to rewrite the policy and report it, keyed by `session_token`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionPolicyEntry {
+    pub session_token: String,
+    pub account_id: String,
+    pub role_name: String,
+    pub session_name: String,
+    pub policy: serde_json::Value,
+}
+
 // ── Detail structs ─────────────────────────────────────────────────────
 
 /// Account detail returned by [`super::ManagementStore::get_account_detail`].

@@ -158,7 +158,7 @@ async fn list_tags_empty() {
 }
 
 #[tokio::test]
-async fn tag_nonexistent_resource() {
+async fn tag_cross_account_resource_is_denied() {
     let c = client();
     let fake_arn = "arn:aws:dynamodb:us-east-1:000000000000:table/nonexistent-xyz";
     let err = c
@@ -166,35 +166,29 @@ async fn tag_nonexistent_resource() {
         .resource_arn(fake_arn)
         .tags(Tag::builder().key("k").value("v").build().unwrap())
         .send()
-        .await;
-    assert!(err.is_err());
-    // extenddb returns ResourceNotFoundException; real DynamoDB returns
-    // AccessDeniedException for cross-account ARNs.
-    let err = err.unwrap_err();
-    let code = err_code(&err);
-    assert!(
-        code == Some("ResourceNotFoundException") || code == Some("AccessDeniedException"),
-        "unexpected error code: {code:?}"
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err_code(&err),
+        Some("AccessDeniedException"),
+        "cross-account ARN must be denied without disclosing existence"
     );
 }
 
 #[tokio::test]
-async fn list_tags_nonexistent_resource() {
+async fn list_tags_cross_account_resource_is_denied() {
     let c = client();
     let fake_arn = "arn:aws:dynamodb:us-east-1:000000000000:table/nonexistent-xyz";
     let err = c
         .list_tags_of_resource()
         .resource_arn(fake_arn)
         .send()
-        .await;
-    assert!(err.is_err());
-    // extenddb returns ResourceNotFoundException; real DynamoDB returns
-    // AccessDeniedException for cross-account ARNs.
-    let err = err.unwrap_err();
-    let code = err_code(&err);
-    assert!(
-        code == Some("ResourceNotFoundException") || code == Some("AccessDeniedException"),
-        "unexpected error code: {code:?}"
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err_code(&err),
+        Some("AccessDeniedException"),
+        "cross-account ARN must be denied without disclosing existence"
     );
 }
 
@@ -230,7 +224,7 @@ async fn tag_multiple_then_untag_all() {
 }
 
 #[tokio::test]
-async fn untag_nonexistent_resource() {
+async fn untag_cross_account_resource_is_denied() {
     let c = client();
     let fake_arn = "arn:aws:dynamodb:us-east-1:000000000000:table/nonexistent-xyz";
     let err = c
@@ -238,15 +232,12 @@ async fn untag_nonexistent_resource() {
         .resource_arn(fake_arn)
         .tag_keys("k")
         .send()
-        .await;
-    assert!(err.is_err());
-    // extenddb returns ResourceNotFoundException; real DynamoDB returns
-    // AccessDeniedException for cross-account ARNs.
-    let err = err.unwrap_err();
-    let code = err_code(&err);
-    assert!(
-        code == Some("ResourceNotFoundException") || code == Some("AccessDeniedException"),
-        "unexpected error code: {code:?}"
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err_code(&err),
+        Some("AccessDeniedException"),
+        "cross-account ARN must be denied without disclosing existence"
     );
 }
 
@@ -306,4 +297,114 @@ async fn tag_empty_value() {
         .map(|t| (t.key().to_string(), t.value().to_string()))
         .collect();
     assert_eq!(tags.get("k").unwrap(), "");
+}
+
+// ---------------------------------------------------------------------------
+// Resource ARN validation.
+//
+// Error classes below match DynamoDB, verified against the service. The ARNs
+// are derived from a real table's ARN so the account and region match the
+// caller's without hardcoding either.
+// ---------------------------------------------------------------------------
+
+/// Replace the table name in a table ARN.
+fn with_table_name(arn: &str, table_name: &str) -> String {
+    format!("{}/{table_name}", arn.rsplit_once('/').unwrap().0)
+}
+
+#[tokio::test]
+async fn tag_nonexistent_table_in_own_account_reports_not_found() {
+    let c = client();
+    let (_name, arn) = create_tagged_table(c).await;
+    let missing = with_table_name(&arn, "nonexistent-xyz-99");
+
+    let err = c
+        .tag_resource()
+        .resource_arn(&missing)
+        .tags(Tag::builder().key("k").value("v").build().unwrap())
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(err_code(&err), Some("ResourceNotFoundException"));
+}
+
+#[tokio::test]
+async fn tag_resource_arn_in_another_region_is_a_validation_error() {
+    let c = client();
+    let (_name, arn) = create_tagged_table(c).await;
+    // Rewrite only the region component, keeping the caller's own account.
+    let parts: Vec<&str> = arn.splitn(6, ':').collect();
+    let other_region = if parts[3] == "us-west-2" {
+        "us-east-1"
+    } else {
+        "us-west-2"
+    };
+    let wrong_region = format!(
+        "{}:{}:{}:{}:{}:{}",
+        parts[0], parts[1], parts[2], other_region, parts[4], parts[5]
+    );
+
+    let err = c
+        .tag_resource()
+        .resource_arn(&wrong_region)
+        .tags(Tag::builder().key("k").value("v").build().unwrap())
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err_code(&err),
+        Some("ValidationException"),
+        "an ARN for a different region must be rejected as invalid"
+    );
+}
+
+#[tokio::test]
+async fn tag_resource_arn_without_arn_prefix_is_a_validation_error() {
+    let c = client();
+    let err = c
+        .tag_resource()
+        .resource_arn("not-an-arn")
+        .tags(Tag::builder().key("k").value("v").build().unwrap())
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(err_code(&err), Some("ValidationException"));
+}
+
+#[tokio::test]
+async fn tag_non_table_dynamodb_arn_is_a_validation_error() {
+    let c = client();
+    let (_name, arn) = create_tagged_table(c).await;
+    // Same account and region, but an index resource rather than a table.
+    let parts: Vec<&str> = arn.splitn(6, ':').collect();
+    let index_arn = format!(
+        "{}:{}:{}:{}:{}:index/foo",
+        parts[0], parts[1], parts[2], parts[3], parts[4]
+    );
+
+    let err = c
+        .tag_resource()
+        .resource_arn(&index_arn)
+        .tags(Tag::builder().key("k").value("v").build().unwrap())
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(err_code(&err), Some("ValidationException"));
+}
+
+#[tokio::test]
+async fn tag_arn_for_another_service_is_denied() {
+    let c = client();
+    let err = c
+        .tag_resource()
+        .resource_arn("arn:aws:s3:::mybucket")
+        .tags(Tag::builder().key("k").value("v").build().unwrap())
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err_code(&err),
+        Some("AccessDeniedException"),
+        "an ARN for another service is denied, not reported as malformed"
+    );
 }

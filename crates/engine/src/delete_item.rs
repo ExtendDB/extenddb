@@ -27,17 +27,27 @@ pub async fn handle_delete_item(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
+    // Aggregated, in the measured clause order (2026-08-24, us-east-1: both
+    // invalid enums answer "2 validation errors detected", RCC's named clause
+    // first, then ReturnValues' bare clause). A member merely disallowed for
+    // DeleteItem passes here and falls through to
+    // validate_put_delete_return_values.
     crate::validate_enum_fields(
         &body,
         &[
-            ("ReturnValues", "returnValues", &["NONE", "ALL_OLD"]),
-            (
-                "ReturnConsumedCapacity",
-                "returnConsumedCapacity",
-                &["INDEXES", "TOTAL", "NONE"],
-            ),
+            crate::EnumField {
+                json_name: "ReturnConsumedCapacity",
+                valid: &["INDEXES", "TOTAL", "NONE"],
+                clause: crate::EnumClause::Named("returnConsumedCapacity"),
+            },
+            crate::EnumField {
+                json_name: "ReturnValues",
+                valid: crate::RETURN_VALUES_MEMBERS,
+                clause: crate::EnumClause::Bare(crate::RETURN_VALUES_BARE_CLAUSE),
+            },
         ],
     )?;
+    crate::validate_put_delete_return_values(&body)?;
     let input: DeleteItemInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
     extenddb_core::validation::validate_table_name(&input.table_name, &ctx.limits)?;
@@ -49,6 +59,15 @@ pub async fn handle_delete_item(
         .condition_expression
         .as_ref()
         .is_some_and(|s| !s.is_empty());
+    let has_expected = input.expected.as_ref().is_some_and(|m| !m.is_empty());
+    let has_cond_op = input.conditional_operator.is_some();
+    extenddb_core::validation::validate_no_expression_param_mixing(
+        &[
+            ("Expected", has_expected),
+            ("ConditionalOperator", has_cond_op),
+        ],
+        &[("ConditionExpression", has_condition)],
+    )?;
     extenddb_core::expression::validate_expression_param_usage(
         input.expression_attribute_names.as_ref(),
         has_condition,
@@ -56,6 +75,26 @@ pub async fn handle_delete_item(
         has_condition,
         &[extenddb_core::expression::ExpressionKind::Condition],
     )?;
+
+    // ConditionalOperator requires an Expected with two or more conditions.
+    extenddb_core::validation::validate_conditional_operator_usage(
+        has_cond_op,
+        input
+            .expected
+            .as_ref()
+            .map_or(0, std::collections::HashMap::len),
+    )?;
+
+    // The nesting-depth limit applies to every ExpressionAttributeValue on the
+    // single-item write paths, condition-only placeholders included: measured
+    // 2026-08-24 (us-east-1), a 32-level value referenced solely by a
+    // ConditionExpression is rejected on PutItem, DeleteItem, and UpdateItem
+    // alike, while 31 levels is accepted. TransactWriteItems deliberately does
+    // NOT get this check: the same 32-level condition-only value is accepted
+    // inside a transaction on every sub-op shape (also measured).
+    if let Some(values) = &input.expression_attribute_values {
+        extenddb_core::validation::validate_attribute_values_nesting_depth(values.values())?;
+    }
 
     let (condition, maps) = resolve_condition(
         input.condition_expression.as_deref(),
@@ -104,13 +143,18 @@ pub async fn handle_delete_item(
         region: ctx.region.clone(),
     });
     let need_old_for_stream = stream.is_some();
+    // Consumed capacity — when requested, the total includes base + affected
+    // GSIs; INDEXES additionally returns the per-index breakdown. The deleted
+    // (old) item is needed to determine which indexes the delete propagated to.
+    let need_old_for_capacity =
+        input.return_consumed_capacity != extenddb_core::types::ReturnConsumedCapacity::None;
 
     let old_item = ctx
         .storage
         .delete_item(
             &key_info,
             &input.key,
-            return_old || need_old_for_stream,
+            return_old || need_old_for_stream || need_old_for_capacity,
             condition.as_ref(),
             &maps,
             stream.as_ref(),
@@ -129,13 +173,28 @@ pub async fn handle_delete_item(
             .map_or_else(|| item_size_bytes(&input.key), item_size_bytes),
     );
 
-    let output = DeleteItemOutput {
-        attributes: if return_old { old_item } else { None },
-        consumed_capacity: capacity_helpers::write_capacity(
+    // Consumed capacity — INDEXES mode uses the deleted (old) item to determine
+    // which indexes the delete propagated to. Index metadata comes from the
+    // (cached) `TableKeyInfo`, so no extra catalog round-trip is needed. If
+    // nothing was deleted, only base-table capacity is reported.
+    let consumed_capacity = match old_item.as_ref() {
+        Some(cc_item) => capacity_helpers::write_capacity_indexed(
             input.return_consumed_capacity,
             &input.table_name,
             wcu,
+            Some(cc_item),
+            None,
+            false,
+            &key_info,
         ),
+        None => {
+            capacity_helpers::write_capacity(input.return_consumed_capacity, &input.table_name, wcu)
+        }
+    };
+
+    let output = DeleteItemOutput {
+        attributes: if return_old { old_item } else { None },
+        consumed_capacity,
         item_collection_metrics: capacity_helpers::item_metrics(
             input.return_item_collection_metrics,
             &key_info.key_schema,

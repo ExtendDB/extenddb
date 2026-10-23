@@ -68,6 +68,31 @@ def _full_access_policy() -> dict:
             "Resource": "*",
         }],
     }
+
+
+class TestAccountLifecycle:
+    """Account deletion must respect table ownership dependencies."""
+
+    def test_delete_account_rejects_existing_table(self, alice_env, mgmt):
+        client, account_id = alice_env
+        table_name = f"account-delete-{uuid.uuid4().hex[:8]}"
+        client.create_table(
+            TableName=table_name,
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        wait_for_active(client, table_name)
+
+        try:
+            response = mgmt.delete_account(account_id)
+            assert response.status_code == 409, response.text
+            assert "existing tables" in response.text.lower()
+        finally:
+            client.delete_table(TableName=table_name)
+            wait_for_deleted(client, table_name)
+
+
 @pytest.fixture(scope="module")
 def auth_env():
     return _require_auth_env()
@@ -353,3 +378,241 @@ class TestConsoleIsolation:
         assert resp.status_code == 200
         assert self.bob_acct in resp.text
         assert self.alice_acct not in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Stream record account scoping
+# ---------------------------------------------------------------------------
+import base64
+import time
+
+
+def _make_streams_client(endpoint_url: str, access_key: str, secret_key: str,
+                         region: str) -> Any:
+    kwargs: dict = dict(
+        service_name="dynamodbstreams",
+        endpoint_url=endpoint_url,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name=region,
+        config=BotoConfig(retries={"max_attempts": 0}),
+    )
+    if endpoint_url.startswith("https://"):
+        kwargs["verify"] = False
+    return boto3.client(**kwargs)
+
+
+def _stream_arn(ddb: Any, table: str) -> str:
+    return ddb.describe_table(TableName=table)["Table"]["LatestStreamArn"]
+
+
+@pytest.fixture(scope="module")
+def stream_accounts(auth_env, mgmt, region):
+    """Two accounts, each with a DynamoDB and a DynamoDB Streams client."""
+    endpoint = auth_env[0]
+    accts: dict[str, dict] = {}
+    for name, passwd in (("accta", "AcctaPass123!"), ("acctb", "AcctbPass456!")):
+        acct_id = f"{uuid.uuid4().int % 10**12:012d}"
+        assert mgmt.create_account(acct_id, f"{name}-acct-{acct_id}").status_code == 201
+        assert mgmt.create_user(acct_id, name, passwd).status_code == 201
+        creds = mgmt.create_access_key(acct_id, name).json()
+        assert mgmt.put_user_policy(acct_id, name, "full",
+                                    _full_access_policy()).status_code == 204
+        ak, sk = creds["access_key_id"], creds["secret_access_key"]
+        accts[name] = {
+            "acct": acct_id,
+            "ddb": _make_dynamodb_client(endpoint, ak, sk, region),
+            "streams": _make_streams_client(endpoint, ak, sk, region),
+        }
+    yield accts
+    for name in ("accta", "acctb"):
+        mgmt.delete_user(accts[name]["acct"], name)
+        mgmt.delete_account(accts[name]["acct"])
+
+
+class TestStreamAccountScoping:
+    """GetRecords returns only the records of the shard's owning account."""
+
+    def test_shard_iterator_only_returns_owning_account_records(self, stream_accounts):
+        owner = stream_accounts["accta"]
+        other = stream_accounts["acctb"]
+        table = f"accta-stream-{uuid.uuid4().hex[:8]}"
+
+        owner["ddb"].create_table(
+            TableName=table,
+            AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            BillingMode="PAY_PER_REQUEST",
+            StreamSpecification={"StreamEnabled": True,
+                                 "StreamViewType": "NEW_AND_OLD_IMAGES"},
+        )
+        wait_for_active(owner["ddb"], table)
+        owner["ddb"].put_item(
+            TableName=table,
+            Item={"pk": {"S": "item1"}, "data": {"S": "owner-value"}},
+        )
+
+        arn = _stream_arn(owner["ddb"], table)
+        shards = owner["streams"].describe_stream(StreamArn=arn)[
+            "StreamDescription"]["Shards"]
+
+        def drain(client: Any, shard_id: str) -> list:
+            it = client.get_shard_iterator(
+                StreamArn=arn, ShardId=shard_id, ShardIteratorType="TRIM_HORIZON",
+            )["ShardIterator"]
+            recs: list = []
+            for _ in range(10):
+                resp = client.get_records(ShardIterator=it, Limit=100)
+                recs.extend(resp["Records"])
+                it = resp.get("NextShardIterator")
+                if recs or not it:
+                    break
+                time.sleep(0.5)
+            return recs
+
+        # Positive control: the owner finds its record in whichever shard holds
+        # it (the item's key hashes to one of the stream's shards).
+        drained = {sh["ShardId"]: drain(owner["streams"], sh["ShardId"]) for sh in shards}
+        target_shard = next(
+            (
+                sid
+                for sid, recs in drained.items()
+                if any(
+                    r["dynamodb"].get("NewImage", {}).get("data", {}).get("S")
+                    == "owner-value"
+                    for r in recs
+                )
+            ),
+            None,
+        )
+        assert target_shard is not None, (
+            "owner should be able to read its own stream records; drained counts="
+            + str({sid: len(recs) for sid, recs in drained.items()})
+            + " sample="
+            + str(drained)[:600]
+        )
+
+        # Account B calls GetRecords with iterators that name account A's shard.
+        # None of them may return A's records, and the answer must not depend on
+        # whether the shard exists, so it cannot be used to probe another
+        # account's streams. A made-up shard id is the control.
+        missing_shard = "shardId-00000000-0000-0000-0000-000000000000-0000000000000000"
+
+        def get_records_error(token: str) -> dict:
+            with pytest.raises(ClientError) as exc:
+                other["streams"].get_records(ShardIterator=token, Limit=100)
+            return exc.value.response["Error"]
+
+        # A token in the format issued before iterators carried their stream
+        # ARN ("<shard>|<type>|<seq>|<ts>"). It is answered by its shape alone,
+        # before any lookup, with ExpiredIteratorException, which is what
+        # DynamoDB returns for an expired iterator; the client asks for a new
+        # one.
+        def old_format(shard_id: str) -> str:
+            return base64.b64encode(
+                f"{shard_id}|AFTER_SEQUENCE_NUMBER||{int(time.time())}".encode()
+            ).decode()
+
+        err = get_records_error(old_format(target_shard))
+        assert err["Code"] == "ExpiredIteratorException", err
+        assert err["Message"] == "Shard iterator has expired", err
+        assert get_records_error(old_format(missing_shard)) == err
+
+        # A token in the current format that names account A's stream ARN.
+        # Authorization pins the stream ARN to account B, and the engine looks
+        # the stream up in account B, where it does not exist, so the request
+        # fails the same way for a real and a made-up shard.
+        def current_format(shard_id: str) -> str:
+            return base64.b64encode(
+                f"{shard_id}|AFTER_SEQUENCE_NUMBER||{int(time.time())}|{arn}".encode()
+            ).decode()
+
+        err = get_records_error(current_format(target_shard))
+        assert err["Code"] == "ResourceNotFoundException", err
+        assert get_records_error(current_format(missing_shard)) == err
+
+        # An iterator that does not decode gets DynamoDB's verbatim answer.
+        err = get_records_error("bm90LWFuLWl0ZXJhdG9y")
+        assert err == {"Code": "ValidationException", "Message": "Invalid ShardIterator"}, err
+
+    def test_metrics_endpoint_requires_admin_auth(self, auth_env):
+        endpoint, admin_user, admin_pass = auth_env
+
+        # An unauthenticated request is rejected outright. Deterministic --
+        # no dependency on the async metrics flush.
+        r = requests.get(f"{endpoint}/metrics", verify=False, timeout=10)
+        assert r.status_code == 401, (
+            f"unauthenticated /metrics returned {r.status_code}, "
+            "expected 401 (must require admin auth)"
+        )
+
+        # With admin Basic auth the endpoint is reachable and returns a metrics
+        # document. (Per-table dimension *retention* is covered deterministically
+        # by the aggregate_rows Rust unit test, not by polling the 60s flush.)
+        r = requests.get(
+            f"{endpoint}/metrics",
+            auth=(admin_user, admin_pass),
+            verify=False,
+            timeout=10,
+        )
+        assert r.status_code == 200, (
+            f"admin /metrics returned {r.status_code}, expected 200"
+        )
+        body = r.json()
+        assert isinstance(body, dict) and ("metrics" in body or "buckets" in body), (
+            "admin /metrics should return a MetricsResponse JSON body"
+        )
+
+
+    def test_console_metrics_data_requires_session(self, auth_env):
+        endpoint, admin_user, admin_pass = auth_env
+
+        # 1. Without a console session, the data route must not serve
+        #    metrics -- it redirects to the console login.
+        r = requests.get(
+            f"{endpoint}/console/metrics-data?window=Last5Minutes",
+            verify=False,
+            timeout=10,
+            allow_redirects=False,
+        )
+        assert r.status_code in (302, 303), (
+            f"unauthenticated /console/metrics-data returned {r.status_code}, "
+            "expected a redirect to login"
+        )
+        assert "/console/login" in r.headers.get("Location", ""), (
+            "unauthenticated /console/metrics-data should redirect to console login"
+        )
+
+        # 2. With a valid console session, the route returns metrics JSON
+        #    (per-table dimensions), gated by the session cookie rather than
+        #    admin Basic auth.
+        s = requests.Session()
+        # The harness sets REQUESTS_CA_BUNDLE/SSL_CERT_FILE, which overrides
+        # session.verify; disable env trust and pass verify=False per request so
+        # the self-signed dev cert is accepted (same as the direct calls above).
+        s.trust_env = False
+        s.verify = False
+        login = s.post(
+            f"{endpoint}/console/login",
+            data={"username": admin_user, "password": admin_pass},
+            timeout=10,
+            allow_redirects=False,
+            verify=False,
+        )
+        assert login.status_code in (302, 303), (
+            f"console login failed: {login.status_code}"
+        )
+        r = s.get(
+            f"{endpoint}/console/metrics-data?window=Last5Minutes",
+            timeout=10,
+            verify=False,
+        )
+        assert r.status_code == 200, (
+            f"authenticated /console/metrics-data returned {r.status_code}, "
+            "expected 200"
+        )
+        body = r.json()
+        assert isinstance(body, dict) and ("metrics" in body or "buckets" in body), (
+            "authenticated /console/metrics-data should return a MetricsResponse "
+            "JSON body"
+        )

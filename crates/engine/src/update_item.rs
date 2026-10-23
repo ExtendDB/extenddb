@@ -37,20 +37,26 @@ pub async fn handle_update_item(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
+    // Sequential rather than aggregated, deliberately: UpdateItem stops at the
+    // FIRST invalid enum and reports one error, where PutItem and DeleteItem
+    // aggregate all of theirs. Measured 2026-08-24 (us-east-1): ReturnValues
+    // and ReturnConsumedCapacity both invalid answers "1 validation error
+    // detected: " followed by ReturnValues' bare clause alone.
     crate::validate_enum_fields(
         &body,
-        &[
-            (
-                "ReturnValues",
-                "returnValues",
-                &["NONE", "ALL_OLD", "ALL_NEW", "UPDATED_OLD", "UPDATED_NEW"],
-            ),
-            (
-                "ReturnConsumedCapacity",
-                "returnConsumedCapacity",
-                &["INDEXES", "TOTAL", "NONE"],
-            ),
-        ],
+        &[crate::EnumField {
+            json_name: "ReturnValues",
+            valid: crate::RETURN_VALUES_MEMBERS,
+            clause: crate::EnumClause::Bare(crate::RETURN_VALUES_BARE_CLAUSE),
+        }],
+    )?;
+    crate::validate_enum_fields(
+        &body,
+        &[crate::EnumField {
+            json_name: "ReturnConsumedCapacity",
+            valid: &["INDEXES", "TOTAL", "NONE"],
+            clause: crate::EnumClause::Named("returnConsumedCapacity"),
+        }],
     )?;
     let input: UpdateItemInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
@@ -60,25 +66,40 @@ pub async fn handle_update_item(
     // desugaring) before the existence check; key, item-content nesting, and
     // the no-key-update checks stay after (post-existence on Amazon DynamoDB).
 
+    let has_update_expr = input
+        .update_expression
+        .as_ref()
+        .is_some_and(|s| !s.is_empty());
+    let has_condition = input
+        .condition_expression
+        .as_ref()
+        .is_some_and(|s| !s.is_empty());
+    let has_expected = input.expected.as_ref().is_some_and(|m| !m.is_empty());
+    let has_cond_op = input.conditional_operator.is_some();
+
+    extenddb_core::validation::validate_no_expression_param_mixing(
+        &[
+            ("AttributeUpdates", input.attribute_updates.is_some()),
+            ("Expected", has_expected),
+            ("ConditionalOperator", has_cond_op),
+        ],
+        &[
+            ("UpdateExpression", input.update_expression.is_some()),
+            ("ConditionExpression", has_condition),
+        ],
+    )?;
+
     // Desugar legacy AttributeUpdates into UpdateExpression if present.
-    // N.B. The literal `{AttributeUpdates}` / `{UpdateExpression}` in the error message
-    // matches real DynamoDB's format — they are not Rust format placeholders.
-    let (effective_update_expr, extra_expr_values, extra_expr_names) = if let Some(attr_updates) =
-        &input.attribute_updates
-    {
-        if input.update_expression.is_some() {
-            return Err(DynamoDbError::ValidationException(
-                "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {AttributeUpdates} Expression parameters: {UpdateExpression}".to_owned(),
-            ));
-        }
-        desugar_attribute_updates(attr_updates)?
-    } else {
-        (
-            input.update_expression.clone(),
-            HashMap::new(),
-            HashMap::new(),
-        )
-    };
+    let (effective_update_expr, extra_expr_values, extra_expr_names) =
+        if let Some(attr_updates) = &input.attribute_updates {
+            desugar_attribute_updates(attr_updates)?
+        } else {
+            (
+                input.update_expression.clone(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+        };
 
     // Merge extra expression values from desugaring with any existing ones.
     let effective_expr_values = if extra_expr_values.is_empty() {
@@ -101,14 +122,6 @@ pub async fn handle_update_item(
         Some(merged)
     };
 
-    let has_update_expr = input
-        .update_expression
-        .as_ref()
-        .is_some_and(|s| !s.is_empty());
-    let has_condition = input
-        .condition_expression
-        .as_ref()
-        .is_some_and(|s| !s.is_empty());
     let has_expr = has_update_expr || has_condition;
     extenddb_core::expression::validate_expression_param_usage(
         input.expression_attribute_names.as_ref(),
@@ -116,6 +129,12 @@ pub async fn handle_update_item(
         input.expression_attribute_values.as_ref(),
         has_expr,
         &[ExpressionKind::Update, ExpressionKind::Condition],
+    )?;
+
+    // ConditionalOperator requires an Expected with two or more conditions.
+    extenddb_core::validation::validate_conditional_operator_usage(
+        has_cond_op,
+        input.expected.as_ref().map_or(0, HashMap::len),
     )?;
 
     let (condition, maps) = resolve_condition(
@@ -182,24 +201,27 @@ pub async fn handle_update_item(
         &key_info.attribute_definitions,
     )?;
 
-    // Amazon DynamoDB enforces nesting depth on values that are stored as item
-    // attributes. For UpdateExpression, walk each SET action's RHS to find the
-    // EAV placeholders it references, resolve them against `maps.values`, and
-    // validate those values' depth. Condition-only EAV is left alone: real
-    // DynamoDB does not apply the nesting limit to values used solely in a
-    // ConditionExpression (verified against the service).
-    {
-        let mut placeholders: Vec<String> = Vec::new();
-        for action in &actions {
-            if let UpdateAction::Set { value, .. } = action {
-                extenddb_core::expression::collect_value_placeholders(value, &mut placeholders);
-            }
-        }
-        let stored: Vec<&extenddb_core::types::AttributeValue> = placeholders
-            .iter()
-            .filter_map(|name| maps.values.get(name))
-            .collect();
-        extenddb_core::validation::validate_attribute_values_nesting_depth(stored)?;
+    // Vector and search-schema attributes are deliberately NOT validated here.
+    // Their validity is a property of the stored value, and the stored value
+    // does not exist until the actions have been evaluated against the
+    // pre-update image, which only the storage layer holds. Validating
+    // expression forms here instead would silently miss every RHS that is not
+    // a bare placeholder (`list_append`, `if_not_exists`, attribute copies, and
+    // anything added later). The authoritative check is
+    // `expression::apply_update_validated`, which every backend applies to the
+    // evaluated image and which no expression form can bypass.
+
+    // Amazon DynamoDB enforces the nesting-depth limit on EVERY
+    // ExpressionAttributeValue, condition-only placeholders included: a
+    // 32-level value referenced solely by a ConditionExpression answers the
+    // nesting ValidationException rather than evaluating the condition.
+    // An earlier measurement had condition-only values exempt, and some
+    // regions did behave that way; re-measured 2026-08-24, both us-east-1 and
+    // eu-west-2 apply the limit to the whole map, so the per-placeholder walk
+    // this replaced is gone. A 31-level value still passes and the condition
+    // evaluates normally.
+    if let Some(values) = &input.expression_attribute_values {
+        extenddb_core::validation::validate_attribute_values_nesting_depth(values.values())?;
     }
 
     // Validate that no update action targets a key attribute (REQ-DATA-003)
@@ -217,6 +239,8 @@ pub async fn handle_update_item(
         region: ctx.region.clone(),
     });
     let need_old_for_stream = stream.is_some();
+    let need_old_for_capacity =
+        input.return_consumed_capacity != extenddb_core::types::ReturnConsumedCapacity::None;
 
     let (old_item, new_item) = ctx
         .storage
@@ -224,7 +248,7 @@ pub async fn handle_update_item(
             &key_info,
             &input.key,
             &actions,
-            return_old || need_old_for_stream,
+            return_old || need_old_for_stream || need_old_for_capacity,
             true, // always fetch new item for WCU calculation
             condition.as_ref(),
             &maps,
@@ -241,6 +265,20 @@ pub async fn handle_update_item(
     let old_bytes = old_item.as_ref().map_or(0, item_size_bytes);
     let new_bytes = new_item.as_ref().map_or(0, item_size_bytes);
     let wcu = capacity_helpers::write_capacity_units(old_bytes.max(new_bytes));
+
+    // Index capacity follows the old-to-new transition, so removing a sparse
+    // index key charges the deleted projection and changing an index key charges
+    // both the old deletion and new insertion. Metadata comes from cached
+    // `TableKeyInfo`; no describe-table round-trip is needed.
+    let consumed_capacity = capacity_helpers::write_capacity_indexed(
+        input.return_consumed_capacity,
+        &input.table_name,
+        wcu,
+        old_item.as_ref(),
+        new_item.as_ref(),
+        false,
+        &key_info,
+    );
 
     // Select the appropriate return value.
     // UPDATED_OLD and UPDATED_NEW return only the attributes that were
@@ -259,11 +297,7 @@ pub async fn handle_update_item(
 
     let output = UpdateItemOutput {
         attributes,
-        consumed_capacity: capacity_helpers::write_capacity(
-            input.return_consumed_capacity,
-            &input.table_name,
-            wcu,
-        ),
+        consumed_capacity,
         item_collection_metrics: capacity_helpers::item_metrics(
             input.return_item_collection_metrics,
             &key_info.key_schema,

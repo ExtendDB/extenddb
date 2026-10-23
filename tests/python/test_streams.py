@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import time
+import uuid
 
 import boto3
 import botocore.config
@@ -46,9 +47,9 @@ def streams_client(endpoint_url):
     return boto3.client(**kwargs)
 
 
-def _create_stream_table(dynamodb_client) -> tuple[str, str]:
+def _create_stream_table(dynamodb_client, name: str | None = None) -> tuple[str, str]:
     """Create a table with streams enabled, return (table_name, stream_arn)."""
-    name = unique_name("stream")
+    name = name or unique_name("stream")
     resp = dynamodb_client.create_table(
         TableName=name,
         AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
@@ -93,6 +94,25 @@ def _read_all_shards(
             if not iterator or not resp["Records"]:
                 break
     return all_records
+
+
+class TestShortTableName:
+    """Regression: short table names produced under-length ShardIds."""
+
+    def test_get_shard_iterator_with_short_table_name(
+        self, dynamodb_client, streams_client
+    ):
+        name = f"t{uuid.uuid4().hex[:5]}"  # 6 chars, well inside the old danger zone
+        _, stream_arn = _create_stream_table(dynamodb_client, name=name)
+        try:
+            dynamodb_client.put_item(TableName=name, Item={"pk": {"S": "a1"}})
+            records = _read_all_shards(streams_client, stream_arn)
+            assert any(
+                r["dynamodb"]["Keys"] == {"pk": {"S": "a1"}} for r in records
+            )
+        finally:
+            dynamodb_client.delete_table(TableName=name)
+            wait_for_deleted(dynamodb_client, name)
 
 
 class TestListStreams:

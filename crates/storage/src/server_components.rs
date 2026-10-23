@@ -4,8 +4,10 @@
 //! Backend factory infrastructure for creating server components.
 //!
 //! This module provides the factory pattern for creating storage backends.
-//! Backends register themselves via the inventory crate, allowing `cmd_serve`
-//! to remain backend-agnostic.
+//! A binary serves exactly one backend, installed from its thin `main` via
+//! [`crate::set_backend`]; this factory is reached through the installed
+//! [`crate::Backend`] value, which is what keeps `cmd_serve` backend-agnostic
+//! without a registry to look anything up in.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -40,8 +42,8 @@ pub struct ServerComponents {
 /// Errors that can occur during backend initialization.
 #[derive(Debug)]
 pub enum BackendError {
-    /// Backend name not registered
-    UnknownBackend(String),
+    /// No storage backend has been installed (set_backend was not called).
+    BackendNotInstalled,
 
     /// Failed to connect to backend database
     ConnectionFailed { backend: String, details: String },
@@ -59,8 +61,11 @@ pub enum BackendError {
 impl std::fmt::Display for BackendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnknownBackend(b) => {
-                write!(f, "Unknown backend '{b}'. Available backends: postgres")
+            Self::BackendNotInstalled => {
+                write!(
+                    f,
+                    "no storage backend installed (set_backend was not called)"
+                )
             }
             Self::ConnectionFailed { backend, details } => {
                 write!(f, "Failed to connect to {backend}: {details}")
@@ -80,42 +85,137 @@ impl std::fmt::Display for BackendError {
 
 impl std::error::Error for BackendError {}
 
-/// Factory function type for creating server components.
-///
-/// Takes a `StorageConfig` trait object and region string, returns a Future
-/// that resolves to `ServerComponents` or `BackendError`.
-pub type ServerComponentsFactory =
-    fn(
-        &dyn StorageConfig,
-        &str,
-    ) -> Pin<Box<dyn Future<Output = Result<ServerComponents, BackendError>> + Send>>;
-
-/// Registration for backend server components factory.
-///
-/// Backends submit this via `inventory::submit`! to register themselves.
-pub struct ServerComponentsRegistration {
-    /// Backend name (e.g., "postgres")
-    pub backend: &'static str,
-
-    /// Factory function that creates the backend components
-    pub factory: ServerComponentsFactory,
+/// Options for server-component creation, beyond the storage config itself.
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
+pub struct ServerComponentsOptions {
+    /// Bootstrap the catalog at serve time when it is not initialized,
+    /// instead of failing with `InitializationFailed`. Set by dev-mode builds
+    /// so `serve` works with no prior `init` (zero-config local/CI use).
+    /// Backends whose bootstrap requires operator input ignore this and fail
+    /// as usual; backends with a self-contained bootstrap (SQLite) honor it.
+    pub bootstrap_if_uninitialized: bool,
 }
 
-inventory::collect!(ServerComponentsRegistration);
-
-/// Create server components for the specified backend.
+/// Factory function type for creating server components.
 ///
-/// Searches registered backends via inventory and calls the matching factory.
-/// Returns `UnknownBackend` error if the backend is not registered.
+/// Takes a `StorageConfig` trait object, region string, and options; returns
+/// a Future that resolves to `ServerComponents` or `BackendError`.
+///
+/// The trait object is bound `+ 'static` (rather than the reference's own
+/// elided lifetime) so factories can use [`StorageConfig::as_any`] to
+/// downcast to a concrete backend config and read backend-specific settings
+/// (e.g. the mongo backend's `transaction_read_concern`) — `Any::downcast_ref`
+/// requires the pointee to be provably `'static`, which an unannotated `&dyn
+/// StorageConfig` does not guarantee even though every real implementor owns
+/// its data.
+pub type ServerComponentsFactory =
+    fn(
+        &(dyn StorageConfig + 'static),
+        &str,
+        ServerComponentsOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<ServerComponents, BackendError>> + Send>>;
+
+/// Create server components using the installed backend.
+///
+/// Calls the factory of the [`Backend`](crate::Backend) installed via
+/// [`set_backend`](crate::set_backend). Returns `BackendNotInstalled` if no
+/// backend has been installed.
+///
+/// A `region` the `BackupArn` parser would refuse is logged at warn first
+/// ([`crate::config::server_region_warning`]): the server still starts, but
+/// the operator is told its own backup ARNs will not resolve.
 pub async fn create_server_components(
-    backend: &str,
-    config: &dyn StorageConfig,
+    config: &(dyn StorageConfig + 'static),
     region: &str,
+    options: ServerComponentsOptions,
 ) -> Result<ServerComponents, BackendError> {
-    for reg in inventory::iter::<ServerComponentsRegistration> {
-        if reg.backend == backend {
-            return (reg.factory)(config, region).await;
+    if let Some(warning) = crate::config::server_region_warning(region) {
+        tracing::warn!("{}", warning.log_message());
+    }
+    let backend = crate::backend::try_backend().ok_or(BackendError::BackendNotInstalled)?;
+    (backend.server_components)(config, region, options).await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fmt::Write as _;
+    use std::sync::{Arc, Mutex};
+
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Level, Subscriber};
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+    use super::*;
+
+    /// Collects the message of every warn-level event.
+    #[derive(Default)]
+    struct Warnings(Arc<Mutex<Vec<String>>>);
+
+    struct Message(String);
+
+    impl Visit for Message {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                let _ = write!(self.0, "{value:?}");
+            }
         }
     }
-    Err(BackendError::UnknownBackend(backend.to_string()))
+
+    impl<S: Subscriber> Layer<S> for Warnings {
+        fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
+            if *event.metadata().level() == Level::WARN {
+                let mut message = Message(String::new());
+                event.record(&mut message);
+                self.0.lock().unwrap().push(message.0);
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct NoConfig;
+
+    impl StorageConfig for NoConfig {
+        fn connection_config(&self) -> &str {
+            ""
+        }
+        fn max_connections(&self) -> u32 {
+            1
+        }
+        fn max_catalog_connections(&self) -> u32 {
+            1
+        }
+        fn clone_box(&self) -> Box<dyn StorageConfig> {
+            Box::new(NoConfig)
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// No backend is installed in this crate's tests, so the call fails
+    /// after the region check; the warning is what is under test.
+    async fn warnings_for(region: &str) -> Vec<String> {
+        let warnings = Warnings::default();
+        let collected = Arc::clone(&warnings.0);
+        let subscriber = tracing_subscriber::registry().with(warnings);
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let result =
+            create_server_components(&NoConfig, region, ServerComponentsOptions::default()).await;
+        assert!(matches!(result, Err(BackendError::BackendNotInstalled)));
+        collected.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn a_region_outside_the_backup_arn_class_is_warned_about_at_startup() {
+        let warnings = warnings_for("LOCAL").await;
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("server.region"), "{warnings:?}");
+        assert!(warnings[0].contains("LOCAL"), "{warnings:?}");
+        assert!(
+            warnings[0].contains("BackupArn is not valid"),
+            "{warnings:?}"
+        );
+        assert!(warnings_for("us-east-1").await.is_empty());
+    }
 }

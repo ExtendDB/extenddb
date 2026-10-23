@@ -7,15 +7,20 @@ Refreshed: v0.0.118 (P115)
 - ⬜ **Backup `TableNotFoundException`** — extenddb returns `ResourceNotFoundException` for backup operations on nonexistent tables; real DynamoDB returns `TableNotFoundException`. Requires adding a new error variant. (P114 follow-up)
 - ⬜ **Tagging rate limiting** — extenddb should implement `LimitExceededException` for rapid tag operations to match real DynamoDB behavior. 5 tagging tests fail against real DynamoDB due to this. (P114 follow-up)
 - ⬜ **Key-vs-item size gap** — batch/transact delete/update WCU uses key size, not old item size. Minor fidelity gap.
+- ⬜ **`f64` equality in `NumericEquals`/`NumericNotEquals`** — `policy/condition.rs` compares parsed numeric condition values with `f64` equality, violating the numeric-safety rule (and clippy `float_cmp`). Verify against AWS numeric-condition semantics (AWS treats these as arbitrary-precision decimals) and switch to `BigDecimal`/integer comparison. (BR-7085 follow-up)
+- ⬜ **Non-`2012-10-17` policy `Version` accepted with warning** — extenddb accepts policy documents with an unrecognized `Version` string and logs a warning; real AWS rejects them with a `MalformedPolicyDocument` error. Confirm intended behavior and align. (BR-7085 follow-up)
 
 ## Test Gaps
 
-- ⬜ **CLI lifecycle tests** — 9 tests exist but require `EXTENDDB_TEST_PG_CONNECTION_STRING` (separate from standard suite). Currently produce 1 failure + 9 errors in pytest output. Not run by `run-tests --pytest`.
+- ⬜ **CLI lifecycle tests** — 9 tests exist but require `EXTENDDB_TEST_PG_CONNECTION_STRING` (separate from standard suite). Currently produce 1 failure + 9 errors in pytest output. Not run by `run-tests --pytest`. The connection-string role (`extenddb`) needs `CREATEDB` in the local test PostgreSQL for these to pass; grant it as part of local test setup.
 - ⬜ **Cross-restart metrics test** — 12 metrics tests exist but none verify metrics survive a server restart.
+- ⬜ **Rust integration tests leak tables** — `tests/rust/src/batch_transact_authz.rs::tables()` creates `BtaAllowed_*`/`BtaSecret_*` tables with no teardown. Under `run-tests --all` (rust-integration before pytest) these pollute the shared server and cause `test_table_operations.py::test_list_tables_pagination` to fail. Add teardown to the Rust suite and add `Bta`/`BtaSecret` to `devtools/cleanup-test-tables` `TEST_PREFIXES`. (BR-7085 test-run finding)
+- ⬜ **`test_list_tables_pagination` isolation sensitivity** — passes in isolation, fails when the shared server carries leaked tables from other suites. Consider scoping the assertion to a unique table-name prefix. (BR-7085 test-run finding)
+- ⬜ **OnDemandThroughput pytest cases need modern boto3** — `test_config_fields.py::TestOnDemandThroughput` fails with `botocore ParamValidationError` on the pinned Python 3.7 / pre-2023 botocore (no `OnDemandThroughput` param). Pre-existing (present in the a2f734c baseline). Upgrade the test venv to a botocore that models `OnDemandThroughput`. (BR-7085 test-run finding)
 
 ## Code Quality Debt
 
-- ⬜ **8 files over 500 lines** — `validation/mod.rs` (969), `policy/condition.rs` (720), `key_condition.rs` (702), `policy/evaluator.rs` (675), `backup_engine.rs` (581), `throttle.rs` (561), `update_evaluator.rs` (561), `policy/document.rs` (552). Human deferred to after testing is complete. P114 recommends splitting validation/mod.rs into `validation/table.rs`, `validation/item.rs`, `validation/key.rs`.
+- ⬜ **6 files over 500 lines** — `validation/mod.rs` (969), `key_condition.rs` (702), `backup_engine.rs` (581), `throttle.rs` (561), `update_evaluator.rs` (561), `policy/document.rs` (552). Human deferred to after testing is complete. P114 recommends splitting validation/mod.rs into `validation/table.rs`, `validation/item.rs`, `validation/key.rs`. (`policy/condition.rs` and `policy/evaluator.rs` split into nested `tests/` modules under 500 lines each in BR-7085.)
 - ⬜ Handler boilerplate consolidation
 - ⬜ AST cache for expressions
 - ⬜ Benchmarking gate
@@ -35,6 +40,8 @@ Refreshed: v0.0.118 (P115)
 ## Standing Items (need human decision)
 
 - ⬜ **22 unapproved license dependencies** — Unicode-3.0, CDLA-Permissive-2.0, MPL-2.0. All pre-existing. Human approved as-is (P99 session).
+- ⬜ **Policy-variable expansion spec/code/AWS divergence** — `05-component-auth.md` §6.5 and `01-requirements.md` (REQ-ABAC-006) state variable substitution is deferred/literal, but `condition.rs::expand_policy_variables` **is** implemented and applied to Condition values only, not Resource ARNs (`evaluator.rs::resource_matches`/`arn_match` do not expand). AWS expands in both. Three-way inconsistent (spec vs code vs AWS). Fail-closed (a `${var}` in a Resource ARN silently fails to match), so not a leak. Resolve by either (a) documenting the implemented condition-value expansion and marking resource-ARN expansion deferred, or (b) completing REQ-ABAC-006. Needs human direction. (BR-7085)
+
 
 ## Recently Completed
 

@@ -363,7 +363,7 @@ Item size is calculated as the sum of all attribute (name size + value size) pai
 | `BOOL` | 1 byte |
 | `NULL` | 1 byte |
 | `L` | Sum of (element value size + 1 byte overhead per element) for all elements. Empty list = 3 bytes overhead. |
-| `M` | Sum of (key name UTF-8 byte length + value size + 3 bytes overhead per entry) for all entries. Empty map = 3 bytes overhead. |
+| `M` | Sum of (key name UTF-8 byte length + value size + 1 byte overhead per entry) for all entries. Empty map = 3 bytes overhead. |
 
 **Total item size** = sum of (attribute name byte length + attribute value size) for all top-level attributes.
 
@@ -388,7 +388,7 @@ fn calculate_attribute_size(value: &AttributeValue) -> usize {
             3 + list.iter().map(|v| calculate_attribute_size(v) + 1).sum::<usize>()
         }
         AttributeValue::M(map) => {
-            3 + map.iter().map(|(k, v)| k.len() + calculate_attribute_size(v) + 3).sum::<usize>()
+            3 + map.iter().map(|(k, v)| k.len() + calculate_attribute_size(v) + 1).sum::<usize>()
         }
     }
 }

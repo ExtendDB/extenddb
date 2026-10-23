@@ -14,7 +14,7 @@ pub fn validate_and_normalize_number(s: &str) -> Result<String, DynamoDbError> {
     // genuinely empty string is reported with a distinct message from a
     // malformed-but-non-empty one.
     if s.is_empty() {
-        return Err(number_err());
+        return Err(empty_numeric_err());
     }
 
     let (negative, rest) = match s.strip_prefix('-') {
@@ -75,7 +75,7 @@ pub fn validate_and_normalize_number(s: &str) -> Result<String, DynamoDbError> {
     }
 
     if sig_trimmed.len() > MAX_SIGNIFICANT_DIGITS {
-        return Err(number_err());
+        return Err(too_many_digits_err());
     }
 
     // The exponent for the normalized form:
@@ -90,10 +90,10 @@ pub fn validate_and_normalize_number(s: &str) -> Result<String, DynamoDbError> {
     let magnitude_exp = sig_trimmed.len() as i32 - 1 + point_offset + trailing_zeros as i32;
 
     if magnitude_exp > MAX_EXPONENT {
-        return Err(number_err());
+        return Err(overflow_err());
     }
     if magnitude_exp < MIN_EXPONENT {
-        return Err(number_err());
+        return Err(underflow_err());
     }
 
     // Format the normalized number
@@ -143,9 +143,39 @@ fn format_plain(negative: bool, digits: &str, exp: i32) -> String {
     result
 }
 
-fn number_err() -> DynamoDbError {
+/// Empty number string, e.g. `{"N":""}`. Real `DynamoDB` reports the generic
+/// numeric-conversion failure with no offending value appended (distinct from
+/// the malformed-but-non-empty message, which appends the input).
+fn empty_numeric_err() -> DynamoDbError {
     DynamoDbError::ValidationException(
-        "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes"
+        "The parameter cannot be converted to a numeric value".to_owned(),
+    )
+}
+
+/// More than 38 significant digits. Real `DynamoDB`:
+/// "Attempting to store more than 38 significant digits in a Number".
+fn too_many_digits_err() -> DynamoDbError {
+    DynamoDbError::ValidationException(
+        "Attempting to store more than 38 significant digits in a Number".to_owned(),
+    )
+}
+
+/// Magnitude above the supported exponent ceiling. Real `DynamoDB`:
+/// "Number overflow. Attempting to store a number with magnitude larger than
+/// supported range".
+fn overflow_err() -> DynamoDbError {
+    DynamoDbError::ValidationException(
+        "Number overflow. Attempting to store a number with magnitude larger than supported range"
+            .to_owned(),
+    )
+}
+
+/// Magnitude below the supported exponent floor. Real `DynamoDB`:
+/// "Number underflow. Attempting to store a number with magnitude smaller than
+/// supported range".
+fn underflow_err() -> DynamoDbError {
+    DynamoDbError::ValidationException(
+        "Number underflow. Attempting to store a number with magnitude smaller than supported range"
             .to_owned(),
     )
 }
@@ -190,7 +220,11 @@ mod tests {
     #[test]
     fn rejects_39_significant_digits() {
         let n = "1".repeat(39);
-        assert!(validate_and_normalize_number(&n).is_err());
+        let err = validate_and_normalize_number(&n).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Attempting to store more than 38 significant digits in a Number"
+        );
     }
 
     #[test]
@@ -201,7 +235,11 @@ mod tests {
 
     #[test]
     fn rejects_over_max_positive() {
-        assert!(validate_and_normalize_number("1E126").is_err());
+        let err = validate_and_normalize_number("1E126").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Number overflow. Attempting to store a number with magnitude larger than supported range"
+        );
     }
 
     #[test]
@@ -211,7 +249,11 @@ mod tests {
 
     #[test]
     fn rejects_below_min_positive() {
-        assert!(validate_and_normalize_number("1E-131").is_err());
+        let err = validate_and_normalize_number("1E-131").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Number underflow. Attempting to store a number with magnitude smaller than supported range"
+        );
     }
 
     #[test]
@@ -279,8 +321,14 @@ mod tests {
     }
 
     #[test]
-    fn empty_uses_empty_value_message() {
+    fn empty_uses_numeric_value_message() {
+        // Real DynamoDB reports an empty number string ({"N":""}) as a
+        // numeric-conversion failure with no value appended, distinct from the
+        // empty-AttributeValue message.
         let err = validate_and_normalize_number("").unwrap_err();
-        assert!(err.to_string().contains("Supplied AttributeValue is empty"));
+        assert_eq!(
+            err.to_string(),
+            "The parameter cannot be converted to a numeric value"
+        );
     }
 }

@@ -10,15 +10,23 @@
 
 pub(crate) mod authorization;
 pub mod authz_cache;
+pub(crate) mod authz_resource;
 pub mod console;
+pub mod dev_credentials;
 mod handler;
+mod import_export_paths;
 pub mod key_info_cache;
+mod leading_keys;
 pub mod management;
 mod metrics_endpoint;
 pub mod rate_limit;
 mod request_helpers;
 mod response;
+mod serve;
 mod throttle_helpers;
+mod workers;
+
+pub use serve::{BuildInfo, LogTarget, ServeParams, log_to_syslog_raw, serve};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -56,6 +64,10 @@ pub struct AppState {
     pub metrics: Arc<MetricsCollector>,
     /// Whether TLS is enabled (affects cookie Secure flag).
     pub tls_enabled: bool,
+    /// Developer mode: authorization is opened for authenticated callers (SigV4
+    /// is still verified). Only ever true in a `dev-mode` build bound to
+    /// loopback; the bin's serve path enforces those preconditions.
+    pub dev_mode: bool,
     /// Allowed directories for import file operations. Empty means imports
     /// are disabled (secure default).
     pub import_paths: Arc<[Arc<std::path::PathBuf>]>,
@@ -113,8 +125,10 @@ pub async fn start_server(
     let catalog_store = state.catalog_store.clone();
     let auth_cache_for_mgmt = state.auth_cache.clone();
     let auth_cache_for_console = state.auth_cache.clone();
+    let metrics_for_console = state.metrics.clone();
     let authz_cache_for_mgmt = state.authz_cache.clone();
     let table_key_info_cache_for_mgmt = state.table_key_info_cache.clone();
+    let mgmt_region = state.region.clone();
     let version_info = state.version_info.clone();
     let docs_store = state.docs_store.clone();
     let listen_url = {
@@ -144,11 +158,12 @@ pub async fn start_server(
         .route("/", post(handler::handle_request))
         .layer(DefaultBodyLimit::max(DYNAMODB_BODY_LIMIT))
         .route("/health", get(health_check))
-        // REQ-OBS-005: Prometheus-compatible metrics endpoint. Public by
-        // design (Prometheus scrapers expect no auth on the scrape URL);
-        // operators who need stricter access should expose this on a
-        // separate bind via firewall/proxy. Returns aggregate metrics
-        // only; per-request data is in the management API.
+        // REQ-OBS-005: Prometheus-compatible metrics endpoint. Requires admin
+        // HTTP Basic auth (enforced in the handler) because the payload carries
+        // per-table CloudWatch-style dimensions, so it is served only to an
+        // authorized caller. Prometheus scrapers configure
+        // `basic_auth`. The web console dashboard uses the session-authed
+        // `/console/metrics-data` route instead.
         .route("/metrics", get(metrics_endpoint::metrics_endpoint))
         // S-6: Explicit small body limit for non-DynamoDB endpoints.
         .layer(DefaultBodyLimit::max(1024))
@@ -161,6 +176,8 @@ pub async fn start_server(
             auth_cache: auth_cache_for_mgmt,
             authz_cache: authz_cache_for_mgmt,
             table_key_info_cache: table_key_info_cache_for_mgmt,
+            region: mgmt_region,
+            secure_transport: tls_enabled,
         });
         let mgmt_router = management::router().with_state(mgmt_state);
         app = app.nest("/management", mgmt_router);
@@ -173,6 +190,7 @@ pub async fn start_server(
             catalog_store,
             docs_store: docs_store.clone(),
             auth_cache: auth_cache_for_console,
+            metrics: metrics_for_console,
         });
         let console_router = console::router().with_state(console_state);
         app = app
@@ -235,7 +253,8 @@ pub async fn start_server(
         // connection. If it's plain HTTP (not 0x16 TLS ClientHello), write
         // a 301 redirect to HTTPS and reject the connection before the TLS
         // handshake. This gives users a helpful redirect instead of a
-        // confusing TLS handshake failure.
+        // confusing TLS handshake failure. The same acceptor sets
+        // TCP_NODELAY on every accepted socket before the handshake.
         let redirect_acceptor = HttpsRedirectAcceptor { addr: local_addr };
         axum_server::from_tcp_rustls(std_listener, rustls_config)?
             .map(|tls| tls.acceptor(redirect_acceptor))
@@ -245,7 +264,7 @@ pub async fn start_server(
     } else {
         tracing::info!("extenddb listening on {local_addr}");
         axum::serve(
-            listener,
+            nodelay_listener(listener),
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
         .with_graceful_shutdown(graceful_shutdown(pid_file.clone()))
@@ -285,12 +304,51 @@ fn cleanup_pid_file(pid_file: Option<&std::path::Path>) {
     }
 }
 
+/// Set `TCP_NODELAY` on an accepted socket.
+///
+/// With Nagle's algorithm on, the kernel holds a small write while an earlier
+/// small write on the connection is unacknowledged, and the client's delayed
+/// ACK leaves with its next request on that connection or when its timer
+/// fires (about 40 ms on Linux). Once one response is written while the
+/// previous one is unacknowledged, each response waits for the client's next
+/// request, and the reply to that request is held behind it in turn. The
+/// response latency then equals the gap between the client's requests on the
+/// connection, for every gap under the delayed-ACK timer. `TCP_NODELAY` sends
+/// each write as it is made. The option lives on the TCP socket, so under TLS
+/// it is set before the handshake and applies below the TLS stream. A failure
+/// to set it is logged at debug and the connection is served with the kernel
+/// default.
+fn set_tcp_nodelay(stream: &tokio::net::TcpStream) {
+    if let Err(e) = stream.set_nodelay(true) {
+        tracing::debug!("Failed to set TCP_NODELAY on accepted connection: {e}");
+    }
+}
+
+/// The plaintext listener: a `TcpListener` whose accepted sockets carry
+/// `TCP_NODELAY`.
+type NodelayListener = axum::serve::TapIo<tokio::net::TcpListener, fn(&mut tokio::net::TcpStream)>;
+
+/// Wrap the plaintext listener so every accepted socket carries `TCP_NODELAY`.
+///
+/// `axum::serve` does not set the option itself; `ListenerExt::tap_io` is its
+/// hook for per-connection socket options.
+fn nodelay_listener(listener: tokio::net::TcpListener) -> NodelayListener {
+    use axum::serve::ListenerExt;
+    listener.tap_io(|stream| set_tcp_nodelay(stream))
+}
+
 /// AI-2: Acceptor that detects plain HTTP connections on the TLS port.
 ///
-/// Peeks the first byte of each connection. If it's `0x16` (TLS `ClientHello`),
-/// the connection passes through to the TLS acceptor. If it's a plain HTTP
-/// verb, a 301 redirect to `https://` is written and the connection is
-/// rejected with an IO error (which `axum_server` handles by dropping it).
+/// Sets `TCP_NODELAY` on the accepted socket first (see [`set_tcp_nodelay`]).
+/// Then peeks the first byte of the connection. If it's `0x16` (TLS
+/// `ClientHello`), the connection passes through to the TLS acceptor. If it's
+/// a plain HTTP verb, a 301 redirect to `https://` is written and the
+/// connection is rejected with an IO error (which `axum_server` handles by
+/// dropping it).
+///
+/// `axum_server` 0.8 ships a `NoDelayAcceptor`, but it cannot be stacked under
+/// this acceptor without a generic wrapper, so this acceptor sets the option
+/// itself, and logs instead of rejecting on failure.
 #[derive(Clone)]
 struct HttpsRedirectAcceptor {
     addr: std::net::SocketAddr,
@@ -310,6 +368,7 @@ impl<S: Send + 'static> axum_server::accept::Accept<tokio::net::TcpStream, S>
     fn accept(&self, stream: tokio::net::TcpStream, service: S) -> Self::Future {
         let addr = self.addr;
         Box::pin(async move {
+            set_tcp_nodelay(&stream);
             let mut peek_buf = [0u8; 1];
             match stream.peek(&mut peek_buf).await {
                 Ok(0) => {
@@ -350,6 +409,7 @@ fn send_https_redirect(stream: &tokio::net::TcpStream, addr: std::net::SocketAdd
     let _ = stream.try_write(response.as_bytes());
 }
 
+#[cfg(unix)]
 async fn shutdown_signal() {
     let ctrl_c = tokio::signal::ctrl_c();
     let Ok(mut sigterm) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -364,4 +424,77 @@ async fn shutdown_signal() {
         _ = sigterm.recv() => {},
     }
     tracing::info!("Shutdown signal received, draining connections...");
+}
+
+/// Non-unix: there is no SIGTERM; Ctrl+C (which tokio maps to the console
+/// control handler on Windows) is the only shutdown signal — and it only
+/// fires for an interactive console. Supervisors that terminate the process
+/// directly (including the npm launcher's `stop()`, which is
+/// `TerminateProcess` on Windows) hard-kill without reaching this path, so
+/// the worker drain is skipped. That is acceptable: drain only cancels and
+/// joins background workers — it flushes nothing, and storage commits
+/// per-transaction.
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+    tracing::info!("Shutdown signal received, draining connections...");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// Bind a loopback listener and connect one client to it.
+    async fn bind_and_connect() -> (TcpListener, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let client = TcpStream::connect(addr).await.expect("connect");
+        (listener, client)
+    }
+
+    /// The TLS path: the acceptor that runs before the TLS handshake sets
+    /// `TCP_NODELAY` on the accepted socket, read back from the socket the
+    /// acceptor hands on.
+    #[tokio::test]
+    async fn tls_acceptor_sets_tcp_nodelay_before_the_handshake() {
+        use axum_server::accept::Accept;
+
+        let (listener, mut client) = bind_and_connect().await;
+        // A TLS ClientHello starts with the handshake record type.
+        client
+            .write_all(&[0x16])
+            .await
+            .expect("write ClientHello byte");
+        let (accepted, _) = listener.accept().await.expect("accept");
+        assert!(
+            !accepted.nodelay().expect("read TCP_NODELAY"),
+            "a fresh accepted socket has Nagle on"
+        );
+
+        let acceptor = HttpsRedirectAcceptor {
+            addr: listener.local_addr().expect("local addr"),
+        };
+        let (stream, ()) = acceptor
+            .accept(accepted, ())
+            .await
+            .expect("a TLS ClientHello passes through to the TLS acceptor");
+        assert!(stream.nodelay().expect("read TCP_NODELAY"));
+    }
+
+    /// The plaintext path: the listener handed to `axum::serve` sets
+    /// `TCP_NODELAY` on every socket it accepts.
+    #[tokio::test]
+    async fn plaintext_listener_sets_tcp_nodelay_on_accepted_sockets() {
+        use axum::serve::Listener;
+
+        let (listener, client) = bind_and_connect().await;
+        let mut listener = nodelay_listener(listener);
+        let (accepted, peer) = listener.accept().await;
+        assert_eq!(peer, client.local_addr().expect("client addr"));
+        assert!(accepted.nodelay().expect("read TCP_NODELAY"));
+    }
 }

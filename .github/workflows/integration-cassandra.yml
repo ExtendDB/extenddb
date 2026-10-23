@@ -1,0 +1,226 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+name: Cassandra Integration Tests
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches: [main, feat/storage-cassandra-in-tree]
+
+permissions:
+  contents: read
+
+# Supersede an in-flight run of the SAME pull request when a new push arrives,
+# so repeated pushes do not stack up on a capped pool. Non-PR runs get a group
+# unique to the run (run_id): merge-group runs reuse a ref across re-queues,
+# and GitHub concurrency replaces a PENDING run in a group even with
+# cancel-in-progress false, so keying them by ref would let one merge-group
+# run cancel another and evict its queue entry.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+
+# The Cassandra backend's integration tests (crates/storage-cassandra/tests)
+# talk to a live node at 127.0.0.1:9042 with default cassandra/cassandra
+# credentials. This workflow enables them to run in CI.
+#
+# A single-node Cassandra installation is enough. the tests create their own
+# keyspaces with replication factor (RF) of 1 (one).
+#
+# The cassandra:4.1 image does not recognize CASSANDRA_AUTHENTICATOR as an
+# environment variable for configuring authentication, so each job patches
+# cassandra.yaml inside the running container to enable password auth, and
+# restarts it before running any tests. The health-check on the service container
+# uses the default AllowAllAuthenticator auth (no auth challenge) before the
+# patch step runs. After the restart a second wait loop confirms the node is
+# back up with PasswordAuthenticator active.
+
+jobs:
+  cassandra-storage:
+    # Dedicated ExtendDB runner group (Ubuntu 24.04, 4 vCPU / 16 GB, capped at
+    # 20 concurrent). ubuntu-latest is an Amazon-wide shared pool where our jobs
+    # waited 10-90 minutes to start (2026-09-29/30); see integration.yml.
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 45
+    services:
+      cassandra:
+        image: cassandra:4.1
+        ports:
+          - 9042:9042
+        env:
+          CASSANDRA_CLUSTER_NAME: extenddb-ci
+          HEAP_NEWSIZE: 128M
+          MAX_HEAP_SIZE: 1024M
+        options: >-
+          --health-cmd "cqlsh -e 'SELECT release_version FROM system.local'"
+          --health-interval 15s
+          --health-timeout 10s
+          --health-retries 20
+          --health-start-period 60s
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Configure Cassandra authentication
+        run: |
+          docker exec ${{ job.services.cassandra.id }} sed -i \
+            's/^authenticator: .*/authenticator: PasswordAuthenticator/' \
+            /etc/cassandra/cassandra.yaml
+          docker restart ${{ job.services.cassandra.id }}
+          for i in $(seq 1 90); do
+            if docker exec ${{ job.services.cassandra.id }} \
+                cqlsh -u cassandra -p cassandra \
+                -e 'SELECT release_version FROM system.local' \
+                >/dev/null 2>&1; then
+              echo "Cassandra ready with PasswordAuthenticator after ${i}s"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Cassandra did not become ready" >&2; exit 1
+      - name: Unit tests
+        run: cargo test -p extenddb-storage-cassandra --lib
+      - name: TTL integration tests
+        continue-on-error: true  # TTL integration tests are known-flaky under CI load; tracked in #338
+        run: cargo test -p extenddb-storage-cassandra --test ttl_integration -- --test-threads=1
+        env:
+          EXTENDDB_TEST_CASSANDRA: required
+      - name: Direct storage-trait integration tests
+        # Ported from the plug-in repo's tests/rust suite. Parallel-safe:
+        # each test provisions its own account and keyspace; the shared
+        # control-plane setting test restores what it mutates.
+        run: cargo test -p extenddb-storage-cassandra --test direct_integration
+        env:
+          EXTENDDB_TEST_CASSANDRA: required
+
+  cassandra-pytest:
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 45
+    services:
+      cassandra:
+        image: cassandra:4.1
+        ports:
+          - 9042:9042
+        env:
+          CASSANDRA_CLUSTER_NAME: extenddb-ci
+          HEAP_NEWSIZE: 128M
+          MAX_HEAP_SIZE: 1024M
+        options: >-
+          --health-cmd "cqlsh -e 'SELECT release_version FROM system.local'"
+          --health-interval 15s
+          --health-timeout 10s
+          --health-retries 20
+          --health-start-period 60s
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Configure Cassandra authentication
+        run: |
+          docker exec ${{ job.services.cassandra.id }} sed -i \
+            's/^authenticator: .*/authenticator: PasswordAuthenticator/' \
+            /etc/cassandra/cassandra.yaml
+          docker restart ${{ job.services.cassandra.id }}
+          for i in $(seq 1 90); do
+            if docker exec ${{ job.services.cassandra.id }} \
+                cqlsh -u cassandra -p cassandra \
+                -e 'SELECT release_version FROM system.local' \
+                >/dev/null 2>&1; then
+              echo "Cassandra ready with PasswordAuthenticator after ${i}s"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Cassandra did not become ready" >&2; exit 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+      - name: Build release (cassandra backend)
+        run: cargo build --release --no-default-features --features cassandra
+      - name: Run Cassandra pytest suite
+        run: devtools/run-cassandra-tests -- --pytest --comprehensive --parallel
+
+  cassandra-rust:
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 45
+    services:
+      cassandra:
+        image: cassandra:4.1
+        ports:
+          - 9042:9042
+        env:
+          CASSANDRA_CLUSTER_NAME: extenddb-ci
+          HEAP_NEWSIZE: 128M
+          MAX_HEAP_SIZE: 1024M
+        options: >-
+          --health-cmd "cqlsh -e 'SELECT release_version FROM system.local'"
+          --health-interval 15s
+          --health-timeout 10s
+          --health-retries 20
+          --health-start-period 60s
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Configure Cassandra authentication
+        run: |
+          docker exec ${{ job.services.cassandra.id }} sed -i \
+            's/^authenticator: .*/authenticator: PasswordAuthenticator/' \
+            /etc/cassandra/cassandra.yaml
+          docker restart ${{ job.services.cassandra.id }}
+          for i in $(seq 1 90); do
+            if docker exec ${{ job.services.cassandra.id }} \
+                cqlsh -u cassandra -p cassandra \
+                -e 'SELECT release_version FROM system.local' \
+                >/dev/null 2>&1; then
+              echo "Cassandra ready with PasswordAuthenticator after ${i}s"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Cassandra did not become ready" >&2; exit 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+      - name: Build release (cassandra backend)
+        run: cargo build --release --no-default-features --features cassandra
+      - name: Run Cassandra rust integration suite
+        run: devtools/run-cassandra-tests -- --rust-integration
+
+  cassandra-production-build:
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Check production Cassandra feature graph
+        run: cargo check --release --no-default-features --features cassandra
+
+  cassandra-integration:
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 75
+    needs: [cassandra-storage, cassandra-pytest, cassandra-rust, cassandra-production-build]
+    if: always()
+    steps:
+      - run: |
+          if [ "${{ needs.cassandra-storage.result }}" != "success" ] || \
+             [ "${{ needs.cassandra-pytest.result }}" != "success" ] || \
+             [ "${{ needs.cassandra-rust.result }}" != "success" ] || \
+             [ "${{ needs.cassandra-production-build.result }}" != "success" ]; then
+            exit 1
+          fi

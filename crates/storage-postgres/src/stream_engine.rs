@@ -9,7 +9,7 @@ use extenddb_core::types::{
 };
 use extenddb_storage::StreamEngine;
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{parse_stream_arn, stream_arn};
+use extenddb_storage::util::{new_stream_label, parse_stream_arn, stream_arn};
 use futures::future::BoxFuture;
 use sqlx::PgPool;
 
@@ -28,6 +28,70 @@ impl PostgresEngine {
     /// # Errors
     ///
     /// Returns [`StorageError::Internal`] if any query fails.
+    /// Remove the shards of deleted tables once their stream has aged out.
+    ///
+    /// DeleteTable leaves a table's shards and records in place, as the service
+    /// keeps a deleted table's stream readable for 24 hours, and the records
+    /// are trimmed by the retention sweep above. The shards were never
+    /// trimmed, so every deleted stream-enabled table left four rows behind
+    /// for good. `stream_shards` is in the data database and `tables` in the
+    /// catalog, so this is two steps: candidates are shards older than the
+    /// retention window belonging to a table with no records left, and only those whose table id
+    /// is absent from the catalog are removed. A table created moments ago is
+    /// never a candidate, because its shards are younger than the window, so
+    /// the gap between inserting shards and committing the catalog row cannot
+    /// be mistaken for a deletion. A live table's unused shards (after a
+    /// stream was disabled and re-enabled) are left alone.
+    async fn cleanup_orphaned_stream_shards(
+        &self,
+        retention_hours: i64,
+    ) -> Result<u64, StorageError> {
+        let candidates: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT s.table_id FROM stream_shards s \
+             WHERE s.created_at < NOW() - make_interval(hours => $1::integer) \
+               AND NOT EXISTS (SELECT 1 FROM stream_records r WHERE r.table_id = s.table_id)",
+        )
+        .bind(retention_hours)
+        .fetch_all(&self.data_pool)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+        let live: Vec<String> =
+            sqlx::query_scalar("SELECT table_id FROM tables WHERE table_id = ANY($1)")
+                .bind(&candidates)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let gone: Vec<String> = candidates
+            .into_iter()
+            .filter(|id| !live.contains(id))
+            .collect();
+        if gone.is_empty() {
+            return Ok(0);
+        }
+        // Re-check for records: a table deleted since the first query may
+        // still have records inside the window. A table's shards go together,
+        // once none of its records remain.
+        let result = sqlx::query(
+            "DELETE FROM stream_shards s WHERE s.table_id = ANY($1) \
+               AND NOT EXISTS (SELECT 1 FROM stream_records r WHERE r.table_id = s.table_id)",
+        )
+        .bind(&gone)
+        .execute(&self.data_pool)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        if result.rows_affected() > 0 {
+            tracing::debug!(
+                shards = result.rows_affected(),
+                tables = gone.len(),
+                "removed stream shards of deleted tables past the retention window"
+            );
+        }
+        Ok(result.rows_affected())
+    }
+
     pub(crate) async fn init_stream_shards(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         data_pool: &PgPool,
@@ -35,14 +99,16 @@ impl PostgresEngine {
         table_name: &str,
         table_id: &str,
     ) -> Result<String, StorageError> {
-        let label: String = sqlx::query_scalar(
-            "UPDATE tables SET stream_label = to_char(NOW(), 'YYYY-MM-DD\"T\"HH24:MI:SS') \
-             WHERE account_id = $1 AND table_name = $2 \
-             RETURNING stream_label",
+        // Formatted here, not in SQL, so every backend issues the same label
+        // shape from one function (`extenddb_storage::util::format_stream_label`).
+        let label = new_stream_label();
+        sqlx::query(
+            "UPDATE tables SET stream_label = $3 WHERE account_id = $1 AND table_name = $2",
         )
         .bind(account_id)
         .bind(table_name)
-        .fetch_one(&mut **tx)
+        .bind(&label)
+        .execute(&mut **tx)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
@@ -55,7 +121,14 @@ impl PostgresEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         for i in 0..SHARDS_PER_STREAM {
-            let shard_id = format!("shardId-{table_name}-{i:012}");
+            // Derived from the table id, not its name. A name is reused by
+            // delete-and-recreate and by every account that picks it, while
+            // `stream_shards.shard_id` is unique across the data database
+            // and PostgreSQL keeps a deleted table's shards. A name of
+            // up to 255 bytes also overflowed the 65-character ShardId limit
+            // the AWS SDKs enforce. The table id is a UUID, giving a
+            // 61-character id.
+            let shard_id = format!("shardId-{table_id}-{i:016}");
             let start_seq = format!("{:021}", 0);
             sqlx::query(
                 "INSERT INTO stream_shards (shard_id, table_id, starting_sequence_number) \
@@ -121,13 +194,52 @@ impl StreamEngine for PostgresEngine {
 
     fn get_stream_records(
         &self,
+        account_id: &str,
         shard_id: &str,
         after_sequence: Option<&str>,
         limit: i64,
     ) -> BoxFuture<'_, Result<(Vec<StreamRecord>, Option<String>), StorageError>> {
+        let account_id = account_id.to_string();
         let shard_id = shard_id.to_string();
         let after_sequence = after_sequence.map(std::string::ToString::to_string);
         Box::pin(async move {
+            // Ownership guard: only return records if the shard's backing table
+            // belongs to the calling account. `stream_shards`/`stream_records`
+            // rows live in the data database while the `tables` catalog (which
+            // carries `account_id`) lives in the catalog database, so ownership
+            // is resolved in two steps across the two pools: shard -> table_id
+            // (data pool), then table_id + account_id (catalog pool). A shard
+            // iterator for a table the caller does not own is rejected as an
+            // invalid shard iterator (below).
+            let shard_table_id: Option<(String,)> =
+                sqlx::query_as("SELECT table_id FROM stream_shards WHERE shard_id = $1")
+                    .bind(&shard_id)
+                    .fetch_optional(&self.data_pool)
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let owned = match &shard_table_id {
+                Some((table_id,)) => sqlx::query_as::<_, (i32,)>(
+                    "SELECT 1 FROM tables WHERE table_id = $1 AND account_id = $2",
+                )
+                .bind(table_id)
+                .bind(account_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?
+                .is_some(),
+                None => false,
+            };
+            // A shard iterator resolves to a shard the caller does not own (step
+            // 2 fails) or one that does not exist (step 1 fails). Real DynamoDB
+            // returns `ValidationException: Invalid ShardIterator` for a
+            // GetRecords iterator it did not issue, and does NOT distinguish
+            // "exists but not yours" from "does not exist" — so neither do we
+            // (both collapse here). Verified against DynamoDB
+            // Streams (us-east-1).
+            if !owned {
+                return Err(StorageError::Validation("Invalid ShardIterator".to_owned()));
+            }
+
             let rows: Vec<(serde_json::Value,)> = if let Some(after) = after_sequence {
                 sqlx::query_as(
                     "SELECT record_data FROM stream_records \
@@ -382,6 +494,7 @@ impl StreamEngine for PostgresEngine {
             .execute(&self.data_pool)
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
+            self.cleanup_orphaned_stream_shards(retention_hours).await?;
             Ok(result.rows_affected())
         })
     }

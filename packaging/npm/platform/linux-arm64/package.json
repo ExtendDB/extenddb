@@ -1,0 +1,22 @@
+{
+  "name": "@extenddb/linux-arm64",
+  "version": "0.0.0-placeholder",
+  "description": "ExtendDB dev server binary for linux arm64. Install the 'extenddb' package instead; npm selects this automatically.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ExtendDB/extenddb.git",
+    "directory": "packaging/npm/platform/linux-arm64"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "extenddb",
+    "NOTICE"
+  ],
+  "preferUnplugged": true
+}

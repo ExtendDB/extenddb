@@ -5,6 +5,7 @@ use super::*;
 use crate::expression::resolver::ExpressionMaps;
 use crate::expression::tokenizer::tokenize;
 use crate::expression::update_parser::parse_update;
+use crate::types::{Projection, ProjectionType};
 use std::collections::HashMap;
 
 fn apply(
@@ -17,6 +18,301 @@ fn apply(
     let actions = parse_update(&tokens)?;
     let maps = ExpressionMaps::new(names, values);
     apply_update(&actions, item, &maps)
+}
+
+/// Vector-validated variants. These exist to prove that validation follows the
+/// evaluated image rather than the expression form, so no SET syntax can
+/// smuggle a malformed vector past the write path.
+mod vector_validated {
+    use super::*;
+    use crate::types::{ScalarAttributeType, VectorIndexKeyInfo};
+
+    const DIMS: u32 = 3;
+
+    fn index() -> VectorIndexKeyInfo {
+        VectorIndexKeyInfo {
+            index_name: "vidx".to_owned(),
+            dimensions: DIMS,
+            vector_attribute_name: "emb".to_owned(),
+            search_schema: Vec::new(),
+            projection: Projection {
+                projection_type: ProjectionType::All,
+                non_key_attributes: None,
+            },
+        }
+    }
+
+    fn num_list(values: &[&str]) -> AttributeValue {
+        AttributeValue::L(
+            values
+                .iter()
+                .map(|v| AttributeValue::N((*v).to_owned()))
+                .collect(),
+        )
+    }
+
+    fn apply_validated(
+        expr_str: &str,
+        item: &mut BTreeMap<String, AttributeValue>,
+        values: HashMap<String, AttributeValue>,
+    ) -> Result<(), DynamoDbError> {
+        let tokens = tokenize(expr_str)?;
+        let actions = parse_update(&tokens)?;
+        let maps = ExpressionMaps::new(HashMap::new(), values);
+        apply_update_validated(&actions, item, &maps, &[index()], &[])
+    }
+
+    fn base_item() -> BTreeMap<String, AttributeValue> {
+        let mut item = BTreeMap::new();
+        item.insert("pk".into(), AttributeValue::S("k1".into()));
+        item
+    }
+
+    /// Control: the form the old expression-matching check did cover.
+    #[test]
+    fn bare_placeholder_wrong_dimension_is_rejected() {
+        let mut values = HashMap::new();
+        values.insert("v".into(), num_list(&["1", "2"]));
+        let err = apply_validated("SET emb = :v", &mut base_item(), values).unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(m) if m.contains("Expected: 3, Actual: 2")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// `list_append` was invisible to the old check: the value it produces
+    /// exists only after evaluation. Two 2-element lists concatenate to 4,
+    /// which must be rejected against a 3-dimension index.
+    #[test]
+    fn list_append_wrong_dimension_is_rejected() {
+        let mut values = HashMap::new();
+        values.insert("a".into(), num_list(&["1", "2"]));
+        values.insert("b".into(), num_list(&["3", "4"]));
+        let err =
+            apply_validated("SET emb = list_append(:a, :b)", &mut base_item(), values).unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(m) if m.contains("Expected: 3, Actual: 4")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// `list_append` reaching the declared dimension must still be accepted,
+    /// so the guard discriminates on the value rather than on the syntax.
+    #[test]
+    fn list_append_correct_dimension_is_accepted() {
+        let mut values = HashMap::new();
+        values.insert("a".into(), num_list(&["1", "2"]));
+        values.insert("b".into(), num_list(&["3"]));
+        let mut item = base_item();
+        apply_validated("SET emb = list_append(:a, :b)", &mut item, values).unwrap();
+        assert_eq!(item.get("emb"), Some(&num_list(&["1", "2", "3"])));
+    }
+
+    /// `if_not_exists` was also invisible: on a fresh item it resolves to the
+    /// placeholder, which here is the wrong dimension.
+    #[test]
+    fn if_not_exists_wrong_dimension_is_rejected() {
+        let mut values = HashMap::new();
+        values.insert("v".into(), num_list(&["1", "2", "3", "4"]));
+        let err = apply_validated("SET emb = if_not_exists(emb, :v)", &mut base_item(), values)
+            .unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(m) if m.contains("Actual: 4")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// Copying another attribute never mentions a placeholder at all, so the
+    /// old check saw nothing to validate.
+    #[test]
+    fn attribute_copy_of_non_vector_is_rejected() {
+        let mut item = base_item();
+        item.insert("other".into(), AttributeValue::S("not-a-vector".into()));
+        let err = apply_validated("SET emb = other", &mut item, HashMap::new()).unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(m) if m.contains("Invalid type for parameter emb")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// Removing the vector attribute leaves no vector in the image, which is
+    /// legal: the validator is presence-conditional and must not demand one.
+    #[test]
+    fn removing_the_vector_attribute_is_allowed() {
+        let mut item = base_item();
+        item.insert("emb".into(), num_list(&["1", "2", "3"]));
+        apply_validated("REMOVE emb", &mut item, HashMap::new()).unwrap();
+        assert!(!item.contains_key("emb"));
+    }
+
+    /// An update that does not touch the vector attribute at all must pass
+    /// even when the stored vector is absent.
+    #[test]
+    fn unrelated_update_is_allowed() {
+        let mut values = HashMap::new();
+        values.insert("v".into(), AttributeValue::S("x".into()));
+        let mut item = base_item();
+        apply_validated("SET label = :v", &mut item, values).unwrap();
+        assert_eq!(item.get("label"), Some(&AttributeValue::S("x".into())));
+    }
+
+    /// Appending to an already-full vector overflows the declared dimension.
+    /// `apply_update` alone succeeds here (both operands are valid lists), so
+    /// only image-level validation can catch it. This also pins the
+    /// pre-update-snapshot semantics: the RHS reads the stored vector.
+    #[test]
+    fn appending_to_a_full_vector_overflows_and_is_rejected() {
+        let mut values = HashMap::new();
+        values.insert("one".into(), num_list(&["4"]));
+        let mut item = base_item();
+        item.insert("emb".into(), num_list(&["1", "2", "3"]));
+        let err =
+            apply_validated("SET emb = list_append(emb, :one)", &mut item, values).unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(m) if m.contains("Expected: 3, Actual: 4")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// Search-schema attributes are validated on the image too, not just the
+    /// vector itself.
+    #[test]
+    fn search_schema_attribute_wrong_type_is_rejected() {
+        let index = VectorIndexKeyInfo {
+            index_name: "vidx".to_owned(),
+            dimensions: DIMS,
+            vector_attribute_name: "emb".to_owned(),
+            search_schema: vec![crate::types::SearchSchemaElement {
+                attribute_name: "tenant".to_owned(),
+                element_type: crate::types::SearchSchemaElementType::Hash,
+            }],
+            projection: Projection {
+                projection_type: ProjectionType::All,
+                non_key_attributes: None,
+            },
+        };
+        let defs = [crate::types::AttributeDefinition {
+            attribute_name: "tenant".to_owned(),
+            attribute_type: ScalarAttributeType::S,
+        }];
+        let mut values = HashMap::new();
+        values.insert("t".into(), AttributeValue::N("1".into()));
+        let tokens = tokenize("SET tenant = :t").unwrap();
+        let actions = parse_update(&tokens).unwrap();
+        let maps = ExpressionMaps::new(HashMap::new(), values);
+        let mut item = base_item();
+        let err = apply_update_validated(&actions, &mut item, &maps, &[index], &defs).unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(_)),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// The type-mismatch message, byte-exact against the service (measured
+    /// 2026-08-14, probe table vixdelta-1786706774). Note the periods rather
+    /// than colons, and the trailing IndexName clause.
+    #[test]
+    fn search_schema_type_mismatch_message_matches_the_service_exactly() {
+        let index = VectorIndexKeyInfo {
+            index_name: "vidx".to_owned(),
+            dimensions: DIMS,
+            vector_attribute_name: "emb".to_owned(),
+            search_schema: vec![crate::types::SearchSchemaElement {
+                attribute_name: "tenant".to_owned(),
+                element_type: crate::types::SearchSchemaElementType::Hash,
+            }],
+            projection: Projection {
+                projection_type: ProjectionType::All,
+                non_key_attributes: None,
+            },
+        };
+        let defs = [crate::types::AttributeDefinition {
+            attribute_name: "tenant".to_owned(),
+            attribute_type: ScalarAttributeType::S,
+        }];
+        let mut values = HashMap::new();
+        values.insert("t".into(), AttributeValue::N("1".into()));
+        let tokens = tokenize("SET tenant = :t").unwrap();
+        let actions = parse_update(&tokens).unwrap();
+        let maps = ExpressionMaps::new(HashMap::new(), values);
+        let mut item = base_item();
+        let err = apply_update_validated(&actions, &mut item, &maps, &[index], &defs).unwrap_err();
+        assert_eq!(
+            format!("{err}"),
+            "One or more parameter values were invalid. Attribute 'tenant' type mismatch. \
+             Expected: S, Actual: N. IndexName: vidx"
+        );
+    }
+
+    /// An update that does not touch the mistyped attribute passes: the
+    /// service validates what the write CHANGES, not the whole stored image
+    /// (measured 2026-08-14: a pre-existing invalid value does not poison
+    /// unrelated updates). Whole-image validation would make items the
+    /// backfill deliberately skipped permanently un-updatable.
+    #[test]
+    fn unrelated_update_is_not_rejected_by_a_pre_existing_mistyped_value() {
+        let index = VectorIndexKeyInfo {
+            index_name: "vidx".to_owned(),
+            dimensions: DIMS,
+            vector_attribute_name: "emb".to_owned(),
+            search_schema: vec![crate::types::SearchSchemaElement {
+                attribute_name: "tenant".to_owned(),
+                element_type: crate::types::SearchSchemaElementType::Hash,
+            }],
+            projection: Projection {
+                projection_type: ProjectionType::All,
+                non_key_attributes: None,
+            },
+        };
+        let defs = [crate::types::AttributeDefinition {
+            attribute_name: "tenant".to_owned(),
+            attribute_type: ScalarAttributeType::S,
+        }];
+        // The stored item already carries tenant as N: wrong for the declared
+        // S, present before this update runs.
+        let mut item = base_item();
+        item.insert("tenant".into(), AttributeValue::N("7".into()));
+
+        let mut values = HashMap::new();
+        values.insert("v".into(), AttributeValue::S("x".into()));
+        let tokens = tokenize("SET unrelated = :v").unwrap();
+        let actions = parse_update(&tokens).unwrap();
+        let maps = ExpressionMaps::new(HashMap::new(), values);
+        apply_update_validated(
+            &actions,
+            &mut item,
+            &maps,
+            std::slice::from_ref(&index),
+            &defs,
+        )
+        .expect("an unrelated update must not re-validate the untouched value");
+
+        // Internal semantics (not a service measurement): re-setting the SAME
+        // invalid value is also unchanged, so it passes too.
+        let mut values = HashMap::new();
+        values.insert("t".into(), AttributeValue::N("7".into()));
+        let tokens = tokenize("SET tenant = :t").unwrap();
+        let actions = parse_update(&tokens).unwrap();
+        let maps = ExpressionMaps::new(HashMap::new(), values);
+        apply_update_validated(
+            &actions,
+            &mut item,
+            &maps,
+            std::slice::from_ref(&index),
+            &defs,
+        )
+        .expect("re-setting the identical value is not a change");
+
+        // Control: actually CHANGING the mistyped value to another wrong-typed
+        // value is rejected, so the two allowances above discriminate.
+        let mut values = HashMap::new();
+        values.insert("t".into(), AttributeValue::N("8".into()));
+        let tokens = tokenize("SET tenant = :t").unwrap();
+        let actions = parse_update(&tokens).unwrap();
+        let maps = ExpressionMaps::new(HashMap::new(), values);
+        apply_update_validated(&actions, &mut item, &maps, &[index], &defs)
+            .expect_err("changing to another wrong-typed value must still reject");
+    }
 }
 
 #[test]

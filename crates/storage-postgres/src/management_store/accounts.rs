@@ -99,6 +99,16 @@ impl PostgresCatalogStore {
             })
     }
 
+    pub(crate) async fn default_account_id_impl(&self) -> OpResult<Option<String>> {
+        sqlx::query_scalar("SELECT value FROM settings WHERE key = 'default_account_id'")
+            .fetch_optional(self.pool())
+            .await
+            .map_err(|e| {
+                tracing::error!("default_account_id: {e}");
+                OpError::Internal("Database error".to_owned())
+            })
+    }
+
     pub(crate) async fn list_all_accounts_full_impl(
         &self,
     ) -> OpResult<Vec<(String, String, time::OffsetDateTime)>> {

@@ -26,7 +26,7 @@ mod types;
 
 pub use types::{
     AccessKeyCreated, AccountDetail, AdminEntry, GroupDetail, MetricsRow, OpError, OpResult,
-    RoleDetail, UserDetail,
+    RoleDetail, SessionPolicyEntry, UserDetail,
 };
 
 use futures::future::BoxFuture;
@@ -156,6 +156,12 @@ pub trait ManagementStore: Send + Sync {
 
     /// List all accounts as `(account_id, account_name)`.
     fn list_all_accounts(&self) -> BoxFuture<'_, OpResult<Vec<(String, String)>>>;
+
+    /// Return the deployment's canonical default account id, recorded at
+    /// bootstrap. Callers must use this rather than inferring the default from
+    /// `list_all_accounts` ordering. Returns `None` if not recorded (catalog
+    /// not bootstrapped by a version that records it).
+    fn default_account_id(&self) -> BoxFuture<'_, OpResult<Option<String>>>;
 
     /// List all accounts with `created_at` as `(account_id, account_name, created_at)`.
     fn list_all_accounts_full(
@@ -440,6 +446,28 @@ pub trait ManagementStore: Send + Sync {
         session_policy: &Option<serde_json::Value>,
         expires_at: time::OffsetDateTime,
     ) -> BoxFuture<'_, OpResult<()>>;
+
+    /// List every stored session that carries a session policy, for the
+    /// resource-tag policy migration.
+    ///
+    /// The default returns an empty list, which is correct for a store that
+    /// keeps no session policies. Backends that store session policies
+    /// override this so the migration can rewrite them.
+    fn list_session_policies(&self) -> BoxFuture<'_, OpResult<Vec<SessionPolicyEntry>>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    /// Replace a stored session's policy document, keyed by `session_token`.
+    /// Used only by the resource-tag policy migration. The default is a no-op
+    /// for a store that keeps no session policies.
+    fn update_session_policy(
+        &self,
+        session_token: &str,
+        document: &serde_json::Value,
+    ) -> BoxFuture<'_, OpResult<()>> {
+        let _ = (session_token, document);
+        Box::pin(async { Ok(()) })
+    }
 
     // ── Caller tags (for trust policy evaluation) ──────────────────
 

@@ -11,6 +11,7 @@ use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::storage_err_to_dynamo;
 use crate::expression_helpers::{build_expression_maps, parse_optional_condition};
+use crate::request_limits;
 use crate::serialize_output;
 use crate::stream_capture;
 use crate::transact_write_helpers::{
@@ -18,14 +19,14 @@ use crate::transact_write_helpers::{
 };
 use crate::{DispatchMetrics, DispatchResult};
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::types::{TransactWriteItem, TransactWriteItemsInput, TransactWriteItemsOutput};
+use extenddb_core::expression::{Expr, ExpressionMaps, PathElement, UpdateAction};
+use extenddb_core::types::{
+    CancellationReason, Item, TransactWriteItem, TransactWriteItemsInput, TransactWriteItemsOutput,
+};
 use extenddb_core::validation::{
     validate_attribute_name_sizes, validate_attribute_values_nesting_depth,
-    validate_item_nesting_depth, validate_item_size, validate_key_sizes,
+    validate_item_nesting_depth, validate_item_size, validate_key_not_empty,
 };
-
-/// Maximum number of items in a single `TransactWriteItems` request.
-const MAX_TRANSACT_WRITE_ITEMS: usize = 100;
 
 /// Handle a `TransactWriteItems` request.
 ///
@@ -52,23 +53,9 @@ pub async fn handle_transact_write_items(
         .map(|t| compute_fingerprint(&body, t))
         .unwrap_or_default();
 
-    if input.transact_items.is_empty() {
-        return Err(DynamoDbError::ValidationException(
-            "1 validation error detected: Value '[]' at 'transactItems' failed to satisfy constraint: Member must have length greater than or equal to 1".to_owned(),
-        ));
-    }
-
-    if input.transact_items.len() > MAX_TRANSACT_WRITE_ITEMS {
-        let items_repr = input
-            .transact_items
-            .iter()
-            .map(|_| "TransactWriteItem")
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(DynamoDbError::ValidationException(format!(
-            "1 validation error detected: Value '[{items_repr}]' at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to 100"
-        )));
-    }
+    // At least one and at most 100 items. The server runs the same check
+    // before authorization.
+    request_limits::check_transact_count(input.transact_items.len(), "TransactWriteItem")?;
 
     // Validate each item has exactly one operation
     for (i, twi) in input.transact_items.iter().enumerate() {
@@ -115,7 +102,45 @@ pub async fn handle_transact_write_items(
         ));
     }
 
+    // Reject oversized primary keys as a per-item cancellation, matching real
+    // DynamoDB: an oversized hash/range key in any sub-op returns
+    // TransactionCanceledException with a ValidationError cancellation reason
+    // for the offending item (an EMPTY key value, by contrast, is a top-level
+    // ValidationException and is handled in prepare_write_op).
+    {
+        let mut reasons: Vec<extenddb_core::types::CancellationReason> =
+            Vec::with_capacity(prepared.len());
+        let mut any_oversized = false;
+        for op in &prepared {
+            match op.oversized_key_reason(&ctx.limits) {
+                Some(reason) => {
+                    any_oversized = true;
+                    reasons.push(reason);
+                }
+                None => reasons.push(extenddb_core::types::CancellationReason::none()),
+            }
+        }
+        if any_oversized {
+            return Err(storage_err_to_dynamo(
+                extenddb_storage::error::StorageError::TransactionCanceled(reasons),
+            ));
+        }
+    }
+
     // Build storage operations
+    // Vector-valued and search-schema validation failures surface as per-item
+    // cancellation reasons rather than a top-level ValidationException.
+    if let Some(reasons) = collect_vector_cancellation_reasons(&prepared) {
+        let codes: Vec<String> = reasons.iter().map(|r| r.code.clone()).collect();
+        return Err(DynamoDbError::TransactionCanceledException {
+            message: format!(
+                "Transaction cancelled, please refer cancellation reasons for specific reasons [{}]",
+                codes.join(", ")
+            ),
+            cancellation_reasons: reasons,
+        });
+    }
+
     let ops: Vec<extenddb_storage::TransactWriteOp<'_>> =
         prepared.iter().map(|p| p.to_storage_op()).collect();
 
@@ -127,16 +152,49 @@ pub async fn handle_transact_write_items(
         validate_client_request_token(token)?;
     }
 
-    let token_pair = input
-        .client_request_token
-        .as_deref()
-        .map(|t| (t, fingerprint.as_str()));
+    let idempotency =
+        input
+            .client_request_token
+            .as_deref()
+            .map(|t| extenddb_storage::IdempotencyKey {
+                account_id: ctx.account_id.as_ref(),
+                token: t,
+                fingerprint: fingerprint.as_str(),
+            });
 
-    match ctx.storage.transact_write_items(&ops, token_pair).await {
+    match ctx.storage.transact_write_items(&ops, idempotency).await {
         Ok(()) => {}
         Err(extenddb_storage::error::StorageError::IdempotentReplay) => {
+            // A same-token replay re-reads the stored result rather than
+            // writing, and its capacity says so: a transactional READ
+            // recomputed against each item's size (2 x ceil(size/4KB)), not
+            // the stored write magnitude relabelled. Measured: a ~1.5KB put
+            // reports 4 WCU on the first call and 2 RCU on the replay, which
+            // only agree below 1KB.
+            let consumed_capacity = match input.return_consumed_capacity {
+                extenddb_core::types::ReturnConsumedCapacity::None => None,
+                rcc => {
+                    let indexes = rcc == extenddb_core::types::ReturnConsumedCapacity::Indexes;
+                    let mut per_table_rcu: HashMap<String, f64> = HashMap::new();
+                    for op in &prepared {
+                        let rcu =
+                            capacity_helpers::read_capacity_units(op.write_bytes(), true) * 2.0;
+                        *per_table_rcu.entry(op.table_name().to_owned()).or_default() += rcu;
+                    }
+                    Some(
+                        per_table_rcu
+                            .iter()
+                            .map(|(t, cu)| {
+                                extenddb_core::types::ConsumedCapacity::transact_replay_read(
+                                    t, *cu, indexes,
+                                )
+                            })
+                            .collect(),
+                    )
+                }
+            };
             let output = TransactWriteItemsOutput {
-                consumed_capacity: None,
+                consumed_capacity,
                 item_collection_metrics: None,
             };
             return Ok(DispatchResult::body_only(serialize_output(&output)?));
@@ -164,7 +222,12 @@ pub async fn handle_transact_write_items(
         })
         .sum();
 
-    let consumed_capacity = capacity_helpers::batch_write_capacity(
+    // NOTE: per-index (INDEXES) consumed-capacity breakdown for transactions is
+    // deferred to the storage-layer capacity-reporting follow-up: the engine has
+    // no resulting/old item for Update/Delete sub-ops, but DynamoDB reports a
+    // per-index breakdown for those ops on GSI tables. Base-table aggregate
+    // only for now.
+    let consumed_capacity = capacity_helpers::transact_write_capacity(
         input.return_consumed_capacity,
         per_table_wcu.iter().map(|(t, cu)| (t.as_str(), *cu)),
     );
@@ -199,6 +262,85 @@ pub async fn handle_transact_write_items(
     })
 }
 
+/// Validate the vector-valued and search-schema attributes of each prepared
+/// write operation. Returns per-item cancellation reasons when any operation
+/// fails, or `None` when all pass.
+fn collect_vector_cancellation_reasons(prepared: &[PreparedOp]) -> Option<Vec<CancellationReason>> {
+    let mut reasons = Vec::with_capacity(prepared.len());
+    let mut any_error = false;
+    for op in prepared {
+        let result = match op {
+            PreparedOp::Put { key_info, item, .. } => {
+                extenddb_core::validation::validate_vector_write(
+                    item,
+                    &key_info.vector_indexes,
+                    &key_info.attribute_definitions,
+                )
+            }
+            PreparedOp::Update {
+                key_info,
+                actions,
+                maps,
+                ..
+            } => {
+                let assigned = assigned_vector_attributes(actions, maps);
+                extenddb_core::validation::validate_vector_write(
+                    &assigned,
+                    &key_info.vector_indexes,
+                    &key_info.attribute_definitions,
+                )
+            }
+            _ => Ok(()),
+        };
+        match result {
+            Ok(()) => reasons.push(CancellationReason::none()),
+            Err(DynamoDbError::ValidationException(message)) => {
+                any_error = true;
+                reasons.push(CancellationReason::validation_error(message));
+            }
+            Err(other) => {
+                any_error = true;
+                reasons.push(CancellationReason::validation_error(other.to_string()));
+            }
+        }
+    }
+    any_error.then_some(reasons)
+}
+
+/// Collect direct `SET attr = :value` assignments into a partial item for
+/// vector validation.
+///
+/// This covers the bare-placeholder form ONLY, and deliberately so: it exists
+/// to produce the correct per-item `CancellationReason` vector for the common
+/// case, which the storage layer cannot reproduce because it aborts at the
+/// first failing operation. It is NOT the authoritative vector check and must
+/// never be treated as one. Any RHS that is not a bare placeholder
+/// (`list_append`, `if_not_exists`, an attribute copy, or a form added later)
+/// is invisible here and is caught instead by
+/// `expression::apply_update_validated` on the evaluated image inside the
+/// transaction, which every backend applies.
+fn assigned_vector_attributes(actions: &[UpdateAction], maps: &ExpressionMaps) -> Item {
+    let mut assigned = Item::new();
+    for action in actions {
+        if let UpdateAction::Set {
+            path,
+            value: Expr::Placeholder(placeholder),
+        } = action
+            && path.len() == 1
+            && let PathElement::Attribute(name) = &path[0]
+        {
+            let resolved = name
+                .strip_prefix('#')
+                .and_then(|reference| maps.names.get(reference).map(String::as_str))
+                .unwrap_or(name.as_str());
+            if let Some(value) = maps.values.get(placeholder) {
+                assigned.insert(resolved.to_owned(), value.clone());
+            }
+        }
+    }
+    assigned
+}
+
 /// Parse and validate a single `TransactWriteItem`, returning a `PreparedOp`.
 async fn prepare_write_op(
     twi: &TransactWriteItem,
@@ -206,19 +348,28 @@ async fn prepare_write_op(
 ) -> Result<PreparedOp, DynamoDbError> {
     if let Some(put) = &twi.put {
         let key_info = ctx
-            .storage
-            .table_key_info(&ctx.account_id, &put.table_name)
+            .table_key_info_uncached(&put.table_name)
             .await
             .map_err(storage_err_to_dynamo)?;
         validate_item_nesting_depth(&put.item)?;
         validate_item_size(&put.item, ctx.limits.max_item_size_bytes)?;
         validate_attribute_name_sizes(&put.item, &ctx.limits)?;
-        validate_key_sizes(&put.item, &key_info.key_schema, &ctx.limits)?;
+        validate_key_not_empty(&put.item, &key_info.key_schema)?;
         let maps = build_expression_maps(
             put.expression_attribute_names.as_ref(),
             put.expression_attribute_values.as_ref(),
         );
         let condition = parse_optional_condition(put.condition_expression.as_deref(), &ctx.limits)?;
+        if let Some(ref expr) = condition {
+            extenddb_core::expression::validate_ordering_operand_types(expr, &maps).map_err(
+                |e| {
+                    crate::expression_helpers::prefix_expression_error(
+                        e,
+                        extenddb_core::expression::ExpressionKind::Condition,
+                    )
+                },
+            )?;
+        }
         // Transactions accept names/values with no expression (unlike single-item
         // APIs); only check for unused refs when a condition is present.
         if condition.is_some() {
@@ -250,19 +401,28 @@ async fn prepare_write_op(
 
     if let Some(del) = &twi.delete {
         let key_info = ctx
-            .storage
-            .table_key_info(&ctx.account_id, &del.table_name)
+            .table_key_info_uncached(&del.table_name)
             .await
             .map_err(storage_err_to_dynamo)?;
         // Empty or oversize key values are up-front input validation in
         // DynamoDB (a top-level ValidationException), unlike a key type
         // mismatch which surfaces as a per-item cancellation reason.
-        validate_key_sizes(&del.key, &key_info.key_schema, &ctx.limits)?;
+        validate_key_not_empty(&del.key, &key_info.key_schema)?;
         let maps = build_expression_maps(
             del.expression_attribute_names.as_ref(),
             del.expression_attribute_values.as_ref(),
         );
         let condition = parse_optional_condition(del.condition_expression.as_deref(), &ctx.limits)?;
+        if let Some(ref expr) = condition {
+            extenddb_core::expression::validate_ordering_operand_types(expr, &maps).map_err(
+                |e| {
+                    crate::expression_helpers::prefix_expression_error(
+                        e,
+                        extenddb_core::expression::ExpressionKind::Condition,
+                    )
+                },
+            )?;
+        }
         if condition.is_some() {
             let exprs: Vec<&extenddb_core::expression::Expr> = condition.iter().collect();
             extenddb_core::expression::validate_unused_attributes(
@@ -292,14 +452,13 @@ async fn prepare_write_op(
 
     if let Some(upd) = &twi.update {
         let key_info = ctx
-            .storage
-            .table_key_info(&ctx.account_id, &upd.table_name)
+            .table_key_info_uncached(&upd.table_name)
             .await
             .map_err(storage_err_to_dynamo)?;
         // Empty or oversize key values are up-front input validation in
         // DynamoDB (a top-level ValidationException), unlike a key type
         // mismatch which surfaces as a per-item cancellation reason.
-        validate_key_sizes(&upd.key, &key_info.key_schema, &ctx.limits)?;
+        validate_key_not_empty(&upd.key, &key_info.key_schema)?;
         let maps = build_expression_maps(
             upd.expression_attribute_names.as_ref(),
             upd.expression_attribute_values.as_ref(),
@@ -323,6 +482,16 @@ async fn prepare_write_op(
             validate_attribute_values_nesting_depth(stored)?;
         }
         let condition = parse_optional_condition(upd.condition_expression.as_deref(), &ctx.limits)?;
+        if let Some(ref expr) = condition {
+            extenddb_core::expression::validate_ordering_operand_types(expr, &maps).map_err(
+                |e| {
+                    crate::expression_helpers::prefix_expression_error(
+                        e,
+                        extenddb_core::expression::ExpressionKind::Condition,
+                    )
+                },
+            )?;
+        }
         {
             let exprs: Vec<&extenddb_core::expression::Expr> = condition.iter().collect();
             extenddb_core::expression::validate_unused_attributes(
@@ -353,20 +522,27 @@ async fn prepare_write_op(
 
     if let Some(cc) = &twi.condition_check {
         let key_info = ctx
-            .storage
-            .table_key_info(&ctx.account_id, &cc.table_name)
+            .table_key_info_uncached(&cc.table_name)
             .await
             .map_err(storage_err_to_dynamo)?;
         // Empty or oversize key values are up-front input validation in
         // DynamoDB (a top-level ValidationException), unlike a key type
         // mismatch which surfaces as a per-item cancellation reason.
-        validate_key_sizes(&cc.key, &key_info.key_schema, &ctx.limits)?;
+        validate_key_not_empty(&cc.key, &key_info.key_schema)?;
         let maps = build_expression_maps(
             cc.expression_attribute_names.as_ref(),
             cc.expression_attribute_values.as_ref(),
         );
         let condition =
             crate::expression_helpers::parse_condition_expr(&cc.condition_expression, &ctx.limits)?;
+        extenddb_core::expression::validate_ordering_operand_types(&condition, &maps).map_err(
+            |e| {
+                crate::expression_helpers::prefix_expression_error(
+                    e,
+                    extenddb_core::expression::ExpressionKind::Condition,
+                )
+            },
+        )?;
         {
             let exprs: Vec<&extenddb_core::expression::Expr> = vec![&condition];
             extenddb_core::expression::validate_unused_attributes(

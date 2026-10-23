@@ -38,6 +38,10 @@ impl extenddb_storage::management_store::ManagementStore for PostgresCatalogStor
         Box::pin(async move { self.list_all_accounts_impl().await })
     }
 
+    fn default_account_id(&self) -> BoxFuture<'_, OpResult<Option<String>>> {
+        Box::pin(async move { self.default_account_id_impl().await })
+    }
+
     fn list_all_accounts_full(
         &self,
     ) -> BoxFuture<'_, OpResult<Vec<(String, String, time::OffsetDateTime)>>> {
@@ -569,6 +573,27 @@ impl extenddb_storage::management_store::ManagementStore for PostgresCatalogStor
                 expires_at,
             )
             .await
+        })
+    }
+
+    // ── Session policies (resource-tag migration) ─────────────────
+
+    fn list_session_policies(
+        &self,
+    ) -> BoxFuture<'_, OpResult<Vec<extenddb_storage::management_store::SessionPolicyEntry>>> {
+        Box::pin(async move { self.list_session_policies_impl().await })
+    }
+
+    fn update_session_policy(
+        &self,
+        session_token: &str,
+        document: &serde_json::Value,
+    ) -> BoxFuture<'_, OpResult<()>> {
+        let session_token = session_token.to_string();
+        let document = document.clone();
+        Box::pin(async move {
+            self.update_session_policy_impl(&session_token, &document)
+                .await
         })
     }
 

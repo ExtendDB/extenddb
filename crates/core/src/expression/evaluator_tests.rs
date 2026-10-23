@@ -409,3 +409,32 @@ fn size_of_missing_attribute_lt_returns_false() {
     // size(missing) < :one should be false
     assert!(!eval("size(missing) < :one", &item, HashMap::new(), values).unwrap());
 }
+
+#[test]
+fn size_of_number_attribute_yields_no_value() {
+    // size() is unsupported for Number: DynamoDB yields no value, so the
+    // comparison is false (never a ValidationException).
+    let item = simple_item(); // age is N:30
+    let mut values = HashMap::new();
+    values.insert("zero".into(), AttributeValue::N("0".into()));
+    assert!(!eval("size(age) > :zero", &item, HashMap::new(), values).unwrap());
+}
+
+#[test]
+fn size_of_bool_attribute_yields_no_value() {
+    // size() is unsupported for Bool: yields no value, comparison false.
+    let item = simple_item(); // active is BOOL:true
+    let mut values = HashMap::new();
+    values.insert("zero".into(), AttributeValue::N("0".into()));
+    assert!(!eval("size(active) > :zero", &item, HashMap::new(), values).unwrap());
+}
+
+#[test]
+fn size_of_null_attribute_yields_no_value() {
+    // size() is unsupported for Null: yields no value, comparison false.
+    let mut item = BTreeMap::new();
+    item.insert("nu".into(), AttributeValue::Null);
+    let mut values = HashMap::new();
+    values.insert("zero".into(), AttributeValue::N("0".into()));
+    assert!(!eval("size(nu) > :zero", &item, HashMap::new(), values).unwrap());
+}

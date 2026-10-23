@@ -10,19 +10,20 @@ use serde_json::Value;
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::Projection;
 use extenddb_core::types::{
-    ItemResponse, TransactGetItemsInput, TransactGetItemsOutput, item_size_bytes,
+    CancellationReason, ItemResponse, TransactGetItemsInput, TransactGetItemsOutput,
+    item_size_bytes,
 };
+use extenddb_core::validation;
 use extenddb_storage::TransactGetOp;
+use extenddb_storage::error::StorageError;
 
 use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::storage_err_to_dynamo;
 use crate::expression_helpers::build_expression_maps;
+use crate::request_limits;
 use crate::serialize_output;
 use crate::{DispatchMetrics, DispatchResult};
-
-/// Maximum number of items in a single `TransactGetItems` request.
-const MAX_TRANSACT_GET_ITEMS: usize = 100;
 
 /// Handle a `TransactGetItems` request.
 ///
@@ -39,23 +40,9 @@ pub async fn handle_transact_get_items(
     let input: TransactGetItemsInput =
         serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
-    if input.transact_items.is_empty() {
-        return Err(DynamoDbError::ValidationException(
-            "1 validation error detected: Value '[]' at 'transactItems' failed to satisfy constraint: Member must have length greater than or equal to 1".to_owned(),
-        ));
-    }
-
-    if input.transact_items.len() > MAX_TRANSACT_GET_ITEMS {
-        return Err(DynamoDbError::ValidationException(format!(
-            "1 validation error detected: Value '[{}]' at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to 100",
-            input
-                .transact_items
-                .iter()
-                .map(|_| "TransactGetItem")
-                .collect::<Vec<_>>()
-                .join(", ")
-        )));
-    }
+    // At least one and at most 100 items. The server runs the same check
+    // before authorization.
+    request_limits::check_transact_count(input.transact_items.len(), "TransactGetItem")?;
 
     // Resolve table key info for each item
     let mut seen_keys: HashSet<Vec<u8>> = HashSet::with_capacity(input.transact_items.len());
@@ -72,8 +59,7 @@ pub async fn handle_transact_get_items(
     let mut key_infos = Vec::with_capacity(input.transact_items.len());
     for tgi in &input.transact_items {
         let key_info = ctx
-            .storage
-            .table_key_info(&ctx.account_id, &tgi.get.table_name)
+            .table_key_info_uncached(&tgi.get.table_name)
             .await
             .map_err(storage_err_to_dynamo)?;
         // Key type validation is deferred to the storage layer so that
@@ -114,6 +100,29 @@ pub async fn handle_transact_get_items(
         } else {
             // No projection: transactions accept names with no expression.
             projections.push(None);
+        }
+    }
+
+    // Reject oversized primary keys as a per-item cancellation, matching real
+    // DynamoDB (TransactionCanceledException with a ValidationError reason for
+    // the offending item). Key type/emptiness is validated in the storage
+    // layer; this enforces the size limit the storage layer does not check.
+    {
+        let mut reasons: Vec<CancellationReason> = Vec::with_capacity(input.transact_items.len());
+        let mut any_oversized = false;
+        for (tgi, ki) in input.transact_items.iter().zip(key_infos.iter()) {
+            match validation::validate_key_size_limits(&tgi.get.key, &ki.key_schema, &ctx.limits) {
+                Ok(()) => reasons.push(CancellationReason::none()),
+                Err(e) => {
+                    any_oversized = true;
+                    reasons.push(CancellationReason::validation_error(e.to_string()));
+                }
+            }
+        }
+        if any_oversized {
+            return Err(storage_err_to_dynamo(StorageError::TransactionCanceled(
+                reasons,
+            )));
         }
     }
 
@@ -172,7 +181,7 @@ pub async fn handle_transact_get_items(
         })
         .collect();
 
-    let consumed_capacity = capacity_helpers::batch_read_capacity(
+    let consumed_capacity = capacity_helpers::transact_read_capacity(
         input.return_consumed_capacity,
         per_table_rcu.iter().map(|(t, cu)| (t.as_str(), *cu)),
     );

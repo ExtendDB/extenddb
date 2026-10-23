@@ -340,15 +340,16 @@ UpdateItem is more complex than PutItem because the storage backend must also ap
 3. Dispatch to Query handler in engine
 4. Validate input: table name, key condition, index name
 5. Parse KeyConditionExpression → extract partition key value + sort key condition
-6. Call storage.query(table_name, index_name, key_condition, limit)
+6. Read from storage in chunks: storage.query(table_name, index_name, key_condition, chunk, cursor)
    - Storage backend: translate key condition to native query (e.g., SQL WHERE)
-   - Execute query with limit
-   - Return items + last evaluated key
-7. For each returned item:
-   a. If FilterExpression: evaluate against item, exclude non-matching
-   b. If ProjectionExpression: project to requested attributes only
-8. Accumulate response size; stop at 1 MB limit, set LastEvaluatedKey
-9. Calculate consumed capacity (total items read × item sizes → RCU)
+   - Execute query for one chunk after the cursor (first chunk 128 items, later chunks sized from the average item size seen so far, at most 1,024)
+   - Return items + whether more exist
+7. For each returned item, in arrival order:
+   a. Stop if the item would take evaluated bytes past 1 MB and at least one item has been evaluated (the page is full; nothing further is read from storage)
+   b. If FilterExpression: evaluate against item, exclude non-matching
+   c. If ProjectionExpression: project to requested attributes only
+8. Repeat step 6 from the last evaluated item until the page is full, Limit items have been evaluated, or storage is exhausted; set LastEvaluatedKey when more data may exist
+9. Calculate consumed capacity (evaluated item sizes → RCU)
 10. Format response (Items, Count, ScannedCount, LastEvaluatedKey, ConsumedCapacity)
 ```
 
@@ -365,11 +366,22 @@ The server runs on a tokio multi-thread runtime. Each incoming HTTP request is h
 All database access goes through an sqlx `PgPool`. The pool size is configurable via `storage.postgres.pool_size` in `extenddb.toml` (default: 20). When all connections are in use, new requests queue at the pool level until a connection is returned or the acquire timeout expires. If the timeout expires, the request fails with an internal server error (HTTP 500).
 
 Total connection footprint on the PostgreSQL server:
-- `pool_size` connections for DynamoDB data operations (shared by all background workers)
-- +2 for the management API (separate pool, `max_connections(2)`)
-- +1 for the log-level poller (separate pool, `max_connections(1)`)
+- `pool_size` for the catalog pool
+- `pool_size` again for the data pool, because `extenddb init` always puts the
+  catalog and the data in separate databases and the engine opens a pool against
+  each. The two collapse into one only where a deployment shares a database.
+- `catalog_pool_size` for the management pool (authorization, IAM, console),
+  which defaults to `pool_size` and has a minimum of 10
+- one session per vector index build running on the server, opened outside every
+  pool because its ownership lock is session-scoped
+- one connection while a schema migration runs, pinned outside the pools so its
+  transaction-scoped lock cannot move between backends
 
-So the total is `pool_size + 3`. The default PostgreSQL `max_connections` is 100, which comfortably supports the default pool_size of 20.
+So the total is `2 * pool_size + catalog_pool_size`, plus builds and migrations.
+There is no separate poller pool: the log-level poller borrows from the management
+pool like every other background poller. `max_connections` is per cluster rather
+than per database, so both `pool_size` pools draw on the same budget: the defaults
+need 60 of PostgreSQL's default 100.
 
 ### 6.3 Row-Level Locking
 
@@ -378,6 +390,7 @@ Read-modify-write operations (UpdateItem, PutItem with conditions, DeleteItem wi
 - **Atomicity:** The condition check and the write happen against the same snapshot.
 - **Serialization:** Concurrent updates to the same item are serialized by PostgreSQL's row lock, not by any in-memory mutex.
 - **No TOCTOU races:** Another request cannot modify the item between the condition check and the write.
+- **Missing items:** A missing item has no row to lock, so `INSERT ... ON CONFLICT DO NOTHING` decides which writer creates it. A PutItem or UpdateItem that loses re-reads the winner `FOR UPDATE`, checks its condition against it, and writes after it. If the winner was deleted in the meantime, it retries the insert, up to 5 inserts in total.
 
 There is no in-memory locking (no `Mutex`, `RwLock`, or similar) on the data path. All contention is managed by PostgreSQL.
 

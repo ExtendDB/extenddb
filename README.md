@@ -106,13 +106,48 @@ key_path = "/etc/extenddb/tls/key.pem"
 
 ## Running in Containers
 
+The production images contain ExtendDB only; the database (PostgreSQL 14+ and MongoDB 7+)
+runs as a separate service. See [`docker/README.md`](docker/README.md) for the PostgreSQL
+image and [`docker/README-mongodb.md`](docker/README-mongodb.md) for the MongoDB
+image, external database requirements, hardened local Compose stacks, smoke tests, and
+explicit init/migrate/serve production lifecycle.
+
 By default `extenddb serve` daemonizes itself, which doesn't play well with container runtimes and process supervisors that expect PID 1 to stay attached. Pass `--foreground` (alias `--no-daemon`) to keep the process in the foreground and stream logs to stderr instead of syslog:
 
 ```bash
 extenddb serve --config extenddb.toml --foreground
 ```
 
-Use this with Docker, Kubernetes, `systemd Type=simple`, runit, s6, or any other supervisor that captures stdout/stderr. `extenddb status` and `extenddb stop` continue to work as in daemon mode, since the PID file is still written.
+Use this with Docker, Kubernetes, `systemd Type=simple`, runit, s6, or any other supervisor that captures stdout/stderr.
+
+In `--foreground` mode extenddb writes no PID file and never creates `run_dir`, so the container can run with a read-only root filesystem. Two consequences:
+
+- `extenddb status` still works (it probes the port) but reports the PID as unknown.
+- `extenddb stop` cannot signal the process — there is no PID file to read. Stop it through your supervisor, which delivers `SIGTERM` and triggers the same graceful shutdown.
+
+Pass `--write-pid-file` to opt back in when you do want `stop` and `status` to work against a foreground server, for example when running it from a shell rather than under a supervisor. The file goes to the usual `run_dir` path, so neither command needs extra arguments, and `run_dir` has to be writable.
+
+For a container `HEALTHCHECK`, use the `healthcheck` subcommand rather than `curl`; it needs no shell or extra binaries, so it works on a `distroless`/`scratch` image and accepts the self-signed certificate:
+
+```bash
+extenddb healthcheck --config extenddb.toml            # exit 0 healthy, 1 not
+extenddb healthcheck --endpoint https://127.0.0.1:18443 # explicit target
+```
+
+This is a liveness check, which is what a container `HEALTHCHECK` wants: `/health` does not query the storage backend, so it reports healthy even if PostgreSQL becomes unreachable after startup. That is deliberate, since a liveness probe that failed on a database outage would restart every replica at once. A backend that is unreachable at startup does stop the server from listening, so that case is caught. There is no separate readiness endpoint yet.
+
+### One instance per database
+
+Run one `extenddb serve` per catalog. On SQLite this is enforced: the server takes an exclusive lock on `<database>.lock` next to the database file and a second server on the same file refuses to start (`init`, `migrate`, and `destroy` take the same lock while they run). On PostgreSQL and MongoDB nothing prevents a second instance, but running more than one against the same catalog is not supported in this release: every instance runs every background worker, credential and policy caches are per instance with no cross-instance invalidation (a revoked key stays valid on the other instance for up to the cache TTL), and `/health` does not check the database. See the [deployment guide](docs/manuals/11-deployment-guide.md#multi-instance-considerations).
+
+To make the generated self-signed certificate valid for the name clients use — an in-cluster service DNS name, for example — pass `--tls-san` to `init` (repeatable):
+
+```bash
+extenddb init --catalog-db extenddb_catalog \
+  --tls-san extenddb.default.svc.cluster.local --tls-san extenddb.example.com
+```
+
+`init` never regenerates an existing certificate, so if one is already present it verifies that it already covers every requested `--tls-san` and fails with an explicit error if it does not, rather than silently dropping the name.
 
 ## Monitoring
 
@@ -142,6 +177,7 @@ extenddb serve --config extenddb.toml --foreground  # Start in foreground
 extenddb init --catalog-db NAME            # Initialize deployment
 extenddb stop --config extenddb.toml           # Graceful shutdown
 extenddb status --config extenddb.toml         # Check if running
+extenddb healthcheck --config extenddb.toml    # Probe /health (exit 0 healthy, 1 not)
 extenddb verify --config extenddb.toml         # Validate deployment
 extenddb migrate --config extenddb.toml        # Apply schema migrations
 extenddb destroy --config extenddb.toml        # Tear down deployment
@@ -164,6 +200,9 @@ Query, Scan (key conditions, filters, projections, pagination, index selection)
 
 ### Batch & Transactions
 BatchGetItem (100 keys), BatchWriteItem (25 ops), TransactGetItems (100 items), TransactWriteItems (100 ops)
+
+### Vector Search
+SearchVectors, and vector indexes on CreateTable and UpdateTable (cosine, Euclidean and dot product; on-demand tables only). On PostgreSQL this requires the pgvector extension on the data database; without it every vector operation is refused and nothing else is affected.
 
 ### Streams
 ListStreams, DescribeStream, GetShardIterator, GetRecords
@@ -229,4 +268,4 @@ Code in protected paths is reviewed via [`.github/CODEOWNERS`](.github/CODEOWNER
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. 
+This software is provided "as is" without warranty of any kind.

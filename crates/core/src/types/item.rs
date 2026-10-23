@@ -356,8 +356,8 @@ pub fn item_size_bytes(item: &Item) -> usize {
 /// - B: raw byte length
 /// - BOOL: 1 byte
 /// - NULL: 1 byte
-/// - L: 3 bytes overhead + sum of element sizes
-/// - M: 3 bytes overhead + sum of (name length + value size) per entry
+/// - L: 3 bytes overhead + sum of (element size + 1) per element
+/// - M: 3 bytes overhead + sum of (name length + value size + 1) per entry
 /// - SS/NS/BS: sum of element sizes
 #[must_use]
 pub fn attribute_value_size(value: &AttributeValue) -> usize {
@@ -366,11 +366,18 @@ pub fn attribute_value_size(value: &AttributeValue) -> usize {
         AttributeValue::N(n) => dynamodb_number_size(n),
         AttributeValue::B(b) => b.len(),
         AttributeValue::Bool(_) | AttributeValue::Null => 1,
-        AttributeValue::L(list) => 3 + list.iter().map(attribute_value_size).sum::<usize>(),
+        // Every list element and map entry adds 1 byte of overhead beyond the
+        // 3-byte container overhead, matching Amazon DynamoDB's item sizing.
+        AttributeValue::L(list) => {
+            3 + list
+                .iter()
+                .map(|v| attribute_value_size(v) + 1)
+                .sum::<usize>()
+        }
         AttributeValue::M(map) => {
             3 + map
                 .iter()
-                .map(|(k, v)| k.len() + attribute_value_size(v))
+                .map(|(k, v)| k.len() + attribute_value_size(v) + 1)
                 .sum::<usize>()
         }
         AttributeValue::SS(set) => set.iter().map(String::len).sum(),
@@ -411,4 +418,61 @@ fn dynamodb_number_size(n: &str) -> usize {
         size += 1;
     }
     size.min(21)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(v: &str) -> AttributeValue {
+        AttributeValue::S(v.to_owned())
+    }
+
+    #[test]
+    fn scalar_sizes_unchanged() {
+        assert_eq!(attribute_value_size(&s("hello")), 5);
+        assert_eq!(attribute_value_size(&AttributeValue::Bool(true)), 1);
+        assert_eq!(attribute_value_size(&AttributeValue::Null), 1);
+    }
+
+    #[test]
+    fn empty_list_and_map_are_container_overhead_only() {
+        assert_eq!(attribute_value_size(&AttributeValue::L(vec![])), 3);
+        assert_eq!(attribute_value_size(&AttributeValue::M(BTreeMap::new())), 3);
+    }
+
+    #[test]
+    fn list_adds_one_byte_per_element() {
+        // Each {"S": "aa"} element is 2 value bytes + 1 byte overhead = 3.
+        let list = AttributeValue::L(vec![s("aa"); 500]);
+        assert_eq!(attribute_value_size(&list), 3 + 500 * 3);
+    }
+
+    #[test]
+    fn map_adds_one_byte_per_entry() {
+        // Entry sizes: name length + value size + 1 byte per entry.
+        let mut m = BTreeMap::new();
+        m.insert("a".to_owned(), s("xy"));
+        m.insert("bb".to_owned(), s("z"));
+        assert_eq!(
+            attribute_value_size(&AttributeValue::M(m)),
+            3 + (1 + 2 + 1) + (2 + 1 + 1)
+        );
+    }
+
+    #[test]
+    fn nested_container_overhead_compounds() {
+        // Outer list holding one empty list: 3 + (3 + 1) = 7.
+        let nested = AttributeValue::L(vec![AttributeValue::L(vec![])]);
+        assert_eq!(attribute_value_size(&nested), 7);
+    }
+
+    #[test]
+    fn item_size_counts_names_and_per_element_overhead() {
+        // pk(2) + "b"(1) + data(4) + [3 + 500*3] = 1510.
+        let mut item = Item::new();
+        item.insert("pk".to_owned(), s("b"));
+        item.insert("data".to_owned(), AttributeValue::L(vec![s("aa"); 500]));
+        assert_eq!(item_size_bytes(&item), 2 + 1 + 4 + (3 + 500 * 3));
+    }
 }

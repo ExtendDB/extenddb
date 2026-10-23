@@ -164,24 +164,19 @@ impl<C: CredentialStore + 'static> AuthProvider for BuiltinAuthProvider<C> {
         // ExpiredTokenException on the cache-miss path, and CachedCredentialStore
         // re-validates `expires_at` on every cache hit before returning so cached
         // entries cannot survive past their issued lifetime.
-        if credential.is_session {
+        // S-5: Compare the session token in constant time and defer the
+        // rejection until after signature verification, so neither the token's
+        // byte contents nor its presence changes the failure-path timing.
+        let session_token_ok = if credential.is_session {
             let token = headers
                 .get("x-amz-security-token")
                 .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| {
-                    DynamoDbError::UnrecognizedClientException(
-                        "The security token included in the request is invalid.".to_owned(),
-                    )
-                })?;
-
-            // Validate the token value against the stored session token.
+                .unwrap_or("");
             let expected = credential.session_token.as_deref().unwrap_or("");
-            if token != expected {
-                return Err(DynamoDbError::UnrecognizedClientException(
-                    "The security token included in the request is invalid.".to_owned(),
-                ));
-            }
-        }
+            sigv4::verify::constant_time_eq(token.as_bytes(), expected.as_bytes())
+        } else {
+            true
+        };
 
         // Verify SigV4 signature — always, even for inactive keys (S-5).
         sigv4::verify::verify_signature(
@@ -194,9 +189,9 @@ impl<C: CredentialStore + 'static> AuthProvider for BuiltinAuthProvider<C> {
             body,
         )?;
 
-        // S-5: Reject inactive keys only after full signature verification
-        // to prevent timing side-channels.
-        if is_inactive {
+        // S-5: Reject inactive keys or a mismatched session token only after
+        // full signature verification, to prevent timing side-channels.
+        if is_inactive || !session_token_ok {
             return Err(DynamoDbError::UnrecognizedClientException(
                 "The security token included in the request is invalid.".to_owned(),
             ));

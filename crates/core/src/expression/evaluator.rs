@@ -14,7 +14,7 @@ use crate::error::DynamoDbError;
 use crate::types::AttributeValue;
 
 use super::ast::{CompareOp, Expr, PathElement};
-use super::resolver::{ExpressionMaps, resolve_path};
+use super::resolver::{ExpressionMaps, attribute_type_code, resolve_path};
 
 /// Evaluate a condition expression against an item.
 ///
@@ -363,34 +363,18 @@ fn evaluate_size<'a>(
     let sz = match v.as_ref() {
         AttributeValue::S(s) => s.encode_utf16().count(),
         AttributeValue::B(b) => b.len(),
-        AttributeValue::N(n) => n.len(), // ASCII digits are 1 byte each, so len() == UTF-8 byte count
         AttributeValue::L(l) => l.len(),
         AttributeValue::M(m) => m.len(),
         AttributeValue::SS(s) | AttributeValue::NS(s) => s.len(),
         AttributeValue::BS(s) => s.len(),
-        AttributeValue::Bool(_) | AttributeValue::Null => {
-            return Err(DynamoDbError::ValidationException(
-                "Invalid ConditionExpression: size is not supported for this type".to_owned(),
-            ));
+        // size() is unsupported for Number, Bool and Null. Amazon DynamoDB
+        // yields no value for these, so the enclosing comparison evaluates to
+        // false rather than raising a ValidationException.
+        AttributeValue::N(_) | AttributeValue::Bool(_) | AttributeValue::Null => {
+            return Ok(None);
         }
     };
     Ok(Some(Cow::Owned(AttributeValue::N(sz.to_string()))))
-}
-
-/// Return the `DynamoDB` type code for an `AttributeValue`.
-fn attribute_type_code(val: &AttributeValue) -> &'static str {
-    match val {
-        AttributeValue::S(_) => "S",
-        AttributeValue::N(_) => "N",
-        AttributeValue::B(_) => "B",
-        AttributeValue::Bool(_) => "BOOL",
-        AttributeValue::Null => "NULL",
-        AttributeValue::L(_) => "L",
-        AttributeValue::M(_) => "M",
-        AttributeValue::SS(_) => "SS",
-        AttributeValue::NS(_) => "NS",
-        AttributeValue::BS(_) => "BS",
-    }
 }
 
 /// Format an `AttributeValue` for error messages (e.g. `N:5`, `S:hello`).

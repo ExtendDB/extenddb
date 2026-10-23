@@ -1,0 +1,101 @@
+# Local development only. PostgreSQL is a separate service and is not included
+# in the ExtendDB image. The passwords below are intentionally development-only.
+name: extenddb-postgres-dev
+
+x-extenddb-image: &extenddb-image
+  image: ${EXTENDDB_IMAGE:-extenddb-postgres:dev}
+
+x-extenddb-hardening: &extenddb-hardening
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=16m
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+
+services:
+  postgres:
+    image: public.ecr.aws/docker/library/postgres:16.10-bookworm@sha256:38471f330eb885e04de130b768d6db4e10469e2311879c7e5c699f6d2d8a1c74
+    environment:
+      POSTGRES_USER: ${PG_ADMIN_USER:-postgres}
+      POSTGRES_PASSWORD: ${PG_ADMIN_PASSWORD:-ExtendDBLocalPostgres123}
+      POSTGRES_DB: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  extenddb-volume-init:
+    <<: *extenddb-image
+    build:
+      context: .
+      args:
+        VERSION: ${EXTENDDB_VERSION:-dev}
+        VCS_REF: ${VCS_REF:-unknown}
+        BUILD_DATE: ${BUILD_DATE:-unknown}
+    user: "0:0"
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+    security_opt:
+      - no-new-privileges:true
+    entrypoint: ["/bin/sh", "-ec"]
+    command: ["chown -R 10001:10001 /var/lib/extenddb"]
+    volumes:
+      - extenddb-state:/var/lib/extenddb
+    restart: "no"
+
+  extenddb-bootstrap:
+    <<: [*extenddb-image, *extenddb-hardening]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      extenddb-volume-init:
+        condition: service_completed_successfully
+    environment:
+      PG_ADMIN_USER: ${PG_ADMIN_USER:-postgres}
+      EXTENDDB_PG_PASSWORD: ${PG_ADMIN_PASSWORD:-ExtendDBLocalPostgres123}
+      APP_DB_USER: ${APP_DB_USER:-extenddb_app}
+      EXTENDDB_APP_PASSWORD: ${APP_DB_PASSWORD:-ExtendDBLocalApp123}
+      EXTENDDB_ADMIN_USER: ${EXTENDDB_ADMIN_USER:-admin}
+      EXTENDDB_ADMIN_PASSWORD: ${EXTENDDB_ADMIN_PASSWORD:-ExtendDBLocalAdmin123}
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        CONFIG=/var/lib/extenddb/extenddb.toml
+        if [ -f "$$CONFIG" ]; then
+          echo "bootstrap: existing config detected; running migrations"
+          exec extenddb migrate --config "$$CONFIG" --yes \
+            --pg-user "$$PG_ADMIN_USER"
+        fi
+        echo "bootstrap: no config detected; initializing"
+        exec extenddb init --config "$$CONFIG" --backend postgres \
+          --pg-host postgres --pg-port 5432 \
+          --pg-user "$$PG_ADMIN_USER" \
+          --extenddb-user "$$APP_DB_USER" \
+          --bind-addr 0.0.0.0 --tls-san localhost --tls-san extenddb
+    volumes:
+      - extenddb-state:/var/lib/extenddb
+    restart: "no"
+
+  extenddb:
+    <<: [*extenddb-image, *extenddb-hardening]
+    depends_on:
+      extenddb-bootstrap:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:${EXTENDDB_PORT:-18443}:18443"
+    volumes:
+      - extenddb-state:/var/lib/extenddb
+    stop_grace_period: 15s
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  extenddb-state:

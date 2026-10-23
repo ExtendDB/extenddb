@@ -7,12 +7,30 @@
 use extenddb_core::expression::{Expr, ExpressionMaps, KeyCondition, UpdateAction};
 use extenddb_core::types::{Item, TableKeyInfo};
 use extenddb_storage::error::StorageError;
-use extenddb_storage::{DataEngine, StreamCapture, TransactGetOp, TransactWriteOp};
+use extenddb_storage::util::pk_to_text;
+use extenddb_storage::{DataEngine, IdempotencyKey, StreamCapture, TransactGetOp, TransactWriteOp};
 use futures::future::BoxFuture;
 
 use crate::PostgresEngine;
 
 impl DataEngine for PostgresEngine {
+    /// Declares vector support only where the server can actually serve it.
+    ///
+    /// `Some(self)` compiles only because `PostgresEngine` implements
+    /// `VectorSearchEngine`, so this cannot claim a capability that does not
+    /// exist in the build. The runtime half is the probe: vector storage needs
+    /// pgvector, which is a property of the PostgreSQL server rather than of this
+    /// binary, so the same build serves vector indexes against a server that has
+    /// the extension and refuses them, byte-identically to before, against one
+    /// that does not.
+    ///
+    /// The answer is the startup probe's, cached, so a request pays nothing for
+    /// it. Installing pgvector on a running server therefore needs a restart to
+    /// be noticed, which the admin guide says.
+    fn as_vector_search(&self) -> Option<&dyn extenddb_storage::VectorSearchEngine> {
+        self.vector_capable.then_some(self)
+    }
+
     fn put_item(
         &self,
         key_info: &TableKeyInfo,
@@ -162,6 +180,38 @@ impl DataEngine for PostgresEngine {
         })
     }
 
+    fn scan_key_in_segment(
+        &self,
+        key_info: &TableKeyInfo,
+        key: &Item,
+        segment: i64,
+        total_segments: i64,
+        _index_name: Option<&str>,
+    ) -> BoxFuture<'_, Result<bool, StorageError>> {
+        // Same hashtext-based assignment the scan predicate uses
+        // ((hashtext(pk)::bigint & 2147483647) % total = seg), evaluated for
+        // the candidate key. `key_info` is scan-shaped, so `key_schema[0]` is
+        // the pk of whichever table (data or index) the scan targets, matching
+        // the `pk` column the predicate hashes. Bigint bitmask instead of
+        // abs() per CB-20 / SP-SCN-002 (hashtext() == i32::MIN).
+        let pk_name = key_info.key_schema[0].attribute_name.clone();
+        let key = key.clone();
+        Box::pin(async move {
+            let Some(pk_value) = key.get(&pk_name) else {
+                // Schema validation upstream already rejects this shape.
+                return Ok(false);
+            };
+            let pk_text = pk_to_text(pk_value)?;
+            sqlx::query_scalar("SELECT (hashtext($1)::bigint & 2147483647) % $2 = $3")
+                .bind(pk_text.as_ref())
+                .bind(total_segments)
+                .bind(segment)
+                .fetch_one(&self.data_pool)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))
+        })
+    }
+
     fn transact_get_items(
         &self,
         ops: &[TransactGetOp<'_>],
@@ -184,7 +234,7 @@ impl DataEngine for PostgresEngine {
     fn transact_write_items(
         &self,
         ops: &[TransactWriteOp<'_>],
-        token: Option<(&str, &str)>,
+        idempotency: Option<IdempotencyKey<'_>>,
     ) -> BoxFuture<'_, Result<(), StorageError>> {
         // Clone ops to owned data - unavoidable due to lifetime constraints
         let owned_ops: Vec<_> = ops
@@ -264,7 +314,13 @@ impl DataEngine for PostgresEngine {
                 ),
             })
             .collect();
-        let token = token.map(|(a, b)| (a.to_string(), b.to_string()));
+        let idempotency = idempotency.map(|k| {
+            (
+                k.account_id.to_string(),
+                k.token.to_string(),
+                k.fingerprint.to_string(),
+            )
+        });
 
         Box::pin(async move {
             // Reconstruct borrowed ops from owned data
@@ -322,7 +378,13 @@ impl DataEngine for PostgresEngine {
                 .collect();
             self.transact_write_items_impl(
                 &borrowed_ops,
-                token.as_ref().map(|(a, b)| (a.as_str(), b.as_str())),
+                idempotency
+                    .as_ref()
+                    .map(|(account_id, token, fingerprint)| IdempotencyKey {
+                        account_id,
+                        token,
+                        fingerprint,
+                    }),
             )
             .await
         })

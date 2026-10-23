@@ -15,9 +15,14 @@ use super::matcher::wildcard_match;
 ///
 /// Returns `true` if the condition is satisfied. The behavior depends on the
 /// operator type:
-/// - Base operators: key must be present, all context values must match at
-///   least one policy value.
-/// - `IfExists`: passes if the key is absent; otherwise evaluates normally.
+/// - Base (bare) operators on a **single-valued** key: key must be present and
+///   its value must match at least one policy value.
+/// - Base (bare) operators on a **multivalued** key (`dynamodb:Attributes`,
+///   `dynamodb:LeadingKeys`): never match. AWS IAM requires a
+///   `ForAllValues:`/`ForAnyValue:` qualifier for multivalued keys; a bare
+///   operator on such a key is a no-op regardless of value count (BR-7085).
+/// - `IfExists`: passes if the key is absent; otherwise evaluates as the base
+///   operator (and so never matches a present multivalued key).
 /// - `Null`: checks key presence/absence.
 /// - `ForAllValues`: every context value must match some policy value.
 ///   Absent key is vacuously true.
@@ -25,6 +30,7 @@ use super::matcher::wildcard_match;
 ///   Absent key is false (unless wrapped in `IfExists`).
 pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext) -> bool {
     let context_values = context.resolve_key(&condition.key);
+    let is_multivalued = context.is_multivalued_key(&condition.key);
 
     // Expand policy variables (e.g. `${aws:PrincipalTag/Team}`) in condition values.
     let expanded_values: Vec<String> = condition
@@ -96,12 +102,96 @@ pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext
         }
         ConditionOperator::IfExists(inner) => match context_values {
             None => true,
+            // A bare operator (even wrapped in IfExists) applied to a multivalued
+            // key never matches in AWS IAM — only ForAllValues/ForAnyValue do.
+            // Key present + multivalued → no match. (BR-7085)
+            Some(_) if is_multivalued => false,
             Some(vals) => evaluate_single_value_condition(inner, &vals, &expanded_values),
         },
         other => match context_values {
-            None => false,
+            // A negated operator on an absent single-valued key evaluates true
+            // in AWS IAM: the key has no value, so it cannot equal the policy
+            // value, so "not equals" holds. This makes a Deny gated on
+            // StringNotEquals apply when the caller omits the key (the
+            // confused-deputy guard). Measured on live IAM/STS and DynamoDB.
+            // Bare operators on multivalued keys
+            // never match, present or absent (BR-7085), so the rule is scoped
+            // to single-valued keys.
+            None => is_negative_operator(other) && !is_multivalued,
+            // Bare operator on a multivalued key never matches (BR-7085). This is
+            // fail-safe: a bare Deny becomes a no-op (matching AWS, which forces the
+            // author to use ForAnyValue:), and a bare Allow allowlist stops granting.
+            Some(_) if is_multivalued => false,
             Some(vals) => evaluate_single_value_condition(other, &vals, &expanded_values),
         },
+    }
+}
+
+/// Three-valued outcome of evaluating a statement's condition block.
+///
+/// A condition key falls into one of three cases, and each is treated
+/// differently:
+/// 1. The context resolves the key to a value: evaluate normally.
+/// 2. The context resolves the key as absent in the same way the service would
+///    have it absent: IAM absent-key semantics apply (including the rule that a
+///    negated operator on an absent single-valued key matches).
+/// 3. The service would populate the key but this context cannot resolve it
+///    (`is_unresolvable_key`): the statement fails closed whatever the operator.
+///    A `Deny` that depends on it blocks; an `Allow` that depends on it does not
+///    grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionMatch {
+    /// All conditions are satisfied; the statement applies.
+    Match,
+    /// A condition is not satisfied; the statement does not apply.
+    NoMatch,
+    /// A condition depends on a key the service populates but this context
+    /// cannot resolve. The statement fails closed.
+    Unresolvable,
+}
+
+/// Evaluate one condition three-valued.
+///
+/// Returns [`ConditionMatch::Unresolvable`] when the key is unresolved and the
+/// context reports it as service-populated (case 3). Otherwise returns `Match`
+/// or `NoMatch` from the ordinary evaluation, so cases 1 and 2 are unchanged.
+pub fn evaluate_condition_match(
+    condition: &Condition,
+    context: &impl ConditionContext,
+) -> ConditionMatch {
+    if context.resolve_key(&condition.key).is_none() && context.is_unresolvable_key(&condition.key)
+    {
+        return ConditionMatch::Unresolvable;
+    }
+    if evaluate_condition(condition, context) {
+        ConditionMatch::Match
+    } else {
+        ConditionMatch::NoMatch
+    }
+}
+
+/// Evaluate a statement's whole condition block (all conditions are ANDed).
+///
+/// `NoMatch` dominates: if any condition is definitely not satisfied the
+/// statement does not apply, even if another condition is unresolvable. Failing
+/// that, any unresolvable condition makes the block `Unresolvable` (fail
+/// closed). Otherwise every condition matched.
+pub fn evaluate_statement_conditions(
+    conditions: &[Condition],
+    context: &impl ConditionContext,
+) -> ConditionMatch {
+    let mut any_unresolvable = false;
+    for condition in conditions {
+        match evaluate_condition_match(condition, context) {
+            ConditionMatch::Match => {}
+            ConditionMatch::NoMatch => return ConditionMatch::NoMatch,
+            ConditionMatch::Unresolvable => any_unresolvable = true,
+        }
+    }
+    if any_unresolvable {
+        ConditionMatch::Unresolvable
+    } else {
+        ConditionMatch::Match
     }
 }
 
@@ -154,19 +244,21 @@ fn unwrap_if_exists(op: &ConditionOperator) -> (bool, &ConditionOperator) {
     }
 }
 
-/// Evaluate a non-set, non-IfExists condition.
+/// Evaluate a non-set, non-IfExists condition for a single-valued key.
 ///
-/// For single-valued keys, `context_values` has one element.
-/// For multi-valued keys (e.g., `dynamodb:LeadingKeys`), all context values
-/// must satisfy the condition (implicit AND).
+/// The caller (`evaluate_condition`) only reaches this for single-valued keys;
+/// bare operators on multivalued keys are rejected before this point (BR-7085).
+/// A single-valued key resolves to exactly one context value in practice, so the
+/// `all`/`any` combinators below collapse to that one value.
 ///
-/// For positive operators (`StringEquals`, `NumericEquals`, etc.): each context
-/// value must match at least one policy value (OR semantics — "value in set").
+/// For positive operators (`StringEquals`, `NumericEquals`, etc.): the context
+/// value must match at least one policy value (OR semantics across policy values
+/// — "value in set").
 ///
-/// For negative operators (`StringNotEquals`, `NumericNotEquals`, etc.): each
-/// context value must satisfy the negative comparison against ALL policy
-/// values (AND semantics — "value not in set"). This matches AWS IAM behavior
-/// where `StringNotEquals` with `["a", "b"]` means "value is neither a nor b".
+/// For negative operators (`StringNotEquals`, `NumericNotEquals`, etc.): the
+/// context value must satisfy the negative comparison against ALL policy values
+/// (AND semantics — "value not in set"). This matches AWS IAM behavior where
+/// `StringNotEquals` with `["a", "b"]` means "value is neither a nor b".
 fn evaluate_single_value_condition(
     op: &ConditionOperator,
     context_values: &[&str],
@@ -192,11 +284,13 @@ fn is_negative_operator(op: &ConditionOperator) -> bool {
     matches!(
         op,
         ConditionOperator::StringNotEquals
+            | ConditionOperator::StringNotEqualsIgnoreCase
             | ConditionOperator::NumericNotEquals
             | ConditionOperator::DateNotEquals
             | ConditionOperator::StringNotLike
             | ConditionOperator::ArnNotEquals
             | ConditionOperator::ArnNotLike
+            | ConditionOperator::NotIpAddress
     )
 }
 
@@ -214,6 +308,9 @@ fn compare_single(op: &ConditionOperator, context_value: &str, policy_value: &st
         ConditionOperator::StringNotEquals => context_value != policy_value,
         ConditionOperator::StringEqualsIgnoreCase => {
             context_value.eq_ignore_ascii_case(policy_value)
+        }
+        ConditionOperator::StringNotEqualsIgnoreCase => {
+            !context_value.eq_ignore_ascii_case(policy_value)
         }
         ConditionOperator::StringLike => wildcard_match(policy_value, context_value),
         ConditionOperator::StringNotLike => !wildcard_match(policy_value, context_value),
@@ -252,6 +349,17 @@ fn compare_single(op: &ConditionOperator, context_value: &str, policy_value: &st
         ConditionOperator::ArnNotEquals => context_value != policy_value,
         ConditionOperator::ArnLike => super::matcher::arn_match(policy_value, context_value),
         ConditionOperator::ArnNotLike => !super::matcher::arn_match(policy_value, context_value),
+        // IpAddress matches only when the caller address and the policy range
+        // are the same family and the address is in the range. NotIpAddress
+        // matches only when they are the same family and the address is not in
+        // the range. A family mismatch or a malformed value makes both false,
+        // matching the live service.
+        ConditionOperator::IpAddress => {
+            super::matcher::ip_in_cidr(policy_value, context_value) == Some(true)
+        }
+        ConditionOperator::NotIpAddress => {
+            super::matcher::ip_in_cidr(policy_value, context_value) == Some(false)
+        }
         // Null, ForAllValues, ForAnyValue, IfExists handled by caller
         _ => false,
     }
@@ -303,626 +411,4 @@ fn parse_epoch_millis(s: &str) -> Option<i128> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::policy::context::ConditionContext;
-    use std::collections::HashMap;
-
-    /// Simple test context that maps keys to values.
-    struct TestContext(HashMap<String, Vec<String>>);
-
-    impl TestContext {
-        fn new() -> Self {
-            Self(HashMap::new())
-        }
-
-        fn with(mut self, key: &str, values: Vec<&str>) -> Self {
-            self.0.insert(
-                key.to_owned(),
-                values.into_iter().map(ToOwned::to_owned).collect(),
-            );
-            self
-        }
-    }
-
-    impl ConditionContext for TestContext {
-        fn resolve_key(&self, key: &str) -> Option<Vec<&str>> {
-            self.0
-                .get(key)
-                .map(|v| v.iter().map(|s| s.as_str()).collect())
-        }
-    }
-
-    fn cond(op: ConditionOperator, key: &str, values: Vec<&str>) -> Condition {
-        Condition {
-            operator: op,
-            key: key.to_owned(),
-            values: values.into_iter().map(ToOwned::to_owned).collect(),
-        }
-    }
-
-    // --- StringEquals ---
-
-    #[test]
-    fn string_equals_match() {
-        let ctx = TestContext::new().with("k", vec!["hello"]);
-        assert!(evaluate_condition(
-            &cond(ConditionOperator::StringEquals, "k", vec!["hello"]),
-            &ctx
-        ));
-    }
-
-    #[test]
-    fn string_equals_no_match() {
-        let ctx = TestContext::new().with("k", vec!["hello"]);
-        assert!(!evaluate_condition(
-            &cond(ConditionOperator::StringEquals, "k", vec!["world"]),
-            &ctx
-        ));
-    }
-
-    #[test]
-    fn string_equals_absent_key() {
-        let ctx = TestContext::new();
-        assert!(!evaluate_condition(
-            &cond(ConditionOperator::StringEquals, "k", vec!["hello"]),
-            &ctx
-        ));
-    }
-
-    #[test]
-    fn string_equals_multiple_policy_values() {
-        let ctx = TestContext::new().with("k", vec!["b"]);
-        assert!(evaluate_condition(
-            &cond(ConditionOperator::StringEquals, "k", vec!["a", "b", "c"]),
-            &ctx
-        ));
-    }
-
-    // --- StringLike ---
-
-    #[test]
-    fn string_like_wildcard() {
-        let ctx = TestContext::new().with("k", vec!["hello-world"]);
-        assert!(evaluate_condition(
-            &cond(ConditionOperator::StringLike, "k", vec!["hello-*"]),
-            &ctx
-        ));
-    }
-
-    #[test]
-    fn string_not_like() {
-        let ctx = TestContext::new().with("k", vec!["hello"]);
-        assert!(evaluate_condition(
-            &cond(ConditionOperator::StringNotLike, "k", vec!["world*"]),
-            &ctx
-        ));
-    }
-
-    // --- StringEqualsIgnoreCase ---
-
-    #[test]
-    fn string_equals_ignore_case() {
-        let ctx = TestContext::new().with("k", vec!["Hello"]);
-        assert!(evaluate_condition(
-            &cond(
-                ConditionOperator::StringEqualsIgnoreCase,
-                "k",
-                vec!["hello"]
-            ),
-            &ctx
-        ));
-    }
-
-    // --- Numeric ---
-
-    #[test]
-    fn numeric_equals() {
-        let ctx = TestContext::new().with("k", vec!["42"]);
-        assert!(evaluate_condition(
-            &cond(ConditionOperator::NumericEquals, "k", vec!["42"]),
-            &ctx
-        ));
-    }
-
-    #[test]
-    fn numeric_less_than() {
-        let ctx = TestContext::new().with("k", vec!["5"]);
-        assert!(evaluate_condition(
-            &cond(ConditionOperator::NumericLessThan, "k", vec!["10"]),
-            &ctx
-        ));
-    }
-
-    #[test]
-    fn numeric_greater_than_equals() {
-        let ctx = TestContext::new().with("k", vec!["10"]);
-        assert!(evaluate_condition(
-            &cond(ConditionOperator::NumericGreaterThanEquals, "k", vec!["10"]),
-            &ctx
-        ));
-    }
-
-    #[test]
-    fn numeric_invalid_parse() {
-        let ctx = TestContext::new().with("k", vec!["abc"]);
-        assert!(!evaluate_condition(
-            &cond(ConditionOperator::NumericEquals, "k", vec!["42"]),
-            &ctx
-        ));
-    }
-
-    // --- Bool ---
-
-    #[test]
-    fn bool_true() {
-        let ctx = TestContext::new().with("k", vec!["true"]);
-        assert!(evaluate_condition(
-            &cond(ConditionOperator::Bool, "k", vec!["true"]),
-            &ctx
-        ));
-    }
-
-    #[test]
-    fn bool_case_insensitive() {
-        let ctx = TestContext::new().with("k", vec!["True"]);
-        assert!(evaluate_condition(
-            &cond(ConditionOperator::Bool, "k", vec!["true"]),
-            &ctx
-        ));
-    }
-
-    // --- Null ---
-
-    #[test]
-    fn null_true_absent_key() {
-        let ctx = TestContext::new();
-        assert!(evaluate_condition(
-            &cond(ConditionOperator::Null, "k", vec!["true"]),
-            &ctx
-        ));
-    }
-
-    #[test]
-    fn null_true_present_key() {
-        let ctx = TestContext::new().with("k", vec!["val"]);
-        assert!(!evaluate_condition(
-            &cond(ConditionOperator::Null, "k", vec!["true"]),
-            &ctx
-        ));
-    }
-
-    #[test]
-    fn null_false_present_key() {
-        let ctx = TestContext::new().with("k", vec!["val"]);
-        assert!(evaluate_condition(
-            &cond(ConditionOperator::Null, "k", vec!["false"]),
-            &ctx
-        ));
-    }
-
-    #[test]
-    fn null_false_absent_key() {
-        let ctx = TestContext::new();
-        assert!(!evaluate_condition(
-            &cond(ConditionOperator::Null, "k", vec!["false"]),
-            &ctx
-        ));
-    }
-
-    // --- ArnLike ---
-
-    #[test]
-    fn arn_like_match() {
-        let ctx = TestContext::new().with("k", vec!["arn:aws:dynamodb:us-east-1:123:table/Users"]);
-        assert!(evaluate_condition(
-            &cond(
-                ConditionOperator::ArnLike,
-                "k",
-                vec!["arn:aws:dynamodb:*:*:table/User*"]
-            ),
-            &ctx
-        ));
-    }
-
-    #[test]
-    fn arn_not_like() {
-        let ctx = TestContext::new().with("k", vec!["arn:aws:dynamodb:us-east-1:123:table/Orders"]);
-        assert!(evaluate_condition(
-            &cond(
-                ConditionOperator::ArnNotLike,
-                "k",
-                vec!["arn:aws:dynamodb:*:*:table/User*"]
-            ),
-            &ctx
-        ));
-    }
-
-    // --- IfExists ---
-
-    #[test]
-    fn if_exists_absent_key_passes() {
-        let ctx = TestContext::new();
-        assert!(evaluate_condition(
-            &cond(
-                ConditionOperator::IfExists(Box::new(ConditionOperator::StringEquals)),
-                "k",
-                vec!["val"]
-            ),
-            &ctx
-        ));
-    }
-
-    #[test]
-    fn if_exists_present_key_evaluates() {
-        let ctx = TestContext::new().with("k", vec!["val"]);
-        assert!(evaluate_condition(
-            &cond(
-                ConditionOperator::IfExists(Box::new(ConditionOperator::StringEquals)),
-                "k",
-                vec!["val"]
-            ),
-            &ctx
-        ));
-    }
-
-    #[test]
-    fn if_exists_present_key_fails() {
-        let ctx = TestContext::new().with("k", vec!["other"]);
-        assert!(!evaluate_condition(
-            &cond(
-                ConditionOperator::IfExists(Box::new(ConditionOperator::StringEquals)),
-                "k",
-                vec!["val"]
-            ),
-            &ctx
-        ));
-    }
-
-    // --- ForAllValues ---
-
-    #[test]
-    fn for_all_values_all_match() {
-        let ctx = TestContext::new().with("k", vec!["a", "b"]);
-        assert!(evaluate_condition(
-            &cond(
-                ConditionOperator::ForAllValues(Box::new(ConditionOperator::StringEquals)),
-                "k",
-                vec!["a", "b", "c"]
-            ),
-            &ctx
-        ));
-    }
-
-    #[test]
-    fn for_all_values_one_missing() {
-        let ctx = TestContext::new().with("k", vec!["a", "d"]);
-        assert!(!evaluate_condition(
-            &cond(
-                ConditionOperator::ForAllValues(Box::new(ConditionOperator::StringEquals)),
-                "k",
-                vec!["a", "b", "c"]
-            ),
-            &ctx
-        ));
-    }
-
-    #[test]
-    fn for_all_values_absent_key_vacuously_true() {
-        let ctx = TestContext::new();
-        assert!(evaluate_condition(
-            &cond(
-                ConditionOperator::ForAllValues(Box::new(ConditionOperator::StringEquals)),
-                "k",
-                vec!["a"]
-            ),
-            &ctx
-        ));
-    }
-
-    // --- ForAnyValue ---
-
-    #[test]
-    fn for_any_value_one_match() {
-        let ctx = TestContext::new().with("k", vec!["x", "a"]);
-        assert!(evaluate_condition(
-            &cond(
-                ConditionOperator::ForAnyValue(Box::new(ConditionOperator::StringEquals)),
-                "k",
-                vec!["a"]
-            ),
-            &ctx
-        ));
-    }
-
-    #[test]
-    fn for_any_value_no_match() {
-        let ctx = TestContext::new().with("k", vec!["x", "y"]);
-        assert!(!evaluate_condition(
-            &cond(
-                ConditionOperator::ForAnyValue(Box::new(ConditionOperator::StringEquals)),
-                "k",
-                vec!["a"]
-            ),
-            &ctx
-        ));
-    }
-
-    #[test]
-    fn for_any_value_absent_key_false() {
-        let ctx = TestContext::new();
-        assert!(!evaluate_condition(
-            &cond(
-                ConditionOperator::ForAnyValue(Box::new(ConditionOperator::StringEquals)),
-                "k",
-                vec!["a"]
-            ),
-            &ctx
-        ));
-    }
-
-    #[test]
-    fn for_any_value_if_exists_absent_key_true() {
-        let ctx = TestContext::new();
-        assert!(evaluate_condition(
-            &cond(
-                ConditionOperator::ForAnyValue(Box::new(ConditionOperator::IfExists(Box::new(
-                    ConditionOperator::StringEquals
-                )))),
-                "k",
-                vec!["a"]
-            ),
-            &ctx
-        ));
-    }
-
-    // --- Date operators ---
-
-    #[test]
-    fn date_equals() {
-        let ctx = TestContext::new().with("k", vec!["2026-01-01T00:00:00Z"]);
-        assert!(evaluate_condition(
-            &cond(
-                ConditionOperator::DateEquals,
-                "k",
-                vec!["2026-01-01T00:00:00Z"]
-            ),
-            &ctx
-        ));
-    }
-
-    #[test]
-    fn date_less_than() {
-        let ctx = TestContext::new().with("k", vec!["2025-01-01T00:00:00Z"]);
-        assert!(evaluate_condition(
-            &cond(
-                ConditionOperator::DateLessThan,
-                "k",
-                vec!["2026-01-01T00:00:00Z"]
-            ),
-            &ctx
-        ));
-    }
-
-    // --- Multi-value context with base operator ---
-
-    #[test]
-    fn multi_value_context_all_must_match() {
-        // With a base operator (not ForAllValues), all context values must match
-        // at least one policy value
-        let ctx = TestContext::new().with("k", vec!["a", "b"]);
-        assert!(evaluate_condition(
-            &cond(ConditionOperator::StringEquals, "k", vec!["a", "b"]),
-            &ctx
-        ));
-    }
-
-    #[test]
-    fn multi_value_context_one_fails() {
-        let ctx = TestContext::new().with("k", vec!["a", "c"]);
-        assert!(!evaluate_condition(
-            &cond(ConditionOperator::StringEquals, "k", vec!["a", "b"]),
-            &ctx
-        ));
-    }
-
-    // --- Negative operators with multiple policy values ---
-
-    #[test]
-    fn string_not_equals_single_policy_value() {
-        let ctx = TestContext::new().with("k", vec!["admin"]);
-        // "admin" == "admin", so StringNotEquals should be false
-        assert!(!evaluate_condition(
-            &cond(ConditionOperator::StringNotEquals, "k", vec!["admin"]),
-            &ctx
-        ));
-    }
-
-    #[test]
-    fn string_not_equals_multiple_policy_values_match() {
-        let ctx = TestContext::new().with("k", vec!["admin"]);
-        // "admin" is in {"admin", "root"}, so StringNotEquals should be false
-        assert!(!evaluate_condition(
-            &cond(
-                ConditionOperator::StringNotEquals,
-                "k",
-                vec!["admin", "root"]
-            ),
-            &ctx
-        ));
-    }
-
-    #[test]
-    fn string_not_equals_multiple_policy_values_no_match() {
-        let ctx = TestContext::new().with("k", vec!["user"]);
-        // "user" is NOT in {"admin", "root"}, so StringNotEquals should be true
-        assert!(evaluate_condition(
-            &cond(
-                ConditionOperator::StringNotEquals,
-                "k",
-                vec!["admin", "root"]
-            ),
-            &ctx
-        ));
-    }
-
-    #[test]
-    fn string_not_like_multiple_policy_values() {
-        let ctx = TestContext::new().with("k", vec!["hello-world"]);
-        // "hello-world" matches "hello-*", so StringNotLike should be false
-        assert!(!evaluate_condition(
-            &cond(
-                ConditionOperator::StringNotLike,
-                "k",
-                vec!["hello-*", "foo-*"]
-            ),
-            &ctx
-        ));
-    }
-
-    #[test]
-    fn string_not_like_multiple_policy_values_no_match() {
-        let ctx = TestContext::new().with("k", vec!["bar-baz"]);
-        // "bar-baz" matches neither "hello-*" nor "foo-*"
-        assert!(evaluate_condition(
-            &cond(
-                ConditionOperator::StringNotLike,
-                "k",
-                vec!["hello-*", "foo-*"]
-            ),
-            &ctx
-        ));
-    }
-
-    // --- Policy variable expansion ---
-
-    #[test]
-    fn policy_variable_expansion_principal_tag() {
-        let ctx = TestContext::new()
-            .with("dynamodb:ResourceTag/Team", vec!["Alpha"])
-            .with("aws:PrincipalTag/Team", vec!["Alpha"]);
-        assert!(evaluate_condition(
-            &cond(
-                ConditionOperator::StringEquals,
-                "dynamodb:ResourceTag/Team",
-                vec!["${aws:PrincipalTag/Team}"]
-            ),
-            &ctx
-        ));
-    }
-
-    #[test]
-    fn policy_variable_expansion_mismatch() {
-        let ctx = TestContext::new()
-            .with("dynamodb:ResourceTag/Team", vec!["Beta"])
-            .with("aws:PrincipalTag/Team", vec!["Alpha"]);
-        assert!(!evaluate_condition(
-            &cond(
-                ConditionOperator::StringEquals,
-                "dynamodb:ResourceTag/Team",
-                vec!["${aws:PrincipalTag/Team}"]
-            ),
-            &ctx
-        ));
-    }
-
-    #[test]
-    fn policy_variable_no_expansion_needed() {
-        let ctx = TestContext::new().with("k", vec!["hello"]);
-        assert!(evaluate_condition(
-            &cond(ConditionOperator::StringEquals, "k", vec!["hello"]),
-            &ctx
-        ));
-    }
-
-    #[test]
-    fn policy_variable_unresolvable_left_literal() {
-        let ctx = TestContext::new().with("k", vec!["${aws:PrincipalTag/Missing}"]);
-        // Unresolvable variable stays literal — matches if context has the literal
-        assert!(evaluate_condition(
-            &cond(
-                ConditionOperator::StringEquals,
-                "k",
-                vec!["${aws:PrincipalTag/Missing}"]
-            ),
-            &ctx
-        ));
-    }
-
-    // --- ForAllValues with negative operators ---
-
-    #[test]
-    fn for_all_values_string_not_equals_context_in_policy_set() {
-        // ForAllValues:StringNotEquals with context ["admin"] and policy ["admin", "root"]
-        // "admin" IS in the set, so the condition should be FALSE (deny applies).
-        let ctx = TestContext::new().with("k", vec!["admin"]);
-        assert!(!evaluate_condition(
-            &cond(
-                ConditionOperator::ForAllValues(Box::new(ConditionOperator::StringNotEquals)),
-                "k",
-                vec!["admin", "root"]
-            ),
-            &ctx
-        ));
-    }
-
-    #[test]
-    fn for_all_values_string_not_equals_context_not_in_policy_set() {
-        // ForAllValues:StringNotEquals with context ["user"] and policy ["admin", "root"]
-        // "user" is NOT in the set, so the condition should be TRUE.
-        let ctx = TestContext::new().with("k", vec!["user"]);
-        assert!(evaluate_condition(
-            &cond(
-                ConditionOperator::ForAllValues(Box::new(ConditionOperator::StringNotEquals)),
-                "k",
-                vec!["admin", "root"]
-            ),
-            &ctx
-        ));
-    }
-
-    #[test]
-    fn for_all_values_string_not_equals_mixed_context() {
-        // ForAllValues:StringNotEquals with context ["user", "admin"] and policy ["admin", "root"]
-        // "admin" IS in the set, so the condition should be FALSE.
-        let ctx = TestContext::new().with("k", vec!["user", "admin"]);
-        assert!(!evaluate_condition(
-            &cond(
-                ConditionOperator::ForAllValues(Box::new(ConditionOperator::StringNotEquals)),
-                "k",
-                vec!["admin", "root"]
-            ),
-            &ctx
-        ));
-    }
-
-    #[test]
-    fn for_any_value_string_not_equals_all_in_set() {
-        // ForAnyValue:StringNotEquals with context ["admin", "root"] and policy ["admin", "root"]
-        // Both context values are in the policy set, so none satisfy "not in set" → FALSE.
-        let ctx = TestContext::new().with("k", vec!["admin", "root"]);
-        assert!(!evaluate_condition(
-            &cond(
-                ConditionOperator::ForAnyValue(Box::new(ConditionOperator::StringNotEquals)),
-                "k",
-                vec!["admin", "root"]
-            ),
-            &ctx
-        ));
-    }
-
-    #[test]
-    fn for_any_value_string_not_equals_one_outside_set() {
-        // ForAnyValue:StringNotEquals with context ["admin", "user"] and policy ["admin", "root"]
-        // "user" is NOT in the set, so at least one satisfies "not in set" → TRUE.
-        let ctx = TestContext::new().with("k", vec!["admin", "user"]);
-        assert!(evaluate_condition(
-            &cond(
-                ConditionOperator::ForAnyValue(Box::new(ConditionOperator::StringNotEquals)),
-                "k",
-                vec!["admin", "root"]
-            ),
-            &ctx
-        ));
-    }
-}
+mod tests;

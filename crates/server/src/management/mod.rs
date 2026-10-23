@@ -12,7 +12,10 @@ mod account;
 pub(crate) use account::generate_account_id;
 mod admin;
 mod assume_role;
-mod auth;
+/// Shared with the web console so both write surfaces validate a trust
+/// policy the same way.
+pub(crate) use assume_role::validate_trust_policy;
+pub(crate) mod auth;
 pub mod cache_invalidate;
 mod cache_metrics;
 pub(crate) mod crypto;
@@ -49,6 +52,12 @@ pub struct ManagementState {
     /// Concrete `TableKeyInfo` cache handle, used by the auth-cache-metrics
     /// endpoint. Same instance is held in `auth_cache.table_key_info`.
     pub table_key_info_cache: Arc<crate::CachedTableKeyInfoStore>,
+    /// Server region, resolved into `aws:RequestedRegion` during trust policy
+    /// evaluation.
+    pub region: Arc<str>,
+    /// Whether the listener serves TLS, resolved into `aws:SecureTransport`
+    /// during trust policy evaluation.
+    pub secure_transport: bool,
 }
 
 /// Build the management API router.
@@ -221,6 +230,82 @@ pub(crate) fn is_valid_iam_name(name: &str) -> bool {
         })
 }
 
+/// Reject a tag set with two keys that collide under ASCII case folding.
+///
+/// The live service treats tag keys as case insensitive for uniqueness: a
+/// `TagUser`/`TagRole`/`TagResource` request carrying both `Team` and `team`
+/// is rejected ("Duplicate tag keys found. Please note that Tag keys are case
+/// insensitive."). Two keys that differ by more than ASCII case (for example
+/// `mass` and `ma\u{00df}`) are distinct and allowed. Returns the duplicate key
+/// when found.
+pub(crate) fn duplicate_tag_key_ci(tags: &[(String, String)]) -> Option<String> {
+    let mut seen: Vec<String> = Vec::with_capacity(tags.len());
+    for (k, _) in tags {
+        let lower = k.to_ascii_lowercase();
+        if seen.contains(&lower) {
+            return Some(k.clone());
+        }
+        seen.push(lower);
+    }
+    None
+}
+
+/// Validate a tag set against the live IAM service's tag rules, returning an
+/// error string for the first violation. Each key is 1-128 characters and each
+/// value at most 256 characters (counted in characters, not bytes), drawn from
+/// IAM's grammar (`[\p{L}\p{Z}\p{N}_.:/=+\-@]`, which excludes combining
+/// marks and most punctuation), and a key must not use the reserved `aws:`
+/// prefix. The empty value and a leading or trailing space are allowed, matching
+/// the service.
+pub(crate) fn validate_iam_tags(tags: &[(String, String)]) -> Result<(), String> {
+    for (k, v) in tags {
+        let n = k.chars().count();
+        if n == 0 || n > 128 {
+            return Err("tag key must be 1-128 characters".to_owned());
+        }
+        if k.to_ascii_lowercase().starts_with("aws:") {
+            return Err("tag key must not begin with the reserved prefix aws:".to_owned());
+        }
+        if !k.chars().all(is_iam_tag_char) {
+            return Err(format!("tag key contains an invalid character: {k}"));
+        }
+        if v.chars().count() > 256 {
+            return Err("tag value must not exceed 256 characters".to_owned());
+        }
+        if !v.chars().all(is_iam_tag_char) {
+            return Err("tag value contains an invalid character".to_owned());
+        }
+    }
+    Ok(())
+}
+
+/// Whether `c` is admissible in an IAM tag key or value.
+///
+/// IAM's tag grammar is `[\p{L}\p{Z}\p{N}_.:/=+\-@]`: any Unicode Letter
+/// (Lu, Ll, Lt, Lm, Lo), Number (Nd, Nl, No) or Separator (Zs, Zl, Zp), plus the
+/// listed symbols. These are Unicode general categories, matched here through
+/// `general_category_group`, not `char::is_alphabetic` / `char::is_numeric`:
+/// `is_alphabetic` is the Alphabetic property, a superset of `\p{L}` that admits
+/// Other_Alphabetic combining marks such as U+0345 (category Mn) that IAM
+/// rejects, and an ASCII-space-only separator check rejects the `\p{Z}`
+/// separators (U+00A0, U+2002, U+3000 and the rest) that IAM accepts.
+///
+/// `unicode-properties` carries Unicode 15.1 general categories; the case-fold
+/// table in `extenddb_auth` is Unicode 15.0.0. Unicode 15.1 added only uncased
+/// characters (CJK Unified Ideographs Extension I and five ideographic
+/// description characters), so its case folding is identical to 15.0.0 and
+/// the fold table holds under either version.
+fn is_iam_tag_char(c: char) -> bool {
+    use unicode_properties::{GeneralCategoryGroup, UnicodeGeneralCategory};
+    matches!(c, '_' | '.' | ':' | '/' | '=' | '+' | '-' | '@')
+        || matches!(
+            c.general_category_group(),
+            GeneralCategoryGroup::Letter
+                | GeneralCategoryGroup::Number
+                | GeneralCategoryGroup::Separator
+        )
+}
+
 /// Validate admin name: 1-64 chars, alphanumeric, hyphens, or underscores.
 fn is_valid_admin_name(name: &str) -> bool {
     !name.is_empty()
@@ -228,4 +313,83 @@ fn is_valid_admin_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+#[cfg(test)]
+mod tag_validation_tests {
+    use super::{duplicate_tag_key_ci, validate_iam_tags};
+
+    fn t(k: &str, v: &str) -> Vec<(String, String)> {
+        vec![(k.to_owned(), v.to_owned())]
+    }
+
+    #[test]
+    fn accepts_service_valid_tags() {
+        assert!(validate_iam_tags(&t("team", "prod")).is_ok());
+        assert!(validate_iam_tags(&t("a_.:/=+-@b", "v_.:/=+-@")).is_ok());
+        assert!(validate_iam_tags(&t("my team", "east coast")).is_ok()); // space ok
+        assert!(validate_iam_tags(&t("team", "")).is_ok()); // empty value ok
+        assert!(validate_iam_tags(&t(" team", "prod")).is_ok()); // leading space ok
+        assert!(validate_iam_tags(&t("equipe\u{00e9}", "prod")).is_ok()); // precomposed letter
+    }
+
+    #[test]
+    fn rejects_service_invalid_tags() {
+        assert!(validate_iam_tags(&t("Equipe\u{0301}", "prod")).is_err()); // combining mark
+        assert!(validate_iam_tags(&t("a#b", "prod")).is_err());
+        assert!(validate_iam_tags(&t("a!b", "prod")).is_err());
+        assert!(validate_iam_tags(&t("aws:team", "prod")).is_err()); // reserved prefix
+        assert!(validate_iam_tags(&t("AWS:team", "prod")).is_err()); // case-insensitive prefix
+        assert!(validate_iam_tags(&t(&"k".repeat(129), "prod")).is_err()); // key too long
+        assert!(validate_iam_tags(&t("team", &"v".repeat(257))).is_err()); // value too long
+        assert!(validate_iam_tags(&t("team", "v\u{0301}")).is_err()); // combining mark in value
+    }
+
+    #[test]
+    fn tag_charset_matches_unicode_general_categories() {
+        // Separators (Zs, Zl, Zp) are accepted, matching live IAM.
+        for sep in [
+            '\u{00a0}', // no-break space (Zs)
+            '\u{2002}', // en space (Zs)
+            '\u{2003}', // em space (Zs)
+            '\u{3000}', // ideographic space (Zs)
+            '\u{2028}', // line separator (Zl)
+            '\u{2029}', // paragraph separator (Zp)
+            '\u{202f}', // narrow no-break space (Zs)
+        ] {
+            let k = format!("a{sep}b");
+            assert!(validate_iam_tags(&t(&k, "v")).is_ok(), "sep {sep:?} key");
+            assert!(validate_iam_tags(&t("k", &k)).is_ok(), "sep {sep:?} value");
+        }
+        // Numbers beyond Nd: Nl and No are accepted.
+        assert!(validate_iam_tags(&t("a\u{2160}b", "v")).is_ok()); // roman numeral one (Nl)
+        assert!(validate_iam_tags(&t("a\u{00b2}b", "v")).is_ok()); // superscript two (No)
+        assert!(validate_iam_tags(&t("a\u{00bd}b", "v")).is_ok()); // vulgar fraction half (No)
+        // Marks (Mn) are rejected even when Alphabetic (Other_Alphabetic),
+        // matching live IAM.
+        assert!(validate_iam_tags(&t("a\u{0345}b", "v")).is_err()); // ypogegrammeni (Mn, Other_Alphabetic)
+        assert!(validate_iam_tags(&t("a\u{0301}b", "v")).is_err()); // combining acute (Mn)
+        assert!(validate_iam_tags(&t("k", "v\u{0345}")).is_err()); // in a value too
+        // Symbols are rejected: an emoji (So).
+        assert!(validate_iam_tags(&t("a\u{1f600}b", "v")).is_err());
+        // Control: ASCII space (Zs) still accepted.
+        assert!(validate_iam_tags(&t("a b", "v")).is_ok());
+    }
+
+    #[test]
+    fn duplicate_ascii_case_key_detected() {
+        let dup = duplicate_tag_key_ci(&[
+            ("Team".to_owned(), "1".to_owned()),
+            ("team".to_owned(), "2".to_owned()),
+        ]);
+        assert_eq!(dup.as_deref(), Some("team"));
+        // mass and sharp-s differ by more than ASCII case: distinct, allowed.
+        assert!(
+            duplicate_tag_key_ci(&[
+                ("mass".to_owned(), "A".to_owned()),
+                ("ma\u{00df}".to_owned(), "B".to_owned()),
+            ])
+            .is_none()
+        );
+    }
 }

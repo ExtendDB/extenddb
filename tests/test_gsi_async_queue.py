@@ -77,7 +77,7 @@ def _set_gsi_delay(config_path, ms):
 
     ``--config`` must precede the ``set`` subcommand for the settings CLI.
     """
-    _run_extenddb("settings", "--config", config_path, "set", "gsi_propagation_delay_ms", str(ms))
+    _run_extenddb("settings", "--config", config_path, "set", "index_propagation_delay_ms", str(ms))
 
 
 def _server_pid_on_port(port):

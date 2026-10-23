@@ -48,22 +48,31 @@ pub async fn handle_put_item(
     }
 
     // Pre-validate enum fields (report all invalid enums together)
+    // Aggregated, in the measured clause order (2026-08-24, us-east-1: three
+    // invalid enums answer "3 validation errors detected" with the clauses in
+    // this sequence). A ReturnValues member merely disallowed for PutItem
+    // passes here and falls through to validate_put_delete_return_values.
     crate::validate_enum_fields(
         &body,
         &[
-            ("ReturnValues", "returnValues", &["NONE", "ALL_OLD"]),
-            (
-                "ReturnConsumedCapacity",
-                "returnConsumedCapacity",
-                &["INDEXES", "TOTAL", "NONE"],
-            ),
-            (
-                "ReturnItemCollectionMetrics",
-                "returnItemCollectionMetrics",
-                &["SIZE", "NONE"],
-            ),
+            crate::EnumField {
+                json_name: "ReturnConsumedCapacity",
+                valid: &["INDEXES", "TOTAL", "NONE"],
+                clause: crate::EnumClause::Named("returnConsumedCapacity"),
+            },
+            crate::EnumField {
+                json_name: "ReturnValues",
+                valid: crate::RETURN_VALUES_MEMBERS,
+                clause: crate::EnumClause::Bare(crate::RETURN_VALUES_BARE_CLAUSE),
+            },
+            crate::EnumField {
+                json_name: "ReturnItemCollectionMetrics",
+                valid: &["SIZE", "NONE"],
+                clause: crate::EnumClause::Named("returnItemCollectionMetrics"),
+            },
         ],
     )?;
+    crate::validate_put_delete_return_values(&body)?;
 
     let input: PutItemInput = serde_json::from_value(body).map_err(|e| {
         let msg = e.to_string();
@@ -85,17 +94,36 @@ pub async fn handle_put_item(
         }
     })?;
 
-    // Reject EAN/EAV supplied without a referencing expression.
+    // Reject mixing legacy and expression parameters, then EAN/EAV supplied
+    // without a referencing expression.
     let has_expression = input
         .condition_expression
         .as_ref()
         .is_some_and(|s| !s.is_empty());
+    let has_expected = input.expected.as_ref().is_some_and(|m| !m.is_empty());
+    let has_cond_op = input.conditional_operator.is_some();
+    extenddb_core::validation::validate_no_expression_param_mixing(
+        &[
+            ("Expected", has_expected),
+            ("ConditionalOperator", has_cond_op),
+        ],
+        &[("ConditionExpression", has_expression)],
+    )?;
     extenddb_core::expression::validate_expression_param_usage(
         input.expression_attribute_names.as_ref(),
         has_expression,
         input.expression_attribute_values.as_ref(),
         has_expression,
         &[extenddb_core::expression::ExpressionKind::Condition],
+    )?;
+
+    // ConditionalOperator requires an Expected with two or more conditions.
+    extenddb_core::validation::validate_conditional_operator_usage(
+        has_cond_op,
+        input
+            .expected
+            .as_ref()
+            .map_or(0, std::collections::HashMap::len),
     )?;
 
     extenddb_core::validation::validate_table_name(&input.table_name, &ctx.limits)?;
@@ -141,11 +169,35 @@ pub async fn handle_put_item(
         &key_info.attribute_definitions,
     )?;
 
-    let return_old = input.return_values == ReturnValues::AllOld;
+    // The nesting-depth limit applies to every ExpressionAttributeValue on the
+    // single-item write paths, condition-only placeholders included: measured
+    // 2026-08-24 (us-east-1), a 32-level value referenced solely by a
+    // ConditionExpression is rejected on PutItem, DeleteItem, and UpdateItem
+    // alike, while 31 levels is accepted. TransactWriteItems deliberately does
+    // NOT get this check: the same 32-level condition-only value is accepted
+    // inside a transaction on every sub-op shape (also measured).
+    if let Some(values) = &input.expression_attribute_values {
+        extenddb_core::validation::validate_attribute_values_nesting_depth(values.values())?;
+    }
 
-    // Capacity metering: full item size, rounded up to 1 KB.
-    let item_bytes = item_size_bytes(&input.item);
-    let wcu = capacity_helpers::write_capacity_units(item_bytes);
+    extenddb_core::validation::validate_vector_write(
+        &input.item,
+        &key_info.vector_indexes,
+        &key_info.attribute_definitions,
+    )?;
+
+    let return_old = input.return_values == ReturnValues::AllOld;
+    let capacity_requested =
+        input.return_consumed_capacity != extenddb_core::types::ReturnConsumedCapacity::None;
+    let needs_index_capacity = capacity_requested
+        && (!key_info.global_secondary_indexes.is_empty()
+            || !key_info.local_secondary_indexes.is_empty()
+            || !key_info.vector_indexes.is_empty());
+
+    // Preserve the new item only when per-index accounting needs to compare it
+    // with the replaced item after storage takes ownership.
+    let new_item_for_capacity = needs_index_capacity.then(|| input.item.clone());
+    let new_item_bytes = item_size_bytes(&input.item);
 
     // Extract item collection metrics before item is moved into storage.
     let icm = capacity_helpers::item_metrics(
@@ -163,16 +215,18 @@ pub async fn handle_put_item(
         user_identity: None,
         region: ctx.region.clone(),
     });
-    // When streams are enabled, always request old item so the storage layer
-    // can determine Insert vs Modify and build old images.
+    // Capacity uses the larger old/new base item and must include index entries
+    // deleted by an overwrite, so request the old item whenever capacity is
+    // requested. Indexed writes already read it inside the storage transaction.
     let need_old_for_stream = stream.is_some();
+    let need_old_for_capacity = capacity_requested;
 
     let old_item = ctx
         .storage
         .put_item(
             &key_info,
             input.item,
-            return_old || need_old_for_stream,
+            return_old || need_old_for_stream || need_old_for_capacity,
             condition.as_ref(),
             &maps,
             stream.as_ref(),
@@ -184,13 +238,31 @@ pub async fn handle_put_item(
 
     // Stream records are now captured atomically within the storage transaction.
 
-    let output = PutItemOutput {
-        attributes: if return_old { old_item } else { None },
-        consumed_capacity: capacity_helpers::write_capacity(
+    let old_item_bytes = old_item.as_ref().map_or(0, item_size_bytes);
+    let wcu = capacity_helpers::write_capacity_units(new_item_bytes.max(old_item_bytes));
+    let consumed_capacity = match new_item_for_capacity.as_ref() {
+        Some(new_item) => capacity_helpers::write_capacity_indexed(
             input.return_consumed_capacity,
             &input.table_name,
             wcu,
+            old_item.as_ref(),
+            Some(new_item),
+            // An overwrite whose projected index entry is unchanged charges
+            // no index write: an identical PutItem overwrite reports the
+            // table arm alone (measured 2026-08-24, us-east-1 and eu-west-2;
+            // an earlier measurement had put replacements charging the index
+            // regardless, which is no longer what the service does).
+            false,
+            &key_info,
         ),
+        None => {
+            capacity_helpers::write_capacity(input.return_consumed_capacity, &input.table_name, wcu)
+        }
+    };
+
+    let output = PutItemOutput {
+        attributes: if return_old { old_item } else { None },
+        consumed_capacity,
         item_collection_metrics: icm,
     };
     let body = serialize_output(&output)?;

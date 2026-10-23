@@ -39,10 +39,10 @@ extenddb uses SigV4 signature verification with a local credential store and IAM
 3. Look up the access key in the credential store
 4. Decrypt the secret key (AES-256-GCM)
 5. Compute the signing key: HMAC-SHA256 chain over date, region, service, "aws4_request"
-6. Compute the string-to-sign from the canonical request
+6. Compute the string-to-sign from the canonical request. The hashed-payload line is the SHA-256 of the body the server received; a client-supplied `x-amz-content-sha256` header is not used for it, so a request whose body was altered after signing fails at step 7
 7. Compare computed signature against the provided signature (constant-time comparison)
-8. On mismatch: return `SignatureDoesNotMatch` (HTTP 403)
-9. On unknown key: return `UnrecognizedClientException` (HTTP 403)
+8. On mismatch: return `InvalidSignatureException` (HTTP 400)
+9. On unknown key: return `UnrecognizedClientException` (HTTP 400)
 
 #### Credential Types
 
@@ -108,7 +108,7 @@ Set operators and `IfExists` can be combined: `ForAllValues:StringEqualsIfExists
 | Key | Type | Description |
 |-----|------|-------------|
 | `aws:PrincipalTag/<key>` | String | Tag on the authenticated principal (user or role) |
-| `dynamodb:ResourceTag/<key>` | String | Tag on the target DynamoDB table |
+| `aws:ResourceTag/<key>` | String | Tag on the target DynamoDB table |
 | `dynamodb:LeadingKeys` | Multi-valued string | Partition key values being accessed |
 | `dynamodb:Attributes` | Multi-valued string | Attribute names being read or written |
 | `dynamodb:Select` | String | The `Select` parameter value |
@@ -127,9 +127,11 @@ extenddb supports the same access control patterns as real AWS IAM:
 
 **Role-Based Access Control (RBAC)**: Create IAM groups with policies, add users to groups. Users inherit group policies. Create IAM roles for cross-account or service-to-service access.
 
-**Attribute-Based Access Control (ABAC)**: Use `aws:PrincipalTag/*` and `dynamodb:ResourceTag/*` condition keys to make access decisions based on tags. Example: allow users tagged `Department=Engineering` to access tables tagged `Department=Engineering`.
+**Attribute-Based Access Control (ABAC)**: Use `aws:PrincipalTag/*` and `aws:ResourceTag/*` condition keys to make access decisions based on tags. Example: allow users tagged `Department=Engineering` to access tables tagged `Department=Engineering`.
 
 **Fine-Grained Access Control (FGAC)**: Use `dynamodb:LeadingKeys` to restrict access to specific partition key values. Use `dynamodb:Attributes` to restrict which attributes can be read or written. Example: allow a user to access only items where the partition key matches their user ID.
+
+`dynamodb:LeadingKeys` is evaluated on `GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `Query`, `BatchGetItem`, `BatchWriteItem`, `TransactGetItems` and `TransactWriteItems`. A `Query` on a global secondary index binds the key to the index's partition key value (its first HASH attribute). `Scan` and `SearchVectors` target no single partition and carry no `dynamodb:LeadingKeys` value, so a `ForAllValues` condition does not fence them; fence a full-table read with `ForAnyValue:StringEquals` or a `Null` guard on the statement. A numeric partition key is compared as the normalized number on `GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `Query` and `BatchGetItem`, and as Java's `BigDecimal` prints it (`10.0` stays `10.0`, `1E1` is `1E+1`) on `BatchWriteItem`, `TransactGetItems` and `TransactWriteItems`, which is what DynamoDB does.
 
 ### Resource ARNs
 
@@ -200,8 +202,19 @@ Input validation is layered:
 
 Import/export file paths are validated:
 - `..` components rejected
-- Paths canonicalized
-- Symlinks detected and rejected
+- Paths namespaced per account: a caller in account `A` may only resolve paths
+  under `<root>/A` for each configured root. Containment in the bare root is not
+  sufficient, so tenants sharing an instance cannot read or overwrite each
+  other's files. The account id comes from the authenticated identity, never
+  from the request
+- Containment is decided before any filesystem access, so a path belonging to
+  another account answers identically whether or not the file exists
+- Paths canonicalized, and containment re-checked afterwards so a symlinked
+  ancestor cannot redirect out of the subtree
+- Symlinks detected and rejected, including one planted at the export filename
+- Export refuses to overwrite an existing file, so it cannot truncate a file it
+  did not create
+- Both operations record the acting account, the operation and the resolved path
 - Error messages use generic text (no raw paths leaked)
 
 ## Error Message Security

@@ -131,7 +131,7 @@ function drawLine(id,labels,series,yLabel){
   for(let i=0;i<labels.length;i+=st){const x=P.l+(i/Math.max(labels.length-1,1))*pw;ctx.fillText(labels[i],x,h-4);}
   for(const s of series){ctx.strokeStyle=s.color;ctx.lineWidth=s.width||2;ctx.beginPath();for(let i=0;i<s.values.length;i++){const x=P.l+(i/Math.max(s.values.length-1,1))*pw,y=P.t+ph*(1-(s.values[i]-mn)/rng);if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);}ctx.stroke();}
 }
-function buildUrl(){if(customStart&&customEnd)return'/metrics?start='+encodeURIComponent(customStart)+'&end='+encodeURIComponent(customEnd);return'/metrics?window='+currentWindow;}
+function buildUrl(){if(customStart&&customEnd)return'/console/metrics-data?start='+encodeURIComponent(customStart)+'&end='+encodeURIComponent(customEnd);return'/console/metrics-data?window='+currentWindow;}
 function updateWindowLinks(){document.querySelectorAll('.window-link').forEach(a=>{if(a.dataset.window===currentWindow&&!customStart){a.style.background='#2563eb';a.style.color='#fff';}else{a.style.background='';a.style.color='';}});}
 function tsLabel(t){const d=new Date(t);return d.getHours().toString().padStart(2,'0')+':'+d.getMinutes().toString().padStart(2,'0');}
 function aggBuckets(bkts,metric,opF){

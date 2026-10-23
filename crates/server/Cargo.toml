@@ -7,9 +7,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+mongodb-test-hooks = []
+
 [dependencies]
 extenddb-cache = { workspace = true }
 extenddb-core = { workspace = true }
+extenddb-config = { workspace = true }
 extenddb-engine = { workspace = true }
 extenddb-storage = { workspace = true }
 extenddb-auth = { workspace = true }
@@ -28,12 +32,22 @@ uuid = { workspace = true }
 metrics = { workspace = true }
 anyhow = { workspace = true }
 bcrypt = { workspace = true }
+# IAM tag charset validation needs the exact Unicode general categories
+# (\p{L}, \p{N}, \p{Z}); char::is_alphabetic / is_numeric are not those sets.
+unicode-properties = "0.1.4"
 base64 = { workspace = true }
 time = { workspace = true }
 aes-gcm = { workspace = true }
 rand = { workspace = true }
 axum-server = { workspace = true }
 rustls = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# POSIX syslog is the daemon-mode log target; neither crate compiles on
+# Windows, where `serve --foreground` (stderr logging) is the only mode.
+[target.'cfg(unix)'.dependencies]
+syslog-tracing = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 extenddb-cache = { workspace = true, features = ["test-util"] }

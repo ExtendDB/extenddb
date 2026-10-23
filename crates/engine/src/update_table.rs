@@ -27,7 +27,27 @@ pub async fn handle_update_table(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
-    let input: UpdateTableInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
+    // Per-member enum validation precedes everything else, including the table
+    // lookup, matching the measured service ordering.
+    crate::validate_enum_fields(
+        &body,
+        &[
+            crate::EnumField {
+                json_name: "BillingMode",
+                valid: &["PROVISIONED", "PAY_PER_REQUEST"],
+                clause: crate::EnumClause::Named("billingMode"),
+            },
+            crate::EnumField {
+                json_name: "TableThroughputMode",
+                valid: &["PROVISIONED", "PAY_PER_REQUEST"],
+                clause: crate::EnumClause::Named("tableThroughputMode"),
+            },
+        ],
+    )?;
+
+    let mut input: UpdateTableInput =
+        serde_json::from_value(body).map_err(crate::deserialize_error)?;
+    input.resolve_table_throughput_mode();
 
     if input.table_name.is_empty() {
         return Err(DynamoDbError::ValidationException(
@@ -35,8 +55,36 @@ pub async fn handle_update_table(
         ));
     }
 
+    crate::vector_gate::ensure_update_table_supported(
+        input.vector_index_updates.as_ref(),
+        ctx.storage.as_vector_search(),
+    )?;
+    // Same per-index rules CreateTable applies, so a malformed index is rejected
+    // identically whichever path it arrives by.
+    extenddb_core::validation::validate_vector_index_updates(
+        input.vector_index_updates.as_ref(),
+        input.attribute_definitions.as_deref().unwrap_or_default(),
+    )?;
+    // Same collapse CreateTable applies, for the same reason: an index added by
+    // either path must reach every backend in one shape.
+    for update in input.vector_index_updates.iter_mut().flatten() {
+        if let Some(create) = update.create.as_mut() {
+            create.normalize_search_schema();
+        }
+    }
+
     let has_gsi_updates = input
         .global_secondary_index_updates
+        .as_ref()
+        .is_some_and(|u| !u.is_empty());
+    // Vector index changes count as a specified field. Measured 2026-08-06: the
+    // service accepts an UpdateTable carrying only VectorIndexUpdates, which is
+    // how the backfill lifecycle was observed. Omitting it here rejected that
+    // request as empty, so a vector-capable backend could never have been reached
+    // by the one operation the contract models a lifecycle for. An empty list is
+    // not a change, matching how the capability gate treats it.
+    let has_vector_updates = input
+        .vector_index_updates
         .as_ref()
         .is_some_and(|u| !u.is_empty());
 
@@ -48,6 +96,7 @@ pub async fn handle_update_table(
         && input.table_class.is_none()
         && input.on_demand_throughput.is_none()
         && !has_gsi_updates
+        && !has_vector_updates
     {
         return Err(DynamoDbError::ValidationException(
             "At least one of BillingMode, ProvisionedThroughput, DeletionProtectionEnabled, StreamSpecification, or GlobalSecondaryIndexUpdates must be specified".to_owned(),
@@ -91,7 +140,74 @@ pub async fn handle_update_table(
             ));
     }
 
-    // Validate GSI updates: each entry must have exactly one of Create, Update, or Delete.
+    validate_gsi_updates(&input)?;
+
+    // A created GSI's projected attributes count toward the table's limit
+    // together with the indexes it already has: the total CreateTable checks,
+    // and so the total a restore of this table's backups checks.
+    if let Some(updates) = &input.global_secondary_index_updates
+        && updates.iter().any(|u| {
+            u.create.as_ref().is_some_and(|c| {
+                c.projection
+                    .non_key_attributes
+                    .as_ref()
+                    .is_some_and(|a| !a.is_empty())
+            })
+        })
+    {
+        let existing = ctx
+            .storage
+            .describe_table(
+                &ctx.account_id,
+                extenddb_core::types::DescribeTableInput {
+                    table_name: input.table_name.clone(),
+                },
+            )
+            .await
+            .map_err(|e| update_table_err_to_dynamo(e, &input.table_name))?;
+        extenddb_core::validation::validate_projected_attribute_total(
+            projected_after_gsi_updates(&existing, updates),
+        )?;
+    }
+
+    let table_name = input.table_name.clone();
+    // Kept for the post-condition check below, since `input` is moved into the
+    // backend call.
+    let vector_index_updates = input.vector_index_updates.clone();
+    let mut desc = ctx
+        .storage
+        .update_table(&ctx.account_id, input)
+        .await
+        .map_err(|e| update_table_err_to_dynamo(e, &table_name))?;
+
+    // A declared-capable backend must not silently drop the vector index change.
+    // Checked against the description it returned, so this cannot be opted out of.
+    crate::vector_gate::ensure_vector_updates_applied(vector_index_updates.as_ref(), &desc)?;
+
+    // Drop the cached TableKeyInfo: index changes, stream-spec changes, and
+    // throughput changes all alter what the cached value contains.
+    //
+    // NOTE: UpdateTable does NOT currently accept Tags. If that ever
+    // changes, also invalidate `resource_tags` for the table ARN here —
+    // the request itself populates resource_tags during authorize_request,
+    // so a stale empty entry would otherwise hide the new tags. See
+    // handle_create_table for the same pattern.
+    ctx.auth_cache
+        .invalidate_table_key_info(&ctx.account_id, &table_name)
+        .await;
+
+    desc.prepare_for_response();
+    let output = extenddb_core::types::UpdateTableOutput {
+        table_description: desc,
+    };
+    serialize_output(&output)
+}
+
+/// The per-entry rules for `GlobalSecondaryIndexUpdates`, checked before any
+/// storage read: each entry has exactly one of Create, Update, or Delete,
+/// and a Create has a valid name, a key schema of defined attributes, and
+/// (when given) a throughput of at least 1 unit each.
+fn validate_gsi_updates(input: &UpdateTableInput) -> Result<(), DynamoDbError> {
     if let Some(updates) = &input.global_secondary_index_updates {
         for update in updates {
             if update.create.is_some() && update.delete.is_some() {
@@ -114,6 +230,10 @@ pub async fn handle_update_table(
             // M3: Validate index names the same way CreateTable does.
             if let Some(create) = &update.create {
                 extenddb_core::validation::validate_index_name(&create.index_name)?;
+                extenddb_core::validation::validate_index_throughput_minimum(
+                    &create.index_name,
+                    create.provisioned_throughput.as_ref(),
+                )?;
                 if create.key_schema.is_empty() {
                     return Err(DynamoDbError::ValidationException(
                         "One or more parameter values were invalid: KeySchema must not be empty for GSI creation".to_owned(),
@@ -144,54 +264,240 @@ pub async fn handle_update_table(
             }
         }
     }
+    Ok(())
+}
 
-    let table_name = input.table_name.clone();
-    let desc = ctx
-        .storage
-        .update_table(&ctx.account_id, input)
-        .await
-        .map_err(|e| match e {
-            extenddb_storage::error::StorageError::TableNotFound(_name) => {
-                DynamoDbError::ResourceNotFoundException("Requested resource not found".to_string())
-            }
-            extenddb_storage::error::StorageError::TableNotActive(name) => {
-                DynamoDbError::ResourceInUseException(format!(
-                    "Table {name} is not in ACTIVE state"
-                ))
-            }
-            extenddb_storage::error::StorageError::IndexAlreadyExists(name) => {
-                DynamoDbError::ValidationException(format!(
-                    "One or more parameter values were invalid: Index already exists: {name}"
-                ))
-            }
-            extenddb_storage::error::StorageError::IndexNotFound(name) => {
-                DynamoDbError::ResourceNotFoundException(format!(
-                    "Requested resource not found: Index {name} for table {table_name}"
-                ))
-            }
-            extenddb_storage::error::StorageError::NoOpUpdate(msg) => {
-                DynamoDbError::ValidationException(msg)
-            }
-            other => {
-                tracing::error!(internal_error = %other, "storage internal error");
-                DynamoDbError::InternalServerError("Internal server error".to_owned())
-            }
-        })?;
-
-    // Drop the cached TableKeyInfo: index changes, stream-spec changes, and
-    // throughput changes all alter what the cached value contains.
-    //
-    // NOTE: UpdateTable does NOT currently accept Tags. If that ever
-    // changes, also invalidate `resource_tags` for the table ARN here —
-    // the request itself populates resource_tags during authorize_request,
-    // so a stale empty entry would otherwise hide the new tags. See
-    // handle_create_table for the same pattern.
-    ctx.auth_cache
-        .invalidate_table_key_info(&ctx.account_id, &table_name)
-        .await;
-
-    let output = extenddb_core::types::UpdateTableOutput {
-        table_description: desc,
+/// The table's projected `NonKeyAttributes` once `updates` apply: its LSIs,
+/// its GSIs that are not deleted, and the GSIs created.
+fn projected_after_gsi_updates(
+    existing: &extenddb_core::types::TableDescription,
+    updates: &[extenddb_core::types::GlobalSecondaryIndexUpdate],
+) -> usize {
+    let deleted = |name: &str| {
+        updates
+            .iter()
+            .filter_map(|u| u.delete.as_ref())
+            .any(|d| d.index_name == name)
     };
-    serialize_output(&output)
+    extenddb_core::validation::projected_non_key_attribute_count(
+        existing
+            .global_secondary_indexes
+            .iter()
+            .flatten()
+            .filter(|g| !deleted(&g.index_name))
+            .map(|g| &g.projection)
+            .chain(
+                existing
+                    .local_secondary_indexes
+                    .iter()
+                    .flatten()
+                    .map(|l| &l.projection),
+            )
+            .chain(
+                updates
+                    .iter()
+                    .filter_map(|u| u.create.as_ref())
+                    .map(|c| &c.projection),
+            ),
+    )
+}
+
+/// Map a backend failure from `update_table` onto the wire error.
+///
+/// A named function rather than an inline closure so every arm is reachable from
+/// a unit test. Two of them are not reachable any other way: no in-tree backend
+/// yet returns `Unsupported` or `IndexesInUse` from `update_table`, and the
+/// vector capability gate refuses vector requests before the backend is called
+/// at all, so a wire test cannot provoke either one today.
+fn update_table_err_to_dynamo(
+    e: extenddb_storage::error::StorageError,
+    table_name: &str,
+) -> DynamoDbError {
+    use extenddb_storage::error::StorageError;
+    match e {
+        StorageError::TableNotFound(_name) => {
+            DynamoDbError::ResourceNotFoundException("Requested resource not found".to_string())
+        }
+        StorageError::TableNotActive(name) => {
+            DynamoDbError::ResourceInUseException(format!("Table {name} is not in ACTIVE state"))
+        }
+        StorageError::IndexAlreadyExists(name) => DynamoDbError::ValidationException(format!(
+            "One or more parameter values were invalid: Index already exists: {name}"
+        )),
+        StorageError::IndexNotFound(name) => DynamoDbError::ResourceNotFoundException(format!(
+            "Requested resource not found: Index {name} for table {table_name}"
+        )),
+        StorageError::NoOpUpdate(msg) => DynamoDbError::ValidationException(msg),
+        StorageError::Validation(msg) => DynamoDbError::ValidationException(msg),
+        StorageError::LimitExceeded(msg) => DynamoDbError::LimitExceededException(msg),
+        // Not a fault, so deliberately not logged at error level: the backend
+        // never claimed the feature. Same mapping CreateTable uses; without this
+        // arm a capability refusal fell through to a 500, which tells a caller
+        // the server is broken when the request simply cannot be served here.
+        StorageError::Unsupported(msg) => DynamoDbError::ValidationException(msg),
+        // The change is refused by the resource's current state, not by the
+        // request. The backend supplies the whole message because only it knows
+        // the state.
+        StorageError::IndexesInUse(msg) => DynamoDbError::ResourceInUseException(msg),
+        other => {
+            tracing::error!(internal_error = %other, "storage internal error");
+            DynamoDbError::InternalServerError("Internal server error".to_owned())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use extenddb_storage::error::StorageError;
+
+    #[test]
+    fn a_created_gsi_throughput_below_one_is_refused() {
+        let input = |pt: Value| -> UpdateTableInput {
+            serde_json::from_value(serde_json::json!({
+                "TableName": "t",
+                "AttributeDefinitions": [{ "AttributeName": "g", "AttributeType": "S" }],
+                "GlobalSecondaryIndexUpdates": [{ "Create": {
+                    "IndexName": "gix",
+                    "KeySchema": [{ "AttributeName": "g", "KeyType": "HASH" }],
+                    "Projection": { "ProjectionType": "ALL" },
+                    "ProvisionedThroughput": pt,
+                }}],
+            }))
+            .unwrap()
+        };
+        for (read, write) in [(0, 0), (0, 1), (1, 0), (-1, 5)] {
+            let pt = serde_json::json!({ "ReadCapacityUnits": read, "WriteCapacityUnits": write });
+            match validate_gsi_updates(&input(pt)).unwrap_err() {
+                DynamoDbError::ValidationException(m) => {
+                    assert!(m.ends_with("for index: gix"), "{m}");
+                }
+                other => panic!("({read}, {write}): {other:?}"),
+            }
+        }
+        let ok = serde_json::json!({ "ReadCapacityUnits": 1, "WriteCapacityUnits": 1 });
+        validate_gsi_updates(&input(ok)).unwrap();
+    }
+
+    #[test]
+    fn projected_total_counts_kept_indexes_and_created_ones() {
+        use extenddb_core::types::{
+            GlobalSecondaryIndexUpdate, GsiDescription, LsiDescription, Projection, ProjectionType,
+            TableDescription,
+        };
+        let include = |n: usize| Projection {
+            projection_type: ProjectionType::Include,
+            non_key_attributes: Some((0..n).map(|i| format!("a{i}")).collect()),
+        };
+        let existing = TableDescription {
+            global_secondary_indexes: Some(vec![
+                GsiDescription {
+                    index_name: "kept".to_owned(),
+                    key_schema: Vec::new(),
+                    projection: include(30),
+                    index_status: "ACTIVE".to_owned(),
+                    provisioned_throughput: None,
+                    index_size_bytes: 0,
+                    item_count: 0,
+                    index_arn: String::new(),
+                },
+                GsiDescription {
+                    index_name: "dropped".to_owned(),
+                    key_schema: Vec::new(),
+                    projection: include(50),
+                    index_status: "ACTIVE".to_owned(),
+                    provisioned_throughput: None,
+                    index_size_bytes: 0,
+                    item_count: 0,
+                    index_arn: String::new(),
+                },
+            ]),
+            local_secondary_indexes: Some(vec![LsiDescription {
+                index_name: "lsi".to_owned(),
+                key_schema: Vec::new(),
+                projection: include(20),
+                index_size_bytes: 0,
+                item_count: 0,
+                index_arn: String::new(),
+            }]),
+            ..Default::default()
+        };
+        let create = |n: usize| -> GlobalSecondaryIndexUpdate {
+            serde_json::from_value(serde_json::json!({ "Create": {
+                "IndexName": "new", "KeySchema": [],
+                "Projection": serde_json::to_value(include(n)).unwrap(),
+            }}))
+            .unwrap()
+        };
+        let delete: GlobalSecondaryIndexUpdate =
+            serde_json::from_value(serde_json::json!({ "Delete": { "IndexName": "dropped" } }))
+                .unwrap();
+
+        assert_eq!(projected_after_gsi_updates(&existing, &[create(1)]), 101);
+        assert_eq!(
+            projected_after_gsi_updates(&existing, &[create(1), delete]),
+            51
+        );
+        assert!(
+            extenddb_core::validation::validate_projected_attribute_total(
+                projected_after_gsi_updates(&existing, &[create(1)])
+            )
+            .is_err()
+        );
+    }
+
+    /// A backend that cannot serve the request reports a 400, not a 500.
+    ///
+    /// This arm was missing while CreateTable had it, so the same refusal
+    /// answered differently depending on which operation carried it. It matters
+    /// for a backend whose vector capability is decided at runtime rather than at
+    /// compile time: its refusal arrives through this path.
+    #[test]
+    fn an_unsupported_feature_is_a_validation_exception() {
+        let err = update_table_err_to_dynamo(
+            StorageError::Unsupported("Vector indexes are not supported here".to_owned()),
+            "t",
+        );
+        match err {
+            DynamoDbError::ValidationException(msg) => {
+                assert_eq!(msg, "Vector indexes are not supported here");
+            }
+            other => panic!("expected ValidationException, got {other:?}"),
+        }
+    }
+
+    /// The backend's whole message survives, unwrapped and unprefixed, because
+    /// the service's own wording for this case names both the table and the index
+    /// and no layer above the backend knows either.
+    #[test]
+    fn a_resource_in_use_refusal_keeps_the_backend_message() {
+        let measured = extenddb_core::types::vector_index_delete_in_allocation_phase("t", "vidx");
+        let err = update_table_err_to_dynamo(StorageError::IndexesInUse(measured.clone()), "t");
+        match err {
+            DynamoDbError::ResourceInUseException(msg) => assert_eq!(msg, measured),
+            other => panic!("expected ResourceInUseException, got {other:?}"),
+        }
+    }
+
+    /// The measured whole string, byte for byte, from probe P2 on 2026-08-19.
+    #[test]
+    fn the_allocation_phase_refusal_is_the_measured_whole_string() {
+        assert_eq!(
+            extenddb_core::types::vector_index_delete_in_allocation_phase(
+                "eddbprobe-backfill",
+                "vidx2"
+            ),
+            "Attempt to change a resource which is still in use: Index creation is in resource \
+             allocation phase. Retry deletion during backfilling phase or when the index is \
+             active. Table: eddbprobe-backfill Index: vidx2"
+        );
+    }
+
+    /// A genuine fault still reports a 500 and is still logged as one.
+    #[test]
+    fn an_internal_failure_is_still_an_internal_server_error() {
+        let err =
+            update_table_err_to_dynamo(StorageError::Internal("disk on fire".to_owned()), "t");
+        assert!(matches!(err, DynamoDbError::InternalServerError(_)));
+    }
 }
