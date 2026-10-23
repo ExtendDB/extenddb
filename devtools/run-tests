@@ -65,6 +65,7 @@ RUN_RUST_INTEGRATION=false
 RUN_PYTEST=false
 RUN_EXTERNAL=false
 RUN_COMPREHENSIVE=false
+RUN_TERRAFORM=false
 RUN_CATALOG_CHECK=false
 
 # Options
@@ -88,6 +89,8 @@ Suites (at least one required):
   --pytest          Python integration tests
   --external        External Java test suite
   --comprehensive   Comprehensive Python suite
+  --terraform       Terraform apply of tests/terraform/warm-throughput (installs
+                    the pinned Terraform unless TERRAFORM names a binary)
   --all             all suites
   --catalog-check   post-test catalog integrity check
 
@@ -115,7 +118,8 @@ while [[ $# -gt 0 ]]; do
         --pytest)         RUN_PYTEST=true; shift ;;
         --external)       RUN_EXTERNAL=true; shift ;;
         --comprehensive)  RUN_COMPREHENSIVE=true; shift ;;
-        --all)            RUN_RUST=true; RUN_RUST_INTEGRATION=true; RUN_PYTEST=true; RUN_EXTERNAL=true; RUN_COMPREHENSIVE=true; shift ;;
+        --terraform)      RUN_TERRAFORM=true; shift ;;
+        --all)            RUN_RUST=true; RUN_RUST_INTEGRATION=true; RUN_PYTEST=true; RUN_EXTERNAL=true; RUN_COMPREHENSIVE=true; RUN_TERRAFORM=true; shift ;;
         --release)        RELEASE=true; shift ;;
         --filter)         FILTER="$2"; shift 2 ;;
         --catalog-check)  RUN_CATALOG_CHECK=true; shift ;;
@@ -155,8 +159,8 @@ if [[ -z "$TARGET" ]]; then
 fi
 
 # --- Validate: at least one suite ---
-if ! $RUN_RUST && ! $RUN_RUST_INTEGRATION && ! $RUN_PYTEST && ! $RUN_EXTERNAL && ! $RUN_COMPREHENSIVE && ! $RUN_CATALOG_CHECK; then
-    echo "error: at least one suite flag is required (--rust, --rust-integration, --pytest, --external, --comprehensive, --all, --catalog-check)"
+if ! $RUN_RUST && ! $RUN_RUST_INTEGRATION && ! $RUN_PYTEST && ! $RUN_EXTERNAL && ! $RUN_COMPREHENSIVE && ! $RUN_TERRAFORM && ! $RUN_CATALOG_CHECK; then
+    echo "error: at least one suite flag is required (--rust, --rust-integration, --pytest, --external, --comprehensive, --terraform, --all, --catalog-check)"
     exit 1
 fi
 
@@ -218,7 +222,7 @@ validate_real_dynamodb() {
 
 # Only validate credentials for integration suites
 NEEDS_INTEGRATION=false
-if $RUN_PYTEST || $RUN_EXTERNAL || $RUN_COMPREHENSIVE || $RUN_CATALOG_CHECK || $RUN_RUST_INTEGRATION; then
+if $RUN_PYTEST || $RUN_EXTERNAL || $RUN_COMPREHENSIVE || $RUN_TERRAFORM || $RUN_CATALOG_CHECK || $RUN_RUST_INTEGRATION; then
     NEEDS_INTEGRATION=true
 fi
 
@@ -547,6 +551,22 @@ if $RUN_COMPREHENSIVE; then
         echo "  ✓ Comprehensive tests passed"
     else
         echo "  ✗ Comprehensive tests had failures (check output for details)"
+        PASS=false
+    fi
+    echo ""
+fi
+
+# --- Terraform (the provider's WarmThroughput wait, issue #462) ---
+if $RUN_TERRAFORM; then
+    OUTFILE="discussions/test-terraform-${HASH}.txt"
+    echo "=== Terraform apply → ${OUTFILE} ==="
+    if [[ "$TARGET" == "real-dynamodb" ]]; then
+        echo "  skipped: the configuration points at an ExtendDB endpoint"
+    elif EXTENDDB_TEST_ENDPOINT="$EXTENDDB_TEST_ENDPOINT" \
+        tests/terraform/warm-throughput/run.sh 2>&1 | tee "$OUTFILE"; then
+        echo "  ✓ Terraform apply passed"
+    else
+        echo "  ✗ Terraform apply failed"
         PASS=false
     fi
     echo ""

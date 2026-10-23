@@ -125,6 +125,7 @@ mod tests {
             deletion_protection_enabled: None,
             table_class: None,
             tags: None,
+            warm_throughput: None,
         };
 
         // Create table

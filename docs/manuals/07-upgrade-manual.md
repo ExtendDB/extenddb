@@ -202,7 +202,20 @@ To discard data written after the upgrade as well, restore `<data-db>` from its 
 
 ## Version History
 
-### Catalog 0.0.4 (Current)
+### Catalog 0.0.5 (Cassandra only)
+
+Adds the stored `WarmThroughput` record: `V006__warm_throughput.cql` adds a nullable `warm_throughput` text column to `tables` and to `indexes` and stamps `catalog_version` 0.0.5. Nothing acts on the value; it is stored and reported by `DescribeTable` (see the differences document). PostgreSQL and SQLite add the same two columns at `serve` start (and in `extenddb migrate`) without a version change, so their catalog stays 0.0.4. <!-- version-literal-ok: names the Cassandra version alongside the shared one -->
+
+A Cassandra server from this release started before `extenddb migrate --yes` serves every table and item operation and reports the default warm throughput; a `CreateTable` or `UpdateTable` that names `WarmThroughput` fails with an internal error (`Undefined column name warm_throughput`) until the catalog is migrated, an `UpdateTable` that switches a table to `PAY_PER_REQUEST` succeeds without storing the on-demand warm throughput (the reported value still follows the on-demand minimum while the table is on-demand), and CreateBackup, RestoreTableFromBackup and DeleteBackup are refused as for V005. Run:
+
+```
+extenddb migrate --config extenddb.toml --cassandra-user <admin>          # exit 3, lists V006
+extenddb migrate --config extenddb.toml --cassandra-user <admin> --yes    # applies V006
+```
+
+V006 only adds columns and the version row; a 0.0.4 Cassandra binary keeps working against a 0.0.5 catalog.
+
+### Catalog 0.0.4 (Current on PostgreSQL and SQLite)
 
 Adds the table definition a backup records and the registration of a running restore:
 

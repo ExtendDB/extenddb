@@ -45,7 +45,7 @@ type CassandraSession = Session<
 >;
 
 /// Embedded catalog migration files, applied in order.
-pub(crate) const CATALOG_MIGRATIONS: &[(&str, &str)] = &[
+pub const CATALOG_MIGRATIONS: &[(&str, &str)] = &[
     (
         "V001__initial_schema.cql",
         include_str!("../migrations/catalog/V001__initial_schema.cql"),
@@ -65,6 +65,10 @@ pub(crate) const CATALOG_MIGRATIONS: &[(&str, &str)] = &[
     (
         "V005__backup_definitions_and_restore_registration.cql",
         include_str!("../migrations/catalog/V005__backup_definitions_and_restore_registration.cql"),
+    ),
+    (
+        "V006__warm_throughput.cql",
+        include_str!("../migrations/catalog/V006__warm_throughput.cql"),
     ),
 ];
 

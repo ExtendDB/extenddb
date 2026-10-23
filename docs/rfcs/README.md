@@ -52,7 +52,6 @@ you whether an RFC, an ADR, or neither is needed.
 | RFC      | Title | Status | Release |
 |:---------|:------|:-------|:--------|
 | [0001]() | | Draft  | |
-| [0002](0002-backend-plugin-policy.md) | Backend Plugin Policy | Draft | |
-| [0003](0003-backend-acceptance-criteria.md) | Backend Acceptance Criteria | Draft | |
+| [0002](0002-backend-plug-policy.md) | Backend Plugin Policy | Draft | |
 
 

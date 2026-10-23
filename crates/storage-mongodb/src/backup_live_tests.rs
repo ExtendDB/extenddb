@@ -167,6 +167,7 @@ async fn source_table_for(engine: &MongoEngine, account: &str, name: &str, items
                 non_key_attributes: None,
             },
             provisioned_throughput: None,
+            warm_throughput: None,
         }]),
         local_secondary_indexes: Some(vec![LsiInput {
             index_name: "l1".to_owned(),
@@ -1688,6 +1689,8 @@ async fn live_update_table_on_a_creating_restore_target_is_refused() {
         table_class: None,
         on_demand_throughput: None,
         vector_index_updates: None,
+        warm_throughput: None,
+        sse_specification: None,
     };
     let changes = vec![
         UpdateTableInput {
@@ -1720,6 +1723,7 @@ async fn live_update_table_on_a_creating_restore_target_is_refused() {
                         non_key_attributes: None,
                     },
                     provisioned_throughput: None,
+                    warm_throughput: None,
                 }),
                 update: None,
                 delete: None,

@@ -342,6 +342,8 @@ fn update_input(table: &str) -> UpdateTableInput {
         on_demand_throughput: None,
         table_throughput_mode: None,
         vector_index_updates: None,
+        warm_throughput: None,
+        sse_specification: None,
     }
 }
 
@@ -2909,6 +2911,7 @@ async fn update_table_refuses_a_vector_index_named_like_an_existing_gsi() {
         key_schema: hash_key("gsipk"),
         projection: projection(ProjectionType::All),
         provisioned_throughput: None,
+        warm_throughput: None,
     }]);
     s.engine
         .create_table(ACCOUNT, input)
@@ -2975,6 +2978,7 @@ async fn update_table_refuses_a_gsi_named_like_an_existing_vector_index() {
                         key_schema: hash_key("pk"),
                         projection: projection(ProjectionType::All),
                         provisioned_throughput: None,
+                        warm_throughput: None,
                     }),
                     update: None,
                     delete: None,

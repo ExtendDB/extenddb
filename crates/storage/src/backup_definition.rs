@@ -493,6 +493,7 @@ mod tests {
                     read_capacity_units: 3,
                     write_capacity_units: 4,
                 }),
+                warm_throughput: None,
             }],
             local_secondary_indexes: Vec::new(),
             table_class: Some("STANDARD_INFREQUENT_ACCESS".to_owned()),
