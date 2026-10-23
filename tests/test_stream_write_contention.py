@@ -33,7 +33,7 @@ from conftest import scoped_table
 WRITERS = 8
 OPS_PER_WRITER = 60
 KEYS = 4
-BATCH_WRITERS = 8
+BATCH_WRITERS = 16
 BATCH_ROUNDS = 30
 UPDATE_WRITERS = 16
 UPDATE_OPS = 20
@@ -195,15 +195,17 @@ def test_batch_writes_racing_puts_on_a_stream_table_never_fail(
     dynamodb_client, raw_client, streams_client, stream_table
 ):
     """BatchWriteItem (the raced key plus a side key) racing PutItem on the
-    raced key: no call fails, a batch that did not apply every request lists
-    the rest in UnprocessedItems, and replaying those lands each side item
-    once.
+    raced key: no batch call fails, a batch that did not apply every request
+    lists the rest in UnprocessedItems, and replaying those lands each side
+    item once.
 
-    Half the batch writers send the raced put first and half send it last.
-    Both orders answer the same way: a request the server could not apply now
-    is reported in UnprocessedItems whether or not an earlier request in the
-    same batch committed. A batch that fails as a whole when the contended
-    request happens to come first is the failure this covers.
+    Each batch round sends the raced put first or the side put first, so both
+    orders are covered. A request the server could not apply now belongs in
+    UnprocessedItems whether or not an earlier request in the same batch
+    committed; a batch that fails as a whole because the contended request
+    happened to come first is the failure this covers. The PutItem arm may
+    answer 503 ServiceUnavailable once a put has spent its retry budget,
+    which the SDKs retry.
     """
     prefix = f"batch-{uuid.uuid4().hex[:8]}-"
     raced = {"pk": {"S": f"{prefix}raced"}}
@@ -212,19 +214,19 @@ def test_batch_writes_racing_puts_on_a_stream_table_never_fail(
         failures: list[str] = []
         records = 0
         unprocessed_rounds = 0
-        raced_first = i % 4 == 0
         for n in range(BATCH_ROUNDS):
             w = {"S": f"w{i}-{n}"}
+            raced_first = n % 2 == 0
             try:
                 if i % 2 == 0:
                     side = {"pk": {"S": f"{prefix}side-{i}"}}
                     raced_req = {"PutRequest": {"Item": {**raced, "w": w}}}
                     side_req = {"PutRequest": {"Item": {**side, "w": w}}}
-                    # Writers 0, 4, ... put the raced key first, so the request
-                    # the server may not be able to apply is the first in the
-                    # batch and nothing has committed when it fails. Writers
-                    # 2, 6, ... put the side key first. Both answer 200 with
-                    # the rest of the batch in UnprocessedItems.
+                    # Even rounds put the raced key first, so the request the
+                    # server may not be able to apply is the first in the
+                    # batch and nothing has committed when it fails. Odd
+                    # rounds put the side key first. Both answer 200 with the
+                    # rest of the batch in UnprocessedItems.
                     pending = (
                         [raced_req, side_req] if raced_first else [side_req, raced_req]
                     )
@@ -239,13 +241,25 @@ def test_batch_writes_racing_puts_on_a_stream_table_never_fail(
                     raw_client.put_item(TableName=stream_table, Item={**raced, "w": w})
                     records += 1
             except ClientError as e:
+                arm = "BatchWriteItem" if i % 2 == 0 else "PutItem"
                 order = "raced first" if raced_first else "side first"
-                failures.append(f"{_error_code(e)} ({order})")
+                failures.append(f"{arm} {_error_code(e)} ({order})")
         return failures, records, unprocessed_rounds
 
     out = _run_writers(BATCH_WRITERS, body)
     failures = [f for fails, _, _ in out for f in fails]
-    assert not failures, f"{len(failures)} calls failed: {sorted(set(failures))}"
+    batch_failures = [f for f in failures if f.startswith("BatchWriteItem")]
+    assert not batch_failures, (
+        f"{len(batch_failures)} batch calls failed: {sorted(set(batch_failures))}; a request "
+        "the server could not apply belongs in UnprocessedItems in either order"
+    )
+    # A single-item PutItem that spends its whole retry budget answers 503
+    # ServiceUnavailable, which the SDKs retry. Any other failure, and any
+    # failure at all from the batch arm, is a defect.
+    put_failures = [
+        f for f in failures if not f.startswith("BatchWriteItem") and "503 " not in f
+    ]
+    assert not put_failures, f"PutItem answers: {sorted(set(put_failures))}"
     # Every side item holds its writer's last value: a replayed request was
     # applied once, after the request that was reported as processed.
     for i in range(0, BATCH_WRITERS, 2):
