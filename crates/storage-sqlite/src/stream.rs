@@ -33,21 +33,25 @@ impl SqliteEngine {
         table_name: &str,
         table_id: &str,
     ) -> Result<String, StorageError> {
-        let label: String = sqlx::query_scalar(
-            "UPDATE tables SET stream_label = strftime('%Y-%m-%dT%H:%M:%S','now') \
-             WHERE account_id = ? AND table_name = ? RETURNING stream_label",
-        )
-        .bind(account_id)
-        .bind(table_name)
-        .fetch_one(&mut **tx)
-        .await
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        // Formatted here, not in SQL, so every backend issues the same label
+        // shape from one function (`extenddb_storage::util::format_stream_label`).
+        let label = extenddb_storage::util::new_stream_label();
+        sqlx::query("UPDATE tables SET stream_label = ? WHERE account_id = ? AND table_name = ?")
+            .bind(&label)
+            .bind(account_id)
+            .bind(table_name)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         for i in 0..SHARDS_PER_STREAM {
-            // Zero-padded to 16 digits so the shard ID is always at
-            // least 28 characters (minimum length the AWS SDKs enforce for ShardId)
-            // even for the shortest legal table name.
-            let shard_id = format!("shardId-{table_name}-{i:016}");
+            // Derived from the table id, not its name. A name is shared by
+            // every account that picks it, while `stream_shards.shard_id` is
+            // unique across the database. A name of up to 255 bytes also
+            // overflowed the 65-character ShardId limit
+            // the AWS SDKs enforce. The table id is a UUID, giving a
+            // 61-character id.
+            let shard_id = format!("shardId-{table_id}-{i:016}");
             let start_seq = format!("{:021}", 0);
             sqlx::query(
                 "INSERT INTO stream_shards (shard_id, table_id, starting_sequence_number) \

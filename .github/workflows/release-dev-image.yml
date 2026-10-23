@@ -3,7 +3,8 @@
 #
 # Publishes the `extenddb-dev` container image (SQLite + dev-mode) to ALL
 # THREE registries, for linux/amd64 and linux/arm64, in a SINGLE dispatch:
-# gate, build, smoke test, push, sign (dockerhub environment approval), then
+# gate, build, smoke test, vulnerability scan, push, sign (dockerhub
+# environment approval), then
 # propagate to GHCR and ECR Public (ghcr environment approval) via the
 # promote-registry composite action — signature verified at each destination
 # before any tag is placed, forward-only latest per destination.
@@ -218,6 +219,20 @@ jobs:
           docker save '${{ env.IMAGE_REPO }}:sha-${{ needs.gate.outputs.sha }}-${{ matrix.arch }}' \
             | gzip > "dev-image-${{ matrix.arch }}.tar.gz"
           ls -lh "dev-image-${{ matrix.arch }}.tar.gz"
+
+      - name: Fail on fixable high or critical vulnerabilities
+        # Same gate as release-image.yml: scans the saved tarball with no
+        # Docker socket, and ignores findings that have no fixed version.
+        env:
+          TRIVY_IMAGE: public.ecr.aws/aquasecurity/trivy:0.76.0@sha256:2416d1f74045b57274df1a340eee6b510cacd73c66a6ccb8da092b117eb7d222
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$PWD/dev-image-${{ matrix.arch }}.tar.gz:/image.tar.gz:ro" \
+            "$TRIVY_IMAGE" image --input /image.tar.gz \
+            --scanners vuln --ignore-unfixed --severity HIGH,CRITICAL \
+            --db-repository public.ecr.aws/aquasecurity/trivy-db:2 \
+            --exit-code 1 --no-progress
 
       - name: Upload the image artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
@@ -479,8 +494,15 @@ jobs:
       - name: Log in to ECR Public
         run: |
           set -euo pipefail
-          aws ecr-public get-login-password --region us-east-1 \
-            | skopeo login public.ecr.aws -u AWS --password-stdin
+          # Both credential stores: skopeo reads containers/auth.json, while
+          # cosign (go-containerregistry) reads ~/.docker/config.json. Without
+          # the docker login, cosign's signature read goes out ANONYMOUSLY and
+          # shares ECR Public's per-IP anonymous quota with every other GitHub
+          # runner — three "Data limit exceeded" failures on 2026-09-30.
+          TOKEN=$(aws ecr-public get-login-password --region us-east-1)
+          skopeo login public.ecr.aws -u AWS --password-stdin <<< "$TOKEN"
+          docker login public.ecr.aws -u AWS --password-stdin <<< "$TOKEN"
+          unset TOKEN
 
       - name: Propagate to ECR Public
         uses: ./.github/actions/promote-registry
@@ -495,7 +517,7 @@ jobs:
         if: always()
         run: |
           skopeo logout ghcr.io || true
-          skopeo logout public.ecr.aws || true
+          skopeo logout public.ecr.aws || true; docker logout public.ecr.aws >/dev/null 2>&1 || true
 
       - name: Summarise
         if: always()

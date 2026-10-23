@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use extenddb_core::error::DynamoDbError;
@@ -32,6 +32,7 @@ use crate::throttle_helpers::{
 pub(crate) async fn handle_request(
     State(state): State<Arc<AppState>>,
     uri: axum::http::Uri,
+    ConnectInfo(peer_addr): ConnectInfo<std::net::SocketAddr>,
     mut headers: HeaderMap,
     body: Result<Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Response {
@@ -135,7 +136,7 @@ pub(crate) async fn handle_request(
 
     // --- Authz segment ---
     let authz_start = std::time::Instant::now();
-    let pre_fetched_key_info;
+    let authorized_key_info;
     {
         if state.catalog_store.is_none() {
             tracing::error!("Authorization required but catalog_store is not configured");
@@ -146,8 +147,26 @@ pub(crate) async fn handle_request(
                 &request_id,
             );
         }
-        match authorize_request(&state, &identity, &input, &operation, &account_id).await {
-            Ok(ki) => pre_fetched_key_info = ki,
+        // aws:SourceIp is the connection peer address; aws:UserAgent is the
+        // User-Agent header. Behind a proxy only the peer address is trusted,
+        // never an X-Forwarded-For header.
+        let source_ip = crate::authorization::condition_source_ip(&peer_addr);
+        let user_agent = headers
+            .get("user-agent")
+            .and_then(|v| v.to_str().ok())
+            .map(ToOwned::to_owned);
+        match authorize_request(
+            &state,
+            &identity,
+            &input,
+            &operation,
+            &account_id,
+            Some(source_ip.as_str()),
+            user_agent.as_deref(),
+        )
+        .await
+        {
+            Ok(ki) => authorized_key_info = ki,
             Err(e) => return error_response(&e, &request_id),
         }
     }
@@ -162,7 +181,7 @@ pub(crate) async fn handle_request(
         account_id,
         import_paths: state.import_paths.clone(),
         export_paths: state.export_paths.clone(),
-        pre_fetched_key_info,
+        authorized_key_info,
         auth_cache: state.auth_cache.clone(),
         table_key_info_lookup: Some(
             state.table_key_info_cache.clone() as Arc<dyn extenddb_storage::TableKeyInfoLookup>

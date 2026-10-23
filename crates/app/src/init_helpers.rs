@@ -311,12 +311,77 @@ key_path = "{tls_key}"
 "#,
     );
 
-    std::fs::write(config_path, &toml)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(config_path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    write_owner_only(config_path, toml.as_bytes())?;
     println!("    Created {config_path}");
     Ok(())
+}
+
+/// Write `contents` to `path` so that no other user can read it at any point:
+/// a new file is created 0600, and an existing one is narrowed to 0600 before
+/// it is truncated and rewritten. The config can carry the PostgreSQL
+/// connection string's password and the Cassandra application password.
+fn write_owner_only(path: &str, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        if std::path::Path::new(path).exists() {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(contents)?;
+        // `mode` applies only when the file is created, and the umask can only
+        // narrow it; this pins the result for both paths.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::File::create(path)?.write_all(contents)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod write_owner_only_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode(path: &std::path::Path) -> u32 {
+        std::fs::metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    /// The config is 0600 from creation, and an existing world-readable one
+    /// is narrowed before the new contents (with a password) are written.
+    #[test]
+    fn the_config_is_never_readable_by_others() {
+        let dir = std::env::temp_dir().join(format!(
+            "extenddb-write-owner-only-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).expect("scratch dir");
+        let path = dir.join("e.toml");
+        let p = path.to_str().expect("utf-8 path");
+
+        super::write_owner_only(p, b"first").expect("create");
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(std::fs::read(&path).expect("read"), b"first");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        super::write_owner_only(p, b"password = \"s\"").expect("overwrite");
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(std::fs::read(&path).expect("read"), b"password = \"s\"");
+
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
 }

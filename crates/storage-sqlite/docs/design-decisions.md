@@ -32,8 +32,9 @@ DynamoDB requires, and the Postgres backend provides:
 - Atomic stream-record capture in the same transaction as the data write.
 - Atomic idempotency-token check+store with the writes.
 
-Postgres achieves this with `BEGIN ISOLATION LEVEL SERIALIZABLE`. SQLite has no
-equivalent knob; a naive multi-connection pool with deferred `BEGIN` allows
+Postgres does not use `SERIALIZABLE` for this. Its write transactions run at `READ COMMITTED` and hold locks until they end: `SELECT ... FOR UPDATE` on every item that exists, and a reserved unique key on every missing item that a ConditionCheck or Delete reads.
+
+SQLite has no row locks to build the same thing from; a naive multi-connection pool with deferred `BEGIN` allows
 write-skew and `SQLITE_BUSY` on the read-then-write path.
 
 ### Options considered

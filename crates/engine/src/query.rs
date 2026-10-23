@@ -12,7 +12,7 @@ use extenddb_core::expression::PathElement;
 use extenddb_core::expression::{ExpressionKind, ExpressionMaps, Projection};
 use extenddb_core::types::{
     IndexType, KeyType, ProjectionType, QueryInput, QueryOutput, Select, TableKeyInfo,
-    VECTOR_INDEX_QUERY_NOT_SUPPORTED, extract_key, item_size_bytes,
+    VECTOR_INDEX_QUERY_NOT_SUPPORTED,
 };
 use extenddb_storage::error::StorageError;
 
@@ -25,7 +25,7 @@ use crate::index_helpers::{
     validate_query_exclusive_start_key,
 };
 use crate::legacy_filter::{desugar_filter, desugar_key_conditions};
-use crate::read_helpers::apply_post_read;
+use crate::read_helpers::{PostRead, read_page};
 use crate::serialize_output;
 use crate::{DispatchMetrics, DispatchResult};
 
@@ -476,51 +476,45 @@ pub async fn handle_query(
         validate_query_exclusive_start_key(start_key, &key_info, index_info.as_ref())?;
     }
 
-    // Query storage
-    let (raw_items, storage_last_key) = ctx
-        .storage
-        .query(
-            &query_key_info,
-            &key_condition,
-            &combined_maps,
-            input.scan_index_forward,
-            input.limit,
-            input.exclusive_start_key.as_ref(),
-            input.index_name.as_deref(),
-        )
-        .await
-        .map_err(storage_err_to_dynamo)?;
-
-    // Capacity metering: RCU based on total pre-projection size of all scanned items.
-    let pre_projection_bytes: usize = raw_items.iter().map(item_size_bytes).sum();
-    let strongly_consistent = input.consistent_read == Some(true);
-    let rcu = capacity_helpers::read_capacity_units(pre_projection_bytes, strongly_consistent);
-
     // Determine which key schema to use for LastEvaluatedKey extraction.
-    // For index queries, the LEK includes both the index key and the base table key.
+    // For index queries, the LEK includes both the index key and the base table key,
+    // and the same shape addresses each chunk read from storage.
     let lek_key_schema = combined_lek_key_schema(&key_info.key_schema, index_info.as_ref());
 
-    // For index queries, enrich the storage LEK with base table key attributes.
-    let enriched_storage_last_key = if storage_last_key.is_some() && index_info.is_some() {
-        raw_items
-            .last()
-            .map(|item| extract_key(item, &lek_key_schema))
-    } else {
-        storage_last_key
-    };
-
-    // Apply FilterExpression, ProjectionExpression, and 1 MB limit
-    let result = apply_post_read(
-        &raw_items,
-        enriched_storage_last_key,
-        &filter,
-        compiled_projection.as_ref(),
-        &combined_maps,
-        &lek_key_schema,
-        input.select.as_ref(),
+    // Read the page from storage in chunks, applying FilterExpression,
+    // ProjectionExpression, and the page budget as items arrive.
+    let post = PostRead {
+        filter: filter.as_ref(),
+        projection: compiled_projection.as_ref(),
+        maps: &combined_maps,
+        lek_key_schema: &lek_key_schema,
+        select: input.select.as_ref(),
         index_proj,
-        &key_info.key_schema,
-    )?;
+        base_key_schema: &key_info.key_schema,
+    };
+    let page = read_page(
+        input.limit,
+        input.exclusive_start_key.as_ref(),
+        &post,
+        |cursor, count| {
+            ctx.storage.query(
+                &query_key_info,
+                &key_condition,
+                &combined_maps,
+                input.scan_index_forward,
+                Some(count),
+                cursor,
+                input.index_name.as_deref(),
+            )
+        },
+    )
+    .await?;
+    let result = page.post;
+
+    // Capacity metering: RCU based on the pre-projection size of the evaluated items.
+    let pre_projection_bytes = page.evaluated_bytes;
+    let strongly_consistent = input.consistent_read == Some(true);
+    let rcu = capacity_helpers::read_capacity_units(pre_projection_bytes, strongly_consistent);
 
     let output = QueryOutput {
         items: result.items,

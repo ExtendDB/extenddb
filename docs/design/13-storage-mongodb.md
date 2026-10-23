@@ -720,10 +720,14 @@ only a first-time enable rotates it. A repeat `UpdateTable`
 `{ StreamEnabled: true }` would otherwise duplicate the shard set and
 invalidate stream ARNs previously handed out to consumers.
 
-**`stream_label` format.** `YYYY-MM-DDThh:mm:ss` (second precision, no
-timezone). Byte-for-byte compatible with the PostgreSQL backend so an
-ARN issued by one backend is parseable by tooling that only ever saw
-the other. See `format_stream_label` in `table_engine.rs`.
+**`stream_label` format.** `YYYY-MM-DDThh:mm:ss.sss` (millisecond
+precision, UTC, no timezone suffix), the shape the service uses. All three
+backends call one function, `extenddb_storage::util::format_stream_label`,
+and bind the result, rather than formatting a timestamp in SQL, so an ARN
+issued by one backend is byte-for-byte parseable by tooling that only ever
+saw another. Second precision gave a table deleted and recreated within one
+second the same stream ARN. Labels written before the change keep their
+second-precision form.
 
 ### 5.6 Write conflict handling
 
@@ -793,19 +797,24 @@ so the stream record matches DynamoDB's format.
 
 ### 5.8 Backups
 
-`CreateBackup` snapshots the source table by running a server-side
+`CreateBackup` copies the source table by running a server-side
 aggregation pipeline `[{ $out: "_backup_<backup_id>" }]` on the data
 collection. `$out` writes the target collection server-side without
-per-item traffic between the driver and the server. The destination
+per-item traffic between the driver and the server. It reads the live
+collection, so the copy is not a point-in-time snapshot: writes made while
+it runs can be in the backup without writes that preceded them (see
+`docs/differences-from-dynamodb.md`, Backup and Restore). The destination
 name is derived from a UUID because the caller-visible `backup_arn`
 contains characters (`:`, `/`) that MongoDB does not allow in
 collection names.
 
-`RestoreTableFromBackup` recreates the target table via
-`CreateTable` (preserving `TableClass` / `SSESpecification` /
-`OnDemandThroughput` from the backup metadata), then clones the backup
-collection into the new data collection with the same `$out` pipeline
-in reverse.
+`RestoreTableFromBackup` creates the target table `CREATING` from the
+table definition the engine resolves from the backup, returns, and then, in
+a background task, clones the backup collection into the new data
+collection with the same `$out` pipeline in reverse and hands the target to
+the index backfill worker, which makes it `ACTIVE`. A restore whose owner
+stops before the hand-over is removed by the heartbeat sweep (startup and
+every 15 s, once the heartbeat is 60 s old).
 
 `DeleteBackup` drops the physical collection using `backup_id` from
 the metadata document and marks the metadata row `DELETED`.
@@ -915,7 +924,13 @@ pub struct MongoStorageConfig {
 ```
 
 The connection string must use `readPreference=primary` (the driver
-default). Persisting the connection string in
+default). The engine opens the catalog database with read preference
+primary and read concern `local` whatever the connection string says, so
+the backup claim protocol sees every write the primary acknowledged. It
+also sets write concern `majority` on the catalog database and on the `$out`
+copies of CreateBackup and restore, so an acknowledged claim is not rolled
+back by a failover; a connection string that sets a weaker write concern
+(`w=0`, a numeric or tagged `w`, `journal=false`) is refused at startup. Persisting the connection string in
 `settings.data_connection_string` uses the raw string as-is; the bin
 layer redacts the password from it for display via the
 `OperationsEngine::redact_connection_string` hook.

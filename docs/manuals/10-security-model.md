@@ -112,7 +112,7 @@ Set operators and `IfExists` can be combined: `ForAllValues:StringEqualsIfExists
 | Key | Type | Description |
 |-----|------|-------------|
 | `aws:PrincipalTag/<key>` | String | Tag on the authenticated principal (user or role) |
-| `dynamodb:ResourceTag/<key>` | String | Tag on the target DynamoDB table |
+| `aws:ResourceTag/<key>` | String | Tag on the target DynamoDB table |
 | `dynamodb:LeadingKeys` | Multi-valued string | Partition key values being accessed |
 | `dynamodb:Attributes` | Multi-valued string | Attribute names being read or written |
 | `dynamodb:Select` | String | The `Select` parameter value |
@@ -131,9 +131,11 @@ extenddb supports the same access control patterns as real AWS IAM:
 
 **Role-Based Access Control (RBAC)**: Create IAM groups with policies, add users to groups. Users inherit group policies. Create IAM roles for cross-account or service-to-service access.
 
-**Attribute-Based Access Control (ABAC)**: Use `aws:PrincipalTag/*` and `dynamodb:ResourceTag/*` condition keys to make access decisions based on tags. Example: allow users tagged `Department=Engineering` to access tables tagged `Department=Engineering`.
+**Attribute-Based Access Control (ABAC)**: Use `aws:PrincipalTag/*` and `aws:ResourceTag/*` condition keys to make access decisions based on tags. Example: allow users tagged `Department=Engineering` to access tables tagged `Department=Engineering`.
 
 **Fine-Grained Access Control (FGAC)**: Use `dynamodb:LeadingKeys` to restrict access to specific partition key values. Use `dynamodb:Attributes` to restrict which attributes can be read or written. Example: allow a user to access only items where the partition key matches their user ID.
+
+`dynamodb:LeadingKeys` is evaluated on `GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `Query`, `BatchGetItem`, `BatchWriteItem`, `TransactGetItems` and `TransactWriteItems`. A `Query` on a global secondary index binds the key to the index's partition key value (its first HASH attribute). `Scan` and `SearchVectors` target no single partition and carry no `dynamodb:LeadingKeys` value, so a `ForAllValues` condition does not fence them; fence a full-table read with `ForAnyValue:StringEquals` or a `Null` guard on the statement. A numeric partition key is compared as the normalized number on `GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `Query` and `BatchGetItem`, and as Java's `BigDecimal` prints it (`10.0` stays `10.0`, `1E1` is `1E+1`) on `BatchWriteItem`, `TransactGetItems` and `TransactWriteItems`, which is what DynamoDB does.
 
 ### Resource ARNs
 

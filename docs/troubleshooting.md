@@ -93,6 +93,14 @@ ss -tlnp | grep :18443                    # find what's using the port
 extenddb serve --port 19443 --config extenddb.toml  # use a different port
 ```
 
+### `another extenddb process is already using <database> (lock held on <database>.lock)`
+
+**Cause:** A SQLite database file has one owner at a time. `extenddb serve` takes an exclusive lock on `<database>.lock` (next to the file SQLite opens, after resolving any `sqlite:` or `file:` form, relative path, or symlink) before it opens the database and holds it until it exits. `init` (through to the admin user being written), `migrate`, and `destroy` take the same lock for as long as they run, because they rewrite or remove the file. The backend serializes writers inside one process and recovers interrupted work at startup, so a second server, or a migration or destroy under a running server, would corrupt the first one's work. Read-only commands (`settings`, `manage`, `verify`, `status`) take no lock and run alongside a server.
+
+**Fix:** Stop the other process (`extenddb stop --config <config>` for a server), or point this command at a different database (`--sqlite-path` at `init` time). The lock is released by the operating system when the holder exits, including after a crash, so a leftover `<database>.lock` file is harmless and needs no cleanup.
+
+**Scope:** The lock is `flock(2)`, taken on Linux and macOS. It is advisory, and on network filesystems (NFS, SMB) its behavior depends on the server and mount options; keep SQLite databases on local disk. On other platforms no lock is taken and the server logs a warning at startup. The directory holding the database must be writable so the lock file can be created; a database in a read-only directory now fails to start with `cannot open lock file`. The lock file is created mode 0600 like the database itself; a world-readable lock file would let any local user hold the lock and keep the server from starting.
+
 ### `Failed to load TLS certificates: <error>`
 
 **Cause:** TLS is enabled (the default) but the server could not load the certificate or private key files. Possible causes:

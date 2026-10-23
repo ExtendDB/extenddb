@@ -30,6 +30,38 @@ pub(crate) fn format_timestamp(ts: OffsetDateTime) -> String {
         .unwrap_or_else(|_| ts.to_string())
 }
 
+/// Format epoch seconds as a catalog timestamp with microsecond precision
+/// (`2026-10-15T12:00:00.438000Z`). Fixed width, so stored values sort as
+/// text in time order.
+///
+/// Rounded to the microsecond before conversion: epoch seconds near 1.8e9
+/// carry about 0.24 us of f64 precision, so finer digits would be noise.
+pub(crate) fn format_epoch_seconds(secs: f64) -> String {
+    #[allow(clippy::cast_possible_truncation)] // saturating; out of range falls back below
+    let micros = (secs * 1e6).round() as i128;
+    let dt = OffsetDateTime::from_unix_timestamp_nanos(micros * 1000)
+        .unwrap_or(OffsetDateTime::UNIX_EPOCH);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}Z",
+        dt.year(),
+        u8::from(dt.month()),
+        dt.day(),
+        dt.hour(),
+        dt.minute(),
+        dt.second(),
+        dt.microsecond()
+    )
+}
+
+/// Epoch seconds, sub-second precision, of a catalog timestamp; 0 if it does
+/// not parse.
+#[allow(clippy::cast_precision_loss)] // epoch seconds fit f64's mantissa
+pub(crate) fn timestamp_epoch_seconds(s: &str) -> f64 {
+    parse_timestamp(s).map_or(0.0, |dt| {
+        dt.unix_timestamp() as f64 + f64::from(dt.nanosecond()) / 1e9
+    })
+}
+
 /// Parse a catalog timestamp string into an `OffsetDateTime`.
 ///
 /// Accepts RFC 3339 (the canonical stored form, e.g. `2026-06-08T12:00:00.123Z`)

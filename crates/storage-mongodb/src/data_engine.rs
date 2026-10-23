@@ -226,6 +226,32 @@ impl DataEngine for MongoEngine {
         })
     }
 
+    fn scan_key_in_segment(
+        &self,
+        key_info: &TableKeyInfo,
+        key: &Item,
+        segment: i64,
+        total_segments: i64,
+        _index_name: Option<&str>,
+    ) -> BoxFuture<'_, Result<bool, StorageError>> {
+        // Same CRC32-of-pk assignment the scan's per-item segment filter uses,
+        // evaluated for the candidate key. `key_info` is scan-shaped, so
+        // `key_schema` names the pk of whichever table (data or index) the
+        // scan targets, matching what the filter hashes. Pure computation, no
+        // round trip.
+        let key_schema = key_info.key_schema.clone();
+        let key = key.clone();
+        Box::pin(async move {
+            let pk_text = composite_pk_to_text(&key, &key_schema)?;
+            let hash = crc32fast::hash(pk_text.as_bytes());
+            #[allow(clippy::cast_sign_loss)]
+            let total_u = total_segments as u32;
+            #[allow(clippy::cast_sign_loss)]
+            let seg_u = segment as u32;
+            Ok(hash % total_u == seg_u)
+        })
+    }
+
     fn transact_get_items(
         &self,
         ops: &[TransactGetOp<'_>],
@@ -1500,12 +1526,20 @@ impl MongoEngine {
         //   (a) we have `limit + 1` in-segment items (so we know we
         //       need a LEK for the next page), or
         //   (b) the cursor is exhausted.
-        // mongo batches under the hood (~101 docs per network trip),
-        // so this is efficient without a hard limit — we consume at
-        // most one extra network batch beyond what we return.
-        let opts = mongodb::options::FindOptions::builder()
+        // The batch size is a network hint, not a bound: it sizes each
+        // trip to what the caller asked for, so a chunked read pulls one
+        // batch of `limit + 1` documents instead of the driver's default
+        // (101, then up to 16 MB per getMore), and a skewed segment scan
+        // keeps pulling further batches until it has its items.
+        let target = limit.map(|l| {
+            #[allow(clippy::cast_sign_loss)]
+            let l = l as usize;
+            l + 1
+        });
+        let mut opts = mongodb::options::FindOptions::builder()
             .sort(sort_doc)
             .build();
+        opts.batch_size = target.map(|t| u32::try_from(t).unwrap_or(u32::MAX));
 
         let mut cursor = coll
             .find(filter)
@@ -1514,11 +1548,6 @@ impl MongoEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let mut items: Vec<Item> = Vec::new();
-        let target = limit.map(|l| {
-            #[allow(clippy::cast_sign_loss)]
-            let l = l as usize;
-            l + 1
-        });
 
         while let Some(doc) = cursor
             .try_next()
@@ -4149,6 +4178,10 @@ mod tests {
             region: "us-east-1".to_owned(),
             gsi_cache: Default::default(),
             tx_read_concern: mongodb::options::ReadConcern::snapshot(),
+            backup_liveness: Default::default(),
+            restore_server_slot_count: 1,
+            restore_server_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            restore_account_slots: Default::default(),
         };
         let base_coll = engine.data_db.collection::<Document>("base");
         let key_schema = vec![KeySchemaElement {

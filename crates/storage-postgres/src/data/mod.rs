@@ -92,7 +92,7 @@ macro_rules! bind_sk_fetch_optional {
                     .await
             }
         }
-        .map_err(|e| extenddb_storage::error::StorageError::Internal(e.to_string()))
+        .map_err($crate::data::index::db_error)
     };
 }
 
@@ -124,7 +124,7 @@ macro_rules! bind_sk_execute {
                     .await
             }
         }
-        .map_err(|e| extenddb_storage::error::StorageError::Internal(e.to_string()))
+        .map_err($crate::data::index::db_error)
     };
 }
 
@@ -142,5 +142,6 @@ mod update_item;
 pub mod vector_index;
 
 pub(crate) use index::{
-    delete_index_row_multi, insert_index_row_multi, item_has_index_keys, project_item_for_index,
+    delete_index_row_multi, insert_index_row_multi, insert_index_rows_multi, item_has_index_keys,
+    project_item_for_index,
 };

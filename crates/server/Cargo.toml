@@ -33,6 +33,9 @@ uuid = { workspace = true }
 metrics = { workspace = true }
 anyhow = { workspace = true }
 bcrypt = { workspace = true }
+# IAM tag charset validation needs the exact Unicode general categories
+# (\p{L}, \p{N}, \p{Z}); char::is_alphabetic / is_numeric are not those sets.
+unicode-properties = "0.1.4"
 base64 = { workspace = true }
 time = { workspace = true }
 aes-gcm = { workspace = true }
