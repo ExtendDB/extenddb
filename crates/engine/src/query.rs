@@ -3,7 +3,7 @@
 
 //! `Query` operation handler.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -19,12 +19,12 @@ use extenddb_storage::error::StorageError;
 use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::storage_err_to_dynamo;
-use crate::expression_helpers::{build_expression_maps, parse_optional_filter};
+use crate::expression_helpers::build_expression_maps;
 use crate::index_helpers::{
     VectorIndexReadRefusal, classify_unresolved_index_read, combined_lek_key_schema,
     validate_query_exclusive_start_key,
 };
-use crate::legacy_filter::{desugar_filter, desugar_key_conditions};
+use crate::legacy_filter::{desugar_filter, desugar_key_conditions, validate_legacy_conditions};
 use crate::read_helpers::{PostRead, read_page};
 use crate::serialize_output;
 use crate::{DispatchMetrics, DispatchResult};
@@ -71,72 +71,6 @@ pub async fn handle_query(
     )?;
     let input: QueryInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
-    // P118: Fetch key_info first so we can use table_id for index lookup.
-    let key_info = ctx
-        .table_key_info(&input.table_name)
-        .await
-        .map_err(storage_err_to_dynamo)?;
-
-    // GSI/LSI: resolve index metadata if querying a secondary index.
-    // Uses table_id from pre-fetched key_info to skip redundant table lookup (P118 #4).
-    // A vector index is not a row in the `indexes` catalog, so a not-found
-    // result is re-resolved against the vector index metadata before the
-    // name is treated as absent.
-    let (index_info, vector_index_named) = match input.index_name {
-        Some(ref idx_name) => {
-            match ctx
-                .storage
-                .index_info_by_table_id(&key_info.table_id, idx_name)
-                .await
-            {
-                // Defense in depth: no in-tree backend stores a vector index in
-                // `indexes`, but if one ever surfaces here it must be refused,
-                // not sent down the GSI/LSI data path.
-                Ok(info) if info.index_type == IndexType::Vector => (None, true),
-                Ok(info) => (Some(info), false),
-                Err(err @ StorageError::IndexNotFound(_)) => {
-                    match classify_unresolved_index_read(ctx, &key_info, idx_name).await? {
-                        VectorIndexReadRefusal::NotFound => {
-                            return Err(storage_err_to_dynamo(err));
-                        }
-                        // Query refuses a backfilling vector index with the same
-                        // message as an active one (measured 2026-08-20; Scan
-                        // differs). The refusal itself fires further down, after
-                        // the KeyConditionExpression checks.
-                        VectorIndexReadRefusal::Backfilling
-                        | VectorIndexReadRefusal::NotSupported => (None, true),
-                    }
-                }
-                Err(err) => return Err(storage_err_to_dynamo(err)),
-            }
-        }
-        None => (None, false),
-    };
-
-    // ConsistentRead is not supported on GSI queries (tenet 1: fidelity).
-    // Measured 2026-08-20: it fires for a vector index too, with the same
-    // wording, and before the vector-index refusal.
-    if input.consistent_read == Some(true)
-        && (vector_index_named
-            || index_info
-                .as_ref()
-                .is_some_and(|idx| idx.index_type == IndexType::Gsi))
-    {
-        return Err(DynamoDbError::ValidationException(
-            "Consistent reads are not supported on global secondary indexes".to_owned(),
-        ));
-    }
-
-    // Select=ALL_ATTRIBUTES requires an ALL-projection GSI (shared with Scan).
-    if let Some(ref idx) = index_info {
-        extenddb_core::validation::validate_all_attributes_index_support(
-            input.select,
-            idx.index_type == IndexType::Gsi,
-            idx.projection.projection_type == ProjectionType::All,
-            &idx.index_name,
-        )?;
-    }
-
     // Validate Limit >= 1 (REQ-QUERY-001)
     if let Some(limit) = input.limit
         && limit < 1
@@ -145,26 +79,6 @@ pub async fn handle_query(
                 "1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1".to_owned(),
             ));
     }
-
-    // For index queries, build a key_info that reflects the index's key schema
-    // so the storage layer uses the correct SK column for the index table.
-    let query_key_info = if let Some(ref idx) = index_info {
-        TableKeyInfo {
-            table_name: key_info.table_name.clone(),
-            account_id: key_info.account_id.clone(),
-            table_id: key_info.table_id.clone(),
-            key_schema: idx.key_schema.clone(),
-            base_key_schema: key_info.key_schema.clone(),
-            attribute_definitions: key_info.attribute_definitions.clone(),
-            has_lsi: key_info.has_lsi,
-            global_secondary_indexes: key_info.global_secondary_indexes.clone(),
-            local_secondary_indexes: key_info.local_secondary_indexes.clone(),
-            stream_specification: None, // Queries don't capture stream records
-            vector_indexes: key_info.vector_indexes.clone(),
-        }
-    } else {
-        key_info.clone()
-    };
 
     // --- Legacy vs expression mutual exclusivity checks ---
     let kce_present = input.key_condition_expression.is_some();
@@ -233,25 +147,233 @@ pub async fn handle_query(
         input.query_filter.as_ref().map_or(0, HashMap::len),
     )?;
 
-    // Parse KeyConditionExpression or desugar legacy KeyConditions
-    let (mut key_condition, legacy_kc_maps) = if let Some(kce_str) =
-        input.key_condition_expression.as_deref()
-    {
-        let parsed = crate::expression_helpers::parse_key_condition_expr(kce_str, &ctx.limits)?;
-        (parsed, None)
-    } else if let Some(ref kc) = input.key_conditions {
-        let key_schema_pairs: Vec<(String, bool)> = query_key_info
-            .key_schema
+    // Request-stage expression checks, before the table is looked up, in the
+    // order the service applies them (measured 2026-10-14): the
+    // FilterExpression (syntax, then references, functions, and operand
+    // types), the KeyConditionExpression (syntax, then references), the
+    // ProjectionExpression (syntax, then references and overlap), then unused
+    // names and values. A missing table is reported after all of these.
+    // A legacy QueryFilter skips the parser; desugar_filter checks each
+    // ComparisonOperator against its value count and types with the service's
+    // messages, still before any row is read. Legacy KeyConditions get the
+    // same value checks here, ahead of the table lookup; the service reported
+    // a bad QueryFilter value before a bad KeyConditions value, and both
+    // before any key schema error (measured 2026-10-23).
+    let (filter, filter_maps) =
+        if let Some(qf) = input.query_filter.as_ref().filter(|qf| !qf.is_empty()) {
+            let cond_op = input.conditional_operator.unwrap_or_default();
+            let (expr, fmaps) = desugar_filter(qf, cond_op)?;
+            (Some(expr), Some(fmaps))
+        } else {
+            match input.filter_expression.as_deref() {
+                Some(expr) if !expr.is_empty() => (
+                    Some(crate::expression_helpers::parse_condition_checked(
+                        expr,
+                        &maps,
+                        &ctx.limits,
+                        false,
+                        ExpressionKind::Filter,
+                    )?),
+                    None,
+                ),
+                _ => (None, None),
+            }
+        };
+    if let Some(kc) = input.key_conditions.as_ref() {
+        validate_legacy_conditions(kc)?;
+    }
+
+    let parsed_key_condition = match input.key_condition_expression.as_deref() {
+        Some(kce_str) => {
+            let parsed = crate::expression_helpers::parse_key_condition_expr(kce_str, &ctx.limits)?;
+            crate::expression_helpers::check_key_condition_refs(&parsed, &maps)?;
+            Some(parsed)
+        }
+        None => None,
+    };
+
+    // Parse ProjectionExpression or desugar legacy AttributesToGet
+    let (effective_projection_str, extra_proj_names) = if input.projection_expression.is_some() {
+        (input.projection_expression.clone(), HashMap::new())
+    } else if let Some(ref attrs) = input.attributes_to_get {
+        let mut names_map = HashMap::new();
+        let placeholders: Vec<String> = attrs
             .iter()
-            .map(|ks| (ks.attribute_name.clone(), ks.key_type == KeyType::Hash))
+            .enumerate()
+            .map(|(i, attr)| {
+                let placeholder = format!("#_ag{i}");
+                names_map.insert(placeholder.clone(), attr.clone());
+                placeholder
+            })
             .collect();
-        let (kc_parsed, kc_maps) = desugar_key_conditions(kc, &key_schema_pairs)?;
-        (kc_parsed, Some(kc_maps))
+        (Some(placeholders.join(", ")), names_map)
     } else {
+        (None, HashMap::new())
+    };
+
+    let projection = if let Some(ref proj_str) = effective_projection_str {
+        Some(crate::expression_helpers::parse_projection_expr(
+            proj_str,
+            &ctx.limits,
+        )?)
+    } else {
+        None
+    };
+
+    // Compile once: resolves #names and rejects overlapping paths. Overlap
+    // rejection is scoped to a user-supplied ProjectionExpression.
+    let compiled_projection = match projection {
+        Some(ref paths) => {
+            let mut names = maps.names.clone();
+            for (k, v) in &extra_proj_names {
+                let stripped = k.strip_prefix('#').unwrap_or(k);
+                names.insert(stripped.to_owned(), v.clone());
+            }
+            let proj_maps = ExpressionMaps::new(names, HashMap::new());
+            Some(Projection::compile(
+                paths,
+                &proj_maps,
+                input.projection_expression.is_some(),
+            )?)
+        }
+        None => None,
+    };
+
+    // Validate unused expression attributes
+    {
+        let exprs: Vec<&extenddb_core::expression::Expr> = filter.iter().collect();
+        let (mut kc_names, kc_values) = match parsed_key_condition {
+            Some(ref kc) => extenddb_core::expression::collect_key_condition_refs(kc),
+            None => (HashSet::new(), HashSet::new()),
+        };
+        // Collect #name refs from projection paths
+        if let Some(ref proj) = projection {
+            for path in proj {
+                for el in path {
+                    if let PathElement::Attribute(name) = el
+                        && let Some(ref_name) = name.strip_prefix('#')
+                    {
+                        kc_names.insert(ref_name.to_owned());
+                    }
+                }
+            }
+        }
+        extenddb_core::expression::validate_unused_attributes(
+            &maps.names,
+            &maps.values,
+            &exprs,
+            &[],
+            &kc_names,
+            &kc_values,
+        )?;
+    }
+
+    // P118: Fetch key_info first so we can use table_id for index lookup.
+    let key_info = ctx
+        .table_key_info(&input.table_name)
+        .await
+        .map_err(storage_err_to_dynamo)?;
+
+    // GSI/LSI: resolve index metadata if querying a secondary index.
+    // Uses table_id from pre-fetched key_info to skip redundant table lookup (P118 #4).
+    // A vector index is not a row in the `indexes` catalog, so a not-found
+    // result is re-resolved against the vector index metadata before the
+    // name is treated as absent.
+    let (index_info, vector_index_named) = match input.index_name {
+        Some(ref idx_name) => {
+            match ctx
+                .storage
+                .index_info_by_table_id(&key_info.table_id, idx_name)
+                .await
+            {
+                // Defense in depth: no in-tree backend stores a vector index in
+                // `indexes`, but if one ever surfaces here it must be refused,
+                // not sent down the GSI/LSI data path.
+                Ok(info) if info.index_type == IndexType::Vector => (None, true),
+                Ok(info) => (Some(info), false),
+                Err(err @ StorageError::IndexNotFound(_)) => {
+                    match classify_unresolved_index_read(ctx, &key_info, idx_name).await? {
+                        VectorIndexReadRefusal::NotFound => {
+                            return Err(storage_err_to_dynamo(err));
+                        }
+                        // Query refuses a backfilling vector index with the same
+                        // message as an active one (measured 2026-08-20; Scan
+                        // differs). The refusal itself fires further down, after
+                        // the KeyConditionExpression checks.
+                        VectorIndexReadRefusal::Backfilling
+                        | VectorIndexReadRefusal::NotSupported => (None, true),
+                    }
+                }
+                Err(err) => return Err(storage_err_to_dynamo(err)),
+            }
+        }
+        None => (None, false),
+    };
+
+    // ConsistentRead is not supported on GSI queries (tenet 1: fidelity).
+    // Measured 2026-08-20: it fires for a vector index too, with the same
+    // wording, and before the vector-index refusal.
+    if input.consistent_read == Some(true)
+        && (vector_index_named
+            || index_info
+                .as_ref()
+                .is_some_and(|idx| idx.index_type == IndexType::Gsi))
+    {
         return Err(DynamoDbError::ValidationException(
-            "Either the KeyConditions or KeyConditionExpression parameter must be specified in the request."
-                .to_owned(),
+            "Consistent reads are not supported on global secondary indexes".to_owned(),
         ));
+    }
+
+    // Select=ALL_ATTRIBUTES requires an ALL-projection GSI (shared with Scan).
+    if let Some(ref idx) = index_info {
+        extenddb_core::validation::validate_all_attributes_index_support(
+            input.select,
+            idx.index_type == IndexType::Gsi,
+            idx.projection.projection_type == ProjectionType::All,
+            &idx.index_name,
+        )?;
+    }
+
+    // For index queries, build a key_info that reflects the index's key schema
+    // so the storage layer uses the correct SK column for the index table.
+    let query_key_info = if let Some(ref idx) = index_info {
+        TableKeyInfo {
+            table_name: key_info.table_name.clone(),
+            account_id: key_info.account_id.clone(),
+            table_id: key_info.table_id.clone(),
+            key_schema: idx.key_schema.clone(),
+            base_key_schema: key_info.key_schema.clone(),
+            attribute_definitions: key_info.attribute_definitions.clone(),
+            has_lsi: key_info.has_lsi,
+            global_secondary_indexes: key_info.global_secondary_indexes.clone(),
+            local_secondary_indexes: key_info.local_secondary_indexes.clone(),
+            stream_specification: None, // Queries don't capture stream records
+            vector_indexes: key_info.vector_indexes.clone(),
+            creation_date_time: key_info.creation_date_time,
+        }
+    } else {
+        key_info.clone()
+    };
+
+    // The key condition: parsed above from KeyConditionExpression, or
+    // desugared here from legacy KeyConditions, which needs the key schema.
+    let (mut key_condition, legacy_kc_maps) = match parsed_key_condition {
+        Some(parsed) => (parsed, None),
+        None => {
+            let Some(ref kc) = input.key_conditions else {
+                return Err(DynamoDbError::ValidationException(
+                    "Either the KeyConditions or KeyConditionExpression parameter must be specified in the request."
+                        .to_owned(),
+                ));
+            };
+            let key_schema_pairs: Vec<(String, bool)> = query_key_info
+                .key_schema
+                .iter()
+                .map(|ks| (ks.attribute_name.clone(), ks.key_type == KeyType::Hash))
+                .collect();
+            let (kc_parsed, kc_maps) = desugar_key_conditions(kc, &key_schema_pairs)?;
+            (kc_parsed, Some(kc_maps))
+        }
     };
 
     // A vector index is searched only via the vector search API, never
@@ -318,105 +440,6 @@ pub async fn handle_query(
         }
     }
 
-    // Parse FilterExpression or desugar legacy QueryFilter
-    let (filter, filter_maps) = if let Some(ref qf) = input.query_filter {
-        if qf.is_empty() {
-            (
-                parse_optional_filter(input.filter_expression.as_deref(), &ctx.limits)?,
-                None,
-            )
-        } else {
-            let cond_op = input.conditional_operator.unwrap_or_default();
-            let (expr, fmaps) = desugar_filter(qf, cond_op)?;
-            (Some(expr), Some(fmaps))
-        }
-    } else {
-        (
-            parse_optional_filter(input.filter_expression.as_deref(), &ctx.limits)?,
-            None,
-        )
-    };
-
-    // Validate #name references in filter are defined in ExpressionAttributeNames
-    if let Some(ref filter_expr) = filter {
-        let names = input.expression_attribute_names.as_ref();
-        validate_name_refs_in_expr(filter_expr, names, ExpressionKind::Filter)?;
-    }
-
-    // Parse ProjectionExpression or desugar legacy AttributesToGet
-    let (effective_projection_str, extra_proj_names) = if input.projection_expression.is_some() {
-        (input.projection_expression.clone(), HashMap::new())
-    } else if let Some(ref attrs) = input.attributes_to_get {
-        let mut names_map = HashMap::new();
-        let placeholders: Vec<String> = attrs
-            .iter()
-            .enumerate()
-            .map(|(i, attr)| {
-                let placeholder = format!("#_ag{i}");
-                names_map.insert(placeholder.clone(), attr.clone());
-                placeholder
-            })
-            .collect();
-        (Some(placeholders.join(", ")), names_map)
-    } else {
-        (None, HashMap::new())
-    };
-
-    let projection = if let Some(ref proj_str) = effective_projection_str {
-        Some(crate::expression_helpers::parse_projection_expr(
-            proj_str,
-            &ctx.limits,
-        )?)
-    } else {
-        None
-    };
-
-    // Compile once: resolves #names and rejects overlapping paths. Overlap
-    // rejection is scoped to a user-supplied ProjectionExpression.
-    let compiled_projection = match projection {
-        Some(ref paths) => {
-            let mut names = maps.names.clone();
-            for (k, v) in &extra_proj_names {
-                let stripped = k.strip_prefix('#').unwrap_or(k);
-                names.insert(stripped.to_owned(), v.clone());
-            }
-            let proj_maps = ExpressionMaps::new(names, HashMap::new());
-            Some(Projection::compile(
-                paths,
-                &proj_maps,
-                input.projection_expression.is_some(),
-            )?)
-        }
-        None => None,
-    };
-
-    // Validate unused expression attributes
-    {
-        let exprs: Vec<&extenddb_core::expression::Expr> = filter.iter().collect();
-        let (mut kc_names, kc_values) =
-            extenddb_core::expression::collect_key_condition_refs(&key_condition);
-        // Collect #name refs from projection paths
-        if let Some(ref proj) = projection {
-            for path in proj {
-                for el in path {
-                    if let PathElement::Attribute(name) = el
-                        && let Some(ref_name) = name.strip_prefix('#')
-                    {
-                        kc_names.insert(ref_name.to_owned());
-                    }
-                }
-            }
-        }
-        extenddb_core::expression::validate_unused_attributes(
-            &maps.names,
-            &maps.values,
-            &exprs,
-            &[],
-            &kc_names,
-            &kc_values,
-        )?;
-    }
-
     // Validate Select vs ProjectionExpression and index requirements (shared
     // with Scan so both reject the same combinations identically).
     extenddb_core::validation::validate_select_projection(
@@ -460,16 +483,6 @@ pub async fn handle_query(
         }
         ExpressionMaps::new(names, values)
     };
-
-    // Validate begins_with operand types upfront (before any rows are read).
-    if let Some(ref f) = filter {
-        extenddb_core::expression::validate_begins_with_operands(f, &combined_maps).map_err(
-            |e| crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Filter),
-        )?;
-        extenddb_core::expression::validate_ordering_operand_types(f, &combined_maps).map_err(
-            |e| crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Filter),
-        )?;
-    }
 
     // Validate ExclusiveStartKey matches the key schema
     if let Some(ref start_key) = input.exclusive_start_key {
@@ -571,67 +584,6 @@ fn resolve_path_attr_name(
             }
         }
         _ => None,
-    }
-}
-
-/// Validate that all `#name` references in an expression AST are defined.
-fn validate_name_refs_in_expr(
-    expr: &extenddb_core::expression::Expr,
-    names: Option<&HashMap<String, String>>,
-    expr_type: ExpressionKind,
-) -> Result<(), DynamoDbError> {
-    use extenddb_core::expression::Expr;
-    match expr {
-        Expr::Path(elements) => {
-            for el in elements {
-                if let PathElement::Attribute(name) = el
-                    && let Some(ref_name) = name.strip_prefix('#')
-                {
-                    let key_with_hash = format!("#{ref_name}");
-                    let defined = names.as_ref().is_some_and(|m| {
-                        m.contains_key(ref_name) || m.contains_key(key_with_hash.as_str())
-                    });
-                    if !defined {
-                        return Err(DynamoDbError::ValidationException(format!(
-                            "Invalid {expr_type}: An expression attribute name used in the document path is not defined; attribute name: #{ref_name}"
-                        )));
-                    }
-                }
-            }
-            Ok(())
-        }
-        Expr::Compare { left, right, .. } => {
-            validate_name_refs_in_expr(left, names, expr_type)?;
-            validate_name_refs_in_expr(right, names, expr_type)
-        }
-        Expr::And(l, r) | Expr::Or(l, r) => {
-            validate_name_refs_in_expr(l, names, expr_type)?;
-            validate_name_refs_in_expr(r, names, expr_type)
-        }
-        Expr::Not(inner) => validate_name_refs_in_expr(inner, names, expr_type),
-        Expr::Between { operand, low, high } => {
-            validate_name_refs_in_expr(operand, names, expr_type)?;
-            validate_name_refs_in_expr(low, names, expr_type)?;
-            validate_name_refs_in_expr(high, names, expr_type)
-        }
-        Expr::In { operand, list } => {
-            validate_name_refs_in_expr(operand, names, expr_type)?;
-            for item in list {
-                validate_name_refs_in_expr(item, names, expr_type)?;
-            }
-            Ok(())
-        }
-        Expr::Function { args, .. } => {
-            for arg in args {
-                validate_name_refs_in_expr(arg, names, expr_type)?;
-            }
-            Ok(())
-        }
-        Expr::Arithmetic { left, right, .. } => {
-            validate_name_refs_in_expr(left, names, expr_type)?;
-            validate_name_refs_in_expr(right, names, expr_type)
-        }
-        Expr::Placeholder(_) => Ok(()),
     }
 }
 

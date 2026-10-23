@@ -18,27 +18,32 @@ mod projection;
 mod reserved_words;
 mod resolver;
 mod search_condition;
+mod semantics;
 mod tokenizer;
 mod update_evaluator;
 mod update_parser;
 
 pub use ast::{ArithOp, CompareOp, Expr, PathElement, UpdateAction};
-pub use evaluator::evaluate_condition;
+pub use evaluator::{compare_orderable, evaluate_condition};
 pub use key_condition::{KeyCondition, SortKeyCondition, parse_key_condition};
 pub use kind::ExpressionKind;
 pub use parser::{parse_condition, parse_condition_with_depth_limit};
 pub use projection::{Projection, parse_projection};
 pub use reserved_words::validate_no_reserved_words;
 pub use resolver::{
-    ExpressionMaps, collect_key_condition_refs, collect_value_placeholders, resolve_element_name,
-    resolve_name_ref, resolve_path, validate_begins_with_operands, validate_expression_param_usage,
-    validate_ordering_operand_types, validate_unused_attributes,
+    ExpressionMaps, attribute_type_code, collect_key_condition_refs, collect_value_placeholders,
+    resolve_element_name, resolve_name_ref, resolve_path, validate_begins_with_operands,
+    validate_expression_param_usage, validate_ordering_operand_types, validate_refs_defined,
+    validate_unused_attributes, validate_update_paths_disjoint,
 };
 pub use search_condition::{
     MAX_INLINE_FILTER_CONDITIONS, MAX_PARTITION_KEY_CONDITIONS, MAX_SEARCH_CONDITIONS,
     SearchCondition, validate_conditions_against_search_schema,
     validate_search_condition_expression,
 };
+pub use semantics::{validate_condition_semantics, validate_update_semantics};
 pub use tokenizer::{Token, tokenize, tokenize_for, tokenize_with_limit};
 pub use update_evaluator::apply_update_validated;
-pub use update_parser::{parse_update, parse_update_from};
+pub use update_parser::{
+    ParsedUpdate, UpdateSection, parse_update, parse_update_from, parse_update_sections,
+};

@@ -102,6 +102,13 @@ pub struct TableKeyInfo {
     /// validate vector-valued and search-schema attributes without an extra
     /// catalog round-trip.
     pub vector_indexes: Vec<VectorIndexKeyInfo>,
+    /// When the table was created, as seconds since the Unix epoch with the
+    /// catalog's sub-second precision; 0.0 when the source carries none. Read
+    /// from the same catalog row as the key schema, so it costs no extra
+    /// round-trip. The transaction handlers order their `ConsumedCapacity`
+    /// entries by it, oldest table first, as DynamoDB does (measured
+    /// 2026-10-23).
+    pub creation_date_time: f64,
 }
 
 /// Vector-index metadata needed by the write path to validate an item's
@@ -294,6 +301,7 @@ mod tests {
             local_secondary_indexes: vec![],
             stream_specification: None,
             vector_indexes: vec![],
+            creation_date_time: 0.0,
         }
     }
 
@@ -474,6 +482,7 @@ mod tests {
             local_secondary_indexes: vec![],
             stream_specification: None,
             vector_indexes: vec![],
+            creation_date_time: 0.0,
         };
         assert_eq!(info.key_schema, info.base_key_schema);
     }
@@ -494,6 +503,7 @@ mod tests {
             local_secondary_indexes: vec![],
             stream_specification: None,
             vector_indexes: vec![],
+            creation_date_time: 0.0,
         };
         assert_eq!(info.key_schema, index_schema);
         assert_eq!(info.base_key_schema, base_schema);

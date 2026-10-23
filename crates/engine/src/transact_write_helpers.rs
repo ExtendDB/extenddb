@@ -58,11 +58,16 @@ pub(crate) enum PreparedOp {
 impl PreparedOp {
     /// The table name for this operation.
     pub(crate) fn table_name(&self) -> &str {
+        &self.key_info().table_name
+    }
+
+    /// The table this operation targets.
+    pub(crate) fn key_info(&self) -> &TableKeyInfo {
         match self {
             Self::Put { key_info, .. }
             | Self::Delete { key_info, .. }
             | Self::Update { key_info, .. }
-            | Self::ConditionCheck { key_info, .. } => &key_info.table_name,
+            | Self::ConditionCheck { key_info, .. } => key_info,
         }
     }
 
@@ -206,28 +211,46 @@ impl PreparedOp {
         capacity_helpers::item_metrics(ricm, &key_info.key_schema, item_or_key, key_info.has_lsi)
     }
 
-    /// Return a `ValidationError` cancellation reason if this op's primary key
-    /// exceeds the size limit (hash > 2048 / range > 1024 bytes by default).
+    /// The per-item cancellation reason for a key that does not fit the
+    /// table's key schema, or `None` when the key is acceptable.
     ///
-    /// Real `DynamoDB` cancels the whole transaction with a per-item
-    /// `ValidationError` reason for an oversized key in ANY sub-op (Put,
-    /// Delete, Update, ConditionCheck). Empty-key values are handled separately
-    /// as a top-level `ValidationException`, so this checks size only.
-    pub(crate) fn oversized_key_reason(
+    /// Covers a key attribute of the wrong type, a `Put` item missing a key
+    /// attribute, a `Delete`, `Update`, or `ConditionCheck` key with extra or
+    /// missing attributes, and a hash or range key over its size limit. The
+    /// service reports all of these as a `ValidationError` cancellation reason
+    /// on the offending item. The reason text follows the service: a `Put`
+    /// item keeps the single-item wording ("Type mismatch for key ..."), a
+    /// `Delete`, `Update`, or `ConditionCheck` key gets "The provided key
+    /// element does not match the schema". An empty key value is a top-level
+    /// `ValidationException` and is checked before this runs.
+    pub(crate) fn key_schema_reason(
         &self,
         limits: &extenddb_core::limits::LimitsConfig,
     ) -> Option<extenddb_core::types::CancellationReason> {
+        use extenddb_core::validation::{
+            validate_batch_key_only, validate_item_keys, validate_key_size_limits,
+        };
         let (key_info, item_or_key) = match self {
             Self::Put { key_info, item, .. } => (key_info, item),
             Self::Delete { key_info, key, .. }
             | Self::Update { key_info, key, .. }
             | Self::ConditionCheck { key_info, key, .. } => (key_info, key),
         };
-        match extenddb_core::validation::validate_key_size_limits(
-            item_or_key,
-            &key_info.key_schema,
-            limits,
-        ) {
+        let schema_check = match self {
+            Self::Put { .. } => validate_item_keys(
+                item_or_key,
+                &key_info.key_schema,
+                &key_info.attribute_definitions,
+            ),
+            _ => validate_batch_key_only(
+                item_or_key,
+                &key_info.key_schema,
+                &key_info.attribute_definitions,
+            ),
+        };
+        let outcome = schema_check
+            .and_then(|()| validate_key_size_limits(item_or_key, &key_info.key_schema, limits));
+        match outcome {
             Ok(()) => None,
             Err(e) => Some(extenddb_core::types::CancellationReason::validation_error(
                 e.to_string(),
