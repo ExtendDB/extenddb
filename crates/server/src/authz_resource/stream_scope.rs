@@ -104,12 +104,26 @@ mod tests {
         validate_operation_arns(op, &json!({ "StreamArn": arn }), R, A)
     }
 
+    /// Names the result's variant for a failure message without printing the
+    /// error's text, which carries the account id from the checked ARN.
+    fn variant(r: &Result<(), DynamoDbError>) -> &'static str {
+        match r {
+            Ok(()) => "Ok",
+            Err(DynamoDbError::ValidationException(_)) => "ValidationException",
+            Err(DynamoDbError::AccessDeniedException(_)) => "AccessDeniedException",
+            Err(_) => "another error",
+        }
+    }
+
     fn assert_invalid_stream_arn(r: Result<(), DynamoDbError>, what: &str, arn: &str) {
         match r {
             Err(DynamoDbError::ValidationException(m)) => {
                 assert_eq!(m, "Invalid StreamArn", "{what} {arn}");
             }
-            other => panic!("{what} {arn}: expected Invalid StreamArn, got {other:?}"),
+            other => panic!(
+                "{what} {arn}: expected Invalid StreamArn, got {}",
+                variant(&other)
+            ),
         }
     }
 
@@ -118,7 +132,10 @@ mod tests {
             Err(DynamoDbError::AccessDeniedException(m)) => {
                 assert_eq!(m, "Access is denied", "{what} {arn}");
             }
-            other => panic!("{what} {arn}: expected Access is denied, got {other:?}"),
+            other => panic!(
+                "{what} {arn}: expected Access is denied, got {}",
+                variant(&other)
+            ),
         }
     }
 
