@@ -80,8 +80,12 @@ impl SqliteEngine {
         // rather than silently producing a malformed / unmatchable index row.
         if !indexes.is_empty() {
             let idx_refs = index_key_refs(&indexes);
-            validation::validate_index_key_types(&item, &idx_refs, &key_info.attribute_definitions)
-                .map_err(|e| StorageError::Validation(e.to_string()))?;
+            validation::validate_index_key_types(
+                &item,
+                &idx_refs,
+                super::index::fresh_attr_defs(&indexes, &key_info.attribute_definitions),
+            )
+            .map_err(|e| StorageError::Validation(e.to_string()))?;
             validation::validate_index_key_not_empty(
                 &item,
                 &idx_refs,
