@@ -17,19 +17,27 @@ RUN test -n "${VCS_REF}" \
  && test "${BUILD_DATE}" != unknown \
  && EXTENDDB_GIT_HASH="${VCS_REF}" \
     EXTENDDB_BUILD_TIME="${BUILD_DATE}" \
+    AWS_LC_SYS_USE_SYSTEM=0 \
     cargo build --locked --release \
       -p extenddb --no-default-features --features postgres
 
-FROM public.ecr.aws/debian/debian:bookworm-slim@sha256:1f6767130e3479e42348856acee11bbe78d26cc558b4bf52ac5106f3fcf594ff AS runtime
+FROM public.ecr.aws/debian/debian:bookworm-slim@sha256:8eeeb3e089a27d34c398a5580fe479b71a457cba535f59d85e52a303610ec583 AS runtime
 ARG VERSION
 ARG VCS_REF
 ARG BUILD_DATE
+ARG DEBIAN_FRONTEND=noninteractive
+# The base digest is a point-in-time snapshot, and package versions in this
+# layer are not pinned: apt-get upgrade installs the bookworm-security updates
+# published since the snapshot, so a release build does not ship a package
+# Debian has already fixed. --with-new-pkgs installs an update that needs a new
+# dependency instead of holding it back.
 RUN test -n "${VERSION}" \
  && test -n "${VCS_REF}" \
  && test "${VCS_REF}" != unknown \
  && test -n "${BUILD_DATE}" \
  && test "${BUILD_DATE}" != unknown \
  && apt-get update \
+ && apt-get upgrade -y --with-new-pkgs --no-install-recommends \
  && apt-get install -y --no-install-recommends \
       ca-certificates \
       tini=0.19.0-1+b3 \

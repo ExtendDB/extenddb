@@ -16,7 +16,17 @@ pub(crate) const CATALOG_MIGRATIONS: &[(&str, &str)] = &[
         "002_vector_indexes.sql",
         include_str!("../../storage-postgres/migrations/002_vector_indexes.sql"),
     ),
+    (
+        "003_backup_definitions.sql",
+        include_str!("../../storage-postgres/migrations/003_backup_definitions.sql"),
+    ),
 ];
+
+/// The runner's convergence write, executed after the walk over
+/// [`CATALOG_MIGRATIONS`]. Same statement shape as the files' own in-file
+/// writes, parameterized on the compiled version.
+pub(crate) const SET_CATALOG_VERSION_SQL: &str =
+    "UPDATE settings SET value = $1 WHERE key = 'catalog_version'";
 
 /// Run catalog migrations, skipping already-applied ones.
 pub(crate) async fn run_catalog_migrations(pool: &PgPool) -> OpResult<()> {
@@ -41,7 +51,208 @@ pub(crate) async fn run_catalog_migrations(pool: &PgPool) -> OpResult<()> {
         // another migration lands.
         record_migration(pool, filename).await?;
     }
+    // The runner owns the final version write. Each file still writes the
+    // version it introduces, but a replay can re-apply an EARLIER file while a
+    // later one stays recorded and skipped: the re-applied file's in-file write
+    // then leaves the stored version behind the schema actually present, the
+    // startup gate refuses the catalog, and a second migrate finds nothing
+    // unrecorded and writes nothing, stranding the deployment. Converging on
+    // the compiled version after every completed walk closes that gap. The
+    // in-file writes stay until #221 moves version ownership into the runner
+    // entirely.
+    converge_catalog_version(pool).await?;
+    for step in converge_catalog_shapes(pool).await? {
+        println!("    Converged catalog shape: {step}.");
+    }
     println!("    Migrations applied.");
+    Ok(())
+}
+
+/// Filenames of [`CATALOG_MIGRATIONS`] not recorded in the catalog's
+/// `schema_history`. The ledger keys on the filename, so this is the set
+/// [`run_catalog_migrations`] would apply, whatever `catalog_version` says:
+/// a catalog stamped with the current version by another migration of the
+/// same number (a different branch's `003_*`) still lists this binary's file
+/// here.
+pub(crate) async fn pending_catalog_migrations(pool: &PgPool) -> OpResult<Vec<String>> {
+    let mut pending = Vec::new();
+    for (filename, _sql) in CATALOG_MIGRATIONS {
+        if !is_migration_applied(pool, filename).await? {
+            pending.push((*filename).to_owned());
+        }
+    }
+    Ok(pending)
+}
+
+/// One catalog shape step: a description for reports, whether the catalog
+/// needs it (a query returning one boolean), and the idempotent SQL that
+/// applies it.
+struct ShapeStep {
+    what: &'static str,
+    needed: &'static str,
+    apply: &'static str,
+    /// Whether `serve` applies this step at startup
+    /// ([`converge_catalog_shapes_at_serve`]); every step is applied by
+    /// `extenddb migrate --yes`.
+    at_serve: bool,
+}
+
+/// Shape steps for a catalog whose recorded migrations ran an earlier
+/// revision of a file (the ledger keys on the filename, so the walk skips
+/// the edited file). Each `needed` query is false on a catalog the current
+/// files created, and on one where `table_restores` does not exist yet (the
+/// walk creates it in the current shape).
+///
+/// `003_backup_definitions.sql` was edited in place before release: its
+/// earlier revision created `table_restores` without `source_table_arn` and
+/// with `DEFAULT NOW()` on `restore_date_time`. DescribeTable selects
+/// `source_table_arn` for every table, so on that shape every DescribeTable
+/// fails. The added column is nullable (rows written by the earlier build
+/// have no value, and are reported without a SourceTableArn); every row this
+/// build writes sets it.
+///
+/// Dropping the default is applied by `migrate --yes` only, never by
+/// `serve`: the earlier build inserts `table_restores` rows without
+/// `restore_date_time` and relies on the default, so dropping it while an
+/// earlier-build server is still running makes that server's restores fail.
+/// `migrate` is run with every server stopped. Until then the default is
+/// harmless to this build, which always writes the value.
+const CATALOG_SHAPE_STEPS: &[ShapeStep] = &[
+    ShapeStep {
+        what: "add table_restores.source_table_arn",
+        needed: "SELECT EXISTS(SELECT 1 FROM information_schema.tables \
+                 WHERE table_schema = 'public' AND table_name = 'table_restores') \
+                 AND NOT EXISTS(SELECT 1 FROM information_schema.columns \
+                 WHERE table_schema = 'public' AND table_name = 'table_restores' \
+                 AND column_name = 'source_table_arn')",
+        apply: "ALTER TABLE table_restores ADD COLUMN IF NOT EXISTS source_table_arn TEXT",
+        at_serve: true,
+    },
+    ShapeStep {
+        what: "drop the default of table_restores.restore_date_time",
+        needed: "SELECT EXISTS(SELECT 1 FROM information_schema.columns \
+                 WHERE table_schema = 'public' AND table_name = 'table_restores' \
+                 AND column_name = 'restore_date_time' AND column_default IS NOT NULL)",
+        apply: "ALTER TABLE table_restores ALTER COLUMN restore_date_time DROP DEFAULT",
+        at_serve: false,
+    },
+];
+
+/// How long a startup shape step waits for its table lock, in seconds. An
+/// `ALTER TABLE` waits behind every open transaction that touched the table,
+/// and every later statement on the table waits behind the `ALTER`; with
+/// other servers still serving, an unbounded wait would stall them all. On
+/// timeout the server refuses to start instead.
+pub(crate) const SERVE_SHAPE_LOCK_TIMEOUT_SECS: u64 = 5;
+
+/// SQLSTATE `lock_not_available`, which `lock_timeout` raises.
+const SQLSTATE_LOCK_NOT_AVAILABLE: &str = "55P03";
+
+async fn shape_step_needed(pool: &PgPool, step: &ShapeStep) -> OpResult<bool> {
+    sqlx::query_scalar(step.needed)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| OpError::Internal(format!("Check catalog shape ({}): {e}", step.what)))
+}
+
+/// The [`CATALOG_SHAPE_STEPS`] this catalog needs, by description.
+pub(crate) async fn pending_catalog_shapes(pool: &PgPool) -> OpResult<Vec<String>> {
+    let mut pending = Vec::new();
+    for step in CATALOG_SHAPE_STEPS {
+        if shape_step_needed(pool, step).await? {
+            pending.push(step.what.to_owned());
+        }
+    }
+    Ok(pending)
+}
+
+/// Apply the [`CATALOG_SHAPE_STEPS`] this catalog needs; returns their
+/// descriptions. Runs at the end of [`run_catalog_migrations`], that is from
+/// `extenddb migrate --yes`. A step that is not needed issues no DDL, so on a
+/// current catalog this only reads `information_schema`. Every step is
+/// idempotent, so two runs at once are safe.
+pub(crate) async fn converge_catalog_shapes(pool: &PgPool) -> OpResult<Vec<String>> {
+    let mut applied = Vec::new();
+    for step in CATALOG_SHAPE_STEPS {
+        if !shape_step_needed(pool, step).await? {
+            continue;
+        }
+        sqlx::query(step.apply)
+            .execute(pool)
+            .await
+            .map_err(|e| OpError::Internal(format!("Catalog shape step ({}): {e}", step.what)))?;
+        applied.push(step.what.to_owned());
+    }
+    Ok(applied)
+}
+
+/// `serve`'s startup converge: apply the needed [`CATALOG_SHAPE_STEPS`]
+/// marked `at_serve`, each in its own transaction under `SET LOCAL
+/// lock_timeout` of [`SERVE_SHAPE_LOCK_TIMEOUT_SECS`]. Returns the applied
+/// steps' descriptions. A step that cannot take its lock in time fails with
+/// an error saying so and changes nothing.
+pub(crate) async fn converge_catalog_shapes_at_serve(pool: &PgPool) -> OpResult<Vec<String>> {
+    let mut applied = Vec::new();
+    for step in CATALOG_SHAPE_STEPS.iter().filter(|s| s.at_serve) {
+        if !shape_step_needed(pool, step).await? {
+            continue;
+        }
+        let fail = |e: sqlx::Error| {
+            let lock_timeout = e
+                .as_database_error()
+                .and_then(|d| d.code())
+                .is_some_and(|c| c == SQLSTATE_LOCK_NOT_AVAILABLE);
+            if lock_timeout {
+                OpError::Internal(format!(
+                    "Catalog shape step ({}): could not lock the table within \
+                     {SERVE_SHAPE_LOCK_TIMEOUT_SECS} s, another session holds it",
+                    step.what
+                ))
+            } else {
+                OpError::Internal(format!("Catalog shape step ({}): {e}", step.what))
+            }
+        };
+        let mut tx = pool.begin().await.map_err(fail)?;
+        sqlx::query(&format!(
+            "SET LOCAL lock_timeout = '{SERVE_SHAPE_LOCK_TIMEOUT_SECS}s'"
+        ))
+        .execute(&mut *tx)
+        .await
+        .map_err(fail)?;
+        sqlx::query(step.apply)
+            .execute(&mut *tx)
+            .await
+            .map_err(fail)?;
+        tx.commit().await.map_err(fail)?;
+        applied.push(step.what.to_owned());
+    }
+    Ok(applied)
+}
+
+/// Write the compiled catalog version, but never move the stored version
+/// backwards and never overwrite one this binary cannot parse: a catalog
+/// stamped by a newer binary (or in a scheme this one does not know) stays
+/// stamped, so that binary's startup gate keeps working and this one's keeps
+/// refusing it. `extenddb migrate` refuses such a catalog before the walk;
+/// this is the runner-level guard for every other caller. The rule is
+/// `extenddb_storage::util::check_stored_catalog_version`, shared with SQLite
+/// and `extenddb migrate`.
+async fn converge_catalog_version(pool: &PgPool) -> OpResult<()> {
+    let stored: Option<(String,)> =
+        sqlx::query_as("SELECT value FROM settings WHERE key = 'catalog_version'")
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| OpError::Internal(format!("Read catalog_version: {e}")))?;
+    extenddb_storage::util::check_stored_catalog_version(
+        stored.as_ref().map(|(v,)| v.as_str()),
+        crate::CATALOG_VERSION,
+    )
+    .map_err(OpError::Internal)?;
+    sqlx::query(SET_CATALOG_VERSION_SQL)
+        .bind(crate::CATALOG_VERSION.to_string())
+        .execute(pool)
+        .await
+        .map_err(|e| OpError::Internal(format!("Write catalog_version: {e}")))?;
     Ok(())
 }
 
@@ -311,10 +522,10 @@ mod tests {
     fn the_migration_count_and_the_catalog_version_agree() {
         assert_eq!(
             CATALOG_MIGRATIONS.len(),
-            2,
+            3,
             "a catalog migration was added or removed; update CATALOG_VERSION and this count"
         );
-        assert_eq!(CATALOG_VERSION.to_string(), "0.0.3");
+        assert_eq!(CATALOG_VERSION.to_string(), "0.0.4");
     }
 
     /// The version the binary expects must be the version the schema writes.
@@ -359,5 +570,100 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The fail-closed catalog guard (`converge_catalog_version`, via
+    /// `check_stored_catalog_version`) against a live catalog: a stored
+    /// version this binary cannot parse, or a newer one, is refused and left
+    /// exactly as stored; an older one is moved up and an equal one kept.
+    /// Needs `EXTENDDB_TEST_PG_CONNECTION_STRING`; reports a skip without it.
+    #[tokio::test]
+    async fn converge_refuses_an_unreadable_or_newer_catalog_version_and_leaves_it() {
+        let Some(base) = std::env::var("EXTENDDB_TEST_PG_CONNECTION_STRING")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+        else {
+            eprintln!(
+                "SKIP converge_refuses_an_unreadable_or_newer_catalog_version: no PostgreSQL"
+            );
+            return;
+        };
+        let base = base.trim_end_matches('/').to_owned();
+        let name = format!("eddb_conv_{}", uuid::Uuid::new_v4().simple())[..24].to_owned();
+        let admin = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&format!("{base}/postgres"))
+            .await
+            .expect("admin");
+        sqlx::query(&format!("CREATE DATABASE \"{name}\""))
+            .execute(&admin)
+            .await
+            .expect("create scratch");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&format!("{base}/{name}"))
+            .await
+            .expect("scratch");
+        sqlx::query("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .expect("settings");
+
+        let compiled = CATALOG_VERSION.to_string();
+        // (stored, expect Ok, stored value afterwards)
+        let cases: [(Option<&str>, bool, Option<&str>); 5] = [
+            (Some("garbage"), false, Some("garbage")),
+            (Some(""), false, Some("")),
+            (Some("9.9.9"), false, Some("9.9.9")),
+            (Some("0.0.3"), true, Some(compiled.as_str())),
+            (Some(compiled.as_str()), true, Some(compiled.as_str())),
+        ];
+        let mut outcomes = Vec::new();
+        for (stored, _, _) in &cases {
+            sqlx::query("DELETE FROM settings")
+                .execute(&pool)
+                .await
+                .expect("clear");
+            if let Some(v) = stored {
+                sqlx::query("INSERT INTO settings (key, value) VALUES ('catalog_version', $1)")
+                    .bind(v)
+                    .execute(&pool)
+                    .await
+                    .expect("seed");
+            }
+            let result = super::converge_catalog_version(&pool).await;
+            let after: Option<String> =
+                sqlx::query_scalar("SELECT value FROM settings WHERE key = 'catalog_version'")
+                    .fetch_optional(&pool)
+                    .await
+                    .expect("read back");
+            outcomes.push((result.map_err(|e| format!("{e:?}")), after));
+        }
+        // Absent: proceeds, and (the write is an UPDATE) stays absent.
+        sqlx::query("DELETE FROM settings")
+            .execute(&pool)
+            .await
+            .expect("clear");
+        let absent = super::converge_catalog_version(&pool).await.is_ok();
+
+        pool.close().await;
+        let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
+            .execute(&admin)
+            .await;
+        admin.close().await;
+
+        for ((stored, ok, want_after), (result, after)) in cases.iter().zip(&outcomes) {
+            assert_eq!(result.is_ok(), *ok, "stored {stored:?}: {result:?}");
+            assert_eq!(
+                after.as_deref(),
+                *want_after,
+                "stored {stored:?} afterwards"
+            );
+        }
+        let garbage = outcomes[0].0.as_ref().expect_err("garbage refused");
+        assert!(garbage.contains("refusing to overwrite"), "{garbage}");
+        let newer = outcomes[2].0.as_ref().expect_err("newer refused");
+        assert!(newer.contains("newer than this binary"), "{newer}");
+        assert!(absent, "an absent version proceeds");
     }
 }

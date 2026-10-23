@@ -15,7 +15,8 @@ mod transaction;
 pub use attribute_value::AttributeValue;
 pub use backup::{
     BackupDescription, BackupDetails, BackupSummary, ContinuousBackupsDescription,
-    PointInTimeRecoveryDescription, SourceTableDetails,
+    GlobalSecondaryIndexInfo, LocalSecondaryIndexInfo, PointInTimeRecoveryDescription,
+    SourceTableDetails, SourceTableFeatureDetails,
 };
 pub use batch::{
     BatchGetItemInput, BatchGetItemOutput, BatchWriteItemInput, BatchWriteItemOutput,

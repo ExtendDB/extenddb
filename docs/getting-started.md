@@ -57,6 +57,9 @@ cargo build --release --no-default-features --features mongodb
 
 # Cassandra backend
 cargo build --release --no-default-features --features cassandra
+
+# SQLite backend (developer mode, see "SQLite backend (developer mode)" below)
+cargo build --release --no-default-features --features sqlite
 ```
 
 Each build produces a single-backend binary. The `postgres`, `mongodb`,
@@ -136,7 +139,15 @@ This generates a certificate with SANs: `localhost`, `127.0.0.1`, and `10.0.1.5`
 ### SQLite backend (developer mode)
 
 For local development and CI, extenddb can run against a SQLite backend instead
-of PostgreSQL. Select it at init time with `--backend sqlite`:
+of PostgreSQL. It requires its own build (the `postgres`, `mongodb`, and
+`sqlite` backends are mutually exclusive, each compiled into a single-backend
+binary — see [Build extenddb](#1-build-extenddb) above):
+
+```bash
+cargo build --release --no-default-features --features sqlite
+```
+
+Then select it at init time with `--backend sqlite`:
 
 ```bash
 ./target/release/extenddb init --backend sqlite
@@ -250,7 +261,7 @@ You should see all checks pass:
 --- Checking catalog connection...
   OK: Connected to catalog.
 --- Checking catalog version...
-  OK: Catalog version 0.0.3
+  OK: Catalog version 0.0.4
 --- Checking data database...
   OK: Connected to data database 'extenddb_catalog_data'.
 --- Enumerating tables...
@@ -266,7 +277,7 @@ extenddb runs as a daemon (background process) and logs to syslog. On startup it
 
 ```bash
 ./target/release/extenddb serve --config extenddb.toml
-# extenddb 0.1.13 (catalog 0.0.3) starting on 127.0.0.1:18443
+# extenddb 0.1.14 (catalog 0.0.4) starting on 127.0.0.1:18443
 #   storage: postgres (postgresql://extenddb:***@localhost:5432/extenddb_catalog)
 ```
 
@@ -1344,8 +1355,8 @@ Each runner requires its tools to be installed. The runner checks prerequisites 
 
 ```bash
 ./target/release/extenddb version
-# extenddb 0.1.13
-# catalog 0.0.3 (postgres)
+# extenddb 0.1.14
+# catalog 0.0.4 (postgres)
 # commit abc1234
 # built 2026-04-17T12:00:00Z
 ```

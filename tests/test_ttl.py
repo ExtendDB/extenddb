@@ -18,7 +18,32 @@ import boto3
 import pytest
 from botocore.exceptions import ClientError
 
-from conftest import wait_for_active, wait_for_deleted
+from conftest import _is_real_dynamodb, wait_for_active, wait_for_deleted
+
+
+def _configured_backend():
+    """The backend under test: `EXTENDDB_TEST_BACKEND` (exported by
+    devtools/run-tests), else the `[storage] backend` of the server's config
+    file, else None (real DynamoDB, or a server started elsewhere)."""
+    explicit = os.environ.get("EXTENDDB_TEST_BACKEND", "").strip()
+    if explicit:
+        return explicit
+    path = os.environ.get("EXTENDDB_CONFIG", "extenddb.toml")
+    try:
+        with open(path) as f:
+            text = f.read()
+    except OSError:
+        return None
+    section = None
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if line.startswith("["):
+            section = line.strip("[]").strip()
+        elif section == "storage" and line.split("=", 1)[0].strip() == "backend":
+            return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return None
+
+
 @pytest.fixture()
 def ttl_table(dynamodb_client, unique_table_name):
     """Create a PAY_PER_REQUEST table for TTL tests."""
@@ -67,6 +92,17 @@ class TestUpdateTimeToLive:
         )
         # DynamoDB rate-limits TTL modifications; wait before disabling.
         time.sleep(6)
+        # A disable is refused while the enable is still ENABLING; on a loaded
+        # server that can outlast the fixed wait.
+        deadline = time.monotonic() + 120
+        while (
+            dynamodb_client.describe_time_to_live(TableName=ttl_table)[
+                "TimeToLiveDescription"
+            ]["TimeToLiveStatus"]
+            == "ENABLING"
+        ):
+            assert time.monotonic() < deadline, "TTL still ENABLING after 120 s"
+            time.sleep(0.5)
         # Disable.
         resp = dynamodb_client.update_time_to_live(
             TableName=ttl_table,
@@ -88,6 +124,74 @@ class TestUpdateTimeToLive:
                 },
             )
         assert exc_info.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    def test_enable_ttl_with_a_gsi_is_applied_or_refused_as_a_client_error(
+        self, dynamodb_client, unique_table_name
+    ):
+        """A table with a GSI: TTL is enabled on DynamoDB, PostgreSQL, SQLite,
+        and MongoDB. On Cassandra it is enabled when the GSI is synchronous
+        and refused with ValidationException naming the index when the GSI
+        propagates asynchronously, which depends on the server's
+        index_propagation_delay_ms; either way never a 5xx, which SDKs retry.
+        The Cassandra refusal itself is pinned by the storage-level test
+        test_ttl_on_a_table_with_an_async_gsi_is_refused_as_a_validation_error.
+        """
+        backend = None if _is_real_dynamodb() else _configured_backend()
+        may_refuse = backend == "cassandra" or (backend is None and not _is_real_dynamodb())
+        print(f"backend under test: {backend or 'unknown'}; refusal allowed: {may_refuse}")
+        dynamodb_client.create_table(
+            TableName=unique_table_name,
+            AttributeDefinitions=[
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "gpk", "AttributeType": "S"},
+            ],
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            GlobalSecondaryIndexes=[
+                {
+                    "IndexName": "by_gpk",
+                    "KeySchema": [{"AttributeName": "gpk", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "KEYS_ONLY"},
+                }
+            ],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        try:
+            wait_for_active(dynamodb_client, unique_table_name)
+            try:
+                resp = dynamodb_client.update_time_to_live(
+                    TableName=unique_table_name,
+                    TimeToLiveSpecification={"Enabled": True, "AttributeName": "expiry"},
+                )
+            except ClientError as e:
+                assert may_refuse, (backend, e.response)
+                meta = e.response["ResponseMetadata"]
+                assert e.response["Error"]["Code"] == "ValidationException", e.response
+                assert meta["HTTPStatusCode"] == 400, meta
+                assert meta.get("RetryAttempts", 0) == 0, meta
+                msg = e.response["Error"]["Message"]
+                assert "by_gpk" in msg and "asynchronously propagated" in msg, msg
+                desc = dynamodb_client.describe_time_to_live(TableName=unique_table_name)
+                assert desc["TimeToLiveDescription"]["TimeToLiveStatus"] == "DISABLED", desc
+                print(f"TTL with an async GSI refused: {msg}")
+            else:
+                assert resp["TimeToLiveSpecification"] == {
+                    "Enabled": True,
+                    "AttributeName": "expiry",
+                }
+                desc = dynamodb_client.describe_time_to_live(TableName=unique_table_name)
+                assert desc["TimeToLiveDescription"]["TimeToLiveStatus"] in (
+                    "ENABLED",
+                    "ENABLING",
+                ), desc
+                print("TTL with a GSI enabled")
+        finally:
+            try:
+                dynamodb_client.delete_table(TableName=unique_table_name)
+                wait_for_deleted(dynamodb_client, unique_table_name)
+            except ClientError:
+                pass
+
+
 class TestDescribeTimeToLive:
     """DescribeTimeToLive operation tests."""
 

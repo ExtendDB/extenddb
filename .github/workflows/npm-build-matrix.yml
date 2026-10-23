@@ -123,7 +123,11 @@ jobs:
         # SQLite backend only, dev-mode on: the launcher's contract binary.
         # `--locked` so the build is exactly the reviewed Cargo.lock. The
         # explicit --target keeps the output path uniform across native and
-        # cross-compiled platforms.
+        # cross-compiled platforms. AWS_LC_SYS_USE_SYSTEM=0 makes aws-lc-sys
+        # build its bundled AWS-LC instead of linking one it finds on the
+        # runner, so the binary's crypto is the version Cargo.lock names.
+        env:
+          AWS_LC_SYS_USE_SYSTEM: '0'
         run: cargo build --release --locked --no-default-features --features sqlite,dev-mode -p extenddb --target ${{ matrix.target }}
 
       - name: The binary must be the target architecture

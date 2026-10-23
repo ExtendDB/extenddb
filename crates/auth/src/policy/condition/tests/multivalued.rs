@@ -247,12 +247,12 @@ fn string_not_like_multiple_policy_values_no_match() {
 #[test]
 fn policy_variable_expansion_principal_tag() {
     let ctx = TestContext::new()
-        .with("dynamodb:ResourceTag/Team", vec!["Alpha"])
+        .with("aws:ResourceTag/Team", vec!["Alpha"])
         .with("aws:PrincipalTag/Team", vec!["Alpha"]);
     assert!(evaluate_condition(
         &cond(
             ConditionOperator::StringEquals,
-            "dynamodb:ResourceTag/Team",
+            "aws:ResourceTag/Team",
             vec!["${aws:PrincipalTag/Team}"]
         ),
         &ctx
@@ -262,12 +262,12 @@ fn policy_variable_expansion_principal_tag() {
 #[test]
 fn policy_variable_expansion_mismatch() {
     let ctx = TestContext::new()
-        .with("dynamodb:ResourceTag/Team", vec!["Beta"])
+        .with("aws:ResourceTag/Team", vec!["Beta"])
         .with("aws:PrincipalTag/Team", vec!["Alpha"]);
     assert!(!evaluate_condition(
         &cond(
             ConditionOperator::StringEquals,
-            "dynamodb:ResourceTag/Team",
+            "aws:ResourceTag/Team",
             vec!["${aws:PrincipalTag/Team}"]
         ),
         &ctx
@@ -369,6 +369,22 @@ fn for_any_value_string_not_equals_one_outside_set() {
             ConditionOperator::ForAnyValue(Box::new(ConditionOperator::StringNotEquals)),
             "k",
             vec!["admin", "root"]
+        ),
+        &ctx
+    ));
+}
+
+#[test]
+fn bare_negative_op_multivalued_absent_no_match() {
+    // BR-7085 preserved: a bare negated operator on an ABSENT multivalued key
+    // still never matches. The negated-absent rule is scoped to single-valued
+    // keys; multivalued keys require ForAllValues/ForAnyValue.
+    let ctx = TestContext::new();
+    assert!(!evaluate_condition(
+        &cond(
+            ConditionOperator::StringNotEquals,
+            "dynamodb:Attributes",
+            vec!["ssn"]
         ),
         &ctx
     ));

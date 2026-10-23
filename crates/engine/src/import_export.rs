@@ -387,15 +387,71 @@ async fn wait_for_table_active(
     )))
 }
 
+/// Resolve the table an export `TableArn` names, using the one shared resource
+/// parser so the engine reads the same table authorization checked.
+///
+/// `ExportTableToPointInTime` names its source in `TableArn`, which must be
+/// exactly a table ARN. A well-formed DynamoDB ARN of the wrong kind (a stream,
+/// index, or backup ARN) reaches here after authorization and is refused with
+/// the service's message (measured live, `live-r2/arn-kinds-live.json`). An
+/// unparseable `TableArn` is refused earlier, before authorization, by
+/// `authz_resource::validate_operation_arns`.
 fn extract_table_name_from_arn(arn: &str) -> Result<String, DynamoDbError> {
-    arn.rsplit_once("table/")
-        .map(|(_, name)| name.to_owned())
-        .ok_or_else(|| DynamoDbError::ValidationException(format!("Invalid table ARN: {arn}")))
+    match extenddb_core::arn::parse(arn) {
+        Some(extenddb_core::arn::TableResource {
+            table, sub: None, ..
+        }) => Ok(table),
+        _ => Err(DynamoDbError::ValidationException(
+            INVALID_TABLE_ARN_REQUEST_MESSAGE.to_owned(),
+        )),
+    }
 }
+
+/// The message DynamoDB returns for an export `TableArn` (or a restore source
+/// ARN) that is a well-formed ARN of the wrong resource kind (measured live).
+const INVALID_TABLE_ARN_REQUEST_MESSAGE: &str = "Invalid Request: Table ARN is invalid.";
 
 fn epoch_seconds() -> f64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+}
+
+#[cfg(test)]
+mod export_arn_tests {
+    use super::{INVALID_TABLE_ARN_REQUEST_MESSAGE, extract_table_name_from_arn};
+    use extenddb_core::error::DynamoDbError;
+
+    #[test]
+    fn exact_table_arn_resolves_to_table_name() {
+        assert_eq!(
+            extract_table_name_from_arn("arn:aws:dynamodb:us-east-1:1:table/orders").unwrap(),
+            "orders"
+        );
+    }
+
+    #[test]
+    fn non_bare_table_arn_is_refused_with_the_measured_message() {
+        // A well-formed stream, index, or backup ARN reaches the handler after
+        // authorization and is refused with the service's message. A trailing
+        // slash and the A1 bypass ARN do not parse and are refused earlier, but
+        // the handler refuses them too if reached.
+        for arn in [
+            "arn:aws:dynamodb:us-east-1:1:table/orders/stream/2026-10-20T16:17:40.188",
+            "arn:aws:dynamodb:us-east-1:1:table/orders/index/gsi1",
+            "arn:aws:dynamodb:us-east-1:1:table/orders/backup/01-ab",
+            "arn:aws:dynamodb:us-east-1:1:table/allowed/stream/table/secret",
+            "arn:aws:dynamodb:us-east-1:1:table/orders/",
+            "banana",
+            "xrn:aws:dynamodb:us-east-1:1:table/orders",
+        ] {
+            match extract_table_name_from_arn(arn) {
+                Err(DynamoDbError::ValidationException(m)) => {
+                    assert_eq!(m, INVALID_TABLE_ARN_REQUEST_MESSAGE, "for {arn}");
+                }
+                other => panic!("expected ValidationException for {arn}, got {other:?}"),
+            }
+        }
+    }
 }

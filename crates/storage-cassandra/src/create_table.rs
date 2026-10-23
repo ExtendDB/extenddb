@@ -6,12 +6,14 @@
 use cdrs_tokio::types::value::Value;
 use extenddb_core::types::{
     BillingMode, BillingModeSummary, CreateTableInput, GsiDescription, LsiDescription,
-    ProvisionedThroughputDescription, SseDescription, SseType, TableDescription, TableStatus,
+    ProvisionedThroughputDescription, RestoreSummary, SseDescription, SseType, TableDescription,
+    TableStatus,
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{index_arn, stream_arn, table_arn};
 
 use crate::CassandraEngine;
+use crate::backup_engine::RestoreHeartbeat;
 
 impl CassandraEngine {
     /// Initialize stream shards for a table atomically.
@@ -93,28 +95,42 @@ impl CassandraEngine {
         account_id: &str,
         input: CreateTableInput,
     ) -> Result<TableDescription, StorageError> {
-        self.create_table_impl_inner(account_id, input, true).await
+        self.create_table_impl_inner(account_id, input, None)
+            .await
+            .map(|(description, _)| description)
     }
 
-    /// Create an inaccessible restore target that must be activated explicitly
-    /// after all backup items have been copied and verified.
+    /// Create a restore target: CREATING, with no generic transition deadline,
+    /// carrying the restore registration columns. Only the restore copy (which
+    /// activates it) or the abandoned-restore sweep (which removes it) moves it
+    /// out of CREATING. Returns the target's heartbeat, started right after
+    /// the row insert; dropping it stops it.
     pub(crate) async fn create_table_for_restore_impl(
         &self,
         account_id: &str,
         input: CreateTableInput,
-    ) -> Result<TableDescription, StorageError> {
-        self.create_table_impl_inner(account_id, input, false).await
+        restore: &RestoreTargetColumns,
+    ) -> Result<(TableDescription, RestoreHeartbeat), StorageError> {
+        let (description, heartbeat) = self
+            .create_table_impl_inner(account_id, input, Some(restore))
+            .await?;
+        let heartbeat = heartbeat.ok_or_else(|| {
+            StorageError::Internal("restore target created without a heartbeat".to_owned())
+        })?;
+        Ok((description, heartbeat))
     }
 
     async fn create_table_impl_inner(
         &self,
         account_id: &str,
         input: CreateTableInput,
-        schedule_activation: bool,
-    ) -> Result<TableDescription, StorageError> {
+        restore: Option<&RestoreTargetColumns>,
+    ) -> Result<(TableDescription, Option<RestoreHeartbeat>), StorageError> {
+        let schedule_activation = restore.is_none();
         Self::validate_account_id(account_id)?;
 
-        let table_id = uuid::Uuid::new_v4().to_string();
+        let table_id =
+            restore.map_or_else(|| uuid::Uuid::new_v4().to_string(), |r| r.table_id.clone());
         let table_arn = table_arn(&self.region, account_id, &input.table_name);
         let billing_mode = input.billing_mode.unwrap_or(BillingMode::Provisioned);
 
@@ -203,52 +219,73 @@ impl CassandraEngine {
             )));
         }
 
-        // Insert table metadata with LWT (IF NOT EXISTS)
-        let insert_table_cql = format!(
-            "INSERT INTO {catalog_keyspace}.tables (account_id, table_name, table_id, table_arn, key_schema, \
+        // Insert table metadata with LWT (IF NOT EXISTS). Only a restore
+        // target names the restore columns (added by catalog migration V005),
+        // so an ordinary CreateTable also works on a catalog that has not run
+        // V005; CQL rejects a statement naming an undefined column even when
+        // no value is bound to it.
+        let mut columns = String::from(
+            "account_id, table_name, table_id, table_arn, key_schema, \
              attribute_definitions, billing_mode, provisioned_throughput, stream_specification, \
              table_class, sse_specification, on_demand_throughput, \
-             table_status, created_at, deletion_protection_enabled, status_transition_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS"
+             table_status, created_at, deletion_protection_enabled, status_transition_at",
+        );
+        let mut values = vec![
+            Value::from(account_id),
+            Value::from(input.table_name.as_str()),
+            Value::from(table_id.as_str()),
+            Value::from(table_arn.as_str()),
+            Value::from(key_schema_json.to_string().as_str()),
+            Value::from(attr_defs_json.to_string().as_str()),
+            Value::from(billing_str),
+            match pt_json.as_ref() {
+                Some(v) => Value::from(v.to_string().as_str()),
+                None => Value::NotSet,
+            },
+            match stream_json.as_ref() {
+                Some(v) => Value::from(v.to_string().as_str()),
+                None => Value::NotSet,
+            },
+            match table_class_str.as_deref() {
+                Some(v) => Value::from(v),
+                None => Value::NotSet,
+            },
+            match sse_json.as_ref() {
+                Some(v) => Value::from(v.to_string().as_str()),
+                None => Value::NotSet,
+            },
+            match on_demand_json.as_ref() {
+                Some(v) => Value::from(v.to_string().as_str()),
+                None => Value::NotSet,
+            },
+            Value::from(initial_status),
+            Value::from(creation_timestamp),
+            Value::from(deletion_protection),
+            Value::from(status_transition_at),
+        ];
+        if let Some(r) = restore {
+            columns.push_str(
+                ", restore_source_backup_arn, restore_source_table_arn, restore_date_time, \
+                 restore_owner, restore_heartbeat",
+            );
+            values.extend([
+                Value::from(r.source_backup_arn.as_str()),
+                Value::from(r.source_table_arn.as_str()),
+                Value::from(r.restore_date_time_ms),
+                Value::from(r.owner),
+                Value::from(creation_timestamp),
+            ]);
+        }
+        let placeholders = vec!["?"; values.len()].join(", ");
+        let insert_table_cql = format!(
+            "INSERT INTO {catalog_keyspace}.tables ({columns}) VALUES ({placeholders}) IF NOT EXISTS"
         );
 
         let result = self
             .session
             .query_with_values(
                 &insert_table_cql,
-                cdrs_tokio::query::QueryValues::SimpleValues(vec![
-                    Value::from(account_id),
-                    Value::from(input.table_name.as_str()),
-                    Value::from(table_id.as_str()),
-                    Value::from(table_arn.as_str()),
-                    Value::from(key_schema_json.to_string().as_str()),
-                    Value::from(attr_defs_json.to_string().as_str()),
-                    Value::from(billing_str),
-                    match pt_json.as_ref() {
-                        Some(v) => Value::from(v.to_string().as_str()),
-                        None => Value::NotSet,
-                    },
-                    match stream_json.as_ref() {
-                        Some(v) => Value::from(v.to_string().as_str()),
-                        None => Value::NotSet,
-                    },
-                    match table_class_str.as_deref() {
-                        Some(v) => Value::from(v),
-                        None => Value::NotSet,
-                    },
-                    match sse_json.as_ref() {
-                        Some(v) => Value::from(v.to_string().as_str()),
-                        None => Value::NotSet,
-                    },
-                    match on_demand_json.as_ref() {
-                        Some(v) => Value::from(v.to_string().as_str()),
-                        None => Value::NotSet,
-                    },
-                    Value::from(initial_status),
-                    Value::from(creation_timestamp),
-                    Value::from(deletion_protection),
-                    Value::from(status_transition_at),
-                ]),
+                cdrs_tokio::query::QueryValues::SimpleValues(values),
             )
             .await
             .map_err(|e| {
@@ -270,9 +307,32 @@ impl CassandraEngine {
                 .map_err(|e| StorageError::Internal(format!("Failed to parse [applied]: {e}")))?;
 
             if !applied {
+                // The refused insert's row carries the existing row's columns.
+                // A restore into a name that is a CREATING restore target is
+                // refused as such, naming that target's source backup (the
+                // service answers TableInUseException); any other taken name
+                // is TableAlreadyExists. The restore column is absent on a
+                // catalog without V005, which reads as "not a restore target".
+                if restore.is_some() {
+                    let status: Option<String> = row.get_by_name("table_status").ok().flatten();
+                    let source: Option<String> =
+                        row.get_by_name("restore_source_backup_arn").ok().flatten();
+                    if let (Some("CREATING"), Some(backup_arn)) = (status.as_deref(), source) {
+                        return Err(StorageError::TableBeingRestored {
+                            table_name: input.table_name.clone(),
+                            backup_arn,
+                        });
+                    }
+                }
                 return Err(StorageError::TableAlreadyExists(input.table_name.clone()));
             }
         }
+
+        // A restore target's heartbeat runs from here, before the DDL below.
+        // An error return from this function drops it, which stops it.
+        let heartbeat = restore.map(|r| {
+            self.start_restore_heartbeat(account_id, &input.table_name, &r.table_id, r.owner)
+        });
 
         // Insert GSI metadata
         let mut gsi_index_ids: Vec<String> = Vec::new();
@@ -527,7 +587,7 @@ impl CassandraEngine {
             self.control_plane_notify.notify_one();
         }
 
-        Ok(TableDescription {
+        let description = TableDescription {
             table_name: input.table_name,
             key_schema: input.key_schema,
             attribute_definitions: input.attribute_definitions,
@@ -575,8 +635,29 @@ impl CassandraEngine {
                 .as_ref()
                 .map(|tc| serde_json::json!({ "TableClass": tc })),
             on_demand_throughput: input.on_demand_throughput,
-            restore_summary: None,
+            restore_summary: restore.map(|r| RestoreSummary {
+                source_backup_arn: Some(r.source_backup_arn.clone()),
+                source_table_arn: Some(r.source_table_arn.clone()),
+                restore_date_time: crate::cassandra_util::millis_to_seconds_f64(
+                    r.restore_date_time_ms,
+                ),
+                restore_in_progress: true,
+            }),
             vector_indexes: None,
-        })
+        };
+        Ok((description, heartbeat))
     }
+}
+
+/// The restore registration a restore target carries on its `tables` row.
+pub(crate) struct RestoreTargetColumns {
+    /// The target's `table_id`, chosen by the caller so it can register the
+    /// restore under it.
+    pub(crate) table_id: String,
+    pub(crate) source_backup_arn: String,
+    pub(crate) source_table_arn: String,
+    /// `RestoreSummary.RestoreDateTime`, epoch milliseconds.
+    pub(crate) restore_date_time_ms: i64,
+    /// The engine instance running the copy; see `CassandraEngine::restore_owner`.
+    pub(crate) owner: uuid::Uuid,
 }
