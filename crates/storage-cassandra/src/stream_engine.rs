@@ -235,7 +235,7 @@ impl StreamEngine for CassandraEngine {
 
             let row = rows.into_iter().next().ok_or_else(|| {
                 StorageError::TableNotFound(format!(
-                    "Requested resource not found: Stream: {stream_arn_str} not found."
+                    "Requested resource not found: Stream: {stream_arn_str} not found"
                 ))
             })?;
 
@@ -526,7 +526,7 @@ impl StreamEngine for CassandraEngine {
                 .next()
                 .ok_or_else(|| {
                     StorageError::TableNotFound(format!(
-                        "Requested resource not found: Stream: {stream_arn} not found."
+                        "Requested resource not found: Stream: {stream_arn} not found"
                     ))
                 })
                 .and_then(|row| {
@@ -555,7 +555,7 @@ impl StreamEngine for CassandraEngine {
 
             if !found {
                 return Err(StorageError::TableNotFound(format!(
-                    "Requested resource not found: Stream: {stream_arn} not found."
+                    "Requested resource not found: Stream: {stream_arn} not found"
                 )));
             }
             Ok(())

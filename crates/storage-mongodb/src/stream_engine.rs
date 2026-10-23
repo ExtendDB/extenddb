@@ -402,7 +402,7 @@ impl StreamEngine for MongoEngine {
                 .map_err(|e| StorageError::Internal(e.to_string()))?
                 .ok_or_else(|| {
                     StorageError::TableNotFound(format!(
-                        "Requested resource not found: Stream: {stream_arn_val} not found."
+                        "Requested resource not found: Stream: {stream_arn_val} not found"
                     ))
                 })?;
 
@@ -710,7 +710,7 @@ impl StreamEngine for MongoEngine {
 
             let Some(table_doc) = table_doc else {
                 return Err(StorageError::TableNotFound(format!(
-                    "Requested resource not found: Stream: {stream_arn_val} not found."
+                    "Requested resource not found: Stream: {stream_arn_val} not found"
                 )));
             };
 
@@ -724,7 +724,7 @@ impl StreamEngine for MongoEngine {
 
             if exists.is_none() {
                 return Err(StorageError::TableNotFound(format!(
-                    "Requested resource not found: Stream: {stream_arn_val} not found."
+                    "Requested resource not found: Stream: {stream_arn_val} not found"
                 )));
             }
             Ok(())

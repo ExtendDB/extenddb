@@ -173,15 +173,19 @@ pub(crate) async fn authorize_request(
     // Tag operations validate the ResourceArn shape before the IAM decision, as
     // the service does: an index ARN (tags are accepted only on a table or
     // stream) is rejected with ValidationException for every principal, before
-    // authorization. A table or stream ARN passes; its account, region, and
-    // existence are checked after authorization by the engine tag handler.
+    // authorization. A table ARN passes; its account, region, and existence
+    // are checked after authorization by the engine tag handler. A stream ARN
+    // must name the caller's account here, before authorization, as the
+    // service does (AccessDeniedException "Access is denied" for every
+    // principal, #450); its partition, service and region are checked by the
+    // engine after authorization, which runs on the ARN as sent (#451).
     if matches!(
         operation,
         "TagResource" | "UntagResource" | "ListTagsOfResource"
     ) && let Some(arn) = input.get("ResourceArn").and_then(Value::as_str)
         && !arn.is_empty()
     {
-        authz_resource::validate_tag_resource_arn_shape(arn)?;
+        authz_resource::validate_tag_resource_arn_shape(arn, account_id)?;
     }
 
     // Every other ARN-bearing field (StreamArn, BackupArn, the export TableArn,
@@ -189,7 +193,10 @@ pub(crate) async fn authorize_request(
     // takes, or the request is refused with ValidationException before the IAM
     // decision. Without this, an ARN the engine resolves one way and
     // authorization reads another lets a Deny on the real resource be bypassed.
-    authz_resource::validate_operation_arns(operation, input)?;
+    // A StreamArn must also be in this deployment's scope (partition, service,
+    // region) and the caller's account, so the stream authorized is the stream
+    // the engine reads and a respelled ARN is never served (#450, #451).
+    authz_resource::validate_operation_arns(operation, input, &state.region, account_id)?;
 
     // GetRecords carries its resource only inside the opaque shard iterator, not
     // in a request body field. Decode the iterator for the stream ARN and
