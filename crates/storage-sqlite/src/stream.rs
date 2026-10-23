@@ -93,15 +93,24 @@ impl StreamEngine for SqliteEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
             let _writer = self.write_lock.lock().await;
+            // created_at follows the record's own timestamp (whole seconds here,
+            // since that is all the record carries), never a second clock read.
+            let created_at = crate::sqlite_util::format_epoch_millis(
+                record
+                    .dynamodb
+                    .approximate_creation_date_time
+                    .saturating_mul(1_000),
+            );
             sqlx::query(
-                "INSERT INTO stream_records (sequence_number, shard_id, table_id, event_name, record_data) \
-                 VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO stream_records (sequence_number, shard_id, table_id, event_name, record_data, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
             )
             .bind(&record.dynamodb.sequence_number)
             .bind(&shard_id)
             .bind(&table_id)
             .bind(format!("{:?}", record.event_name))
             .bind(&record_json)
+            .bind(created_at)
             .execute(&self.pool)
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;

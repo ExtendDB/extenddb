@@ -635,3 +635,92 @@ async fn test_list_streams_includes_stream_enabled_table() {
 
     assert!(streams.iter().any(|s| s.stream_arn == expected_arn));
 }
+
+/// `created_at`, the sequence number's millisecond prefix, and the record's
+/// `ApproximateCreationDateTime` all derive from one clock read: for every
+/// stored record `created_at_ms <= hlc_ms` and `created_at_ms / 1000` equals
+/// the record's timestamp. Covers a plain write and a service-identity
+/// deletion (the TTL worker's shape).
+#[tokio::test]
+async fn test_stream_record_created_at_matches_the_record_and_sequence() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let table = TestTable::new(&engine, "StreamClock", false).await;
+    let view = StreamViewType::NewAndOldImages;
+
+    for v in ["one", "two"] {
+        let mut item = BTreeMap::new();
+        item.insert("id".to_string(), AttributeValue::S("pk-clock".to_string()));
+        item.insert("val".to_string(), AttributeValue::S(v.to_string()));
+        engine
+            .put_item(
+                &table.key_info,
+                item,
+                false,
+                None,
+                &Default::default(),
+                Some(&capture(view)),
+            )
+            .await
+            .unwrap();
+    }
+    let mut key = BTreeMap::new();
+    key.insert("id".to_string(), AttributeValue::S("pk-clock".to_string()));
+    engine
+        .delete_item(
+            &table.key_info,
+            &key,
+            false,
+            None,
+            &Default::default(),
+            Some(&StreamCapture {
+                view_type: view,
+                user_identity: Some(extenddb_core::types::UserIdentity {
+                    identity_type: "Service".to_string(),
+                    principal_id: "dynamodb.amazonaws.com".to_string(),
+                }),
+                region: Arc::from("us-east-1"),
+            }),
+        )
+        .await
+        .unwrap();
+
+    let shard_id = shard_for("pk-clock", &table.key_info.table_id);
+    let keyspace = format!("extenddb_ttl_test_account_{}", table.key_info.account_id);
+    let query = format!(
+        "SELECT sequence_number, created_at, record_data FROM {keyspace}.stream_records \
+         WHERE shard_id = ?"
+    );
+    let result = engine
+        .session_arc()
+        .query_with_values(&query, cdrs_tokio::query_values!(shard_id.as_str()))
+        .await
+        .unwrap();
+    let rows = result
+        .response_body()
+        .unwrap()
+        .into_rows()
+        .unwrap_or_default();
+    assert_eq!(rows.len(), 3, "two puts and one delete");
+    for row in rows {
+        let seq: String = row.get_r_by_name("sequence_number").unwrap();
+        let created_at_ms: i64 = row.get_r_by_name("created_at").unwrap();
+        let data: String = row.get_r_by_name("record_data").unwrap();
+        let record: serde_json::Value = serde_json::from_str(&data).unwrap();
+        let hlc_ms: i64 = seq[..13].parse().unwrap();
+        let approx = record["dynamodb"]["ApproximateCreationDateTime"]
+            .as_i64()
+            .unwrap();
+        assert!(
+            created_at_ms <= hlc_ms,
+            "created_at {created_at_ms} exceeds the sequence prefix {hlc_ms} in {seq}"
+        );
+        assert_eq!(
+            created_at_ms.div_euclid(1_000),
+            approx,
+            "created_at {created_at_ms} and ApproximateCreationDateTime {approx} disagree"
+        );
+    }
+}
