@@ -94,6 +94,22 @@ pub async fn handle_put_item(
         }
     })?;
 
+    // An attribute name over the size limit is input validation: the service
+    // reports it ahead of the table lookup, so a request naming a missing
+    // table answers with the name refusal. A name that arrives only through
+    // the condition's ExpressionAttributeNames is refused the same way.
+    extenddb_core::validation::validate_attribute_name_sizes(
+        &input.item,
+        &ctx.limits,
+        extenddb_core::validation::AttributeNameRequestForm::SingleItem,
+    )?;
+    extenddb_core::validation::validate_expression_attribute_name_sizes(
+        input.expression_attribute_names.as_ref(),
+        input.expression_attribute_values.as_ref(),
+        &ctx.limits,
+        extenddb_core::validation::AttributeNameRequestForm::SingleItem,
+    )?;
+
     // Reject mixing legacy and expression parameters, then EAN/EAV supplied
     // without a referencing expression.
     let has_expression = input
