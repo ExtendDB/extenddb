@@ -10,7 +10,7 @@ use extenddb_core::types::{
     TableStatus,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{index_arn, stream_arn};
+use extenddb_storage::util::{index_arn, parse_warm_throughput_record, stream_arn};
 
 use crate::CassandraEngine;
 
@@ -165,6 +165,9 @@ impl CassandraEngine {
             .ok()
             .flatten()
             .and_then(|s: String| serde_json::from_str(&s).ok());
+        // Absent on a catalog that has not run V006 (SELECT * tolerates it).
+        let warm_json: Option<String> = table_row.get_by_name("warm_throughput").ok().flatten();
+        let warm_throughput_record = parse_warm_throughput_record(warm_json.as_deref())?;
 
         // A restore target reports its registration for as long as the row
         // carries it; the engine shows it only while the table is CREATING.
@@ -218,6 +221,7 @@ impl CassandraEngine {
 
             if index_type == "GSI" {
                 let pt_str: Option<String> = row.get_r_by_name("provisioned_throughput").ok();
+                let warm_json: Option<String> = row.get_by_name("warm_throughput").ok().flatten();
 
                 gsis.push(GsiDescription {
                     index_name: index_name.clone(),
@@ -228,6 +232,8 @@ impl CassandraEngine {
                     index_size_bytes: 0,
                     item_count: 0,
                     index_arn: index_arn(&self.region, account_id, &table_name, &index_name),
+                    warm_throughput: None,
+                    warm_throughput_record: parse_warm_throughput_record(warm_json.as_deref())?,
                 });
             } else {
                 lsis.push(LsiDescription {
@@ -301,6 +307,8 @@ impl CassandraEngine {
             on_demand_throughput,
             restore_summary,
             vector_indexes: None,
+            warm_throughput: None,
+            warm_throughput_record,
         })
     }
 }

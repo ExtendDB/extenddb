@@ -136,6 +136,34 @@ const CATALOG_SHAPE_STEPS: &[ShapeStep] = &[
         apply: "ALTER TABLE table_restores ALTER COLUMN restore_date_time DROP DEFAULT",
         at_serve: false,
     },
+    // WarmThroughput as the client set it (one JSONB record per table and per
+    // index, see extenddb_core::types::WarmThroughputRecord). Stored and
+    // reported only: nothing pre-warms or scales on it, and it has no effect
+    // on throughput, throttling or storage. `001_schema.sql` creates the
+    // columns on a fresh catalog; these steps add them to a catalog that ran
+    // the earlier revision of that file. Nullable, so rows written before the
+    // column report the defaults for their billing mode. A shape step rather
+    // than a numbered migration, so no catalog version moves.
+    ShapeStep {
+        what: "add tables.warm_throughput",
+        needed: "SELECT EXISTS(SELECT 1 FROM information_schema.tables \
+                 WHERE table_schema = 'public' AND table_name = 'tables') \
+                 AND NOT EXISTS(SELECT 1 FROM information_schema.columns \
+                 WHERE table_schema = 'public' AND table_name = 'tables' \
+                 AND column_name = 'warm_throughput')",
+        apply: "ALTER TABLE tables ADD COLUMN IF NOT EXISTS warm_throughput JSONB",
+        at_serve: true,
+    },
+    ShapeStep {
+        what: "add indexes.warm_throughput",
+        needed: "SELECT EXISTS(SELECT 1 FROM information_schema.tables \
+                 WHERE table_schema = 'public' AND table_name = 'indexes') \
+                 AND NOT EXISTS(SELECT 1 FROM information_schema.columns \
+                 WHERE table_schema = 'public' AND table_name = 'indexes' \
+                 AND column_name = 'warm_throughput')",
+        apply: "ALTER TABLE indexes ADD COLUMN IF NOT EXISTS warm_throughput JSONB",
+        at_serve: true,
+    },
 ];
 
 /// How long a startup shape step waits for its table lock, in seconds. An

@@ -30,7 +30,8 @@ impl PostgresEngine {
                       EXTRACT(EPOCH FROM creation_date_time)::FLOAT8 as creation_epoch,
                       table_size_bytes, item_count, table_arn, table_id,
                       deletion_protection_enabled, stream_label,
-                      table_class, sse_specification, on_demand_throughput
+                      table_class, sse_specification, on_demand_throughput,
+                      warm_throughput
                FROM tables WHERE account_id = $1 AND table_name = $2 AND table_status IN ('ACTIVE', 'CREATING')
                FOR UPDATE",
         )
@@ -73,7 +74,7 @@ impl PostgresEngine {
         // Fetch indexes for the response description.
         let index_rows: Vec<IndexRow> = sqlx::query_as(
             r"SELECT index_name, index_id, index_type, key_schema, projection,
-                      index_status, provisioned_throughput
+                      index_status, provisioned_throughput, warm_throughput
                FROM indexes WHERE table_id = $1",
         )
         .bind(&row.table_id)

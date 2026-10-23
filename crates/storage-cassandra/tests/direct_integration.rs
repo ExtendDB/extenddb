@@ -57,3 +57,5 @@ mod transact_write_items;
 mod transaction_ledger;
 #[path = "direct/users.rs"]
 mod users;
+#[path = "direct/warm_throughput_catalog.rs"]
+mod warm_throughput_catalog;

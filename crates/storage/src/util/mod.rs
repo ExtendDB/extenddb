@@ -10,6 +10,7 @@ mod arn;
 mod backup_id;
 mod catalog_version;
 mod key;
+mod warm_throughput;
 
 pub use arn::{
     ARN_PARTITION, format_stream_label, index_arn, new_stream_label, parse_stream_arn, stream_arn,
@@ -26,4 +27,8 @@ pub use key::{
     composite_pk_to_text, effective_attribute_definitions, encode_netstring_composite,
     merge_attribute_definitions, parse_sk, pk_to_text, recover_sort_key_definitions, sk_column,
     sk_column_n, sk_info,
+};
+pub use warm_throughput::{
+    parse_warm_throughput_record, warm_throughput_record_for_create,
+    warm_throughput_record_for_update, warm_throughput_record_json, warm_throughput_updating_until,
 };

@@ -18,7 +18,9 @@ use extenddb_core::types::{
     TableDescription, UpdateTableInput, VectorIndexSpecification,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::effective_attribute_definitions;
+use extenddb_storage::util::{
+    effective_attribute_definitions, warm_throughput_record_for_create, warm_throughput_record_json,
+};
 
 use crate::store::SqliteEngine;
 
@@ -307,6 +309,10 @@ impl SqliteEngine {
             }
         }
 
+        // WarmThroughput on the table and on updated indexes: stored as sent,
+        // nothing acts on it. Validated by the engine against the current values.
+        Self::store_warm_throughput_updates(&mut tx, account_id, &table_id, &input).await?;
+
         // GSI create/delete.
         let mut created: Vec<String> = Vec::new();
         let mut deleted: Vec<String> = Vec::new();
@@ -342,12 +348,19 @@ impl SqliteEngine {
                         })
                         .transpose()
                         .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    let warm = warm_throughput_record_for_create(
+                        create.warm_throughput.as_ref(),
+                        Self::control_plane_delay_secs(&mut tx).await?,
+                    )
+                    .as_ref()
+                    .map(warm_throughput_record_json)
+                    .transpose()?;
                     let index_id = uuid::Uuid::new_v4().to_string();
                     sqlx::query(
                         "INSERT INTO indexes \
                          (table_id, index_name, index_id, index_type, key_schema, projection, \
-                          index_status, provisioned_throughput) \
-                         VALUES (?, ?, ?, 'GSI', ?, ?, 'CREATING', ?)",
+                          index_status, provisioned_throughput, warm_throughput) \
+                         VALUES (?, ?, ?, 'GSI', ?, ?, 'CREATING', ?, ?)",
                     )
                     .bind(&table_id)
                     .bind(&create.index_name)
@@ -355,6 +368,7 @@ impl SqliteEngine {
                     .bind(&ks)
                     .bind(&proj)
                     .bind(&pt)
+                    .bind(&warm)
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;

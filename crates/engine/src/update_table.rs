@@ -88,18 +88,20 @@ pub async fn handle_update_table(
         .as_ref()
         .is_some_and(|u| !u.is_empty());
 
-    // Validate: at least one field must be specified.
+    // Validate: at least one field must be specified. An UpdateTable carrying
+    // only WarmThroughput is accepted (measured 2026-10-23).
     if input.billing_mode.is_none()
         && input.provisioned_throughput.is_none()
         && input.deletion_protection_enabled.is_none()
         && input.stream_specification.is_none()
         && input.table_class.is_none()
         && input.on_demand_throughput.is_none()
+        && input.warm_throughput.is_none()
         && !has_gsi_updates
         && !has_vector_updates
     {
         return Err(DynamoDbError::ValidationException(
-            "At least one of BillingMode, ProvisionedThroughput, DeletionProtectionEnabled, StreamSpecification, or GlobalSecondaryIndexUpdates must be specified".to_owned(),
+            "At least one of BillingMode, ProvisionedThroughput, DeletionProtectionEnabled, StreamSpecification, GlobalSecondaryIndexUpdates, or WarmThroughput must be specified".to_owned(),
         ));
     }
 
@@ -140,21 +142,39 @@ pub async fn handle_update_table(
             ));
     }
 
-    validate_gsi_updates(&input)?;
+    // A table-level WarmThroughput stands alone in its request, with the
+    // measured per-companion sentences (measured 2026-10-23). Checked before
+    // the value rules, as the service does: it fired on requests whose values
+    // were otherwise valid. GlobalSecondaryIndexUpdates is accepted beside it.
+    extenddb_core::validation::validate_warm_throughput_is_only_operation(&input)?;
+
+    crate::gsi_updates::validate_gsi_updates(&input)?;
 
     // A created GSI's projected attributes count toward the table's limit
     // together with the indexes it already has: the total CreateTable checks,
     // and so the total a restore of this table's backups checks.
-    if let Some(updates) = &input.global_secondary_index_updates
-        && updates.iter().any(|u| {
-            u.create.as_ref().is_some_and(|c| {
-                c.projection
-                    .non_key_attributes
-                    .as_ref()
-                    .is_some_and(|a| !a.is_empty())
+    let projects_attributes = input
+        .global_secondary_index_updates
+        .as_ref()
+        .is_some_and(|u| {
+            u.iter().any(|u| {
+                u.create.as_ref().is_some_and(|c| {
+                    c.projection
+                        .non_key_attributes
+                        .as_ref()
+                        .is_some_and(|a| !a.is_empty())
+                })
             })
-        })
-    {
+        });
+    // WarmThroughput may not go below the current values, a created index's
+    // follows the table's billing mode, and an index Update carrying nothing
+    // answers a sentence that names the mode: all need the table as it is.
+    let touches_warm = crate::warm_throughput::touches_warm_throughput(&input);
+    let bare_update = crate::gsi_updates::has_bare_update(&input);
+    // A switch to PAY_PER_REQUEST stores the on-demand minimum as the warm
+    // throughput of a provisioned table that is below it, so it needs the table.
+    let switches_to_on_demand = matches!(input.billing_mode, Some(BillingMode::PayPerRequest));
+    if projects_attributes || touches_warm || bare_update || switches_to_on_demand {
         let existing = ctx
             .storage
             .describe_table(
@@ -165,9 +185,29 @@ pub async fn handle_update_table(
             )
             .await
             .map_err(|e| update_table_err_to_dynamo(e, &input.table_name))?;
-        extenddb_core::validation::validate_projected_attribute_total(
-            projected_after_gsi_updates(&existing, updates),
-        )?;
+        if let Some(updates) = &input.global_secondary_index_updates
+            && projects_attributes
+        {
+            extenddb_core::validation::validate_projected_attribute_total(
+                projected_after_gsi_updates(&existing, updates),
+            )?;
+        }
+        if bare_update {
+            let pay_per_request = existing
+                .billing_mode_summary
+                .as_ref()
+                .is_some_and(|s| s.billing_mode == BillingMode::PayPerRequest);
+            crate::gsi_updates::refuse_bare_updates(&input, pay_per_request)?;
+        }
+        if touches_warm {
+            crate::warm_throughput::validate_warm_throughput_updates(&input, &existing)?;
+        }
+        if switches_to_on_demand {
+            // After every validation: the client cannot send WarmThroughput
+            // beside BillingMode, so this is the only way both reach a backend.
+            input.warm_throughput =
+                crate::warm_throughput::on_demand_switch_warm_throughput(&existing);
+        }
     }
 
     let table_name = input.table_name.clone();
@@ -201,70 +241,6 @@ pub async fn handle_update_table(
         table_description: desc,
     };
     serialize_output(&output)
-}
-
-/// The per-entry rules for `GlobalSecondaryIndexUpdates`, checked before any
-/// storage read: each entry has exactly one of Create, Update, or Delete,
-/// and a Create has a valid name, a key schema of defined attributes, and
-/// (when given) a throughput of at least 1 unit each.
-fn validate_gsi_updates(input: &UpdateTableInput) -> Result<(), DynamoDbError> {
-    if let Some(updates) = &input.global_secondary_index_updates {
-        for update in updates {
-            if update.create.is_some() && update.delete.is_some() {
-                return Err(DynamoDbError::ValidationException(
-                    "One or more parameter values were invalid: Only one of Create or Delete can be specified per GlobalSecondaryIndexUpdate".to_owned(),
-                ));
-            }
-            if let Some(ref upd) = update.update {
-                // S3: Acknowledge the Update action but reject it as unsupported.
-                let _ = upd;
-                return Err(DynamoDbError::ValidationException(
-                    "UpdateGlobalSecondaryIndex is not yet supported".to_owned(),
-                ));
-            }
-            if update.create.is_none() && update.delete.is_none() {
-                return Err(DynamoDbError::ValidationException(
-                    "One or more parameter values were invalid: GlobalSecondaryIndexUpdate must contain Create, Update, or Delete".to_owned(),
-                ));
-            }
-            // M3: Validate index names the same way CreateTable does.
-            if let Some(create) = &update.create {
-                extenddb_core::validation::validate_index_name(&create.index_name)?;
-                extenddb_core::validation::validate_index_throughput_minimum(
-                    &create.index_name,
-                    create.provisioned_throughput.as_ref(),
-                )?;
-                if create.key_schema.is_empty() {
-                    return Err(DynamoDbError::ValidationException(
-                        "One or more parameter values were invalid: KeySchema must not be empty for GSI creation".to_owned(),
-                    ));
-                }
-                // Validate that all key attributes are defined in AttributeDefinitions
-                let attr_defs = input.attribute_definitions.as_deref().unwrap_or(&[]);
-                for ks in &create.key_schema {
-                    if !attr_defs
-                        .iter()
-                        .any(|ad| ad.attribute_name == ks.attribute_name)
-                    {
-                        return Err(DynamoDbError::ValidationException(format!(
-                            "One or more parameter values were invalid: Some index key attributes are not defined in AttributeDefinitions. \
-                             Keys: [{}], AttributeDefinitions: [{}]",
-                            ks.attribute_name,
-                            attr_defs
-                                .iter()
-                                .map(|ad| ad.attribute_name.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        )));
-                    }
-                }
-            }
-            if let Some(delete) = &update.delete {
-                extenddb_core::validation::validate_index_name(&delete.index_name)?;
-            }
-        }
-    }
-    Ok(())
 }
 
 /// The table's projected `NonKeyAttributes` once `updates` apply: its LSIs,
@@ -352,34 +328,6 @@ mod tests {
     use extenddb_storage::error::StorageError;
 
     #[test]
-    fn a_created_gsi_throughput_below_one_is_refused() {
-        let input = |pt: Value| -> UpdateTableInput {
-            serde_json::from_value(serde_json::json!({
-                "TableName": "t",
-                "AttributeDefinitions": [{ "AttributeName": "g", "AttributeType": "S" }],
-                "GlobalSecondaryIndexUpdates": [{ "Create": {
-                    "IndexName": "gix",
-                    "KeySchema": [{ "AttributeName": "g", "KeyType": "HASH" }],
-                    "Projection": { "ProjectionType": "ALL" },
-                    "ProvisionedThroughput": pt,
-                }}],
-            }))
-            .unwrap()
-        };
-        for (read, write) in [(0, 0), (0, 1), (1, 0), (-1, 5)] {
-            let pt = serde_json::json!({ "ReadCapacityUnits": read, "WriteCapacityUnits": write });
-            match validate_gsi_updates(&input(pt)).unwrap_err() {
-                DynamoDbError::ValidationException(m) => {
-                    assert!(m.ends_with("for index: gix"), "{m}");
-                }
-                other => panic!("({read}, {write}): {other:?}"),
-            }
-        }
-        let ok = serde_json::json!({ "ReadCapacityUnits": 1, "WriteCapacityUnits": 1 });
-        validate_gsi_updates(&input(ok)).unwrap();
-    }
-
-    #[test]
     fn projected_total_counts_kept_indexes_and_created_ones() {
         use extenddb_core::types::{
             GlobalSecondaryIndexUpdate, GsiDescription, LsiDescription, Projection, ProjectionType,
@@ -400,6 +348,8 @@ mod tests {
                     index_size_bytes: 0,
                     item_count: 0,
                     index_arn: String::new(),
+                    warm_throughput: None,
+                    warm_throughput_record: None,
                 },
                 GsiDescription {
                     index_name: "dropped".to_owned(),
@@ -410,6 +360,8 @@ mod tests {
                     index_size_bytes: 0,
                     item_count: 0,
                     index_arn: String::new(),
+                    warm_throughput: None,
+                    warm_throughput_record: None,
                 },
             ]),
             local_secondary_indexes: Some(vec![LsiDescription {

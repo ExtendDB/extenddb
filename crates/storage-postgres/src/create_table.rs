@@ -8,7 +8,7 @@ use extenddb_core::types::{
     ProvisionedThroughputDescription, SseDescription, SseType, TableDescription, TableStatus,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{index_arn, stream_arn, table_arn};
+use extenddb_storage::util::{index_arn, stream_arn, table_arn, warm_throughput_record_for_create};
 
 use crate::PostgresEngine;
 
@@ -182,6 +182,18 @@ impl PostgresEngine {
             }
         }
 
+        // WarmThroughput as sent, reported back and acted on by nothing (see
+        // the shape step on `tables.warm_throughput`). UPDATING for the same
+        // delay the CREATING to ACTIVE flip takes.
+        let delay_secs = Self::control_plane_delay_secs(&mut tx).await?;
+        let warm_record =
+            warm_throughput_record_for_create(input.warm_throughput.as_ref(), delay_secs);
+        let warm_json = warm_record
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+
         // Insert table metadata, returning creation timestamp and actual status.
         // Use PG error code 23505 for robust duplicate detection instead of string matching.
         // H-5: Insert as CREATING with a scheduled transition to ACTIVE,
@@ -198,7 +210,8 @@ impl PostgresEngine {
                (account_id, table_name, key_schema, attribute_definitions, billing_mode,
                 provisioned_throughput, stream_specification, table_status,
                 creation_date_time, table_arn, table_id, deletion_protection_enabled,
-                status_transition_at, table_class, sse_specification, on_demand_throughput)
+                status_transition_at, table_class, sse_specification, on_demand_throughput,
+                warm_throughput)
                VALUES ($1, $2, $3, $4, $5, $6, $7,
                 CASE WHEN $14 THEN 'CREATING'
                      WHEN (SELECT secs FROM delay) = 0
@@ -209,7 +222,7 @@ impl PostgresEngine {
                      THEN NULL
                      ELSE NOW() + make_interval(secs => (SELECT secs FROM delay))
                 END,
-                $11, $12, $13)
+                $11, $12, $13, $15)
                RETURNING EXTRACT(EPOCH FROM creation_date_time)::FLOAT8, table_status",
         )
         .bind(account_id)
@@ -226,6 +239,7 @@ impl PostgresEngine {
         .bind(&sse_spec_json)
         .bind(&on_demand_json)
         .bind(defer_active)
+        .bind(&warm_json)
         .fetch_one(&mut *tx)
         .await;
         let (creation_epoch, actual_status): (f64, String) = match inserted {
@@ -260,8 +274,17 @@ impl PostgresEngine {
         // ProvisionedThroughput) so DescribeTable can deserialize it without
         // failing on the missing NumberOfDecreasesToday field.
         let mut gsi_index_ids: Vec<String> = Vec::new();
+        let mut gsi_warm_records = Vec::new();
         if let Some(gsis) = &input.global_secondary_indexes {
             for gsi in gsis {
+                let gsi_warm =
+                    warm_throughput_record_for_create(gsi.warm_throughput.as_ref(), delay_secs);
+                let gsi_warm_json = gsi_warm
+                    .as_ref()
+                    .map(serde_json::to_value)
+                    .transpose()
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                gsi_warm_records.push(gsi_warm);
                 let gsi_ks = serde_json::to_value(&gsi.key_schema)
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
                 let gsi_proj = serde_json::to_value(&gsi.projection)
@@ -285,8 +308,8 @@ impl PostgresEngine {
                 sqlx::query(
                     r"INSERT INTO indexes
                        (table_id, index_name, index_id, index_type, key_schema, projection,
-                        index_status, provisioned_throughput)
-                       VALUES ($1, $2, $3, 'GSI', $4, $5, 'ACTIVE', $6)",
+                        index_status, provisioned_throughput, warm_throughput)
+                       VALUES ($1, $2, $3, 'GSI', $4, $5, 'ACTIVE', $6, $7)",
                 )
                 .bind(&table_id)
                 .bind(&gsi.index_name)
@@ -294,6 +317,7 @@ impl PostgresEngine {
                 .bind(&gsi_ks)
                 .bind(&gsi_proj)
                 .bind(&gsi_pt)
+                .bind(&gsi_warm_json)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -552,7 +576,8 @@ impl PostgresEngine {
 
         let gsis = input.global_secondary_indexes.as_ref().map(|gs| {
             gs.iter()
-                .map(|g| GsiDescription {
+                .zip(gsi_warm_records)
+                .map(|(g, warm)| GsiDescription {
                     index_name: g.index_name.clone(),
                     key_schema: g.key_schema.clone(),
                     projection: g.projection.clone(),
@@ -578,6 +603,8 @@ impl PostgresEngine {
                         &input.table_name,
                         &g.index_name,
                     ),
+                    warm_throughput: None,
+                    warm_throughput_record: warm,
                 })
                 .collect()
         });
@@ -700,6 +727,9 @@ impl PostgresEngine {
                 .as_ref()
                 .map(|tc| serde_json::json!({ "TableClass": tc })),
             on_demand_throughput: input.on_demand_throughput,
+            // Derived by the engine from the record; see core.
+            warm_throughput: None,
+            warm_throughput_record: warm_record,
             // Every field is populated deliberately, with no
             // `..Default::default()` spread. This response is the complete
             // description of what was just created, so a new core field should

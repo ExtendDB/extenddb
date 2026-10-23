@@ -10,7 +10,10 @@ use extenddb_core::types::{
     TableStatus,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{index_arn, stream_arn, table_arn};
+use extenddb_storage::util::{
+    index_arn, stream_arn, table_arn, warm_throughput_record_for_create,
+    warm_throughput_record_json,
+};
 
 use crate::CassandraEngine;
 use crate::backup_engine::RestoreHeartbeat;
@@ -263,6 +266,17 @@ impl CassandraEngine {
             Value::from(deletion_protection),
             Value::from(status_transition_at),
         ];
+        // WarmThroughput as sent, reported back and acted on by nothing (see
+        // catalog migration V006). UPDATING for the same delay the CREATING to
+        // ACTIVE flip takes. Named only when sent, for the same reason as the
+        // restore columns: a catalog that has not run V006 still serves an
+        // ordinary CreateTable.
+        let warm_record =
+            warm_throughput_record_for_create(input.warm_throughput.as_ref(), delay_seconds);
+        if let Some(record) = warm_record.as_ref() {
+            columns.push_str(", warm_throughput");
+            values.push(Value::from(warm_throughput_record_json(record)?.as_str()));
+        }
         if let Some(r) = restore {
             columns.push_str(
                 ", restore_source_backup_arn, restore_source_table_arn, restore_date_time, \
@@ -336,6 +350,7 @@ impl CassandraEngine {
 
         // Insert GSI metadata
         let mut gsi_index_ids: Vec<String> = Vec::new();
+        let mut gsi_warm_records = Vec::new();
         if let Some(gsis) = &input.global_secondary_indexes {
             for gsi in gsis {
                 let gsi_ks = serde_json::to_value(&gsi.key_schema)
@@ -358,26 +373,39 @@ impl CassandraEngine {
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
                 let index_id = uuid::Uuid::new_v4().to_string();
+                let gsi_warm =
+                    warm_throughput_record_for_create(gsi.warm_throughput.as_ref(), delay_seconds);
+                let mut index_values = vec![
+                    Value::from(table_id.as_str()),
+                    Value::from(gsi.index_name.as_str()),
+                    Value::from(index_id.as_str()),
+                    Value::from(gsi_ks.to_string().as_str()),
+                    Value::from(gsi_proj.to_string().as_str()),
+                    match gsi_pt.as_ref() {
+                        Some(v) => Value::from(v.to_string().as_str()),
+                        None => Value::NotSet,
+                    },
+                ];
+                // Named only when sent; see the table insert above.
+                let (warm_column, warm_placeholder) = match gsi_warm.as_ref() {
+                    Some(record) => {
+                        index_values
+                            .push(Value::from(warm_throughput_record_json(record)?.as_str()));
+                        (", warm_throughput", ", ?")
+                    }
+                    None => ("", ""),
+                };
+                gsi_warm_records.push(gsi_warm);
                 let insert_index_cql = format!(
                     "INSERT INTO {catalog_keyspace}.indexes (table_id, index_name, index_id, index_type, \
-                     key_schema, projection, index_status, provisioned_throughput) \
-                     VALUES (?, ?, ?, 'GSI', ?, ?, 'ACTIVE', ?)"
+                     key_schema, projection, index_status, provisioned_throughput{warm_column}) \
+                     VALUES (?, ?, ?, 'GSI', ?, ?, 'ACTIVE', ?{warm_placeholder})"
                 );
 
                 self.session
                     .query_with_values(
                         &insert_index_cql,
-                        cdrs_tokio::query::QueryValues::SimpleValues(vec![
-                            Value::from(table_id.as_str()),
-                            Value::from(gsi.index_name.as_str()),
-                            Value::from(index_id.as_str()),
-                            Value::from(gsi_ks.to_string().as_str()),
-                            Value::from(gsi_proj.to_string().as_str()),
-                            match gsi_pt.as_ref() {
-                                Some(v) => Value::from(v.to_string().as_str()),
-                                None => Value::NotSet,
-                            },
-                        ]),
+                        cdrs_tokio::query::QueryValues::SimpleValues(index_values),
                     )
                     .await
                     .map_err(|e| {
@@ -513,7 +541,8 @@ impl CassandraEngine {
 
         let gsis = input.global_secondary_indexes.as_ref().map(|gs| {
             gs.iter()
-                .map(|g| GsiDescription {
+                .zip(gsi_warm_records)
+                .map(|(g, warm)| GsiDescription {
                     index_name: g.index_name.clone(),
                     key_schema: g.key_schema.clone(),
                     projection: g.projection.clone(),
@@ -539,6 +568,8 @@ impl CassandraEngine {
                         &input.table_name,
                         &g.index_name,
                     ),
+                    warm_throughput: None,
+                    warm_throughput_record: warm,
                 })
                 .collect()
         });
@@ -644,6 +675,9 @@ impl CassandraEngine {
                 restore_in_progress: true,
             }),
             vector_indexes: None,
+            // Derived by the engine from the record; see core.
+            warm_throughput: None,
+            warm_throughput_record: warm_record,
         };
         Ok((description, heartbeat))
     }
