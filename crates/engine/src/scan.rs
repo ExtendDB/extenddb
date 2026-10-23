@@ -182,11 +182,14 @@ pub async fn handle_scan(
     // form runs the service's ordered semantic walk (references, functions,
     // operand types) here, ahead of the projection, the unused check, and the
     // table lookup, so an undefined `:q` is a request error even when no row
-    // would be evaluated (measured 2026-10-14 on an empty table).
+    // would be evaluated (measured 2026-10-14 on an empty table). A legacy
+    // ScanFilter skips the parser, so its operand types are checked
+    // separately, still before any row is read.
     let (filter, filter_maps) =
         if let Some(sf) = input.scan_filter.as_ref().filter(|sf| !sf.is_empty()) {
             let cond_op = input.conditional_operator.unwrap_or_default();
             let (expr, fmaps) = desugar_filter(sf, cond_op)?;
+            crate::expression_helpers::check_legacy_filter_operand_types(&expr, &fmaps)?;
             (Some(expr), Some(fmaps))
         } else {
             match input.filter_expression.as_deref() {
