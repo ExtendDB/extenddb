@@ -39,7 +39,7 @@ pub async fn handle_delete_table(
     );
     ctx.auth_cache.invalidate_resource_tags(&arn).await;
 
-    table_desc.populate_table_throughput_mode_summary();
+    table_desc.prepare_for_response();
     let output = DeleteTableOutput {
         table_description: table_desc,
     };

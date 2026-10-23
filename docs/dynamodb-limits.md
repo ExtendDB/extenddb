@@ -51,7 +51,7 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 |-------|---------------|--------|-------|
 | GSIs per table | 20 | Enforced | `validate_gsi_count`, `LimitsConfig::max_gsis_per_table`, configurable |
 | LSIs per table | 5 | Enforced | `validate_lsi_count`, `LimitsConfig::max_lsis_per_table`, configurable |
-| Projected attributes across all indexes | 100 | Not enforced | No cross-index projected attribute count validation |
+| Projected attributes across all indexes | 100 | Enforced | `validate_projected_attribute_total`: every `NonKeyAttributes` entry of every GSI and LSI counts, on CreateTable (and so RestoreTableFromBackup) and UpdateTable's GSI Create |
 | Index name length | 3–255 characters | Enforced | `validate_index_name` |
 | Index name character set | `[a-zA-Z0-9_.-]` | Enforced | `validate_index_name` |
 | LSI item collection size | 10 GB | Not enforced | No item collection size tracking |
@@ -128,7 +128,13 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 
 | Limit | DynamoDB Value | Status | Notes |
 |-------|---------------|--------|-------|
-| Concurrent restores | 50 | N/A | ExtendDB does not support backup/restore |
+| Concurrent restores | 50 | Partial | PostgreSQL: one server process runs at most 4 restores per account and at most half its `pool_size` (after the minimum of 10 is applied; 10 with the default `pool_size` of 20), capped at 16, in total. A restore that cannot get both an account slot and a server slot within 30 seconds is refused with `LimitExceededException`. Measured on an earlier build of this branch, with four restores running in one account: a fifth in the same account waited for a slot and answered after 3.1 s, when one of the four finished, while another account's restore answered in 0.05 s. The 30-second refusal is from the code and storage-level tests, not from a running server. MongoDB: the same bound, 4 per account and `min(16, pool/2)` per server where the pool is the engine client's `maxPoolSize` (`max_connections`, or the driver default of 10, so 5 restores), refused with `LimitExceededException` after 30 seconds; a restore request that is not registered within 60 seconds answers an internal error while the restore continues (storage-level tests; measured with 20 concurrent restores on a served default build: all accepted, server responsive). SQLite and Cassandra have no restore limit (five started at once were all answered without waiting for each other, on an earlier build); SQLite bounds `CreateBackup` instead: at most `pool_size / 2 - 1` (4 by default) at once, `LimitExceededException` after 30 seconds |
+| `BackupName` and `TableName` on `CreateBackup`, `TableName` on `ListBackups` | Length 3 to 255, `[a-zA-Z0-9_.-]+` | Enforced | The service model's constraints, with its texts ("1 validation error detected: Value '<v>' at 'backupName' failed to satisfy constraint: ...", "2 validation errors detected: ...; ..." when length and pattern both fail). Length is counted in characters. `BackupName` takes the model's 3 to 255; a `TableName` member takes the deployment's `[limits]` `min_table_name_length` and `max_table_name_length` (defaults 3 and 255), as `CreateTable` does, so a table the deployment can create can be backed up and listed. `CreateBackup`'s `TableName` may also be the table's ARN; `ListBackups`'s may not. The value is echoed in the message as sent |
+| `BackupArn` | 37 to 1024 characters | Maximum enforced; minimum implied | Surrounding ASCII whitespace is trimmed first, then over 1024 bytes, not of the backup ARN shape, a control or non-ASCII character, or a region outside `[a-z0-9-]`, an account that is not digits, or a table name outside `[a-zA-Z0-9_.-]` is `ValidationException` "Invalid Request: BackupArn is not valid"; the right shape with an id that is not a backup id is "Invalid Backup ARN"; a digit-only account that is not the caller's is `AccessDeniedException`. No minimum is checked: the shortest string of the right shape is longer than 37 characters. Another region of the caller's account resolves (the server's region is tried first, then the ARN as written). `ListBackups`'s `ExclusiveStartBackupArn` must also match the account, the region, and `TableName` when given |
+| `ListBackups` page size | 100 | Enforced | `Limit` 1 to 100, default 100; more rows come back through `LastEvaluatedBackupArn` and `ExclusiveStartBackupArn`. Each request reads every backup of the account (or of the table, with `TableName`) and pages in memory, so walking N backups reads about N²/100 rows. `TimeRangeLowerBound`, `TimeRangeUpperBound`, and `BackupType` filter the list before paging; a bound before the epoch, or a lower bound above the upper bound ("Time range lower bound must be less than or equal to upper bound"), is `ValidationException` |
+| Backup contents | Key schema, attribute definitions, items, indexes, billing mode, provisioned throughput, on-demand throughput (table and GSI level), SSE. Table class is not carried (a restore is `STANDARD`) | Partial | ExtendDB restores the same set, except a GSI's on-demand throughput (it records none per index); table class is not restored, as on the service. Streams, TTL, tags, and deletion protection are not restored, as on the service. Backups are stored inside the database the server uses; take database-level backups for off-host copies |
+| Point-in-time recovery | 35-day window | N/A | `RestoreTableToPointInTime` is refused. `UpdateContinuousBackups` accepts enabling point-in-time recovery and reports a 35-day restorable window, but nothing is recorded (see differences-from-dynamodb.md) |
+| `RestoreTableFromBackup` overrides | `BillingModeOverride`, `ProvisionedThroughputOverride`, `GlobalSecondaryIndexOverride`, `LocalSecondaryIndexOverride`, `SSESpecificationOverride`, `OnDemandThroughputOverride`, `VectorIndexOverride` | Partial | All but `VectorIndexOverride` are applied as the service applies them: an index override list replaces the backup's indexes of that kind (empty restores none, a subset restores those, a GSI entry's throughput is the restored index's), `OnDemandThroughputOverride` is the restored table's on-demand throughput on an on-demand restore. Refused with `ValidationException` before the target is created: an index the backup does not have or a changed index definition, a throughput member contradicting the billing mode, `{0, 0}`, a `PROVISIONED` restore of a GSI without throughput ("Invalid Request: Must override ProvisionedThroughput if BillingMode is overridden to PROVISIONED for index <name>"), a GSI entry's `OnDemandThroughput` on a `PROVISIONED` restore (on an on-demand restore it is accepted and not recorded), and `VectorIndexOverride`. See differences-from-dynamodb.md |
 
 ## Global Tables
 
@@ -152,32 +158,31 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 | Throughput | 5 | 0 | 1 | 2 |
 | Tables | 4 | 0 | 0 | 0 |
 | Items | 6 | 0 | 0 | 0 |
-| Secondary Indexes | 4 | 0 | 2 | 0 |
+| Secondary Indexes | 5 | 0 | 1 | 0 |
 | Query/Scan | 2 | 0 | 5 | 0 |
 | Batch Operations | 3 | 0 | 2 | 0 |
 | Transactions | 3 | 0 | 1 | 0 |
 | Streams | 1 | 0 | 3 | 0 |
 | API-Level | 1 | 0 | 3 | 1 |
-| Import/Export/Backup | 0 | 0 | 0 | 8 |
+| Import/Export/Backup | 2 | 2 | 0 | 7 |
 | Global Tables | 0 | 0 | 0 | 2 |
 | Contributor Insights | 0 | 0 | 0 | 1 |
-| **Total** | **29** | **0** | **17** | **14** |
+| **Total** | **32** | **2** | **16** | **13** |
 
 ### Unenforced Limits Requiring Tracking
 
 The following unenforced limits are tracked in `docs/technical-debt.md`:
 
 1. **Provisioned capacity decrease limit** (27/day) — would require per-table decrease counter with hourly replenishment
-2. **Projected attributes across all indexes** (100) — requires cross-index attribute counting in CreateTable validation
-3. **LSI item collection size** (10 GB) — requires per-partition size tracking in storage layer
-4. **Expression aggregate size limits** (2 MB total expression attribute names/values) — requires aggregate byte-length tracking across all expression parameters. (Per-expression 4 KB limits for condition/filter/projection/update/key-condition are enforced via `check_expression_size`.)
-5. **BatchGetItem response size** (16 MB) — requires aggregate response size tracking
-6. **BatchWriteItem request size** (16 MB) — requires aggregate request size tracking
-7. **Transaction request size** (4 MB) — requires aggregate request size tracking
-8. **GetRecords max per call** (1,000) — requires record count limit in streams
-9. **Shard iterator lifetime** (15 minutes) — requires timestamp tracking on shard iterators
-10. **Tag count per resource** (50) — requires count validation in TagResource
-11. **Tag key/value length** (128/256 chars) — requires length validation in TagResource
+2. **LSI item collection size** (10 GB) — requires per-partition size tracking in storage layer
+3. **Expression aggregate size limits** (2 MB total expression attribute names/values) — requires aggregate byte-length tracking across all expression parameters. (Per-expression 4 KB limits for condition/filter/projection/update/key-condition are enforced via `check_expression_size`.)
+4. **BatchGetItem response size** (16 MB) — requires aggregate response size tracking
+5. **BatchWriteItem request size** (16 MB) — requires aggregate request size tracking
+6. **Transaction request size** (4 MB) — requires aggregate request size tracking
+7. **GetRecords max per call** (1,000) — requires record count limit in streams
+8. **Shard iterator lifetime** (15 minutes) — requires timestamp tracking on shard iterators
+9. **Tag count per resource** (50) — requires count validation in TagResource
+10. **Tag key/value length** (128/256 chars) — requires length validation in TagResource
 
 ---
 

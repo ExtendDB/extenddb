@@ -12,6 +12,17 @@ use extenddb_storage::util::{index_arn, stream_arn, table_arn};
 
 use crate::PostgresEngine;
 
+/// What a restore target records about where it came from, written in the
+/// same catalog transaction that creates it.
+pub(crate) struct RestoreRegistration<'a> {
+    pub(crate) backup_arn: &'a str,
+    /// Reported as `RestoreSummary.SourceTableArn`.
+    pub(crate) source_table_arn: &'a str,
+    /// Reported as `RestoreSummary.RestoreDateTime`, epoch seconds: the value
+    /// the engine passes (the source backup's creation time), not "now".
+    pub(crate) restore_date_time: f64,
+}
+
 impl PostgresEngine {
     /// Core implementation of `create_table` (Fix #4: wrapped in a transaction).
     /// Create a table. When `defer_active` is set (the restore path), the row
@@ -25,6 +36,75 @@ impl PostgresEngine {
         account_id: &str,
         input: CreateTableInput,
         defer_active: bool,
+    ) -> Result<TableDescription, StorageError> {
+        self.create_table_impl_inner(account_id, input, defer_active, None)
+            .await
+    }
+
+    /// Create a restore target while holding its AVAILABLE source backup's row
+    /// FOR UPDATE, refusing when a CREATING target of that backup exists, and
+    /// record the provenance before the catalog transaction commits. A
+    /// concurrent DeleteBackup or second restore of the backup therefore
+    /// orders wholly before this transaction (and no target is created) or
+    /// wholly after it (and sees a CREATING restore that is using the backup).
+    pub(crate) async fn create_table_for_restore(
+        &self,
+        account_id: &str,
+        input: CreateTableInput,
+        registration: &RestoreRegistration<'_>,
+    ) -> Result<TableDescription, StorageError> {
+        self.create_table_impl_inner(account_id, input, true, Some(registration))
+            .await
+    }
+
+    /// The error for a CreateTable or restore whose catalog insert hit the
+    /// name's unique index. A restore (`for_restore`) into a name that is a
+    /// CREATING restore target is `TableBeingRestored`, naming that target's
+    /// source backup (the service: `TableInUseException`); any other taken
+    /// name is `TableAlreadyExists`. Reads committed state through the pool,
+    /// because the failed insert aborted the caller's transaction.
+    pub(crate) async fn name_taken_error(
+        &self,
+        account_id: &str,
+        table_name: &str,
+        for_restore: bool,
+    ) -> StorageError {
+        if for_restore && let Some(backup_arn) = self.restoring_into(account_id, table_name).await {
+            return StorageError::TableBeingRestored {
+                table_name: table_name.to_owned(),
+                backup_arn,
+            };
+        }
+        StorageError::TableAlreadyExists(table_name.to_owned())
+    }
+
+    /// The source backup of the CREATING restore target named `table_name`,
+    /// if the name is one. A read failure is reported as "not one": the
+    /// caller is already producing an error for the taken name.
+    pub(crate) async fn restoring_into(
+        &self,
+        account_id: &str,
+        table_name: &str,
+    ) -> Option<String> {
+        sqlx::query_scalar(
+            "SELECT r.source_backup_arn FROM tables t \
+             JOIN table_restores r ON r.table_id = t.table_id \
+             WHERE t.account_id = $1 AND t.table_name = $2 AND t.table_status = 'CREATING'",
+        )
+        .bind(account_id)
+        .bind(table_name)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten()
+    }
+
+    async fn create_table_impl_inner(
+        &self,
+        account_id: &str,
+        input: CreateTableInput,
+        defer_active: bool,
+        restore: Option<&RestoreRegistration<'_>>,
     ) -> Result<TableDescription, StorageError> {
         Self::validate_account_id(account_id)?;
         let table_id = uuid::Uuid::new_v4().to_string();
@@ -66,13 +146,49 @@ impl PostgresEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
+        if let Some(RestoreRegistration { backup_arn, .. }) = restore {
+            // FOR UPDATE, not FOR SHARE: two restores of one backup must not
+            // both pass the CREATING-target check below, so they serialize on
+            // the backup row (DeleteBackup locks it the same way).
+            let available: Option<i32> = sqlx::query_scalar(
+                "SELECT 1 FROM backups WHERE backup_arn = $1 AND account_id = $2 \
+                 AND backup_status = 'AVAILABLE' FOR UPDATE",
+            )
+            .bind(backup_arn)
+            .bind(account_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            if available.is_none() {
+                return Err(StorageError::Validation(format!(
+                    "Backup not found: {backup_arn}"
+                )));
+            }
+            // One restore of a backup at a time, as the service: while a
+            // target restored from it is CREATING the backup is in use. Same
+            // predicate as DeleteBackup's.
+            let restoring: Option<String> = sqlx::query_scalar(
+                "SELECT t.table_name FROM table_restores r JOIN tables t ON t.table_id = r.table_id \
+                 WHERE r.source_backup_arn = $1 AND t.table_status = 'CREATING' LIMIT 1",
+            )
+            .bind(backup_arn)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            if let Some(table) = restoring {
+                return Err(StorageError::BackupInUse(format!(
+                    "Backup is being used to restore table {table}: {backup_arn}"
+                )));
+            }
+        }
+
         // Insert table metadata, returning creation timestamp and actual status.
         // Use PG error code 23505 for robust duplicate detection instead of string matching.
         // H-5: Insert as CREATING with a scheduled transition to ACTIVE,
         // or directly as ACTIVE when control_plane_delay_seconds=0 (no async
         // transition needed). This lets external test suites that don't call
         // waitForActive() work correctly.
-        let (creation_epoch, actual_status): (f64, String) = sqlx::query_as(
+        let inserted: Result<(f64, String), sqlx::Error> = sqlx::query_as(
             r"WITH delay AS (
                 SELECT COALESCE(
                   (SELECT value::FLOAT8 FROM settings WHERE key = 'control_plane_delay_seconds'), 0.25
@@ -111,13 +227,33 @@ impl PostgresEngine {
         .bind(&on_demand_json)
         .bind(defer_active)
         .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| match &e {
-            sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("23505") => {
-                StorageError::TableAlreadyExists(input.table_name.clone())
+        .await;
+        let (creation_epoch, actual_status): (f64, String) = match inserted {
+            Ok(row) => row,
+            Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("23505") => {
+                // The transaction is aborted by the failed insert; the
+                // committed state of the taken name is read through the pool.
+                return Err(self
+                    .name_taken_error(account_id, &input.table_name, restore.is_some())
+                    .await);
             }
-            _ => StorageError::Internal(e.to_string()),
-        })?;
+            Err(e) => return Err(StorageError::Internal(e.to_string())),
+        };
+
+        if let Some(r) = restore {
+            sqlx::query(
+                "INSERT INTO table_restores \
+                 (table_id, source_backup_arn, source_table_arn, restore_date_time) \
+                 VALUES ($1, $2, $3, to_timestamp($4))",
+            )
+            .bind(&table_id)
+            .bind(r.backup_arn)
+            .bind(r.source_table_arn)
+            .bind(r.restore_date_time)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        }
 
         // Insert GSI metadata
         // F-1: Store full ProvisionedThroughputDescription (not the input
