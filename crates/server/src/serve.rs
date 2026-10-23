@@ -145,6 +145,38 @@ impl ServeParams {
     }
 }
 
+/// The largest `request_timeout_secs` the server accepts.
+///
+/// hyper adds the HTTP/1 header read timeout to `Instant::now()` once per
+/// connection, and that addition panics on overflow, so a value near
+/// `u64::MAX` panics the task of every connection the server accepts. A day
+/// is longer than any pause a client takes between connecting and sending a
+/// request, and it leaves the addition far from the overflow point.
+const MAX_REQUEST_TIMEOUT_SECS: u64 = 86_400;
+
+/// Check the `request_timeout_secs` value from the `[server]` section.
+///
+/// Returns the startup error message when the value is outside the accepted
+/// range, so misconfiguration fails fast instead of reaching the listener.
+fn check_request_timeout_secs(secs: u64) -> Result<(), String> {
+    if secs == 0 {
+        return Err(
+            "Invalid [server] configuration: request_timeout_secs must be at least 1 \
+                    (0 would close every connection before it could send a request)."
+                .to_owned(),
+        );
+    }
+    if secs > MAX_REQUEST_TIMEOUT_SECS {
+        return Err(format!(
+            "Invalid [server] configuration: request_timeout_secs must be at most \
+             {MAX_REQUEST_TIMEOUT_SECS} (a day); the per-connection timers add it to the \
+             current instant, and a larger value overflows that addition and panics the \
+             connection task."
+        ));
+    }
+    Ok(())
+}
+
 /// Run the ExtendDB server on the pre-bound listener in `params` until shutdown.
 ///
 /// On any error before the HTTP server starts, the PID file is removed and a
@@ -375,6 +407,9 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
              soft_ttl_seconds, negative_ttl_seconds, max_entries."
         );
     }
+    if let Err(e) = check_request_timeout_secs(app_config.server.request_timeout_secs) {
+        anyhow::bail!("{e}");
+    }
     if !cache_enabled {
         tracing::warn!(
             "auth.cache.enabled = false — auth/authz caches are in pass-through mode \
@@ -393,9 +428,11 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
             make_cache_cfg("credential"),
         )
     });
-    let auth: Arc<dyn extenddb_auth::AuthProvider> = Arc::new(
-        extenddb_auth::BuiltinAuthProvider::new((*cached_cred_store).clone()),
-    );
+    let auth: Arc<dyn extenddb_auth::AuthProvider> =
+        Arc::new(extenddb_auth::BuiltinAuthProvider::new(
+            (*cached_cred_store).clone(),
+            app_config.server.region.as_str(),
+        ));
 
     // Phase 3: Build the authorization cache.
     let authz_cache: Arc<crate::CachedAuthzStore> = {
@@ -587,6 +624,7 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         ),
         metrics: metrics.clone(),
         tls_enabled,
+        request_timeout: Duration::from_secs(app_config.server.request_timeout_secs),
         dev_mode,
         import_paths,
         export_paths,
@@ -726,3 +764,6 @@ pub fn log_to_syslog_raw(msg: &str) {
 pub fn log_to_syslog_raw(msg: &str) {
     eprintln!("{msg}");
 }
+
+#[cfg(test)]
+mod tests;
