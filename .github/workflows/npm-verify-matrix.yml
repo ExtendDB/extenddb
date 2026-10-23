@@ -1,0 +1,232 @@
+# Verifies a published npm release of the ExtendDB dev launcher from the
+# public registry, on every platform it ships for. Shared by npm-publish.yml,
+# which calls it after a candidate publish and again before a promotion.
+#
+# One leg per platform package, each on its NATIVE runner and holding no
+# credentials. Each leg installs `@extenddb/dev@X.Y.Z` into an empty
+# directory exactly as a user would, and requires:
+#
+#   * the launcher and its platform package both installed at X.Y.Z;
+#   * `npm audit signatures` verifying registry signatures AND provenance
+#     attestations on both;
+#   * the binary reporting X.Y.Z;
+#   * the launcher resolving its platform package on its own, with no binary
+#     option and no EXTENDDB_BINARY (the build matrix cannot test that: no
+#     platform package is installed there);
+#   * the launcher suite from the tagged commit passing against the installed
+#     launcher and binary, in both storage modes.
+#
+# CodeQL's actions/cache-poisoning/poisonable-step query flags the checkout
+# below for the same reason it flags npm-build-matrix.yml: a dispatch-time ref
+# is checked out in the default branch's context. The same two properties
+# make it unexploitable here: the caller's gate has proved the SHA is an
+# ancestor of origin/main, and no step reads or writes the Actions cache
+# (no actions/cache, no `cache:` input on setup-node). Keep both true.
+name: npm verify matrix
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Release version to verify, X.Y.Z (callers pass the gate output)'
+        required: true
+        type: string
+      sha:
+        description: 'Commit the tag resolves to; its launcher suite is the one run'
+        required: true
+        type: string
+      platforms:
+        description: 'Space-separated platform packages of the release, e.g. "darwin-arm64 linux-x64"'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    strategy:
+      # Every platform reports: a verify failure is information about the
+      # candidate, and the full picture is worth more than the first casualty.
+      fail-fast: false
+      matrix:
+        # Same runner labels as npm-build-matrix.yml, one leg per platform
+        # package. darwin-x64 runs on an arm64 host under Rosetta 2 with an
+        # x64 node, so npm selects the x64 platform package and the binary
+        # executes on the x86_64 instruction set, as it does for a user on an
+        # Intel Mac.
+        include:
+          - pkg: linux-x64
+            runner: ubuntu-latest
+            node-arch: ''
+          - pkg: linux-arm64
+            runner: ubuntu-24.04-arm
+            node-arch: ''
+          - pkg: darwin-x64
+            runner: macos-15
+            node-arch: x64
+          - pkg: darwin-arm64
+            runner: macos-15
+            node-arch: ''
+          - pkg: win32-x64
+            runner: windows-latest
+            node-arch: ''
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read              # no registry credential in any verify leg
+    env:
+      VERSION: ${{ inputs.version }}
+      PKG: ${{ matrix.pkg }}
+      PLATFORMS: ${{ inputs.platforms }}
+    steps:
+      # The launcher suite that gated THIS release, not whatever main has
+      # since become: a later contract change must not fail the promotion of
+      # an older candidate. Sparse: only packaging/npm is read here.
+      - name: Check out the launcher suite at the tagged commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          ref: ${{ inputs.sha }}
+          sparse-checkout: packaging/npm
+          sparse-checkout-cone-mode: true
+
+      - name: Rosetta 2 must be present (darwin-x64 runs on an arm64 host)
+        if: matrix.pkg == 'darwin-x64'
+        run: |
+          set -euo pipefail
+          # Same gate as the build matrix: the installer's exit code is not
+          # trusted, the capability probe is.
+          sudo softwareupdate --install-rosetta --agree-to-license || true
+          arch -x86_64 /usr/bin/true
+
+      - name: Set up node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: '22'
+          architecture: ${{ matrix.node-arch }}
+
+      - name: This leg must be a platform of the release
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The matrix above is written by hand; the release's platform list
+          # comes from the launcher's optionalDependencies. A leg that is not
+          # in the list verifies nothing and must fail loudly.
+          [[ " ${PLATFORMS} " == *" ${PKG} "* ]] \
+            || { echo "::error::${PKG} is not among the release's platform packages (${PLATFORMS})"; exit 1; }
+          # node must report the platform this leg claims, or npm selects a
+          # different platform package and the leg proves the wrong one.
+          node -e 'const want = process.argv[1]; const got = process.platform + "-" + process.arch; if (got !== want) { console.error("node reports " + got + ", leg is " + want); process.exit(1); }' "$PKG"
+
+      - name: Install the release from the public registry, as a user would
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          rm -rf verify-npm && mkdir verify-npm && cd verify-npm
+          npm init -y >/dev/null
+          BIN="extenddb"; [[ "$PKG" == win32-* ]] && BIN="extenddb.exe"
+          # A fresh publish can take a short while to be visible on every
+          # registry replica, and npm tolerates an optional dependency that
+          # fails to fetch by silently omitting it, so "install succeeded" is
+          # not the condition; both packages being present at VERSION is.
+          # --prefer-online: the registry serves package documents with a
+          # five-minute max-age and npm reuses its cached copy for that long,
+          # so without it attempts 2 to 10 would re-read the document attempt
+          # 1 cached and never see the version appear.
+          for attempt in $(seq 1 10); do
+            if npm install "@extenddb/dev@${VERSION}" --prefer-online --no-audit --no-fund --loglevel=error \
+               && [[ -f "node_modules/@extenddb/dev/package.json" ]] \
+               && [[ -f "node_modules/@extenddb/${PKG}/${BIN}" ]]; then
+              break
+            fi
+            if [[ "$attempt" -eq 10 ]]; then
+              echo "::error::@extenddb/dev@${VERSION} with @extenddb/${PKG} did not install from the registry after ${attempt} attempts"
+              exit 1
+            fi
+            echo "attempt ${attempt}: not fully visible on the registry yet; retrying in 30s"
+            rm -rf node_modules package-lock.json
+            sleep 30
+          done
+
+          # Both packages at exactly VERSION. The launcher pins its platform
+          # packages by exact version, so anything else means npm resolved a
+          # launcher or a platform package this release did not publish.
+          GOT_DEV=$(node -p "require('./node_modules/@extenddb/dev/package.json').version")
+          GOT_PKG=$(node -p "require('./node_modules/@extenddb/${PKG}/package.json').version")
+          [[ "$GOT_DEV" == "$VERSION" ]] || { echo "::error::installed @extenddb/dev is ${GOT_DEV}, expected ${VERSION}"; exit 1; }
+          [[ "$GOT_PKG" == "$VERSION" ]] || { echo "::error::installed @extenddb/${PKG} is ${GOT_PKG}, expected ${VERSION}"; exit 1; }
+
+          # The binary users get must identify itself as this release. The
+          # first line is "extenddb X.Y.Z"; the lines after it name the
+          # catalog version, commit and build time. The whole output is
+          # captured and the first line taken afterwards: a `| head -n 1`
+          # closes the pipe after one line, the binary's next write gets
+          # EPIPE, and a Rust println panics with exit 101, about one run in
+          # four under pipefail (measured 5 of 40). Nothing may read this
+          # output through a pipe.
+          GOT_BIN=$("node_modules/@extenddb/${PKG}/${BIN}" --version)
+          GOT_BIN=${GOT_BIN%%$'\n'*}
+          [[ "$GOT_BIN" == "extenddb ${VERSION}" ]] || { echo "::error::binary reports '${GOT_BIN}', expected 'extenddb ${VERSION}'"; exit 1; }
+
+      - name: Registry signatures and provenance attestations must verify on both packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/verify-npm"
+          # npm audit signatures exits non-zero on an invalid or missing
+          # registry signature, but a package WITHOUT an attestation is not
+          # counted and does not fail it, so the count is asserted: both
+          # installed packages must carry a verified provenance attestation.
+          # --color=false: npm bolds "verified" when colour is forced, which
+          # would break the match.
+          npm audit signatures --color=false | tee audit.txt
+          grep -Eq '^2 packages have verified registry signatures' audit.txt \
+            || { echo "::error::expected 2 verified registry signatures"; exit 1; }
+          grep -Eq '^2 packages have verified attestations' audit.txt \
+            || { echo "::error::expected 2 verified provenance attestations"; exit 1; }
+
+      - name: The launcher must find its platform package on its own
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/verify-npm"
+          # No `binary` option and no EXTENDDB_BINARY: the only way start()
+          # can succeed is by resolving @extenddb/<platform> through
+          # optionalDependencies, which is the path every user takes and the
+          # one path the build matrix cannot exercise.
+          cat > resolve-smoke.js <<'EOF'
+          const assert = require("node:assert");
+          const http = require("node:http");
+          const { start } = require("@extenddb/dev");
+          (async () => {
+            const eb = await start({ memory: true });
+            const status = await new Promise((resolve, reject) => {
+              http.get(`${eb.endpoint}/health`, (res) => { res.resume(); resolve(res.statusCode); }).on("error", reject);
+            });
+            await eb.stop();
+            assert.strictEqual(status, 200, `health returned ${status}`);
+            console.log(`launcher resolved its platform package and served ${eb.endpoint}/health`);
+          })().catch((err) => { console.error(err); process.exit(1); });
+          EOF
+          env -u EXTENDDB_BINARY node resolve-smoke.js
+
+      - name: Run the launcher suite against the installed launcher and binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/verify-npm"
+          BIN="extenddb"; [[ "$PKG" == win32-* ]] && BIN="extenddb.exe"
+          # The suite requires ../index.js, so it is copied beside the
+          # INSTALLED launcher and run there: the launcher under test is the
+          # one npm delivered, not the checkout's. The published package does
+          # not ship the suite (files whitelist), hence the copy. On Windows
+          # node needs a native path; `pwd -W` gives one under Git Bash.
+          cp -R "${GITHUB_WORKSPACE}/packaging/npm/test" node_modules/@extenddb/dev/test
+          HERE=$(pwd -W 2>/dev/null || pwd)
+          BIN_PATH="${HERE}/node_modules/@extenddb/${PKG}/${BIN}"
+          # The launcher falls back to the platform package when the path it
+          # is given does not exist, so a wrong path here would be masked by
+          # a passing suite. Require the path before handing it over.
+          [[ -f "$BIN_PATH" ]] || { echo "::error::no binary at ${BIN_PATH}; the suite would silently fall back"; exit 1; }
+          EXTENDDB_BINARY="$BIN_PATH" node node_modules/@extenddb/dev/test/launcher.test.js
