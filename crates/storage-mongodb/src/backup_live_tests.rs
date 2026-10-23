@@ -1773,3 +1773,104 @@ async fn live_update_table_on_a_creating_restore_target_is_refused() {
     assert!(desc.deletion_protection_enabled);
     fx.finish().await;
 }
+
+/// A stream record's `created_at` field and its own `ApproximateCreationDateTime`
+/// come from one clock read on the live write path, for a plain write and for
+/// a service-identity deletion (the TTL worker's shape).
+#[tokio::test]
+#[ignore = "needs EXTENDDB_TEST_MONGODB_URI"]
+async fn live_stream_record_created_at_matches_the_record_timestamp() {
+    use extenddb_core::expression::ExpressionMaps;
+    use extenddb_core::types::{StreamSpecification, StreamViewType, UserIdentity};
+    use extenddb_storage::{DataEngine, StreamCapture};
+
+    let fx = Fixture::new().await;
+    fx.engine
+        .create_table(
+            ACCOUNT,
+            CreateTableInput {
+                table_name: "clock".to_owned(),
+                key_schema: vec![key("pk", KeyType::Hash)],
+                attribute_definitions: vec![attr("pk", ScalarAttributeType::S)],
+                billing_mode: Some(BillingMode::PayPerRequest),
+                stream_specification: Some(StreamSpecification {
+                    stream_enabled: true,
+                    stream_view_type: Some(StreamViewType::NewAndOldImages),
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create the table");
+    let key_info = fx
+        .engine
+        .table_key_info(ACCOUNT, "clock")
+        .await
+        .expect("key info");
+    let maps = ExpressionMaps::default();
+    let capture = StreamCapture {
+        view_type: StreamViewType::NewAndOldImages,
+        user_identity: None,
+        region: Arc::from("us-east-1"),
+    };
+    for v in ["one", "two"] {
+        let item: Item = [
+            ("pk".to_owned(), AttributeValue::S("k".to_owned())),
+            ("v".to_owned(), AttributeValue::S(v.to_owned())),
+        ]
+        .into_iter()
+        .collect();
+        fx.engine
+            .put_item(&key_info, item, false, None, &maps, Some(&capture))
+            .await
+            .expect("put");
+    }
+    let key: Item = [("pk".to_owned(), AttributeValue::S("k".to_owned()))]
+        .into_iter()
+        .collect();
+    fx.engine
+        .delete_item(
+            &key_info,
+            &key,
+            false,
+            None,
+            &maps,
+            Some(&StreamCapture {
+                view_type: StreamViewType::NewAndOldImages,
+                user_identity: Some(UserIdentity {
+                    identity_type: "Service".to_owned(),
+                    principal_id: "dynamodb.amazonaws.com".to_owned(),
+                }),
+                region: Arc::from("us-east-1"),
+            }),
+        )
+        .await
+        .expect("delete");
+
+    let mut cursor = fx
+        .engine
+        .data_db
+        .collection::<Document>("stream_records")
+        .find(doc! {})
+        .await
+        .expect("read back");
+    let mut seen = 0;
+    while cursor.advance().await.expect("cursor") {
+        let d = cursor.deserialize_current().expect("document");
+        let created_at = d.get_datetime("created_at").expect("created_at");
+        let approx = d
+            .get_document("record_data")
+            .and_then(|r| r.get_document("dynamodb"))
+            .expect("record_data.dynamodb")
+            .get_i64("ApproximateCreationDateTime")
+            .expect("ApproximateCreationDateTime");
+        assert_eq!(
+            created_at.timestamp_millis().div_euclid(1_000),
+            approx,
+            "created_at {created_at} and ApproximateCreationDateTime {approx} disagree"
+        );
+        seen += 1;
+    }
+    assert_eq!(seen, 3, "two puts and one delete");
+    fx.finish().await;
+}

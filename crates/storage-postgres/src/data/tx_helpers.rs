@@ -344,6 +344,12 @@ pub(super) async fn write_stream_record_in_tx(
         .map_err(db_error)?;
     let seq = format!("{seq_val:021}");
 
+    // One wall-clock read feeds both the record's ApproximateCreationDateTime
+    // and the created_at column. The column default (NOW()) is the transaction
+    // start time, which in a long transaction sits seconds before the record.
+    let created_at = time::OffsetDateTime::now_utc();
+    let approximate_creation_date_time = created_at.unix_timestamp();
+
     let record = StreamRecord {
         event_id: uuid::Uuid::new_v4().to_string(),
         event_name: event,
@@ -351,13 +357,7 @@ pub(super) async fn write_stream_record_in_tx(
         event_source: "aws:dynamodb".to_owned(),
         aws_region: capture.region.to_string(),
         dynamodb: StreamRecordData {
-            approximate_creation_date_time: i64::try_from(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            )
-            .unwrap_or(i64::MAX),
+            approximate_creation_date_time,
             keys,
             new_image,
             old_image,
@@ -372,14 +372,15 @@ pub(super) async fn write_stream_record_in_tx(
         serde_json::to_value(&record).map_err(|e| StorageError::Internal(e.to_string()))?;
 
     sqlx::query(
-        "INSERT INTO stream_records (sequence_number, shard_id, table_id, event_name, record_data) \
-         VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO stream_records (sequence_number, shard_id, table_id, event_name, record_data, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(&record.dynamodb.sequence_number)
     .bind(shard_id)
     .bind(&key_info.table_id)
     .bind(format!("{:?}", record.event_name))
     .bind(&record_json)
+    .bind(created_at)
     .execute(&mut **tx)
     .await
     .map_err(db_error)?;
