@@ -18,9 +18,31 @@ use extenddb_core::types::{
     TableDescription, UpdateTableInput, VectorIndexSpecification,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::effective_attribute_definitions;
+use extenddb_storage::util::{building_refuses, effective_attribute_definitions};
 
 use crate::store::SqliteEngine;
+
+/// Refuse a GSI Create, or a Delete of a GSI other than the one building, while
+/// a GSI on the table is `CREATING`.
+async fn refuse_while_building(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: &str,
+    updates: &[extenddb_core::types::GlobalSecondaryIndexUpdate],
+) -> Result<(), StorageError> {
+    let building: Vec<String> = sqlx::query_scalar(
+        "SELECT index_name FROM indexes WHERE table_id = ? AND index_status = 'CREATING'",
+    )
+    .bind(table_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|e| StorageError::Internal(e.to_string()))?;
+    if building_refuses(&building, updates) {
+        return Err(StorageError::LimitExceeded(
+            extenddb_core::types::ONLINE_INDEX_LIMIT.to_owned(),
+        ));
+    }
+    Ok(())
+}
 
 /// Refuse a new index whose name is already taken on this table, whatever index
 /// family holds it.
@@ -63,6 +85,34 @@ impl SqliteEngine {
         input: UpdateTableInput,
     ) -> Result<TableDescription, StorageError> {
         Self::validate_account_id(account_id)?;
+
+        // A GSI build in this process runs under the write lock below and keeps
+        // it until the index is ACTIVE, so a check taken under the lock would
+        // only ever see the build finished. Read before taking it, from a WAL
+        // snapshot that needs no lock, so a second index change sent during a
+        // build is refused at once, as the service refuses it, instead of
+        // waiting for the build and then succeeding. It sees only a committed
+        // CREATING row: a build that holds the lock but is still in its catalog
+        // transaction is not seen, and the request then waits for that build
+        // and succeeds, as it did before this check.
+        if let Some(updates) = &input.global_secondary_index_updates
+            && !updates.is_empty()
+        {
+            let building: Vec<String> = sqlx::query_scalar(
+                "SELECT i.index_name FROM indexes i JOIN tables t ON t.table_id = i.table_id \
+                 WHERE t.account_id = ? AND t.table_name = ? AND i.index_status = 'CREATING'",
+            )
+            .bind(account_id)
+            .bind(&input.table_name)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            if building_refuses(&building, updates) {
+                return Err(StorageError::LimitExceeded(
+                    extenddb_core::types::ONLINE_INDEX_LIMIT.to_owned(),
+                ));
+            }
+        }
 
         let _writer = self.write_lock.lock().await;
         let mut tx = self
@@ -315,6 +365,18 @@ impl SqliteEngine {
         // columns from the same set the catalog now holds.
         let mut merged_attr_defs_for_ddl: Option<Vec<AttributeDefinition>> = None;
         if let Some(updates) = &input.global_secondary_index_updates {
+            {
+                // One index change at a time while a GSI builds, as the service
+                // has it: a Create, or a Delete of any other GSI, is refused with
+                // LimitExceededException (measured for both, in both of the
+                // service's CREATING phases). A Delete of the index that is
+                // building is a different case and is left to the delete path.
+                // Inside the write lock this sees a CREATING row only from
+                // another process on the same file or one a crash left; a build
+                // in this process is caught before the lock is taken, see the
+                // top of this function.
+                refuse_while_building(&mut tx, &table_id, updates).await?;
+            }
             for update in updates {
                 if let Some(create) = &update.create {
                     // Across families, not just this one: see
@@ -1435,6 +1497,224 @@ mod reconciler_tests {
                 .expect("second reconcile"),
             0,
             "reconciler must be idempotent"
+        );
+    }
+
+    /// A write that carries the key info cached before an UpdateTable added a GSI
+    /// with a sort key on a new attribute must still give the index row its sort
+    /// key. The engine drops the cached key info only when UpdateTable returns, so
+    /// writes in between carry definitions that do not know the new attribute;
+    /// with them the row was written without the sort key column, and a Query on
+    /// the full index key did not find the item.
+    #[tokio::test]
+    async fn write_with_key_info_older_than_a_new_gsi_indexes_its_sort_key() {
+        use extenddb_storage::{DataEngine, TableEngine};
+
+        let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
+            .await
+            .expect("engine");
+        crate::schema::apply(&engine.pool).await.expect("schema");
+        let account = "000000000000";
+        sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
+            .bind(account)
+            .execute(&engine.pool)
+            .await
+            .expect("account");
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES ('index_propagation_delay_ms', '0') \
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        )
+        .execute(&engine.pool)
+        .await
+        .expect("synchronous propagation");
+
+        let input: extenddb_core::types::CreateTableInput = serde_json::from_value(json!({
+            "TableName": "t",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST"
+        }))
+        .expect("input");
+        engine
+            .create_table_impl(account, input, false)
+            .await
+            .expect("create table");
+        sqlx::query("UPDATE tables SET table_status = 'ACTIVE' WHERE table_name = 't'")
+            .execute(&engine.pool)
+            .await
+            .expect("activate the table");
+        let stale = engine.table_key_info(account, "t").await.expect("key info");
+
+        let update: extenddb_core::types::UpdateTableInput = serde_json::from_value(json!({
+            "TableName": "t",
+            "AttributeDefinitions": [
+                {"AttributeName": "g", "AttributeType": "S"},
+                {"AttributeName": "r", "AttributeType": "N"}
+            ],
+            "GlobalSecondaryIndexUpdates": [{"Create": {
+                "IndexName": "gidx",
+                "KeySchema": [
+                    {"AttributeName": "g", "KeyType": "HASH"},
+                    {"AttributeName": "r", "KeyType": "RANGE"}
+                ],
+                "Projection": {"ProjectionType": "ALL"}
+            }}]
+        }))
+        .expect("update input");
+        engine
+            .update_table_impl(account, update)
+            .await
+            .expect("add the GSI");
+
+        let item: extenddb_core::types::Item = serde_json::from_value(json!({
+            "pk": {"S": "a"}, "g": {"S": "x"}, "r": {"N": "7"}
+        }))
+        .expect("item");
+        engine
+            .put_item(
+                &stale,
+                item,
+                false,
+                None,
+                &extenddb_core::expression::ExpressionMaps::default(),
+                None,
+            )
+            .await
+            .expect("put with the older key info");
+
+        let (index_id,): (String,) =
+            sqlx::query_as("SELECT index_id FROM indexes WHERE index_name = 'gidx'")
+                .fetch_one(&engine.pool)
+                .await
+                .expect("index id");
+        let missing: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM \"_ddb_{index_id}\" WHERE sk_n IS NULL"
+        ))
+        .fetch_one(&engine.pool)
+        .await
+        .expect("count rows without a sort key");
+        let rows: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM \"_ddb_{index_id}\""))
+            .fetch_one(&engine.pool)
+            .await
+            .expect("count rows");
+        assert_eq!((rows, missing), (1, 0), "one index row, with its sort key");
+    }
+
+    /// While a GSI row is `CREATING`, with the engine write lock held as a build
+    /// in this process holds it: a second Create, and a Delete of another GSI,
+    /// are refused within 500 ms, without waiting for the lock, and with the
+    /// service's LimitExceeded sentence, and a read naming the index is told the
+    /// table has no such index, as the service does. Main returned a 500 from
+    /// the missing or partial data table instead.
+    #[tokio::test]
+    async fn a_creating_gsi_refuses_a_second_change_and_reads() {
+        use extenddb_storage::TableEngine;
+
+        let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
+            .await
+            .expect("engine");
+        crate::schema::apply(&engine.pool).await.expect("schema");
+        let account = "000000000000";
+        sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
+            .bind(account)
+            .execute(&engine.pool)
+            .await
+            .expect("account");
+        let input: extenddb_core::types::CreateTableInput = serde_json::from_value(json!({
+            "TableName": "t",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "g", "AttributeType": "S"}
+            ],
+            "BillingMode": "PAY_PER_REQUEST"
+        }))
+        .expect("input");
+        engine
+            .create_table_impl(account, input, false)
+            .await
+            .expect("create table");
+        sqlx::query("UPDATE tables SET table_status = 'ACTIVE' WHERE table_name = 't'")
+            .execute(&engine.pool)
+            .await
+            .expect("activate the table");
+        let (table_id,): (String,) =
+            sqlx::query_as("SELECT table_id FROM tables WHERE table_name = 't'")
+                .fetch_one(&engine.pool)
+                .await
+                .expect("table_id");
+        sqlx::query(
+            "INSERT INTO indexes \
+             (table_id, index_id, index_name, index_type, key_schema, projection, index_status) \
+             VALUES (?, 'idx-1', 'gsi1', 'GSI', ?, ?, 'CREATING')",
+        )
+        .bind(&table_id)
+        .bind(json!([{"AttributeName": "g", "KeyType": "HASH"}]).to_string())
+        .bind(json!({"ProjectionType": "ALL"}).to_string())
+        .execute(&engine.pool)
+        .await
+        .expect("plant a CREATING index");
+
+        let second: extenddb_core::types::UpdateTableInput = serde_json::from_value(json!({
+            "TableName": "t",
+            "GlobalSecondaryIndexUpdates": [{"Create": {
+                "IndexName": "gsi2",
+                "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"}
+            }}]
+        }))
+        .expect("update input");
+        // A build in this process holds the write lock until it publishes. With
+        // it held, the refusal must come at once rather than after the build.
+        let building = engine.write_lock.lock().await;
+        let refused = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            engine.update_table_impl(account, second),
+        )
+        .await
+        .expect("refused without waiting for the build's lock");
+        let Err(extenddb_storage::error::StorageError::LimitExceeded(msg)) = refused else {
+            panic!("a second create during a build was not refused with LimitExceeded");
+        };
+        assert_eq!(msg, extenddb_core::types::ONLINE_INDEX_LIMIT);
+
+        // A Delete of another GSI is refused the same way, also without waiting.
+        sqlx::query(
+            "INSERT INTO indexes \
+             (table_id, index_id, index_name, index_type, key_schema, projection, index_status) \
+             VALUES (?, 'idx-0', 'gsi0', 'GSI', ?, ?, 'ACTIVE')",
+        )
+        .bind(&table_id)
+        .bind(json!([{"AttributeName": "g", "KeyType": "HASH"}]).to_string())
+        .bind(json!({"ProjectionType": "ALL"}).to_string())
+        .execute(&engine.pool)
+        .await
+        .expect("plant an ACTIVE index");
+        let delete_other: extenddb_core::types::UpdateTableInput = serde_json::from_value(json!({
+            "TableName": "t",
+            "GlobalSecondaryIndexUpdates": [{"Delete": {"IndexName": "gsi0"}}]
+        }))
+        .expect("update input");
+        let refused = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            engine.update_table_impl(account, delete_other),
+        )
+        .await
+        .expect("refused without waiting for the build's lock");
+        assert!(
+            matches!(
+                refused,
+                Err(extenddb_storage::error::StorageError::LimitExceeded(_))
+            ),
+            "deleting another GSI during a build was not refused with LimitExceeded"
+        );
+        drop(building);
+        assert!(
+            matches!(
+                engine.index_info_by_table_id(&table_id, "gsi1").await,
+                Err(extenddb_storage::error::StorageError::IndexNotFound(_))
+            ),
+            "a read of a CREATING index resolves as no such index"
         );
     }
 

@@ -132,6 +132,7 @@ macro_rules! bind_sk_execute {
 mod data_engine;
 mod ddl;
 mod delete_item;
+pub(crate) mod gsi_build;
 pub(crate) mod index;
 mod put_item;
 mod query;
@@ -141,7 +142,4 @@ mod tx_helpers;
 mod update_item;
 pub mod vector_index;
 
-pub(crate) use index::{
-    delete_index_row_multi, insert_index_row_multi, insert_index_rows_multi, item_has_index_keys,
-    project_item_for_index,
-};
+pub(crate) use index::{insert_index_rows_multi, item_has_index_keys, project_item_for_index};

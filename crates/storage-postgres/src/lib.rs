@@ -39,6 +39,13 @@ pub use catalog_store::PostgresCatalogStore;
 pub use config::PostgresStorageConfig;
 pub use config::parse_connection_string;
 pub use credential_store::DbCredentialStore;
+/// Finish GSI builds left `CREATING`, once. The server runs it from a background
+/// worker; exported for its test.
+pub use data::gsi_build::reconcile_creating_gsis;
+/// Make writes pause at a chosen point, so a test can produce a write that missed
+/// a GSI created in between. Hidden because no deployment path calls it.
+#[doc(hidden)]
+pub use data::gsi_build::{PauseWrites, pause_writes_for_tests};
 /// Apply one queued vector row from its own context.
 ///
 /// Reachable so an integration test can drive the classification the propagation
@@ -688,6 +695,14 @@ impl ServerRuntimeHooks for PostgresRuntimeHooks {
             workers::vector_stuck_build_worker(storage_for_builds, token).await;
         });
 
+        // 6b. GSI builds a crash left CREATING. Not a startup step: a rebuild
+        // scans the table, and writes keep a CREATING index current meanwhile.
+        let storage_for_gsi_builds = self.engine.clone();
+        let token = ctx.shutdown.clone();
+        let gsi_builds = tokio::spawn(async move {
+            crate::data::gsi_build::recovery_worker(storage_for_gsi_builds, token).await;
+        });
+
         // 7. Pool metrics worker - needs both catalog and data pools
         let catalog_pool = self.engine.pool.clone();
         let data_pool = self.engine.data_pool().clone();
@@ -712,6 +727,7 @@ impl ServerRuntimeHooks for PostgresRuntimeHooks {
             idempotency_cleanup,
             ttl,
             vector_builds,
+            gsi_builds,
             pool_metrics,
             gsi_poller,
         ]
