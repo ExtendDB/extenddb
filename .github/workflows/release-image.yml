@@ -19,7 +19,9 @@
 #   build     One job per architecture, each on its NATIVE runner. No emulation,
 #             so the arm64 image is genuinely executed rather than published
 #             untested. Each job builds with `load: true`, smoke tests the
-#             result, then saves the image as a workflow artifact. `docker
+#             result, saves the image as a workflow artifact, and fails if the
+#             saved tarball has a fixable high or critical vulnerability in
+#             its operating system packages. `docker
 #             save`/`load` preserves the image ID, so the artifact is
 #             bit-for-bit what was tested. These jobs hold NO registry
 #             credentials.
@@ -309,6 +311,21 @@ jobs:
           docker save '${{ needs.gate.outputs.image_repo }}:sha-${{ needs.gate.outputs.sha }}-${{ matrix.arch }}' \
             | gzip > "image-${{ matrix.arch }}.tar.gz"
           ls -lh "image-${{ matrix.arch }}.tar.gz"
+
+      - name: Fail on fixable high or critical vulnerabilities
+        # Scans the saved tarball, so the result describes the bytes publish
+        # pushes, and the scanner gets no Docker socket. --ignore-unfixed: a
+        # finding with no fixed package version cannot be cleared by a rebuild.
+        env:
+          TRIVY_IMAGE: public.ecr.aws/aquasecurity/trivy:0.76.0@sha256:2416d1f74045b57274df1a340eee6b510cacd73c66a6ccb8da092b117eb7d222
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$PWD/image-${{ matrix.arch }}.tar.gz:/image.tar.gz:ro" \
+            "$TRIVY_IMAGE" image --input /image.tar.gz \
+            --scanners vuln --ignore-unfixed --severity HIGH,CRITICAL \
+            --db-repository public.ecr.aws/aquasecurity/trivy-db:2 \
+            --exit-code 1 --no-progress
 
       - name: Upload the image artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2

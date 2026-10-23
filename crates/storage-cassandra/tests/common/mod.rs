@@ -17,9 +17,22 @@ use std::sync::Arc;
 /// Keyspaces queued for async drop between tests.
 static PENDING_DROPS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
-fn queue_keyspace_drop(keyspace: String) {
+pub fn queue_keyspace_drop(keyspace: String) {
     if let Ok(mut q) = PENDING_DROPS.lock() {
         q.push(keyspace);
+    }
+}
+
+/// Queues its keyspaces for drop when the test holding it ends. Queuing at
+/// the start of a test instead lets a concurrently starting test's
+/// `setup_engine` drop them while the first test still uses them.
+pub struct DropKeyspacesOnDrop(pub Vec<String>);
+
+impl Drop for DropKeyspacesOnDrop {
+    fn drop(&mut self) {
+        for keyspace in self.0.drain(..) {
+            queue_keyspace_drop(keyspace);
+        }
     }
 }
 

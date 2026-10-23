@@ -39,6 +39,9 @@ use futures::future::BoxFuture;
 pub struct CachedSessionData {
     pub session_policy: Option<Arc<PolicyDocument>>,
     pub session_tags: HashMap<String, String>,
+    /// The session issue time (`aws:TokenIssueTime`), RFC 3339 UTC, or `None`
+    /// if the stored value could not be read.
+    pub token_issue_time: Option<String>,
 }
 
 /// Configuration for the authorization cache. Each sub-cache is sized
@@ -111,6 +114,11 @@ pub struct CachedAuthzStore {
     role_tags: SwrCache<(String, String), TagMap, OpError>,
     session_data: SwrCache<(String, String, String), Arc<CachedSessionData>, OpError>,
     resource_tags: SwrCache<String, TagMap, OpError>,
+    /// Principal creation time (RFC 3339), part of the `aws:userid` derivation.
+    /// Invalidated with the principal's other entries so a delete and recreate
+    /// resolves a fresh id.
+    user_created_at: SwrCache<(String, String), Arc<String>, OpError>,
+    role_created_at: SwrCache<(String, String), Arc<String>, OpError>,
 }
 
 impl CachedAuthzStore {
@@ -153,6 +161,9 @@ impl CachedAuthzStore {
                 extenddb_cache::SwrCache::new(loader, cache_cfg)
             }
         }
+        // The principal creation-time caches reuse the per-principal tag cache
+        // sizing; capture it before the field initializers consume it.
+        let created_at_cfg = cfg.principal_tags.clone();
         Self {
             user_policies: mk_cache(
                 make_user_policies_loader(inner.clone()),
@@ -192,6 +203,22 @@ impl CachedAuthzStore {
             session_data: mk_cache(
                 make_session_data_loader(inner.clone()),
                 cfg.session_data,
+                pass_through,
+            ),
+            user_created_at: mk_cache(
+                make_user_created_at_loader(inner.clone()),
+                extenddb_cache::SwrCacheConfig {
+                    name: "user_created_at",
+                    ..created_at_cfg.clone()
+                },
+                pass_through,
+            ),
+            role_created_at: mk_cache(
+                make_role_created_at_loader(inner.clone()),
+                extenddb_cache::SwrCacheConfig {
+                    name: "role_created_at",
+                    ..created_at_cfg
+                },
                 pass_through,
             ),
             resource_tags: mk_cache(
@@ -303,9 +330,17 @@ impl CachedAuthzStore {
             .await
     }
 
-    /// Fetch resource tags as a flat map. Empty for wildcard resources.
+    /// Fetch resource tags as a flat map. Empty for wildcard resources, and
+    /// for backups.
+    ///
+    /// `DynamoDB` backups carry no tags: the service's authorization reference
+    /// lists no `aws:ResourceTag` key for the `backup` resource, so a
+    /// tag condition never matches one. `TagResource` refuses backup ARNs, but
+    /// tags written under one by an earlier build may still be stored; they
+    /// are never read here, so the decision does not depend on them. Uses the
+    /// same predicate as the tagging refusal.
     pub async fn fetch_resource_tags(&self, arn: &str) -> OpResult<TagMap> {
-        if arn.ends_with("/*") {
+        if arn.ends_with("/*") || extenddb_storage::util::is_backup_resource_arn(arn) {
             return Ok(Arc::new(HashMap::new()));
         }
         Ok(self
@@ -313,6 +348,30 @@ impl CachedAuthzStore {
             .get(arn.to_owned())
             .await?
             .unwrap_or_else(|| Arc::new(HashMap::new())))
+    }
+
+    /// Fetch a user's creation time (RFC 3339), part of its `aws:userid`.
+    /// `None` if the user does not exist.
+    pub async fn fetch_user_created_at(
+        &self,
+        account_id: &str,
+        user_name: &str,
+    ) -> OpResult<Option<Arc<String>>> {
+        self.user_created_at
+            .get((account_id.to_owned(), user_name.to_owned()))
+            .await
+    }
+
+    /// Fetch a role's creation time (RFC 3339), part of its `aws:userid`.
+    /// `None` if the role does not exist.
+    pub async fn fetch_role_created_at(
+        &self,
+        account_id: &str,
+        role_name: &str,
+    ) -> OpResult<Option<Arc<String>>> {
+        self.role_created_at
+            .get((account_id.to_owned(), role_name.to_owned()))
+            .await
     }
 
     // ── Invalidation API ───────────────────────────────────────────────
@@ -360,6 +419,12 @@ impl CachedAuthzStore {
             .await;
     }
 
+    pub async fn invalidate_user_created_at(&self, account_id: &str, user_name: &str) {
+        self.user_created_at
+            .invalidate(&(account_id.to_owned(), user_name.to_owned()))
+            .await;
+    }
+
     pub async fn invalidate_role_policies(&self, account_id: &str, role_name: &str) {
         self.role_policies
             .invalidate(&(account_id.to_owned(), role_name.to_owned()))
@@ -374,6 +439,12 @@ impl CachedAuthzStore {
 
     pub async fn invalidate_role_tags(&self, account_id: &str, role_name: &str) {
         self.role_tags
+            .invalidate(&(account_id.to_owned(), role_name.to_owned()))
+            .await;
+    }
+
+    pub async fn invalidate_role_created_at(&self, account_id: &str, role_name: &str) {
+        self.role_created_at
             .invalidate(&(account_id.to_owned(), role_name.to_owned()))
             .await;
     }
@@ -452,6 +523,12 @@ impl CachedAuthzStore {
         if let Err(e) = self.user_tags.invalidate_if(pred_user.clone()) {
             log_err("user_tags", e);
         }
+        if let Err(e) = self.user_created_at.invalidate_if(pred_user.clone()) {
+            log_err("user_created_at", e);
+        }
+        if let Err(e) = self.role_created_at.invalidate_if(pred_user.clone()) {
+            log_err("role_created_at", e);
+        }
         if let Err(e) = self.role_policies.invalidate_if(pred_user.clone()) {
             log_err("role_policies", e);
         }
@@ -483,6 +560,8 @@ impl CachedAuthzStore {
         self.role_tags.invalidate_all();
         self.session_data.invalidate_all();
         self.resource_tags.invalidate_all();
+        self.user_created_at.invalidate_all();
+        self.role_created_at.invalidate_all();
     }
 
     /// Snapshot per-sub-cache counters for export to `/auth-cache-metrics`.
@@ -500,6 +579,8 @@ impl CachedAuthzStore {
             role_tags: self.role_tags.metrics().snapshot(),
             session_data: self.session_data.metrics().snapshot(),
             resource_tags: self.resource_tags.metrics().snapshot(),
+            user_created_at: self.user_created_at.metrics().snapshot(),
+            role_created_at: self.role_created_at.metrics().snapshot(),
         })
     }
 
@@ -525,6 +606,8 @@ pub struct AuthzCacheMetricsSnapshot {
     pub role_tags: extenddb_cache::SwrMetricsSnapshot,
     pub session_data: extenddb_cache::SwrMetricsSnapshot,
     pub resource_tags: extenddb_cache::SwrMetricsSnapshot,
+    pub user_created_at: extenddb_cache::SwrMetricsSnapshot,
+    pub role_created_at: extenddb_cache::SwrMetricsSnapshot,
 }
 
 impl extenddb_auth::AuthzCacheInvalidator for CachedAuthzStore {
@@ -568,6 +651,14 @@ impl extenddb_auth::AuthzCacheInvalidator for CachedAuthzStore {
         Box::pin(self.invalidate_user_tags(account_id, user_name))
     }
 
+    fn invalidate_user_created_at<'a>(
+        &'a self,
+        account_id: &'a str,
+        user_name: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(self.invalidate_user_created_at(account_id, user_name))
+    }
+
     fn invalidate_role_policies<'a>(
         &'a self,
         account_id: &'a str,
@@ -590,6 +681,14 @@ impl extenddb_auth::AuthzCacheInvalidator for CachedAuthzStore {
         role_name: &'a str,
     ) -> BoxFuture<'a, ()> {
         Box::pin(self.invalidate_role_tags(account_id, role_name))
+    }
+
+    fn invalidate_role_created_at<'a>(
+        &'a self,
+        account_id: &'a str,
+        role_name: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(self.invalidate_role_created_at(account_id, role_name))
     }
 
     fn invalidate_session<'a>(
@@ -639,6 +738,7 @@ type BoundaryLoader = Loader<(String, String), Arc<PolicyDocument>, OpError>;
 type TagsLoader = Loader<(String, String), TagMap, OpError>;
 type SessionLoader = Loader<(String, String, String), Arc<CachedSessionData>, OpError>;
 type ResourceTagsLoader = Loader<String, TagMap, OpError>;
+type CreatedAtLoader = Loader<(String, String), Arc<String>, OpError>;
 
 // Policy loaders surface `Ok(None)` when the underlying store returns an
 // empty Vec — same rationale as the tag loaders below. "Principal exists
@@ -779,6 +879,34 @@ fn make_resource_tags_loader(inner: Arc<dyn AuthorizationStore>) -> ResourceTags
     )
 }
 
+fn make_user_created_at_loader(inner: Arc<dyn AuthorizationStore>) -> CreatedAtLoader {
+    Arc::new(move |(account_id, user_name): (String, String)|
+        -> BoxFuture<'static, OpResult<Option<Arc<String>>>> {
+        let inner = inner.clone();
+        async move {
+            Ok(inner
+                .fetch_user_created_at(&account_id, &user_name)
+                .await?
+                .map(Arc::new))
+        }
+        .boxed()
+    })
+}
+
+fn make_role_created_at_loader(inner: Arc<dyn AuthorizationStore>) -> CreatedAtLoader {
+    Arc::new(move |(account_id, role_name): (String, String)|
+        -> BoxFuture<'static, OpResult<Option<Arc<String>>>> {
+        let inner = inner.clone();
+        async move {
+            Ok(inner
+                .fetch_role_created_at(&account_id, &role_name)
+                .await?
+                .map(Arc::new))
+        }
+        .boxed()
+    })
+}
+
 fn make_session_data_loader(inner: Arc<dyn AuthorizationStore>) -> SessionLoader {
     Arc::new(move |(account_id, role_name, session_name): (String, String, String)|
         -> BoxFuture<'static, OpResult<Option<Arc<CachedSessionData>>>> {
@@ -797,6 +925,7 @@ fn make_session_data_loader(inner: Arc<dyn AuthorizationStore>) -> SessionLoader
             Ok(Some(Arc::new(CachedSessionData {
                 session_policy,
                 session_tags,
+                token_issue_time: data.created_at,
             })))
         }
         .boxed()
@@ -818,7 +947,7 @@ fn parse_document(s: &str) -> OpResult<Arc<PolicyDocument>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -835,7 +964,7 @@ mod tests {
 
     /// Counts calls per method so tests can assert the cache prevents repeats.
     #[derive(Default)]
-    struct CountingAuthzStore {
+    pub(crate) struct CountingAuthzStore {
         user_policies_calls: AtomicUsize,
         user_group_policies_calls: AtomicUsize,
         user_boundary_calls: AtomicUsize,
@@ -844,17 +973,17 @@ mod tests {
         role_boundary_calls: AtomicUsize,
         role_tags_calls: AtomicUsize,
         session_data_calls: AtomicUsize,
-        resource_tags_calls: AtomicUsize,
+        pub(crate) resource_tags_calls: AtomicUsize,
 
-        user_policies: Mutex<HashMap<PrincipalKey, Vec<String>>>,
+        pub(crate) user_policies: Mutex<HashMap<PrincipalKey, Vec<String>>>,
         user_group_policies: Mutex<HashMap<PrincipalKey, Vec<String>>>,
         user_boundary: Mutex<HashMap<PrincipalKey, Option<String>>>,
         user_tags: Mutex<HashMap<PrincipalKey, TagPairs>>,
-        role_policies: Mutex<HashMap<PrincipalKey, Vec<String>>>,
+        pub(crate) role_policies: Mutex<HashMap<PrincipalKey, Vec<String>>>,
         role_boundary: Mutex<HashMap<PrincipalKey, Option<String>>>,
         role_tags: Mutex<HashMap<PrincipalKey, TagPairs>>,
         session_data: Mutex<HashMap<SessionKey, Option<SessionData>>>,
-        resource_tags: Mutex<HashMap<String, TagPairs>>,
+        pub(crate) resource_tags: Mutex<HashMap<String, TagPairs>>,
     }
 
     impl AuthorizationStore for CountingAuthzStore {
@@ -1012,9 +1141,25 @@ mod tests {
                 .unwrap_or_default();
             Box::pin(async move { Ok(v) })
         }
+
+        fn fetch_user_created_at(
+            &self,
+            _account_id: &str,
+            _user_name: &str,
+        ) -> BoxFuture<'_, OpResult<Option<String>>> {
+            Box::pin(async move { Ok(None) })
+        }
+
+        fn fetch_role_created_at(
+            &self,
+            _account_id: &str,
+            _role_name: &str,
+        ) -> BoxFuture<'_, OpResult<Option<String>>> {
+            Box::pin(async move { Ok(None) })
+        }
     }
 
-    fn fast_authz_cfg() -> AuthzCacheConfig {
+    pub(crate) fn fast_authz_cfg() -> AuthzCacheConfig {
         let base = SwrCacheConfig {
             ttl: Duration::from_millis(200),
             soft_ttl: Duration::from_millis(50),
@@ -1134,6 +1279,39 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn resource_tags_of_a_backup_are_never_read() {
+        let inner = Arc::new(CountingAuthzStore::default());
+        let cache = CachedAuthzStore::new(inner.clone(), fast_authz_cfg());
+        let p = "arn:aws:dynamodb:us-east-1:1:table/Music";
+        for arn in [
+            format!("{p}/backup/01791976431438-73d8d5bc"),
+            format!("{p}/backup/1489602797149-x"),
+            format!("{p}/backup/1/x"),
+            format!("{p}/backup"),
+        ] {
+            inner
+                .resource_tags
+                .lock()
+                .unwrap()
+                .insert(arn.clone(), vec![("classification".into(), "dev".into())]);
+            assert!(
+                cache.fetch_resource_tags(&arn).await.unwrap().is_empty(),
+                "{arn}"
+            );
+        }
+        assert_eq!(inner.resource_tags_calls.load(Ordering::SeqCst), 0);
+        // Liveness: a table's stored tags are read.
+        inner
+            .resource_tags
+            .lock()
+            .unwrap()
+            .insert(p.to_owned(), vec![("classification".into(), "dev".into())]);
+        let tags = cache.fetch_resource_tags(p).await.unwrap();
+        assert_eq!(tags.get("classification").map(String::as_str), Some("dev"));
+        assert_eq!(inner.resource_tags_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn user_tags_round_trip() {
         let inner = Arc::new(CountingAuthzStore::default());
         inner.user_tags.lock().unwrap().insert(
@@ -1158,6 +1336,7 @@ mod tests {
             Some(SessionData {
                 session_policy: Some(allow_policy("dynamodb:Query")),
                 session_tags: vec![("Project".to_owned(), "Atlas".to_owned())],
+                created_at: None,
             }),
         );
         let cache = CachedAuthzStore::new(inner.clone(), fast_authz_cfg());
@@ -1195,6 +1374,7 @@ mod tests {
                 Some(SessionData {
                     session_policy: None,
                     session_tags: vec![],
+                    created_at: None,
                 }),
             );
         }
@@ -1204,6 +1384,7 @@ mod tests {
             Some(SessionData {
                 session_policy: None,
                 session_tags: vec![],
+                created_at: None,
             }),
         );
         let cache = CachedAuthzStore::new(inner.clone(), fast_authz_cfg());
