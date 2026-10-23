@@ -125,11 +125,23 @@ def poller_thread() -> None:
         for shard in resp["StreamDescription"]["Shards"]:
             sid = shard["ShardId"]
             if sid not in shard_iterators:
-                it = streams_client.get_shard_iterator(
-                    StreamArn=stream_arn,
-                    ShardId=sid,
-                    ShardIteratorType="TRIM_HORIZON",
-                )
+                # EXTENDDB_STREAM_SINCE (epoch seconds) starts each shard at
+                # the first record created at or after that time instead of
+                # the oldest retained record.
+                since = os.environ.get("EXTENDDB_STREAM_SINCE")
+                if since:
+                    it = streams_client.get_shard_iterator(
+                        StreamArn=stream_arn,
+                        ShardId=sid,
+                        ShardIteratorType="AT_TIMESTAMP",
+                        Timestamp=float(since),
+                    )
+                else:
+                    it = streams_client.get_shard_iterator(
+                        StreamArn=stream_arn,
+                        ShardId=sid,
+                        ShardIteratorType="TRIM_HORIZON",
+                    )
                 shard_iterators[sid] = it["ShardIterator"]
                 log("POLLER", f"Tracking shard {sid}")
 

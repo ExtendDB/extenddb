@@ -24,6 +24,7 @@ mod metadata_engine;
 mod migrations;
 mod operations;
 mod pg_util;
+mod stream_at_timestamp;
 mod stream_engine;
 mod table_engine;
 mod table_helpers;

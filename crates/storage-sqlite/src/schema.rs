@@ -181,6 +181,8 @@ CREATE TABLE IF NOT EXISTS stream_records (
 );
 
 CREATE INDEX IF NOT EXISTS idx_stream_records_created ON stream_records (created_at);
+-- Serves the AT_TIMESTAMP seek: one shard filtered by creation time.
+CREATE INDEX IF NOT EXISTS idx_stream_records_shard_created ON stream_records (shard_id, created_at);
 
 -- Admin users.
 CREATE TABLE IF NOT EXISTS admin_users (

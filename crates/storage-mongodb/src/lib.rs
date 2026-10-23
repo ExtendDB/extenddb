@@ -21,6 +21,7 @@ mod management_store;
 mod metadata_engine;
 mod operations;
 pub mod pushdown;
+mod stream_at_timestamp;
 mod stream_engine;
 mod table_engine;
 mod ttl_worker;
