@@ -81,13 +81,21 @@ pub async fn handle_batch_write_item(
     let mut per_table_gsi: HashMap<String, HashMap<String, f64>> = HashMap::new();
     let mut per_table_lsi: HashMap<String, HashMap<String, f64>> = HashMap::new();
 
-    // Requests the batch did not apply: a write that failed because the
-    // backend could not apply it now, after an earlier request committed,
-    // and every request after it. Amazon DynamoDB tolerates the failure of
-    // individual requests in a batch and reports them in UnprocessedItems
-    // for the client to replay; the whole batch fails only when nothing was
-    // applied. Answering an error after a committed write would report that
-    // write as failed.
+    // Requests the batch did not apply: the first write that failed because
+    // the backend could not apply it now, and every request after it. Amazon
+    // DynamoDB tolerates the failure of individual requests in a batch and
+    // reports them in UnprocessedItems for the client to replay, whether or
+    // not an earlier request in the same batch was applied: "If any requested
+    // operations fail because the table's provisioned throughput is exceeded
+    // or an internal processing failure occurs, the failed operations are
+    // returned in the UnprocessedItems response parameter." The whole batch is
+    // rejected only for the request faults the same page lists (a missing
+    // table, a key that does not match the schema, duplicate keys, too many
+    // requests, an item or request over the size limit), and the one error for
+    // a batch that applied nothing is a throttle, which this server does not
+    // account for. So a batch that could apply none of its requests also
+    // answers 200 with every request in UnprocessedItems, and the answer to
+    // one contended request does not depend on where it sat in the batch.
     let mut unprocessed: HashMap<String, Vec<WriteRequest>> = HashMap::new();
     let mut applied = 0usize;
     let tables: Vec<(&String, &Vec<WriteRequest>)> = input.request_items.iter().collect();
@@ -174,7 +182,7 @@ pub async fn handle_batch_write_item(
 
             let (old_item, new_item) = match written {
                 Ok(outcome) => outcome,
-                Err(e) if applied > 0 && is_deferrable(&e) => {
+                Err(e) if is_deferrable(&e) => {
                     tracing::warn!(
                         table = %table_name,
                         error = %e,
@@ -268,18 +276,20 @@ pub async fn handle_batch_write_item(
 /// replay instead of failing the batch.
 ///
 /// These are the errors a replay may clear: the backend could not apply the
-/// request now (a write that lost every retry against concurrent writers, a
-/// transient or connection failure, an internal failure). Amazon DynamoDB
-/// lists throttling and internal processing failures as the causes of
-/// UnprocessedItems. A fault in the request itself (validation, a missing
-/// table, a condition) fails the batch as before.
+/// request now, because the write lost every retry against concurrent writers
+/// or because the connection failed. A fault in the request itself
+/// (validation, a missing table, a condition) fails the batch as before, and
+/// so does an internal error: the documentation lists an internal processing
+/// failure among the causes of UnprocessedItems, but a storage fault here is
+/// not cleared by replaying the request, and a client's UnprocessedItems loop
+/// would spin on it. An internal error keeps answering HTTP 500, which is
+/// what it answered before this handler deferred anything.
 fn is_deferrable(e: &StorageError) -> bool {
     matches!(
         e,
         StorageError::TransactionConflict(_)
             | StorageError::Transient(_)
             | StorageError::Connection(_)
-            | StorageError::Internal(_)
     )
 }
 
@@ -423,7 +433,9 @@ mod tests {
         )));
         assert!(is_deferrable(&StorageError::Transient(String::new())));
         assert!(is_deferrable(&StorageError::Connection(String::new())));
-        assert!(is_deferrable(&StorageError::Internal(String::new())));
+        // A storage fault is not cleared by a replay: it keeps answering 500
+        // rather than being handed to the client's UnprocessedItems loop.
+        assert!(!is_deferrable(&StorageError::Internal(String::new())));
         assert!(!is_deferrable(&StorageError::Validation(String::new())));
         assert!(!is_deferrable(&StorageError::TableNotFound(String::new())));
         assert!(!is_deferrable(&StorageError::ConditionFailed(None)));

@@ -35,6 +35,8 @@ OPS_PER_WRITER = 60
 KEYS = 4
 BATCH_WRITERS = 8
 BATCH_ROUNDS = 30
+UPDATE_WRITERS = 16
+UPDATE_OPS = 20
 
 
 @pytest.fixture(scope="module")
@@ -45,7 +47,7 @@ def raw_client(endpoint_url):
         "region_name": os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
         "config": Config(
             retries={"total_max_attempts": 1, "mode": "standard"},
-            max_pool_connections=BATCH_WRITERS * 2,
+            max_pool_connections=UPDATE_WRITERS * 2,
         ),
     }
     if endpoint_url:
@@ -72,6 +74,31 @@ def streams_client(endpoint_url):
 def stream_table(dynamodb_client):
     with scoped_table(
         dynamodb_client,
+        StreamSpecification={"StreamEnabled": True, "StreamViewType": "NEW_AND_OLD_IMAGES"},
+    ) as name:
+        yield name
+
+
+@pytest.fixture(scope="module")
+def stream_gsi_table(dynamodb_client):
+    """A table with both a stream and a GSI: the shape the UpdateItem
+    contention measurement was taken on. A write on this table takes the item,
+    its index entry, the stream sequence counter and the stream record in one
+    transaction, so concurrent writers on one key have four documents to
+    conflict on."""
+    with scoped_table(
+        dynamodb_client,
+        attribute_definitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "g", "AttributeType": "S"},
+        ],
+        GlobalSecondaryIndexes=[
+            {
+                "IndexName": "g-index",
+                "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        ],
         StreamSpecification={"StreamEnabled": True, "StreamViewType": "NEW_AND_OLD_IMAGES"},
     ) as name:
         yield name
@@ -170,7 +197,14 @@ def test_batch_writes_racing_puts_on_a_stream_table_never_fail(
     """BatchWriteItem (the raced key plus a side key) racing PutItem on the
     raced key: no call fails, a batch that did not apply every request lists
     the rest in UnprocessedItems, and replaying those lands each side item
-    once."""
+    once.
+
+    Half the batch writers send the raced put first and half send it last.
+    Both orders answer the same way: a request the server could not apply now
+    is reported in UnprocessedItems whether or not an earlier request in the
+    same batch committed. A batch that fails as a whole when the contended
+    request happens to come first is the failure this covers.
+    """
     prefix = f"batch-{uuid.uuid4().hex[:8]}-"
     raced = {"pk": {"S": f"{prefix}raced"}}
 
@@ -178,18 +212,22 @@ def test_batch_writes_racing_puts_on_a_stream_table_never_fail(
         failures: list[str] = []
         records = 0
         unprocessed_rounds = 0
+        raced_first = i % 4 == 0
         for n in range(BATCH_ROUNDS):
             w = {"S": f"w{i}-{n}"}
             try:
                 if i % 2 == 0:
                     side = {"pk": {"S": f"{prefix}side-{i}"}}
-                    # The side put first, so that a raced put the server
-                    # could not apply is reported in UnprocessedItems after a
-                    # committed put rather than failing the batch.
-                    pending = [
-                        {"PutRequest": {"Item": {**side, "w": w}}},
-                        {"PutRequest": {"Item": {**raced, "w": w}}},
-                    ]
+                    raced_req = {"PutRequest": {"Item": {**raced, "w": w}}}
+                    side_req = {"PutRequest": {"Item": {**side, "w": w}}}
+                    # Writers 0, 4, ... put the raced key first, so the request
+                    # the server may not be able to apply is the first in the
+                    # batch and nothing has committed when it fails. Writers
+                    # 2, 6, ... put the side key first. Both answer 200 with
+                    # the rest of the batch in UnprocessedItems.
+                    pending = (
+                        [raced_req, side_req] if raced_first else [side_req, raced_req]
+                    )
                     while pending:
                         r = raw_client.batch_write_item(RequestItems={stream_table: pending})
                         left = r.get("UnprocessedItems", {}).get(stream_table, [])
@@ -201,7 +239,8 @@ def test_batch_writes_racing_puts_on_a_stream_table_never_fail(
                     raw_client.put_item(TableName=stream_table, Item={**raced, "w": w})
                     records += 1
             except ClientError as e:
-                failures.append(_error_code(e))
+                order = "raced first" if raced_first else "side first"
+                failures.append(f"{_error_code(e)} ({order})")
         return failures, records, unprocessed_rounds
 
     out = _run_writers(BATCH_WRITERS, body)
@@ -219,3 +258,114 @@ def test_batch_writes_racing_puts_on_a_stream_table_never_fail(
     want = sum(records for _, records, _ in out)
     got = _wait_for_record_count(dynamodb_client, streams_client, stream_table, prefix, want)
     assert got == want, f"stream records {got}, writes applied {want}"
+
+
+def test_update_item_contention_is_never_a_transaction_conflict(
+    dynamodb_client, raw_client, stream_gsi_table
+):
+    """16 writers on one key: UpdateItem never answers 400
+    TransactionConflictException.
+
+    Amazon DynamoDB applies this shape and answers 200 to every call (measured
+    on 2026-10-23 against the service, client retries off, on a table with a
+    GSI and a stream: 16 writers x 20 `ADD c :1` and 16 writers x 20
+    `SET l = list_append(l, :m)` on one key). It answers
+    TransactionConflictException to a single-item write only while a
+    TransactWriteItems holds the item, and no caller here sends one. A write
+    this backend could not apply inside its retry budget answers 503
+    ServiceUnavailable, which the SDKs retry, the same answer PutItem and
+    DeleteItem give to the same contention.
+
+    The writes that were accepted are checked too: the counter equals the
+    number of calls that answered 200, and every marker a caller was told
+    committed is stored once, so a retried update neither drops a write nor
+    applies one twice.
+    """
+    run = uuid.uuid4().hex[:8]
+    add_key = f"upd-add-{run}"
+    list_key = f"upd-list-{run}"
+    raw_client.put_item(
+        TableName=stream_gsi_table,
+        Item={"pk": {"S": list_key}, "g": {"S": f"{list_key}-g"}, "l": {"L": []}},
+    )
+
+    def add_body(i: int) -> tuple[list[str], list[int]]:
+        outcomes: list[str] = []
+        counters: list[int] = []
+        for n in range(UPDATE_OPS):
+            try:
+                r = raw_client.update_item(
+                    TableName=stream_gsi_table,
+                    Key={"pk": {"S": add_key}},
+                    UpdateExpression="ADD #c :one SET #g = :g",
+                    ExpressionAttributeNames={"#c": "c", "#g": "g"},
+                    ExpressionAttributeValues={
+                        ":one": {"N": "1"},
+                        ":g": {"S": f"{add_key}-{i}-{n}"},
+                    },
+                    ReturnValues="ALL_NEW",
+                )
+                outcomes.append("200")
+                counters.append(int(r["Attributes"]["c"]["N"]))
+            except ClientError as e:
+                outcomes.append(_error_code(e))
+        return outcomes, counters
+
+    def list_body(i: int) -> tuple[list[str], list[str]]:
+        outcomes: list[str] = []
+        committed: list[str] = []
+        for n in range(UPDATE_OPS):
+            marker = f"m-{i}-{n}"
+            try:
+                raw_client.update_item(
+                    TableName=stream_gsi_table,
+                    Key={"pk": {"S": list_key}},
+                    UpdateExpression="SET #l = list_append(#l, :m)",
+                    ExpressionAttributeNames={"#l": "l"},
+                    ExpressionAttributeValues={":m": {"L": [{"S": marker}]}},
+                )
+                outcomes.append("200")
+                committed.append(marker)
+            except ClientError as e:
+                outcomes.append(_error_code(e))
+        return outcomes, committed
+
+    add_out = _run_writers(UPDATE_WRITERS, add_body)
+    list_out = _run_writers(UPDATE_WRITERS, list_body)
+
+    outcomes = [o for part, _ in add_out + list_out for o in part]
+    conflicts = [o for o in outcomes if "TransactionConflict" in o]
+    assert not conflicts, (
+        f"{len(conflicts)} of {len(outcomes)} UpdateItem calls answered "
+        f"{sorted(set(conflicts))}; the service answers 200 to this shape and "
+        "a write this backend could not apply answers 503"
+    )
+    unexpected = sorted({o for o in outcomes if o not in ("200", "503 ServiceUnavailable")})
+    assert not unexpected, f"unexpected answers: {unexpected}"
+
+    applied = sum(1 for part, _ in add_out for o in part if o == "200")
+    stored = int(
+        dynamodb_client.get_item(
+            TableName=stream_gsi_table, Key={"pk": {"S": add_key}}, ConsistentRead=True
+        )["Item"]["c"]["N"]
+    )
+    assert stored == applied, f"counter {stored}, calls answered 200 {applied}"
+    returned = [v for _, counters in add_out for v in counters]
+    assert sorted(returned) == list(range(1, applied + 1)), (
+        "each ALL_NEW counter value should be returned to exactly one caller, "
+        f"got {len(set(returned))} distinct of {len(returned)}"
+    )
+
+    committed = {m for _, part in list_out for m in part}
+    stored_list = [
+        x["S"]
+        for x in dynamodb_client.get_item(
+            TableName=stream_gsi_table, Key={"pk": {"S": list_key}}, ConsistentRead=True
+        )["Item"]["l"]["L"]
+    ]
+    assert len(stored_list) == len(set(stored_list)), "a marker was appended twice"
+    assert committed == set(stored_list), (
+        f"{len(committed - set(stored_list))} markers a caller was told committed are "
+        f"not stored, {len(set(stored_list) - committed)} stored markers were never "
+        "reported as committed"
+    )

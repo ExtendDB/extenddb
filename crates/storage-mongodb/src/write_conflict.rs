@@ -42,8 +42,8 @@ pub(crate) fn transaction_error(e: mongodb::error::Error) -> StorageError {
 ///
 /// Amazon DynamoDB applies concurrent writes to one item one after another
 /// and answers each with 200; it answers `TransactionConflictException` to a
-/// PutItem or DeleteItem only while a TransactWriteItems holds the item,
-/// which this backend cannot tell apart from a race against other
+/// PutItem, DeleteItem or UpdateItem only while a TransactWriteItems holds
+/// the item, which this backend cannot tell apart from a race against other
 /// single-item writes. A write that ran out of attempts is a write the
 /// backend could not apply now, so it is reported as
 /// [`StorageError::Transient`], which the engine answers as HTTP 503
@@ -51,6 +51,11 @@ pub(crate) fn transaction_error(e: mongodb::error::Error) -> StorageError {
 /// `ServiceUnavailable` (HTTP 503) as "OK to retry? Yes", and the SDK retry
 /// modes retry a 503 on their own, whereas a 400 `TransactionConflictException`
 /// is handed to the application.
+///
+/// Every single-item write path uses this one error, so the three operations
+/// answer the same way to the same contention. `TransactWriteItems` keeps
+/// `TransactionCanceledException` with a per-operation `TransactionConflict`
+/// reason, which is what the service answers for a transaction.
 pub(crate) fn retry_budget_exhausted(operation: &str, attempts: u32) -> StorageError {
     StorageError::Transient(format!(
         "{operation}: the write lost {attempts} attempts to concurrent writers; retry the request"

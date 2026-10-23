@@ -1061,8 +1061,12 @@ impl MongoEngine {
             }
         }
 
-        Err(StorageError::TransactionConflict(
-            "UpdateItem: too many concurrent write conflicts, giving up".to_owned(),
+        // Retry ceiling exhausted: see `write_conflict::retry_budget_exhausted`.
+        // The same answer as PutItem and DeleteItem, which lose their budget to
+        // the same contention on the same item.
+        Err(crate::write_conflict::retry_budget_exhausted(
+            "UpdateItem",
+            TRANSIENT_RETRY_ATTEMPTS,
         ))
     }
 
