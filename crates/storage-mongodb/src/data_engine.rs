@@ -413,7 +413,24 @@ impl MongoEngine {
         // single-document atomicity instead. Two concurrent writes
         // serialize at the storage engine level; one wins the last-
         // writer-wins race and the other's version is overwritten.
-        // No txn, no retry loop, no possible 500 from contention.
+        //
+        // The one exception is two puts that both create the item: each
+        // finds no document and each inserts, and the second insert fails
+        // with a duplicate-key error. The collection has two unique
+        // indexes: `_id_`, and one on the key fields (`pk`, plus the sort
+        // key field on a table with a sort key). MongoDB retries such an
+        // upsert itself only when the filter is an equality on the fields
+        // of the index that raised the error. This filter names `pk` and,
+        // on a table with a sort key, the sort key field, so the server
+        // would retry a collision on the key-field index. Every
+        // duplicate-key error measured on MongoDB 7.0 names `_id_`, which
+        // the filter does not name, so the server does not retry it and
+        // this loop does. The error means another put's item is already in
+        // the collection, so the next attempt finds that item, replaces it
+        // and returns it as the old image; if a delete removed that item
+        // first, the next attempt inserts. Attempts share the transient
+        // retry budget and back off between them, as the transaction path
+        // below does.
         if condition.is_none()
             && stream.is_none()
             && self.gsi_cache_get_fresh(&key_info.table_id) == Some(false)
@@ -424,13 +441,23 @@ impl MongoEngine {
                 .upsert(true)
                 .return_document(ReturnDocument::Before)
                 .build();
-            let old_doc = coll
-                .find_one_and_replace(key_filter, new_doc)
-                .with_options(opts)
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            let old_item = old_doc.as_ref().map(document_to_item).transpose()?;
-            return Ok(if return_old { old_item } else { None });
+            for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
+                match coll
+                    .find_one_and_replace(key_filter.clone(), &new_doc)
+                    .with_options(opts.clone())
+                    .await
+                {
+                    Ok(old_doc) => {
+                        let old_item = old_doc.as_ref().map(document_to_item).transpose()?;
+                        return Ok(if return_old { old_item } else { None });
+                    }
+                    Err(e) if is_duplicate_key(&e) => {
+                        backoff_sleep(attempt).await;
+                    }
+                    Err(e) => return Err(StorageError::Internal(e.to_string())),
+                }
+            }
+            return Err(create_race_exhausted(TRANSIENT_RETRY_ATTEMPTS));
         }
 
         let mut session = self
@@ -440,6 +467,7 @@ impl MongoEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let tx_options = self.write_transaction_options();
+        let mut lost_create_races = 0;
 
         for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
             let new_doc =
@@ -455,6 +483,8 @@ impl MongoEngine {
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
 
+            // Set when the unconditional upsert below lost a create race.
+            let mut lost_create_race = false;
             let attempt_res: Result<Option<Item>, TxErr> = async {
                 let old_item: Option<Item>;
 
@@ -521,12 +551,26 @@ impl MongoEngine {
                         .upsert(true)
                         .return_document(ReturnDocument::Before)
                         .build();
-                    let old_doc = coll
+                    // Same create race as the fast path above: a
+                    // duplicate-key error means another put created the
+                    // item first. Run the transaction again, so that it
+                    // finds that item, replaces it, and removes its index
+                    // entries and records it as the stream old image. A
+                    // lost create race uses the same retry budget and
+                    // backoff as a write conflict.
+                    let old_doc = match coll
                         .find_one_and_replace(key_filter.clone(), new_doc)
                         .with_options(opts)
                         .session(&mut session)
                         .await
-                        .map_err(TxErr::from)?;
+                    {
+                        Ok(old_doc) => old_doc,
+                        Err(e) if is_duplicate_key(&e) => {
+                            lost_create_race = true;
+                            return Err(TxErr::Transient);
+                        }
+                        Err(e) => return Err(TxErr::from(e)),
+                    };
                     old_item = old_doc.as_ref().map(document_to_item).transpose()?;
                 }
 
@@ -564,6 +608,9 @@ impl MongoEngine {
                 },
                 Err(TxErr::Transient) => {
                     let _ = session.abort_transaction().await;
+                    if lost_create_race {
+                        lost_create_races += 1;
+                    }
                     backoff_sleep(attempt).await;
                     continue;
                 }
@@ -572,6 +619,12 @@ impl MongoEngine {
                     return Err(e);
                 }
             }
+        }
+
+        // Every attempt lost the create race: give up with the same error
+        // as the sessionless path above.
+        if lost_create_races == TRANSIENT_RETRY_ATTEMPTS {
+            return Err(create_race_exhausted(lost_create_races));
         }
 
         // Retry ceiling exhausted. RFC-0003 §4.3 requires
@@ -3609,17 +3662,36 @@ enum CommitOutcome {
     RerunBody,
 }
 
-/// Detect a duplicate-key error (E11000, code 11000). Used at
-/// conditional-insert sites — a duplicate is the manifestation of a
-/// conditional-put race, so it must be surfaced as
-/// `ConditionalCheckFailedException` rather than a 500.
+/// Detect a duplicate-key error (E11000, code 11000).
+///
+/// The driver reports it in two forms: `insert_one` returns it as a write
+/// error, and `findAndModify` (`find_one_and_replace` with upsert) returns
+/// it as a command error. At conditional-insert sites a duplicate is the
+/// manifestation of a conditional-put race, so it must be surfaced as
+/// `ConditionalCheckFailedException` rather than a 500. At unconditional
+/// upsert sites it means another put created the item first, and the put
+/// is retried so that it replaces that item.
 fn is_duplicate_key(e: &mongodb::error::Error) -> bool {
-    matches!(
-        *e.kind,
-        mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(
-            mongodb::error::WriteError { code: 11000, .. }
-        ))
-    )
+    matches!(*e.kind, mongodb::error::ErrorKind::Command(ref c) if c.code == 11000)
+        || matches!(
+            *e.kind,
+            mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(
+                mongodb::error::WriteError { code: 11000, .. }
+            ))
+        )
+}
+
+/// The error when every attempt of an unconditional PutItem lost the create
+/// race: each attempt found no item, and its insert hit an item another
+/// writer created, which was deleted again before the next attempt read it.
+/// `attempt` is the number of attempts made. The message is the internal
+/// error (HTTP 500) the PostgreSQL backend returns when its own retries of
+/// this race run out.
+fn create_race_exhausted(attempt: u32) -> StorageError {
+    StorageError::Internal(format!(
+        "PutItem could not create the item after {attempt} attempts: each insert lost the \
+         create race to a concurrent writer"
+    ))
 }
 
 /// Build a `mongodb::error::Error` carrying the given error labels.
@@ -4134,6 +4206,284 @@ mod tests {
         let e = command_error(11600);
         assert!(matches!(classify_commit_error(&e), CommitErrorClass::Fatal));
         assert!(!is_transient_write_conflict(&e));
+    }
+
+    /// Build a write error with the given code, the form `insert_one`
+    /// returns.
+    fn write_error(code: i32) -> mongodb::error::Error {
+        let write_error: mongodb::error::WriteError = bson::from_document(doc! {
+            "code": code,
+            "codeName": "SyntheticTestError",
+            "errmsg": "synthetic write error",
+        })
+        .expect("static WriteError document deserializes");
+        mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(write_error))
+            .into()
+    }
+
+    #[test]
+    fn duplicate_key_is_recognized_as_a_command_error_and_as_a_write_error() {
+        // findAndModify, which an upserting find_one_and_replace sends,
+        // reports E11000 as a command error.
+        assert!(is_duplicate_key(&command_error(11000)));
+        // insert_one reports it as a write error.
+        assert!(is_duplicate_key(&write_error(11000)));
+        assert!(!is_duplicate_key(&command_error(112)));
+        assert!(!is_duplicate_key(&write_error(112)));
+        assert!(!is_transient_write_conflict(&command_error(11000)));
+    }
+
+    /// Connection string of the MongoDB replica set for a test that needs a
+    /// server, or `None` after reporting that the test is skipped.
+    ///
+    /// `devtools/run-mongodb-tests` exports `EXTENDDB_TEST_MONGODB_URI`
+    /// together with `EXTENDDB_TEST_MONGODB_CONTAINER`. Without the URI the
+    /// test prints a SKIP line and returns, as the PostgreSQL storage crate's
+    /// live tests do. The line is written to the stderr handle, because the
+    /// test harness captures `eprintln!` output of a passing test. When the
+    /// container variable is set and the URI is not, the test is running
+    /// under that runner and the URI export is missing, so it fails instead
+    /// of skipping.
+    fn live_mongodb_uri(test: &str) -> Option<String> {
+        let set = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
+        if let Some(uri) = set("EXTENDDB_TEST_MONGODB_URI") {
+            return Some(uri);
+        }
+        if let Some(container) = set("EXTENDDB_TEST_MONGODB_CONTAINER") {
+            panic!(
+                "{test}: EXTENDDB_TEST_MONGODB_CONTAINER is set ({container}) but \
+                 EXTENDDB_TEST_MONGODB_URI is not; devtools/run-mongodb-tests exports both"
+            );
+        }
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "SKIP {test}: EXTENDDB_TEST_MONGODB_URI is not set, so there is no MongoDB replica \
+             set to run against."
+        );
+        None
+    }
+
+    /// Run `body` with an engine on two new databases of the replica set at
+    /// `uri`, then drop both databases, also when `body` panics.
+    async fn with_scratch_engine<F, Fut>(uri: &str, body: F)
+    where
+        F: FnOnce(MongoEngine, mongodb::Database) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        use futures::FutureExt as _;
+        let client = mongodb::Client::with_uri_str(uri)
+            .await
+            .expect("EXTENDDB_TEST_MONGODB_URI must parse");
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let data_db = client.database(&format!("extenddb_test_{suffix}"));
+        let catalog_db = client.database(&format!("extenddb_test_{suffix}_catalog"));
+        let engine = MongoEngine {
+            client: client.clone(),
+            catalog_db: catalog_db.clone(),
+            data_db: data_db.clone(),
+            region: "us-east-1".to_owned(),
+            gsi_cache: Default::default(),
+            tx_read_concern: mongodb::options::ReadConcern::snapshot(),
+        };
+        let outcome = std::panic::AssertUnwindSafe(body(engine, data_db.clone()))
+            .catch_unwind()
+            .await;
+        let _ = data_db.drop().await;
+        let _ = catalog_db.drop().await;
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// Key info for a table with a string hash key `pk`. The GSI cache is set
+    /// so that an unconditional put takes the sessionless path (`has_gsi`
+    /// false) or the transaction path (`has_gsi` true). The catalog has no
+    /// index rows, so the transaction path writes no index entries.
+    fn hash_key_table(engine: &MongoEngine, table_id: &str, has_gsi: bool) -> TableKeyInfo {
+        engine.gsi_cache_set(table_id, has_gsi);
+        let key_schema = vec![KeySchemaElement {
+            attribute_name: "pk".to_owned(),
+            key_type: extenddb_core::types::KeyType::Hash,
+        }];
+        TableKeyInfo {
+            table_id: table_id.to_owned(),
+            key_schema: key_schema.clone(),
+            base_key_schema: key_schema,
+            attribute_definitions: vec![extenddb_core::types::AttributeDefinition {
+                attribute_name: "pk".to_owned(),
+                attribute_type: ScalarAttributeType::S,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn item_with(pk: &str, w: &str) -> Item {
+        let mut item = Item::new();
+        item.insert("pk".to_owned(), AttributeValue::S(pk.to_owned()));
+        item.insert("w".to_owned(), AttributeValue::S(w.to_owned()));
+        item
+    }
+
+    fn stored_document(item: &Item, key_info: &TableKeyInfo) -> Document {
+        item_to_document(item, &key_info.key_schema, &key_info.attribute_definitions)
+            .expect("test item converts to a document")
+    }
+
+    /// An unconditional PutItem whose insert keeps colliding on `_id` retries
+    /// for the whole transient retry budget, then gives up with the create
+    /// race error, on the sessionless path and on the transaction path.
+    ///
+    /// A document that holds the item's `_id` under a different `pk` makes
+    /// every attempt collide: the put's filter on `pk` finds no item, and its
+    /// insert raises the same duplicate-key error a put gets when another
+    /// put created the item first. The obstructing document stays as it was.
+    #[tokio::test]
+    async fn unconditional_put_retries_a_lost_create_race_and_then_gives_up() {
+        let Some(uri) =
+            live_mongodb_uri("unconditional_put_retries_a_lost_create_race_and_then_gives_up")
+        else {
+            return;
+        };
+        with_scratch_engine(&uri, |engine, data_db| async move {
+            let maps = ExpressionMaps::default();
+            for (table_id, has_gsi) in [("sessionless-put", false), ("transaction-put", true)] {
+                let key_info = hash_key_table(&engine, table_id, has_gsi);
+                let item = item_with("k1", "new");
+                let id = stored_document(&item, &key_info)
+                    .get("_id")
+                    .cloned()
+                    .expect("document has an _id");
+                let coll = data_db.collection::<Document>(&data_collection_name(table_id));
+                coll.insert_one(doc! { "_id": id.clone(), "pk": "another-key", "item_data": {} })
+                    .await
+                    .expect("insert the obstructing document");
+
+                let res = engine
+                    .put_item_impl(&key_info, item, true, None, &maps, None)
+                    .await;
+
+                let want =
+                    format!("could not create the item after {TRANSIENT_RETRY_ATTEMPTS} attempts");
+                match res {
+                    Err(StorageError::Internal(msg)) => assert!(
+                        msg.contains(&want),
+                        "{table_id}: want the create race error, got: {msg}"
+                    ),
+                    other => panic!("{table_id}: want the create race error, got: {other:?}"),
+                }
+                assert_eq!(
+                    coll.count_documents(doc! {}).await.expect("count"),
+                    1,
+                    "{table_id}: the put wrote a document"
+                );
+                let left = coll
+                    .find_one(doc! { "_id": id })
+                    .await
+                    .expect("read back")
+                    .expect("obstructing document is still there");
+                assert_eq!(left.get_str("pk").expect("pk"), "another-key", "{table_id}");
+            }
+        })
+        .await;
+    }
+
+    /// What happens to the obstructing document while the put retries.
+    #[derive(Clone, Copy, Debug)]
+    enum Obstruction {
+        /// It is replaced, under the same `_id`, with the item of another put
+        /// that created the key.
+        BecomesTheOtherPutsItem,
+        /// It is deleted, as a DeleteItem removes the item another put
+        /// created.
+        IsDeleted,
+    }
+
+    /// An unconditional PutItem that lost the create race succeeds on a later
+    /// attempt, on the sessionless path and on the transaction path.
+    ///
+    /// The put starts while a document holds the item's `_id` under another
+    /// `pk`, so its first attempts collide. 100 ms later another task either
+    /// replaces that document with the item of another put on the same key,
+    /// or deletes it. The put's attempts back off between collisions and
+    /// together take longer than 100 ms, so a later attempt either replaces
+    /// the other put's item and returns it as the old image, or inserts and
+    /// returns no old image. In both cases the stored document is this put's
+    /// item.
+    #[tokio::test]
+    async fn unconditional_put_that_lost_a_create_race_succeeds_on_a_later_attempt() {
+        let Some(uri) = live_mongodb_uri(
+            "unconditional_put_that_lost_a_create_race_succeeds_on_a_later_attempt",
+        ) else {
+            return;
+        };
+        with_scratch_engine(&uri, |engine, data_db| async move {
+            let maps = ExpressionMaps::default();
+            for (path, has_gsi) in [("sessionless", false), ("transaction", true)] {
+                for change in [Obstruction::BecomesTheOtherPutsItem, Obstruction::IsDeleted] {
+                    let table_id = format!("{path}-{change:?}");
+                    let key_info = hash_key_table(&engine, &table_id, has_gsi);
+                    let item = item_with("k1", "this-put");
+                    let other_put = item_with("k1", "other-put");
+                    let other_put_doc = stored_document(&other_put, &key_info);
+                    let id = other_put_doc
+                        .get("_id")
+                        .cloned()
+                        .expect("document has an _id");
+                    let coll = data_db.collection::<Document>(&data_collection_name(&table_id));
+                    coll.insert_one(
+                        doc! { "_id": id.clone(), "pk": "another-key", "item_data": {} },
+                    )
+                    .await
+                    .expect("insert the obstructing document");
+
+                    let put =
+                        engine.put_item_impl(&key_info, item.clone(), true, None, &maps, None);
+                    let clear = async {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        match change {
+                            Obstruction::BecomesTheOtherPutsItem => {
+                                coll.replace_one(doc! { "_id": id.clone() }, other_put_doc.clone())
+                                    .await
+                                    .expect("replace the obstructing document");
+                            }
+                            Obstruction::IsDeleted => {
+                                coll.delete_one(doc! { "_id": id.clone() })
+                                    .await
+                                    .expect("delete the obstructing document");
+                            }
+                        }
+                    };
+                    let (res, ()) = tokio::join!(put, clear);
+
+                    let old = match res {
+                        Ok(old) => old,
+                        Err(e) => panic!("{table_id}: want the put to succeed, got: {e:?}"),
+                    };
+                    let want_old = match change {
+                        Obstruction::BecomesTheOtherPutsItem => Some(other_put),
+                        Obstruction::IsDeleted => None,
+                    };
+                    assert_eq!(old, want_old, "{table_id}: old image");
+                    assert_eq!(
+                        coll.count_documents(doc! {}).await.expect("count"),
+                        1,
+                        "{table_id}: documents in the collection"
+                    );
+                    let stored = coll
+                        .find_one(doc! { "_id": id })
+                        .await
+                        .expect("read back")
+                        .expect("the put's document is stored");
+                    assert_eq!(
+                        document_to_item(&stored).expect("stored document converts to an item"),
+                        item,
+                        "{table_id}: stored item"
+                    );
+                }
+            }
+        })
+        .await;
     }
 
     #[derive(Default)]
