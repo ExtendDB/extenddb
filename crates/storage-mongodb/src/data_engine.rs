@@ -627,12 +627,19 @@ impl MongoEngine {
             return Err(create_race_exhausted(lost_create_races));
         }
 
-        // Retry ceiling exhausted. RFC-0003 §4.3 requires
-        // `TransactionConflictException` when a single-item write can't
-        // serialize against concurrent activity — never a bare 500.
-        Err(StorageError::TransactionConflict(
-            "PutItem: too many concurrent write conflicts, giving up".to_owned(),
-        ))
+        // Retry ceiling exhausted. Amazon DynamoDB applies concurrent puts
+        // on one item one after another and answers each with 200; it
+        // answers `TransactionConflictException` to a PutItem only when the
+        // item is held by an in-flight TransactWriteItems, which this
+        // backend cannot tell apart from a lost race against other puts.
+        // Give up with a transient error, which the engine answers as HTTP
+        // 503 ServiceUnavailable: every AWS SDK retries that, and the retry
+        // succeeds once the contention has passed, whereas a
+        // `TransactionConflictException` is surfaced to the application.
+        Err(StorageError::Transient(format!(
+            "PutItem: the write lost {TRANSIENT_RETRY_ATTEMPTS} attempts to concurrent writers; \
+             retry the request"
+        )))
     }
 
     async fn get_item_impl(
@@ -3544,11 +3551,22 @@ pub(crate) struct GsiBackfillProgress {
 // ── Contention / retry helpers ──────────────────────────────────────────
 
 /// Maximum number of times to retry a write that MongoDB aborted as a
-/// transient conflict. Small enough that we don't lock a partition on
-/// sustained hot-key contention; large enough to absorb ordinary
-/// snapshot-isolation aborts. Matches the OCC retry ceiling elsewhere
-/// in this file.
-const TRANSIENT_RETRY_ATTEMPTS: u32 = 50;
+/// transient conflict.
+///
+/// MongoDB aborts the loser of a same-document conflict at once instead of
+/// queueing it, so a hot key is settled by retries with backoff: of N
+/// writers on one key, one commits per round and the rest start over. The
+/// backoff is random, so a writer can lose many rounds in a row, and the
+/// chance of losing every attempt falls off exponentially with the budget.
+/// Measured with 32 clients putting one key of a table with a GSI (2,016
+/// puts per run, MongoDB 7.0 on one 16-core host): 50 attempts left 15 to
+/// 25 percent of the puts without a commit; 400 left none in four runs at a
+/// load average of 15 and one put in 2,016 at a load average of 30, and 20
+/// of 1,984 with 64 clients. With `backoff_sleep` capped at 12.8 ms, 1,000
+/// attempts bound the wait at about 6.4 s of backoff plus the attempts' own
+/// round trips before the write gives up, under the SDKs' request timeouts.
+/// Same ceiling for every write path in this file.
+const TRANSIENT_RETRY_ATTEMPTS: u32 = 1000;
 
 /// Return type of `try_build_native_update`. Distinguishes an
 /// operator-document update (`{$set, $unset, $inc}`) from an
@@ -4482,6 +4500,186 @@ mod tests {
                     );
                 }
             }
+        })
+        .await;
+    }
+
+    /// Concurrent unconditional puts on one key of a table with a GSI all
+    /// commit: 32 writers put the same key 8 times each, every put returns
+    /// Ok, and the index holds the final item's entry only. On the service
+    /// every one of these puts answers 200; the backend reaches that through
+    /// its retry budget.
+    ///
+    /// The table has a GSI row in the catalog, so `sync_indexes_in_session`
+    /// writes an index entry per put and keeps the GSI cache at `true`.
+    /// Without the row the first committed put flips the cache to `false`,
+    /// the other writers take the sessionless path, and a sessionless
+    /// findAndModify on a document an open transaction has written waits for
+    /// that transaction; with 32 writers starting transactions without pause
+    /// the run stalled for minutes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_unconditional_puts_on_one_key_of_a_gsi_table_all_commit() {
+        let Some(uri) =
+            live_mongodb_uri("concurrent_unconditional_puts_on_one_key_of_a_gsi_table_all_commit")
+        else {
+            return;
+        };
+        with_scratch_engine(&uri, |engine, data_db| async move {
+            const WRITERS: usize = 32;
+            const PUTS: usize = 8;
+            let engine = std::sync::Arc::new(engine);
+            let key_info = std::sync::Arc::new(hash_key_table(&engine, "hot-key", true));
+            let gsi_key_schema = vec![KeySchemaElement {
+                attribute_name: "gk".to_owned(),
+                key_type: extenddb_core::types::KeyType::Hash,
+            }];
+            let projection = Projection {
+                projection_type: ProjectionType::All,
+                non_key_attributes: None,
+            };
+            engine
+                .catalog_db
+                .collection::<Document>("indexes")
+                .insert_one(doc! {
+                    "_id": { "table_id": "hot-key", "index_name": "gk-index" },
+                    "index_id": "hot-key-gk-index",
+                    "index_type": "GSI",
+                    "key_schema": bson::to_bson(&gsi_key_schema).expect("key schema"),
+                    "projection": bson::to_bson(&projection).expect("projection"),
+                    "index_status": "ACTIVE",
+                })
+                .await
+                .expect("insert the GSI catalog row");
+            let start = std::sync::Arc::new(tokio::sync::Barrier::new(WRITERS));
+            let mut tasks = Vec::with_capacity(WRITERS);
+            for w in 0..WRITERS {
+                let (engine, key_info, start) = (engine.clone(), key_info.clone(), start.clone());
+                tasks.push(tokio::spawn(async move {
+                    let maps = ExpressionMaps::default();
+                    start.wait().await;
+                    let mut failures = Vec::new();
+                    for n in 0..PUTS {
+                        let mut item = item_with("k1", &format!("w{w}-{n}"));
+                        item.insert("gk".to_owned(), AttributeValue::S(format!("g-w{w}-{n}")));
+                        if let Err(e) = engine
+                            .put_item_impl(&key_info, item, false, None, &maps, None)
+                            .await
+                        {
+                            failures.push(format!("{e:?}"));
+                        }
+                    }
+                    failures
+                }));
+            }
+            let mut failures = Vec::new();
+            for task in tasks {
+                failures.extend(task.await.expect("writer task"));
+            }
+            assert!(
+                failures.is_empty(),
+                "{} of {} puts failed: {:?}",
+                failures.len(),
+                WRITERS * PUTS,
+                &failures[..failures.len().min(3)]
+            );
+            let coll = data_db.collection::<Document>(&data_collection_name("hot-key"));
+            assert_eq!(coll.count_documents(doc! {}).await.expect("count"), 1);
+            let stored = coll
+                .find_one(doc! {})
+                .await
+                .expect("read")
+                .expect("the item");
+            let stored = document_to_item(&stored).expect("stored document converts to an item");
+            let idx_coll =
+                data_db.collection::<Document>(&data_collection_name("hot-key-gk-index"));
+            use futures::TryStreamExt as _;
+            let entries: Vec<Document> = idx_coll
+                .find(doc! {})
+                .await
+                .expect("read the index")
+                .try_collect()
+                .await
+                .expect("collect the index");
+            assert_eq!(entries.len(), 1, "index entries: {entries:?}");
+            let entry = document_to_item(&entries[0]).expect("index entry converts to an item");
+            assert_eq!(
+                entry.get("gk"),
+                stored.get("gk"),
+                "index entry {entry:?} for {stored:?}"
+            );
+        })
+        .await;
+    }
+
+    /// A put whose every attempt conflicts gives up with a transient error,
+    /// the one the engine answers as HTTP 503, not with a transaction
+    /// conflict. Another session writes the item inside a transaction it
+    /// never commits, so each attempt of the put hits a write conflict until
+    /// the budget is spent; the held transaction is then aborted.
+    #[tokio::test]
+    async fn unconditional_put_that_loses_every_attempt_gives_up_with_a_transient_error() {
+        let Some(uri) = live_mongodb_uri(
+            "unconditional_put_that_loses_every_attempt_gives_up_with_a_transient_error",
+        ) else {
+            return;
+        };
+        with_scratch_engine(&uri, |engine, data_db| async move {
+            let maps = ExpressionMaps::default();
+            let key_info = hash_key_table(&engine, "held-key", true);
+            let coll = data_db.collection::<Document>(&data_collection_name("held-key"));
+            let held = stored_document(&item_with("k1", "held"), &key_info);
+            coll.insert_one(held.clone())
+                .await
+                .expect("insert the item");
+
+            let mut holder = engine.client.start_session().await.expect("session");
+            holder
+                .start_transaction()
+                .with_options(engine.write_transaction_options())
+                .await
+                .expect("start the holding transaction");
+            let rewritten = stored_document(&item_with("k1", "rewritten"), &key_info);
+            coll.replace_one(doc! { "pk": "k1" }, rewritten)
+                .session(&mut holder)
+                .await
+                .expect("write the item inside the held transaction");
+
+            let started = std::time::Instant::now();
+            let res = engine
+                .put_item_impl(
+                    &key_info,
+                    item_with("k1", "this-put"),
+                    false,
+                    None,
+                    &maps,
+                    None,
+                )
+                .await;
+            let elapsed = started.elapsed();
+            let _ = holder.abort_transaction().await;
+
+            match res {
+                Err(StorageError::Transient(msg)) => assert!(
+                    msg.contains(&format!("lost {TRANSIENT_RETRY_ATTEMPTS} attempts")),
+                    "message: {msg}"
+                ),
+                other => panic!("want the transient exhausted-budget error, got: {other:?}"),
+            }
+            // The budget is bounded: 1,000 attempts with backoff capped at
+            // 12.8 ms end under a client's read timeout.
+            assert!(
+                elapsed < std::time::Duration::from_secs(30),
+                "took {elapsed:?}"
+            );
+            let stored = coll
+                .find_one(doc! { "pk": "k1" })
+                .await
+                .expect("read")
+                .expect("item");
+            assert_eq!(
+                document_to_item(&stored).expect("item"),
+                item_with("k1", "held")
+            );
         })
         .await;
     }
