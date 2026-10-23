@@ -1,20 +1,41 @@
-# Publishes CANDIDATE npm packages for the ExtendDB dev launcher: the five
-# @extenddb/<os>-<arch> platform binary packages plus the `@extenddb/dev` launcher
-# that selects among them via optionalDependencies.
+# Publishes and promotes the npm packages for the ExtendDB dev launcher: the
+# five @extenddb/<os>-<arch> platform binary packages plus the `@extenddb/dev`
+# launcher that selects among them via optionalDependencies.
 #
-# This workflow deliberately stops at the candidate. Every package is published
-# under the `candidate` dist-tag, never `latest`, so nothing a user installs by
-# default can come from an unverified run. Promotion is a maintainer step
-# recorded in packaging/README.md:
+# Two dispatch actions, each a separately approved run, mirroring the container
+# release (release-image.yml publishes a candidate, promote-image.yml moves the
+# human tags):
 #
-#   npm dist-tag add @extenddb/dev@<version> latest   (and one per platform pkg)
+#   candidate  (default) Builds on five native runners and publishes every
+#              package under the `candidate` dist-tag, never `latest`, so
+#              nothing a user installs by default can come from an unverified
+#              run. Then installs the candidate back from the registry on all
+#              five platforms and proves it (see `verify`).
 #
-# Shape, and why (mirrors .github/workflows/release-image.yml):
+#   promote    For a candidate already on the registry: proves it again from
+#              the registry on all five platforms, then moves `latest` on all
+#              six packages with `npm dist-tag add`, authenticated by the same
+#              trusted-publishing OIDC credential the publish uses. No
+#              maintainer login, token or 2FA device is involved, so the step
+#              no longer depends on one person. Before `latest` moves, a
+#              transient tag is added and removed on every package: that is a
+#              write, so it proves the credential and the dist-tag permission
+#              on each entry. Re-running for the version `latest` already
+#              holds therefore exercises the whole path (`npm dist-tag add`
+#              alone would return before any request) and leaves every
+#              durable tag as it was.
+#
+# Shape, and why:
 #
 #   gate      Runs once. Cheap checks that need no build: the dispatch input is
 #             validated as a strict `vX.Y.Z` tag, resolved to a full commit
 #             SHA, that SHA must be contained in origin/main, and the version
-#             must agree with the workspace version at the tagged commit.
+#             must agree with the workspace version at the tagged commit. For
+#             `candidate` it refuses a version already on the registry. For
+#             `promote` it requires every package of the release to be on
+#             the registry at exactly that version, each with a provenance
+#             attestation whose signed statement names this repository and
+#             this workflow file, and refuses to move `latest` backwards.
 #
 #             The launcher versions WITH the server, off the same `vX.Y.Z` tag
 #             the container release uses, because the five platform packages
@@ -36,11 +57,35 @@
 #             registry credentials.
 #
 #   publish   Runs once, after all five platforms pass, in the `npm` protected
-#             environment. This is the only job with the npm token, so the
-#             token never exists in a job that is executing a freshly built
-#             binary, and never exists at all unless every platform passed.
-#             Publishes with --provenance, binding each package to this
-#             workflow run and commit.
+#             environment. No job that executes a freshly built binary holds
+#             a credential: `build` and `verify` run binaries and have no
+#             id-token; `publish` and `promote` mint the OIDC credential and
+#             run no binary. The credential exists only once every platform
+#             passed. Publishes with --provenance, binding each package to
+#             this workflow run and commit.
+#
+#   verify    One job per platform, each on its NATIVE runner, holding no
+#             credentials. Installs `@extenddb/dev@X.Y.Z` from the public
+#             registry into an empty directory, exactly as a user would, and
+#             requires: the launcher and its platform package both at X.Y.Z;
+#             `npm audit signatures` verifying registry signatures AND
+#             provenance attestations on both; the binary reporting X.Y.Z; the
+#             launcher resolving its platform package on its own (the build
+#             matrix cannot test that: no platform package is installed
+#             there); and the launcher suite from the tagged commit passing
+#             against the installed launcher and binary, in both storage
+#             modes. Runs after `publish` for a candidate, and before
+#             `promote`, so what is promoted is what was proved minutes
+#             earlier.
+#
+#   promote   Runs once, after all five verify legs pass, in the `npm`
+#             protected environment, so it waits for a second reviewer
+#             approval. Re-reads every `latest` seconds before writing (the
+#             gate's read is minutes old by then), proves the dist-tag write
+#             on every package with a transient tag, then moves `latest` to
+#             X.Y.Z on each platform package and then the launcher, reads
+#             every tag back from the registry, and fails if any did not move
+#             or a probe tag remains.
 #
 # Trigger: manual workflow_dispatch only. There is intentionally no
 # `push: tags:` trigger: a tag-triggered run executes the workflow definition
@@ -51,7 +96,8 @@
 # One-time setup (Settings -> Environments -> npm):
 #   Deployment branches: Selected, rule `branch: main`. A dispatch from any
 #     other ref cannot read the token at all.
-#   Required reviewers: the candidate publish must be approved before it runs.
+#   Required reviewers: the candidate publish and the promotion must each be
+#     approved before they run.
 #   Secrets: none. Authentication is npm trusted publishing (OIDC), so there
 #     is no token to store, leak, or rotate. The environment gate is still
 #     load-bearing: npm matches the environment name as part of the trust
@@ -63,6 +109,9 @@
 #   Repository:           extenddb
 #   Workflow filename:    npm-publish.yml
 #   Environment:          npm
+#   Allowed actions:      npm publish, and "Allow npm dist-tag" (the promote
+#                         job needs it; without it the dist-tag step fails
+#                         naming that setting; needs npm CLI 11.21.0 or later)
 # Every field is matched exactly, the workflow filename included, so renaming
 # this file breaks publishing until the six entries are updated.
 #
@@ -76,8 +125,16 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing release tag to publish npm candidates for, e.g. v0.1.4'
+        description: 'Existing release tag, e.g. v0.1.4'
         required: true
+      action:
+        description: 'candidate: build and publish under the candidate dist-tag, then verify. promote: verify the published candidate and move latest.'
+        required: true
+        type: choice
+        default: candidate
+        options:
+          - candidate
+          - promote
 
 # Nothing is committed, so no write scope on the repo is needed. The publish
 # job adds id-token at job level, which is what both authenticates to npm
@@ -97,6 +154,7 @@ jobs:
     outputs:
       version: ${{ steps.meta.outputs.version }}
       sha: ${{ steps.meta.outputs.sha }}
+      platforms: ${{ steps.meta.outputs.platforms }}
     steps:
       - name: Check out main (the reviewed workflow's own ref)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
@@ -109,8 +167,13 @@ jobs:
           # Dispatch inputs are untrusted; they reach the shell only through the
           # environment, never by interpolation into the script source.
           RAW_TAG: ${{ inputs.tag }}
+          ACTION: ${{ inputs.action }}
         run: |
           set -euo pipefail
+
+          case "$ACTION" in candidate|promote) ;; *)
+            echo "::error::action must be candidate or promote, got '$ACTION'"; exit 1;;
+          esac
 
           # 1. Strict shape first: anything else cannot be a launcher release
           #    tag and must not reach git commands as a ref expression.
@@ -153,18 +216,98 @@ jobs:
           # tooling and lives on main (same rule as the workflow definition
           # itself). A tag cut before a manifest bump merged would otherwise
           # fail here forever.
-          PKG_VERSION=$(git show "origin/main:packaging/npm/package.json" | jq -r .version)
-          if [[ "$VERSION" != "$PKG_VERSION" ]]; then
-            echo "::error::packaging/npm/package.json on origin/main says ${PKG_VERSION}, expected ${VERSION} (bump it with the workspace version)"
-            exit 1
+          # Candidate only: a promotion may run after main has moved to the
+          # next version, and it publishes nothing from the manifest.
+          if [[ "$ACTION" == "candidate" ]]; then
+            PKG_VERSION=$(git show "origin/main:packaging/npm/package.json" | jq -r .version)
+            if [[ "$VERSION" != "$PKG_VERSION" ]]; then
+              echo "::error::packaging/npm/package.json on origin/main says ${PKG_VERSION}, expected ${VERSION} (bump it with the workspace version)"
+              exit 1
+            fi
+            # The platform list is the launcher's optionalDependencies, the
+            # single source of truth; the publish loop and the verify legs
+            # both check themselves against it.
+            PLATFORMS=$(jq -r '.optionalDependencies | keys[] | ltrimstr("@extenddb/")' packaging/npm/package.json | tr '\n' ' ')
+            # npm never accepts a version number twice, so a re-dispatch for a
+            # published version would build on five runners and spend an
+            # approval before failing at the publish. Refuse it here instead
+            # and name the step that is wanted.
+            if curl -fsSL "https://registry.npmjs.org/@extenddb%2fdev" | jq -e --arg v "$VERSION" '.versions[$v]' >/dev/null; then
+              echo "::error::@extenddb/dev@${VERSION} is already on the registry; dispatch with action: promote to move latest"
+              exit 1
+            fi
           fi
+
+          # 6. Promote only: the candidate must already be on the registry, in
+          #    full and from this workflow, and `latest` may only move forwards.
+          if [[ "$ACTION" == "promote" ]]; then
+            REGISTRY=https://registry.npmjs.org
+            # The launcher document at this version names the platform
+            # packages of THIS release (pinned to the same version), so the
+            # promotion cannot drift from what was published.
+            LAUNCHER=$(curl -fsSL "${REGISTRY}/@extenddb%2fdev")
+            jq -e --arg v "$VERSION" '.versions[$v]' <<<"$LAUNCHER" >/dev/null \
+              || { echo "::error::@extenddb/dev@${VERSION} is not on the registry; publish the candidate first"; exit 1; }
+            PLATFORMS=$(jq -r --arg v "$VERSION" '.versions[$v].optionalDependencies | to_entries[] | select(.value == $v) | .key | ltrimstr("@extenddb/")' <<<"$LAUNCHER" | tr '\n' ' ')
+            PINNED=$(jq -r --arg v "$VERSION" '.versions[$v].optionalDependencies | length' <<<"$LAUNCHER")
+            [[ "$(wc -w <<<"$PLATFORMS")" -eq "$PINNED" && "$PINNED" -gt 0 ]] \
+              || { echo "::error::@extenddb/dev@${VERSION} pins platform packages at another version; not a release this workflow produced"; exit 1; }
+
+            for pkg in $PLATFORMS dev; do
+              DOC=$(curl -fsSL "${REGISTRY}/@extenddb%2f${pkg}")
+              jq -e --arg v "$VERSION" '.versions[$v]' <<<"$DOC" >/dev/null \
+                || { echo "::error::@extenddb/${pkg}@${VERSION} is not on the registry"; exit 1; }
+              # A provenance attestation exists only for a publish from CI
+              # with provenance; its signed SLSA statement names the
+              # repository and workflow file that ran the publish. Require
+              # both to be this one, so a version published by any other
+              # route (a maintainer machine, another repository's workflow)
+              # is not promoted by this path.
+              ATT_URL=$(jq -r --arg v "$VERSION" '.versions[$v].dist.attestations.url // empty' <<<"$DOC")
+              [[ -n "$ATT_URL" ]] \
+                || { echo "::error::@extenddb/${pkg}@${VERSION} carries no provenance attestation"; exit 1; }
+              WORKFLOW=$(curl -fsSL "$ATT_URL" \
+                | jq -r '.attestations[] | select(.predicateType == "https://slsa.dev/provenance/v1") | .bundle.dsseEnvelope.payload' \
+                | base64 -d \
+                | jq -c '.predicate.buildDefinition.externalParameters.workflow | {repository, path}')
+              EXPECTED='{"repository":"https://github.com/ExtendDB/extenddb","path":".github/workflows/npm-publish.yml"}'
+              [[ "$WORKFLOW" == "$EXPECTED" ]] \
+                || { echo "::error::@extenddb/${pkg}@${VERSION} was attested by ${WORKFLOW}, not by this workflow"; exit 1; }
+              # Forwards only. `latest` already at this version is allowed
+              # (idempotent re-run); `latest` ahead of it is refused, because
+              # moving it back would downgrade every user who does not pin.
+              # The promote job repeats this read immediately before the
+              # write; here it fails the run early, before the verify legs.
+              LATEST=$(jq -r '.["dist-tags"].latest // "0.0.0"' <<<"$DOC")
+              NEWEST=$(printf '%s\n%s\n' "$LATEST" "$VERSION" | sort -V | tail -n 1)
+              if [[ "$NEWEST" != "$VERSION" ]]; then
+                echo "::error::@extenddb/${pkg} latest is ${LATEST}, ahead of ${VERSION}; latest only moves forwards"
+                exit 1
+              fi
+              echo "@extenddb/${pkg}@${VERSION}: attested by this workflow; latest is ${LATEST}"
+            done
+          fi
+
+          # 7. Every platform of the release must have a verify leg. The legs
+          #    in npm-verify-matrix.yml are written by hand (runner labels
+          #    differ per platform); each leg checks it is IN the list, and
+          #    this is the converse, so a platform package added to
+          #    optionalDependencies cannot be published and promoted
+          #    unverified. Update both when a platform is added.
+          VERIFY_LEGS="darwin-arm64 darwin-x64 linux-arm64 linux-x64 win32-x64"
+          for pkg in $PLATFORMS; do
+            [[ " ${VERIFY_LEGS} " == *" ${pkg} "* ]] \
+              || { echo "::error::${pkg} is a platform of this release but npm-verify-matrix.yml has no leg for it"; exit 1; }
+          done
 
           {
             echo "version=$VERSION"
             echo "sha=$SHA"
+            echo "platforms=${PLATFORMS% }"
           } >> "$GITHUB_OUTPUT"
 
   build:
+    if: inputs.action == 'candidate'
     needs: gate
     # The matrix lives in npm-build-matrix.yml, shared with the pull-request
     # dry run (npm-build-dryrun.yml) so the release path and the pre-merge
@@ -175,6 +318,7 @@ jobs:
       ref: ${{ needs.gate.outputs.sha }}
 
   publish:
+    if: inputs.action == 'candidate'
     needs: [gate, build]
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -201,11 +345,12 @@ jobs:
 
       # Trusted publishing needs npm >= 11.5.1 for the OIDC exchange, and the
       # Node 22 image bundles npm 10. Without this the publish falls back to
-      # looking for a token and fails with ENEEDAUTH.
-      - name: Upgrade npm to a trusted-publishing capable version
+      # looking for a token and fails with ENEEDAUTH. Pinned to the version
+      # the promote job uses; bump both together.
+      - name: Install the pinned npm that supports trusted publishing
         run: |
           set -euo pipefail
-          npm install -g npm@11
+          npm install -g npm@11.21.1
           npm --version
 
       - name: Download the built binaries
@@ -268,3 +413,157 @@ jobs:
 
           echo "Publishing @extenddb/dev@${VERSION} (candidate)"
           npm publish --provenance --access public --tag candidate
+
+  verify:
+    # Runs for both actions. After `publish` for a candidate (so a candidate
+    # that does not install or does not pass is known at once), and straight
+    # after the gate for a promotion. The publish job is skipped in promote
+    # mode, so the plain `needs` success rule would skip this job too; the
+    # condition below admits exactly the two intended shapes and nothing else
+    # (a failed or cancelled publish still stops it).
+    needs: [gate, publish]
+    if: >-
+      ${{ !cancelled() && needs.gate.result == 'success'
+          && (needs.publish.result == 'success'
+              || (inputs.action == 'promote' && needs.publish.result == 'skipped')) }}
+    # The legs live in npm-verify-matrix.yml: one definition, called after a
+    # candidate publish and again before a promotion.
+    uses: ./.github/workflows/npm-verify-matrix.yml
+    with:
+      version: ${{ needs.gate.outputs.version }}
+      sha: ${{ needs.gate.outputs.sha }}
+      platforms: ${{ needs.gate.outputs.platforms }}
+
+  promote:
+    if: inputs.action == 'promote'
+    needs: [gate, verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Second approval of the run: the same protected environment that gates
+    # the candidate publish, and the same trusted-publisher match (workflow
+    # filename plus environment name), so no new trust relationship is
+    # created for promotion; the existing six entries only need "Allow npm
+    # dist-tag" ticked.
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write            # the OIDC identity npm exchanges for a
+                                 # short-lived credential; npm dist-tag uses
+                                 # it directly, no token is stored anywhere
+    env:
+      VERSION: ${{ needs.gate.outputs.version }}
+      PLATFORMS: ${{ needs.gate.outputs.platforms }}
+    steps:
+      - name: Set up node against the public registry
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      # dist-tag over trusted publishing needs npm 11.21.0 or later; the Node
+      # 22 image bundles npm 10, and an older 11 would fall back to looking
+      # for a token and fail with ENEEDAUTH, which reads like a missing
+      # secret. Pinned: this is the one tool that performs the credentialed
+      # write, and everything else in this file is pinned by SHA. Bump it on
+      # purpose; the floor check stays so a wrong bump fails by name.
+      - name: Install the pinned npm that can manage dist-tags over OIDC
+        run: |
+          set -euo pipefail
+          npm install -g npm@11.21.1
+          node -e '
+            const v = process.argv[1];
+            const [maj, min] = v.split(".").map(Number);
+            if (maj < 11 || (maj === 11 && min < 21)) { console.error("npm " + v + " is below 11.21.0"); process.exit(1); }
+          ' "$(npm --version)"
+          npm --version
+
+      - name: latest must still be at or behind this version, seconds before the write
+        run: |
+          set -euo pipefail
+          # The gate made this check minutes ago, before the verify legs and
+          # an approval wait with no deadline. A maintainer with an npm login
+          # could have moved latest ahead in that window; repeat the read here
+          # so the check and the write are seconds apart.
+          for pkg in $PLATFORMS dev; do
+            LATEST=$(curl -fsSL "https://registry.npmjs.org/-/package/@extenddb%2f${pkg}/dist-tags" | jq -r '.latest // "0.0.0"' || echo unavailable)
+            [[ "$LATEST" != "unavailable" ]] \
+              || { echo "::error::@extenddb/${pkg}: could not read dist-tags from the registry; not writing blind"; exit 1; }
+            NEWEST=$(printf '%s\n%s\n' "$LATEST" "$VERSION" | sort -V | tail -n 1)
+            if [[ "$NEWEST" != "$VERSION" ]]; then
+              echo "::error::@extenddb/${pkg} latest is now ${LATEST}, ahead of ${VERSION}; refusing to move it back"
+              exit 1
+            fi
+          done
+
+      - name: Prove the dist-tag write permission on every package before latest moves
+        run: |
+          set -euo pipefail
+          # `npm dist-tag add` returns before any request when the tag already
+          # holds the version, and npm's OIDC helper turns a failed exchange
+          # into an anonymous read, so a re-run for the version latest already
+          # holds exits 0 without ever using the credential. A transient tag
+          # is a write: adding it exercises the OIDC exchange and the "Allow
+          # npm dist-tag" setting on each of the six entries, and removing it
+          # leaves the registry as it was. If one entry lacks the permission
+          # this fails here, before `latest` has moved on any package.
+          PROBE="promote-probe-${GITHUB_RUN_ID}"
+          for pkg in $PLATFORMS dev; do
+            # npm's OIDC helper never throws: a failed exchange (trust entry
+            # mismatch, environment mismatch, id-token permission missing) is
+            # logged at verbose level and the command carries on without a
+            # credential, so the exchange is asserted from the log line npm
+            # writes on success; a probe that then fails names the right
+            # half (the exchange, or the dist-tag permission on the PUT).
+            npm dist-tag add "@extenddb/${pkg}@${VERSION}" "$PROBE" --loglevel=verbose 2>&1 | tee probe.log
+            grep -q 'oidc Successfully retrieved and set token' probe.log \
+              || { echo "::error::@extenddb/${pkg}: the OIDC exchange did not succeed (check the trusted publisher entry: workflow npm-publish.yml, environment npm)"; exit 1; }
+            READ=$(curl -fsSL "https://registry.npmjs.org/-/package/@extenddb%2f${pkg}/dist-tags" | jq -r --arg t "$PROBE" '.[$t] // empty' || echo unavailable)
+            [[ "$READ" == "$VERSION" ]] \
+              || { echo "::error::@extenddb/${pkg}: probe tag did not land (read '${READ}'); the dist-tag write did not take (is \"Allow npm dist-tag\" enabled on this entry?)"; exit 1; }
+            npm dist-tag rm "@extenddb/${pkg}" "$PROBE"
+            echo "@extenddb/${pkg}: OIDC exchange and dist-tag write proved"
+          done
+
+      - name: Move latest to this version on every package of the release
+        run: |
+          set -euo pipefail
+          # Platform packages first, launcher last, the same order the publish
+          # uses: a launcher at `latest` never points at platform packages
+          # that are not yet there. (Resolution is by exact version anyway;
+          # the order is for anyone reading the tags mid-run.) Re-tagging a
+          # version that `latest` already holds is a no-op for npm.
+          for pkg in $PLATFORMS dev; do
+            echo "@extenddb/${pkg}: latest -> ${VERSION}"
+            npm dist-tag add "@extenddb/${pkg}@${VERSION}" latest
+          done
+
+      - name: Every latest tag must now read back as this version, and no probe tag may remain
+        run: |
+          set -euo pipefail
+          # The registry is the oracle, not npm's exit code: read each tag
+          # back from the public endpoint and fail on any that did not move
+          # or any probe tag left behind.
+          PROBE="promote-probe-${GITHUB_RUN_ID}"
+          FAILED=0
+          for pkg in $PLATFORMS dev; do
+            for _ in $(seq 1 6); do
+              # A failed read (network, non-2xx) is a mismatch to retry, not a
+              # reason to end the step with a bare curl exit code after the
+              # tags have already moved.
+              TAGS=$(curl -fsSL "https://registry.npmjs.org/-/package/@extenddb%2f${pkg}/dist-tags" || echo '{}')
+              LATEST=$(jq -r '.latest // "unavailable"' <<<"$TAGS")
+              [[ "$LATEST" == "$VERSION" ]] && break
+              sleep 10
+            done
+            if [[ "$LATEST" == "$VERSION" ]]; then
+              echo "@extenddb/${pkg}: latest is ${VERSION}"
+            else
+              echo "::error::@extenddb/${pkg}: latest reads ${LATEST}, expected ${VERSION}"
+              FAILED=1
+            fi
+            if jq -e --arg t "$PROBE" 'has($t)' <<<"$TAGS" >/dev/null; then
+              echo "::error::@extenddb/${pkg}: probe tag ${PROBE} is still present"
+              FAILED=1
+            fi
+          done
+          exit "$FAILED"
