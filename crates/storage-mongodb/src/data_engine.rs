@@ -441,7 +441,7 @@ impl MongoEngine {
                 .upsert(true)
                 .return_document(ReturnDocument::Before)
                 .build();
-            for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
+            for attempt in 0..CREATE_RACE_ATTEMPTS {
                 match coll
                     .find_one_and_replace(key_filter.clone(), &new_doc)
                     .with_options(opts.clone())
@@ -457,7 +457,7 @@ impl MongoEngine {
                     Err(e) => return Err(StorageError::Internal(e.to_string())),
                 }
             }
-            return Err(create_race_exhausted(TRANSIENT_RETRY_ATTEMPTS));
+            return Err(create_race_exhausted(CREATE_RACE_ATTEMPTS));
         }
 
         let mut session = self
@@ -610,6 +610,13 @@ impl MongoEngine {
                     let _ = session.abort_transaction().await;
                     if lost_create_race {
                         lost_create_races += 1;
+                        // The create race has its own budget: a put that has
+                        // lost it this many times is not waiting out
+                        // contention on an item, so it gives up here rather
+                        // than spending the contention budget.
+                        if lost_create_races >= CREATE_RACE_ATTEMPTS {
+                            return Err(create_race_exhausted(lost_create_races));
+                        }
                     }
                     backoff_sleep(attempt).await;
                     continue;
@@ -619,12 +626,6 @@ impl MongoEngine {
                     return Err(e);
                 }
             }
-        }
-
-        // Every attempt lost the create race: give up with the same error
-        // as the sessionless path above.
-        if lost_create_races == TRANSIENT_RETRY_ATTEMPTS {
-            return Err(create_race_exhausted(lost_create_races));
         }
 
         // Retry ceiling exhausted. Amazon DynamoDB applies concurrent puts
@@ -3449,7 +3450,7 @@ impl MongoEngine {
     ) -> Result<CommitOutcome, StorageError> {
         #[cfg(not(feature = "test-hooks"))]
         let _ = gate_table;
-        for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
+        for attempt in 0..COMMIT_RETRY_ATTEMPTS {
             let commit_res = session.commit_transaction().await;
             #[cfg(feature = "test-hooks")]
             let commit_res = self
@@ -3562,11 +3563,43 @@ pub(crate) struct GsiBackfillProgress {
 /// puts per run, MongoDB 7.0 on one 16-core host): 50 attempts left 15 to
 /// 25 percent of the puts without a commit; 400 left none in four runs at a
 /// load average of 15 and one put in 2,016 at a load average of 30, and 20
-/// of 1,984 with 64 clients. With `backoff_sleep` capped at 12.8 ms, 1,000
-/// attempts bound the wait at about 6.4 s of backoff plus the attempts' own
-/// round trips before the write gives up, under the SDKs' request timeouts.
-/// Same ceiling for every write path in this file.
+/// of 1,984 with 64 clients. `backoff_sleep` draws each sleep uniformly from
+/// 0 to 12.8 ms once the base is capped, so 1,000 attempts sleep about 6.4 s
+/// in total on average and 12.8 s at worst, plus the attempts' own round
+/// trips, before the write gives up. Against a transaction another session
+/// holds open, where an attempt waits out MongoDB's lock timeout, a put that
+/// loses all 1,000 attempts returns in about 10 s, under the SDKs' request
+/// timeouts.
+///
+/// This budget sizes the contention retry loops only: the put, delete,
+/// update, transact and GSI backfill loops, which re-run their transaction
+/// body after a conflict. The commit retry and the create-race give-up have
+/// their own budgets below, because the measurements that set this one say
+/// nothing about either.
 const TRANSIENT_RETRY_ATTEMPTS: u32 = 1000;
+
+/// Maximum number of times to retry `commitTransaction` in place after an
+/// `UnknownTransactionCommitResult`.
+///
+/// Not a contention loop: the label means the commit's outcome is unknown,
+/// the commit is idempotent and the body must not be re-run, so these
+/// attempts are waiting for one reply rather than racing other writers. No
+/// measurement sizes a longer wait, and a longer one only delays the HTTP
+/// 500 this path answers when the outcome stays unknown, so it keeps the
+/// value every write path used before the contention budget was raised.
+const COMMIT_RETRY_ATTEMPTS: u32 = 50;
+
+/// Maximum number of attempts of an unconditional PutItem that may lose the
+/// create race before it gives up.
+///
+/// A lost create race is not a write conflict: the attempt found no item and
+/// its insert hit an item another writer created and deleted again. #431
+/// measured this budget, with its backoff, as the one that lets the race
+/// resolve: a put blocked by a document that is removed 100 ms after the put
+/// starts commits well inside it, and the storage tests fail when the cap is
+/// put back to 5. A longer budget only delays the HTTP 500 this path
+/// answers, so the contention budget above does not govern it.
+const CREATE_RACE_ATTEMPTS: u32 = 50;
 
 /// Return type of `try_build_native_update`. Distinguishes an
 /// operator-document update (`{$set, $unset, $inc}`) from an
@@ -4349,8 +4382,8 @@ mod tests {
     }
 
     /// An unconditional PutItem whose insert keeps colliding on `_id` retries
-    /// for the whole transient retry budget, then gives up with the create
-    /// race error, on the sessionless path and on the transaction path.
+    /// for the whole create-race budget, then gives up with the create race
+    /// error, on the sessionless path and on the transaction path.
     ///
     /// A document that holds the item's `_id` under a different `pk` makes
     /// every attempt collide: the put's filter on `pk` finds no item, and its
@@ -4382,7 +4415,7 @@ mod tests {
                     .await;
 
                 let want =
-                    format!("could not create the item after {TRANSIENT_RETRY_ATTEMPTS} attempts");
+                    format!("could not create the item after {CREATE_RACE_ATTEMPTS} attempts");
                 match res {
                     Err(StorageError::Internal(msg)) => assert!(
                         msg.contains(&want),
@@ -4665,8 +4698,12 @@ mod tests {
                 ),
                 other => panic!("want the transient exhausted-budget error, got: {other:?}"),
             }
-            // The budget is bounded: 1,000 attempts with backoff capped at
-            // 12.8 ms end under a client's read timeout.
+            // The sleeps alone come to about 6.4 s on average and 12.8 s at
+            // worst. Each attempt against a document a transaction holds also
+            // waits out MongoDB's lock timeout, so the wall time measured here
+            // runs to about 10 s. The bound asserted is the one a caller
+            // cares about: the write answers inside a client's read timeout.
+            println!("the put lost every attempt and answered in {elapsed:?}");
             assert!(
                 elapsed < std::time::Duration::from_secs(30),
                 "took {elapsed:?}"
