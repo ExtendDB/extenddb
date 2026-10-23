@@ -815,10 +815,14 @@ fn compare_single(op: &ConditionOperator, context_value: &str, policy_value: &st
             compare_dates(op, context_value, policy_value),
         ConditionOperator::Bool =>
             context_value.eq_ignore_ascii_case(policy_value),
-        ConditionOperator::ArnEquals => context_value == policy_value,
-        ConditionOperator::ArnNotEquals => context_value != policy_value,
-        ConditionOperator::ArnLike => arn_match(policy_value, context_value),
-        ConditionOperator::ArnNotLike => !arn_match(policy_value, context_value),
+        // IAM evaluates ArnEquals as ArnLike and ArnNotEquals as ArnNotLike:
+        // `*` and `?` match in every ARN field, and a context value that is
+        // not an ARN matches neither operator (measured with
+        // simulate-custom-policy).
+        ConditionOperator::ArnEquals | ConditionOperator::ArnLike =>
+            is_arn(context_value) && arn_match(policy_value, context_value),
+        ConditionOperator::ArnNotEquals | ConditionOperator::ArnNotLike =>
+            is_arn(context_value) && !arn_match(policy_value, context_value),
         // Null, ForAllValues, ForAnyValue, IfExists are handled by the caller
         _ => false,
     }

@@ -345,10 +345,24 @@ fn compare_single(op: &ConditionOperator, context_value: &str, policy_value: &st
             compare_dates(context_value, policy_value, |a, b| a >= b)
         }
         ConditionOperator::Bool => context_value.eq_ignore_ascii_case(policy_value),
-        ConditionOperator::ArnEquals => context_value == policy_value,
-        ConditionOperator::ArnNotEquals => context_value != policy_value,
-        ConditionOperator::ArnLike => super::matcher::arn_match(policy_value, context_value),
-        ConditionOperator::ArnNotLike => !super::matcher::arn_match(policy_value, context_value),
+        // IAM evaluates ArnEquals exactly as ArnLike and ArnNotEquals exactly
+        // as ArnNotLike: `*` and `?` match in every ARN field, matching is
+        // case sensitive, and both sides need the same number of fields.
+        // A context value that is not an ARN (fewer than six fields) matches
+        // neither the positive nor the negative operator, so a Deny on
+        // ArnNotEquals does not apply to a malformed value. Measured with
+        // simulate-custom-policy across all four operators, with and without
+        // IfExists, under ForAnyValue and ForAllValues, with a wildcard in
+        // each of the six fields, with field-count and case differences, with
+        // non-ARN values, and with a policy variable in the value.
+        ConditionOperator::ArnEquals | ConditionOperator::ArnLike => {
+            super::matcher::is_arn(context_value)
+                && super::matcher::arn_match(policy_value, context_value)
+        }
+        ConditionOperator::ArnNotEquals | ConditionOperator::ArnNotLike => {
+            super::matcher::is_arn(context_value)
+                && !super::matcher::arn_match(policy_value, context_value)
+        }
         // IpAddress matches only when the caller address and the policy range
         // are the same family and the address is in the range. NotIpAddress
         // matches only when they are the same family and the address is not in
