@@ -37,6 +37,24 @@ use cdrs_tokio::load_balancing::RoundRobinLoadBalancingStrategy;
 use cdrs_tokio::transport::TransportTcp;
 use extenddb_storage::management_store::{OpError, OpResult};
 use std::sync::Arc;
+use tokio::sync::Mutex;
+
+/// Serializes migration runs across the whole process (issue #408).
+///
+/// Migrations set the keyspace with `USE <keyspace>` on the shared cdrs-tokio
+/// `Session` and then run UNQUALIFIED DDL (`CREATE TABLE IF NOT EXISTS <name>`).
+/// cdrs-tokio keeps one current keyspace per `Session`, and the whole process
+/// shares one `Session`, so two concurrent migration runs (e.g. two accounts
+/// created at once) interleave their `USE` and one account's DDL lands in the
+/// other's keyspace — while its own `schema_history` still records the
+/// migration as applied, so it never retries. Holding this lock for the whole
+/// `USE`-then-DDL sequence makes each run atomic with respect to the shared
+/// keyspace state. Both catalog and data migrations take the SAME lock, because
+/// they race on the same `Session`.
+///
+/// The lock is held only during a migration run (rare: account/catalog
+/// creation), never on the request hot path.
+static MIGRATION_LOCK: Mutex<()> = Mutex::const_new(());
 
 type CassandraSession = Session<
     TransportTcp,
@@ -85,6 +103,11 @@ pub async fn run_catalog_migrations(
     session: &Arc<CassandraSession>,
     keyspace: &str,
 ) -> OpResult<()> {
+    // Hold the process-wide migration lock for the whole USE-then-DDL sequence
+    // so a concurrent run cannot move the Session's current keyspace (issue
+    // #408). Held until this function returns.
+    let _guard = MIGRATION_LOCK.lock().await;
+
     println!("--- Running catalog migrations...");
 
     // Set keyspace context for all subsequent queries
@@ -108,6 +131,11 @@ pub async fn run_catalog_migrations(
 
 /// Run data database migrations.
 pub async fn run_data_migrations(session: &Arc<CassandraSession>, keyspace: &str) -> OpResult<()> {
+    // Hold the process-wide migration lock for the whole USE-then-DDL sequence
+    // so a concurrent run cannot move the Session's current keyspace out from
+    // under this account's unqualified DDL (issue #408). Held until return.
+    let _guard = MIGRATION_LOCK.lock().await;
+
     println!("--- Running data migrations...");
 
     // Set keyspace context for all subsequent queries

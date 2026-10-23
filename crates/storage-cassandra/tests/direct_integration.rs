@@ -25,6 +25,8 @@ mod authorization_store;
 mod backup_engine;
 #[path = "direct/cassandra_engine.rs"]
 mod cassandra_engine;
+#[path = "direct/concurrent_account_creation.rs"]
+mod concurrent_account_creation;
 #[path = "direct/delete_item.rs"]
 mod delete_item;
 #[path = "direct/groups.rs"]
