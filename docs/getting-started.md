@@ -38,7 +38,9 @@ See [Local Development with Docker Compose](local-dev-docker-compose.md).
 
 - **Storage backend** (one of):
   - PostgreSQL 14+ running locally (see `docs/local-postgres-setup.md`)
+  - SQLite (embedded; nothing to install)
   - MongoDB 7.0+ with replica set (see `docs/local-mongodb-setup.md`)
+  - Cassandra 4.1+ running locally (see `docs/cassandra-setup.md`)
 - Rust toolchain (1.88+)
 - AWS CLI v2 (for testing)
 - Python 3.10+ with virtual environment (see [Python Environment Setup](../README.md#python-environment-setup) in the README)
@@ -53,14 +55,17 @@ cargo build --release
 # (backends are mutually exclusive; disable the default postgres feature)
 cargo build --release --no-default-features --features mongodb
 
+# Cassandra backend
+cargo build --release --no-default-features --features cassandra
+
 # SQLite backend (developer mode, see "SQLite backend (developer mode)" below)
 cargo build --release --no-default-features --features sqlite
 ```
 
-Each build produces a single-backend binary. The `postgres`, `mongodb`, and
-`sqlite` features are mutually exclusive — a build enabling more than one is
-rejected at compile time — so to run two backends, build one binary per
-backend.
+Each build produces a single-backend binary. The `postgres`, `mongodb`,
+`sqlite`, and `cassandra` features are mutually exclusive — a build enabling
+more than one is rejected at compile time — so to run two backends, build one
+binary per backend.
 
 The binary is at `target/release/extenddb`.
 
@@ -74,11 +79,14 @@ Run `extenddb init` to create the catalog and data databases:
 
 # MongoDB
 ./target/release/extenddb init --backend mongodb
+
+# Cassandra
+./target/release/extenddb init --backend cassandra
 ```
 
 This will:
-- Create the `extenddb_catalog` database (catalog metadata)
-- Create the data database (user item data)
+- Create the `extenddb_catalog` database/keyspace (catalog metadata)
+- Create the data database/keyspace (user item data)
 - Generate an AES-256-GCM encryption key (for access key storage)
 - Create a default account and print the account ID
 - Create an `admin` user and print the credentials once
@@ -167,6 +175,62 @@ EXTENDDB__STORAGE__SQLITE__PATH=/data/other.sqlite ./target/release/extenddb ser
 
 Use `:memory:` (in the config, the environment variable, or `init
 --sqlite-path`) for an ephemeral database that is discarded on shutdown.
+
+### Cassandra backend
+
+ExtendDB can run against an Apache Cassandra cluster. The Cassandra backend is
+experimental; see [Cassandra setup](cassandra-setup.md) for its current
+limitations and the full walkthrough. Select it at init time with
+`--backend cassandra`:
+
+```bash
+./target/release/extenddb init \
+    --backend cassandra \
+    --cassandra-contact-points 127.0.0.1:9042 \
+    --cassandra-user cassandra \
+    --cassandra-pass cassandra
+```
+
+The node must run `PasswordAuthenticator`. `init` always creates its
+application role with a password, so it fails against a stock node using the
+default `AllowAllAuthenticator` — there is no credential-free path. Pass the
+Cassandra admin credentials with `--cassandra-user` / `--cassandra-pass`; `init`
+uses them to create the keyspaces and the application role. `init` writes a
+`[storage.cassandra]` section to the config, with the application credentials
+commented out:
+
+```toml
+[storage.cassandra]
+contact_points = ["127.0.0.1:9042"]
+# username = "cassandra"          # Application user
+# password = "cassandra-password" # Application password
+keyspace_prefix = "extenddb"
+replication_factor = 1           # init always writes 1; edit for production
+datacenter = "datacenter1"       # must be datacenter1 (hardcoded by init)
+max_connections = 10
+```
+
+Before starting the server, uncomment `username` and `password` and set them to
+the application role `init` created — by default `extenddb` /
+`extenddb-local-dev`. With them commented out, `serve` cannot authenticate and
+times out.
+
+To override a default, pass the matching flag at init time:
+
+- `--cassandra-contact-points host1:9042,host2:9042` — one or more contact
+  points for a remote or multi-node cluster.
+- `--cassandra-user` and `--cassandra-pass` — the admin credentials `init` uses
+  to create the keyspaces and the application role (required).
+- `--extenddb-user` and `--extenddb-pass` — override the application role's name
+  and password (default `extenddb` / `extenddb-local-dev`).
+- `--keyspace-prefix myapp` — a different keyspace prefix, so one cluster can
+  host more than one deployment.
+
+For a higher replication factor, edit `replication_factor` in the config after
+`init` (there is no init flag for it today). The datacenter must be
+`datacenter1`. For replication strategy, datacenter topology, authentication,
+authorization, and the fact that connections are unencrypted, see
+`docs/cassandra-setup.md`.
 
 ### Generating a self-signed certificate manually
 

@@ -1,27 +1,31 @@
 # ExtendDB
 
-> **ExtendDB is an independent open source project managed by Amazon Web Services. It is not Amazon DynamoDB and does not contain any DynamoDB source code.** "DynamoDB" is a trademark of Amazon.com, Inc. ExtendDB is a clean-room implementation that speaks the DynamoDB wire protocol. Behavioral differences from the real service are documented in [Differences from DynamoDB](docs/differences-from-dynamodb.md).
+> **ExtendDB is an independent open source project managed by Amazon Web Services. It is not Amazon DynamoDB and does
+> not contain any DynamoDB source code.** "DynamoDB" is a trademark of Amazon.com, Inc. ExtendDB is a clean-room
+> implementation that speaks the DynamoDB wire protocol. Behavioral differences from the real service are documented
+> in [Differences from DynamoDB](docs/differences-from-dynamodb.md).
 
-A DynamoDB-compatible API adapter, ExtendDB speaks the DynamoDB wire protocol — any AWS SDK, CLI, or tool that works with DynamoDB works with ExtendDB, unchanged.
+A DynamoDB-compatible API adapter, ExtendDB speaks the DynamoDB wire protocol — any AWS SDK, CLI, or tool that works
+with DynamoDB works with ExtendDB, unchanged.
 
 ## Use Cases
 
 - **Local development** — run DynamoDB workloads on your laptop with zero cloud dependency
 - **CI/CD pipelines** — deterministic integration tests against a DynamoDB-compatible backend
 - **Self-hosted deployments** — run DynamoDB workloads on your own infrastructure (on-premises, private cloud, edge)
-- **Multi-cloud** — use DynamoDB semantics on any cloud that runs PostgreSQL
+- **Multi-cloud** — use DynamoDB semantics on any cloud that runs an ExtendDB-supported database backend
 - **Air-gapped environments** — DynamoDB functionality with no internet connectivity
 
 ## Features
 
 - Full DynamoDB wire protocol: CRUD, Query, Scan, Batch, Transactions, Streams, TTL, Import/Export
+- Pluggable storage: PostgreSQL (default), SQLite, MongoDB, and Cassandra
 - SigV4 authentication with IAM compatibility: users, groups, roles, policies, permissions boundaries
 - Web management console for account and credential administration
 - TLS with automatic self-signed certificate generation (replaceable with CA-signed certs)
 - CSRF protection, security headers, session management
 - JSON metrics endpoint with DynamoDB CloudWatch-style metric names and dimensions
 - Daemon mode with syslog logging, plus `--foreground` for container and supervisor environments
-- PostgreSQL storage — use standard backup, replication, and HA tools
 
 ## Quick Start
 
@@ -50,8 +54,12 @@ scripts/install-macos.sh   # macOS
 ## Prerequisites
 
 - Rust 1.88+ (`rustup update`)
-- PostgreSQL 14+ (see `docs/local-postgres-setup.md`)
 - Python 3.10+ (for test suites and documentation)
+- A storage backend:
+  - PostgreSQL 14+ (see `docs/local-postgres-setup.md`)
+  - SQLite (embedded)
+  - MongoDB 7+ (see `docs/local-mongodb-setup.md`)
+  - Cassandra 4.1+ (see `docs/cassandra-setup.md`)
 
 ### Python Environment
 
@@ -106,11 +114,10 @@ key_path = "/etc/extenddb/tls/key.pem"
 
 ## Running in Containers
 
-The production images contain ExtendDB only; the database (PostgreSQL 14+ and MongoDB 7+)
-runs as a separate service. See [`docker/README.md`](docker/README.md) for the PostgreSQL
-image and [`docker/README-mongodb.md`](docker/README-mongodb.md) for the MongoDB
-image, external database requirements, hardened local Compose stacks, smoke tests, and
-explicit init/migrate/serve production lifecycle.
+The production images contain ExtendDB only. The storage backend runs as a separate service. See
+[`docker/README.md`](docker/README.md) for the PostgreSQL image and [`docker/README-mongodb.md`](docker/README-mongodb.md) for the MongoDB image,
+external database requirements, hardened local Compose stacks, smoke tests, and explicit init/migrate/serve
+production lifecycle. The SQLite and Cassandra backends have no dedicated container guide yet.
 
 By default `extenddb serve` daemonizes itself, which doesn't play well with container runtimes and process supervisors that expect PID 1 to stay attached. Pass `--foreground` (alias `--no-daemon`) to keep the process in the foreground and stream logs to stderr instead of syslog:
 
@@ -134,11 +141,20 @@ extenddb healthcheck --config extenddb.toml            # exit 0 healthy, 1 not
 extenddb healthcheck --endpoint https://127.0.0.1:18443 # explicit target
 ```
 
-This is a liveness check, which is what a container `HEALTHCHECK` wants: `/health` does not query the storage backend, so it reports healthy even if PostgreSQL becomes unreachable after startup. That is deliberate, since a liveness probe that failed on a database outage would restart every replica at once. A backend that is unreachable at startup does stop the server from listening, so that case is caught. There is no separate readiness endpoint yet.
+This is a liveness check, which is what a container `HEALTHCHECK` wants. The `/health` path does not query the storage
+backend, so it will report healthy even if the storage backend becomes unreachable after startup. That is deliberate,
+since a liveness probe that failed on a database outage would restart every replica at once. A backend that is
+unreachable at startup does stop the server from listening. There is no separate readiness endpoint yet.
 
 ### One instance per database
 
-Run one `extenddb serve` per catalog. On SQLite this is enforced: the server takes an exclusive lock on `<database>.lock` next to the database file and a second server on the same file refuses to start (`init`, `migrate`, and `destroy` take the same lock while they run). On PostgreSQL and MongoDB nothing prevents a second instance, but running more than one against the same catalog is not supported in this release: every instance runs every background worker, credential and policy caches are per instance with no cross-instance invalidation (a revoked key stays valid on the other instance for up to the cache TTL), and `/health` does not check the database. See the [deployment guide](docs/manuals/11-deployment-guide.md#multi-instance-considerations).
+Run one `extenddb serve` per catalog. On SQLite this is enforced: the server takes an exclusive lock on `<database>.lock`
+next to the database file and a second server on the same file will refuse to start (`init`, `migrate`, and `destroy` take
+the same lock while they run). On PostgreSQL, MongoDB and Cassandra nothing prevents a second ExtendDB instance from
+running, but running more than one against the same catalog is not supported in this release: every instance runs every
+background worker, credential and policy caches are per instance with no cross-instance invalidation (a revoked key
+stays valid on the other instance for up to the cache TTL), and `/health` does not check the database.
+See the [deployment guide](docs/manuals/11-deployment-guide.md#multi-instance-considerations).
 
 To make the generated self-signed certificate valid for the name clients use — an in-cluster service DNS name, for example — pass `--tls-san` to `init` (repeatable):
 
@@ -174,7 +190,7 @@ Web-based administration at `https://127.0.0.1:18443/console/`. Manage accounts,
 ```
 extenddb serve --config extenddb.toml          # Start server (daemon)
 extenddb serve --config extenddb.toml --foreground  # Start in foreground
-extenddb init --catalog-db NAME            # Initialize deployment
+extenddb init --catalog-db NAME                # Initialize deployment
 extenddb stop --config extenddb.toml           # Graceful shutdown
 extenddb status --config extenddb.toml         # Check if running
 extenddb healthcheck --config extenddb.toml    # Probe /health (exit 0 healthy, 1 not)
@@ -214,17 +230,22 @@ UpdateTimeToLive, DescribeTimeToLive, TagResource, UntagResource, ListTagsOfReso
 
 ```
 crates/
-  core/             — types, validation, expressions (pure sync Rust, no async)
-  engine/           — operation handlers
-  storage/          — storage trait definitions
-  storage-postgres/ — PostgreSQL backend
-  auth/             — SigV4 verification, IAM policy engine
-  server/           — HTTP server, management API, web console
-  bin/              — CLI, config, daemon lifecycle
+  auth/               — SigV4 verification, IAM policy engine
+  bin/                — CLI, config, daemon lifecycle
+  core/               — types, validation, expressions (pure sync Rust, no async)
+  engine/             — operation handlers
+  server/             — HTTP server, management API, web console
+  storage/            — storage trait definitions
+  storage-cassandra/  — Cassandra backend (experimental)
+  storage-mongodb/    — MongoDB backend
+  storage-postgres/   — PostgreSQL backend (default/reference)
+  storage-sqlite/     — SQLite backend (embedded)
+
+
 docs/
+  adr/              — architecture decision records
   design/           — architecture and design documents
   manuals/          — user-facing guides (PDF pipeline)
-  adr/              — architecture decision records
 ```
 
 ## Documentation
