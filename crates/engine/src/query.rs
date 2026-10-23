@@ -24,7 +24,7 @@ use crate::index_helpers::{
     VectorIndexReadRefusal, classify_unresolved_index_read, combined_lek_key_schema,
     validate_query_exclusive_start_key,
 };
-use crate::legacy_filter::{desugar_filter, desugar_key_conditions};
+use crate::legacy_filter::{desugar_filter, desugar_key_conditions, validate_legacy_conditions};
 use crate::read_helpers::{PostRead, read_page};
 use crate::serialize_output;
 use crate::{DispatchMetrics, DispatchResult};
@@ -154,8 +154,11 @@ pub async fn handle_query(
     // ProjectionExpression (syntax, then references and overlap), then unused
     // names and values. A missing table is reported after all of these.
     // A legacy QueryFilter skips the parser; desugar_filter checks each
-    // ComparisonOperator against its value types with the service's message,
-    // still before any row is read.
+    // ComparisonOperator against its value count and types with the service's
+    // messages, still before any row is read. Legacy KeyConditions get the
+    // same value checks here, ahead of the table lookup; the service reported
+    // a bad QueryFilter value before a bad KeyConditions value, and both
+    // before any key schema error (measured 2026-10-23).
     let (filter, filter_maps) =
         if let Some(qf) = input.query_filter.as_ref().filter(|qf| !qf.is_empty()) {
             let cond_op = input.conditional_operator.unwrap_or_default();
@@ -176,6 +179,9 @@ pub async fn handle_query(
                 _ => (None, None),
             }
         };
+    if let Some(kc) = input.key_conditions.as_ref() {
+        validate_legacy_conditions(kc)?;
+    }
 
     let parsed_key_condition = match input.key_condition_expression.as_deref() {
         Some(kce_str) => {

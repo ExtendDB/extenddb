@@ -6,12 +6,13 @@
 //! Converts pre-expression parameters (`KeyConditions`, `QueryFilter`, `ScanFilter`)
 //! into expression-based equivalents.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{
     CompareOp, Expr, ExpressionMaps, KeyCondition, PathElement, SortKeyCondition,
-    attribute_type_code,
+    attribute_type_code, compare_orderable,
 };
 use extenddb_core::types::{AttributeValue, Condition, ConditionalOperator};
 
@@ -32,6 +33,8 @@ pub fn desugar_key_conditions(
             DynamoDbError::ValidationException("No hash key in key schema".to_owned())
         })?;
 
+    validate_legacy_conditions(conditions)?;
+
     let hash_cond = conditions.get(hash_attr).ok_or_else(|| {
         DynamoDbError::ValidationException(format!(
             "Query condition missed key schema element: {hash_attr}"
@@ -41,12 +44,6 @@ pub fn desugar_key_conditions(
     if hash_cond.comparison_operator != "EQ" {
         return Err(DynamoDbError::ValidationException(
             "Query key condition not supported".to_owned(),
-        ));
-    }
-
-    if hash_cond.attribute_value_list.len() != 1 {
-        return Err(DynamoDbError::ValidationException(
-            "Query key condition must have exactly one value for EQ".to_owned(),
         ));
     }
 
@@ -107,11 +104,6 @@ fn desugar_sk_condition(
     let path = vec![PathElement::Attribute(range_name.to_owned())];
     match cond.comparison_operator.as_str() {
         "EQ" | "LE" | "LT" | "GE" | "GT" => {
-            if cond.attribute_value_list.len() != 1 {
-                return Err(DynamoDbError::ValidationException(
-                    "Invalid number of values for comparison".to_owned(),
-                ));
-            }
             let placeholder = "_kc_sk".to_owned();
             values.insert(placeholder.clone(), cond.attribute_value_list[0].clone());
             let op = match cond.comparison_operator.as_str() {
@@ -129,11 +121,6 @@ fn desugar_sk_condition(
             })
         }
         "BETWEEN" => {
-            if cond.attribute_value_list.len() != 2 {
-                return Err(DynamoDbError::ValidationException(
-                    "BETWEEN requires exactly 2 values".to_owned(),
-                ));
-            }
             let lo_placeholder = "_kc_sk_lo".to_owned();
             let hi_placeholder = "_kc_sk_hi".to_owned();
             values.insert(lo_placeholder.clone(), cond.attribute_value_list[0].clone());
@@ -145,11 +132,6 @@ fn desugar_sk_condition(
             })
         }
         "BEGINS_WITH" => {
-            if cond.attribute_value_list.len() != 1 {
-                return Err(DynamoDbError::ValidationException(
-                    "BEGINS_WITH requires exactly 1 value".to_owned(),
-                ));
-            }
             let placeholder = "_kc_sk".to_owned();
             values.insert(placeholder.clone(), cond.attribute_value_list[0].clone());
             Ok(SortKeyCondition::BeginsWith {
@@ -157,8 +139,10 @@ fn desugar_sk_condition(
                 prefix: Expr::Placeholder(placeholder),
             })
         }
-        other => Err(DynamoDbError::ValidationException(format!(
-            "Unsupported KeyCondition operator: {other}"
+        // NE, NULL, NOT_NULL, CONTAINS, NOT_CONTAINS and IN pass the value
+        // checks and are then refused on a key (measured 2026-10-23).
+        _ => Err(DynamoDbError::ValidationException(format!(
+            "{INVALID_PARAMS}Attempted conditional constraint is not an indexable operation"
         ))),
     }
 }
@@ -209,45 +193,114 @@ pub fn desugar_filter(
     Ok((combined, maps))
 }
 
-/// Refuse a legacy `ComparisonOperator` whose `AttributeValueList` holds a
-/// value of a type the operator does not take, with the service's message,
-/// before the condition is desugared and before any row is read.
+const INVALID_PARAMS: &str = "One or more parameter values were invalid: ";
+
+/// Validate one legacy condition (`ScanFilter`, `QueryFilter` or
+/// `KeyConditions` entry) the way the service does at request time, before
+/// the table is looked up and before any row is read, with its messages
+/// (measured 2026-10-23 on empty tables). In order:
 ///
-/// The service checks this at request time, on an empty table too (measured
-/// 2026-10-23: `BEGINS_WITH` with `N`, `LT` and `GT` with `BOOL`, and
-/// `BETWEEN` with `L` then `N`, which names the `L`). `EQ` and `NE` take every
-/// type; `NULL` and `NOT_NULL` take no value; `BEGINS_WITH` takes `S` and `B`;
-/// the ordering operators, `BETWEEN`, `IN`, `CONTAINS` and `NOT_CONTAINS` take
-/// `S`, `N` and `B`. The first value of a type the operator does not take is
-/// the one named.
+/// 1. the operator is one of the thirteen (`Invalid comparison operator`);
+/// 2. the value count fits the operator: none for `NULL` and `NOT_NULL`, two
+///    for `BETWEEN`, one or more for `IN`, one otherwise (`Invalid number of
+///    argument(s) for the <op> ComparisonOperator`);
+/// 3. the first value's type is one the operator takes: `EQ` and `NE` take
+///    every type, `BEGINS_WITH` takes `S` and `B`, `CONTAINS` and
+///    `NOT_CONTAINS` take `S`, `N`, `B`, `BOOL` and `NULL`, the ordering
+///    operators, `BETWEEN` and `IN` take `S`, `N` and `B` (`ComparisonOperator
+///    <op> is not valid for <type> AttributeValue type`);
+/// 4. every value has the first value's type (`AttributeValues inside
+///    AttributeValueList must be of same type`);
+/// 5. a `BETWEEN` lower bound is not above its upper bound (`The BETWEEN
+///    condition was provided a range where the lower bound is greater than
+///    the upper bound`).
+///
+/// The order of step 2 against step 3 within one condition was not measured;
+/// each was measured against a well-formed other.
 ///
 /// # Errors
 ///
-/// Returns `DynamoDbError::ValidationException` with the text
-/// `One or more parameter values were invalid: ComparisonOperator <op> is not
-/// valid for <type> AttributeValue type`.
-pub fn check_legacy_operand_types(
+/// Returns `DynamoDbError::ValidationException` with the service's text,
+/// prefixed `One or more parameter values were invalid: `.
+pub fn validate_legacy_condition(
     operator: &str,
     values: &[AttributeValue],
 ) -> Result<(), DynamoDbError> {
-    let allowed = |v: &AttributeValue| match operator {
-        "EQ" | "NE" | "NULL" | "NOT_NULL" => true,
-        "BEGINS_WITH" => matches!(v, AttributeValue::S(_) | AttributeValue::B(_)),
-        "LE" | "LT" | "GE" | "GT" | "BETWEEN" | "IN" | "CONTAINS" | "NOT_CONTAINS" => {
-            matches!(
-                v,
-                AttributeValue::S(_) | AttributeValue::N(_) | AttributeValue::B(_)
-            )
-        }
-        _ => true,
+    let refuse = |text: String| {
+        Err(DynamoDbError::ValidationException(format!(
+            "{INVALID_PARAMS}{text}"
+        )))
     };
-    match values.iter().find(|v| !allowed(v)) {
-        Some(bad) => Err(DynamoDbError::ValidationException(format!(
-            "One or more parameter values were invalid: ComparisonOperator {operator} is not valid for {} AttributeValue type",
-            attribute_type_code(bad)
-        ))),
-        None => Ok(()),
+    let count_ok = match operator {
+        "NULL" | "NOT_NULL" => values.is_empty(),
+        "BETWEEN" => values.len() == 2,
+        "IN" => !values.is_empty(),
+        "EQ" | "NE" | "LE" | "LT" | "GE" | "GT" | "CONTAINS" | "NOT_CONTAINS" | "BEGINS_WITH" => {
+            values.len() == 1
+        }
+        _ => return refuse("Invalid comparison operator".to_owned()),
+    };
+    if !count_ok {
+        return refuse(format!(
+            "Invalid number of argument(s) for the {operator} ComparisonOperator"
+        ));
     }
+    let Some(first) = values.first() else {
+        return Ok(());
+    };
+    let scalar = matches!(
+        first,
+        AttributeValue::S(_) | AttributeValue::N(_) | AttributeValue::B(_)
+    );
+    let type_ok = match operator {
+        "EQ" | "NE" => true,
+        "BEGINS_WITH" => matches!(first, AttributeValue::S(_) | AttributeValue::B(_)),
+        "CONTAINS" | "NOT_CONTAINS" => {
+            scalar || matches!(first, AttributeValue::Bool(_) | AttributeValue::Null)
+        }
+        _ => scalar,
+    };
+    if !type_ok {
+        return refuse(format!(
+            "ComparisonOperator {operator} is not valid for {} AttributeValue type",
+            attribute_type_code(first)
+        ));
+    }
+    if values
+        .iter()
+        .any(|v| attribute_type_code(v) != attribute_type_code(first))
+    {
+        return refuse("AttributeValues inside AttributeValueList must be of same type".to_owned());
+    }
+    if operator == "BETWEEN" && compare_orderable(&values[0], &values[1]) == Some(Ordering::Greater)
+    {
+        return refuse(
+            "The BETWEEN condition was provided a range where the lower bound is greater than the upper bound"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+/// Run [`validate_legacy_condition`] over every entry of a legacy condition
+/// map, in attribute name order, so `KeyConditions` can be checked before the
+/// table is looked up (the service refuses a bad `QueryFilter` value before it
+/// reports a missing table; a bad `KeyConditions` value was measured ahead of
+/// every key schema error).
+///
+/// # Errors
+///
+/// The first entry's error, in attribute name order.
+pub fn validate_legacy_conditions(
+    conditions: &HashMap<String, Condition>,
+) -> Result<(), DynamoDbError> {
+    let mut names: Vec<&String> = conditions.keys().collect();
+    names.sort();
+    for name in names {
+        let cond = &conditions[name];
+        validate_legacy_condition(&cond.comparison_operator, &cond.attribute_value_list)?;
+    }
+    Ok(())
 }
 
 fn desugar_one_filter_condition(
@@ -256,14 +309,9 @@ fn desugar_one_filter_condition(
     values: &mut HashMap<String, AttributeValue>,
     counter: &mut u32,
 ) -> Result<Expr, DynamoDbError> {
-    check_legacy_operand_types(&cond.comparison_operator, &cond.attribute_value_list)?;
+    validate_legacy_condition(&cond.comparison_operator, &cond.attribute_value_list)?;
     match cond.comparison_operator.as_str() {
         "EQ" | "NE" | "LE" | "LT" | "GE" | "GT" => {
-            if cond.attribute_value_list.len() != 1 {
-                return Err(DynamoDbError::ValidationException(
-                    "Invalid number of attribute values for comparison".to_owned(),
-                ));
-            }
             let placeholder = format!("_f{counter}");
             *counter += 1;
             values.insert(placeholder.clone(), cond.attribute_value_list[0].clone());
@@ -283,11 +331,6 @@ fn desugar_one_filter_condition(
             })
         }
         "BETWEEN" => {
-            if cond.attribute_value_list.len() != 2 {
-                return Err(DynamoDbError::ValidationException(
-                    "BETWEEN requires exactly 2 values".to_owned(),
-                ));
-            }
             let lo = format!("_f{counter}");
             *counter += 1;
             let hi = format!("_f{counter}");
@@ -301,11 +344,6 @@ fn desugar_one_filter_condition(
             })
         }
         "BEGINS_WITH" => {
-            if cond.attribute_value_list.len() != 1 {
-                return Err(DynamoDbError::ValidationException(
-                    "BEGINS_WITH requires exactly 1 value".to_owned(),
-                ));
-            }
             let placeholder = format!("_f{counter}");
             *counter += 1;
             values.insert(placeholder.clone(), cond.attribute_value_list[0].clone());
@@ -315,11 +353,6 @@ fn desugar_one_filter_condition(
             })
         }
         "CONTAINS" => {
-            if cond.attribute_value_list.len() != 1 {
-                return Err(DynamoDbError::ValidationException(
-                    "CONTAINS requires exactly 1 value".to_owned(),
-                ));
-            }
             let placeholder = format!("_f{counter}");
             *counter += 1;
             values.insert(placeholder.clone(), cond.attribute_value_list[0].clone());
@@ -329,11 +362,6 @@ fn desugar_one_filter_condition(
             })
         }
         "NOT_CONTAINS" => {
-            if cond.attribute_value_list.len() != 1 {
-                return Err(DynamoDbError::ValidationException(
-                    "NOT_CONTAINS requires exactly 1 value".to_owned(),
-                ));
-            }
             let placeholder = format!("_f{counter}");
             *counter += 1;
             values.insert(placeholder.clone(), cond.attribute_value_list[0].clone());
@@ -351,11 +379,6 @@ fn desugar_one_filter_condition(
             args: vec![path.clone()],
         }),
         "IN" => {
-            if cond.attribute_value_list.is_empty() {
-                return Err(DynamoDbError::ValidationException(
-                    "IN requires at least 1 value".to_owned(),
-                ));
-            }
             let placeholders: Vec<Expr> = cond
                 .attribute_value_list
                 .iter()
@@ -371,76 +394,13 @@ fn desugar_one_filter_condition(
                 list: placeholders,
             })
         }
-        other => Err(DynamoDbError::ValidationException(format!(
-            "Unsupported filter operator: {other}"
+        // validate_legacy_condition refused every other operator above.
+        _ => Err(DynamoDbError::ValidationException(format!(
+            "{INVALID_PARAMS}Invalid comparison operator"
         ))),
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn msg(op: &str, values: &[AttributeValue]) -> Option<String> {
-        match check_legacy_operand_types(op, values) {
-            Ok(()) => None,
-            Err(DynamoDbError::ValidationException(m)) => Some(m),
-            Err(other) => panic!("unexpected error {other:?}"),
-        }
-    }
-
-    fn refusal(op: &str, ty: &str) -> String {
-        format!(
-            "One or more parameter values were invalid: ComparisonOperator {op} is not valid for {ty} AttributeValue type"
-        )
-    }
-
-    #[test]
-    fn measured_rows_carry_the_service_message() {
-        let n = AttributeValue::N("1".to_owned());
-        let b = AttributeValue::Bool(true);
-        let l = AttributeValue::L(Vec::new());
-        assert_eq!(
-            msg("BEGINS_WITH", std::slice::from_ref(&n)),
-            Some(refusal("BEGINS_WITH", "N"))
-        );
-        assert_eq!(
-            msg("LT", std::slice::from_ref(&b)),
-            Some(refusal("LT", "BOOL"))
-        );
-        assert_eq!(msg("GT", &[b]), Some(refusal("GT", "BOOL")));
-        assert_eq!(msg("BETWEEN", &[l, n]), Some(refusal("BETWEEN", "L")));
-    }
-
-    #[test]
-    fn accepted_types_pass() {
-        let s = AttributeValue::S("p".to_owned());
-        let n = AttributeValue::N("1".to_owned());
-        let bin = AttributeValue::B(vec![1]);
-        assert_eq!(msg("BEGINS_WITH", std::slice::from_ref(&s)), None);
-        assert_eq!(msg("BEGINS_WITH", std::slice::from_ref(&bin)), None);
-        assert_eq!(msg("BETWEEN", &[n.clone(), n.clone()]), None);
-        assert_eq!(msg("IN", &[s.clone(), n.clone(), bin]), None);
-        assert_eq!(msg("EQ", &[AttributeValue::L(Vec::new())]), None);
-        assert_eq!(msg("NE", &[AttributeValue::Bool(false)]), None);
-        assert_eq!(msg("NULL", &[]), None);
-        assert_eq!(msg("CONTAINS", &[n]), None);
-    }
-
-    #[test]
-    fn desugar_filter_refuses_before_desugaring() {
-        let mut filter = HashMap::new();
-        filter.insert(
-            "f".to_owned(),
-            Condition {
-                comparison_operator: "BEGINS_WITH".to_owned(),
-                attribute_value_list: vec![AttributeValue::N("1".to_owned())],
-            },
-        );
-        let err = desugar_filter(&filter, ConditionalOperator::And).unwrap_err();
-        assert!(
-            matches!(&err, DynamoDbError::ValidationException(m) if *m == refusal("BEGINS_WITH", "N")),
-            "{err:?}"
-        );
-    }
-}
+#[path = "legacy_filter_tests.rs"]
+mod tests;

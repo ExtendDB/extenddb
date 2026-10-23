@@ -184,8 +184,8 @@ pub async fn handle_scan(
     // table lookup, so an undefined `:q` is a request error even when no row
     // would be evaluated (measured 2026-10-14 on an empty table). A legacy
     // ScanFilter skips the parser; desugar_filter checks each
-    // ComparisonOperator against its value types with the service's message,
-    // still before any row is read.
+    // ComparisonOperator against its value count and types with the service's
+    // messages, still before any row is read.
     let (filter, filter_maps) =
         if let Some(sf) = input.scan_filter.as_ref().filter(|sf| !sf.is_empty()) {
             let cond_op = input.conditional_operator.unwrap_or_default();
