@@ -48,20 +48,8 @@ pub(crate) async fn handle_request(
     }
     let request_id = uuid::Uuid::new_v4().to_string();
 
-    // A request carrying more than one `host` or `authorization` header is
-    // refused outright, as the service's front end does (400, connection
-    // closed). Either duplicate is a header-confusion shape a proxy in front
-    // of this server could resolve differently from the signature check.
-    if headers.get_all("host").iter().count() > 1
-        || headers.get_all("authorization").iter().count() > 1
-    {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            [(axum::http::header::CONNECTION, "close")],
-            "400 Bad Request",
-        )
-            .into_response();
-    }
+    // A repeated `host` or `authorization` header was refused before routing
+    // (see `repeated_headers`), so each is read as one value from here on.
 
     // SP-WIRE-007: body limit exceeded → 413. Any other failure to read the
     // body is the body timeout (the client stopped sending) → 408.
