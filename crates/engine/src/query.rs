@@ -270,50 +270,70 @@ pub async fn handle_query(
         &maps
     };
 
-    // Correct PK/SK assignment when both clauses are equality comparisons.
-    // The parser can't distinguish PK from SK without the key schema.
     let pk_attr = &query_key_info.key_schema[0].attribute_name;
-    key_condition.resolve_pk_sk(pk_attr, &effective_maps.names)?;
-
-    // Validate that the partition key is actually referenced in the condition.
-    let pk_resolved = resolve_path_attr_name(&key_condition.pk_path, &effective_maps.names);
-    if pk_resolved.as_deref() != Some(pk_attr.as_str()) {
-        return Err(DynamoDbError::ValidationException(format!(
-            "Query condition missed key schema element: {pk_attr}"
-        )));
-    }
-
-    // For multi-part key schemas (GSIs with >1 HASH attribute), reclassify
-    // the parsed conditions so all HASH attributes go to pk_path/extra_pk_conditions
-    // and the RANGE condition stays as sk_condition.
     if extenddb_core::types::is_multipart_key_schema(&query_key_info.key_schema) {
-        let hash_elements = extenddb_core::types::hash_key_elements(&query_key_info.key_schema);
-        let hash_attrs: Vec<&str> = hash_elements
-            .iter()
-            .map(|ks| ks.attribute_name.as_str())
-            .collect();
-        key_condition.resolve_multipart(&hash_attrs, &effective_maps.names)?;
-
-        // Validate all HASH attributes are present in the KeyConditionExpression.
-        let provided_count = 1 + key_condition.extra_pk_conditions.len();
-        if provided_count != hash_attrs.len() {
-            // Find the first missing HASH attribute for the error message.
-            let missing = hash_attrs
+        // A key schema with several HASH or several RANGE attributes: assign
+        // every clause by name, require an equality on each HASH attribute,
+        // and require the RANGE conditions to cover a leading run of the
+        // RANGE attributes with equalities before the last one.
+        let hash_attrs: Vec<&str> =
+            extenddb_core::types::hash_key_elements(&query_key_info.key_schema)
                 .iter()
-                .find(|attr| {
-                    let pk_name =
-                        resolve_path_attr_name(&key_condition.pk_path, &effective_maps.names);
-                    if pk_name.as_deref() == Some(*attr) {
-                        return false;
-                    }
-                    !key_condition.extra_pk_conditions.iter().any(|(path, _)| {
-                        resolve_path_attr_name(path, &effective_maps.names).as_deref()
-                            == Some(*attr)
-                    })
-                })
-                .unwrap_or(&hash_attrs[0]);
+                .map(|ks| ks.attribute_name.as_str())
+                .collect();
+        let range_attrs: Vec<&str> =
+            extenddb_core::types::range_key_elements(&query_key_info.key_schema)
+                .iter()
+                .map(|ks| ks.attribute_name.as_str())
+                .collect();
+        // A wrong-typed value is reported after the structural rules and
+        // before the non-key rule (measured 2026-10-21), so the type check
+        // runs inside the classifier.
+        key_condition.resolve_multipart_with(
+            &hash_attrs,
+            &range_attrs,
+            &effective_maps.names,
+            |path, value| {
+                check_key_value_type(
+                    path,
+                    value,
+                    &query_key_info.attribute_definitions,
+                    effective_maps,
+                )
+            },
+        )?;
+        refuse_begins_with_on_number(
+            &key_condition,
+            &query_key_info.attribute_definitions,
+            effective_maps,
+        )?;
+    } else {
+        // On a single-attribute key schema the service reports a wrong-typed
+        // value ahead of the missing-key check (measured 2026-10-21: `pk = :n`
+        // on an S key with a second clause on a non-key attribute reports the
+        // type, not the missing key).
+        for_each_key_clause(&key_condition, |path, value| {
+            check_key_value_type(
+                path,
+                value,
+                &query_key_info.attribute_definitions,
+                effective_maps,
+            )
+        })?;
+        refuse_begins_with_on_number(
+            &key_condition,
+            &query_key_info.attribute_definitions,
+            effective_maps,
+        )?;
+        // Correct PK/SK assignment when both clauses are equality comparisons.
+        // The parser can't distinguish PK from SK without the key schema.
+        key_condition.resolve_pk_sk(pk_attr, &effective_maps.names)?;
+
+        // Validate that the partition key is actually referenced in the condition.
+        let pk_resolved = resolve_path_attr_name(&key_condition.pk_path, &effective_maps.names);
+        if pk_resolved.as_deref() != Some(pk_attr.as_str()) {
             return Err(DynamoDbError::ValidationException(format!(
-                "Query condition missed key schema element: {missing}"
+                "Query condition missed key schema element: {pk_attr}"
             )));
         }
     }
@@ -572,6 +592,113 @@ fn resolve_path_attr_name(
         }
         _ => None,
     }
+}
+
+/// Call `f` with every clause of a key condition: the partition key clause,
+/// the extra HASH and RANGE equalities, and each operand of the sort key
+/// condition.
+fn for_each_key_clause<F>(
+    key_condition: &extenddb_core::expression::KeyCondition,
+    mut f: F,
+) -> Result<(), DynamoDbError>
+where
+    F: FnMut(&[PathElement], &extenddb_core::expression::Expr) -> Result<(), DynamoDbError>,
+{
+    use extenddb_core::expression::SortKeyCondition;
+
+    f(&key_condition.pk_path, &key_condition.pk_value)?;
+    for (path, value) in &key_condition.extra_pk_conditions {
+        f(path, value)?;
+    }
+    for (path, value) in &key_condition.extra_sk_conditions {
+        f(path, value)?;
+    }
+    match &key_condition.sk_condition {
+        Some(SortKeyCondition::Compare { path, value, .. }) => f(path, value),
+        Some(SortKeyCondition::Between { path, low, high }) => {
+            f(path, low)?;
+            f(path, high)
+        }
+        Some(SortKeyCondition::BeginsWith { path, prefix }) => f(path, prefix),
+        None => Ok(()),
+    }
+}
+
+/// Refuse a key condition value whose type differs from the attribute
+/// definition of the attribute it names.
+///
+/// Measured on the service 2026-10-21: an S key compared with an N value,
+/// an N sort key compared with an S value in `=`, `>`, `begins_with` or a
+/// BETWEEN bound, and the same on an index, all answer
+/// `One or more parameter values were invalid: Condition parameter type does
+/// not match schema type`, on single-attribute and multi-attribute key
+/// schemas alike. A clause on an attribute without a definition is not
+/// checked here; the classifier reports it.
+fn check_key_value_type(
+    path: &[PathElement],
+    expr: &extenddb_core::expression::Expr,
+    attribute_definitions: &[extenddb_core::types::AttributeDefinition],
+    maps: &ExpressionMaps,
+) -> Result<(), DynamoDbError> {
+    use extenddb_core::expression::Expr;
+    use extenddb_core::types::{AttributeValue, ScalarAttributeType};
+
+    let Some(attr) = resolve_path_attr_name(path, &maps.names) else {
+        return Ok(());
+    };
+    let Some(def) = attribute_definitions
+        .iter()
+        .find(|d| d.attribute_name == attr)
+    else {
+        return Ok(());
+    };
+    let Expr::Placeholder(name) = expr else {
+        return Ok(());
+    };
+    let Some(value) = maps.values.get(name) else {
+        return Ok(());
+    };
+    let matches = matches!(
+        (def.attribute_type, value),
+        (ScalarAttributeType::S, AttributeValue::S(_))
+            | (ScalarAttributeType::N, AttributeValue::N(_))
+            | (ScalarAttributeType::B, AttributeValue::B(_))
+    );
+    if matches {
+        Ok(())
+    } else {
+        Err(DynamoDbError::ValidationException(
+            "One or more parameter values were invalid: Condition parameter type does not match \
+             schema type"
+                .to_owned(),
+        ))
+    }
+}
+
+/// Refuse `begins_with` on a number key attribute (measured 2026-10-21:
+/// `Invalid KeyConditionExpression: Incorrect operand type for operator or
+/// function; operator or function: begins_with, operand type: N`).
+fn refuse_begins_with_on_number(
+    key_condition: &extenddb_core::expression::KeyCondition,
+    attribute_definitions: &[extenddb_core::types::AttributeDefinition],
+    maps: &ExpressionMaps,
+) -> Result<(), DynamoDbError> {
+    use extenddb_core::expression::SortKeyCondition;
+    use extenddb_core::types::ScalarAttributeType;
+
+    if let Some(SortKeyCondition::BeginsWith { path, .. }) = &key_condition.sk_condition
+        && let Some(attr) = resolve_path_attr_name(path, &maps.names)
+        && attribute_definitions
+            .iter()
+            .any(|d| d.attribute_name == attr && d.attribute_type == ScalarAttributeType::N)
+    {
+        return Err(DynamoDbError::ValidationException(
+            "Invalid KeyConditionExpression: Incorrect operand type for operator or function; \
+             operator or function: begins_with, operand type: N"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Validate that all `#name` references in an expression AST are defined.

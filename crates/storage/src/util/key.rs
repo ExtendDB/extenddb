@@ -129,6 +129,67 @@ pub fn sk_info<'a>(
     Some((&sk_element.attribute_name, attr_def.attribute_type))
 }
 
+/// Refuse a Query key condition that a backend applying the sort key
+/// condition to the first RANGE attribute only cannot serve.
+///
+/// On a key schema with several RANGE attributes the engine classifies a
+/// condition on any of them; the MongoDB and Cassandra backends store and
+/// filter the first RANGE attribute only, so a condition on a later one has
+/// no column to apply to. Answering with the first attribute's filter alone
+/// would return items that do not satisfy the stated condition. `backend`
+/// names the backend in the message.
+pub fn refuse_conditions_beyond_first_range(
+    key_condition: &extenddb_core::expression::KeyCondition,
+    key_schema: &[KeySchemaElement],
+    names: &std::collections::HashMap<String, String>,
+    backend: &str,
+) -> Result<(), StorageError> {
+    let range_attrs: Vec<&str> = key_schema
+        .iter()
+        .filter(|ks| ks.key_type == KeyType::Range)
+        .map(|ks| ks.attribute_name.as_str())
+        .collect();
+    let attr_of = |path: &[extenddb_core::expression::PathElement]| -> Option<String> {
+        match path.first() {
+            Some(extenddb_core::expression::PathElement::Attribute(name)) => name
+                .strip_prefix('#')
+                .map_or_else(|| Some(name.clone()), |r| names.get(r).cloned()),
+            _ => None,
+        }
+    };
+    // Every RANGE attribute with a condition, whichever slot the classifier
+    // put it in; the one with the smallest key-schema position past the first
+    // names the refusal.
+    let mut conditioned: Vec<String> = key_condition
+        .extra_sk_conditions
+        .iter()
+        .filter_map(|(path, _)| attr_of(path))
+        .collect();
+    if let Some(sk) = &key_condition.sk_condition
+        && let Some(attr) = attr_of(sk.path())
+    {
+        conditioned.push(attr);
+    }
+    let beyond = conditioned
+        .into_iter()
+        .filter_map(|attr| {
+            range_attrs
+                .iter()
+                .position(|r| *r == attr)
+                .filter(|pos| *pos > 0)
+                .map(|pos| (pos, attr))
+        })
+        .min()
+        .map(|(_, attr)| attr);
+    match beyond {
+        Some(attr) => Err(StorageError::Validation(format!(
+            "Key condition on {attr}: the {backend} backend applies a key condition to the first \
+             RANGE attribute of a multi-attribute index only"
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// Merge the attribute definitions supplied by an `UpdateTable` request into the
 /// table's persisted set, returning the union.
 ///

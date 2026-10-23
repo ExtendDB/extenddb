@@ -1123,6 +1123,13 @@ impl MongoEngine {
 
         let mut filter = doc! { "pk": &pk_text };
 
+        extenddb_storage::util::refuse_conditions_beyond_first_range(
+            key_condition,
+            &effective_key_schema,
+            &maps.names,
+            "MongoDB",
+        )?;
+
         // Determine sort key field using effective key schema
         let sk_field = sk_field_name(&effective_key_schema, &key_info.attribute_definitions);
 

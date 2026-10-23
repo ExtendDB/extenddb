@@ -145,9 +145,11 @@ pub(crate) fn build_sk_sql(
 ///
 /// # Parameter binding order:
 /// 1. `pk_text` (partition key)
-/// 2. SK condition params (from `build_sk_sql`)
-/// 3. Extra SK equality params (multi-range schemas)
-/// 4. `ExclusiveStartKey` index SK value (if paginating with sort key)
+/// 2. SK condition params (from `build_sk_sql`), as `sk_cond_type`
+/// 3. RANGE equality params that are not the SK condition, in `extra_sk_binds`
+///    order (the order their placeholders were written)
+/// 4. `ExclusiveStartKey` values of every RANGE attribute in `range_keys`
+///    (the index sort key columns of the cursor comparison)
 /// 5. Pagination extra binds (from `PaginationBinds` enum — built in `query_scan.rs`
 ///    in the same branch that generates the SQL, so order cannot diverge)
 #[allow(clippy::too_many_arguments)]
@@ -156,8 +158,9 @@ pub(crate) async fn execute_query_sql(
     pk_text: &str,
     key_condition: &KeyCondition,
     maps: &ExpressionMaps,
-    sk_info: Option<(&str, ScalarAttributeType)>,
-    extra_sk_col_indices: &[(usize, ScalarAttributeType)],
+    sk_cond_type: Option<ScalarAttributeType>,
+    extra_sk_binds: &[(ScalarAttributeType, &Expr)],
+    range_keys: &[(&str, ScalarAttributeType)],
     exclusive_start_key: Option<&Item>,
     pagination_binds: &PaginationBinds,
     pool: &sqlx::PgPool,
@@ -166,25 +169,26 @@ pub(crate) async fn execute_query_sql(
     query = query.bind(pk_text.to_owned());
 
     // Bind sort key condition values
-    if let (Some(sk_cond), Some((_, sk_type))) = (&key_condition.sk_condition, sk_info) {
+    if let (Some(sk_cond), Some(sk_type)) = (&key_condition.sk_condition, sk_cond_type) {
         query = bind_sk_condition(query, sk_cond, sk_type, maps)?;
     }
 
-    // Bind extra RANGE key equality values
-    for (i, &(_pos, sk_type)) in extra_sk_col_indices.iter().enumerate() {
-        if let Some((_, value)) = key_condition.extra_sk_conditions.get(i) {
-            let av = resolve_expr_to_av(value, maps)?;
-            let sk = parse_sk(&av, sk_type)?;
-            query = bind_sk_value(query, &sk);
-        }
+    // Bind the other RANGE key equality values
+    for &(sk_type, value) in extra_sk_binds {
+        let av = resolve_expr_to_av(value, maps)?;
+        let sk = parse_sk(&av, sk_type)?;
+        query = bind_sk_value(query, &sk);
     }
 
-    // Bind exclusive start key SK value (index SK for the > / < comparison)
-    if let (Some(start_key), Some((sk_name, sk_type))) = (exclusive_start_key, sk_info)
-        && let Some(sk_val) = start_key.get(sk_name)
-    {
-        let sk = parse_sk(sk_val, sk_type)?;
-        query = bind_sk_value(query, &sk);
+    // Bind the exclusive start key's RANGE values (index SK columns of the
+    // > / < row comparison)
+    if let Some(start_key) = exclusive_start_key {
+        for &(sk_name, sk_type) in range_keys {
+            if let Some(sk_val) = start_key.get(sk_name) {
+                let sk = parse_sk(sk_val, sk_type)?;
+                query = bind_sk_value(query, &sk);
+            }
+        }
     }
 
     // Bind pagination extra values — order is determined by the enum variant,
