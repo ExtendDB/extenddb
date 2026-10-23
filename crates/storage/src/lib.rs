@@ -9,6 +9,7 @@
 
 pub mod authorization_store;
 pub mod backend;
+pub mod backup_definition;
 pub mod bootstrapper;
 pub mod config;
 pub mod diagnostics;
@@ -16,7 +17,9 @@ pub mod diagnostics_store;
 pub mod error;
 pub mod hooks;
 pub mod management_store;
+pub mod management_store_factory;
 pub mod operations;
+pub mod policy_migration;
 pub mod server_components;
 pub mod settings_store;
 pub mod transact;
@@ -24,6 +27,7 @@ pub mod vector_catalog;
 pub mod vector_lifecycle;
 
 pub use backend::{Backend, BackendAlreadySet, backend_name, set_backend, try_backend};
+pub use backup_definition::{BackupRestoreSource, RestoreRequest, RestoreTableOverrides};
 
 pub use transact::{IdempotencyKey, TransactGetOp, TransactWriteOp};
 
@@ -376,6 +380,35 @@ pub trait DataEngine: Send + Sync {
         index_name: Option<&str>,
     ) -> BoxFuture<'_, QueryResult>;
 
+    /// Whether `key` belongs to `segment` of a `total_segments`-way parallel
+    /// scan, under this backend's own segment-assignment function.
+    ///
+    /// Segment assignment is backend-private (Postgres hashes the partition
+    /// key with `hashtext`, MongoDB with CRC32, SQLite partitions by rowid),
+    /// so only the backend can answer this. The engine owns the rule and the
+    /// error: a `Scan` whose `ExclusiveStartKey` reports `false` here is
+    /// refused before storage is asked to scan, because resuming a segment
+    /// with another segment's key would otherwise return a silently wrong
+    /// (truncated or fabricated) page.
+    ///
+    /// `Ok(true)` means "cannot be proven foreign" rather than "proven local":
+    /// a backend whose assignment depends on storage identity rather than key
+    /// content (SQLite's rowid) MUST return `true` for a key it cannot resolve,
+    /// because DynamoDB permits an `ExclusiveStartKey` that no longer exists
+    /// and refusing it would reject legitimate resumptions after a delete.
+    ///
+    /// Required, not defaulted: a new backend must decide its answer
+    /// explicitly, since returning a constant `true` silently disables the
+    /// engine's cross-segment refusal for that backend.
+    fn scan_key_in_segment(
+        &self,
+        key_info: &TableKeyInfo,
+        key: &Item,
+        segment: i64,
+        total_segments: i64,
+        index_name: Option<&str>,
+    ) -> BoxFuture<'_, Result<bool, StorageError>>;
+
     /// The vector-search implementation, if this backend has one.
     ///
     /// Defaults to `None`, so a backend that has never heard of vector search is
@@ -679,7 +712,12 @@ pub trait BackupEngine: Send + Sync {
         backup_arn: &str,
     ) -> BoxFuture<'_, Result<extenddb_core::types::BackupDescription, StorageError>>;
 
-    /// List backups for a table.
+    /// List the account's backups, optionally only those of `table_name`.
+    ///
+    /// Returns every matching backup in any order; the engine sorts, applies
+    /// `Limit` and `ExclusiveStartBackupArn`, and sets
+    /// `LastEvaluatedBackupArn`. Each summary carries the source table's
+    /// `TableId`.
     fn list_backups(
         &self,
         account_id: &str,
@@ -696,16 +734,54 @@ pub trait BackupEngine: Send + Sync {
         backup_arn: &str,
     ) -> BoxFuture<'_, Result<extenddb_core::types::BackupDescription, StorageError>>;
 
-    /// Restore a table from a backup.
+    /// The backup's recorded source, for an AVAILABLE backup owned by
+    /// `account_id`.
     ///
-    /// `account_id` is the caller's account: it owns the new table *and* scopes
-    /// the source backup lookup, since a backup can only be restored by the
-    /// account that owns it.
+    /// The engine resolves the restore target and runs every refusal from
+    /// this, and fills DescribeBackup's `SourceTableFeatureDetails` and
+    /// `SourceTableDetails.ProvisionedThroughput` from it. `definition` is the
+    /// stored [`backup_definition::BackupTableDefinition`] (with
+    /// `time_to_live` and `stream_specification` as captured at
+    /// CreateBackup), or `None` for a backup recorded without one.
+    ///
+    /// # Errors
+    ///
+    /// `StorageError::Validation("Backup not found: <arn>")` if the backup is
+    /// missing, owned by another account, or not AVAILABLE.
+    /// `StorageError::Unsupported` for a stored definition this build cannot
+    /// read ([`backup_definition::BackupTableDefinition::from_json`]).
+    fn backup_restore_source(
+        &self,
+        account_id: &str,
+        backup_arn: &str,
+    ) -> BoxFuture<'_, Result<BackupRestoreSource, StorageError>>;
+
+    /// Restore `request.input.table_name` from `request.backup_arn`.
+    ///
+    /// `request.input` is resolved and validated by the engine; create exactly
+    /// that table, CREATING. In the same atomic step that re-checks the backup
+    /// is still AVAILABLE, register the restore (source backup ARN, source
+    /// table ARN, `restore_date_time`) so DescribeTable can report
+    /// `RestoreSummary`, DeleteBackup refuses the source, and DeleteTable
+    /// refuses the target while it is being restored. Then return the CREATING
+    /// description at once.
+    ///
+    /// The item copy runs in a detached task (`tokio::spawn`) that owns its
+    /// own clones, so the request future being dropped (a client timeout) does
+    /// not stop it. The task flips the target ACTIVE when the copy completes,
+    /// or removes the target on failure.
+    ///
+    /// # Errors
+    ///
+    /// Returned synchronously, before the copy starts:
+    /// `StorageError::Validation("Backup not found: <arn>")` if the backup is
+    /// not AVAILABLE at registration; `StorageError::TableAlreadyExists(name)`
+    /// if the name is taken; `StorageError::LimitExceeded` if the backend's
+    /// restore capacity is exhausted.
     fn restore_table_from_backup(
         &self,
         account_id: &str,
-        target_table_name: &str,
-        backup_arn: &str,
+        request: RestoreRequest,
     ) -> BoxFuture<'_, Result<TableDescription, StorageError>>;
 
     /// Describe continuous backups / PITR status for a table.
@@ -722,17 +798,6 @@ pub trait BackupEngine: Send + Sync {
         table_name: &str,
         pitr_enabled: bool,
     ) -> BoxFuture<'_, Result<extenddb_core::types::ContinuousBackupsDescription, StorageError>>;
-
-    /// Restore a table to a point in time.
-    // TODO(cleanup): This method is unreachable — the engine handler returns
-    // ValidationException("not yet supported") before calling storage. Remove
-    // when real PITR is implemented or during the next storage trait cleanup.
-    fn restore_table_to_point_in_time(
-        &self,
-        account_id: &str,
-        source_table_name: &str,
-        target_table_name: &str,
-    ) -> BoxFuture<'_, Result<TableDescription, StorageError>>;
 }
 
 /// Supertrait combining all `DynamoDB` operation traits.
@@ -816,6 +881,17 @@ mod vector_opt_out_tests {
     struct MinimalDataEngine;
 
     impl DataEngine for MinimalDataEngine {
+        fn scan_key_in_segment(
+            &self,
+            _key_info: &TableKeyInfo,
+            _key: &Item,
+            _segment: i64,
+            _total_segments: i64,
+            _index_name: Option<&str>,
+        ) -> BoxFuture<'_, Result<bool, StorageError>> {
+            Box::pin(async { Ok(true) })
+        }
+
         fn put_item(
             &self,
             _key_info: &TableKeyInfo,

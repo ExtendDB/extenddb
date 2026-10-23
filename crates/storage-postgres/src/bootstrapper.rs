@@ -97,7 +97,7 @@ impl PostgresBootstrapper {
                     .max_connections(1)
                     .connect_with(opts)
                     .await
-                    .map_err(|e| OpError::Internal(format!("Cannot connect as admin: {e}")))
+                    .map_err(|e| OpError::Internal(admin_connect_error(&self.config, &e)))
             })
             .await
     }
@@ -295,12 +295,19 @@ impl Bootstrapper for PostgresBootstrapper {
     }
 
     async fn run_data_migrations(&self) -> OpResult<()> {
+        // Catalog work the version string does not show (see
+        // `pending_data_migrations`) is applied first, by the same walk
+        // `run_catalog_migrations` runs, so `extenddb migrate --yes` applies
+        // it even when the stored catalog version already matches.
+        let catalog_pool = self.app_pool(&self.config.catalog_db).await?;
+        if !pending_catalog_work(&catalog_pool).await?.is_empty() {
+            migrations::run_catalog_migrations(&catalog_pool).await?;
+        }
         let pool = self.app_pool(&self.config.data_db).await?;
         self.try_create_vector_extension(&pool).await;
         migrations::run_data_migrations(&pool).await?;
         // Programmatic migrations need the catalog pool (to enumerate index
         // tables) plus the data pool (where the `_ddb_*` tables live).
-        let catalog_pool = self.app_pool(&self.config.catalog_db).await?;
         migrations::run_data_code_migrations(&catalog_pool, &pool).await
     }
 
@@ -435,8 +442,11 @@ impl Bootstrapper for PostgresBootstrapper {
     }
 
     async fn pending_data_migrations(&self) -> OpResult<Vec<String>> {
+        let catalog_pool = self.app_pool(&self.config.catalog_db).await?;
+        let mut pending = pending_catalog_work(&catalog_pool).await?;
         let pool = self.app_pool(&self.config.data_db).await?;
-        migrations::pending_data_migrations(&pool).await
+        pending.extend(migrations::pending_data_migrations(&pool).await?);
+        Ok(pending)
     }
 
     /// `004_escape_control_chars` rewrites rows in the data database and in the
@@ -842,6 +852,29 @@ connection_string = "{}"
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
+/// Catalog work `extenddb migrate` must report and apply even when the
+/// stored `catalog_version` already equals this binary's: catalog migration
+/// files not recorded in `schema_history` (`catalog <filename>`), and catalog
+/// shape steps (`catalog: <step>`, see `migrations::CATALOG_SHAPE_STEPS`).
+///
+/// The `Bootstrapper` trait has no catalog counterpart of
+/// `pending_data_migrations`, so this list is reported through that hook and
+/// applied by `run_data_migrations`, which `migrate --yes` always calls.
+pub(crate) async fn pending_catalog_work(catalog_pool: &PgPool) -> OpResult<Vec<String>> {
+    let mut pending: Vec<String> = migrations::pending_catalog_migrations(catalog_pool)
+        .await?
+        .into_iter()
+        .map(|f| format!("catalog {f}"))
+        .collect();
+    pending.extend(
+        migrations::pending_catalog_shapes(catalog_pool)
+            .await?
+            .into_iter()
+            .map(|s| format!("catalog: {s}")),
+    );
+    Ok(pending)
+}
+
 /// Create a database, aborting if it already exists.
 async fn create_database(pool: &PgPool, name: &str, owner: &str) -> OpResult<()> {
     println!("--- Creating database '{name}'...");
@@ -950,12 +983,8 @@ impl PostgresBootstrapper {
         let resolved_admin_user = pg_user
             .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "postgres".to_owned()));
         let resolved_catalog_db = catalog_db.unwrap_or(catalog_db_name);
-        let final_data_db = data_db.unwrap_or_else(|| {
-            resolved_catalog_db
-                .strip_suffix("_catalog")
-                .unwrap_or(&resolved_catalog_db)
-                .to_owned()
-        });
+        let explicit_data_db = data_db.is_some();
+        let final_data_db = data_db.unwrap_or_else(|| derive_data_db_name(&resolved_catalog_db));
         let resolved_app_user = extenddb_user.unwrap_or(user);
         let resolved_app_password = extenddb_pass.unwrap_or(password);
 
@@ -970,10 +999,61 @@ impl PostgresBootstrapper {
             data_db: final_data_db,
         };
 
-        Self::connect(config)
+        // The message alone: `{e:?}` here nested the variant name into the text
+        // (`Internal("Cannot connect as admin: ...")`), and the CLI wrapped it again.
+        let op_message = |e: OpError| match e {
+            OpError::Validation(m)
+            | OpError::AlreadyExists(m)
+            | OpError::NotFound(m)
+            | OpError::HasDependents(m)
+            | OpError::Internal(m) => m,
+        };
+        let mut store = Self::connect(config)
             .await
-            .map_err(|e| StorageError::Internal(format!("{e:?}")))
+            .map_err(|e| StorageError::Internal(op_message(e)))?;
+        // An existing catalog knows its data database: `init` stores the name
+        // in its settings. Without `--data-db`, that name wins over the
+        // `<catalog-db>` minus `_catalog` derivation, so `migrate` and the
+        // other commands reach the data database of a deployment that was
+        // initialised with another name. A catalog without the setting (or no
+        // catalog yet, as during `init`) keeps the derivation.
+        if !explicit_data_db
+            && let Some(stored) = store
+                .get_data_db_name()
+                .await
+                .map_err(|e| StorageError::Internal(op_message(e)))?
+            && stored != store.config.data_db
+        {
+            println!(
+                "--- Data database '{stored}' (recorded in the catalog's settings; the derived \
+                 name would have been '{}')",
+                store.config.data_db
+            );
+            store.config.data_db = stored;
+        }
+        Ok(store)
     }
+}
+
+/// The data database name `init` uses when `--data-db` is not given:
+/// `<catalog-db>` without its `_catalog` suffix.
+pub(crate) fn derive_data_db_name(catalog_db: &str) -> String {
+    catalog_db
+        .strip_suffix("_catalog")
+        .unwrap_or(catalog_db)
+        .to_owned()
+}
+
+/// One line naming the role and server the admin connection tried, and what
+/// to pass instead. When `--pg-user` is absent the role defaults to `$USER`,
+/// which is rarely a PostgreSQL role with a password, so the hint matters.
+fn admin_connect_error(config: &BootstrapConfig, e: &sqlx::Error) -> String {
+    format!(
+        "Cannot connect to PostgreSQL at {}:{} as admin user \"{}\": {e}. Pass the admin role \
+         with --pg-user <role> and its password in the EXTENDDB_PG_PASSWORD environment \
+         variable.",
+        config.host, config.port, config.admin_user
+    )
 }
 
 #[cfg(test)]
@@ -981,6 +1061,43 @@ mod tests {
     use super::*;
     use extenddb_storage::bootstrapper::BootstrapConfig;
 
+    /// `extenddb migrate`/`init`/`destroy` print this error as the whole
+    /// reason they stopped (it used to read
+    /// `Internal("Internal(\"Cannot connect as admin: ...\")")`).
+    #[tokio::test]
+    async fn an_admin_connection_failure_is_one_plain_line_naming_the_user() {
+        // Port 1 on loopback: nothing listens, so the connect fails at once.
+        let args: Vec<String> = [
+            "extenddb",
+            "migrate",
+            "--pg-host",
+            "127.0.0.1",
+            "--pg-port",
+            "1",
+            "--pg-user",
+            "someadmin",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        let Err(err) = PostgresBootstrapper::from_config("/nonexistent/extenddb.toml", &args).await
+        else {
+            panic!("connecting to 127.0.0.1:1 succeeded");
+        };
+        let extenddb_storage::error::StorageError::Internal(msg) = &err else {
+            panic!("unexpected error variant: {err:?}");
+        };
+        assert!(!msg.contains("Internal("), "{msg}");
+        assert!(!msg.contains('\n'), "{msg}");
+        assert!(
+            msg.starts_with(
+                "Cannot connect to PostgreSQL at 127.0.0.1:1 as admin user \"someadmin\": "
+            ),
+            "{msg}"
+        );
+        assert!(msg.contains("--pg-user"), "{msg}");
+        assert!(msg.contains("EXTENDDB_PG_PASSWORD"), "{msg}");
+    }
     #[test]
     fn test_connection_url_tcp_host() {
         let config = BootstrapConfig {

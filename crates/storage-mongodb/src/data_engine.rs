@@ -228,6 +228,32 @@ impl DataEngine for MongoEngine {
         })
     }
 
+    fn scan_key_in_segment(
+        &self,
+        key_info: &TableKeyInfo,
+        key: &Item,
+        segment: i64,
+        total_segments: i64,
+        _index_name: Option<&str>,
+    ) -> BoxFuture<'_, Result<bool, StorageError>> {
+        // Same CRC32-of-pk assignment the scan's per-item segment filter uses,
+        // evaluated for the candidate key. `key_info` is scan-shaped, so
+        // `key_schema` names the pk of whichever table (data or index) the
+        // scan targets, matching what the filter hashes. Pure computation, no
+        // round trip.
+        let key_schema = key_info.key_schema.clone();
+        let key = key.clone();
+        Box::pin(async move {
+            let pk_text = composite_pk_to_text(&key, &key_schema)?;
+            let hash = crc32fast::hash(pk_text.as_bytes());
+            #[allow(clippy::cast_sign_loss)]
+            let total_u = total_segments as u32;
+            #[allow(clippy::cast_sign_loss)]
+            let seg_u = segment as u32;
+            Ok(hash % total_u == seg_u)
+        })
+    }
+
     fn transact_get_items(
         &self,
         ops: &[TransactGetOp<'_>],
@@ -4159,6 +4185,10 @@ mod tests {
             region: "us-east-1".to_owned(),
             gsi_cache: Default::default(),
             tx_read_concern: mongodb::options::ReadConcern::snapshot(),
+            backup_liveness: Default::default(),
+            restore_server_slot_count: 1,
+            restore_server_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            restore_account_slots: Default::default(),
         };
         let base_coll = engine.data_db.collection::<Document>("base");
         let key_schema = vec![KeySchemaElement {

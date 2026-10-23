@@ -46,6 +46,9 @@ impl SqliteCatalogStore {
         let encrypted = encrypt_secret(&secret_access_key, &enc_key, &access_key_id)
             .map_err(|e| OpError::Internal(format!("encrypt secret: {e}")))?;
 
+        // D1: every writer holds the write lock. Key generation, encryption,
+        // and the encryption-key read above all run before it.
+        let _writer = self.lock_writes().await;
         sqlx::query(
             "INSERT INTO access_keys \
              (access_key_id, secret_key_encrypted, account_id, user_name) \
@@ -78,6 +81,8 @@ impl SqliteCatalogStore {
         user_name: &str,
         key_id: &str,
     ) -> OpResult<()> {
+        // D1: every writer holds the write lock.
+        let _writer = self.lock_writes().await;
         let result = sqlx::query(
             "DELETE FROM access_keys \
              WHERE access_key_id = ? AND account_id = ? AND user_name = ?",
@@ -137,6 +142,9 @@ impl SqliteCatalogStore {
         let encrypted = encrypt_secret(secret_access_key, &enc_key, access_key_id)
             .map_err(|e| OpError::Internal(format!("encrypt secret: {e}")))?;
 
+        // D1: every writer holds the write lock. Encryption and the
+        // encryption-key read above run before it.
+        let _writer = self.lock_writes().await;
         sqlx::query(
             "INSERT INTO access_keys \
              (access_key_id, secret_key_encrypted, account_id, user_name) \

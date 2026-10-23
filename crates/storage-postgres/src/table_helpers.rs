@@ -242,7 +242,9 @@ impl PostgresEngine {
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let table_name_owned = row.table_name.clone();
+        let table_id = row.table_id.clone();
         let mut desc = self.build_table_description_from_row(account_id, row, index_rows)?;
+        desc.restore_summary = self.restore_summary(&table_id, &desc.table_status).await?;
         desc.vector_indexes = vector_index_descriptions(
             &self.region,
             account_id,
@@ -434,5 +436,35 @@ impl PostgresEngine {
             // service sends for a table that is going away.
             ..Default::default()
         })
+    }
+
+    /// The RestoreSummary of a table created by RestoreTableFromBackup, or
+    /// `None` for any other table. In progress until the table is ACTIVE; the
+    /// engine drops the summary from DescribeTable once the table is not
+    /// CREATING.
+    pub(crate) async fn restore_summary(
+        &self,
+        table_id: &str,
+        status: &extenddb_core::types::TableStatus,
+    ) -> Result<Option<extenddb_core::types::RestoreSummary>, StorageError> {
+        // source_table_arn is NULL only on a row written by an earlier build
+        // of this release's 003 (see `migrations::CATALOG_SHAPE_STEPS`).
+        let row: Option<(String, Option<String>, f64)> = sqlx::query_as(
+            "SELECT source_backup_arn, source_table_arn, \
+             EXTRACT(EPOCH FROM restore_date_time)::FLOAT8 \
+             FROM table_restores WHERE table_id = $1",
+        )
+        .bind(table_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        Ok(row.map(
+            |(arn, source_table_arn, at)| extenddb_core::types::RestoreSummary {
+                source_backup_arn: Some(arn),
+                source_table_arn,
+                restore_date_time: at,
+                restore_in_progress: *status == extenddb_core::types::TableStatus::Creating,
+            },
+        ))
     }
 }

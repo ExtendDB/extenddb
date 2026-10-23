@@ -367,3 +367,69 @@ fn date_less_than() {
         &ctx
     ));
 }
+
+// --- Negated operators on an absent single-valued key ---
+//
+// AWS IAM: an absent key cannot equal the policy value, so a negated operator
+// ("not equals") holds. A Deny gated on StringNotEquals therefore applies when
+// the caller omits the key. Measured on live IAM/STS and DynamoDB.
+
+#[test]
+fn string_not_equals_absent_key_matches() {
+    let ctx = TestContext::new();
+    assert!(evaluate_condition(
+        &cond(
+            ConditionOperator::StringNotEquals,
+            "sts:ExternalId",
+            vec!["secret"]
+        ),
+        &ctx
+    ));
+}
+
+#[test]
+fn string_not_like_absent_key_matches() {
+    let ctx = TestContext::new();
+    assert!(evaluate_condition(
+        &cond(ConditionOperator::StringNotLike, "k", vec!["sec*"]),
+        &ctx
+    ));
+}
+
+#[test]
+fn arn_not_equals_absent_key_matches() {
+    let ctx = TestContext::new();
+    assert!(evaluate_condition(
+        &cond(
+            ConditionOperator::ArnNotEquals,
+            "k",
+            vec!["arn:aws:iam::123456789012:user/x"]
+        ),
+        &ctx
+    ));
+}
+
+#[test]
+fn positive_op_absent_key_still_no_match() {
+    // Regression: positive operators on an absent key remain false.
+    let ctx = TestContext::new();
+    assert!(!evaluate_condition(
+        &cond(ConditionOperator::StringEquals, "k", vec!["x"]),
+        &ctx
+    ));
+}
+
+#[test]
+fn string_not_equals_present_key_still_compares() {
+    // Regression: present key still evaluates normally.
+    let ctx = TestContext::new().with("k", vec!["secret"]);
+    assert!(!evaluate_condition(
+        &cond(ConditionOperator::StringNotEquals, "k", vec!["secret"]),
+        &ctx
+    ));
+    let ctx2 = TestContext::new().with("k", vec!["other"]);
+    assert!(evaluate_condition(
+        &cond(ConditionOperator::StringNotEquals, "k", vec!["secret"]),
+        &ctx2
+    ));
+}

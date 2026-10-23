@@ -15,6 +15,8 @@ impl SqliteCatalogStore {
         group_name: &str,
     ) -> OpResult<()> {
         let group_arn = format!("arn:aws:iam::{account_id}:group/{group_name}");
+        // D1: every writer holds the write lock.
+        let _writer = self.lock_writes().await;
         sqlx::query("INSERT INTO iam_groups (account_id, group_name, group_arn) VALUES (?, ?, ?)")
             .bind(account_id)
             .bind(group_name)
@@ -39,6 +41,8 @@ impl SqliteCatalogStore {
         account_id: &str,
         group_name: &str,
     ) -> OpResult<()> {
+        // D1: every writer holds the write lock.
+        let _writer = self.lock_writes().await;
         let result = sqlx::query("DELETE FROM iam_groups WHERE account_id = ? AND group_name = ?")
             .bind(account_id)
             .bind(group_name)
@@ -140,6 +144,8 @@ impl SqliteCatalogStore {
         group_name: &str,
         user_name: &str,
     ) -> OpResult<()> {
+        // D1: every writer holds the write lock.
+        let _writer = self.lock_writes().await;
         sqlx::query(
             "INSERT INTO iam_group_members (account_id, group_name, user_name) VALUES (?, ?, ?)",
         )
@@ -167,6 +173,8 @@ impl SqliteCatalogStore {
         group_name: &str,
         user_name: &str,
     ) -> OpResult<()> {
+        // D1: every writer holds the write lock.
+        let _writer = self.lock_writes().await;
         let result = sqlx::query(
             "DELETE FROM iam_group_members \
              WHERE account_id = ? AND group_name = ? AND user_name = ?",

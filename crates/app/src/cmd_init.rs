@@ -52,6 +52,23 @@ pub struct InitArgs {
     #[arg(long)]
     pg_pass: Option<String>,
 
+    /// Cassandra contact points (comma-separated host:port)
+    #[arg(long)]
+    cassandra_contact_points: Option<String>,
+
+    /// Cassandra admin user (for CREATE ROLE)
+    #[arg(long)]
+    cassandra_user: Option<String>,
+
+    /// Cassandra admin password.
+    /// Prefer `EXTENDDB_CASSANDRA_PASSWORD` to keep the value out of process arguments.
+    #[arg(long)]
+    cassandra_pass: Option<String>,
+
+    /// Cassandra keyspace prefix
+    #[arg(long)]
+    keyspace_prefix: Option<String>,
+
     /// extenddb application user
     #[arg(long)]
     extenddb_user: Option<String>,
@@ -141,7 +158,8 @@ pub async fn run(args: InitArgs) -> anyhow::Result<u8> {
     {
         anyhow::bail!(
             "this binary is built with the '{backend}' backend; \
-             --backend {requested} requires the extenddb-{requested} binary"
+             --backend {requested} requires rebuilding with \
+             `cargo build --release --no-default-features --features {requested}`"
         );
     }
     if args.backend.is_none() && Path::new(&args.config).exists() {
@@ -183,6 +201,12 @@ pub async fn run(args: InitArgs) -> anyhow::Result<u8> {
         std::env::var_os("EXTENDDB_APP_PASSWORD"),
         "EXTENDDB_APP_PASSWORD",
     )?;
+    crate::util::append_secret_arg(
+        &mut cli_args,
+        "--cassandra-pass",
+        std::env::var_os("EXTENDDB_CASSANDRA_PASSWORD"),
+        "EXTENDDB_CASSANDRA_PASSWORD",
+    )?;
 
     // Extract bind_addr from CLI args
     let bind_addr =
@@ -197,32 +221,32 @@ pub async fn run(args: InitArgs) -> anyhow::Result<u8> {
     // Create bootstrapper via registry (no hardcoded match!)
     let bootstrapper = extenddb_storage::bootstrapper::create_bootstrapper(&args.config, &cli_args)
         .await
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        .map_err(crate::cmd_migrate::storage_err)?;
 
     // Ensure application user exists.
     bootstrapper
         .ensure_app_user()
         .await
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        .map_err(crate::cmd_migrate::op_err)?;
 
     // Grant the application role to the admin user so CREATE DATABASE ... OWNER
     // succeeds on RDS/Aurora where the admin is not a true superuser.
     bootstrapper
         .grant_app_role_to_admin()
         .await
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        .map_err(crate::cmd_migrate::op_err)?;
 
     // Create catalog database — abort if it already exists.
     bootstrapper
         .create_catalog_db()
         .await
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        .map_err(crate::cmd_migrate::op_err)?;
 
     // Create data database — abort if it already exists.
     bootstrapper
         .create_data_db()
         .await
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        .map_err(crate::cmd_migrate::op_err)?;
 
     // Take the same lock `migrate` uses around the schema work below, so an
     // init cannot race a migrate running on another replica and fail on a
@@ -238,10 +262,13 @@ pub async fn run(args: InitArgs) -> anyhow::Result<u8> {
     bootstrapper
         .acquire_migration_lock()
         .await
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        .map_err(crate::cmd_migrate::op_err)?;
     let bootstrap_result = run_init_bootstrap(bootstrapper.as_ref()).await;
     if let Err(e) = bootstrapper.release_migration_lock().await {
-        tracing::warn!("Failed to release migration lock: {e:?}");
+        tracing::warn!(
+            "Failed to release migration lock: {}",
+            crate::cmd_migrate::op_err(e)
+        );
     }
     let admin_result = bootstrap_result?;
 
@@ -310,12 +337,12 @@ async fn run_init_bootstrap(
     bootstrapper
         .bootstrap_encryption_key()
         .await
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?; // REQ-AUTH-010
+        .map_err(crate::cmd_migrate::op_err)?; // REQ-AUTH-010
 
     bootstrapper
         .bootstrap_default_account()
         .await
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        .map_err(crate::cmd_migrate::op_err)?;
 
     // REQ-AUTH-003
     let env_user = std::env::var("EXTENDDB_ADMIN_USER").ok();
@@ -323,7 +350,7 @@ async fn run_init_bootstrap(
     bootstrapper
         .bootstrap_admin_user(env_user.as_deref(), env_pass.as_deref())
         .await
-        .map_err(|e| anyhow::anyhow!("{e:?}"))
+        .map_err(crate::cmd_migrate::op_err)
 }
 
 async fn run_init_migrations(
@@ -333,7 +360,7 @@ async fn run_init_migrations(
     let initialized = bootstrapper
         .is_catalog_initialized()
         .await
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        .map_err(crate::cmd_migrate::op_err)?;
 
     if initialized {
         println!("--- Catalog already initialized. Use 'extenddb migrate' for pending migrations.");
@@ -341,20 +368,20 @@ async fn run_init_migrations(
         bootstrapper
             .run_catalog_migrations()
             .await
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            .map_err(crate::cmd_migrate::op_err)?;
     }
 
     // Record data database connection in catalog.
     bootstrapper
         .record_data_connection()
         .await
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        .map_err(crate::cmd_migrate::op_err)?;
 
     // Initialize data database schema.
     bootstrapper
         .run_data_migrations()
         .await
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        .map_err(crate::cmd_migrate::op_err)?;
 
     Ok(())
 }

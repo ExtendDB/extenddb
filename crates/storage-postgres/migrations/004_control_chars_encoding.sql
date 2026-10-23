@@ -1,6 +1,6 @@
 -- Copyright 2026 ExtendDB contributors
 -- SPDX-License-Identifier: Apache-2.0
--- Stored string encoding changed (catalog version 0.0.4).
+-- Migration 004: stored string encoding changed (catalog version 0.0.5).
 --
 -- This migration changes no schema. It moves the catalog version because the
 -- form of the stored data changed: from this release, strings in the data
@@ -18,6 +18,6 @@
 
 BEGIN;
 
-UPDATE settings SET value = '0.0.4' WHERE key = 'catalog_version';
+UPDATE settings SET value = '0.0.5' WHERE key = 'catalog_version';
 
 COMMIT;

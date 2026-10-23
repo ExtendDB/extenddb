@@ -106,6 +106,22 @@ pub fn backend() -> extenddb_storage::Backend {
                     >)
             })
         },
+        management_store: |connection_string| {
+            let connection_string = connection_string.to_string();
+            Box::pin(async move {
+                let pool = sqlx::PgPool::connect(&connection_string)
+                    .await
+                    .map_err(|e| {
+                        extenddb_storage::management_store_factory::ManagementStoreError::ConnectionFailed(
+                            e.to_string(),
+                        )
+                    })?;
+                Ok(Box::new(PostgresCatalogStore::new(pool))
+                    as Box<
+                        dyn extenddb_storage::management_store::ManagementStore,
+                    >)
+            })
+        },
         diagnostics_store: |connection_string| {
             let connection_string = connection_string.to_string();
             Box::pin(async move {
@@ -136,11 +152,11 @@ use sqlx::postgres::PgPoolOptions;
 /// The tuple is the single source of truth. Use `CATALOG_VERSION.to_string()`
 /// wherever a string representation is needed.
 ///
-/// 0.0.4 changed no schema: it marks the stored string encoding introduced with
+/// 0.0.5 changed no schema: it marks the stored string encoding introduced with
 /// data migration `004_escape_control_chars`, so that a binary from an earlier
 /// release refuses a migrated deployment instead of reading escaped strings as
 /// literal data.
-pub const CATALOG_VERSION: CatalogVersion = CatalogVersion::new(0, 0, 4);
+pub const CATALOG_VERSION: CatalogVersion = CatalogVersion::new(0, 0, 5);
 
 /// Minimum number of connections allowed per pool.
 ///
@@ -186,6 +202,11 @@ pub(crate) const INDEX_PROPAGATION_DELAY_QUERY: &str = "SELECT value FROM settin
      WHERE key IN ('index_propagation_delay_ms', 'gsi_propagation_delay_ms') \
      ORDER BY key = 'index_propagation_delay_ms' DESC LIMIT 1";
 
+/// Cloning is cheap and shares the pools and caches: a clone is another
+/// handle on the same engine. RestoreTableFromBackup hands one to the detached
+/// task that copies the backup's items, so the copy does not borrow from the
+/// request.
+#[derive(Clone)]
 pub struct PostgresEngine {
     pub(crate) pool: PgPool,
     /// Connection pool for the data database where `_ddb_*` tables live.
@@ -214,6 +235,15 @@ pub struct PostgresEngine {
     /// the search path exists, so this backend still refuses vector operations
     /// over the wire; the flag is what that decision will read.
     pub(crate) vector_capable: bool,
+    /// Restores this engine (one per server process) may have in flight
+    /// across all accounts; see `backup_engine::restore_server_slot_count`.
+    pub(crate) restore_server_slots: Arc<tokio::sync::Semaphore>,
+    /// The number of permits `restore_server_slots` was created with, for
+    /// the refusal message.
+    pub(crate) restore_server_slot_count: usize,
+    /// Restores each account may run at once in this process; see
+    /// `backup_engine::RestoreAccountSlots`.
+    pub(crate) restore_account_slots: backup_engine::RestoreAccountSlots,
 }
 
 impl PostgresEngine {
@@ -288,6 +318,7 @@ impl PostgresEngine {
             ),
         }
 
+        let server_slots = backup_engine::restore_server_slot_count(pool_size);
         Ok(Self {
             pool,
             data_pool,
@@ -299,6 +330,9 @@ impl PostgresEngine {
                 initial_gsi_delay,
             )),
             vector_capable,
+            restore_server_slots: Arc::new(tokio::sync::Semaphore::new(server_slots)),
+            restore_server_slot_count: server_slots,
+            restore_account_slots: backup_engine::RestoreAccountSlots::default(),
         })
     }
 
@@ -375,7 +409,8 @@ impl PostgresEngine {
     ///
     /// Returns `StorageError::CatalogNotInitialized` if the catalog tables don't exist.
     /// Returns `StorageError::CatalogVersionMismatch` if the version doesn't match.
-    /// Returns `StorageError::Internal` if the stored version string is malformed.
+    /// Returns `StorageError::Internal` if the stored version string is malformed, carrying
+    /// `check_stored_catalog_version`'s refusal text.
     pub async fn check_catalog_version(&self) -> Result<(), StorageError> {
         // Check table existence via information_schema (robust, not string-matching).
         let exists: (bool,) = sqlx::query_as(
@@ -397,9 +432,18 @@ impl PostgresEngine {
 
         let found_str = row.ok_or(StorageError::CatalogNotInitialized)?.0;
 
-        let found = found_str
-            .parse::<CatalogVersion>()
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        // An unreadable version gets the shared guard's refusal, the text
+        // `extenddb migrate` prints for the same catalog.
+        let found = found_str.parse::<CatalogVersion>().map_err(|e| {
+            StorageError::Internal(
+                extenddb_storage::util::check_stored_catalog_version(
+                    Some(&found_str),
+                    CATALOG_VERSION,
+                )
+                .err()
+                .unwrap_or_else(|| e.to_string()),
+            )
+        })?;
 
         if found != CATALOG_VERSION {
             return Err(StorageError::CatalogVersionMismatch {
@@ -441,6 +485,55 @@ impl PostgresEngine {
              database, run 'extenddb migrate --yes', then start this server.",
             missing.join(", ")
         )))
+    }
+
+    /// Everything `serve` checks and changes in the catalog before serving,
+    /// in order; returns the shape steps applied.
+    ///
+    /// 1. The version gate ([`Self::check_catalog_version`]).
+    /// 2. The ledger: a catalog migration file this binary carries that the
+    ///    catalog's `schema_history` does not record refuses startup, naming
+    ///    the files. The version alone does not show it: another migration of
+    ///    the same number (another branch's `003_*`) can have stamped the
+    ///    current version. Every catalog has a ledger (`001_schema.sql`
+    ///    creates it and the runner records each file it applies), so a
+    ///    catalog that ran every file lists none here.
+    /// 3. The startup shape steps (`migrations::converge_catalog_shapes_at_serve`):
+    ///    a catalog stamped with the current version by an earlier revision of
+    ///    a migration file is otherwise served in a shape on which every
+    ///    DescribeTable fails. Each step waits at most
+    ///    `migrations::SERVE_SHAPE_LOCK_TIMEOUT_SECS` for its lock. On a
+    ///    current catalog this only reads `information_schema`.
+    ///
+    /// # Errors
+    ///
+    /// `BackendError::CatalogVersionMismatch` from the gate;
+    /// `BackendError::InitializationFailed` for every other failure, with
+    /// the advice to run `extenddb migrate --yes` for steps 2 and 3.
+    pub async fn prepare_catalog_for_serve(&self) -> Result<Vec<String>, BackendError> {
+        self.check_catalog_version().await.map_err(|e| match e {
+            StorageError::CatalogVersionMismatch { expected, found } => {
+                BackendError::CatalogVersionMismatch { expected, found }
+            }
+            // The unreadable-version refusal: printed as is, not as
+            // "Internal error: ...".
+            StorageError::Internal(refusal) => BackendError::InitializationFailed(refusal),
+            _ => BackendError::InitializationFailed(e.to_string()),
+        })?;
+        let migrate =
+            "; stop the servers and run `extenddb migrate --yes` with the admin credentials";
+        let unrecorded = migrations::pending_catalog_migrations(&self.pool)
+            .await
+            .map_err(|e| BackendError::InitializationFailed(format!("{}{migrate}", op_msg(e))))?;
+        if !unrecorded.is_empty() {
+            return Err(BackendError::InitializationFailed(format!(
+                "the catalog does not record these catalog migration files as applied: {}{migrate}",
+                unrecorded.join(", ")
+            )));
+        }
+        migrations::converge_catalog_shapes_at_serve(&self.pool)
+            .await
+            .map_err(|e| BackendError::InitializationFailed(format!("{}{migrate}", op_msg(e))))
     }
 
     /// Query the data database name from the catalog for the startup banner (REQ-LOG-001).
@@ -551,6 +644,18 @@ impl PostgresEngine {
 use extenddb_auth::CredentialStore;
 use extenddb_storage::hooks::{ServerRuntimeHooks, WorkerContext};
 use extenddb_storage::server_components::{BackendError, ServerComponents};
+
+/// The message of a management-store error, without its variant name.
+fn op_msg(e: extenddb_storage::management_store::OpError) -> String {
+    use extenddb_storage::management_store::OpError;
+    match e {
+        OpError::Validation(m)
+        | OpError::AlreadyExists(m)
+        | OpError::NotFound(m)
+        | OpError::HasDependents(m)
+        | OpError::Internal(m) => m,
+    }
+}
 
 /// Backend-specific runtime hooks for `PostgreSQL`.
 struct PostgresRuntimeHooks {
@@ -685,13 +790,10 @@ fn server_components_factory(
                 details: e.to_string(),
             })?;
 
-        // Check catalog version
-        engine.check_catalog_version().await.map_err(|e| match e {
-            StorageError::CatalogVersionMismatch { expected, found } => {
-                BackendError::CatalogVersionMismatch { expected, found }
-            }
-            _ => BackendError::InitializationFailed(e.to_string()),
-        })?;
+        // Version gate, unrecorded migration files, startup shape steps.
+        for step in engine.prepare_catalog_for_serve().await? {
+            tracing::warn!("converged the catalog shape at startup: {step}");
+        }
 
         // This build stores strings through the control-character escape, and the
         // re-encoding migration cannot tell a row this build wrote from a row an

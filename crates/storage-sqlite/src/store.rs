@@ -29,12 +29,14 @@
 //! writer holding the file lock fails a plain `PutItem` with exactly the
 //! `InternalServerError` seen in the `run-integration-sqlite` CI flake.
 //!
-//! Deliberate exclusions from the lock, so the invariant stays auditable:
-//! init-time bootstrap in this file (runs before the server serves traffic),
-//! and the management/credential stores, which write through the separate
-//! catalog pool in `lib.rs`. For a file-backed database that second pool
-//! opens the same file, so its small single-row autocommit writes carry a
-//! residual, much smaller, version of the same contention risk.
+//! The management stores (users, access keys, policies, groups, roles,
+//! accounts, admin, settings, metrics) write through the separate catalog
+//! pool in `lib.rs`, which for a file-backed database opens the same file;
+//! the server wiring shares this same lock instance into
+//! `SqliteCatalogStore`, so those writers queue with the engine's. The
+//! credential store only reads. The one deliberate exclusion from the lock,
+//! so the invariant stays auditable, is init-time bootstrap (in this file and
+//! in `bootstrapper.rs`), which runs before the server serves traffic.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -55,6 +57,9 @@ pub struct SqliteEngine {
     pub(crate) pool: SqlitePool,
     pub(crate) region: String,
     pub(crate) max_item_size_bytes: usize,
+    /// Whether this engine owns a single-connection in-memory database.
+    /// Backup strategy depends on this property, not on user pool sizing.
+    pub(crate) in_memory: bool,
     /// Wakes the control-plane poller when a table enters CREATING / DELETING.
     pub(crate) control_plane_notify: Arc<tokio::sync::Notify>,
     /// Cached default GSI propagation delay (ms); refreshed by a worker and
@@ -78,6 +83,10 @@ pub struct SqliteEngine {
     /// clone of the engine lives. `None` outside `serve` and for in-memory
     /// databases.
     pub(crate) serve_lock: Option<Arc<crate::serve_lock::ServeLock>>,
+    /// Backups this process may run at once, and the semaphore that enforces
+    /// it; see [`crate::backup::backup_server_slot_count`].
+    pub(crate) backup_server_slot_count: usize,
+    pub(crate) backup_server_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl SqliteEngine {
@@ -91,17 +100,28 @@ impl SqliteEngine {
         max_item_size_bytes: usize,
     ) -> Result<Self, StorageError> {
         let url = sqlite_url(path_or_url);
+        // Use the same parsed-location classifier as the serve lock. String
+        // containment misclassifies file names such as `mode=memory.db`.
+        let in_memory = crate::serve_lock::database_file(path_or_url)
+            .map_err(StorageError::Connection)?
+            .is_none();
         // An in-memory database lives only inside its own connection: a second
-        // connection opens a *separate* empty database. So for `:memory:` we pin
-        // the pool to a single connection that is never recycled (idle and
-        // lifetime timeouts disabled), guaranteeing one shared database for the
-        // process lifetime. Writes are already serialized by `write_lock`, so a
-        // single connection costs only read concurrency — acceptable for the
-        // ephemeral in-memory use case. File-backed databases keep the full WAL
-        // pool (concurrent readers alongside a single writer).
-        let in_memory = url.contains(":memory:") || url.contains("mode=memory");
+        // connection opens a *separate* empty database. So for an in-memory
+        // location we pin the pool to a single connection that is never
+        // recycled. File-backed backups hold a WAL reader while committing
+        // bounded backup-item batches, so they require a second connection
+        // even when `pool_size = 1` was configured.
+        let max_connections = if in_memory { 1 } else { pool_size.max(2) };
+        if !in_memory && max_connections != pool_size {
+            tracing::info!(
+                "SQLite pool_size {pool_size} raised to {max_connections} for a file-backed \
+                 database: a backup holds one reader connection for its whole duration while \
+                 its batches write through another. Set pool_size >= 3 so a running backup \
+                 does not contend with ordinary requests for connections"
+            );
+        }
         let mut opts = SqlitePoolOptions::new()
-            .max_connections(if in_memory { 1 } else { pool_size.max(1) })
+            .max_connections(max_connections)
             .min_connections(1);
         if in_memory {
             opts = opts.idle_timeout(None).max_lifetime(None);
@@ -147,10 +167,12 @@ impl SqliteEngine {
                 .and_then(|(v,)| v.parse::<u64>().ok())
                 .unwrap_or(10);
 
+        let backup_server_slot_count = crate::backup::backup_server_slot_count(max_connections);
         Ok(Self {
             pool,
             region: region.to_owned(),
             max_item_size_bytes,
+            in_memory,
             control_plane_notify: Arc::new(tokio::sync::Notify::new()),
             index_propagation_delay_cache: Arc::new(AtomicU64::new(initial_index_delay)),
             gsi_notify: Arc::new(tokio::sync::Notify::new()),
@@ -159,6 +181,8 @@ impl SqliteEngine {
                 std::sync::Mutex::new(std::collections::HashSet::new()),
             ),
             serve_lock: None,
+            backup_server_slot_count,
+            backup_server_slots: Arc::new(tokio::sync::Semaphore::new(backup_server_slot_count)),
         })
     }
 
@@ -386,7 +410,8 @@ impl SqliteEngine {
     /// # Errors
     /// - [`StorageError::CatalogNotInitialized`] if the catalog is absent.
     /// - [`StorageError::CatalogVersionMismatch`] if versions differ.
-    /// - [`StorageError::Internal`] if the stored version is malformed.
+    /// - [`StorageError::Internal`] if the stored version is malformed, carrying
+    ///   `check_stored_catalog_version`'s refusal text.
     pub async fn check_catalog_version(&self) -> Result<(), StorageError> {
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'settings')",
@@ -408,9 +433,20 @@ impl SqliteEngine {
         .ok_or(StorageError::CatalogNotInitialized)?
         .0;
 
+        // An unreadable version gets the shared guard's refusal, the text
+        // `extenddb migrate` prints for the same catalog.
         let found = found_str
             .parse::<extenddb_core::version::CatalogVersion>()
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            .map_err(|e| {
+                StorageError::Internal(
+                    extenddb_storage::util::check_stored_catalog_version(
+                        Some(&found_str),
+                        CATALOG_VERSION,
+                    )
+                    .err()
+                    .unwrap_or_else(|| e.to_string()),
+                )
+            })?;
 
         if found != CATALOG_VERSION {
             return Err(StorageError::CatalogVersionMismatch {
@@ -432,6 +468,43 @@ impl SqliteEngine {
         .ok()
         .flatten()
         .map_or_else(|| "(not configured)".to_owned(), |(v,)| v)
+    }
+}
+
+#[cfg(test)]
+mod catalog_version_tests {
+    use super::SqliteEngine;
+    use extenddb_storage::error::StorageError;
+
+    /// `serve` once printed the unreadable-version refusal as
+    /// "Internal error: <parse error>"; it now carries the shared guard's
+    /// text, which `extenddb migrate` prints for the same catalog.
+    #[tokio::test]
+    async fn an_unreadable_version_carries_the_shared_refusal() {
+        let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
+            .await
+            .expect("engine");
+        crate::schema::apply(&engine.pool).await.expect("schema");
+        engine
+            .check_catalog_version()
+            .await
+            .expect("current catalog");
+        for stored in ["garbage", "0.0", "v0.0.4"] {
+            sqlx::query("UPDATE settings SET value = ? WHERE key = 'catalog_version'")
+                .bind(stored)
+                .execute(&engine.pool)
+                .await
+                .expect("tamper");
+            let expected = extenddb_storage::util::check_stored_catalog_version(
+                Some(stored),
+                crate::schema::CATALOG_VERSION,
+            )
+            .expect_err("unreadable");
+            match engine.check_catalog_version().await {
+                Err(StorageError::Internal(msg)) => assert_eq!(msg, expected, "{stored}"),
+                other => panic!("{stored}: {other:?}"),
+            }
+        }
     }
 }
 
@@ -625,6 +698,214 @@ mod d1_write_lock_tests {
                     .expect("update continuous backups");
             },
             "update_continuous_backups",
+        )
+        .await;
+    }
+
+    /// Build a catalog store over the engine's pool and, critically, the
+    /// engine's OWN write lock, mirroring the server wiring in `lib.rs`. The
+    /// cached key lets access-key creation encrypt without a settings lookup.
+    fn catalog_store(engine: &SqliteEngine) -> crate::SqliteCatalogStore {
+        use base64::Engine as _;
+        let key = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
+        crate::SqliteCatalogStore::with_encryption_key(
+            engine.pool.clone(),
+            key,
+            std::sync::Arc::clone(&engine.write_lock),
+        )
+    }
+
+    /// The management-store writer observed losing its file lock in the
+    /// `run-integration-sqlite` flake (`put_policy: ... database is locked`,
+    /// surfacing as HTTP 500 where 204 was expected).
+    #[tokio::test]
+    async fn management_put_policy_waits_for_the_write_lock() {
+        use extenddb_storage::management_store::ManagementStore;
+        let engine = engine().await;
+        let store = catalog_store(&engine);
+        assert_serialized(
+            &engine,
+            async move {
+                ManagementStore::put_policy(
+                    &store,
+                    "000000000000",
+                    "user",
+                    "d1-user",
+                    "full",
+                    &json!({"Version": "2012-10-17", "Statement": []}),
+                )
+                .await
+                .expect("put policy");
+            },
+            "put_policy",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn management_create_user_waits_for_the_write_lock() {
+        use extenddb_storage::management_store::ManagementStore;
+        let engine = engine().await;
+        let store = catalog_store(&engine);
+        assert_serialized(
+            &engine,
+            async move {
+                ManagementStore::create_user(&store, "000000000000", "d1-user", None)
+                    .await
+                    .expect("create user");
+            },
+            "create_user",
+        )
+        .await;
+    }
+
+    /// The caller-tag lookup resolves tags for a `user/<name>` resource, which
+    /// is the form the server passes from the caller ARN. It also resolves a
+    /// `role/<name>` and an `assumed-role/<role>/<session>` resource to the
+    /// role's tags.
+    #[tokio::test]
+    async fn fetch_caller_tags_resolves_user_and_role() {
+        use extenddb_storage::management_store::ManagementStore;
+        let engine = engine().await;
+        let store = catalog_store(&engine);
+
+        ManagementStore::create_user(&store, "000000000000", "tag-user", None)
+            .await
+            .expect("create user");
+        ManagementStore::tag_user(
+            &store,
+            "000000000000",
+            "tag-user",
+            &[("team".to_owned(), "contractors".to_owned())],
+        )
+        .await
+        .expect("tag user");
+        let tags = ManagementStore::fetch_caller_tags(&store, "000000000000", "user/tag-user")
+            .await
+            .expect("fetch user tags");
+        assert_eq!(tags, vec![("team".to_owned(), "contractors".to_owned())]);
+
+        ManagementStore::create_role(
+            &store,
+            "000000000000",
+            "tag-role",
+            &json!({"Version": "2012-10-17", "Statement": [
+                {"Effect": "Allow", "Principal": {"AWS": "*"}, "Action": "sts:AssumeRole"}]}),
+        )
+        .await
+        .expect("create role");
+        ManagementStore::tag_role(
+            &store,
+            "000000000000",
+            "tag-role",
+            &[("env".to_owned(), "prod".to_owned())],
+        )
+        .await
+        .expect("tag role");
+        let role_tags = ManagementStore::fetch_caller_tags(&store, "000000000000", "role/tag-role")
+            .await
+            .expect("fetch role tags");
+        assert_eq!(role_tags, vec![("env".to_owned(), "prod".to_owned())]);
+        let assumed = ManagementStore::fetch_caller_tags(
+            &store,
+            "000000000000",
+            "assumed-role/tag-role/session1",
+        )
+        .await
+        .expect("fetch assumed-role tags");
+        assert_eq!(assumed, vec![("env".to_owned(), "prod".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn management_create_access_key_waits_for_the_write_lock() {
+        use extenddb_storage::management_store::ManagementStore;
+        let engine = engine().await;
+        // The owning user must exist before the lock window (foreign key);
+        // key generation and encryption also run pre-lock inside the writer.
+        sqlx::query(
+            "INSERT INTO iam_users (account_id, user_name, user_arn) \
+             VALUES ('000000000000', 'd1-key-user', 'arn:aws:iam::000000000000:user/d1-key-user')",
+        )
+        .execute(&engine.pool)
+        .await
+        .expect("user");
+        let store = catalog_store(&engine);
+        assert_serialized(
+            &engine,
+            async move {
+                ManagementStore::create_access_key(&store, "000000000000", "d1-key-user")
+                    .await
+                    .expect("create access key");
+            },
+            "create_access_key",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn management_create_account_waits_for_the_write_lock() {
+        use extenddb_storage::management_store::ManagementStore;
+        let engine = engine().await;
+        let store = catalog_store(&engine);
+        assert_serialized(
+            &engine,
+            async move {
+                ManagementStore::create_account(&store, "111111111111", "d1-acct")
+                    .await
+                    .expect("create account");
+            },
+            "create_account",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn management_create_group_waits_for_the_write_lock() {
+        use extenddb_storage::management_store::ManagementStore;
+        let engine = engine().await;
+        let store = catalog_store(&engine);
+        assert_serialized(
+            &engine,
+            async move {
+                ManagementStore::create_group(&store, "000000000000", "d1-group")
+                    .await
+                    .expect("create group");
+            },
+            "create_group",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn admin_create_waits_for_the_write_lock() {
+        use extenddb_storage::management_store::AdminStore;
+        let engine = engine().await;
+        let store = catalog_store(&engine);
+        assert_serialized(
+            &engine,
+            async move {
+                AdminStore::create_admin(&store, "d1-admin", "hash")
+                    .await
+                    .expect("create admin");
+            },
+            "create_admin",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn set_setting_waits_for_the_write_lock() {
+        use extenddb_storage::management_store::SettingsStore;
+        let engine = engine().await;
+        let store = catalog_store(&engine);
+        assert_serialized(
+            &engine,
+            async move {
+                SettingsStore::set_setting(&store, "d1-setting", "v")
+                    .await
+                    .expect("set setting");
+            },
+            "set_setting",
         )
         .await;
     }

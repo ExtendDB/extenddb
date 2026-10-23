@@ -352,6 +352,18 @@ impl Bootstrapper for MongoBootstrapper {
             .upsert(true)
             .await;
 
+        // Seed the resource-tag migration marker on this fresh catalog so the
+        // server's startup guard passes. An existing catalog created before
+        // this change has no such row, so serve refuses it until
+        // `extenddb migrate --yes` records it.
+        let _ = settings
+            .update_one(
+                doc! { "_id": "resource_tag_migration" },
+                doc! { "$setOnInsert": { "value": "applied" } },
+            )
+            .upsert(true)
+            .await;
+
         // Record migration
         let schema_history = db.collection::<Document>("schema_history");
         let _ = schema_history

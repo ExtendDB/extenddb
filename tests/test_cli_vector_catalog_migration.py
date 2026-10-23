@@ -1,7 +1,11 @@
 # Copyright 2026 ExtendDB contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Catalog migration tests for the vector index schema (catalog 0.0.2 upwards).
+"""Catalog migration tests against a live PostgreSQL deployment.
+
+The vector index schema (catalog 0.0.3), the backup table definitions
+(catalog 0.0.4) and the stored string encoding marker (catalog 0.0.5) are
+exercised through an upgrade from the pre-vector shape.
 
 These exercise the migration against a live deployment rather than asserting the
 SQL text: init one, roll its catalog back to the pre-vector shape, and check that
@@ -29,12 +33,17 @@ from lifecycle_helpers import (
 )
 
 VECTOR_MIGRATION = "002_vector_indexes.sql"
+BACKUP_DEFINITIONS_MIGRATION = "003_backup_definitions.sql"
 # Moves the version for the stored string encoding; changes no schema. A 0.0.2
-# deployment has neither this nor the vector migration recorded.
-ENCODING_MIGRATION = "003_control_chars_encoding.sql"
-CURRENT_CATALOG_VERSION = "0.0.4"
-# One past the compiled version, for the gate's other direction.
-FUTURE_CATALOG_VERSION = "0.0.5"
+# deployment has none of these three recorded.
+ENCODING_MIGRATION = "004_control_chars_encoding.sql"
+
+# The version the binary expects, written by the last catalog migration. Every
+# current-version assertion reads it from here so the next bump is one edit.
+CURRENT_CATALOG_VERSION = "0.0.5"
+
+# A version no release has reached, for the symmetric version-gate test.
+FUTURE_CATALOG_VERSION = "0.0.6"
 
 
 def _catalog_conn(cli_env):
@@ -73,6 +82,12 @@ def _backups_has_vector_column(cli_env):
     )
 
 
+def _backup_definitions_table_exists(cli_env):
+    return _catalog_query(
+        cli_env, "SELECT to_regclass('public.backup_definitions') IS NOT NULL"
+    )
+
+
 def _init(cli_env):
     result = _run_extenddb(
         "init", *_init_args(cli_env),
@@ -86,18 +101,19 @@ def _roll_catalog_back_to_pre_vector(cli_env):
     """Turn a freshly initialised catalog into the shape 0.0.2 deployments have.
 
     Reproduces an upgrade rather than a fresh install, which is the case that
-    matters: a fresh install applies both migrations in order and reaches the same
+    matters: a fresh install applies the migrations in order and reaches the same
     end state trivially.
     """
     conn = _catalog_conn(cli_env)
     try:
         conn.autocommit = True
         with conn.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS backup_definitions")
             cur.execute("DROP TABLE IF EXISTS vector_indexes")
             cur.execute("ALTER TABLE backups DROP COLUMN IF EXISTS vector_indexes")
             cur.execute(
-                "DELETE FROM schema_history WHERE filename IN (%s, %s)",
-                (VECTOR_MIGRATION, ENCODING_MIGRATION),
+                "DELETE FROM schema_history WHERE filename IN (%s, %s, %s)",
+                (VECTOR_MIGRATION, BACKUP_DEFINITIONS_MIGRATION, ENCODING_MIGRATION),
             )
             cur.execute("UPDATE settings SET value = '0.0.2' WHERE key = 'catalog_version'")
     finally:
@@ -105,9 +121,9 @@ def _roll_catalog_back_to_pre_vector(cli_env):
 
 
 class TestVectorCatalogMigration:
-    """Catalog 0.0.3 (vector index table and backup snapshot) and 0.0.4 (version marker)."""
+    """Migrations from the pre-vector catalog shape to the current version."""
 
-    def test_init_creates_the_vector_catalog_at_the_current_version(self, cli_env):
+    def test_init_creates_the_catalog_at_the_current_version(self, cli_env):
         """A fresh init applies every catalog migration and records the version.
 
         The version is what the binary checks at startup, so a migration that
@@ -119,6 +135,7 @@ class TestVectorCatalogMigration:
         assert _catalog_version(cli_env) == CURRENT_CATALOG_VERSION
         assert _vector_table_exists(cli_env) is True
         assert _backups_has_vector_column(cli_env) is True
+        assert _backup_definitions_table_exists(cli_env) is True
 
         conn = _catalog_conn(cli_env)
         try:
@@ -131,6 +148,7 @@ class TestVectorCatalogMigration:
         # deployment that is already current. The statements are idempotent too,
         # so a replay after a crash between applying and recording is harmless.
         assert VECTOR_MIGRATION in tracked, tracked
+        assert BACKUP_DEFINITIONS_MIGRATION in tracked, tracked
         assert ENCODING_MIGRATION in tracked, tracked
 
     def test_migrate_upgrades_a_pre_vector_deployment(self, cli_env):
@@ -218,12 +236,9 @@ class TestVectorCatalogMigration:
         try:
             conn.autocommit = True
             with conn.cursor() as cur:
-                # Ledger rows gone, schema left in place: the crash window. The
-                # encoding migration's row goes too, so the walk ends at the
-                # current version rather than at the one the vector file writes.
+                # Ledger row gone, schema left in place: the crash window.
                 cur.execute(
-                    "DELETE FROM schema_history WHERE filename IN (%s, %s)",
-                    (VECTOR_MIGRATION, ENCODING_MIGRATION),
+                    "DELETE FROM schema_history WHERE filename = %s", (VECTOR_MIGRATION,)
                 )
                 # Force the runner to walk the file list, the way a later
                 # migration would.
@@ -302,4 +317,6 @@ class TestVectorCatalogMigration:
             ) from None
         combined = refused.stdout + refused.stderr
         assert refused.returncode != 0, combined
-        assert CURRENT_CATALOG_VERSION in combined and FUTURE_CATALOG_VERSION in combined, combined
+        assert CURRENT_CATALOG_VERSION in combined and FUTURE_CATALOG_VERSION in combined, (
+            combined
+        )

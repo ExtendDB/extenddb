@@ -14,8 +14,8 @@
 //! backfill lifecycle the service was measured to report.
 
 use extenddb_core::types::{
-    AttributeDefinition, BillingMode, KeySchemaElement, TableDescription, UpdateTableInput,
-    VectorIndexSpecification,
+    AttributeDefinition, BillingMode, KeySchemaElement, ProvisionedThroughputDescription,
+    TableDescription, UpdateTableInput, VectorIndexSpecification,
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::effective_attribute_definitions;
@@ -324,10 +324,22 @@ impl SqliteEngine {
                         .map_err(|e| StorageError::Internal(e.to_string()))?;
                     let proj = serde_json::to_string(&create.projection)
                         .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    // Stored as the description DescribeTable parses, as
+                    // CreateTable does: the request's two-member shape has no
+                    // NumberOfDecreasesToday and made every DescribeTable of
+                    // the table an internal error afterwards.
                     let pt = create
                         .provisioned_throughput
                         .as_ref()
-                        .map(serde_json::to_string)
+                        .map(|pt| {
+                            serde_json::to_string(&ProvisionedThroughputDescription {
+                                read_capacity_units: pt.read_capacity_units,
+                                write_capacity_units: pt.write_capacity_units,
+                                number_of_decreases_today: 0,
+                                last_increase_date_time: None,
+                                last_decrease_date_time: None,
+                            })
+                        })
                         .transpose()
                         .map_err(|e| StorageError::Internal(e.to_string()))?;
                     let index_id = uuid::Uuid::new_v4().to_string();
@@ -1211,6 +1223,130 @@ async fn update_col(
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod gsi_throughput_tests {
+    use crate::SqliteEngine;
+    use extenddb_storage::TableEngine;
+    use serde_json::json;
+
+    /// A GSI added by UpdateTable with ProvisionedThroughput on a PROVISIONED
+    /// table is stored as the throughput description DescribeTable reads, so
+    /// DescribeTable keeps working and reports the index's units with
+    /// NumberOfDecreasesToday 0. A row an earlier build wrote in the request's
+    /// shape (no NumberOfDecreasesToday) is read the same way.
+    #[tokio::test]
+    async fn describe_table_works_after_adding_a_provisioned_gsi() {
+        let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
+            .await
+            .expect("engine");
+        crate::schema::apply(&engine.pool).await.expect("schema");
+        sqlx::query("UPDATE settings SET value = '0' WHERE key = 'control_plane_delay_seconds'")
+            .execute(&engine.pool)
+            .await
+            .expect("delay");
+        let account = "000000000000";
+        sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
+            .bind(account)
+            .execute(&engine.pool)
+            .await
+            .expect("account");
+        let input: extenddb_core::types::CreateTableInput = serde_json::from_value(json!({
+            "TableName": "t",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PROVISIONED",
+            "ProvisionedThroughput": {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5}
+        }))
+        .expect("input");
+        engine
+            .create_table_impl(account, input, false)
+            .await
+            .expect("create table");
+        let update: extenddb_core::types::UpdateTableInput = serde_json::from_value(json!({
+            "TableName": "t",
+            "AttributeDefinitions": [{"AttributeName": "g", "AttributeType": "S"}],
+            "GlobalSecondaryIndexUpdates": [{"Create": {
+                "IndexName": "gsi",
+                "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"},
+                "ProvisionedThroughput": {"ReadCapacityUnits": 3, "WriteCapacityUnits": 4}
+            }}]
+        }))
+        .expect("update");
+        engine
+            .update_table(account, update)
+            .await
+            .expect("UpdateTable adding a provisioned GSI");
+        let desc = engine
+            .describe_table(
+                account,
+                extenddb_core::types::DescribeTableInput {
+                    table_name: "t".to_owned(),
+                },
+            )
+            .await
+            .expect("DescribeTable after adding a provisioned GSI");
+        let gsi = &desc.global_secondary_indexes.expect("gsis")[0];
+        let pt = gsi.provisioned_throughput.as_ref().expect("gsi throughput");
+        assert_eq!(
+            (
+                pt.read_capacity_units,
+                pt.write_capacity_units,
+                pt.number_of_decreases_today
+            ),
+            (3, 4, 0)
+        );
+
+        // The shape earlier builds stored for the same UpdateTable.
+        sqlx::query(
+            "UPDATE indexes SET provisioned_throughput = \
+             '{\"ReadCapacityUnits\":6,\"WriteCapacityUnits\":7}' WHERE index_name = 'gsi'",
+        )
+        .execute(&engine.pool)
+        .await
+        .expect("rewrite the row in the old shape");
+        let desc = engine
+            .describe_table(
+                account,
+                extenddb_core::types::DescribeTableInput {
+                    table_name: "t".to_owned(),
+                },
+            )
+            .await
+            .expect("DescribeTable of a GSI throughput row written by an earlier build");
+        let gsi = &desc.global_secondary_indexes.expect("gsis")[0];
+        let pt = gsi.provisioned_throughput.as_ref().expect("gsi throughput");
+        assert_eq!(
+            (
+                pt.read_capacity_units,
+                pt.write_capacity_units,
+                pt.number_of_decreases_today
+            ),
+            (6, 7, 0)
+        );
+        // Anything else in the column is still an error, not zero throughput.
+        sqlx::query(
+            "UPDATE indexes SET provisioned_throughput = '{\"x\":1}' WHERE index_name = 'gsi'",
+        )
+        .execute(&engine.pool)
+        .await
+        .expect("rewrite the row as garbage");
+        let err = engine
+            .describe_table(
+                account,
+                extenddb_core::types::DescribeTableInput {
+                    table_name: "t".to_owned(),
+                },
+            )
+            .await
+            .expect_err("an unreadable throughput row is reported");
+        assert!(
+            matches!(&err, extenddb_storage::error::StorageError::Internal(m) if m.starts_with("index pt:")),
+            "{err:?}"
+        );
+    }
 }
 
 #[cfg(test)]
