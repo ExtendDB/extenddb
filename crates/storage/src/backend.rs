@@ -51,6 +51,8 @@ pub struct Backend {
     pub operations: &'static dyn OperationsEngine,
     /// Creates the runtime settings store.
     pub settings_store: SettingsStoreFactory,
+    /// Creates a catalog-only management store (used by `migrate`).
+    pub management_store: crate::management_store_factory::ManagementStoreFactory,
     /// Creates the diagnostics store (`catalog-check`, `verify`).
     pub diagnostics_store: DiagnosticsStoreFactory,
     /// Creates the assembled server components for `serve`.

@@ -348,13 +348,40 @@ pub(crate) async fn insert_index_row_multi(
     idx_sks: &[(&str, ScalarAttributeType)],
     base_sks: &[(&str, ScalarAttributeType)],
 ) -> Result<(), StorageError> {
-    let idx_pk_text = composite_pk_to_text(item, index_ks)?;
-    let base_pk_text = composite_pk_to_text(item, base_ks)?;
+    insert_index_rows_multi(
+        tx,
+        idx_table,
+        &[(item, projected)],
+        index_ks,
+        base_ks,
+        idx_sks,
+        base_sks,
+    )
+    .await
+}
 
-    let item_json =
-        serde_json::to_value(projected).map_err(|e| StorageError::Internal(e.to_string()))?;
-
-    // Build column list dynamically
+/// Insert rows into one index table in a single multi-row INSERT.
+///
+/// Each row is `(item, projected)`: the item supplies the index and base key
+/// columns, the projection is stored as `item_data`. The one implementation
+/// behind both the write path ([`insert_index_row_multi`], one row) and the
+/// restore copy (one statement per index per batch), so the two cannot lay
+/// out an index row differently. Every key attribute must be present on
+/// every item (callers filter with [`item_has_index_keys`]); a missing one
+/// is an error rather than a misaligned bind.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn insert_index_rows_multi(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    idx_table: &str,
+    rows: &[(&Item, &Item)],
+    index_ks: &[KeySchemaElement],
+    base_ks: &[KeySchemaElement],
+    idx_sks: &[(&str, ScalarAttributeType)],
+    base_sks: &[(&str, ScalarAttributeType)],
+) -> Result<(), StorageError> {
+    if rows.is_empty() {
+        return Ok(());
+    }
     let mut cols = vec!["pk".to_owned()];
     for (i, &(_, sk_type)) in idx_sks.iter().enumerate() {
         cols.push(sk_column_n(i, sk_type));
@@ -370,45 +397,54 @@ pub(crate) async fn insert_index_row_multi(
     }
     cols.push("item_data".to_owned());
 
-    let placeholders: Vec<String> = (1..=cols.len()).map(|i| format!("${i}")).collect();
+    let width = cols.len();
+    let tuples: Vec<String> = (0..rows.len())
+        .map(|r| {
+            let ps: Vec<String> = (1..=width).map(|c| format!("${}", r * width + c)).collect();
+            format!("({})", ps.join(", "))
+        })
+        .collect();
     let sql = format!(
-        "INSERT INTO {idx_table} ({}) VALUES ({})",
+        "INSERT INTO {idx_table} ({}) VALUES {}",
         cols.join(", "),
-        placeholders.join(", ")
+        tuples.join(", ")
     );
 
-    let mut query = sqlx::query(&sql).bind(idx_pk_text);
-
-    // Bind index SK values
-    for &(sk_name, sk_type) in idx_sks {
-        if let Some(sk_val) = item.get(sk_name) {
-            let sk = parse_sk(sk_val, sk_type)?;
-            query = match sk {
-                SortKeyValue::S(s) => query.bind(s),
-                SortKeyValue::N(n) => query.bind(n),
-                SortKeyValue::B(b) => query.bind(b),
-            };
+    let mut query = sqlx::query(&sql);
+    for &(item, projected) in rows {
+        query = query.bind(composite_pk_to_text(item, index_ks)?);
+        for &(sk_name, sk_type) in idx_sks {
+            query = bind_index_sk(query, idx_table, item, sk_name, sk_type)?;
         }
-    }
-
-    // Bind base PK
-    query = query.bind(base_pk_text);
-
-    // Bind base SK values
-    for &(sk_name, sk_type) in base_sks {
-        if let Some(sk_val) = item.get(sk_name) {
-            let sk = parse_sk(sk_val, sk_type)?;
-            query = match sk {
-                SortKeyValue::S(s) => query.bind(s),
-                SortKeyValue::N(n) => query.bind(n),
-                SortKeyValue::B(b) => query.bind(b),
-            };
+        query = query.bind(composite_pk_to_text(item, base_ks)?);
+        for &(sk_name, sk_type) in base_sks {
+            query = bind_index_sk(query, idx_table, item, sk_name, sk_type)?;
         }
+        query = query.bind(
+            serde_json::to_value(projected).map_err(|e| StorageError::Internal(e.to_string()))?,
+        );
     }
-
-    // Bind item_data
-    query = query.bind(item_json);
 
     query.execute(&mut **tx).await.map_err(db_error)?;
     Ok(())
+}
+
+/// Bind one sort-key value of an index row, refusing a missing attribute.
+fn bind_index_sk<'q>(
+    query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    idx_table: &str,
+    item: &Item,
+    sk_name: &str,
+    sk_type: ScalarAttributeType,
+) -> Result<sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>, StorageError> {
+    let sk_val = item.get(sk_name).ok_or_else(|| {
+        StorageError::Internal(format!(
+            "index row for {idx_table} is missing key attribute {sk_name}"
+        ))
+    })?;
+    Ok(match parse_sk(sk_val, sk_type)? {
+        SortKeyValue::S(s) => query.bind(s),
+        SortKeyValue::N(n) => query.bind(n),
+        SortKeyValue::B(b) => query.bind(b),
+    })
 }

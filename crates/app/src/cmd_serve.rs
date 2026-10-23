@@ -172,7 +172,9 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
         backend,
         config::redact_password(app_config.storage.connection_config()),
     );
-    let startup_warnings = render_startup_warnings(&app_config.storage.startup_warnings());
+    let mut warnings = app_config.storage.startup_warnings();
+    warnings.extend(app_config.server.startup_warnings());
+    let startup_warnings = render_startup_warnings(&warnings);
     if args.foreground {
         eprint!("{wordmark}");
         eprintln!("{banner_line1}");

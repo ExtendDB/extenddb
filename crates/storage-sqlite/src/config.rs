@@ -11,8 +11,18 @@ use serde::Deserialize;
 /// SQLite backend configuration.
 ///
 /// `path` is the database file location; `:memory:` selects an ephemeral
-/// in-memory database. `pool_size` bounds the read connection pool (writes are
-/// serialized by the engine regardless).
+/// in-memory database. `pool_size` bounds the connection pool (writes are
+/// serialized by the engine regardless). File databases clamp this to at least
+/// two connections so a backup reader can coexist with its batched writer, and
+/// log at info when they do. A backup holds its reader connection for its whole
+/// duration, so `pool_size >= 3` keeps a running backup from contending with
+/// ordinary requests for connections. The process runs at most
+/// `pool_size / 2 - 1` backups at once (between 1 and 16; 4 for the default
+/// of 10) and answers `LimitExceededException` to a CreateBackup that waited
+/// 30 s for a slot. Running backups hold one connection each for their read
+/// snapshot plus one shared writer (`n` backups hold `n + 1`), so from
+/// `pool_size` 4 up a flood of backups leaves at least half the pool to other
+/// requests; with 2 or 3 the one admitted backup holds two of them.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SqliteConfig {

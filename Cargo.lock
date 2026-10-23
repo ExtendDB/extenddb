@@ -1230,7 +1230,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "extenddb-app",
@@ -1244,9 +1244,10 @@ dependencies = [
 
 [[package]]
 name = "extenddb-app"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64 0.22.1",
  "clap",
  "daemonize",
@@ -1271,7 +1272,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-auth"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "async-trait",
  "axum",
@@ -1291,7 +1292,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-cache"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "futures",
  "moka",
@@ -1302,7 +1303,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-config"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "config",
@@ -1315,7 +1316,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-core"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "base64 0.22.1",
  "bigdecimal",
@@ -1328,7 +1329,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-engine"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "base64 0.22.1",
  "crc32fast",
@@ -1347,7 +1348,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-server"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1378,12 +1379,13 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "unicode-properties",
  "uuid",
 ]
 
 [[package]]
 name = "extenddb-storage"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -1407,7 +1409,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-storage-cassandra"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -1434,7 +1436,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-storage-mongodb"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1464,7 +1466,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-storage-postgres"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1492,7 +1494,7 @@ dependencies = [
 
 [[package]]
 name = "extenddb-storage-sqlite"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "aes-gcm",
  "async-trait",

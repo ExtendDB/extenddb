@@ -24,7 +24,26 @@ pub enum DynamoDbError {
     #[error("{0}")]
     BackupNotFoundException(String),
     #[error("{0}")]
+    BackupInUseException(String),
+    #[error("{0}")]
     ResourceInUseException(String),
+    /// HTTP 400. `RestoreTableFromBackup` into a table name that is already
+    /// taken. Listed in the operation's errors in the 2012-08-10 service model
+    /// (botocore 1.33.13 `service-2.json`, shape `TableAlreadyExistsException`)
+    /// and measured on DynamoDB. `CreateTable` keeps
+    /// `ResourceInUseException`, which is what the service returns there.
+    #[error("{0}")]
+    TableAlreadyExistsException(String),
+    /// HTTP 400. `RestoreTableFromBackup` into a name that is itself a
+    /// `CREATING` restore target. Measured on DynamoDB: `Table: <name> is
+    /// already being restored from backup: <arn>`.
+    #[error("{0}")]
+    TableInUseException(String),
+    /// HTTP 400. `CreateBackup` on a table that does not exist or is not yet
+    /// `ACTIVE`. Measured on DynamoDB: `Table not found: <name>`. Distinct
+    /// from `ResourceNotFoundException`, which the data plane returns.
+    #[error("{0}")]
+    TableNotFoundException(String),
     /// A per-table or per-account limit was exceeded.
     ///
     /// Distinct from `ValidationException` on purpose: the service uses this
@@ -114,7 +133,11 @@ impl DynamoDbError {
             Self::ValidationException(_)
             | Self::ResourceNotFoundException(_)
             | Self::BackupNotFoundException(_)
+            | Self::BackupInUseException(_)
             | Self::ResourceInUseException(_)
+            | Self::TableAlreadyExistsException(_)
+            | Self::TableInUseException(_)
+            | Self::TableNotFoundException(_)
             | Self::LimitExceededException(_)
             | Self::ConditionalCheckFailedException(..)
             | Self::TransactionCanceledException { .. }
@@ -155,7 +178,11 @@ impl DynamoDbError {
             Self::ValidationException(_) => "ValidationException",
             Self::ResourceNotFoundException(_) => "ResourceNotFoundException",
             Self::BackupNotFoundException(_) => "BackupNotFoundException",
+            Self::BackupInUseException(_) => "BackupInUseException",
             Self::ResourceInUseException(_) => "ResourceInUseException",
+            Self::TableAlreadyExistsException(_) => "TableAlreadyExistsException",
+            Self::TableInUseException(_) => "TableInUseException",
+            Self::TableNotFoundException(_) => "TableNotFoundException",
             Self::LimitExceededException(_) => "LimitExceededException",
             Self::ConditionalCheckFailedException(..) => "ConditionalCheckFailedException",
             Self::TransactionCanceledException { .. } => "TransactionCanceledException",
@@ -221,7 +248,11 @@ impl DynamoDbError {
             Self::ValidationException(m)
             | Self::ResourceNotFoundException(m)
             | Self::BackupNotFoundException(m)
+            | Self::BackupInUseException(m)
             | Self::ResourceInUseException(m)
+            | Self::TableAlreadyExistsException(m)
+            | Self::TableInUseException(m)
+            | Self::TableNotFoundException(m)
             | Self::LimitExceededException(m)
             | Self::ConditionalCheckFailedException(m, _)
             | Self::IdempotentParameterMismatchException(m)
@@ -315,8 +346,13 @@ mod tests {
             (DynamoDbError::RequestLimitExceeded(String::new()), 400),
             (DynamoDbError::RequestTimeoutException(String::new()), 408),
             (DynamoDbError::ResourceInUseException(String::new()), 400),
+            (
+                DynamoDbError::TableAlreadyExistsException(String::new()),
+                400,
+            ),
             (DynamoDbError::ResourceNotFoundException(String::new()), 400),
             (DynamoDbError::BackupNotFoundException(String::new()), 400),
+            (DynamoDbError::BackupInUseException(String::new()), 400),
             (DynamoDbError::SerializationException(String::new()), 400),
             (DynamoDbError::ServiceUnavailable(String::new()), 503),
             (DynamoDbError::ThrottlingException(String::new()), 400),
@@ -354,5 +390,15 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn table_already_exists_uses_the_dynamodb_namespace() {
+        let err = DynamoDbError::TableAlreadyExistsException("Table already exists: t".to_owned());
+        assert_eq!(
+            err.full_error_type(),
+            "com.amazonaws.dynamodb.v20120810#TableAlreadyExistsException"
+        );
+        assert_eq!(err.message(), "Table already exists: t");
     }
 }

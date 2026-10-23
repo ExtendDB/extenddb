@@ -101,6 +101,23 @@ pub const VECTOR_INDEX_MIN_CREATING_MS: &str = "vector_index_min_creating_ms";
 /// Unset, nothing waits and no branch is taken.
 pub const VECTOR_ALLOCATION_PHASE_DELAY_MS: &str = "vector_allocation_phase_delay_ms";
 
+/// Marker recording that the resource-tag condition-key migration has run on
+/// this catalog, or that the catalog was created after the migration existed
+/// and so has nothing to rewrite.
+///
+/// `extenddb migrate --yes` writes it after rewriting every stored policy from
+/// `dynamodb:ResourceTag/*` to `aws:ResourceTag/*` with no storage errors;
+/// `init` and every fresh-catalog bootstrap write it on a new catalog. `serve`
+/// reads this one row at startup and refuses to start when it is absent, naming
+/// `extenddb migrate --yes`, so a pre-migration catalog is never served under
+/// the new evaluator (which leaves `dynamodb:ResourceTag/*` absent). The value
+/// is informational; presence of the key is the signal.
+pub const RESOURCE_TAG_MIGRATION: &str = "resource_tag_migration";
+
+/// The value written for [`RESOURCE_TAG_MIGRATION`] when the migration is
+/// complete.
+pub const RESOURCE_TAG_MIGRATION_DONE: &str = "applied";
+
 /// Resolve a caller-supplied settings key to its canonical name.
 ///
 /// Accepting the old name keeps `extenddb settings set gsi_propagation_delay_ms 0`
