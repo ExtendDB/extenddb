@@ -628,10 +628,13 @@ When `NULL`, no transition is pending.
 - `CreateTable` inserts with `table_status = 'CREATING'` and sets `status_transition_at` to
 `NOW() + control_plane_delay_seconds`. The delay is read from the settings table via a subquery in the same INSERT
 (no extra round-trip).
-- `DeleteTable` sets `table_status = 'DELETING'` with a scheduled transition time. The row, its indexes, and tags are
-removed when the transition fires.
+- `DeleteTable` sets `table_status = 'DELETING'` with a scheduled transition time (immediately due when the
+configured delay is below one second). The data tables are dropped and that transaction committed before the row,
+its indexes and tags are removed; a drop that fails or times out on a lock leaves the row `DELETING` for the next
+pass. With the default delay the request runs that pass for its own table in a spawned task and awaits it, so a
+client disconnect cannot cancel the drop part way.
 - A background poller processes pending transitions. `CREATING → ACTIVE` is a single UPDATE; `DELETING → removed`
-uses `DELETE ... FOR UPDATE SKIP LOCKED ... RETURNING` for concurrent safety.
+selects candidate rows `FOR UPDATE SKIP LOCKED`, drops their data tables, then deletes the rows.
 - On startup, `process_control_plane_transitions()` recovers any in-flight
   operations from a previous server instance.
 - A partial index (`idx_tables_pending_transition ON tables

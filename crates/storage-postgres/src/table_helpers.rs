@@ -41,7 +41,6 @@ pub(crate) struct TableRow {
 #[derive(sqlx::FromRow)]
 pub(crate) struct IndexRow {
     pub index_name: String,
-    pub index_id: String,
     pub index_type: String,
     pub key_schema: serde_json::Value,
     pub projection: serde_json::Value,
@@ -223,7 +222,7 @@ impl PostgresEngine {
         let row = row.ok_or_else(|| StorageError::TableNotFound(table_name.to_owned()))?;
 
         let index_rows: Vec<IndexRow> = sqlx::query_as(
-            r"SELECT index_name, index_id, index_type, key_schema, projection,
+            r"SELECT index_name, index_type, key_schema, projection,
                       index_status, provisioned_throughput
                FROM indexes WHERE table_id = $1",
         )

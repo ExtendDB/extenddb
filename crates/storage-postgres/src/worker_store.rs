@@ -40,19 +40,46 @@ impl PostgresEngine {
     pub async fn process_control_plane_transitions(
         &self,
     ) -> Result<Vec<(String, &'static str)>, StorageError> {
+        self.process_transitions(None).await
+    }
+
+    /// Finish the delete of one table whose catalog row is `DELETING` with a
+    /// transition time that has passed: drop its data tables, then remove the
+    /// row. `DeleteTable` runs this from a spawned task so a client that gives
+    /// up on the request cannot cancel the drop part way.
+    ///
+    /// Returns `true` when this call removed the table. `false` means the row
+    /// was not a candidate (already gone, including when a poller pass that
+    /// held the row removed it while this call waited for the lock) or the
+    /// drop failed and was logged; in both cases the row, if it still exists,
+    /// stays `DELETING` for the poller to finish.
+    pub(crate) async fn finish_table_delete(&self, table_id: &str) -> Result<bool, StorageError> {
+        let transitions = self.process_transitions(Some(table_id)).await?;
+        Ok(!transitions.is_empty())
+    }
+
+    /// The pass behind [`Self::process_control_plane_transitions`]. With
+    /// `only_table` set, only that table's `DELETING` row is a candidate and the
+    /// `CREATING` activation and the abandoned-restore sweep are skipped.
+    async fn process_transitions(
+        &self,
+        only_table: Option<&str>,
+    ) -> Result<Vec<(String, &'static str)>, StorageError> {
         let mut transitions = Vec::new();
 
         // CREATING → ACTIVE
-        let activated: Vec<(String,)> = sqlx::query_as(
-            r"UPDATE tables SET table_status = 'ACTIVE', status_transition_at = NULL
-               WHERE table_status = 'CREATING' AND status_transition_at <= NOW()
-               RETURNING table_name",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
-        for (name,) in activated {
-            transitions.push((name, "CREATING → active"));
+        if only_table.is_none() {
+            let activated: Vec<(String,)> = sqlx::query_as(
+                r"UPDATE tables SET table_status = 'ACTIVE', status_transition_at = NULL
+                   WHERE table_status = 'CREATING' AND status_transition_at <= NOW()
+                   RETURNING table_name",
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            for (name,) in activated {
+                transitions.push((name, "CREATING → active"));
+            }
         }
 
         // DELETING → remove row (with tags and data table cleanup).
@@ -62,20 +89,34 @@ impl PostgresEngine {
         // fails, the transaction rolls back and the row remains DELETING for
         // the next pass. Once the data transaction commits, deleting the table
         // row cascades its index and stream rows without orphaning data tables.
+        //
+        // The poller pass skips rows another pass holds. The scoped pass run by
+        // DeleteTable waits for them instead: if a poller pass is removing the
+        // table, the request answers once that pass has committed (bounded by
+        // its 3 s lock timeout per candidate) and the row is gone, rather than
+        // answering DELETING while the drop is still running.
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let candidates: Vec<(String, String, String)> = sqlx::query_as(
-            r"SELECT table_name, table_arn, table_id FROM tables
-               WHERE table_status = 'DELETING' AND status_transition_at <= NOW()
-               FOR UPDATE SKIP LOCKED",
-        )
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let lock_clause = if only_table.is_some() {
+            "FOR UPDATE"
+        } else {
+            "FOR UPDATE SKIP LOCKED"
+        };
+        let candidate_sql = format!(
+            "SELECT table_name, table_arn, table_id FROM tables \
+             WHERE table_status = 'DELETING' AND status_transition_at <= NOW() \
+               AND ($1::TEXT IS NULL OR table_id = $1) \
+             {lock_clause}"
+        );
+        let candidates: Vec<(String, String, String)> = sqlx::query_as(&candidate_sql)
+            .bind(only_table)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         for (name, arn, table_id) in &candidates {
             let index_ids: Vec<String> =
@@ -177,13 +218,15 @@ impl PostgresEngine {
         // lock; a still-owned restore closes that probe and is checked again on
         // the next pass. Failures are logged and skipped, so they cannot hold
         // up the transitions above.
-        match self.sweep_abandoned_restores().await {
-            Ok(names) => {
-                for name in names {
-                    transitions.push((name, "abandoned restore → removed"));
+        if only_table.is_none() {
+            match self.sweep_abandoned_restores().await {
+                Ok(names) => {
+                    for name in names {
+                        transitions.push((name, "abandoned restore → removed"));
+                    }
                 }
+                Err(e) => tracing::warn!("abandoned restore sweep failed: {e}"),
             }
-            Err(e) => tracing::warn!("abandoned restore sweep failed: {e}"),
         }
 
         Ok(transitions)
