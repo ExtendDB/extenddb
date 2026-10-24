@@ -468,3 +468,69 @@ class TestCreateTableTags:
                 dynamodb_client_no_validation.delete_table(TableName=name)
             except ClientError:
                 pass
+
+
+# UntagResource with a valid key still runs both halves of the ARN check: the
+# account half before the keys and the region and table half after them.
+# Measured against DynamoDB in us-east-1 on 2026-10-24: the cross-region,
+# cross-partition and wrong-service ARNs answer ValidationException, an ARN
+# naming no table answers ResourceNotFoundException, and another account's ARN
+# answers AccessDeniedException.
+
+
+@pytest.fixture(scope="module")
+def arn_shapes(dynamodb_client):
+    with scoped_table(dynamodb_client) as name:
+        arn = dynamodb_client.describe_table(TableName=name)["Table"]["TableArn"]
+        parts = arn.split(":")
+        region, account = parts[3], parts[4]
+        other_region = "us-west-2" if region != "us-west-2" else "us-east-1"
+        other_account = "111122223333" if account != "111122223333" else "222233334444"
+        yield {
+            "cross_region": f"arn:aws:dynamodb:{other_region}:{account}:table/{name}",
+            "cross_partition": arn.replace("arn:aws:", "arn:aws-cn:", 1),
+            "wrong_service": arn.replace(":dynamodb:", ":s3:", 1),
+            "absent": f"arn:aws:dynamodb:{region}:{account}:table/{name}-absent",
+            "cross_account": f"arn:aws:dynamodb:{region}:{other_account}:table/{name}",
+        }
+
+
+@pytest.mark.parametrize(
+    "shape,expected",
+    [
+        ("cross_region", "ValidationException"),
+        ("cross_partition", "ValidationException"),
+        ("wrong_service", "ValidationException"),
+        ("absent", "ResourceNotFoundException"),
+        ("cross_account", "AccessDeniedException"),
+    ],
+)
+def test_untag_with_a_valid_key_still_checks_the_arn(
+    dynamodb_client_no_validation, arn_shapes, shape, expected
+):
+    with pytest.raises(ClientError) as exc:
+        dynamodb_client_no_validation.untag_resource(
+            ResourceArn=arn_shapes[shape], TagKeys=["valid-key"]
+        )
+    assert exc.value.response["Error"]["Code"] == expected, shape
+
+
+# ListTagsOfResource reaches the same two halves. Measured against DynamoDB in
+# us-east-1 on 2026-10-24 at 02:51 UTC with the same five ARN shapes: the same
+# five answers as UntagResource.
+
+
+@pytest.mark.parametrize(
+    "shape,expected",
+    [
+        ("cross_region", "ValidationException"),
+        ("cross_partition", "ValidationException"),
+        ("wrong_service", "ValidationException"),
+        ("absent", "ResourceNotFoundException"),
+        ("cross_account", "AccessDeniedException"),
+    ],
+)
+def test_list_tags_checks_the_arn(dynamodb_client_no_validation, arn_shapes, shape, expected):
+    with pytest.raises(ClientError) as exc:
+        dynamodb_client_no_validation.list_tags_of_resource(ResourceArn=arn_shapes[shape])
+    assert exc.value.response["Error"]["Code"] == expected, shape
