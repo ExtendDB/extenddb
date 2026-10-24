@@ -1324,6 +1324,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "time",
+ "unicode-properties",
  "uuid",
 ]
 
