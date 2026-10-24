@@ -56,12 +56,18 @@ impl KeyCondition {
     ///
     /// # Errors
     ///
-    /// Returns `ValidationException` if a `#name` reference cannot be resolved.
+    /// Returns `ValidationException` if a `#name` reference cannot be resolved,
+    /// or if two conditions name the same key attribute.
     pub fn resolve_pk_sk(
         &mut self,
         pk_attr: &str,
         names: &std::collections::HashMap<String, String>,
     ) -> Result<(), DynamoDbError> {
+        // One condition per key attribute, with `#name` references resolved, so
+        // `#p = :a AND pk = :b` with `#p` defined as `pk` is rejected as well.
+        // `parse_key_condition` has already compared the names as written.
+        reject_duplicate_key_attrs(&self.key_paths(), names)?;
+
         // Only ambiguous when SK is an Eq comparison (both clauses were Eq).
         let sk_is_eq = matches!(
             self.sk_condition,
@@ -200,6 +206,71 @@ impl KeyCondition {
 
         Ok(())
     }
+
+    /// Every key attribute path this condition carries, in parse order.
+    fn key_paths(&self) -> Vec<&[PathElement]> {
+        let mut paths: Vec<&[PathElement]> =
+            Vec::with_capacity(2 + self.extra_pk_conditions.len() + self.extra_sk_conditions.len());
+        paths.push(&self.pk_path);
+        paths.extend(
+            self.extra_pk_conditions
+                .iter()
+                .map(|(path, _)| path.as_slice()),
+        );
+        if let Some(sk) = self.sk_condition.as_ref() {
+            paths.push(sk.path());
+        }
+        paths.extend(
+            self.extra_sk_conditions
+                .iter()
+                .map(|(path, _)| path.as_slice()),
+        );
+        paths
+    }
+}
+
+/// The service's message when a `KeyConditionExpression` carries more than one
+/// condition on the same key attribute. Measured 2026-10-24 (us-east-1).
+const ONE_CONDITION_PER_KEY_ERR: &str = "Invalid KeyConditionExpression: KeyConditionExpressions must only contain one condition per key";
+
+/// The attribute name a key condition path compares on, for the duplicate check.
+///
+/// A `#name` reference that `names` does not define yields `None`: such a
+/// request is rejected for the undefined name instead, which is the order the
+/// service uses (measured 2026-10-24: `#u = :a AND #u = :b` answers the
+/// undefined-name message, not the duplicate one).
+fn dup_check_name<'a>(
+    path: &'a [PathElement],
+    names: &'a std::collections::HashMap<String, String>,
+) -> Option<&'a str> {
+    let Some(PathElement::Attribute(name)) = path.first() else {
+        return None;
+    };
+    match name.strip_prefix('#') {
+        Some(ref_name) => names.get(ref_name).map(String::as_str),
+        None => Some(name.as_str()),
+    }
+}
+
+/// Reject a key condition that names the same key attribute twice.
+///
+/// DynamoDB allows one condition per key attribute, on the partition key and on
+/// the sort key alike, whatever the operators are (measured 2026-10-24).
+fn reject_duplicate_key_attrs(
+    paths: &[&[PathElement]],
+    names: &std::collections::HashMap<String, String>,
+) -> Result<(), DynamoDbError> {
+    let mut seen: Vec<&str> = Vec::with_capacity(paths.len());
+    for path in paths {
+        let Some(name) = dup_check_name(path, names) else {
+            continue;
+        };
+        if seen.contains(&name) {
+            return Err(validation_err(ONE_CONDITION_PER_KEY_ERR));
+        }
+        seen.push(name);
+    }
+    Ok(())
 }
 
 /// Resolve a path's top-level attribute name, handling `#name` references.
@@ -246,6 +317,17 @@ pub enum SortKeyCondition {
         path: Vec<PathElement>,
         prefix: Expr,
     },
+}
+
+impl SortKeyCondition {
+    /// The attribute path this condition compares on.
+    fn path(&self) -> &[PathElement] {
+        match self {
+            Self::Compare { path, .. }
+            | Self::Between { path, .. }
+            | Self::BeginsWith { path, .. } => path,
+        }
+    }
 }
 
 /// Parse a `KeyConditionExpression` token stream.
@@ -299,6 +381,12 @@ pub fn parse_key_condition(tokens: &[Token]) -> Result<KeyCondition, DynamoDbErr
     for clause in &clauses {
         reject_nested_key_path(raw_clause_path(clause))?;
     }
+
+    // One condition per key attribute, compared on the names as written. A
+    // duplicate reached through a defined `#name` reference is rejected in
+    // `resolve_pk_sk`, which holds the name map.
+    let raw_paths: Vec<&[PathElement]> = clauses.iter().map(raw_clause_path).collect();
+    reject_duplicate_key_attrs(&raw_paths, &std::collections::HashMap::new())?;
 
     match clauses.len() {
         1 => classify_single(clauses.remove(0)),
@@ -989,6 +1077,143 @@ mod tests {
                 parse_key_condition(&tokens).is_ok(),
                 "expr {expr} should parse"
             );
+        }
+    }
+
+    #[test]
+    fn duplicate_condition_on_one_key_attribute_rejected() {
+        // Measured 2026-10-24 (us-east-1): every one of these shapes answers
+        // the one-condition-per-key message, whatever the operators are and
+        // whichever key attribute is named twice.
+        for expr in [
+            "pk = :a AND pk = :b",
+            "pk = :a AND pk = :a",
+            "pk = :a AND pk = :b AND sk = :c",
+            "pk = :a AND pk > :b",
+            "pk > :b AND pk = :a",
+            ":a = pk AND pk = :b",
+            "(pk = :a) AND (pk = :b)",
+            "pk = :a AND sk = :b AND sk = :c",
+            "pk = :a AND sk = :b AND sk = :b",
+            "pk = :a AND sk BETWEEN :b AND :c AND sk = :b",
+            "pk = :a AND sk BETWEEN :b AND :c AND begins_with(sk, :b)",
+            "pk = :a AND begins_with(sk, :b) AND sk = :c",
+            "pk = :a AND sk > :b AND sk < :c",
+            "pk = :a AND begins_with(sk, :b) AND begins_with(sk, :c)",
+            "pk = :a AND pk = :b AND sk = :b AND sk = :c",
+            "sk = :b AND sk = :c",
+        ] {
+            let tokens = tokenize(expr).unwrap();
+            let err = parse_key_condition(&tokens).unwrap_err();
+            assert!(
+                matches!(&err, DynamoDbError::ValidationException(msg)
+                    if msg == ONE_CONDITION_PER_KEY_ERR),
+                "expr {expr}: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_condition_through_name_reference_rejected() {
+        // `#p` and `pk` name the same attribute, which the parser cannot see
+        // without the name map, so this one is caught in resolve_pk_sk.
+        let tokens = tokenize("#p = :a AND pk = :b").unwrap();
+        let mut kc = parse_key_condition(&tokens).unwrap();
+        let mut names = HashMap::new();
+        names.insert("p".to_owned(), "pk".to_owned());
+        let err = kc.resolve_pk_sk("pk", &names).unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg)
+                if msg == ONE_CONDITION_PER_KEY_ERR),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_condition_through_two_name_references_rejected() {
+        let tokens = tokenize("#p = :a AND #q = :b").unwrap();
+        let mut kc = parse_key_condition(&tokens).unwrap();
+        let mut names = HashMap::new();
+        names.insert("p".to_owned(), "pk".to_owned());
+        names.insert("q".to_owned(), "pk".to_owned());
+        let err = kc.resolve_pk_sk("pk", &names).unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg)
+                if msg == ONE_CONDITION_PER_KEY_ERR),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_condition_on_sort_key_through_name_reference_rejected() {
+        let tokens = tokenize("pk = :a AND #s = :b AND sk = :c").unwrap();
+        let mut kc = parse_key_condition(&tokens).unwrap();
+        let mut names = HashMap::new();
+        names.insert("s".to_owned(), "sk".to_owned());
+        let err = kc.resolve_pk_sk("pk", &names).unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg)
+                if msg == ONE_CONDITION_PER_KEY_ERR),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn undefined_name_reported_ahead_of_duplicate() {
+        // Measured 2026-10-24: `#u = :a AND #u = :b` answers the undefined-name
+        // message, so an undefined reference is not counted as a duplicate.
+        let tokens = tokenize("#u = :a AND #u = :b").unwrap();
+        let mut kc = parse_key_condition(&tokens).unwrap();
+        let err = kc.resolve_pk_sk("pk", &HashMap::new()).unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg)
+                if msg.contains("An expression attribute name used in the document path is not defined; attribute name: #u")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn nested_path_reported_ahead_of_duplicate() {
+        // Measured 2026-10-24: both of these answer their own message, not the
+        // one-condition-per-key message.
+        let tokens = tokenize("pk = :a AND pk.foo = :b").unwrap();
+        let err = parse_key_condition(&tokens).unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg) if msg == NESTED_KEY_ERR),
+            "got {err:?}"
+        );
+
+        let tokens = tokenize("((pk = :a)) AND (pk = :b)").unwrap();
+        let err = parse_key_condition(&tokens).unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg)
+                if msg == "Invalid KeyConditionExpression: The expression has redundant parentheses;"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn distinct_key_attributes_accepted_after_duplicate_check() {
+        // The multi-part key extension and the ordinary shapes keep working:
+        // the check is per attribute name, not per clause count.
+        for expr in [
+            "pk = :a",
+            "pk = :a AND sk = :b",
+            "sk = :b AND pk = :a",
+            "pk = :a AND sk BETWEEN :b AND :c",
+            "pk = :a AND begins_with(sk, :b)",
+            "pk1 = :a AND pk2 = :b AND sk = :c",
+            "pk1 = :a AND pk2 = :b AND sk1 = :c AND sk2 = :d",
+            "#p = :a AND #s = :b",
+        ] {
+            let tokens = tokenize(expr).unwrap();
+            let mut kc = parse_key_condition(&tokens)
+                .unwrap_or_else(|err| panic!("expr {expr} should parse: {err:?}"));
+            let mut names = HashMap::new();
+            names.insert("p".to_owned(), "pk".to_owned());
+            names.insert("s".to_owned(), "sk".to_owned());
+            kc.resolve_pk_sk("pk", &names)
+                .unwrap_or_else(|err| panic!("expr {expr} should resolve: {err:?}"));
         }
     }
 }
