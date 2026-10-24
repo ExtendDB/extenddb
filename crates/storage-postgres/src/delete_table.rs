@@ -72,7 +72,7 @@ impl PostgresEngine {
 
         // Fetch indexes for the response description.
         let index_rows: Vec<IndexRow> = sqlx::query_as(
-            r"SELECT index_name, index_id, index_type, key_schema, projection,
+            r"SELECT index_name, index_type, key_schema, projection,
                       index_status, provisioned_throughput
                FROM indexes WHERE table_id = $1",
         )
@@ -81,21 +81,13 @@ impl PostgresEngine {
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        // Vector index ids, read while the rows still exist. Deleting the table
-        // row cascades them away, and each id names a data table that has to be
-        // dropped afterwards: the same ordering the GSI path uses, and for the same
-        // reason.
-        let vector_index_ids: Vec<String> =
-            sqlx::query_scalar("SELECT index_id FROM vector_indexes WHERE table_id = $1")
-                .bind(&row.table_id)
-                .fetch_all(&mut *tx)
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-        // H-5 (delete): synchronous control-plane shortcut when delay < 1s.
-        // When control_plane_delay_seconds is small, the poller may not run
-        // before the next request, causing stale DELETING rows. Synchronous
-        // delete avoids this. Mirrors create_table's H-5 fast path.
+        // H-5 (delete): the control-plane delay decides whether the table is
+        // removed before this call answers or by the poller later. Both paths
+        // mark the row DELETING here and commit; the data tables are dropped
+        // afterwards by the control-plane pass, which deletes the catalog row
+        // only once the data transaction has committed. A server that dies
+        // between the two leaves a DELETING row that the startup pass finishes,
+        // instead of data tables that no catalog row names.
         let delay_row: (f64,) = sqlx::query_as(
             "SELECT COALESCE((SELECT value::FLOAT8 FROM settings WHERE key = 'control_plane_delay_seconds'), 0.25)",
         )
@@ -103,87 +95,65 @@ impl PostgresEngine {
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
         let delay_secs = delay_row.0;
+        let immediate = delay_secs < 1.0;
+        let scheduled_delay = if immediate { 0.0 } else { delay_secs };
 
-        let index_ids: Vec<String> = index_rows.iter().map(|r| r.index_id.clone()).collect();
+        sqlx::query(
+            r"UPDATE tables SET table_status = 'DELETING',
+                status_transition_at = NOW() + make_interval(secs => $3)
+               WHERE account_id = $1 AND table_name = $2",
+        )
+        .bind(account_id)
+        .bind(&input.table_name)
+        .bind(scheduled_delay)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        if delay_secs < 1.0 {
-            // Synchronous delete: remove tags, catalog row, and data tables inline.
-            // Note: deleting the tables row cascades to indexes and stream rows via FK CASCADE.
-            // Vector index rows cascade the same way, through
-            // vector_indexes_table_id_fkey, so a table with vector indexes needs
-            // no extra catalog cleanup. Their data tables do need dropping, and
-            // the cascade takes away the rows that name them, which is why the
-            // index ids are collected BEFORE the catalog row goes.
-            sqlx::query("DELETE FROM tags WHERE resource_arn = $1")
-                .bind(&row.table_arn)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            sqlx::query("DELETE FROM tables WHERE table_id = $1")
-                .bind(&row.table_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            tx.commit()
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            // Drop data tables after catalog commit.
-            let mut data_tx = self
-                .data_pool
-                .begin()
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            for idx_id in &index_ids {
-                Self::drop_index_data_table(&mut data_tx, idx_id).await?;
-            }
-            for index_id in &vector_index_ids {
-                Self::drop_vector_data_table(&mut data_tx, index_id).await?;
-            }
-            // Holds go with the table. A hold for a table that no longer exists
-            // would block claims for a table id that can never be released.
-            sqlx::query("DELETE FROM vector_index_holds WHERE table_id = $1")
-                .bind(&row.table_id)
-                .execute(&mut *data_tx)
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            Self::drop_data_table(&mut data_tx, &row.table_id).await?;
-
-            // Drop any still-pending GSI propagation rows for this table in the
-            // same transaction that drops the tables. Workers tolerate orphans
-            // (savepoint-skip on 42P01), but removing them here avoids the
-            // wasted claim→deserialize→attempt→skip cycle and the log noise,
-            // especially when many items were written just before deletion.
-            sqlx::query("DELETE FROM gsi_pending WHERE table_id = $1")
-                .bind(&row.table_id)
-                .execute(&mut *data_tx)
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            data_tx
-                .commit()
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-        } else {
-            // Async delete: set DELETING status with scheduled removal time.
-            sqlx::query(
-                r"UPDATE tables SET table_status = 'DELETING',
-                    status_transition_at = NOW() + make_interval(secs => $3)
-                   WHERE account_id = $1 AND table_name = $2",
-            )
-            .bind(account_id)
-            .bind(&input.table_name)
-            .bind(delay_secs)
-            .execute(&mut *tx)
+        tx.commit()
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-            tx.commit()
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-
+        if immediate {
+            // Finish the delete before answering. In the common case (no lock
+            // held on the data tables) the name is free when the response
+            // arrives, and a poller that may not run before the next request
+            // leaves no stale DELETING row (mirrors create_table's H-5 fast
+            // path). The exceptions, where the response is DELETING and the
+            // poller finishes the drop: the drop waited past the pass's 3 s
+            // lock timeout, or it was the victim of a deadlock with the GSI
+            // propagation worker. The work runs in a spawned task, as
+            // UpdateTable runs a GSI build: a client that times out drops this
+            // future, and a drop that was waiting on a lock must not be rolled
+            // back with it. The task, not this future, wakes the poller when the
+            // table is not removed, so a client that is gone by then does not
+            // leave the row to the poller's idle timeout. If this future is
+            // dropped during the commit above and the commit landed, no task is
+            // spawned and the row stays DELETING until the poller's idle sweep;
+            // one round trip wide, same as the delayed path, no data at risk.
+            let engine = self.clone();
+            let table_id = row.table_id.clone();
+            let table_name = input.table_name.clone();
+            let task = tokio::spawn(async move {
+                match engine.finish_table_delete(&table_id).await {
+                    Ok(true) => return,
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!(
+                        "DeleteTable '{table_name}': could not finish the delete inline, the \
+                         table remains DELETING and the control plane will retry: {e}"
+                    ),
+                }
+                engine.control_plane_notify.notify_one();
+            });
+            if let Err(e) = task.await {
+                tracing::warn!(
+                    "DeleteTable '{}': the delete task ended early, the table remains DELETING \
+                     and the control plane will retry: {e}",
+                    input.table_name
+                );
+                self.control_plane_notify.notify_one();
+            }
+        } else {
             // F-3: Wake the control plane poller so it processes the DELETING →
             // removed transition without waiting for the idle timeout.
             self.control_plane_notify.notify_one();
