@@ -432,6 +432,16 @@ async fn execute_transact_write_op(
                 validation::SecondaryIndexEmptyContext::UpdateExpression,
             )
             .map_err(|e| TxnOpError::Validation(e.to_string()))?;
+            // REMOVE and DELETE on a key that holds no item change nothing: the
+            // service writes no item and emits no stream record (issue #510).
+            // The actions were still applied above so that their validation
+            // errors surface the same way as on an existing item, and the
+            // condition was evaluated above, so a failing condition still
+            // cancels the transaction. Returning no images keeps the stream
+            // record and the index work out of this op.
+            if existing.is_none() && expression::removes_only(actions) {
+                return Ok((None, None));
+            }
             upsert_item_in_tx(tx, key_info, &item)
                 .await
                 .map_err(TxnOpError::Storage)?;

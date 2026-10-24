@@ -607,6 +607,15 @@ async fn execute_transact_write_op(
             let mut existing = fetch_item_for_update(tx, key_info, key)
                 .await
                 .map_err(TxnOpError::Storage)?;
+            // A removal-only update on a key that holds no row writes nothing
+            // (issue #510), which makes it the same shape as deleting a missing
+            // item: reserve the key so a concurrent create cannot commit
+            // between the condition check and the end of this transaction. The
+            // reservation returns the winner's item when a create raced in, and
+            // the normal write path below then runs against it.
+            if existing.is_none() && expression::removes_only(actions) {
+                existing = reserve_missing_item(tx, key_info, key).await?;
+            }
             // Compute and validate the post-update item from a given base.
             // Runs once on the fast path, and again when a create race is
             // lost and the loser's expression must re-apply on top of the
@@ -658,6 +667,12 @@ async fn execute_transact_write_op(
                 existing.as_ref(),
             )?;
             let mut item = compute_item(existing.as_ref())?;
+            if existing.is_none() && expression::removes_only(actions) {
+                // The key was reserved above and the actions ran for their
+                // validation errors only. Nothing is written, so no stream
+                // record and no index work follow from this op.
+                return Ok((None, None));
+            }
             if existing.is_some() {
                 // The locking read above holds the row: no concurrent writer can
                 // slip between the condition check and this write.
