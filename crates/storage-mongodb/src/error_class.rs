@@ -40,9 +40,10 @@ const RETRYABLE_READ_CODES: [i32; 13] = [
 /// error. `DnsResolve` is a name lookup that did not answer.
 ///
 /// The classification errs narrow, for the reason `map_sqlx_err` gives: a
-/// fault wrongly called transient is retried by a client that cannot succeed,
-/// and the GSI and TTL queue workers retry a `Transient` row instead of
-/// dropping it, so a permanent fault called transient stalls a queue.
+/// fault wrongly called transient is retried by a client that cannot succeed.
+/// On the SQLite backend the queue workers also retry a `Transient` row
+/// instead of dropping it, so a permanent fault called transient stalls that
+/// queue; this backend's GSI and TTL workers log every error and continue.
 fn is_unreachable(e: &DriverError) -> bool {
     match &*e.kind {
         ErrorKind::Io(_)
