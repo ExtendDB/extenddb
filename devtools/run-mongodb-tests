@@ -135,7 +135,7 @@ trap cleanup EXIT
 
 echo "=== Starting MongoDB 7 replica set on host port $MONGO_PORT ==="
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-docker run -d --name "$CONTAINER_NAME" -p "$MONGO_PORT:27017" mongo:7 \
+docker run -d --name "$CONTAINER_NAME" -p "127.0.0.1:$MONGO_PORT:27017" mongo:7 \
     mongod --replSet rs0 --bind_ip_all --wiredTigerCacheSizeGB 1 >/dev/null
 
 # Wait for mongod to accept pings

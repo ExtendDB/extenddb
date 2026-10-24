@@ -48,7 +48,7 @@ jobs:
       cassandra:
         image: cassandra:4.1
         ports:
-          - 9042:9042
+          - 127.0.0.1:9042:9042
         env:
           CASSANDRA_CLUSTER_NAME: extenddb-ci
           HEAP_NEWSIZE: 128M
@@ -104,7 +104,7 @@ jobs:
       cassandra:
         image: cassandra:4.1
         ports:
-          - 9042:9042
+          - 127.0.0.1:9042:9042
         env:
           CASSANDRA_CLUSTER_NAME: extenddb-ci
           HEAP_NEWSIZE: 128M
@@ -155,7 +155,7 @@ jobs:
       cassandra:
         image: cassandra:4.1
         ports:
-          - 9042:9042
+          - 127.0.0.1:9042:9042
         env:
           CASSANDRA_CLUSTER_NAME: extenddb-ci
           HEAP_NEWSIZE: 128M
