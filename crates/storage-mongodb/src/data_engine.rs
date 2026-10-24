@@ -468,8 +468,12 @@ impl MongoEngine {
 
         let tx_options = self.write_transaction_options();
         let mut lost_create_races = 0;
+        let contention_started = std::time::Instant::now();
 
         for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
+            if contention_deadline_passed(attempt, contention_started) {
+                return Err(contention_deadline_exhausted("PutItem"));
+            }
             let new_doc =
                 item_to_document(&item, &key_info.key_schema, &key_info.attribute_definitions)?;
             // Capture before the transaction's first database operation. If
@@ -711,8 +715,12 @@ impl MongoEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let tx_options = self.write_transaction_options();
+        let contention_started = std::time::Instant::now();
 
         for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
+            if contention_deadline_passed(attempt, contention_started) {
+                return Err(contention_deadline_exhausted("DeleteItem"));
+            }
             // Capture before the transaction's first database operation so a
             // concurrent catalog mutation cannot be hidden by the snapshot.
             let cache_generation = self.gsi_cache_generation(&key_info.table_id);
@@ -936,8 +944,12 @@ impl MongoEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let tx_options = self.write_transaction_options();
+        let contention_started = std::time::Instant::now();
 
         for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
+            if contention_deadline_passed(attempt, contention_started) {
+                return Err(contention_deadline_exhausted("UpdateItem"));
+            }
             // Capture before the transaction's first database operation. A
             // later UpdateTable must invalidate this observation rather than
             // allowing a stale no-index result to be published.
@@ -2252,7 +2264,18 @@ impl MongoEngine {
             )
         });
 
+        let contention_started = std::time::Instant::now();
+
         for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
+            // A transaction that reaches the deadline stops retrying and
+            // falls through to the give-up after the loop, which answers
+            // `TransactionCanceledException` with a `TransactionConflict`
+            // reason per item: the error the service answers for a
+            // transaction that loses to contention. Only the single-item
+            // writes answer the deadline with HTTP 503.
+            if contention_deadline_passed(attempt, contention_started) {
+                break;
+            }
             let idempotency = idem_owned.as_ref().map(|(a, t, f)| IdempotencyKey {
                 account_id: a.as_str(),
                 token: t.as_str(),
@@ -3280,6 +3303,10 @@ impl MongoEngine {
             )
             .build();
 
+        // No contention deadline here. This loop runs inside the background
+        // GSI backfill job in `ttl_worker.rs`, not inside a request: no
+        // caller is waiting for a reply, and giving up on the clock would
+        // leave the index CREATING with its cursor where it stopped.
         for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
             session
                 .start_transaction()
@@ -3578,6 +3605,34 @@ pub(crate) struct GsiBackfillProgress {
 /// nothing about either.
 const TRANSIENT_RETRY_ATTEMPTS: u32 = 1000;
 
+/// Wall-clock deadline for the contention retry loop of one request.
+///
+/// The attempt budget bounds the number of attempts, not the time a caller
+/// waits, because an attempt's own round trip has no bound. The same 1,000
+/// attempts against a transaction another session holds open returned in 9.5
+/// to 12.7 s over six runs on a shared host, and under many writers on one
+/// key the attempts queue behind each other: at 256 writers putting one key
+/// of a GSI table, 89 of 5,120 calls were still waiting when the client's
+/// 120 s read timeout fired, and the 5,120 calls measured p50 29 s and p99
+/// 120 s. The budget alone therefore let a request outlive every SDK's
+/// default read timeout.
+///
+/// 10 s sits above the 9.5 to 12.7 s a put spends losing all 1,000 attempts
+/// and below botocore's 60 s default read timeout, so a caller gets an answer
+/// to retry rather than a socket timeout. Which bound a write reaches first
+/// depends on the host's load, and both answer the same HTTP 503, so the
+/// caller's handling does not change with it.
+///
+/// The deadline is read before an attempt starts, so a request answers within
+/// the deadline plus one attempt. It governs the loops that serve a request:
+/// put, delete, update and transact. The single-item writes answer it with
+/// HTTP 503; a transaction answers it as it answers a spent attempt budget,
+/// with `TransactionCanceledException`. The GSI backfill loop shares the attempt
+/// budget and takes no deadline: it runs in the background worker in
+/// `ttl_worker.rs`, where no caller is waiting for a reply and giving up
+/// leaves the index CREATING.
+const CONTENTION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Maximum number of times to retry `commitTransaction` in place after an
 /// `UnknownTransactionCommitResult`.
 ///
@@ -3742,6 +3797,31 @@ fn create_race_exhausted(attempt: u32) -> StorageError {
     StorageError::Internal(format!(
         "PutItem could not create the item after {attempt} attempts: each insert lost the \
          create race to a concurrent writer"
+    ))
+}
+
+/// Whether the contention retry loop of a request that entered it at
+/// `started` must stop before running attempt number `attempt`.
+///
+/// The first attempt of a request always runs, so a request never answers
+/// 503 without having tried the write once.
+fn contention_deadline_passed(attempt: u32, started: std::time::Instant) -> bool {
+    attempt > 0 && started.elapsed() >= CONTENTION_DEADLINE
+}
+
+/// The error for a write that stopped retrying because `CONTENTION_DEADLINE`
+/// passed while it was losing to concurrent writers. `operation` names the
+/// API operation.
+///
+/// Like the attempt-budget give-up of PutItem this is a
+/// [`StorageError::Transient`], which the engine answers as HTTP 503
+/// `ServiceUnavailable`: the SDK retry modes retry a 503 on their own and the
+/// retry succeeds once the contention has passed, whereas a 400
+/// `TransactionConflictException` is handed to the application.
+fn contention_deadline_exhausted(operation: &str) -> StorageError {
+    StorageError::Transient(format!(
+        "{operation}: the write lost to concurrent writers for {} seconds; retry the request",
+        CONTENTION_DEADLINE.as_secs()
     ))
 }
 
@@ -4259,6 +4339,46 @@ mod tests {
         assert!(!is_transient_write_conflict(&e));
     }
 
+    /// The first attempt of a request runs whatever the clock reads, and no
+    /// attempt starts once the deadline has passed.
+    #[test]
+    fn the_contention_deadline_stops_the_loop_after_the_first_attempt() {
+        let spent = std::time::Instant::now()
+            .checked_sub(CONTENTION_DEADLINE + std::time::Duration::from_secs(1))
+            .expect("the process clock reaches one deadline back");
+        assert!(!contention_deadline_passed(0, spent));
+        assert!(contention_deadline_passed(1, spent));
+        assert!(contention_deadline_passed(
+            TRANSIENT_RETRY_ATTEMPTS - 1,
+            spent
+        ));
+        let fresh = std::time::Instant::now();
+        assert!(!contention_deadline_passed(1, fresh));
+        assert!(!contention_deadline_passed(
+            TRANSIENT_RETRY_ATTEMPTS - 1,
+            fresh
+        ));
+    }
+
+    /// The give-up on the deadline is the transient error the engine answers
+    /// as HTTP 503, and its message names the operation and the wait.
+    #[test]
+    fn the_deadline_give_up_is_transient_and_names_the_operation() {
+        for operation in ["PutItem", "DeleteItem", "UpdateItem"] {
+            match contention_deadline_exhausted(operation) {
+                StorageError::Transient(msg) => {
+                    assert!(msg.starts_with(&format!("{operation}: ")), "{msg}");
+                    assert!(
+                        msg.contains("lost to concurrent writers for 10 seconds"),
+                        "{msg}"
+                    );
+                    assert!(msg.contains("retry the request"), "{msg}");
+                }
+                other => panic!("want Transient, got {other:?}"),
+            }
+        }
+    }
+
     /// Build a write error with the given code, the form `insert_one`
     /// returns.
     fn write_error(code: i32) -> mongodb::error::Error {
@@ -4656,7 +4776,8 @@ mod tests {
     /// the one the engine answers as HTTP 503, not with a transaction
     /// conflict. Another session writes the item inside a transaction it
     /// never commits, so each attempt of the put hits a write conflict until
-    /// the budget is spent; the held transaction is then aborted.
+    /// one of the two bounds is reached; the held transaction is then
+    /// aborted.
     #[tokio::test]
     async fn unconditional_put_that_loses_every_attempt_gives_up_with_a_transient_error() {
         let Some(uri) = live_mongodb_uri(
@@ -4700,21 +4821,27 @@ mod tests {
             let _ = holder.abort_transaction().await;
 
             match res {
-                Err(StorageError::Transient(msg)) => assert!(
-                    msg.contains(&format!("lost {TRANSIENT_RETRY_ATTEMPTS} attempts")),
-                    "message: {msg}"
-                ),
+                Err(StorageError::Transient(msg)) => {
+                    let on_the_deadline = msg.contains("lost to concurrent writers for 10 seconds");
+                    let on_the_attempts =
+                        msg.contains(&format!("lost {TRANSIENT_RETRY_ATTEMPTS} attempts"));
+                    assert!(on_the_deadline || on_the_attempts, "message: {msg}");
+                    println!("the put gave up with: {msg}");
+                }
                 other => panic!("want the transient exhausted-budget error, got: {other:?}"),
             }
-            // The sleeps alone come to about 6.4 s on average and 12.8 s at
-            // worst. Each attempt against a document a transaction holds also
-            // waits out MongoDB's lock timeout, so the wall time measured here
-            // ran 9.5 to 12.7 s on a shared host. The bound asserted is the
-            // one a caller
-            // cares about: the write answers inside a client's read timeout.
+            // Two bounds end this put, and both answer HTTP 503. The 1,000
+            // attempts take 9.5 to 12.7 s against a document a transaction
+            // holds, measured over nine runs on a shared host, because each
+            // attempt waits out MongoDB's lock timeout on top of the backoff
+            // sleeps, which come to about 6.4 s on average. The deadline
+            // stops the loop at 10 s, so which bound the put reaches first
+            // depends on the host's load. The bound asserted here is the one
+            // a caller cares about: the deadline plus the one attempt that
+            // was already running.
             println!("the put lost every attempt and answered in {elapsed:?}");
             assert!(
-                elapsed < std::time::Duration::from_secs(30),
+                elapsed < CONTENTION_DEADLINE + std::time::Duration::from_secs(5),
                 "took {elapsed:?}"
             );
             let stored = coll
