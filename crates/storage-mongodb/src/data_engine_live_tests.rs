@@ -143,7 +143,7 @@ fn expected_document(item: &Item, key_info: &TableKeyInfo, v: i64) -> Document {
 }
 
 /// An UpdateItem that creates the item, on the native fast path (SET with a
-/// placeholder, REMOVE) and on the transaction path (numeric ADD), stores the
+/// placeholder) and on the transaction path (numeric ADD), stores the
 /// same document PutItem would store: `_id` as the key text, the key
 /// attributes in `item_data`, version 1. ALL_NEW returns the item with its
 /// key. A PutItem on the key then replaces the item and returns it as the old
@@ -152,7 +152,7 @@ fn expected_document(item: &Item, key_info: &TableKeyInfo, v: i64) -> Document {
 #[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
 async fn live_update_item_that_creates_an_item_stores_its_key_like_put_item() {
     let engine = scratch_engine().await;
-    let cases: [(&str, Vec<UpdateAction>, AttributeValue, Item); 3] = [
+    let cases: [(&str, Vec<UpdateAction>, AttributeValue, Item); 2] = [
         (
             "set",
             vec![UpdateAction::Set {
@@ -161,12 +161,6 @@ async fn live_update_item_that_creates_an_item_stores_its_key_like_put_item() {
             }],
             s("upd"),
             with(Item::new(), "w", s("upd")),
-        ),
-        (
-            "remove",
-            vec![UpdateAction::Remove { path: path("w") }],
-            s("unused"),
-            Item::new(),
         ),
         (
             "add",
@@ -231,6 +225,65 @@ async fn live_update_item_that_creates_an_item_stores_its_key_like_put_item() {
                 "{table_id}: put replaced the item"
             );
         }
+    }
+    finish(engine).await;
+}
+
+/// A REMOVE-only UpdateItem on a missing key, on the native fast path (the
+/// table helper records that the table has no GSI), writes nothing: no old
+/// or new image and no document (issue #478). A PutItem on the key then
+/// creates the item.
+#[tokio::test]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_remove_only_update_on_a_missing_key_writes_nothing() {
+    let engine = scratch_engine().await;
+    for range in [false, true] {
+        let table_id = format!("remove-{}", if range { "range" } else { "hash" });
+        let key_info = table(&engine, &table_id, range);
+        let key = item_key(range);
+        let remove = vec![UpdateAction::Remove { path: path("w") }];
+        let images = engine
+            .update_item_impl(
+                &key_info,
+                &key,
+                &remove,
+                false,
+                true,
+                None,
+                &maps(s("x")),
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{table_id}: update: {e:?}"));
+        assert_eq!(images, (None, None), "{table_id}: no image");
+        let filter =
+            pk_filter(&key, &key_info.key_schema, &key_info.attribute_definitions).expect("filter");
+        let doc = engine
+            .data_db
+            .collection::<Document>(&data_collection_name(&key_info.table_id))
+            .find_one(filter)
+            .await
+            .expect("read back");
+        assert_eq!(doc, None, "{table_id}: no document");
+
+        let put = with(key.clone(), "w", s("put"));
+        engine
+            .put_item_impl(
+                &key_info,
+                put.clone(),
+                true,
+                None,
+                &ExpressionMaps::default(),
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{table_id}: put: {e:?}"));
+        let after = stored(&engine, &key_info, &key).await;
+        assert_eq!(
+            document_to_item(&after).expect("item"),
+            put,
+            "{table_id}: put"
+        );
     }
     finish(engine).await;
 }
