@@ -534,6 +534,52 @@ class TestExplicitDenyOnResourceArn:
                 lambda a=arn, dd=d: dd.tag_resource(ResourceArn=a, Tags=[{"Key": "k", "Value": "v"}]),
                 code, substr)
 
+    # -- the denial names the ARN as the caller supplied it (issue #447) --
+    # Measured on DynamoDB 2026-10-20 (TagResource, no-policy caller): the
+    # message carries the caller's partition, service and region unchanged, and
+    # an ARN in another account answers "Access is denied" for an admin and a
+    # no-policy caller alike.
+
+    def _denial_message(self, fn) -> str:
+        with pytest.raises(ClientError) as exc:
+            fn()
+        err = exc.value.response["Error"]
+        assert err["Code"] == "AccessDeniedException", err
+        return err["Message"]
+
+    def test_tag_denial_names_supplied_arn_noperm(self, table):
+        v = self._ordering_variants(table)
+        noperm = {"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "dynamodb:ListTables", "Resource": "*"}]}
+        d = self._ddb(noperm)
+        for label in ("wrong_partition", "wrong_service", "cross_region", "nonexistent"):
+            arn = v[label]
+            msg = self._denial_message(
+                lambda a=arn: d.tag_resource(ResourceArn=a, Tags=[{"Key": "k", "Value": "v"}]))
+            assert f"on resource: {arn} because no identity-based policy allows " in msg, (label, msg)
+
+    def test_tag_cross_account_is_access_denied_for_every_principal(self, table):
+        arn = self._ordering_variants(table)["cross_account"]
+        noperm = {"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "dynamodb:ListTables", "Resource": "*"}]}
+        for policy in (noperm, ALLOW_ALL):
+            d = self._ddb(policy)
+            msg = self._denial_message(
+                lambda: d.tag_resource(ResourceArn=arn, Tags=[{"Key": "k", "Value": "v"}]))
+            assert msg == "Access is denied", msg
+
+    def test_get_item_table_arn_in_tablename_denial_names_table_arn(self, table):
+        # Measured on DynamoDB 2026-10-20 (resource-probe GetItem_tableArnInTableName).
+        noperm = {"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "dynamodb:ListTables", "Resource": "*"}]}
+        d = self._ddb(noperm)
+        msg = self._denial_message(
+            lambda: d.get_item(TableName=table["table_arn"], Key={"pk": {"S": "p1"}}))
+        assert (
+            f"dynamodb:GetItem on resource: {table['table_arn']} because no identity-based "
+            "policy allows the dynamodb:GetItem action"
+        ) in msg, msg
+
     # -- permission chains: a Deny anywhere in the chain blocks the operation --
 
     def test_restore_from_backup_deny_target_item_action_blocks(self, table):
