@@ -375,37 +375,60 @@ fn for_any_value_string_not_equals_one_outside_set() {
 }
 
 #[test]
-fn bare_negative_op_multivalued_absent_matches() {
-    // A bare negated operator on an ABSENT multivalued key matches, the same as
-    // on an absent single-valued key. Measured on IAM with
-    // simulate-custom-policy on 2026-10-24 for all three multivalued keys
-    // (aws:TagKeys, dynamodb:LeadingKeys, dynamodb:Attributes): a Deny carrying
-    // a bare StringNotEquals, StringNotEqualsIgnoreCase or StringNotLike on the
-    // key fires when the key is absent from the request. BR-7085 covers the
-    // PRESENT case, which still never matches a bare operator.
+fn bare_negated_op_absent_tagkeys_matches() {
+    // A bare negated operator on an ABSENT aws:TagKeys matches, as on an
+    // absent single-valued key. Measured on IAM with simulate-custom-policy on
+    // 2026-10-24: a Deny carrying a bare StringNotEquals,
+    // StringNotEqualsIgnoreCase or StringNotLike on the key fires when the key
+    // is absent, and an Allow gated the same way grants. ExtendDB populates
+    // aws:TagKeys on exactly the operations the service does, so its absence
+    // is the service's absence and IAM's answer applies.
     let ctx = TestContext::new();
-    for key in ["dynamodb:Attributes", "dynamodb:LeadingKeys", "aws:TagKeys"] {
+    for op in [
+        ConditionOperator::StringNotEquals,
+        ConditionOperator::StringNotEqualsIgnoreCase,
+        ConditionOperator::StringNotLike,
+    ] {
         assert!(
-            evaluate_condition(
-                &cond(ConditionOperator::StringNotEquals, key, vec!["ssn"]),
-                &ctx
-            ),
-            "a bare StringNotEquals on absent {key} matches, as on IAM"
+            evaluate_condition(&cond(op, "aws:TagKeys", vec!["secret"]), &ctx),
+            "a bare negated operator on absent aws:TagKeys matches, as on IAM"
         );
-        assert!(
-            evaluate_condition(
-                &cond(ConditionOperator::StringNotLike, key, vec!["ss*"]),
-                &ctx
+    }
+    assert!(
+        !evaluate_condition(
+            &cond(
+                ConditionOperator::StringEquals,
+                "aws:TagKeys",
+                vec!["secret"]
             ),
-            "a bare StringNotLike on absent {key} matches, as on IAM"
-        );
-        assert!(
-            !evaluate_condition(
-                &cond(ConditionOperator::StringEquals, key, vec!["ssn"]),
-                &ctx
-            ),
-            "a bare positive operator on absent {key} does not match"
-        );
+            &ctx
+        ),
+        "a bare positive operator on absent aws:TagKeys does not match"
+    );
+}
+
+#[test]
+fn bare_negated_op_absent_dynamodb_keys_do_not_match() {
+    // IAM matches a bare negated operator on absent dynamodb:Attributes and
+    // dynamodb:LeadingKeys too, but ExtendDB leaves both absent on requests
+    // where the service populates them (Attributes on writes, AttributesToGet
+    // reads and batch and transaction targets; LeadingKeys on query shapes the
+    // extractor cannot pin). Matching there would grant an Allow the service
+    // refuses for the present key, so for these two keys an absent key keeps
+    // the no-match rule (BR-7085).
+    let ctx = TestContext::new();
+    for key in ["dynamodb:Attributes", "dynamodb:LeadingKeys"] {
+        for op in [
+            ConditionOperator::StringNotEquals,
+            ConditionOperator::StringNotEqualsIgnoreCase,
+            ConditionOperator::StringNotLike,
+            ConditionOperator::StringEquals,
+        ] {
+            assert!(
+                !evaluate_condition(&cond(op, key, vec!["ssn"]), &ctx),
+                "a bare operator on absent {key} does not match"
+            );
+        }
     }
 }
 

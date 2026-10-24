@@ -43,6 +43,23 @@ pub trait ConditionContext {
     fn is_unresolvable_key(&self, _key: &str) -> bool {
         false
     }
+
+    /// Whether a bare negated operator (`StringNotEquals`, `StringNotLike`,
+    /// `StringNotEqualsIgnoreCase` and the other `Not` forms) matches when
+    /// `key`, a multivalued key, is absent from the request.
+    ///
+    /// IAM answers yes for every key: an absent key has no value, so "not
+    /// equals" holds (measured with `simulate-custom-policy` for
+    /// `aws:TagKeys`, `dynamodb:LeadingKeys` and `dynamodb:Attributes`). That
+    /// answer is right for ExtendDB only where ExtendDB leaves the key absent
+    /// on the same requests the service does. Where ExtendDB leaves a key
+    /// absent that the service populates, matching would grant an Allow the
+    /// service refuses, so the default is `false` (no match) and a context
+    /// opts in per key. Consulted only for a key `is_multivalued_key` reports
+    /// as multivalued; single-valued keys always match here.
+    fn bare_negated_matches_absent_multivalued_key(&self, _key: &str) -> bool {
+        false
+    }
 }
 
 /// Look up a tag map by key, matching the live service.
@@ -312,6 +329,48 @@ impl RequestContext {
             request_tag_keys: params.request_tag_keys.filter(|k| !k.is_empty()),
         }
     }
+
+    /// Resolve `aws:RequestTag/<sub_key>` against the tags the request carries.
+    ///
+    /// The tag name in the condition key is matched under Unicode case folding,
+    /// as the principal-tag and resource-tag keys are on this path. The engine
+    /// stores every spelling the request names as its own tag, so a request
+    /// carrying `Env=prod` and `env=dev` stores both. When two or more stored
+    /// spellings fold to the policy's name, the key has one value only if they
+    /// all carry the same value; otherwise it is ambiguous, and the caller
+    /// fails the statement closed rather than pick one spelling and let the
+    /// other value through. IAM refuses a request context carrying two case
+    /// variants of one tag name, so the service's own answer for a request of
+    /// this shape is not measured.
+    fn request_tag_values(&self, sub_key: &str) -> RequestTagLookup<'_> {
+        let Some(tags) = self.request_tags.as_ref() else {
+            return RequestTagLookup::Absent;
+        };
+        let want = super::casefold::case_fold(sub_key);
+        let mut found: Option<&str> = None;
+        for (k, v) in tags {
+            if super::casefold::case_fold(k) != want {
+                continue;
+            }
+            match found {
+                None => found = Some(v.as_str()),
+                Some(seen) if seen == v.as_str() => {}
+                Some(_) => return RequestTagLookup::Ambiguous,
+            }
+        }
+        found.map_or(RequestTagLookup::Absent, RequestTagLookup::Value)
+    }
+}
+
+/// The outcome of resolving `aws:RequestTag/<key>` on a `DynamoDB` request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestTagLookup<'a> {
+    /// The request names no tag that folds to the key.
+    Absent,
+    /// Every tag that folds to the key carries this value.
+    Value(&'a str),
+    /// Two or more tags fold to the key with differing values.
+    Ambiguous,
 }
 
 impl ConditionContext for RequestContext {
@@ -328,10 +387,14 @@ impl ConditionContext for RequestContext {
             // the operations that take a tag set, from the tags in the request
             // body, and leaves it absent for every other operation. Resolved
             // from the same map the engine writes, so a statement gated on a
-            // request tag reads the value the request would store.
-            self.request_tags
-                .as_ref()
-                .and_then(|tags| tag_lookup(tags, sub, super::casefold::case_fold))
+            // request tag reads the value the request would store. A request
+            // naming the tag under several spellings that fold to one name
+            // with differing values resolves to nothing here and is reported
+            // by `is_unresolvable_key`, so the statement fails closed.
+            match self.request_tag_values(sub) {
+                RequestTagLookup::Value(v) => Some(vec![v]),
+                RequestTagLookup::Absent | RequestTagLookup::Ambiguous => None,
+            }
         } else if let Some(sub) = strip_prefix_ci(key, "aws:ResourceTag/") {
             // The service evaluates resource tags only as aws:ResourceTag/*,
             // resolved from the resource-tag map. dynamodb:ResourceTag/* is
@@ -416,11 +479,32 @@ impl ConditionContext for RequestContext {
     }
 
     fn is_unresolvable_key(&self, key: &str) -> bool {
-        // An unresolved aws: global key that is neither a tag sub-key nor on the
-        // absent-ok allowlist is one the service populates but this context has
-        // no value for (for example aws:PrincipalOrgID, aws:SourceIp): it fails
-        // closed. Keys resolved above never reach here.
+        // A request tag key the request names under two or more spellings that
+        // fold to one name and do not all carry one value cannot be read as one
+        // value: the statement fails closed (a Deny blocks, an Allow does not
+        // grant). Every other unresolved aws: global key that is neither a tag
+        // sub-key nor on the absent-ok allowlist is one the service populates
+        // but this context has no value for (for example aws:PrincipalOrgID,
+        // aws:SourceIp): it fails closed. Keys resolved above never reach here.
+        if let Some(sub) = strip_prefix_ci(key, "aws:RequestTag/") {
+            return self.request_tag_values(sub) == RequestTagLookup::Ambiguous;
+        }
         aws_key_is_unresolvable(key)
+    }
+
+    fn bare_negated_matches_absent_multivalued_key(&self, key: &str) -> bool {
+        // IAM matches a bare negated operator on any absent multivalued key.
+        // ExtendDB applies that only to `aws:TagKeys`, which it populates on
+        // exactly the three operations the AWS service authorization reference
+        // lists it for (TagResource, UntagResource, CreateTable with Tags), so
+        // its absence here is the service's absence. `dynamodb:Attributes` is
+        // left absent on writes, on reads that project with `AttributesToGet`
+        // and on batch and transaction targets, and `dynamodb:LeadingKeys` on
+        // query shapes the extractor cannot pin to a partition value, where the
+        // service populates both; for those two an absent key keeps the
+        // no-match rule, so an Allow gated on a bare negated operator over them
+        // grants nothing, as the service grants nothing for the present key.
+        super::casefold::case_fold(key) == "aws:tagkeys"
     }
 }
 
@@ -547,6 +631,9 @@ impl ConditionContext for AssumeRoleContext {
         aws_key_is_unresolvable(key)
     }
 }
+
+#[cfg(test)]
+mod request_tag_tests;
 
 #[cfg(test)]
 mod tests {

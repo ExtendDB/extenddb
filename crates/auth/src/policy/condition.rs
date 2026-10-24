@@ -22,7 +22,9 @@ use super::matcher::wildcard_match;
 ///   present. AWS IAM requires a `ForAllValues:`/`ForAnyValue:` qualifier for
 ///   multivalued keys; a bare operator on a present multivalued key is a no-op
 ///   regardless of value count (BR-7085). A bare NEGATED operator on an
-///   **absent** key matches whatever the key's arity (measured on IAM).
+///   **absent** multivalued key matches on IAM; here it matches only when the
+///   context's `bare_negated_matches_absent_multivalued_key` says so for the
+///   key, which the `DynamoDB` request context does for `aws:TagKeys` alone.
 /// - `IfExists`: passes if the key is absent; otherwise evaluates as the base
 ///   operator (and so never matches a present multivalued key).
 /// - `Null`: checks key presence/absence.
@@ -115,14 +117,24 @@ pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext
             // the key has no value, so it cannot equal the policy value, so
             // "not equals" holds. This makes a Deny gated on StringNotEquals
             // apply when the caller omits the key (the confused-deputy guard).
-            // Measured on live IAM/STS and DynamoDB, and on IAM for an absent
-            // multivalued key (`aws:TagKeys`, `dynamodb:LeadingKeys`,
-            // `dynamodb:Attributes`): a bare `StringNotEquals`,
-            // `StringNotEqualsIgnoreCase` or `StringNotLike` Deny on any of the
-            // three fires when the key is absent, so the rule is not scoped to
-            // single-valued keys. A bare POSITIVE operator still never matches
-            // a present multivalued key (below).
-            None => is_negative_operator(other),
+            // Measured on live IAM/STS and DynamoDB for single-valued keys, and
+            // on IAM for the absent multivalued keys `aws:TagKeys`,
+            // `dynamodb:LeadingKeys` and `dynamodb:Attributes`. For a
+            // multivalued key the context decides whether that answer applies:
+            // it is right only where ExtendDB leaves the key absent on the same
+            // requests the service does. ExtendDB leaves `dynamodb:Attributes`
+            // absent on writes, on `AttributesToGet` reads and on batch and
+            // transaction targets, and `dynamodb:LeadingKeys` absent on query
+            // shapes it cannot pin to a partition value, where the service
+            // populates them; matching there would grant an Allow the service
+            // refuses, so those keys keep the no-match rule. `aws:TagKeys` is
+            // populated on exactly the three operations the service reference
+            // lists it for, so its absent-key answer is IAM's.
+            None => {
+                is_negative_operator(other)
+                    && (!is_multivalued
+                        || context.bare_negated_matches_absent_multivalued_key(&condition.key))
+            }
             // Bare operator on a present multivalued key never matches
             // (BR-7085). This is fail-safe: a bare Deny becomes a no-op
             // (matching AWS, which forces the author to use ForAnyValue:), and a
