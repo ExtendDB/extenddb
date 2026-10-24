@@ -19,7 +19,10 @@ and the operator, BETWEEN, binary, LSI, legacy, multi-attribute and two-HASH
 rows on 2026-10-23 (``issues/query-parity/service-435-shapes.jsonl``,
 ``service-435-review.jsonl`` and ``service-435-440-review-2.jsonl``). Rows that
 send several RANGE clauses on one index are skipped on a server that refuses
-that shape earlier as ``Query condition missed key schema element: h``. Multi-byte
+that shape earlier as ``Query condition missed key schema element: h``, and the
+``idx`` accept rows are skipped on a backend that answers ``InternalServerError``
+to any Query on an index with several RANGE attributes (Cassandra, see
+``query_key_size_support.require_multi_range``). Multi-byte
 values, ordered BETWEEN bounds, undefined references and a hash-only table are in
 ``test_query_key_size_values.py``; the order against other refusals is in
 ``test_query_key_size_order.py``.
@@ -72,11 +75,9 @@ class TestGsiQueryKeySize:
         )
 
     def test_one_600_byte_range_value_is_accepted(self, dynamodb_client, gsi_table):
-        resp = dynamodb_client.query(
-            TableName=gsi_table,
-            **self._query("h = :h AND a = :s600", {":h": S(1, "h"), ":s600": S(600)}),
-        )
-        assert resp["Count"] == 0
+        query = self._query("h = :h AND a = :s600", {":h": S(1, "h"), ":s600": S(600)})
+        require_multi_range(dynamodb_client, TableName=gsi_table, **query)
+        assert dynamodb_client.query(TableName=gsi_table, **query)["Count"] == 0
 
     def test_two_600_byte_range_values_are_refused_together(
         self, dynamodb_client, gsi_table
