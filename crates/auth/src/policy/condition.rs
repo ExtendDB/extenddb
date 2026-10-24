@@ -197,40 +197,12 @@ pub fn evaluate_statement_conditions(
 
 /// Expand IAM policy variables in a string value.
 ///
-/// Replaces `${variable}` patterns with their resolved values from the context.
-/// Supported variables: `aws:PrincipalTag/*` and any key the context can
-/// resolve. Unresolvable variables are left as-is (IAM behavior).
+/// Replaces `${variable}` and `${variable, 'default'}` patterns with their
+/// resolved values from the context (see [`super::variables`]). Supported
+/// variables: `aws:PrincipalTag/*` and any key the context can resolve.
+/// Unresolvable variables with no default are left as-is (IAM behavior).
 fn expand_policy_variables(value: &str, context: &impl ConditionContext) -> String {
-    if !value.contains("${") {
-        return value.to_owned();
-    }
-
-    let mut result = String::with_capacity(value.len());
-    let mut rest = value;
-
-    while let Some(start) = rest.find("${") {
-        result.push_str(&rest[..start]);
-        let after_start = &rest[start + 2..];
-        if let Some(end) = after_start.find('}') {
-            let var_name = &after_start[..end];
-            if let Some(vals) = context.resolve_key(var_name) {
-                // Use the first value for single-valued expansion.
-                if let Some(v) = vals.first() {
-                    result.push_str(v);
-                }
-            } else {
-                // Unresolvable — leave the variable literal.
-                result.push_str(&rest[start..start + 3 + end]);
-            }
-            rest = &after_start[end + 1..];
-        } else {
-            // No closing brace — copy literally.
-            result.push_str(&rest[start..]);
-            rest = "";
-        }
-    }
-    result.push_str(rest);
-    result
+    super::variables::expand_condition_value(value, context)
 }
 
 /// Unwrap an `IfExists` wrapper if present.

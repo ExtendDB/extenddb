@@ -1,0 +1,305 @@
+// Copyright 2026 ExtendDB contributors
+// SPDX-License-Identifier: Apache-2.0
+
+//! Unit tests for policy variable parsing, expansion and token matching.
+
+use super::*;
+use std::collections::HashMap;
+
+struct Ctx(HashMap<String, Vec<String>>);
+
+impl Ctx {
+    fn empty() -> Self {
+        Self(HashMap::new())
+    }
+
+    fn with(mut self, key: &str, values: &[&str]) -> Self {
+        self.0.insert(
+            key.to_owned(),
+            values.iter().map(|v| (*v).to_owned()).collect(),
+        );
+        self
+    }
+}
+
+impl ConditionContext for Ctx {
+    fn resolve_key(&self, key: &str) -> Option<Vec<&str>> {
+        self.0
+            .get(key)
+            .map(|v| v.iter().map(String::as_str).collect())
+    }
+
+    fn is_multivalued_key(&self, _key: &str) -> bool {
+        false
+    }
+}
+
+const TEAM: &str = "aws:PrincipalTag/team";
+const BLUE: &str = "arn:aws:dynamodb:us-east-1:123456789012:table/blue";
+
+fn team_blue() -> Ctx {
+    Ctx::empty().with(TEAM, &["blue"])
+}
+
+// --- parse_reference ---
+
+#[test]
+fn parse_plain_key() {
+    assert_eq!(
+        parse_reference("aws:username"),
+        Reference::Key {
+            name: "aws:username",
+            default: None
+        }
+    );
+}
+
+#[test]
+fn parse_default_form_with_and_without_space() {
+    for inner in [
+        "aws:username, 'anon'",
+        "aws:username,'anon'",
+        " aws:username , 'anon' ",
+    ] {
+        assert_eq!(
+            parse_reference(inner),
+            Reference::Key {
+                name: "aws:username",
+                default: Some("anon")
+            },
+            "{inner}"
+        );
+    }
+}
+
+#[test]
+fn parse_comma_without_quotes_is_key_text() {
+    assert_eq!(
+        parse_reference("a, b"),
+        Reference::Key {
+            name: "a, b",
+            default: None
+        }
+    );
+}
+
+#[test]
+fn parse_escapes() {
+    assert_eq!(parse_reference("*"), Reference::Escape(b'*'));
+    assert_eq!(parse_reference("?"), Reference::Escape(b'?'));
+    assert_eq!(parse_reference("$"), Reference::Escape(b'$'));
+}
+
+// --- resource_pattern_matches ---
+
+#[test]
+fn no_variable_is_arn_match() {
+    let ctx = Ctx::empty();
+    assert!(resource_pattern_matches(
+        "arn:aws:dynamodb:*:*:table/bl*",
+        BLUE,
+        true,
+        &ctx
+    ));
+    assert!(resource_pattern_matches("*", BLUE, true, &ctx));
+    assert!(!resource_pattern_matches(
+        "arn:aws:dynamodb:*:*:table/red",
+        BLUE,
+        true,
+        &ctx
+    ));
+}
+
+#[test]
+fn variable_expands_when_enabled_only() {
+    let pattern = "arn:aws:dynamodb:us-east-1:123456789012:table/${aws:PrincipalTag/team}";
+    assert!(resource_pattern_matches(pattern, BLUE, true, &team_blue()));
+    assert!(!resource_pattern_matches(
+        pattern,
+        BLUE,
+        false,
+        &team_blue()
+    ));
+}
+
+#[test]
+fn unresolved_variable_matches_nothing() {
+    let pattern = "arn:aws:dynamodb:us-east-1:123456789012:table/${aws:PrincipalTag/team}";
+    assert!(!resource_pattern_matches(
+        pattern,
+        BLUE,
+        true,
+        &Ctx::empty()
+    ));
+    assert!(!resource_pattern_matches(
+        "${aws:PrincipalTag/team}*",
+        BLUE,
+        true,
+        &Ctx::empty()
+    ));
+}
+
+#[test]
+fn default_used_when_key_absent() {
+    let pattern = "arn:aws:dynamodb:us-east-1:123456789012:table/${aws:PrincipalTag/team, 'blue'}";
+    assert!(resource_pattern_matches(pattern, BLUE, true, &Ctx::empty()));
+    let red = Ctx::empty().with(TEAM, &["red"]);
+    assert!(!resource_pattern_matches(pattern, BLUE, true, &red));
+}
+
+#[test]
+fn wildcard_after_variable_still_matches() {
+    let pattern = "arn:aws:dynamodb:us-east-1:123456789012:table/${aws:PrincipalTag/team}*";
+    let blue_x = "arn:aws:dynamodb:us-east-1:123456789012:table/blue-x";
+    assert!(resource_pattern_matches(
+        pattern,
+        blue_x,
+        true,
+        &team_blue()
+    ));
+    assert!(!resource_pattern_matches(
+        pattern,
+        "arn:aws:dynamodb:us-east-1:123456789012:table/red",
+        true,
+        &team_blue()
+    ));
+}
+
+#[test]
+fn wildcard_inside_variable_value_is_literal() {
+    let pattern = "arn:aws:dynamodb:us-east-1:123456789012:table/${aws:PrincipalTag/team}";
+    let star = Ctx::empty().with(TEAM, &["*"]);
+    assert!(!resource_pattern_matches(pattern, BLUE, true, &star));
+    assert!(resource_pattern_matches(
+        pattern,
+        "arn:aws:dynamodb:us-east-1:123456789012:table/*",
+        true,
+        &star
+    ));
+}
+
+#[test]
+fn escapes_are_literal_characters() {
+    let ctx = Ctx::empty();
+    let star = "arn:aws:dynamodb:us-east-1:123456789012:table/${*}";
+    assert!(!resource_pattern_matches(star, BLUE, true, &ctx));
+    assert!(resource_pattern_matches(
+        star,
+        "arn:aws:dynamodb:us-east-1:123456789012:table/*",
+        true,
+        &ctx
+    ));
+    let question = "arn:aws:dynamodb:us-east-1:123456789012:table/${?}";
+    assert!(!resource_pattern_matches(
+        question,
+        "arn:aws:dynamodb:us-east-1:123456789012:table/x",
+        true,
+        &ctx
+    ));
+    assert!(resource_pattern_matches(
+        question,
+        "arn:aws:dynamodb:us-east-1:123456789012:table/?",
+        true,
+        &ctx
+    ));
+    let dollar = "arn:aws:dynamodb:us-east-1:123456789012:table/${$}x";
+    assert!(resource_pattern_matches(
+        dollar,
+        "arn:aws:dynamodb:us-east-1:123456789012:table/$x",
+        true,
+        &ctx
+    ));
+}
+
+#[test]
+fn multivalued_key_uses_first_value() {
+    let pattern = "arn:aws:dynamodb:us-east-1:123456789012:table/${aws:PrincipalTag/team}";
+    let ctx = Ctx::empty().with(TEAM, &["blue", "red"]);
+    assert!(resource_pattern_matches(pattern, BLUE, true, &ctx));
+}
+
+#[test]
+fn present_key_with_no_values_expands_empty() {
+    let pattern = "arn:aws:dynamodb:us-east-1:123456789012:table/${aws:PrincipalTag/team}";
+    let ctx = Ctx::empty().with(TEAM, &[]);
+    assert!(resource_pattern_matches(
+        pattern,
+        "arn:aws:dynamodb:us-east-1:123456789012:table/",
+        true,
+        &ctx
+    ));
+    assert!(!resource_pattern_matches(pattern, BLUE, true, &ctx));
+}
+
+#[test]
+fn field_count_rule_holds_after_expansion() {
+    let pattern = "arn:aws:dynamodb:${aws:RequestedRegion}:*:table/blue";
+    let ctx = Ctx::empty().with("aws:RequestedRegion", &["us-east-1"]);
+    assert!(resource_pattern_matches(pattern, BLUE, true, &ctx));
+    assert!(!resource_pattern_matches(
+        pattern,
+        "arn:aws:dynamodb:us-east-1:table/blue",
+        true,
+        &ctx
+    ));
+}
+
+#[test]
+fn unclosed_brace_is_literal_text() {
+    let pattern = "arn:aws:dynamodb:us-east-1:123456789012:table/${aws";
+    assert!(resource_pattern_matches(
+        pattern,
+        "arn:aws:dynamodb:us-east-1:123456789012:table/${aws",
+        true,
+        &Ctx::empty()
+    ));
+    assert!(!resource_pattern_matches(
+        pattern,
+        BLUE,
+        true,
+        &Ctx::empty()
+    ));
+}
+
+// --- expand_condition_value ---
+
+#[test]
+fn condition_value_expands_variable_and_default() {
+    let ctx = team_blue();
+    assert_eq!(
+        expand_condition_value("team-${aws:PrincipalTag/team}", &ctx),
+        "team-blue"
+    );
+    assert_eq!(
+        expand_condition_value("${aws:username, 'anon'}", &ctx),
+        "anon"
+    );
+    assert_eq!(
+        expand_condition_value("${aws:PrincipalTag/team, 'none'}", &ctx),
+        "blue"
+    );
+}
+
+#[test]
+fn condition_value_leaves_unresolved_and_escapes_literal() {
+    let ctx = Ctx::empty();
+    assert_eq!(
+        expand_condition_value("${aws:username}", &ctx),
+        "${aws:username}"
+    );
+    assert_eq!(
+        expand_condition_value("a${*}b${?}c${$}", &ctx),
+        "a${*}b${?}c${$}"
+    );
+    assert_eq!(expand_condition_value("plain", &ctx), "plain");
+    assert_eq!(expand_condition_value("${open", &ctx), "${open");
+}
+
+#[test]
+fn condition_value_present_key_without_values_is_empty() {
+    let ctx = Ctx::empty().with(TEAM, &[]);
+    assert_eq!(
+        expand_condition_value("x${aws:PrincipalTag/team}y", &ctx),
+        "xy"
+    );
+}
