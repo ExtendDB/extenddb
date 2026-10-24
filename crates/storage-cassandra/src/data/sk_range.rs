@@ -152,6 +152,11 @@ fn cmp_sk(a: &SortKeyValue, b: &SortKeyValue) -> Ordering {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use extenddb_core::expression::{parse_key_condition, tokenize};
+    use extenddb_core::types::AttributeValue;
+
     use super::*;
 
     fn s(v: &str) -> SortKeyValue {
@@ -300,6 +305,116 @@ mod tests {
         match range.lower {
             Some((">", SortKeyValue::N(v))) => assert_eq!(v.to_string(), "10"),
             other => panic!("unexpected lower bound: {:?}", other.map(|(op, _)| op)),
+        }
+    }
+
+    /// Parse a key condition's sort key clause the way the Query path does.
+    fn condition(
+        expr: &str,
+        values: &[(&str, AttributeValue)],
+    ) -> (SortKeyCondition, ExpressionMaps) {
+        let tokens = tokenize(expr).unwrap();
+        let mut kc = parse_key_condition(&tokens).unwrap();
+        kc.resolve_pk_sk("pk", &HashMap::new()).unwrap();
+        let values = values
+            .iter()
+            .map(|(k, v)| (k.trim_start_matches(':').to_owned(), v.clone()))
+            .collect();
+        (
+            kc.sk_condition.expect("a sort key clause"),
+            ExpressionMaps::new(HashMap::new(), values),
+        )
+    }
+
+    /// Render a range as its clause and binds printed by type, for any sort key type.
+    fn shown(range: SkRange) -> (String, Vec<String>) {
+        let (clause, binds) = range.render("sk");
+        let binds = binds
+            .into_iter()
+            .map(|b| match b {
+                SortKeyValue::S(v) => format!("S:{v}"),
+                SortKeyValue::B(v) => format!(
+                    "B:{}",
+                    v.iter().map(|x| format!("{x:02x}")).collect::<String>()
+                ),
+                SortKeyValue::N(v) => format!("N:{v}"),
+            })
+            .collect();
+        (clause, binds)
+    }
+
+    #[test]
+    fn from_condition_pins_each_operator_and_the_begins_with_upper_bound() {
+        let s_av = |v: &str| AttributeValue::S(v.to_owned());
+        let range = |expr: &str, values: &[(&str, AttributeValue)], ty: ScalarAttributeType| {
+            let (cond, maps) = condition(expr, values);
+            shown(SkRange::from_condition(&cond, &maps, ty).unwrap())
+        };
+        let strs = |v: &[&str]| v.iter().map(|x| format!("S:{x}")).collect::<Vec<_>>();
+
+        // `=` is one inclusive bound on each side, rendered as a single `= ?`.
+        assert_eq!(
+            range(
+                "pk = :p AND sk = :v",
+                &[(":v", s_av("m"))],
+                ScalarAttributeType::S
+            ),
+            (" AND sk = ?".to_owned(), strs(&["m"]))
+        );
+        // BETWEEN is inclusive on both sides.
+        assert_eq!(
+            range(
+                "pk = :p AND sk BETWEEN :lo AND :hi",
+                &[(":lo", s_av("aa")), (":hi", s_av("m"))],
+                ScalarAttributeType::S
+            ),
+            (" AND sk >= ? AND sk <= ?".to_owned(), strs(&["aa", "m"]))
+        );
+        // begins_with on a string: inclusive prefix, exclusive prefix plus U+10FFFF.
+        assert_eq!(
+            range(
+                "pk = :p AND begins_with(sk, :v)",
+                &[(":v", s_av("ab"))],
+                ScalarAttributeType::S
+            ),
+            (
+                " AND sk >= ? AND sk < ?".to_owned(),
+                strs(&["ab", "ab\u{10FFFF}"])
+            )
+        );
+        // begins_with on binary: the last byte below 0xFF is incremented and the
+        // rest dropped; an all-0xFF prefix has no finite upper bound.
+        assert_eq!(
+            range(
+                "pk = :p AND begins_with(sk, :v)",
+                &[(":v", AttributeValue::B(vec![0x61, 0xFF]))],
+                ScalarAttributeType::B
+            ),
+            (
+                " AND sk >= ? AND sk < ?".to_owned(),
+                vec!["B:61ff".to_owned(), "B:62".to_owned()]
+            )
+        );
+        assert_eq!(
+            range(
+                "pk = :p AND begins_with(sk, :v)",
+                &[(":v", AttributeValue::B(vec![0xFF, 0xFF]))],
+                ScalarAttributeType::B
+            ),
+            (" AND sk >= ?".to_owned(), vec!["B:ffff".to_owned()])
+        );
+        // The strict and inclusive comparisons land on the expected side.
+        for (expr, clause) in [
+            ("pk = :p AND sk < :v", " AND sk < ?"),
+            ("pk = :p AND sk <= :v", " AND sk <= ?"),
+            ("pk = :p AND sk > :v", " AND sk > ?"),
+            ("pk = :p AND sk >= :v", " AND sk >= ?"),
+        ] {
+            assert_eq!(
+                range(expr, &[(":v", s_av("m"))], ScalarAttributeType::S),
+                (clause.to_owned(), strs(&["m"])),
+                "{expr}"
+            );
         }
     }
 }
