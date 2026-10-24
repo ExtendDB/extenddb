@@ -1,0 +1,395 @@
+// SPDX-License-Identifier: Apache-2.0
+
+use std::collections::HashMap;
+
+use extenddb_core::error::DynamoDbError;
+use extenddb_core::expression::{
+    ExpressionMaps, KeyCondition, parse_key_condition, tokenize_with_limit,
+};
+use extenddb_core::types::{AttributeDefinition, AttributeValue, QueryInput, ScalarAttributeType};
+
+use super::{
+    KEY_CONDITION_TYPE_MISMATCH, LIMIT_BELOW_ONE, validate_expression_attribute_value_numbers,
+    validate_key_condition_types, validate_query_request_values,
+};
+
+fn defs(pairs: &[(&str, ScalarAttributeType)]) -> Vec<AttributeDefinition> {
+    pairs
+        .iter()
+        .map(|(name, ty)| AttributeDefinition {
+            attribute_name: (*name).to_owned(),
+            attribute_type: *ty,
+        })
+        .collect()
+}
+
+fn parse(kce: &str) -> KeyCondition {
+    let tokens = tokenize_with_limit(kce, 1000).expect("tokenize");
+    parse_key_condition(&tokens).expect("parse")
+}
+
+fn maps(names: &[(&str, &str)], values: &[(&str, AttributeValue)]) -> ExpressionMaps {
+    ExpressionMaps::new(
+        names
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect(),
+        values
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), v.clone()))
+            .collect(),
+    )
+}
+
+fn s(v: &str) -> AttributeValue {
+    AttributeValue::S(v.to_owned())
+}
+
+fn n(v: &str) -> AttributeValue {
+    AttributeValue::N(v.to_owned())
+}
+
+fn message(result: Result<(), DynamoDbError>) -> Option<String> {
+    match result {
+        Ok(()) => None,
+        Err(DynamoDbError::ValidationException(msg)) => Some(msg),
+        Err(other) => panic!("unexpected error {other:?}"),
+    }
+}
+
+const SS: &[(&str, ScalarAttributeType)] = &[
+    ("pk", ScalarAttributeType::S),
+    ("sk", ScalarAttributeType::S),
+];
+
+#[test]
+fn partition_value_of_another_type_is_refused() {
+    let kc = parse("pk = :u");
+    for wrong in [
+        n("5"),
+        AttributeValue::B(vec![1]),
+        AttributeValue::Bool(true),
+        AttributeValue::Null,
+    ] {
+        let m = maps(&[], &[("u", wrong)]);
+        assert_eq!(
+            message(validate_key_condition_types(&kc, &m, &defs(SS))).as_deref(),
+            Some(KEY_CONDITION_TYPE_MISMATCH)
+        );
+    }
+}
+
+#[test]
+fn matching_types_pass() {
+    let kc = parse("pk = :u AND sk BETWEEN :a AND :b");
+    let m = maps(&[], &[("u", s("x")), ("a", s("a")), ("b", s("b"))]);
+    assert!(validate_key_condition_types(&kc, &m, &defs(SS)).is_ok());
+
+    let kc = parse("pk = :u AND begins_with(sk, :p)");
+    let m = maps(&[], &[("u", s("x")), ("p", s("a"))]);
+    assert!(validate_key_condition_types(&kc, &m, &defs(SS)).is_ok());
+
+    let n_sk = defs(&[
+        ("pk", ScalarAttributeType::S),
+        ("sk", ScalarAttributeType::N),
+    ]);
+    let kc = parse("pk = :u AND sk > :v");
+    let m = maps(&[], &[("u", s("x")), ("v", n("5"))]);
+    assert!(validate_key_condition_types(&kc, &m, &n_sk).is_ok());
+}
+
+#[test]
+fn sort_key_value_of_another_type_is_refused_for_every_operator() {
+    for kce in [
+        "pk = :u AND sk = :v",
+        "pk = :u AND sk < :v",
+        "pk = :u AND sk <= :v",
+        "pk = :u AND sk > :v",
+        "pk = :u AND sk >= :v",
+        "pk = :u AND :v <= sk",
+        "pk = :u AND begins_with(sk, :v)",
+    ] {
+        let kc = parse(kce);
+        let m = maps(&[], &[("u", s("x")), ("v", n("5"))]);
+        assert_eq!(
+            message(validate_key_condition_types(&kc, &m, &defs(SS))).as_deref(),
+            Some(KEY_CONDITION_TYPE_MISMATCH),
+            "{kce}"
+        );
+    }
+}
+
+#[test]
+fn either_between_bound_of_another_type_is_refused() {
+    let kc = parse("pk = :u AND sk BETWEEN :a AND :b");
+    for (a, b) in [(n("1"), s("b")), (s("a"), n("2")), (n("1"), n("2"))] {
+        let m = maps(&[], &[("u", s("x")), ("a", a), ("b", b)]);
+        assert_eq!(
+            message(validate_key_condition_types(&kc, &m, &defs(SS))).as_deref(),
+            Some(KEY_CONDITION_TYPE_MISMATCH)
+        );
+    }
+}
+
+#[test]
+fn string_on_a_number_or_binary_key_is_refused() {
+    let n_sk = defs(&[
+        ("pk", ScalarAttributeType::S),
+        ("sk", ScalarAttributeType::N),
+    ]);
+    let kc = parse("pk = :u AND sk = :v");
+    let m = maps(&[], &[("u", s("x")), ("v", s("5"))]);
+    assert_eq!(
+        message(validate_key_condition_types(&kc, &m, &n_sk)).as_deref(),
+        Some(KEY_CONDITION_TYPE_MISMATCH)
+    );
+
+    let b_pk = defs(&[
+        ("bpk", ScalarAttributeType::B),
+        ("bsk", ScalarAttributeType::B),
+    ]);
+    let kc = parse("bpk = :u");
+    for wrong in [s("x"), n("5")] {
+        let m = maps(&[], &[("u", wrong)]);
+        assert_eq!(
+            message(validate_key_condition_types(&kc, &m, &b_pk)).as_deref(),
+            Some(KEY_CONDITION_TYPE_MISMATCH)
+        );
+    }
+}
+
+#[test]
+fn name_reference_resolves_to_the_defined_attribute() {
+    let kc = parse("#p = :u");
+    let m = maps(&[("p", "pk")], &[("u", n("5"))]);
+    assert_eq!(
+        message(validate_key_condition_types(&kc, &m, &defs(SS))).as_deref(),
+        Some(KEY_CONDITION_TYPE_MISMATCH)
+    );
+    let m = maps(&[("p", "pk")], &[("u", s("x"))]);
+    assert!(validate_key_condition_types(&kc, &m, &defs(SS)).is_ok());
+}
+
+#[test]
+fn index_key_schema_uses_the_index_attribute_definition() {
+    // A GSI on gpk (S) with a range key gsk (S) on a table whose base sort key is N.
+    let d = defs(&[
+        ("pk", ScalarAttributeType::S),
+        ("sk", ScalarAttributeType::N),
+        ("gpk", ScalarAttributeType::S),
+        ("gsk", ScalarAttributeType::S),
+    ]);
+    let kc = parse("gpk = :g AND gsk = :s");
+    let m = maps(&[], &[("g", s("x")), ("s", n("5"))]);
+    assert_eq!(
+        message(validate_key_condition_types(&kc, &m, &d)).as_deref(),
+        Some(KEY_CONDITION_TYPE_MISMATCH)
+    );
+    let m = maps(&[], &[("g", s("x")), ("s", s("g"))]);
+    assert!(validate_key_condition_types(&kc, &m, &d).is_ok());
+}
+
+#[test]
+fn multipart_hash_conditions_are_checked() {
+    let d = defs(&[
+        ("g1", ScalarAttributeType::S),
+        ("g2", ScalarAttributeType::N),
+        ("r", ScalarAttributeType::S),
+    ]);
+    let mut kc = parse("g1 = :a AND g2 = :b AND r > :c");
+    let names = HashMap::new();
+    kc.resolve_multipart(&["g1", "g2"], &names)
+        .expect("resolve");
+    assert_eq!(kc.extra_pk_conditions.len(), 1);
+    let m = maps(&[], &[("a", s("x")), ("b", s("1")), ("c", s("r"))]);
+    assert_eq!(
+        message(validate_key_condition_types(&kc, &m, &d)).as_deref(),
+        Some(KEY_CONDITION_TYPE_MISMATCH)
+    );
+    let m = maps(&[], &[("a", s("x")), ("b", n("1")), ("c", s("r"))]);
+    assert!(validate_key_condition_types(&kc, &m, &d).is_ok());
+}
+
+#[test]
+fn undefined_placeholder_and_undefined_attribute_are_left_to_other_checks() {
+    let kc = parse("pk = :u AND sk = :zz");
+    let m = maps(&[], &[("u", n("5"))]);
+    // The partition value is wrong, and :zz is undefined: the service reports
+    // the undefined placeholder first, so the type check stands aside.
+    assert!(validate_key_condition_types(&kc, &m, &defs(SS)).is_ok());
+    let m = maps(&[], &[("u", s("x"))]);
+    assert!(validate_key_condition_types(&kc, &m, &defs(SS)).is_ok());
+
+    // No AttributeDefinition for the attribute: not this check's refusal.
+    let kc = parse("other = :u");
+    let m = maps(&[], &[("u", n("5"))]);
+    assert!(validate_key_condition_types(&kc, &m, &defs(SS)).is_ok());
+}
+
+fn query(body: serde_json::Value) -> QueryInput {
+    serde_json::from_value(body).expect("QueryInput")
+}
+
+#[test]
+fn number_values_that_are_not_numbers_are_refused_with_the_bare_message() {
+    let cases = [
+        (
+            "bob",
+            "The parameter cannot be converted to a numeric value: bob",
+        ),
+        (
+            "1e",
+            "The parameter cannot be converted to a numeric value: 1e",
+        ),
+        (
+            "12abc",
+            "The parameter cannot be converted to a numeric value: 12abc",
+        ),
+        (
+            " 5",
+            "The parameter cannot be converted to a numeric value:  5",
+        ),
+        ("", "The parameter cannot be converted to a numeric value: "),
+        (
+            "1e200",
+            "Number overflow. Attempting to store a number with magnitude larger than supported range",
+        ),
+    ];
+    for (raw, expected) in cases {
+        let values = HashMap::from([(":u".to_owned(), n(raw))]);
+        assert_eq!(
+            message(validate_expression_attribute_value_numbers(&values)).as_deref(),
+            Some(expected),
+            "{raw:?}"
+        );
+    }
+    let values = HashMap::from([(":u".to_owned(), n(&"1".repeat(39)))]);
+    assert_eq!(
+        message(validate_expression_attribute_value_numbers(&values)).as_deref(),
+        Some("Attempting to store more than 38 significant digits in a Number")
+    );
+}
+
+#[test]
+fn number_values_that_are_numbers_and_other_types_pass() {
+    let values = HashMap::from([
+        (":u".to_owned(), n("5")),
+        (":v".to_owned(), n("-1.5e3")),
+        (":w".to_owned(), s("bob")),
+        (":x".to_owned(), AttributeValue::Bool(true)),
+        (":y".to_owned(), AttributeValue::L(vec![n("1"), s("bob")])),
+    ]);
+    assert!(validate_expression_attribute_value_numbers(&values).is_ok());
+}
+
+#[test]
+fn every_value_in_the_map_is_checked_whatever_reads_it() {
+    // :n is read by nothing in the key condition: checked all the same.
+    let values = HashMap::from([(":p".to_owned(), s("x")), (":n".to_owned(), n("bob"))]);
+    assert_eq!(
+        message(validate_expression_attribute_value_numbers(&values)).as_deref(),
+        Some("The parameter cannot be converted to a numeric value: bob")
+    );
+}
+
+#[test]
+fn numbers_nested_in_sets_lists_and_maps_are_checked() {
+    let nested = [
+        AttributeValue::NS(["1".to_owned(), "bob".to_owned()].into_iter().collect()),
+        AttributeValue::L(vec![s("a"), n("bob")]),
+        AttributeValue::M([("a".to_owned(), n("bob"))].into_iter().collect()),
+        AttributeValue::M(
+            [(
+                "a".to_owned(),
+                AttributeValue::L(vec![AttributeValue::M(
+                    [("b".to_owned(), n("bob"))].into_iter().collect(),
+                )]),
+            )]
+            .into_iter()
+            .collect(),
+        ),
+    ];
+    for value in nested {
+        let values = HashMap::from([(":p".to_owned(), s("x")), (":n".to_owned(), value.clone())]);
+        assert_eq!(
+            message(validate_expression_attribute_value_numbers(&values)).as_deref(),
+            Some("The parameter cannot be converted to a numeric value: bob"),
+            "{value:?}"
+        );
+    }
+}
+
+#[test]
+fn first_invalid_number_in_placeholder_order_is_reported() {
+    let values = HashMap::from([(":b".to_owned(), n("two")), (":a".to_owned(), n("one"))]);
+    assert_eq!(
+        message(validate_expression_attribute_value_numbers(&values)).as_deref(),
+        Some("The parameter cannot be converted to a numeric value: one")
+    );
+}
+
+#[test]
+fn request_time_checks_run_limit_then_mix_then_numbers() {
+    let bad_number = serde_json::json!({
+        "TableName": "t",
+        "KeyConditionExpression": "pk = :u",
+        "ExpressionAttributeValues": {":u": {"N": "bob"}},
+    });
+
+    let mut with_limit = bad_number.clone();
+    with_limit["Limit"] = serde_json::json!(0);
+    assert_eq!(
+        message(validate_query_request_values(&query(with_limit))).as_deref(),
+        Some(LIMIT_BELOW_ONE)
+    );
+
+    let mut with_mix = bad_number.clone();
+    with_mix["KeyConditions"] = serde_json::json!({
+        "pk": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "x"}]}
+    });
+    assert_eq!(
+        message(validate_query_request_values(&query(with_mix))).as_deref(),
+        Some(
+            "Can not use both expression and non-expression parameters in the same request: \
+             Non-expression parameters: {KeyConditions} Expression parameters: {KeyConditionExpression}"
+        )
+    );
+
+    assert_eq!(
+        message(validate_query_request_values(&query(bad_number))).as_deref(),
+        Some("The parameter cannot be converted to a numeric value: bob")
+    );
+
+    // A number only a FilterExpression reads, and one nothing reads.
+    for body in [
+        serde_json::json!({
+            "TableName": "t",
+            "KeyConditionExpression": "pk = :p",
+            "FilterExpression": "a = :n",
+            "ExpressionAttributeValues": {":p": {"S": "x"}, ":n": {"N": "bob"}},
+        }),
+        serde_json::json!({
+            "TableName": "t",
+            "KeyConditionExpression": "pk = :p",
+            "ExpressionAttributeValues": {":p": {"S": "x"}, ":n": {"N": "bob"}},
+        }),
+    ] {
+        assert_eq!(
+            message(validate_query_request_values(&query(body))).as_deref(),
+            Some("The parameter cannot be converted to a numeric value: bob")
+        );
+    }
+
+    // Legacy KeyConditions alone does not join the mix check; a well-formed
+    // request passes.
+    let legacy = serde_json::json!({
+        "TableName": "t",
+        "KeyConditions": {
+            "pk": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "x"}]}
+        },
+        "FilterExpression": "a = :n",
+        "ExpressionAttributeValues": {":n": {"N": "5"}},
+        "Limit": 1,
+    });
+    assert!(validate_query_request_values(&query(legacy)).is_ok());
+}

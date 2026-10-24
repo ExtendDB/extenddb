@@ -71,6 +71,14 @@ pub async fn handle_query(
     )?;
     let input: QueryInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
+    // Request-time checks in the service's order: Limit, the expression and
+    // non-expression parameter mix, then every number in
+    // ExpressionAttributeValues (measured 2026-10-24: a Limit of 0 and a
+    // parameter mix are reported ahead of an N value that is not a number, and
+    // that value is reported ahead of a missing table or index). The server
+    // runs the same function ahead of the IAM decision; see `query_key_values`.
+    crate::query_key_values::validate_query_request_values(&input)?;
+
     // P118: Fetch key_info first so we can use table_id for index lookup.
     let key_info = ctx
         .table_key_info(&input.table_name)
@@ -137,14 +145,7 @@ pub async fn handle_query(
         )?;
     }
 
-    // Validate Limit >= 1 (REQ-QUERY-001)
-    if let Some(limit) = input.limit
-        && limit < 1
-    {
-        return Err(DynamoDbError::ValidationException(
-                "1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1".to_owned(),
-            ));
-    }
+    // Limit >= 1 is checked at request time in validate_query_request_values.
 
     // For index queries, build a key_info that reflects the index's key schema
     // so the storage layer uses the correct SK column for the index table.
@@ -166,34 +167,9 @@ pub async fn handle_query(
         key_info.clone()
     };
 
-    // --- Legacy vs expression mutual exclusivity checks ---
-    let kce_present = input.key_condition_expression.is_some();
-    let has_kc = input.key_conditions.as_ref().is_some_and(|m| !m.is_empty());
-    let has_fe = input.filter_expression.is_some();
-    let has_qf = input.query_filter.as_ref().is_some_and(|m| !m.is_empty());
-    let has_pe = input.projection_expression.is_some();
-    let has_atg = input
-        .attributes_to_get
-        .as_ref()
-        .is_some_and(|a| !a.is_empty());
+    // The legacy versus expression mutual exclusivity check runs at request
+    // time in validate_query_request_values.
     let has_cond_op = input.conditional_operator.is_some();
-
-    // KeyConditions legitimately combines with FilterExpression and
-    // ProjectionExpression, so it joins the mixing check only when
-    // KeyConditionExpression is also present.
-    extenddb_core::validation::validate_no_expression_param_mixing(
-        &[
-            ("AttributesToGet", has_atg),
-            ("QueryFilter", has_qf),
-            ("ConditionalOperator", has_cond_op),
-            ("KeyConditions", has_kc && kce_present),
-        ],
-        &[
-            ("ProjectionExpression", has_pe),
-            ("FilterExpression", has_fe),
-            ("KeyConditionExpression", kce_present),
-        ],
-    )?;
 
     // An explicitly empty KeyConditionExpression is rejected up front, before
     // the expression-parameter-usage checks (matching real DynamoDB).
@@ -468,6 +444,19 @@ pub async fn handle_query(
         )?;
         extenddb_core::expression::validate_ordering_operand_types(f, &combined_maps).map_err(
             |e| crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Filter),
+        )?;
+    }
+
+    // A key condition value whose type is not the key attribute's type is
+    // refused after the key schema, filter, projection, unused value and
+    // Select checks and before the ExclusiveStartKey check (measured
+    // 2026-10-24). The legacy KeyConditions path makes its own checks when it
+    // desugars.
+    if legacy_kc_maps.is_none() {
+        crate::query_key_values::validate_key_condition_types(
+            &key_condition,
+            effective_maps,
+            &query_key_info.attribute_definitions,
         )?;
     }
 

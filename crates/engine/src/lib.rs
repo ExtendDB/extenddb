@@ -27,6 +27,7 @@ mod legacy_filter;
 mod list_tables;
 mod put_item;
 mod query;
+pub mod query_key_values;
 mod read_helpers;
 mod request_limits;
 mod scan;

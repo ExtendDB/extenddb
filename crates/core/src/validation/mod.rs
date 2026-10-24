@@ -1903,7 +1903,15 @@ fn validate_lsi_requires_range_key(input: &CreateTableInput) -> Result<(), Dynam
     Ok(())
 }
 
-fn validate_attribute_number(value: &AttributeValue) -> Result<(), DynamoDbError> {
+/// Validate every number inside one attribute value (`N`, `NS` members, and
+/// the values nested in `L` and `M`) against the `DynamoDB` number rules, with
+/// the bare numeric message.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` for the first number that is
+/// not a number, has more than 38 significant digits, or is out of range.
+pub fn validate_attribute_number(value: &AttributeValue) -> Result<(), DynamoDbError> {
     match value {
         AttributeValue::N(n) => {
             number::validate_and_normalize_number(n)?;

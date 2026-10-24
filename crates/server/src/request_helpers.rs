@@ -184,6 +184,20 @@ pub(crate) async fn authorize_request(
         authz_resource::validate_tag_resource_arn_shape(arn)?;
     }
 
+    // A Query's request-time checks (Limit, the expression and non-expression
+    // parameter mix, every number in ExpressionAttributeValues) run before the
+    // IAM decision, for every principal. The engine makes the same checks at
+    // request time; they run here as well because authorization binds no
+    // dynamodb:LeadingKeys value to a number it cannot parse, and a fence that
+    // needs the key present (ForAnyValue, a Null guard, the plain operators)
+    // would otherwise answer AccessDeniedException where ValidationException is
+    // the request's error. A body the engine cannot deserialize is left to it.
+    if operation == "Query"
+        && let Ok(query) = serde_json::from_value::<extenddb_core::types::QueryInput>(input.clone())
+    {
+        extenddb_engine::query_key_values::validate_query_request_values(&query)?;
+    }
+
     // Every other ARN-bearing field (StreamArn, BackupArn, the export TableArn,
     // a restore SourceTableArn) must parse to the resource kind the operation
     // takes, or the request is refused with ValidationException before the IAM
