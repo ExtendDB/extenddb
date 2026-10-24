@@ -162,3 +162,7 @@ impl SqliteEngine {
         Ok((old_ret, new_ret))
     }
 }
+
+#[cfg(test)]
+#[path = "update_item_tests.rs"]
+mod tests;
