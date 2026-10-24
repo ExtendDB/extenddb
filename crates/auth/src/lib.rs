@@ -148,18 +148,20 @@ impl<C: CredentialStore + 'static> AuthProvider for BuiltinAuthProvider<C> {
         // The service checks the request timestamp, then the credential
         // scope, then looks the key up (measured 2026-10-23: an unknown key
         // with a stale date answers the timestamp error, an unknown key with
-        // a wrong region answers the scope message, and a stale date with a
-        // wrong region answers the timestamp error). Neither check reads the
-        // stored credential, so running them first leaves the S-5 timing
-        // argument below unchanged.
+        // a wrong region answers the scope message, an unknown key with a
+        // scope date of the previous day answers the scope date message, and
+        // a stale date with a wrong region answers the timestamp error).
+        // Neither check reads the stored credential, so running them first
+        // leaves the S-5 timing argument below unchanged.
         //
-        // Validate timestamp (±15 minute window).
-        sigv4::verify::validate_timestamp(headers)?;
+        // Validate timestamp (±15 minute window). The X-Amz-Date value it
+        // returns is what the scope date is compared against.
+        let timestamp = sigv4::verify::validate_timestamp(headers)?;
 
-        // The credential scope must name this server's region and the
-        // dynamodb service; the service reports both complaints in one
-        // message when both are wrong.
-        sigv4::verify::check_scope(&parsed, &self.region)?;
+        // The credential scope must name this server's region, the dynamodb
+        // service and the date of X-Amz-Date; the service reports every
+        // complaint in one message when more than one is wrong.
+        sigv4::verify::check_scope(&parsed, &self.region, &timestamp)?;
 
         let credential = self
             .credential_store
