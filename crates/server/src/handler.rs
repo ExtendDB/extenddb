@@ -19,8 +19,8 @@ use crate::AppState;
 use crate::request_helpers::{authorize_request, extract_operation, extract_table_name};
 use crate::response::{error_response, record_error_metrics, success_response};
 use crate::throttle_helpers::{
-    classify_data_operation, extract_partition_value, table_description_to_throughput,
-    throttle_error, update_throttle_buckets,
+    classify_data_operation, extract_partition_value, record_partial_batch_throttle,
+    table_description_to_throughput, throttle_error, update_throttle_buckets,
 };
 
 /// Main Virtual `DynamoDB` request handler.
@@ -275,6 +275,9 @@ pub(crate) async fn handle_request(
                 table_name.as_deref(),
                 &result.body,
             );
+            // A batch a backend served partially is a throttle the server's own
+            // bucket never saw; count it so the metrics do not read as zero.
+            record_partial_batch_throttle(&state.metrics, &operation, &result.body);
 
             let m = &result.metrics;
             if let Some(ref tn) = table_name {
