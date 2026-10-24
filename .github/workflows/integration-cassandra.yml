@@ -51,6 +51,11 @@ jobs:
           - 9042:9042
         env:
           CASSANDRA_CLUSTER_NAME: extenddb-ci
+          # Advertise the address the runner reaches the service on (the mapped
+          # port on localhost). Otherwise the node advertises its container IP,
+          # which the Cassandra driver would reconnect to and never reach,
+          # hanging the pool after any connection drop (issue #403).
+          CASSANDRA_BROADCAST_RPC_ADDRESS: 127.0.0.1
           HEAP_NEWSIZE: 128M
           MAX_HEAP_SIZE: 1024M
         options: >-
@@ -107,6 +112,11 @@ jobs:
           - 9042:9042
         env:
           CASSANDRA_CLUSTER_NAME: extenddb-ci
+          # Advertise the address the runner reaches the service on (the mapped
+          # port on localhost). Otherwise the node advertises its container IP,
+          # which the Cassandra driver would reconnect to and never reach,
+          # hanging the pool after any connection drop (issue #403).
+          CASSANDRA_BROADCAST_RPC_ADDRESS: 127.0.0.1
           HEAP_NEWSIZE: 128M
           MAX_HEAP_SIZE: 1024M
         options: >-
@@ -158,6 +168,11 @@ jobs:
           - 9042:9042
         env:
           CASSANDRA_CLUSTER_NAME: extenddb-ci
+          # Advertise the address the runner reaches the service on (the mapped
+          # port on localhost). Otherwise the node advertises its container IP,
+          # which the Cassandra driver would reconnect to and never reach,
+          # hanging the pool after any connection drop (issue #403).
+          CASSANDRA_BROADCAST_RPC_ADDRESS: 127.0.0.1
           HEAP_NEWSIZE: 128M
           MAX_HEAP_SIZE: 1024M
         options: >-

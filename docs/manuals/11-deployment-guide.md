@@ -244,7 +244,62 @@ pool_size = 50  # Increase for higher concurrency
 
 Ensure PostgreSQL `max_connections` accommodates the total pool size plus overhead.
 
-Backup and restore work is admitted against the pool so it cannot take every connection from ordinary requests. On PostgreSQL and MongoDB one server runs at most 4 `RestoreTableFromBackup` copies per account and `min(16, pool/2)` in total (PostgreSQL: `pool_size`; MongoDB: the engine's driver pool, `maxPoolSize` in the connection string or `max_connections`, default 10, so 5 restores); a restore that waits more than 30 seconds for a slot is refused with `LimitExceededException` and creates nothing. On SQLite one server runs at most `pool_size / 2 - 1` `CreateBackup` copies at once (between 1 and 16; 4 for the default `pool_size` of 10), each holding its snapshot connection for its duration, and refuses a backup that waited 30 seconds with `LimitExceededException`. A MongoDB restore request that is not registered within 60 seconds answers an internal error while the restore goes on in the background; the MongoDB driver does not enforce `waitQueueTimeoutMS`, so the admission bound is what keeps a flood of restores from holding every pooled connection.
+Backup and restore work is admitted against the pool so it cannot take every connection from ordinary requests. On PostgreSQL and MongoDB
+one server runs at most 4 `RestoreTableFromBackup` copies per account and `min(16, pool/2)` in total (PostgreSQL: `pool_size`; MongoDB: 
+the engine's driver pool, `maxPoolSize` in the connection string or `max_connections`, default 10, so 5 restores). A restore that waits more
+than 30 seconds for a slot is refused with `LimitExceededException` and creates nothing. On SQLite one server runs at most `pool_size / 2 - 1`
+`CreateBackup` copies at once (between 1 and 16; 4 for the default `pool_size` of 10), each holding its snapshot connection for its duration,
+and refuses a backup that waited 30 seconds with `LimitExceededException`. A MongoDB restore request that is not registered within 60 seconds
+answers an internal error while the restore goes on in the background; the MongoDB driver does not enforce `waitQueueTimeoutMS`, so the
+admission bound is what keeps a flood of restores from holding every pooled connection.
+
+### Cassandra Connection Pool and Broadcast Address
+
+Two Cassandra-specific settings affect connection resilience. Both matter for
+any production deployment.
+
+**Pool size.** The Cassandra backend opens `max_connections` connections per
+node (default 10) and scatters requests across them:
+
+```toml
+[storage.cassandra]
+max_connections = 10  # connections per node
+```
+
+Keep this above 1. A single connection serializes every request's protocol
+stream id onto one socket and leaves no headroom if that socket drops. More
+connections also divide the stream-id space, which avoids a driver-level
+stream-id reuse hazard under sustained load with a slow statement in flight.
+
+**Broadcast RPC address (important).** The Cassandra driver reconnects to the
+address each node advertises in `system.local`/`system.peers`
+(`broadcast_rpc_address`), *not* to the contact point ExtendDB was configured
+with. If a node advertises an address the ExtendDB host cannot reach, the
+connection works at first but the pool never recovers from any later drop — a
+node restart, a network blip, an idle timeout — and every request fails with
+`No nodes available in query plan!` until ExtendDB is restarted.
+
+Configure each node's `broadcast_rpc_address` to an address every ExtendDB
+instance can reach:
+
+```yaml
+# cassandra.yaml
+broadcast_rpc_address: <address clients connect to>
+```
+
+This is the usual trap for **containerized** Cassandra: a container advertises
+its internal bridge IP (for example `240.x` or `172.x`), which a client
+connecting through a published host port cannot reach. For the official
+`cassandra` image, set it through the environment:
+
+```bash
+docker run ... -e CASSANDRA_BROADCAST_RPC_ADDRESS=<reachable-address> cassandra:4.1
+```
+
+For local development and CI, `devtools/cassandra-node` sets
+`CASSANDRA_BROADCAST_RPC_ADDRESS=127.0.0.1` by default (override with
+`--broadcast-rpc-address`), and the `integration-cassandra` CI workflow sets the
+same on its service container.
 
 ### PostgreSQL Tuning
 

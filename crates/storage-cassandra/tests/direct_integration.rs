@@ -25,6 +25,8 @@ mod authorization_store;
 mod backup_engine;
 #[path = "direct/cassandra_engine.rs"]
 mod cassandra_engine;
+#[path = "direct/connection_pool_size.rs"]
+mod connection_pool_size;
 #[path = "direct/delete_item.rs"]
 mod delete_item;
 #[path = "direct/groups.rs"]
@@ -33,6 +35,8 @@ mod groups;
 mod index;
 #[path = "direct/metadata_engine.rs"]
 mod metadata_engine;
+#[path = "direct/migration_schema_agreement.rs"]
+mod migration_schema_agreement;
 #[path = "direct/policies.rs"]
 mod policies;
 #[path = "direct/put_get_item.rs"]

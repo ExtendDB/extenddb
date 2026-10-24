@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use cdrs_tokio::authenticators::{NoneAuthenticatorProvider, StaticPasswordAuthenticatorProvider};
+use cdrs_tokio::cluster::connection_pool::ConnectionPoolConfigBuilder;
 use cdrs_tokio::cluster::session::{Session, SessionBuilder, TcpSessionBuilder};
 use cdrs_tokio::cluster::{NodeTcpConfigBuilder, TcpConnectionManager};
 use cdrs_tokio::load_balancing::RoundRobinLoadBalancingStrategy;
@@ -186,11 +187,28 @@ impl CassandraEngine {
             StorageError::Connection(format!("Failed to build cluster config: {e}"))
         })?;
 
-        // Create session with round-robin load balancing
+        // Create session with round-robin load balancing.
+        //
+        // Pool size: cdrs-tokio defaults to ONE connection per node
+        // (ConnectionPoolConfig::default is local_size=1, remote_size=1). One
+        // connection serializes the whole CQL stream-id space onto a single
+        // socket and gives no headroom if that socket drops, so we size the pool
+        // from `max_connections` (default 10) and scatter requests across it.
+        // This is also the mitigation for the cdrs-tokio stream-id reuse hazard
+        // (issue #403): more connections divide the id space. A single-node
+        // deployment is "local", so local_size is the one that matters; we set
+        // remote_size the same for multi-node clusters.
+        let pool_size = config.max_connections.max(1) as usize;
+        let pool_config = ConnectionPoolConfigBuilder::new()
+            .with_local_size(pool_size)
+            .with_remote_size(pool_size)
+            .build();
         // Wrap in timeout to prevent indefinite hangs on connection/auth failures
         const CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
         let lb = RoundRobinLoadBalancingStrategy::new();
-        let session_future = TcpSessionBuilder::new(lb, cluster_config).build();
+        let session_future = TcpSessionBuilder::new(lb, cluster_config)
+            .with_connection_pool_config(pool_config)
+            .build();
 
         let session = tokio::time::timeout(CONNECTION_TIMEOUT, session_future)
             .await
