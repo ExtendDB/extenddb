@@ -806,8 +806,20 @@ impl TableDescription {
     ///   table is ACTIVE (measured on DynamoDB, and still absent 30 s later).
     ///   Backends report the summary whenever the table has a registered
     ///   restore.
+    /// - A disabled `StreamSpecification` is omitted: the service carries the
+    ///   member only while a stream is enabled (measured 2026-10-24 on the
+    ///   disable response and on `DescribeTable` afterwards). Backends keep
+    ///   the disabled specification stored, with the closed stream's view
+    ///   type, so `DescribeStream` of that stream can still report it.
     pub fn prepare_for_response(&mut self) {
         self.populate_table_throughput_mode_summary();
+        if self
+            .stream_specification
+            .as_ref()
+            .is_some_and(|s| !s.stream_enabled)
+        {
+            self.stream_specification = None;
+        }
         if self.table_status != TableStatus::Creating {
             self.restore_summary = None;
         } else if let Some(summary) = self.restore_summary.as_mut() {

@@ -30,7 +30,7 @@ impl CassandraEngine {
             &self.session,
             &format!(
                 "SELECT table_id, table_status, key_schema, attribute_definitions, \
-                 billing_mode, provisioned_throughput \
+                 billing_mode, provisioned_throughput, stream_specification, stream_label \
                  FROM {catalog_ks}.tables WHERE account_id = ? AND table_name = ?"
             ),
             cdrs_tokio::query_values!(account_id, input.table_name.as_str()),
@@ -151,53 +151,17 @@ impl CassandraEngine {
             add_update!("on_demand_throughput", odt_json.as_str());
         }
 
-        // Stream specification: add to batch, then handle shard init separately
-        // (init_stream_shards writes to a different keyspace and does its own batch).
-        let mut needs_shard_init = false;
-        let mut needs_label_restore = false;
+        // Stream specification: the catalog columns go in the tables LWT; the
+        // shard changes run after it (`PendingStream`), since the shards are
+        // in a different keyspace.
+        let mut pending_stream = None;
         if let Some(spec) = &input.stream_specification {
-            let spec_json =
-                serde_json::to_string(spec).map_err(|e| StorageError::Internal(e.to_string()))?;
-            add_update!("stream_specification", spec_json.as_str());
-
-            if spec.stream_enabled {
-                let account_ks = self.account_keyspace(account_id);
-                let existing = query_optional(
-                    &self.session,
-                    &format!(
-                        "SELECT shard_id FROM {account_ks}.stream_shards \
-                         WHERE table_id = ? LIMIT 1 ALLOW FILTERING"
-                    ),
-                    cdrs_tokio::query_values!(table_id.as_str()),
-                    "update_table stream_shards check",
-                )
-                .await?;
-
-                if existing.is_none() {
-                    needs_shard_init = true;
-                } else {
-                    // Re-enabling: check if stream_label needs restoring.
-                    let label_row = query_optional(
-                        &self.session,
-                        &format!(
-                            "SELECT stream_label FROM {catalog_ks}.tables \
-                             WHERE account_id = ? AND table_name = ?"
-                        ),
-                        cdrs_tokio::query_values!(account_id, input.table_name.as_str()),
-                        "update_table stream_label check",
-                    )
-                    .await?;
-                    let has_label = label_row.is_some_and(|r| {
-                        let v: Option<String> = r.get_by_name("stream_label").ok().flatten();
-                        v.is_some()
-                    });
-                    if !has_label {
-                        needs_label_restore = true;
-                        let label = extenddb_storage::util::new_stream_label();
-                        add_update!("stream_label", label.as_str());
-                    }
-                }
+            let (cols, pending) =
+                crate::stream_lifecycle::PendingStream::decide(&row, &input.table_name, spec)?;
+            for (col, val) in cols {
+                table_cols.push((col, Value::from(val.as_str())));
             }
+            pending_stream = Some(pending);
         }
 
         // GSI updates: pre-validate, then add catalog changes to batch.
@@ -416,8 +380,7 @@ impl CassandraEngine {
                 table_cols,
                 indexes_batch,
                 indexes_batch_has_statements,
-                needs_shard_init,
-                needs_label_restore,
+                pending_stream,
                 &table_id,
                 &gsi_creates,
                 &gsi_deletes,
@@ -451,8 +414,7 @@ impl CassandraEngine {
         table_cols: Vec<(&'static str, Value)>,
         indexes_batch: BatchQueryBuilder,
         indexes_batch_has_statements: bool,
-        needs_shard_init: bool,
-        needs_label_restore: bool,
+        pending_stream: Option<crate::stream_lifecycle::PendingStream>,
         table_id: &str,
         gsi_creates: &[(String, String)],
         gsi_deletes: &[String],
@@ -505,13 +467,26 @@ impl CassandraEngine {
                 .map(|(col, _)| format!("{col} = ?"))
                 .collect::<Vec<_>>()
                 .join(", ");
+            // A stream change is decided on the specification and label the
+            // row carried and written only if they still are those values:
+            // of two overlapping stream changes the one whose write finds them
+            // changed re-reads the row and is refused by `stream_change` as a
+            // request arriving after the other's commit would be.
+            let condition = match &pending_stream {
+                Some(_) => "IF stream_specification = ? AND stream_label = ?",
+                None => "IF EXISTS",
+            };
             let cql = format!(
                 "UPDATE {catalog_ks}.tables SET {set_clause} \
-                 WHERE account_id = ? AND table_name = ? IF EXISTS"
+                 WHERE account_id = ? AND table_name = ? {condition}"
             );
             let mut vals: Vec<Value> = table_cols.into_iter().map(|(_, v)| v).collect();
             vals.push(Value::from(account_id));
             vals.push(Value::from(input.table_name.as_str()));
+            if let Some(pending) = &pending_stream {
+                vals.push(Value::from(pending.read_specification.as_deref()));
+                vals.push(Value::from(pending.read_label.as_deref()));
+            }
             let result = crate::cassandra_util::query_lwt(
                 &self.session,
                 &cql,
@@ -536,7 +511,10 @@ impl CassandraEngine {
                 }
             })?;
             // IF EXISTS returns false only if the row was deleted between our
-            // earlier SELECT and this UPDATE — treat as TableNotFound.
+            // earlier SELECT and this UPDATE: treat as TableNotFound. Under a
+            // stream change the condition also fails when another stream
+            // change committed in between; `refuse_overlapping_stream_change`
+            // re-reads the row and answers as that later request would be.
             // NOTE: the tables LWT commits before the indexes batch below runs.
             // A failure in the indexes batch leaves the table row updated with
             // no corresponding index rows; the recovery worker does not cover
@@ -559,6 +537,10 @@ impl CassandraEngine {
                         )
                         .await;
                     });
+                }
+                if pending_stream.is_some() {
+                    self.refuse_overlapping_stream_change(account_id, &input.table_name, input)
+                        .await?;
                 }
                 return Err(StorageError::TableNotFound(input.table_name.clone()));
             }
@@ -591,12 +573,12 @@ impl CassandraEngine {
             return Err(e);
         }
 
-        // Post-batch: shard init (has its own internal batch across two keyspaces).
-        if needs_shard_init {
-            self.init_stream_shards(account_id, &input.table_name, &account_ks, table_id)
+        // Post-batch: close the stream's shards and create the new stream's.
+        if let Some(pending) = pending_stream {
+            pending
+                .apply(self, account_id, &account_ks, &input.table_name, table_id)
                 .await?;
         }
-        let _ = needs_label_restore; // stream_label is set via add_update! above
 
         // Post-batch: GSI data table DDL and async backfill.
         if let Some(updates) = &input.global_secondary_index_updates {

@@ -18,19 +18,19 @@ use crate::backup_engine::RestoreHeartbeat;
 impl CassandraEngine {
     /// Initialize stream shards for a table atomically.
     ///
-    /// Writes 4 shard rows into the account keyspace and updates
-    /// `catalog.tables.stream_label` in a single LOGGED BATCH.
-    /// Returns the stream label (ISO 8601 timestamp).
+    /// Sets `catalog.tables.stream_label` with an LWT, then writes the four
+    /// shard rows of the new stream into the account keyspace in one LOGGED
+    /// BATCH, each starting at zero. Returns the stream label.
     pub(crate) async fn init_stream_shards(
         &self,
         account_id: &str,
         table_name: &str,
         account_keyspace: &str,
         table_id: &str,
+        view_type: extenddb_core::types::StreamViewType,
     ) -> Result<String, StorageError> {
-        let label = extenddb_storage::util::new_stream_label();
+        let label = extenddb_storage::stream_lineage::next_stream_label(None);
         let catalog_keyspace = self.catalog_keyspace();
-        let now_ms = chrono::Utc::now().timestamp_millis();
 
         // Update stream_label via LWT to avoid mixing plain/LWT writes on the
         // tables row (which was created with IF NOT EXISTS). See ADR-0021.
@@ -52,24 +52,14 @@ impl CassandraEngine {
             return Err(StorageError::TableNotFound(table_name.to_owned()));
         }
 
-        // Insert 4 shard rows into account keyspace (plain inserts, separate batch)
-        let mut shard_statements = Vec::new();
-        for i in 0..crate::stream_util::SHARDS_PER_STREAM {
-            let shard_id = format!("shardId-{table_id}-{i:012}");
-            shard_statements.push(format!(
-                "INSERT INTO {account_keyspace}.stream_shards \
-                 (shard_id, table_id, starting_sequence_number, created_at) \
-                 VALUES ('{shard_id}', '{table_id}', '{}', {now_ms})",
-                crate::stream_util::ZERO_SEQUENCE
-            ));
-        }
-
-        let batch = format!("BEGIN BATCH\n{}\nAPPLY BATCH", shard_statements.join(";\n"));
-        // Note: values are interpolated rather than bound because Cassandra LOGGED BATCH
-        // does not support parameterized statements spanning multiple tables.
-        // All interpolated values are server-generated (UUIDs, timestamps, label from chrono).
-        if let Err(e) = self.session.query(&batch).await {
-            tracing::error!("init_stream_shards batch: {e}");
+        let starts = vec![
+            crate::stream_util::ZERO_SEQUENCE.to_owned();
+            extenddb_storage::stream_lineage::SHARDS_PER_STREAM as usize
+        ];
+        if let Err(e) = self
+            .insert_stream_shards(account_keyspace, table_id, &label, view_type, &starts)
+            .await
+        {
             // Clear the label so ListStreams does not report a stream with no shards.
             let clear_cql = format!(
                 "UPDATE {catalog_keyspace}.tables SET stream_label = null \
@@ -81,9 +71,7 @@ impl CassandraEngine {
                 cdrs_tokio::query_values!(account_id, table_name, label.as_str()),
             )
             .await;
-            return Err(StorageError::Internal(format!(
-                "Failed to initialize stream shards: {e}"
-            )));
+            return Err(e);
         }
 
         Ok(label)
@@ -128,6 +116,7 @@ impl CassandraEngine {
     ) -> Result<(TableDescription, Option<RestoreHeartbeat>), StorageError> {
         let schedule_activation = restore.is_none();
         Self::validate_account_id(account_id)?;
+        let input = extenddb_storage::stream_lineage::without_disabled_specification(input);
 
         let table_id =
             restore.map_or_else(|| uuid::Uuid::new_v4().to_string(), |r| r.table_id.clone());
@@ -449,22 +438,23 @@ impl CassandraEngine {
         }
 
         // Initialize stream shards (if enabled)
-        let stream_label: Option<String> = if input
+        let stream_label: Option<String> = match input
             .stream_specification
             .as_ref()
-            .is_some_and(|s| s.stream_enabled)
+            .filter(|s| s.stream_enabled)
+            .and_then(|s| s.stream_view_type)
         {
-            Some(
+            Some(view_type) => Some(
                 self.init_stream_shards(
                     account_id,
                     &input.table_name,
                     &account_keyspace,
                     &table_id,
+                    view_type,
                 )
                 .await?,
-            )
-        } else {
-            None
+            ),
+            None => None,
         };
 
         // Create data table in account keyspace

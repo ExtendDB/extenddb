@@ -262,49 +262,14 @@ impl SqliteEngine {
             .await?;
         }
         if let Some(spec) = &input.stream_specification {
-            let j =
-                serde_json::to_string(spec).map_err(|e| StorageError::Internal(e.to_string()))?;
-            update_col(
+            Self::apply_stream_specification(
                 &mut tx,
                 account_id,
                 &input.table_name,
-                "stream_specification",
-                &j,
+                &table_id,
+                spec,
             )
             .await?;
-            if spec.stream_enabled {
-                let existing: Option<(String,)> =
-                    sqlx::query_as("SELECT shard_id FROM stream_shards WHERE table_id = ? LIMIT 1")
-                        .bind(&table_id)
-                        .fetch_optional(&mut *tx)
-                        .await
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
-                if existing.is_none() {
-                    Self::init_stream_shards(&mut tx, account_id, &input.table_name, &table_id)
-                        .await?;
-                } else {
-                    let label: Option<String> = sqlx::query_scalar(
-                        "SELECT stream_label FROM tables WHERE account_id = ? AND table_name = ?",
-                    )
-                    .bind(account_id)
-                    .bind(&input.table_name)
-                    .fetch_one(&mut *tx)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-                    if label.is_none() {
-                        sqlx::query(
-                            "UPDATE tables SET stream_label = ? \
-                             WHERE account_id = ? AND table_name = ?",
-                        )
-                        .bind(extenddb_storage::util::new_stream_label())
-                        .bind(account_id)
-                        .bind(&input.table_name)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
-                    }
-                }
-            }
         }
 
         // GSI create/delete.

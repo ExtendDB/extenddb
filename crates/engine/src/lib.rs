@@ -156,6 +156,24 @@ pub(crate) fn sanitize_storage_error(e: extenddb_storage::error::StorageError) -
 /// Enum validation errors (produced by custom Deserialize impls) contain
 /// "validation error detected" and should be returned as `ValidationException`.
 /// All other deserialization failures are `SerializationException`.
+/// A `StreamSpecification` member without `StreamEnabled`, on `CreateTable`
+/// and `UpdateTable` alike (measured 2026-10-24). Checked before the body is
+/// deserialised, where the missing field would otherwise surface as a
+/// serialization error; its order against the other request checks is not
+/// measured.
+pub(crate) fn require_stream_enabled_member(body: &serde_json::Value) -> Result<(), DynamoDbError> {
+    if let Some(spec) = body.get("StreamSpecification").filter(|v| !v.is_null())
+        && spec
+            .get("StreamEnabled")
+            .is_none_or(serde_json::Value::is_null)
+    {
+        return Err(DynamoDbError::ValidationException(
+            "1 validation error detected: Value null at 'streamSpecification.streamEnabled' failed to satisfy constraint: Member must not be null".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn deserialize_error(e: serde_json::Error) -> DynamoDbError {
     let msg = e.to_string();
     if msg.contains("validation error detected")

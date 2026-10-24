@@ -40,6 +40,7 @@ mod serve_lock;
 mod sqlite_util;
 mod store;
 mod stream;
+mod stream_lifecycle;
 mod table_engine;
 mod table_helpers;
 mod update_table;

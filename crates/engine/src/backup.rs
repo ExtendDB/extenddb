@@ -489,7 +489,12 @@ fn apply_source_to_description(
                         })
                         .collect()
                 }),
-                stream_description: d.stream_specification.clone(),
+                // A disabled specification is kept by the backends for the
+                // closed stream's view type; the service's DescribeBackup for
+                // a table whose stream was disabled is not measured, so the
+                // member is omitted as it was before the specification was
+                // kept.
+                stream_description: d.stream_specification.clone().filter(|s| s.stream_enabled),
                 time_to_live_description: d.time_to_live.clone(),
                 sse_description: SseDescription::from_specification(
                     d.sse_specification.as_ref(),

@@ -48,6 +48,7 @@ adaptation when switching between ExtendDB and the real service.
 |------|----------|------|
 | Table creation delay | Returns `CREATING` immediately; transitions to `ACTIVE` typically within seconds. Same behavior for on-demand and provisioned | Configurable via `control_plane_delay_seconds` runtime setting (default: 5s) |
 | DeletionProtectionEnabled | Enforced | Enforced (accepted and stored, DeleteTable rejects when enabled) |
+| Stream disable and enable | `UpdateTable StreamEnabled=false` answers `UPDATING`; the stream reports `DISABLED` a few seconds later with every shard closed, and every write acknowledged before that lands in the closed stream. `StreamEnabled=true` afterwards creates a new stream with a later label; both streams stay listed, and a disabled stream stays describable after its table is deleted | The shards close inside the `UpdateTable` call and the response says `ACTIVE`. A write that reaches storage after the close is acknowledged and recorded in no stream (on MongoDB it is recorded past the shard's `EndingSequenceNumber` instead); the window is one write wide. A disabled stream is removed with its table. A stream created by a release before this one loses its ARN once the table is disabled and re-enabled (its label lived only in the table row) |
 
 ## Time to Live (TTL)
 
