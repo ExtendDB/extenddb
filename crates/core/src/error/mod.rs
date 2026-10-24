@@ -55,6 +55,13 @@ pub enum DynamoDbError {
     LimitExceededException(String),
     #[error("{0}")]
     ConditionalCheckFailedException(String, Option<Item>),
+    /// A PartiQL `INSERT` targeted a primary key that already exists.
+    ///
+    /// `INSERT` is create-only, so a duplicate full key fails with this error
+    /// rather than `ConditionalCheckFailedException`. HTTP 400. The message is
+    /// always `Duplicate primary key exists in table`, measured on the service.
+    #[error("{0}")]
+    DuplicateItemException(String),
     #[error("{message}")]
     TransactionCanceledException {
         /// Human-readable message.
@@ -140,6 +147,7 @@ impl DynamoDbError {
             | Self::TableNotFoundException(_)
             | Self::LimitExceededException(_)
             | Self::ConditionalCheckFailedException(..)
+            | Self::DuplicateItemException(_)
             | Self::TransactionCanceledException { .. }
             | Self::IdempotentParameterMismatchException(_)
             | Self::SerializationException(_)
@@ -185,6 +193,7 @@ impl DynamoDbError {
             Self::TableNotFoundException(_) => "TableNotFoundException",
             Self::LimitExceededException(_) => "LimitExceededException",
             Self::ConditionalCheckFailedException(..) => "ConditionalCheckFailedException",
+            Self::DuplicateItemException(_) => "DuplicateItemException",
             Self::TransactionCanceledException { .. } => "TransactionCanceledException",
             Self::IdempotentParameterMismatchException(_) => "IdempotentParameterMismatchException",
             Self::SerializationException(_) => "SerializationException",
@@ -255,6 +264,7 @@ impl DynamoDbError {
             | Self::TableNotFoundException(m)
             | Self::LimitExceededException(m)
             | Self::ConditionalCheckFailedException(m, _)
+            | Self::DuplicateItemException(m)
             | Self::IdempotentParameterMismatchException(m)
             | Self::SerializationException(m)
             | Self::UnknownOperationException(m)

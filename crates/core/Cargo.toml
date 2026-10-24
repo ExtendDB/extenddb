@@ -15,3 +15,9 @@ base64 = { workspace = true }
 bigdecimal = { workspace = true }
 time = { workspace = true }
 uuid = { workspace = true }
+
+[features]
+default = ["partiql"]
+# PartiQL grammar, AST and query planning. Removable: with this off, the
+# `partiql` module is not compiled and nothing else in core references it.
+partiql = []
