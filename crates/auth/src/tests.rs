@@ -495,7 +495,12 @@ async fn pre_lookup_faults_answer_alike_for_a_known_and_an_unknown_key() {
         ),
         (
             "scope date the previous day",
-            signed_with_scope("AKIAEXTENDDB00000000", "us-east-1", "dynamodb", Some(&stale)),
+            signed_with_scope(
+                "AKIAEXTENDDB00000000",
+                "us-east-1",
+                "dynamodb",
+                Some(&stale),
+            ),
         ),
         (
             "scope date eight letters",
@@ -554,7 +559,8 @@ async fn scope_date_comparison_is_exact() {
         "",
         "2026102X",
     ] {
-        let headers = signed_with_scope("AKIAEXTENDDB00000000", "us-east-1", "dynamodb", Some(date));
+        let headers =
+            signed_with_scope("AKIAEXTENDDB00000000", "us-east-1", "dynamodb", Some(date));
         match provider(false).authenticate(&headers, b"{}").await {
             Err(DynamoDbError::InvalidSignatureException(msg)) => {
                 assert_eq!(msg, SCOPE_DATE_MESSAGE, "scope date {date:?}");
