@@ -375,17 +375,56 @@ fn for_any_value_string_not_equals_one_outside_set() {
 }
 
 #[test]
-fn bare_negative_op_multivalued_absent_no_match() {
-    // BR-7085 preserved: a bare negated operator on an ABSENT multivalued key
-    // still never matches. The negated-absent rule is scoped to single-valued
-    // keys; multivalued keys require ForAllValues/ForAnyValue.
+fn bare_negative_op_multivalued_absent_matches() {
+    // A bare negated operator on an ABSENT multivalued key matches, the same as
+    // on an absent single-valued key. Measured on IAM with
+    // simulate-custom-policy on 2026-10-24 for all three multivalued keys
+    // (aws:TagKeys, dynamodb:LeadingKeys, dynamodb:Attributes): a Deny carrying
+    // a bare StringNotEquals, StringNotEqualsIgnoreCase or StringNotLike on the
+    // key fires when the key is absent from the request. BR-7085 covers the
+    // PRESENT case, which still never matches a bare operator.
     let ctx = TestContext::new();
-    assert!(!evaluate_condition(
-        &cond(
+    for key in ["dynamodb:Attributes", "dynamodb:LeadingKeys", "aws:TagKeys"] {
+        assert!(
+            evaluate_condition(
+                &cond(ConditionOperator::StringNotEquals, key, vec!["ssn"]),
+                &ctx
+            ),
+            "a bare StringNotEquals on absent {key} matches, as on IAM"
+        );
+        assert!(
+            evaluate_condition(
+                &cond(ConditionOperator::StringNotLike, key, vec!["ss*"]),
+                &ctx
+            ),
+            "a bare StringNotLike on absent {key} matches, as on IAM"
+        );
+        assert!(
+            !evaluate_condition(
+                &cond(ConditionOperator::StringEquals, key, vec!["ssn"]),
+                &ctx
+            ),
+            "a bare positive operator on absent {key} does not match"
+        );
+    }
+}
+
+#[test]
+fn bare_op_multivalued_present_never_matches() {
+    // BR-7085, measured again on IAM 2026-10-24: with the key PRESENT, neither
+    // a bare positive nor a bare negative operator matches. The author must
+    // qualify with ForAllValues or ForAnyValue.
+    for key in ["dynamodb:Attributes", "dynamodb:LeadingKeys", "aws:TagKeys"] {
+        let ctx = TestContext::new().with(key, vec!["colour"]);
+        for op in [
+            ConditionOperator::StringEquals,
             ConditionOperator::StringNotEquals,
-            "dynamodb:Attributes",
-            vec!["ssn"]
-        ),
-        &ctx
-    ));
+            ConditionOperator::StringNotEqualsIgnoreCase,
+        ] {
+            assert!(
+                !evaluate_condition(&cond(op, key, vec!["ssn"]), &ctx),
+                "a bare operator on present {key} does not match"
+            );
+        }
+    }
 }

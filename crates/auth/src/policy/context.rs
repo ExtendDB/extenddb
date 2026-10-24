@@ -193,6 +193,12 @@ pub struct RequestParams {
     /// assumed without MFA) and leaves it absent for an IAM user with long-term
     /// keys. `Some(false)` for a role session, `None` for an IAM user.
     pub multi_factor_auth_present: Option<bool>,
+    /// The tags the request carries, for `aws:RequestTag/<key>`. `None` for an
+    /// operation that carries no tag values, where the key is absent.
+    pub request_tags: Option<HashMap<String, String>>,
+    /// The tag keys the request names, for `aws:TagKeys`, in request order.
+    /// `None` for an operation that names no tag key, where the key is absent.
+    pub request_tag_keys: Option<Vec<String>>,
 }
 
 /// Context for evaluating conditions on `DynamoDB` operations.
@@ -251,6 +257,14 @@ pub struct RequestContext {
     pub current_time: String,
     /// The request time formatted for `aws:EpochTime` (whole seconds).
     pub epoch_time: String,
+    /// The tags the request carries, resolved as `aws:RequestTag/<key>`.
+    /// `None` for an operation that carries no tag values, where the service
+    /// leaves the key absent.
+    pub request_tags: Option<HashMap<String, String>>,
+    /// The tag keys the request names, resolved as `aws:TagKeys`, in request
+    /// order. `None` for an operation that names no tag key, where the service
+    /// leaves the key absent.
+    pub request_tag_keys: Option<Vec<String>>,
 }
 
 impl RequestContext {
@@ -291,6 +305,11 @@ impl RequestContext {
             multi_factor_auth_present: params.multi_factor_auth_present,
             current_time,
             epoch_time,
+            // An operation that carries a tag set but an empty one populates
+            // neither key: the service has no tag key to put in aws:TagKeys and
+            // no value to put in aws:RequestTag/<key>, so both read absent.
+            request_tags: params.request_tags.filter(|t| !t.is_empty()),
+            request_tag_keys: params.request_tag_keys.filter(|k| !k.is_empty()),
         }
     }
 }
@@ -304,6 +323,15 @@ impl ConditionContext for RequestContext {
         // under Unicode full case folding, matching the live DynamoDB path.
         if let Some(sub) = strip_prefix_ci(key, "aws:PrincipalTag/") {
             tag_lookup(&self.principal_tags, sub, super::casefold::case_fold)
+        } else if let Some(sub) = strip_prefix_ci(key, "aws:RequestTag/") {
+            // The tags the request carries. The service populates this key for
+            // the operations that take a tag set, from the tags in the request
+            // body, and leaves it absent for every other operation. Resolved
+            // from the same map the engine writes, so a statement gated on a
+            // request tag reads the value the request would store.
+            self.request_tags
+                .as_ref()
+                .and_then(|tags| tag_lookup(tags, sub, super::casefold::case_fold))
         } else if let Some(sub) = strip_prefix_ci(key, "aws:ResourceTag/") {
             // The service evaluates resource tags only as aws:ResourceTag/*,
             // resolved from the resource-tag map. dynamodb:ResourceTag/* is
@@ -349,6 +377,14 @@ impl ConditionContext for RequestContext {
                 "aws:userid" => self.userid.as_deref().map(|v| vec![v]),
                 "aws:resourceaccount" => self.resource_account.as_deref().map(|v| vec![v]),
                 "aws:tokenissuetime" => self.token_issue_time.as_deref().map(|v| vec![v]),
+                // The tag keys the request names, in request order. The service
+                // populates this key for the operations that take a tag set and
+                // leaves it absent for every other operation, and for a
+                // tag-taking operation that names no key.
+                "aws:tagkeys" => self
+                    .request_tag_keys
+                    .as_ref()
+                    .map(|v| v.iter().map(std::string::String::as_str).collect()),
                 // Populated for a role session (false for a session assumed
                 // without MFA), absent for an IAM user, matching the service.
                 "aws:multifactorauthpresent" => self
@@ -367,12 +403,15 @@ impl ConditionContext for RequestContext {
     fn is_multivalued_key(&self, key: &str) -> bool {
         // Per the AWS DynamoDB service authorization reference these keys are
         // `ArrayOfString` (multivalued); all other DynamoDB keys and tag keys are
-        // single-valued. Verified against real AWS IAM (BR-7085). Key names are
+        // single-valued. Verified against real AWS IAM (BR-7085). `aws:TagKeys`
+        // is multivalued for the same reason: it is the set of tag keys the
+        // request names, and IAM answers a bare operator on it the way it
+        // answers one on `dynamodb:LeadingKeys` (measured). Key names are
         // matched under Unicode full case folding, matching the service.
         let folded = super::casefold::case_fold(key);
         matches!(
             folded.as_str(),
-            "dynamodb:leadingkeys" | "dynamodb:attributes"
+            "dynamodb:leadingkeys" | "dynamodb:attributes" | "aws:tagkeys"
         )
     }
 

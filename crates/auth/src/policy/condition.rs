@@ -18,9 +18,11 @@ use super::matcher::wildcard_match;
 /// - Base (bare) operators on a **single-valued** key: key must be present and
 ///   its value must match at least one policy value.
 /// - Base (bare) operators on a **multivalued** key (`dynamodb:Attributes`,
-///   `dynamodb:LeadingKeys`): never match. AWS IAM requires a
-///   `ForAllValues:`/`ForAnyValue:` qualifier for multivalued keys; a bare
-///   operator on such a key is a no-op regardless of value count (BR-7085).
+///   `dynamodb:LeadingKeys`, `aws:TagKeys`): never match while the key is
+///   present. AWS IAM requires a `ForAllValues:`/`ForAnyValue:` qualifier for
+///   multivalued keys; a bare operator on a present multivalued key is a no-op
+///   regardless of value count (BR-7085). A bare NEGATED operator on an
+///   **absent** key matches whatever the key's arity (measured on IAM).
 /// - `IfExists`: passes if the key is absent; otherwise evaluates as the base
 ///   operator (and so never matches a present multivalued key).
 /// - `Null`: checks key presence/absence.
@@ -109,18 +111,22 @@ pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext
             Some(vals) => evaluate_single_value_condition(inner, &vals, &expanded_values),
         },
         other => match context_values {
-            // A negated operator on an absent single-valued key evaluates true
-            // in AWS IAM: the key has no value, so it cannot equal the policy
-            // value, so "not equals" holds. This makes a Deny gated on
-            // StringNotEquals apply when the caller omits the key (the
-            // confused-deputy guard). Measured on live IAM/STS and DynamoDB.
-            // Bare operators on multivalued keys
-            // never match, present or absent (BR-7085), so the rule is scoped
-            // to single-valued keys.
-            None => is_negative_operator(other) && !is_multivalued,
-            // Bare operator on a multivalued key never matches (BR-7085). This is
-            // fail-safe: a bare Deny becomes a no-op (matching AWS, which forces the
-            // author to use ForAnyValue:), and a bare Allow allowlist stops granting.
+            // A negated operator on an absent key evaluates true in AWS IAM:
+            // the key has no value, so it cannot equal the policy value, so
+            // "not equals" holds. This makes a Deny gated on StringNotEquals
+            // apply when the caller omits the key (the confused-deputy guard).
+            // Measured on live IAM/STS and DynamoDB, and on IAM for an absent
+            // multivalued key (`aws:TagKeys`, `dynamodb:LeadingKeys`,
+            // `dynamodb:Attributes`): a bare `StringNotEquals`,
+            // `StringNotEqualsIgnoreCase` or `StringNotLike` Deny on any of the
+            // three fires when the key is absent, so the rule is not scoped to
+            // single-valued keys. A bare POSITIVE operator still never matches
+            // a present multivalued key (below).
+            None => is_negative_operator(other),
+            // Bare operator on a present multivalued key never matches
+            // (BR-7085). This is fail-safe: a bare Deny becomes a no-op
+            // (matching AWS, which forces the author to use ForAnyValue:), and a
+            // bare Allow allowlist stops granting.
             Some(_) if is_multivalued => false,
             Some(vals) => evaluate_single_value_condition(other, &vals, &expanded_values),
         },

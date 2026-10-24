@@ -153,12 +153,20 @@ pub(crate) async fn authorize_request(
     }
 
     // Request-level condition keys every evaluation below carries: the
-    // deployment region, aws:SecureTransport, aws:SourceIp and aws:UserAgent.
+    // deployment region, aws:SecureTransport, aws:SourceIp and aws:UserAgent,
+    // and the tag condition keys the operation populates (aws:TagKeys and
+    // aws:RequestTag/<key>, empty for every operation that carries no tag set).
+    // The tag keys go in here, not in one operation's branch, so a tag-taking
+    // operation reaching any branch below carries them.
+    let (request_tags, request_tag_keys) =
+        crate::request_tags::tag_condition_keys(operation, input);
     let base_params = || extenddb_auth::policy::context::RequestParams {
         region: Some(state.region.to_string()),
         secure_transport: state.tls_enabled,
         source_ip: source_ip.map(ToOwned::to_owned),
         user_agent: user_agent.map(ToOwned::to_owned),
+        request_tags: request_tags.clone(),
+        request_tag_keys: request_tag_keys.clone(),
         ..Default::default()
     };
 
