@@ -36,7 +36,7 @@ Catalog not initialized. Run 'extenddb init' to set up the catalog.
 **Cause:** The server connected to the database but the catalog tables don't exist. The database hasn't been initialized with `extenddb init`.
 
 **Fix:**
-Run `extenddb init` to create the catalog schema and data database. See `docs/getting-started.md`.
+Run `extenddb init` to create the catalog schema and data database. See `docs/install-from-source.md`.
 
 **Source:** `docs/troubleshooting.md`, section "`Catalog not initialized. Run 'extenddb init' to set up the catalog.`", last synced 2026-05-12.
 

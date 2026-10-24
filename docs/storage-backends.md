@@ -9,10 +9,10 @@ ExtendDB stores tables, items, indexes and its own catalog in a database you run
 
 | Backend | Build feature | Published image | Database you provide | Documented in |
 |---|---|---|---|---|
-| PostgreSQL (default) | `postgres` | `extenddb/extenddb-postgres` | PostgreSQL 14 or newer; the pgvector extension on the data database for vector indexes | [Docker Compose](/local-dev-docker-compose/), [full walkthrough](/getting-started/), [deployment](/manuals/deployment-guide/) |
-| MongoDB | `mongodb` | `extenddb/extenddb-mongodb` | MongoDB 7.0 or newer as a replica set, including for a single node | [full walkthrough](/getting-started/), [MongoDB container](https://github.com/ExtendDB/extenddb/blob/main/docker/README-mongodb.md) |
-| SQLite | `sqlite` | `extenddb/extenddb-dev` (built in developer mode, see below) | None; a file, or `:memory:` | [development image](/dev-image/), [SQLite section of the walkthrough](/getting-started/#sqlite-backend-developer-mode) |
-| Cassandra | `cassandra` | None | An Apache Cassandra cluster | [upgrade manual](/manuals/upgrade-manual/), [backend RFC (draft)](/rfcs/draft-cassandra-backend/) |
+| PostgreSQL (default) | `postgres` | `extenddb/extenddb-postgres` | PostgreSQL 14 or newer; the pgvector extension on the data database for vector indexes | [Docker Compose](/local-dev-docker-compose/), [from source](/install-from-source/#install-postgresql), [deployment](/manuals/deployment-guide/) |
+| MongoDB | `mongodb` | `extenddb/extenddb-mongodb` | MongoDB 7.0 or newer as a replica set, including for a single node | [from source](/install-from-source/#install-mongodb), [MongoDB container](https://github.com/ExtendDB/extenddb/blob/main/docker/README-mongodb.md) |
+| SQLite | `sqlite` | `extenddb/extenddb-dev` (built in developer mode, see below) | None; a file, or `:memory:` | [development image](/dev-image/), [from source](/install-from-source/#initialize-on-sqlite) |
+| Cassandra | `cassandra` | None | An Apache Cassandra cluster | [from source](/install-from-source/#install-cassandra), [upgrade manual](/manuals/upgrade-manual/), [backend RFC (draft)](/rfcs/draft-cassandra-backend/) |
 
 ## Selecting a backend
 
@@ -29,7 +29,7 @@ cargo build --release --no-default-features --features cassandra # Cassandra
 
 ```bash
 extenddb init                      # PostgreSQL
-extenddb init --backend mongodb
+extenddb init --backend mongodb --config extenddb.toml --overwrite   # after writing the [storage.mongodb] seed, see Install from source
 extenddb init --backend sqlite --sqlite-path /data/extenddb.sqlite
 ```
 
@@ -48,4 +48,4 @@ Running more than one server against one PostgreSQL or MongoDB catalog is not su
 
 ## Developer notes
 
-Setting up a local PostgreSQL or MongoDB for building and testing ExtendDB itself is covered under [Contributing](/contributing/local-databases/).
+Setting up a local PostgreSQL or MongoDB for building and testing ExtendDB itself is covered in the [developer and test guide](/manuals/developer-test-guide/#local-databases-for-the-test-suite).
