@@ -291,6 +291,30 @@ fn query_kce_sort_key_before_partition_key() {
 }
 
 #[test]
+fn query_kce_without_a_partition_key_equality_leaves_the_key_undetermined() {
+    // Clauses with no equality parse without a partition key condition, and
+    // an equality on another attribute with a non-equality on the partition
+    // key is no partition key equality either; the engine refuses these
+    // requests, so no key is determinable.
+    for kce in [
+        "pk > :v",
+        "begins_with(pk, :v)",
+        "sk > :v",
+        "pk > :v AND sk > :s",
+        "sk > :v AND zz > :s",
+        "sk = :v AND pk > :s",
+    ] {
+        let input = json!({
+            "TableName": "t",
+            "KeyConditionExpression": kce,
+            "ExpressionAttributeValues": {":v": {"S": "alice"}, ":s": {"S": "x"}},
+        });
+        let r = single_table_leading_keys(&input, "Query", Some(&main_table()), MAX_TOKENS);
+        assert_eq!(r, None, "{kce}");
+    }
+}
+
+#[test]
 fn query_legacy_key_conditions() {
     let input = json!({
         "TableName": "t",

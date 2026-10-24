@@ -270,51 +270,58 @@ pub async fn handle_query(
         &maps
     };
 
-    // Correct PK/SK assignment when both clauses are equality comparisons.
-    // The parser can't distinguish PK from SK without the key schema.
-    let pk_attr = &query_key_info.key_schema[0].attribute_name;
-    key_condition.resolve_pk_sk(pk_attr, &effective_maps.names)?;
+    // A key condition with no equality clause on the HASH attribute has no
+    // partition key clause to assign or check. It is refused after the
+    // expression validations below, where the key schema picks the wording
+    // (measured 2026-10-23: an unused value, an invalid FilterExpression or
+    // ProjectionExpression and an invalid Select are reported ahead of it).
+    if !key_condition.lacks_hash_equality(&query_key_info.key_schema, &effective_maps.names) {
+        // Correct PK/SK assignment when both clauses are equality comparisons.
+        // The parser can't distinguish PK from SK without the key schema.
+        let pk_attr = &query_key_info.key_schema[0].attribute_name;
+        key_condition.resolve_pk_sk(pk_attr, &effective_maps.names)?;
 
-    // Validate that the partition key is actually referenced in the condition.
-    let pk_resolved = resolve_path_attr_name(&key_condition.pk_path, &effective_maps.names);
-    if pk_resolved.as_deref() != Some(pk_attr.as_str()) {
-        return Err(DynamoDbError::ValidationException(format!(
-            "Query condition missed key schema element: {pk_attr}"
-        )));
-    }
-
-    // For multi-part key schemas (GSIs with >1 HASH attribute), reclassify
-    // the parsed conditions so all HASH attributes go to pk_path/extra_pk_conditions
-    // and the RANGE condition stays as sk_condition.
-    if extenddb_core::types::is_multipart_key_schema(&query_key_info.key_schema) {
-        let hash_elements = extenddb_core::types::hash_key_elements(&query_key_info.key_schema);
-        let hash_attrs: Vec<&str> = hash_elements
-            .iter()
-            .map(|ks| ks.attribute_name.as_str())
-            .collect();
-        key_condition.resolve_multipart(&hash_attrs, &effective_maps.names)?;
-
-        // Validate all HASH attributes are present in the KeyConditionExpression.
-        let provided_count = 1 + key_condition.extra_pk_conditions.len();
-        if provided_count != hash_attrs.len() {
-            // Find the first missing HASH attribute for the error message.
-            let missing = hash_attrs
-                .iter()
-                .find(|attr| {
-                    let pk_name =
-                        resolve_path_attr_name(&key_condition.pk_path, &effective_maps.names);
-                    if pk_name.as_deref() == Some(*attr) {
-                        return false;
-                    }
-                    !key_condition.extra_pk_conditions.iter().any(|(path, _)| {
-                        resolve_path_attr_name(path, &effective_maps.names).as_deref()
-                            == Some(*attr)
-                    })
-                })
-                .unwrap_or(&hash_attrs[0]);
+        // Validate that the partition key is actually referenced in the condition.
+        let pk_resolved = resolve_path_attr_name(&key_condition.pk_path, &effective_maps.names);
+        if pk_resolved.as_deref() != Some(pk_attr.as_str()) {
             return Err(DynamoDbError::ValidationException(format!(
-                "Query condition missed key schema element: {missing}"
+                "Query condition missed key schema element: {pk_attr}"
             )));
+        }
+
+        // For multi-part key schemas (GSIs with >1 HASH attribute), reclassify
+        // the parsed conditions so all HASH attributes go to pk_path/extra_pk_conditions
+        // and the RANGE condition stays as sk_condition.
+        if extenddb_core::types::is_multipart_key_schema(&query_key_info.key_schema) {
+            let hash_elements = extenddb_core::types::hash_key_elements(&query_key_info.key_schema);
+            let hash_attrs: Vec<&str> = hash_elements
+                .iter()
+                .map(|ks| ks.attribute_name.as_str())
+                .collect();
+            key_condition.resolve_multipart(&hash_attrs, &effective_maps.names)?;
+
+            // Validate all HASH attributes are present in the KeyConditionExpression.
+            let provided_count = 1 + key_condition.extra_pk_conditions.len();
+            if provided_count != hash_attrs.len() {
+                // Find the first missing HASH attribute for the error message.
+                let missing = hash_attrs
+                    .iter()
+                    .find(|attr| {
+                        let pk_name =
+                            resolve_path_attr_name(&key_condition.pk_path, &effective_maps.names);
+                        if pk_name.as_deref() == Some(*attr) {
+                            return false;
+                        }
+                        !key_condition.extra_pk_conditions.iter().any(|(path, _)| {
+                            resolve_path_attr_name(path, &effective_maps.names).as_deref()
+                                == Some(*attr)
+                        })
+                    })
+                    .unwrap_or(&hash_attrs[0]);
+                return Err(DynamoDbError::ValidationException(format!(
+                    "Query condition missed key schema element: {missing}"
+                )));
+            }
         }
     }
 
@@ -432,6 +439,18 @@ pub async fn handle_query(
         input.index_name.is_some(),
         extenddb_core::validation::IS_QUERY,
     )?;
+
+    // An undefined #name or :value in the key condition is reported first,
+    // with the KeyConditionExpression prefix, whatever the key schema says.
+    // Then a key condition with no equality clause on the HASH attribute is
+    // refused, the key schema of the table or index queried picking the
+    // wording. An ExclusiveStartKey or a key value size is checked after it
+    // (measured 2026-10-23). Legacy KeyConditions is desugared above with
+    // every reference defined and an equality on the HASH attribute, or
+    // refused there, so it passes both calls.
+    key_condition.validate_references(effective_maps)?;
+    key_condition
+        .refuse_without_hash_equality(&query_key_info.key_schema, &effective_maps.names)?;
 
     // When Select=ALL_PROJECTED_ATTRIBUTES, capture the index info for post-read filtering.
     let index_proj = if matches!(input.select, Some(Select::AllProjectedAttributes)) {
