@@ -1,4 +1,4 @@
-# ADR-0002: Transaction and Atomicity Patterns
+# ADR-0012: Transaction and Atomicity Patterns
 
 - Status: Accepted
 - Date: 2026-06-04
@@ -36,7 +36,7 @@ Check-then-batch pattern for operations requiring both duplicate detection and a
 ## Consequences
 
 - All multi-entity IAM operations follow this pattern:
-  1. Pre-check foreign keys (via ADR-0001)
+  1. Pre-check foreign keys (via ADR-0011)
   2. SELECT to check for duplicate primary keys
   3. Logged BATCH to perform atomic writes
 - Small race window: Another concurrent operation could insert the same entity between steps 2 and 3. Mitigation: IAM operations are admin-driven and infrequent. Application-layer retry with exponential backoff handles the rare collision.
@@ -49,7 +49,7 @@ Check-then-batch pattern for operations requiring both duplicate detection and a
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
-See [LICENSE](../../LICENSE) for the full text.
+See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
 This software is provided "as is" without warranty of any kind. ExtendDB is not
 affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is

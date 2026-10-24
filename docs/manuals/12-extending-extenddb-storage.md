@@ -1,16 +1,20 @@
-# Extending extenddb Storage
+---
+description: "The storage trait and what a new backend implements."
+---
 
-> See [NOTICE](../NOTICE.md) for important disclaimers.
+# Extending ExtendDB Storage
+
+> See [NOTICE](https://github.com/ExtendDB/extenddb/blob/main/docs/NOTICE.md) for important disclaimers.
 
 ## Introduction
 
-extenddb uses a fully trait-based storage abstraction. The default backend is PostgreSQL, implemented in the `storage-postgres` crate. This document explains the storage architecture, lists every trait a new backend must implement, and provides guidance for adding a new storage backend.
+ExtendDB uses a fully trait-based storage abstraction. The default backend is PostgreSQL, implemented in the `storage-postgres` crate. This document explains the storage architecture, lists every trait a new backend must implement, and provides guidance for adding a new storage backend.
 
 As of v0.0.81, the server crate has **no direct PostgreSQL dependencies**. All database access goes through traits defined in the `storage` and `auth` crates. PostgreSQL-specific code lives exclusively in `storage-postgres` and the `bin` crate's wiring layer.
 
 ## Architecture Overview
 
-extenddb is organized as a Cargo workspace with seven crates:
+ExtendDB is organized as a Cargo workspace with seven crates:
 
 ```
 bin              → CLI entry point (init, serve, stop, migrate, manage, etc.)
@@ -29,24 +33,24 @@ The key architectural principle: neither the `engine` nor the `server` crate tou
 A new backend must implement **13 storage traits** plus the `CredentialStore` trait from the `auth` crate:
 
 **DynamoDB data path** (defined in `crates/storage/src/lib.rs`):
-1. `TableEngine` — table lifecycle
-2. `DataEngine` — item CRUD, query, scan, transactions
-3. `MetadataEngine` — TTL, tags, table statistics
-4. `StreamEngine` — DynamoDB Streams
-5. `WorkerStore` — background worker operations (GSI propagation, TTL cleanup)
+1. `TableEngine`: table lifecycle
+2. `DataEngine`: item CRUD, query, scan, transactions
+3. `MetadataEngine`: TTL, tags, table statistics
+4. `StreamEngine`: DynamoDB Streams
+5. `WorkerStore`: background worker operations (GSI propagation, TTL cleanup)
 
 **Management and operational** (defined in `crates/storage/src/`):
-6. `ManagementStore` — IAM CRUD (users, groups, roles, policies, access keys, accounts)
-7. `AdminStore` — admin user management
-8. `SettingsStore` — runtime settings
-9. `MetricsStore` — historical metrics persistence and query
-10. `RateLimitStore` — login rate limiting and account lockout
-11. `AuthorizationStore` — policy lookups for authorization decisions
-12. `BackupEngine` — backup and restore operations
-13. `Bootstrapper` — database initialization, destruction, migration, verification
+6. `ManagementStore`: IAM CRUD (users, groups, roles, policies, access keys, accounts)
+7. `AdminStore`: admin user management
+8. `SettingsStore`: runtime settings
+9. `MetricsStore`: historical metrics persistence and query
+10. `RateLimitStore`: login rate limiting and account lockout
+11. `AuthorizationStore`: policy lookups for authorization decisions
+12. `BackupEngine`: backup and restore operations
+13. `Bootstrapper`: database initialization, destruction, migration, verification
 
 **Additionally**, the `auth` crate defines:
-14. `CredentialStore` — access key and session credential lookup for SigV4 verification
+14. `CredentialStore`: access key and session credential lookup for SigV4 verification
 
 Backends register at compile time using the `inventory` crate and are selected by name at startup. The `RuntimeHooks` trait allows backends to spawn backend-specific workers (PostgreSQL spawns 7).
 
@@ -90,7 +94,7 @@ Item CRUD, query, scan, and transaction operations:
 | `cleanup_expired_idempotency_tokens` | Garbage-collect old idempotency tokens |
 
 Key design decisions:
-- **Condition expressions** are evaluated inside the storage transaction. The engine parses and compiles expressions; the storage layer receives an AST (`Expr`) and evaluates it against the existing item within the same transaction that performs the write. This is critical for correctness — condition checks and writes must be atomic.
+- **Condition expressions** are evaluated inside the storage transaction. The engine parses and compiles expressions; the storage layer receives an AST (`Expr`) and evaluates it against the existing item within the same transaction that performs the write. Condition checks and writes must be atomic, so the evaluation cannot move outside the transaction.
 - **Stream capture** is passed as `Option<&StreamCapture>`. When present, the stream record must be written in the same transaction as the data write.
 - **Idempotency tokens** for `TransactWriteItems` must be checked and stored atomically with the writes, and must be scoped per account: a `ClientRequestToken` is unique per account in DynamoDB, not globally, so the store must key on `(account_id, token)`. Keying on the token alone lets the same token value from two accounts collide (one account's transaction wrongly replayed or rejected against another's).
 - **Lock order in `transact_write_items`**: a backend that takes blocking row locks must lock a transaction's items in one global order, so two write transactions cannot deadlock on each other. The PostgreSQL backend runs the ops sorted by table ID and key and keeps the results in request order. When the database still aborts a transaction to break a conflict (a deadlock or a serialization failure), return `StorageError::TransactionCanceled`, never an internal error. Put the `TransactionConflict` reason on the item whose statement hit the abort and `None` on the others. When the abort cannot be tied to one item (for example, it comes at commit), mark every item `TransactionConflict`.
@@ -284,9 +288,9 @@ The `storage-postgres` crate provides the default implementation:
 
 ### Database Architecture
 
-extenddb uses a dual-database architecture:
-- **Catalog database** (`extenddb`) — table metadata, IAM data, settings, metrics, stream records, tags, idempotency tokens, login attempts
-- **Data database** (`extenddb_data`) — DynamoDB items and index rows
+ExtendDB uses a dual-database architecture:
+- **Catalog database** (`extenddb`): table metadata, IAM data, settings, metrics, stream records, tags, idempotency tokens, login attempts
+- **Data database** (`extenddb_data`): DynamoDB items and index rows
 
 ### Migrations
 
@@ -361,7 +365,7 @@ The `bin` crate will discover your backend at startup and select it by name from
 
 Use the test suite as your specification:
 - **Python integration tests** (`tests/`) exercise the DynamoDB wire protocol end-to-end. They are backend-agnostic.
-- **External Java SDK test suite** (`run-external-tests`) runs real AWS SDK integration tests.
+- **External Java SDK test suite** (`run-external-tests`) runs AWS SDK integration tests against a running server.
 - If your backend passes the same tests, it is correct.
 
 ## Design Constraints for New Backends
@@ -381,7 +385,7 @@ Stream records must be written in the same transaction as data writes. A backend
 
 ### No Caching
 
-extenddb prohibits in-process caching of database state. Multiple extenddb instances may share the same backend. Any caching requires a cross-instance invalidation design and explicit human approval.
+ExtendDB prohibits in-process caching of database state. Multiple ExtendDB instances may share the same backend. Any caching requires a cross-instance invalidation design and explicit human approval.
 
 ### Sequence Monotonicity
 
@@ -395,17 +399,17 @@ Account deletion must cascade to all child resources (users, groups, roles, poli
 
 The PostgreSQL implementation makes backend-specific choices. These are implementation details inside `storage-postgres`, not leaks in the trait abstraction:
 
-1. **JSONB item storage** — items are stored as JSONB, enabling PostgreSQL-specific query optimizations. The traits pass `Item` = `BTreeMap<String, AttributeValue>` — your backend can use any serialization format.
+1. **JSONB item storage**: items are stored as JSONB, enabling PostgreSQL-specific query optimizations. The traits pass `Item` = `BTreeMap<String, AttributeValue>`, so your backend can use any serialization format.
 
 2. **Transaction isolation**: the PostgreSQL backend runs `transact_write_items` at `READ COMMITTED` and makes it serializable with locks held until commit: `SELECT ... FOR UPDATE` on every item that exists, and a reserved unique key on every item that a ConditionCheck or Delete finds missing. Your backend needs equivalent isolation guarantees.
 
-3. **Sequence generation** — stream sequence numbers use PostgreSQL sequences (`nextval`). Your backend needs a monotonic counter mechanism.
+3. **Sequence generation**: stream sequence numbers use PostgreSQL sequences (`nextval`). Your backend needs a monotonic counter mechanism.
 
-4. **CASCADE deletes** — account deletion cascades through foreign keys. Your backend needs equivalent cascade logic (can be application-level).
+4. **CASCADE deletes**: account deletion cascades through foreign keys. Your backend needs equivalent cascade logic (can be application-level).
 
-5. **Dual-database architecture** — catalog and data are separate PostgreSQL databases. Your backend might use a single database with keyspace separation, or a different topology entirely.
+5. **Dual-database architecture**: catalog and data are separate PostgreSQL databases. Your backend might use a single database with keyspace separation, or a different topology entirely.
 
-6. **SQL migrations** — migration files are raw SQL. Your backend needs its own schema initialization mechanism, exposed through `Bootstrapper`.
+6. **SQL migrations**: migration files are raw SQL. Your backend needs its own schema initialization mechanism, exposed through `Bootstrapper`.
 
 ## Summary of Traits and Implementations
 

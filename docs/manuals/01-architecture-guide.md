@@ -1,12 +1,16 @@
+---
+description: "The parts of an ExtendDB server, how a request flows through them, and how the storage backends fit."
+---
+
 # Architecture Guide
 
-> See [NOTICE](../NOTICE.md) for important disclaimers.
+> See [NOTICE](https://github.com/ExtendDB/extenddb/blob/main/docs/NOTICE.md) for important disclaimers.
 
 ## Overview
 
-extenddb (ExtendDB) is a standalone DynamoDB-compatible API server written in Rust. It receives DynamoDB wire protocol requests over HTTP/HTTPS, authenticates and authorizes them via SigV4 and a local IAM policy engine, executes operation logic in a backend-agnostic engine, and delegates persistence to a pluggable storage backend (currently PostgreSQL).
+ExtendDB (ExtendDB) is a standalone DynamoDB-compatible API server written in Rust. It receives DynamoDB wire protocol requests over HTTP/HTTPS, authenticates and authorizes them via SigV4 and a local IAM policy engine, executes operation logic in a backend-agnostic engine, and delegates persistence to a pluggable storage backend (currently PostgreSQL).
 
-extenddb runs as a daemon process, logging to syslog. It is designed for any environment where DynamoDB semantics are needed — local development, CI pipelines, self-hosted production, multi-cloud, or air-gapped deployments. Developers and applications point their AWS SDKs at extenddb and get identical DynamoDB behavior.
+ExtendDB runs as a daemon process, logging to syslog. It is designed for any environment where DynamoDB semantics are needed — local development, CI pipelines, self-hosted production, multi-cloud, or air-gapped deployments. Developers and applications point their AWS SDKs at ExtendDB and get identical DynamoDB behavior.
 
 ## Cargo Workspace
 
@@ -50,7 +54,7 @@ Pure sync Rust library. No async runtime, no database drivers, no HTTP framework
 - **expression**: Parser and evaluator for `ConditionExpression`, `FilterExpression`, `UpdateExpression`, `ProjectionExpression`, and `KeyConditionExpression`
 - **validation**: Input validation (table names, item sizes, attribute types, key schema rules)
 - **error**: `DynamoDbError` enum mapping every DynamoDB error code to its HTTP status and message
-- **limits**: Configurable limits matching real DynamoDB defaults (item size, batch sizes, expression depth/tokens)
+- **limits**: Configurable limits matching the DynamoDB service defaults (item size, batch sizes, expression depth/tokens)
 - **capacity**: RCU/WCU calculation logic
 
 ### engine
@@ -106,7 +110,7 @@ Authentication and authorization:
 
 - **BuiltinAuthProvider**: Full SigV4 signature verification with local IAM (`auth.provider = "builtin"`, the only supported mode)
 
-The IAM policy engine evaluates identity-based policies, group policies, role policies, session policies, and permissions boundaries. Policy evaluation follows the same logic as real AWS IAM. Unparseable stored policies fail closed (access denied).
+The IAM policy engine evaluates identity-based policies, group policies, role policies, session policies, and permissions boundaries. Policy evaluation follows the same logic as AWS IAM. Unparseable stored policies fail closed (access denied).
 
 ### server
 
@@ -143,7 +147,7 @@ Thin binary that wires everything together:
 
 ## Process Lifecycle
 
-extenddb daemonizes by default. Pass `serve --foreground` (alias `--no-daemon`)
+ExtendDB daemonizes by default. Pass `serve --foreground` (alias `--no-daemon`)
 to stay attached, which is what container runtimes and process supervisors
 expect.
 
@@ -167,7 +171,7 @@ commands at the cost of needing a writable `run_dir`.
 
 ## Catalog Model
 
-extenddb uses a dual-database architecture:
+ExtendDB uses a dual-database architecture:
 
 - **Catalog database** (e.g., `extenddb_catalog`): Stores table metadata, account/user/group/role/policy definitions, access keys, settings, stream metadata, and metrics. Shared across all accounts.
 - **Data database** (e.g., `extenddb_catalog_data`): Stores user items, GSI/LSI data, and stream records. Each table gets its own PostgreSQL table.
@@ -262,7 +266,7 @@ Configuration precedence: CLI flags > environment variables > config file > defa
 
 ## DynamoDB Streams
 
-extenddb implements DynamoDB Streams for change data capture. Stream records are captured atomically with data writes inside the same PostgreSQL transaction. Both the DynamoDB API and Streams API are served on the same port.
+ExtendDB implements DynamoDB Streams for change data capture. Stream records are captured atomically with data writes inside the same PostgreSQL transaction. Both the DynamoDB API and Streams API are served on the same port.
 
 Supported operations: `ListStreams`, `DescribeStream`, `GetShardIterator`, `GetRecords`.
 
@@ -270,10 +274,10 @@ Stream records are retained for 24 hours. A background worker cleans up expired 
 
 ## Deployment Models
 
-extenddb is a single-binary server that connects to PostgreSQL. Deployment options include:
+ExtendDB is a single-binary server that connects to PostgreSQL. Deployment options include:
 
-- **Single-node**: extenddb + PostgreSQL on the same host (development, small workloads)
-- **Separated**: extenddb on an application server, PostgreSQL on a dedicated database server or managed service (RDS, Aurora, Cloud SQL)
+- **Single-node**: ExtendDB + PostgreSQL on the same host (development, small workloads)
+- **Separated**: ExtendDB on an application server, PostgreSQL on a dedicated database server or managed service (RDS, Aurora, Cloud SQL)
 - **Containerized**: Docker/Kubernetes with PostgreSQL as a sidecar or external service
 - **Air-gapped**: No internet connectivity required; all functionality is self-contained
 
@@ -284,7 +288,7 @@ PostgreSQL provides the durability, replication, and backup capabilities. Use st
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
-See [LICENSE](../../LICENSE) for the full text.
+See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
 This software is provided "as is" without warranty of any kind. ExtendDB is not
 affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark

@@ -1,4 +1,4 @@
-# ADR-0004: Natural UPSERT Semantics
+# ADR-0014: Natural UPSERT Semantics
 
 - Status: Accepted
 - Date: 2026-06-04
@@ -52,7 +52,7 @@ Use natural INSERT behavior for operations requiring UPSERT semantics.
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
-See [LICENSE](../../LICENSE) for the full text.
+See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
 This software is provided "as is" without warranty of any kind. ExtendDB is not
 affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is

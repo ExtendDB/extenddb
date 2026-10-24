@@ -1,21 +1,25 @@
-# Installing extenddb on Linux
+---
+description: "Build and run ExtendDB from source on Ubuntu, Debian, Amazon Linux, Fedora or RHEL with a system PostgreSQL."
+---
 
-> See [NOTICE](../NOTICE.md) for important disclaimers.
+# Installing ExtendDB on Linux
+
+> See [NOTICE](https://github.com/ExtendDB/extenddb/blob/main/docs/NOTICE.md) for important disclaimers.
 
 This guide is the Linux-specific path for the generic instructions in
-`docs/getting-started.md`. See that doc for the full CLI surface and
+the [full walkthrough](../getting-started.md). See that guide for the full CLI surface and
 feature walkthrough.
 
 ## Quick Install (recommended)
 
-The installer script checks dependencies, builds extenddb, sets up a Python
+The installer script checks dependencies, builds ExtendDB, sets up a Python
 venv for documentation, and builds PDF manuals:
 
 ```bash
 scripts/install-linux.sh
 ```
 
-The script does **not** install missing dependencies — it reports what's
+The script does **not** install missing dependencies; it reports what's
 missing so you can install them with your package manager, then re-run.
 
 After the script completes, skip to [Step 3: Initialize the deployment](#3-initialize-the-deployment).
@@ -44,7 +48,7 @@ sudo systemctl enable postgresql
 
 **Amazon Linux 2 (PGDG):**
 
-> **Note:** These instructions target Amazon Linux 2 (EL-7 compatible). For Amazon Linux 2023, use `sudo dnf install -y postgresql15-server postgresql15` directly — no PGDG workaround needed.
+> **Note:** These instructions target Amazon Linux 2 (EL-7 compatible). For Amazon Linux 2023, use `sudo dnf install -y postgresql15-server postgresql15` directly; no PGDG workaround is needed.
 
 ```bash
 sudo rpm -ivh --nodeps \
@@ -72,7 +76,7 @@ pg_isready
 # /var/run/postgresql:5432 - accepting connections
 ```
 
-## 2. Build extenddb
+## 2. Build ExtendDB
 
 ```bash
 cargo build --release
@@ -94,13 +98,13 @@ On most Linux systems the PostgreSQL admin user is `postgres`:
 ```
 
 If you run PostgreSQL as your own user (e.g., Amazon Linux 2 with a
-user-owned data directory), omit `--pg-user` — it defaults to `$(whoami)`:
+user-owned data directory), omit `--pg-user`; it defaults to `$(whoami)`:
 
 ```bash
 ./target/release/extenddb init
 ```
 
-This prints the admin credentials **once**. Save them — they cannot be
+This prints the admin credentials **once**. Save them; they cannot be
 retrieved later.
 
 `init` writes a `extenddb.toml` with `auth.provider = "builtin"` (the default).
@@ -129,7 +133,7 @@ Expected:
 ./target/release/extenddb serve --config extenddb.toml
 ```
 
-extenddb daemonizes automatically and logs to syslog.
+ExtendDB daemonizes automatically and logs to syslog.
 
 Check status:
 
@@ -202,14 +206,14 @@ No data is lost; only the catalog schema is updated.
 | `FATAL: Peer authentication failed`                    | Edit `pg_hba.conf` to allow `trust` or `md5` for local connections  |
 | DROP DATABASE hangs after hard kill                    | Check for lingering backends: `ps -eo pid,command \| grep postgres` |
 
-See `docs/troubleshooting.md` for the full troubleshooting guide.
+See [Troubleshooting](../troubleshooting.md) for the full troubleshooting guide.
 
 ---
 
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
-See [LICENSE](../../LICENSE) for the full text.
+See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
 This software is provided "as is" without warranty of any kind. ExtendDB is not
 affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
