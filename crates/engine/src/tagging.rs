@@ -7,6 +7,7 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::types::{
     ListTagsOfResourceInput, ListTagsOfResourceOutput, TagResourceInput, UntagResourceInput,
 };
+use extenddb_core::validation::{validate_tag_keys, validate_tags};
 use serde_json::Value;
 
 use crate::OperationContext;
@@ -67,7 +68,19 @@ fn extract_table_name_from_arn(arn: &str) -> Option<&str> {
 /// fields are valid. For a table ARN, a no-permissions principal is denied by
 /// authorization before this runs; the partition, service, region, and
 /// existence errors therefore surface only for an authorized principal.
+///
+/// The two halves are called separately by the tag-writing handlers, because
+/// tag keys and values are checked between them: a request carrying an invalid
+/// tag key is refused for the tag on a cross-region ARN and on an ARN naming no
+/// existing table, and denied on a cross-account ARN (measured).
 async fn validate_resource_arn(arn: &str, ctx: &OperationContext) -> Result<(), DynamoDbError> {
+    validate_arn_shape_and_account(arn, ctx)?;
+    validate_arn_region_and_table(arn, ctx).await
+}
+
+/// First half of [`validate_resource_arn`]: the ARN prefix, its resource kind,
+/// and the account.
+fn validate_arn_shape_and_account(arn: &str, ctx: &OperationContext) -> Result<(), DynamoDbError> {
     if !arn.starts_with("arn:") {
         return Err(DynamoDbError::ValidationException(format!(
             "One or more parameter values were invalid: ARNs must start with 'arn:': {arn}"
@@ -77,11 +90,10 @@ async fn validate_resource_arn(arn: &str, ctx: &OperationContext) -> Result<(), 
     // A string that is not shaped like an ARN (fewer than the five
     // colon-separated fields) is denied rather than reported as malformed.
     let Some(extenddb_core::arn::ArnFields {
-        partition,
         service,
-        region,
         account,
         resource,
+        ..
     }) = extenddb_core::arn::fields(arn)
     else {
         return Err(DynamoDbError::AccessDeniedException(
@@ -127,6 +139,27 @@ async fn validate_resource_arn(arn: &str, ctx: &OperationContext) -> Result<(), 
         ));
     }
 
+    Ok(())
+}
+
+/// Second half of [`validate_resource_arn`]: the partition, service and region,
+/// then the table's existence.
+async fn validate_arn_region_and_table(
+    arn: &str,
+    ctx: &OperationContext,
+) -> Result<(), DynamoDbError> {
+    let Some(extenddb_core::arn::ArnFields {
+        partition,
+        service,
+        region,
+        ..
+    }) = extenddb_core::arn::fields(arn)
+    else {
+        return Err(DynamoDbError::AccessDeniedException(
+            "Access is denied".to_owned(),
+        ));
+    };
+
     if partition != "aws" || service != "dynamodb" || region != ctx.region.as_ref() {
         return Err(DynamoDbError::ValidationException(format!(
             "Invalid TableArn: Invalid ResourceArn provided as input {arn}"
@@ -161,7 +194,8 @@ async fn validate_resource_arn(arn: &str, ctx: &OperationContext) -> Result<(), 
 /// # Errors
 ///
 /// Returns `ResourceNotFoundException` if the resource does not exist.
-/// Returns `ValidationException` if the resource ARN is empty.
+/// Returns `ValidationException` if the resource ARN is empty or a tag key or
+/// value is outside the grammar the service accepts.
 /// Returns `InternalServerError` on storage failures.
 pub async fn handle_tag_resource(
     body: Value,
@@ -175,7 +209,9 @@ pub async fn handle_tag_resource(
         ));
     }
 
-    validate_resource_arn(&input.resource_arn, ctx).await?;
+    validate_arn_shape_and_account(&input.resource_arn, ctx)?;
+    validate_tags(&input.tags)?;
+    validate_arn_region_and_table(&input.resource_arn, ctx).await?;
 
     ctx.storage
         .tag_resource(&input.resource_arn, &input.tags)
@@ -197,7 +233,8 @@ pub async fn handle_tag_resource(
 /// # Errors
 ///
 /// Returns `ResourceNotFoundException` if the resource does not exist.
-/// Returns `ValidationException` if the resource ARN is empty.
+/// Returns `ValidationException` if the resource ARN is empty or a tag key is
+/// outside the grammar the service accepts.
 /// Returns `InternalServerError` on storage failures.
 pub async fn handle_untag_resource(
     body: Value,
@@ -212,7 +249,9 @@ pub async fn handle_untag_resource(
         ));
     }
 
-    validate_resource_arn(&input.resource_arn, ctx).await?;
+    validate_arn_shape_and_account(&input.resource_arn, ctx)?;
+    validate_tag_keys(&input.tag_keys)?;
+    validate_arn_region_and_table(&input.resource_arn, ctx).await?;
 
     ctx.storage
         .untag_resource(&input.resource_arn, &input.tag_keys)
