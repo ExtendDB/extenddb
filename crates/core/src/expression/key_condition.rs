@@ -258,6 +258,45 @@ pub enum SortKeyCondition {
 ///
 /// Returns `ValidationException` for syntax errors or unsupported constructs.
 pub fn parse_key_condition(tokens: &[Token]) -> Result<KeyCondition, DynamoDbError> {
+    let mut clauses = parse_clauses(tokens)?;
+
+    match clauses.len() {
+        1 => classify_single(clauses.remove(0)),
+        2 => classify_pair(clauses.remove(0), clauses.remove(0)),
+        _ => classify_multi(clauses),
+    }
+}
+
+/// The attribute path and single value operand of each clause of a
+/// `KeyConditionExpression` that compares an attribute with something other
+/// than equality.
+///
+/// Authorization reads this to find the value a key condition names for the
+/// partition key when the operator makes the shape one the engine rejects. A
+/// `BETWEEN` clause carries two operands and is left out, since it names no
+/// single value for the attribute.
+///
+/// # Errors
+///
+/// Returns `ValidationException` for the same syntax errors and unsupported
+/// constructs [`parse_key_condition`] rejects before it classifies clauses.
+pub fn key_condition_inequality_operands(
+    tokens: &[Token],
+) -> Result<Vec<(Vec<PathElement>, Expr)>, DynamoDbError> {
+    Ok(parse_clauses(tokens)?
+        .into_iter()
+        .filter_map(|clause| match clause {
+            RawClause::Compare(path, _, value) | RawClause::BeginsWith(path, value) => {
+                Some((path, value))
+            }
+            RawClause::Eq(..) | RawClause::Between(..) => None,
+        })
+        .collect())
+}
+
+/// Parse a `KeyConditionExpression` token stream into its AND-ed clauses,
+/// before any of them is read as the partition or the sort key condition.
+fn parse_clauses(tokens: &[Token]) -> Result<Vec<RawClause>, DynamoDbError> {
     parser_common::check_redundant_parens(tokens)
         .map_err(|body| validation_err(&format!("Invalid KeyConditionExpression: {body}")))?;
 
@@ -300,11 +339,7 @@ pub fn parse_key_condition(tokens: &[Token]) -> Result<KeyCondition, DynamoDbErr
         reject_nested_key_path(raw_clause_path(clause))?;
     }
 
-    match clauses.len() {
-        1 => classify_single(clauses.remove(0)),
-        2 => classify_pair(clauses.remove(0), clauses.remove(0)),
-        _ => classify_multi(clauses),
-    }
+    Ok(clauses)
 }
 
 /// The attribute-side path of a raw clause.
@@ -988,6 +1023,73 @@ mod tests {
             assert!(
                 parse_key_condition(&tokens).is_ok(),
                 "expr {expr} should parse"
+            );
+        }
+    }
+
+    /// The attribute and operand of each non-equality clause, which is what
+    /// authorization reads to find the partition value of a key condition the
+    /// engine rejects for its operator.
+    #[test]
+    fn inequality_operands_are_the_non_equality_clauses() {
+        let cases: &[(&str, &[(&str, &str)])] = &[
+            ("pk = :v", &[]),
+            ("pk = :v AND sk = :s", &[]),
+            ("pk > :v", &[("pk", "v")]),
+            (":v > pk", &[("pk", "v")]),
+            ("begins_with(pk, :v)", &[("pk", "v")]),
+            ("(pk >= :v)", &[("pk", "v")]),
+            ("#p <= :v", &[("#p", "v")]),
+            ("pk = :v AND sk < :s", &[("sk", "s")]),
+            ("pk > :v AND sk = :s", &[("pk", "v")]),
+            ("pk < :v AND sk > :s", &[("pk", "v"), ("sk", "s")]),
+            // BETWEEN names two operands, so it contributes none.
+            ("pk BETWEEN :lo AND :hi", &[]),
+            ("pk = :v AND sk BETWEEN :lo AND :hi", &[]),
+        ];
+        for (expr, want) in cases {
+            let tokens = tokenize(expr).unwrap();
+            let got = key_condition_inequality_operands(&tokens).unwrap();
+            let got: Vec<(String, String)> = got
+                .into_iter()
+                .map(|(path, value)| {
+                    let name = match &path[0] {
+                        PathElement::Attribute(n) => n.clone(),
+                        PathElement::Index(i) => format!("[{i}]"),
+                    };
+                    let value = match value {
+                        Expr::Placeholder(n) => n,
+                        other => format!("{other:?}"),
+                    };
+                    (name, value)
+                })
+                .collect();
+            let want: Vec<(String, String)> = want
+                .iter()
+                .map(|(a, v)| ((*a).to_owned(), (*v).to_owned()))
+                .collect();
+            assert_eq!(got, want, "expr {expr}");
+        }
+    }
+
+    /// The same syntax errors and unsupported constructs `parse_key_condition`
+    /// rejects before classification.
+    #[test]
+    fn inequality_operands_reject_what_the_parser_rejects() {
+        for expr in [
+            "pk :: :v",
+            "pk > :v OR sk = :s",
+            "((pk = :v))",
+            "pk.sub > :v",
+            "pk <> :v",
+            "pk >",
+        ] {
+            let Ok(tokens) = tokenize(expr) else {
+                continue;
+            };
+            assert!(
+                key_condition_inequality_operands(&tokens).is_err(),
+                "expr {expr} should be rejected"
             );
         }
     }

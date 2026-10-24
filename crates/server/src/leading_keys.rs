@@ -12,12 +12,15 @@
 //! LeadingKeys, so a `ForAllValues` condition is satisfied vacuously (the read
 //! is allowed) and an operator fences them with `ForAnyValue` or a `Null`
 //! guard, which is how the service treats a `Scan`. Operations the engine
-//! rejects before any data flows (an unparseable or non-equality key condition,
-//! a missing key condition, an unresolved placeholder name, a table that does
-//! not exist) are left with the key absent on purpose: the engine returns
+//! rejects before any data flows (an unparseable key condition, a missing key
+//! condition, an unresolved placeholder name, a table that does not exist) are
+//! left with the key absent on purpose: the engine returns
 //! `ValidationException` or `ResourceNotFoundException`, which is what live
 //! `DynamoDB` returns for those shapes even under a LeadingKeys policy (measured
-//! 2026-10-20).
+//! 2026-10-20). A key condition that names the partition key with a single
+//! operand the engine then rejects as a shape, such as `pk > :v`, is the
+//! exception: the service binds that operand and evaluates the policy first, so
+//! the key is extracted here as well (measured 2026-10-21).
 //!
 //! Behaviour measured against live `DynamoDB`:
 //!
@@ -48,7 +51,10 @@
 
 use std::collections::HashMap;
 
-use extenddb_core::expression::{Expr, PathElement, parse_key_condition, tokenize_with_limit};
+use extenddb_core::expression::{
+    Expr, PathElement, Token, key_condition_inequality_operands, parse_key_condition,
+    tokenize_with_limit,
+};
 use extenddb_core::types::{KeyType, TableKeyInfo};
 use serde_json::Value;
 
@@ -226,8 +232,8 @@ pub(crate) fn single_table_leading_keys(
 }
 
 /// The partition key value a `Query` touches, resolved against the queried key
-/// schema (base table, or the named index). `None` when it cannot be
-/// determined, which is every shape the engine rejects before returning data.
+/// schema (base table, or the named index). `None` when the key condition names
+/// no single value for that partition attribute.
 fn query_leading_keys(input: &Value, key_info: &TableKeyInfo, max_tokens: usize) -> Option<String> {
     // The partition attribute of whatever the query targets: the named index's
     // partition key, or the base table's. A GSI has its own partition key; an
@@ -250,23 +256,38 @@ fn query_leading_keys(input: &Value, key_info: &TableKeyInfo, max_tokens: usize)
 
     if let Some(kce) = input.get("KeyConditionExpression").and_then(Value::as_str) {
         let tokens = tokenize_with_limit(kce, max_tokens).ok()?;
-        let mut kc = parse_key_condition(&tokens).ok()?;
-        // Assign PK vs SK using the partition attribute, mirroring the engine.
-        kc.resolve_pk_sk(&pk_attr, &names).ok()?;
-        // The condition must actually pin the partition key; if it does not, the
-        // engine rejects the query, so the key is not determinable here.
-        if resolve_attr_name(&kc.pk_path, &names).as_deref() != Some(pk_attr.as_str()) {
-            return None;
+        // The partition key pinned by an equality, which is the only shape the
+        // engine runs.
+        if let Some(value) = equality_pk_value(&tokens, &pk_attr, &names, &values) {
+            return Some(value);
         }
-        return value_of(&kc.pk_value, &values);
+        // A key condition that names the partition key with a single operand
+        // under an operator the engine rejects, such as `pk > :v`. The service
+        // binds LeadingKeys to that operand and evaluates the policy before it
+        // rejects the shape, so a principal fenced away from the value gets
+        // AccessDeniedException while one fenced to it gets the shape's
+        // ValidationException (measured 2026-10-21 for `pk > :v`). A condition
+        // that does not parse, one that names no partition clause, and a
+        // partition clause carrying no single operand all leave the key absent,
+        // which is what the service answers for those (it returns
+        // ValidationException to every principal).
+        let (_, operand) = key_condition_inequality_operands(&tokens)
+            .ok()?
+            .into_iter()
+            .find(|(path, _)| {
+                resolve_attr_name(path, &names).as_deref() == Some(pk_attr.as_str())
+            })?;
+        return value_of(&operand, &values);
     }
 
-    // Legacy KeyConditions: an EQ on the partition attribute.
+    // Legacy KeyConditions: the partition attribute's single operand. An EQ is
+    // the only operator the engine accepts, and the others (`LE` and
+    // `BEGINS_WITH` measured 2026-10-21) are authorized against that operand
+    // before the engine rejects the shape, as in the expression path above. An
+    // operator carrying no operand or more than one, such as BETWEEN or IN,
+    // names no single partition value and leaves the key absent.
     if let Some(conds) = input.get("KeyConditions").and_then(Value::as_object) {
         let cond = conds.get(&pk_attr)?.as_object()?;
-        if cond.get("ComparisonOperator").and_then(Value::as_str) != Some("EQ") {
-            return None;
-        }
         let list = cond.get("AttributeValueList")?.as_array()?;
         if list.len() != 1 {
             return None;
@@ -275,6 +296,26 @@ fn query_leading_keys(input: &Value, key_info: &TableKeyInfo, max_tokens: usize)
     }
 
     None
+}
+
+/// The partition key value a `KeyConditionExpression` pins with an equality,
+/// resolved the way the engine resolves it. `None` when the expression does not
+/// parse as a key condition or does not pin `pk_attr` by equality.
+fn equality_pk_value(
+    tokens: &[Token],
+    pk_attr: &str,
+    names: &HashMap<String, String>,
+    values: &HashMap<String, Value>,
+) -> Option<String> {
+    let mut kc = parse_key_condition(tokens).ok()?;
+    // Assign PK vs SK using the partition attribute, mirroring the engine.
+    kc.resolve_pk_sk(pk_attr, names).ok()?;
+    // The condition must actually pin the partition key; if it does not, the
+    // engine rejects the query.
+    if resolve_attr_name(&kc.pk_path, names).as_deref() != Some(pk_attr) {
+        return None;
+    }
+    value_of(&kc.pk_value, values)
 }
 
 /// Resolve a key-condition value expression to its scalar string. Only a

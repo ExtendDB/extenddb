@@ -781,9 +781,9 @@ class TestLeadingKeys:
     # other principal. Every rejected shape returned ValidationException to the
     # owner and to the fenced principal. To the other principal the service
     # returned ValidationException, except where QUERY_REJECTED_OTHER_CODE
-    # names a different code. For the shapes in that map ExtendDB returns the
-    # other of the two codes, so the test asserts only that no data is
-    # returned.
+    # names a different code. For the shapes in QUERY_REJECTED_CODE_DIVERGES
+    # ExtendDB still answers the other code, so the test asserts only that no
+    # data is returned.
 
     QUERY_ACCEPTED = [
         ("pk eq placeholder", "main", {"KeyConditionExpression": "pk = :v",
@@ -879,13 +879,22 @@ class TestLeadingKeys:
                                              "ExpressionAttributeValues": {":a": {"S": "alice"}}}),
     ]
 
-    # Rejected shapes where the service and ExtendDB return different error
-    # codes to the principal fenced away from the value. The value is the code
-    # the service returned.
+    # Rejected shapes where the service returns a code other than
+    # ValidationException to the principal fenced away from the value. The value
+    # is the code the service returned on 2026-10-21. For these shapes the
+    # partition key's condition names one value, which the service binds to
+    # dynamodb:LeadingKeys and evaluates before it rejects the shape.
     QUERY_REJECTED_OTHER_CODE = {
         "non-eq pk": "AccessDeniedException",
         "legacy non-eq pk": "AccessDeniedException",
         "legacy begins_with pk": "AccessDeniedException",
+    }
+
+    # Rejected shapes where ExtendDB still answers a different code than the
+    # service to the principal fenced away from the value. The service returned
+    # ValidationException to all three principals for the GSI shape below, while
+    # ExtendDB binds g1's value and denies. Tracked separately from issue #448.
+    QUERY_REJECTED_CODE_DIVERGES = {
         "multi hash gsi missing g2": "ValidationException",
     }
 
@@ -954,12 +963,13 @@ class TestLeadingKeys:
                 if err != "ValidationException":
                     failures.append(f"{label}: {who} got {err or 'rows'}, expected ValidationException")
             _, err_o = call(other, table_key, kwargs)
-            if label in self.QUERY_REJECTED_OTHER_CODE:
-                if err_o not in ("AccessDeniedException", "ValidationException"):
-                    failures.append(f"{label}: other principal got {err_o or 'rows'}")
-            elif err_o != "ValidationException":
+            want = self.QUERY_REJECTED_OTHER_CODE.get(label, "ValidationException")
+            if label in self.QUERY_REJECTED_CODE_DIVERGES:
+                if err_o is None:
+                    failures.append(f"{label}: other principal got rows")
+            elif err_o != want:
                 failures.append(f"{label}: other principal got {err_o or 'rows'}, "
-                                "expected ValidationException")
+                                f"expected {want}")
 
         assert not failures, "\n".join(failures)
 
