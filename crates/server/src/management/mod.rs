@@ -220,8 +220,9 @@ pub fn router() -> Router<Arc<ManagementState>> {
         .route("/cache/invalidate", post(cache_invalidate::invalidate))
 }
 
-/// Validate an IAM name: 1-128 chars, alphanumeric, hyphens, underscores, dots, plus, equals, at.
-/// Matches AWS IAM naming rules.
+/// Validate an IAM name the way the management API does: 1-128 ASCII bytes of
+/// alphanumerics and `-_.+=@`. IAM's own rules differ: it also allows a comma,
+/// and it caps role names at 64 characters.
 pub(crate) fn is_valid_iam_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 128
@@ -399,7 +400,7 @@ mod iam_name_tests {
     use super::is_valid_iam_name;
 
     #[test]
-    fn accepts_service_valid_names() {
+    fn accepts_management_api_names() {
         assert!(is_valid_iam_name("a"));
         assert!(is_valid_iam_name("Role-1_2.3+4=5@6"));
         assert!(is_valid_iam_name(&"x".repeat(128)));

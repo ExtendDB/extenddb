@@ -478,6 +478,20 @@ class TestConsoleRoles:
         assert "role_name must be 1-128 characters" in resp.text
         resp = self.console.get(f"/accounts/{self.account_id}")
         assert role not in resp.text
+
+    @pytest.mark.parametrize("role", ["", "x" * 129, "y" * 2000])
+    def test_create_role_rejects_empty_and_long_names(self, role):
+        # The length bounds of is_valid_iam_name, at the console call site.
+        role_link = f"/console/accounts/{self.account_id}/roles/"
+        before = self.console.get(f"/accounts/{self.account_id}").text.count(role_link)
+        resp = self.console.post(f"/accounts/{self.account_id}/roles/new", {
+            "role_name": role,
+            "trust_policy": self._trust_policy(),
+        })
+        assert resp.status_code == 200
+        assert "role_name must be 1-128 characters" in resp.text
+        after = self.console.get(f"/accounts/{self.account_id}").text.count(role_link)
+        assert after == before
 # ---------------------------------------------------------------------------
 # Policy CRUD
 # ---------------------------------------------------------------------------
