@@ -350,3 +350,193 @@ class TestConditionApiSurface:
         err = _err(ei)
         assert err["Code"] == "ValidationException"
         assert "Invalid FilterExpression: Incorrect operand type" in err["Message"]
+
+
+@pytest.fixture(scope="class")
+def empty_table(dynamodb_client):
+    name = f"expr_legacy_{uuid.uuid4().hex[:8]}"
+    dynamodb_client.create_table(
+        TableName=name,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    from conftest import wait_for_active
+
+    wait_for_active(dynamodb_client, name)
+    yield name
+    dynamodb_client.delete_table(TableName=name)
+
+
+@pytest.fixture(scope="class")
+def empty_range_table(dynamodb_client):
+    name = f"expr_legacy_rk_{uuid.uuid4().hex[:8]}"
+    dynamodb_client.create_table(
+        TableName=name,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}, {"AttributeName": "sk", "KeyType": "RANGE"}],
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+        ],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    from conftest import wait_for_active
+
+    wait_for_active(dynamodb_client, name)
+    yield name
+    dynamodb_client.delete_table(TableName=name)
+
+
+INVALID_PARAMS = "One or more parameter values were invalid: "
+LEGACY_TYPE = INVALID_PARAMS + "ComparisonOperator {} is not valid for {} AttributeValue type"
+LEGACY_COUNT = INVALID_PARAMS + "Invalid number of argument(s) for the {} ComparisonOperator"
+LEGACY_SAME_TYPE = INVALID_PARAMS + "AttributeValues inside AttributeValueList must be of same type"
+LEGACY_RANGE = INVALID_PARAMS + "The BETWEEN condition was provided a range where the lower bound is greater than the upper bound"
+LEGACY_OPERATOR = INVALID_PARAMS + "Invalid comparison operator"
+LEGACY_NOT_INDEXABLE = INVALID_PARAMS + "Attempted conditional constraint is not an indexable operation"
+KC_ABSENT = {"pk": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "absent"}]}}
+S_A = {"S": "a"}
+N_1 = {"N": "1"}
+B_1 = {"B": b"\x01"}
+BOOL_T = {"BOOL": True}
+L_E = {"L": []}
+
+# One refused type and one accepted type per operator (measured 2026-10-23;
+# the full grid is in the engine's unit tests).
+LEGACY_TYPE_ROWS = [
+    ("LE", [{"SS": ["a"]}], "SS"),
+    ("LT", [BOOL_T], "BOOL"),
+    ("GE", [{"NULL": True}], "NULL"),
+    ("GT", [{"M": {}}], "M"),
+    ("CONTAINS", [L_E], "L"),
+    ("NOT_CONTAINS", [{"NS": ["1"]}], "NS"),
+    ("BEGINS_WITH", [N_1], "N"),
+    ("BEGINS_WITH", [{"BS": [b"\x01"]}], "BS"),
+    ("IN", [BOOL_T], "BOOL"),
+    ("BETWEEN", [L_E, L_E], "L"),
+    ("BETWEEN", [L_E, N_1], "L"),
+    ("BETWEEN", [BOOL_T, L_E], "BOOL"),
+    ("IN", [L_E, S_A], "L"),
+]
+LEGACY_ACCEPTED_ROWS = [
+    ("EQ", [L_E]),
+    ("NE", [BOOL_T]),
+    ("LT", [B_1]),
+    ("GE", [N_1]),
+    ("CONTAINS", [BOOL_T]),
+    ("NOT_CONTAINS", [{"NULL": True}]),
+    ("BEGINS_WITH", [B_1]),
+    ("IN", [N_1, {"N": "2"}, {"N": "3"}]),
+    ("BETWEEN", [N_1, {"N": "10"}]),
+    ("NULL", None),
+    ("NOT_NULL", None),
+]
+LEGACY_COUNT_ROWS = [
+    ("EQ", [], "EQ"),
+    ("EQ", [S_A, S_A], "EQ"),
+    ("NULL", [S_A], "NULL"),
+    ("NOT_NULL", [S_A], "NOT_NULL"),
+    ("IN", [], "IN"),
+    ("BETWEEN", [S_A], "BETWEEN"),
+    ("BETWEEN", [S_A, S_A, S_A], "BETWEEN"),
+    ("BEGINS_WITH", [S_A, S_A], "BEGINS_WITH"),
+]
+LEGACY_OTHER_ROWS = [
+    ("BETWEEN", [S_A, N_1], LEGACY_SAME_TYPE),
+    ("BETWEEN", [N_1, L_E], LEGACY_SAME_TYPE),
+    ("IN", [S_A, N_1], LEGACY_SAME_TYPE),
+    ("IN", [S_A, L_E], LEGACY_SAME_TYPE),
+    ("BETWEEN", [{"N": "2"}, N_1], LEGACY_RANGE),
+    ("BETWEEN", [{"S": "b"}, S_A], LEGACY_RANGE),
+    ("FOO", [S_A], LEGACY_OPERATOR),
+    ("eq", [S_A], LEGACY_OPERATOR),
+]
+
+
+def _cond(operator, values):
+    cond = {"ComparisonOperator": operator}
+    if values is not None:
+        cond["AttributeValueList"] = values
+    return cond
+
+
+def _legacy_error(call):
+    with pytest.raises(ClientError) as ei:
+        call()
+    assert _err(ei)["Code"] == "ValidationException"
+    return _err(ei)["Message"]
+
+
+class TestLegacyFilterOperandType:
+    """The legacy QueryFilter, ScanFilter and KeyConditions parameters are
+    checked at request time, on an empty table where no row is evaluated and
+    before the table is looked up, with the service's messages (measured
+    against Amazon DynamoDB on 2026-10-23): the operator name, the value
+    count, the first value's type, that every value has the first value's
+    type, and that a BETWEEN range is not inverted. The engine's unit tests
+    hold the full operator by type grid; these rows cover each message on the
+    wire."""
+
+    @pytest.mark.parametrize(("operator", "values", "named_type"), LEGACY_TYPE_ROWS)
+    def test_scan_filter_refuses_a_type_the_operator_does_not_take(self, dynamodb_client_no_validation, empty_table, operator, values, named_type):
+        msg = _legacy_error(lambda: dynamodb_client_no_validation.scan(TableName=empty_table, ScanFilter={"f": _cond(operator, values)}))
+        assert msg == LEGACY_TYPE.format(operator, named_type)
+
+    @pytest.mark.parametrize(("operator", "values", "named_type"), LEGACY_TYPE_ROWS)
+    def test_query_filter_refuses_a_type_the_operator_does_not_take(self, dynamodb_client_no_validation, empty_table, operator, values, named_type):
+        msg = _legacy_error(lambda: dynamodb_client_no_validation.query(TableName=empty_table, KeyConditions=KC_ABSENT, QueryFilter={"f": _cond(operator, values)}))
+        assert msg == LEGACY_TYPE.format(operator, named_type)
+
+    @pytest.mark.parametrize(("operator", "values"), LEGACY_ACCEPTED_ROWS)
+    def test_scan_filter_accepts_the_types_the_operator_takes(self, dynamodb_client_no_validation, empty_table, operator, values):
+        resp = dynamodb_client_no_validation.scan(TableName=empty_table, ScanFilter={"f": _cond(operator, values)})
+        assert resp["Count"] == 0
+
+    @pytest.mark.parametrize(("operator", "values", "named"), LEGACY_COUNT_ROWS)
+    def test_scan_filter_refuses_a_wrong_value_count(self, dynamodb_client_no_validation, empty_table, operator, values, named):
+        msg = _legacy_error(lambda: dynamodb_client_no_validation.scan(TableName=empty_table, ScanFilter={"f": _cond(operator, values)}))
+        assert msg == LEGACY_COUNT.format(named)
+
+    @pytest.mark.parametrize(("operator", "values", "message"), LEGACY_OTHER_ROWS)
+    def test_scan_filter_mixed_types_ranges_and_operator_names(self, dynamodb_client_no_validation, empty_table, operator, values, message):
+        msg = _legacy_error(lambda: dynamodb_client_no_validation.scan(TableName=empty_table, ScanFilter={"f": _cond(operator, values)}))
+        assert msg == message
+
+    @pytest.mark.parametrize(("operator", "values", "message"), LEGACY_OTHER_ROWS)
+    def test_query_filter_mixed_types_ranges_and_operator_names(self, dynamodb_client_no_validation, empty_table, operator, values, message):
+        msg = _legacy_error(lambda: dynamodb_client_no_validation.query(TableName=empty_table, KeyConditions=KC_ABSENT, QueryFilter={"f": _cond(operator, values)}))
+        assert msg == message
+
+    def test_scan_filter_is_checked_before_the_table_lookup(self, dynamodb_client):
+        msg = _legacy_error(lambda: dynamodb_client.scan(TableName=f"absent_{uuid.uuid4().hex[:8]}", ScanFilter={"f": _cond("BEGINS_WITH", [N_1])}))
+        assert msg == LEGACY_TYPE.format("BEGINS_WITH", "N")
+
+    def test_query_filter_is_checked_before_the_table_lookup_and_the_key_conditions(self, dynamodb_client):
+        msg = _legacy_error(lambda: dynamodb_client.query(TableName=f"absent_{uuid.uuid4().hex[:8]}", KeyConditions={"pk": _cond("LT", [S_A])}, QueryFilter={"f": _cond("BEGINS_WITH", [N_1])}))
+        assert msg == LEGACY_TYPE.format("BEGINS_WITH", "N")
+
+    @pytest.mark.parametrize(("operator", "values", "named_type"), [("BEGINS_WITH", [N_1], "N"), ("LT", [BOOL_T], "BOOL"), ("CONTAINS", [{"SS": ["a"]}], "SS"), ("BETWEEN", [L_E, N_1], "L")])
+    def test_key_conditions_get_the_same_value_checks(self, dynamodb_client_no_validation, empty_range_table, operator, values, named_type):
+        msg = _legacy_error(lambda: dynamodb_client_no_validation.query(TableName=empty_range_table, KeyConditions={"pk": KC_ABSENT["pk"], "sk": _cond(operator, values)}))
+        assert msg == LEGACY_TYPE.format(operator, named_type)
+
+    @pytest.mark.parametrize(("operator", "values", "named"), [("EQ", [S_A, S_A], "EQ"), ("NULL", [S_A], "NULL"), ("BETWEEN", [S_A], "BETWEEN"), ("IN", [], "IN")])
+    def test_key_conditions_refuse_a_wrong_value_count(self, dynamodb_client_no_validation, empty_range_table, operator, values, named):
+        msg = _legacy_error(lambda: dynamodb_client_no_validation.query(TableName=empty_range_table, KeyConditions={"pk": KC_ABSENT["pk"], "sk": _cond(operator, values)}))
+        assert msg == LEGACY_COUNT.format(named)
+
+    @pytest.mark.parametrize(("operator", "values"), [("NE", [S_A]), ("NULL", None), ("NOT_NULL", None), ("CONTAINS", [S_A]), ("NOT_CONTAINS", [N_1]), ("IN", [S_A, {"S": "b"}])])
+    def test_key_conditions_refuse_non_indexable_operators_after_the_value_checks(self, dynamodb_client_no_validation, empty_range_table, operator, values):
+        msg = _legacy_error(lambda: dynamodb_client_no_validation.query(TableName=empty_range_table, KeyConditions={"pk": KC_ABSENT["pk"], "sk": _cond(operator, values)}))
+        assert msg == LEGACY_NOT_INDEXABLE
+
+    def test_key_conditions_inverted_between_range(self, dynamodb_client, empty_range_table):
+        msg = _legacy_error(lambda: dynamodb_client.query(TableName=empty_range_table, KeyConditions={"pk": KC_ABSENT["pk"], "sk": _cond("BETWEEN", [{"S": "b"}, S_A])}))
+        assert msg == LEGACY_RANGE
+
+    def test_scan_filter_begins_with_string_accepted(self, dynamodb_client, empty_table):
+        resp = dynamodb_client.scan(
+            TableName=empty_table,
+            ScanFilter={"pk": {"ComparisonOperator": "BEGINS_WITH", "AttributeValueList": [{"S": "p"}]}},
+        )
+        assert resp["Count"] == 0

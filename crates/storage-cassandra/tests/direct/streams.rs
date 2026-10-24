@@ -106,6 +106,7 @@ async fn setup_stream_table(
         global_secondary_indexes: Vec::new(),
         local_secondary_indexes: Vec::new(),
         stream_specification: desc.stream_specification,
+        creation_date_time: 0.0,
     };
 
     (key_info, stream_label)

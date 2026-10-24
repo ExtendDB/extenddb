@@ -8,8 +8,9 @@ use std::collections::HashMap;
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{
     Expr, ExpressionKind, ExpressionMaps, KeyCondition, PathElement, Token, UpdateAction,
-    parse_condition_with_depth_limit, parse_key_condition, parse_projection, parse_update_from,
-    tokenize_for, tokenize_with_limit, validate_no_reserved_words, validate_ordering_operand_types,
+    parse_condition_with_depth_limit, parse_key_condition, parse_projection, parse_update_sections,
+    tokenize_for, tokenize_with_limit, validate_condition_semantics, validate_no_reserved_words,
+    validate_update_semantics,
 };
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{AttributeValue, ConditionalOperator, ExpectedAttributeValue};
@@ -67,10 +68,31 @@ pub fn check_expression_size(
     kind: ExpressionKind,
     limits: &LimitsConfig,
 ) -> Result<(), DynamoDbError> {
+    check_expression_size_with(expr, kind, limits, kind.size_error_includes_length())
+}
+
+/// `check_expression_size` with the length suffix decided by the caller.
+///
+/// Amazon DynamoDB appends ` expression size: N` for a `ConditionExpression`
+/// inside a transaction and for a Scan `FilterExpression`, and omits it for a
+/// `ConditionExpression` on PutItem, UpdateItem, or DeleteItem and for a Query
+/// `FilterExpression` (measured 2026-10-14). The suffix is therefore a property
+/// of the operation, not of the expression kind alone.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` when the expression is over
+/// the configured byte limit.
+pub fn check_expression_size_with(
+    expr: &str,
+    kind: ExpressionKind,
+    limits: &LimitsConfig,
+    include_length: bool,
+) -> Result<(), DynamoDbError> {
     if expr.len() > limits.max_expression_length_bytes {
         let mut msg =
             format!("Invalid {kind}: Expression size has exceeded the maximum allowed size;");
-        if kind.size_error_includes_length() {
+        if include_length {
             use std::fmt::Write as _;
             let _ = write!(msg, " expression size: {}", expr.len());
         }
@@ -79,33 +101,68 @@ pub fn check_expression_size(
     Ok(())
 }
 
-/// Tokenize, reserved-word check, and parse a required `ConditionExpression`.
+/// Amazon DynamoDB wraps the expression-stage errors of the single-item write
+/// APIs (PutItem, UpdateItem, DeleteItem) in `1 validation error detected: `:
+/// every `Invalid ConditionExpression:` and `Invalid UpdateExpression:` message,
+/// the unused-name and unused-value messages, and the names-or-values-without-
+/// expression messages. The read APIs, the batch APIs, and the transactions
+/// return the same messages bare. Apply this at the expression stage of those
+/// three handlers only; other validation messages there ("Cannot update
+/// attribute pk", key schema, item size) carry no prefix on the service.
+pub fn single_item_write_prefix(err: DynamoDbError) -> DynamoDbError {
+    match err {
+        DynamoDbError::ValidationException(msg)
+            if !msg.starts_with("1 validation error detected")
+                && (msg.starts_with("Invalid ConditionExpression:")
+                    || msg.starts_with("Invalid UpdateExpression:")
+                    || msg.starts_with("Value provided in ExpressionAttribute")
+                    || msg.starts_with("ExpressionAttributeNames can only be specified")
+                    || msg.starts_with("ExpressionAttributeValues can only be specified")) =>
+        {
+            DynamoDbError::ValidationException(format!("1 validation error detected: {msg}"))
+        }
+        other => other,
+    }
+}
+
+/// Tokenize, reserved-word check, and parse a required `ConditionExpression`,
+/// with the size-error length suffix decided by the caller (see
+/// `check_expression_size_with`).
 ///
 /// Errors carry the `ConditionExpression` prefix, matching Amazon DynamoDB.
 ///
 /// # Errors
 ///
-/// Returns `DynamoDbError::ValidationException` for syntax or reserved-word errors.
-pub fn parse_condition_expr(expr: &str, limits: &LimitsConfig) -> Result<Expr, DynamoDbError> {
-    check_expression_size(expr, ExpressionKind::Condition, limits)?;
+/// Returns `DynamoDbError::ValidationException` for over-size, syntax, or
+/// reserved-word errors.
+pub fn parse_condition_expr_with(
+    expr: &str,
+    limits: &LimitsConfig,
+    include_length: bool,
+) -> Result<Expr, DynamoDbError> {
+    check_expression_size_with(expr, ExpressionKind::Condition, limits, include_length)?;
     tokenize_expression(expr, limits)
         .and_then(|tokens| parse_condition_with_depth_limit(&tokens, limits.max_expression_depth))
         .map_err(|e| prefix_expression_error(e, ExpressionKind::Condition))
 }
 
-/// Tokenize, reserved-word check, and parse an `UpdateExpression`.
-///
-/// Errors carry the `UpdateExpression` prefix, matching Amazon DynamoDB.
+/// Size-check, tokenize, parse, and semantically validate an
+/// `UpdateExpression` against the request's expression maps: every syntax
+/// error first, then the service's single ordered walk (function names,
+/// operand counts and types, undefined references, repeated sections), then
+/// overlapping paths. See `extenddb_core::expression::validate_update_semantics`.
 ///
 /// # Errors
 ///
-/// Returns `DynamoDbError::ValidationException` for syntax or reserved-word errors.
-pub fn parse_update_expr(
+/// Returns `DynamoDbError::ValidationException` with the `Invalid
+/// UpdateExpression:` prefix.
+pub fn parse_update_expr_checked(
     update_expr: &str,
+    maps: &ExpressionMaps,
     limits: &LimitsConfig,
 ) -> Result<Vec<UpdateAction>, DynamoDbError> {
     check_expression_size(update_expr, ExpressionKind::Update, limits)?;
-    tokenize_for(
+    let parsed = tokenize_for(
         update_expr,
         limits.max_expression_tokens,
         ExpressionKind::Update,
@@ -114,42 +171,54 @@ pub fn parse_update_expr(
         if limits.enforce_reserved_keywords {
             validate_no_reserved_words(&update_tokens)?;
         }
-        parse_update_from(&update_tokens, update_expr)
+        parse_update_sections(&update_tokens, Some(update_expr))
     })
-    .map_err(|e| prefix_expression_error(e, ExpressionKind::Update))
+    .map_err(|e| prefix_expression_error(e, ExpressionKind::Update))?;
+    validate_update_semantics(&parsed, maps)?;
+    Ok(parsed.actions)
 }
 
-/// Parse an optional condition expression string into an AST.
+/// Size-check, tokenize, parse, and semantically validate a condition-grammar
+/// expression (`ConditionExpression` or `FilterExpression`) against the
+/// request's expression maps. Syntax errors come first, then the service's
+/// ordered walk: undefined references, function names, operand counts and
+/// types, and functions in the wrong position. See
+/// `extenddb_core::expression::validate_condition_semantics`.
 ///
-/// Returns `None` if the input is `None` or empty.
+/// `kind` labels the messages; `include_length` decides the size-error suffix
+/// (see [`check_expression_size_with`]).
 ///
 /// # Errors
 ///
-/// Returns `DynamoDbError::ValidationException` for syntax errors.
-pub fn parse_optional_condition(
-    expr: Option<&str>,
+/// Returns `DynamoDbError::ValidationException` with the `Invalid {kind}:` prefix.
+pub fn parse_condition_checked(
+    expr: &str,
+    maps: &ExpressionMaps,
     limits: &LimitsConfig,
-) -> Result<Option<Expr>, DynamoDbError> {
-    match expr {
-        Some(s) if !s.is_empty() => parse_condition_expr(s, limits).map(Some),
-        _ => Ok(None),
-    }
+    include_length: bool,
+    kind: ExpressionKind,
+) -> Result<Expr, DynamoDbError> {
+    let parsed = parse_condition_expr_with(expr, limits, include_length)
+        .map_err(|e| prefix_expression_error(e, kind))?;
+    validate_condition_semantics(&parsed, maps, kind)?;
+    Ok(parsed)
 }
 
-/// Parse an optional filter expression string into an AST.
-///
-/// `FilterExpression` uses the same grammar as `ConditionExpression`.
-/// Returns `None` if the input is `None` or empty.
-///
-/// # Errors
-///
-/// Returns `DynamoDbError::ValidationException` for syntax errors.
+/// Parse an optional filter expression (grammar only, `FilterExpression`
+/// prefix). The handlers run the semantic pass through
+/// [`parse_condition_checked`]; this remains for the parser tests.
+#[cfg(test)]
 pub fn parse_optional_filter(
     expr: Option<&str>,
     limits: &LimitsConfig,
+    include_length: bool,
 ) -> Result<Option<Expr>, DynamoDbError> {
-    parse_optional_condition(expr, limits)
-        .map_err(|e| prefix_expression_error(e, ExpressionKind::Filter))
+    match expr {
+        Some(s) if !s.is_empty() => parse_condition_expr_with(s, limits, include_length)
+            .map(Some)
+            .map_err(|e| prefix_expression_error(e, ExpressionKind::Filter)),
+        _ => Ok(None),
+    }
 }
 
 /// Resolve a condition from either `ConditionExpression` or legacy `Expected`.
@@ -201,11 +270,20 @@ pub fn resolve_condition(
     }
 
     let maps = build_expression_maps(names, values);
-    let condition = parse_optional_condition(condition_expression, limits)?;
-    if let Some(ref expr) = condition {
-        validate_ordering_operand_types(expr, &maps)
-            .map_err(|e| prefix_expression_error(e, ExpressionKind::Condition))?;
-    }
+    // The single-item write APIs report an over-size condition without the
+    // length suffix; transactions keep it (see `check_expression_size_with`).
+    // The whole condition, syntax and semantics, is checked here before the
+    // caller looks at any other expression, as the service does.
+    let condition = match condition_expression {
+        Some(s) if !s.is_empty() => Some(parse_condition_checked(
+            s,
+            &maps,
+            limits,
+            false,
+            ExpressionKind::Condition,
+        )?),
+        _ => None,
+    };
     Ok((condition, maps))
 }
 
@@ -262,6 +340,44 @@ pub fn parse_key_condition_expr(
     .map_err(|e| prefix_expression_error(e, ExpressionKind::KeyCondition))
 }
 
+/// Reject a parsed `KeyConditionExpression` that references a `#name` or
+/// `:value` absent from the request maps, with the `Invalid
+/// KeyConditionExpression:` prefix the service uses. Runs before the key
+/// schema is consulted, so an undefined `#n` is reported as such rather than
+/// as a key schema mismatch (measured 2026-10-14).
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` naming the first undefined
+/// reference, names before values.
+pub fn check_key_condition_refs(
+    kc: &KeyCondition,
+    maps: &ExpressionMaps,
+) -> Result<(), DynamoDbError> {
+    let (names, values) = extenddb_core::expression::collect_key_condition_refs(kc);
+    let mut missing: Vec<&String> = names
+        .iter()
+        .filter(|n| !maps.names.contains_key(*n))
+        .collect();
+    missing.sort();
+    if let Some(name) = missing.first() {
+        return Err(DynamoDbError::ValidationException(format!(
+            "Invalid KeyConditionExpression: An expression attribute name used in the document path is not defined; attribute name: #{name}"
+        )));
+    }
+    let mut missing: Vec<&String> = values
+        .iter()
+        .filter(|v| !maps.values.contains_key(*v))
+        .collect();
+    missing.sort();
+    if let Some(value) = missing.first() {
+        return Err(DynamoDbError::ValidationException(format!(
+            "Invalid KeyConditionExpression: An expression attribute value used in expression is not defined; attribute value: :{value}"
+        )));
+    }
+    Ok(())
+}
+
 /// Prefix an expression error with the expression type, matching `DynamoDB`'s format.
 ///
 /// `FilterExpression` shares the condition parser, so its errors arrive labelled
@@ -302,7 +418,7 @@ mod tests {
             "((a = :v AND b = :v2))",
             "((NOT (a = :v)))",
         ] {
-            let err = parse_optional_condition(Some(expr), &limits).unwrap_err();
+            let err = parse_condition_expr_with(expr, &limits, true).unwrap_err();
             assert!(
                 matches!(&err, DynamoDbError::ValidationException(msg) if msg == CONDITION_REDUNDANT),
                 "expr {expr}: got {err:?}"
@@ -320,7 +436,7 @@ mod tests {
             "(NOT (a = :v))",
         ] {
             assert!(
-                parse_optional_condition(Some(expr), &limits).is_ok(),
+                parse_condition_expr_with(expr, &limits, true).is_ok(),
                 "expr {expr} should parse"
             );
         }
@@ -329,7 +445,7 @@ mod tests {
     #[test]
     fn filter_redundant_parens_rejected_with_filter_label() {
         let limits = LimitsConfig::default();
-        let err = parse_optional_filter(Some("((a = :v))"), &limits).unwrap_err();
+        let err = parse_optional_filter(Some("((a = :v))"), &limits, true).unwrap_err();
         assert!(
             matches!(&err, DynamoDbError::ValidationException(msg)
                 if msg == "Invalid FilterExpression: The expression has redundant parentheses;"),
@@ -340,7 +456,7 @@ mod tests {
     #[test]
     fn filter_parser_errors_carry_filter_label() {
         let limits = LimitsConfig::default();
-        let err = parse_optional_filter(Some("a"), &limits).unwrap_err();
+        let err = parse_optional_filter(Some("a"), &limits, true).unwrap_err();
         assert!(
             matches!(&err, DynamoDbError::ValidationException(msg)
                 if msg.starts_with("Invalid FilterExpression:")),
@@ -354,7 +470,7 @@ mod tests {
         let limits = LimitsConfig::default();
         let path = "a".to_owned() + &"z".repeat(limits.max_expression_length_bytes);
         let expr = format!("{path} = :v");
-        let err = parse_optional_filter(Some(&expr), &limits).unwrap_err();
+        let err = parse_optional_filter(Some(&expr), &limits, true).unwrap_err();
         assert!(
             matches!(&err, DynamoDbError::ValidationException(msg)
                 if *msg == format!(
@@ -369,7 +485,7 @@ mod tests {
         let limits = LimitsConfig::default();
         let path = "a".to_owned() + &"z".repeat(limits.max_expression_length_bytes);
         let expr = format!("attribute_not_exists({path})");
-        let err = parse_optional_condition(Some(&expr), &limits).unwrap_err();
+        let err = parse_condition_expr_with(&expr, &limits, true).unwrap_err();
         assert!(
             matches!(&err, DynamoDbError::ValidationException(msg)
                 if *msg == format!(

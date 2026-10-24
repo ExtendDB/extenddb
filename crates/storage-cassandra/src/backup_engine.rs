@@ -979,6 +979,7 @@ impl CassandraEngine {
             local_secondary_indexes: Vec::new(),
             stream_specification: None,
             vector_indexes: Vec::new(),
+            creation_date_time: 0.0,
         };
         let account_keyspace = self.account_keyspace(&job.account_id);
         let query = format!(
