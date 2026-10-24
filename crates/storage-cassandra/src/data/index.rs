@@ -35,6 +35,41 @@ pub struct IndexMeta {
     pub propagation_delay_ms: Option<i32>,
 }
 
+/// Reject a wrong-typed or empty binary/string secondary-index key on a
+/// post-update item. Emptiness is reported in `UpdateExpression` context (no
+/// `IndexName`/`IndexKey` suffix), matching the service and the SQLite,
+/// PostgreSQL and MongoDB update paths (issue #410). Shared by the standalone
+/// and transacted Cassandra update paths; the `PutItem` path uses
+/// `validate_index_keys` (same checks, `Item` emptiness context) instead.
+///
+/// Runs the same two checks the SQL backends run on update: the type check is
+/// context-independent; the emptiness check uses `UpdateExpression`.
+///
+/// Returns the core `DynamoDbError` so each caller maps it to its own error
+/// type (`StorageError::Validation` or `CancellationReason::validation_error`).
+pub fn check_update_index_keys(
+    item: &Item,
+    indexes: &[IndexMeta],
+    attr_defs: &[AttributeDefinition],
+) -> Result<(), extenddb_core::error::DynamoDbError> {
+    if indexes.is_empty() {
+        return Ok(());
+    }
+    let index_refs: Vec<extenddb_core::validation::IndexKeyRef<'_>> = indexes
+        .iter()
+        .map(|idx| extenddb_core::validation::IndexKeyRef {
+            index_name: &idx.index_name,
+            key_schema: &idx.key_schema,
+        })
+        .collect();
+    extenddb_core::validation::validate_index_key_types(item, &index_refs, attr_defs)?;
+    extenddb_core::validation::validate_index_key_not_empty(
+        item,
+        &index_refs,
+        extenddb_core::validation::SecondaryIndexEmptyContext::UpdateExpression,
+    )
+}
+
 /// Fetch all index metadata for a table from the catalog.
 pub async fn fetch_indexes_for_table(
     table_id: &str,
