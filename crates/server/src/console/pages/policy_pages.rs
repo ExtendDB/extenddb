@@ -267,6 +267,24 @@ async fn put_policy(
         return r;
     }
 
+    // Same name rule as the management API (`management::iam_policy::put_policy`).
+    if !crate::management::is_valid_iam_name(&form.policy_name) {
+        let nav = html::nav_bar(&identity_label(&session.identity));
+        let content = format!(
+            "<h1>Add Policy</h1>{}",
+            html::alert_error(
+                "policy_name must be 1-128 characters: alphanumeric, hyphens, underscores, dots, plus, equals, at"
+            )
+        );
+        return Html(html::layout_csrf(
+            "New Policy",
+            &nav,
+            &content,
+            &session.csrf_token,
+        ))
+        .into_response();
+    }
+
     // Validate JSON.
     let doc: serde_json::Value = if let Ok(v) = serde_json::from_str(&form.policy_document) {
         v

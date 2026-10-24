@@ -376,6 +376,18 @@ class TestConsoleGroups:
 
         resp = self.console.get(f"/accounts/{self.account_id}")
         assert group not in resp.text
+
+    def test_create_group_rejects_invalid_name(self):
+        # The management API refuses this name with HTTP 400 (is_valid_iam_name).
+        group = f"bad group!*{uuid.uuid4().hex[:6]}"
+        resp = self.console.post(f"/accounts/{self.account_id}/groups/new", {
+            "group_name": group,
+        })
+        # The form is re-rendered with an error instead of redirecting.
+        assert resp.status_code == 200
+        assert "group_name must be 1-128 characters" in resp.text
+        resp = self.console.get(f"/accounts/{self.account_id}")
+        assert group not in resp.text
 # ---------------------------------------------------------------------------
 # Role CRUD
 # ---------------------------------------------------------------------------
@@ -453,6 +465,19 @@ class TestConsoleRoles:
         assert "Invalid trust policy" in resp.text
         resp = self.console.get(f"/accounts/{self.account_id}")
         assert role not in resp.text
+
+    def test_create_role_rejects_invalid_name(self):
+        # The management API refuses this name with HTTP 400 (is_valid_iam_name).
+        role = f"bad role!*{uuid.uuid4().hex[:6]}"
+        resp = self.console.post(f"/accounts/{self.account_id}/roles/new", {
+            "role_name": role,
+            "trust_policy": self._trust_policy(),
+        })
+        # The form is re-rendered with an error instead of redirecting.
+        assert resp.status_code == 200
+        assert "role_name must be 1-128 characters" in resp.text
+        resp = self.console.get(f"/accounts/{self.account_id}")
+        assert role not in resp.text
 # ---------------------------------------------------------------------------
 # Policy CRUD
 # ---------------------------------------------------------------------------
@@ -507,6 +532,50 @@ class TestConsolePolicies:
             assert "Invalid policy document" in resp.text
             resp = self.console.get(f"/accounts/{self.account_id}/users/{user}")
             assert policy not in resp.text
+
+    @pytest.mark.parametrize("principal_type", ["user", "group", "role"])
+    def test_policy_rejects_invalid_name(self, principal_type):
+        # The management API refuses this policy name with HTTP 400
+        # (is_valid_iam_name); the console shares one put_policy handler for
+        # user, group and role policies.
+        principal = f"pn-{uuid.uuid4().hex[:8]}"
+        if principal_type == "user":
+            self.console.post(f"/accounts/{self.account_id}/users/new", {
+                "user_name": principal,
+                "password": "TestPass123!",
+            })
+        elif principal_type == "group":
+            self.console.post(f"/accounts/{self.account_id}/groups/new", {
+                "group_name": principal,
+            })
+        else:
+            self.console.post(f"/accounts/{self.account_id}/roles/new", {
+                "role_name": principal,
+                "trust_policy": json.dumps({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": {"AWS": f"arn:aws:iam::{self.account_id}:root"},
+                        "Action": "sts:AssumeRole",
+                    }],
+                }),
+            })
+        policy = f"bad policy!*{uuid.uuid4().hex[:6]}"
+        resp = self.console.post(
+            f"/accounts/{self.account_id}/{principal_type}s/{principal}/policies/new",
+            {"policy_name": policy, "policy_document": self._full_access_doc()},
+        )
+        # The form is re-rendered with an error instead of redirecting.
+        assert resp.status_code == 200
+        assert "policy_name must be 1-128 characters" in resp.text
+        resp = self.console.get(
+            f"/accounts/{self.account_id}/{principal_type}s/{principal}"
+        )
+        assert resp.status_code == 200
+        assert policy not in resp.text
+        self.console.post(
+            f"/accounts/{self.account_id}/{principal_type}s/{principal}/delete"
+        )
 
     def test_user_policy_crud(self):
         user = f"pu-{uuid.uuid4().hex[:8]}"
