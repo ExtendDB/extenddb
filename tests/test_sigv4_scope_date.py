@@ -210,9 +210,9 @@ class TestScopeDateBeforeTheKeyLookup:
     def test_a_correct_request_still_tells_the_two_keys_apart(self):
         """The control: with no fault, the unknown key is reported as unknown.
 
-        This is what makes the other cases meaningful. A key that exists gets
-        past the credential lookup, so its answer is about authorization
-        rather than the key.
+        A key that exists gets past the credential lookup, so its answer is
+        about authorization rather than the key, and the two keys answer
+        differently when no pre-lookup fault is present.
         """
         known, unknown = self._both_keys()
         assert unknown[1].endswith("UnrecognizedClientException"), unknown
