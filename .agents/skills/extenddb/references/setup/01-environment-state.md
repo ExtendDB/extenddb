@@ -58,7 +58,7 @@ The binary is present, but `${REPO_ROOT}/extenddb.toml` is absent. The user has 
 
 The binary and `extenddb.toml` are present, but `${HOME}/.extenddb/tls/cert.pem` is absent. This is a partial-init state: `extenddb init` completed far enough to create the `extenddb_catalog` and `extenddb` data databases in PostgreSQL (and almost certainly the admin user and encryption key) but did not emit the self-signed TLS cert. Warn the user that re-running `extenddb init` will abort with a "`Database '<name>' already exists`" error because the databases are still there. `extenddb destroy --config extenddb.toml --yes` drops both databases; run it first, then re-run `extenddb init`. Load `references/setup/04-init-stage.md` for the destroy-and-reinit sequence and the one-time credential capture warning.
 
-Alternative path: if the user saved the admin credentials from the prior init run, they may be able to regenerate only the TLS cert pair with `openssl` (per `docs/getting-started.md`) and avoid destroying the databases. `references/setup/04-init-stage.md` covers both paths.
+Alternative path: if the user saved the admin credentials from the prior init run, they may be able to regenerate only the TLS cert pair with `openssl` (per `docs/install-from-source.md`) and avoid destroying the databases. `references/setup/04-init-stage.md` covers both paths.
 
 ### `iam`
 

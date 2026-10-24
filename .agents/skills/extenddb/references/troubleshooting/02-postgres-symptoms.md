@@ -44,7 +44,7 @@ psql -U "$(whoami)" -d postgres -c "CREATE USER extenddb WITH PASSWORD 'extenddb
 psql -U "$(whoami)" -d postgres -c "CREATE DATABASE extenddb OWNER extenddb;"
 ```
 
-See `docs/local-postgres-setup.md` for full setup instructions.
+See the PostgreSQL section of `docs/install-from-source.md` for the setup.
 
 **Source:** `docs/troubleshooting.md`, section "`password authentication failed for user "extenddb"`", last synced 2026-05-12.
 

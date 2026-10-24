@@ -122,6 +122,100 @@ Activate the virtual environment before running any test suites:
 source ~/venvs/extenddb-venv/bin/activate
 ```
 
+### Local databases for the test suite
+
+The integration suites run against a server backed by a local PostgreSQL or MongoDB. Installing either database is covered in [Installing from source](../install-from-source.md); this section records the connection details and configuration the test setup assumes.
+
+#### PostgreSQL
+
+| Setting | Value |
+|---------|-------|
+| Host | `localhost` |
+| Port | `5432` |
+| Database | `extenddb` |
+| User | `extenddb` |
+| Password | `extenddb-local-dev` |
+| Connection string | `postgresql://extenddb:extenddb-local-dev@localhost:5432/extenddb` |
+| Admin user | the OS user that ran `initdb` (trusted via local socket) |
+
+The paths below are the Amazon Linux 2 setup from the install page (PostgreSQL 15 from the PGDG repository, data directory `~/pgdata`, running as the current user). If `initdb` fails there, the current user may need to be in the `postgres` group; check its log.
+
+```bash
+export PATH=/usr/pgsql-15/bin:$PATH
+
+# Start
+pg_ctl -D ~/pgdata -l ~/pgdata/server.log start
+
+# Stop
+pg_ctl -D ~/pgdata stop
+
+# Status
+pg_ctl -D ~/pgdata status
+
+# Logs
+tail -f ~/pgdata/server.log
+```
+
+`pgdata/pg_hba.conf` is configured so:
+- The `extenddb` user requires md5 password auth over TCP (`127.0.0.1`, `::1`)
+- The OS user that ran `initdb` has trust auth for admin tasks
+- Local socket connections use trust auth
+
+`extenddb init` writes `extenddb.toml` with the catalog database it creates (`extenddb_catalog` by default). To point the server at the role above, edit the generated section:
+
+```toml
+[storage.postgres]
+connection_string = "postgresql://extenddb:extenddb-local-dev@localhost:5432/extenddb_catalog"
+pool_size = 20
+```
+
+Or via environment variable:
+```bash
+export EXTENDDB__STORAGE__POSTGRES__CONNECTION_STRING=\
+"postgresql://extenddb:extenddb-local-dev@localhost:5432/extenddb_catalog"
+```
+
+#### MongoDB
+
+```toml
+[storage]
+backend = "mongodb"
+
+[storage.mongodb]
+connection_string = "mongodb://localhost:27017/?replicaSet=rs0"
+# max_connections = 50
+# max_catalog_connections = 20
+```
+
+`max_connections` limits data-operation connections. The catalog and
+authentication clients share a separate pool controlled by
+`max_catalog_connections`, so size that value for their combined management
+and authorization concurrency.
+
+Or via environment variable:
+```bash
+export EXTENDDB__STORAGE__MONGODB__CONNECTION_STRING="mongodb://localhost:27017/?replicaSet=rs0"
+```
+
+Verify the connection once the server is up:
+
+```bash
+# Health check
+curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/health
+
+# List tables (should return empty)
+aws dynamodb list-tables \
+    --endpoint-url https://127.0.0.1:18443 \
+    --region us-east-1
+```
+
+Differences from the PostgreSQL backend:
+
+- **Replica set required:** Even single-node MongoDB must be configured as a replica set.
+- **DynamoDB Streams:** Inline record writes with atomic sequence numbers.
+- **GSI propagation:** Synchronous inline updates during data operations.
+- **Concurrency model:** Optimistic versioning with retry on conflict (vs row-level locking in PostgreSQL).
+
 ### Test Runner Script
 
 All tests should be run via `devtools/run-tests`, which handles credential provisioning, runtime configuration, and artifact collection.
@@ -233,6 +327,54 @@ python3 devtools/run-external-tests --dry-run
 ```
 
 The external test runner parses Maven surefire XML reports as a fallback when `mvn -q` suppresses stdout summary lines.
+
+ExtendDB supports running external test suites (Java/JUnit, Python/pytest, and others) against a running instance. Suites are registered in `external-suites.toml` at the project root (copy `external-suites.sample.toml` to create it; `--config PATH` selects another registry) and referenced by path, never copied into the repo. `--suite` can be repeated to run several named suites.
+
+Before running external suites directly, set the GSI propagation delay to 0. External suites expect synchronous GSI behavior (the service's propagation is usually under a millisecond); the async GSI path is tested separately by the ExtendDB-specific `test_gsi_async.py` suite. `run-tests` does this for you.
+
+```bash
+./target/release/extenddb settings --config extenddb.toml set index_propagation_delay_ms 0
+```
+
+Further options of `run-external-tests`:
+
+```bash
+# Override the endpoint (default: $EXTENDDB_ENDPOINT or http://localhost:18443)
+python3 devtools/run-external-tests --endpoint http://localhost:9000
+
+# Generate a JSON report
+python3 devtools/run-external-tests --report results.json
+```
+
+`--dry-run` shows what would execute without running anything; `--verbose` shows full test output.
+
+#### Registering a new suite
+
+Add a `[[suite]]` entry to `external-suites.toml`:
+
+```toml
+[[suite]]
+name = "My Test Suite"
+path = "~/source/my-test-suite"
+runner = "maven"       # maven, gradle, pytest, or cargo
+enabled = true
+
+[suite.env]
+DDB_ENDPOINT = "${EXTENDDB_ENDPOINT}"
+```
+
+The `${EXTENDDB_ENDPOINT}` placeholder is replaced with the `--endpoint` value at runtime.
+
+Supported runners: `maven` (`mvn test`), `gradle` (`gradle test`), `pytest` (`python3 -m pytest`), `cargo` (`cargo test`).
+
+#### Prerequisites
+
+Each runner requires its tools to be installed. The runner checks prerequisites before executing and skips suites with missing tools:
+
+- **maven:** `java`, `mvn`
+- **gradle:** `java`, `gradle`
+- **pytest:** `python3`, `pytest`
+- **cargo:** `cargo`
 
 ### Rust Unit Tests
 

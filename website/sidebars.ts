@@ -37,17 +37,15 @@ const sidebars: SidebarsConfig = {
             title: 'Install ExtendDB',
             slug: '/start/install',
             description:
-              'Two container images for a server in one command, or a build from source on Linux, macOS or any platform with a Rust toolchain.',
+              'Three ways to get a server: the development image, Docker Compose with PostgreSQL, or a build from source on Linux or macOS.',
           },
           items: [
             {type: 'doc', id: 'dev-image', label: 'Development image'},
             {type: 'doc', id: 'local-dev-docker-compose', label: 'Docker Compose with PostgreSQL'},
-            {type: 'doc', id: 'manuals/install-linux', label: 'Linux'},
-            {type: 'doc', id: 'manuals/install-macos', label: 'macOS'},
-            {type: 'doc', id: 'manuals/quickstart-setup-guide', label: 'Quick start from source'},
-            {type: 'doc', id: 'getting-started', label: 'Full walkthrough from source'},
+            {type: 'doc', id: 'install-from-source', label: 'From source'},
           ],
         },
+        {type: 'doc', id: 'first-requests', label: 'First requests'},
       ],
     },
   ],
@@ -119,21 +117,8 @@ const sidebars: SidebarsConfig = {
           description: 'Filing issues, the pull request process and the review rules, on GitHub.',
         },
         {type: 'doc', id: 'manuals/developer-test-guide', label: 'Developer and test guide'},
+        {type: 'doc', id: 'manuals/writing-migrations', label: 'Writing a catalog migration'},
         {type: 'ref', id: 'design/testing', label: 'Test strategy'},
-        {
-          type: 'category',
-          label: 'Local database setup',
-          link: {
-            type: 'generated-index',
-            title: 'Local database setup',
-            slug: '/contributing/local-databases',
-            description: 'Notes for running a PostgreSQL or MongoDB instance on a development machine for building and testing ExtendDB.',
-          },
-          items: [
-            {type: 'doc', id: 'local-postgres-setup', label: 'Local PostgreSQL setup (development)'},
-            {type: 'doc', id: 'local-mongodb-setup', label: 'Local MongoDB setup (development)'},
-          ],
-        },
         {
           type: 'category',
           label: 'Adding a storage backend',
