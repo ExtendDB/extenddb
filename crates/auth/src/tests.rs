@@ -578,3 +578,36 @@ async fn matching_scope_date_authenticates() {
     let id = provider(false).authenticate(&headers, b"{}").await.unwrap();
     assert!(matches!(id, AuthIdentity::User { .. }));
 }
+
+/// Measured 2026-10-24 (B18-1 cases 1c, 1d, 1e, 2e, 2f): the date complaint
+/// joins the region and service complaints in one message and comes last.
+#[tokio::test]
+async fn scope_wrong_in_more_than_one_part_reports_each_complaint() {
+    let stale = yesterday();
+    let region_then_date = format!(
+        "Credential should be scoped to a valid region. {}",
+        SCOPE_DATE_MESSAGE
+    );
+    let service_then_date = format!(
+        "Credential should be scoped to correct service: 'dynamodb'. {}",
+        SCOPE_DATE_MESSAGE
+    );
+    let all_three = format!(
+        "Credential should be scoped to a valid region. Credential should be scoped to correct service: 'dynamodb'. {}",
+        SCOPE_DATE_MESSAGE
+    );
+    let cases = [
+        ("us-west-2", "dynamodb", region_then_date),
+        ("us-east-1", "s3", service_then_date),
+        ("us-west-2", "s3", all_three),
+    ];
+    for (region, service, expected) in cases {
+        let headers = signed_with_scope("AKIAEXTENDDB00000000", region, service, Some(&stale));
+        match provider(false).authenticate(&headers, b"{}").await {
+            Err(DynamoDbError::InvalidSignatureException(msg)) => {
+                assert_eq!(msg, expected, "scope {region}/{service} with a stale date");
+            }
+            other => panic!("scope {region}/{service}: expected the scope message, got {other:?}"),
+        }
+    }
+}

@@ -260,3 +260,27 @@ class TestScopeDateBeforeTheKeyLookup:
         known, unknown = self._both_keys(scope_date=tomorrow)
         assert known == unknown, "a scope date ahead: the two keys answered differently"
         assert known[2] == SCOPE_DATE_MESSAGE, known
+
+    @pytest.mark.parametrize(
+        "name,kwargs,expected_message",
+        [
+            (
+                "region and date",
+                {"region": "us-west-2"},
+                REGION_MESSAGE + SCOPE_DATE_MESSAGE,
+            ),
+            ("service and date", {"service": "s3"}, SERVICE_MESSAGE + SCOPE_DATE_MESSAGE),
+            (
+                "region, service and date",
+                {"region": "us-west-2", "service": "s3"},
+                REGION_MESSAGE + SERVICE_MESSAGE + SCOPE_DATE_MESSAGE,
+            ),
+        ],
+    )
+    def test_more_than_one_wrong_scope_part_reports_each_complaint(
+        self, name, kwargs, expected_message
+    ):
+        """Measured against the service on 2026-10-24: one message, date last."""
+        known, unknown = self._both_keys(scope_date=_yesterday(), **kwargs)
+        assert known == unknown, f"{name}: the two keys answered differently"
+        assert known[2] == expected_message, known
