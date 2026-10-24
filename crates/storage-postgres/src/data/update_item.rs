@@ -190,6 +190,14 @@ impl PostgresEngine {
             validation::validate_item_size(&item, self.max_item_size_bytes)
                 .map_err(|e| StorageError::Validation(e.to_string()))?;
 
+            // REMOVE and DELETE on a key that holds no row change nothing: the
+            // service writes no item and emits no stream record (issue #478).
+            // The actions were still applied above so that their validation
+            // errors surface the same way as on an existing row.
+            if old_json.is_none() && expression::removes_only(actions) {
+                return Ok((None, None));
+            }
+
             let new_item = if return_new { Some(item.clone()) } else { None };
 
             let item_json =

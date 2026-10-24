@@ -4,7 +4,8 @@
 //! `update_item` for the SQLite backend.
 //!
 //! UpdateItem is an upsert: when the item is absent a new one is created from
-//! the key plus the applied actions. The condition is evaluated against the
+//! the key plus the applied actions, unless every action is a REMOVE or DELETE,
+//! in which case nothing is written. The condition is evaluated against the
 //! pre-update image (or an empty item), then update actions are applied and the
 //! result is validated and written — all under the engine write lock (D1).
 
@@ -90,6 +91,14 @@ impl SqliteEngine {
             .map_err(|e| StorageError::Validation(e.to_string()))?;
         }
 
+        // REMOVE and DELETE on a key that holds no item change nothing: the
+        // service writes no item and emits no stream record (issue #478). The
+        // actions were still applied above so that their validation errors
+        // surface the same way as on an existing item.
+        if old.is_none() && expression::removes_only(actions) {
+            return Ok((None, None));
+        }
+
         upsert_item_in_tx(&mut tx, key_info, &item).await?;
 
         if !indexes.is_empty() {
@@ -153,3 +162,7 @@ impl SqliteEngine {
         Ok((old_ret, new_ret))
     }
 }
+
+#[cfg(test)]
+#[path = "update_item_tests.rs"]
+mod tests;
