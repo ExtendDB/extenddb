@@ -2747,6 +2747,16 @@ impl MongoEngine {
                     })?;
                 }
 
+                // REMOVE and DELETE on a key that holds no document change
+                // nothing: the service writes no item and emits no stream
+                // record (issue #510). The actions ran above so that their
+                // validation errors surface the same way as on an existing
+                // document, and the condition was evaluated above, so a
+                // failing condition still cancels the transaction.
+                if is_creating && expression::removes_only(actions) {
+                    return Ok(());
+                }
+
                 let new_doc =
                     item_to_document(&item, &key_info.key_schema, &key_info.attribute_definitions)
                         .map_err(TransactOpError::Storage)?;
