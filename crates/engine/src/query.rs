@@ -11,7 +11,7 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::PathElement;
 use extenddb_core::expression::{ExpressionKind, ExpressionMaps, Projection};
 use extenddb_core::types::{
-    IndexType, KeyType, ProjectionType, QueryInput, QueryOutput, Select, TableKeyInfo,
+    IndexType, KeyType, QueryInput, QueryOutput, Select, TableKeyInfo,
     VECTOR_INDEX_QUERY_NOT_SUPPORTED,
 };
 use extenddb_storage::error::StorageError;
@@ -22,11 +22,15 @@ use crate::create_table::storage_err_to_dynamo;
 use crate::expression_helpers::{build_expression_maps, parse_optional_filter};
 use crate::index_helpers::{
     VectorIndexReadRefusal, classify_unresolved_index_read, combined_lek_key_schema,
-    validate_query_exclusive_start_key,
+    validate_query_select_index_support,
 };
 use crate::legacy_filter::{desugar_filter, desugar_key_conditions};
 use crate::read_helpers::{PostRead, read_page};
 use crate::serialize_output;
+use crate::start_key::{
+    QueryReadShape, page_ends_at_far_end, validate_query_exclusive_start_key,
+    validate_query_start_key_bounds,
+};
 use crate::{DispatchMetrics, DispatchResult};
 
 /// Handle a `Query` request.
@@ -128,13 +132,9 @@ pub async fn handle_query(
     }
 
     // Select=ALL_ATTRIBUTES requires an ALL-projection GSI (shared with Scan).
-    if let Some(ref idx) = index_info {
-        extenddb_core::validation::validate_all_attributes_index_support(
-            input.select,
-            idx.index_type == IndexType::Gsi,
-            idx.projection.projection_type == ProjectionType::All,
-            &idx.index_name,
-        )?;
+    // With an ExclusiveStartKey this runs after the start key checks below.
+    if input.exclusive_start_key.is_none() {
+        validate_query_select_index_support(input.select, index_info.as_ref())?;
     }
 
     // Validate Limit >= 1 (REQ-QUERY-001)
@@ -474,6 +474,17 @@ pub async fn handle_query(
     // Validate ExclusiveStartKey matches the key schema
     if let Some(ref start_key) = input.exclusive_start_key {
         validate_query_exclusive_start_key(start_key, &key_info, index_info.as_ref())?;
+        validate_query_start_key_bounds(
+            start_key,
+            &key_condition,
+            effective_maps,
+            QueryReadShape {
+                key_schema: &query_key_info.key_schema,
+                on_index: index_info.is_some(),
+                forward: input.scan_index_forward,
+            },
+        )?;
+        validate_query_select_index_support(input.select, index_info.as_ref())?;
     }
 
     // Determine which key schema to use for LastEvaluatedKey extraction.
@@ -509,7 +520,23 @@ pub async fn handle_query(
         },
     )
     .await?;
-    let result = page.post;
+    let mut result = page.post;
+    // A page that ends at the far end of the sort key range carries no key;
+    // the start key check would refuse it.
+    if let Some(ref last_key) = result.last_evaluated_key
+        && page_ends_at_far_end(
+            last_key,
+            &key_condition,
+            effective_maps,
+            QueryReadShape {
+                key_schema: &query_key_info.key_schema,
+                on_index: index_info.is_some(),
+                forward: input.scan_index_forward,
+            },
+        )
+    {
+        result.last_evaluated_key = None;
+    }
 
     // Capacity metering: RCU based on the pre-projection size of the evaluated items.
     let pre_projection_bytes = page.evaluated_bytes;
