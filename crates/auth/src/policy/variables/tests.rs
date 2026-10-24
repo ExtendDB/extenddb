@@ -229,7 +229,9 @@ fn escapes_are_literal_characters() {
 }
 
 #[test]
-fn multivalued_key_uses_first_value() {
+fn a_present_single_valued_key_with_several_values_uses_the_first() {
+    // The request context lists one value for a single-valued key; a second
+    // value can only come from a test context. The first is used, as before.
     let pattern = "arn:aws:dynamodb:us-east-1:123456789012:table/${aws:PrincipalTag/team}";
     let ctx = Ctx::empty().with(TEAM, &["blue", "red"]);
     assert!(resource_pattern_matches(pattern, BLUE, true, &ctx));

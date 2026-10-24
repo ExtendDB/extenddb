@@ -7,8 +7,9 @@
 //! a condition value, and IAM replaces it with the request's value for `key`
 //! before matching. The forms are:
 //!
-//! - `${key}`: the value of `key` in the request context. For a multivalued
-//!   key the first value is used.
+//! - `${key}`: the value of `key` in the request context. A multivalued key
+//!   is never a variable: it resolves as if the request did not carry it,
+//!   with one value or several (measured, issue #533 review cells C1 and D1).
 //! - `${key, 'default'}`: the value of `key`, or `default` when the request
 //!   does not carry `key`.
 //! - `${*}`, `${?}`, `${$}`: a literal `*`, `?` or `$`.
@@ -25,7 +26,9 @@
 //! ARN matching here follows the same field rule as
 //! [`super::matcher::arn_match`]: the first five `:` separate fields, the
 //! resource field keeps its own `:` and `/`, and both sides need the same
-//! number of fields.
+//! number of fields. Only a `:` written in the policy text separates fields;
+//! a `:` inside a variable value is matched as a byte of its field (measured:
+//! a region-field value `us-east-1:123456789012` matches no table ARN).
 
 use super::context::ConditionContext;
 use super::document::PolicyDocument;
@@ -51,6 +54,9 @@ enum Token {
     Star,
     /// `?` written in the policy text: matches exactly one byte.
     Question,
+    /// `:` written in the policy text: a field separator among the first five,
+    /// a literal `:` in the resource field.
+    Colon,
     /// One byte matched literally.
     Byte(u8),
 }
@@ -127,15 +133,18 @@ fn parts(value: &str) -> Vec<Part<'_>> {
     out
 }
 
-/// The request's value for `key`: the first value of a present key, the
-/// default when the key is absent and a default was written, `None` when the
-/// key is absent and no default was written. A present key with no values
-/// expands to the empty string.
+/// The request's value for `key`: the value of a present single-valued key,
+/// the default when the key is absent and a default was written, `None` when
+/// the key is absent and no default was written. A present key with no values
+/// expands to the empty string. A multivalued key is treated as absent.
 fn resolve<'a>(
     name: &str,
     default: Option<&'a str>,
     context: &'a impl ConditionContext,
 ) -> Option<&'a str> {
+    if context.is_multivalued_key(name) {
+        return default;
+    }
     match context.resolve_key(name) {
         Some(values) => Some(values.first().copied().unwrap_or("")),
         None => default,
@@ -151,6 +160,7 @@ fn expand_tokens(pattern: &str, context: &impl ConditionContext) -> Option<Vec<T
             Part::Text(text) => tokens.extend(text.bytes().map(|b| match b {
                 b'*' => Token::Star,
                 b'?' => Token::Question,
+                b':' => Token::Colon,
                 other => Token::Byte(other),
             })),
             Part::Ref(_, Reference::Escape(byte)) => tokens.push(Token::Byte(byte)),
@@ -224,13 +234,13 @@ fn arn_match_tokens(pattern: &[Token], value: &str) -> bool {
         .all(|(p, v)| match_tokens(p, v.as_bytes()))
 }
 
-/// Split at the first five literal `:` bytes, so the resource field keeps its
-/// own `:`.
+/// Split at the first five `:` written in the policy text, so the resource
+/// field keeps its own `:` and a `:` from a variable value stays in its field.
 fn split_fields(pattern: &[Token]) -> Vec<&[Token]> {
     let mut fields = Vec::with_capacity(6);
     let mut rest = pattern;
     while fields.len() < 5 {
-        match rest.iter().position(|t| *t == Token::Byte(b':')) {
+        match rest.iter().position(|t| *t == Token::Colon) {
             Some(i) => {
                 fields.push(&rest[..i]);
                 rest = &rest[i + 1..];
@@ -256,7 +266,11 @@ fn match_tokens(p: &[Token], v: &[u8]) -> bool {
             last_star = pi + 1;
             match_from = vi;
             pi += 1;
-        } else if pi < plen && (p[pi] == Token::Question || p[pi] == Token::Byte(v[vi])) {
+        } else if pi < plen
+            && (p[pi] == Token::Question
+                || p[pi] == Token::Byte(v[vi])
+                || (p[pi] == Token::Colon && v[vi] == b':'))
+        {
             pi += 1;
             vi += 1;
         } else if last_star != usize::MAX {
