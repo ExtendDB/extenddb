@@ -349,13 +349,71 @@ pub async fn handle_get_records(
     serialize_output(&output)
 }
 
-fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
+pub(crate) fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
     match e {
         StorageError::Validation(msg) => DynamoDbError::ValidationException(msg),
         StorageError::TableNotFound(name) => DynamoDbError::ResourceNotFoundException(name),
+        // The backend already classified this failure into the service error
+        // vocabulary and chose the client-facing message. Pass it through
+        // unchanged; it is not a storage fault, so it is not logged as one.
+        StorageError::Service(e) => e,
         other => {
             tracing::error!(internal_error = %other, "storage internal error");
             DynamoDbError::InternalServerError("Internal server error".to_owned())
+        }
+    }
+}
+
+#[cfg(test)]
+mod storage_error_mapping_tests {
+    use super::storage_to_dynamo;
+    use extenddb_core::error::DynamoDbError;
+    use extenddb_storage::error::StorageError;
+
+    // A backend-classified error reaches the client unchanged through the
+    // streams mapper, keeping both its variant and its message.
+
+    #[test]
+    fn service_internal_server_error_passes_through() {
+        let err = storage_to_dynamo(StorageError::Service(DynamoDbError::InternalServerError(
+            "backend internal".to_owned(),
+        )));
+        match err {
+            DynamoDbError::InternalServerError(msg) => assert_eq!(msg, "backend internal"),
+            other => panic!("expected InternalServerError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_service_unavailable_passes_through() {
+        let err = storage_to_dynamo(StorageError::Service(DynamoDbError::ServiceUnavailable(
+            "retry shortly".to_owned(),
+        )));
+        match err {
+            DynamoDbError::ServiceUnavailable(msg) => assert_eq!(msg, "retry shortly"),
+            other => panic!("expected ServiceUnavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_expired_iterator_passes_through() {
+        let err = storage_to_dynamo(StorageError::Service(
+            DynamoDbError::ExpiredIteratorException("Iterator expired.".to_owned()),
+        ));
+        match err {
+            DynamoDbError::ExpiredIteratorException(msg) => assert_eq!(msg, "Iterator expired."),
+            other => panic!("expected ExpiredIteratorException, got {other:?}"),
+        }
+    }
+
+    // Control: an unclassified driver error is still redacted behind the fixed
+    // string, with the driver text absent from the client message.
+    #[test]
+    fn internal_driver_text_is_redacted() {
+        let err = storage_to_dynamo(StorageError::Internal("driver text".to_owned()));
+        match err {
+            DynamoDbError::InternalServerError(msg) => assert_eq!(msg, "Internal server error"),
+            other => panic!("expected InternalServerError, got {other:?}"),
         }
     }
 }
