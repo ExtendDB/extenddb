@@ -17,16 +17,6 @@ use super::{json_to_item, query_with_pk_sk};
 use crate::CassandraEngine;
 use crate::stream_util::stream_record_statement;
 
-/// How a put maintains GSIs.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum IndexWrites {
-    /// Each GSI by its propagation delay: synchronous at 0, otherwise through
-    /// the `gsi_pending` queue.
-    AsConfigured,
-    /// Every GSI in the item's own batch, as with a 0 delay.
-    AllSynchronous,
-}
-
 impl CassandraEngine {
     /// Implementation of `DataEngine::put_item`.
     ///
@@ -43,67 +33,11 @@ impl CassandraEngine {
         maps: &ExpressionMaps,
         stream: Option<&StreamCapture>,
     ) -> Result<Option<Item>, StorageError> {
-        self.put_item_with_retry(
-            key_info,
-            item,
-            return_old,
-            condition,
-            maps,
-            stream,
-            IndexWrites::AsConfigured,
-        )
-        .await
-    }
-
-    /// The write a restore copy makes for one backup item: the ordinary put
-    /// path (same base-row write, same index maintenance helpers, same
-    /// projection), with every GSI written in the item's own logged batch as
-    /// LSIs always are, instead of through the asynchronous propagation queue.
-    /// A restore target becomes ACTIVE only after its last item is written,
-    /// and DynamoDB reports a restored table's indexes as complete at ACTIVE;
-    /// queueing the rows would let ACTIVE precede them.
-    pub(crate) async fn put_restored_item(
-        &self,
-        key_info: &TableKeyInfo,
-        item: Item,
-    ) -> Result<(), StorageError> {
-        self.put_item_with_retry(
-            key_info,
-            item,
-            false,
-            None,
-            &ExpressionMaps::default(),
-            None,
-            IndexWrites::AllSynchronous,
-        )
-        .await
-        .map(|_| ())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn put_item_with_retry(
-        &self,
-        key_info: &TableKeyInfo,
-        item: Item,
-        return_old: bool,
-        condition: Option<&Expr>,
-        maps: &ExpressionMaps,
-        stream: Option<&StreamCapture>,
-        index_writes: IndexWrites,
-    ) -> Result<Option<Item>, StorageError> {
         use super::delete_item::{TTL_CLAIM_MAX_RETRIES, ttl_claim_backoff};
 
         for attempt in 0..=TTL_CLAIM_MAX_RETRIES {
             match self
-                .put_item_impl_inner(
-                    key_info,
-                    item.clone(),
-                    return_old,
-                    condition,
-                    maps,
-                    stream,
-                    index_writes,
-                )
+                .put_item_impl_inner(key_info, item.clone(), return_old, condition, maps, stream)
                 .await
             {
                 Err(StorageError::TransactionConflict(message))
@@ -126,7 +60,6 @@ impl CassandraEngine {
         unreachable!("loop returns on the final attempt")
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn put_item_impl_inner(
         &self,
         key_info: &TableKeyInfo,
@@ -135,7 +68,6 @@ impl CassandraEngine {
         condition: Option<&Expr>,
         maps: &ExpressionMaps,
         stream: Option<&StreamCapture>,
-        index_writes: IndexWrites,
     ) -> Result<Option<Item>, StorageError> {
         let data_keyspace = self.account_keyspace(&key_info.account_id);
         let catalog_keyspace = self.catalog_keyspace();
@@ -149,7 +81,7 @@ impl CassandraEngine {
 
         // Fetch indexes for GSI/LSI updates
         // Both are catalog reads with no data dependency; overlap them.
-        let (mut indexes, ttl_config) = futures::try_join!(
+        let (indexes, ttl_config) = futures::try_join!(
             super::index::fetch_indexes_for_table(
                 &key_info.table_id,
                 &self.session,
@@ -174,12 +106,7 @@ impl CassandraEngine {
             )
             .map_err(|e| StorageError::Validation(e.to_string()))?;
         }
-        if index_writes == IndexWrites::AllSynchronous {
-            for index in &mut indexes {
-                index.propagation_delay_ms = Some(0);
-            }
-        }
-        let sys_delay = if indexes.is_empty() || index_writes == IndexWrites::AllSynchronous {
+        let sys_delay = if indexes.is_empty() {
             0
         } else {
             self.gsi_default_delay_ms

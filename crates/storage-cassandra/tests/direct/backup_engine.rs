@@ -29,7 +29,7 @@ use crate::helpers::{TestAccount, TestTable, setup_engine, unique_test_account};
 
 type Item = BTreeMap<String, AttributeValue>;
 
-fn item(id: &str, sort: Option<&str>, value: &str) -> Item {
+pub(crate) fn item(id: &str, sort: Option<&str>, value: &str) -> Item {
     let mut item = BTreeMap::new();
     item.insert("id".to_owned(), AttributeValue::S(id.to_owned()));
     if let Some(sort) = sort {
@@ -39,7 +39,7 @@ fn item(id: &str, sort: Option<&str>, value: &str) -> Item {
     item
 }
 
-fn key(id: &str, sort: Option<&str>) -> Item {
+pub(crate) fn key(id: &str, sort: Option<&str>) -> Item {
     let mut key = BTreeMap::new();
     key.insert("id".to_owned(), AttributeValue::S(id.to_owned()));
     if let Some(sort) = sort {
@@ -48,21 +48,21 @@ fn key(id: &str, sort: Option<&str>) -> Item {
     key
 }
 
-fn ks(name: &str, key_type: KeyType) -> KeySchemaElement {
+pub(crate) fn ks(name: &str, key_type: KeyType) -> KeySchemaElement {
     KeySchemaElement {
         attribute_name: name.to_owned(),
         key_type,
     }
 }
 
-fn attr(name: &str, attribute_type: ScalarAttributeType) -> AttributeDefinition {
+pub(crate) fn attr(name: &str, attribute_type: ScalarAttributeType) -> AttributeDefinition {
     AttributeDefinition {
         attribute_name: name.to_owned(),
         attribute_type,
     }
 }
 
-async fn activate_tables(engine: &CassandraEngine) {
+pub(crate) async fn activate_tables(engine: &CassandraEngine) {
     tokio::time::sleep(Duration::from_millis(350)).await;
     engine
         .process_control_plane_transitions()
@@ -71,7 +71,7 @@ async fn activate_tables(engine: &CassandraEngine) {
 }
 
 /// Create `input` in `account_id`, activate it, and return its key info.
-async fn create_active_table(
+pub(crate) async fn create_active_table(
     engine: &CassandraEngine,
     account_id: &str,
     input: CreateTableInput,
@@ -90,7 +90,11 @@ async fn create_active_table(
 
 /// Make every GSI of a table synchronous, so the source's indexes are
 /// complete without the GSI propagation workers (not running in these tests).
-async fn make_gsis_synchronous(engine: &CassandraEngine, table_id: &str, names: &[&str]) {
+pub(crate) async fn make_gsis_synchronous(
+    engine: &CassandraEngine,
+    table_id: &str,
+    names: &[&str],
+) {
     let query = format!(
         "UPDATE {}.indexes SET propagation_delay_ms = 0 WHERE table_id = ? AND index_name = ?",
         engine.catalog_keyspace()
@@ -104,7 +108,7 @@ async fn make_gsis_synchronous(engine: &CassandraEngine, table_id: &str, names: 
     }
 }
 
-async fn put_all(engine: &CassandraEngine, key_info: &TableKeyInfo, items: Vec<Item>) {
+pub(crate) async fn put_all(engine: &CassandraEngine, key_info: &TableKeyInfo, items: Vec<Item>) {
     let mut writes = futures::stream::iter(items)
         .map(|item| engine.put_item(key_info, item, false, None, &Default::default(), None))
         .buffer_unordered(32);
@@ -113,7 +117,11 @@ async fn put_all(engine: &CassandraEngine, key_info: &TableKeyInfo, items: Vec<I
     }
 }
 
-async fn describe(engine: &CassandraEngine, account_id: &str, name: &str) -> TableDescription {
+pub(crate) async fn describe(
+    engine: &CassandraEngine,
+    account_id: &str,
+    name: &str,
+) -> TableDescription {
     engine
         .describe_table(
             account_id,
@@ -133,7 +141,7 @@ fn flip_last_hex(arn: &str) -> String {
 }
 
 /// Restore `backup_arn` into `target` the way the engine does.
-async fn restore(
+pub(crate) async fn restore(
     engine: &CassandraEngine,
     account_id: &str,
     backup_arn: &str,
@@ -157,7 +165,7 @@ async fn restore(
 }
 
 /// Poll until `name` is ACTIVE; panic after `timeout`.
-async fn wait_active(
+pub(crate) async fn wait_active(
     engine: &CassandraEngine,
     account_id: &str,
     name: &str,
@@ -178,7 +186,7 @@ async fn wait_active(
     }
 }
 
-async fn scan_count(engine: &CassandraEngine, key_info: &TableKeyInfo) -> usize {
+pub(crate) async fn scan_count(engine: &CassandraEngine, key_info: &TableKeyInfo) -> usize {
     let mut count = 0;
     let mut start: Option<Item> = None;
     loop {
@@ -195,7 +203,7 @@ async fn scan_count(engine: &CassandraEngine, key_info: &TableKeyInfo) -> usize 
 }
 
 /// Every item a Query on `index` for `pk_attr = value` returns, all pages.
-async fn query_index(
+pub(crate) async fn query_index(
     engine: &CassandraEngine,
     key_info: &TableKeyInfo,
     index: &str,
@@ -934,7 +942,7 @@ async fn test_restore_returns_creating_and_survives_the_request() {
     if crate::helpers::skip_without_cassandra() {
         return;
     }
-    const ITEMS: usize = 1_500;
+    const ITEMS: usize = 10_000;
     let observer = setup_engine().await;
     let (account, _source, backup_arn) =
         backed_up_plain_table(&observer, "DetachedSource", ITEMS).await;
@@ -990,7 +998,7 @@ async fn test_dropped_restore_request_still_reaches_active() {
     if crate::helpers::skip_without_cassandra() {
         return;
     }
-    const ITEMS: usize = 1_500;
+    const ITEMS: usize = 10_000;
     let engine = setup_engine().await;
     let (account, _source, backup_arn) =
         backed_up_plain_table(&engine, "DroppedSource", ITEMS).await;
@@ -1064,7 +1072,7 @@ async fn test_backup_and_target_are_held_while_restoring() {
     if crate::helpers::skip_without_cassandra() {
         return;
     }
-    const ITEMS: usize = 1_500;
+    const ITEMS: usize = 10_000;
     let engine = setup_engine().await;
     let (account, source, backup_arn) = backed_up_plain_table(&engine, "HeldSource", ITEMS).await;
     let account_id = account.account_id.clone();
@@ -1291,7 +1299,52 @@ async fn test_a_restore_is_refused_while_a_target_of_its_backup_is_creating() {
     )
     .await;
 
-    // Simultaneous: four restores of b2 started together, exactly one admitted.
+    // Simultaneous, against a held registration: a CREATING restore target
+    // of b2 is put in the catalog by hand and registered on b2 the way
+    // register_restore does, so the registration is held for as long as the
+    // test wants it (a real copy of b2 is over before a second target's
+    // schema is created). Four restores of b2 fired at once are all turned
+    // away as BackupInUse naming that target, and none creates a target.
+    // Once the registration is released, a restore of b2 is admitted.
+    let held_id = uuid::Uuid::new_v4().to_string();
+    let catalog = engine.catalog_keyspace();
+    engine
+        .session()
+        .query_with_values(
+            &format!(
+                "INSERT INTO {catalog}.tables \
+                 (account_id, table_name, table_id, table_status, restore_source_backup_arn) \
+                 VALUES (?, ?, ?, 'CREATING', ?)"
+            ),
+            cdrs_tokio::query_values!(
+                account_id.as_str(),
+                "HeldTarget",
+                held_id.as_str(),
+                b2.as_str()
+            ),
+        )
+        .await
+        .expect("held target row");
+    let registered = extenddb_storage_cassandra::cassandra_util::query_lwt(
+        engine.session(),
+        &format!(
+            "UPDATE {catalog}.backups_by_arn SET active_restores[?] = ? \
+             WHERE account_id = ? AND backup_arn = ? \
+             IF backup_status = 'AVAILABLE' AND active_restores = null"
+        ),
+        cdrs_tokio::query_values!(
+            held_id.as_str(),
+            "HeldTarget",
+            account_id.as_str(),
+            b2.as_str()
+        ),
+    )
+    .await
+    .expect("register the held restore");
+    assert!(
+        extenddb_storage_cassandra::cassandra_util::lwt_applied(&registered).unwrap(),
+        "b2 had no registration before the held one"
+    );
     let results = futures::future::join_all((0..4).map(|i| {
         let engine = engine.clone();
         let account_id = account_id.clone();
@@ -1308,27 +1361,38 @@ async fn test_a_restore_is_refused_while_a_target_of_its_backup_is_creating() {
         }
     }))
     .await;
-    let accepted: Vec<usize> = results
-        .iter()
-        .enumerate()
-        .filter_map(|(i, r)| r.is_ok().then_some(i))
-        .collect();
-    assert_eq!(accepted.len(), 1, "exactly one is accepted: {results:?}");
     for (i, result) in results.iter().enumerate() {
-        if i != accepted[0] {
-            assert!(
-                matches!(result, Err(StorageError::BackupInUse(_))),
-                "restore {i}: {result:?}"
-            );
-        }
+        assert!(
+            matches!(result, Err(StorageError::BackupInUse(m)) if m.contains("HeldTarget")),
+            "restore {i} against the held registration: {result:?}"
+        );
+        let gone = engine
+            .describe_table(
+                &account_id,
+                DescribeTableInput {
+                    table_name: format!("SimTarget{i}"),
+                },
+            )
+            .await;
+        assert!(
+            matches!(gone, Err(StorageError::TableNotFound(_))),
+            "refused restore {i} left a target: {gone:?}"
+        );
     }
-    wait_active(
-        &engine,
-        &account_id,
-        &format!("SimTarget{}", accepted[0]),
-        Duration::from_secs(180),
-    )
-    .await;
+    engine
+        .session()
+        .query_with_values(
+            &format!("DELETE FROM {catalog}.tables WHERE account_id = ? AND table_name = ?"),
+            cdrs_tokio::query_values!(account_id.as_str(), "HeldTarget"),
+        )
+        .await
+        .expect("remove the held target row");
+    // The registration is now stale (its target is gone); the next restore's
+    // backup check clears it and the restore is admitted.
+    restore(&engine, &account_id, &b2, "SimTarget0", &overrides)
+        .await
+        .expect("a restore once the held registration is released");
+    wait_active(&engine, &account_id, "SimTarget0", Duration::from_secs(180)).await;
 }
 
 /// (e) A backup row with no definition (written before V005) restores as a
@@ -1442,7 +1506,7 @@ async fn test_sweep_removes_abandoned_restore_target() {
     if crate::helpers::skip_without_cassandra() {
         return;
     }
-    const ITEMS: usize = 1_500;
+    const ITEMS: usize = 10_000;
     let engine = setup_engine().await;
     let (account, _source, backup_arn) =
         backed_up_plain_table(&engine, "AbandonedSource", ITEMS).await;

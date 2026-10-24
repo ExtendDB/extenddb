@@ -39,6 +39,12 @@ mod policies;
 mod put_get_item;
 #[path = "direct/query.rs"]
 mod query;
+#[path = "direct/restore_timing.rs"]
+mod restore_timing;
+#[path = "direct/restore_write.rs"]
+mod restore_write;
+#[path = "direct/restore_write_controls.rs"]
+mod restore_write_controls;
 #[path = "direct/roles.rs"]
 mod roles;
 #[path = "direct/scan.rs"]
