@@ -27,7 +27,7 @@ const SCOPE_DATE_COMPLAINT: &str =
 /// The comparison is on bytes, so a date of another length, a date carrying
 /// letters and a date naming a day that does not exist are all a mismatch.
 fn scope_date_matches(date: &str, timestamp: &str) -> bool {
-    timestamp.len() >= 8 && date == &timestamp[..8]
+    timestamp.get(..8) == Some(date)
 }
 
 /// Check the credential scope's region, service and date against this server
