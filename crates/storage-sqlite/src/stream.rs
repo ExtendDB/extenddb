@@ -4,69 +4,20 @@
 //! `StreamEngine` trait implementation for `SqliteEngine`.
 //!
 //! Shards, records, and the sequence counter all live in the one SQLite file,
-//! so `init_stream_shards` runs in the caller's catalog transaction.
-//! Monotonic sequence numbers come from the `seq_counters` table (there is no
-//! PostgreSQL sequence). Retention cleanup compares an RFC 3339 cutoff computed
-//! in Rust.
+//! so `init_stream_shards` (`stream_lifecycle.rs`) runs in the caller's
+//! catalog transaction. Monotonic sequence numbers come from the
+//! `seq_counters` table (there is no PostgreSQL sequence). Retention cleanup
+//! compares an RFC 3339 cutoff computed in Rust.
 
-use extenddb_core::types::{
-    DescribeStreamInput, SequenceNumberRange, Shard, StreamDescription, StreamRecord, StreamStatus,
-    StreamSummary, StreamViewType,
-};
+use extenddb_core::types::{DescribeStreamInput, StreamDescription, StreamRecord};
 use extenddb_storage::error::StorageError;
+use extenddb_storage::stream_lineage;
 use extenddb_storage::util::{parse_stream_arn, stream_arn};
 use extenddb_storage::{StreamEngine, StreamListResult, StreamRecordsResult};
 use futures::future::BoxFuture;
 
 use crate::sqlite_util::format_timestamp;
 use crate::store::SqliteEngine;
-
-/// Fixed shards per stream (hash-based partition-key assignment).
-const SHARDS_PER_STREAM: u32 = 4;
-
-impl SqliteEngine {
-    /// Initialize stream shards and set `stream_label`, within the caller's
-    /// transaction. Returns the assigned stream label.
-    pub(crate) async fn init_stream_shards(
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-        account_id: &str,
-        table_name: &str,
-        table_id: &str,
-    ) -> Result<String, StorageError> {
-        // Formatted here, not in SQL, so every backend issues the same label
-        // shape from one function (`extenddb_storage::util::format_stream_label`).
-        let label = extenddb_storage::util::new_stream_label();
-        sqlx::query("UPDATE tables SET stream_label = ? WHERE account_id = ? AND table_name = ?")
-            .bind(&label)
-            .bind(account_id)
-            .bind(table_name)
-            .execute(&mut **tx)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-        for i in 0..SHARDS_PER_STREAM {
-            // Derived from the table id, not its name. A name is shared by
-            // every account that picks it, while `stream_shards.shard_id` is
-            // unique across the database. A name of up to 255 bytes also
-            // overflowed the 65-character ShardId limit
-            // the AWS SDKs enforce. The table id is a UUID, giving a
-            // 61-character id.
-            let shard_id = format!("shardId-{table_id}-{i:016}");
-            let start_seq = format!("{:021}", 0);
-            sqlx::query(
-                "INSERT INTO stream_shards (shard_id, table_id, starting_sequence_number) \
-                 VALUES (?, ?, ?)",
-            )
-            .bind(&shard_id)
-            .bind(table_id)
-            .bind(&start_seq)
-            .execute(&mut **tx)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-        }
-        Ok(label)
-    }
-}
 
 impl StreamEngine for SqliteEngine {
     fn write_stream_record(
@@ -183,95 +134,28 @@ impl StreamEngine for SqliteEngine {
     ) -> BoxFuture<'_, Result<StreamDescription, StorageError>> {
         let account_id = account_id.to_owned();
         let stream_arn = input.stream_arn.clone();
-        let limit = input.limit.unwrap_or(100);
+        let limit = input.limit;
         let start = input.exclusive_start_shard_id.clone();
         Box::pin(async move {
             let (table_name, stream_label) = parse_stream_arn(&stream_arn)?;
-            let row: Option<(String, Option<String>, String, String)> = sqlx::query_as(
-                "SELECT key_schema, stream_specification, table_status, table_id \
-                 FROM tables WHERE account_id = ? AND table_name = ? AND stream_label = ?",
-            )
-            .bind(&account_id)
-            .bind(&table_name)
-            .bind(&stream_label)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            let (ks_json, stream_spec_json, table_status, table_id) = row.ok_or_else(|| {
-                StorageError::TableNotFound(format!(
-                    "Requested resource not found: Stream: {stream_arn} not found."
-                ))
-            })?;
-
+            let (table, ks_json) = self
+                .stream_table_row(&account_id, &table_name)
+                .await?
+                .ok_or_else(|| stream_lineage::stream_not_found(&stream_arn))?;
             let key_schema = serde_json::from_str(&ks_json)
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
-            let stream_view_type = stream_spec_json
-                .as_deref()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-                .and_then(|v| {
-                    v.get("StreamViewType")
-                        .and_then(|sv| serde_json::from_value::<StreamViewType>(sv.clone()).ok())
-                })
-                .unwrap_or(StreamViewType::KeysOnly);
-
-            let shard_rows: Vec<(String, Option<String>, String, Option<String>)> =
-                if let Some(ref s) = start {
-                    sqlx::query_as(
-                        "SELECT shard_id, parent_shard_id, starting_sequence_number, ending_sequence_number \
-                         FROM stream_shards WHERE table_id = ? AND shard_id > ? \
-                         ORDER BY shard_id LIMIT ?",
-                    )
-                    .bind(&table_id)
-                    .bind(s)
-                    .bind(limit + 1)
-                    .fetch_all(&self.pool)
-                    .await
-                } else {
-                    sqlx::query_as(
-                        "SELECT shard_id, parent_shard_id, starting_sequence_number, ending_sequence_number \
-                         FROM stream_shards WHERE table_id = ? ORDER BY shard_id LIMIT ?",
-                    )
-                    .bind(&table_id)
-                    .bind(limit + 1)
-                    .fetch_all(&self.pool)
-                    .await
-                }
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            #[allow(clippy::cast_sign_loss)]
-            let limit_usize = limit.max(0) as usize;
-            let last_shard =
-                (shard_rows.len() > limit_usize).then(|| shard_rows[limit_usize - 1].0.clone());
-            let shards: Vec<Shard> = shard_rows
-                .into_iter()
-                .take(limit_usize)
-                .map(|(id, parent, start, end)| Shard {
-                    shard_id: id,
-                    parent_shard_id: parent,
-                    sequence_number_range: SequenceNumberRange {
-                        starting_sequence_number: start,
-                        ending_sequence_number: end,
-                    },
-                })
-                .collect();
-
-            let stream_status = if table_status == "DELETING" {
-                StreamStatus::Disabling
-            } else {
-                StreamStatus::Enabled
-            };
-
-            Ok(StreamDescription {
+            let shards = self
+                .stream_shard_rows(&account_id, Some(&table.table_id))
+                .await?;
+            stream_lineage::describe_stream(
                 stream_arn,
-                stream_label,
-                stream_status,
-                stream_view_type,
-                table_name,
+                &table,
                 key_schema,
-                shards,
-                last_evaluated_shard_id: last_shard,
-            })
+                stream_label,
+                &shards,
+                limit,
+                start.as_deref(),
+            )
         })
     }
 
@@ -286,77 +170,17 @@ impl StreamEngine for SqliteEngine {
         let table_name = table_name.map(str::to_owned);
         let start_arn = exclusive_start_stream_arn.map(str::to_owned);
         Box::pin(async move {
-            let rows: Vec<(String, String)> = match (table_name.as_deref(), start_arn.as_deref()) {
-                (Some(tn), Some(arn)) => {
-                    let (_, start_label) = parse_stream_arn(arn)?;
-                    sqlx::query_as(
-                        "SELECT table_name, stream_label FROM tables \
-                         WHERE account_id = ? AND stream_label IS NOT NULL AND table_name = ? \
-                           AND stream_label > ? ORDER BY stream_label LIMIT ?",
-                    )
-                    .bind(&account_id)
-                    .bind(tn)
-                    .bind(&start_label)
-                    .bind(limit + 1)
-                    .fetch_all(&self.pool)
-                    .await
-                }
-                (Some(tn), None) => {
-                    sqlx::query_as(
-                        "SELECT table_name, stream_label FROM tables \
-                     WHERE account_id = ? AND stream_label IS NOT NULL AND table_name = ? \
-                     ORDER BY stream_label LIMIT ?",
-                    )
-                    .bind(&account_id)
-                    .bind(tn)
-                    .bind(limit + 1)
-                    .fetch_all(&self.pool)
-                    .await
-                }
-                (None, Some(arn)) => {
-                    let (start_table, start_label) = parse_stream_arn(arn)?;
-                    sqlx::query_as(
-                        "SELECT table_name, stream_label FROM tables \
-                         WHERE account_id = ? AND stream_label IS NOT NULL \
-                           AND (table_name, stream_label) > (?, ?) \
-                         ORDER BY table_name, stream_label LIMIT ?",
-                    )
-                    .bind(&account_id)
-                    .bind(&start_table)
-                    .bind(&start_label)
-                    .bind(limit + 1)
-                    .fetch_all(&self.pool)
-                    .await
-                }
-                (None, None) => {
-                    sqlx::query_as(
-                        "SELECT table_name, stream_label FROM tables \
-                     WHERE account_id = ? AND stream_label IS NOT NULL \
-                     ORDER BY table_name, stream_label LIMIT ?",
-                    )
-                    .bind(&account_id)
-                    .bind(limit + 1)
-                    .fetch_all(&self.pool)
-                    .await
-                }
-            }
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            #[allow(clippy::cast_sign_loss)]
-            let limit_usize = limit.max(0) as usize;
-            let summaries: Vec<StreamSummary> = rows
-                .iter()
-                .take(limit_usize)
-                .map(|(tn, label)| StreamSummary {
-                    stream_arn: stream_arn(&self.region, &account_id, tn, label),
-                    stream_label: label.clone(),
-                    table_name: tn.clone(),
-                })
-                .collect();
-            let last = (rows.len() > limit_usize)
-                .then(|| summaries.last().map(|s| s.stream_arn.clone()))
-                .flatten();
-            Ok((summaries, last))
+            let start = start_arn.as_deref().map(parse_stream_arn).transpose()?;
+            let tables = self.stream_table_rows(&account_id).await?;
+            let shards = self.stream_shard_rows(&account_id, None).await?;
+            stream_lineage::list_streams(
+                &tables,
+                &shards,
+                table_name.as_deref(),
+                limit,
+                start,
+                |t, l| stream_arn(&self.region, &account_id, t, l),
+            )
         })
     }
 
@@ -398,8 +222,11 @@ impl StreamEngine for SqliteEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
+            // Only the open shards: they belong to the table's enabled stream.
+            // A disabled stream's closed shards take no new records.
             let shards: Vec<(String,)> = sqlx::query_as(
-                "SELECT shard_id FROM stream_shards WHERE table_id = ? ORDER BY shard_id",
+                "SELECT shard_id FROM stream_shards \
+                 WHERE table_id = ? AND ending_sequence_number IS NULL ORDER BY shard_id",
             )
             .bind(&table_id)
             .fetch_all(&self.pool)
@@ -450,35 +277,20 @@ impl StreamEngine for SqliteEngine {
         let shard_id = shard_id.to_owned();
         Box::pin(async move {
             let (table_name, stream_label) = parse_stream_arn(&stream_arn)?;
-            let table_id: Option<String> = sqlx::query_scalar(
-                "SELECT table_id FROM tables \
-                 WHERE account_id = ? AND table_name = ? AND stream_label = ?",
-            )
-            .bind(&account_id)
-            .bind(&table_name)
-            .bind(&stream_label)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            let Some(table_id) = table_id else {
-                return Err(StorageError::TableNotFound(format!(
-                    "Requested resource not found: Stream: {stream_arn} not found."
-                )));
+            let table = self.stream_table_row(&account_id, &table_name).await?;
+            let shards = match &table {
+                Some((t, _)) => {
+                    self.stream_shard_rows(&account_id, Some(&t.table_id))
+                        .await?
+                }
+                None => Vec::new(),
             };
-            let exists: Option<(i64,)> =
-                sqlx::query_as("SELECT 1 FROM stream_shards WHERE shard_id = ? AND table_id = ?")
-                    .bind(&shard_id)
-                    .bind(&table_id)
-                    .fetch_optional(&self.pool)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-            if exists.is_none() {
-                return Err(StorageError::TableNotFound(format!(
-                    "Requested resource not found: Stream: {stream_arn} not found."
-                )));
-            }
-            Ok(())
+            stream_lineage::validate_shard(
+                table.as_ref().map(|(t, _)| t),
+                &stream_label,
+                &shards,
+                &shard_id,
+            )
         })
     }
 

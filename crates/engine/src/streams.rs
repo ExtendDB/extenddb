@@ -27,6 +27,14 @@ pub async fn handle_describe_stream(
 ) -> Result<Value, DynamoDbError> {
     let input: DescribeStreamInput = serde_json::from_value(body)
         .map_err(|e| DynamoDbError::SerializationException(e.to_string()))?;
+    if let Some(start) = &input.exclusive_start_shard_id
+        && start.chars().count() < SHARD_ID_MIN_LEN
+    {
+        return Err(DynamoDbError::ValidationException(constraint(
+            "exclusiveStartShardId",
+            "have length greater than or equal to 28",
+        )));
+    }
 
     let desc = ctx
         .storage
@@ -51,6 +59,23 @@ pub async fn handle_list_streams(
 ) -> Result<Value, DynamoDbError> {
     let input: ListStreamsInput = serde_json::from_value(body)
         .map_err(|e| DynamoDbError::SerializationException(e.to_string()))?;
+    // Measured 2026-10-24: Limit=0 and a start ARN under 37 characters are
+    // refused with the model's constraint sentences (no value quoted). The
+    // upper bound of Limit is not measured; it is clamped to 100.
+    if input.limit.is_some_and(|l| l < 1) {
+        return Err(DynamoDbError::ValidationException(constraint(
+            "limit",
+            "have value greater than or equal to 1",
+        )));
+    }
+    if let Some(start) = &input.exclusive_start_stream_arn
+        && start.chars().count() < 37
+    {
+        return Err(DynamoDbError::ValidationException(constraint(
+            "exclusiveStartStreamArn",
+            "have length greater than or equal to 37",
+        )));
+    }
 
     let limit = input.limit.unwrap_or(100).min(100);
     let (streams, last_arn) = ctx
@@ -86,6 +111,33 @@ pub async fn handle_get_shard_iterator(
     let input: GetShardIteratorInput = serde_json::from_value(body)
         .map_err(|e| DynamoDbError::SerializationException(e.to_string()))?;
 
+    // The service's ShardId bound is 28 to 65 characters, checked before any
+    // lookup with the model's constraint sentences (both measured 2026-10-24).
+    // A SequenceNumber, when given, is at least 21 characters (measured with
+    // "0" on AT_SEQUENCE_NUMBER).
+    let shard_len = input.shard_id.chars().count();
+    if shard_len < SHARD_ID_MIN_LEN {
+        return Err(DynamoDbError::ValidationException(
+            SHARD_ID_TOO_SHORT.to_owned(),
+        ));
+    }
+    if shard_len > SHARD_ID_MAX_LEN {
+        return Err(DynamoDbError::ValidationException(constraint(
+            "shardId",
+            "have length less than or equal to 65",
+        )));
+    }
+    if input
+        .sequence_number
+        .as_ref()
+        .is_some_and(|n| n.chars().count() < 21)
+    {
+        return Err(DynamoDbError::ValidationException(constraint(
+            "sequenceNumber",
+            "have length greater than or equal to 21",
+        )));
+    }
+
     // Validate the stream and shard exist before issuing an iterator.
     ctx.storage
         .validate_shard(&ctx.account_id, &input.stream_arn, &input.shard_id)
@@ -106,9 +158,12 @@ pub async fn handle_get_shard_iterator(
         ShardIteratorType::AtSequenceNumber => {
             // Convert to AFTER_SEQUENCE_NUMBER by subtracting 1, so the
             // exclusive "after" semantics produce inclusive "at" behavior.
+            // Measured 2026-10-24 for AT_SEQUENCE_NUMBER; AFTER_SEQUENCE_NUMBER
+            // without a number is not measured and keeps its sentence below.
             let raw = input.sequence_number.clone().ok_or_else(|| {
                 DynamoDbError::ValidationException(
-                    "SequenceNumber is required for AT_SEQUENCE_NUMBER iterator type".to_owned(),
+                    "One or more parameter values were invalid: SequenceNumber cannot be null"
+                        .to_owned(),
                 )
             })?;
             let n = raw.parse::<u128>().map_err(|_| {
@@ -163,6 +218,24 @@ pub async fn handle_get_shard_iterator(
 
 /// Shard iterator expiration: 15 minutes (900 seconds), matching real `DynamoDB`.
 const SHARD_ITERATOR_EXPIRY_SECS: u64 = 900;
+
+/// The shortest and longest `ShardId` the service accepts.
+const SHARD_ID_MIN_LEN: usize = 28;
+const SHARD_ID_MAX_LEN: usize = 65;
+
+/// The model's constraint sentence for a member value, as the service renders
+/// it for the streams API (no value quoted; measured 2026-10-24 on `shardId`,
+/// `exclusiveStartShardId`, `sequenceNumber`, `limit` and
+/// `exclusiveStartStreamArn`).
+fn constraint(member: &str, rule: &str) -> String {
+    format!(
+        "1 validation error detected: Value at '{member}' failed to satisfy constraint: Member must {rule}"
+    )
+}
+
+/// `GetShardIterator` with a `ShardId` under 28 characters (measured 2026-10-24
+/// with `nope`); the same shape `constraint` renders.
+pub const SHARD_ID_TOO_SHORT: &str = "1 validation error detected: Value at 'shardId' failed to satisfy constraint: Member must have length greater than or equal to 28";
 
 /// The message `DynamoDB` returns for an expired shard iterator (measured live,
 /// `live-r2/iter-live.json`: an iterator 990 seconds old returns
@@ -417,6 +490,18 @@ mod tests {
 
     fn b64(s: &str) -> String {
         base64::Engine::encode(&base64::engine::general_purpose::STANDARD, s)
+    }
+
+    #[test]
+    fn the_constraint_sentences_match_the_measured_ones() {
+        assert_eq!(
+            super::constraint("shardId", "have length greater than or equal to 28"),
+            super::SHARD_ID_TOO_SHORT
+        );
+        assert_eq!(
+            super::constraint("limit", "have value greater than or equal to 1"),
+            "1 validation error detected: Value at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"
+        );
     }
 
     #[test]

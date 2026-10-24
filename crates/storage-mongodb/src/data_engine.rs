@@ -2024,14 +2024,17 @@ impl MongoEngine {
         // ordering safe under contention — see
         // stream_engine::next_sequence_number_in_session for the full
         // rationale.
-        let shard_id = self
+        let Some(shard_id) = self
             .assign_shard_in_session(
                 &key_info.account_id,
                 &key_info.table_name,
                 &pk_str,
                 &mut *session,
             )
-            .await?;
+            .await?
+        else {
+            return Ok(());
+        };
         let seq = self
             .next_sequence_number_in_session(&shard_id, &mut *session)
             .await?;

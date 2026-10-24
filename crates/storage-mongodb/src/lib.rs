@@ -22,6 +22,7 @@ mod metadata_engine;
 mod operations;
 pub mod pushdown;
 mod stream_engine;
+mod stream_lifecycle;
 mod table_engine;
 mod ttl_worker;
 mod worker_store;

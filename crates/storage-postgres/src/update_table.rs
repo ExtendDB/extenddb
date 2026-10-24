@@ -306,75 +306,21 @@ impl PostgresEngine {
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
         }
 
-        // Apply stream specification change (enable/disable streams).
-        if let Some(spec) = &input.stream_specification {
-            let spec_json =
-                serde_json::to_value(spec).map_err(|e| StorageError::Internal(e.to_string()))?;
-            sqlx::query(
-                "UPDATE tables SET stream_specification = $1 \
-                 WHERE account_id = $2 AND table_name = $3",
-            )
-            .bind(&spec_json)
-            .bind(account_id)
-            .bind(&input.table_name)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            if spec.stream_enabled {
-                // Check if shards already exist (re-enabling streams on a table
-                // that previously had them). Query the data pool since
-                // stream_shards lives in the data database.
-                let existing: Option<(String,)> = sqlx::query_as(
-                    "SELECT shard_id FROM stream_shards \
-                     WHERE table_id = $1 \
-                     LIMIT 1",
+        // Apply stream specification change (enable/disable streams). The
+        // shard changes run once the catalog has committed.
+        let pending_stream = match &input.stream_specification {
+            Some(spec) => Some(
+                Self::apply_stream_specification(
+                    &mut tx,
+                    account_id,
+                    &input.table_name,
+                    &table_id,
+                    spec,
                 )
-                .bind(&table_id)
-                .fetch_optional(&self.data_pool)
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-                if existing.is_none() {
-                    Self::init_stream_shards(
-                        &mut tx,
-                        &self.data_pool,
-                        account_id,
-                        &input.table_name,
-                        &table_id,
-                    )
-                    .await?;
-                } else {
-                    // Shards exist but stream_label may be NULL if streams were
-                    // previously disabled and the disable path cleared the label.
-                    // This is a defensive check — init_stream_shards sets the
-                    // label on first enable, but re-enable after disable needs
-                    // to restore it.
-                    let current_label: Option<String> = sqlx::query_scalar(
-                        "SELECT stream_label FROM tables \
-                         WHERE account_id = $1 AND table_name = $2",
-                    )
-                    .bind(account_id)
-                    .bind(&input.table_name)
-                    .fetch_one(&mut *tx)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-                    if current_label.is_none() {
-                        sqlx::query(
-                            "UPDATE tables SET stream_label = $3 \
-                             WHERE account_id = $1 AND table_name = $2",
-                        )
-                        .bind(account_id)
-                        .bind(&input.table_name)
-                        .bind(extenddb_storage::util::new_stream_label())
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
-                    }
-                }
-            }
-        }
+                .await?,
+            ),
+            None => None,
+        };
 
         // Apply table class change.
         if let Some(tc) = &input.table_class {
@@ -760,6 +706,10 @@ impl PostgresEngine {
         {
             release_taken_holds(&self.data_pool, &table_id, &taken_holds, &input.table_name).await;
             return Err(e);
+        }
+
+        if let Some(pending) = pending_stream {
+            pending.apply(self, account_id, &input.table_name).await?;
         }
 
         // P54 Bug 1: Execute data DDL on the data pool after catalog commit.

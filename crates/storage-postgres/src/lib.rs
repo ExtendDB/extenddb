@@ -25,6 +25,7 @@ mod migrations;
 mod operations;
 mod pg_util;
 mod stream_engine;
+mod stream_lifecycle;
 mod table_engine;
 mod table_helpers;
 mod ttl_worker;
