@@ -20,7 +20,7 @@
 //! not carry, with no default, makes the pattern match nothing. Both rules
 //! were measured with the IAM policy simulator (issue #533). Only a document
 //! whose `Version` is `2012-10-17` expands variables; the caller decides that
-//! with [`super::document::PolicyDocument::expands_policy_variables`].
+//! with [`PolicyDocument::expands_policy_variables`].
 //!
 //! ARN matching here follows the same field rule as
 //! [`super::matcher::arn_match`]: the first five `:` separate fields, the
@@ -28,7 +28,21 @@
 //! number of fields.
 
 use super::context::ConditionContext;
+use super::document::PolicyDocument;
 use super::matcher::arn_match;
+
+impl PolicyDocument {
+    /// Whether `${key}` policy variables in `Resource` and `NotResource`
+    /// patterns are expanded.
+    ///
+    /// IAM expands them only in a `2012-10-17` document; a `2008-10-17`
+    /// document, or one with no `Version`, matches the pattern as written.
+    /// Measured with the IAM policy simulator (issue #533).
+    #[must_use]
+    pub fn expands_policy_variables(&self) -> bool {
+        self.version.as_deref() == Some("2012-10-17")
+    }
+}
 
 /// One unit of an expanded pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -20,19 +20,6 @@ pub struct PolicyDocument {
     pub statements: Vec<Statement>,
 }
 
-impl PolicyDocument {
-    /// Whether `${key}` policy variables in `Resource` and `NotResource`
-    /// patterns are expanded.
-    ///
-    /// IAM expands them only in a `2012-10-17` document; a `2008-10-17`
-    /// document, or one with no `Version`, matches the pattern as written.
-    /// Measured with the IAM policy simulator (issue #533).
-    #[must_use]
-    pub fn expands_policy_variables(&self) -> bool {
-        self.version.as_deref() == Some("2012-10-17")
-    }
-}
-
 /// A single policy statement.
 #[derive(Debug, Clone)]
 pub struct Statement {
@@ -507,18 +494,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn version_2008_or_absent_does_not_expand_variables() {
-        let stmt = r#""Statement":[{"Effect":"Allow","Action":"dynamodb:*","Resource":"*"}]"#;
-        let v2008 =
-            PolicyDocument::from_json(&format!(r#"{{"Version":"2008-10-17",{stmt}}}"#)).unwrap();
-        assert_eq!(v2008.version.as_deref(), Some("2008-10-17"));
-        assert!(!v2008.expands_policy_variables());
-        let none = PolicyDocument::from_json(&format!("{{{stmt}}}")).unwrap();
-        assert_eq!(none.version, None);
-        assert!(!none.expands_policy_variables());
-    }
-
-    #[test]
     fn parse_simple_allow_policy() {
         let json = r#"{
             "Version": "2012-10-17",
@@ -530,7 +505,6 @@ mod tests {
         }"#;
         let doc = PolicyDocument::from_json(json).unwrap();
         assert_eq!(doc.version.as_deref(), Some("2012-10-17"));
-        assert!(doc.expands_policy_variables());
         assert_eq!(doc.statements.len(), 1);
         assert_eq!(doc.statements[0].effect, Effect::Allow);
         assert!(matches!(

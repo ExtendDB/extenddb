@@ -41,6 +41,23 @@ fn team_blue() -> Ctx {
     Ctx::empty().with(TEAM, &["blue"])
 }
 
+// --- PolicyDocument::expands_policy_variables ---
+
+#[test]
+fn only_version_2012_expands_variables() {
+    let stmt = r#""Statement":[{"Effect":"Allow","Action":"dynamodb:*","Resource":"*"}]"#;
+    let v2012 =
+        PolicyDocument::from_json(&format!(r#"{{"Version":"2012-10-17",{stmt}}}"#)).unwrap();
+    assert!(v2012.expands_policy_variables());
+    let v2008 =
+        PolicyDocument::from_json(&format!(r#"{{"Version":"2008-10-17",{stmt}}}"#)).unwrap();
+    assert_eq!(v2008.version.as_deref(), Some("2008-10-17"));
+    assert!(!v2008.expands_policy_variables());
+    let none = PolicyDocument::from_json(&format!("{{{stmt}}}")).unwrap();
+    assert_eq!(none.version, None);
+    assert!(!none.expands_policy_variables());
+}
+
 // --- parse_reference ---
 
 #[test]
