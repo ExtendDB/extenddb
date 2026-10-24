@@ -53,6 +53,26 @@ pub(crate) fn format_epoch_seconds(secs: f64) -> String {
     )
 }
 
+/// Format epoch milliseconds in the shape the `stream_records.created_at`
+/// column default produces (`strftime('%Y-%m-%dT%H:%M:%fZ')`, millisecond
+/// precision, 24 characters): `2026-10-15T12:00:00.438Z`. Same width as the
+/// default, so rows written before and after this formatter was introduced
+/// sort together as text in time order.
+pub(crate) fn format_epoch_millis(ms: i64) -> String {
+    let dt = OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000)
+        .unwrap_or(OffsetDateTime::UNIX_EPOCH);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        dt.year(),
+        u8::from(dt.month()),
+        dt.day(),
+        dt.hour(),
+        dt.minute(),
+        dt.second(),
+        dt.millisecond()
+    )
+}
+
 /// Epoch seconds, sub-second precision, of a catalog timestamp; 0 if it does
 /// not parse.
 #[allow(clippy::cast_precision_loss)] // epoch seconds fit f64's mantissa
