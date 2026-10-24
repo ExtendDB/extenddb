@@ -270,6 +270,7 @@ fn numbers_are_checked_before_the_operator_checks() {
         ))
     };
     assert_eq!(msg("EQ", &[n("abc")]), bad("abc"));
+    assert_eq!(msg("EQ", &[n("")]), bad(""));
     assert_eq!(msg("EQ", &[n("12e")]), bad("12e"));
     assert_eq!(msg("BEGINS_WITH", &[n("abc")]), bad("abc"));
     assert_eq!(msg("FOO", &[n("abc")]), bad("abc"));

@@ -127,7 +127,7 @@ class TestLegacyNumberValues:
         msg = _validation_error(lambda: dynamodb_client_no_validation.scan(TableName=ss_table, ScanFilter={"a": _cond(operator, values)}))
         assert msg == NOT_A_NUMBER.format("abc")
 
-    @pytest.mark.parametrize(("raw", "message"), [("12e", NOT_A_NUMBER.format("12e")), (" 1", NOT_A_NUMBER.format(" 1")), ("1e400", "Number overflow. Attempting to store a number with magnitude larger than supported range"), ("1e-400", "Number underflow. Attempting to store a number with magnitude smaller than supported range"), ("1" * 39, "Attempting to store more than 38 significant digits in a Number")])
+    @pytest.mark.parametrize(("raw", "message"), [("", NOT_A_NUMBER.format("")), ("12e", NOT_A_NUMBER.format("12e")), (" 1", NOT_A_NUMBER.format(" 1")), ("1e400", "Number overflow. Attempting to store a number with magnitude larger than supported range"), ("1e-400", "Number underflow. Attempting to store a number with magnitude smaller than supported range"), ("1" * 39, "Attempting to store more than 38 significant digits in a Number")])
     def test_scan_filter_number_messages(self, dynamodb_client_no_validation, ss_table, raw, message):
         msg = _validation_error(lambda: dynamodb_client_no_validation.scan(TableName=ss_table, ScanFilter={"a": _cond("EQ", [_n(raw)])}))
         assert msg == message
@@ -287,7 +287,8 @@ class TestQueryFilterOnKeyAttribute:
 
 class TestBatchGetAbsentKeyCapacity:
     """BatchGetItem charges each absent key the minimum read and lists every
-    requested table in ConsumedCapacity, in table name order."""
+    requested table in ConsumedCapacity. The service lists the tables in no
+    stable order, so the order is not asserted."""
 
     def test_absent_keys_are_charged(self, dynamodb_client, sn_table):
         client = dynamodb_client
@@ -321,10 +322,11 @@ class TestBatchGetAbsentKeyCapacity:
         resp = client.batch_get_item(RequestItems={sn_table: {"Keys": [absent]}})
         assert "ConsumedCapacity" not in resp
 
-    def test_two_tables_all_absent_in_name_order(self, dynamodb_client, ss_table, sn_table):
+    def test_two_tables_all_absent_each_listed_once(self, dynamodb_client, ss_table, sn_table):
         client = dynamodb_client
         items = {sn_table: {"Keys": [{"pk": _s("nope"), "sk": _n("1")}]}, ss_table: {"Keys": [{"pk": _s("nope"), "sk": _s("x")}]}}
         for order in (list(items), list(reversed(list(items)))):
             resp = client.batch_get_item(RequestItems={t: items[t] for t in order}, ReturnConsumedCapacity="TOTAL")
             assert resp["Responses"] == {ss_table: [], sn_table: []}
-            assert resp["ConsumedCapacity"] == [{"TableName": t, "CapacityUnits": 0.5} for t in sorted(items)]
+            listed = sorted(resp["ConsumedCapacity"], key=lambda entry: entry["TableName"])
+            assert listed == [{"TableName": t, "CapacityUnits": 0.5} for t in sorted(items)]

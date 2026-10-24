@@ -201,8 +201,10 @@ pub fn validate_key_conditions(
 /// Primary key attribute: <name>`, the hash key named first (measured
 /// 2026-10-24: table keys on a table query, index keys on a GSI query; table
 /// keys pass on a GSI query and index keys pass on a table query). The
-/// service reports it after every other Query error, so the caller runs it
-/// last, after the Select checks and before the `ExclusiveStartKey` check.
+/// service reports it after the table and index lookup, the key schema and
+/// empty key value checks and the Select checks, and before the key value
+/// size check and the `ExclusiveStartKey` check, so the caller runs it after
+/// the Select checks.
 ///
 /// # Errors
 ///
@@ -324,6 +326,20 @@ pub fn desugar_filter(
 
 const INVALID_PARAMS: &str = "One or more parameter values were invalid: ";
 
+/// The item-path number check, with one difference in wording. A legacy
+/// condition value `{"N": ""}` answers `The parameter cannot be converted to a
+/// numeric value: `, the separator kept with nothing after it, where the item
+/// path answers the text without the separator. Measured on a ScanFilter `EQ`
+/// condition; every other number error answers the item-path text.
+fn validate_legacy_number(value: &AttributeValue) -> Result<(), DynamoDbError> {
+    if matches!(value, AttributeValue::N(n) if n.is_empty()) {
+        return Err(DynamoDbError::ValidationException(
+            "The parameter cannot be converted to a numeric value: ".to_owned(),
+        ));
+    }
+    validate_attribute_number(value)
+}
+
 /// Validate one legacy condition (`ScanFilter`, `QueryFilter` or
 /// `KeyConditions` entry) the way the service does at request time, before
 /// the table is looked up and before any row is read, with its messages
@@ -361,7 +377,7 @@ pub fn validate_legacy_condition(
     values: &[AttributeValue],
 ) -> Result<(), DynamoDbError> {
     for value in values {
-        validate_attribute_number(value)?;
+        validate_legacy_number(value)?;
     }
     let refuse = |text: String| {
         Err(DynamoDbError::ValidationException(format!(

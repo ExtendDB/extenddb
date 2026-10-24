@@ -460,8 +460,8 @@ pub async fn handle_query(
     )?;
 
     // A legacy QueryFilter may not name a key of the queried table or index.
-    // The service reports this after every other Query error, including the
-    // Select checks above, and before the ExclusiveStartKey check below
+    // The service reports this after the key schema and Select checks above,
+    // and before the key value size check and the ExclusiveStartKey check
     // (measured 2026-10-24).
     if let Some(qf) = input.query_filter.as_ref().filter(|qf| !qf.is_empty()) {
         reject_query_filter_on_key(qf, &query_key_info.key_schema)?;
