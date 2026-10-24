@@ -139,6 +139,73 @@ fn ambiguous_request_tag_fails_the_statement_closed() {
 }
 
 #[test]
+fn ambiguous_request_tag_as_a_policy_variable_fails_the_statement_closed() {
+    use crate::policy::condition::{ConditionMatch, evaluate_statement_conditions};
+    use crate::policy::document::{Condition, ConditionOperator};
+
+    let mut resource = HashMap::new();
+    resource.insert("env".to_owned(), "prod".to_owned());
+    let with_resource_tag = |tags: &[(&str, &str)]| {
+        let mut ctx = ctx_with(tags, &[]);
+        ctx.resource_tags = resource.clone();
+        ctx
+    };
+    let deny = [Condition {
+        operator: ConditionOperator::StringEquals,
+        key: "aws:ResourceTag/env".to_owned(),
+        values: vec!["${aws:RequestTag/env}".to_owned()],
+    }];
+    // One spelling expands to its value.
+    for tags in [[("env", "prod")], [("Env", "prod")]] {
+        assert_eq!(
+            evaluate_statement_conditions(&deny, &with_resource_tag(&tags)),
+            ConditionMatch::Match
+        );
+    }
+    // Two spellings with differing values have no value to expand to.
+    for tags in [
+        [("Env", "prod"), ("env", "dev")],
+        [("env", "dev"), ("Env", "prod")],
+    ] {
+        assert_eq!(
+            evaluate_statement_conditions(&deny, &with_resource_tag(&tags)),
+            ConditionMatch::Unresolvable
+        );
+    }
+    // The variable inside a longer value, and a negated operator, fail closed too.
+    let embedded = [Condition {
+        operator: ConditionOperator::StringNotEquals,
+        key: "aws:ResourceTag/env".to_owned(),
+        values: vec!["x-${aws:RequestTag/env}-y".to_owned()],
+    }];
+    assert_eq!(
+        evaluate_statement_conditions(
+            &embedded,
+            &with_resource_tag(&[("Env", "prod"), ("env", "dev")])
+        ),
+        ConditionMatch::Unresolvable
+    );
+    // An absent request tag is not ambiguous: the variable stays literal, as before.
+    assert_eq!(
+        evaluate_statement_conditions(&deny, &with_resource_tag(&[("team", "x")])),
+        ConditionMatch::NoMatch
+    );
+    // A brace that never closes names no variable.
+    let unclosed = [Condition {
+        operator: ConditionOperator::StringEquals,
+        key: "aws:ResourceTag/env".to_owned(),
+        values: vec!["${aws:RequestTag/env".to_owned()],
+    }];
+    assert_eq!(
+        evaluate_statement_conditions(
+            &unclosed,
+            &with_resource_tag(&[("Env", "prod"), ("env", "dev")])
+        ),
+        ConditionMatch::NoMatch
+    );
+}
+
+#[test]
 fn principal_and_resource_tag_lookup_keep_the_exact_first_rule() {
     // Only aws:RequestTag changed. The neighbouring tag keys still resolve a
     // byte-exact stored key first and otherwise the smallest fold-matching key.

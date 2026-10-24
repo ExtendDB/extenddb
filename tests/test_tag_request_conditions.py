@@ -665,3 +665,28 @@ class TestTagRequestConditions:
             ResourceArn=self.arn,
             Tags=[{"Key": "owner", "Value": "someone-else"}],
         )
+
+    def test_ambiguous_request_tag_as_a_policy_variable_is_refused(self):
+        # IAM case V (2026-10-24): a Deny `StringEquals aws:ResourceTag/env
+        # ${aws:RequestTag/env}` refuses env=prod on a table tagged env=prod and
+        # does not apply when the request carries no env tag. A request naming
+        # the tag under two spellings with differing values has no value to
+        # expand the variable to, so the statement fails closed as it does when
+        # the key is the condition key: refused in either order, nothing stored.
+        self.admin_client.tag_resource(
+            ResourceArn=self.arn, Tags=[{"Key": "env", "Value": "prod"}]
+        )
+        client, _ = self._restricted(
+            _deny({"StringEquals": {"aws:ResourceTag/env": "${aws:RequestTag/env}"}})
+        )
+        self._assert_denied(
+            client.tag_resource, ResourceArn=self.arn, Tags=[{"Key": "env", "Value": "prod"}]
+        )
+        for tags in (
+            [{"Key": "Env", "Value": "prod"}, {"Key": "env", "Value": "dev"}],
+            [{"Key": "env", "Value": "dev"}, {"Key": "Env", "Value": "prod"}],
+        ):
+            self._assert_denied(client.tag_resource, ResourceArn=self.arn, Tags=tags)
+            assert self._stored_tags() == {"env": "prod"}, tags
+        client.tag_resource(ResourceArn=self.arn, Tags=[{"Key": "team", "Value": "x"}])
+        assert self._stored_tags() == {"env": "prod", "team": "x"}

@@ -171,14 +171,15 @@ pub enum ConditionMatch {
 /// Evaluate one condition three-valued.
 ///
 /// Returns [`ConditionMatch::Unresolvable`] when the key is unresolved and the
-/// context reports it as service-populated (case 3). Otherwise returns `Match`
-/// or `NoMatch` from the ordinary evaluation, so cases 1 and 2 are unchanged.
+/// context reports it as service-populated (case 3), and when a condition value
+/// reads such a key through a `${name}` policy variable, since the variable has
+/// no value to expand to. Otherwise returns `Match` or `NoMatch` from the
+/// ordinary evaluation, so cases 1 and 2 are unchanged.
 pub fn evaluate_condition_match(
     condition: &Condition,
     context: &impl ConditionContext,
 ) -> ConditionMatch {
-    if context.resolve_key(&condition.key).is_none() && context.is_unresolvable_key(&condition.key)
-    {
+    if is_unresolvable(&condition.key, context) || reads_unresolvable_variable(condition, context) {
         return ConditionMatch::Unresolvable;
     }
     if evaluate_condition(condition, context) {
@@ -186,6 +187,35 @@ pub fn evaluate_condition_match(
     } else {
         ConditionMatch::NoMatch
     }
+}
+
+/// Whether `key` is unresolved and the context reports it as one the service
+/// populates.
+fn is_unresolvable(key: &str, context: &impl ConditionContext) -> bool {
+    context.resolve_key(key).is_none() && context.is_unresolvable_key(key)
+}
+
+/// Whether a value of `condition` names, as a `${name}` policy variable, a key
+/// [`is_unresolvable`] reports.
+fn reads_unresolvable_variable(condition: &Condition, context: &impl ConditionContext) -> bool {
+    condition
+        .values
+        .iter()
+        .any(|value| policy_variable_names(value).any(|name| is_unresolvable(name, context)))
+}
+
+/// The names of the `${name}` policy variables in `value`, in the order
+/// [`expand_policy_variables`] reads them. A `${` with no closing brace names
+/// nothing, as it expands to itself.
+fn policy_variable_names(value: &str) -> impl Iterator<Item = &str> {
+    let mut rest = value;
+    std::iter::from_fn(move || {
+        let start = rest.find("${")?;
+        let after_start = &rest[start + 2..];
+        let end = after_start.find('}')?;
+        rest = &after_start[end + 1..];
+        Some(&after_start[..end])
+    })
 }
 
 /// Evaluate a statement's whole condition block (all conditions are ANDed).
