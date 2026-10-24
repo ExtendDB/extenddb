@@ -1070,11 +1070,23 @@ pub async fn rebuild_stuck_vector_indexes(
     // committing the catalog row, and a crash after a delete commits but before its
     // release. Without this they are permanent until a restart; with it they heal
     // within a minute. The age bound is what keeps a peer's just-taken hold safe.
-    let building: Vec<String> =
-        sqlx::query_scalar("SELECT index_id FROM vector_indexes WHERE index_status = 'CREATING'")
-            .fetch_all(&engine.pool)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+    //
+    // The live set spans both index families, because the holds table is shared.
+    // A GSI creation takes its hold in `vector_index_holds` through the same
+    // `take_hold`, and its CREATING row lives in the `indexes` catalog, not in
+    // `vector_indexes`. A GSI id left out of the live set would be swept the
+    // moment its backfill ran past the age bound, releasing the queue onto a
+    // half-built index. Carrying both families' CREATING ids here is the whole
+    // change: the hold machinery is already shared, so one live-set query covers
+    // it without a second holds table.
+    let building: Vec<String> = sqlx::query_scalar(
+        "SELECT index_id FROM vector_indexes WHERE index_status = 'CREATING' \
+         UNION \
+         SELECT index_id FROM indexes WHERE index_status = 'CREATING'",
+    )
+    .fetch_all(&engine.pool)
+    .await
+    .map_err(|e| StorageError::Internal(e.to_string()))?;
     sweep_orphan_holds(engine, &building).await?;
 
     let mut rebuilt = 0usize;

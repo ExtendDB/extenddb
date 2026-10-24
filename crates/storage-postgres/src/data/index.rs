@@ -50,6 +50,12 @@ pub(crate) struct IndexMeta {
     /// Per-GSI propagation delay in milliseconds. `None` means use system
     /// default. `Some(0)` means synchronous.
     pub(super) propagation_delay_ms: Option<i32>,
+    /// Catalog status of the index: `ACTIVE` once its backfill has committed,
+    /// `CREATING` while it is being built. A `CREATING` index must never take an
+    /// inline write: its backfill is scanning the base table under a hold that
+    /// pauses this table's propagation, so the write waits in the queue and is
+    /// applied after the backfill rather than racing it.
+    pub(super) index_status: String,
 }
 
 /// Both index families a write has to maintain, read in one catalog visit.
@@ -78,6 +84,19 @@ pub(crate) async fn fetch_write_path_indexes(
     Ok((indexes, vector_metas))
 }
 
+/// Columns of one `indexes` catalog row, in the order the write-path read
+/// selects them: `(index_id, index_name, index_type, key_schema, projection,
+/// propagation_delay_ms, index_status)`.
+type IndexMetaRow = (
+    String,
+    String,
+    String,
+    serde_json::Value,
+    serde_json::Value,
+    Option<i32>,
+    String,
+);
+
 /// Fetch all index metadata for a table from the catalog.
 pub(crate) async fn fetch_indexes_for_table<'e, E>(
     table_id: &str,
@@ -86,8 +105,8 @@ pub(crate) async fn fetch_indexes_for_table<'e, E>(
 where
     E: sqlx::PgExecutor<'e>,
 {
-    let rows: Vec<(String, String, String, serde_json::Value, serde_json::Value, Option<i32>)> = sqlx::query_as(
-        "SELECT index_id, index_name, index_type, key_schema, projection, propagation_delay_ms FROM indexes WHERE table_id = $1",
+    let rows: Vec<IndexMetaRow> = sqlx::query_as(
+        "SELECT index_id, index_name, index_type, key_schema, projection, propagation_delay_ms, index_status FROM indexes WHERE table_id = $1",
     )
     .bind(table_id)
     .fetch_all(executor)
@@ -95,20 +114,23 @@ where
     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
     rows.into_iter()
-        .map(|(id, index_name, idx_type, ks_json, proj_json, delay)| {
-            let key_schema: Vec<KeySchemaElement> = serde_json::from_value(ks_json)
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            let projection: Projection = serde_json::from_value(proj_json)
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            Ok(IndexMeta {
-                index_id: id,
-                index_name,
-                index_type: idx_type,
-                key_schema,
-                projection,
-                propagation_delay_ms: delay,
-            })
-        })
+        .map(
+            |(id, index_name, idx_type, ks_json, proj_json, delay, index_status)| {
+                let key_schema: Vec<KeySchemaElement> = serde_json::from_value(ks_json)
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                let projection: Projection = serde_json::from_value(proj_json)
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                Ok(IndexMeta {
+                    index_id: id,
+                    index_name,
+                    index_type: idx_type,
+                    key_schema,
+                    projection,
+                    propagation_delay_ms: delay,
+                    index_status,
+                })
+            },
+        )
         .collect()
 }
 
@@ -173,6 +195,58 @@ pub(super) fn effective_delay(idx: &IndexMeta, system_default: u64) -> u64 {
     }
 }
 
+/// Whether a secondary index's write maintenance is deferred to the propagation
+/// queue rather than applied in the writer's own transaction.
+///
+/// A GSI still being created is always deferred, whatever its configured delay:
+/// the creation holds this table's propagation until the backfill commits, so the
+/// write waits in the queue and is applied after the backfill instead of racing
+/// it, and it never touches an index data table that may not exist yet. Once the
+/// index is `ACTIVE`, a non-zero effective delay keeps it on the queue and a zero
+/// delay returns it to synchronous maintenance. LSIs are never deferred and are
+/// filtered by the caller.
+///
+/// A zero delay ACTIVE index is still deferred while rows for it remain in the
+/// queue. The backfill of a freshly created index leaves a backlog that drains
+/// after the flip to ACTIVE; a synchronous write applied inline during that
+/// window would write the newest image, and an older queued row drained after it
+/// would delete by base key and reinsert the stale image. Deferring the write to
+/// the queue while a backlog exists keeps per base key order across the queue to
+/// inline handover; once the backlog drains, maintenance returns to the inline
+/// path. The backlog probe runs only in the synchronous case, so the default
+/// non-zero delay never pays for it.
+pub(super) async fn gsi_defers_to_queue(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    idx: &IndexMeta,
+    system_default: u64,
+) -> Result<bool, StorageError> {
+    if idx.index_status != "ACTIVE" || effective_delay(idx, system_default) != 0 {
+        return Ok(true);
+    }
+    index_has_queued_rows(tx, &idx.index_id).await
+}
+
+/// Whether the propagation queue still holds a row targeting this index.
+///
+/// The index id is globally unique, so the row's own target id in the context is
+/// enough to match without the table id. A vector context carries no `index`
+/// member, so it never matches a GSI id.
+async fn index_has_queued_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    index_id: &str,
+) -> Result<bool, StorageError> {
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS( \
+             SELECT 1 FROM gsi_pending WHERE (index_context->'index'->>'index_id') = $1 \
+         )",
+    )
+    .bind(index_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|e| StorageError::Internal(e.to_string()))?;
+    Ok(exists)
+}
+
 /// Synchronously update index tables for indexes with zero propagation delay.
 ///
 /// Called within the same PG transaction as the base table write.
@@ -189,8 +263,8 @@ pub(crate) async fn sync_indexes(
     system_default_delay: u64,
 ) -> Result<(), StorageError> {
     for idx in indexes {
-        if idx.index_type != "LSI" && effective_delay(idx, system_default_delay) != 0 {
-            continue; // Async — handled after commit. LSIs are always synchronous.
+        if idx.index_type != "LSI" && gsi_defers_to_queue(tx, idx, system_default_delay).await? {
+            continue; // Async or still being created, handled by the queue. LSIs are always synchronous.
         }
         let idx_table = index_table_name(&idx.index_id);
         let idx_sks = all_sort_key_info(&idx.key_schema, attr_defs);
@@ -252,10 +326,13 @@ pub(crate) async fn enqueue_async_indexes(
         if idx.index_type == "LSI" {
             continue; // LSIs are always synchronous.
         }
-        let delay = effective_delay(idx, system_default_delay);
-        if delay == 0 {
-            continue; // Synchronous GSI — handled in-transaction by sync_indexes.
+        if !gsi_defers_to_queue(tx, idx, system_default_delay).await? {
+            continue; // Synchronous, ACTIVE GSI, handled in-transaction by sync_indexes.
         }
+        // A GSI still being created with a zero configured delay still needs a
+        // positive queue delay, so its row is ordered after any work already
+        // queued and is picked up once the creation releases this table's hold.
+        let delay = effective_delay(idx, system_default_delay).max(1);
         let context = GsiApplyContext {
             base_key_schema: key_info.key_schema.clone(),
             attribute_definitions: key_info.attribute_definitions.clone(),
@@ -360,6 +437,37 @@ pub(crate) async fn insert_index_row_multi(
     .await
 }
 
+/// Insert a backfilled index row, ignoring a primary-key conflict.
+///
+/// The backfill reads the base table under a frozen snapshot and is the only
+/// writer to the index table while the creation holds the table, so a conflict
+/// can only be the same base row seen twice; the row written is identical either
+/// way, so ignoring the conflict is correct and keeps a double read from failing
+/// the whole index creation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn insert_index_row_multi_ignore_conflict(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    idx_table: &str,
+    item: &Item,
+    projected: &Item,
+    index_ks: &[KeySchemaElement],
+    base_ks: &[KeySchemaElement],
+    idx_sks: &[(&str, ScalarAttributeType)],
+    base_sks: &[(&str, ScalarAttributeType)],
+) -> Result<(), StorageError> {
+    insert_index_rows_multi_inner(
+        tx,
+        idx_table,
+        &[(item, projected)],
+        index_ks,
+        base_ks,
+        idx_sks,
+        base_sks,
+        true,
+    )
+    .await
+}
+
 /// Insert rows into one index table in a single multi-row INSERT.
 ///
 /// Each row is `(item, projected)`: the item supplies the index and base key
@@ -378,6 +486,23 @@ pub(crate) async fn insert_index_rows_multi(
     base_ks: &[KeySchemaElement],
     idx_sks: &[(&str, ScalarAttributeType)],
     base_sks: &[(&str, ScalarAttributeType)],
+) -> Result<(), StorageError> {
+    insert_index_rows_multi_inner(
+        tx, idx_table, rows, index_ks, base_ks, idx_sks, base_sks, false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_index_rows_multi_inner(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    idx_table: &str,
+    rows: &[(&Item, &Item)],
+    index_ks: &[KeySchemaElement],
+    base_ks: &[KeySchemaElement],
+    idx_sks: &[(&str, ScalarAttributeType)],
+    base_sks: &[(&str, ScalarAttributeType)],
+    ignore_conflict: bool,
 ) -> Result<(), StorageError> {
     if rows.is_empty() {
         return Ok(());
@@ -404,8 +529,13 @@ pub(crate) async fn insert_index_rows_multi(
             format!("({})", ps.join(", "))
         })
         .collect();
+    let on_conflict = if ignore_conflict {
+        " ON CONFLICT DO NOTHING"
+    } else {
+        ""
+    };
     let sql = format!(
-        "INSERT INTO {idx_table} ({}) VALUES {}",
+        "INSERT INTO {idx_table} ({}) VALUES {}{on_conflict}",
         cols.join(", "),
         tuples.join(", ")
     );

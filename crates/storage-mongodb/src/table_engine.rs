@@ -382,6 +382,7 @@ impl MongoEngine {
                     index_name: gsi.index_name.clone(),
                     key_schema: gsi.key_schema.clone(),
                     projection: gsi.projection.clone(),
+                    backfilling: None,
                     index_status: index_status.to_string(),
                     provisioned_throughput: gsi.provisioned_throughput.as_ref().map(|pt| {
                         ProvisionedThroughputDescription {
@@ -1540,6 +1541,7 @@ impl MongoEngine {
                         index_name: idx_name,
                         key_schema: idx_key_schema,
                         projection: idx_projection,
+                        backfilling: None,
                         index_status: idx_doc
                             .get_str("index_status")
                             .unwrap_or("ACTIVE")

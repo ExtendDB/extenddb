@@ -4,7 +4,8 @@
 //! `update_table` implementation for `PostgresEngine`.
 
 use extenddb_core::types::{
-    AttributeDefinition, BillingMode, KeySchemaElement, TableDescription, UpdateTableInput,
+    AttributeDefinition, BillingMode, KeySchemaElement, Projection, TableDescription,
+    UpdateTableInput,
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::effective_attribute_definitions;
@@ -408,10 +409,17 @@ impl PostgresEngine {
         // Apply GSI updates (create/delete).
         let mut created_index_ids: Vec<String> = Vec::new();
         let mut deleted_index_ids: Vec<String> = Vec::new();
+        // Holds taken for GSIs this request creates, given back on every error
+        // path. Taken on the data database before the CREATING catalog row
+        // commits, a hold pauses this table's index propagation so a concurrent
+        // writer's maintenance for the new index waits in the queue until the
+        // backfill has committed.
+        let mut gsi_taken_holds: Vec<String> = Vec::new();
         // The merged and pruned attribute definitions persisted by this
         // UpdateTable, carried out of the catalog transaction so the post-commit
         // index DDL builds its columns from the same set the catalog now holds.
         let mut merged_attr_defs_for_ddl: Option<Vec<AttributeDefinition>> = None;
+        let gsi_catalog_result: Result<(), StorageError> = async {
         if let Some(updates) = &input.global_secondary_index_updates {
             for update in updates {
                 if let Some(create) = &update.create {
@@ -431,11 +439,19 @@ impl PostgresEngine {
                         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
                     let index_id = uuid::Uuid::new_v4().to_string();
+                    // Pause this table's propagation before the CREATING row
+                    // becomes visible, so a concurrent writer enqueues against an
+                    // index the queue already knows to hold back rather than
+                    // applying maintenance against a half-built index or dropping
+                    // it because the data table does not yet exist.
+                    crate::data::vector_index::take_hold(&self.data_pool, &table_id, &index_id)
+                        .await?;
+                    gsi_taken_holds.push(index_id.clone());
                     sqlx::query(
                         r"INSERT INTO indexes
                            (table_id, index_name, index_id, index_type, key_schema, projection,
                             index_status, provisioned_throughput)
-                           VALUES ($1, $2, $3, 'GSI', $4, $5, 'ACTIVE', $6)",
+                           VALUES ($1, $2, $3, 'GSI', $4, $5, 'CREATING', $6)",
                     )
                     .bind(&table_id)
                     .bind(&create.index_name)
@@ -448,8 +464,8 @@ impl PostgresEngine {
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
                     created_index_ids.push(index_id);
 
-                    // Create the index data table on the data pool (P54 Bug 1).
-                    // Catalog metadata is committed first; data DDL follows.
+                    // The index data table is created and backfilled after the
+                    // catalog commit; the catalog row stays CREATING until then.
                 }
 
                 if let Some(delete) = &update.delete {
@@ -537,6 +553,19 @@ impl PostgresEngine {
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
             }
             merged_attr_defs_for_ddl = Some(effective);
+        }
+            Ok(())
+        }
+        .await;
+        if let Err(e) = gsi_catalog_result {
+            release_taken_holds(
+                &self.data_pool,
+                &table_id,
+                &gsi_taken_holds,
+                &input.table_name,
+            )
+            .await;
+            return Err(e);
         }
 
         // Ids of the vector indexes this request deletes, so their data tables can
@@ -745,6 +774,13 @@ impl PostgresEngine {
         .await;
         if let Err(e) = vector_updates {
             release_taken_holds(&self.data_pool, &table_id, &taken_holds, &input.table_name).await;
+            release_taken_holds(
+                &self.data_pool,
+                &table_id,
+                &gsi_taken_holds,
+                &input.table_name,
+            )
+            .await;
             return Err(e);
         }
 
@@ -759,6 +795,13 @@ impl PostgresEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))
         {
             release_taken_holds(&self.data_pool, &table_id, &taken_holds, &input.table_name).await;
+            release_taken_holds(
+                &self.data_pool,
+                &table_id,
+                &gsi_taken_holds,
+                &input.table_name,
+            )
+            .await;
             return Err(e);
         }
 
@@ -783,10 +826,26 @@ impl PostgresEngine {
                 if let Some(create) = &update.create {
                     let idx_id = &created_index_ids[create_idx];
                     create_idx += 1;
+                    // Hold the per-index build lock for the whole backfill. A
+                    // runtime reconciler on this or another front-end takes the
+                    // same lock to decide whether a creation is still live, so a
+                    // held lock keeps it from rebuilding under an in-flight create.
+                    // The lock dies with this process, so a crash releases it and
+                    // the reconciler can then take over.
+                    let _build_owner =
+                        crate::data::vector_index::build_ownership(&self.data_pool, idx_id).await;
                     let data_result = async {
                         let mut data_tx = self
                             .data_pool
                             .begin()
+                            .await
+                            .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+                        // Freeze the backfill on one base-table snapshot, so paging
+                        // over it is stable while concurrent writers change the base
+                        // table. Set before any statement acquires a snapshot.
+                        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                            .execute(&mut *data_tx)
                             .await
                             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
@@ -834,8 +893,92 @@ impl PostgresEngine {
                         .bind(&create.index_name)
                         .execute(&self.pool)
                         .await;
+                        // Drop the half-built data table and give the hold back so
+                        // the table's propagation resumes. Rows queued for this
+                        // index find the table gone and are consumed by the worker.
+                        if let Ok(mut cleanup_tx) = self.data_pool.begin().await {
+                            let _ = Self::drop_index_data_table(&mut cleanup_tx, idx_id).await;
+                            let _ = cleanup_tx.commit().await;
+                        }
+                        let _ = crate::data::vector_index::release_hold(
+                            &self.data_pool,
+                            &table_id,
+                            idx_id,
+                        )
+                        .await;
                         return Err(e);
                     }
+
+                    // Drain the rows that queued for this index during the
+                    // backfill before the flip to ACTIVE. The hold still parks the
+                    // worker and still forces concurrent writes onto the queue, so
+                    // this applies the backlog in id order while no inline write
+                    // can run. After the flip a zero delay index maintains writes
+                    // inline, and a queued row drained then could land after a newer
+                    // inline write and reinsert a stale image.
+                    if let Err(e) = crate::gsi_queue::drain_index_pending_before_activation(
+                        &self.data_pool,
+                        &table_id,
+                        idx_id,
+                    )
+                    .await
+                    {
+                        tracing::error!(
+                            "Failed to drain the propagation queue for GSI '{}' on '{}', \
+                             cleaning up catalog: {e}",
+                            create.index_name,
+                            input.table_name,
+                        );
+                        let _ = sqlx::query(
+                            "DELETE FROM indexes WHERE table_id = $1 AND index_name = $2",
+                        )
+                        .bind(&table_id)
+                        .bind(&create.index_name)
+                        .execute(&self.pool)
+                        .await;
+                        if let Ok(mut cleanup_tx) = self.data_pool.begin().await {
+                            let _ = Self::drop_index_data_table(&mut cleanup_tx, idx_id).await;
+                            let _ = cleanup_tx.commit().await;
+                        }
+                        let _ = crate::data::vector_index::release_hold(
+                            &self.data_pool,
+                            &table_id,
+                            idx_id,
+                        )
+                        .await;
+                        return Err(e);
+                    }
+
+                    // The backfill committed: publish the index and resume
+                    // propagation. The catalog flips to ACTIVE, then the hold is
+                    // given back and the workers are woken to drain anything that
+                    // queued during the backfill. The hold is released whatever the
+                    // catalog update does, so a failed flip cannot leave the table's
+                    // propagation paused.
+                    let active_result = sqlx::query(
+                        "UPDATE indexes SET index_status = 'ACTIVE' \
+                         WHERE table_id = $1 AND index_name = $2",
+                    )
+                    .bind(&table_id)
+                    .bind(&create.index_name)
+                    .execute(&self.pool)
+                    .await;
+                    if let Err(release) =
+                        crate::data::vector_index::release_hold(&self.data_pool, &table_id, idx_id)
+                            .await
+                    {
+                        tracing::error!(
+                            "could not release the propagation hold after creating GSI '{}' on \
+                             '{}'; the table's index propagation stays paused until the orphan \
+                             sweep clears it: {release}",
+                            create.index_name,
+                            input.table_name,
+                        );
+                    }
+                    if let Some(ref q) = self.gsi_queue {
+                        q.notify_workers();
+                    }
+                    active_result.map_err(|e| StorageError::Internal(e.to_string()))?;
                 }
 
                 if update.delete.is_some() {
@@ -1093,5 +1236,188 @@ impl PostgresEngine {
             .await;
         });
         Ok(())
+    }
+}
+
+impl PostgresEngine {
+    /// Rebuild every GSI a crash left `CREATING`.
+    ///
+    /// A GSI creation commits a `CREATING` catalog row and takes the table's
+    /// propagation hold, then creates and backfills the index data table and flips
+    /// to `ACTIVE`. A crash between the catalog commit and the flip leaves the
+    /// index `CREATING` with a half built or missing data table: its name is
+    /// wedged, reads of it are refused, and writes to it defer to a queue that is
+    /// consumed and dropped against the missing table. Nothing else repairs it.
+    ///
+    /// This drops whatever the dead creation left, rebuilds the data table under a
+    /// fresh hold, drains the rows that queued while it was `CREATING`, flips it to
+    /// `ACTIVE` and releases the hold. It runs at startup, where no creation of
+    /// this process can be live, and from the runtime sweep. Ownership is taken per
+    /// index, so a live creation holds the same lock and is never rebuilt under it,
+    /// and peers starting together do not rebuild the same index. A rebuild that
+    /// fails leaves the index `CREATING` for the next pass rather than half done.
+    ///
+    /// Returns the number of indexes this process rebuilt.
+    pub async fn reconcile_incomplete_indexes(&self) -> Result<usize, StorageError> {
+        let rows: Vec<(
+            String,
+            String,
+            String,
+            serde_json::Value,
+            serde_json::Value,
+            serde_json::Value,
+            serde_json::Value,
+        )> = sqlx::query_as(
+            "SELECT i.index_id, i.table_id, i.index_name, i.key_schema, i.projection, \
+                    t.key_schema, t.attribute_definitions \
+             FROM indexes i JOIN tables t ON t.table_id = i.table_id \
+             WHERE i.index_type = 'GSI' AND i.index_status = 'CREATING' \
+             ORDER BY i.index_name",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        let mut rebuilt = 0usize;
+        for (index_id, table_id, index_name, idx_ks_json, proj_json, base_ks_json, base_ad_json) in
+            rows
+        {
+            // Ownership answers whether a creation is still running: a live create
+            // holds this lock for the whole backfill, and a crashed one released it
+            // when its connection died.
+            let Some(_owner) =
+                crate::data::vector_index::build_ownership(&self.data_pool, &index_id).await
+            else {
+                tracing::info!(
+                    index_id = %index_id,
+                    "GSI build is owned by another process; not rebuilding it here"
+                );
+                continue;
+            };
+
+            let idx_key_schema: Vec<KeySchemaElement> = serde_json::from_value(idx_ks_json)
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let projection: Projection = serde_json::from_value(proj_json)
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let base_key_schema: Vec<KeySchemaElement> = serde_json::from_value(base_ks_json)
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let base_attr_defs: Vec<AttributeDefinition> = serde_json::from_value(base_ad_json)
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+            // Re-take the hold rather than assume it: a crash may have happened
+            // either side of the original insert, and holding twice is harmless.
+            // The hold pauses the table's propagation so the worker does not drain
+            // onto the index while it is rebuilt.
+            if let Err(e) =
+                crate::data::vector_index::take_hold(&self.data_pool, &table_id, &index_id).await
+            {
+                tracing::error!("could not take the hold to rebuild GSI '{index_name}': {e}");
+                continue;
+            }
+
+            let rebuild = async {
+                let mut data_tx = self
+                    .data_pool
+                    .begin()
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                // Freeze the backfill on one base-table snapshot, set before any
+                // statement acquires one.
+                sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                    .execute(&mut *data_tx)
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                // Drop whatever the dead creation left, then build from scratch:
+                // rows already written would collide with the backfill's plain
+                // insert, so a rebuild is cleaner than a resume.
+                Self::drop_index_data_table(&mut data_tx, &index_id).await?;
+                Self::create_index_data_table(
+                    &mut data_tx,
+                    &index_id,
+                    &idx_key_schema,
+                    &base_attr_defs,
+                    &base_key_schema,
+                    &base_attr_defs,
+                )
+                .await?;
+                Self::backfill_gsi(
+                    &mut data_tx,
+                    &table_id,
+                    &index_id,
+                    &idx_key_schema,
+                    &base_attr_defs,
+                    &base_key_schema,
+                    &base_attr_defs,
+                    &projection,
+                )
+                .await?;
+                data_tx
+                    .commit()
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                Ok::<(), StorageError>(())
+            }
+            .await;
+
+            if let Err(e) = rebuild {
+                tracing::error!(
+                    "failed to rebuild incomplete GSI '{index_name}'; leaving it CREATING: {e}"
+                );
+                let _ =
+                    crate::data::vector_index::release_hold(&self.data_pool, &table_id, &index_id)
+                        .await;
+                continue;
+            }
+
+            // Drain the rows that queued while the index was CREATING before the
+            // flip, so a zero delay index does not race an inline write against an
+            // older queued row once it is ACTIVE.
+            if let Err(e) = crate::gsi_queue::drain_index_pending_before_activation(
+                &self.data_pool,
+                &table_id,
+                &index_id,
+            )
+            .await
+            {
+                tracing::error!(
+                    "failed to drain the queue while rebuilding GSI '{index_name}'; leaving it \
+                     CREATING: {e}"
+                );
+                let _ =
+                    crate::data::vector_index::release_hold(&self.data_pool, &table_id, &index_id)
+                        .await;
+                continue;
+            }
+
+            let flip = sqlx::query(
+                "UPDATE indexes SET index_status = 'ACTIVE' WHERE table_id = $1 AND index_id = $2",
+            )
+            .bind(&table_id)
+            .bind(&index_id)
+            .execute(&self.pool)
+            .await;
+            if let Err(release) =
+                crate::data::vector_index::release_hold(&self.data_pool, &table_id, &index_id).await
+            {
+                tracing::error!(
+                    "could not release the hold after rebuilding GSI '{index_name}': {release}"
+                );
+            }
+            if let Some(ref q) = self.gsi_queue {
+                q.notify_workers();
+            }
+            match flip {
+                Ok(_) => {
+                    rebuilt += 1;
+                    tracing::info!(
+                        "rebuilt an incomplete GSI '{index_name}' and flipped it ACTIVE"
+                    );
+                }
+                Err(e) => tracing::error!(
+                    "rebuilt GSI '{index_name}' data but failed to flip it ACTIVE: {e}"
+                ),
+            }
+        }
+        Ok(rebuilt)
     }
 }

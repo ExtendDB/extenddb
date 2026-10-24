@@ -202,6 +202,7 @@ impl SqliteEngine {
                     index_name: idx.index_name.clone(),
                     key_schema: ks,
                     projection: proj,
+                    backfilling: None,
                     index_status: idx.index_status,
                     provisioned_throughput: pt.or(Some(zero_throughput())),
                     index_size_bytes: 0,

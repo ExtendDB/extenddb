@@ -292,6 +292,16 @@ pub struct GsiDescription {
     pub projection: Projection,
     #[serde(rename = "IndexStatus")]
     pub index_status: String,
+    /// Whether the index is still being populated. Present and `true` while the
+    /// index is `CREATING` and its backfill runs; absent once the index is
+    /// `ACTIVE`, which matches the documented GSI behaviour, so `None` here
+    /// serialises as an absent member rather than `false`.
+    #[serde(
+        rename = "Backfilling",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub backfilling: Option<bool>,
     #[serde(
         rename = "ProvisionedThroughput",
         skip_serializing_if = "Option::is_none"

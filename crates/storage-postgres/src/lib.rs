@@ -768,6 +768,17 @@ fn server_components_factory(
             Err(e) => tracing::error!("Failed to reconcile incomplete vector indexes: {e}"),
         }
 
+        // Rebuild any GSI a crash left CREATING, before serving: such an index has
+        // a half built or missing data table, its reads are refused, and its
+        // writes defer to a queue that is dropped against the missing table.
+        match engine.reconcile_incomplete_indexes().await {
+            Ok(n) if n > 0 => {
+                tracing::info!("Reconciled {n} incomplete GSI(s) at startup");
+            }
+            Ok(_) => {}
+            Err(e) => tracing::error!("Failed to reconcile incomplete GSIs: {e}"),
+        }
+
         // Recover control plane transitions (ignore errors)
         match engine.process_control_plane_transitions().await {
             Ok(ref t) if t.is_empty() => {}
