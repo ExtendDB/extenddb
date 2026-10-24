@@ -46,11 +46,19 @@ impl ConditionContext for TestContext {
     fn is_multivalued_key(&self, key: &str) -> bool {
         // Mirror the real RequestContext classification so tests exercise the
         // production arity rule.
-        matches!(key, "dynamodb:LeadingKeys" | "dynamodb:Attributes")
+        matches!(
+            key,
+            "dynamodb:LeadingKeys" | "dynamodb:Attributes" | "aws:TagKeys"
+        )
     }
 
     fn is_unresolvable_key(&self, key: &str) -> bool {
         self.unresolvable.contains(key)
+    }
+
+    fn bare_negated_matches_absent_multivalued_key(&self, key: &str) -> bool {
+        // Mirror RequestContext: only aws:TagKeys takes IAM's absent-key answer.
+        key == "aws:TagKeys"
     }
 }
 

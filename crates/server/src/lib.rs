@@ -21,6 +21,7 @@ pub mod management;
 mod metrics_endpoint;
 pub mod rate_limit;
 mod request_helpers;
+mod request_tags;
 mod response;
 mod serve;
 mod throttle_helpers;

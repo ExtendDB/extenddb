@@ -375,17 +375,79 @@ fn for_any_value_string_not_equals_one_outside_set() {
 }
 
 #[test]
-fn bare_negative_op_multivalued_absent_no_match() {
-    // BR-7085 preserved: a bare negated operator on an ABSENT multivalued key
-    // still never matches. The negated-absent rule is scoped to single-valued
-    // keys; multivalued keys require ForAllValues/ForAnyValue.
+fn bare_negated_op_absent_tagkeys_matches() {
+    // A bare negated operator on an ABSENT aws:TagKeys matches, as on an
+    // absent single-valued key. Measured on IAM with simulate-custom-policy on
+    // 2026-10-24: a Deny carrying a bare StringNotEquals,
+    // StringNotEqualsIgnoreCase or StringNotLike on the key fires when the key
+    // is absent, and an Allow gated the same way grants. ExtendDB populates
+    // aws:TagKeys on exactly the operations the service does, so its absence
+    // is the service's absence and IAM's answer applies.
     let ctx = TestContext::new();
-    assert!(!evaluate_condition(
-        &cond(
-            ConditionOperator::StringNotEquals,
-            "dynamodb:Attributes",
-            vec!["ssn"]
+    for op in [
+        ConditionOperator::StringNotEquals,
+        ConditionOperator::StringNotEqualsIgnoreCase,
+        ConditionOperator::StringNotLike,
+    ] {
+        assert!(
+            evaluate_condition(&cond(op, "aws:TagKeys", vec!["secret"]), &ctx),
+            "a bare negated operator on absent aws:TagKeys matches, as on IAM"
+        );
+    }
+    assert!(
+        !evaluate_condition(
+            &cond(
+                ConditionOperator::StringEquals,
+                "aws:TagKeys",
+                vec!["secret"]
+            ),
+            &ctx
         ),
-        &ctx
-    ));
+        "a bare positive operator on absent aws:TagKeys does not match"
+    );
+}
+
+#[test]
+fn bare_negated_op_absent_dynamodb_keys_do_not_match() {
+    // IAM matches a bare negated operator on absent dynamodb:Attributes and
+    // dynamodb:LeadingKeys too, but ExtendDB leaves both absent on requests
+    // where the service populates them (Attributes on writes, AttributesToGet
+    // reads and batch and transaction targets; LeadingKeys on query shapes the
+    // extractor cannot pin). Matching there would grant an Allow the service
+    // refuses for the present key, so for these two keys an absent key keeps
+    // the no-match rule (BR-7085).
+    let ctx = TestContext::new();
+    for key in ["dynamodb:Attributes", "dynamodb:LeadingKeys"] {
+        for op in [
+            ConditionOperator::StringNotEquals,
+            ConditionOperator::StringNotEqualsIgnoreCase,
+            ConditionOperator::StringNotLike,
+            ConditionOperator::StringEquals,
+        ] {
+            assert!(
+                !evaluate_condition(&cond(op, key, vec!["ssn"]), &ctx),
+                "a bare operator on absent {key} does not match"
+            );
+        }
+    }
+}
+
+#[test]
+fn bare_op_multivalued_present_never_matches() {
+    // BR-7085, measured again on IAM 2026-10-24: with the key PRESENT, neither
+    // a bare positive nor a bare negative operator matches. The author must
+    // qualify with ForAllValues or ForAnyValue.
+    for key in ["dynamodb:Attributes", "dynamodb:LeadingKeys", "aws:TagKeys"] {
+        let ctx = TestContext::new().with(key, vec!["colour"]);
+        for op in [
+            ConditionOperator::StringEquals,
+            ConditionOperator::StringNotEquals,
+            ConditionOperator::StringNotEqualsIgnoreCase,
+        ] {
+            assert!(
+                !evaluate_condition(&cond(op, key, vec!["ssn"]), &ctx),
+                "a bare operator on present {key} does not match"
+            );
+        }
+    }
 }

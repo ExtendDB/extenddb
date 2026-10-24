@@ -18,9 +18,13 @@ use super::matcher::wildcard_match;
 /// - Base (bare) operators on a **single-valued** key: key must be present and
 ///   its value must match at least one policy value.
 /// - Base (bare) operators on a **multivalued** key (`dynamodb:Attributes`,
-///   `dynamodb:LeadingKeys`): never match. AWS IAM requires a
-///   `ForAllValues:`/`ForAnyValue:` qualifier for multivalued keys; a bare
-///   operator on such a key is a no-op regardless of value count (BR-7085).
+///   `dynamodb:LeadingKeys`, `aws:TagKeys`): never match while the key is
+///   present. AWS IAM requires a `ForAllValues:`/`ForAnyValue:` qualifier for
+///   multivalued keys; a bare operator on a present multivalued key is a no-op
+///   regardless of value count (BR-7085). A bare NEGATED operator on an
+///   **absent** multivalued key matches on IAM; here it matches only when the
+///   context's `bare_negated_matches_absent_multivalued_key` says so for the
+///   key, which the `DynamoDB` request context does for `aws:TagKeys` alone.
 /// - `IfExists`: passes if the key is absent; otherwise evaluates as the base
 ///   operator (and so never matches a present multivalued key).
 /// - `Null`: checks key presence/absence.
@@ -109,18 +113,32 @@ pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext
             Some(vals) => evaluate_single_value_condition(inner, &vals, &expanded_values),
         },
         other => match context_values {
-            // A negated operator on an absent single-valued key evaluates true
-            // in AWS IAM: the key has no value, so it cannot equal the policy
-            // value, so "not equals" holds. This makes a Deny gated on
-            // StringNotEquals apply when the caller omits the key (the
-            // confused-deputy guard). Measured on live IAM/STS and DynamoDB.
-            // Bare operators on multivalued keys
-            // never match, present or absent (BR-7085), so the rule is scoped
-            // to single-valued keys.
-            None => is_negative_operator(other) && !is_multivalued,
-            // Bare operator on a multivalued key never matches (BR-7085). This is
-            // fail-safe: a bare Deny becomes a no-op (matching AWS, which forces the
-            // author to use ForAnyValue:), and a bare Allow allowlist stops granting.
+            // A negated operator on an absent key evaluates true in AWS IAM:
+            // the key has no value, so it cannot equal the policy value, so
+            // "not equals" holds. This makes a Deny gated on StringNotEquals
+            // apply when the caller omits the key (the confused-deputy guard).
+            // Measured on live IAM/STS and DynamoDB for single-valued keys, and
+            // on IAM for the absent multivalued keys `aws:TagKeys`,
+            // `dynamodb:LeadingKeys` and `dynamodb:Attributes`. For a
+            // multivalued key the context decides whether that answer applies:
+            // it is right only where ExtendDB leaves the key absent on the same
+            // requests the service does. ExtendDB leaves `dynamodb:Attributes`
+            // absent on writes, on `AttributesToGet` reads and on batch and
+            // transaction targets, and `dynamodb:LeadingKeys` absent on query
+            // shapes it cannot pin to a partition value, where the service
+            // populates them; matching there would grant an Allow the service
+            // refuses, so those keys keep the no-match rule. `aws:TagKeys` is
+            // populated on exactly the three operations the service reference
+            // lists it for, so its absent-key answer is IAM's.
+            None => {
+                is_negative_operator(other)
+                    && (!is_multivalued
+                        || context.bare_negated_matches_absent_multivalued_key(&condition.key))
+            }
+            // Bare operator on a present multivalued key never matches
+            // (BR-7085). This is fail-safe: a bare Deny becomes a no-op
+            // (matching AWS, which forces the author to use ForAnyValue:), and a
+            // bare Allow allowlist stops granting.
             Some(_) if is_multivalued => false,
             Some(vals) => evaluate_single_value_condition(other, &vals, &expanded_values),
         },
@@ -153,14 +171,15 @@ pub enum ConditionMatch {
 /// Evaluate one condition three-valued.
 ///
 /// Returns [`ConditionMatch::Unresolvable`] when the key is unresolved and the
-/// context reports it as service-populated (case 3). Otherwise returns `Match`
-/// or `NoMatch` from the ordinary evaluation, so cases 1 and 2 are unchanged.
+/// context reports it as service-populated (case 3), and when a condition value
+/// reads such a key through a `${name}` policy variable, since the variable has
+/// no value to expand to. Otherwise returns `Match` or `NoMatch` from the
+/// ordinary evaluation, so cases 1 and 2 are unchanged.
 pub fn evaluate_condition_match(
     condition: &Condition,
     context: &impl ConditionContext,
 ) -> ConditionMatch {
-    if context.resolve_key(&condition.key).is_none() && context.is_unresolvable_key(&condition.key)
-    {
+    if is_unresolvable(&condition.key, context) || reads_unresolvable_variable(condition, context) {
         return ConditionMatch::Unresolvable;
     }
     if evaluate_condition(condition, context) {
@@ -168,6 +187,35 @@ pub fn evaluate_condition_match(
     } else {
         ConditionMatch::NoMatch
     }
+}
+
+/// Whether `key` is unresolved and the context reports it as one the service
+/// populates.
+fn is_unresolvable(key: &str, context: &impl ConditionContext) -> bool {
+    context.resolve_key(key).is_none() && context.is_unresolvable_key(key)
+}
+
+/// Whether a value of `condition` names, as a `${name}` policy variable, a key
+/// [`is_unresolvable`] reports.
+fn reads_unresolvable_variable(condition: &Condition, context: &impl ConditionContext) -> bool {
+    condition
+        .values
+        .iter()
+        .any(|value| policy_variable_names(value).any(|name| is_unresolvable(name, context)))
+}
+
+/// The names of the `${name}` policy variables in `value`, in the order
+/// [`expand_policy_variables`] reads them. A `${` with no closing brace names
+/// nothing, as it expands to itself.
+fn policy_variable_names(value: &str) -> impl Iterator<Item = &str> {
+    let mut rest = value;
+    std::iter::from_fn(move || {
+        let start = rest.find("${")?;
+        let after_start = &rest[start + 2..];
+        let end = after_start.find('}')?;
+        rest = &after_start[end + 1..];
+        Some(&after_start[..end])
+    })
 }
 
 /// Evaluate a statement's whole condition block (all conditions are ANDed).
