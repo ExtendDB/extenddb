@@ -213,6 +213,7 @@ fn described(request: &RestoreRequest) -> TableDescription {
                     index_size_bytes: 0,
                     item_count: 0,
                     index_arn: String::new(),
+                    backfilling: None,
                 })
                 .collect()
         }),
