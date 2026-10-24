@@ -568,6 +568,18 @@ class TestExplicitDenyOnResourceArn:
                 lambda: d.tag_resource(ResourceArn=arn, Tags=[{"Key": "k", "Value": "v"}]))
             assert msg == "Access is denied", msg
 
+    def test_tag_cross_account_index_and_backup_arns_are_access_denied(self, table):
+        # Measured on DynamoDB 2026-10-24 (admin): another account's index or
+        # backup ARN answers "Access is denied", not the shape ValidationException
+        # the same ARN in this account gets.
+        region = table["table_arn"].split(":")[3]
+        base = f"arn:aws:dynamodb:{region}:111122223333:table/{table['name']}"
+        d = self._ddb(ALLOW_ALL)
+        for arn in (f"{base}/index/gsi1", f"{base}/backup/01700000000000-aaaaaaaa"):
+            msg = self._denial_message(
+                lambda a=arn: d.tag_resource(ResourceArn=a, Tags=[{"Key": "k", "Value": "v"}]))
+            assert msg == "Access is denied", (arn, msg)
+
     def test_get_item_table_arn_in_tablename_denial_names_table_arn(self, table):
         # Measured on DynamoDB 2026-10-20 (resource-probe GetItem_tableArnInTableName).
         noperm = {"Version": "2012-10-17", "Statement": [

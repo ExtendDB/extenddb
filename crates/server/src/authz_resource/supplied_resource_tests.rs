@@ -133,6 +133,29 @@ fn other_arn_fields_keep_the_supplied_spelling() {
     assert_eq!((t.resource.as_str(), t.supplied.as_str()), (CANON, CANON));
 }
 
+/// An ARN in TableName that is not a table resource ARN (an index ARN, a
+/// malformed resource) names the canonical index ARN on an index query, so
+/// the denial never names a resource the caller did not write.
+#[test]
+fn index_query_with_a_non_table_arn_names_the_canonical_index_arn() {
+    for table_name in [
+        "arn:aws:dynamodb:us-east-1:964157134968:table/bb-arn-main/index/gsi1",
+        "arn:aws:dynamodb:us-east-1:964157134968:TABLE/bb-arn-main",
+        "arn:aws:dynamodb:us-east-1:964157134968:table/x/table/bb-arn-main",
+        "arn:aws:dynamodb:us-east-1:964157134968:banana/x",
+    ] {
+        for op in ["Query", "Scan"] {
+            let t = single(op, json!({ "TableName": table_name, "IndexName": "gsi1" }));
+            assert!(
+                !t.supplied.contains("/index/gsi1/index/"),
+                "{op} {table_name}: {}",
+                t.supplied
+            );
+            assert_eq!(t.supplied, t.resource, "{op} {table_name}");
+        }
+    }
+}
+
 /// A table or stream ARN in another account is "Access is denied" for every
 /// principal (measured 2026-10-20 with an admin and a no-policy caller);
 /// anything else passes to authorization.

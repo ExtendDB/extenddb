@@ -93,11 +93,11 @@ impl AuthzTarget {
         }
     }
 
-    /// A target derived from request field `field`: when the field holds an
-    /// ARN, the denial names it as written; otherwise it names the canonical
-    /// ARN.
+    /// A target derived from request field `field`: when the field parses as
+    /// a `DynamoDB` resource ARN, the denial names it as written; otherwise
+    /// it names `resource`.
     fn from_field(action: &str, resource: String, field: &str) -> Self {
-        let supplied = if field.starts_with("arn:") {
+        let supplied = if extenddb_core::arn::parse(field).is_some() {
             field.to_owned()
         } else {
             resource.clone()
@@ -660,15 +660,27 @@ pub(crate) fn authz_targets(
             v
         }
         // Query and Scan on an index authorize the index ARN. With a table ARN
-        // in TableName the denial names that ARN with the index appended.
+        // in TableName the denial names that ARN with the index appended; any
+        // other ARN in TableName (an index ARN, a malformed resource) names
+        // the canonical index ARN, so the denial never names a resource the
+        // caller did not write.
         "Query" | "Scan" => {
             let base = table_resource_arn(&table_name, region, account_id);
             match str_field(input, "IndexName") {
                 Some(idx) if !idx.is_empty() => {
-                    let mut t = AuthzTarget::from_field(operation, base, &table_name);
-                    t.resource = format!("{}/index/{idx}", t.resource);
-                    t.supplied = format!("{}/index/{idx}", t.supplied);
-                    vec![t]
+                    let resource = format!("{base}/index/{idx}");
+                    let names_a_table =
+                        extenddb_core::arn::parse(&table_name).is_some_and(|r| r.sub.is_none());
+                    let supplied = if names_a_table {
+                        format!("{table_name}/index/{idx}")
+                    } else {
+                        resource.clone()
+                    };
+                    vec![AuthzTarget {
+                        action: operation.to_owned(),
+                        resource,
+                        supplied,
+                    }]
                 }
                 _ => from(base, &table_name),
             }
