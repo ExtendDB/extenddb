@@ -51,3 +51,7 @@ libc = { workspace = true }
 
 [dev-dependencies]
 extenddb-cache = { workspace = true, features = ["test-util"] }
+# Test-only: an in-memory StorageEngine with a bootstrapped catalog, so the
+# handler tests can drive a table through its own throttle path. A workspace
+# crate, dev-only, absent from the shipped binary.
+extenddb-storage-sqlite = { workspace = true }

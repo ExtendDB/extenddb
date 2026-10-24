@@ -1364,6 +1364,7 @@ dependencies = [
  "extenddb-core",
  "extenddb-engine",
  "extenddb-storage",
+ "extenddb-storage-sqlite",
  "futures",
  "hyper",
  "libc",

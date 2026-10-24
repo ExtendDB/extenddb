@@ -6,6 +6,50 @@ pub use messages::{ErrorMessageKey, error_message, validation_error, validation_
 
 use crate::types::{CancellationReason, Item};
 
+/// One entry of the reasons list the service returns on a throttle error.
+/// Measured against Amazon DynamoDB on 2026-10-20 (435 raw throttle bodies,
+/// one Region) and 2026-10-24 (9,622, two Regions): every reasons list that
+/// was present carried exactly one entry of this shape.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ThrottlingReason {
+    /// `ResourceType + OperationType + LimitType`, for example
+    /// `TableWriteProvisionedThroughputExceeded` or
+    /// `IndexReadProvisionedThroughputExceeded`.
+    pub reason: String,
+    /// The table or index ARN, the string `DescribeTable` returns as
+    /// `TableArn` or `IndexArn`.
+    pub resource: String,
+}
+
+/// The `ProvisionedThroughputExceededException` message the service sends
+/// when a table's own provisioned capacity is exceeded, on every read and
+/// write operation, and on a hot key or an index read of a provisioned
+/// table. Measured 2026-10-20 (424 of 424: 423 writes on the table's own
+/// capacity and one hot-key write) and 2026-10-24 (1,538 read throttles on
+/// the table's own capacity, 648 index reads and 162 writes in a second
+/// Region, all carrying this text; the 104 index-write bodies of that run
+/// carry a different message naming global secondary indexes, which the
+/// server does not model). Trailing period.
+pub const PROVISIONED_THROUGHPUT_EXCEEDED_MESSAGE: &str = "The level of configured provisioned throughput for the table was exceeded. Consider increasing your provisioning level with the UpdateTable API.";
+
+/// The `ThrottlingException` message the service sends on an on-demand table
+/// whose partition is hot. Measured 2026-10-20 (11 of 11) and 2026-10-24
+/// (7,070 of 7,070, two Regions). No trailing period.
+pub const THROTTLING_EXCEPTION_MESSAGE: &str = "Throughput exceeds the current capacity of your table or index. DynamoDB is automatically scaling your table or index so please try again shortly. If exceptions persist, check if you have a hot key: https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-partition-key-design.html";
+
+/// The `ThrottlingException` message the service sends when an on-demand
+/// table reaches the `OnDemandThroughput` caps set on it. Measured
+/// 2026-10-24 (100 of 100: 52 `Query` reads, 48 `BatchWriteItem` writes). No
+/// trailing period.
+pub const MAX_ON_DEMAND_THROUGHPUT_MESSAGE: &str =
+    "Throughput exceeds the maximum OnDemandThroughput configured on table or index";
+
+/// `RequestLimitExceeded` wording. The API Reference (PutItem Errors, read
+/// 2026-10-20) describes the error as throughput exceeding the account's
+/// quota and points at Support for an increase; the wire `message` field has
+/// not been measured, so this text is the documented description.
+pub const REQUEST_LIMIT_EXCEEDED_MESSAGE: &str = "Throughput exceeds the current throughput quota for your account. Please contact Amazon Web Services Support to request a quota increase.";
+
 /// All Virtual `DynamoDB` error types with HTTP status codes.
 ///
 /// REQ-ERR-001 through REQ-ERR-004: error JSON format, status codes, and SDK retry behavior.
@@ -94,15 +138,42 @@ pub enum DynamoDbError {
     /// SP-ERR-002: Concurrent modification of the same item in a transaction.
     #[error("{0}")]
     TransactionConflictException(String),
-    /// SP-ERR-002: Throughput exceeded.
-    #[error("{0}")]
-    ProvisionedThroughputExceededException(String),
-    /// SP-ERR-002: General throttling.
-    #[error("{0}")]
-    ThrottlingException(String),
-    /// SP-ERR-002: Per-account RPS cap.
-    #[error("{0}")]
-    RequestLimitExceeded(String),
+    /// SP-ERR-002: Throughput exceeded. HTTP 400. The reasons list is
+    /// rendered as `ThrottlingReasons` (capital T, measured 2026-10-20 and
+    /// 2026-10-24) and omitted when empty.
+    #[error("{message}")]
+    ProvisionedThroughputExceededException {
+        /// Human-readable message; the service's text for a table's own
+        /// capacity is [`PROVISIONED_THROUGHPUT_EXCEEDED_MESSAGE`].
+        message: String,
+        /// One entry per throttled resource.
+        reasons: Vec<ThrottlingReason>,
+    },
+    /// SP-ERR-002: General throttling. HTTP 400. The `__type` namespace is
+    /// `com.amazon.coral.availability#` and the reasons list is rendered as
+    /// `throttlingReasons` (lower t), both measured 2026-10-20 and
+    /// 2026-10-24. The list is omitted when empty, which is what the service
+    /// sends for a hot-key read on an on-demand table (5,615 of 5,615).
+    #[error("{message}")]
+    ThrottlingException {
+        /// Human-readable message; [`THROTTLING_EXCEPTION_MESSAGE`] for a hot
+        /// key, [`MAX_ON_DEMAND_THROUGHPUT_MESSAGE`] at the table's caps.
+        message: String,
+        /// One entry per throttled resource.
+        reasons: Vec<ThrottlingReason>,
+    },
+    /// SP-ERR-002: Per-account throughput quota. HTTP 400. The API Reference
+    /// documents a `ThrottlingReasons` member on this error (PutItem Errors,
+    /// read 2026-10-20); rendered with that casing and omitted when empty.
+    /// Not measured: the probes did not reach an account quota.
+    #[error("{message}")]
+    RequestLimitExceeded {
+        /// Human-readable message; [`REQUEST_LIMIT_EXCEEDED_MESSAGE`] is the
+        /// documented wording.
+        message: String,
+        /// One entry per throttled resource.
+        reasons: Vec<ThrottlingReason>,
+    },
     /// SP-ERR-002 / SP-WIRE-007: Request body exceeds 16 MB. HTTP 413.
     #[error("{0}")]
     RequestEntityTooLargeException(String),
@@ -147,9 +218,9 @@ impl DynamoDbError {
             | Self::ExpiredTokenException(_)
             | Self::ExpiredIteratorException(_)
             | Self::TransactionConflictException(_)
-            | Self::ProvisionedThroughputExceededException(_)
-            | Self::ThrottlingException(_)
-            | Self::RequestLimitExceeded(_)
+            | Self::ProvisionedThroughputExceededException { .. }
+            | Self::ThrottlingException { .. }
+            | Self::RequestLimitExceeded { .. }
             | Self::MalformedHttpRequestException(_)
             | Self::TransactionInProgressException(_)
             | Self::ItemCollectionSizeLimitExceededException(_)
@@ -198,11 +269,11 @@ impl DynamoDbError {
             Self::ExpiredIteratorException(_) => "ExpiredIteratorException",
             Self::ServiceUnavailable(_) => "ServiceUnavailable",
             Self::TransactionConflictException(_) => "TransactionConflictException",
-            Self::ProvisionedThroughputExceededException(_) => {
+            Self::ProvisionedThroughputExceededException { .. } => {
                 "ProvisionedThroughputExceededException"
             }
-            Self::ThrottlingException(_) => "ThrottlingException",
-            Self::RequestLimitExceeded(_) => "RequestLimitExceeded",
+            Self::ThrottlingException { .. } => "ThrottlingException",
+            Self::RequestLimitExceeded { .. } => "RequestLimitExceeded",
             Self::RequestEntityTooLargeException(_) => "RequestEntityTooLargeException",
             Self::MalformedHttpRequestException(_) => "MalformedHttpRequestException",
             Self::TransactionInProgressException(_) => "TransactionInProgressException",
@@ -224,9 +295,12 @@ impl DynamoDbError {
     ///   (`SerializationException`, `UnknownOperationException`,
     ///   `MissingAuthenticationToken`, `IncompleteSignature`,
     ///   `InvalidSignatureException`)
+    /// - `ThrottlingException` → `com.amazon.coral.availability#` (measured
+    ///   2026-10-20, 11 of 11, and 2026-10-24, 7,170 of 7,170 on-demand
+    ///   throttles)
     /// - All other `DynamoDB` errors → `com.amazonaws.dynamodb.v20120810#`
     ///
-    /// Verified against real `DynamoDB` 2026-05-04.
+    /// Verified against the service 2026-05-04 and 2026-10-24.
     #[must_use]
     pub fn full_error_type(&self) -> String {
         let prefix = match self {
@@ -236,6 +310,7 @@ impl DynamoDbError {
             | Self::MissingAuthenticationToken(_)
             | Self::IncompleteSignature(_)
             | Self::InvalidSignatureException(_) => "com.amazon.coral.service#",
+            Self::ThrottlingException { .. } => "com.amazon.coral.availability#",
             _ => "com.amazonaws.dynamodb.v20120810#",
         };
         format!("{prefix}{}", self.error_type())
@@ -267,9 +342,9 @@ impl DynamoDbError {
             | Self::ExpiredIteratorException(m)
             | Self::ServiceUnavailable(m)
             | Self::TransactionConflictException(m)
-            | Self::ProvisionedThroughputExceededException(m)
-            | Self::ThrottlingException(m)
-            | Self::RequestLimitExceeded(m)
+            | Self::ProvisionedThroughputExceededException { message: m, .. }
+            | Self::ThrottlingException { message: m, .. }
+            | Self::RequestLimitExceeded { message: m, .. }
             | Self::RequestEntityTooLargeException(m)
             | Self::MalformedHttpRequestException(m)
             | Self::TransactionInProgressException(m)
@@ -300,6 +375,58 @@ impl DynamoDbError {
             Self::ConditionalCheckFailedException(_, item) => item.as_ref(),
             _ => None,
         }
+    }
+
+    /// A `ProvisionedThroughputExceededException` carrying `reasons`.
+    #[must_use]
+    pub fn provisioned_throughput_exceeded(
+        message: impl Into<String>,
+        reasons: Vec<ThrottlingReason>,
+    ) -> Self {
+        Self::ProvisionedThroughputExceededException {
+            message: message.into(),
+            reasons,
+        }
+    }
+
+    /// A `ThrottlingException` carrying `reasons`.
+    #[must_use]
+    pub fn throttling(message: impl Into<String>, reasons: Vec<ThrottlingReason>) -> Self {
+        Self::ThrottlingException {
+            message: message.into(),
+            reasons,
+        }
+    }
+
+    /// A `RequestLimitExceeded` carrying `reasons`.
+    #[must_use]
+    pub fn request_limit_exceeded(
+        message: impl Into<String>,
+        reasons: Vec<ThrottlingReason>,
+    ) -> Self {
+        Self::RequestLimitExceeded {
+            message: message.into(),
+            reasons,
+        }
+    }
+
+    /// For the three throttle errors (`ProvisionedThroughputExceededException`,
+    /// `ThrottlingException`, `RequestLimitExceeded`), the per-resource
+    /// reasons, possibly empty; `None` for every other variant.
+    #[must_use]
+    pub fn throttling_reasons(&self) -> Option<&[ThrottlingReason]> {
+        match self {
+            Self::ProvisionedThroughputExceededException { reasons, .. }
+            | Self::ThrottlingException { reasons, .. }
+            | Self::RequestLimitExceeded { reasons, .. } => Some(reasons),
+            _ => None,
+        }
+    }
+
+    /// Whether this error is one of the three throttle errors.
+    #[must_use]
+    pub fn is_throttle(&self) -> bool {
+        self.throttling_reasons().is_some()
     }
 }
 
@@ -336,14 +463,17 @@ mod tests {
                 400,
             ),
             (
-                DynamoDbError::ProvisionedThroughputExceededException(String::new()),
+                DynamoDbError::provisioned_throughput_exceeded(String::new(), vec![]),
                 400,
             ),
             (
                 DynamoDbError::RequestEntityTooLargeException(String::new()),
                 413,
             ),
-            (DynamoDbError::RequestLimitExceeded(String::new()), 400),
+            (
+                DynamoDbError::request_limit_exceeded(String::new(), vec![]),
+                400,
+            ),
             (DynamoDbError::RequestTimeoutException(String::new()), 408),
             (DynamoDbError::ResourceInUseException(String::new()), 400),
             (
@@ -355,7 +485,7 @@ mod tests {
             (DynamoDbError::BackupInUseException(String::new()), 400),
             (DynamoDbError::SerializationException(String::new()), 400),
             (DynamoDbError::ServiceUnavailable(String::new()), 503),
-            (DynamoDbError::ThrottlingException(String::new()), 400),
+            (DynamoDbError::throttling(String::new(), vec![]), 400),
             (
                 DynamoDbError::TransactionCanceledException {
                     message: String::new(),
@@ -402,3 +532,6 @@ mod tests {
         assert_eq!(err.message(), "Table already exists: t");
     }
 }
+
+#[cfg(test)]
+mod throttle_tests;
