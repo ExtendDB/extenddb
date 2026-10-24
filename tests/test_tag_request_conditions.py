@@ -330,6 +330,32 @@ class TestTagRequestConditions:
             Tags=[{"Key": "env", "Value": "dev"}, {"Key": "env", "Value": "prod"}],
         )
 
+    def test_request_tag_case_variant_keys_with_differing_values_are_refused(self):
+        # The engine stores Env=prod and env=dev as two tags
+        # (probes/records/P19-2.out), so a request naming the tag under two
+        # spellings with differing values has no single value for
+        # aws:RequestTag/env. The key then fails closed: the Deny blocks in
+        # either order and nothing is stored. IAM refuses a simulated context of
+        # this shape, so the service's own answer for it is unmeasured.
+        client, _ = self._restricted(_deny({"StringEquals": {"aws:RequestTag/env": "prod"}}))
+        for tags in (
+            [{"Key": "Env", "Value": "prod"}, {"Key": "env", "Value": "dev"}],
+            [{"Key": "env", "Value": "dev"}, {"Key": "Env", "Value": "prod"}],
+        ):
+            self._assert_denied(client.tag_resource, ResourceArn=self.arn, Tags=tags)
+            assert self._stored_tags() == {}, "a refused request stores neither spelling"
+        # The same two spellings carrying one value read as that value.
+        self._assert_denied(
+            client.tag_resource,
+            ResourceArn=self.arn,
+            Tags=[{"Key": "Env", "Value": "prod"}, {"Key": "ENV", "Value": "prod"}],
+        )
+        client.tag_resource(
+            ResourceArn=self.arn,
+            Tags=[{"Key": "Env", "Value": "dev"}, {"Key": "ENV", "Value": "dev"}],
+        )
+        assert self._stored_tags() == {"Env": "dev", "ENV": "dev"}
+
     def test_request_tag_negated_deny_refuses_a_request_without_the_key(self):
         # B19-1 B-deny-StringNotEquals-ctx-absent: explicitDeny. The absent-key
         # rule for a negated operator on a single-valued key.
