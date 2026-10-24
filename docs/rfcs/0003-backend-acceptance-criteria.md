@@ -125,7 +125,7 @@ If implementing pushdown, numeric comparisons must be numeric (not string-lexico
 
 **9.1. No silent degradation.** If an operation cannot be performed correctly, the backend must return an error, never silently drop side-effects (stream records, index updates), return partial results without a `LastEvaluatedKey`, or succeed while leaving inconsistent state.
 
-**9.2. DynamoDB error codes.** Client-visible errors must use DynamoDB-compatible error codes and HTTP status codes. Internal storage errors (connection failures, type mismatches) must map to appropriate DynamoDB errors, typically `InternalServerError` (500) with retry semantics, or `ValidationException` (400) for input problems. Backend-specific error codes must never leak to clients.
+**9.2. DynamoDB error codes.** Client-visible errors must use DynamoDB-compatible error codes and HTTP status codes. Internal storage errors (connection failures, type mismatches) must map to appropriate DynamoDB errors, typically `InternalServerError` (500) with retry semantics, or `ValidationException` (400) for input problems. Backend-specific error codes must never leak to clients. A backend that returns `StorageError::Service` is responsible for the message it carries: the engine passes that error to the client with its message unchanged and does not redact it, so the message must be service-shaped text with no driver output, host names, connection strings or credentials.
 
 ### 10. Operational Correctness
 

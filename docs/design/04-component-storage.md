@@ -334,8 +334,21 @@ Storage backends write stream records atomically with data writes when `stream` 
 - `IdempotentMismatch` — idempotency token exists with different operations
 - `IndexNotFound` — secondary index does not exist
 - `Internal(String)` — backend-specific error
+- `Service(DynamoDbError)`: a client error the backend has already classified, carrying its own message
 
-The `engine` crate maps `StorageError` to wire protocol error responses.
+The `engine` crate maps `StorageError` to wire protocol error responses. An
+`Internal` error is logged at error level and reaches the client as the fixed
+`InternalServerError` text, so backend driver messages never cross the wire.
+A `Service` error is the exception: the backend has mapped its own failure onto
+a service error class (a hosted database reporting a documented unavailability
+or capacity condition, for example), so every engine mapping site returns it
+to the client with its variant and message unchanged and does not log it as a
+storage fault (a conditional check error carries its item only when the
+request asked for `ALL_OLD`, as with the engine's own). The backend is
+responsible for the message it puts inside: it crosses the wire verbatim, so it
+must be service-shaped text with no driver output, host names, connection
+strings or credentials, and a failure the backend cannot classify stays
+`Internal`.
 
 ## 5. PostgreSQL Backend Implementation
 
