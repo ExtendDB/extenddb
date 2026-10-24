@@ -116,6 +116,7 @@ async fn engine_on(catalog: &str, data: &str, liveness: BackupLiveness) -> Mongo
         restore_server_slot_count: slots,
         restore_server_slots: Arc::new(tokio::sync::Semaphore::new(slots)),
         restore_account_slots: super::RestoreAccountSlots::default(),
+        contention_deadline: crate::data_engine::CONTENTION_DEADLINE,
     }
 }
 
