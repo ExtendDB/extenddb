@@ -471,6 +471,22 @@ pub async fn handle_query(
         )?;
     }
 
+    // Refuse key values over the key size limits (hash 2048 bytes, all range
+    // values together 1024 bytes) before any storage read. Order measured
+    // 2026-10-23 with a 2049-byte hash value plus one other fault: a missing
+    // table, a wrong IndexName, ConsistentRead on a GSI, Limit 0, a key
+    // condition that misses the key schema, a wrong-typed key value (the type
+    // check arrives with the multi-attribute range change and belongs above
+    // this call), a FilterExpression syntax error and an unused expression
+    // value are all reported ahead of the size; an invalid ExclusiveStartKey
+    // is reported after it. KeyConditions is checked like the expression.
+    extenddb_core::validation::validate_query_key_sizes(
+        &key_condition,
+        &query_key_info.key_schema,
+        effective_maps,
+        &ctx.limits,
+    )?;
+
     // Validate ExclusiveStartKey matches the key schema
     if let Some(ref start_key) = input.exclusive_start_key {
         validate_query_exclusive_start_key(start_key, &key_info, index_info.as_ref())?;

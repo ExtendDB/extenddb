@@ -39,8 +39,8 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 | Limit | DynamoDB Value | Status | Notes                                                                         |
 |-------|---------------|--------|-------------------------------------------------------------------------------|
 | Maximum item size | 400 KB (409,600 bytes) | Enforced | `LimitsConfig::max_item_size_bytes`, validated on PutItem and post-UpdateItem |
-| Partition key size | 1–2,048 bytes | Enforced | `validate_key_sizes`, `LimitsConfig::max_partition_key_size_bytes`            |
-| Sort key size | 1–1,024 bytes | Enforced | `validate_key_sizes`, `LimitsConfig::max_sort_key_size_bytes`                 |
+| Partition key size | 1 to 2,048 bytes | Enforced | `validate_key_sizes`, `LimitsConfig::max_partition_key_size_bytes`; on Query, `validate_query_key_sizes` checks each partition key value in the key condition, and the sum of the partition key values of an index with several HASH attributes |
+| Sort key size | 1 to 1,024 bytes | Enforced | `validate_key_sizes`, `LimitsConfig::max_sort_key_size_bytes`; on Query, `validate_query_key_sizes` adds up the value of every sort key clause (any operator; a `BETWEEN` counts its larger bound) and checks the total |
 | Attribute name size | 1–64 KB (65,535 bytes) | Partial | `validate_attribute_name_sizes`, `LimitsConfig::max_attribute_name_bytes`; top-level names and nested map keys at every depth, on PutItem, BatchWriteItem.PutRequest, TransactWriteItems.Put, and ImportTable. Not enforced on UpdateItem or TransactWriteItems.Update at any level. |
 | Attribute nesting depth | 32 levels | Enforced | `validate_item_nesting_depth`, applied on PutItem, UpdateItem, BatchWriteItem.PutRequest, TransactWriteItems.Put, ImportTable |
 | Number of attributes per item | No practical limit | Enforced | ExtendDB has no per-item attribute count limit                                |
