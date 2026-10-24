@@ -365,6 +365,12 @@ pub struct MongoEngine {
     /// Restores each account may run at once in this process; see
     /// [`backup_engine::RestoreAccountSlots`].
     pub(crate) restore_account_slots: backup_engine::RestoreAccountSlots,
+    /// Wall-clock deadline for the contention retry loop of one request; see
+    /// [`crate::data_engine::CONTENTION_DEADLINE`], which every production
+    /// construction uses. A test sets it short to make the deadline the bound
+    /// a contended write reaches, or long to make the attempt budget the
+    /// bound, instead of racing the two.
+    pub(crate) contention_deadline: std::time::Duration,
 }
 
 /// Build a MongoDB client from a connection string, applying the shared
@@ -574,6 +580,7 @@ impl MongoEngine {
             restore_server_slot_count,
             restore_server_slots: Arc::new(tokio::sync::Semaphore::new(restore_server_slot_count)),
             restore_account_slots: backup_engine::RestoreAccountSlots::default(),
+            contention_deadline: data_engine::CONTENTION_DEADLINE,
         })
     }
 

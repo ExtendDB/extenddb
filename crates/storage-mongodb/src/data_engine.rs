@@ -471,8 +471,11 @@ impl MongoEngine {
         let contention_started = std::time::Instant::now();
 
         for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
-            if contention_deadline_passed(attempt, contention_started) {
-                return Err(contention_deadline_exhausted("PutItem"));
+            if contention_deadline_passed(attempt, contention_started, self.contention_deadline) {
+                return Err(contention_deadline_exhausted(
+                    "PutItem",
+                    self.contention_deadline,
+                ));
             }
             let new_doc =
                 item_to_document(&item, &key_info.key_schema, &key_info.attribute_definitions)?;
@@ -718,8 +721,11 @@ impl MongoEngine {
         let contention_started = std::time::Instant::now();
 
         for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
-            if contention_deadline_passed(attempt, contention_started) {
-                return Err(contention_deadline_exhausted("DeleteItem"));
+            if contention_deadline_passed(attempt, contention_started, self.contention_deadline) {
+                return Err(contention_deadline_exhausted(
+                    "DeleteItem",
+                    self.contention_deadline,
+                ));
             }
             // Capture before the transaction's first database operation so a
             // concurrent catalog mutation cannot be hidden by the snapshot.
@@ -947,8 +953,11 @@ impl MongoEngine {
         let contention_started = std::time::Instant::now();
 
         for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
-            if contention_deadline_passed(attempt, contention_started) {
-                return Err(contention_deadline_exhausted("UpdateItem"));
+            if contention_deadline_passed(attempt, contention_started, self.contention_deadline) {
+                return Err(contention_deadline_exhausted(
+                    "UpdateItem",
+                    self.contention_deadline,
+                ));
             }
             // Capture before the transaction's first database operation. A
             // later UpdateTable must invalidate this observation rather than
@@ -2273,7 +2282,7 @@ impl MongoEngine {
             // reason per item: the error the service answers for a
             // transaction that loses to contention. Only the single-item
             // writes answer the deadline with HTTP 503.
-            if contention_deadline_passed(attempt, contention_started) {
+            if contention_deadline_passed(attempt, contention_started, self.contention_deadline) {
                 break;
             }
             let idempotency = idem_owned.as_ref().map(|(a, t, f)| IdempotencyKey {
@@ -3620,8 +3629,16 @@ const TRANSIENT_RETRY_ATTEMPTS: u32 = 1000;
 /// 10 s sits above the 9.5 to 12.7 s a put spends losing all 1,000 attempts
 /// and below botocore's 60 s default read timeout, so a caller gets an answer
 /// to retry rather than a socket timeout. Which bound a write reaches first
-/// depends on the host's load, and both answer the same HTTP 503, so the
-/// caller's handling does not change with it.
+/// depends on the host's load, and which error class the caller is told
+/// depends on that for two of the four operations: PutItem answers HTTP 503
+/// on either bound, and `TransactWriteItems` answers
+/// `TransactionCanceledException` on either bound, but DeleteItem and
+/// UpdateItem answer HTTP 503 on the deadline and 400
+/// `TransactionConflictException` when their attempt budget runs out first
+/// (measured in 2 of 4 rounds against a held document, where the 1,000
+/// attempts and the deadline both land near 10 s). The 400 of those two
+/// paths is what #437 replaces, after which every single-item write answers
+/// 503 whichever bound it reaches.
 ///
 /// The deadline is read before an attempt starts, so a request answers within
 /// the deadline plus one attempt. It governs the loops that serve a request:
@@ -3631,7 +3648,14 @@ const TRANSIENT_RETRY_ATTEMPTS: u32 = 1000;
 /// budget and takes no deadline: it runs in the background worker in
 /// `ttl_worker.rs`, where no caller is waiting for a reply and giving up
 /// leaves the index CREATING.
-const CONTENTION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+///
+/// The engine carries the deadline in
+/// [`MongoEngine::contention_deadline`](crate::MongoEngine) so that a test can
+/// set it: a deadline shorter than the attempt budget's run time reaches the
+/// deadline first, a longer one reaches the attempt budget first, and neither
+/// test has to race 1,000 attempts against a wall clock. Every production
+/// construction uses this value.
+pub(crate) const CONTENTION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Maximum number of times to retry `commitTransaction` in place after an
 /// `UnknownTransactionCommitResult`.
@@ -3801,27 +3825,33 @@ fn create_race_exhausted(attempt: u32) -> StorageError {
 }
 
 /// Whether the contention retry loop of a request that entered it at
-/// `started` must stop before running attempt number `attempt`.
+/// `started` must stop before running attempt number `attempt`, given the
+/// `deadline` the engine carries.
 ///
 /// The first attempt of a request always runs, so a request never answers
 /// 503 without having tried the write once.
-fn contention_deadline_passed(attempt: u32, started: std::time::Instant) -> bool {
-    attempt > 0 && started.elapsed() >= CONTENTION_DEADLINE
+fn contention_deadline_passed(
+    attempt: u32,
+    started: std::time::Instant,
+    deadline: std::time::Duration,
+) -> bool {
+    attempt > 0 && started.elapsed() >= deadline
 }
 
-/// The error for a write that stopped retrying because `CONTENTION_DEADLINE`
-/// passed while it was losing to concurrent writers. `operation` names the
-/// API operation.
+/// The error for a write that stopped retrying because the engine's
+/// contention deadline passed while it was losing to concurrent writers.
+/// `operation` names the API operation and `deadline` is the deadline that
+/// passed.
 ///
 /// Like the attempt-budget give-up of PutItem this is a
 /// [`StorageError::Transient`], which the engine answers as HTTP 503
 /// `ServiceUnavailable`: the SDK retry modes retry a 503 on their own and the
 /// retry succeeds once the contention has passed, whereas a 400
 /// `TransactionConflictException` is handed to the application.
-fn contention_deadline_exhausted(operation: &str) -> StorageError {
+fn contention_deadline_exhausted(operation: &str, deadline: std::time::Duration) -> StorageError {
     StorageError::Transient(format!(
         "{operation}: the write lost to concurrent writers for {} seconds; retry the request",
-        CONTENTION_DEADLINE.as_secs()
+        deadline.as_secs()
     ))
 }
 
@@ -4346,17 +4376,32 @@ mod tests {
         let spent = std::time::Instant::now()
             .checked_sub(CONTENTION_DEADLINE + std::time::Duration::from_secs(1))
             .expect("the process clock reaches one deadline back");
-        assert!(!contention_deadline_passed(0, spent));
-        assert!(contention_deadline_passed(1, spent));
+        assert!(!contention_deadline_passed(0, spent, CONTENTION_DEADLINE));
+        assert!(contention_deadline_passed(1, spent, CONTENTION_DEADLINE));
         assert!(contention_deadline_passed(
             TRANSIENT_RETRY_ATTEMPTS - 1,
-            spent
+            spent,
+            CONTENTION_DEADLINE
         ));
         let fresh = std::time::Instant::now();
-        assert!(!contention_deadline_passed(1, fresh));
+        assert!(!contention_deadline_passed(1, fresh, CONTENTION_DEADLINE));
         assert!(!contention_deadline_passed(
             TRANSIENT_RETRY_ATTEMPTS - 1,
-            fresh
+            fresh,
+            CONTENTION_DEADLINE
+        ));
+        // A deadline a test sets decides the answer, so the same elapsed
+        // time stops a short-deadline loop and lets a long-deadline loop
+        // keep its attempts.
+        assert!(contention_deadline_passed(
+            1,
+            spent,
+            std::time::Duration::from_secs(1)
+        ));
+        assert!(!contention_deadline_passed(
+            1,
+            spent,
+            CONTENTION_DEADLINE * 60
         ));
     }
 
@@ -4365,7 +4410,7 @@ mod tests {
     #[test]
     fn the_deadline_give_up_is_transient_and_names_the_operation() {
         for operation in ["PutItem", "DeleteItem", "UpdateItem"] {
-            match contention_deadline_exhausted(operation) {
+            match contention_deadline_exhausted(operation, CONTENTION_DEADLINE) {
                 StorageError::Transient(msg) => {
                     assert!(msg.starts_with(&format!("{operation}: ")), "{msg}");
                     assert!(
@@ -4376,6 +4421,14 @@ mod tests {
                 }
                 other => panic!("want Transient, got {other:?}"),
             }
+        }
+        // The message carries the deadline that passed, not the default.
+        match contention_deadline_exhausted("PutItem", std::time::Duration::from_secs(2)) {
+            StorageError::Transient(msg) => assert!(
+                msg.contains("lost to concurrent writers for 2 seconds"),
+                "{msg}"
+            ),
+            other => panic!("want Transient, got {other:?}"),
         }
     }
 
@@ -4442,6 +4495,21 @@ mod tests {
         F: FnOnce(MongoEngine, mongodb::Database) -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
+        with_scratch_engine_deadline(uri, CONTENTION_DEADLINE, body).await;
+    }
+
+    /// `with_scratch_engine` with the engine's contention deadline set, so a
+    /// test can decide which bound a contended write reaches: a deadline
+    /// below the time the attempt budget takes makes the deadline the bound,
+    /// one far above it makes the attempt budget the bound.
+    async fn with_scratch_engine_deadline<F, Fut>(
+        uri: &str,
+        contention_deadline: std::time::Duration,
+        body: F,
+    ) where
+        F: FnOnce(MongoEngine, mongodb::Database) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
         use futures::FutureExt as _;
         let client = mongodb::Client::with_uri_str(uri)
             .await
@@ -4464,6 +4532,7 @@ mod tests {
             restore_server_slot_count: slots,
             restore_server_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(slots)),
             restore_account_slots: crate::backup_engine::RestoreAccountSlots::default(),
+            contention_deadline,
         };
         let outcome = std::panic::AssertUnwindSafe(body(engine, data_db.clone()))
             .catch_unwind()
@@ -4778,33 +4847,268 @@ mod tests {
     /// never commits, so each attempt of the put hits a write conflict until
     /// one of the two bounds is reached; the held transaction is then
     /// aborted.
+    /// The key of `item_with(pk, ...)` on a hash-key table.
+    fn hash_key(pk: &str) -> Item {
+        let mut key = Item::new();
+        key.insert("pk".to_owned(), AttributeValue::S(pk.to_owned()));
+        key
+    }
+
+    /// `SET w = :w` with its placeholder, for an UpdateItem under contention.
+    fn set_w(value: &str) -> (Vec<UpdateAction>, ExpressionMaps) {
+        let actions = vec![UpdateAction::Set {
+            path: vec![PathElement::Attribute("w".to_owned())],
+            value: Expr::Placeholder(":w".to_owned()),
+        }];
+        let maps = ExpressionMaps::new(
+            std::collections::HashMap::new(),
+            std::collections::HashMap::from([(
+                ":w".to_owned(),
+                AttributeValue::S(value.to_owned()),
+            )]),
+        );
+        (actions, maps)
+    }
+
+    /// Hold `pk` of `table_id` inside a transaction that is never committed,
+    /// so every attempt of a contended write on that key conflicts. The
+    /// caller aborts the returned session when it is done.
+    async fn hold_item_in_a_transaction(
+        engine: &MongoEngine,
+        data_db: &mongodb::Database,
+        key_info: &TableKeyInfo,
+        pk: &str,
+    ) -> mongodb::ClientSession {
+        let coll = data_db.collection::<Document>(&data_collection_name(&key_info.table_id));
+        coll.insert_one(stored_document(&item_with(pk, "held"), key_info))
+            .await
+            .expect("insert the item to hold");
+        let mut holder = engine.client.start_session().await.expect("session");
+        holder
+            .start_transaction()
+            .with_options(engine.write_transaction_options())
+            .await
+            .expect("start the holding transaction");
+        coll.replace_one(
+            doc! { "pk": pk },
+            stored_document(&item_with(pk, "rewritten"), key_info),
+        )
+        .session(&mut holder)
+        .await
+        .expect("write the item inside the held transaction");
+        holder
+    }
+
+    /// Each single-item write that reaches the engine's contention deadline
+    /// gives up with the transient error the engine answers as HTTP 503
+    /// `ServiceUnavailable`, and the message names the operation and the
+    /// deadline that passed.
+    ///
+    /// The deadline is 2 s here, below the 9.5 to 12.7 s the 1,000 attempts
+    /// take against a document a transaction holds, so the deadline is the
+    /// bound each of the three writes reaches, with no race between the two.
+    /// The attempt budget is the bound in
+    /// `unconditional_put_that_spends_its_attempt_budget_gives_up_with_a_transient_error`.
     #[tokio::test]
-    async fn unconditional_put_that_loses_every_attempt_gives_up_with_a_transient_error() {
+    async fn a_single_item_write_that_reaches_the_deadline_answers_a_transient_error() {
         let Some(uri) = live_mongodb_uri(
-            "unconditional_put_that_loses_every_attempt_gives_up_with_a_transient_error",
+            "a_single_item_write_that_reaches_the_deadline_answers_a_transient_error",
         ) else {
             return;
         };
-        with_scratch_engine(&uri, |engine, data_db| async move {
+        let deadline = std::time::Duration::from_secs(2);
+        with_scratch_engine_deadline(&uri, deadline, |engine, data_db| async move {
+            let maps = ExpressionMaps::default();
+            let key_info = hash_key_table(&engine, "deadline-key", true);
+            let coll = data_db.collection::<Document>(&data_collection_name("deadline-key"));
+            let mut holder = hold_item_in_a_transaction(&engine, &data_db, &key_info, "k1").await;
+            let key = hash_key("k1");
+            let (actions, update_maps) = set_w("this-update");
+
+            for operation in ["PutItem", "DeleteItem", "UpdateItem"] {
+                let started = std::time::Instant::now();
+                let res = match operation {
+                    "PutItem" => engine
+                        .put_item_impl(
+                            &key_info,
+                            item_with("k1", "this-put"),
+                            false,
+                            None,
+                            &maps,
+                            None,
+                        )
+                        .await
+                        .map(|_| ()),
+                    "DeleteItem" => engine
+                        .delete_item_impl(&key_info, &key, false, None, &maps, None)
+                        .await
+                        .map(|_| ()),
+                    _ => engine
+                        .update_item_impl(
+                            &key_info,
+                            &key,
+                            &actions,
+                            false,
+                            false,
+                            None,
+                            &update_maps,
+                            None,
+                        )
+                        .await
+                        .map(|_| ()),
+                };
+                let elapsed = started.elapsed();
+                match res {
+                    Err(StorageError::Transient(msg)) => {
+                        assert_eq!(
+                            msg,
+                            format!(
+                                "{operation}: the write lost to concurrent writers for 2 \
+                                 seconds; retry the request"
+                            )
+                        );
+                        println!("{operation} gave up on the deadline in {elapsed:?}: {msg}");
+                    }
+                    other => {
+                        panic!("{operation}: want the transient deadline error, got: {other:?}")
+                    }
+                }
+                assert!(
+                    elapsed >= deadline,
+                    "{operation} answered in {elapsed:?}, before the deadline"
+                );
+                assert!(
+                    elapsed < deadline + std::time::Duration::from_secs(5),
+                    "{operation} took {elapsed:?}, so a bound other than the deadline ended it"
+                );
+            }
+
+            let _ = holder.abort_transaction().await;
+            // No give-up wrote anything: the held item is as it was inserted.
+            let stored = coll
+                .find_one(doc! { "pk": "k1" })
+                .await
+                .expect("read")
+                .expect("item");
+            assert_eq!(
+                document_to_item(&stored).expect("item"),
+                item_with("k1", "held")
+            );
+        })
+        .await;
+    }
+
+    /// A `TransactWriteItems` that reaches the deadline answers a canceled
+    /// transaction with a `TransactionConflict` reason per item, which is
+    /// what live DynamoDB answers a transaction that loses to contention
+    /// (107 of 160 calls at 16 writers on one key, probes/R10-1.out). It does
+    /// not answer the HTTP 503 the single-item writes answer.
+    #[tokio::test]
+    async fn a_transaction_that_reaches_the_deadline_answers_a_canceled_transaction() {
+        let Some(uri) = live_mongodb_uri(
+            "a_transaction_that_reaches_the_deadline_answers_a_canceled_transaction",
+        ) else {
+            return;
+        };
+        let deadline = std::time::Duration::from_secs(2);
+        with_scratch_engine_deadline(&uri, deadline, |engine, data_db| async move {
+            let key_info = hash_key_table(&engine, "deadline-transact", true);
+            let coll = data_db.collection::<Document>(&data_collection_name("deadline-transact"));
+            let mut holder = hold_item_in_a_transaction(&engine, &data_db, &key_info, "k1").await;
+
+            // Two operations, one on the held key and one on a free key, so
+            // the transaction conflicts and the answer carries one reason
+            // per operation rather than one for the contended item.
+            let ops = vec![
+                OwnedTransactWriteOp::Put {
+                    key_info: key_info.clone(),
+                    item: item_with("k1", "this-transaction"),
+                    condition: None,
+                    maps: ExpressionMaps::default(),
+                    return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+                    stream: None,
+                },
+                OwnedTransactWriteOp::Put {
+                    key_info: key_info.clone(),
+                    item: item_with("k2", "this-transaction"),
+                    condition: None,
+                    maps: ExpressionMaps::default(),
+                    return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+                    stream: None,
+                },
+            ];
+
+            let started = std::time::Instant::now();
+            let res = engine.transact_write_items_impl(&ops, None).await;
+            let elapsed = started.elapsed();
+            let _ = holder.abort_transaction().await;
+
+            match res {
+                Err(StorageError::TransactionCanceled(reasons)) => {
+                    assert_eq!(reasons.len(), ops.len(), "one reason per operation");
+                    for reason in &reasons {
+                        assert_eq!(reason.code, "TransactionConflict");
+                        assert_eq!(
+                            reason.message.as_deref(),
+                            Some("Transaction is ongoing for the item")
+                        );
+                    }
+                    println!("the transaction was canceled in {elapsed:?}: {reasons:?}");
+                }
+                other => panic!("want a canceled transaction, got: {other:?}"),
+            }
+            assert!(
+                elapsed >= deadline,
+                "the transaction answered in {elapsed:?}, before the deadline"
+            );
+            assert!(
+                elapsed < deadline + std::time::Duration::from_secs(5),
+                "took {elapsed:?}, so a bound other than the deadline ended it"
+            );
+
+            // Neither operation of the canceled transaction was applied.
+            let stored = coll
+                .find_one(doc! { "pk": "k1" })
+                .await
+                .expect("read")
+                .expect("item");
+            assert_eq!(
+                document_to_item(&stored).expect("item"),
+                item_with("k1", "held")
+            );
+            assert!(
+                coll.find_one(doc! { "pk": "k2" })
+                    .await
+                    .expect("read")
+                    .is_none(),
+                "the free key of the canceled transaction must not be written"
+            );
+        })
+        .await;
+    }
+
+    /// An unconditional PutItem that spends its whole attempt budget on
+    /// contention gives up with the transient error naming the attempts,
+    /// which the engine answers as HTTP 503.
+    ///
+    /// The deadline is set far above the time the budget takes (9.5 to 12.7 s
+    /// against a document a transaction holds, over nine runs on a shared
+    /// host), so the attempt budget is the bound this test reaches. With the
+    /// production deadline of 10 s either bound can fire first, which is why
+    /// the deadline is the test's input rather than its race.
+    #[tokio::test]
+    async fn unconditional_put_that_spends_its_attempt_budget_gives_up_with_a_transient_error() {
+        let Some(uri) = live_mongodb_uri(
+            "unconditional_put_that_spends_its_attempt_budget_gives_up_with_a_transient_error",
+        ) else {
+            return;
+        };
+        let deadline = std::time::Duration::from_secs(600);
+        with_scratch_engine_deadline(&uri, deadline, |engine, data_db| async move {
             let maps = ExpressionMaps::default();
             let key_info = hash_key_table(&engine, "held-key", true);
             let coll = data_db.collection::<Document>(&data_collection_name("held-key"));
-            let held = stored_document(&item_with("k1", "held"), &key_info);
-            coll.insert_one(held.clone())
-                .await
-                .expect("insert the item");
-
-            let mut holder = engine.client.start_session().await.expect("session");
-            holder
-                .start_transaction()
-                .with_options(engine.write_transaction_options())
-                .await
-                .expect("start the holding transaction");
-            let rewritten = stored_document(&item_with("k1", "rewritten"), &key_info);
-            coll.replace_one(doc! { "pk": "k1" }, rewritten)
-                .session(&mut holder)
-                .await
-                .expect("write the item inside the held transaction");
+            let mut holder = hold_item_in_a_transaction(&engine, &data_db, &key_info, "k1").await;
 
             let started = std::time::Instant::now();
             let res = engine
@@ -4822,26 +5126,23 @@ mod tests {
 
             match res {
                 Err(StorageError::Transient(msg)) => {
-                    let on_the_deadline = msg.contains("lost to concurrent writers for 10 seconds");
-                    let on_the_attempts =
-                        msg.contains(&format!("lost {TRANSIENT_RETRY_ATTEMPTS} attempts"));
-                    assert!(on_the_deadline || on_the_attempts, "message: {msg}");
-                    println!("the put gave up with: {msg}");
+                    assert_eq!(
+                        msg,
+                        format!(
+                            "PutItem: the write lost {TRANSIENT_RETRY_ATTEMPTS} attempts to \
+                             concurrent writers; retry the request"
+                        )
+                    );
+                    println!("the put spent its attempt budget in {elapsed:?}: {msg}");
                 }
-                other => panic!("want the transient exhausted-budget error, got: {other:?}"),
+                other => panic!("want the transient spent-budget error, got: {other:?}"),
             }
-            // Two bounds end this put, and both answer HTTP 503. The 1,000
-            // attempts take 9.5 to 12.7 s against a document a transaction
-            // holds, measured over nine runs on a shared host, because each
-            // attempt waits out MongoDB's lock timeout on top of the backoff
-            // sleeps, which come to about 6.4 s on average. The deadline
-            // stops the loop at 10 s, so which bound the put reaches first
-            // depends on the host's load. The bound asserted here is the one
-            // a caller cares about: the deadline plus the one attempt that
-            // was already running.
-            println!("the put lost every attempt and answered in {elapsed:?}");
+            // The 1,000 attempts take 9.5 to 12.7 s on a shared host, and
+            // the sleeps alone come to 12.8 s at worst, so the bound here is
+            // loose: what it rules out is a budget that no longer ends the
+            // loop at all.
             assert!(
-                elapsed < CONTENTION_DEADLINE + std::time::Duration::from_secs(5),
+                elapsed < std::time::Duration::from_secs(120),
                 "took {elapsed:?}"
             );
             let stored = coll
@@ -4903,6 +5204,7 @@ mod tests {
             restore_server_slot_count: 1,
             restore_server_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             restore_account_slots: Default::default(),
+            contention_deadline: CONTENTION_DEADLINE,
         };
         let base_coll = engine.data_db.collection::<Document>("base");
         let key_schema = vec![KeySchemaElement {
