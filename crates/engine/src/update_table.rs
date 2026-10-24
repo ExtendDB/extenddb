@@ -375,14 +375,15 @@ mod tests {
     #[test]
     fn service_capacity_error_passes_through() {
         let err = update_table_err_to_dynamo(
-            StorageError::Service(DynamoDbError::ProvisionedThroughputExceededException(
-                "capacity".to_owned(),
+            StorageError::Service(DynamoDbError::provisioned_throughput_exceeded(
+                "capacity",
+                vec![],
             )),
             "t",
         );
         match err {
-            DynamoDbError::ProvisionedThroughputExceededException(msg) => {
-                assert_eq!(msg, "capacity");
+            DynamoDbError::ProvisionedThroughputExceededException { message, .. } => {
+                assert_eq!(message, "capacity");
             }
             other => panic!("expected ProvisionedThroughputExceededException, got {other:?}"),
         }

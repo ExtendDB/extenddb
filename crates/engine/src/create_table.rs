@@ -313,11 +313,11 @@ mod storage_error_mapping_tests {
     #[test]
     fn service_capacity_error_passes_through() {
         let err = storage_err_to_dynamo(StorageError::Service(
-            DynamoDbError::ProvisionedThroughputExceededException(CAPACITY_MSG.to_owned()),
+            DynamoDbError::provisioned_throughput_exceeded(CAPACITY_MSG, vec![]),
         ));
         match err {
-            DynamoDbError::ProvisionedThroughputExceededException(msg) => {
-                assert_eq!(msg, CAPACITY_MSG);
+            DynamoDbError::ProvisionedThroughputExceededException { message, .. } => {
+                assert_eq!(message, CAPACITY_MSG);
             }
             other => panic!("expected ProvisionedThroughputExceededException, got {other:?}"),
         }
@@ -365,14 +365,15 @@ mod storage_error_mapping_tests {
     #[test]
     fn service_capacity_error_passes_through_with_ccf() {
         let err = storage_err_to_dynamo_with_ccf(
-            StorageError::Service(DynamoDbError::ProvisionedThroughputExceededException(
-                CAPACITY_MSG.to_owned(),
+            StorageError::Service(DynamoDbError::provisioned_throughput_exceeded(
+                CAPACITY_MSG,
+                vec![],
             )),
             ReturnValuesOnConditionCheckFailure::None,
         );
         match err {
-            DynamoDbError::ProvisionedThroughputExceededException(msg) => {
-                assert_eq!(msg, CAPACITY_MSG);
+            DynamoDbError::ProvisionedThroughputExceededException { message, .. } => {
+                assert_eq!(message, CAPACITY_MSG);
             }
             other => panic!("expected ProvisionedThroughputExceededException, got {other:?}"),
         }
