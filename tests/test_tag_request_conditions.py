@@ -9,8 +9,7 @@ authorization reference (dynamodb v1.5) lists them on: `TagResource` and
 other operation populates neither.
 
 Every expected answer here comes from a measurement of IAM's evaluation of the
-two keys with `iam simulate-custom-policy` on 2026-10-24
-(`wave-2026-10-23/probes/B19-1.out` and `B19-2.out`): which operator forms a
+two keys with `iam simulate-custom-policy` on 2026-10-24: which operator forms a
 Deny fires under, which context values match, and what happens when the key is
 absent.
 
@@ -213,7 +212,7 @@ class TestTagRequestConditions:
         assert self._stored_tags() == {}, "neither tag of a refused request is stored"
 
     def test_tagkeys_values_compare_case_sensitively(self):
-        # B19-1 A-deny-ForAnyValue-StringEquals-ctx-Secret-upper: allowed.
+        # IAM case A-deny-ForAnyValue-StringEquals-ctx-Secret-upper: allowed.
         client, _ = self._restricted(
             _deny({"ForAnyValue:StringEquals": {"aws:TagKeys": "secret"}})
         )
@@ -221,7 +220,7 @@ class TestTagRequestConditions:
         assert "Secret" in self._stored_tags()
 
     def test_tagkeys_ignore_case_operator_refuses_the_case_variant(self):
-        # B19-1 A-deny-ForAnyValue-StringEqualsIgnoreCase-ctx-Secret-upper:
+        # IAM case A-deny-ForAnyValue-StringEqualsIgnoreCase-ctx-Secret-upper:
         # explicitDeny.
         client, _ = self._restricted(
             _deny({"ForAnyValue:StringEqualsIgnoreCase": {"aws:TagKeys": "secret"}})
@@ -233,7 +232,7 @@ class TestTagRequestConditions:
         )
 
     def test_tagkeys_deny_refuses_a_duplicated_named_key(self):
-        # B19-1 A-deny-ForAnyValue-StringEquals-ctx-dup-secret: explicitDeny.
+        # IAM case A-deny-ForAnyValue-StringEquals-ctx-dup-secret: explicitDeny.
         client, _ = self._restricted(
             _deny({"ForAnyValue:StringEquals": {"aws:TagKeys": "secret"}})
         )
@@ -244,7 +243,7 @@ class TestTagRequestConditions:
         )
 
     def test_tagkeys_for_all_values_allows_a_set_outside_the_list(self):
-        # B19-1 A-deny-ForAllValues-StringEquals-ctx-both: allowed, because one
+        # IAM case A-deny-ForAllValues-StringEquals-ctx-both: allowed, because one
         # key is outside the policy list.
         client, _ = self._restricted(
             _deny({"ForAllValues:StringEquals": {"aws:TagKeys": ["colour"]}})
@@ -266,8 +265,8 @@ class TestTagRequestConditions:
         )
 
     def test_bare_operator_on_a_present_tagkeys_does_not_refuse(self):
-        # B19-2 G-aws-TagKeys-bare-StringNotEquals-present and
-        # B19-1 A-deny-plain-StringEquals-ctx-secret: both allowed. An
+        # IAM case G-aws-TagKeys-bare-StringNotEquals-present and
+        # IAM case A-deny-plain-StringEquals-ctx-secret: both allowed. An
         # unqualified operator on a present multivalued key never matches.
         for cond in [
             {"StringEquals": {"aws:TagKeys": "secret"}},
@@ -296,13 +295,13 @@ class TestTagRequestConditions:
         assert self._stored_tags()["env"] == "dev"
 
     def test_request_tag_values_compare_case_sensitively(self):
-        # B19-1 B-deny-StringEquals-ctx-Prod-upper: allowed.
+        # IAM case B-deny-StringEquals-ctx-Prod-upper: allowed.
         client, _ = self._restricted(_deny({"StringEquals": {"aws:RequestTag/env": "prod"}}))
         client.tag_resource(ResourceArn=self.arn, Tags=[{"Key": "env", "Value": "Prod"}])
         assert self._stored_tags()["env"] == "Prod"
 
     def test_request_tag_sub_key_matches_case_insensitively(self):
-        # B19-1 C-subkey-policy-Env-ctx-env and C-subkey-policy-env-ctx-Env:
+        # IAM case C-subkey-policy-Env-ctx-env and C-subkey-policy-env-ctx-Env:
         # both explicitDeny. The tag name in the condition key is matched
         # without regard to case.
         client, _ = self._restricted(_deny({"StringEquals": {"aws:RequestTag/Env": "prod"}}))
@@ -313,7 +312,7 @@ class TestTagRequestConditions:
         )
 
     def test_request_tag_deny_allows_a_request_naming_another_tag(self):
-        # B19-1 B-deny-StringEquals-ctx-absent: allowed. A request that does not
+        # IAM case B-deny-StringEquals-ctx-absent: allowed. A request that does not
         # carry the key leaves it absent, and a positive operator on an absent
         # key does not match.
         client, _ = self._restricted(_deny({"StringEquals": {"aws:RequestTag/env": "prod"}}))
@@ -331,8 +330,8 @@ class TestTagRequestConditions:
         )
 
     def test_request_tag_case_variant_keys_with_differing_values_are_refused(self):
-        # The engine stores Env=prod and env=dev as two tags
-        # (probes/records/P19-2.out), so a request naming the tag under two
+        # The service (measured on 2026-10-24) and the engine both store
+        # Env=prod and env=dev as two tags, so a request naming the tag under two
         # spellings with differing values has no single value for
         # aws:RequestTag/env. The key then fails closed: the Deny blocks in
         # either order and nothing is stored. IAM refuses a simulated context of
@@ -357,7 +356,7 @@ class TestTagRequestConditions:
         assert self._stored_tags() == {"Env": "dev", "ENV": "dev"}
 
     def test_request_tag_negated_deny_refuses_a_request_without_the_key(self):
-        # B19-1 B-deny-StringNotEquals-ctx-absent: explicitDeny. The absent-key
+        # IAM case B-deny-StringNotEquals-ctx-absent: explicitDeny. The absent-key
         # rule for a negated operator on a single-valued key.
         client, _ = self._restricted(
             _deny({"StringNotEquals": {"aws:RequestTag/env": "prod"}})
@@ -432,7 +431,7 @@ class TestTagRequestConditions:
         assert _error_code(exc.value) == "ResourceNotFoundException"
 
     def test_create_table_without_tags_is_allowed_under_the_same_deny(self):
-        # B19-1 F-deny-tagkeys-ctx-absent-CreateTable: allowed. CreateTable with
+        # IAM case F-deny-tagkeys-ctx-absent-CreateTable: allowed. CreateTable with
         # no Tags leaves aws:TagKeys absent.
         client, _ = self._restricted(
             _deny(
@@ -475,7 +474,7 @@ class TestTagRequestConditions:
     # -- the keys are absent on operations that carry no tag set ----------
 
     def test_tagkeys_is_absent_on_an_item_operation(self):
-        # B19-2 G-aws-TagKeys-bare-StringNotEquals-absent: explicitDeny, and
+        # IAM case G-aws-TagKeys-bare-StringNotEquals-absent: explicitDeny, and
         # A-deny-ForAnyValue-StringEquals-ctx-absent: allowed. GetItem carries
         # no tag set, so aws:TagKeys is absent for it.
         allow_client, _ = self._restricted(
@@ -494,14 +493,14 @@ class TestTagRequestConditions:
         )
 
     def test_bare_negated_tagkeys_deny_refuses_an_operation_with_no_tags(self):
-        # B19-2 G-aws-TagKeys-bare-StringNotEquals-absent: explicitDeny.
+        # IAM case G-aws-TagKeys-bare-StringNotEquals-absent: explicitDeny.
         client, _ = self._restricted(
             _deny({"StringNotEquals": {"aws:TagKeys": "secret"}}, actions="dynamodb:GetItem")
         )
         self._assert_denied(client.get_item, TableName=self.table, Key={"pk": {"S": "k"}})
 
     def test_for_all_values_tagkeys_deny_refuses_an_operation_with_no_tags(self):
-        # B19-1 A-deny-ForAllValues-StringEquals-ctx-absent: explicitDeny.
+        # IAM case A-deny-ForAllValues-StringEquals-ctx-absent: explicitDeny.
         # ForAllValues on an absent key holds vacuously.
         client, _ = self._restricted(
             _deny(
@@ -512,7 +511,7 @@ class TestTagRequestConditions:
         self._assert_denied(client.get_item, TableName=self.table, Key={"pk": {"S": "k"}})
 
     def test_null_false_tagkeys_deny_refuses_a_tagged_request(self):
-        # B19-1 A-deny-Null-false-ctx-secret: explicitDeny.
+        # IAM case A-deny-Null-false-ctx-secret: explicitDeny.
         client, _ = self._restricted(_deny({"Null": {"aws:TagKeys": "false"}}))
         self._assert_denied(
             client.tag_resource,
@@ -523,7 +522,7 @@ class TestTagRequestConditions:
     # -- the policy types that carry the condition ------------------------
 
     def test_permissions_boundary_deny_refuses_the_named_key(self):
-        # B19-1 E-boundary-deny-tagkeys-ctx-secret: explicitDeny.
+        # IAM case E-boundary-deny-tagkeys-ctx-secret: explicitDeny.
         name = f"ub-{uuid.uuid4().hex[:8]}"
         ak, sk = _user_with_key(self.mgmt, self.account_id, name)
         resp = self.mgmt.put_user_policy(self.account_id, name, "p", ALLOW_ALL)
@@ -635,7 +634,7 @@ class TestTagRequestConditions:
     # -- policy variables -------------------------------------------------
 
     def test_request_tag_expands_as_a_policy_variable(self):
-        # B19-1 D-var-principaltag-eq-requesttag-match: allowed, -differ:
+        # IAM case D-var-principaltag-eq-requesttag-match: allowed, -differ:
         # implicitDeny. An Allow that holds only when the request tag equals
         # another resolved key.
         name = f"pv-{uuid.uuid4().hex[:8]}"

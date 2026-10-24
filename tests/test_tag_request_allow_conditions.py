@@ -5,12 +5,11 @@
 
 IAM matches a bare negated operator (`StringNotEquals`, `StringNotLike`,
 `StringNotEqualsIgnoreCase`) on an absent multivalued key and never on a
-present one (`wave-2026-10-23/probes/B19-2.out` group G, `H19-1.out` groups A,
-B and I, `iam simulate-custom-policy`, 2026-10-24). ExtendDB applies the
-absent-key answer to `aws:TagKeys` alone, which it populates on exactly the
-operations the AWS service authorization reference lists it for. It leaves
-`dynamodb:Attributes` absent on writes, on `AttributesToGet` reads and on batch
-and transaction targets, where the service populates the key and answers
+present one (measured with `iam simulate-custom-policy` on 2026-10-24). ExtendDB
+applies the absent-key answer to `aws:TagKeys` alone, which it populates on
+exactly the operations the AWS service authorization reference lists it for. It
+leaves `dynamodb:Attributes` absent on writes, on `AttributesToGet` reads and on
+batch and transaction targets, where the service populates the key and answers
 implicitDeny for a bare operator, so for that key an absent key does not match
 and such an Allow grants nothing on those operations.
 
@@ -222,7 +221,7 @@ class TestBareNegatedAllow:
     @pytest.mark.parametrize("kind", PRINCIPAL_KINDS)
     @pytest.mark.parametrize("operation", sorted(_ssn_operations("t")))
     def test_allow_unless_ssn_does_not_grant(self, kind: str, operation: str):
-        # H19-1 a_allow_attr_putitem_ne_present_named,
+        # IAM case a_allow_attr_putitem_ne_present_named,
         # a_allow_attr_updateitem_ne_present_named and
         # i_role_allow_attr_put_ne_present_named: implicitDeny. The service
         # populates dynamodb:Attributes on these operations, and a bare operator
@@ -236,8 +235,8 @@ class TestBareNegatedAllow:
 
     @pytest.mark.parametrize("kind", PRINCIPAL_KINDS)
     def test_allow_unless_secret_tag_grants_an_untagged_operation(self, kind: str):
-        # B19-2 G-aws-TagKeys-bare-StringNotEquals-absent (the Deny fires) and
-        # H19-1 a_allow_tagkeys_tagresource_ne_absent, i_role_allow_tagkeys_*
+        # IAM case G-aws-TagKeys-bare-StringNotEquals-absent (the Deny fires) and
+        # IAM case a_allow_tagkeys_tagresource_ne_absent, i_role_allow_tagkeys_*
         # (the Allow grants): an absent aws:TagKeys matches a bare negated
         # operator. GetItem carries no tag set.
         client = self._client_holding(kind, ALLOW_UNLESS_SECRET_TAG)
@@ -245,7 +244,7 @@ class TestBareNegatedAllow:
 
     @pytest.mark.parametrize("kind", PRINCIPAL_KINDS)
     def test_allow_unless_secret_tag_does_not_grant_a_tagged_request(self, kind: str):
-        # H19-1 a_allow_tagkeys_tagresource_ne_present_named and
+        # IAM case a_allow_tagkeys_tagresource_ne_present_named and
         # _present_other: implicitDeny. A bare operator on a present multivalued
         # key does not match, whichever keys the request names.
         client = self._client_holding(kind, ALLOW_UNLESS_SECRET_TAG)
