@@ -301,6 +301,65 @@ fn query_legacy_key_conditions() {
     assert_eq!(r, Some(vec!["alice".to_owned()]));
 }
 
+/// Measured against live `DynamoDB` on 2026-10-21: legacy `KeyConditions` with
+/// `LE` or `BEGINS_WITH` on the partition key and the operand `alice` returned
+/// ValidationException (`Query key condition not supported`) to the table owner
+/// and to a principal fenced to `alice`, and AccessDeniedException to a
+/// principal fenced to `nobody`. The remaining single-operand operators are not
+/// measured and carry their operand the same way.
+#[test]
+fn query_legacy_non_equality_partition_operator_binds_the_operand() {
+    for op in [
+        "LE",
+        "BEGINS_WITH",
+        "LT",
+        "GT",
+        "GE",
+        "NE",
+        "CONTAINS",
+        "NOT_CONTAINS",
+    ] {
+        let input = json!({
+            "TableName": "t",
+            "KeyConditions": {"pk": {"ComparisonOperator": op,
+                                     "AttributeValueList": [{"S": "alice"}]}},
+        });
+        let r = single_table_leading_keys(&input, "Query", Some(&main_table()), MAX_TOKENS);
+        assert_eq!(r, Some(vec!["alice".to_owned()]), "{op}");
+    }
+}
+
+/// A legacy operator that carries no operand or more than one names no single
+/// partition value. Which value the service binds for these is not measured.
+#[test]
+fn query_legacy_partition_operator_without_one_operand_is_absent() {
+    for list in [
+        json!([]),
+        json!([{"S": "a"}, {"S": "z"}]),
+        json!([{"S": "a"}, {"S": "b"}, {"S": "c"}]),
+    ] {
+        let input = json!({
+            "TableName": "t",
+            "KeyConditions": {"pk": {"ComparisonOperator": "BETWEEN",
+                                     "AttributeValueList": list}},
+        });
+        let r = single_table_leading_keys(&input, "Query", Some(&main_table()), MAX_TOKENS);
+        assert_eq!(r, None, "{input}");
+    }
+}
+
+/// Legacy `KeyConditions` naming only the sort key: no partition value.
+#[test]
+fn query_legacy_key_conditions_without_the_partition_key_is_absent() {
+    let input = json!({
+        "TableName": "t",
+        "KeyConditions": {"sk": {"ComparisonOperator": "EQ",
+                                 "AttributeValueList": [{"S": "x"}]}},
+    });
+    let r = single_table_leading_keys(&input, "Query", Some(&main_table()), MAX_TOKENS);
+    assert_eq!(r, None);
+}
+
 #[test]
 fn query_on_lsi_uses_base_partition_key() {
     let input = json!({
@@ -385,15 +444,249 @@ fn query_missing_key_condition_is_absent() {
     assert_eq!(r, None);
 }
 
+/// Measured against live `DynamoDB` on 2026-10-21 on a table with this key
+/// schema: `pk > :v` with `:v = {"S": "alice"}` returned ValidationException
+/// (`Query key condition not supported`) to the table owner and to a principal
+/// fenced to `alice`, and AccessDeniedException to a principal fenced to
+/// `nobody`. The service bound LeadingKeys to the partition operand and
+/// evaluated the policy before it rejected the shape.
 #[test]
-fn query_non_equality_partition_key_is_absent() {
+fn query_non_equality_partition_key_binds_the_operand() {
     let input = json!({
         "TableName": "t",
         "KeyConditionExpression": "pk > :v",
         "ExpressionAttributeValues": {":v": {"S": "alice"}},
     });
     let r = single_table_leading_keys(&input, "Query", Some(&main_table()), MAX_TOKENS);
+    assert_eq!(r, Some(vec!["alice".to_owned()]));
+}
+
+/// The same shape with the operand on the left. The parser reverses the
+/// operator and keeps the operand, so the key is the same value. Not measured
+/// against the service in this form.
+#[test]
+fn query_non_equality_partition_key_value_first_binds_the_operand() {
+    let input = json!({
+        "TableName": "t",
+        "KeyConditionExpression": ":v > pk",
+        "ExpressionAttributeValues": {":v": {"S": "alice"}},
+    });
+    let r = single_table_leading_keys(&input, "Query", Some(&main_table()), MAX_TOKENS);
+    assert_eq!(r, Some(vec!["alice".to_owned()]));
+}
+
+/// The other single-operand non-equality operators on the partition key. The
+/// service was measured on `>` only; these carry one operand on the partition
+/// attribute in the same way and are bound the same way.
+#[test]
+fn query_other_non_equality_partition_operators_bind_the_operand() {
+    for kce in [
+        "pk < :v",
+        "pk <= :v",
+        "pk >= :v",
+        "begins_with(pk, :v)",
+        "pk > :v AND sk = :s",
+        "pk > :v AND sk < :s",
+    ] {
+        let input = json!({
+            "TableName": "t",
+            "KeyConditionExpression": kce,
+            "ExpressionAttributeValues": {":v": {"S": "alice"}, ":s": {"S": "x"}},
+        });
+        let r = single_table_leading_keys(&input, "Query", Some(&main_table()), MAX_TOKENS);
+        assert_eq!(r, Some(vec!["alice".to_owned()]), "{kce}");
+    }
+}
+
+/// A `BETWEEN` on the partition key names two values and no single partition
+/// value, so the key stays absent. Which value the service binds for this shape
+/// is not measured.
+#[test]
+fn query_between_on_the_partition_key_is_absent() {
+    let input = json!({
+        "TableName": "t",
+        "KeyConditionExpression": "pk BETWEEN :lo AND :hi",
+        "ExpressionAttributeValues": {":lo": {"S": "a"}, ":hi": {"S": "z"}},
+    });
+    let r = single_table_leading_keys(&input, "Query", Some(&main_table()), MAX_TOKENS);
     assert_eq!(r, None);
+}
+
+/// An equality on the partition key decides the key, even when its value
+/// cannot be read and another clause names the partition key: the other
+/// clause's operand is never bound in its place. With `:u = {"N": "bob"}`
+/// (not a number) the key stays absent, as on main, rather than becoming
+/// `alice`.
+#[test]
+fn query_unreadable_partition_equality_binds_no_other_clause() {
+    for (kce, u) in [
+        ("pk = :u AND pk > :v", json!({"N": "bob"})),
+        ("pk > :v AND pk = :u", json!({"N": "bob"})),
+        ("#p = :u AND pk > :v", json!({"N": "bob"})),
+        ("pk = :u AND begins_with(pk, :v)", json!({"N": "1e"})),
+    ] {
+        let input = json!({
+            "TableName": "t",
+            "KeyConditionExpression": kce,
+            "ExpressionAttributeNames": {"#p": "pk"},
+            "ExpressionAttributeValues": {":u": u, ":v": {"S": "alice"}},
+        });
+        let r = single_table_leading_keys(&input, "Query", Some(&main_table()), MAX_TOKENS);
+        assert_eq!(r, None, "{kce}");
+    }
+    // A readable equality keeps its own value with another partition clause.
+    let input = json!({
+        "TableName": "t",
+        "KeyConditionExpression": "pk = :u AND pk > :v",
+        "ExpressionAttributeValues": {":u": {"S": "bob"}, ":v": {"S": "alice"}},
+    });
+    let r = single_table_leading_keys(&input, "Query", Some(&main_table()), MAX_TOKENS);
+    assert_ne!(r, Some(vec!["alice".to_owned()]));
+}
+
+/// Two non-equality clauses on the partition key: which operand the service
+/// binds is not measured, so neither is bound, in either clause order.
+#[test]
+fn query_two_non_equality_partition_clauses_bind_nothing() {
+    for kce in [
+        "pk > :v AND pk > :b",
+        "pk > :b AND pk > :v",
+        "pk < :v AND begins_with(pk, :b)",
+    ] {
+        let input = json!({
+            "TableName": "t",
+            "KeyConditionExpression": kce,
+            "ExpressionAttributeValues": {":v": {"S": "alice"}, ":b": {"S": "bob"}},
+        });
+        let r = single_table_leading_keys(&input, "Query", Some(&main_table()), MAX_TOKENS);
+        assert_eq!(r, None, "{kce}");
+    }
+}
+
+/// A legacy `ComparisonOperator` that is not one of the service's operators is
+/// not read as an operator, so its operand is not bound.
+#[test]
+fn query_legacy_unknown_operator_binds_nothing() {
+    for operator in ["BOGUS", "eq", "", "BETWEEN", "IN", "NULL"] {
+        let input = json!({
+            "TableName": "t",
+            "KeyConditions": {"pk": {
+                "ComparisonOperator": operator,
+                "AttributeValueList": [{"S": "alice"}],
+            }},
+        });
+        let r = single_table_leading_keys(&input, "Query", Some(&main_table()), MAX_TOKENS);
+        assert_eq!(r, None, "{operator}");
+    }
+}
+
+/// A non-equality condition on an attribute that is not the partition key, with
+/// no condition on the partition key, names no partition value.
+#[test]
+fn query_non_equality_on_the_sort_key_alone_is_absent() {
+    let input = json!({
+        "TableName": "t",
+        "KeyConditionExpression": "sk > :s",
+        "ExpressionAttributeValues": {":s": {"S": "x"}},
+    });
+    let r = single_table_leading_keys(&input, "Query", Some(&main_table()), MAX_TOKENS);
+    assert_eq!(r, None);
+}
+
+/// A non-equality partition condition whose operand is an undefined
+/// placeholder: no value to bind.
+#[test]
+fn query_non_equality_partition_key_with_unknown_placeholder_is_absent() {
+    let input = json!({
+        "TableName": "t",
+        "KeyConditionExpression": "pk > :v",
+        "ExpressionAttributeValues": {":other": {"S": "alice"}},
+    });
+    let r = single_table_leading_keys(&input, "Query", Some(&main_table()), MAX_TOKENS);
+    assert_eq!(r, None);
+}
+
+/// A non-equality partition condition reached through
+/// `ExpressionAttributeNames`, and one whose name reference is undefined.
+#[test]
+fn query_non_equality_partition_key_resolves_a_name_reference() {
+    let input = json!({
+        "TableName": "t",
+        "KeyConditionExpression": "#p > :v",
+        "ExpressionAttributeNames": {"#p": "pk"},
+        "ExpressionAttributeValues": {":v": {"S": "alice"}},
+    });
+    assert_eq!(
+        single_table_leading_keys(&input, "Query", Some(&main_table()), MAX_TOKENS),
+        Some(vec!["alice".to_owned()])
+    );
+
+    let input = json!({
+        "TableName": "t",
+        "KeyConditionExpression": "#p > :v",
+        "ExpressionAttributeValues": {":v": {"S": "alice"}},
+    });
+    assert_eq!(
+        single_table_leading_keys(&input, "Query", Some(&main_table()), MAX_TOKENS),
+        None
+    );
+}
+
+/// A number operand on a non-equality partition condition is normalized, as it
+/// is on the equality path for a Query.
+#[test]
+fn query_non_equality_n_operand_is_normalized() {
+    let input = json!({
+        "TableName": "n",
+        "KeyConditionExpression": "pk >= :v",
+        "ExpressionAttributeValues": {":v": {"N": "010"}},
+    });
+    let r = single_table_leading_keys(&input, "Query", Some(&num_table()), MAX_TOKENS);
+    assert_eq!(r, Some(vec!["10".to_owned()]));
+}
+
+/// A non-equality condition on the queried GSI's partition key binds that
+/// index's partition value, not the base table's.
+#[test]
+fn query_non_equality_on_a_gsi_partition_key_binds_the_index_operand() {
+    let input = json!({
+        "TableName": "t",
+        "IndexName": "gsi1",
+        "KeyConditionExpression": "gpk > :v",
+        "ExpressionAttributeValues": {":v": {"S": "galice"}},
+    });
+    let r = single_table_leading_keys(&input, "Query", Some(&main_table()), MAX_TOKENS);
+    assert_eq!(r, Some(vec!["galice".to_owned()]));
+}
+
+/// The single-clause shapes of the fix are shapes the engine's own parser
+/// rejects, so the engine never reads a partition value for them and cannot
+/// disagree with the value authorization binds. The two-clause shapes the fix
+/// also binds (`pk > :v AND sk = :s`, `pk > :v AND sk < :s`) parse or not
+/// depending on the sort clause, and the engine refuses them when it resolves
+/// the partition attribute; the wire test
+/// `test_non_equality_partition_with_sort_clause_is_refused` covers that. The
+/// equality shapes the engine accepts keep the value they had, which the
+/// accepted-shape tests above cover.
+#[test]
+fn the_parser_still_rejects_every_single_clause_shape_whose_operand_is_now_bound() {
+    for kce in [
+        "pk > :v",
+        "pk < :v",
+        "pk <= :v",
+        "pk >= :v",
+        "begins_with(pk, :v)",
+    ] {
+        let tokens = extenddb_core::expression::tokenize(kce).unwrap();
+        let err = extenddb_core::expression::parse_key_condition(&tokens).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                extenddb_core::error::DynamoDbError::ValidationException(_)
+            ),
+            "{kce}: {err:?}"
+        );
+    }
 }
 
 #[test]
