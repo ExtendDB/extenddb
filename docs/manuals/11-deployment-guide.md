@@ -1,22 +1,26 @@
-# Deployment Guide
+---
+description: "Running ExtendDB on your own servers: single host, split host, managed PostgreSQL, containers, air-gapped, and the production checklist."
+---
 
-> See [NOTICE](../NOTICE.md) for important disclaimers.
+# Deployment
 
-This guide covers deploying extenddb in various environments beyond local development.
+> See [NOTICE](https://github.com/ExtendDB/extenddb/blob/main/docs/NOTICE.md) for important disclaimers.
+
+This guide covers deploying ExtendDB in various environments beyond local development.
 
 ## Architecture Overview
 
-extenddb is a single Rust binary that connects to PostgreSQL. All durable state lives in PostgreSQL; extenddb keeps only short-lived credential, policy, and table-metadata caches in process. This means:
+ExtendDB is a single Rust binary that connects to the database of the backend it was built with (PostgreSQL by default; see [Storage backends](../storage-backends.md)). All durable state lives in that database; ExtendDB keeps only short-lived credential, policy, and table-metadata caches in process. This guide uses PostgreSQL in its examples. This means:
 
-- Multiple extenddb instances can share a PostgreSQL catalog (with caveats — see Multi-Instance below)
+- Running more than one ExtendDB instance against one catalog is not supported in this release (see [Multi-Instance Considerations](#multi-instance-considerations))
 - Standard PostgreSQL HA, backup, and replication tools provide durability
-- extenddb can run anywhere PostgreSQL is reachable
+- ExtendDB can run anywhere PostgreSQL is reachable
 
 ## Deployment Models
 
 ### Single-Node
 
-extenddb and PostgreSQL on the same host. Simplest setup, suitable for development, CI, and small workloads.
+ExtendDB and PostgreSQL on the same host. Simplest setup, suitable for development, CI, and small workloads.
 
 ```
 ┌─────────────────────────┐
@@ -34,7 +38,7 @@ extenddb serve --config extenddb.toml
 
 ### Separated Database
 
-extenddb on an application server, PostgreSQL on a dedicated database server or managed service.
+ExtendDB on an application server, PostgreSQL on a dedicated database server or managed service.
 
 ```
 ┌──────────┐       ┌──────────────┐
@@ -61,7 +65,7 @@ Use `sslmode=require` (or `verify-full` with a CA certificate) for encrypted dat
 
 ### Managed PostgreSQL
 
-extenddb works with any PostgreSQL 14+ service:
+ExtendDB works with any PostgreSQL 14+ service:
 
 - **Amazon RDS for PostgreSQL** / **Amazon Aurora PostgreSQL**
 - **Google Cloud SQL for PostgreSQL**
@@ -78,7 +82,7 @@ extenddb init \
 
 ### Containerized
 
-extenddb runs in Docker or Kubernetes. The binary has no runtime dependencies beyond libc and network access to PostgreSQL.
+ExtendDB runs in Docker or Kubernetes. The binary has no runtime dependencies beyond libc and network access to PostgreSQL.
 
 Example Dockerfile:
 
@@ -105,7 +109,7 @@ CMD ["/usr/local/bin/entrypoint.sh"]
 ```
 
 Run the server with `serve --foreground` (alias `--no-daemon`) so it stays PID 1's
-child and receives `SIGTERM` directly. In foreground mode extenddb writes no PID
+child and receives `SIGTERM` directly. In foreground mode ExtendDB writes no PID
 file and never creates `run_dir`, so the root filesystem can be read-only. Use
 `tini` as PID 1 to reap any stray children and forward signals:
 
@@ -121,7 +125,7 @@ exec extenddb serve --foreground --config /etc/extenddb/extenddb.toml
 `extenddb stop` cannot stop a foreground server, because there is no PID file to
 read; stop the container instead, which delivers `SIGTERM` and triggers the same
 graceful shutdown. Outside a container, where you may want `stop` to work, add
-`--write-pid-file` — it writes the PID file to the usual `run_dir` path, which
+`--write-pid-file`; it writes the PID file to the usual `run_dir` path, which
 then has to be writable.
 
 What the health check covers: `extenddb healthcheck` exits 0 when the server is
@@ -137,14 +141,14 @@ There is no readiness endpoint yet, so do not expect a Kubernetes
 becomes unreachable. Until a readiness endpoint that probes the storage layer
 exists, treat backend failures as something clients retry through.
 
-For Kubernetes, run `extenddb init` as an init container or a one-time Job, then deploy extenddb as a Deployment with the generated `extenddb.toml` mounted as a ConfigMap or Secret.
+For Kubernetes, run `extenddb init` as an init container or a one-time Job, then deploy ExtendDB as a Deployment with the generated `extenddb.toml` mounted as a ConfigMap or Secret.
 
 ### Air-Gapped
 
-extenddb requires no internet connectivity. All functionality is self-contained in the binary. Build on a connected host, transfer the binary and `extenddb.toml` to the air-gapped environment, and run.
+ExtendDB requires no internet connectivity. All functionality is self-contained in the binary. Build on a connected host, transfer the binary and `extenddb.toml` to the air-gapped environment, and run.
 
 Requirements in the air-gapped environment:
-- PostgreSQL 14+ (reachable from the extenddb host)
+- PostgreSQL 14+ (reachable from the ExtendDB host)
 - The `extenddb` binary (statically linked or with matching libc)
 
 ## Production Checklist
@@ -158,20 +162,20 @@ Requirements in the air-gapped environment:
 
 ### Transport
 
-- [ ] TLS is enabled by default. Verify it is not disabled in `extenddb.toml`
+- [ ] TLS is always on; the server refuses to start with `tls.enabled = false`. Confirm the certificate and key paths in `extenddb.toml`
 - [ ] Replace the self-signed certificate with a CA-signed certificate
 - [ ] Use `sslmode=require` or `sslmode=verify-full` in the PostgreSQL connection string
 
 ### Network
 
-- [ ] Set `bind_addr` to the appropriate interface (not `0.0.0.0` unless behind a load balancer)
-- [ ] Firewall: allow only necessary ports (extenddb port, PostgreSQL port)
-- [ ] Consider a reverse proxy (nginx, HAProxy) for TLS termination, rate limiting, and access logging
+- [ ] Set `bind_addr` to the interface your clients reach, not `0.0.0.0`
+- [ ] Firewall: allow only necessary ports (the ExtendDB port, the database port)
+- [ ] Consider a reverse proxy (nginx, HAProxy) for rate limiting and access logging. The proxy re-encrypts to the server, which always serves TLS; see [Multi-Instance Considerations](#multi-instance-considerations) before putting more than one instance behind it
 
 ### Database
 
-- [ ] Use a dedicated PostgreSQL user for extenddb with minimal privileges
-- [ ] Configure PostgreSQL `max_connections` ≥ extenddb `pool_size` + 3
+- [ ] Use a dedicated PostgreSQL user for ExtendDB with minimal privileges
+- [ ] Configure PostgreSQL `max_connections` ≥ ExtendDB `pool_size` + 3
 - [ ] Enable PostgreSQL TLS
 - [ ] Set up automated backups (pg_dump, WAL archiving, or managed service snapshots)
 - [ ] Monitor PostgreSQL disk usage, connection count, and query performance
@@ -181,7 +185,7 @@ Requirements in the air-gapped environment:
 - [ ] Poll `/metrics` for JSON snapshots and forward to your monitoring system (the response is custom JSON, not Prometheus exposition format; convert as needed)
 - [ ] Forward syslog to a log aggregation service
 - [ ] Set up alerts on health check failures (`/health`)
-- [ ] Monitor extenddb process with systemd, supervisord, or equivalent
+- [ ] Monitor ExtendDB process with systemd, supervisord, or equivalent
 
 ### Upgrades
 
@@ -223,7 +227,7 @@ sudo systemctl start extenddb
 
 ## Multi-Instance Considerations
 
-Run one extenddb instance per catalog. Multiple instances behind a load balancer are not supported in this release:
+Run one ExtendDB instance per catalog. Multiple instances behind a load balancer are not supported in this release:
 
 - Credentials, policies, and table metadata are cached in each process (see the cache TTLs in the admin guide). Nothing invalidates a cache on another instance, so a key revoked or a policy changed through one instance stays in force on the others until the TTL expires.
 - Every instance runs every background worker (TTL expiry, GSI backfill, stream retention, control-plane transitions). The workers are safe to run twice, but the work is duplicated.
@@ -248,7 +252,7 @@ Backup and restore work is admitted against the pool so it cannot take every con
 
 ### PostgreSQL Tuning
 
-Key PostgreSQL settings for extenddb workloads:
+Key PostgreSQL settings for ExtendDB workloads:
 
 - `shared_buffers`: 25% of available RAM
 - `effective_cache_size`: 75% of available RAM
@@ -276,7 +280,7 @@ ORDER BY mean_exec_time DESC LIMIT 10;
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
-See [LICENSE](../../LICENSE) for the full text.
+See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
 This software is provided "as is" without warranty of any kind. ExtendDB is not
 affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark

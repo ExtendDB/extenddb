@@ -1,14 +1,18 @@
-# Usage Guide
+---
+description: "Connecting an SDK and using tables, items, queries, batches, transactions, streams and vector search against ExtendDB, with examples."
+---
 
-> See [NOTICE](../NOTICE.md) for important disclaimers.
+# Using ExtendDB
+
+> See [NOTICE](https://github.com/ExtendDB/extenddb/blob/main/docs/NOTICE.md) for important disclaimers.
 
 ## Introduction
 
-extenddb implements the DynamoDB wire protocol. Any AWS SDK or tool that speaks DynamoDB can connect to extenddb by changing the endpoint URL. This guide covers all supported operations, SDK configuration, expression syntax, error handling, and feature support.
+ExtendDB implements the DynamoDB wire protocol. Any AWS SDK or tool that speaks DynamoDB can connect to ExtendDB by changing the endpoint URL. This guide covers all supported operations, SDK configuration, expression syntax, error handling, and feature support.
 
 ## SDK Configuration
 
-Point your SDK at extenddb by setting the endpoint URL. extenddb uses TLS with a self-signed certificate — set `AWS_CA_BUNDLE` to trust it. All requests must be signed with valid access keys created via the management API.
+Point your SDK at ExtendDB by setting the endpoint URL. ExtendDB uses TLS with a self-signed certificate; set `AWS_CA_BUNDLE` to trust it. All requests must be signed with valid access keys created via the management API.
 
 ### AWS CLI
 
@@ -194,7 +198,7 @@ aws dynamodb update-item \
     --return-values ALL_NEW
 ```
 
-UpdateItem is an upsert — if the item does not exist, it is created with the key attributes plus the update expression result.
+UpdateItem is an upsert: if the item does not exist, it is created with the key attributes plus the update expression result.
 
 Supports `ReturnValues`: NONE, ALL_OLD, ALL_NEW, UPDATED_OLD, UPDATED_NEW.
 
@@ -371,7 +375,7 @@ aws dynamodb create-table \
 
 Stream view types: `KEYS_ONLY`, `NEW_IMAGE`, `OLD_IMAGE`, `NEW_AND_OLD_IMAGES`.
 
-**Important: SDK users need a separate `dynamodbstreams` client.** DynamoDB and DynamoDB Streams are separate services in every AWS SDK. Both clients must point at the same extenddb endpoint URL. See `getting-started.md` for Python examples and the polling pattern.
+**Important: SDK users need a separate `dynamodbstreams` client.** DynamoDB and DynamoDB Streams are separate services in every AWS SDK. Both clients must point at the same ExtendDB endpoint URL. See the [full walkthrough](../getting-started.md) for Python examples and the polling pattern.
 
 Read stream records:
 
@@ -397,7 +401,7 @@ aws dynamodbstreams get-records \
     --shard-iterator "<iterator>"
 ```
 
-Both DynamoDB and DynamoDB Streams endpoints use the same extenddb server URL. See `samples/stream_consumer.py` for a complete working example.
+Both DynamoDB and DynamoDB Streams endpoints use the same ExtendDB server URL. See `samples/stream_consumer.py` for a complete working example.
 
 ## Vector Search
 
@@ -445,7 +449,7 @@ table.
 
 **Scores and ranking differ from the service in documented ways** at extreme
 component magnitudes, and tie ordering is deterministic here where the service's is
-measured unstable. Both are in `docs/differences-from-dynamodb.md`.
+measured unstable. Both are on the [Differences from DynamoDB](../differences-from-dynamodb.md) page.
 
 ## Other Operations
 
@@ -532,7 +536,7 @@ metadata.tags[2].name
 
 ## Error Reference
 
-extenddb reproduces DynamoDB error responses exactly. Common errors:
+ExtendDB returns the DynamoDB error types and, where measured against the service, the same messages; the exceptions are listed on the [Differences from DynamoDB](../differences-from-dynamodb.md) page. Common errors:
 
 | Error | HTTP Status | Cause |
 |-------|-------------|-------|
@@ -568,10 +572,11 @@ extenddb reproduces DynamoDB error responses exactly. Common errors:
 | SigV4 Authentication | ✓ |
 | IAM Policy Evaluation | ✓ |
 | Legacy API (Expected, AttributeUpdates, AttributesToGet) | ✓ |
-| PartiQL | ✗ (not planned) |
+| PartiQL (ExecuteStatement, BatchExecuteStatement, ExecuteTransaction) | ✗ (not implemented; returns UnknownOperationException) |
 | DAX | ✗ (not applicable) |
-| Global Tables | ✗ (future) |
-| Backups / PITR | ✗ (future) |
+| Global Tables | ✗ (not implemented; returns UnknownOperationException) |
+| On-demand backups (CreateBackup, RestoreTableFromBackup, DescribeBackup, ListBackups, DeleteBackup) | ✓ (see the backup rows on the differences page) |
+| Point-in-time recovery | ✗ (RestoreTableToPointInTime is refused with ValidationException) |
 | Import/Export (local filesystem) | ✓ (FileSource instead of S3) |
 
 ---
@@ -579,7 +584,7 @@ extenddb reproduces DynamoDB error responses exactly. Common errors:
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
-See [LICENSE](../../LICENSE) for the full text.
+See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
 This software is provided "as is" without warranty of any kind. ExtendDB is not
 affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark

@@ -1,4 +1,4 @@
-# ADR-0008: DynamoDB Streams Implementation on Cassandra
+# ADR-0018: DynamoDB Streams Implementation on Cassandra
 
 - Status: Draft
 - Date: 2026-06-25
@@ -463,5 +463,5 @@ This refactoring should be done **as part of the Cassandra streams implementatio
 
 - [DynamoDB Streams Documentation](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Streams.html)
 - [DynamoDB Streams API Reference](https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_Operations_Amazon_DynamoDB_Streams.html)
-- [PostgreSQL Reference Implementation](../../extenddb/crates/storage-postgres/src/stream_engine.rs)
+- [PostgreSQL Reference Implementation](https://github.com/ExtendDB/extenddb/blob/main/crates/storage-postgres/src/stream_engine.rs)
 - [Hybrid Logical Clocks Paper](https://cse.buffalo.edu/tech-reports/2014-04.pdf) (Kulkarni et al.)

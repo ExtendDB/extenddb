@@ -1,10 +1,14 @@
-# Quick Start & Setup Guide
+---
+description: "Clone, build, initialize and run ExtendDB from source in a few minutes, then set it up for regular use."
+---
 
-> See [NOTICE](../NOTICE.md) for important disclaimers.
+# Quick start from source
+
+> See [NOTICE](https://github.com/ExtendDB/extenddb/blob/main/docs/NOTICE.md) for important disclaimers.
 
 ## Quick Start (5 Minutes)
 
-This section gets you from zero to a working extenddb instance as fast as possible. Detailed explanations follow in later chapters.
+This section gets you from zero to a working ExtendDB instance as fast as possible. Detailed explanations follow in later chapters.
 
 ### Prerequisites
 
@@ -16,7 +20,7 @@ This section gets you from zero to a working extenddb instance as fast as possib
 
 ```bash
 # 1. Clone and build
-git clone <repo-url> extenddb && cd extenddb
+git clone https://github.com/ExtendDB/extenddb.git && cd extenddb
 cargo build --release
 
 # 2. Initialize (creates databases, admin user, TLS cert, config file)
@@ -56,6 +60,7 @@ aws dynamodb create-table \
     --attribute-definitions AttributeName=pk,AttributeType=S \
     --key-schema AttributeName=pk,KeyType=HASH \
     --billing-mode PAY_PER_REQUEST
+aws dynamodb wait table-exists --table-name QuickTest
 
 # 8. Insert an item
 aws dynamodb put-item \
@@ -68,13 +73,13 @@ aws dynamodb get-item \
     --key '{"pk": {"S": "hello"}}'
 ```
 
-If step 8 returns your item, extenddb is working correctly.
+If step 9 returns the item written in step 8, ExtendDB is working.
 
 ## Detailed Setup
 
 ### PostgreSQL Installation
 
-extenddb requires PostgreSQL 14 or later. Install it for your platform:
+ExtendDB requires PostgreSQL 14 or later. Install it for your platform:
 
 **Ubuntu/Debian:**
 
@@ -113,7 +118,7 @@ sudo -u postgres createuser --createdb extenddb
 sudo -u postgres psql -c "ALTER USER extenddb WITH PASSWORD 'extenddb-local-dev';"
 ```
 
-### Building extenddb
+### Building ExtendDB
 
 ```bash
 # Debug build (faster compilation, slower runtime)
@@ -187,7 +192,7 @@ Expected output:
 ./target/release/extenddb serve --config extenddb.toml
 ```
 
-extenddb runs as a daemon (background process). It prints a startup banner, then forks to background. All logging goes to syslog.
+ExtendDB runs as a daemon (background process). It prints a startup banner, then forks to background. All logging goes to syslog.
 
 Check status:
 
@@ -228,7 +233,7 @@ kill <pid>
 
 ### AWS CLI Configuration
 
-extenddb uses TLS with a self-signed certificate. Set `AWS_CA_BUNDLE` to trust it:
+ExtendDB uses TLS with a self-signed certificate. Set `AWS_CA_BUNDLE` to trust it:
 
 ```bash
 export AWS_CA_BUNDLE=~/.extenddb/tls/cert.pem
@@ -280,7 +285,7 @@ aws dynamodb list-tables --endpoint-url https://127.0.0.1:18443
 
 ### Setting Up Credentials
 
-extenddb ships with builtin IAM authentication enabled. After `extenddb init`, create an IAM user and access key:
+ExtendDB ships with builtin IAM authentication enabled. After `extenddb init`, create an IAM user and access key:
 
 ```bash
 # Create an account (--account-id is optional; auto-generated if omitted)
@@ -405,17 +410,17 @@ This drops both databases after confirmation.
 | `connection refused` on port 18443 | Server not running. Start with `extenddb serve --config extenddb.toml` |
 | `CATALOG_VERSION_MISMATCH` | Run `extenddb migrate --config extenddb.toml` |
 | `ResourceNotFoundException` on CreateTable | Table is still in CREATING status. Poll DescribeTable until `TableStatus` is `ACTIVE` |
-| `UnrecognizedClientException` | Invalid access key. Check credentials — verify the access key ID and secret match what was returned by `create-access-key` |
+| `UnrecognizedClientException` | Invalid access key. Check credentials: verify the access key ID and secret match what was returned by `create-access-key` |
 | `AccessDeniedException` | IAM policy does not allow the operation. Attach a policy with the required permissions |
 
-See `docs/troubleshooting.md` for the full troubleshooting guide.
+See [Troubleshooting](../troubleshooting.md) for the full troubleshooting guide.
 
 ---
 
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
-See [LICENSE](../../LICENSE) for the full text.
+See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
 This software is provided "as is" without warranty of any kind. ExtendDB is not
 affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark

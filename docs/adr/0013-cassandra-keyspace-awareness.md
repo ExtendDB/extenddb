@@ -1,4 +1,4 @@
-# ADR-0003: Dynamic Keyspace Construction
+# ADR-0013: Dynamic Keyspace Construction
 
 - Status: Accepted
 - Date: 2026-06-04
@@ -57,7 +57,7 @@ Dynamic keyspace construction with JDBC-style connection strings.
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
-See [LICENSE](../../LICENSE) for the full text.
+See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
 This software is provided "as is" without warranty of any kind. ExtendDB is not
 affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is

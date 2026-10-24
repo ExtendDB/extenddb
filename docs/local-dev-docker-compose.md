@@ -1,13 +1,32 @@
-# Local Development with Docker Compose
+---
+description: "Start the PostgreSQL image and a PostgreSQL container with one docker compose command, then create users, access keys and tables."
+---
 
-A `docker-compose.yml` is included at the repository root. It wires the official
-`extenddb/extenddb-postgres` image to a PostgreSQL container and handles
-initialization automatically — no manual `extenddb init` required.
+# Docker Compose with PostgreSQL
+
+The repository's `docker-compose.yml` starts the published
+`extenddb/extenddb-postgres` image together with a PostgreSQL container and runs
+the initialization for you; no manual `extenddb init` is required. The result is
+a server with TLS on the loopback interface, for local development and testing
+against the PostgreSQL backend. For running ExtendDB on your own servers, see the
+[deployment guide](manuals/11-deployment-guide.md).
 
 ## Prerequisites
 
 - Docker Engine 20.10+ with Compose plugin (`docker compose`)
 - AWS CLI v2 (for testing)
+
+## Get the Compose file
+
+The file lives at the root of the repository. Either clone the repository and
+work from its root, or fetch the one file into an empty directory:
+
+```bash
+mkdir extenddb-compose && cd extenddb-compose
+curl -fsSLO https://raw.githubusercontent.com/ExtendDB/extenddb/main/docker-compose.yml
+```
+
+Every `docker compose` command below runs from the directory that holds the file.
 
 ## Start the stack
 
@@ -15,20 +34,25 @@ initialization automatically — no manual `extenddb init` required.
 EXTENDDB_IMAGE=extenddb/extenddb-postgres:latest docker compose up -d
 ```
 
+`EXTENDDB_IMAGE` names the image to run. Without it the file falls back to the tag a
+local source build produces, so keep the variable on every `up`.
+
 This starts four services in order:
 
-1. `postgres` — PostgreSQL 16
-2. `extenddb-volume-init` — sets up the state volume (runs once)
-3. `extenddb-bootstrap` — runs `extenddb init` and applies migrations (runs once)
-4. `extenddb` — the ExtendDB server
+1. `postgres`: PostgreSQL 16
+2. `extenddb-volume-init`: sets up the state volume (runs once)
+3. `extenddb-bootstrap`: runs `extenddb init` and applies migrations (runs once)
+4. `extenddb`: the ExtendDB server
 
 Wait for the stack to be ready:
 
 ```bash
-docker compose ps
+docker compose ps -a
 ```
 
-All services should show `healthy` or `exited` (bootstrap services exit after completing).
+The two bootstrap services show `Exited (0)` once they have run (`-a` includes
+them; without it Compose lists only running containers). `extenddb` shows
+`(health: starting)` for 10 to 20 seconds, then `(healthy)`.
 
 Verify ExtendDB is responding:
 
@@ -37,21 +61,27 @@ curl -sk https://127.0.0.1:18443/health
 # {"status":"healthy"}
 ```
 
-## Default credentials
+## Default credentials and variables
 
-| Setting | Value |
-|---------|-------|
-| Admin user | `admin` |
-| Admin password | `ExtendDBLocalAdmin123` |
-| Port | `18443` |
+| Variable | Default | What it sets |
+|---|---|---|
+| `EXTENDDB_IMAGE` | a local build tag | The ExtendDB image to run; use `extenddb/extenddb-postgres:latest` |
+| `EXTENDDB_PORT` | `18443` | The host port published on `127.0.0.1` |
+| `EXTENDDB_ADMIN_USER` | `admin` | Admin user created by the bootstrap |
+| `EXTENDDB_ADMIN_PASSWORD` | `ExtendDBLocalAdmin123` | Admin password |
+| `PG_ADMIN_USER` | `postgres` | PostgreSQL superuser |
+| `PG_ADMIN_PASSWORD` | `ExtendDBLocalPostgres123` | PostgreSQL superuser password |
+| `APP_DB_USER` | `extenddb_app` | The PostgreSQL role ExtendDB connects as |
+| `APP_DB_PASSWORD` | `ExtendDBLocalApp123` | That role's password |
 
-Override any value with environment variables before running `docker compose up`:
+Set a variable before the command to override it:
 
 ```bash
 EXTENDDB_ADMIN_PASSWORD=mysecret EXTENDDB_IMAGE=extenddb/extenddb-postgres:latest docker compose up -d
 ```
 
-See the comments in `docker-compose.yml` for all available variables.
+These passwords are for a local stack on the loopback interface; change them before
+exposing the port anywhere else.
 
 ## TLS certificate
 
@@ -104,7 +134,7 @@ export AWS_CA_BUNDLE=/tmp/extenddb-cert.pem
 aws dynamodb list-tables --endpoint-url https://127.0.0.1:18443
 ```
 
-For more CLI examples, see [Getting Started](getting-started.md#6-try-it-out).
+For more CLI examples, see [section 6 of the full walkthrough](getting-started.md#6-try-it-out); the table at the top of its section 5 lists the endpoint, certificate and credentials for a Compose server.
 
 ## View logs
 
@@ -141,7 +171,7 @@ aws ecr-public get-login-password --region us-east-1 | \
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
-See [LICENSE](../LICENSE) for the full text.
+See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
 This software is provided "as is" without warranty of any kind. ExtendDB is not
 affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark

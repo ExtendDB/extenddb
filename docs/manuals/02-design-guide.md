@@ -1,12 +1,16 @@
+---
+description: "How ExtendDB stores tables and items, evaluates expressions, authenticates requests, implements streams, calculates capacity and caches."
+---
+
 # Design Guide
 
-> See [NOTICE](../NOTICE.md) for important disclaimers.
+> See [NOTICE](https://github.com/ExtendDB/extenddb/blob/main/docs/NOTICE.md) for important disclaimers.
 
 ## Storage Schema
 
 ### Dual-Database Architecture
 
-extenddb uses two PostgreSQL databases per deployment:
+ExtendDB uses two PostgreSQL databases per deployment:
 
 - **Catalog database** (e.g., `extenddb_catalog`): All metadata — table definitions, indexes, accounts, IAM entities, settings, stream metadata, and schema history.
 - **Data database** (e.g., `extenddb_catalog_data`): User item data. Each DynamoDB table maps to a PostgreSQL table. GSI and LSI data are stored in separate PostgreSQL tables.
@@ -99,7 +103,7 @@ Parsed by the engine and translated to SQL WHERE clauses by the storage backend.
 
 ### Built-in Auth (`auth.provider = "builtin"`)
 
-extenddb uses SigV4 signature verification with a local IAM credential store. This is the only supported authentication mode.
+ExtendDB uses SigV4 signature verification with a local IAM credential store. This is the only supported authentication mode.
 
 Full SigV4 signature verification:
 
@@ -157,7 +161,7 @@ Stream records are retained for 24 hours. A background task runs hourly to delet
 
 ### SQL Injection Defense
 
-All user-supplied strings are validated at the engine layer before reaching storage. The storage layer uses parameterized queries exclusively — no dynamic SQL construction with user input. See `docs/adr/sql-injection-defense.md`.
+All user-supplied strings are validated at the engine layer before reaching storage. The storage layer uses parameterized queries exclusively, with no dynamic SQL construction from user input. See [ADR-0002: SQL injection defense](../adr/0002-sql-injection-defense.md).
 
 ### BoxFuture vs async_trait
 
@@ -169,7 +173,7 @@ Condition expressions are evaluated inside the storage transaction (after `SELEC
 
 ## Capacity Calculation
 
-extenddb calculates consumed capacity matching real DynamoDB:
+ExtendDB calculates consumed capacity matching the DynamoDB service:
 
 - **Read capacity**: Item size rounded up to 4 KB. Eventually consistent reads cost 0.5 RCU per 4 KB. Strongly consistent reads cost 1.0 RCU per 4 KB. Transactional reads cost 2.0 RCU per 4 KB.
 - **Write capacity**: Item size rounded up to 1 KB. Standard writes cost 1.0 WCU per 1 KB. Transactional writes cost 2.0 WCU per 1 KB.
@@ -179,7 +183,7 @@ Item size includes attribute names and values, matching DynamoDB's size calculat
 
 ## Caching Design
 
-extenddb caches a small set of operational settings in memory to avoid per-request database queries on hot paths. Catalog state (table metadata, auth policies, tags, GSI definitions) is never cached.
+ExtendDB caches a small set of operational settings in memory to avoid per-request database queries on hot paths. Catalog state (table metadata, auth policies, tags, GSI definitions) is never cached.
 
 ### What Is Cached
 
@@ -227,7 +231,7 @@ Caching of operational settings is currently unconditional. If issues arise (e.g
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
-See [LICENSE](../../LICENSE) for the full text.
+See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
 This software is provided "as is" without warranty of any kind. ExtendDB is not
 affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark

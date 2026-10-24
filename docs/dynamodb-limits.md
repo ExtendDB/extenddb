@@ -1,6 +1,10 @@
-# DynamoDB Limits Enforcement Status
+---
+description: "Each DynamoDB service quota and whether ExtendDB enforces it."
+---
 
-Last updated: 2026-04-23 (P42)
+# Limits
+
+This page lists each DynamoDB service quota and whether ExtendDB enforces it.
 
 Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/ServiceQuotas.html)
 
@@ -8,7 +12,7 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 
 - **Enforced**: ExtendDB validates and rejects requests that exceed this limit
 - **Partial**: ExtendDB enforces the limit in some but not all code paths
-- **Not enforced**: ExtendDB accepts requests that would exceed this limit on real DynamoDB
+- **Not enforced**: ExtendDB accepts requests that would exceed this limit on the DynamoDB service
 - **N/A**: Limit does not apply to ExtendDB (e.g., provisioned throughput billing, global tables)
 
 ## Read/Write Throughput
@@ -31,7 +35,7 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 |-------|---------------|--------|-------|
 | Maximum tables per account per region | 2,500 (adjustable to 10,000) | Enforced | `LimitsConfig::max_tables_per_account`, configurable |
 | Table size | No practical limit | Enforced | ExtendDB has no table size limit |
-| Table name length | 3–255 characters | Enforced | `validate_table_name`, `LimitsConfig` |
+| Table name length | 3 to 255 characters | Enforced | `validate_table_name`, `LimitsConfig` |
 | Table name character set | `[a-zA-Z0-9_.-]` | Enforced | `validate_table_name_chars` |
 
 ## Items
@@ -39,9 +43,9 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 | Limit | DynamoDB Value | Status | Notes                                                                         |
 |-------|---------------|--------|-------------------------------------------------------------------------------|
 | Maximum item size | 400 KB (409,600 bytes) | Enforced | `LimitsConfig::max_item_size_bytes`, validated on PutItem and post-UpdateItem |
-| Partition key size | 1–2,048 bytes | Enforced | `validate_key_sizes`, `LimitsConfig::max_partition_key_size_bytes`            |
-| Sort key size | 1–1,024 bytes | Enforced | `validate_key_sizes`, `LimitsConfig::max_sort_key_size_bytes`                 |
-| Attribute name size | 1–64 KB (65,535 bytes) | Partial | `validate_attribute_name_sizes`, `LimitsConfig::max_attribute_name_bytes`; top-level names and nested map keys at every depth, on PutItem, BatchWriteItem.PutRequest, TransactWriteItems.Put, and ImportTable. Not enforced on UpdateItem or TransactWriteItems.Update at any level. |
+| Partition key size | 1 to 2,048 bytes | Enforced | `validate_key_sizes`, `LimitsConfig::max_partition_key_size_bytes`            |
+| Sort key size | 1 to 1,024 bytes | Enforced | `validate_key_sizes`, `LimitsConfig::max_sort_key_size_bytes`                 |
+| Attribute name size | 1 to 64 KB (65,535 bytes) | Partial | `validate_attribute_name_sizes`, `LimitsConfig::max_attribute_name_bytes`; top-level names and nested map keys at every depth, on PutItem, BatchWriteItem.PutRequest, TransactWriteItems.Put, and ImportTable. Not enforced on UpdateItem or TransactWriteItems.Update at any level. |
 | Attribute nesting depth | 32 levels | Enforced | `validate_item_nesting_depth`, applied on PutItem, UpdateItem, BatchWriteItem.PutRequest, TransactWriteItems.Put, ImportTable |
 | Number of attributes per item | No practical limit | Enforced | ExtendDB has no per-item attribute count limit                                |
 
@@ -52,7 +56,7 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 | GSIs per table | 20 | Enforced | `validate_gsi_count`, `LimitsConfig::max_gsis_per_table`, configurable |
 | LSIs per table | 5 | Enforced | `validate_lsi_count`, `LimitsConfig::max_lsis_per_table`, configurable |
 | Projected attributes across all indexes | 100 | Enforced | `validate_projected_attribute_total`: every `NonKeyAttributes` entry of every GSI and LSI counts, on CreateTable (and so RestoreTableFromBackup) and UpdateTable's GSI Create |
-| Index name length | 3–255 characters | Enforced | `validate_index_name` |
+| Index name length | 3 to 255 characters | Enforced | `validate_index_name` |
 | Index name character set | `[a-zA-Z0-9_.-]` | Enforced | `validate_index_name` |
 | LSI item collection size | 10 GB | Not enforced | No item collection size tracking |
 
@@ -105,8 +109,8 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 | ListTables: max per page | 100 | Enforced | `LimitsConfig::list_tables_max_per_page` |
 | DescribeTable: request rate | No specific limit | N/A | ExtendDB does not rate-limit             |
 | TagResource: max tags per resource | 50 | Not enforced | No tag count validation                  |
-| Tag key length | 1–128 characters | Not enforced | No tag key length validation             |
-| Tag value length | 0–256 characters | Not enforced | No tag value length validation           |
+| Tag key length | 1 to 128 characters | Not enforced | No tag key length validation             |
+| Tag value length | 0 to 256 characters | Not enforced | No tag value length validation           |
 
 ## Import from Amazon S3
 
@@ -122,7 +126,7 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 |-------|---------------|--------|-------|
 | Concurrent export tasks | 300 | N/A | ExtendDB export is synchronous, single-threaded |
 | Total in-flight export size | 100 TB | N/A | No size limit on local export |
-| Incremental export window | 15 min – 24 hours | N/A | ExtendDB does not support incremental export |
+| Incremental export window | 15 minutes to 24 hours | N/A | ExtendDB does not support incremental export |
 
 ## Backup and Restore
 
@@ -171,25 +175,25 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 
 ### Unenforced Limits Requiring Tracking
 
-The following unenforced limits are tracked in `docs/technical-debt.md`:
+The following unenforced limits are tracked in the repository's [technical debt ledger](https://github.com/ExtendDB/extenddb/blob/main/docs/technical-debt.md):
 
-1. **Provisioned capacity decrease limit** (27/day) — would require per-table decrease counter with hourly replenishment
-2. **LSI item collection size** (10 GB) — requires per-partition size tracking in storage layer
-3. **Expression aggregate size limits** (2 MB total expression attribute names/values) — requires aggregate byte-length tracking across all expression parameters. (Per-expression 4 KB limits for condition/filter/projection/update/key-condition are enforced via `check_expression_size`.)
-4. **BatchGetItem response size** (16 MB) — requires aggregate response size tracking
-5. **BatchWriteItem request size** (16 MB) — requires aggregate request size tracking
-6. **Transaction request size** (4 MB) — requires aggregate request size tracking
-7. **GetRecords max per call** (1,000) — requires record count limit in streams
-8. **Shard iterator lifetime** (15 minutes) — requires timestamp tracking on shard iterators
-9. **Tag count per resource** (50) — requires count validation in TagResource
-10. **Tag key/value length** (128/256 chars) — requires length validation in TagResource
+1. **Provisioned capacity decrease limit** (27/day): would require per-table decrease counter with hourly replenishment
+2. **LSI item collection size** (10 GB): requires per-partition size tracking in storage layer
+3. **Expression aggregate size limits** (2 MB total expression attribute names/values): requires aggregate byte-length tracking across all expression parameters. (Per-expression 4 KB limits for condition/filter/projection/update/key-condition are enforced via `check_expression_size`.)
+4. **BatchGetItem response size** (16 MB): requires aggregate response size tracking
+5. **BatchWriteItem request size** (16 MB): requires aggregate request size tracking
+6. **Transaction request size** (4 MB): requires aggregate request size tracking
+7. **GetRecords max per call** (1,000): requires record count limit in streams
+8. **Shard iterator lifetime** (15 minutes): requires timestamp tracking on shard iterators
+9. **Tag count per resource** (50): requires count validation in TagResource
+10. **Tag key/value length** (128/256 chars): requires length validation in TagResource
 
 ---
 
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
-See [LICENSE](../LICENSE) for the full text.
+See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
 This software is provided "as is" without warranty of any kind. ExtendDB is not
 affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark

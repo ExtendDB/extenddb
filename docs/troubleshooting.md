@@ -1,4 +1,10 @@
+---
+description: "Error messages at startup, in TLS, authentication, requests, streams and the console, each with its cause and fix."
+---
+
 # Troubleshooting
+
+Errors are grouped by where they appear: at startup, in TLS, in authentication and authorization, in requests, in streams, and in the web console. Each entry gives the message as logged or returned, the cause, and the fix. Find a message with the search box or the table of contents.
 
 ## Startup Errors
 
@@ -57,7 +63,7 @@ psql -U $(id -nu) -d postgres -c "CREATE USER extenddb WITH PASSWORD 'extenddb-l
 psql -U $(id -nu) -d postgres -c "CREATE DATABASE extenddb OWNER extenddb;"
 ```
 
-See `docs/local-postgres-setup.md` for full setup instructions.
+See [Local PostgreSQL setup](local-postgres-setup.md) for full setup instructions.
 
 ### `migration failed: ...`
 
@@ -67,7 +73,7 @@ See `docs/local-postgres-setup.md` for full setup instructions.
 
 ### `Catalog version mismatch: expected X, found Y. Run 'extenddb migrate' to update.`
 
-**Cause:** The catalog database was initialized with a different version of extenddb. The binary expects catalog version X but the database has version Y.
+**Cause:** The catalog database was initialized with a different version of ExtendDB. The binary expects catalog version X but the database has version Y.
 
 **Fix:** Run `extenddb migrate` to apply schema migrations and update the catalog version. Back up the database first.
 
@@ -75,7 +81,7 @@ See `docs/local-postgres-setup.md` for full setup instructions.
 
 **Cause:** The server connected to the database but the catalog tables don't exist. The database hasn't been initialized with `extenddb init`.
 
-**Fix:** Run `extenddb init` to create the catalog schema and data database. See `docs/getting-started.md`.
+**Fix:** Run `extenddb init` to create the catalog schema and data database. See the [full walkthrough](getting-started.md).
 
 ### `Database '<name>' already exists. Run 'extenddb destroy --config <config>' first, then re-run 'extenddb init'.`
 
@@ -103,9 +109,9 @@ extenddb serve --port 19443 --config extenddb.toml  # use a different port
 
 ### `Failed to load TLS certificates: <error>`
 
-**Cause:** TLS is enabled (the default) but the server could not load the certificate or private key files. Possible causes:
+**Cause:** TLS is always on, and the server could not load the certificate or private key files. Possible causes:
 - The certificate or key file does not exist at the configured path
-- The file exists but the extenddb process does not have read permission
+- The file exists but the ExtendDB process does not have read permission
 - The file is not valid PEM format (e.g., DER-encoded, corrupted, or contains extra data)
 - The path in `extenddb.toml` is wrong (note: `~` is expanded to `$HOME`)
 
@@ -117,12 +123,12 @@ The error intentionally does not name the specific file to avoid leaking filesys
    ls -la ~/.extenddb/tls/cert.pem ~/.extenddb/tls/key.pem
    ```
 2. If missing, run `extenddb init` to generate a self-signed certificate, or provide your own CA-signed certificate.
-3. Check permissions — the extenddb process must be able to read both files:
+3. Check permissions: the ExtendDB process must be able to read both files:
    ```bash
    chmod 600 ~/.extenddb/tls/key.pem
    chmod 644 ~/.extenddb/tls/cert.pem
    ```
-4. Verify PEM format — the cert file should start with `-----BEGIN CERTIFICATE-----` and the key file with `-----BEGIN PRIVATE KEY-----` (or `-----BEGIN EC PRIVATE KEY-----`).
+4. Verify PEM format: the cert file should start with `-----BEGIN CERTIFICATE-----` and the key file with `-----BEGIN PRIVATE KEY-----` (or `-----BEGIN EC PRIVATE KEY-----`).
 
 ### `Config file <path> has permissions <mode>, which is too open.`
 
@@ -176,9 +182,9 @@ at that path produces the same error rather than being followed.
 
 ### `Failed to daemonize: <error>`
 
-**Cause:** extenddb runs as a daemon by default. This error means the process could not fork.
+**Cause:** ExtendDB runs as a daemon by default. This error means the process could not fork.
 
-**Fix:** Check that the process has permission to fork. If another extenddb instance is running, stop it first:
+**Fix:** Check that the process has permission to fork. If another ExtendDB instance is running, stop it first:
 ```bash
 extenddb stop --config extenddb.toml     # preferred
 extenddb status --config extenddb.toml   # shows PID (if stop is unavailable)
@@ -190,11 +196,11 @@ To view logs in real time (useful for debugging):
 journalctl -t extenddb -f
 ```
 
-### `Failed to initialize syslog — another syslog logger may already be active`
+### `Failed to initialize syslog: another syslog logger may already be active`
 
-**Cause:** extenddb logs to syslog. This error means another syslog connection is already active in the process.
+**Cause:** ExtendDB logs to syslog. This error means another syslog connection is already active in the process.
 
-**Fix:** Ensure no other library or init code opens syslog before extenddb starts.
+**Fix:** Ensure no other library or init code opens syslog before ExtendDB starts.
 
 ### `Failed to connect for log-level polling: <error>`
 
@@ -218,27 +224,27 @@ journalctl -t extenddb -f
 
 ### `No PID file found at ... Is extenddb running on port ...?`
 
-**Cause:** `extenddb stop` could not find the PID file for the specified port. Either extenddb is not running, or it was started with a different config/port.
+**Cause:** `extenddb stop` could not find the PID file for the specified port. Either ExtendDB is not running, or it was started with a different config/port.
 
-**Fix:** Check that extenddb is running with `extenddb status`. If using a non-default port or config, pass the same `--config` or `--port` to `extenddb stop`.
+**Fix:** Check that ExtendDB is running with `extenddb status`. If using a non-default port or config, pass the same `--config` or `--port` to `extenddb stop`.
 
 ### `Failed to read PID file <path>: <error>`
 
 **Cause:** The PID file exists but cannot be read (permission denied, I/O error).
 
-**Fix:** Check file permissions on the PID file. The extenddb process must have read access.
+**Fix:** Check file permissions on the PID file. The ExtendDB process must have read access.
 
 ### `Invalid PID in <path>: '<value>'`
 
 **Cause:** The PID file contains a value that is not a valid integer. The file may be corrupted.
 
-**Fix:** Delete the PID file manually and use `extenddb status` or `ps` to find the extenddb process. Stop it with `kill <pid>`.
+**Fix:** Delete the PID file manually and use `extenddb status` or `ps` to find the ExtendDB process. Stop it with `kill <pid>`.
 
 ### `Failed to send SIGTERM to pid <pid>: <error>`
 
-**Cause:** `extenddb stop` found a valid PID but could not send SIGTERM. Common causes: permission denied (the extenddb process is owned by a different user) or the process exited between the liveness check and the signal send.
+**Cause:** `extenddb stop` found a valid PID but could not send SIGTERM. Common causes: permission denied (the ExtendDB process is owned by a different user) or the process exited between the liveness check and the signal send.
 
-**Fix:** If permission denied, run `extenddb stop` as the same user that started extenddb. If the process already exited, the stale PID file will be cleaned up on the next `extenddb stop` invocation.
+**Fix:** If permission denied, run `extenddb stop` as the same user that started ExtendDB. If the process already exited, the stale PID file will be cleaned up on the next `extenddb stop` invocation.
 
 ### `extenddb (pid <pid>) did not exit within 10s after SIGTERM`
 
@@ -269,7 +275,7 @@ journalctl -t extenddb -f
 - Attribute definitions don't cover all key attributes
 - Unused attribute definitions (defined but not used in any key schema)
 
-**Fix:** Check the error message — it describes the specific validation failure. Compare against the [DynamoDB CreateTable API reference](https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_CreateTable.html).
+**Fix:** Check the error message; it describes the specific validation failure. Compare against the [DynamoDB CreateTable API reference](https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_CreateTable.html).
 
 ### Empty response body or connection reset
 
@@ -289,15 +295,15 @@ These errors occur when `auth.provider = "builtin"` is enabled.
 
 ### `UnrecognizedClientException: The security token included in the request is invalid`
 
-**Cause:** The access key ID in the request does not exist in extenddb's credential store. Either the key was never created, was deleted, or is misspelled.
+**Cause:** The access key ID in the request does not exist in ExtendDB's credential store. Either the key was never created, was deleted, or is misspelled.
 
 **Fix:** Verify the access key ID with `extenddb manage list-access-keys`. Create a new access key if needed.
 
 ### `InvalidSignatureException: The request signature we calculated does not match the signature you provided`
 
-**Cause:** The secret key used to sign the request does not match the secret key stored in extenddb. This can happen if the secret key was copied incorrectly (even a single character difference causes a completely different signature).
+**Cause:** The secret key used to sign the request does not match the secret key stored in ExtendDB. This can happen if the secret key was copied incorrectly (even a single character difference causes a completely different signature).
 
-**Fix:** Verify you are using the exact secret key returned when the access key was created. Secret keys cannot be retrieved after creation — if lost, delete the access key and create a new one.
+**Fix:** Verify you are using the exact secret key returned when the access key was created. Secret keys cannot be retrieved after creation; if lost, delete the access key and create a new one.
 
 ### `AccessDeniedException: User: <ARN> is not authorized to perform: <action>`
 
@@ -307,7 +313,7 @@ These errors occur when `auth.provider = "builtin"` is enabled.
 
 ### A `Deny` on `dynamodb:Attributes` (or `dynamodb:LeadingKeys`) does not deny the request
 
-**Cause:** `dynamodb:Attributes` and `dynamodb:LeadingKeys` are *multivalued* (multi-valued) condition keys. In IAM, a **bare** condition operator (one without a `ForAnyValue:` or `ForAllValues:` qualifier) applied to a multivalued key **never matches** — regardless of the operator or how many values the request carries. This mirrors real AWS behavior exactly (verified against the IAM Policy Simulator and live DynamoDB). A policy like the following is therefore a **no-op** and grants no protection:
+**Cause:** `dynamodb:Attributes` and `dynamodb:LeadingKeys` are *multivalued* (multi-valued) condition keys. In IAM, a **bare** condition operator (one without a `ForAnyValue:` or `ForAllValues:` qualifier) applied to a multivalued key **never matches**, regardless of the operator or how many values the request carries. This mirrors real AWS behavior exactly (verified against the IAM Policy Simulator and live DynamoDB). A policy like the following is therefore a **no-op** and grants no protection:
 
 ```json
 {
@@ -331,13 +337,13 @@ These errors occur when `auth.provider = "builtin"` is enabled.
 
 To allowlist attributes (allow only when *every* requested attribute is in the set), use `ForAllValues:` on an `Allow` statement. The same rule applies to `dynamodb:LeadingKeys`.
 
-> Note: prior to v0.1.6, extenddb incorrectly treated a bare operator on these keys as an implicit AND across the requested values, so a single-attribute request appeared to be denied while a multi-attribute request leaked. That behavior diverged from AWS and gave a false sense of security. See the upgrade manual for migration guidance.
+> Note: prior to v0.1.6, ExtendDB incorrectly treated a bare operator on these keys as an implicit AND across the requested values, so a single-attribute request appeared to be denied while a multi-attribute request leaked. That behavior diverged from AWS and gave a false sense of security. See the upgrade manual for migration guidance.
 
 ## Connection Issues
 
 ### AWS CLI returns `Could not connect to the endpoint URL`
 
-**Cause:** extenddb is not running, or the endpoint URL is wrong.
+**Cause:** ExtendDB is not running, or the endpoint URL is wrong.
 
 **Fix:**
 ```bash
@@ -345,34 +351,34 @@ curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/health
 # Should return: {"status":"healthy"}
 ```
 
-If the health check fails, start extenddb. If it succeeds, check your `--endpoint-url` matches the server's bind address and port.
+If the health check fails, start ExtendDB. If it succeeds, check your `--endpoint-url` matches the server's bind address and port.
 
 ### SDK timeout errors
 
-**Cause:** extenddb is running but slow to respond (e.g., PostgreSQL connection pool exhausted).
+**Cause:** ExtendDB is running but slow to respond (e.g., PostgreSQL connection pool exhausted).
 
-**Fix:** Check `extenddb.toml` `[storage.postgres] pool_size` — increase if under heavy concurrent load. Check PostgreSQL logs for slow queries.
+**Fix:** Check `extenddb.toml` `[storage.postgres] pool_size`; increase it under heavy concurrent load. Check PostgreSQL logs for slow queries.
 
 ### Table stuck in CREATING or DELETING state
 
 **Cause:** The background transition poller processes status changes when notified by CreateTable/DeleteTable, or on a 60-second defensive sweep. If the server was stopped while a table was in a transitional state, the transition completes on the next server startup.
 
 **Fix:** If a table appears stuck:
-1. Check that extenddb is running (`extenddb status`).
-2. Wait for the configured `control_plane_delay_seconds` (default: 5) — the poller is woken immediately when a table enters a transitional state.
+1. Check that ExtendDB is running (`extenddb status`).
+2. Wait for the configured `control_plane_delay_seconds` (default: 5); the poller is woken immediately when a table enters a transitional state.
 3. If the server was restarted, transitions are recovered automatically at startup.
 
 ### CreateTable returns CREATING instead of ACTIVE
 
-**Cause:** extenddb emulates real DynamoDB's async control plane behavior. Tables start in CREATING state and transition to ACTIVE after a configurable delay (default: 5 seconds).
+**Cause:** ExtendDB emulates the DynamoDB service's async control plane behavior. Tables start in CREATING state and transition to ACTIVE after a configurable delay (default: 5 seconds).
 
-**Fix:** This is expected behavior matching real DynamoDB. Poll with DescribeTable until `TableStatus` is `ACTIVE` before performing operations on the table. All test code should use a `wait_for_active()` helper after CreateTable.
+**Fix:** This is expected behavior matching the DynamoDB service. Poll with DescribeTable until `TableStatus` is `ACTIVE` before performing operations on the table. All test code should use a `wait_for_active()` helper after CreateTable.
 
 ### Failed to recover control plane transitions
 
-**Cause:** At startup, extenddb attempts to complete any in-flight control plane transitions (CREATING→ACTIVE, DELETING→removed) left over from a previous server instance. This error means the recovery query failed, likely due to a database connectivity issue.
+**Cause:** At startup, ExtendDB attempts to complete any in-flight control plane transitions (CREATING→ACTIVE, DELETING→removed) left over from a previous server instance. This error means the recovery query failed, likely due to a database connectivity issue.
 
-**Fix:** Check PostgreSQL connectivity and that the catalog database is accessible. Tables may be stuck in CREATING or DELETING state until the issue is resolved. Once the database is reachable, restart extenddb to retry recovery.
+**Fix:** Check PostgreSQL connectivity and that the catalog database is accessible. Tables may be stuck in CREATING or DELETING state until the issue is resolved. Once the database is reachable, restart ExtendDB to retry recovery.
 
 ### Control plane transition poll failed
 
@@ -486,7 +492,7 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 
 ### `Management API: tag IAM user failed: <error>`
 
-**Cause:** The `INSERT INTO iam_user_tags` query failed for a reason other than a FK violation. Likely a database connectivity issue. The tag transaction is rolled back — no partial tags are applied.
+**Cause:** The `INSERT INTO iam_user_tags` query failed for a reason other than a FK violation. Likely a database connectivity issue. The tag transaction is rolled back; no partial tags are applied.
 
 **Fix:** Check PostgreSQL connectivity and logs.
 
@@ -498,7 +504,7 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 
 ### `Management API: untag IAM user failed: <error>`
 
-**Cause:** The `DELETE FROM iam_user_tags` query failed. The untag transaction is rolled back — no partial deletes are applied. Likely a database connectivity issue.
+**Cause:** The `DELETE FROM iam_user_tags` query failed. The untag transaction is rolled back; no partial deletes are applied. Likely a database connectivity issue.
 
 **Fix:** Check PostgreSQL connectivity and logs.
 
@@ -758,19 +764,19 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 
 ### `Stream capture: failed to assign shard for <table>: <error>`
 
-**Cause:** After a successful write (PutItem, DeleteItem, UpdateItem), extenddb tried to capture a stream record but could not determine which shard to assign it to. The data write succeeded — only the stream record is missing.
+**Cause:** After a successful write (PutItem, DeleteItem, UpdateItem), ExtendDB tried to capture a stream record but could not determine which shard to assign it to. The data write succeeded; only the stream record is missing.
 
 **Fix:** Check PostgreSQL connectivity. Verify the table's stream shards exist in the `stream_shards` table. If the table was created before streams were enabled, the shards may not have been initialized.
 
 ### `Stream capture: failed to write record for <table>: <error>`
 
-**Cause:** A stream record was constructed but could not be persisted to the `stream_records` table. The data write succeeded — only the stream record is missing.
+**Cause:** A stream record was constructed but could not be persisted to the `stream_records` table. The data write succeeded; only the stream record is missing.
 
-**Fix:** Check PostgreSQL connectivity and disk space. If the error mentions a unique constraint violation, two writes to the same shard may have occurred in the same microsecond — retry the operation.
+**Fix:** Check PostgreSQL connectivity and disk space. If the error mentions a unique constraint violation, two writes to the same shard may have occurred in the same microsecond, retry the operation.
 
 ### `Stream capture: failed to get sequence number: <error>`
 
-**Cause:** extenddb could not generate a sequence number for a stream record. The data write succeeded — only the stream record is missing.
+**Cause:** ExtendDB could not generate a sequence number for a stream record. The data write succeeded; only the stream record is missing.
 
 **Fix:** Check PostgreSQL connectivity.
 
@@ -792,7 +798,7 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 
 **Cause:** The session cookie has expired (sessions last 8 hours) or cookies are blocked by the browser.
 
-**Fix:** Log in again. Ensure cookies are enabled for the extenddb server address. If using a reverse proxy, ensure it forwards the `Cookie` and `Set-Cookie` headers.
+**Fix:** Log in again. Ensure cookies are enabled for the ExtendDB server address. If using a reverse proxy, ensure it forwards the `Cookie` and `Set-Cookie` headers.
 
 ### Console shows "Encryption key not found" when creating access keys
 
@@ -806,13 +812,13 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 
 **Cause:** The `FileSource.Path` in an `ImportTable` request points to a file or directory that does not exist on the server's filesystem.
 
-**Fix:** Verify the path is correct and accessible to the extenddb process. Paths are relative to the server's working directory.
+**Fix:** Verify the path is correct and accessible to the ExtendDB process. Paths are relative to the server's working directory.
 
 ### `Cannot open source file: <error>`
 
 **Cause:** The import source file exists but cannot be opened (permission denied, is a directory, etc.).
 
-**Fix:** Check file permissions. The extenddb process must have read access to the file.
+**Fix:** Check file permissions. The ExtendDB process must have read access to the file.
 
 ### `Invalid JSON at line N: <error>`
 
@@ -824,7 +830,7 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 
 **Cause:** The export destination path is not writable (permission denied, disk full, etc.).
 
-**Fix:** Check that the extenddb process has write access to the destination directory. Parent directories are created automatically.
+**Fix:** Check that the ExtendDB process has write access to the destination directory. Parent directories are created automatically.
 
 ### `Invalid table ARN: <arn>`
 
@@ -836,7 +842,7 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 
 ### GSI query returns stale data after a write
 
-**Cause:** GSI updates are applied asynchronously with a configurable propagation delay (default 10ms). This matches real DynamoDB's eventually consistent GSI behavior. Each GSI can have its own `propagation_delay_ms` setting; the system-wide default is controlled by the `index_propagation_delay_ms` runtime setting.
+**Cause:** GSI updates are applied asynchronously with a configurable propagation delay (default 10ms). This matches the DynamoDB service's eventually consistent GSI behavior. Each GSI can have its own `propagation_delay_ms` setting; the system-wide default is controlled by the `index_propagation_delay_ms` runtime setting.
 
 **Fix:** This is expected behavior. For tests that query GSIs after writes, poll/retry the GSI query until the expected data appears. To make all GSIs synchronous for testing, set `extenddb settings set index_propagation_delay_ms 0`. For production-like testing, keep the default async delay.
 
@@ -844,7 +850,7 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 
 ### HTTP 500 on all requests under heavy load
 
-**Cause:** The PostgreSQL connection pool is exhausted. All connections are in use and new requests cannot acquire a connection within the timeout. extenddb currently returns HTTP 500 (Internal Server Error) instead of the more appropriate 503 (Service Unavailable).
+**Cause:** The PostgreSQL connection pool is exhausted. All connections are in use and new requests cannot acquire a connection within the timeout. ExtendDB currently returns HTTP 500 (Internal Server Error) instead of the more appropriate 503 (Service Unavailable).
 
 **Fix:** Increase the pool size in `extenddb.toml`:
 ```toml
@@ -901,7 +907,7 @@ even after the extension exists.
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
-See [LICENSE](../LICENSE) for the full text.
+See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
 This software is provided "as is" without warranty of any kind. ExtendDB is not
 affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark

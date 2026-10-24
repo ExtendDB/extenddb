@@ -1,3 +1,7 @@
+---
+description: "Proposal to add MongoDB as a storage backend."
+---
+
 # RFC-206: MongoDB Storage Backend
 
 - Status: Draft
@@ -298,7 +302,7 @@ MongoDB has a native change-data-capture feature (Change Streams) that could bac
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
-See [LICENSE](../../LICENSE) for the full text.
+See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
 This software is provided "as is" without warranty of any kind. ExtendDB is not
 affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is
