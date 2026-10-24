@@ -117,7 +117,7 @@ Set operators and `IfExists` can be combined: `ForAllValues:StringEqualsIfExists
 | `dynamodb:FullTableScan` | Boolean | `true` for Scan operations |
 | `dynamodb:EnclosingOperation` | String | The enclosing operation for batch/transact sub-operations |
 
-Policy variables (e.g., `${aws:PrincipalTag/Team}`) are expanded in condition values. The `${key, 'default'}` form expands to `default` when the request does not carry `key`.
+Policy variables (e.g., `${aws:PrincipalTag/Team}`) are expanded in condition values. The `${key, 'default'}` form expands to `default` when the request does not carry `key`. A multivalued key such as `dynamodb:LeadingKeys` is not expanded.
 
 ### Access Control Patterns
 
@@ -141,7 +141,7 @@ Resources are identified by ARN: `arn:aws:dynamodb:<region>:<account-id>:table/<
 
 - `Effect`: Allow, Deny
 - `Action` / `NotAction`: DynamoDB actions (e.g., `dynamodb:PutItem`, `dynamodb:*`)
-- `Resource` / `NotResource`: ARN patterns with wildcards. In a `2012-10-17` document, `${key}` policy variables in the pattern are expanded from the request before matching (for example `arn:aws:dynamodb:*:*:table/${aws:username}`); a wildcard written after a variable still matches; `${key, 'default'}` falls back to `default`; `${*}`, `${?}` and `${$}` stand for literal characters; a variable whose key the request does not carry makes the pattern match nothing. A `2008-10-17` document, or one with no `Version`, matches the pattern as written, as IAM does.
+- `Resource` / `NotResource`: ARN patterns with wildcards. In a `2012-10-17` document, `${key}` policy variables in the pattern are expanded from the request before matching (for example `arn:aws:dynamodb:*:*:table/${aws:username}`); a wildcard written after a variable still matches; `${key, 'default'}` falls back to `default`; `${*}`, `${?}` and `${$}` stand for literal characters; a variable whose key the request does not carry, or that names a multivalued key such as `dynamodb:LeadingKeys`, makes the pattern match nothing; a `:` inside a substituted value does not separate ARN fields. A `2008-10-17` document, or one with no `Version`, matches the pattern as written, as IAM does.
 - `Condition`: Full condition block support (see operators and keys above)
 
 ## Transport Security
