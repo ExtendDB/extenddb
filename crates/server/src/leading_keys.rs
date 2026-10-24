@@ -52,7 +52,7 @@
 use std::collections::HashMap;
 
 use extenddb_core::expression::{
-    Expr, PathElement, Token, key_condition_inequality_operands, parse_key_condition,
+    Expr, PathElement, Token, key_condition_clause_operands, parse_key_condition,
     tokenize_with_limit,
 };
 use extenddb_core::types::{KeyType, TableKeyInfo};
@@ -256,28 +256,35 @@ fn query_leading_keys(input: &Value, key_info: &TableKeyInfo, max_tokens: usize)
 
     if let Some(kce) = input.get("KeyConditionExpression").and_then(Value::as_str) {
         let tokens = tokenize_with_limit(kce, max_tokens).ok()?;
-        // The partition key pinned by an equality, which is the only shape the
-        // engine runs.
-        if let Some(value) = equality_pk_value(&tokens, &pk_attr, &names, &values) {
-            return Some(value);
-        }
-        // A key condition that names the partition key with a single operand
-        // under an operator the engine rejects, such as `pk > :v`. The service
-        // binds LeadingKeys to that operand and evaluates the policy before it
-        // rejects the shape, so a principal fenced away from the value gets
-        // AccessDeniedException while one fenced to it gets the shape's
-        // ValidationException (measured 2026-10-21 for `pk > :v`). A condition
-        // that does not parse, one that names no partition clause, and a
-        // partition clause carrying no single operand all leave the key absent,
-        // which is what the service answers for those (it returns
-        // ValidationException to every principal).
-        let (_, operand) = key_condition_inequality_operands(&tokens)
+        // The clauses that name the partition attribute, as written.
+        let pk_clauses: Vec<_> = key_condition_clause_operands(&tokens)
             .ok()?
             .into_iter()
-            .find(|(path, _)| {
-                resolve_attr_name(path, &names).as_deref() == Some(pk_attr.as_str())
-            })?;
-        return value_of(&operand, &values);
+            .filter(|clause| {
+                resolve_attr_name(&clause.path, &names).as_deref() == Some(pk_attr.as_str())
+            })
+            .collect();
+        // An equality on the partition attribute decides the key, as the
+        // engine reads it. When its value cannot be read here (an `N` that
+        // is not a number, a placeholder with no value), the key stays absent
+        // and no other clause's operand is bound in its place: the equality,
+        // not the other clause, names the partition.
+        if pk_clauses.iter().any(|clause| clause.equality) {
+            return equality_pk_value(&tokens, &pk_attr, &names, &values);
+        }
+        // Exactly one clause names the partition key, under an operator the
+        // engine rejects, such as `pk > :v`. The service binds LeadingKeys to
+        // that operand and evaluates the policy before it rejects the shape,
+        // so a principal fenced away from the value gets AccessDeniedException
+        // while one fenced to it gets the shape's ValidationException
+        // (measured 2026-10-21 for `pk > :v`). A condition that does not
+        // parse, one that names no partition clause, and one with two
+        // non-equality partition clauses (which value the service binds for
+        // that shape is not measured) leave the key absent.
+        let [clause] = pk_clauses.as_slice() else {
+            return None;
+        };
+        return value_of(&clause.value, &values);
     }
 
     // Legacy KeyConditions: the partition attribute's single operand. An EQ is
@@ -285,9 +292,15 @@ fn query_leading_keys(input: &Value, key_info: &TableKeyInfo, max_tokens: usize)
     // `BEGINS_WITH` measured 2026-10-21) are authorized against that operand
     // before the engine rejects the shape, as in the expression path above. An
     // operator carrying no operand or more than one, such as BETWEEN or IN,
-    // names no single partition value and leaves the key absent.
+    // names no single partition value, and a value that is not one of the
+    // service's comparison operators is not read as one; both leave the key
+    // absent.
     if let Some(conds) = input.get("KeyConditions").and_then(Value::as_object) {
         let cond = conds.get(&pk_attr)?.as_object()?;
+        let operator = cond.get("ComparisonOperator").and_then(Value::as_str)?;
+        if !LEGACY_SINGLE_OPERAND_OPERATORS.contains(&operator) {
+            return None;
+        }
         let list = cond.get("AttributeValueList")?.as_array()?;
         if list.len() != 1 {
             return None;
@@ -297,6 +310,19 @@ fn query_leading_keys(input: &Value, key_info: &TableKeyInfo, max_tokens: usize)
 
     None
 }
+
+/// The legacy `ComparisonOperator` values that take exactly one operand.
+const LEGACY_SINGLE_OPERAND_OPERATORS: [&str; 9] = [
+    "EQ",
+    "NE",
+    "LE",
+    "LT",
+    "GE",
+    "GT",
+    "CONTAINS",
+    "NOT_CONTAINS",
+    "BEGINS_WITH",
+];
 
 /// The partition key value a `KeyConditionExpression` pins with an equality,
 /// resolved the way the engine resolves it. `None` when the expression does not

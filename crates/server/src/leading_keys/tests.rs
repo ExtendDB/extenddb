@@ -512,6 +512,74 @@ fn query_between_on_the_partition_key_is_absent() {
     assert_eq!(r, None);
 }
 
+/// An equality on the partition key decides the key, even when its value
+/// cannot be read and another clause names the partition key: the other
+/// clause's operand is never bound in its place. With `:u = {"N": "bob"}`
+/// (not a number) the key stays absent, as on main, rather than becoming
+/// `alice`.
+#[test]
+fn query_unreadable_partition_equality_binds_no_other_clause() {
+    for (kce, u) in [
+        ("pk = :u AND pk > :v", json!({"N": "bob"})),
+        ("pk > :v AND pk = :u", json!({"N": "bob"})),
+        ("#p = :u AND pk > :v", json!({"N": "bob"})),
+        ("pk = :u AND begins_with(pk, :v)", json!({"N": "1e"})),
+    ] {
+        let input = json!({
+            "TableName": "t",
+            "KeyConditionExpression": kce,
+            "ExpressionAttributeNames": {"#p": "pk"},
+            "ExpressionAttributeValues": {":u": u, ":v": {"S": "alice"}},
+        });
+        let r = single_table_leading_keys(&input, "Query", Some(&main_table()), MAX_TOKENS);
+        assert_eq!(r, None, "{kce}");
+    }
+    // A readable equality keeps its own value with another partition clause.
+    let input = json!({
+        "TableName": "t",
+        "KeyConditionExpression": "pk = :u AND pk > :v",
+        "ExpressionAttributeValues": {":u": {"S": "bob"}, ":v": {"S": "alice"}},
+    });
+    let r = single_table_leading_keys(&input, "Query", Some(&main_table()), MAX_TOKENS);
+    assert_ne!(r, Some(vec!["alice".to_owned()]));
+}
+
+/// Two non-equality clauses on the partition key: which operand the service
+/// binds is not measured, so neither is bound, in either clause order.
+#[test]
+fn query_two_non_equality_partition_clauses_bind_nothing() {
+    for kce in [
+        "pk > :v AND pk > :b",
+        "pk > :b AND pk > :v",
+        "pk < :v AND begins_with(pk, :b)",
+    ] {
+        let input = json!({
+            "TableName": "t",
+            "KeyConditionExpression": kce,
+            "ExpressionAttributeValues": {":v": {"S": "alice"}, ":b": {"S": "bob"}},
+        });
+        let r = single_table_leading_keys(&input, "Query", Some(&main_table()), MAX_TOKENS);
+        assert_eq!(r, None, "{kce}");
+    }
+}
+
+/// A legacy `ComparisonOperator` that is not one of the service's operators is
+/// not read as an operator, so its operand is not bound.
+#[test]
+fn query_legacy_unknown_operator_binds_nothing() {
+    for operator in ["BOGUS", "eq", "", "BETWEEN", "IN", "NULL"] {
+        let input = json!({
+            "TableName": "t",
+            "KeyConditions": {"pk": {
+                "ComparisonOperator": operator,
+                "AttributeValueList": [{"S": "alice"}],
+            }},
+        });
+        let r = single_table_leading_keys(&input, "Query", Some(&main_table()), MAX_TOKENS);
+        assert_eq!(r, None, "{operator}");
+    }
+}
+
 /// A non-equality condition on an attribute that is not the partition key, with
 /// no condition on the partition key, names no partition value.
 #[test]
@@ -591,12 +659,17 @@ fn query_non_equality_on_a_gsi_partition_key_binds_the_index_operand() {
     assert_eq!(r, Some(vec!["galice".to_owned()]));
 }
 
-/// The three shapes of the fix are shapes the engine's own parser rejects, so
-/// the engine never reads a partition value for them and cannot disagree with
-/// the value authorization binds. The equality shapes the engine accepts keep
-/// the value they had, which the accepted-shape tests above cover.
+/// The single-clause shapes of the fix are shapes the engine's own parser
+/// rejects, so the engine never reads a partition value for them and cannot
+/// disagree with the value authorization binds. The two-clause shapes the fix
+/// also binds (`pk > :v AND sk = :s`, `pk > :v AND sk < :s`) parse or not
+/// depending on the sort clause, and the engine refuses them when it resolves
+/// the partition attribute; the wire test
+/// `test_non_equality_partition_with_sort_clause_is_refused` covers that. The
+/// equality shapes the engine accepts keep the value they had, which the
+/// accepted-shape tests above cover.
 #[test]
-fn the_engine_still_rejects_every_shape_whose_operand_is_now_bound() {
+fn the_parser_still_rejects_every_single_clause_shape_whose_operand_is_now_bound() {
     for kce in [
         "pk > :v",
         "pk < :v",

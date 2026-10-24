@@ -268,30 +268,51 @@ pub fn parse_key_condition(tokens: &[Token]) -> Result<KeyCondition, DynamoDbErr
 }
 
 /// The attribute path and single value operand of each clause of a
-/// `KeyConditionExpression` that compares an attribute with something other
-/// than equality.
+/// `KeyConditionExpression`, and whether the clause compares by equality.
 ///
 /// Authorization reads this to find the value a key condition names for the
-/// partition key when the operator makes the shape one the engine rejects. A
-/// `BETWEEN` clause carries two operands and is left out, since it names no
-/// single value for the attribute.
+/// partition key when the operator makes the shape one the engine rejects, and
+/// to tell that case apart from an equality on the partition key whose value
+/// it cannot read. A `BETWEEN` clause carries two operands and is left out,
+/// since it names no single value for the attribute.
 ///
 /// # Errors
 ///
 /// Returns `ValidationException` for the same syntax errors and unsupported
 /// constructs [`parse_key_condition`] rejects before it classifies clauses.
-pub fn key_condition_inequality_operands(
+pub fn key_condition_clause_operands(
     tokens: &[Token],
-) -> Result<Vec<(Vec<PathElement>, Expr)>, DynamoDbError> {
+) -> Result<Vec<KeyClauseOperand>, DynamoDbError> {
     Ok(parse_clauses(tokens)?
         .into_iter()
         .filter_map(|clause| match clause {
+            RawClause::Eq(path, value) => Some(KeyClauseOperand {
+                path,
+                value,
+                equality: true,
+            }),
             RawClause::Compare(path, _, value) | RawClause::BeginsWith(path, value) => {
-                Some((path, value))
+                Some(KeyClauseOperand {
+                    path,
+                    value,
+                    equality: false,
+                })
             }
-            RawClause::Eq(..) | RawClause::Between(..) => None,
+            RawClause::Between(..) => None,
         })
         .collect())
+}
+
+/// One clause of a `KeyConditionExpression`, as [`key_condition_clause_operands`]
+/// returns it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeyClauseOperand {
+    /// The attribute side of the clause, as written.
+    pub path: Vec<PathElement>,
+    /// The single value operand.
+    pub value: Expr,
+    /// Whether the clause is `attribute = value`.
+    pub equality: bool,
 }
 
 /// Parse a `KeyConditionExpression` token stream into its AND-ed clauses,
@@ -1027,46 +1048,62 @@ mod tests {
         }
     }
 
-    /// The attribute and operand of each non-equality clause, which is what
-    /// authorization reads to find the partition value of a key condition the
-    /// engine rejects for its operator.
+    /// The attribute and operand of each clause, and whether it is an
+    /// equality, which is what authorization reads to find the partition value
+    /// of a key condition the engine rejects for its operator.
     #[test]
-    fn inequality_operands_are_the_non_equality_clauses() {
-        let cases: &[(&str, &[(&str, &str)])] = &[
-            ("pk = :v", &[]),
-            ("pk = :v AND sk = :s", &[]),
-            ("pk > :v", &[("pk", "v")]),
-            (":v > pk", &[("pk", "v")]),
-            ("begins_with(pk, :v)", &[("pk", "v")]),
-            ("(pk >= :v)", &[("pk", "v")]),
-            ("#p <= :v", &[("#p", "v")]),
-            ("pk = :v AND sk < :s", &[("sk", "s")]),
-            ("pk > :v AND sk = :s", &[("pk", "v")]),
-            ("pk < :v AND sk > :s", &[("pk", "v"), ("sk", "s")]),
+    fn clause_operands_name_every_single_operand_clause() {
+        let cases: &[(&str, &[(&str, &str, bool)])] = &[
+            ("pk = :v", &[("pk", "v", true)]),
+            (
+                "pk = :v AND sk = :s",
+                &[("pk", "v", true), ("sk", "s", true)],
+            ),
+            ("pk > :v", &[("pk", "v", false)]),
+            (":v > pk", &[("pk", "v", false)]),
+            ("begins_with(pk, :v)", &[("pk", "v", false)]),
+            ("(pk >= :v)", &[("pk", "v", false)]),
+            ("#p <= :v", &[("#p", "v", false)]),
+            (
+                "pk = :v AND sk < :s",
+                &[("pk", "v", true), ("sk", "s", false)],
+            ),
+            (
+                "pk > :v AND sk = :s",
+                &[("pk", "v", false), ("sk", "s", true)],
+            ),
+            (
+                "pk < :v AND sk > :s",
+                &[("pk", "v", false), ("sk", "s", false)],
+            ),
+            (
+                "pk = :u AND pk > :v",
+                &[("pk", "u", true), ("pk", "v", false)],
+            ),
             // BETWEEN names two operands, so it contributes none.
             ("pk BETWEEN :lo AND :hi", &[]),
-            ("pk = :v AND sk BETWEEN :lo AND :hi", &[]),
+            ("pk = :v AND sk BETWEEN :lo AND :hi", &[("pk", "v", true)]),
         ];
         for (expr, want) in cases {
             let tokens = tokenize(expr).unwrap();
-            let got = key_condition_inequality_operands(&tokens).unwrap();
-            let got: Vec<(String, String)> = got
+            let got = key_condition_clause_operands(&tokens).unwrap();
+            let got: Vec<(String, String, bool)> = got
                 .into_iter()
-                .map(|(path, value)| {
-                    let name = match &path[0] {
+                .map(|clause| {
+                    let name = match &clause.path[0] {
                         PathElement::Attribute(n) => n.clone(),
                         PathElement::Index(i) => format!("[{i}]"),
                     };
-                    let value = match value {
+                    let value = match clause.value {
                         Expr::Placeholder(n) => n,
                         other => format!("{other:?}"),
                     };
-                    (name, value)
+                    (name, value, clause.equality)
                 })
                 .collect();
-            let want: Vec<(String, String)> = want
+            let want: Vec<(String, String, bool)> = want
                 .iter()
-                .map(|(a, v)| ((*a).to_owned(), (*v).to_owned()))
+                .map(|(a, v, e)| ((*a).to_owned(), (*v).to_owned(), *e))
                 .collect();
             assert_eq!(got, want, "expr {expr}");
         }
@@ -1075,7 +1112,7 @@ mod tests {
     /// The same syntax errors and unsupported constructs `parse_key_condition`
     /// rejects before classification.
     #[test]
-    fn inequality_operands_reject_what_the_parser_rejects() {
+    fn clause_operands_reject_what_the_parser_rejects() {
         for expr in [
             "pk :: :v",
             "pk > :v OR sk = :s",
@@ -1088,7 +1125,7 @@ mod tests {
                 continue;
             };
             assert!(
-                key_condition_inequality_operands(&tokens).is_err(),
+                key_condition_clause_operands(&tokens).is_err(),
                 "expr {expr} should be rejected"
             );
         }
