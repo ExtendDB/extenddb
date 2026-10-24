@@ -1048,12 +1048,15 @@ mod tests {
         }
     }
 
+    /// One expected clause: attribute, operand placeholder, equality.
+    type ExpectedClause = (&'static str, &'static str, bool);
+
     /// The attribute and operand of each clause, and whether it is an
     /// equality, which is what authorization reads to find the partition value
     /// of a key condition the engine rejects for its operator.
     #[test]
     fn clause_operands_name_every_single_operand_clause() {
-        let cases: &[(&str, &[(&str, &str, bool)])] = &[
+        let cases: &[(&str, &[ExpectedClause])] = &[
             ("pk = :v", &[("pk", "v", true)]),
             (
                 "pk = :v AND sk = :s",
