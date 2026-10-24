@@ -218,12 +218,13 @@ fn condition_value_default_form_expands_when_key_absent() {
             "Condition":{{"StringEquals":{{"aws:ResourceTag/owner":"${{aws:username, 'anon'}}"}}}}
         }}]}}"#
     ));
+    let p = std::slice::from_ref(&p);
     let owned_by_anon = Ctx::empty().with("aws:ResourceTag/owner", vec!["anon"]);
-    assert_eq!(get(&[p.clone()], "T", &owned_by_anon), AuthzDecision::Allow);
+    assert_eq!(get(p, "T", &owned_by_anon), AuthzDecision::Allow);
     let owned_by_alice = Ctx::empty().with("aws:ResourceTag/owner", vec!["alice"]);
-    assert_eq!(get(&[p.clone()], "T", &owned_by_alice), AuthzDecision::Deny);
+    assert_eq!(get(p, "T", &owned_by_alice), AuthzDecision::Deny);
     let alice_on_alice = owned_by_alice.with("aws:username", vec!["alice"]);
-    assert_eq!(get(&[p], "T", &alice_on_alice), AuthzDecision::Allow);
+    assert_eq!(get(p, "T", &alice_on_alice), AuthzDecision::Allow);
 }
 
 // --- Boundary and session policy paths ---
