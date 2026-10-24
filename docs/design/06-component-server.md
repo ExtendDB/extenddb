@@ -614,7 +614,7 @@ struct TokenBucketState {
 }
 ```
 
-The handler calls `core::capacity::calculator` to compute consumed RCU/WCU, then calls `ThroughputTracker::consume()` to deduct tokens. If insufficient tokens, returns `ProvisionedThroughputExceededException`.
+The handler calls `core::capacity::calculator` to compute consumed RCU/WCU, then calls `ThroughputTracker::consume()` to deduct tokens. If insufficient tokens, returns the throttle error for the refusing bucket and billing mode (`throttle_helpers::throttle_error`): the provisioned class, `ThrottlingException` or `RequestLimitExceeded`, with the table ARN and the limit in the reasons list where the service sends one; see differences-from-dynamodb.md.
 
 ---
 
