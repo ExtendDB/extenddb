@@ -154,6 +154,14 @@ impl CassandraEngine {
             validation::validate_item_size(&item, MAX_ITEM_SIZE_BYTES)
                 .map_err(|e| StorageError::Validation(e.to_string()))?;
 
+            // REMOVE and DELETE on a key that holds no item change nothing: the
+            // service writes no item and emits no stream record (issue #478).
+            // The actions were still applied above so that their validation
+            // errors surface the same way as on an existing item.
+            if !item_existed && expression::removes_only(actions) {
+                return Ok((None, None));
+            }
+
             let new_item = if return_new { Some(item.clone()) } else { None };
 
             let item_json =

@@ -316,7 +316,11 @@ pub trait DataEngine: Send + Sync {
     /// Update an item by primary key using update actions.
     ///
     /// `UpdateItem` is an upsert: if the item doesn't exist, a new item is created
-    /// containing the key attributes plus the SET values.
+    /// containing the key attributes plus the SET values. The exception is an
+    /// update whose actions all remove data (`REMOVE`, `DELETE`): on a missing
+    /// item it writes nothing, emits no stream record, and returns
+    /// `(None, None)` whatever `return_old` and `return_new` say
+    /// (`extenddb_core::expression::removes_only`).
     ///
     /// If `condition` is `Some`, evaluates the condition against the existing item
     /// (or empty item for new) inside a transaction.
