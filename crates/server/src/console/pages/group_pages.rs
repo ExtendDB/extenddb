@@ -88,6 +88,24 @@ pub async fn create_group(
         return r;
     }
 
+    // Same name rule as the management API (`management::iam_group::create_group`).
+    if !crate::management::is_valid_iam_name(&form.group_name) {
+        let nav = html::nav_bar(&identity_label(&session.identity));
+        let content = format!(
+            "<h1>Create Group</h1>{}",
+            html::alert_error(
+                "group_name must be 1-128 characters: alphanumeric, hyphens, underscores, dots, plus, equals, at"
+            )
+        );
+        return Html(html::layout_csrf(
+            "New Group",
+            &nav,
+            &content,
+            &session.csrf_token,
+        ))
+        .into_response();
+    }
+
     match state
         .catalog_store
         .create_group(&account_id, &form.group_name)
