@@ -11,7 +11,7 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::PathElement;
 use extenddb_core::expression::{ExpressionKind, ExpressionMaps, Projection};
 use extenddb_core::types::{
-    IndexType, KeyType, ProjectionType, QueryInput, QueryOutput, Select, TableKeyInfo,
+    IndexType, ProjectionType, QueryInput, QueryOutput, Select, TableKeyInfo,
     VECTOR_INDEX_QUERY_NOT_SUPPORTED,
 };
 use extenddb_storage::error::StorageError;
@@ -24,7 +24,9 @@ use crate::index_helpers::{
     VectorIndexReadRefusal, classify_unresolved_index_read, combined_lek_key_schema,
     validate_query_exclusive_start_key,
 };
-use crate::legacy_filter::{desugar_filter, desugar_key_conditions, validate_legacy_conditions};
+use crate::legacy_filter::{
+    desugar_filter, desugar_key_conditions, reject_query_filter_on_key, validate_key_conditions,
+};
 use crate::read_helpers::{PostRead, read_page};
 use crate::serialize_output;
 use crate::{DispatchMetrics, DispatchResult};
@@ -156,9 +158,10 @@ pub async fn handle_query(
     // A legacy QueryFilter skips the parser; desugar_filter checks each
     // ComparisonOperator against its value count and types with the service's
     // messages, still before any row is read. Legacy KeyConditions get the
-    // same value checks here, ahead of the table lookup; the service reported
-    // a bad QueryFilter value before a bad KeyConditions value, and both
-    // before any key schema error (measured 2026-10-23).
+    // same value checks here, ahead of the table lookup, plus the
+    // non-indexable operator refusal; the service reported a bad QueryFilter
+    // value before a bad KeyConditions value, and both before any key schema
+    // error (measured 2026-10-23 and 2026-10-24).
     let (filter, filter_maps) =
         if let Some(qf) = input.query_filter.as_ref().filter(|qf| !qf.is_empty()) {
             let cond_op = input.conditional_operator.unwrap_or_default();
@@ -180,7 +183,7 @@ pub async fn handle_query(
             }
         };
     if let Some(kc) = input.key_conditions.as_ref() {
-        validate_legacy_conditions(kc)?;
+        validate_key_conditions(kc)?;
     }
 
     let parsed_key_condition = match input.key_condition_expression.as_deref() {
@@ -356,7 +359,8 @@ pub async fn handle_query(
     };
 
     // The key condition: parsed above from KeyConditionExpression, or
-    // desugared here from legacy KeyConditions, which needs the key schema.
+    // desugared here from legacy KeyConditions, which needs the key schema
+    // and the attribute types of the queried table or index.
     let (mut key_condition, legacy_kc_maps) = match parsed_key_condition {
         Some(parsed) => (parsed, None),
         None => {
@@ -366,12 +370,11 @@ pub async fn handle_query(
                         .to_owned(),
                 ));
             };
-            let key_schema_pairs: Vec<(String, bool)> = query_key_info
-                .key_schema
-                .iter()
-                .map(|ks| (ks.attribute_name.clone(), ks.key_type == KeyType::Hash))
-                .collect();
-            let (kc_parsed, kc_maps) = desugar_key_conditions(kc, &key_schema_pairs)?;
+            let (kc_parsed, kc_maps) = desugar_key_conditions(
+                kc,
+                &query_key_info.key_schema,
+                &query_key_info.attribute_definitions,
+            )?;
             (kc_parsed, Some(kc_maps))
         }
     };
@@ -455,6 +458,14 @@ pub async fn handle_query(
         input.index_name.is_some(),
         extenddb_core::validation::IS_QUERY,
     )?;
+
+    // A legacy QueryFilter may not name a key of the queried table or index.
+    // The service reports this after every other Query error, including the
+    // Select checks above, and before the ExclusiveStartKey check below
+    // (measured 2026-10-24).
+    if let Some(qf) = input.query_filter.as_ref().filter(|qf| !qf.is_empty()) {
+        reject_query_filter_on_key(qf, &query_key_info.key_schema)?;
+    }
 
     // When Select=ALL_PROJECTED_ATTRIBUTES, capture the index info for post-read filtering.
     let index_proj = if matches!(input.select, Some(Select::AllProjectedAttributes)) {

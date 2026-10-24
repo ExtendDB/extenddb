@@ -94,6 +94,12 @@ adaptation when switching between ExtendDB and the real service.
 | GSI throughput on a `PROVISIONED` table | Every GSI needs `ProvisionedThroughput` of at least 1 read and 1 write unit | A GSI `ProvisionedThroughput` below 1 (including 0/0) is `ValidationException` on `CreateTable` of a `PROVISIONED` table and on `UpdateTable`'s GSI `Create` ("ReadCapacityUnits and WriteCapacityUnits must both be greater than or equal to 1 for index: <name>"; the service's text was not captured). A GSI with no `ProvisionedThroughput` is still accepted on a `PROVISIONED` table, and `UpdateTable` to `PROVISIONED` leaves an on-demand table's GSIs without one; see the `BillingModeOverride` row under Backup and Restore for how a backup of such a table restores |
 | Projected attributes across all indexes | At most 100 | Enforced on `CreateTable` (and so on `RestoreTableFromBackup`, which validates its target the same way) and on `UpdateTable`'s GSI `Create`: every `NonKeyAttributes` entry of every GSI and LSI is counted, so an attribute projected into two indexes counts twice. Over 100 is `ValidationException` ("Number of projected attributes in all indexes exceeds limit of 100, projected: <n>"; the service's text was not captured) |
 
+## Query and Scan
+
+| Area | DynamoDB | ExtendDB |
+|------|----------|------|
+| Which entry of a legacy `ScanFilter`, `QueryFilter` or `KeyConditions` map is named when two or more entries are invalid | One of the invalid entries, with its own message. Measured 2026-10-23 and 2026-10-24 on 44 two- and three-entry maps: the entry named changed with the attribute names, with the order the entries were sent, and between two runs of the same request, so it is not a function of the request | The invalid entry that sorts first by attribute name, on every backend. One invalid entry is always named with the service's message; only the choice between several differs |
+
 ## Backup and Restore
 
 Behaviour stated as measured, and every number below, was observed with release builds of this branch for each backend (PostgreSQL, SQLite, MongoDB, Cassandra) on one host with the database on loopback, except where a row says otherwise, so timings say how the backends compare, not what a networked deployment will see. Numbers marked *(earlier build)* were measured on an earlier build of this branch and not repeated on the final one. Sentences marked *(from the code)* rest on reading the code and on storage-level tests, not on a running server.

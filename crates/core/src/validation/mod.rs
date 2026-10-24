@@ -1423,7 +1423,7 @@ fn validate_key_attribute_type(
 ///
 /// Returns `DynamoDbError::ValidationException` if `value` is an empty string
 /// (`S("")`) or empty binary (`B(<empty>)`).
-fn validate_no_empty_key_value(
+pub fn validate_no_empty_key_value(
     attr_name: &str,
     value: &AttributeValue,
 ) -> Result<(), DynamoDbError> {
@@ -1911,7 +1911,14 @@ fn validate_lsi_requires_range_key(input: &CreateTableInput) -> Result<(), Dynam
     Ok(())
 }
 
-fn validate_attribute_number(value: &AttributeValue) -> Result<(), DynamoDbError> {
+/// Validate every number inside one attribute value (`N`, `NS`, and the
+/// numbers nested in `L` and `M`) with the service's messages.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` for the first number that is
+/// not a valid `DynamoDB` number.
+pub fn validate_attribute_number(value: &AttributeValue) -> Result<(), DynamoDbError> {
     match value {
         AttributeValue::N(n) => {
             number::validate_and_normalize_number(n)?;

@@ -3,7 +3,7 @@
 
 //! `BatchGetItem` operation handler.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -154,7 +154,10 @@ pub async fn handle_batch_get_item(
     let mut total_rcu: f64 = 0.0;
     let mut total_pre_proj_bytes: usize = 0;
     let mut returned_count: u64 = 0;
-    let mut per_table_rcu: HashMap<String, f64> = HashMap::new();
+    // Keyed by table name so ConsumedCapacity lists the tables in name order,
+    // the order the service returned for two tables in both request orders
+    // (measured 2026-10-24).
+    let mut per_table_rcu: BTreeMap<String, f64> = BTreeMap::new();
 
     for (table_name, ka) in &input.request_items {
         let key_info = ctx
@@ -165,30 +168,36 @@ pub async fn handle_batch_get_item(
         let projection = table_projections.get(table_name).and_then(Option::as_ref);
 
         let mut table_items: Vec<Item> = Vec::new();
+        let strongly_consistent = ka.consistent_read == Some(true);
         for key in &ka.keys {
             validate_batch_key_only(key, &key_info.key_schema, &key_info.attribute_definitions)?;
             validate_key_sizes(key, &key_info.key_schema, &ctx.limits)?;
 
-            if let Some(item) = ctx
+            let item = ctx
                 .storage
                 .get_item(&key_info, key)
                 .await
-                .map_err(storage_err_to_dynamo)?
-            {
-                let size = item_size_bytes(&item);
-                let strongly_consistent = ka.consistent_read == Some(true);
-                let item_rcu = capacity_helpers::read_capacity_units(size, strongly_consistent);
-                total_rcu += item_rcu;
-                *per_table_rcu.entry(table_name.clone()).or_default() += item_rcu;
-                total_pre_proj_bytes += size;
-                returned_count += 1;
-                let item = if let Some(projection) = projection {
-                    projection.apply(&item)
-                } else {
-                    item
-                };
-                table_items.push(item);
-            }
+                .map_err(storage_err_to_dynamo)?;
+            // An absent key is charged the minimum read (0.5 eventually
+            // consistent, 1.0 strongly consistent) and keeps its table in
+            // ConsumedCapacity, as GetItem does (measured 2026-10-24: one
+            // absent key 0.5, two 1.0, one hundred 50.0, ConsistentRead 1.0
+            // each).
+            let size = item.as_ref().map_or(0, item_size_bytes);
+            let item_rcu = capacity_helpers::read_capacity_units(size, strongly_consistent);
+            total_rcu += item_rcu;
+            *per_table_rcu.entry(table_name.clone()).or_default() += item_rcu;
+            let Some(item) = item else {
+                continue;
+            };
+            total_pre_proj_bytes += size;
+            returned_count += 1;
+            let item = if let Some(projection) = projection {
+                projection.apply(&item)
+            } else {
+                item
+            };
+            table_items.push(item);
         }
         responses.insert(table_name.clone(), table_items);
     }
