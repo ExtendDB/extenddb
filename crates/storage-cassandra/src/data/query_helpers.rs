@@ -289,56 +289,23 @@ pub(super) async fn query_with_pk_pk_sk(
     }
 }
 
-/// Execute query with PK and three SK parameters.
-pub(super) async fn query_with_pk_sk_sk_sk(
+/// Execute query with PK and zero, one or two SK parameters, bound in order.
+pub(super) async fn query_with_pk_sks(
     session: &Arc<crate::cassandra_util::CassandraSession>,
     query: &str,
     pk: &str,
-    sk1: &SortKeyValue,
-    sk2: &SortKeyValue,
-    sk3: &SortKeyValue,
+    sks: &[SortKeyValue],
     label: &str,
 ) -> Result<Vec<Row>, StorageError> {
-    match (sk1, sk2, sk3) {
-        (SortKeyValue::S(s1), SortKeyValue::S(s2), SortKeyValue::S(s3)) => {
-            cassandra_util::query_rows(
-                session,
-                query,
-                cdrs_tokio::query_values!(pk, s1.as_str(), s2.as_str(), s3.as_str()),
-                label,
-            )
-            .await
+    match sks {
+        [] => {
+            cassandra_util::query_rows(session, query, cdrs_tokio::query_values!(pk), label).await
         }
-        (SortKeyValue::N(n1), SortKeyValue::N(n2), SortKeyValue::N(n3)) => {
-            cassandra_util::query_rows(
-                session,
-                query,
-                cdrs_tokio::query_values!(
-                    pk,
-                    super::decimal_to_value(n1),
-                    super::decimal_to_value(n2),
-                    super::decimal_to_value(n3)
-                ),
-                label,
-            )
-            .await
-        }
-        (SortKeyValue::B(b1), SortKeyValue::B(b2), SortKeyValue::B(b3)) => {
-            cassandra_util::query_rows(
-                session,
-                query,
-                cdrs_tokio::query_values!(
-                    pk,
-                    Blob::new(b1.clone()),
-                    Blob::new(b2.clone()),
-                    Blob::new(b3.clone())
-                ),
-                label,
-            )
-            .await
-        }
-        _ => Err(StorageError::Internal(
-            "Type mismatch in query parameters".to_owned(),
-        )),
+        [sk] => query_with_pk_sk(session, query, pk, sk, label).await,
+        [sk1, sk2] => query_with_pk_sk_sk(session, query, pk, sk1, sk2, label).await,
+        _ => Err(StorageError::Internal(format!(
+            "{label}: {} sort key binds, at most two expected",
+            sks.len()
+        ))),
     }
 }
