@@ -22,6 +22,7 @@ pub mod operations;
 pub mod policy_migration;
 pub mod server_components;
 pub mod settings_store;
+pub mod stream_lineage;
 pub mod transact;
 pub mod vector_catalog;
 pub mod vector_lifecycle;

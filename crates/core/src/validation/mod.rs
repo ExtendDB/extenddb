@@ -659,15 +659,21 @@ fn validate_index_projections(input: &CreateTableInput) -> Result<(), DynamoDbEr
 /// # Errors
 ///
 /// Returns `DynamoDbError::ValidationException` when `StreamEnabled` is false
-/// but a `StreamViewType` is present.
+/// but a `StreamViewType` is present, or `StreamEnabled` is true without one
+/// (measured 2026-10-24; its order against the other CreateTable checks is not
+/// measured, so it sits with the other stream check).
 fn validate_stream_specification(input: &CreateTableInput) -> Result<(), DynamoDbError> {
-    if let Some(stream) = &input.stream_specification
-        && !stream.stream_enabled
-        && stream.stream_view_type.is_some()
-    {
-        return Err(DynamoDbError::ValidationException(
-            "One or more parameter values were invalid: Table is being created with a stream disabled, UpdateViewType should not be specified".to_owned(),
-        ));
+    if let Some(stream) = &input.stream_specification {
+        if !stream.stream_enabled && stream.stream_view_type.is_some() {
+            return Err(DynamoDbError::ValidationException(
+                "One or more parameter values were invalid: Table is being created with a stream disabled, UpdateViewType should not be specified".to_owned(),
+            ));
+        }
+        if stream.stream_enabled && stream.stream_view_type.is_none() {
+            return Err(DynamoDbError::ValidationException(
+                "One or more parameter values were invalid: Table is being created with a stream enabled, UpdateViewType is required".to_owned(),
+            ));
+        }
     }
     Ok(())
 }
@@ -3722,6 +3728,17 @@ mod tests {
             stream_view_type: Some(StreamViewType::NewImage),
         });
         assert!(validate_create_table(&input, &LimitsConfig::default()).is_ok());
+
+        // Enabled without a view type is refused (measured 2026-10-24).
+        input.stream_specification = Some(StreamSpecification {
+            stream_enabled: true,
+            stream_view_type: None,
+        });
+        let err = validate_create_table(&input, &LimitsConfig::default()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "One or more parameter values were invalid: Table is being created with a stream enabled, UpdateViewType is required"
+        );
     }
 
     #[test]

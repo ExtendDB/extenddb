@@ -149,6 +149,7 @@ impl MongoEngine {
         restore: Option<&crate::backup_engine::RestoreProvenance<'_>>,
     ) -> Result<TableDescription, StorageError> {
         Self::validate_account_id(account_id)?;
+        let input = extenddb_storage::stream_lineage::without_disabled_specification(input);
 
         let table_id = uuid::Uuid::new_v4().to_string();
         let table_arn_val = table_arn(&self.region, account_id, &input.table_name);
@@ -323,10 +324,16 @@ impl MongoEngine {
         }
 
         // Initialize stream shards if streaming is enabled. shard_id is
-        // derived from table_id (UUID), never table_name — see
-        // stream_engine::build_shard_id for the security rationale.
-        if stream_label_opt.is_some() {
-            self.init_stream_shards(&table_id).await?;
+        // derived from table_id (UUID), never table_name, and names the
+        // stream's label and view type (`extenddb_storage::stream_lineage`).
+        if let (Some(label), Some(view_type)) = (
+            stream_label_opt.as_deref(),
+            input
+                .stream_specification
+                .as_ref()
+                .and_then(|s| s.stream_view_type),
+        ) {
+            self.init_stream_shards(&table_id, label, view_type).await?;
         }
 
         // Handle GSI creation
@@ -816,67 +823,71 @@ impl MongoEngine {
             update_doc.insert("on_demand_throughput", odt_bson);
         }
 
+        // A stream change is decided on the specification and label the table
+        // document carries, and written only if they are still those values:
+        // this backend has no transaction around UpdateTable, so of two
+        // overlapping stream changes the one whose write finds the document
+        // changed re-reads it and is refused by `stream_change` as a request
+        // arriving after the other's commit would be.
+        let mut pending_stream = None;
+        let mut stream_guard = Document::new();
         if let Some(ss) = &input.stream_specification {
-            let ss_bson = bson::to_bson(ss).map_err(|e| StorageError::Internal(e.to_string()))?;
-            update_doc.insert("stream_specification", ss_bson);
-            if ss.stream_enabled {
-                let table_doc = tables_coll
-                    .find_one(doc! { "_id": { "account_id": account_id, "table_name": &input.table_name } })
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?
-                    .ok_or_else(|| StorageError::TableNotFound(input.table_name.clone()))?;
-                let table_id = table_doc
-                    .get_str("table_id")
-                    .map_err(|_| StorageError::Internal("missing table_id".to_string()))?;
-
-                // Idempotent re-enable: if shards already exist for this
-                // table, reuse them and preserve the existing
-                // stream_label. Otherwise a repeat UpdateTable would
-                // insert duplicate shards (DescribeStream would then
-                // report N × k) and rotate stream_label, invalidating
-                // stream ARNs previously handed out to consumers.
-                let shards_coll = self.data_db.collection::<Document>("stream_shards");
-                let existing_shard = shards_coll
-                    .find_one(doc! { "table_id": table_id })
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-                if existing_shard.is_none() {
-                    let label = extenddb_storage::util::format_stream_label(
-                        time::OffsetDateTime::now_utc(),
-                    );
-                    update_doc.insert("stream_label", &label);
-                    self.init_stream_shards(table_id).await?;
-                } else if table_doc
-                    .get_str("stream_label")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-                    .is_none()
-                {
-                    // Shards exist but the label was cleared by a
-                    // previous disable — restore a fresh label so the
-                    // ARN resolves again.
-                    let label = extenddb_storage::util::format_stream_label(
-                        time::OffsetDateTime::now_utc(),
-                    );
-                    update_doc.insert("stream_label", &label);
-                }
+            let table_doc = tables_coll
+                .find_one(
+                    doc! { "_id": { "account_id": account_id, "table_name": &input.table_name } },
+                )
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?
+                .ok_or_else(|| StorageError::TableNotFound(input.table_name.clone()))?;
+            pending_stream = Some(Self::prepare_stream_update(
+                &mut update_doc,
+                &table_doc,
+                &input.table_name,
+                ss,
+            )?);
+            for field in ["stream_specification", "stream_label"] {
+                stream_guard.insert(
+                    field,
+                    table_doc.get(field).cloned().unwrap_or(bson::Bson::Null),
+                );
             }
         }
 
         if !update_doc.is_empty() {
+            let mut filter = active_table_filter(&table_filter);
+            filter.extend(stream_guard);
             let result = tables_coll
-                .update_one(
-                    active_table_filter(&table_filter),
-                    doc! { "$set": &update_doc },
-                )
+                .update_one(filter, doc! { "$set": &update_doc })
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
             if result.matched_count == 0 {
-                // Deleted or left ACTIVE since the check above; report which.
+                // Deleted or left ACTIVE since the check above, or the stream
+                // fields changed under a stream change; report which. A stream
+                // change the re-read state would still accept (a disable that
+                // overlapped an enable) is reported as not ACTIVE, the nearest
+                // of ExtendDB's answers to the service's in-progress refusal.
                 self.require_active_table(&tables_coll, &table_filter, &input.table_name)
                     .await?;
+                if let Some(ss) = &input.stream_specification {
+                    let table_doc = tables_coll
+                        .find_one(doc! {
+                            "_id": { "account_id": account_id, "table_name": &input.table_name }
+                        })
+                        .await
+                        .map_err(|e| StorageError::Internal(e.to_string()))?
+                        .ok_or_else(|| StorageError::TableNotFound(input.table_name.clone()))?;
+                    let _would_apply = Self::prepare_stream_update(
+                        &mut Document::new(),
+                        &table_doc,
+                        &input.table_name,
+                        ss,
+                    )?;
+                }
                 return Err(StorageError::TableNotActive(input.table_name.clone()));
             }
+        }
+        if let Some(pending) = pending_stream {
+            pending.apply(self, account_id, &input.table_name).await?;
         }
 
         if clear_provisioned_throughput {
