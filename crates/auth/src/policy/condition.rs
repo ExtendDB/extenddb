@@ -47,6 +47,9 @@ pub fn evaluate_condition_with(
 ) -> bool {
     let context_values = context.resolve_key(&condition.key);
     let is_multivalued = context.is_multivalued_key(&condition.key);
+    // Only the string and ARN operators expand policy variables; a numeric or
+    // `Bool` value written as a variable is compared as written (measured).
+    let expand_variables = expand_variables && operator_expands_variables(&condition.operator);
 
     // Expand policy variables (e.g. `${aws:PrincipalTag/Team}`) in condition values.
     let expanded_values: Vec<ConditionValue> = condition
@@ -234,6 +237,30 @@ fn expand_policy_variables(
     context: &impl ConditionContext,
 ) -> ConditionValue {
     super::variables::expand_condition_value(value, expand_variables, context)
+}
+
+/// Whether `op` expands policy variables in its values: the string and ARN
+/// operators, with or without a set qualifier or `IfExists`. IAM documents
+/// variables for string comparisons and ARNs; `NumericEquals` and `Bool` were
+/// measured to compare a variable as written, and the date, address and `Null`
+/// operators are treated the same way.
+fn operator_expands_variables(op: &ConditionOperator) -> bool {
+    match op {
+        ConditionOperator::ForAllValues(inner)
+        | ConditionOperator::ForAnyValue(inner)
+        | ConditionOperator::IfExists(inner) => operator_expands_variables(inner),
+        ConditionOperator::StringEquals
+        | ConditionOperator::StringNotEquals
+        | ConditionOperator::StringEqualsIgnoreCase
+        | ConditionOperator::StringNotEqualsIgnoreCase
+        | ConditionOperator::StringLike
+        | ConditionOperator::StringNotLike
+        | ConditionOperator::ArnEquals
+        | ConditionOperator::ArnNotEquals
+        | ConditionOperator::ArnLike
+        | ConditionOperator::ArnNotLike => true,
+        _ => false,
+    }
 }
 
 /// Unwrap an `IfExists` wrapper if present.
