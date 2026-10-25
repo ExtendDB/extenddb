@@ -118,7 +118,7 @@ pub async fn handle_query(
         )?;
     }
 
-    // Limit >= 1 is checked at request time in validate_query_request_values.
+    // Limit >= 1 is checked at request time in validate_query_request_body.
 
     // For index queries, build a key_info that reflects the index's key schema
     // so the storage layer uses the correct SK column for the index table.
@@ -141,7 +141,7 @@ pub async fn handle_query(
     };
 
     // The legacy versus expression mutual exclusivity check runs at request
-    // time in validate_query_request_values.
+    // time in validate_query_request_body.
     let has_cond_op = input.conditional_operator.is_some();
 
     // An explicitly empty KeyConditionExpression is rejected up front, before
