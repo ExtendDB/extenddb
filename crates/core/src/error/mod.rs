@@ -28,9 +28,19 @@ pub struct ThrottlingReason {
 /// capacity and one hot-key write) and 2026-10-24 (1,538 read throttles on
 /// the table's own capacity, 648 index reads and 162 writes in a second
 /// Region, all carrying this text; the 104 index-write bodies of that run
-/// carry a different message naming global secondary indexes, which the
-/// server does not model). Trailing period.
+/// carry a different message naming global secondary indexes,
+/// [`INDEX_WRITE_PROVISIONED_THROUGHPUT_EXCEEDED_MESSAGE`]). Trailing period.
 pub const PROVISIONED_THROUGHPUT_EXCEEDED_MESSAGE: &str = "The level of configured provisioned throughput for the table was exceeded. Consider increasing your provisioning level with the UpdateTable API.";
+
+/// The `ProvisionedThroughputExceededException` message the service sends
+/// when a write to the base table is held back by a provisioned global
+/// secondary index's write capacity. Measured 2026-10-24 (104
+/// `BatchWriteItem`) and 2026-10-25 (5,876 bodies: 2,376 `PutItem`, 2,000
+/// `UpdateItem` and 1,500 single-item `TransactWriteItems`), every body
+/// carrying this text with the reason
+/// `IndexWriteProvisionedThroughputExceeded` and the index ARN. No trailing
+/// period. An index read past its read capacity carries the table message.
+pub const INDEX_WRITE_PROVISIONED_THROUGHPUT_EXCEEDED_MESSAGE: &str = "The level of configured provisioned throughput for one or more global secondary indexes of the table was exceeded. Consider increasing your provisioning level for the under-provisioned global secondary indexes with the UpdateTable API";
 
 /// The `ThrottlingException` message the service sends on an on-demand table
 /// whose partition is hot. Measured 2026-10-20 (11 of 11) and 2026-10-24

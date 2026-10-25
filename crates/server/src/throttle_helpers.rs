@@ -11,6 +11,15 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::throttle::ThrottleManager;
 use serde_json::Value;
 
+mod index;
+#[cfg(test)]
+mod index_tests;
+
+pub(crate) use index::{
+    extract_index_name, extract_index_throughputs_from_response,
+    table_description_to_index_throughputs,
+};
+
 /// Convert a `TableDescription` to a `TableThroughput` for throttle registration.
 pub(crate) fn table_description_to_throughput(
     desc: &extenddb_core::types::TableDescription,
@@ -55,9 +64,12 @@ pub(crate) fn classify_data_operation(operation: &str) -> (bool, bool) {
 
 /// Update throttle buckets after a successful table lifecycle operation.
 ///
-/// - `CreateTable` / `DescribeTable`: registers the table's throughput.
-/// - `UpdateTable`: updates the table's throughput.
-/// - `DeleteTable`: removes the table's buckets.
+/// - `CreateTable` / `DescribeTable`: registers the table's throughput and
+///   its provisioned global secondary indexes.
+/// - `UpdateTable`: updates the table's throughput and replaces the index
+///   set, so an index the update created gets buckets and one it deleted
+///   stops holding back writes.
+/// - `DeleteTable`: removes the table's buckets and its indexes'.
 ///
 /// Extracts throughput from the response body's `TableDescription` to avoid
 /// an extra database round-trip.
@@ -73,6 +85,9 @@ pub(crate) fn update_throttle_buckets(
         "CreateTable" | "UpdateTable" | "DescribeTable" => {
             if let Some(throughput) = extract_throughput_from_response(body) {
                 throttle.register_table(account_id, tn, throughput);
+            }
+            if let Some(indexes) = extract_index_throughputs_from_response(body) {
+                throttle.register_indexes(account_id, tn, indexes);
             }
         }
         "DeleteTable" => {
@@ -135,7 +150,8 @@ pub(crate) fn extract_partition_value(input: &Value, operation: &str) -> Option<
 }
 
 /// The throttle error the service sends for a refusal by `cause` on a table
-/// billed as the cause says, naming `table_arn` as the throttled resource.
+/// billed as the cause says, naming `resource_arn` as the throttled resource:
+/// the table ARN, or the index ARN for an [`ThrottleCause::Index`] cause.
 /// `None` (a name no table can have) sends the class and message with no
 /// reasons list, since the service cannot name a resource that cannot exist.
 ///
@@ -150,27 +166,35 @@ pub(crate) fn extract_partition_value(input: &Value, operation: &str) -> Option<
 /// provisioned table was captured once on 2026-10-20 (a `BatchWriteItem`):
 /// the provisioned class, the table message and
 /// `TableWriteKeyRangeThroughputExceeded`; the read form follows the
-/// documented grammar. Documented in the API Reference (ThrottlingReason,
-/// PutItem Errors; read 2026-10-20) and not produced by the probes: an
-/// on-demand table past its default ceiling and the account aggregate carry
-/// `Table{Read|Write}AccountLimitExceeded`, on `ThrottlingException` and
-/// `RequestLimitExceeded` respectively.
+/// documented grammar. A provisioned global secondary index past its own
+/// capacity (2026-10-24 and 2026-10-25: 648 index reads, 104 `BatchWriteItem`
+/// and 5,876 `PutItem`, `UpdateItem` and single-item `TransactWriteItems`)
+/// gives the provisioned class with the index
+/// ARN as the resource: a `Query` or `Scan` naming the index carries the
+/// table message and `IndexReadProvisionedThroughputExceeded`; a base-table
+/// write carries the index message and
+/// `IndexWriteProvisionedThroughputExceeded`. Documented in the API Reference
+/// (ThrottlingReason, PutItem Errors; read 2026-10-20) and not produced by
+/// the probes: an on-demand table past its default ceiling and the account
+/// aggregate carry `Table{Read|Write}AccountLimitExceeded`, on
+/// `ThrottlingException` and `RequestLimitExceeded` respectively.
 pub(crate) fn throttle_error(
-    cause: extenddb_core::throttle::ThrottleCause,
+    cause: &extenddb_core::throttle::ThrottleCause,
     read: bool,
-    table_arn: Option<String>,
+    resource_arn: Option<String>,
 ) -> DynamoDbError {
     use extenddb_core::error::{
-        MAX_ON_DEMAND_THROUGHPUT_MESSAGE, PROVISIONED_THROUGHPUT_EXCEEDED_MESSAGE,
-        REQUEST_LIMIT_EXCEEDED_MESSAGE, THROTTLING_EXCEPTION_MESSAGE, ThrottlingReason,
+        INDEX_WRITE_PROVISIONED_THROUGHPUT_EXCEEDED_MESSAGE, MAX_ON_DEMAND_THROUGHPUT_MESSAGE,
+        PROVISIONED_THROUGHPUT_EXCEEDED_MESSAGE, REQUEST_LIMIT_EXCEEDED_MESSAGE,
+        THROTTLING_EXCEPTION_MESSAGE, ThrottlingReason,
     };
     use extenddb_core::throttle::ThrottleCause;
     let op = if read { "Read" } else { "Write" };
-    let reason = |limit: &str| {
-        table_arn
+    let reason = |scope: &str, limit: &str| {
+        resource_arn
             .iter()
             .map(|resource| ThrottlingReason {
-                reason: format!("Table{op}{limit}"),
+                reason: format!("{scope}{op}{limit}"),
                 resource: resource.clone(),
             })
             .collect::<Vec<_>>()
@@ -180,12 +204,22 @@ pub(crate) fn throttle_error(
             on_demand: false, ..
         } => DynamoDbError::provisioned_throughput_exceeded(
             PROVISIONED_THROUGHPUT_EXCEEDED_MESSAGE,
-            reason("ProvisionedThroughputExceeded"),
+            reason("Table", "ProvisionedThroughputExceeded"),
+        ),
+        // An index read carries the table message; an index write carries
+        // its own, with no trailing period.
+        ThrottleCause::Index { .. } if read => DynamoDbError::provisioned_throughput_exceeded(
+            PROVISIONED_THROUGHPUT_EXCEEDED_MESSAGE,
+            reason("Index", "ProvisionedThroughputExceeded"),
+        ),
+        ThrottleCause::Index { .. } => DynamoDbError::provisioned_throughput_exceeded(
+            INDEX_WRITE_PROVISIONED_THROUGHPUT_EXCEEDED_MESSAGE,
+            reason("Index", "ProvisionedThroughputExceeded"),
         ),
         ThrottleCause::Partition { on_demand: false } => {
             DynamoDbError::provisioned_throughput_exceeded(
                 PROVISIONED_THROUGHPUT_EXCEEDED_MESSAGE,
-                reason("KeyRangeThroughputExceeded"),
+                reason("Table", "KeyRangeThroughputExceeded"),
             )
         }
         // A hot-key read on an on-demand table carries no reasons list
@@ -195,7 +229,7 @@ pub(crate) fn throttle_error(
         }
         ThrottleCause::Partition { on_demand: true } => DynamoDbError::throttling(
             THROTTLING_EXCEPTION_MESSAGE,
-            reason("KeyRangeThroughputExceeded"),
+            reason("Table", "KeyRangeThroughputExceeded"),
         ),
         // `capped` is the refusing direction's own cap, so a table capped in
         // one direction sends the default-ceiling body for the other.
@@ -204,17 +238,18 @@ pub(crate) fn throttle_error(
             capped: true,
         } => DynamoDbError::throttling(
             MAX_ON_DEMAND_THROUGHPUT_MESSAGE,
-            reason("MaxOnDemandThroughputExceeded"),
+            reason("Table", "MaxOnDemandThroughputExceeded"),
         ),
         ThrottleCause::Table {
             on_demand: true,
             capped: false,
-        } => {
-            DynamoDbError::throttling(THROTTLING_EXCEPTION_MESSAGE, reason("AccountLimitExceeded"))
-        }
+        } => DynamoDbError::throttling(
+            THROTTLING_EXCEPTION_MESSAGE,
+            reason("Table", "AccountLimitExceeded"),
+        ),
         ThrottleCause::Account => DynamoDbError::request_limit_exceeded(
             REQUEST_LIMIT_EXCEEDED_MESSAGE,
-            reason("AccountLimitExceeded"),
+            reason("Table", "AccountLimitExceeded"),
         ),
     }
 }
@@ -431,7 +466,7 @@ mod throttle_error_tests {
             ),
         ];
         for (cause, read, class, message, reasons) in cases {
-            let err = throttle_error(cause, read, Some(ARN.to_owned()));
+            let err = throttle_error(&cause, read, Some(ARN.to_owned()));
             assert_eq!(
                 parts(&err),
                 (class, message.to_owned(), reasons),
@@ -453,7 +488,7 @@ mod throttle_error_tests {
             ThrottleCause::Partition { on_demand: true },
             ThrottleCause::Account,
         ] {
-            let err = throttle_error(cause, false, None);
+            let err = throttle_error(&cause, false, None);
             assert_eq!(err.throttling_reasons(), Some(&[][..]), "{cause:?}");
             assert!(!err.message().is_empty());
         }

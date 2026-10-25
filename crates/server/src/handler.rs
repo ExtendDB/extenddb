@@ -18,7 +18,9 @@ use serde_json::Value;
 use crate::AppState;
 use crate::request_helpers::{authorize_request, extract_operation, extract_table_name};
 use crate::response::{error_response, record_error_metrics, success_response};
-use crate::throttle_helpers::{extract_partition_value, update_throttle_buckets};
+use crate::throttle_helpers::{
+    extract_index_name, extract_partition_value, update_throttle_buckets,
+};
 
 mod throttle_segment;
 
@@ -136,6 +138,7 @@ pub(crate) async fn handle_request(
         account_id,
         table_name,
         partition_value,
+        index_name,
         dispatch_result,
         auth_us,
         authz_us,
@@ -211,6 +214,7 @@ pub(crate) async fn handle_request(
                     m.read_capacity_units,
                     m.write_capacity_units,
                     partition_value.as_deref(),
+                    index_name.as_deref(),
                 );
             }
 
@@ -325,6 +329,9 @@ struct Served {
     account_id: Arc<str>,
     table_name: Option<String>,
     partition_value: Option<String>,
+    /// The index a `Query` or `Scan` named, charged in place of the table on
+    /// a read when it is a provisioned global secondary index.
+    index_name: Option<String>,
     dispatch_result: Result<extenddb_engine::DispatchResult, DynamoDbError>,
     auth_us: f64,
     authz_us: f64,
@@ -426,12 +433,14 @@ async fn serve_request(
     // --- Throttle segment ---
     let throttle_start = std::time::Instant::now();
     let partition_value = extract_partition_value(&input, operation);
+    let index_name = extract_index_name(&input, operation);
     throttle_segment::check(
         state,
         &ctx,
         operation,
         table_name.as_deref(),
         partition_value.as_deref(),
+        index_name.as_deref(),
     )
     .await?;
     #[allow(clippy::cast_precision_loss)]
@@ -472,6 +481,7 @@ async fn serve_request(
         account_id: ctx.account_id,
         table_name,
         partition_value,
+        index_name,
         dispatch_result,
         auth_us,
         authz_us,
@@ -520,3 +530,6 @@ mod request_scope_tests;
 mod start_server_tests;
 #[cfg(test)]
 mod throttle_wire_tests;
+
+#[cfg(test)]
+mod index_throttle_wire_tests;
