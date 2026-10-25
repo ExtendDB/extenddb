@@ -563,8 +563,9 @@ fn a_shape_fault_in_another_field_is_reported_ahead_of_the_checks() {
     );
 
     // Neither does an unknown type descriptor, which the deserializer reports
-    // as a SerializationException: the service answers the Limit text
-    // (measured 2026-10-25).
+    // as a SerializationException: the service answers the Limit
+    // ValidationException (measured 2026-10-25), in its older
+    // `Value '0' at 'limit'` form; ExtendDB answers its usual Limit text.
     let unknown_type = serde_json::json!({
         "TableName": "t", "KeyConditionExpression": "pk = :p",
         "Limit": 0, "ExpressionAttributeValues": {":p": {"S": "x"}, ":a": {"X": "1"}},
