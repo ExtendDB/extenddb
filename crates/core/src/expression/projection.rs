@@ -65,10 +65,18 @@ fn parse_projection_path(
     pos: &mut usize,
 ) -> Result<Vec<PathElement>, DynamoDbError> {
     match tokens.get(*pos) {
-        None | Some(Token::Comma) => Err(syntax_error(ExpressionKind::Projection, source, tokens, *pos)),
-        Some(token) if is_operator_or_keyword(token) => {
-            Err(syntax_error(ExpressionKind::Projection, source, tokens, *pos))
-        }
+        None | Some(Token::Comma) => Err(syntax_error(
+            ExpressionKind::Projection,
+            source,
+            tokens,
+            *pos,
+        )),
+        Some(token) if is_operator_or_keyword(token) => Err(syntax_error(
+            ExpressionKind::Projection,
+            source,
+            tokens,
+            *pos,
+        )),
         Some(_) => super::parser_common::parse_path(tokens, pos),
     }
 }

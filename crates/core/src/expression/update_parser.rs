@@ -96,9 +96,7 @@ fn parse_action_path(
 ) -> Result<Vec<super::ast::PathElement>, DynamoDbError> {
     match tokens.get(*pos) {
         None => Err(syntax_error(KIND, src, tokens, *pos)),
-        Some(token) if is_operator_or_keyword(token) => {
-            Err(syntax_error(KIND, src, tokens, *pos))
-        }
+        Some(token) if is_operator_or_keyword(token) => Err(syntax_error(KIND, src, tokens, *pos)),
         _ => parser_common::parse_path(tokens, pos),
     }
 }

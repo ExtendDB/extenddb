@@ -341,7 +341,10 @@ fn repeated_operator_quotes_the_source_window() {
         kce_msg("pk = = :v"),
         "Invalid KeyConditionExpression: Syntax error; token: \"=\", near: \"= = :v\""
     );
-    assert_eq!(kce_msg("pk = :v AND sk = = :s"), "Invalid KeyConditionExpression: Syntax error; token: \"=\", near: \"= = :s\"");
+    assert_eq!(
+        kce_msg("pk = :v AND sk = = :s"),
+        "Invalid KeyConditionExpression: Syntax error; token: \"=\", near: \"= = :s\""
+    );
 }
 
 #[test]
@@ -351,7 +354,10 @@ fn trailing_keyword_is_eof_with_the_keyword_as_window() {
         kce_msg("pk = :v AND"),
         "Invalid KeyConditionExpression: Syntax error; token: \"<EOF>\", near: \"AND\""
     );
-    assert_eq!(kce_msg("pk ="), "Invalid KeyConditionExpression: Syntax error; token: \"<EOF>\", near: \"=\"");
+    assert_eq!(
+        kce_msg("pk ="),
+        "Invalid KeyConditionExpression: Syntax error; token: \"<EOF>\", near: \"=\""
+    );
 }
 
 #[test]

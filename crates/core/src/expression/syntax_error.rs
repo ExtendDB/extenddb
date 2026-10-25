@@ -120,7 +120,9 @@ pub fn syntax_error(
     tokens: &[Token],
     pos: usize,
 ) -> DynamoDbError {
-    let token = tokens.get(pos).map_or_else(|| "<EOF>".to_owned(), token_text);
+    let token = tokens
+        .get(pos)
+        .map_or_else(|| "<EOF>".to_owned(), token_text);
     let near = near_window(source, tokens, pos);
     DynamoDbError::ValidationException(format!(
         "Invalid {kind}: Syntax error; token: \"{token}\", near: \"{near}\""
@@ -216,7 +218,10 @@ mod tests {
             msg(ExpressionKind::Condition, "#v = :v AND AND #v = :v", 4),
             "Invalid ConditionExpression: Syntax error; token: \"AND\", near: \"AND AND #v\""
         );
-        assert!(msg(ExpressionKind::Condition, "#v = :v and and #v", 4).ends_with("near: \"and and #v\""));
+        assert!(
+            msg(ExpressionKind::Condition, "#v = :v and and #v", 4)
+                .ends_with("near: \"and and #v\"")
+        );
     }
 
     #[test]
@@ -227,6 +232,9 @@ mod tests {
         else {
             panic!()
         };
-        assert_eq!(m, "Invalid FilterExpression: Syntax error; token: \"=\", near: \"= = :v\"");
+        assert_eq!(
+            m,
+            "Invalid FilterExpression: Syntax error; token: \"=\", near: \"= = :v\""
+        );
     }
 }
