@@ -531,7 +531,12 @@ provably in agreement with `evaluate_condition`:
 Not pushable: any operand of type `N` (numbers stored as strings; `"10"
 > "9"` is false lex-wise), `size` (MongoDB has no UTF-16 code-unit
 count), `BETWEEN` / `IN` (pending proptest coverage; the compiler emits
-them, the analyzer refuses them), and `NOT` around anything else.
+them, the analyzer refuses them), `NOT` around anything else, and a
+condition whose `AND`, `OR` and `NOT` nest more than 64 levels deep. The
+compiler emits one `$and`, `$or` or `$nor` level per operator, and MongoDB
+refuses a filter nested past its BSON depth limit: measured on mongo:7, the
+merged filter runs with 98 nested levels and fails with 99 (97 and 98 with
+`contains` leaves).
 
 Property tests (`tests/pushdown_parity.rs`) generate random items and
 expressions, compile the filter, and check that a pure-Rust BSON
