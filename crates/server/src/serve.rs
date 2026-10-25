@@ -217,6 +217,7 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     let crate::Extensions {
         http: extension_http,
         request_observer,
+        console_tabs,
     } = extensions;
     let catalog_version =
         extenddb_storage::operations::catalog_version().unwrap_or_else(|_| "unknown".to_string());
@@ -681,8 +682,15 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         None
     };
 
-    let server_result =
-        crate::start_server(listener, state, pid_file, tls_config, extension_http).await;
+    let server_result = crate::start_server(
+        listener,
+        state,
+        pid_file,
+        tls_config,
+        extension_http,
+        console_tabs,
+    )
+    .await;
 
     // The HTTP server has stopped accepting; drain the workers so in-flight
     // cycles finish and the metrics flush worker writes its final bucket.

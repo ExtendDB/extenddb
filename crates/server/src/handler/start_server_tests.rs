@@ -139,6 +139,22 @@ async fn serve(
     observer: Option<Arc<Recording>>,
     auth_delay_ms: u64,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    serve_with_tabs(extensions, Vec::new(), observer, auth_delay_ms).await
+}
+
+/// Credentials of the admin seeded on the fixture's catalog for the console
+/// tab tests.
+const ADMIN_NAME: &str = "tab-admin";
+const ADMIN_PASSWORD: &str = "tab-admin-password-1";
+
+/// `serve` with console tabs; the fixture's catalog gets one admin so a test
+/// can log in to the console.
+async fn serve_with_tabs(
+    extensions: Vec<(String, Router)>,
+    tabs: Vec<crate::extensions::ConsoleTab>,
+    observer: Option<Arc<Recording>>,
+    auth_delay_ms: u64,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let installed = observer.map(|o| o as Arc<dyn RequestObserver>);
     let (state, _) = build_state_with(
         move |account_id| {
@@ -153,10 +169,22 @@ async fn serve(
     let state = Arc::try_unwrap(state)
         .ok()
         .expect("the fixture holds the only reference");
+    if !tabs.is_empty() {
+        let hash = crate::management::password::hash_password(ADMIN_PASSWORD.to_owned())
+            .await
+            .expect("bcrypt");
+        state
+            .catalog_store
+            .as_ref()
+            .expect("fixture has a catalog store")
+            .create_admin(ADMIN_NAME, &hash)
+            .await
+            .expect("seed admin");
+    }
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     let task = tokio::spawn(async move {
-        crate::start_server(listener, state, None, None, extensions)
+        crate::start_server(listener, state, None, None, extensions, tabs)
             .await
             .expect("start_server");
     });
@@ -296,4 +324,231 @@ async fn a_client_that_goes_away_mid_request_is_recorded_once_with_status_zero()
     assert_eq!(records[0].account_id, None);
 
     task.abort();
+}
+
+/// A tab page that renders the console layout from the identity the session
+/// check inserted, so the test can read the navigation bar, plus a POST route
+/// that acts only when the form's `_csrf` field is the session's token.
+fn tab_router() -> Router {
+    #[derive(serde::Deserialize)]
+    struct Act {
+        #[serde(rename = "_csrf", default)]
+        csrf: String,
+    }
+    Router::new()
+        .route(
+            "/",
+            get(
+                |identity: axum::Extension<crate::console::ConsoleIdentity>| async move {
+                    let nav = crate::console::html::nav_bar(&identity.label, &identity.tabs);
+                    axum::response::Html(crate::console::html::layout_with_version_csrf(
+                        "Chaos",
+                        &nav,
+                        &format!(
+                            "<p id=\"who\">{}</p><p id=\"admin\">{}</p>",
+                            crate::console::html::escape(&identity.label),
+                            identity.is_admin
+                        ),
+                        Some(&identity.version_info),
+                        &identity.csrf_token,
+                    ))
+                },
+            ),
+        )
+        .route(
+            "/act",
+            post(
+                |identity: axum::Extension<crate::console::ConsoleIdentity>,
+                 axum::Form(form): axum::Form<Act>| async move {
+                    if identity.csrf_matches(&form.csrf) {
+                        (axum::http::StatusCode::OK, "acted")
+                    } else {
+                        (axum::http::StatusCode::FORBIDDEN, "CSRF token mismatch")
+                    }
+                },
+            ),
+        )
+}
+
+/// Log in to the console as the seeded admin and return the session cookie.
+async fn login(addr: SocketAddr) -> String {
+    let body = format!("username={ADMIN_NAME}&password={ADMIN_PASSWORD}");
+    let reply = raw(
+        addr,
+        &post_req(
+            "/console/login",
+            "Content-Type: application/x-www-form-urlencoded\r\n",
+            body.as_bytes(),
+        ),
+    )
+    .await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    let cookie = reply.header("set-cookie").expect("session cookie set");
+    cookie.split(';').next().expect("cookie pair").to_owned()
+}
+
+fn post_req_with_cookie(path: &str, cookie: &str, body: &[u8]) -> Vec<u8> {
+    let mut v = format!(
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nCookie: {cookie}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    v.extend_from_slice(body);
+    v
+}
+
+fn get_req_with_cookie(path: &str, cookie: &str) -> Vec<u8> {
+    format!(
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nCookie: {cookie}\r\n\r\n"
+    )
+    .into_bytes()
+}
+
+#[tokio::test]
+async fn a_console_tab_is_behind_the_session_check_and_listed_in_the_nav_bar() {
+    // The label carries the characters the bar must escape.
+    let tabs = vec![crate::extensions::ConsoleTab {
+        label: r#"Chaos <b>&"x"</b>"#.to_owned(),
+        slug: "chaos".to_owned(),
+        router: tab_router(),
+    }];
+    const ESCAPED_LINK: &str =
+        r#"<a href="/console/chaos">Chaos &lt;b&gt;&amp;&quot;x&quot;&lt;/b&gt;</a>"#;
+    let (addr, task) = serve_with_tabs(Vec::new(), tabs, None, 0).await;
+
+    // Without a session: the page, a non-route under it and the slash form
+    // all redirect to the login page, so the slug is not confirmed.
+    for path in ["/console/chaos", "/console/chaos/other", "/console/chaos/"] {
+        let r = raw(addr, &get_req(path)).await;
+        assert_eq!(r.status, 303, "{path}: {}", r.body);
+        assert_eq!(r.header("location"), Some("/console/login"), "{path}");
+    }
+
+    let cookie = login(addr).await;
+
+    // With a session: the page renders inside the console layout with the
+    // admin's label and the tab in the navigation bar; the slash form
+    // redirects to the page; a non-route under the tab is 404.
+    let page = raw(addr, &get_req_with_cookie("/console/chaos", &cookie)).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(page.body.contains("<nav>"), "{}", page.body);
+    assert!(page.body.contains(ESCAPED_LINK), "{}", page.body);
+    assert!(!page.body.contains("<b>&\"x\"</b>"), "{}", page.body);
+    assert!(
+        page.body.contains(r#"<p id="who">Admin: tab-admin</p>"#),
+        "{}",
+        page.body
+    );
+    for (name, value) in SECURITY {
+        assert_eq!(page.header(name), Some(value), "tab page carries {name}");
+    }
+    assert!(
+        !page.body.contains("Self-signed TLS certificate"),
+        "the tab footer is the logged-in pages' footer: {}",
+        page.body
+    );
+    assert!(
+        page.body.contains(r#"<p id="admin">true</p>"#),
+        "{}",
+        page.body
+    );
+
+    // The page's meta tag carries the session's CSRF token; a POST with it
+    // acts, a POST without it is refused as the built-in pages refuse.
+    let token = page
+        .body
+        .split(r#"name="csrf-token" content=""#)
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("csrf meta tag")
+        .to_owned();
+    let act = raw(
+        addr,
+        &post_req_with_cookie(
+            "/console/chaos/act",
+            &cookie,
+            format!("_csrf={token}&x=1").as_bytes(),
+        ),
+    )
+    .await;
+    assert_eq!(act.status, 200, "{}", act.body);
+    let refused = raw(
+        addr,
+        &post_req_with_cookie("/console/chaos/act", &cookie, b"x=1"),
+    )
+    .await;
+    assert_eq!(refused.status, 403, "{}", refused.body);
+    let no_session = raw(addr, &post_req("/console/chaos/act", "", b"x=1")).await;
+    assert_eq!(no_session.status, 303, "{}", no_session.body);
+    assert_eq!(no_session.header("location"), Some("/console/login"));
+
+    let slash = raw(addr, &get_req_with_cookie("/console/chaos/", &cookie)).await;
+    assert_eq!(slash.status, 308, "{}", slash.body);
+    assert_eq!(slash.header("location"), Some("/console/chaos"));
+
+    let missing = raw(addr, &get_req_with_cookie("/console/chaos/other", &cookie)).await;
+    assert_eq!(missing.status, 404, "{}", missing.body);
+
+    // A built-in console page lists the tab too.
+    let home = raw(addr, &get_req_with_cookie("/console", &cookie)).await;
+    assert_eq!(home.status, 200, "{}", home.body);
+    assert!(home.body.contains(ESCAPED_LINK), "{}", home.body);
+
+    task.abort();
+}
+
+#[tokio::test]
+async fn without_tabs_the_console_nav_bar_and_routes_are_unchanged() {
+    let (addr, task) = serve_with_tabs(Vec::new(), Vec::new(), None, 0).await;
+    let r = raw(addr, &get_req("/console/chaos")).await;
+    // No tab mounted: the console's own fallback answers, behind no gate.
+    assert_eq!(r.status, 404, "{}", r.body);
+    let login_page = raw(addr, &get_req("/console/login")).await;
+    assert_eq!(login_page.status, 200);
+    assert!(!login_page.body.contains("/console/chaos"));
+    task.abort();
+}
+
+/// `start_server` refuses a bad console tab slug and a bad extension prefix
+/// with the error naming the cause, before it serves a request; the checks
+/// run in `start_server` itself, not only in `cmd_serve`, so a caller that
+/// embeds the server gets them too.
+#[tokio::test]
+async fn start_server_refuses_a_reserved_slug_and_a_reserved_prefix_before_serving() {
+    for (extensions, tabs, expected) in [
+        (
+            Vec::new(),
+            vec![crate::extensions::ConsoleTab {
+                label: "Login".to_owned(),
+                slug: "login".to_owned(),
+                router: tab_router(),
+            }],
+            "console tab slug 'login' is a built-in console route",
+        ),
+        (
+            vec![("/health/live".to_owned(), probe_router())],
+            Vec::new(),
+            "extension router prefix '/health/live' collides with '/health'",
+        ),
+    ] {
+        let (state, _) = build_state_with(
+            |account_id| {
+                Arc::new(SlowAuth {
+                    account_id,
+                    delay_ms: 0,
+                })
+            },
+            None,
+        )
+        .await;
+        let state = Arc::try_unwrap(state)
+            .ok()
+            .expect("the fixture holds the only reference");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let err = crate::start_server(listener, state, None, None, extensions, tabs)
+            .await
+            .expect_err("start_server refuses");
+        assert_eq!(err.to_string(), expected);
+    }
 }

@@ -44,7 +44,7 @@ pub async fn metrics_page(State(state): State<Arc<ConsoleState>>, headers: Heade
         Err(redirect) => return redirect,
     };
 
-    let nav = html::nav_bar(&identity_label(&session.identity));
+    let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
     let breadcrumb = html::breadcrumb(&[("Console", Some("/console")), ("Metrics", None)]);
 
     // D17: For non-admin users, inject their account_id so JS can filter.

@@ -163,8 +163,13 @@ label{{display:block;margin:0.5rem 0 0.2rem;font-weight:500;font-size:0.9rem}}
     )
 }
 
-/// Build the navigation bar for an authenticated session.
-pub fn nav_bar(identity_label: &str) -> String {
+/// Build the navigation bar for an authenticated session. `tabs` are the
+/// extension links shown after the built-in ones, as `(label, href)`.
+pub fn nav_bar(identity_label: &str, tabs: &[(String, String)]) -> String {
+    let mut extra = String::new();
+    for (label, href) in tabs {
+        let _ = writeln!(extra, r#"<a href="{}">{}</a>"#, escape(href), escape(label));
+    }
     format!(
         r#"<nav>
 <span class="brand">extenddb Console</span>
@@ -173,7 +178,7 @@ pub fn nav_bar(identity_label: &str) -> String {
 <a href="/console/metrics">Metrics</a>
 <a href="/console/settings">Settings</a>
 <a href="/console/cache">Cache</a>
-<span class="spacer"></span>
+{extra}<span class="spacer"></span>
 <span>{identity}</span>
 <form class="inline" method="post" action="/console/logout">
 <button class="btn btn-sm" type="submit">Logout</button>

@@ -31,7 +31,7 @@ pub async fn new_user_form(
         return Redirect::to(&format!("/console/accounts/{account_id}")).into_response();
     }
 
-    let nav = html::nav_bar(&identity_label(&session.identity));
+    let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
     let eid = html::escape(&account_id);
     let crumbs = html::breadcrumb(&[
         ("Dashboard", Some("/console")),
@@ -93,7 +93,7 @@ pub async fn create_user(
 
     // Validation stays in the server layer.
     if !crate::management::is_valid_iam_name(&form.user_name) {
-        let nav = html::nav_bar(&identity_label(&session.identity));
+        let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
         let content = format!(
             "<h1>Create User</h1>{}",
             html::alert_error(
@@ -114,7 +114,7 @@ pub async fn create_user(
     if let Some(p) = pw
         && p.len() > 72
     {
-        let nav = html::nav_bar(&identity_label(&session.identity));
+        let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
         let content = format!(
             "<h1>Create User</h1>{}",
             html::alert_error("password must not exceed 72 bytes (bcrypt limit)")
@@ -133,7 +133,7 @@ pub async fn create_user(
             Ok(h) => Some(h),
             Err(e) => {
                 tracing::error!("create_user bcrypt hash: {e}");
-                let nav = html::nav_bar(&identity_label(&session.identity));
+                let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
                 let content = format!(
                     "<h1>Create User</h1>{}",
                     html::alert_error("Internal error")
@@ -161,7 +161,7 @@ pub async fn create_user(
         ))
         .into_response(),
         Err(e) => {
-            let nav = html::nav_bar(&identity_label(&session.identity));
+            let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
             let content = format!(
                 "<h1>Create User</h1>{}",
                 html::alert_error(&op_error_message(e))
@@ -188,7 +188,7 @@ pub async fn user_detail(
         Err(r) => return r,
     };
 
-    let nav = html::nav_bar(&identity_label(&session.identity));
+    let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
     let eid = html::escape(&account_id);
     let eun = html::escape(&user_name);
     let crumbs = html::breadcrumb(&[
@@ -381,7 +381,7 @@ pub async fn delete_user(
             Redirect::to(&format!("/console/accounts/{account_id}")).into_response()
         }
         Err(e) => {
-            let nav = html::nav_bar(&identity_label(&session.identity));
+            let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
             let content = format!(
                 "<h1>Delete User</h1>{}",
                 html::alert_error(&op_error_message(e))

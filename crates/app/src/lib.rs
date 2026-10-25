@@ -31,7 +31,8 @@
 //!     build,
 //!     extenddb_app::Extensions::default()
 //!         .with_router("/_mybackend/status", status_router())
-//!         .with_request_observer(my_observer),
+//!         .with_request_observer(my_observer)
+//!         .with_console_tab("My backend", "mybackend", page_router()),
 //! )
 //! ```
 
@@ -64,7 +65,16 @@ pub use extenddb_server::BuildInfo;
 /// A thin binary's extension points, re-exported from `extenddb-server` so a
 /// thin `main` needs only the `extenddb-app` dependency to use them. Pass an
 /// [`Extensions`] to [`run_with`]; [`run`] uses the empty default.
-pub use extenddb_server::{Extensions, RequestObserver, RequestRecord};
+pub use extenddb_server::{
+    ConsoleIdentity, ConsoleTab, Extensions, RequestObserver, RequestRecord,
+};
+
+/// The console's HTML helpers (`nav_bar`, `layout_with_version_csrf`, `escape`),
+/// so a console tab's page renders the console's layout from its
+/// [`ConsoleIdentity`] with the one `extenddb-app` dependency.
+pub mod console_html {
+    pub use extenddb_server::console::html::*;
+}
 
 /// The `axum` the server is built with, so a thin binary builds its
 /// [`Extensions::http`] routers against the same `Router` type without naming

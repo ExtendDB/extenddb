@@ -44,7 +44,7 @@ pub async fn create_access_key(
         return r;
     }
 
-    let nav = html::nav_bar(&identity_label(&session.identity));
+    let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
     let eid = html::escape(&account_id);
     let eun = html::escape(&user_name);
 
@@ -151,7 +151,7 @@ pub async fn delete_access_key(
                 .into_response()
         }
         Err(e) => {
-            let nav = html::nav_bar(&identity_label(&session.identity));
+            let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
             let content = format!("<h1>Error</h1>{}", html::alert_error(&op_error_message(e)));
             Html(html::layout_csrf(
                 "Error",

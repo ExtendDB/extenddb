@@ -29,8 +29,10 @@ mod workers;
 
 /// The `axum` this server is built with, for a thin binary's extension routers.
 pub use axum;
+pub use console::ConsoleIdentity;
 pub use extensions::{
-    ExtensionMountError, Extensions, RequestObserver, RequestRecord, validate_extension_prefixes,
+    ConsoleTab, ExtensionMountError, Extensions, RequestObserver, RequestRecord,
+    validate_console_slugs, validate_extension_prefixes,
 };
 pub use serve::{BuildInfo, LogTarget, ServeParams, log_to_syslog_raw, serve};
 
@@ -149,13 +151,18 @@ pub struct ServerTlsConfig {
 /// the response security layer, so an extension response carries the security
 /// headers too. A prefix that is not absolute, is `/`, or collides with a
 /// built-in route or an earlier extension is an error and the server does not
-/// start.
+/// start. `console_tabs` are the thin binary's console pages (see
+/// [`extensions::ConsoleTab`]); each is nested at `/console/<slug>` behind the
+/// console's session check and listed in the navigation bar. A malformed,
+/// reserved or repeated slug is an error whether or not the console is
+/// mounted.
 pub async fn start_server(
     listener: tokio::net::TcpListener,
     state: AppState,
     pid_file: Option<PathBuf>,
     tls: Option<ServerTlsConfig>,
     extension_routers: Vec<(String, Router)>,
+    console_tabs: Vec<extensions::ConsoleTab>,
 ) -> Result<(), anyhow::Error> {
     // SP-WIRE-007: DynamoDB request body limit is 16 MB.
     const DYNAMODB_BODY_LIMIT: usize = 16 * 1024 * 1024;
@@ -193,6 +200,10 @@ pub async fn start_server(
         .layer(DefaultBodyLimit::max(1024))
         .with_state(shared);
 
+    // Tab slugs are checked in every deployment, as extension prefixes are,
+    // so a bad slug is a startup error whether or not the console is mounted.
+    extensions::validate_console_slugs(&console_tabs).map_err(|e| anyhow::anyhow!("{e}"))?;
+
     // Mount management API and web console if catalog store is available.
     if let Some(catalog_store) = catalog_store {
         let mgmt_state = Arc::new(management::ManagementState {
@@ -206,8 +217,15 @@ pub async fn start_server(
         let mgmt_router = management::router().with_state(mgmt_state);
         app = app.nest("/management", mgmt_router);
 
+        // Each tab is nested at /console/<slug> behind the console's session
+        // check and listed in the navigation bar.
+        let tab_links: Arc<[(String, String)]> = console_tabs
+            .iter()
+            .map(|t| (t.label.clone(), format!("/console/{}", t.slug)))
+            .collect();
         let console_state = Arc::new(console::ConsoleState {
             sessions: console::session::SessionStore::new(),
+            tabs: tab_links,
             version_info,
             listen_url,
             config_entries,
@@ -216,7 +234,35 @@ pub async fn start_server(
             auth_cache: auth_cache_for_console,
             metrics: metrics_for_console,
         });
-        let console_router = console::router().with_state(console_state);
+        // The console's own fallback is explicit so that the fallbacks nested
+        // below it (each tab's, inside its session layer) are kept when the
+        // console is nested into the app; axum drops a child's fallback when
+        // its parent still has the default one.
+        let mut console_router = console::router()
+            .fallback(|| async { StatusCode::NOT_FOUND })
+            .with_state(console_state.clone());
+        for tab in console_tabs {
+            let gate = axum::middleware::from_fn_with_state(
+                console_state.clone(),
+                console::require_console_session,
+            );
+            // The fallback sits inside the layer, so every path under the tab
+            // (its routes and its non-routes alike) meets the session check.
+            let gated = tab
+                .router
+                .fallback(|| async { StatusCode::NOT_FOUND })
+                .layer(gate.clone());
+            // The trailing-slash form redirects to the page, as /console/ does
+            // below, behind the same check so a slug is not confirmed to a
+            // client without a session.
+            let page = format!("/console/{}", tab.slug);
+            let slash = Router::new()
+                .route("/", get(move || async move { Redirect::permanent(&page) }))
+                .layer(gate);
+            console_router = console_router
+                .nest(&format!("/{}", tab.slug), gated)
+                .nest(&format!("/{}/", tab.slug), slash);
+        }
         app = app
             .nest("/console", console_router)
             // Redirect /console/ (trailing slash) to /console so the nested
