@@ -20,6 +20,7 @@ pub mod management_store;
 pub mod management_store_factory;
 pub mod operations;
 pub mod policy_migration;
+pub mod request_scope;
 pub mod server_components;
 pub mod settings_store;
 pub mod transact;
@@ -28,6 +29,7 @@ pub mod vector_lifecycle;
 
 pub use backend::{Backend, BackendAlreadySet, backend_name, set_backend, try_backend};
 pub use backup_definition::{BackupRestoreSource, RestoreRequest, RestoreTableOverrides};
+pub use request_scope::RequestScope;
 
 pub use transact::{IdempotencyKey, TransactGetOp, TransactWriteOp};
 

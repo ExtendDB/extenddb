@@ -7,6 +7,8 @@
 //! inputs, dispatches operations by name, and translates storage errors into
 //! `DynamoDB`-format error responses.
 
+#[macro_use]
+mod fault_log;
 mod backup;
 mod batch_get_item;
 mod batch_write_item;
@@ -29,6 +31,8 @@ mod put_item;
 mod query;
 mod read_helpers;
 mod request_limits;
+#[cfg(test)]
+mod request_scope_log_tests;
 mod scan;
 mod search_vectors;
 #[cfg(test)]
@@ -154,7 +158,7 @@ pub(crate) fn sanitize_storage_error(e: extenddb_storage::error::StorageError) -
     if let extenddb_storage::error::StorageError::Service(e) = e {
         return e;
     }
-    tracing::error!(internal_error = %e, "storage internal error");
+    log_storage_fault!(e, "storage internal error");
     DynamoDbError::InternalServerError("Internal server error".to_owned())
 }
 
@@ -437,12 +441,19 @@ impl OperationContext {
 /// Dispatch an operation by name.
 ///
 /// Returns the JSON response body and sideband metrics for the metrics collector.
+///
+/// The server calls this inside the request scope
+/// (`extenddb_storage::request_scope`), so everything reached from here on the
+/// same task, including the storage backend and the error mappers, can read
+/// the request id and operation. The trace event at entry, under the target
+/// `extenddb_engine::dispatch`, is written inside that scope too.
 pub async fn dispatch(
     operation: &str,
     body: serde_json::Value,
     ctx: &OperationContext,
     server_addr: &str,
 ) -> Result<DispatchResult, DynamoDbError> {
+    tracing::trace!(target: "extenddb_engine::dispatch", operation, "dispatch");
     match operation {
         "CreateTable" => handle_create_table(body, ctx)
             .await

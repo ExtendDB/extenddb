@@ -358,7 +358,7 @@ pub(crate) fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
         // unchanged; it is not a storage fault, so it is not logged as one.
         StorageError::Service(e) => e,
         other => {
-            tracing::error!(internal_error = %other, "storage internal error");
+            log_storage_fault!(other, "storage internal error");
             DynamoDbError::InternalServerError("Internal server error".to_owned())
         }
     }
