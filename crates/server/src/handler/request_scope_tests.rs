@@ -174,6 +174,15 @@ async fn the_scope_is_current_when_the_auth_provider_runs() {
 #[tokio::test]
 async fn the_scope_is_current_at_dispatch_entry_and_gone_at_request_complete() {
     let (state, _) = build_state().await;
+    // Register the two callsites this test reads before the subscriber goes
+    // in. While exactly one scoped subscriber exists, `tracing` computes a
+    // newly hit callsite's interest from the hitting thread's own dispatcher,
+    // so a sibling test with no subscriber first-hitting `request complete`
+    // would cache it as skipped for the whole process. Hitting both here
+    // registers them; `set_default` then recomputes every registered callsite
+    // against this layer.
+    let (status, _) = fire(Arc::clone(&state), "ListTables", "{}", &[]).await;
+    assert_eq!(status, 200);
     let layer = ScopeAtEvents::default();
     let at_dispatch = Arc::clone(&layer.at_dispatch);
     let at_complete = Arc::clone(&layer.at_complete);
