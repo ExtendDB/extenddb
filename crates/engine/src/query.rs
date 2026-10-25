@@ -341,6 +341,9 @@ pub async fn handle_query(
     if let Some(ref filter_expr) = filter {
         let names = input.expression_attribute_names.as_ref();
         validate_name_refs_in_expr(filter_expr, names, ExpressionKind::Filter)?;
+        // The operator cap follows the undefined name check and precedes the
+        // unused placeholder check (measured 2026-10-25).
+        crate::expression_helpers::check_operator_count(filter_expr, ExpressionKind::Filter)?;
     }
 
     // Parse ProjectionExpression or desugar legacy AttributesToGet

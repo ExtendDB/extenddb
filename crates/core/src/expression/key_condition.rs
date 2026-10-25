@@ -14,7 +14,9 @@
 //! - No OR, NOT, nested conditions, or other functions
 
 use super::ast::{CompareOp, Expr, PathElement};
+use super::kind::ExpressionKind;
 use super::parser_common;
+use super::syntax_error::{is_operator_or_keyword, syntax_error};
 use super::tokenizer::Token;
 use crate::error::DynamoDbError;
 
@@ -258,24 +260,48 @@ pub enum SortKeyCondition {
 ///
 /// Returns `ValidationException` for syntax errors or unsupported constructs.
 pub fn parse_key_condition(tokens: &[Token]) -> Result<KeyCondition, DynamoDbError> {
+    parse_key_condition_from(tokens, "")
+}
+
+/// Parse a `KeyConditionExpression` whose tokens came from `source`, so a
+/// syntax error can quote the source window around the offending token as
+/// Amazon `DynamoDB` does (`pk = = :v` answers `Syntax error; token: "=",
+/// near: "= = :v"`; `pk = :v AND` answers `token: "<EOF>", near: "AND"`,
+/// measured 2026-10-25). An empty `source` joins the token texts instead.
+///
+/// # Errors
+///
+/// Returns `ValidationException` for syntax errors or unsupported constructs.
+pub fn parse_key_condition_from(
+    tokens: &[Token],
+    source: &str,
+) -> Result<KeyCondition, DynamoDbError> {
     parser_common::check_redundant_parens(tokens)
         .map_err(|body| validation_err(&format!("Invalid KeyConditionExpression: {body}")))?;
 
     // Strip outer parentheses: "(pk = :pk AND sk > :sk)" → "pk = :pk AND sk > :sk"
-    let tokens = if tokens.len() >= 2
+    let all = tokens;
+    let (tokens, offset) = if tokens.len() >= 2
         && tokens[0] == Token::LParen
         && tokens[tokens.len() - 1] == Token::RParen
         && outer_parens_match(tokens)
     {
-        &tokens[1..tokens.len() - 1]
+        (&tokens[1..tokens.len() - 1], 1)
     } else {
-        tokens
+        (tokens, 0)
+    };
+    // Syntax errors quote the window from the full token list, so a position
+    // inside the stripped slice is shifted back by the stripped parenthesis.
+    let src = Source {
+        text: source,
+        all,
+        offset,
     };
 
     let mut pos = 0;
     let mut clauses = Vec::new();
 
-    clauses.push(parse_key_clause(tokens, &mut pos)?);
+    clauses.push(parse_key_clause(tokens, &src, &mut pos)?);
 
     while pos < tokens.len() {
         if tokens[pos] != Token::And {
@@ -284,7 +310,7 @@ pub fn parse_key_condition(tokens: &[Token]) -> Result<KeyCondition, DynamoDbErr
             ));
         }
         pos += 1;
-        clauses.push(parse_key_clause(tokens, &mut pos)?);
+        clauses.push(parse_key_clause(tokens, &src, &mut pos)?);
     }
 
     if pos < tokens.len() {
@@ -304,6 +330,27 @@ pub fn parse_key_condition(tokens: &[Token]) -> Result<KeyCondition, DynamoDbErr
         1 => classify_single(clauses.remove(0)),
         2 => classify_pair(clauses.remove(0), clauses.remove(0)),
         _ => classify_multi(clauses),
+    }
+}
+
+/// The expression text and full token list a clause parser reports syntax
+/// errors against; `offset` is the number of tokens stripped before the slice
+/// being parsed.
+struct Source<'a> {
+    text: &'a str,
+    all: &'a [Token],
+    offset: usize,
+}
+
+impl Source<'_> {
+    /// The service's syntax error for the token at `pos` of the parsed slice.
+    fn syntax_error(&self, pos: usize) -> DynamoDbError {
+        syntax_error(
+            ExpressionKind::KeyCondition,
+            self.text,
+            self.all,
+            pos + self.offset,
+        )
     }
 }
 
@@ -449,17 +496,25 @@ fn raw_to_sk(clause: RawClause) -> SortKeyCondition {
     }
 }
 
-fn parse_key_clause(tokens: &[Token], pos: &mut usize) -> Result<RawClause, DynamoDbError> {
+fn parse_key_clause(
+    tokens: &[Token],
+    src: &Source<'_>,
+    pos: &mut usize,
+) -> Result<RawClause, DynamoDbError> {
     if *pos >= tokens.len() {
-        return Err(validation_err(
-            "Invalid KeyConditionExpression: unexpected end of expression",
-        ));
+        if tokens.is_empty() {
+            return Err(validation_err(
+                "Invalid KeyConditionExpression: unexpected end of expression",
+            ));
+        }
+        // Input ends where a clause is required (`pk = :v AND`).
+        return Err(src.syntax_error(*pos));
     }
 
     // Allow one level of parentheses around a single clause
     if tokens[*pos] == Token::LParen {
         *pos += 1;
-        let clause = parse_key_clause_inner(tokens, pos)?;
+        let clause = parse_key_clause_inner(tokens, src, pos)?;
         if *pos < tokens.len() && tokens[*pos] == Token::RParen {
             *pos += 1;
             return Ok(clause);
@@ -469,14 +524,16 @@ fn parse_key_clause(tokens: &[Token], pos: &mut usize) -> Result<RawClause, Dyna
         ));
     }
 
-    parse_key_clause_inner(tokens, pos)
+    parse_key_clause_inner(tokens, src, pos)
 }
 
-fn parse_key_clause_inner(tokens: &[Token], pos: &mut usize) -> Result<RawClause, DynamoDbError> {
+fn parse_key_clause_inner(
+    tokens: &[Token],
+    src: &Source<'_>,
+    pos: &mut usize,
+) -> Result<RawClause, DynamoDbError> {
     if *pos >= tokens.len() {
-        return Err(validation_err(
-            "Invalid KeyConditionExpression: unexpected end of expression",
-        ));
+        return Err(src.syntax_error(*pos));
     }
 
     // begins_with(path, :val)
@@ -487,15 +544,15 @@ fn parse_key_clause_inner(tokens: &[Token], pos: &mut usize) -> Result<RawClause
     {
         *pos += 1; // skip function name
         parser_common::expect_token(tokens, pos, &Token::LParen, "(", "KeyConditionExpression")?;
-        let path = parse_key_operand_path(tokens, pos)?;
+        let path = parse_key_operand_path(tokens, src, pos)?;
         parser_common::expect_token(tokens, pos, &Token::Comma, ",", "KeyConditionExpression")?;
-        let prefix = parse_key_value(tokens, pos)?;
+        let prefix = parse_key_value(tokens, src, pos)?;
         parser_common::expect_token(tokens, pos, &Token::RParen, ")", "KeyConditionExpression")?;
         return Ok(RawClause::BeginsWith(path, prefix));
     }
 
     // path op :value | :value op path | path BETWEEN :lo AND :hi
-    let left = parse_key_operand(tokens, pos)?;
+    let left = parse_key_operand(tokens, src, pos)?;
 
     if *pos >= tokens.len() {
         return Err(validation_err(
@@ -518,7 +575,7 @@ fn parse_key_clause_inner(tokens: &[Token], pos: &mut usize) -> Result<RawClause
             }
             *pos += 1;
 
-            let path = parse_key_operand_path(tokens, pos)?;
+            let path = parse_key_operand_path(tokens, src, pos)?;
             // Key conditions are stored path-first, so reverse the operator when
             // the source expression puts the value placeholder on the left.
             let op = reverse_comparator(op);
@@ -534,9 +591,9 @@ fn parse_key_clause_inner(tokens: &[Token], pos: &mut usize) -> Result<RawClause
     // BETWEEN
     if tokens[*pos] == Token::Between {
         *pos += 1;
-        let low = parse_key_value(tokens, pos)?;
+        let low = parse_key_value(tokens, src, pos)?;
         parser_common::expect_token(tokens, pos, &Token::And, "AND", "KeyConditionExpression")?;
-        let high = parse_key_value(tokens, pos)?;
+        let high = parse_key_value(tokens, src, pos)?;
         return Ok(RawClause::Between(path, low, high));
     }
 
@@ -553,7 +610,7 @@ fn parse_key_clause_inner(tokens: &[Token], pos: &mut usize) -> Result<RawClause
     }
     *pos += 1;
 
-    let value = parse_key_value(tokens, pos)?;
+    let value = parse_key_value(tokens, src, pos)?;
 
     if op == CompareOp::Eq {
         Ok(RawClause::Eq(path, value))
@@ -562,11 +619,13 @@ fn parse_key_clause_inner(tokens: &[Token], pos: &mut usize) -> Result<RawClause
     }
 }
 
-fn parse_key_operand(tokens: &[Token], pos: &mut usize) -> Result<KeyOperand, DynamoDbError> {
+fn parse_key_operand(
+    tokens: &[Token],
+    src: &Source<'_>,
+    pos: &mut usize,
+) -> Result<KeyOperand, DynamoDbError> {
     if *pos >= tokens.len() {
-        return Err(validation_err(
-            "Invalid KeyConditionExpression: unexpected end of expression",
-        ));
+        return Err(src.syntax_error(*pos));
     }
 
     match &tokens[*pos] {
@@ -575,9 +634,11 @@ fn parse_key_operand(tokens: &[Token], pos: &mut usize) -> Result<KeyOperand, Dy
             Ok(KeyOperand::Path(path))
         }
         Token::Placeholder(_) => {
-            let value = parse_key_value(tokens, pos)?;
+            let value = parse_key_value(tokens, src, pos)?;
             Ok(KeyOperand::Value(value))
         }
+        // An operator or keyword where an operand is required (`AND pk = :v`).
+        token if is_operator_or_keyword(token) => Err(src.syntax_error(*pos)),
         _ => Err(validation_err(
             "Invalid KeyConditionExpression: expected attribute path or value placeholder",
         )),
@@ -586,27 +647,30 @@ fn parse_key_operand(tokens: &[Token], pos: &mut usize) -> Result<KeyOperand, Dy
 
 fn parse_key_operand_path(
     tokens: &[Token],
+    src: &Source<'_>,
     pos: &mut usize,
 ) -> Result<Vec<PathElement>, DynamoDbError> {
     if *pos >= tokens.len() {
-        return Err(validation_err(
-            "Invalid KeyConditionExpression: expected attribute path",
-        ));
+        return Err(src.syntax_error(*pos));
     }
 
     match &tokens[*pos] {
         Token::Ident(_) | Token::NameRef(_) => parser_common::parse_path(tokens, pos),
+        token if is_operator_or_keyword(token) => Err(src.syntax_error(*pos)),
         _ => Err(validation_err(
             "Invalid KeyConditionExpression: expected attribute path",
         )),
     }
 }
 
-fn parse_key_value(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbError> {
+fn parse_key_value(
+    tokens: &[Token],
+    src: &Source<'_>,
+    pos: &mut usize,
+) -> Result<Expr, DynamoDbError> {
     if *pos >= tokens.len() {
-        return Err(validation_err(
-            "Invalid KeyConditionExpression: expected value",
-        ));
+        // Input ends where a value is required (`pk =`).
+        return Err(src.syntax_error(*pos));
     }
     match &tokens[*pos] {
         Token::Placeholder(name) => {
@@ -614,6 +678,9 @@ fn parse_key_value(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbEr
             *pos += 1;
             Ok(expr)
         }
+        // An operator or keyword where a value is required (`pk = = :v`,
+        // measured 2026-10-25: token "=", near "= = :v").
+        token if is_operator_or_keyword(token) => Err(src.syntax_error(*pos)),
         _ => Err(validation_err(
             "Invalid KeyConditionExpression: key condition values must be expression attribute value placeholders",
         )),
@@ -990,5 +1057,60 @@ mod tests {
                 "expr {expr} should parse"
             );
         }
+    }
+
+    // Syntax error wording measured 2026-10-25 (us-east-1) on Query.
+
+    fn kce_msg(src: &str) -> String {
+        match parse_key_condition_from(&tokenize(src).unwrap(), src) {
+            Err(DynamoDbError::ValidationException(m)) => m,
+            other => panic!("expected ValidationException, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repeated_operator_quotes_the_source_window() {
+        // [d22] `pk = = :v`
+        assert_eq!(
+            kce_msg("pk = = :v"),
+            "Invalid KeyConditionExpression: Syntax error; token: \"=\", near: \"= = :v\""
+        );
+        assert_eq!(kce_msg("pk = :v AND sk = = :s"), "Invalid KeyConditionExpression: Syntax error; token: \"=\", near: \"= = :s\"");
+    }
+
+    #[test]
+    fn trailing_keyword_is_eof_with_the_keyword_as_window() {
+        // [d23] `pk = :v AND`
+        assert_eq!(
+            kce_msg("pk = :v AND"),
+            "Invalid KeyConditionExpression: Syntax error; token: \"<EOF>\", near: \"AND\""
+        );
+        assert_eq!(kce_msg("pk ="), "Invalid KeyConditionExpression: Syntax error; token: \"<EOF>\", near: \"=\"");
+    }
+
+    #[test]
+    fn stripped_outer_parentheses_keep_the_source_window() {
+        // The window is taken from the full token list, so the stripped
+        // parenthesis does not shift the quoted text.
+        assert_eq!(
+            kce_msg("(pk = = :v)"),
+            "Invalid KeyConditionExpression: Syntax error; token: \"=\", near: \"= = :v\""
+        );
+    }
+
+    #[test]
+    fn other_key_condition_texts_are_unchanged() {
+        assert_eq!(
+            kce_msg("pk = :v OR sk = :s"),
+            "Invalid KeyConditionExpression: only AND is supported between key conditions"
+        );
+        assert_eq!(
+            kce_msg("pk"),
+            "Invalid KeyConditionExpression: expected operator after operand"
+        );
+        assert_eq!(
+            kce_msg("pk = :v AND sk = sk2"),
+            "Invalid KeyConditionExpression: key condition values must be expression attribute value placeholders"
+        );
     }
 }
