@@ -33,7 +33,8 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{
     Expr, ExpressionMaps, KeyCondition, PathElement, SortKeyCondition,
 };
-use extenddb_core::types::{AttributeDefinition, AttributeValue, ScalarAttributeType};
+use extenddb_core::types::{AttributeDefinition, AttributeValue, QueryInput, ScalarAttributeType};
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 /// The service's text for a key condition value of the wrong type.
@@ -55,18 +56,54 @@ const EMPTY_NUMBER: &str = "The parameter cannot be converted to a numeric value
 /// that value ahead of an invalid `Select`).
 ///
 /// The checks read the raw body, so a field that does not deserialize (an
-/// invalid `Select`, for one) does not stop the ones before it. A field of the
-/// wrong JSON shape is left to the deserializer, which runs next.
+/// invalid `Select`, for one) does not stop the ones before it. When a check
+/// fails, the body is deserialized as a [`QueryInput`], and a
+/// `SerializationException` from that (a field of the wrong JSON shape
+/// anywhere in the body) is the answer instead, as the service reports a shape
+/// fault ahead of every validation (measured 2026-10-25: a `Limit` of 0 with a
+/// string `ExpressionAttributeValues`, a string `ExpressionAttributeNames` with
+/// an `N` value that is not a number, and a `Limit` of 0 with `Select: 5` all
+/// answer `SerializationException`). A `ValidationException` the deserializer
+/// raises (an empty set, a duplicate, an invalid `AttributeValue`) does not
+/// preempt the check. A body that passes every check is not deserialized here.
 ///
 /// The server runs the same function ahead of the IAM decision, so a principal
 /// whose `dynamodb:LeadingKeys` fence cannot bind a number that does not parse
 /// gets the request's `ValidationException` rather than
-/// `AccessDeniedException`.
+/// `AccessDeniedException`. That call goes through this function too, so it
+/// answers the shape fault first as well.
 ///
 /// # Errors
 ///
-/// Returns `DynamoDbError::ValidationException` with the service's text.
+/// Returns `DynamoDbError::ValidationException` with the service's text, or
+/// `DynamoDbError::SerializationException` for a body of the wrong shape.
 pub fn validate_query_request_body(body: &Value) -> Result<(), DynamoDbError> {
+    query_request_checks(body).map_err(|check| shape_fault_first::<QueryInput>(body, check))
+}
+
+/// When a request-time check has failed with `check`, the deserializer's
+/// `SerializationException` for `body` if there is one, else `check`. The two
+/// enum fields stay in the body: an enum value that is a string but not a
+/// member deserializes to a `ValidationException`, which this ignores, and one
+/// of another JSON type is a shape fault the service reports ahead of the
+/// checks (measured 2026-10-25: `Select: 5` with a `Limit` of 0 answers
+/// `SerializationException: NUMBER_VALUE cannot be converted to String`).
+pub(crate) fn shape_fault_first<T: DeserializeOwned>(
+    body: &Value,
+    check: DynamoDbError,
+) -> DynamoDbError {
+    match serde_json::from_value::<T>(body.clone()) {
+        Err(e) => match crate::deserialize_error(e) {
+            shape @ DynamoDbError::SerializationException(_) => shape,
+            _ => check,
+        },
+        Ok(_) => check,
+    }
+}
+
+/// The `Query` checks in the service's order; see
+/// [`validate_query_request_body`].
+fn query_request_checks(body: &Value) -> Result<(), DynamoDbError> {
     if let Some(limit) = body.get("Limit").and_then(Value::as_i64)
         && limit < 1
     {
@@ -153,6 +190,12 @@ fn non_empty(body: &Value, field: &str) -> bool {
 /// deterministic when several are invalid. An empty `N` answers the message
 /// with the colon and nothing after it, as the service does on `Query`.
 ///
+/// A Unicode decimal digit (general category `Nd`) counts as the digit it
+/// stands for, as the service reads it (measured 2026-10-25: a fullwidth or
+/// Arabic-Indic digit is accepted, thirty nine Devanagari ones answer the 38
+/// digit message); see [`crate::decimal_digits`]. The message echoes the value
+/// as the request wrote it.
+///
 /// # Errors
 ///
 /// Returns `DynamoDbError::ValidationException` with the service's text.
@@ -162,17 +205,34 @@ pub fn validate_expression_attribute_value_numbers(
     let mut keys: Vec<&String> = values.keys().collect();
     keys.sort();
     for key in keys {
-        match extenddb_core::validation::validate_attribute_number(&values[key]) {
-            Ok(()) => {}
-            Err(DynamoDbError::ValidationException(msg)) if msg == EMPTY_NUMBER => {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "{EMPTY_NUMBER}: "
-                )));
-            }
-            Err(other) => return Err(other),
-        }
+        validate_value_numbers(&values[key])?;
     }
     Ok(())
+}
+
+/// Every number inside one attribute value (`N`, `NS` members, and the values
+/// nested in `L` and `M`), with Unicode decimal digits folded for the check.
+fn validate_value_numbers(value: &AttributeValue) -> Result<(), DynamoDbError> {
+    match value {
+        AttributeValue::N(n) => validate_number_text(n),
+        AttributeValue::NS(set) => set.iter().try_for_each(|n| validate_number_text(n)),
+        AttributeValue::L(list) => list.iter().try_for_each(validate_value_numbers),
+        AttributeValue::M(map) => map.values().try_for_each(validate_value_numbers),
+        _ => Ok(()),
+    }
+}
+
+/// One number text against the number rules, with the service's `Query`
+/// message for an empty value and the original text echoed for a malformed one.
+fn validate_number_text(text: &str) -> Result<(), DynamoDbError> {
+    let folded = crate::decimal_digits::fold_decimal_digits(text);
+    match extenddb_core::validation::number::validate_and_normalize_number(&folded) {
+        Ok(_) => Ok(()),
+        Err(DynamoDbError::ValidationException(msg)) if msg.starts_with(EMPTY_NUMBER) => Err(
+            DynamoDbError::ValidationException(format!("{EMPTY_NUMBER}: {text}")),
+        ),
+        Err(other) => Err(other),
+    }
 }
 
 /// Refuse a key condition value whose type is not the key's

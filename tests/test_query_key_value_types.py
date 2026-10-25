@@ -9,7 +9,10 @@ value: <value>``) or when a key condition value's type is not the key
 attribute's ``AttributeDefinitions`` type (``One or more parameter values were
 invalid: Condition parameter type does not match schema type``). Every expected
 answer below was measured against the service on 2026-10-24 (15:10, 21:00,
-21:06 and 23:42 UTC) on tables with S/S, S/N and B/B keys, a GSI and an LSI.
+21:06 and 23:42 UTC) and 2026-10-25 (11:31 UTC) on tables with S/S, S/N and
+B/B keys, a GSI and an LSI. A Unicode decimal digit in an N value counts as
+the digit it stands for; a field of the wrong JSON type anywhere in the body
+answers SerializationException ahead of every check.
 The rows also pin where the two checks fall against the other Query checks:
 the numeric check after Limit, the expression parameter mix check and the
 ReturnConsumedCapacity enum, and before the Select enum and the table lookup;
@@ -115,6 +118,10 @@ def ns_table(dynamodb_client):
         for pk in ("alice", "bob"):
             dynamodb_client.put_item(TableName=name, Item={
                 "pk": {"S": pk}, "sk": {"N": "5"}, "gpk": {"S": pk}, "gsk": {"S": "g"}})
+        # The item the Unicode digit rows read: sk N 1 and a N 1 in ASCII.
+        dynamodb_client.put_item(TableName=name, Item={
+            "pk": {"S": "carol"}, "sk": {"N": "1"}, "a": {"N": "1"},
+            "gpk": {"S": "carol"}, "gsk": {"S": "g"}})
         yield name
 
 
@@ -165,6 +172,14 @@ RESERVED_KCE = (
 )
 NO_INDEX = "The table does not have the specified index: nope"
 UNUSED_X = "Value provided in ExpressionAttributeValues unused in expressions: keys: {:x}"
+UNUSED_F = "Value provided in ExpressionAttributeValues unused in expressions: keys: {:f}"
+# Unicode decimal digits (general category Nd) and characters that are not.
+FW_ONE = "\uff11"        # fullwidth digit one
+AR_ONE = "\u0661"        # Arabic-Indic digit one
+DEVA_ONE = "\u0967"      # Devanagari digit one
+# Superscript two, vulgar half, fullwidth minus then 1, 1 fullwidth full stop 5.
+NOT_DIGITS = ["\u00b2", "\u00bd", "\uff0d1", "1\uff0e5"]
+CAROL = {"S": "carol"}
 GSI_CONSISTENT = "Consistent reads are not supported on global secondary indexes"
 FILTER_BEGINS_WITH_N = (
     "Invalid FilterExpression: Incorrect operand type for operator or function; "
@@ -354,6 +369,35 @@ ROWS = [
     ("f6 Limit -1 with N bob", "ss", kce("pk = :u", {":u": NB}, Limit=-1), V, LIMIT_MSG),
     ("f7 Limit 0 with a type mismatch and N bob", "ss",
      kce("pk = :u AND sk = :s", {":u": N5, ":s": NB}, Limit=0), V, LIMIT_MSG),
+    # Unicode decimal digits are read as the digits they stand for; other
+    # characters are refused with the value echoed as sent (measured
+    # 2026-10-25 11:31 UTC on an S/N table).
+    ("g1 39 Devanagari ones as sk", "ns",
+     kce("pk = :u AND sk = :s", {":u": CAROL, ":s": {"N": DEVA_ONE * 39}}), V, DIGITS_MSG),
+    ("g2 39 Devanagari ones in filter", "ns",
+     kce("pk = :u AND sk = :s", {":u": CAROL, ":s": {"N": "1"}, ":f": {"N": DEVA_ONE * 39}},
+         FilterExpression="a = :f"), V, DIGITS_MSG),
+    ("g3 39 Devanagari ones unused", "ns",
+     kce("pk = :u AND sk = :s", {":u": CAROL, ":s": {"N": "1"}, ":f": {"N": DEVA_ONE * 39}}),
+     V, DIGITS_MSG),
+    *[(f"g4 {raw!r} as sk", "ns",
+       kce("pk = :u AND sk = :s", {":u": CAROL, ":s": {"N": raw}}), V, NUMERIC + raw)
+      for raw in NOT_DIGITS],
+    *[(f"g5 {raw!r} in filter", "ns",
+       kce("pk = :u AND sk = :s", {":u": CAROL, ":s": {"N": "1"}, ":f": {"N": raw}},
+           FilterExpression="a = :f"), V, NUMERIC + raw)
+      for raw in NOT_DIGITS],
+    *[(f"g6 {raw!r} unused", "ns",
+       kce("pk = :u AND sk = :s", {":u": CAROL, ":s": {"N": "1"}, ":f": {"N": raw}}),
+       V, NUMERIC + raw)
+      for raw in NOT_DIGITS],
+    *[(f"g7 {raw!r} unused passes the number check", "ns",
+       kce("pk = :u AND sk = :s", {":u": CAROL, ":s": {"N": "1"}, ":f": {"N": raw}}),
+       V, UNUSED_F)
+      for raw in (FW_ONE, AR_ONE, DEVA_ONE, "1\uff12", "1e\uff12")],
+    ("g8 NS with a fullwidth digit unused", "ns",
+     kce("pk = :u AND sk = :s", {":u": CAROL, ":s": {"N": "1"}, ":f": {"NS": [FW_ONE]}}),
+     V, UNUSED_F),
     # The other value types the earlier record covers.
     ("pk = BOOL", "ss", kce("pk = :u", {":u": {"BOOL": True}}), V, TYPE_MISMATCH),
     ("pk = N bob AND pk > S alice", "ss",
@@ -390,6 +434,112 @@ class TestKeyConditionValueTypes:
         assert dynamodb_client.query(
             TableName=bb_table, KeyConditionExpression="bpk = :u",
             ExpressionAttributeValues={":u": B_BOB})["Count"] == 1
+
+
+class TestUnicodeDecimalDigitsAreRead:
+    """A Unicode decimal digit in an N value is the digit it stands for: as a
+    key condition value it reads the item stored with the ASCII digit, as a
+    filter value it matches the ASCII attribute (measured 2026-10-25 11:31 UTC
+    on an S/N table holding sk N 1 and a N 1)."""
+
+    DIGITS = [FW_ONE, AR_ONE, DEVA_ONE]
+    DIGIT_IDS = ["fullwidth", "arabic-indic", "devanagari"]
+
+    @pytest.mark.parametrize("digit", DIGITS, ids=DIGIT_IDS)
+    def test_key_condition_value_reads_the_ascii_item(self, dynamodb_client, ns_table, digit):
+        resp = dynamodb_client.query(
+            TableName=ns_table, KeyConditionExpression="pk = :u AND sk = :s",
+            ExpressionAttributeValues={":u": CAROL, ":s": {"N": digit}})
+        assert resp["Count"] == 1
+        assert resp["Items"][0]["sk"] == {"N": "1"}
+
+    @pytest.mark.parametrize("digit", DIGITS, ids=DIGIT_IDS)
+    def test_filter_value_matches_the_ascii_attribute(self, dynamodb_client, ns_table, digit):
+        resp = dynamodb_client.query(
+            TableName=ns_table, KeyConditionExpression="pk = :u AND sk = :s",
+            FilterExpression="a = :f",
+            ExpressionAttributeValues={":u": CAROL, ":s": {"N": "1"}, ":f": {"N": digit}})
+        assert resp["Count"] == 1
+        assert resp["Items"][0]["a"] == {"N": "1"}
+
+    @pytest.mark.parametrize("raw", ["1\uff12", "1e\uff12"], ids=["1-fullwidth-2", "1e-fullwidth-2"])
+    def test_mixed_digits_are_one_number(self, dynamodb_client, ns_table, raw):
+        # Read as 12 and 1e2: accepted, matching nothing stored.
+        as_key = dynamodb_client.query(
+            TableName=ns_table, KeyConditionExpression="pk = :u AND sk = :s",
+            ExpressionAttributeValues={":u": CAROL, ":s": {"N": raw}})
+        assert (as_key["Count"], as_key["ScannedCount"]) == (0, 0)
+        in_filter = dynamodb_client.query(
+            TableName=ns_table, KeyConditionExpression="pk = :u AND sk = :s",
+            FilterExpression="a = :f",
+            ExpressionAttributeValues={":u": CAROL, ":s": {"N": "1"}, ":f": {"N": raw}})
+        assert (in_filter["Count"], in_filter["ScannedCount"]) == (0, 1)
+
+    def test_fullwidth_digit_in_a_number_set_passes_the_check(self, dynamodb_client, ns_table):
+        resp = dynamodb_client.query(
+            TableName=ns_table, KeyConditionExpression="pk = :u AND sk = :s",
+            FilterExpression="contains(ns, :f)",
+            ExpressionAttributeValues={":u": CAROL, ":s": {"N": "1"}, ":f": {"NS": [FW_ONE]}})
+        assert (resp["Count"], resp["ScannedCount"]) == (0, 1)
+
+
+def _raw_query(client, body: dict):
+    """POST ``body`` as the Query JSON exactly as written, signed with the
+    client's credentials, so a field of the wrong JSON type reaches the server
+    (boto3 would refuse or reshape it)."""
+    import json
+
+    from botocore.awsrequest import AWSRequest
+
+    req = AWSRequest(method="POST", url=client.meta.endpoint_url, data=json.dumps(body),
+                     headers={"Content-Type": "application/x-amz-json-1.0",
+                              "X-Amz-Target": "DynamoDB_20120810.Query"})
+    client._request_signer.sign("Query", req)
+    resp = client._endpoint.http_session.send(req.prepare())
+    return resp.status_code, json.loads(resp.content.decode("utf-8", "replace") or "{}")
+
+
+SHAPE_FAULTS = [
+    ("Limit 0 with ExpressionAttributeValues string",
+     {"KeyConditionExpression": "pk = :p", "Limit": 0, "ExpressionAttributeValues": "x"}),
+    ("ExpressionAttributeNames string with N bob",
+     {"KeyConditionExpression": "pk = :p", "ExpressionAttributeNames": "x",
+      "ExpressionAttributeValues": {":p": NB}}),
+    ("Limit string with N bob",
+     {"KeyConditionExpression": "pk = :p", "Limit": "1", "ExpressionAttributeValues": {":p": NB}}),
+    ("AttributesToGet object with ProjectionExpression",
+     {"KeyConditionExpression": "pk = :p", "AttributesToGet": {"a": 1}, "ProjectionExpression": "a",
+      "ExpressionAttributeValues": {":p": SX}}),
+    ("QueryFilter array with FilterExpression",
+     {"KeyConditionExpression": "pk = :p", "QueryFilter": [1], "FilterExpression": "a = :p",
+      "ExpressionAttributeValues": {":p": SX}}),
+    ("Select number with N bob",
+     {"KeyConditionExpression": "pk = :p", "Select": 5, "ExpressionAttributeValues": {":p": NB}}),
+    ("Limit 0 with Select number",
+     {"KeyConditionExpression": "pk = :p", "Limit": 0, "Select": 5,
+      "ExpressionAttributeValues": {":p": SX}}),
+]
+
+
+class TestShapeFaultsAreReportedFirst:
+    """A field of the wrong JSON type anywhere in the body answers
+    SerializationException ahead of the Limit, parameter mix, enum and number
+    checks (measured 2026-10-25 11:31 UTC). The message texts differ between
+    the service and extenddb, so only the error type is asserted."""
+
+    @pytest.mark.parametrize("row,body", SHAPE_FAULTS, ids=[r[0] for r in SHAPE_FAULTS])
+    def test_rows(self, dynamodb_client, ss_table, row, body):
+        status, payload = _raw_query(dynamodb_client, {"TableName": ss_table, **body})
+        assert status == 400
+        assert payload.get("__type", "").endswith("SerializationException"), payload
+
+    def test_control_without_a_shape_fault_answers_the_check(self, dynamodb_client, ss_table):
+        status, payload = _raw_query(dynamodb_client, {
+            "TableName": ss_table, "KeyConditionExpression": "pk = :p", "Limit": 0,
+            "ExpressionAttributeValues": {":p": NB}})
+        assert status == 400
+        assert payload.get("__type", "").endswith("ValidationException")
+        assert payload.get("message", payload.get("Message")) == LIMIT_MSG
 
 
 class TestLeadingKeysWithAnInvalidKeyValue:

@@ -12,6 +12,7 @@ mod batch_get_item;
 mod batch_write_item;
 pub mod capacity_helpers;
 mod create_table;
+mod decimal_digits;
 mod delete_item;
 mod delete_table;
 mod describe_endpoints;
