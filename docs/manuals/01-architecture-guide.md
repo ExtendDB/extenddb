@@ -192,6 +192,10 @@ The server sets `extenddb_storage::request_scope::RequestScope` around each requ
 
 The engine's fault log lines (`storage internal error`, `backup storage error`, and the three create_table arms for a catalog or idempotency fault) carry `request_id` and `operation` from the scope next to the redacted error text, so an operator can match the line to the request id the client received. Outside a request the line carries neither field. At trace level the engine writes one `dispatch` event per request under the target `extenddb_engine::dispatch`, inside the scope, with the operation.
 
+### Thin binary extensions
+
+A backend's `main` passes an `extenddb_app::Extensions` value to `extenddb_app::run_with`; `run` is the same call with the empty default. `Extensions::http` is a list of axum routers with absolute prefixes of literal segments; `start_server` nests each after the built-in routes and before the response security layer, so an extension response carries the same security headers and nothing else of the server's (no authentication, no rate limit, axum's default body limit). A prefix that is `/`, is not absolute, ends with `/`, has an empty segment, a parameter or wildcard segment or a byte no request path carries, is at or under `/health`, `/metrics`, `/management` or `/console`, or is at, under or above an earlier prefix is a startup error, reported before the backend connects. `Extensions::request_observer` is an optional `RequestObserver`; the handler calls it once per request that reached authentication, after the response is built and outside the request scope, with a `RequestRecord` (request id, operation, table, account, status, error type, latency, a hash of the raw body, and the two SDK correlation headers). A request the client abandons in flight is reported with status 0. Without an observer the handler builds no record and hashes no body.
+
 ## Security Architecture
 
 ### Authentication
