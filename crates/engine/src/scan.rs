@@ -41,57 +41,19 @@ pub async fn handle_scan(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
-    // Pre-scanned before typed deserialization. Scan AGGREGATES its invalid
-    // enums with Select's clause ahead of ReturnConsumedCapacity's, the
-    // opposite of Query on both counts (Query stops at the first, RCC-first).
-    // Measured 2026-08-24 (us-east-1): both invalid answers "2 validation
-    // errors detected: ... 'select' ...; ... 'returnConsumedCapacity' ...".
-    crate::validate_enum_fields(
-        &body,
-        &[
-            crate::EnumField {
-                json_name: "Select",
-                valid: &[
-                    "SPECIFIC_ATTRIBUTES",
-                    "COUNT",
-                    "ALL_ATTRIBUTES",
-                    "ALL_PROJECTED_ATTRIBUTES",
-                ],
-                clause: crate::EnumClause::Named("select"),
-            },
-            crate::EnumField {
-                json_name: "ReturnConsumedCapacity",
-                valid: &["INDEXES", "TOTAL", "NONE"],
-                clause: crate::EnumClause::Named("returnConsumedCapacity"),
-            },
-        ],
-    )?;
+    // Request-time checks on the raw body, in the service's order: the Limit,
+    // Segment and TotalSegments ranges, the expression and non-expression
+    // parameter mix, the ReturnConsumedCapacity enum, every number in
+    // ExpressionAttributeValues, the Select enum. They run before typed
+    // deserialization so a field that does not deserialize does not stop the
+    // ones before it; a field of the wrong JSON type anywhere in the body is
+    // reported ahead of them; see `scan_request`.
+    crate::scan_request::validate_scan_request_body(&body)?;
     let input: ScanInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
     // Validate Filter/Projection expressions before the existence
-    // check; index resolution, Segment/Limit/Select and key checks stay after.
-
-    // --- Legacy vs expression mutual exclusivity checks ---
-    let has_fe = input.filter_expression.is_some();
-    let has_sf = input.scan_filter.as_ref().is_some_and(|m| !m.is_empty());
-    let has_pe = input.projection_expression.is_some();
-    let has_atg = input
-        .attributes_to_get
-        .as_ref()
-        .is_some_and(|a| !a.is_empty());
+    // check; index resolution, Segment pairing, Select and key checks stay after.
     let has_cond_op = input.conditional_operator.is_some();
-
-    extenddb_core::validation::validate_no_expression_param_mixing(
-        &[
-            ("AttributesToGet", has_atg),
-            ("ScanFilter", has_sf),
-            ("ConditionalOperator", has_cond_op),
-        ],
-        &[
-            ("ProjectionExpression", has_pe),
-            ("FilterExpression", has_fe),
-        ],
-    )?;
 
     let maps = build_expression_maps(
         input.expression_attribute_names.as_ref(),
@@ -299,7 +261,9 @@ pub async fn handle_scan(
         )?;
     }
 
-    // Validate Segment/TotalSegments — DynamoDB returns different messages per direction
+    // Validate Segment/TotalSegments pairing. The range of each field is
+    // checked at request time in validate_scan_request_body; the service
+    // reports a missing partner with a message per direction.
     match (input.segment, input.total_segments) {
         (Some(_), None) => {
             return Err(DynamoDbError::ValidationException(
@@ -314,26 +278,6 @@ pub async fn handle_scan(
             ));
         }
         (Some(seg), Some(total)) => {
-            if total < 1 {
-                return Err(DynamoDbError::ValidationException(
-                    "The parameter TotalSegments should be greater than or equal to 1".to_owned(),
-                ));
-            }
-            if total > 1_000_000 {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "1 validation error detected: Value '{total}' at 'totalSegments' failed to satisfy constraint: Member must have value less than or equal to 1000000"
-                )));
-            }
-            if seg < 0 {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "1 validation error detected: Value '{seg}' at 'segment' failed to satisfy constraint: Member must have value greater than or equal to 0"
-                )));
-            }
-            if seg > 999_999 {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "1 validation error detected: Value '{seg}' at 'segment' failed to satisfy constraint: Member must have value less than or equal to 999999"
-                )));
-            }
             if seg >= total {
                 return Err(DynamoDbError::ValidationException(format!(
                     "The Segment parameter is zero-based and must be less than parameter TotalSegments: \
@@ -344,14 +288,7 @@ pub async fn handle_scan(
         (None, None) => {}
     }
 
-    // Validate Limit >= 1
-    if let Some(limit) = input.limit
-        && limit < 1
-    {
-        return Err(DynamoDbError::ValidationException(format!(
-            "1 validation error detected: Value '{limit}' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"
-        )));
-    }
+    // Limit >= 1 is checked at request time in validate_scan_request_body.
 
     // For index scans, build a key_info that reflects the index's key schema.
     let scan_key_info = if let Some(ref idx) = index_info {

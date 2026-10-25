@@ -32,6 +32,7 @@ pub mod query_key_values;
 mod read_helpers;
 mod request_limits;
 mod scan;
+pub mod scan_request;
 mod search_vectors;
 pub mod stream_capture;
 mod streams;
@@ -217,7 +218,7 @@ pub(crate) const RETURN_VALUES_MEMBERS: &[&str] =
 /// Pre-validate enum fields in a JSON body and return a combined error if
 /// multiple are invalid, in the order listed. Whether an operation aggregates
 /// its enum violations or stops at the first is per operation on the service
-/// (PutItem/DeleteItem/Scan aggregate; UpdateItem and Query stop at the
+/// (PutItem and DeleteItem aggregate; UpdateItem, Query and Scan stop at the
 /// first), so callers choose by passing one list or several sequential calls.
 pub(crate) fn validate_enum_fields(
     body: &serde_json::Value,

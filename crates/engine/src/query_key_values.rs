@@ -181,12 +181,12 @@ fn query_request_checks(body: &Value) -> Result<(), DynamoDbError> {
 
 /// Whether `field` is in the body with a value other than `null`, as a typed
 /// `Option` field would deserialize to `Some`.
-fn present(body: &Value, field: &str) -> bool {
+pub(crate) fn present(body: &Value, field: &str) -> bool {
     body.get(field).is_some_and(|v| !v.is_null())
 }
 
 /// Whether `field` is a non-empty JSON object or array in the body.
-fn non_empty(body: &Value, field: &str) -> bool {
+pub(crate) fn non_empty(body: &Value, field: &str) -> bool {
     match body.get(field) {
         Some(Value::Object(map)) => !map.is_empty(),
         Some(Value::Array(items)) => !items.is_empty(),
