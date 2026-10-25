@@ -18,10 +18,9 @@ use serde_json::Value;
 use crate::AppState;
 use crate::request_helpers::{authorize_request, extract_operation, extract_table_name};
 use crate::response::{error_response, record_error_metrics, success_response};
-use crate::throttle_helpers::{
-    classify_data_operation, extract_partition_value, table_description_to_throughput,
-    throttle_error, update_throttle_buckets,
-};
+use crate::throttle_helpers::{extract_partition_value, update_throttle_buckets};
+
+mod throttle_segment;
 
 /// Main Virtual `DynamoDB` request handler.
 /// REQ-WIRE-001: Accept HTTP POST to `/`.
@@ -426,73 +425,15 @@ async fn serve_request(
 
     // --- Throttle segment ---
     let throttle_start = std::time::Instant::now();
-    let (is_read_op, is_write_op) = classify_data_operation(operation);
     let partition_value = extract_partition_value(&input, operation);
-    if let Some(ref tn) = table_name
-        && (is_read_op || is_write_op)
-    {
-        if !state.throttle.is_registered(&ctx.account_id, tn)
-            && let Ok(desc) = ctx
-                .storage
-                .describe_table(
-                    &ctx.account_id,
-                    extenddb_core::types::DescribeTableInput {
-                        table_name: tn.clone(),
-                    },
-                )
-                .await
-        {
-            let throughput = table_description_to_throughput(&desc);
-            state
-                .throttle
-                .register_table(&ctx.account_id, tn, throughput);
-        }
-
-        let result = state.throttle.check_capacity_with_partition(
-            &ctx.account_id,
-            tn,
-            is_read_op,
-            is_write_op,
-            partition_value.as_deref(),
-        );
-        if let Some(cause) = result.cause() {
-            let throttled_read = matches!(
-                result,
-                extenddb_core::throttle::ThrottleResult::ThrottledRead(_)
-            );
-            let metric = if throttled_read {
-                extenddb_core::metrics::MetricName::ReadThrottleEvents
-            } else {
-                extenddb_core::metrics::MetricName::WriteThrottleEvents
-            };
-            state
-                .metrics
-                .record(metric, 1.0, Some(tn), None, Some(operation));
-            state.metrics.record(
-                extenddb_core::metrics::MetricName::ThrottledRequests,
-                1.0,
-                Some(tn),
-                None,
-                Some(operation),
-            );
-            // The service names the throttled resource and the limit on a
-            // throttle: one reason with the table ARN, the same string
-            // DescribeTable returns as TableArn. The error class, the message
-            // and the limit follow the bucket that refused and the table's
-            // billing mode. The account bucket can refuse before the engine
-            // has seen the name, so an ARN naming a table in this account is
-            // reduced to the bare name first, and a name the engine would
-            // refuse gets no resource at all.
-            let name = crate::authz_resource::key_lookup_name(tn, &state.region, &ctx.account_id);
-            let table_arn = extenddb_core::validation::validate_table_name_chars(&name)
-                .is_ok()
-                .then(|| extenddb_storage::util::table_arn(&state.region, &ctx.account_id, &name));
-            return Err(Refused {
-                error: throttle_error(cause, throttled_read, table_arn),
-                account_id: Some(ctx.account_id.to_string()),
-            });
-        }
-    }
+    throttle_segment::check(
+        state,
+        &ctx,
+        operation,
+        table_name.as_deref(),
+        partition_value.as_deref(),
+    )
+    .await?;
     #[allow(clippy::cast_precision_loss)]
     let throttle_us = throttle_start.elapsed().as_micros() as f64;
 
