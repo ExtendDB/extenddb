@@ -503,6 +503,7 @@ class TestSyntaxErrorWording:
             ("d19", "#v = :v AND NOT", "<EOF>", "NOT"),
             ("d29", "=", "=", "="),
             ("d30", "= =", "=", "= ="),
+            ("H501-1 s30", "#v = :v and and #v = :v", "and", "and and #v"),
         ],
     )
     def test_put_item_condition(self, dynamodb_client, table, case, expr, token, near):
@@ -530,6 +531,10 @@ class TestSyntaxErrorWording:
         assert _validation(scan(dynamodb_client, table, "#v = :v AND")) == syntax(
             "FilterExpression", "<EOF>", "AND"
         )
+        # [H501-1 s01]: a lower-case keyword is shown as written.
+        assert _validation(scan(dynamodb_client, table, "#v = :v and and #v = :v")) == syntax(
+            "FilterExpression", "and", "and and #v"
+        )
 
     def test_query_key_condition(self, dynamodb_client, table):
         # [d22], [d23]
@@ -539,6 +544,14 @@ class TestSyntaxErrorWording:
         assert _validation(query(dynamodb_client, table, "pk = :v AND")) == syntax(
             "KeyConditionExpression", "<EOF>", "AND"
         )
+        # [H501-1 k07]
+        lower = query(
+            dynamodb_client,
+            table,
+            "pk = :p and and sk = :s",
+            ExpressionAttributeValues={":p": {"S": "p1"}, ":s": {"S": "a"}, ":v": {"S": "x"}},
+        )
+        assert _validation(lower) == syntax("KeyConditionExpression", "and", "and and sk")
 
     @pytest.mark.parametrize(
         "case, expr, token, near",
