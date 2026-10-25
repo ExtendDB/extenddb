@@ -11,6 +11,7 @@
 mod ast;
 mod evaluator;
 mod key_condition;
+mod key_condition_resolve;
 mod kind;
 mod operator_count;
 mod parser;
