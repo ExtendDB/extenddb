@@ -186,6 +186,12 @@ Storage backends implement thirteen traits (see **storage** section above). The 
 
 Auth providers implement the `AuthProvider` trait using `#[async_trait]` for object safety. The provider is selected at startup and stored as `Arc<dyn AuthProvider>`. The `BuiltinAuthProvider` uses a `CredentialStore` trait (also `#[async_trait]`) for credential lookup, with a database-backed implementation.
 
+### Request scope
+
+The server sets `extenddb_storage::request_scope::RequestScope` around each request from authentication through dispatch. It holds the request id the client receives in the `x-amzn-RequestId` response header, the operation name from `X-Amz-Target`, and the `amz-sdk-invocation-id` and `amz-sdk-request` headers when the client sent them. A storage backend or an engine error mapper running inline on the request task reads it with `request_scope::current()` or `request_scope::with_current()`. The scope is a Tokio task-local, absent in background workers and in tasks started with `tokio::spawn`; the one request-started task in the engine, the detached restore of `RestoreTableFromBackup`, carries it across by hand.
+
+The engine's fault log lines (`storage internal error`, `backup storage error`, and the three create_table arms for a catalog or idempotency fault) carry `request_id` and `operation` from the scope next to the redacted error text, so an operator can match the line to the request id the client received. Outside a request the line carries neither field. At trace level the engine writes one `dispatch` event per request under the target `extenddb_engine::dispatch`, inside the scope, with the operation.
+
 ## Security Architecture
 
 ### Authentication

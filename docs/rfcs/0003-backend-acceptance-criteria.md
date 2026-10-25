@@ -135,6 +135,8 @@ If implementing pushdown, numeric comparisons must be numeric (not string-lexico
 
 **10.3. UpdateTable idempotency.** Repeated `UpdateTable` calls with the same specification must not corrupt state (duplicate shards, broken ARNs, phantom index entries). Either reject the redundant call with the appropriate error, or make it a no-op.
 
+**10.4. Request correlation.** A log line the backend writes for a failure it returns as `StorageError::Internal`, `Connection` or `Transient` carries the request id from `extenddb_storage::request_scope` when one is current, so an operator can match the line to the `x-amzn-RequestId` the client received. See the Request Correlation section of the storage extension manual for the accessors and the cases where no scope is current.
+
 ## Conformance Verification
 
 ### Required test suites
