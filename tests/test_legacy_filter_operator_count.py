@@ -51,7 +51,7 @@ def table(dynamodb_client):
 
 
 def test_scan_filter_with_160_conditions_is_not_counted(dynamodb_client, table):
-    # H501-1 n16: OK, Count 0, ScannedCount 1.
+    # Measured 2026-10-25: OK, Count 0, ScannedCount 1.
     out = dynamodb_client.scan(
         TableName=table, Limit=1, ScanFilter=_eq_conditions(CONDITIONS)
     )
@@ -60,7 +60,7 @@ def test_scan_filter_with_160_conditions_is_not_counted(dynamodb_client, table):
 
 
 def test_query_filter_with_160_conditions_is_not_counted(dynamodb_client, table):
-    # H501-1 n18: OK, Count 0.
+    # Measured 2026-10-25: OK, Count 0.
     out = dynamodb_client.query(
         TableName=table,
         Limit=1,
@@ -73,7 +73,7 @@ def test_query_filter_with_160_conditions_is_not_counted(dynamodb_client, table)
 
 
 def test_expected_with_160_conditions_is_evaluated(dynamodb_client, table):
-    # H501-1 n19: ConditionalCheckFailedException, the item has none of the
+    # Measured 2026-10-25: ConditionalCheckFailedException, the item has none of the
     # compared attributes.
     with pytest.raises(ClientError) as exc_info:
         dynamodb_client.put_item(
