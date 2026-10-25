@@ -14,7 +14,7 @@ use crate::serve_helpers::check_config_permissions;
 use crate::serve_helpers::verify_daemon_started;
 use extenddb_config as config;
 use extenddb_config::pid_file_path;
-use extenddb_server::{BuildInfo, LogTarget, ServeParams};
+use extenddb_server::{BuildInfo, Extensions, LogTarget, ServeParams};
 
 #[derive(Args, Default)]
 pub struct ServeArgs {
@@ -51,7 +51,11 @@ pub struct ServeArgs {
 /// Bind the listening socket, daemonize, then start the tokio runtime.
 /// Binding before forking ensures port conflicts are reported to stderr
 /// before the parent process exits (D-4).
-pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
+pub fn run(args: &ServeArgs, build: BuildInfo, extensions: Extensions) -> anyhow::Result<()> {
+    // A refused extension prefix is a startup error; checking it here, before
+    // the backend connects or the daemon forks, puts the message on stderr.
+    extenddb_server::validate_extension_prefixes(&extensions.http)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     // Load config early so bind address is known before fork. A dev-mode
     // build serves with built-in defaults when no config file exists
     // (zero-config local/CI use: loopback, in-memory storage, seeded dev
@@ -273,7 +277,8 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
                 } else {
                     LogTarget::Syslog
                 })
-                .with_dev_mode(cfg!(feature = "dev-mode")),
+                .with_dev_mode(cfg!(feature = "dev-mode"))
+                .with_extensions(extensions),
         ))
 }
 

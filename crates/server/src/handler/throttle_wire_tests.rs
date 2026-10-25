@@ -55,13 +55,15 @@ fn cache_cfg(name: &'static str) -> extenddb_cache::SwrCacheConfig {
 /// `dev_mode` on. Returns the state and the account id the stub answers with,
 /// so the expected ARN can be formed.
 pub(super) async fn build_state() -> (Arc<AppState>, String) {
-    build_state_with(|account_id| Arc::new(StubAuth { account_id })).await
+    build_state_with(|account_id| Arc::new(StubAuth { account_id }), None).await
 }
 
 /// `build_state` with the auth provider built by `auth` from the bootstrapped
-/// default account id, for a test that needs its own provider.
+/// default account id and an optional request observer, for a test that needs
+/// its own.
 pub(super) async fn build_state_with(
     auth: impl FnOnce(String) -> Arc<dyn AuthProvider>,
+    request_observer: Option<Arc<dyn crate::extensions::RequestObserver>>,
 ) -> (Arc<AppState>, String) {
     let _ = extenddb_storage::set_backend(extenddb_storage_sqlite::backend());
     let config = extenddb_storage_sqlite::SqliteConfig {
@@ -123,6 +125,7 @@ pub(super) async fn build_state_with(
         table_key_info_cache,
         config_entries: Vec::new(),
         docs_store: None,
+        request_observer,
     });
     (state, account_id)
 }
@@ -154,7 +157,7 @@ pub(super) async fn call(state: &Arc<AppState>, operation: &str, body: Value) ->
 /// Create `table` with the given billing fields and wait for ACTIVE. No
 /// worker runs in this test, so the CREATING to ACTIVE transition is driven
 /// here.
-async fn create_table(state: &Arc<AppState>, table: &str, billing: Value) {
+pub(super) async fn create_table(state: &Arc<AppState>, table: &str, billing: Value) {
     let mut create = json!({
         "TableName": table,
         "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],

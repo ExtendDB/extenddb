@@ -13,6 +13,7 @@ pub mod authz_cache;
 pub(crate) mod authz_resource;
 pub mod console;
 pub mod dev_credentials;
+pub mod extensions;
 mod handler;
 mod import_export_paths;
 pub mod key_info_cache;
@@ -26,6 +27,11 @@ mod serve;
 mod throttle_helpers;
 mod workers;
 
+/// The `axum` this server is built with, for a thin binary's extension routers.
+pub use axum;
+pub use extensions::{
+    ExtensionMountError, Extensions, RequestObserver, RequestRecord, validate_extension_prefixes,
+};
 pub use serve::{BuildInfo, LogTarget, ServeParams, log_to_syslog_raw, serve};
 
 use std::path::PathBuf;
@@ -93,6 +99,31 @@ pub struct AppState {
     pub config_entries: Vec<(String, String)>,
     /// Runtime documentation store. `None` if `docs_dir` is not configured.
     pub docs_store: Option<console::docs_embed::DocsStore>,
+    /// Called once per request after the response is built, when a thin
+    /// binary installed one through [`Extensions::request_observer`]. `None`
+    /// leaves the request path as it was and builds no record.
+    pub request_observer: Option<Arc<dyn extensions::RequestObserver>>,
+}
+
+/// The response security headers over the whole app: `X-Content-Type-Options`,
+/// `X-Frame-Options` and `Referrer-Policy`. HSTS is added in [`start_server`]
+/// when TLS is on. A function of its own so the extension mount tests apply
+/// the layer the server applies.
+fn apply_security_headers(app: Router) -> Router {
+    let security_layers = ServiceBuilder::new()
+        .layer(SetResponseHeaderLayer::overriding(
+            axum::http::header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            axum::http::header::X_FRAME_OPTIONS,
+            HeaderValue::from_static("DENY"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            axum::http::header::REFERRER_POLICY,
+            HeaderValue::from_static("strict-origin-when-cross-origin"),
+        ));
+    app.layer(security_layers)
 }
 
 /// TLS configuration passed from the binary crate.
@@ -112,11 +143,19 @@ pub struct ServerTlsConfig {
 ///
 /// When `tls` is `Some`, the server serves HTTPS using `axum-server` with rustls.
 /// When `tls` is `None`, the server serves plaintext HTTP.
+///
+/// `extension_routers` are a thin binary's HTTP routers (see
+/// [`Extensions::http`]). Each is mounted after the built-in routes and before
+/// the response security layer, so an extension response carries the security
+/// headers too. A prefix that is not absolute, is `/`, or collides with a
+/// built-in route or an earlier extension is an error and the server does not
+/// start.
 pub async fn start_server(
     listener: tokio::net::TcpListener,
     state: AppState,
     pid_file: Option<PathBuf>,
     tls: Option<ServerTlsConfig>,
+    extension_routers: Vec<(String, Router)>,
 ) -> Result<(), anyhow::Error> {
     // SP-WIRE-007: DynamoDB request body limit is 16 MB.
     const DYNAMODB_BODY_LIMIT: usize = 16 * 1024 * 1024;
@@ -138,21 +177,6 @@ pub async fn start_server(
     };
     let config_entries = state.config_entries.clone();
     let shared = Arc::new(state);
-
-    // Security headers applied to all responses.
-    let security_layers = ServiceBuilder::new()
-        .layer(SetResponseHeaderLayer::overriding(
-            axum::http::header::X_CONTENT_TYPE_OPTIONS,
-            HeaderValue::from_static("nosniff"),
-        ))
-        .layer(SetResponseHeaderLayer::overriding(
-            axum::http::header::X_FRAME_OPTIONS,
-            HeaderValue::from_static("DENY"),
-        ))
-        .layer(SetResponseHeaderLayer::overriding(
-            axum::http::header::REFERRER_POLICY,
-            HeaderValue::from_static("strict-origin-when-cross-origin"),
-        ));
 
     let mut app = Router::new()
         .route("/", post(handler::handle_request))
@@ -203,8 +227,14 @@ pub async fn start_server(
             );
     }
 
-    // Apply security headers to all routes.
-    let app = app.layer(security_layers);
+    // Thin-bin extension routers go after the built-in nests and before the
+    // security layer, so their responses carry the security headers too. A
+    // refused prefix is a startup error.
+    let app =
+        extensions::mount_extensions(app, extension_routers).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Apply security headers to all routes, built-in and extension.
+    let app = apply_security_headers(app);
 
     // Add HSTS header only when TLS is enabled.
     let app = if tls_enabled {
