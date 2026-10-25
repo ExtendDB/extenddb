@@ -53,6 +53,17 @@ pub struct SessionData {
     pub csrf_token: String,
 }
 
+/// The live session behind the request's cookie, if any: the identity and
+/// its CSRF token. What [`require_session`] and the extension-tab middleware
+/// both read.
+pub(super) async fn session_for_headers(
+    headers: &HeaderMap,
+    state: &Arc<ConsoleState>,
+) -> Option<(CallerIdentity, String)> {
+    let token = extract_session_token(headers)?;
+    state.sessions.get(&token).await
+}
+
 /// Extract session identity and CSRF token from the cookie header. Returns
 /// the session data or a redirect to the login page.
 #[allow(clippy::result_large_err)]
@@ -76,7 +87,7 @@ async fn require_session(
 
 /// Validate a CSRF token from a form submission against the session's token.
 /// Uses constant-time comparison to prevent timing attacks.
-fn validate_csrf(submitted: &str, expected: &str) -> bool {
+pub(super) fn validate_csrf(submitted: &str, expected: &str) -> bool {
     if submitted.len() != expected.len() {
         return false;
     }
@@ -120,7 +131,7 @@ fn extract_session_token(headers: &HeaderMap) -> Option<String> {
 }
 
 /// Format a `CallerIdentity` for display in the nav bar.
-fn identity_label(identity: &CallerIdentity) -> String {
+pub(super) fn identity_label(identity: &CallerIdentity) -> String {
     match identity {
         CallerIdentity::Admin(name) => format!("Admin: {name}"),
         CallerIdentity::IamUser {
@@ -133,7 +144,7 @@ fn identity_label(identity: &CallerIdentity) -> String {
 }
 
 /// Check if the caller is an admin. Returns true for admins, false for IAM users.
-fn is_admin(identity: &CallerIdentity) -> bool {
+pub(super) fn is_admin(identity: &CallerIdentity) -> bool {
     matches!(identity, CallerIdentity::Admin(_))
 }
 

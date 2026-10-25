@@ -11,7 +11,9 @@
 //! request that reached authentication: the operation, the status, the error
 //! type, the latency, a hash of the request body and the two SDK correlation
 //! headers. The record is built only when an observer is installed; with none,
-//! the request path hashes no body and builds no record.
+//! the request path hashes no body and builds no record. Its [`ConsoleTab`]s
+//! are pages nested under `/console/<slug>` behind the console's session
+//! check and listed in the console's navigation bar.
 
 use std::hash::{DefaultHasher, Hasher};
 use std::sync::Arc;
@@ -36,6 +38,11 @@ pub struct Extensions {
     pub http: Vec<(String, Router)>,
     /// Receives one record per request that reached authentication.
     pub request_observer: Option<Arc<dyn RequestObserver>>,
+    /// Pages added to the console: each is a link in the console's navigation
+    /// bar and a router nested at `/console/<slug>` behind the console's
+    /// session check, so an extension page is reachable only by a logged-in
+    /// console user and renders inside the console's layout.
+    pub console_tabs: Vec<ConsoleTab>,
 }
 
 impl Extensions {
@@ -52,6 +59,99 @@ impl Extensions {
         self.request_observer = Some(observer);
         self
     }
+
+    /// Add a console tab: `label` is the link text, `slug` one path segment
+    /// of `[a-z0-9-]`, `router` the page at `/console/<slug>`.
+    #[must_use]
+    pub fn with_console_tab(
+        mut self,
+        label: impl Into<String>,
+        slug: impl Into<String>,
+        router: Router,
+    ) -> Self {
+        self.console_tabs.push(ConsoleTab {
+            label: label.into(),
+            slug: slug.into(),
+            router,
+        });
+        self
+    }
+}
+
+/// A page a thin binary adds to the console.
+///
+/// The router is nested at `/console/<slug>` inside the console and wrapped in
+/// the console's session check: a request without a live session is redirected
+/// to the login page before it reaches the router, and one with a session
+/// carries a [`crate::console::ConsoleIdentity`] request extension, so the
+/// page can render the console's navigation bar and layout through
+/// [`crate::console::html`]. Every path under the slug meets the session
+/// check, including paths the router has no route for: the server installs a
+/// plain 404 fallback on the tab router inside the check, and a fallback the
+/// extension set on its router is replaced by it. `/console/<slug>/` redirects
+/// to `/console/<slug>`, behind the same check. `slug` is one path segment of
+/// `[a-z0-9-]` that is not a built-in console route and not another tab's;
+/// `label` is the link text. Build it through
+/// [`Extensions::with_console_tab`]; the struct may gain fields in a minor
+/// release.
+#[non_exhaustive]
+pub struct ConsoleTab {
+    /// The link text in the navigation bar.
+    pub label: String,
+    /// The path segment under `/console/`.
+    pub slug: String,
+    /// The page.
+    pub router: Router,
+}
+
+/// Console paths the server owns at the first segment under `/console/`; a
+/// tab may not take one.
+const CONSOLE_RESERVED_SLUGS: &[&str] = &[
+    "login",
+    "logout",
+    "docs",
+    "metrics",
+    "metrics-data",
+    "settings",
+    "cache",
+    "accounts",
+    "users",
+    "groups",
+    "roles",
+    "policies",
+    "access-keys",
+];
+
+/// Check one tab slug against the rule and the slugs already taken.
+pub(crate) fn validate_console_slug(
+    slug: &str,
+    already_taken: &[String],
+) -> Result<(), ExtensionMountError> {
+    let well_formed = !slug.is_empty()
+        && slug
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if !well_formed {
+        return Err(ExtensionMountError::BadSlug(slug.to_owned()));
+    }
+    if CONSOLE_RESERVED_SLUGS.contains(&slug) {
+        return Err(ExtensionMountError::ReservedSlug(slug.to_owned()));
+    }
+    if already_taken.iter().any(|t| t == slug) {
+        return Err(ExtensionMountError::RepeatedSlug(slug.to_owned()));
+    }
+    Ok(())
+}
+
+/// Check every tab slug in `tabs` as the server will at startup, without
+/// mounting.
+pub fn validate_console_slugs(tabs: &[ConsoleTab]) -> Result<(), ExtensionMountError> {
+    let mut taken: Vec<String> = Vec::with_capacity(tabs.len());
+    for tab in tabs {
+        validate_console_slug(&tab.slug, &taken)?;
+        taken.push(tab.slug.clone());
+    }
+    Ok(())
 }
 
 /// A per-request hook. The server calls [`on_response`](Self::on_response)
@@ -123,6 +223,12 @@ pub enum ExtensionMountError {
     NotAbsolute(String),
     /// The prefix is `/`, which would shadow the request handler.
     Root,
+    /// A console tab slug is not one segment of `[a-z0-9-]`.
+    BadSlug(String),
+    /// A console tab slug is one of the console's own first segments.
+    ReservedSlug(String),
+    /// A console tab slug repeats an earlier tab's.
+    RepeatedSlug(String),
     /// The prefix ends with `/`, has an empty segment (`//`), has a parameter
     /// or wildcard segment (`{`, `}`, `*`), or has a byte no request path can
     /// carry (`?`, `#`, a space, a control byte). `Router::nest` refuses or
@@ -151,6 +257,16 @@ impl std::fmt::Display for ExtensionMountError {
                 "extension router prefix '/' is not allowed: it would shadow the \
                  request handler at the root path"
             ),
+            Self::BadSlug(slug) => write!(
+                f,
+                "console tab slug '{slug}' must be one segment of [a-z0-9-]"
+            ),
+            Self::ReservedSlug(slug) => {
+                write!(f, "console tab slug '{slug}' is a built-in console route")
+            }
+            Self::RepeatedSlug(slug) => {
+                write!(f, "console tab slug '{slug}' is used by an earlier tab")
+            }
             Self::BadShape(prefix) => write!(
                 f,
                 "extension router prefix '{prefix}' must be one or more non-empty \

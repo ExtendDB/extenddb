@@ -54,7 +54,7 @@ pub async fn settings_page(State(state): State<Arc<ConsoleState>>, headers: Head
             .into_response();
     }
 
-    let nav = html::nav_bar(&identity_label(&session.identity));
+    let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
     let crumbs = html::breadcrumb(&[("Console", Some("/console")), ("Settings", None)]);
 
     // --- Static configuration from .toml ---

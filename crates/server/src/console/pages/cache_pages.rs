@@ -42,7 +42,7 @@ pub async fn cache_page(State(state): State<Arc<ConsoleState>>, headers: HeaderM
             .into_response();
     }
 
-    let nav = html::nav_bar(&identity_label(&session.identity));
+    let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
     let crumbs = html::breadcrumb(&[("Console", Some("/console")), ("Cache", None)]);
 
     let content = format!(
@@ -198,7 +198,7 @@ pub async fn invalidate_cache(
 
     let scope = match parse_scope(&form.scope) {
         Ok(s) => s,
-        Err(msg) => return render_error(&session, &msg),
+        Err(msg) => return render_error(&session, &state.tabs, &msg),
     };
 
     // The console form-confirmation pattern: scope=all requires the
@@ -207,6 +207,7 @@ pub async fn invalidate_cache(
     if scope == Scope::All && !confirm_ok {
         return render_error(
             &session,
+            &state.tabs,
             &format!(
                 r#"scope "all" requires typing "{ALL_CONFIRMATION_TOKEN}" in the confirmation field"#
             ),
@@ -239,8 +240,8 @@ pub async fn invalidate_cache(
     let request = InvalidateRequest { scope, selectors };
 
     match apply_invalidation(&state.auth_cache, request, &admin_name).await {
-        Ok(resp) => render_success(&session, &resp),
-        Err(msg) => render_error(&session, &msg),
+        Ok(resp) => render_success(&session, &state.tabs, &resp),
+        Err(msg) => render_error(&session, &state.tabs, &msg),
     }
 }
 
@@ -263,9 +264,10 @@ fn optional(s: &str) -> Option<String> {
 
 fn render_success(
     session: &super::SessionData,
+    tabs: &[(String, String)],
     resp: &cache_invalidate::InvalidateResponse,
 ) -> Response {
-    let nav = html::nav_bar(&identity_label(&session.identity));
+    let nav = html::nav_bar(&identity_label(&session.identity), tabs);
     let crumbs = html::breadcrumb(&[
         ("Console", Some("/console")),
         ("Cache", Some("/console/cache")),
@@ -296,8 +298,8 @@ fn render_success(
     .into_response()
 }
 
-fn render_error(session: &super::SessionData, msg: &str) -> Response {
-    let nav = html::nav_bar(&identity_label(&session.identity));
+fn render_error(session: &super::SessionData, tabs: &[(String, String)], msg: &str) -> Response {
+    let nav = html::nav_bar(&identity_label(&session.identity), tabs);
     let crumbs = html::breadcrumb(&[
         ("Console", Some("/console")),
         ("Cache", Some("/console/cache")),

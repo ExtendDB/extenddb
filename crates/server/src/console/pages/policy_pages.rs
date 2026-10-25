@@ -198,7 +198,7 @@ async fn policy_form(
         return Redirect::to("/console").into_response();
     }
 
-    let nav = html::nav_bar(&identity_label(&session.identity));
+    let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
     let eid = html::escape(account_id);
     let een = html::escape(principal_name);
     let eet = html::escape(principal_type);
@@ -271,7 +271,7 @@ async fn put_policy(
     let doc: serde_json::Value = if let Ok(v) = serde_json::from_str(&form.policy_document) {
         v
     } else {
-        let nav = html::nav_bar(&identity_label(&session.identity));
+        let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
         let content = format!(
             "<h1>Add Policy</h1>{}",
             html::alert_error("Policy document is not valid JSON")
@@ -296,7 +296,7 @@ async fn put_policy(
             .map(|e| format!("Invalid policy document: {e}"))
     };
     if let Some(msg) = invalid {
-        let nav = html::nav_bar(&identity_label(&session.identity));
+        let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
         let content = format!("<h1>Add Policy</h1>{}", html::alert_error(&msg));
         return Html(html::layout_csrf(
             "New Policy",
@@ -323,7 +323,7 @@ async fn put_policy(
             Redirect::to(redirect_url).into_response()
         }
         Err(e) => {
-            let nav = html::nav_bar(&identity_label(&session.identity));
+            let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
             let content = format!(
                 "<h1>Add Policy</h1>{}",
                 html::alert_error(&op_error_message(e))
@@ -372,7 +372,7 @@ async fn delete_policy(
             Redirect::to(redirect_url).into_response()
         }
         Err(e) => {
-            let nav = html::nav_bar(&identity_label(&session.identity));
+            let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
             let content = format!(
                 "<h1>Delete Policy</h1>{}",
                 html::alert_error(&op_error_message(e))
