@@ -14,7 +14,7 @@ Last updated: 2026-09-16
 | # | Item | Location | Priority | Origin |
 |---|------|----------|----------|--------|
 | F-1 | `AttributesToGet` (legacy API) not supported | `core/types/batch.rs:27` | Low | P6 |
-| F-2 | `ConsistentRead=false` not routed to read replica | `core/types/item.rs:166` | Low | P5 |
+| F-2 | `ConsistentRead=false` is served the same way as `ConsistentRead=true` on every backend; the PostgreSQL read replica mode that would route it is proposed, not built (REQ-PG-008) | `core/types/item.rs:176` | Low | P5 |
 | F-3 | Import/export: full Ion parser not implemented (JSON subset only) | `engine/import_export.rs:339` | Medium | P24 |
 | F-4 | Import/export: full Ion writer not implemented (JSON subset only) | `engine/import_export.rs:433` | Medium | P24 |
 | F-5 | `PutItem` returns `None` for `Item` field instead of omitting it | `server/lib.rs:235` | Low | P2 |
