@@ -53,7 +53,15 @@ pub struct AppConfig {
 pub struct ImportExportPathConfig {
     /// Allowed directories. All file paths are canonicalized and must resolve
     /// under one of these roots. Symlinks escaping a root are rejected.
-    #[serde(default)]
+    ///
+    /// An environment override carries one string, so
+    /// `EXTENDDB__IMPORT__PATHS="/data/in,/data/shared"` is split on commas,
+    /// each item trimmed and empty items dropped (issue #539); see
+    /// `extenddb_storage::config::string_coerce::string_list`.
+    #[serde(
+        default,
+        deserialize_with = "extenddb_storage::config::string_coerce::string_list"
+    )]
     pub paths: Vec<String>,
 }
 
@@ -406,6 +414,12 @@ pub fn is_tls_enabled(config: &AppConfig) -> bool {
     config.server.tls.enabled && !cfg!(feature = "dev-mode")
 }
 
+/// The environment-variable source every load path adds on top of the file:
+/// `EXTENDDB__<SECTION>__<KEY>`, one value per variable, arriving as a string.
+fn environment_source() -> config::Environment {
+    config::Environment::with_prefix("EXTENDDB").separator("__")
+}
+
 /// Load `AppConfig` from a config file (optional) and environment variables.
 ///
 /// # Errors
@@ -415,7 +429,7 @@ pub fn is_tls_enabled(config: &AppConfig) -> bool {
 pub fn load(config_path: &str) -> anyhow::Result<AppConfig> {
     let config = config::Config::builder()
         .add_source(config::File::with_name(config_path).required(false))
-        .add_source(config::Environment::with_prefix("EXTENDDB").separator("__"))
+        .add_source(environment_source())
         .build()?;
     Ok(config.try_deserialize()?)
 }
@@ -446,7 +460,7 @@ pub fn load_builtin_defaults() -> anyhow::Result<AppConfig> {
             &storage_section,
             config::FileFormat::Toml,
         ))
-        .add_source(config::Environment::with_prefix("EXTENDDB").separator("__"))
+        .add_source(environment_source())
         .build()?;
     Ok(config.try_deserialize()?)
 }
@@ -499,43 +513,4 @@ mod display;
 pub use display::{build_config_entries, should_redact};
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn server_region_outside_the_arn_class_is_a_startup_warning() {
-        let mut server = ServerConfig::default();
-        assert!(server.startup_warnings().is_empty(), "default region");
-        server.region = "LOCAL".to_owned();
-        let warnings = server.startup_warnings();
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].title.contains("server.region"));
-    }
-
-    #[test]
-    fn expand_tilde_with_home() {
-        let home = std::env::var("HOME").unwrap();
-        assert_eq!(expand_tilde("~/foo/bar"), format!("{home}/foo/bar"));
-        assert_eq!(expand_tilde("~"), home);
-    }
-
-    #[test]
-    fn expand_tilde_no_tilde() {
-        assert_eq!(expand_tilde("/absolute/path"), "/absolute/path");
-        assert_eq!(expand_tilde("relative/path"), "relative/path");
-    }
-
-    #[test]
-    fn expand_tilde_not_home_prefix() {
-        // ~user should NOT be expanded (we only handle ~/...)
-        assert_eq!(expand_tilde("~user/foo"), "~user/foo");
-    }
-
-    #[test]
-    fn pid_file_path_formats_port() {
-        assert_eq!(
-            pid_file_path("/run/extenddb", 18443),
-            PathBuf::from("/run/extenddb/extenddb-18443.pid")
-        );
-    }
-}
+mod tests;
