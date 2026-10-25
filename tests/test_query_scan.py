@@ -614,17 +614,17 @@ class TestScanValidation:
     def test_scan_segment_one_over_max_rejected(
         self, dynamodb_client_no_validation, scan_table
     ):
-        """Segment > 999999 returns the Coral-format ValidationException."""
+        """Segment > 999999 returns the range ValidationException (measured 2026-10-25)."""
         with pytest.raises(ClientError) as exc_info:
             dynamodb_client_no_validation.scan(
                 TableName=scan_table, Segment=1_000_000, TotalSegments=1_000_000
             )
         err = exc_info.value.response["Error"]
         assert err["Code"] == "ValidationException"
-        msg = err["Message"]
-        assert "1 validation error detected" in msg
-        assert "'1000000' at 'segment'" in msg
-        assert "Member must have value less than or equal to 999999" in msg
+        assert err["Message"] == (
+            "1 validation error detected: Value at 'Segment' failed to satisfy "
+            "constraint: Member must have value less than or equal to 999999"
+        )
 
     def test_scan_total_segments_at_max_accepted(self, dynamodb_client, scan_table):
         """TotalSegments=1000000 with Segment=0 is at the documented bound."""
@@ -635,17 +635,17 @@ class TestScanValidation:
     def test_scan_total_segments_one_over_max_rejected(
         self, dynamodb_client_no_validation, scan_table
     ):
-        """TotalSegments > 1000000 returns the Coral-format ValidationException."""
+        """TotalSegments > 1000000 returns the range ValidationException (measured 2026-10-25)."""
         with pytest.raises(ClientError) as exc_info:
             dynamodb_client_no_validation.scan(
                 TableName=scan_table, Segment=0, TotalSegments=1_000_001
             )
         err = exc_info.value.response["Error"]
         assert err["Code"] == "ValidationException"
-        msg = err["Message"]
-        assert "1 validation error detected" in msg
-        assert "'1000001' at 'totalSegments'" in msg
-        assert "Member must have value less than or equal to 1000000" in msg
+        assert err["Message"] == (
+            "1 validation error detected: Value at 'TotalSegments' failed to satisfy "
+            "constraint: Member must have value less than or equal to 1000000"
+        )
 
     def test_scan_all_projected_attributes_without_index_rejected(
         self, dynamodb_client, scan_table
