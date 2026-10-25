@@ -440,8 +440,7 @@ fn enum_checks_sit_on_either_side_of_the_numbers() {
 
 #[test]
 fn unicode_decimal_digits_count_as_the_digits_they_stand_for() {
-    // Measured 2026-10-25 (X545-1 K1 to K6, F1 to F6, U1 to U6; H545-2 C11,
-    // C12, C17): a fullwidth, Arabic-Indic or Devanagari digit is accepted as a
+    // Measured 2026-10-25: a fullwidth, Arabic-Indic or Devanagari digit is accepted as a
     // key condition, filter or unused value; thirty nine Devanagari ones answer
     // the 38 digit message; `1\u{ff12}` and `1e\u{ff12}` are accepted.
     for raw in [
@@ -463,7 +462,7 @@ fn unicode_decimal_digits_count_as_the_digits_they_stand_for() {
         message(validate_expression_attribute_value_numbers(&values)).as_deref(),
         Some("Attempting to store more than 38 significant digits in a Number")
     );
-    // A fullwidth digit as an NS member (H545-2 C18, X545-1 NS1).
+    // A fullwidth digit as an NS member.
     let values = HashMap::from([(
         ":u".to_owned(),
         AttributeValue::NS(["\u{ff11}".to_owned()].into_iter().collect()),
@@ -473,7 +472,7 @@ fn unicode_decimal_digits_count_as_the_digits_they_stand_for() {
 
 #[test]
 fn characters_that_are_not_decimal_digits_are_refused_with_the_text_as_sent() {
-    // Measured 2026-10-25 (X545-1 K7 to K10; H545-2 C13 to C16): a superscript,
+    // Measured 2026-10-25: a superscript,
     // a vulgar fraction, a fullwidth minus and a fullwidth full stop are refused
     // and the message echoes the value as the request wrote it.
     for raw in ["\u{b2}", "\u{bd}", "\u{ff0d}1", "1\u{ff0e}5", "\u{ff11}bob"] {
@@ -488,7 +487,7 @@ fn characters_that_are_not_decimal_digits_are_refused_with_the_text_as_sent() {
 
 #[test]
 fn a_shape_fault_in_another_field_is_reported_ahead_of_the_checks() {
-    // Measured 2026-10-25 (X545-1 S1 to S6, S8): a field of the wrong JSON type
+    // Measured 2026-10-25: a field of the wrong JSON type
     // anywhere in the body answers SerializationException even when a Limit,
     // mix, enum or number check would fail.
     let shape_faults = [
@@ -535,7 +534,7 @@ fn a_shape_fault_in_another_field_is_reported_ahead_of_the_checks() {
     }
 
     // A string enum value that is not a member is the checks' own answer, not a
-    // shape fault (X545-1 S7 and the 2026-10-24 enum rows).
+    // shape fault.
     let mut select = serde_json::json!({
         "TableName": "t", "KeyConditionExpression": "pk = :p",
         "Limit": 0, "ExpressionAttributeValues": {":p": {"S": "x"}},
@@ -560,6 +559,18 @@ fn a_shape_fault_in_another_field_is_reported_ahead_of_the_checks() {
     });
     assert_eq!(
         message(validate_query_request_body(&empty_set)).as_deref(),
+        Some(LIMIT_BELOW_ONE)
+    );
+
+    // Neither does an unknown type descriptor, which the deserializer reports
+    // as a SerializationException: the service answers the Limit text
+    // (measured 2026-10-25).
+    let unknown_type = serde_json::json!({
+        "TableName": "t", "KeyConditionExpression": "pk = :p",
+        "Limit": 0, "ExpressionAttributeValues": {":p": {"S": "x"}, ":a": {"X": "1"}},
+    });
+    assert_eq!(
+        message(validate_query_request_body(&unknown_type)).as_deref(),
         Some(LIMIT_BELOW_ONE)
     );
 

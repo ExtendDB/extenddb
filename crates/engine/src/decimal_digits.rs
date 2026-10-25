@@ -17,6 +17,11 @@
 //! its zero, so the table below holds the 68 zeros (generated with Python's
 //! `unicodedata`, Unicode 15.0.0) and a digit's value is its offset from the
 //! run's zero.
+//!
+//! The fold applies to the check only. The handler and the server's
+//! `dynamodb:LeadingKeys` binding read the value as the request wrote it, so
+//! both see the same text; reading a Unicode digit as the digit has to change
+//! both together.
 
 use std::borrow::Cow;
 
@@ -61,8 +66,8 @@ mod tests {
 
     #[test]
     fn measured_digits_fold_to_their_ascii_value() {
-        // Fullwidth one, Arabic-Indic one, Devanagari one (X545-1 K1 to K3),
-        // fullwidth seven (H545-2 C11).
+        // Fullwidth one, Arabic-Indic one, Devanagari one and fullwidth seven,
+        // measured 2026-10-25.
         assert_eq!(ascii_digit('\u{ff11}'), Some('1'));
         assert_eq!(ascii_digit('\u{661}'), Some('1'));
         assert_eq!(ascii_digit('\u{967}'), Some('1'));
@@ -73,8 +78,8 @@ mod tests {
 
     #[test]
     fn measured_controls_are_not_digits() {
-        // Superscript two, vulgar half, fullwidth minus, fullwidth full stop
-        // (H545-2 C13 to C16): refused by the service.
+        // Superscript two, vulgar half, fullwidth minus, fullwidth full stop:
+        // refused by the service (measured 2026-10-25).
         for c in ['\u{b2}', '\u{bd}', '\u{ff0d}', '\u{ff0e}'] {
             assert_eq!(ascii_digit(c), None, "{c:?}");
         }

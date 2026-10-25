@@ -88,18 +88,30 @@ pub fn validate_query_request_body(body: &Value) -> Result<(), DynamoDbError> {
 /// of another JSON type is a shape fault the service reports ahead of the
 /// checks (measured 2026-10-25: `Select: 5` with a `Limit` of 0 answers
 /// `SerializationException: NUMBER_VALUE cannot be converted to String`).
+///
+/// An AttributeValue with an unknown type descriptor is not a shape fault to
+/// the service: `Limit: 0` beside `{"X": "1"}` answers the `Limit`
+/// `ValidationException` (measured 2026-10-25), so the deserializer's
+/// `SerializationException` for that message does not preempt the check.
 pub(crate) fn shape_fault_first<T: DeserializeOwned>(
     body: &Value,
     check: DynamoDbError,
 ) -> DynamoDbError {
     match serde_json::from_value::<T>(body.clone()) {
         Err(e) => match crate::deserialize_error(e) {
+            DynamoDbError::SerializationException(msg) if msg.contains(UNKNOWN_TYPE_DESCRIPTOR) => {
+                check
+            }
             shape @ DynamoDbError::SerializationException(_) => shape,
             _ => check,
         },
         Ok(_) => check,
     }
 }
+
+/// The deserializer's text for an AttributeValue whose type descriptor is not
+/// one of the service's.
+const UNKNOWN_TYPE_DESCRIPTOR: &str = "unknown AttributeValue type descriptor";
 
 /// The `Query` checks in the service's order; see
 /// [`validate_query_request_body`].

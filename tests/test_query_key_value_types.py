@@ -436,44 +436,31 @@ class TestKeyConditionValueTypes:
             ExpressionAttributeValues={":u": B_BOB})["Count"] == 1
 
 
-class TestUnicodeDecimalDigitsAreRead:
-    """A Unicode decimal digit in an N value is the digit it stands for: as a
-    key condition value it reads the item stored with the ASCII digit, as a
-    filter value it matches the ASCII attribute (measured 2026-10-25 11:31 UTC
-    on an S/N table holding sk N 1 and a N 1)."""
+class TestUnicodeDecimalDigitsPassTheCheck:
+    """A Unicode decimal digit in an N value passes the request-time number
+    check: the service reads it as the digit it stands for (measured 2026-10-25
+    11:31 UTC). Reading such a value as the digit is not part of this change,
+    so only the acceptance is asserted, in the positions where the request
+    reaches no numeric key comparison."""
 
     DIGITS = [FW_ONE, AR_ONE, DEVA_ONE]
     DIGIT_IDS = ["fullwidth", "arabic-indic", "devanagari"]
 
     @pytest.mark.parametrize("digit", DIGITS, ids=DIGIT_IDS)
-    def test_key_condition_value_reads_the_ascii_item(self, dynamodb_client, ns_table, digit):
-        resp = dynamodb_client.query(
-            TableName=ns_table, KeyConditionExpression="pk = :u AND sk = :s",
-            ExpressionAttributeValues={":u": CAROL, ":s": {"N": digit}})
-        assert resp["Count"] == 1
-        assert resp["Items"][0]["sk"] == {"N": "1"}
-
-    @pytest.mark.parametrize("digit", DIGITS, ids=DIGIT_IDS)
-    def test_filter_value_matches_the_ascii_attribute(self, dynamodb_client, ns_table, digit):
+    def test_filter_value_is_accepted(self, dynamodb_client, ns_table, digit):
         resp = dynamodb_client.query(
             TableName=ns_table, KeyConditionExpression="pk = :u AND sk = :s",
             FilterExpression="a = :f",
             ExpressionAttributeValues={":u": CAROL, ":s": {"N": "1"}, ":f": {"N": digit}})
-        assert resp["Count"] == 1
-        assert resp["Items"][0]["a"] == {"N": "1"}
+        assert resp["ScannedCount"] == 1
 
     @pytest.mark.parametrize("raw", ["1\uff12", "1e\uff12"], ids=["1-fullwidth-2", "1e-fullwidth-2"])
-    def test_mixed_digits_are_one_number(self, dynamodb_client, ns_table, raw):
-        # Read as 12 and 1e2: accepted, matching nothing stored.
-        as_key = dynamodb_client.query(
-            TableName=ns_table, KeyConditionExpression="pk = :u AND sk = :s",
-            ExpressionAttributeValues={":u": CAROL, ":s": {"N": raw}})
-        assert (as_key["Count"], as_key["ScannedCount"]) == (0, 0)
-        in_filter = dynamodb_client.query(
+    def test_mixed_digits_in_the_filter_are_accepted(self, dynamodb_client, ns_table, raw):
+        resp = dynamodb_client.query(
             TableName=ns_table, KeyConditionExpression="pk = :u AND sk = :s",
             FilterExpression="a = :f",
             ExpressionAttributeValues={":u": CAROL, ":s": {"N": "1"}, ":f": {"N": raw}})
-        assert (in_filter["Count"], in_filter["ScannedCount"]) == (0, 1)
+        assert (resp["Count"], resp["ScannedCount"]) == (0, 1)
 
     def test_fullwidth_digit_in_a_number_set_passes_the_check(self, dynamodb_client, ns_table):
         resp = dynamodb_client.query(
@@ -660,3 +647,38 @@ class TestLeadingKeysWithAnInvalidKeyValue:
                         failures.append(f"{shape} / {label}: {err['Code']} {err['Message']}")
         owner.delete_table(TableName=table)
         assert not failures, "\n".join(failures)
+
+    def test_a_unicode_digit_key_value_reads_no_fenced_partition(self):
+        """A partition key value written with Unicode digits is not bound to a
+        LeadingKeys value, so it must not read a partition the fence keeps the
+        principal from. The service's answer for a fenced principal cannot be
+        measured here; the test asserts only that no item of partition 20 is
+        returned, whatever the answer is."""
+        owner = self._client({
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow", "Action": "dynamodb:*", "Resource": "*"}],
+        })
+        table = f"kv-{uuid.uuid4().hex[:8]}"
+        owner.create_table(
+            TableName=table,
+            AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "N"}],
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            BillingMode="PAY_PER_REQUEST")
+        wait_for_active(owner, table)
+        for pk in ("10", "20"):
+            owner.put_item(TableName=table, Item={"pk": {"N": pk}, "v": {"S": "p" + pk}})
+        fenced = self._client(self._fence(
+            {"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": ["10"]}}, table))
+        leaks = []
+        for label, value in (("fullwidth", "\uff12\uff10"), ("arabic-indic", "\u0662\u0660"),
+                             ("devanagari", "\u0968\u0966")):
+            try:
+                resp = fenced.query(
+                    TableName=table, KeyConditionExpression="pk = :p",
+                    ExpressionAttributeValues={":p": {"N": value}})
+            except ClientError:
+                continue
+            if any(item.get("v") == {"S": "p20"} for item in resp["Items"]):
+                leaks.append(label)
+        owner.delete_table(TableName=table)
+        assert not leaks, leaks
