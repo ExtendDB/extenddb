@@ -3,12 +3,14 @@
 
 """A character outside the expression grammar.
 
-Amazon DynamoDB answers ``Invalid <Kind>: Syntax error; token: "<t>", near:
-"<window>"``: the token is the character as sent, a whole code point, and the
-window runs from the start of the previous token to the end of the next one,
-with each character outside the grammar counted as one token. The write paths
-carry a ``1 validation error detected: `` prefix that ExtendDB does not emit;
-those assertions compare the text after it.
+When the character is the first fault in the expression, Amazon DynamoDB
+answers ``Invalid <Kind>: Syntax error; token: "<t>", near: "<window>"``: the
+token is the character as sent, a whole code point, and the window runs from
+the start of the previous token (or of the expression, when no token comes
+before it) to the end of the next one, with each character outside the
+grammar counted as one token. U+0000 is removed from the token and the window.
+The write paths carry a ``1 validation error detected: `` prefix that
+ExtendDB does not emit; those assertions compare the text after it.
 
 Every expected text was measured against Amazon DynamoDB on 2026-10-25
 (us-east-1), each request twice.
@@ -34,7 +36,10 @@ def _message(func) -> str:
         func()
     err = exc_info.value.response["Error"]
     assert err["Code"] == "ValidationException", err
-    msg = err["Message"]
+    return err["Message"]
+
+
+def _after_prefix(msg: str) -> str:
     return msg[len(PREFIX) :] if msg.startswith(PREFIX) else msg
 
 
@@ -82,6 +87,20 @@ def table(dynamodb_client):
         ("#v = :v !", "!", ":v !"),
         ("#v =\t\u00e9", "\u00e9", "=\t\u00e9"),
         ("#v =\u00e9", "\u00e9", "=\u00e9"),
+        # No token before the character: the window starts at the start.
+        ("  \u00e9 = :v", "\u00e9", "  \u00e9 ="),
+        ("\t\u00e9 = :v", "\u00e9", "\t\u00e9 ="),
+        ("  $ = :v", "$", "  $ ="),
+        (" (\u00e9)", "\u00e9", "(\u00e9)"),
+        # U+0000 is removed from the token and the window.
+        ("#v = :v AND \u0000", "", "AND "),
+        ("#v = \u0000x", "", "= x"),
+        ("a\u0000b = :v", "", "ab"),
+        # The next token: two-character operators, a name run, a digit run.
+        ("#v \u00e9<> :v", "\u00e9", "#v \u00e9<>"),
+        ("#v \u00e9>= :v", "\u00e9", "#v \u00e9>="),
+        ("#v = \u00e9 abc", "\u00e9", "= \u00e9 abc"),
+        ("#v[\u00e912] = :v", "\u00e9", "[\u00e912"),
     ],
 )
 def test_scan_filter(dynamodb_client, table, expr, token, near):
@@ -114,7 +133,35 @@ def test_put_item_condition(dynamodb_client, table, condition, token, near):
             ExpressionAttributeValues=VALUES,
         )
     )
-    assert msg == syntax("ConditionExpression", token, near)
+    assert _after_prefix(msg) == syntax("ConditionExpression", token, near)
+
+
+def test_update_item_condition(dynamodb_client, table):
+    msg = _message(
+        lambda: dynamodb_client.update_item(
+            TableName=table,
+            Key=ABSENT,
+            UpdateExpression="SET #v = :v",
+            ConditionExpression="attribute_exists(pk) AND #v = \u00e9\u00e9\u00e9",
+            ExpressionAttributeNames=NAMES,
+            ExpressionAttributeValues=VALUES,
+        )
+    )
+    assert _after_prefix(msg) == syntax("ConditionExpression", "\u00e9", "= \u00e9\u00e9")
+
+
+def test_query_filter(dynamodb_client, table):
+    msg = _message(
+        lambda: dynamodb_client.query(
+            TableName=table,
+            Limit=1,
+            KeyConditionExpression="pk = :v",
+            FilterExpression="#v = \u00e9\u00e9\u00e9",
+            ExpressionAttributeNames=NAMES,
+            ExpressionAttributeValues=VALUES,
+        )
+    )
+    assert msg == syntax("FilterExpression", "\u00e9", "= \u00e9\u00e9")
 
 
 @pytest.mark.parametrize(
@@ -122,6 +169,11 @@ def test_put_item_condition(dynamodb_client, table, condition, token, near):
     [
         ("pk = \u00e9", "\u00e9", "= \u00e9"),
         ("pk = :v AND \u00e9", "\u00e9", "AND \u00e9"),
+        # The server reads the key condition before authorization.
+        ("pk = \u00e9\u00e9\u00e9", "\u00e9", "= \u00e9\u00e9"),
+        ("  \u00e9 = :v", "\u00e9", "  \u00e9 ="),
+        ("pk = \u0000", "", "= "),
+        ("pk \u00e9<= :v", "\u00e9", "pk \u00e9<="),
     ],
 )
 def test_query_key_condition(dynamodb_client, table, kce, token, near):
@@ -134,13 +186,17 @@ def test_query_key_condition(dynamodb_client, table, kce, token, near):
 
 
 @pytest.mark.parametrize(
-    "update, token, near",
+    "update, token, near, values",
     [
-        ("SET #v = \u00e9\u00e9", "\u00e9", "= \u00e9\u00e9"),
-        ("SET #v = $x", "$", "= $x"),
+        ("SET #v = \u00e9\u00e9", "\u00e9", "= \u00e9\u00e9", None),
+        ("SET #v = $x", "$", "= $x", None),
+        ("  \u00e9 SET #v = :v", "\u00e9", "  \u00e9 SET", VALUES),
+        ("SET #v = \u0000", "", "= ", VALUES),
+        ("SET #v = :v \u00e9<> :v", "\u00e9", ":v \u00e9<>", VALUES),
     ],
 )
-def test_update_expression(dynamodb_client, table, update, token, near):
+def test_update_expression(dynamodb_client, table, update, token, near, values):
+    extra = {"ExpressionAttributeValues": values} if values else {}
     msg = _message(
         lambda: dynamodb_client.update_item(
             TableName=table,
@@ -148,9 +204,10 @@ def test_update_expression(dynamodb_client, table, update, token, near):
             UpdateExpression=update,
             ConditionExpression="attribute_exists(pk)",
             ExpressionAttributeNames=NAMES,
+            **extra,
         )
     )
-    assert msg == syntax("UpdateExpression", token, near)
+    assert _after_prefix(msg) == syntax("UpdateExpression", token, near)
 
 
 @pytest.mark.parametrize(
@@ -158,6 +215,10 @@ def test_update_expression(dynamodb_client, table, update, token, near):
     [
         ("#v, \u00e9", "\u00e9", ", \u00e9"),
         ("#v, $x", "$", ", $x"),
+        ("#v, \u00e9\u00e9\u00e9", "\u00e9", ", \u00e9\u00e9"),
+        ("  \u00e9", "\u00e9", "  \u00e9"),
+        ("#v, \u0000", "", ", "),
+        ("#v \u00e9>=", "\u00e9", "#v \u00e9>="),
     ],
 )
 def test_projection_expression(dynamodb_client, table, projection, token, near):
