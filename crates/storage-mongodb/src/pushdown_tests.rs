@@ -219,6 +219,49 @@ fn and_taints_on_either_side() {
     assert!(!is_pushable(&expr, &maps_with(&[])).is_yes());
 }
 
+/// `#v = :s OR #v = :s OR ...` with `terms` terms, left-nested as parsed.
+fn or_chain(terms: usize) -> Expr {
+    let term = || Expr::Compare {
+        left: Box::new(path("v")),
+        op: CompareOp::Eq,
+        right: Box::new(Expr::Placeholder(":s".into())),
+    };
+    (1..terms).fold(term(), |acc, _| Expr::Or(Box::new(acc), Box::new(term())))
+}
+
+#[test]
+fn logical_nesting_past_the_limit_is_not_pushable() {
+    let maps = maps_with(&[(":s", AttributeValue::S("x".into()))]);
+    assert_eq!(
+        is_pushable(&or_chain(MAX_LOGICAL_DEPTH + 1), &maps),
+        Pushable::Yes
+    );
+    assert_eq!(
+        is_pushable(&or_chain(MAX_LOGICAL_DEPTH + 2), &maps),
+        Pushable::No("AND, OR and NOT nest deeper than a MongoDB filter allows")
+    );
+    // A 150-term chain, which nested 149 `$or` levels in one filter.
+    assert!(!is_pushable(&or_chain(150), &maps).is_yes());
+    // Depth 97, the first depth at which a chain of `contains` leaves fails
+    // on MongoDB, is refused whatever the limit is set to.
+    assert!(!is_pushable(&or_chain(98), &maps).is_yes());
+    // Depth is the deeper side's: the NOT on the left adds one level to a
+    // depth-1 side, the chain on the right sets the depth.
+    let not_wrapped = Expr::And(
+        Box::new(Expr::Not(Box::new(Expr::Function {
+            name: "attribute_exists".into(),
+            args: vec![path("a")],
+        }))),
+        Box::new(or_chain(MAX_LOGICAL_DEPTH)),
+    );
+    assert_eq!(logical_depth(&not_wrapped), MAX_LOGICAL_DEPTH);
+    // NOT counts as a level.
+    assert_eq!(
+        logical_depth(&Expr::Not(Box::new(or_chain(MAX_LOGICAL_DEPTH + 1)))),
+        MAX_LOGICAL_DEPTH + 1
+    );
+}
+
 #[test]
 fn between_is_not_pushable() {
     let expr = Expr::Between {
