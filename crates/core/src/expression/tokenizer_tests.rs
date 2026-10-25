@@ -218,6 +218,32 @@ const UNKNOWN_CHARACTER_ROWS: &[(&str, &str, &str)] = &[
     ("pk = :v AND é", "é", "AND é"),
     ("SET #v = éé", "é", "= éé"),
     ("#v, $x", "$", ", $x"),
+    // No token before the character: the window starts at the start.
+    ("  é = :v", "é", "  é ="),
+    ("\té = :v", "é", "\té ="),
+    ("\n\né = :v", "é", "\n\né ="),
+    (" é", "é", " é"),
+    ("  $ = :v", "$", "  $ ="),
+    ("   éé = :v", "é", "   éé"),
+    ("  é SET #v = :v", "é", "  é SET"),
+    (" #v = :v AND é", "é", "AND é"),
+    (" (é)", "é", "(é)"),
+    // U+0000 is removed from the token and the window.
+    ("#v = :v AND \0", "", "AND "),
+    ("#v = \0x", "", "= x"),
+    ("\0#v = :v", "", "#v"),
+    ("#v = é\0", "é", "= é"),
+    ("#v\0 = :v", "", "#v ="),
+    ("#v = :v AND \0\0", "", "AND "),
+    ("a\0b = :v", "", "ab"),
+    // The next token: two-character operators, a name run, a digit run.
+    ("#v é<> :v", "é", "#v é<>"),
+    ("#v é<= :v", "é", "#v é<="),
+    ("#v é>= :v", "é", "#v é>="),
+    ("#v <>é", "é", "<>é"),
+    ("#v = é abc", "é", "= é abc"),
+    ("#v[é12] = :v", "é", "[é12"),
+    ("#v BETWEEN é AND :v", "é", "BETWEEN é AND"),
 ];
 
 #[test]
