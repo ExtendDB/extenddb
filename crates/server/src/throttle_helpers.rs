@@ -115,6 +115,45 @@ fn extract_throughput_from_response(
     ))
 }
 
+/// Record throttle metrics for a batch response a backend served partially.
+///
+/// The server's own bucket records `ThrottledRequests` and the read or write
+/// throttle event when it refuses a request. A backend throttle that leaves
+/// entries under `UnprocessedKeys` or `UnprocessedItems` returns a 200 and
+/// would otherwise count as no throttle at all, so this records
+/// `ThrottledRequests` and the read or write throttle event once per table
+/// named in the non-empty map, with the table as the dimension the bucket's
+/// own records carry. The map's keys are the table names, which the batch
+/// operations do not carry at the top level.
+pub(crate) fn record_partial_batch_throttle(
+    metrics: &extenddb_core::metrics::MetricsCollector,
+    operation: &str,
+    body: &Value,
+) {
+    use extenddb_core::metrics::MetricName;
+    let (field, event) = match operation {
+        "BatchGetItem" => ("UnprocessedKeys", MetricName::ReadThrottleEvents),
+        "BatchWriteItem" => ("UnprocessedItems", MetricName::WriteThrottleEvents),
+        _ => return,
+    };
+    let Some(tables) = body.get(field).and_then(Value::as_object) else {
+        return;
+    };
+    if tables.is_empty() {
+        return;
+    }
+    for table in tables.keys() {
+        metrics.record(
+            MetricName::ThrottledRequests,
+            1.0,
+            Some(table),
+            None,
+            Some(operation),
+        );
+        metrics.record(event, 1.0, Some(table), None, Some(operation));
+    }
+}
+
 /// Extract the partition key value from a request body for per-partition throttling.
 ///
 /// For item-level operations (`GetItem`, `PutItem`, `DeleteItem`, `UpdateItem`),
@@ -457,5 +496,65 @@ mod throttle_error_tests {
             assert_eq!(err.throttling_reasons(), Some(&[][..]), "{cause:?}");
             assert!(!err.message().is_empty());
         }
+    }
+}
+
+#[cfg(test)]
+mod partial_batch_throttle_tests {
+    use extenddb_core::metrics::{MetricName, MetricsCollector, MetricsQuery, TimeWindow};
+    use serde_json::json;
+
+    use super::record_partial_batch_throttle;
+
+    fn sum(c: &MetricsCollector, metric: MetricName, table: Option<&str>) -> f64 {
+        c.query(&MetricsQuery {
+            table_name: table.map(str::to_owned),
+            metric: Some(metric),
+            window: Some(TimeWindow::AllTime),
+            ..Default::default()
+        })
+        .iter()
+        .map(|s| s.sum)
+        .sum()
+    }
+
+    #[test]
+    fn a_partial_batch_get_records_a_request_and_a_read_event_per_table() {
+        let c = MetricsCollector::new();
+        record_partial_batch_throttle(
+            &c,
+            "BatchGetItem",
+            &json!({"Responses": {"T": []}, "UnprocessedKeys": {"T": {"Keys": []}, "U": {"Keys": []}}}),
+        );
+        assert_eq!(sum(&c, MetricName::ThrottledRequests, None), 2.0);
+        assert_eq!(sum(&c, MetricName::ThrottledRequests, Some("T")), 1.0);
+        assert_eq!(sum(&c, MetricName::ThrottledRequests, Some("U")), 1.0);
+        assert_eq!(sum(&c, MetricName::ReadThrottleEvents, Some("T")), 1.0);
+        assert_eq!(sum(&c, MetricName::ReadThrottleEvents, Some("U")), 1.0);
+        assert_eq!(sum(&c, MetricName::WriteThrottleEvents, None), 0.0);
+    }
+
+    #[test]
+    fn a_partial_batch_write_records_a_write_event() {
+        let c = MetricsCollector::new();
+        record_partial_batch_throttle(
+            &c,
+            "BatchWriteItem",
+            &json!({"UnprocessedItems": {"T": [{"PutRequest": {"Item": {}}}]}}),
+        );
+        assert_eq!(sum(&c, MetricName::ThrottledRequests, Some("T")), 1.0);
+        assert_eq!(sum(&c, MetricName::WriteThrottleEvents, Some("T")), 1.0);
+    }
+
+    /// A fully served batch (the map present and empty) and a non-batch
+    /// operation record nothing.
+    #[test]
+    fn a_full_batch_or_another_operation_records_nothing() {
+        let c = MetricsCollector::new();
+        record_partial_batch_throttle(&c, "BatchGetItem", &json!({"UnprocessedKeys": {}}));
+        record_partial_batch_throttle(&c, "BatchWriteItem", &json!({"UnprocessedItems": {}}));
+        record_partial_batch_throttle(&c, "GetItem", &json!({"UnprocessedKeys": {"T": {}}}));
+        assert_eq!(sum(&c, MetricName::ThrottledRequests, None), 0.0);
+        assert_eq!(sum(&c, MetricName::ReadThrottleEvents, None), 0.0);
     }
 }

@@ -14,7 +14,7 @@ pub enum MetricName {
     SuccessfulRequestLatency,
     SystemErrors,
     UserErrors,
-    /// Throttled request count. Recorded when token bucket rejects a request.
+    /// Throttled request count. Recorded when the token bucket rejects a request or a backend serves a batch partially.
     ThrottledRequests,
     /// Read throttle events. Recorded when a read operation is throttled.
     ReadThrottleEvents,

@@ -17,6 +17,7 @@ use extenddb_core::validation::{
     validate_attribute_name_sizes, validate_batch_item_keys, validate_batch_key_only,
     validate_item_nesting_depth, validate_item_size, validate_key_sizes,
 };
+use extenddb_storage::error::StorageError;
 
 use crate::OperationContext;
 use crate::capacity_helpers;
@@ -51,6 +52,8 @@ pub async fn handle_batch_write_item(
         .map(|(table_name, reqs)| (table_name.as_str(), Some(reqs.len())))
         .collect();
     request_limits::check_batch_counts("BatchWriteItem", &counts)?;
+    // The partial-success boundary below compares against the whole request.
+    let total_ops: usize = counts.iter().map(|(_, n)| n.unwrap_or(0)).sum();
 
     // Validate: each WriteRequest has exactly one of PutRequest or DeleteRequest
     for reqs in input.request_items.values() {
@@ -78,6 +81,15 @@ pub async fn handle_batch_write_item(
         input.return_consumed_capacity == extenddb_core::types::ReturnConsumedCapacity::Indexes;
     let mut per_table_gsi: HashMap<String, HashMap<String, f64>> = HashMap::new();
     let mut per_table_lsi: HashMap<String, HashMap<String, f64>> = HashMap::new();
+    // Entries a backend throttled, echoed as sent under `UnprocessedItems`
+    // (measured for PutRequest on an on-demand table, 2026-10-20: 18 of 80
+    // batches returned 200 with 6 to 24 of 25 entries unprocessed;
+    // DeleteRequest documented, not measured). When every entry was throttled
+    // the call fails with the throttle error instead (API Reference;
+    // documented, not measured).
+    let mut unprocessed_items: HashMap<String, Vec<WriteRequest>> = HashMap::new();
+    let mut throttled_count: usize = 0;
+    let mut first_throttle: Option<DynamoDbError> = None;
 
     for (table_name, reqs) in &input.request_items {
         let key_info = ctx
@@ -89,6 +101,7 @@ pub async fn handle_batch_write_item(
         validate_no_duplicate_keys(reqs, &key_info.key_schema)?;
 
         let view_type = stream_capture::stream_view_type(&key_info);
+        let mut table_unprocessed: Vec<WriteRequest> = Vec::new();
 
         for wr in reqs {
             if let Some(put) = &wr.put_request {
@@ -107,24 +120,13 @@ pub async fn handle_batch_write_item(
                     &key_info.attribute_definitions,
                 )?;
 
-                collect_icm_if_needed(
-                    input.return_item_collection_metrics,
-                    &key_info,
-                    &put.item,
-                    table_name,
-                    &mut all_icm,
-                );
-
                 let stream = view_type.map(|vt| extenddb_storage::StreamCapture {
                     view_type: vt,
                     user_identity: None,
                     region: ctx.region.clone(),
                 });
                 let need_old_for_stream = stream.is_some();
-                let item_wcu = capacity_helpers::write_capacity_units(item_size_bytes(&put.item));
-                total_wcu += item_wcu;
-                *per_table_wcu.entry(table_name.clone()).or_default() += item_wcu;
-                let old_item = ctx
+                let old_item = match ctx
                     .storage
                     .put_item(
                         &key_info,
@@ -135,7 +137,32 @@ pub async fn handle_batch_write_item(
                         stream.as_ref(),
                     )
                     .await
-                    .map_err(storage_err_to_dynamo)?;
+                {
+                    Ok(old_item) => old_item,
+                    // A throttled entry is returned unprocessed and the loop
+                    // continues; nothing below is charged or reported for it.
+                    // Every other storage error still fails the request.
+                    Err(StorageError::Service(e)) if e.is_throttle() => {
+                        table_unprocessed.push(wr.clone());
+                        throttled_count += 1;
+                        if first_throttle.is_none() {
+                            first_throttle = Some(e);
+                        }
+                        continue;
+                    }
+                    Err(e) => return Err(storage_err_to_dynamo(e)),
+                };
+                // Applied: charge capacity and report metrics for this entry.
+                collect_icm_if_needed(
+                    input.return_item_collection_metrics,
+                    &key_info,
+                    &put.item,
+                    table_name,
+                    &mut all_icm,
+                );
+                let item_wcu = capacity_helpers::write_capacity_units(item_size_bytes(&put.item));
+                total_wcu += item_wcu;
+                *per_table_wcu.entry(table_name.clone()).or_default() += item_wcu;
                 if want_index_cc {
                     let (gsi, lsi) = capacity_helpers::index_write_units(
                         old_item.as_ref(),
@@ -159,26 +186,13 @@ pub async fn handle_batch_write_item(
                     &key_info.attribute_definitions,
                 )?;
 
-                collect_icm_if_needed(
-                    input.return_item_collection_metrics,
-                    &key_info,
-                    &del.key,
-                    table_name,
-                    &mut all_icm,
-                );
-
                 let stream = view_type.map(|vt| extenddb_storage::StreamCapture {
                     view_type: vt,
                     user_identity: None,
                     region: ctx.region.clone(),
                 });
                 let need_old_for_stream = stream.is_some();
-                // TODO(fidelity): DynamoDB charges WCU based on old item size for deletes,
-                // but old item size is not available here. Using key size as lower bound.
-                let item_wcu = capacity_helpers::write_capacity_units(item_size_bytes(&del.key));
-                total_wcu += item_wcu;
-                *per_table_wcu.entry(table_name.clone()).or_default() += item_wcu;
-                let old_item = ctx
+                let old_item = match ctx
                     .storage
                     .delete_item(
                         &key_info,
@@ -189,7 +203,31 @@ pub async fn handle_batch_write_item(
                         stream.as_ref(),
                     )
                     .await
-                    .map_err(storage_err_to_dynamo)?;
+                {
+                    Ok(old_item) => old_item,
+                    Err(StorageError::Service(e)) if e.is_throttle() => {
+                        table_unprocessed.push(wr.clone());
+                        throttled_count += 1;
+                        if first_throttle.is_none() {
+                            first_throttle = Some(e);
+                        }
+                        continue;
+                    }
+                    Err(e) => return Err(storage_err_to_dynamo(e)),
+                };
+                // Applied: charge capacity and report metrics for this entry.
+                collect_icm_if_needed(
+                    input.return_item_collection_metrics,
+                    &key_info,
+                    &del.key,
+                    table_name,
+                    &mut all_icm,
+                );
+                // TODO(fidelity): DynamoDB charges WCU based on old item size for deletes,
+                // but old item size is not available here. Using key size as lower bound.
+                let item_wcu = capacity_helpers::write_capacity_units(item_size_bytes(&del.key));
+                total_wcu += item_wcu;
+                *per_table_wcu.entry(table_name.clone()).or_default() += item_wcu;
                 if want_index_cc {
                     let (gsi, lsi) = capacity_helpers::index_write_units(
                         old_item.as_ref(),
@@ -208,6 +246,19 @@ pub async fn handle_batch_write_item(
                 }
             }
         }
+        if !table_unprocessed.is_empty() {
+            // Request order; the service's lists came back in neither request
+            // nor sorted order.
+            unprocessed_items.insert(table_name.clone(), table_unprocessed);
+        }
+    }
+
+    // No entry of any table could be written: the call fails with the first
+    // throttle error (API Reference; documented, not measured).
+    if let Some(e) = first_throttle
+        && throttled_count == total_ops
+    {
+        return Err(e);
     }
 
     // With INDEXES, each per-table entry carries the arms the batch actually
@@ -241,12 +292,19 @@ pub async fn handle_batch_write_item(
     let wcu = total_wcu;
 
     let output = BatchWriteItemOutput {
-        unprocessed_items: HashMap::new(),
+        unprocessed_items,
         consumed_capacity,
-        item_collection_metrics: if all_icm.is_empty() {
-            None
-        } else {
+        // The service answers a SIZE request with the field present even when
+        // no written item belongs to an item collection: 13 of 13 fully
+        // processed batches on a table without a local secondary index carried
+        // "ItemCollectionMetrics": {} (measured 2026-10-21). Without SIZE the
+        // field is absent.
+        item_collection_metrics: if input.return_item_collection_metrics
+            == ReturnItemCollectionMetrics::Size
+        {
             Some(all_icm)
+        } else {
+            None
         },
     };
     let body = serialize_output(&output)?;

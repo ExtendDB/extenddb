@@ -9,8 +9,11 @@ use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::Projection;
-use extenddb_core::types::{BatchGetItemInput, BatchGetItemOutput, Item, item_size_bytes};
+use extenddb_core::types::{
+    BatchGetItemInput, BatchGetItemOutput, Item, KeysAndAttributes, item_size_bytes,
+};
 use extenddb_core::validation::{validate_batch_key_only, validate_key_sizes};
+use extenddb_storage::error::StorageError;
 
 use crate::OperationContext;
 use crate::capacity_helpers;
@@ -45,6 +48,8 @@ pub async fn handle_batch_get_item(
         .map(|(table_name, ka)| (table_name.as_str(), Some(ka.keys.len())))
         .collect();
     request_limits::check_batch_counts("BatchGetItem", &counts)?;
+    // The partial-success boundary below compares against the whole request.
+    let total_keys: usize = counts.iter().map(|(_, n)| n.unwrap_or(0)).sum();
 
     // Reject mixing expression and non-expression parameters anywhere in the
     // request. The check is request-wide: ProjectionExpression on one table and
@@ -151,6 +156,15 @@ pub async fn handle_batch_get_item(
     }
 
     let mut responses: HashMap<String, Vec<Item>> = HashMap::new();
+    // Keys a backend throttled, grouped by table. The service serves the rest
+    // of the batch and returns these under `UnprocessedKeys` with the table's
+    // request fields echoed (measured 2026-10-21: 2 partial responses, 16 of
+    // 25 keys served, `ConsistentRead` and `ProjectionExpression` echoed);
+    // when every key was throttled the call fails with the throttle error
+    // instead (API Reference; documented, not reached in the sample).
+    let mut unprocessed_keys: HashMap<String, KeysAndAttributes> = HashMap::new();
+    let mut throttled_count: usize = 0;
+    let mut first_throttle: Option<DynamoDbError> = None;
     let mut total_rcu: f64 = 0.0;
     let mut total_pre_proj_bytes: usize = 0;
     let mut returned_count: u64 = 0;
@@ -165,16 +179,27 @@ pub async fn handle_batch_get_item(
         let projection = table_projections.get(table_name).and_then(Option::as_ref);
 
         let mut table_items: Vec<Item> = Vec::new();
+        let mut table_unprocessed: Vec<Item> = Vec::new();
         for key in &ka.keys {
             validate_batch_key_only(key, &key_info.key_schema, &key_info.attribute_definitions)?;
             validate_key_sizes(key, &key_info.key_schema, &ctx.limits)?;
 
-            if let Some(item) = ctx
-                .storage
-                .get_item(&key_info, key)
-                .await
-                .map_err(storage_err_to_dynamo)?
-            {
+            let fetched = match ctx.storage.get_item(&key_info, key).await {
+                Ok(fetched) => fetched,
+                // A throttled key is not an error for the batch: it is reported
+                // back unprocessed and the loop continues. Every other storage
+                // error still fails the request.
+                Err(StorageError::Service(e)) if e.is_throttle() => {
+                    table_unprocessed.push(key.clone());
+                    throttled_count += 1;
+                    if first_throttle.is_none() {
+                        first_throttle = Some(e);
+                    }
+                    continue;
+                }
+                Err(e) => return Err(storage_err_to_dynamo(e)),
+            };
+            if let Some(item) = fetched {
                 let size = item_size_bytes(&item);
                 let strongly_consistent = ka.consistent_read == Some(true);
                 let item_rcu = capacity_helpers::read_capacity_units(size, strongly_consistent);
@@ -190,7 +215,38 @@ pub async fn handle_batch_get_item(
                 table_items.push(item);
             }
         }
+        if !table_unprocessed.is_empty() {
+            // The request's KeysAndAttributes with Keys reduced to the
+            // unprocessed ones, in request order (the service's order is not
+            // measured: its served and unprocessed lists came back in neither
+            // request nor sorted order); the other fields are echoed as sent
+            // (ConsistentRead and ProjectionExpression measured,
+            // ExpressionAttributeNames and AttributesToGet documented).
+            unprocessed_keys.insert(
+                table_name.clone(),
+                KeysAndAttributes {
+                    keys: table_unprocessed,
+                    consistent_read: ka.consistent_read,
+                    projection_expression: ka.projection_expression.clone(),
+                    expression_attribute_names: ka.expression_attribute_names.clone(),
+                    attributes_to_get: ka.attributes_to_get.clone(),
+                },
+            );
+        }
         responses.insert(table_name.clone(), table_items);
+    }
+
+    // No key of any table could be read: the call fails with the first
+    // throttle error (API Reference; documented, not measured). "First" is the
+    // request map's iteration order, so with tables of different billing modes
+    // either error class can come out; the service's choice for that case is
+    // not measured (one table per request in the sample). A table whose every
+    // key was throttled beside a served table keeps an empty `Responses` list;
+    // unmeasured as well.
+    if let Some(e) = first_throttle
+        && throttled_count == total_keys
+    {
+        return Err(e);
     }
 
     let consumed_capacity = capacity_helpers::batch_read_capacity(
@@ -203,7 +259,7 @@ pub async fn handle_batch_get_item(
 
     let output = BatchGetItemOutput {
         responses,
-        unprocessed_keys: HashMap::new(),
+        unprocessed_keys,
         consumed_capacity,
     };
     let body = serialize_output(&output)?;
