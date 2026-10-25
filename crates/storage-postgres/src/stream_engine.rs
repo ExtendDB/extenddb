@@ -376,6 +376,7 @@ impl StreamEngine for PostgresEngine {
             };
 
             Ok(StreamDescription {
+                creation_request_date_time: None,
                 stream_arn,
                 stream_label,
                 stream_status,

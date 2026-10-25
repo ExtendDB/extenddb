@@ -13,7 +13,7 @@ mod key;
 
 pub use arn::{
     ARN_PARTITION, format_stream_label, index_arn, new_stream_label, parse_stream_arn, stream_arn,
-    table_arn,
+    stream_label_creation_date_time, table_arn,
 };
 pub use backup_id::{
     BackupArnError, BackupArnParts, MAX_BACKUP_ARN_LEN, backup_arn, backup_creation_date_time,

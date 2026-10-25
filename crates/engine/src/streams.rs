@@ -7,9 +7,10 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::types::{
     DescribeStreamInput, DescribeStreamOutput, GetRecordsInput, GetRecordsOutput,
     GetShardIteratorInput, GetShardIteratorOutput, ListStreamsInput, ListStreamsOutput,
-    ShardIteratorType,
+    ShardIteratorType, StreamDescription,
 };
 use extenddb_storage::error::StorageError;
+use extenddb_storage::util::stream_label_creation_date_time;
 use serde_json::Value;
 
 use crate::OperationContext;
@@ -35,9 +36,17 @@ pub async fn handle_describe_stream(
         .map_err(storage_to_dynamo)?;
 
     let output = DescribeStreamOutput {
-        stream_description: desc,
+        stream_description: with_creation_request_date_time(desc),
     };
     serialize_output(&output)
+}
+
+/// The service returns `CreationRequestDateTime` on every stream, enabled or
+/// disabled. The label is the creation instant to the millisecond, so it is
+/// derived here for every backend rather than stored by each.
+fn with_creation_request_date_time(mut desc: StreamDescription) -> StreamDescription {
+    desc.creation_request_date_time = stream_label_creation_date_time(&desc.stream_label);
+    desc
 }
 
 /// Handle `ListStreams`.
@@ -362,6 +371,49 @@ fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
 
 #[cfg(test)]
 mod tests {
+    /// `DescribeStream` renders `CreationRequestDateTime` as the label's
+    /// instant in epoch seconds, next to the members it already had, and
+    /// omits the member only when the label is not a timestamp.
+    #[test]
+    fn describe_stream_output_carries_creation_request_date_time() {
+        use extenddb_core::types::{
+            DescribeStreamOutput, StreamDescription, StreamStatus, StreamViewType,
+        };
+        let desc = StreamDescription {
+            creation_request_date_time: None,
+            stream_arn: "arn:aws:dynamodb:us-east-1:1:table/T/stream/2026-10-24T11:31:45.748"
+                .to_owned(),
+            stream_label: "2026-10-24T11:31:45.748".to_owned(),
+            stream_status: StreamStatus::Disabled,
+            stream_view_type: StreamViewType::KeysOnly,
+            table_name: "T".to_owned(),
+            key_schema: Vec::new(),
+            shards: Vec::new(),
+            last_evaluated_shard_id: None,
+        };
+        let v = crate::serialize_output(&DescribeStreamOutput {
+            stream_description: super::with_creation_request_date_time(desc.clone()),
+        })
+        .unwrap();
+        let sd = &v["StreamDescription"];
+        assert_eq!(sd["CreationRequestDateTime"], 1_792_841_505.748);
+        assert_eq!(sd["StreamLabel"], "2026-10-24T11:31:45.748");
+        assert_eq!(sd["StreamStatus"], "DISABLED");
+
+        let v = crate::serialize_output(&DescribeStreamOutput {
+            stream_description: super::with_creation_request_date_time(StreamDescription {
+                stream_label: "not-a-label".to_owned(),
+                ..desc
+            }),
+        })
+        .unwrap();
+        assert!(
+            v["StreamDescription"]
+                .get("CreationRequestDateTime")
+                .is_none()
+        );
+    }
+
     /// AT_SEQUENCE_NUMBER converts to AFTER by subtracting 1 and padding to
     /// the backend's stored width. Verify that an unpadded client input is
     /// normalised correctly for both the 21-digit (postgres/sqlite/mongodb)
