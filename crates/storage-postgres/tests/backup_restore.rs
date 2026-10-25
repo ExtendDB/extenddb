@@ -30,7 +30,7 @@ use extenddb_core::types::{
 use extenddb_core::validation::validate_create_table;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::{
-    BackupEngine, DataEngine, RestoreRequest, RestoreTableOverrides, TableEngine,
+    BackupEngine, DataEngine, ReadOptions, RestoreRequest, RestoreTableOverrides, TableEngine,
 };
 use extenddb_storage_postgres::{PostgresConfig, PostgresEngine};
 use futures::FutureExt;
@@ -532,7 +532,7 @@ async fn legacy_composite_backup_restores_with_sort_keys() {
             .collect();
         let got = s
             .engine
-            .get_item(&key_info, &key)
+            .get_item(&key_info, &key, ReadOptions::default())
             .await
             .expect("point read");
         assert_eq!(got.as_ref(), Some(&item));

@@ -29,7 +29,7 @@ use extenddb_core::types::{
     StreamViewType, TableKeyInfo,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::{DataEngine, StreamCapture, TableEngine, TransactWriteOp};
+use extenddb_storage::{DataEngine, ReadOptions, StreamCapture, TableEngine, TransactWriteOp};
 use extenddb_storage_postgres::{PostgresConfig, PostgresEngine};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Postgres, Transaction};
@@ -649,7 +649,10 @@ async fn a_plain_put_waits_for_a_check_of_the_missing_item() {
         wait_for_lock_waiters(&s.db, holder_pid, 1).await;
         // Readers neither see the reserved key nor wait for it.
         let read = tokio::time::timeout(Duration::from_secs(5), async {
-            let got = s.engine.get_item(&key_info, &key("0c")).await;
+            let got = s
+                .engine
+                .get_item(&key_info, &key("0c"), ReadOptions::default())
+                .await;
             let rows: i64 =
                 sqlx::query_scalar(&format!("SELECT count(*) FROM {table} WHERE pk = '0c'"))
                     .fetch_one(&s.db)

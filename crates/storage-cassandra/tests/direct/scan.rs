@@ -13,6 +13,7 @@
 
 use extenddb_core::types::AttributeValue;
 use extenddb_storage::DataEngine;
+use extenddb_storage::ReadOptions;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 
@@ -65,7 +66,15 @@ async fn test_scan_empty_table() {
     let table = TestTable::new(&engine, "ScanEmptyTable", false).await;
 
     let (items, last_key) = engine
-        .scan(&table.key_info, None, None, None, None, None)
+        .scan(
+            &table.key_info,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ReadOptions::default(),
+        )
         .await
         .expect("scan should succeed");
 
@@ -87,7 +96,15 @@ async fn test_scan_pk_only_all() {
     put_pk_only_items(&engine, &table, 10).await;
 
     let (items, last_key) = engine
-        .scan(&table.key_info, None, None, None, None, None)
+        .scan(
+            &table.key_info,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ReadOptions::default(),
+        )
         .await
         .expect("scan should succeed");
 
@@ -134,7 +151,15 @@ async fn test_scan_composite_key_all() {
     }
 
     let (items, last_key) = engine
-        .scan(&table.key_info, None, None, None, None, None)
+        .scan(
+            &table.key_info,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ReadOptions::default(),
+        )
         .await
         .expect("scan should succeed");
 
@@ -170,7 +195,15 @@ async fn test_scan_limit_returns_last_key() {
     put_pk_only_items(&engine, &table, 10).await;
 
     let (items, last_key) = engine
-        .scan(&table.key_info, Some(4), None, None, None, None)
+        .scan(
+            &table.key_info,
+            Some(4),
+            None,
+            None,
+            None,
+            None,
+            ReadOptions::default(),
+        )
         .await
         .expect("scan should succeed");
 
@@ -206,6 +239,7 @@ async fn test_scan_pagination_pk_only() {
                 None,
                 None,
                 None,
+                ReadOptions::default(),
             )
             .await
             .expect("scan page should succeed");
@@ -276,6 +310,7 @@ async fn test_scan_pagination_composite_key() {
                 None,
                 None,
                 None,
+                ReadOptions::default(),
             )
             .await
             .expect("scan page should succeed");
@@ -330,6 +365,7 @@ async fn test_scan_parallel_segments() {
                 Some(segment),
                 Some(total_segments),
                 None,
+                ReadOptions::default(),
             )
             .await
             .expect("segment scan should succeed");
@@ -404,7 +440,15 @@ async fn test_scan_gsi() {
 
     // Scan the index table itself (all index entries).
     let (items, last_key) = engine
-        .scan(&table.key_info, None, None, None, None, Some("StatusIndex"))
+        .scan(
+            &table.key_info,
+            None,
+            None,
+            None,
+            None,
+            Some("StatusIndex"),
+            ReadOptions::default(),
+        )
         .await
         .expect("index scan should succeed");
 
@@ -482,6 +526,7 @@ async fn test_scan_gsi_pagination() {
                 None,
                 None,
                 Some("StatusIndex"),
+                ReadOptions::default(),
             )
             .await
             .expect("index scan page should succeed");
@@ -559,7 +604,15 @@ async fn test_scan_numeric_sort_key_all() {
     }
 
     let (items, last_key) = engine
-        .scan(&table.key_info, None, None, None, None, None)
+        .scan(
+            &table.key_info,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ReadOptions::default(),
+        )
         .await
         .expect("scan should succeed");
 
@@ -630,6 +683,7 @@ async fn test_scan_numeric_sort_key_pagination() {
                 None,
                 None,
                 None,
+                ReadOptions::default(),
             )
             .await
             .expect("scan page should succeed");
@@ -698,7 +752,15 @@ async fn test_scan_binary_sort_key_all() {
     }
 
     let (items, last_key) = engine
-        .scan(&table.key_info, None, None, None, None, None)
+        .scan(
+            &table.key_info,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ReadOptions::default(),
+        )
         .await
         .expect("scan should succeed");
 
@@ -760,7 +822,15 @@ async fn test_scan_lsi() {
     }
 
     let (items, last_key) = engine
-        .scan(&table.key_info, None, None, None, None, Some("LsiPriority"))
+        .scan(
+            &table.key_info,
+            None,
+            None,
+            None,
+            None,
+            Some("LsiPriority"),
+            ReadOptions::default(),
+        )
         .await
         .expect("LSI scan should succeed");
 

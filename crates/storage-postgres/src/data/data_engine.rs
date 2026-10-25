@@ -8,7 +8,9 @@ use extenddb_core::expression::{Expr, ExpressionMaps, KeyCondition, UpdateAction
 use extenddb_core::types::{Item, TableKeyInfo};
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::pk_to_text;
-use extenddb_storage::{DataEngine, IdempotencyKey, StreamCapture, TransactGetOp, TransactWriteOp};
+use extenddb_storage::{
+    DataEngine, IdempotencyKey, ReadOptions, StreamCapture, TransactGetOp, TransactWriteOp,
+};
 use futures::future::BoxFuture;
 
 use crate::PostgresEngine;
@@ -57,10 +59,16 @@ impl DataEngine for PostgresEngine {
         })
     }
 
+    /// `_opts.consistent_read` is accepted and not acted on. Item reads and
+    /// writes share `data_pool`, so every read is served by the copy that took
+    /// the write. Routing `false` to a streaming replica of the data database
+    /// needs a second data pool and a setting for it; `true` stays on
+    /// `data_pool`.
     fn get_item(
         &self,
         key_info: &TableKeyInfo,
         key: &Item,
+        _opts: ReadOptions,
     ) -> BoxFuture<'_, Result<Option<Item>, StorageError>> {
         let key_info = key_info.clone();
         let key = key.clone();
@@ -126,6 +134,7 @@ impl DataEngine for PostgresEngine {
         })
     }
 
+    /// `_opts`: see `get_item`.
     fn query(
         &self,
         key_info: &TableKeyInfo,
@@ -135,6 +144,7 @@ impl DataEngine for PostgresEngine {
         limit: Option<i64>,
         exclusive_start_key: Option<&Item>,
         index_name: Option<&str>,
+        _opts: ReadOptions,
     ) -> BoxFuture<'_, Result<(Vec<Item>, Option<Item>), StorageError>> {
         let key_info = key_info.clone();
         let key_condition = key_condition.clone();
@@ -155,6 +165,7 @@ impl DataEngine for PostgresEngine {
         })
     }
 
+    /// `_opts`: see `get_item`.
     fn scan(
         &self,
         key_info: &TableKeyInfo,
@@ -163,6 +174,7 @@ impl DataEngine for PostgresEngine {
         segment: Option<i64>,
         total_segments: Option<i64>,
         index_name: Option<&str>,
+        _opts: ReadOptions,
     ) -> BoxFuture<'_, Result<(Vec<Item>, Option<Item>), StorageError>> {
         let key_info = key_info.clone();
         let exclusive_start_key = exclusive_start_key.cloned();
