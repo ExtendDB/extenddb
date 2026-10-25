@@ -46,7 +46,8 @@ pub async fn handle_scan(
     // parameter mix, the ReturnConsumedCapacity enum, every number in
     // ExpressionAttributeValues, the Select enum. They run before typed
     // deserialization so a field that does not deserialize does not stop the
-    // ones before it; see `scan_request`.
+    // ones before it; a field of the wrong JSON type anywhere in the body is
+    // reported ahead of them; see `scan_request`.
     crate::scan_request::validate_scan_request_body(&body)?;
     let input: ScanInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 

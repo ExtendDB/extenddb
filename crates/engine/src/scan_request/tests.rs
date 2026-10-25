@@ -1,8 +1,12 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Every expected text below was measured against the service on 2026-10-25
-//! (us-east-1, each request twice).
+//! The expected texts below were measured against the service on 2026-10-25
+//! (us-east-1, each request twice), except where a test says otherwise: the
+//! `Segment` and `TotalSegments` range texts are the previous release's (the
+//! service aggregates range faults into one message with a different form, a
+//! separate issue), and the deserializer test pins this module's hand-off, not
+//! a service text.
 
 use extenddb_core::error::DynamoDbError;
 use serde_json::{Value, json};
@@ -122,7 +126,7 @@ fn nested_numbers_and_the_other_number_faults_are_reported_with_the_service_text
 }
 
 #[test]
-fn limit_segment_and_total_segments_ranges_come_first_and_aggregate() {
+fn limit_segment_and_total_segments_ranges_come_first() {
     let base = bad_number();
     assert_eq!(
         check(&with(base.clone(), "Limit", json!(0))).as_deref(),
@@ -132,33 +136,45 @@ fn limit_segment_and_total_segments_ranges_come_first_and_aggregate() {
         check(&with(base.clone(), "Limit", json!(-1))).as_deref(),
         Some(&*format!("1 validation error detected: {LIMIT_RANGE}"))
     );
+    // The int32 minimum itself gets the capitalised form; below it the service
+    // saturates the value and uses the older form (measured 2026-10-25).
+    assert_eq!(
+        check(&with(base.clone(), "Limit", json!(-2_147_483_648_i64))).as_deref(),
+        Some(&*format!("1 validation error detected: {LIMIT_RANGE}"))
+    );
+    assert_eq!(
+        check(&with(base.clone(), "Limit", json!(-2_147_483_649_i64))).as_deref(),
+        Some(
+            "1 validation error detected: Value '-2147483648' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"
+        )
+    );
     // Each segment field is range checked when present, with or without the
-    // other one.
+    // other one (the service's position; the texts are the previous release's).
     for (field, value, text) in [
         (
             "Segment",
             -1,
-            "Value at 'Segment' failed to satisfy constraint: Member must have value greater than or equal to 0",
+            "1 validation error detected: Value '-1' at 'segment' failed to satisfy constraint: Member must have value greater than or equal to 0",
         ),
         (
             "Segment",
             1_000_000,
-            "Value at 'Segment' failed to satisfy constraint: Member must have value less than or equal to 999999",
+            "1 validation error detected: Value '1000000' at 'segment' failed to satisfy constraint: Member must have value less than or equal to 999999",
         ),
         (
             "TotalSegments",
             0,
-            "Value at 'TotalSegments' failed to satisfy constraint: Member must have value greater than or equal to 1",
+            "The parameter TotalSegments should be greater than or equal to 1",
         ),
         (
             "TotalSegments",
             1_000_001,
-            "Value at 'TotalSegments' failed to satisfy constraint: Member must have value less than or equal to 1000000",
+            "1 validation error detected: Value '1000001' at 'totalSegments' failed to satisfy constraint: Member must have value less than or equal to 1000000",
         ),
     ] {
         assert_eq!(
             check(&with(base.clone(), field, json!(value))).as_deref(),
-            Some(&*format!("1 validation error detected: {text}")),
+            Some(text),
             "{field} {value}"
         );
         let partner = if field == "Segment" {
@@ -173,12 +189,13 @@ fn limit_segment_and_total_segments_ranges_come_first_and_aggregate() {
         );
         assert_eq!(
             check(&paired).as_deref(),
-            Some(&*format!("1 validation error detected: {text}")),
+            Some(text),
             "{field} {value} with {}",
             partner.0
         );
     }
-    // Limit, Segment, TotalSegments, in that order, one message.
+    // Several range faults: the first in the order Limit, Segment,
+    // TotalSegments is reported.
     let three = with(
         with(
             with(json!({"TableName": "t"}), "Limit", json!(0)),
@@ -190,10 +207,14 @@ fn limit_segment_and_total_segments_ranges_come_first_and_aggregate() {
     );
     assert_eq!(
         check(&three).as_deref(),
-        Some(
-            "3 validation errors detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1; Value at 'Segment' failed to satisfy constraint: Member must have value greater than or equal to 0; Value at 'TotalSegments' failed to satisfy constraint: Member must have value less than or equal to 1000000"
-        )
+        Some(&*format!("1 validation error detected: {LIMIT_RANGE}"))
     );
+    let two = with(
+        with(json!({"TableName": "t"}), "Segment", json!(-1)),
+        "TotalSegments",
+        json!(1_000_001),
+    );
+    assert!(check(&two).is_some_and(|m| m.contains("at 'segment'")));
     // Values at the bounds pass.
     assert!(
         check(
@@ -207,7 +228,7 @@ fn limit_segment_and_total_segments_ranges_come_first_and_aggregate() {
         "ScanFilter",
         json!({"a": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "x"}]}}),
     );
-    assert!(check(&mix).is_some_and(|m| m.contains("Value at 'Segment'")));
+    assert!(check(&mix).is_some_and(|m| m.contains("at 'segment'")));
     let rcc = with(
         with(base, "Limit", json!(0)),
         "ReturnConsumedCapacity",
@@ -268,16 +289,17 @@ fn parameter_mix_beats_the_enum_and_the_numbers() {
         .as_deref(),
         Some(NUMERIC_BOB)
     );
-    // An empty ScanFilter or AttributesToGet does not join the mix.
-    assert!(
+    // An empty ScanFilter alone is accepted, and an unused N bob beside it
+    // answers the number (measured 2026-10-25).
+    assert!(check(&json!({"TableName": "t", "ScanFilter": {}})).is_none());
+    assert_eq!(
         check(&json!({
             "TableName": "t",
             "ScanFilter": {},
-            "AttributesToGet": [],
-            "FilterExpression": "a = :n",
-            "ExpressionAttributeValues": {":n": {"N": "1"}},
+            "ExpressionAttributeValues": {":n": {"N": "bob"}},
         }))
-        .is_none()
+        .as_deref(),
+        Some(NUMERIC_BOB)
     );
 }
 
@@ -318,12 +340,101 @@ fn enum_checks_sit_on_either_side_of_the_numbers() {
 }
 
 #[test]
-fn values_that_do_not_deserialize_are_left_to_the_deserializer() {
-    // A string Limit and a malformed ExpressionAttributeValues are not range
-    // or number faults here; the typed deserializer reports them next.
+fn a_shape_fault_anywhere_in_the_body_is_reported_first() {
+    // Measured 2026-10-25: a field of the wrong
+    // JSON type in another field answers SerializationException ahead of the
+    // range, mix and number checks.
+    let shape_faults = [
+        json!({"TableName": "t", "Limit": 0, "ExpressionAttributeValues": "x"}),
+        json!({"TableName": "t", "Segment": -1, "TotalSegments": "2"}),
+        with(bad_number(), "ExpressionAttributeNames", json!("x")),
+        json!({"TableName": "t", "AttributesToGet": {"a": 1}, "ProjectionExpression": "a"}),
+        json!({"TableName": "t", "ScanFilter": [1], "FilterExpression": "a = :n",
+               "ExpressionAttributeValues": {":n": {"N": "1"}}}),
+        json!({"TableName": "t", "Limit": 0, "Select": 5}),
+    ];
+    for body in shape_faults {
+        assert!(
+            matches!(
+                validate_scan_request_body(&body),
+                Err(DynamoDbError::SerializationException(_))
+            ),
+            "{body}"
+        );
+    }
+    // A string enum that is not a member is the checks' answer (not a shape
+    // fault), and a ValidationException the deserializer raises (an empty NS)
+    // does not preempt a check.
+    assert_eq!(
+        check(&with(
+            with(bad_number(), "Limit", json!(0)),
+            "Select",
+            json!("NOPE")
+        ))
+        .as_deref(),
+        Some(&*format!("1 validation error detected: {LIMIT_RANGE}"))
+    );
+    assert_eq!(
+        check(&json!({
+            "TableName": "t", "Limit": 0,
+            "ExpressionAttributeValues": {":s": {"NS": []}},
+        }))
+        .as_deref(),
+        Some(&*format!("1 validation error detected: {LIMIT_RANGE}"))
+    );
+    // A body that passes every check is left to the handler's deserializer: a
+    // string Limit and a malformed AttributeValue are not range or number
+    // faults here.
     assert!(check(&json!({"TableName": "t", "Limit": "0"})).is_none());
     assert!(
         check(&json!({"TableName": "t", "ExpressionAttributeValues": {":n": {"X": "bob"}}}))
             .is_none()
     );
+}
+
+#[test]
+fn unicode_decimal_digits_pass_the_number_check() {
+    // Measured 2026-10-25: fullwidth and Arabic-Indic digits are read as digits, thirty nine
+    // Devanagari ones answer the 38 digit message, a superscript, a fraction, a
+    // fullwidth minus and a fullwidth full stop are refused with the value as
+    // sent.
+    for raw in ["\u{ff11}", "\u{661}", "\u{ff17}", "\u{ff11}e2"] {
+        assert!(
+            check(&with(
+                bad_number(),
+                "ExpressionAttributeValues",
+                json!({":n": {"N": raw}})
+            ))
+            .is_none(),
+            "{raw:?}"
+        );
+    }
+    assert!(
+        check(&json!({
+            "TableName": "t", "FilterExpression": "a = :p",
+            "ExpressionAttributeValues": {":p": {"S": "x"}, ":s": {"NS": ["1", "\u{ff12}"]}},
+        }))
+        .is_none()
+    );
+    assert_eq!(
+        check(&with(
+            bad_number(),
+            "ExpressionAttributeValues",
+            json!({":n": {"N": "\u{967}".repeat(39)}})
+        ))
+        .as_deref(),
+        Some("Attempting to store more than 38 significant digits in a Number")
+    );
+    for raw in ["\u{b2}", "\u{bd}", "\u{ff0d}1", "1\u{ff0e}5"] {
+        assert_eq!(
+            check(&with(
+                bad_number(),
+                "ExpressionAttributeValues",
+                json!({":n": {"N": raw}})
+            ))
+            .as_deref(),
+            Some(format!("The parameter cannot be converted to a numeric value: {raw}").as_str()),
+            "{raw:?}"
+        );
+    }
 }

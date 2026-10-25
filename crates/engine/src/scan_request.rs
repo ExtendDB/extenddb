@@ -7,16 +7,21 @@
 //! Measured 2026-10-25 (us-east-1, each request twice):
 //!
 //! 1. the range constraints on `Limit` (at least 1), `Segment` (0 to 999999)
-//!    and `TotalSegments` (1 to 1000000), aggregated into one message in that
-//!    order with no value echoed: `2 validation errors detected: Value at
-//!    'Limit' failed to satisfy constraint: Member must have value greater than
-//!    or equal to 1; Value at 'Segment' ...`. Each field is checked when
-//!    present, whether or not the other segment field is;
+//!    and `TotalSegments` (1 to 1000000), each checked when present, whether or
+//!    not the other segment field is. A `Limit` below 1 inside the int32 range
+//!    answers `1 validation error detected: Value at 'Limit' failed to satisfy
+//!    constraint: Member must have value greater than or equal to 1`; below
+//!    int32 the service saturates the value and answers the older form
+//!    `Value '-2147483648' at 'limit' ...`. The service aggregates several
+//!    range faults into one message; this module reports the first in the
+//!    order `Limit`, `Segment`, `TotalSegments`, with the `Segment` and
+//!    `TotalSegments` texts the previous release used;
 //! 2. the expression and non-expression parameter mix;
 //! 3. the `ReturnConsumedCapacity` enum;
 //! 4. every number in `ExpressionAttributeValues`, `NS` members and values
 //!    nested in `L` and `M` included, whether a `FilterExpression` reads the
-//!    value, nothing reads it, or the request carries no expression at all;
+//!    value, nothing reads it, or the request carries no expression at all; a
+//!    Unicode decimal digit counts as the digit it stands for;
 //! 5. the `Select` enum. Both enums invalid answers the `ReturnConsumedCapacity`
 //!    error alone, so the two are not aggregated.
 //!
@@ -25,15 +30,18 @@
 //! (Segment without TotalSegments and the reverse, Segment not below
 //! TotalSegments, the undefined placeholder, unused value, filter syntax,
 //! IndexName, ConsistentRead, Select with ProjectionExpression and
-//! ExclusiveStartKey checks).
+//! ExclusiveStartKey checks). A field of the wrong JSON type anywhere in the
+//! body is reported ahead of all of them, as a `SerializationException`.
 
 use std::collections::HashMap;
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::types::AttributeValue;
+use extenddb_core::types::{AttributeValue, ScanInput};
 use serde_json::Value;
 
-use crate::query_key_values::{non_empty, present, validate_expression_attribute_value_numbers};
+use crate::query_key_values::{
+    non_empty, present, shape_fault_first, validate_expression_attribute_value_numbers,
+};
 
 /// The `Scan` checks that run on the raw request body, in the service's order:
 /// the `Limit`, `Segment` and `TotalSegments` ranges, the expression and
@@ -41,13 +49,24 @@ use crate::query_key_values::{non_empty, present, validate_expression_attribute_
 /// number in `ExpressionAttributeValues`, then the `Select` enum.
 ///
 /// The checks read the raw body, so a field that does not deserialize (an
-/// invalid `Select`, for one) does not stop the ones before it. A field of the
-/// wrong JSON shape is left to the deserializer, which runs next.
+/// invalid `Select`, for one) does not stop the ones before it. When a check
+/// fails, the body is deserialized as a [`ScanInput`] and a
+/// `SerializationException` from that (a field of the wrong JSON shape
+/// anywhere in the body) is the answer instead, as the service reports a shape
+/// fault ahead of every validation; see [`shape_fault_first`]. A body that
+/// passes every check is not deserialized here.
 ///
 /// # Errors
 ///
-/// Returns `DynamoDbError::ValidationException` with the service's text.
+/// Returns `DynamoDbError::ValidationException` with the service's text, or
+/// `DynamoDbError::SerializationException` for a body of the wrong shape.
 pub fn validate_scan_request_body(body: &Value) -> Result<(), DynamoDbError> {
+    scan_request_checks(body).map_err(|check| shape_fault_first::<ScanInput>(body, check))
+}
+
+/// The `Scan` checks in the service's order; see
+/// [`validate_scan_request_body`].
+fn scan_request_checks(body: &Value) -> Result<(), DynamoDbError> {
     validate_ranges(body)?;
 
     extenddb_core::validation::validate_no_expression_param_mixing(
@@ -95,38 +114,56 @@ pub fn validate_scan_request_body(body: &Value) -> Result<(), DynamoDbError> {
     )
 }
 
-/// The range constraints on `Limit`, `Segment` and `TotalSegments`, aggregated
-/// in that order as the service reports them. The field name is capitalised
-/// and the value is not echoed, unlike the `select` and `segment` style the
-/// other `1 validation error detected` messages use.
+/// The range constraints on `Limit`, `Segment` and `TotalSegments`, the first
+/// fault in that order.
+///
+/// `Limit` answers the service's text: inside the int32 range the field is
+/// capitalised and the value is not echoed; below int32 the service saturates
+/// the value and uses the older `Value '<n>' at 'limit'` form (measured
+/// 2026-10-25, `Limit: -2147483649`). `Segment` and `TotalSegments` keep the
+/// texts of the previous release.
 fn validate_ranges(body: &Value) -> Result<(), DynamoDbError> {
-    let mut errors: Vec<String> = Vec::new();
-    let mut check = |field: &str, below: i64, above: i64| {
-        let Some(value) = body.get(field).and_then(Value::as_i64) else {
-            return;
+    let get = |field: &str| body.get(field).and_then(Value::as_i64);
+    if let Some(limit) = get("Limit")
+        && limit < 1
+    {
+        let text = if limit >= i64::from(i32::MIN) {
+            "Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1".to_owned()
+        } else {
+            format!(
+                "Value '{}' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1",
+                i32::MIN
+            )
         };
-        if value < below {
-            errors.push(format!(
-                "Value at '{field}' failed to satisfy constraint: Member must have value greater than or equal to {below}"
-            ));
-        } else if value > above {
-            errors.push(format!(
-                "Value at '{field}' failed to satisfy constraint: Member must have value less than or equal to {above}"
+        return Err(DynamoDbError::ValidationException(format!(
+            "1 validation error detected: {text}"
+        )));
+    }
+    if let Some(segment) = get("Segment") {
+        if segment < 0 {
+            return Err(DynamoDbError::ValidationException(format!(
+                "1 validation error detected: Value '{segment}' at 'segment' failed to satisfy constraint: Member must have value greater than or equal to 0"
+            )));
+        }
+        if segment > 999_999 {
+            return Err(DynamoDbError::ValidationException(format!(
+                "1 validation error detected: Value '{segment}' at 'segment' failed to satisfy constraint: Member must have value less than or equal to 999999"
+            )));
+        }
+    }
+    if let Some(total) = get("TotalSegments") {
+        if total < 1 {
+            return Err(DynamoDbError::ValidationException(
+                "The parameter TotalSegments should be greater than or equal to 1".to_owned(),
             ));
         }
-    };
-    check("Limit", 1, i64::MAX);
-    check("Segment", 0, 999_999);
-    check("TotalSegments", 1, 1_000_000);
-    if errors.is_empty() {
-        return Ok(());
+        if total > 1_000_000 {
+            return Err(DynamoDbError::ValidationException(format!(
+                "1 validation error detected: Value '{total}' at 'totalSegments' failed to satisfy constraint: Member must have value less than or equal to 1000000"
+            )));
+        }
     }
-    let count = errors.len();
-    Err(DynamoDbError::ValidationException(format!(
-        "{count} validation error{} detected: {}",
-        if count == 1 { "" } else { "s" },
-        errors.join("; ")
-    )))
+    Ok(())
 }
 
 #[cfg(test)]
