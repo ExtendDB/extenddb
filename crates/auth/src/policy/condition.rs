@@ -51,6 +51,11 @@ pub fn evaluate_condition_with(
 ) -> bool {
     let context_values = context.resolve_key(&condition.key);
     let is_multivalued = context.is_multivalued_key(&condition.key);
+    // Only the string and ARN operators expand policy variables (measured). A
+    // numeric value written as a variable is compared as written, and a `Bool`
+    // or `Null` value written as one is read as the boolean `false`
+    // (`bool_matches`, `null_holds`).
+    let expand_variables = expand_variables && operator_expands_variables(&condition.operator);
 
     // Expand policy variables (e.g. `${aws:PrincipalTag/Team}`) in condition values.
     let expanded_values: Vec<ConditionValue> = condition
@@ -65,7 +70,7 @@ pub fn evaluate_condition_with(
             expanded_values
                 .first()
                 .and_then(ConditionValue::text)
-                .is_some_and(|v| (v == "true" && key_absent) || (v == "false" && !key_absent))
+                .is_some_and(|v| null_holds(v, key_absent))
         }
         ConditionOperator::ForAllValues(inner) => {
             let (_absent_passes, base_op) = unwrap_if_exists(inner);
@@ -195,20 +200,27 @@ pub enum ConditionMatch {
 /// Evaluate one condition three-valued.
 ///
 /// Returns [`ConditionMatch::Unresolvable`] when the key is unresolved and the
-/// context reports it as service-populated (case 3), and, with
-/// `expand_variables`, when a condition value reads such a key through a
-/// `${name}` or `${name, 'default'}` policy variable, since the variable has no
-/// value to expand to and the service, which has one, would not use the
-/// default. Without `expand_variables` the value is compared as written and
-/// reads no key. Otherwise returns `Match` or `NoMatch` from the ordinary
-/// evaluation, so cases 1 and 2 are unchanged.
+/// context reports it as service-populated (case 3), and, when the value is
+/// expanded (`expand_variables` and a string or ARN operator), when a
+/// condition value reads such a key through a `${name}` or `${name, 'default'}`
+/// policy variable, since the variable has no value to expand to and the
+/// service, which has one, would not use the default. A value that also names
+/// a key the request does not carry, with no default, fails closed here
+/// although it matches nothing whatever the other key holds; a `Resource`
+/// pattern of that shape does not. Without `expand_variables`, and under an
+/// operator that does not expand variables ([`operator_expands_variables`]),
+/// the value is not expanded and reads no
+/// key. Otherwise returns `Match` or `NoMatch` from the ordinary evaluation,
+/// so cases 1 and 2 are unchanged.
 pub fn evaluate_condition_match(
     condition: &Condition,
     expand_variables: bool,
     context: &impl ConditionContext,
 ) -> ConditionMatch {
     if is_unresolvable(&condition.key, context)
-        || (expand_variables && reads_unresolvable_variable(condition, context))
+        || (expand_variables
+            && operator_expands_variables(&condition.operator)
+            && reads_unresolvable_variable(condition, context))
     {
         return ConditionMatch::Unresolvable;
     }
@@ -293,6 +305,30 @@ fn expand_policy_variables(
     context: &impl ConditionContext,
 ) -> ConditionValue {
     super::variables::expand_condition_value(value, expand_variables, context)
+}
+
+/// Whether `op` expands policy variables in its values: the string and ARN
+/// operators, with or without a set qualifier or `IfExists`. IAM documents
+/// variables for string comparisons and ARNs; `NumericEquals` and `Bool` were
+/// measured to compare a variable as written, and the date, address and `Null`
+/// operators are treated the same way.
+fn operator_expands_variables(op: &ConditionOperator) -> bool {
+    match op {
+        ConditionOperator::ForAllValues(inner)
+        | ConditionOperator::ForAnyValue(inner)
+        | ConditionOperator::IfExists(inner) => operator_expands_variables(inner),
+        ConditionOperator::StringEquals
+        | ConditionOperator::StringNotEquals
+        | ConditionOperator::StringEqualsIgnoreCase
+        | ConditionOperator::StringNotEqualsIgnoreCase
+        | ConditionOperator::StringLike
+        | ConditionOperator::StringNotLike
+        | ConditionOperator::ArnEquals
+        | ConditionOperator::ArnNotEquals
+        | ConditionOperator::ArnLike
+        | ConditionOperator::ArnNotLike => true,
+        _ => false,
+    }
 }
 
 /// Unwrap an `IfExists` wrapper if present.
@@ -467,7 +503,7 @@ fn compare_single(op: &ConditionOperator, context_value: &str, value: &Condition
         ConditionOperator::DateGreaterThanEquals => {
             compare_dates(context_value, policy_value, |a, b| a >= b)
         }
-        ConditionOperator::Bool => context_value.eq_ignore_ascii_case(policy_value),
+        ConditionOperator::Bool => bool_matches(context_value, policy_value),
         // IAM evaluates ArnEquals exactly as ArnLike and ArnNotEquals exactly
         // as ArnNotLike: `*` and `?` match in every ARN field, matching is
         // case sensitive, and both sides need the same number of fields,
@@ -499,6 +535,33 @@ fn compare_single(op: &ConditionOperator, context_value: &str, value: &Condition
         // Null, ForAllValues, ForAnyValue, IfExists handled by caller
         _ => false,
     }
+}
+
+/// Whether `Null` with the policy value `policy_value` holds: `true` means the
+/// key must be absent and `false` that it must be present, and any other text
+/// matches nothing. `Null` does not expand a policy variable. IAM reads a value
+/// written as one as a boolean, `false` unless the text is `true` ignoring
+/// case, so the key must be present whatever the variable's value or default
+/// (measured with the IAM policy simulator, cells N1a to N1f).
+fn null_holds(policy_value: &str, key_absent: bool) -> bool {
+    if policy_value.contains("${") {
+        return policy_value.eq_ignore_ascii_case("true") == key_absent;
+    }
+    (policy_value == "true" && key_absent) || (policy_value == "false" && !key_absent)
+}
+
+/// Whether `Bool` with the policy value `policy_value` matches the request
+/// value: the two texts are equal ignoring case. `Bool` does not expand a
+/// policy variable. IAM reads a value written as one as a boolean, `false`
+/// unless the text is `true` ignoring case, so it matches a request value that
+/// is not `true` whatever the variable's value (measured with the IAM policy
+/// simulator, cells N2a to N2e).
+fn bool_matches(context_value: &str, policy_value: &str) -> bool {
+    if policy_value.contains("${") {
+        return context_value.eq_ignore_ascii_case("true")
+            == policy_value.eq_ignore_ascii_case("true");
+    }
+    context_value.eq_ignore_ascii_case(policy_value)
 }
 
 /// Parse two strings as f64 and compare them.

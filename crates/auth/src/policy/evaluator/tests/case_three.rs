@@ -368,3 +368,94 @@ fn a_2008_or_no_version_condition_value_naming_an_unresolvable_key_is_compared_a
         }
     }
 }
+
+#[test]
+fn a_condition_value_naming_an_unresolvable_key_under_a_numeric_operator_is_compared_as_written() {
+    // Only the string and ARN operators expand a condition value. Under
+    // `NumericLessThan` the value is its text, with or without a default, and
+    // reads no key. The text is not a number, so the Deny does not apply, and
+    // it does not fail closed.
+    for value in ["${aws:PrincipalOrgID}", "${aws:PrincipalOrgID, '600'}"] {
+        let p = allow_all_and(&format!(
+            r#"{{"Effect":"Deny","Action":"dynamodb:GetItem","Resource":"*",
+                "Condition":{{"NumericLessThan":{{"aws:MultiFactorAuthAge":"{value}"}}}}}}"#
+        ));
+        let ctx = Ctx::empty()
+            .unresolvable("aws:PrincipalOrgID")
+            .with("aws:MultiFactorAuthAge", vec!["300"]);
+        assert_eq!(get_t_as_blue(&p, ctx), AuthzDecision::Allow, "{value}");
+    }
+}
+
+#[test]
+fn an_arn_condition_value_naming_an_unresolvable_key_fails_closed_with_or_without_a_default() {
+    // The `Arn*` operators expand a condition value as the string ones do, so
+    // under `ArnLike` and `ArnNotLike` a value naming the key fails the
+    // condition closed too, with or without a default: the Deny applies and
+    // the Allow does not grant, for a request whose `aws:SourceArn` is an ARN.
+    // The value has the five `:` of an ARN written, so the `Arn*` field rule
+    // does not decide it.
+    let source = || {
+        Ctx::empty()
+            .unresolvable("aws:PrincipalOrgID")
+            .with("aws:SourceArn", vec![RES])
+    };
+    for value in [
+        "arn:aws:dynamodb:us-east-1:123456789012:table/${aws:PrincipalOrgID}",
+        "arn:aws:dynamodb:us-east-1:123456789012:table/${aws:PrincipalOrgID, 'blue'}",
+    ] {
+        let deny = allow_all_and(&format!(
+            r#"{{"Effect":"Deny","Action":"dynamodb:GetItem","Resource":"*",
+                "Condition":{{"ArnLike":{{"aws:SourceArn":"{value}"}}}}}}"#
+        ));
+        assert_eq!(
+            get_t_as_blue(&deny, source()),
+            AuthzDecision::Deny,
+            "ArnLike {value}"
+        );
+        let allow = [only(&format!(
+            r#"{{"Effect":"Allow","Action":"dynamodb:GetItem","Resource":"*",
+                "Condition":{{"ArnNotLike":{{"aws:SourceArn":"{value}"}}}}}}"#
+        ))];
+        assert_eq!(
+            get_t_as_blue(&allow, source()),
+            AuthzDecision::Deny,
+            "ArnNotLike {value}"
+        );
+    }
+    // In a `2008-10-17` document the value is text and reads no key, so the
+    // condition does not fail closed: the Deny applies only to a request whose
+    // `aws:SourceArn` is that text, and the Allow grants every other request.
+    let value = "arn:aws:dynamodb:us-east-1:123456789012:table/${aws:PrincipalOrgID}";
+    let in_2008 = |statement: String| {
+        parse(&format!(
+            r#"{{"Version":"2008-10-17","Statement":[{statement}]}}"#
+        ))
+    };
+    let deny = [
+        only(r#"{"Effect":"Allow","Action":"dynamodb:*","Resource":"*"}"#),
+        in_2008(format!(
+            r#"{{"Effect":"Deny","Action":"dynamodb:GetItem","Resource":"*",
+                "Condition":{{"ArnLike":{{"aws:SourceArn":"{value}"}}}}}}"#
+        )),
+    ];
+    let allow = [in_2008(format!(
+        r#"{{"Effect":"Allow","Action":"dynamodb:GetItem","Resource":"*",
+            "Condition":{{"ArnNotLike":{{"aws:SourceArn":"{value}"}}}}}}"#
+    ))];
+    let source_is_the_text = || {
+        Ctx::empty()
+            .unresolvable("aws:PrincipalOrgID")
+            .with("aws:SourceArn", vec![value])
+    };
+    assert_eq!(get_t_as_blue(&deny, source()), AuthzDecision::Allow);
+    assert_eq!(
+        get_t_as_blue(&deny, source_is_the_text()),
+        AuthzDecision::Deny
+    );
+    assert_eq!(get_t_as_blue(&allow, source()), AuthzDecision::Allow);
+    assert_eq!(
+        get_t_as_blue(&allow, source_is_the_text()),
+        AuthzDecision::Deny
+    );
+}

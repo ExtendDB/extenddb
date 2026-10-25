@@ -61,6 +61,7 @@ mod case_three;
 mod combined;
 mod condition_variables;
 mod condition_variables_arn_context;
+mod condition_variables_operators;
 mod core;
 mod resource_variables;
 mod resource_variables_fields;
