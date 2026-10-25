@@ -59,6 +59,7 @@ fn parse(json: &str) -> PolicyDocument {
 
 mod case_three;
 mod combined;
+mod condition_variables;
 mod core;
 mod resource_variables;
 mod resource_variables_fields;

@@ -9,7 +9,7 @@
 
 use super::context::ConditionContext;
 use super::document::{Condition, ConditionOperator};
-use super::matcher::wildcard_match;
+use super::variables::ConditionValue;
 
 /// Evaluate a single condition against a context.
 ///
@@ -28,15 +28,31 @@ use super::matcher::wildcard_match;
 ///   Absent key is vacuously true.
 /// - `ForAnyValue`: at least one context value must match some policy value.
 ///   Absent key is false (unless wrapped in `IfExists`).
+///
+/// Policy variables in the values are expanded as in a `2012-10-17` document;
+/// [`evaluate_condition_with`] takes the document's choice.
 pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext) -> bool {
+    evaluate_condition_with(condition, true, context)
+}
+
+/// [`evaluate_condition`] with `expand_variables` saying whether the document
+/// expands policy variables in condition values
+/// ([`super::document::PolicyDocument::expands_policy_variables`]). A
+/// `2008-10-17` document, or one with no `Version`, compares each value as
+/// written.
+pub fn evaluate_condition_with(
+    condition: &Condition,
+    expand_variables: bool,
+    context: &impl ConditionContext,
+) -> bool {
     let context_values = context.resolve_key(&condition.key);
     let is_multivalued = context.is_multivalued_key(&condition.key);
 
     // Expand policy variables (e.g. `${aws:PrincipalTag/Team}`) in condition values.
-    let expanded_values: Vec<String> = condition
+    let expanded_values: Vec<ConditionValue> = condition
         .values
         .iter()
-        .map(|v| expand_policy_variables(v, context))
+        .map(|v| expand_policy_variables(v, expand_variables, context))
         .collect();
 
     match &condition.operator {
@@ -44,6 +60,7 @@ pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext
             let key_absent = context_values.is_none();
             expanded_values
                 .first()
+                .and_then(ConditionValue::text)
                 .is_some_and(|v| (v == "true" && key_absent) || (v == "false" && !key_absent))
         }
         ConditionOperator::ForAllValues(inner) => {
@@ -157,13 +174,14 @@ pub enum ConditionMatch {
 /// or `NoMatch` from the ordinary evaluation, so cases 1 and 2 are unchanged.
 pub fn evaluate_condition_match(
     condition: &Condition,
+    expand_variables: bool,
     context: &impl ConditionContext,
 ) -> ConditionMatch {
     if context.resolve_key(&condition.key).is_none() && context.is_unresolvable_key(&condition.key)
     {
         return ConditionMatch::Unresolvable;
     }
-    if evaluate_condition(condition, context) {
+    if evaluate_condition_with(condition, expand_variables, context) {
         ConditionMatch::Match
     } else {
         ConditionMatch::NoMatch
@@ -176,13 +194,17 @@ pub fn evaluate_condition_match(
 /// statement does not apply, even if another condition is unresolvable. Failing
 /// that, any unresolvable condition makes the block `Unresolvable` (fail
 /// closed). Otherwise every condition matched.
+///
+/// `expand_variables` is the document's
+/// [`super::document::PolicyDocument::expands_policy_variables`].
 pub fn evaluate_statement_conditions(
     conditions: &[Condition],
+    expand_variables: bool,
     context: &impl ConditionContext,
 ) -> ConditionMatch {
     let mut any_unresolvable = false;
     for condition in conditions {
-        match evaluate_condition_match(condition, context) {
+        match evaluate_condition_match(condition, expand_variables, context) {
             ConditionMatch::Match => {}
             ConditionMatch::NoMatch => return ConditionMatch::NoMatch,
             ConditionMatch::Unresolvable => any_unresolvable = true,
@@ -197,14 +219,21 @@ pub fn evaluate_statement_conditions(
 
 /// Expand IAM policy variables in a string value.
 ///
-/// Replaces `${variable}` and `${variable, 'default'}` patterns with their
-/// resolved values from the context (see [`super::variables`]). Supported
-/// variables: `aws:PrincipalTag/*` and any key the context can resolve.
-/// Unresolved variables with no default are left as-is (IAM behavior). A
-/// variable naming a key the context cannot resolve is also left as-is, with
-/// or without a default; see [`super::variables::expand_condition_value`].
-fn expand_policy_variables(value: &str, context: &impl ConditionContext) -> String {
-    super::variables::expand_condition_value(value, context)
+/// With `expand_variables`, replaces `${variable}` and `${variable, 'default'}`
+/// patterns with their resolved values from the context and `${*}`, `${?}` and
+/// `${$}` with the literal character (see [`super::variables`]). Supported
+/// variables: `aws:PrincipalTag/*` and any key the context can resolve. A
+/// variable with no default whose key the request does not carry makes the
+/// value match nothing, and so does a variable naming a key the context cannot
+/// resolve, with or without a default; see
+/// [`super::variables::expand_condition_value`]. Without `expand_variables`
+/// the value is compared as written.
+fn expand_policy_variables(
+    value: &str,
+    expand_variables: bool,
+    context: &impl ConditionContext,
+) -> ConditionValue {
+    super::variables::expand_condition_value(value, expand_variables, context)
 }
 
 /// Unwrap an `IfExists` wrapper if present.
@@ -236,7 +265,7 @@ fn unwrap_if_exists(op: &ConditionOperator) -> (bool, &ConditionOperator) {
 fn evaluate_single_value_condition(
     op: &ConditionOperator,
     context_values: &[&str],
-    policy_values: &[String],
+    policy_values: &[ConditionValue],
 ) -> bool {
     if is_negative_operator(op) {
         // Negative operators: context value must not match ANY policy value.
@@ -270,13 +299,19 @@ fn is_negative_operator(op: &ConditionOperator) -> bool {
 
 /// Compare a single context value against a single policy value.
 ///
-/// Returns `true` if the comparison holds for the given operator.
+/// Returns `true` if the comparison holds for the given operator. An
+/// unresolved policy value ([`ConditionValue::Unresolved`]) matches nothing:
+/// a positive operator is false and a negative operator true, the answer an
+/// absent key gets (measured for `StringEquals` and `StringNotEquals`).
 ///
 /// # Panics
 ///
 /// Does not panic. Returns `false` for set/wrapper operators that should
 /// have been handled by the caller.
-fn compare_single(op: &ConditionOperator, context_value: &str, policy_value: &str) -> bool {
+fn compare_single(op: &ConditionOperator, context_value: &str, value: &ConditionValue) -> bool {
+    let Some(policy_value) = value.text() else {
+        return is_negative_operator(op);
+    };
     match op {
         ConditionOperator::StringEquals => context_value == policy_value,
         ConditionOperator::StringNotEquals => context_value != policy_value,
@@ -286,8 +321,8 @@ fn compare_single(op: &ConditionOperator, context_value: &str, policy_value: &st
         ConditionOperator::StringNotEqualsIgnoreCase => {
             !context_value.eq_ignore_ascii_case(policy_value)
         }
-        ConditionOperator::StringLike => wildcard_match(policy_value, context_value),
-        ConditionOperator::StringNotLike => !wildcard_match(policy_value, context_value),
+        ConditionOperator::StringLike => value.wildcard_matches(context_value),
+        ConditionOperator::StringNotLike => !value.wildcard_matches(context_value),
         ConditionOperator::NumericEquals => parse_f64_cmp(context_value, policy_value, f64::eq),
         ConditionOperator::NumericNotEquals => {
             parse_f64_cmp(context_value, policy_value, |a, b| a != b)
@@ -321,8 +356,8 @@ fn compare_single(op: &ConditionOperator, context_value: &str, policy_value: &st
         ConditionOperator::Bool => context_value.eq_ignore_ascii_case(policy_value),
         ConditionOperator::ArnEquals => context_value == policy_value,
         ConditionOperator::ArnNotEquals => context_value != policy_value,
-        ConditionOperator::ArnLike => super::matcher::arn_match(policy_value, context_value),
-        ConditionOperator::ArnNotLike => !super::matcher::arn_match(policy_value, context_value),
+        ConditionOperator::ArnLike => value.arn_matches(context_value),
+        ConditionOperator::ArnNotLike => !value.arn_matches(context_value),
         // IpAddress matches only when the caller address and the policy range
         // are the same family and the address is in the range. NotIpAddress
         // matches only when they are the same family and the address is not in

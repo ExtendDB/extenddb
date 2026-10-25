@@ -508,7 +508,11 @@ enum ConditionOutcome {
 fn evaluate_conditions(stmt: &Value, context: &AssumeRoleContext) -> ConditionOutcome {
     let normalized = normalize_condition_scalars(&stmt["Condition"]);
     match parse_conditions(&normalized) {
-        Ok(conds) => match evaluate_statement_conditions(&conds, context) {
+        // Policy variables in trust-policy condition values are expanded
+        // whatever the document's `Version`, as before this evaluator took
+        // the document's choice; the identity-policy evaluator expands them
+        // only in a `2012-10-17` document.
+        Ok(conds) => match evaluate_statement_conditions(&conds, true, context) {
             ConditionMatch::Match => ConditionOutcome::Pass,
             ConditionMatch::NoMatch => ConditionOutcome::Fail,
             // A condition on a key STS populates but ExtendDB cannot resolve
