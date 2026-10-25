@@ -554,6 +554,30 @@ class TestSyntaxErrorWording:
             "FilterExpression", "and", "and and #v"
         )
 
+    def test_fault_at_the_first_token_keeps_leading_whitespace(self, dynamodb_client, table):
+        # Measured 2026-10-25: the window starts at the start of the expression.
+        for expr, token, near in [
+            ("  = #v = :v", "=", "  = #v"),
+            ("\t= #v = :v", "=", "\t= #v"),
+            ("  AND #v = :v", "AND", "  AND #v"),
+            ("= #v = :v", "=", "= #v"),
+        ]:
+            assert _validation(scan(dynamodb_client, table, expr)) == syntax(
+                "FilterExpression", token, near
+            ), expr
+        assert _validation(query(dynamodb_client, table, "  = pk = :v")) == syntax(
+            "KeyConditionExpression", "=", "  = pk"
+        )
+        msg = _validation(
+            lambda: dynamodb_client.get_item(
+                TableName=table,
+                Key={"pk": {"S": "p1"}, "sk": {"S": "s1"}},
+                ProjectionExpression="  , #v",
+                ExpressionAttributeNames=NAMES,
+            )
+        )
+        assert msg == syntax("ProjectionExpression", ",", "  , #v")
+
     def test_query_key_condition(self, dynamodb_client, table):
         # [d22], [d23]
         assert _validation(query(dynamodb_client, table, "pk = = :v")) == syntax(
