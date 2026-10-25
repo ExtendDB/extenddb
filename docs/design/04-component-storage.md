@@ -144,7 +144,9 @@ widen the three signatures again. The contract is what the read returns:
 with `true` the read reflects every write acknowledged before it started; with
 `false` it may miss recently acknowledged writes. A backend that serves every
 read from the copy that took the write meets both by ignoring the value, which
-every in-tree backend does today. A backend with followers can serve `false`
+the SQLite, PostgreSQL and MongoDB backends do today; the Cassandra backend
+reads at `ONE` against a keyspace whose replication factor defaults to 3, so
+it does not meet `true` (ADR-0024, Consequences; issue #560). A backend with followers can serve `false`
 from a follower (a streaming replica on PostgreSQL, where section 5.3 describes
 that routing as a proposal; a `secondaryPreferred` read selected per operation
 on MongoDB); a quorum backend needs read and write levels that intersect for
