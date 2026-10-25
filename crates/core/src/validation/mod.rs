@@ -1661,7 +1661,7 @@ pub fn validate_select_projection(
     }
     if matches!(select, Some(Select::AllProjectedAttributes)) && !has_index_name {
         return Err(DynamoDbError::ValidationException(
-            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName".to_owned(),
+            "1 validation error detected: ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName".to_owned(),
         ));
     }
     Ok(())
@@ -3457,7 +3457,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err.to_string(),
-            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName"
+            "1 validation error detected: ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName"
         );
         assert!(
             validate_select_projection(
