@@ -43,41 +43,14 @@ pub async fn handle_query(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
-    // Pre-scanned before typed deserialization, sequentially: Query stops at
-    // the FIRST invalid enum, checking ReturnConsumedCapacity ahead of Select.
-    // Measured 2026-08-24 (us-east-1): both invalid answers "1 validation
-    // error detected" naming returnConsumedCapacity alone. (Scan is the
-    // opposite on both counts: it aggregates, select-first; see handle_scan.)
-    crate::validate_enum_fields(
-        &body,
-        &[crate::EnumField {
-            json_name: "ReturnConsumedCapacity",
-            valid: &["INDEXES", "TOTAL", "NONE"],
-            clause: crate::EnumClause::Named("returnConsumedCapacity"),
-        }],
-    )?;
-    crate::validate_enum_fields(
-        &body,
-        &[crate::EnumField {
-            json_name: "Select",
-            valid: &[
-                "SPECIFIC_ATTRIBUTES",
-                "COUNT",
-                "ALL_ATTRIBUTES",
-                "ALL_PROJECTED_ATTRIBUTES",
-            ],
-            clause: crate::EnumClause::Named("select"),
-        }],
-    )?;
+    // Request-time checks on the raw body, in the service's order: Limit, the
+    // expression and non-expression parameter mix, the ReturnConsumedCapacity
+    // enum, every number in ExpressionAttributeValues, the Select enum. They
+    // run before typed deserialization so a field that does not deserialize
+    // does not stop the ones before it. The server runs the same function
+    // ahead of the IAM decision; see `query_key_values`.
+    crate::query_key_values::validate_query_request_body(&body)?;
     let input: QueryInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
-
-    // Request-time checks in the service's order: Limit, the expression and
-    // non-expression parameter mix, then every number in
-    // ExpressionAttributeValues (measured 2026-10-24: a Limit of 0 and a
-    // parameter mix are reported ahead of an N value that is not a number, and
-    // that value is reported ahead of a missing table or index). The server
-    // runs the same function ahead of the IAM decision; see `query_key_values`.
-    crate::query_key_values::validate_query_request_values(&input)?;
 
     // P118: Fetch key_info first so we can use table_id for index lookup.
     let key_info = ctx

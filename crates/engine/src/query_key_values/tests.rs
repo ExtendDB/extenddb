@@ -6,11 +6,11 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{
     ExpressionMaps, KeyCondition, parse_key_condition, tokenize_with_limit,
 };
-use extenddb_core::types::{AttributeDefinition, AttributeValue, QueryInput, ScalarAttributeType};
+use extenddb_core::types::{AttributeDefinition, AttributeValue, ScalarAttributeType};
 
 use super::{
     KEY_CONDITION_TYPE_MISMATCH, LIMIT_BELOW_ONE, validate_expression_attribute_value_numbers,
-    validate_key_condition_types, validate_query_request_values,
+    validate_key_condition_types, validate_query_request_body,
 };
 
 fn defs(pairs: &[(&str, ScalarAttributeType)]) -> Vec<AttributeDefinition> {
@@ -226,10 +226,6 @@ fn undefined_placeholder_and_undefined_attribute_are_left_to_other_checks() {
     assert!(validate_key_condition_types(&kc, &m, &defs(SS)).is_ok());
 }
 
-fn query(body: serde_json::Value) -> QueryInput {
-    serde_json::from_value(body).expect("QueryInput")
-}
-
 #[test]
 fn number_values_that_are_not_numbers_are_refused_with_the_bare_message() {
     let cases = [
@@ -339,7 +335,7 @@ fn request_time_checks_run_limit_then_mix_then_numbers() {
     let mut with_limit = bad_number.clone();
     with_limit["Limit"] = serde_json::json!(0);
     assert_eq!(
-        message(validate_query_request_values(&query(with_limit))).as_deref(),
+        message(validate_query_request_body(&with_limit)).as_deref(),
         Some(LIMIT_BELOW_ONE)
     );
 
@@ -348,7 +344,7 @@ fn request_time_checks_run_limit_then_mix_then_numbers() {
         "pk": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "x"}]}
     });
     assert_eq!(
-        message(validate_query_request_values(&query(with_mix))).as_deref(),
+        message(validate_query_request_body(&with_mix)).as_deref(),
         Some(
             "Can not use both expression and non-expression parameters in the same request: \
              Non-expression parameters: {KeyConditions} Expression parameters: {KeyConditionExpression}"
@@ -356,7 +352,7 @@ fn request_time_checks_run_limit_then_mix_then_numbers() {
     );
 
     assert_eq!(
-        message(validate_query_request_values(&query(bad_number))).as_deref(),
+        message(validate_query_request_body(&bad_number)).as_deref(),
         Some("The parameter cannot be converted to a numeric value: bob")
     );
 
@@ -375,7 +371,7 @@ fn request_time_checks_run_limit_then_mix_then_numbers() {
         }),
     ] {
         assert_eq!(
-            message(validate_query_request_values(&query(body))).as_deref(),
+            message(validate_query_request_body(&body)).as_deref(),
             Some("The parameter cannot be converted to a numeric value: bob")
         );
     }
@@ -391,5 +387,53 @@ fn request_time_checks_run_limit_then_mix_then_numbers() {
         "ExpressionAttributeValues": {":n": {"N": "5"}},
         "Limit": 1,
     });
-    assert!(validate_query_request_values(&query(legacy)).is_ok());
+    assert!(validate_query_request_body(&legacy).is_ok());
+}
+
+#[test]
+fn enum_checks_sit_on_either_side_of_the_numbers() {
+    // Measured 2026-10-24: an invalid ReturnConsumedCapacity is reported ahead
+    // of an N value that is not a number, and that value ahead of an invalid
+    // Select; a Limit of 0 and a parameter mix ahead of either enum.
+    let bad_number = serde_json::json!({
+        "TableName": "t",
+        "KeyConditionExpression": "pk = :u",
+        "ExpressionAttributeValues": {":u": {"N": "bob"}},
+    });
+    let mut rcc = bad_number.clone();
+    rcc["ReturnConsumedCapacity"] = serde_json::json!("bad");
+    assert_eq!(
+        message(validate_query_request_body(&rcc)).as_deref(),
+        Some(
+            "1 validation error detected: Value 'bad' at 'returnConsumedCapacity' failed to \
+             satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"
+        )
+    );
+    let mut select = bad_number.clone();
+    select["Select"] = serde_json::json!("bad");
+    assert_eq!(
+        message(validate_query_request_body(&select)).as_deref(),
+        Some("The parameter cannot be converted to a numeric value: bob")
+    );
+    for field in ["ReturnConsumedCapacity", "Select"] {
+        let mut limit = bad_number.clone();
+        limit[field] = serde_json::json!("bad");
+        limit["Limit"] = serde_json::json!(0);
+        assert_eq!(
+            message(validate_query_request_body(&limit)).as_deref(),
+            Some(LIMIT_BELOW_ONE),
+            "{field}"
+        );
+    }
+    // With the numbers valid, an invalid Select is still reported.
+    let mut only_select = serde_json::json!({
+        "TableName": "t",
+        "KeyConditionExpression": "pk = :u",
+        "ExpressionAttributeValues": {":u": {"S": "bob"}},
+    });
+    only_select["Select"] = serde_json::json!("bad");
+    assert!(
+        message(validate_query_request_body(&only_select))
+            .is_some_and(|m| m.contains("at 'select' failed to satisfy constraint"))
+    );
 }

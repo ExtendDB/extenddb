@@ -8,12 +8,13 @@ A ``KeyConditionExpression`` value is refused before any row is read when an
 value: <value>``) or when a key condition value's type is not the key
 attribute's ``AttributeDefinitions`` type (``One or more parameter values were
 invalid: Condition parameter type does not match schema type``). Every expected
-answer below was measured against the service on 2026-10-24 (15:10 UTC and
-21:00 UTC) on tables with S/S, S/N and B/B keys, a GSI and an LSI. The rows
-also pin where the two checks fall against the other Query checks: the numeric
-check after Limit and the expression parameter mix check and before the table
-lookup; the type check after the key schema, filter, projection, unused value
-and Select checks and before the ExclusiveStartKey check.
+answer below was measured against the service on 2026-10-24 (15:10, 21:00,
+21:06 and 23:42 UTC) on tables with S/S, S/N and B/B keys, a GSI and an LSI.
+The rows also pin where the two checks fall against the other Query checks:
+the numeric check after Limit, the expression parameter mix check and the
+ReturnConsumedCapacity enum, and before the Select enum and the table lookup;
+the type check after the key schema, filter, projection, unused value and
+Select checks and before the ExclusiveStartKey check.
 
 Dual-target: runs against the service and against extenddb with the same
 assertions. The LeadingKeys class needs the extenddb management API and is
@@ -180,6 +181,10 @@ SELECT_PROJECTION = (
     "1 validation error detected: Cannot specify the ProjectionExpression when choosing to "
     "get ALL_ATTRIBUTES"
 )
+RCC_MSG = (
+    "1 validation error detected: Value 'bad' at 'returnConsumedCapacity' failed to satisfy "
+    "constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"
+)
 V = "ValidationException"
 RNF = "ResourceNotFoundException"
 
@@ -334,6 +339,21 @@ ROWS = [
      kce("pk = :p", {":p": SX}, Limit=0, KeyConditions=LEGACY_PK), V, LIMIT_MSG),
     ("d6 Limit 0 with N bob and an undefined placeholder", "ss",
      kce("pk = :p AND sk = :zz", {":p": SX, ":n": NB}, Limit=0), V, LIMIT_MSG),
+    # The two enum checks against the numeric check, Limit and the mix.
+    ("f1 invalid Select with N bob", "ss", kce("pk = :u", {":u": NB}, Select="bad"), V, NUMERIC + "bob"),
+    ("f2 invalid ReturnConsumedCapacity with N bob", "ss",
+     kce("pk = :u", {":u": NB}, ReturnConsumedCapacity="bad"), V, RCC_MSG),
+    ("f3 invalid Select with Limit 0", "ss",
+     kce("pk = :u", {":u": {"S": "alice"}}, Select="bad", Limit=0), V, LIMIT_MSG),
+    ("f4 invalid ReturnConsumedCapacity with Limit 0", "ss",
+     kce("pk = :u", {":u": {"S": "alice"}}, ReturnConsumedCapacity="bad", Limit=0), V, LIMIT_MSG),
+    ("f5 invalid Select with KeyConditions and KeyConditionExpression", "ss",
+     kce("pk = :u", {":u": {"S": "alice"}}, Select="bad",
+         KeyConditions={"pk": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "alice"}]}}),
+     V, MIX_MSG),
+    ("f6 Limit -1 with N bob", "ss", kce("pk = :u", {":u": NB}, Limit=-1), V, LIMIT_MSG),
+    ("f7 Limit 0 with a type mismatch and N bob", "ss",
+     kce("pk = :u AND sk = :s", {":u": N5, ":s": NB}, Limit=0), V, LIMIT_MSG),
     # The other value types the earlier record covers.
     ("pk = BOOL", "ss", kce("pk = :u", {":u": {"BOOL": True}}), V, TYPE_MISMATCH),
     ("pk = N bob AND pk > S alice", "ss",
@@ -471,6 +491,9 @@ class TestLeadingKeysWithAnInvalidKeyValue:
             "pk = S bob, N bob unused": {
                 "TableName": table, "KeyConditionExpression": "pk = :u",
                 "ExpressionAttributeValues": {":u": {"S": "bob"}, ":n": NB}},
+            "pk = N bob, invalid Select": {
+                "TableName": table, "KeyConditionExpression": "pk = :u",
+                "ExpressionAttributeValues": {":u": NB}, "Select": "bad"},
         }
         failures = []
         clients = {label: self._client(self._fence(condition, table))

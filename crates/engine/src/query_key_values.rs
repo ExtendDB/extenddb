@@ -12,7 +12,7 @@
 //!    checked, whether the key condition, the filter or nothing reads it. The
 //!    check runs at request time, after the `Limit` check and the expression
 //!    and non-expression parameter mix check, and before the table is looked
-//!    up; see [`validate_query_request_values`];
+//!    up; see [`validate_query_request_body`];
 //! 2. a key condition value whose type is not the key attribute's
 //!    `AttributeDefinitions` type answers `One or more parameter values were
 //!    invalid: Condition parameter type does not match schema type`, on the
@@ -33,7 +33,8 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{
     Expr, ExpressionMaps, KeyCondition, PathElement, SortKeyCondition,
 };
-use extenddb_core::types::{AttributeDefinition, AttributeValue, QueryInput, ScalarAttributeType};
+use extenddb_core::types::{AttributeDefinition, AttributeValue, ScalarAttributeType};
+use serde_json::Value;
 
 /// The service's text for a key condition value of the wrong type.
 pub const KEY_CONDITION_TYPE_MISMATCH: &str = "One or more parameter values were invalid: Condition parameter type does not match schema type";
@@ -44,10 +45,18 @@ pub const LIMIT_BELOW_ONE: &str = "1 validation error detected: Value at 'Limit'
 /// The bare numeric message the number validator uses for an empty `N`.
 const EMPTY_NUMBER: &str = "The parameter cannot be converted to a numeric value";
 
-/// The `Query` checks that run on the request alone, before the table is
-/// looked up, in the service's order: `Limit`, the expression and
-/// non-expression parameter mix, then every number in
-/// `ExpressionAttributeValues`.
+/// The `Query` checks that run on the request body alone, before the body is
+/// deserialized and before the table is looked up, in the service's order:
+/// `Limit`, the expression and non-expression parameter mix, the
+/// `ReturnConsumedCapacity` enum, every number in `ExpressionAttributeValues`,
+/// then the `Select` enum (measured 2026-10-24: a `Limit` of 0 and a parameter
+/// mix are reported ahead of an invalid enum value of either field, an invalid
+/// `ReturnConsumedCapacity` ahead of an `N` value that is not a number, and
+/// that value ahead of an invalid `Select`).
+///
+/// The checks read the raw body, so a field that does not deserialize (an
+/// invalid `Select`, for one) does not stop the ones before it. A field of the
+/// wrong JSON shape is left to the deserializer, which runs next.
 ///
 /// The server runs the same function ahead of the IAM decision, so a principal
 /// whose `dynamodb:LeadingKeys` fence cannot bind a number that does not parse
@@ -57,8 +66,8 @@ const EMPTY_NUMBER: &str = "The parameter cannot be converted to a numeric value
 /// # Errors
 ///
 /// Returns `DynamoDbError::ValidationException` with the service's text.
-pub fn validate_query_request_values(input: &QueryInput) -> Result<(), DynamoDbError> {
-    if let Some(limit) = input.limit
+pub fn validate_query_request_body(body: &Value) -> Result<(), DynamoDbError> {
+    if let Some(limit) = body.get("Limit").and_then(Value::as_i64)
         && limit < 1
     {
         return Err(DynamoDbError::ValidationException(
@@ -66,36 +75,74 @@ pub fn validate_query_request_values(input: &QueryInput) -> Result<(), DynamoDbE
         ));
     }
 
-    let kce_present = input.key_condition_expression.is_some();
-    let has_kc = input.key_conditions.as_ref().is_some_and(|m| !m.is_empty());
-    let has_qf = input.query_filter.as_ref().is_some_and(|m| !m.is_empty());
-    let has_atg = input
-        .attributes_to_get
-        .as_ref()
-        .is_some_and(|a| !a.is_empty());
+    let kce_present = present(body, "KeyConditionExpression");
     // KeyConditions combines with FilterExpression and ProjectionExpression, so
     // it joins the mix check only when KeyConditionExpression is also present.
     extenddb_core::validation::validate_no_expression_param_mixing(
         &[
-            ("AttributesToGet", has_atg),
-            ("QueryFilter", has_qf),
-            ("ConditionalOperator", input.conditional_operator.is_some()),
-            ("KeyConditions", has_kc && kce_present),
+            ("AttributesToGet", non_empty(body, "AttributesToGet")),
+            ("QueryFilter", non_empty(body, "QueryFilter")),
+            ("ConditionalOperator", present(body, "ConditionalOperator")),
+            (
+                "KeyConditions",
+                non_empty(body, "KeyConditions") && kce_present,
+            ),
         ],
         &[
             (
                 "ProjectionExpression",
-                input.projection_expression.is_some(),
+                present(body, "ProjectionExpression"),
             ),
-            ("FilterExpression", input.filter_expression.is_some()),
+            ("FilterExpression", present(body, "FilterExpression")),
             ("KeyConditionExpression", kce_present),
         ],
     )?;
 
-    if let Some(values) = &input.expression_attribute_values {
-        validate_expression_attribute_value_numbers(values)?;
+    // Query stops at the first invalid enum, ReturnConsumedCapacity ahead of
+    // Select (measured 2026-08-24); the numbers sit between the two.
+    crate::validate_enum_fields(
+        body,
+        &[crate::EnumField {
+            json_name: "ReturnConsumedCapacity",
+            valid: &["INDEXES", "TOTAL", "NONE"],
+            clause: crate::EnumClause::Named("returnConsumedCapacity"),
+        }],
+    )?;
+
+    if let Some(raw) = body.get("ExpressionAttributeValues")
+        && let Ok(values) = serde_json::from_value::<HashMap<String, AttributeValue>>(raw.clone())
+    {
+        validate_expression_attribute_value_numbers(&values)?;
     }
-    Ok(())
+
+    crate::validate_enum_fields(
+        body,
+        &[crate::EnumField {
+            json_name: "Select",
+            valid: &[
+                "SPECIFIC_ATTRIBUTES",
+                "COUNT",
+                "ALL_ATTRIBUTES",
+                "ALL_PROJECTED_ATTRIBUTES",
+            ],
+            clause: crate::EnumClause::Named("select"),
+        }],
+    )
+}
+
+/// Whether `field` is in the body with a value other than `null`, as a typed
+/// `Option` field would deserialize to `Some`.
+fn present(body: &Value, field: &str) -> bool {
+    body.get(field).is_some_and(|v| !v.is_null())
+}
+
+/// Whether `field` is a non-empty JSON object or array in the body.
+fn non_empty(body: &Value, field: &str) -> bool {
+    match body.get(field) {
+        Some(Value::Object(map)) => !map.is_empty(),
+        Some(Value::Array(items)) => !items.is_empty(),
+        _ => false,
+    }
 }
 
 /// Refuse the first `N` value in `ExpressionAttributeValues` (including `NS`
