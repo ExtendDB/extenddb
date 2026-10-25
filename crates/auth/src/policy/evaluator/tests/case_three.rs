@@ -326,3 +326,45 @@ fn a_condition_value_naming_an_unresolvable_key_fails_closed_with_or_without_a_d
     assert_eq!(get_t_as_blue(&p, org("blue")), AuthzDecision::Deny);
     assert_eq!(get_t_as_blue(&p, org("red")), AuthzDecision::Allow);
 }
+
+#[test]
+fn a_2008_or_no_version_condition_value_naming_an_unresolvable_key_is_compared_as_written() {
+    // Only a `2012-10-17` document expands a condition value. Here the value
+    // is text and reads no key, so there is nothing to fail closed on, with or
+    // without a default: the Deny applies only to a caller whose tag is that
+    // text.
+    for (label, version) in [
+        ("2008-10-17", r#""Version":"2008-10-17","#),
+        ("no Version", ""),
+    ] {
+        for value in ["${aws:PrincipalOrgID}", "${aws:PrincipalOrgID, 'blue'}"] {
+            let deny = parse(&format!(
+                r#"{{{version}"Statement":[{{"Effect":"Deny","Action":"dynamodb:GetItem","Resource":"*",
+                    "Condition":{{"StringEquals":{{"aws:PrincipalTag/team":"{value}"}}}}}}]}}"#
+            ));
+            let p = [
+                only(r#"{"Effect":"Allow","Action":"dynamodb:*","Resource":"*"}"#),
+                deny,
+            ];
+            let unresolvable = || Ctx::empty().unresolvable("aws:PrincipalOrgID");
+            assert_eq!(
+                get_t_as_blue(&p, unresolvable()),
+                AuthzDecision::Allow,
+                "{label} {value}"
+            );
+            let tagged_with_the_text = unresolvable().with("aws:PrincipalTag/team", vec![value]);
+            assert_eq!(
+                evaluate_policies(
+                    &p,
+                    None,
+                    None,
+                    "dynamodb:GetItem",
+                    RES,
+                    &tagged_with_the_text
+                ),
+                AuthzDecision::Deny,
+                "{label} {value}"
+            );
+        }
+    }
+}

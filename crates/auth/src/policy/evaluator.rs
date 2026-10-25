@@ -102,7 +102,7 @@ pub fn explicit_deny_matches_arc(
                 stmt.effect == Effect::Deny
                     && action_matches(stmt, action)
                     && resource_matches(policy, stmt, resource_arn, context)
-                    && deny_conditions_apply(stmt, context)
+                    && deny_conditions_apply(policy, stmt, context)
             })
         })
 }
@@ -131,7 +131,7 @@ where
             if stmt.effect == Effect::Deny
                 && action_matches(stmt, action)
                 && resource_matches(policy, stmt, resource_arn, context)
-                && deny_conditions_apply(stmt, context)
+                && deny_conditions_apply(policy, stmt, context)
             {
                 return AuthzDecision::Deny;
             }
@@ -144,7 +144,7 @@ where
             stmt.effect == Effect::Allow
                 && action_matches(stmt, action)
                 && resource_matches(boundary, stmt, resource_arn, context)
-                && allow_conditions_grant(stmt, context)
+                && allow_conditions_grant(boundary, stmt, context)
         });
         if !boundary_allows {
             return AuthzDecision::Deny;
@@ -157,7 +157,7 @@ where
             stmt.effect == Effect::Allow
                 && action_matches(stmt, action)
                 && resource_matches(session, stmt, resource_arn, context)
-                && allow_conditions_grant(stmt, context)
+                && allow_conditions_grant(session, stmt, context)
         });
         if !session_allows {
             return AuthzDecision::Deny;
@@ -170,7 +170,7 @@ where
             if stmt.effect == Effect::Allow
                 && action_matches(stmt, action)
                 && resource_matches(policy, stmt, resource_arn, context)
-                && allow_conditions_grant(stmt, context)
+                && allow_conditions_grant(policy, stmt, context)
             {
                 return AuthzDecision::Allow;
             }
@@ -234,26 +234,44 @@ fn resource_matches(
     }
 }
 
-/// Outcome of a statement's `Condition` block, three-valued.
-fn statement_conditions(statement: &Statement, context: &impl ConditionContext) -> ConditionMatch {
-    evaluate_statement_conditions(&statement.conditions, context)
+/// Outcome of a statement's `Condition` block, three-valued. Policy variables
+/// in condition values are expanded only when `policy` is a `2012-10-17`
+/// document.
+fn statement_conditions(
+    policy: &PolicyDocument,
+    statement: &Statement,
+    context: &impl ConditionContext,
+) -> ConditionMatch {
+    evaluate_statement_conditions(
+        &statement.conditions,
+        policy.expands_policy_variables(),
+        context,
+    )
 }
 
 /// Whether a `Deny` applies: its conditions match, or depend on a key the
 /// service populates but the context cannot resolve (fail closed, so the Deny
 /// blocks rather than being silently dropped).
-fn deny_conditions_apply(statement: &Statement, context: &impl ConditionContext) -> bool {
+fn deny_conditions_apply(
+    policy: &PolicyDocument,
+    statement: &Statement,
+    context: &impl ConditionContext,
+) -> bool {
     matches!(
-        statement_conditions(statement, context),
+        statement_conditions(policy, statement, context),
         ConditionMatch::Match | ConditionMatch::Unresolvable
     )
 }
 
 /// Whether an `Allow` grants: its conditions definitely match. An unresolvable
 /// key does not grant (fail closed).
-fn allow_conditions_grant(statement: &Statement, context: &impl ConditionContext) -> bool {
+fn allow_conditions_grant(
+    policy: &PolicyDocument,
+    statement: &Statement,
+    context: &impl ConditionContext,
+) -> bool {
     matches!(
-        statement_conditions(statement, context),
+        statement_conditions(policy, statement, context),
         ConditionMatch::Match
     )
 }
