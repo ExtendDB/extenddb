@@ -64,7 +64,10 @@ pub fn tokenize_with_limit(input: &str, max_tokens: usize) -> Result<Vec<Token>,
     let bytes = input.as_bytes();
     let mut i = 0;
 
+    let mut prev_start: Option<usize> = None;
     while i < bytes.len() {
+        let tok_start = i;
+        let before = tokens.len();
         match bytes[i] {
             b' ' | b'\t' | b'\n' | b'\r' => i += 1,
             b'(' => {
@@ -178,15 +181,15 @@ pub fn tokenize_with_limit(input: &str, max_tokens: usize) -> Result<Vec<Token>,
                     max_tokens,
                 )?;
             }
-            other => {
-                let ch = other as char;
-                let near_start = i.saturating_sub(5);
-                let near_end = std::cmp::min(i + 5, input.len());
-                let near = &input[near_start..near_end];
+            _ => {
+                let (ch, near) = unknown_character(input, i, prev_start);
                 return Err(validation_err(&format!(
                     "Syntax error; token: \"{ch}\", near: \"{near}\""
                 )));
             }
+        }
+        if tokens.len() > before {
+            prev_start = Some(tok_start);
         }
     }
 
@@ -211,7 +214,10 @@ pub fn tokenize_for(
     let bytes = input.as_bytes();
     let mut i = 0;
 
+    let mut prev_start: Option<usize> = None;
     while i < bytes.len() {
+        let tok_start = i;
+        let before = tokens.len();
         match bytes[i] {
             b' ' | b'\t' | b'\n' | b'\r' => i += 1,
             b'(' => {
@@ -325,26 +331,14 @@ pub fn tokenize_for(
                 )?;
             }
             _ => {
-                // Safety: use chars() to safely extract the character at this
-                // byte position, avoiding panics on multi-byte UTF-8 input.
-                let ch = input[i..].chars().next().unwrap_or('?');
-                let ch_len = ch.len_utf8();
-                let near_end = std::cmp::min(i + ch_len + 1, input.len());
-                // Clamp near_end to a valid char boundary
-                let near_end = if near_end <= input.len() {
-                    let mut end = near_end;
-                    while end < input.len() && !input.is_char_boundary(end) {
-                        end += 1;
-                    }
-                    if end > input.len() { input.len() } else { end }
-                } else {
-                    input.len()
-                };
-                let near = &input[i..near_end];
+                let (ch, near) = unknown_character(input, i, prev_start);
                 return Err(DynamoDbError::ValidationException(format!(
                     "Invalid {kind}: Syntax error; token: \"{ch}\", near: \"{near}\""
                 )));
             }
+        }
+        if tokens.len() > before {
+            prev_start = Some(tok_start);
         }
     }
     Ok(tokens)
@@ -370,6 +364,55 @@ fn is_ident_start(c: u8) -> bool {
 
 fn is_ident_char(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_'
+}
+
+/// The token text and the `near` window the service reports for a character
+/// the expression grammar does not accept, at byte offset `at` of `input`.
+///
+/// Measured 2026-10-25 on FilterExpression, ConditionExpression,
+/// KeyConditionExpression, UpdateExpression and ProjectionExpression: the
+/// token is the character as sent (a whole code point, `é` or an emoji), and
+/// the window is the source text from the start of the previous token to the
+/// end of the next one, whitespace kept, each dropped when absent. Every
+/// character outside the grammar is a token of its own, so `#v = ééé` answers
+/// `token: "é", near: "= éé"`, and a name stops at the first such character,
+/// so `abéc = :v` answers `near: "abéc"`.
+///
+/// `prev_start` is the byte offset where the previous token starts.
+fn unknown_character(input: &str, at: usize, prev_start: Option<usize>) -> (String, String) {
+    let ch = input[at..].chars().next().unwrap_or('?');
+    let after = at + ch.len_utf8();
+    let end = next_token_end(input, after).unwrap_or(after);
+    let start = prev_start.unwrap_or(at);
+    (ch.to_string(), input[start..end].to_owned())
+}
+
+/// The byte offset where the next token after `from` ends, skipping the
+/// tokenizer's whitespace, or `None` at the end of input. Mirrors the token
+/// rules of [`tokenize_with_limit`], with a character outside the grammar
+/// counted as one token.
+fn next_token_end(input: &str, from: usize) -> Option<usize> {
+    let bytes = input.as_bytes();
+    let mut i = from;
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r') {
+        i += 1;
+    }
+    let first = *bytes.get(i)?;
+    let run = |mut j: usize, pred: fn(u8) -> bool| {
+        while j < bytes.len() && pred(bytes[j]) {
+            j += 1;
+        }
+        j
+    };
+    Some(match first {
+        b'<' if matches!(bytes.get(i + 1), Some(b'>' | b'=')) => i + 2,
+        b'>' if bytes.get(i + 1) == Some(&b'=') => i + 2,
+        b'(' | b')' | b'[' | b']' | b',' | b'.' | b'+' | b'-' | b'=' | b'<' | b'>' => i + 1,
+        b'#' | b':' => run(i + 1, is_ident_char),
+        c if is_ident_start(c) => run(i, is_ident_char),
+        c if c.is_ascii_digit() => run(i, |b| b.is_ascii_digit()),
+        _ => i + input[i..].chars().next().map_or(1, char::len_utf8),
+    })
 }
 
 fn keyword_or_ident(word: &str) -> Token {
@@ -585,5 +628,52 @@ mod tests {
         assert!(
             matches!(err, DynamoDbError::ValidationException(ref msg) if msg.contains("Syntax error"))
         );
+    }
+
+    /// The token and window the service reports for a character outside the
+    /// grammar (measured 2026-10-25), as `(expression, token, near)`.
+    const UNKNOWN_CHARACTER_ROWS: &[(&str, &str, &str)] = &[
+        ("#v = ééé", "é", "= éé"),
+        ("#v = é", "é", "= é"),
+        ("é = :v", "é", "é ="),
+        ("#v = :v AND é", "é", "AND é"),
+        ("#v = é #v", "é", "= é #v"),
+        ("#v = 日本語", "日", "= 日本"),
+        ("#v = 😀x", "😀", "= 😀x"),
+        ("#v = $x", "$", "= $x"),
+        ("#v = @", "@", "= @"),
+        ("#v = aé", "é", "aé"),
+        ("abéc = :v", "é", "abéc"),
+        ("#longname = é", "é", "= é"),
+        ("#v = é é", "é", "= é é"),
+        ("(#v = é)", "é", "= é)"),
+        ("contains(#v, é)", "é", ", é)"),
+        ("#v = :v !", "!", ":v !"),
+        ("#v =\té", "é", "=\té"),
+        ("#v =é", "é", "=é"),
+        ("pk = :v AND é", "é", "AND é"),
+        ("SET #v = éé", "é", "= éé"),
+        ("#v, $x", "$", ", $x"),
+    ];
+
+    #[test]
+    fn unknown_character_reports_the_character_and_the_service_window() {
+        for (expr, token, near) in UNKNOWN_CHARACTER_ROWS {
+            let expected = format!("Syntax error; token: \"{token}\", near: \"{near}\"");
+            let Err(DynamoDbError::ValidationException(msg)) = tokenize(expr) else {
+                panic!("{expr}: expected a syntax error");
+            };
+            assert_eq!(msg, expected, "{expr}");
+            let Err(DynamoDbError::ValidationException(msg)) =
+                tokenize_for(expr, 4096, super::super::ExpressionKind::Filter)
+            else {
+                panic!("{expr}: expected a syntax error");
+            };
+            assert_eq!(
+                msg,
+                format!("Invalid FilterExpression: {expected}"),
+                "{expr}"
+            );
+        }
     }
 }
