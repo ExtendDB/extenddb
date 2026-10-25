@@ -58,6 +58,13 @@ pub(crate) async fn handle_request(
         );
     };
 
+    // A thin binary's observer receives one record per request that reached
+    // authentication. The body hash is taken from the raw bytes before they
+    // are parsed, and only when an observer is installed; with none, nothing
+    // below allocates for a record.
+    let observing = state.request_observer.is_some();
+    let record_body_hash = observing.then(|| crate::extensions::body_hash(body.as_ref()));
+
     // Extract operation from X-Amz-Target
     let operation = match extract_operation(&headers) {
         Ok(op) => op,
@@ -95,6 +102,37 @@ pub(crate) async fn handle_request(
     // the request makes and to the engine's error mappers, so a fault log line
     // can name the x-amzn-RequestId the client received. The early returns
     // above touch no storage and the response building below runs outside it.
+    // One record per observed request, built here once with everything known
+    // before authentication. The guard holds it: if the client goes away
+    // while the request is in flight, hyper drops this future and the guard's
+    // Drop reports the record with status 0. On the normal path the guard
+    // hands the record back, the exit completes it (account, status, error
+    // type, latency) and reports it once.
+    let mut abandon_guard = state
+        .request_observer
+        .as_ref()
+        .map(|observer| AbandonGuard {
+            observer: Arc::clone(observer),
+            record: Some(crate::extensions::RequestRecord {
+                request_id: request_id.clone(),
+                operation: operation.clone(),
+                table_name: extract_table_name(&input),
+                account_id: None,
+                status: 0,
+                error_type: None,
+                latency_us: 0,
+                body_hash: record_body_hash.unwrap_or_default(),
+                sdk_invocation_id: header_string(&headers, "amz-sdk-invocation-id"),
+                sdk_request: header_string(&headers, "amz-sdk-request"),
+            }),
+            started: handler_start,
+        });
+    let served = extenddb_storage::request_scope::with_scope(
+        request_scope_for(&request_id, &operation, &headers),
+        serve_request(&state, &headers, &body, peer_addr, &operation, input),
+    )
+    .await;
+    let mut record = abandon_guard.as_mut().and_then(AbandonGuard::disarm);
     let Served {
         account_id,
         table_name,
@@ -104,18 +142,30 @@ pub(crate) async fn handle_request(
         authz_us,
         throttle_us,
         dispatch_us,
-    } = match extenddb_storage::request_scope::with_scope(
-        request_scope_for(&request_id, &operation, &headers),
-        serve_request(&state, &headers, &body, peer_addr, &operation, input),
-    )
-    .await
-    {
+    } = match served {
         Ok(served) => served,
-        Err(e) => return error_response(&e, &request_id),
+        Err(refused) => {
+            // A refusal before dispatch (authentication, authorization or
+            // the throttle) is observed too: the operation and table are
+            // known and the error names the cause, and a throttle report that
+            // could not see throttled requests would be wrong about retries.
+            let response = error_response(&refused.error, &request_id);
+            if let (Some(observer), Some(mut record)) =
+                (state.request_observer.as_ref(), record.take())
+            {
+                record.account_id = refused.account_id;
+                record.status = response.status().as_u16();
+                record.error_type = Some(refused.error.error_type().to_owned());
+                record.latency_us = elapsed_us(handler_start);
+                observer.on_response(record);
+            }
+            return response;
+        }
     };
 
     // --- Response segment ---
     let response_start = std::time::Instant::now();
+    let mut record_error_type = None;
     let response = match dispatch_result {
         Ok(result) => {
             update_throttle_buckets(
@@ -169,6 +219,9 @@ pub(crate) async fn handle_request(
         }
         Err(e) => {
             record_error_metrics(&state.metrics, &e, table_name.as_deref(), &operation);
+            if observing {
+                record_error_type = Some(e.error_type().to_owned());
+            }
             error_response(&e, &request_id)
         }
     };
@@ -209,7 +262,62 @@ pub(crate) async fn handle_request(
         "request complete"
     );
 
+    // The observed exit for every request that reached dispatch.
+    if let (Some(observer), Some(mut record)) = (state.request_observer.as_ref(), record.take()) {
+        record.account_id = Some(account_id.to_string());
+        record.status = response.status().as_u16();
+        record.error_type = record_error_type;
+        record.latency_us = elapsed_us(handler_start);
+        observer.on_response(record);
+    }
+
     response
+}
+
+/// Microseconds since `start`, saturating.
+fn elapsed_us(start: std::time::Instant) -> u64 {
+    u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+/// Holds the one record of an observed request while `serve_request` runs.
+/// If the handler future is dropped before its normal exit (the client went
+/// away while the request was in flight), `Drop` reports the record with
+/// status 0, so a record of attempts includes the request the client gave up
+/// on. On the normal path `disarm` hands the record back for the exit to
+/// complete and report. A handler that panics drops the guard during
+/// unwinding; the observer is not called then, since a panic in the observer
+/// at that point would abort the process.
+struct AbandonGuard {
+    observer: Arc<dyn crate::extensions::RequestObserver>,
+    record: Option<crate::extensions::RequestRecord>,
+    started: std::time::Instant,
+}
+
+impl AbandonGuard {
+    fn disarm(&mut self) -> Option<crate::extensions::RequestRecord> {
+        self.record.take()
+    }
+}
+
+impl Drop for AbandonGuard {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        if let Some(mut record) = self.record.take() {
+            record.latency_us = elapsed_us(self.started);
+            self.observer.on_response(record);
+        }
+    }
+}
+
+/// A refusal before dispatch, with the account authentication had produced
+/// when it had. The table name is on the record already, from the parsed
+/// body; there is no `From` for the bare error, so every refusal site states
+/// the account.
+struct Refused {
+    error: DynamoDbError,
+    account_id: Option<String>,
 }
 
 /// What the request produced between authentication and the end of dispatch:
@@ -227,9 +335,10 @@ struct Served {
 
 /// Authenticate, authorize, throttle and dispatch one request. Every storage
 /// read the request makes happens here, so `handle_request` runs this whole
-/// future inside the request scope. A refusal before dispatch returns `Err`;
-/// a dispatch error is inside `Served::dispatch_result`, because the response
-/// segment accounts for it differently.
+/// future inside the request scope. A refusal before dispatch returns `Err`
+/// with the account the refusal had resolved; a dispatch error is inside
+/// `Served::dispatch_result`, because the response segment accounts for it
+/// differently.
 #[allow(clippy::too_many_lines)] // sequential request pipeline
 async fn serve_request(
     state: &Arc<AppState>,
@@ -238,10 +347,17 @@ async fn serve_request(
     peer_addr: std::net::SocketAddr,
     operation: &str,
     input: Value,
-) -> Result<Served, DynamoDbError> {
+) -> Result<Served, Refused> {
     // --- Auth segment ---
     let auth_start = std::time::Instant::now();
-    let identity = state.auth.authenticate(headers, body).await?;
+    let identity = state
+        .auth
+        .authenticate(headers, body)
+        .await
+        .map_err(|error| Refused {
+            error,
+            account_id: None,
+        })?;
     #[allow(clippy::cast_precision_loss)]
     let auth_us = auth_start.elapsed().as_micros() as f64;
 
@@ -258,9 +374,12 @@ async fn serve_request(
     {
         if state.catalog_store.is_none() {
             tracing::error!("Authorization required but catalog_store is not configured");
-            return Err(DynamoDbError::AccessDeniedException(
-                "User: is not authorized to perform this operation".to_owned(),
-            ));
+            return Err(Refused {
+                error: DynamoDbError::AccessDeniedException(
+                    "User: is not authorized to perform this operation".to_owned(),
+                ),
+                account_id: Some(account_id.to_string()),
+            });
         }
         // aws:SourceIp is the connection peer address; aws:UserAgent is the
         // User-Agent header. Behind a proxy only the peer address is trusted,
@@ -279,7 +398,11 @@ async fn serve_request(
             Some(source_ip.as_str()),
             user_agent.as_deref(),
         )
-        .await?;
+        .await
+        .map_err(|error| Refused {
+            error,
+            account_id: Some(account_id.to_string()),
+        })?;
     }
     #[allow(clippy::cast_precision_loss)]
     let authz_us = authz_start.elapsed().as_micros() as f64;
@@ -364,7 +487,10 @@ async fn serve_request(
             let table_arn = extenddb_core::validation::validate_table_name_chars(&name)
                 .is_ok()
                 .then(|| extenddb_storage::util::table_arn(&state.region, &ctx.account_id, &name));
-            return Err(throttle_error(cause, throttled_read, table_arn));
+            return Err(Refused {
+                error: throttle_error(cause, throttled_read, table_arn),
+                account_id: Some(ctx.account_id.to_string()),
+            });
         }
     }
     #[allow(clippy::cast_precision_loss)]
@@ -446,6 +572,10 @@ fn header_string(headers: &HeaderMap, name: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+mod observer_tests;
+#[cfg(test)]
 mod request_scope_tests;
+#[cfg(test)]
+mod start_server_tests;
 #[cfg(test)]
 mod throttle_wire_tests;

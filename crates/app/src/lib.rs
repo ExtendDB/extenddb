@@ -21,6 +21,19 @@
 //!     })
 //! }
 //! ```
+//!
+//! A backend that adds HTTP routes or a per-request observer calls
+//! [`run_with`] with an [`Extensions`] value; [`run`] is the same call with the
+//! empty default:
+//!
+//! ```ignore
+//! extenddb_app::run_with(
+//!     build,
+//!     extenddb_app::Extensions::default()
+//!         .with_router("/_mybackend/status", status_router())
+//!         .with_request_observer(my_observer),
+//! )
+//! ```
 
 mod cmd_catalog_check;
 mod cmd_destroy;
@@ -47,6 +60,16 @@ use clap::{Parser, Subcommand};
 /// console version string) and re-exported here so a thin `main` only needs the
 /// `extenddb-app` dependency.
 pub use extenddb_server::BuildInfo;
+
+/// A thin binary's extension points, re-exported from `extenddb-server` so a
+/// thin `main` needs only the `extenddb-app` dependency to use them. Pass an
+/// [`Extensions`] to [`run_with`]; [`run`] uses the empty default.
+pub use extenddb_server::{Extensions, RequestObserver, RequestRecord};
+
+/// The `axum` the server is built with, so a thin binary builds its
+/// [`Extensions::http`] routers against the same `Router` type without naming
+/// the version itself.
+pub use extenddb_server::axum;
 
 #[derive(Parser)]
 #[command(name = "extenddb", about = "ExtendDB — DynamoDB-compatible API server")]
@@ -90,12 +113,28 @@ enum Command {
 /// Parse the command line and dispatch the selected subcommand.
 ///
 /// The backend must already be installed via
-/// [`extenddb_storage::set_backend`] before this is called.
+/// [`extenddb_storage::set_backend`] before this is called. The same as
+/// [`run_with`] with the empty [`Extensions::default`].
 ///
 /// # Errors
 ///
 /// Returns any error produced by the selected subcommand.
 pub fn run(build: BuildInfo) -> anyhow::Result<()> {
+    run_with(build, Extensions::default())
+}
+
+/// Parse the command line and dispatch the selected subcommand, handing a thin
+/// binary's [`Extensions`] to the `serve` subcommand.
+///
+/// The backend must already be installed via
+/// [`extenddb_storage::set_backend`] before this is called. Every subcommand
+/// other than `serve` ignores the extensions, so a binary that passes routers
+/// or an observer keeps the full command line.
+///
+/// # Errors
+///
+/// Returns any error produced by the selected subcommand.
+pub fn run_with(build: BuildInfo, extensions: Extensions) -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     if cli.version {
@@ -104,7 +143,7 @@ pub fn run(build: BuildInfo) -> anyhow::Result<()> {
     }
 
     match cli.command.unwrap_or(Command::Version) {
-        Command::Serve(args) => cmd_serve::run(&args, build),
+        Command::Serve(args) => cmd_serve::run(&args, build, extensions),
         Command::Init(args) => {
             let code = run_interactive(cmd_init::run(args))?;
             if code != 0 {
