@@ -263,3 +263,66 @@ fn test_attribute_type() {
     let filter = condition_to_filter(&expr, &maps).unwrap();
     assert_eq!(filter, doc! { "item_data.field.S": { "$exists": true } });
 }
+
+fn path(elements: &[&str]) -> Expr {
+    Expr::Path(
+        elements
+            .iter()
+            .map(|e| match e.parse::<usize>() {
+                Ok(i) => PathElement::Index(i),
+                Err(_) => PathElement::Attribute((*e).to_string()),
+            })
+            .collect(),
+    )
+}
+
+fn exists(elements: &[&str]) -> Document {
+    let maps = make_maps(vec![("m", "m"), ("k", "k")], vec![]);
+    let expr = Expr::Function {
+        name: "attribute_exists".to_string(),
+        args: vec![path(elements)],
+    };
+    condition_to_filter(&expr, &maps).unwrap()
+}
+
+#[test]
+fn map_members_and_list_elements_use_the_typed_fields() {
+    // A map member sits under the map's `M` field and a list element under
+    // the list's `L` field, as `item_to_document` stores them.
+    assert_eq!(
+        exists(&["#m", "#k"]),
+        doc! { "item_data.m.M.k": { "$exists": true } }
+    );
+    assert_eq!(
+        exists(&["m", "mm", "k"]),
+        doc! { "item_data.m.M.mm.M.k": { "$exists": true } }
+    );
+    assert_eq!(
+        exists(&["l", "0", "k"]),
+        doc! { "item_data.l.L.0.M.k": { "$exists": true } }
+    );
+    assert_eq!(
+        exists(&["m", "n", "1"]),
+        doc! { "item_data.m.M.n.L.1": { "$exists": true } }
+    );
+    assert_eq!(
+        exists(&["l", "0"]),
+        doc! { "item_data.l.L.0": { "$exists": true } }
+    );
+    assert_eq!(exists(&["m"]), doc! { "item_data.m": { "$exists": true } });
+}
+
+#[test]
+fn comparison_on_a_map_member_uses_the_typed_field() {
+    let maps = make_maps(
+        vec![("m", "m"), ("k", "k")],
+        vec![(":v", AttributeValue::S("inner".to_string()))],
+    );
+    let expr = Expr::Compare {
+        left: Box::new(path(&["#m", "#k"])),
+        op: CompareOp::Eq,
+        right: Box::new(Expr::Placeholder(":v".to_string())),
+    };
+    let filter = condition_to_filter(&expr, &maps).unwrap();
+    assert_eq!(filter, doc! { "item_data.m.M.k.S": "inner" });
+}

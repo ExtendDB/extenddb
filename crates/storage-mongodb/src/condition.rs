@@ -22,14 +22,17 @@ pub fn condition_to_filter(expr: &Expr, maps: &ExpressionMaps) -> Result<Documen
 
 /// Resolve a path to the `MongoDB` field path within `item_data`.
 ///
-/// `DynamoDB` paths like `address.city` or `tags[0]` become
-/// `item_data.address.city` or `item_data.tags.L.0` in `MongoDB`.
+/// `item_data` holds each attribute value in its typed form, so a map's
+/// members sit under its `M` field and a list's elements under its `L` field.
+/// `DynamoDB` paths like `address.city`, `tags[0]` or `tags[0].name` become
+/// `item_data.address.M.city`, `item_data.tags.L.0` or
+/// `item_data.tags.L.0.M.name` in `MongoDB`.
 fn resolve_path_to_field(
     elements: &[PathElement],
     maps: &ExpressionMaps,
 ) -> Result<String, StorageError> {
     let mut parts = vec!["item_data".to_string()];
-    for elem in elements {
+    for (position, elem) in elements.iter().enumerate() {
         match elem {
             PathElement::Attribute(name) => {
                 let resolved = if let Some(stripped) = name.strip_prefix('#') {
@@ -39,6 +42,11 @@ fn resolve_path_to_field(
                 } else {
                     name.clone()
                 };
+                // A member name after the top-level attribute is a key of
+                // the enclosing map.
+                if position > 0 {
+                    parts.push("M".to_string());
+                }
                 parts.push(resolved);
             }
             PathElement::Index(idx) => {
