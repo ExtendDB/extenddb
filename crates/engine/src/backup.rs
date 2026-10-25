@@ -999,7 +999,7 @@ pub(crate) async fn handle_restore_table_from_backup(
 /// drops only the wait, so the restore is not cancelled part-way. Without
 /// this, a disconnect while the backup was being read (step 4 below) dropped
 /// the request before the backend registered the restore, and no restore ran.
-async fn restore_table_from_backup_detached<S, F, Fut>(
+pub(crate) async fn restore_table_from_backup_detached<S, F, Fut>(
     storage: Arc<S>,
     account_id: Arc<str>,
     region: Arc<str>,
@@ -1012,12 +1012,20 @@ where
     F: FnOnce(Arc<str>, String) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send,
 {
-    tokio::spawn(async move {
-        let (target_table_name, response) =
-            restore_table_from_backup(&*storage, &account_id, &region, &limits, &body).await?;
-        after(account_id, target_table_name).await;
-        Ok(response)
-    })
+    // The restore runs in a task of its own so a client disconnect does not
+    // cancel it part-way. A spawned task does not inherit the request scope,
+    // so it is carried across by hand: the task's fault lines then name the
+    // request id the client received.
+    let scope = extenddb_storage::request_scope::current();
+    tokio::spawn(extenddb_storage::request_scope::with_scope_opt(
+        scope,
+        async move {
+            let (target_table_name, response) =
+                restore_table_from_backup(&*storage, &account_id, &region, &limits, &body).await?;
+            after(account_id, target_table_name).await;
+            Ok(response)
+        },
+    ))
     .await
     .map_err(|e| {
         tracing::error!("RestoreTableFromBackup task failed: {e}");
@@ -1282,7 +1290,7 @@ pub(crate) fn storage_err_to_dynamo(e: StorageError) -> DynamoDbError {
         // the catch-all that reports a storage fault.
         StorageError::Service(e) => e,
         other => {
-            tracing::error!(internal_error = %other, "backup storage error");
+            log_storage_fault!(other, "backup storage error");
             DynamoDbError::InternalServerError("Internal server error".to_owned())
         }
     }

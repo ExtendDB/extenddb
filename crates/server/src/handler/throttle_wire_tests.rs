@@ -54,7 +54,15 @@ fn cache_cfg(name: &'static str) -> extenddb_cache::SwrCacheConfig {
 /// catalog, the stub auth bound to the default account, throttling on, and
 /// `dev_mode` on. Returns the state and the account id the stub answers with,
 /// so the expected ARN can be formed.
-async fn build_state() -> (Arc<AppState>, String) {
+pub(super) async fn build_state() -> (Arc<AppState>, String) {
+    build_state_with(|account_id| Arc::new(StubAuth { account_id })).await
+}
+
+/// `build_state` with the auth provider built by `auth` from the bootstrapped
+/// default account id, for a test that needs its own provider.
+pub(super) async fn build_state_with(
+    auth: impl FnOnce(String) -> Arc<dyn AuthProvider>,
+) -> (Arc<AppState>, String) {
     let _ = extenddb_storage::set_backend(extenddb_storage_sqlite::backend());
     let config = extenddb_storage_sqlite::SqliteConfig {
         path: ":memory:".to_owned(),
@@ -98,9 +106,7 @@ async fn build_state() -> (Arc<AppState>, String) {
 
     let state = Arc::new(AppState {
         storage: components.engine,
-        auth: Arc::new(StubAuth {
-            account_id: account_id.clone(),
-        }),
+        auth: auth(account_id.clone()),
         throttle,
         limits,
         region: Arc::from("us-east-1"),
@@ -121,7 +127,7 @@ async fn build_state() -> (Arc<AppState>, String) {
     (state, account_id)
 }
 
-async fn call(state: &Arc<AppState>, operation: &str, body: Value) -> (u16, Value) {
+pub(super) async fn call(state: &Arc<AppState>, operation: &str, body: Value) -> (u16, Value) {
     let mut headers = HeaderMap::new();
     headers.insert(
         "x-amz-target",
