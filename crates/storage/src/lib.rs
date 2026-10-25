@@ -603,13 +603,19 @@ pub trait StreamEngine: Send + Sync {
 
     /// Read stream records from a shard starting after a sequence number.
     ///
-    /// `account_id` is the authenticated caller's account. Implementations MUST
-    /// return records only for shards whose backing table belongs to that
-    /// account; a shard whose table belongs to a different account must yield no
-    /// records, so a shard iterator only reads its owning account's stream data.
+    /// `stream_arn` is the stream the shard iterator was issued for, and the
+    /// resource the request was authorized against. Implementations MUST
+    /// resolve the shard against the table and stream label that ARN names,
+    /// scoped to `account_id`, in the same round trip as the records read, and
+    /// return `StorageError::TableNotFound` with the message
+    /// `Requested resource not found: Stream: <arn> not found.` when the
+    /// stream does not exist for that account or the shard is not one of that
+    /// stream's shards. A shard of another table, another account, or an
+    /// earlier stream label on the same table therefore yields no records.
     fn get_stream_records(
         &self,
         account_id: &str,
+        stream_arn: &str,
         shard_id: &str,
         after_sequence: Option<&str>,
         limit: i64,

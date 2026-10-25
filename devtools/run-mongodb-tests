@@ -249,6 +249,17 @@ fi
 # ---------------------------------------------------------------------------
 
 echo ""
+if [[ " ${RUN_TESTS_ARGS[*]} " == *" --rust"* ]]; then
+    # The storage-level MongoDB tests that need a live server (the stream
+    # records page over 16 MB and the shard ownership predicates) are
+    # #[ignore]d in the crate and read their server from this variable; this
+    # container is the one place in CI that has one.
+    echo "=== Running MongoDB storage-level live tests (records_live) ==="
+    echo ""
+    EXTENDDB_TEST_MONGODB_URI="mongodb://localhost:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
+        cargo test -p extenddb-storage-mongodb --lib -- --ignored records_live
+    echo ""
+fi
 echo "=== Running test suite via devtools/run-tests --backend mongodb ==="
 echo "  passthrough args: ${RUN_TESTS_ARGS[*]}"
 echo ""

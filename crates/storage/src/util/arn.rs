@@ -90,6 +90,20 @@ pub fn parse_stream_arn(arn: &str) -> Result<(String, String), StorageError> {
     }
 }
 
+/// The error a stream operation returns when the stream ARN names no stream of
+/// the caller's account, or a shard that is not one of that stream's shards.
+/// `describe_stream`, `validate_shard` and `get_stream_records` on every
+/// backend answer with this same text, so a shard iterator that pairs an
+/// authorized stream ARN with another stream's shard gets the same answer
+/// whichever path checks it. Measured on `DescribeStream` 2026-10-24: no
+/// trailing period.
+#[must_use]
+pub fn stream_not_found(stream_arn: &str) -> StorageError {
+    StorageError::TableNotFound(format!(
+        "Requested resource not found: Stream: {stream_arn} not found"
+    ))
+}
+
 #[cfg(test)]
 mod stream_label_tests {
     use super::format_stream_label;

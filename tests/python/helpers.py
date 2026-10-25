@@ -71,3 +71,10 @@ def wait_for_deleted(client, table_name: str, timeout: float = 60.0) -> None:
 def unique_name(prefix: str = "test") -> str:
     """Generate a unique name for test isolation."""
     return f"{prefix}-{uuid.uuid4().hex[:12]}"
+
+
+def stream_not_found_message(stream_arn: str) -> str:
+    """The sentence a streams call answers for a stream ARN that names no stream
+    of the caller's account, or a shard that is not that stream's (measured on
+    DescribeStream 2026-10-24: no trailing period)."""
+    return f"Requested resource not found: Stream: {stream_arn} not found"
