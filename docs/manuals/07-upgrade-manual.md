@@ -319,6 +319,54 @@ Catalog upgrades change the schema; behavior changes alter how the running serve
 interprets existing data or configuration. Review these before upgrading a live
 deployment, even when no catalog migration is required.
 
+### Cassandra: reads with `ConsistentRead: true` and every item write need a local quorum
+
+**What changed.** The Cassandra backend now reads with `ConsistentRead: true`
+(GetItem, Query, Scan, and each table of a BatchGetItem that asks for it) at
+`LOCAL_QUORUM` and with `ConsistentRead: false` at `LOCAL_ONE`, and every write
+of item data is acknowledged at `LOCAL_QUORUM`; conditional writes run their
+Paxos round at `LOCAL_SERIAL`. The export scan, the global secondary index
+backfill and the reads that decide a write also read at `LOCAL_QUORUM`. Before
+this release these reads and writes ran at the driver default, `ONE`, so with a
+replication factor above 1 a `ConsistentRead: true` read could return an item
+as it was before a write the client had seen succeed (issue #560, ADR-0025).
+Catalog and queue reads still read one replica.
+
+**Who is affected.** Every Cassandra deployment whose keyspaces have a
+replication factor above 1. A local quorum is `replication_factor / 2 + 1`
+replicas in the datacenter named by `datacenter`: two of three at the default
+of 3.
+
+- A `ConsistentRead: true` read, an export, and a DeleteItem of an item that
+  does not exist now need a local quorum up, where one replica answered before.
+  With fewer replicas up the request fails with HTTP 500
+  `InternalServerError`, and the server logs the driver error: "Cannot achieve
+  consistency level LOCAL_QUORUM" on a cluster, "No nodes available in query
+  plan!" on a single node. A `ConsistentRead: false` read still needs one
+  replica.
+- PutItem, UpdateItem, DeleteItem of an existing item and TransactWriteItems
+  already needed a quorum for their Paxos round. Their commit now waits for a
+  local quorum to acknowledge it instead of one replica, which adds the time of
+  the second acknowledgement to each write.
+- A single node whose keyspaces were created at replication factor 3 refuses
+  every `ConsistentRead: true` read, as it already refused PutItem and
+  UpdateItem. A configuration file without `replication_factor` uses 3.
+- Every keyspace replicates to the one datacenter named by `datacenter`, and
+  the driver sends statements to every node it discovers. A coordinator in a
+  datacenter that holds no replica refuses `LOCAL_QUORUM` and `LOCAL_ONE`
+  statements, and the driver retries once on the next node. Run ExtendDB
+  against contact points whose peers are all in `datacenter`.
+
+**Migration.** No catalog migration is required. Before upgrading:
+
+- On a single node, set `replication_factor = 1`. The setting applies only to
+  keyspaces created after it changes, so lower each existing keyspace whose
+  name starts with `<keyspace_prefix>_` (the catalog keyspace and one keyspace
+  per account):
+  `ALTER KEYSPACE <keyspace> WITH replication = {'class': 'NetworkTopologyStrategy', '<datacenter>': 1};`
+- On a cluster at replication factor 3, keep two replicas of every token range
+  up in `datacenter`: take one node down at a time.
+
 ### v0.1.14 LeadingKeys now enforced on Query, batch and transaction operations
 
 **What changed.** `dynamodb:LeadingKeys` is now evaluated on `Query`,

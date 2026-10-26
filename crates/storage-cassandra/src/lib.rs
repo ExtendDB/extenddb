@@ -7,6 +7,12 @@
 //! as the underlying database. It provides a DynamoDB-compatible API backed
 //! by Cassandra's distributed architecture.
 
+// `clippy.toml` disallows the driver calls that run at the driver default
+// consistency. The catalog, metadata, backup and bootstrap code outside
+// `data/` runs at that default, so the lint is off here and `data/mod.rs`
+// turns it back on for the data path.
+#![allow(clippy::disallowed_methods)]
+
 pub const CATALOG_VERSION: &str = "0.0.4";
 
 mod admin_store;

@@ -84,18 +84,15 @@ impl CassandraEngine {
              FROM {catalog_keyspace}.tables WHERE account_id = ? AND table_name = ?"
         );
         let values = cdrs_tokio::query_values!(account_id, table_name);
-        let rows = if quorum {
-            crate::cassandra_util::query_rows_quorum(
-                &self.session,
-                &query,
-                values,
-                "fetch_table_key_info",
-            )
-            .await?
-        } else {
-            crate::cassandra_util::query_rows(&self.session, &query, values, "fetch_table_key_info")
-                .await?
-        };
+        // `quorum` reads at `LOCAL_QUORUM`, otherwise at `LOCAL_ONE`.
+        let rows = crate::cassandra_util::query_rows_at(
+            &self.session,
+            &query,
+            values,
+            quorum,
+            "fetch_table_key_info",
+        )
+        .await?;
 
         let row = rows
             .into_iter()
@@ -270,6 +267,8 @@ impl CassandraEngine {
             )
         };
 
+        // A schema statement: DDL runs at the driver default.
+        #[allow(clippy::disallowed_methods)]
         self.session
             .query(&ddl)
             .await
@@ -287,6 +286,8 @@ impl CassandraEngine {
         let ddb_table = data_table_name(table_id);
         let ddl = format!("DROP TABLE IF EXISTS {account_keyspace}.{ddb_table}");
 
+        // A schema statement: DDL runs at the driver default.
+        #[allow(clippy::disallowed_methods)]
         self.session
             .query(&ddl)
             .await
@@ -304,6 +305,8 @@ impl CassandraEngine {
         let idx_table = index_table_name(index_id);
         let ddl = format!("DROP TABLE IF EXISTS {account_keyspace}.{idx_table}");
 
+        // A schema statement: DDL runs at the driver default.
+        #[allow(clippy::disallowed_methods)]
         self.session
             .query(&ddl)
             .await
@@ -409,6 +412,8 @@ impl CassandraEngine {
             primary_key
         );
 
+        // A schema statement: DDL runs at the driver default.
+        #[allow(clippy::disallowed_methods)]
         self.session
             .query(&ddl)
             .await
@@ -443,8 +448,6 @@ pub(crate) async fn backfill_gsi(
     projection: &extenddb_core::types::Projection,
 ) -> Result<(), StorageError> {
     use crate::data::index::{insert_index_row_multi, item_has_index_keys, project_item_for_index};
-    use cdrs_tokio::consistency::Consistency;
-    use cdrs_tokio::query::BatchQueryBuilder;
 
     const PAGE_SIZE: i64 = 500;
 
@@ -471,20 +474,24 @@ pub(crate) async fn backfill_gsi(
 
     let mut last_token: Option<i64> = None;
 
+    // The backfill reads at `LOCAL_QUORUM`, like the other table walks, so a
+    // page reflects every write acknowledged before it was read.
     loop {
         let rows = if let Some(tok) = last_token {
-            crate::cassandra_util::query_rows::<StorageError>(
+            crate::cassandra_util::query_rows_at::<StorageError>(
                 session,
                 &next_page_query,
                 cdrs_tokio::query_values!(tok),
+                true,
                 "backfill_gsi",
             )
             .await?
         } else {
-            crate::cassandra_util::query_rows::<StorageError>(
+            crate::cassandra_util::query_rows_at::<StorageError>(
                 session,
                 &first_page_query,
                 cdrs_tokio::query_values!(),
+                true,
                 "backfill_gsi",
             )
             .await?
@@ -494,7 +501,7 @@ pub(crate) async fn backfill_gsi(
             break;
         }
 
-        let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
+        let mut batch = crate::cassandra_util::batch_builder();
         let mut batch_has_rows = false;
 
         for row in &rows {
@@ -536,7 +543,7 @@ pub(crate) async fn backfill_gsi(
 
         // Update heartbeat after each page so a recovery worker can
         // distinguish a live (slow) backfill from a crashed one.
-        if let Err(e) = crate::cassandra_util::execute::<StorageError>(
+        if let Err(e) = crate::cassandra_util::execute_quorum::<StorageError>(
             session,
             &heartbeat_cql,
             cdrs_tokio::query_values!(table_id, index_name),
@@ -560,10 +567,11 @@ pub(crate) async fn backfill_gsi(
             let token_query = format!(
                 "SELECT token(pk) AS tok FROM {account_keyspace}.{base_table} WHERE pk = ?"
             );
-            let tok_rows = crate::cassandra_util::query_rows::<StorageError>(
+            let tok_rows = crate::cassandra_util::query_rows_at::<StorageError>(
                 session,
                 &token_query,
                 cdrs_tokio::query_values!(pk.as_str()),
+                true,
                 "backfill_gsi_token",
             )
             .await?;

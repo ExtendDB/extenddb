@@ -2,12 +2,35 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Data table operations for Cassandra.
+//!
+//! Every statement under this module states its consistency level through
+//! [`read_params`](crate::cassandra_util::read_params),
+//! [`write_params`](crate::cassandra_util::write_params) or
+//! [`lwt_params`](crate::cassandra_util::lwt_params); the schema statements in
+//! `ddl.rs` are the one exception. Two checks hold that. The lint below
+//! rejects the `Session` methods and `cassandra_util` helpers named in
+//! `clippy.toml`, each of which runs a statement at the driver default; it
+//! cannot name a `Default` constructor (`StatementParams::default()`,
+//! `StatementParamsBuilder::default()`, `BatchQueryBuilder::default()`) and it
+//! does not see which constructor a call passes or the level a
+//! `BatchQueryBuilder` sets. The test in
+//! `level_pairing_tests.rs` reads the statement sites in this module's files
+//! whose CQL and level it can resolve and checks that a `SELECT` carries a
+//! read level, a plain write `write_params` and an `IF` statement
+//! `lwt_params`, and that no batch builder other than
+//! [`batch_builder`](crate::cassandra_util::batch_builder) appears here.
+//! Allow the lint only on a schema statement.
+
+#![warn(clippy::disallowed_methods)]
 
 use cdrs_tokio::cluster::TcpConnectionManager;
 use cdrs_tokio::cluster::session::Session;
+use cdrs_tokio::frame::Envelope;
 use cdrs_tokio::load_balancing::RoundRobinLoadBalancingStrategy;
+use cdrs_tokio::query::QueryValues;
+use cdrs_tokio::statement::StatementParams;
 use cdrs_tokio::transport::TransportTcp;
-use cdrs_tokio::types::blob::Blob;
+use cdrs_tokio::types::value::{Bytes, Value};
 use extenddb_core::expression::ExpressionMaps;
 use extenddb_core::types::Item;
 use extenddb_storage::error::StorageError;
@@ -27,8 +50,12 @@ mod transactions;
 pub(crate) mod ttl;
 mod update_item;
 
+#[cfg(test)]
+mod level_pairing_tests;
+
 use condition::check_condition;
 use extenddb_core::expression;
+use index::sk_to_value;
 
 /// Resolve an expression (placeholder) to an `AttributeValue`.
 pub(crate) fn resolve_expr_to_av(
@@ -84,34 +111,32 @@ pub(crate) fn decimal_to_value(n: &bigdecimal::BigDecimal) -> cdrs_tokio::types:
     cdrs_tokio::types::value::Value::from(bigdecimal_to_cql_decimal(n))
 }
 
-/// Execute a query with pk and sort key, returning the result.
-///
-/// Helper to reduce repetitive match-on-sk-type pattern.
+/// Execute `query` with positional `values` at the level `params` builds:
+/// [`read_params`](crate::cassandra_util::read_params),
+/// [`write_params`](crate::cassandra_util::write_params) or
+/// [`lwt_params`](crate::cassandra_util::lwt_params).
+async fn execute_bound(
+    session: &CassandraSession,
+    query: &str,
+    values: Vec<Value>,
+    params: impl FnOnce(QueryValues) -> StatementParams,
+) -> Result<Envelope, StorageError> {
+    let params = params(QueryValues::SimpleValues(values));
+    crate::cassandra_util::execute_at(session, query, params, "Query failed").await
+}
+
+/// Execute a query with `(pk, sk)` bound parameters at the level `params`
+/// states.
 pub(crate) async fn query_with_pk_sk(
     session: &CassandraSession,
     query: &str,
     pk: &str,
     sk: &SortKeyValue,
-) -> Result<cdrs_tokio::frame::Envelope, StorageError> {
-    match sk {
-        SortKeyValue::S(s) => {
-            session
-                .query_with_values(query, cdrs_tokio::query_values!(pk, s.as_str()))
-                .await
-        }
-        SortKeyValue::N(n) => {
-            session
-                .query_with_values(query, cdrs_tokio::query_values!(pk, decimal_to_value(n)))
-                .await
-        }
-        SortKeyValue::B(b) => {
-            session
-                .query_with_values(query, cdrs_tokio::query_values!(pk, Blob::new(b.clone())))
-                .await
-        }
-    }
-    .map_err(|e| StorageError::Internal(format!("Query failed: {e}")))
+    params: impl FnOnce(QueryValues) -> StatementParams,
+) -> Result<Envelope, StorageError> {
+    execute_bound(session, query, vec![pk.into(), sk_to_value(sk)], params).await
 }
+
 /// Execute a query with `(pk, sk, txn_id_bytes)` bound parameters.
 ///
 /// Used for: rollback DELETE, commit DELETE.
@@ -120,32 +145,11 @@ pub(crate) async fn query_with_pk_sk_txnid(
     query: &str,
     pk: &str,
     sk: &SortKeyValue,
-    txn_id: cdrs_tokio::types::value::Bytes,
-) -> Result<cdrs_tokio::frame::Envelope, StorageError> {
-    match sk {
-        SortKeyValue::S(s) => {
-            session
-                .query_with_values(query, cdrs_tokio::query_values!(pk, s.as_str(), txn_id))
-                .await
-        }
-        SortKeyValue::N(n) => {
-            session
-                .query_with_values(
-                    query,
-                    cdrs_tokio::query_values!(pk, decimal_to_value(n), txn_id),
-                )
-                .await
-        }
-        SortKeyValue::B(b) => {
-            session
-                .query_with_values(
-                    query,
-                    cdrs_tokio::query_values!(pk, Blob::new(b.clone()), txn_id),
-                )
-                .await
-        }
-    }
-    .map_err(|e| StorageError::Internal(format!("Query failed: {e}")))
+    txn_id: Bytes,
+    params: impl FnOnce(QueryValues) -> StatementParams,
+) -> Result<Envelope, StorageError> {
+    let values = vec![pk.into(), sk_to_value(sk), txn_id.into()];
+    execute_bound(session, query, values, params).await
 }
 
 /// Execute a query with `(txn_id_bytes, txn_timestamp, pk, sk)` bound parameters.
@@ -154,96 +158,49 @@ pub(crate) async fn query_with_pk_sk_txnid(
 pub(crate) async fn query_with_txnid_ts_pk_sk(
     session: &CassandraSession,
     query: &str,
-    txn_id: cdrs_tokio::types::value::Bytes,
+    txn_id: Bytes,
     txn_timestamp: i64,
     pk: &str,
     sk: &SortKeyValue,
-) -> Result<cdrs_tokio::frame::Envelope, StorageError> {
-    match sk {
-        SortKeyValue::S(s) => {
-            session
-                .query_with_values(
-                    query,
-                    cdrs_tokio::query_values!(txn_id, txn_timestamp, pk, s.as_str()),
-                )
-                .await
-        }
-        SortKeyValue::N(n) => {
-            session
-                .query_with_values(
-                    query,
-                    cdrs_tokio::query_values!(txn_id, txn_timestamp, pk, decimal_to_value(n)),
-                )
-                .await
-        }
-        SortKeyValue::B(b) => {
-            session
-                .query_with_values(
-                    query,
-                    cdrs_tokio::query_values!(txn_id, txn_timestamp, pk, Blob::new(b.clone())),
-                )
-                .await
-        }
-    }
-    .map_err(|e| StorageError::Internal(format!("Query failed: {e}")))
+    params: impl FnOnce(QueryValues) -> StatementParams,
+) -> Result<Envelope, StorageError> {
+    let values = vec![
+        txn_id.into(),
+        txn_timestamp.into(),
+        pk.into(),
+        sk_to_value(sk),
+    ];
+    execute_bound(session, query, values, params).await
 }
 
 /// Execute a query with `(pk, sk, item_text, txn_id_bytes, txn_timestamp)` bound parameters.
 ///
 /// Used for: prepare INSERT new item.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn query_with_pk_sk_item_txnid_ts(
     session: &CassandraSession,
     query: &str,
     pk: &str,
     sk: &SortKeyValue,
     item_text: &str,
-    txn_id: cdrs_tokio::types::value::Bytes,
+    txn_id: Bytes,
     txn_timestamp: i64,
-) -> Result<cdrs_tokio::frame::Envelope, StorageError> {
-    match sk {
-        SortKeyValue::S(s) => {
-            session
-                .query_with_values(
-                    query,
-                    cdrs_tokio::query_values!(pk, s.as_str(), item_text, txn_id, txn_timestamp),
-                )
-                .await
-        }
-        SortKeyValue::N(n) => {
-            session
-                .query_with_values(
-                    query,
-                    cdrs_tokio::query_values!(
-                        pk,
-                        decimal_to_value(n),
-                        item_text,
-                        txn_id,
-                        txn_timestamp
-                    ),
-                )
-                .await
-        }
-        SortKeyValue::B(b) => {
-            session
-                .query_with_values(
-                    query,
-                    cdrs_tokio::query_values!(
-                        pk,
-                        Blob::new(b.clone()),
-                        item_text,
-                        txn_id,
-                        txn_timestamp
-                    ),
-                )
-                .await
-        }
-    }
-    .map_err(|e| StorageError::Internal(format!("Query failed: {e}")))
+    params: impl FnOnce(QueryValues) -> StatementParams,
+) -> Result<Envelope, StorageError> {
+    let values = vec![
+        pk.into(),
+        sk_to_value(sk),
+        item_text.into(),
+        txn_id.into(),
+        txn_timestamp.into(),
+    ];
+    execute_bound(session, query, values, params).await
 }
 
 /// Execute a query with `(item_text, txn_timestamp, pk, sk, txn_id_bytes)` bound parameters.
 ///
 /// Used for: commit PUT/UPDATE.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn query_with_item_ts_pk_sk_txnid(
     session: &CassandraSession,
     query: &str,
@@ -251,53 +208,25 @@ pub(crate) async fn query_with_item_ts_pk_sk_txnid(
     txn_timestamp: i64,
     pk: &str,
     sk: &SortKeyValue,
-    txn_id: cdrs_tokio::types::value::Bytes,
-) -> Result<cdrs_tokio::frame::Envelope, StorageError> {
-    match sk {
-        SortKeyValue::S(s) => {
-            session
-                .query_with_values(
-                    query,
-                    cdrs_tokio::query_values!(item_text, txn_timestamp, pk, s.as_str(), txn_id),
-                )
-                .await
-        }
-        SortKeyValue::N(n) => {
-            session
-                .query_with_values(
-                    query,
-                    cdrs_tokio::query_values!(
-                        item_text,
-                        txn_timestamp,
-                        pk,
-                        decimal_to_value(n),
-                        txn_id
-                    ),
-                )
-                .await
-        }
-        SortKeyValue::B(b) => {
-            session
-                .query_with_values(
-                    query,
-                    cdrs_tokio::query_values!(
-                        item_text,
-                        txn_timestamp,
-                        pk,
-                        Blob::new(b.clone()),
-                        txn_id
-                    ),
-                )
-                .await
-        }
-    }
-    .map_err(|e| StorageError::Internal(format!("Query failed: {e}")))
+    txn_id: Bytes,
+    params: impl FnOnce(QueryValues) -> StatementParams,
+) -> Result<Envelope, StorageError> {
+    let values = vec![
+        item_text.into(),
+        txn_timestamp.into(),
+        pk.into(),
+        sk_to_value(sk),
+        txn_id.into(),
+    ];
+    execute_bound(session, query, values, params).await
 }
 
-/// Execute a SELECT query by primary key (pk only, or pk + sort key).
+/// Execute a SELECT query by primary key (pk only, or pk + sort key) at
+/// [`read_consistency`](crate::cassandra_util::read_consistency)`(consistent_read)`.
 ///
 /// Builds the appropriate query based on whether a sort key is present,
 /// executes it, and returns the first row if any.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn select_by_pk(
     session: &CassandraSession,
     keyspace: &str,
@@ -306,17 +235,16 @@ pub(crate) async fn select_by_pk(
     pk: &str,
     sk: Option<&SortKeyValue>,
     sk_col: Option<&str>,
+    consistent_read: bool,
 ) -> Result<Option<cdrs_tokio::types::rows::Row>, StorageError> {
+    let params = |values| crate::cassandra_util::read_params(consistent_read, values);
     let result = if let (Some(sk), Some(sk_col)) = (sk, sk_col) {
         let query =
             format!("SELECT {columns} FROM {keyspace}.{table} WHERE pk = ? AND {sk_col} = ?");
-        query_with_pk_sk(session, &query, pk, sk).await
+        query_with_pk_sk(session, &query, pk, sk, params).await
     } else {
         let query = format!("SELECT {columns} FROM {keyspace}.{table} WHERE pk = ?");
-        session
-            .query_with_values(&query, cdrs_tokio::query_values!(pk))
-            .await
-            .map_err(|e| StorageError::Internal(format!("Query failed: {e}")))
+        execute_bound(session, &query, vec![pk.into()], params).await
     }?;
 
     let rows = result

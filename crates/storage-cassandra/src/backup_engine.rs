@@ -1512,6 +1512,7 @@ impl BackupEngine for CassandraEngine {
                             None,
                             None,
                             None,
+                            true,
                         )
                         .await?;
                     for item in items {

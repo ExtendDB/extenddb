@@ -50,3 +50,4 @@ decision, write a new ADR.
 | [0021](0021-cassandra-lwt-delete-atomicity-gap.md) | Cassandra: LWT delete atomicity gap and required worker/saga pattern | Accepted |
 | [0022](0022-trust-policy-deny-over-allow.md) | Role trust-policy evaluation follows IAM Deny-over-Allow order | Accepted |
 | [0024](0024-read-options-parameter.md) | Read consistency reaches storage as a `ReadOptions` parameter | Accepted |
+| [0025](0025-cassandra-statement-consistency-levels.md) | Cassandra: every data-path statement states its consistency level | Accepted |

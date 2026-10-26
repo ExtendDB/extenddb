@@ -617,7 +617,15 @@ impl CassandraEngine {
                 return Ok(None);
             }
             let (items, next_key) = self
-                .scan_impl(&key_info, Some(1_000), start_key.as_ref(), None, None, None)
+                .scan_impl(
+                    &key_info,
+                    Some(1_000),
+                    start_key.as_ref(),
+                    None,
+                    None,
+                    None,
+                    true,
+                )
                 .await?;
             for item in items {
                 if let Some(entry) =
@@ -766,7 +774,15 @@ impl CassandraEngine {
                 return Ok(());
             }
             let (items, next_key) = self
-                .scan_impl(&key_info, Some(1_000), start_key.as_ref(), None, None, None)
+                .scan_impl(
+                    &key_info,
+                    Some(1_000),
+                    start_key.as_ref(),
+                    None,
+                    None,
+                    None,
+                    true,
+                )
                 .await?;
             for item in items {
                 if let Some(entry) =
@@ -1429,7 +1445,15 @@ impl MetadataEngine for CassandraEngine {
             let mut start_key = None;
             loop {
                 let (items, next_key) = self
-                    .scan_impl(&key_info, Some(1_000), start_key.as_ref(), None, None, None)
+                    .scan_impl(
+                        &key_info,
+                        Some(1_000),
+                        start_key.as_ref(),
+                        None,
+                        None,
+                        None,
+                        true,
+                    )
                     .await?;
                 for item in items {
                     count += 1;

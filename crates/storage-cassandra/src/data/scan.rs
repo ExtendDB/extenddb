@@ -100,30 +100,14 @@ fn sk_to_value(sk: &SortKeyValue) -> Value {
     }
 }
 
-/// Execute a scan query that has no bind parameters and return the rows.
-///
-/// Used for the first page (no `ExclusiveStartKey`), where the only predicates
-/// are literal token-range bounds.
-async fn rows_no_values(
-    session: &Arc<CassandraSession>,
-    query: &str,
-) -> Result<Vec<cdrs_tokio::types::rows::Row>, StorageError> {
-    let result = session
-        .query(query)
-        .await
-        .map_err(|e| StorageError::Internal(format!("scan query failed: {e}")))?;
-    let body = result
-        .response_body()
-        .map_err(|e| StorageError::Internal(format!("scan parse failed: {e}")))?;
-    Ok(body.into_rows().unwrap_or_default())
-}
-
 impl crate::CassandraEngine {
-    /// Implementation of `DataEngine::scan`.
+    /// Implementation of `DataEngine::scan`. Every read runs at
+    /// [`read_consistency`](crate::cassandra_util::read_consistency)`(consistent_read)`.
     ///
     /// Returns up to `limit` items (the engine layer applies any
     /// `FilterExpression`, `ProjectionExpression`, and the 1 MB cap) along with
     /// a `LastEvaluatedKey` when more items remain.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn scan_impl(
         &self,
         key_info: &TableKeyInfo,
@@ -132,6 +116,7 @@ impl crate::CassandraEngine {
         segment: Option<i64>,
         total_segments: Option<i64>,
         index_name: Option<&str>,
+        consistent_read: bool,
     ) -> Result<(Vec<Item>, Option<Item>), StorageError> {
         let session = self.session_arc();
 
@@ -194,6 +179,7 @@ impl crate::CassandraEngine {
                 start_key,
                 token_upper,
                 fetch_limit,
+                consistent_read,
             )
             .await?
         } else {
@@ -206,18 +192,15 @@ impl crate::CassandraEngine {
                 values.push(Value::from(hi));
             }
             query.push_str(&format!(" LIMIT {fetch_limit}"));
-            if values.is_empty() {
-                // Unrestricted full scan — no bind parameters.
-                rows_no_values(&session, &query).await?
-            } else {
-                cassandra_util::query_rows::<StorageError>(
-                    &session,
-                    &query,
-                    QueryValues::SimpleValues(values),
-                    "scan_first_page",
-                )
-                .await?
-            }
+            // An unrestricted full scan binds an empty value list.
+            cassandra_util::query_rows_at::<StorageError>(
+                &session,
+                &query,
+                QueryValues::SimpleValues(values),
+                consistent_read,
+                "scan_first_page",
+            )
+            .await?
         };
 
         // Parse item_data JSON into items.
@@ -310,10 +293,13 @@ impl crate::CassandraEngine {
         // exactly one row, and `token()` is independent of the queried table's
         // schema, so this needs neither the data table to exist nor a matching
         // row in it.
-        let rows = cassandra_util::query_rows::<StorageError>(
+        // `token(?)` is a pure function of its argument, so the read level does
+        // not change the answer.
+        let rows = cassandra_util::query_rows_at::<StorageError>(
             &self.session_arc(),
             "SELECT token(?) AS t FROM system.local",
             QueryValues::SimpleValues(vec![Value::from(pk_text.as_str())]),
+            false,
             "scan_key_in_segment",
         )
         .await?;
@@ -342,6 +328,7 @@ impl crate::CassandraEngine {
         start_key: &Item,
         token_upper: Option<i64>,
         fetch_limit: usize,
+        consistent_read: bool,
     ) -> Result<Vec<cdrs_tokio::types::rows::Row>, StorageError> {
         // Partition key text of the resume row (single or composite HASH key).
         let pk_text = composite_pk_to_text(start_key, scan_key_schema)?;
@@ -373,10 +360,11 @@ impl crate::CassandraEngine {
             let mut values: Vec<Value> = Vec::with_capacity(1 + clustering_binds.len());
             values.push(Value::from(pk_text.as_str()));
             values.extend(clustering_binds);
-            let rows1 = cassandra_util::query_rows::<StorageError>(
+            let rows1 = cassandra_util::query_rows_at::<StorageError>(
                 session,
                 &query1,
                 QueryValues::SimpleValues(values),
+                consistent_read,
                 "scan_finish_partition",
             )
             .await?;
@@ -393,10 +381,11 @@ impl crate::CassandraEngine {
             if let Some(hi) = token_upper {
                 values.push(Value::from(hi));
             }
-            let rows2 = cassandra_util::query_rows::<StorageError>(
+            let rows2 = cassandra_util::query_rows_at::<StorageError>(
                 session,
                 &query2,
                 QueryValues::SimpleValues(values),
+                consistent_read,
                 "scan_next_partitions",
             )
             .await?;
