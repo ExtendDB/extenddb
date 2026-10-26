@@ -46,10 +46,16 @@ pub async fn flush_pending_drops(session: &Arc<CassandraSession>) {
         let _ = session.query(format!("DROP KEYSPACE IF EXISTS {ks}")).await;
     }
 }
+/// The Cassandra node the suites use, as `host:port`: the value of
+/// `EXTENDDB_TEST_CASSANDRA_ADDR`, or `127.0.0.1:9042` when it is unset.
+pub fn test_cassandra_addr() -> String {
+    std::env::var("EXTENDDB_TEST_CASSANDRA_ADDR").unwrap_or_else(|_| "127.0.0.1:9042".to_owned())
+}
+
 /// Returns a standard test configuration for Cassandra.
 pub fn test_config() -> CassandraStorageConfig {
     let mut config = CassandraStorageConfig {
-        contact_points: vec!["127.0.0.1:9042".to_string()],
+        contact_points: vec![test_cassandra_addr()],
         username: Some("cassandra".to_string()),
         password: Some("cassandra".to_string()),
         keyspace_prefix: "extenddb_ttl_test".to_string(),
@@ -715,24 +721,31 @@ pub async fn put_item_then_lock(
 /// True when the suite should be skipped because no Cassandra is reachable.
 ///
 /// The workspace `cargo test` job in test.yml runs with no services, so these
-/// suites probe 127.0.0.1:9042 and skip themselves when nothing is listening.
+/// suites probe the node [`test_cassandra_addr`] names (`127.0.0.1:9042`
+/// unless `EXTENDDB_TEST_CASSANDRA_ADDR` sets another `host:port`) and skip
+/// themselves when nothing is listening there.
 /// The dedicated integration-cassandra workflow provides a service container
 /// and sets `EXTENDDB_TEST_CASSANDRA=required`, under which this never skips:
 /// if Cassandra is down there, setup fails loudly rather than the suite
 /// silently passing with zero tests executed (the failure mode integration.yml
 /// documents for batch_transact_authz).
 pub fn skip_without_cassandra() -> bool {
+    use std::net::ToSocketAddrs as _;
+
     if std::env::var("EXTENDDB_TEST_CASSANDRA").as_deref() == Ok("required") {
         return false;
     }
-    let reachable = std::net::TcpStream::connect_timeout(
-        &std::net::SocketAddr::from(([127, 0, 0, 1], 9042)),
-        std::time::Duration::from_secs(2),
-    )
-    .is_ok();
+    let addr = test_cassandra_addr();
+    let reachable = addr
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut resolved| resolved.next())
+        .is_some_and(|socket| {
+            std::net::TcpStream::connect_timeout(&socket, std::time::Duration::from_secs(2)).is_ok()
+        });
     if !reachable {
         eprintln!(
-            "skipping: no Cassandra at 127.0.0.1:9042 (set EXTENDDB_TEST_CASSANDRA=required to fail instead)"
+            "skipping: no Cassandra at {addr} (set EXTENDDB_TEST_CASSANDRA=required to fail instead)"
         );
     }
     !reachable
