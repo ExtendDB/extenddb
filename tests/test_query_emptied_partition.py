@@ -5,11 +5,13 @@
 
 Amazon DynamoDB answers a Query of such a partition with no items, whatever
 its shape, on the table and on a global secondary index, and a GetItem of a
-deleted item with no Item. A partition with one item left answers that item.
-A global secondary index added by UpdateTable to a table holding such a
-partition becomes ACTIVE and holds only the items that exist. Measured on
-2026-10-26 at 06:48, 06:52, 06:59, 07:09 and 08:00 UTC (us-east-1), each case
-twice.
+deleted item with no Item. The Query consumes the capacity of an empty read,
+and answers the same when the items were deleted by TransactWriteItems or
+BatchWriteItem, or when it starts from an ExclusiveStartKey. A partition with
+one item left answers that item. A global secondary index added by
+UpdateTable to a table holding such a partition becomes ACTIVE and holds only
+the items that exist. Measured on 2026-10-26 at 06:48, 06:52, 06:59, 07:09,
+08:00 and 14:45 UTC (us-east-1), each case twice.
 
 Dual-target against Amazon DynamoDB and extenddb.
 """
@@ -74,6 +76,61 @@ def test_query_of_an_emptied_partition_answers_no_items(dynamodb_client, table, 
     resp = _query(dynamodb_client, table, pk, **kw)
     assert resp["Count"] == 0
     assert resp.get("Items", []) == []
+
+
+def test_capacity_of_a_query_of_an_emptied_partition(dynamodb_client, table):
+    _fill_and_empty(dynamodb_client, table, "emptied-cc")
+    cc = _query(dynamodb_client, table, "emptied-cc", ReturnConsumedCapacity="INDEXES")["ConsumedCapacity"]
+    assert (cc["CapacityUnits"], cc["Table"]["CapacityUnits"]) == (0.5, 0.5)
+    resp = _query(dynamodb_client, table, "emptied-cc", ReturnConsumedCapacity="TOTAL", ConsistentRead=True)
+    assert resp["Count"] == 0
+    assert resp["ConsumedCapacity"]["CapacityUnits"] == 1.0
+
+
+ESK_SHAPES = [
+    ("inside", "a", True),
+    ("before_all", "0", True),
+    ("after_all_descending", "zzz", False),
+]
+
+
+@pytest.mark.parametrize(("case", "sk", "forward"), ESK_SHAPES, ids=[c[0] for c in ESK_SHAPES])
+def test_query_from_an_exclusive_start_key_in_an_emptied_partition(dynamodb_client, table, case, sk, forward):
+    pk = f"emptied-esk-{case}"
+    _fill_and_empty(dynamodb_client, table, pk)
+    resp = _query(dynamodb_client, table, pk, ConsistentRead=True, ScanIndexForward=forward,
+                  ExclusiveStartKey={"pk": {"S": pk}, "sk": {"S": sk}})
+    assert resp["Count"] == 0
+    assert "LastEvaluatedKey" not in resp
+
+
+def _delete_by_transaction(client, table, pk):
+    client.transact_write_items(TransactItems=[
+        {"Delete": {"TableName": table, "Key": {"pk": {"S": pk}, "sk": {"S": sk}}}} for sk in ("a", "b", "c")
+    ])
+
+
+def _delete_by_batch(client, table, pk):
+    client.batch_write_item(RequestItems={table: [
+        {"DeleteRequest": {"Key": {"pk": {"S": pk}, "sk": {"S": sk}}}} for sk in ("a", "b", "c")
+    ]})
+
+
+TX_BATCH_SHAPES = [
+    ("transaction", _delete_by_transaction, ({"ConsistentRead": True}, {"ConsistentRead": True, "Limit": 1})),
+    ("batch", _delete_by_batch, ({"ConsistentRead": True},)),
+]
+
+
+@pytest.mark.parametrize(("case", "delete", "shapes"), TX_BATCH_SHAPES, ids=[c[0] for c in TX_BATCH_SHAPES])
+def test_query_of_a_partition_emptied_by_a_transaction_or_a_batch(dynamodb_client, table, case, delete, shapes):
+    pk = f"emptied-by-{case}"
+    for sk in ("a", "b", "c"):
+        dynamodb_client.put_item(TableName=table, Item={"pk": {"S": pk}, "sk": {"S": sk}})
+    delete(dynamodb_client, table, pk)
+    for kw in shapes:
+        resp = _query(dynamodb_client, table, pk, **kw)
+        assert (resp["Count"], resp.get("Items", [])) == (0, []), kw
 
 
 def test_query_with_a_sort_key_condition(dynamodb_client, table):
