@@ -70,6 +70,17 @@ fn a_parent_that_is_not_a_map_is_refused() {
     );
 }
 
+/// A list of maps, so an index clamped to the last element would be accepted.
+#[test]
+fn an_index_past_the_end_of_a_list_of_maps_is_refused() {
+    let maps = AttributeValue::L(vec![m(&[])]);
+    refused("ADD l[5].a :one", BTreeMap::from([("l".to_owned(), maps)]));
+    refused(
+        "ADD l[0].a :one",
+        BTreeMap::from([("l".to_owned(), AttributeValue::L(Vec::new()))]),
+    );
+}
+
 #[test]
 fn a_map_inside_a_list_is_reached() {
     let mut item = BTreeMap::from([("l".to_owned(), AttributeValue::L(vec![m(&[])]))]);

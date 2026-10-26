@@ -9,7 +9,7 @@ the next element needs (a map for a name, a list for an index). Otherwise the
 update answers ValidationException ``The document path provided in the update
 expression is invalid for update`` and writes nothing, the other actions of
 the request included. A failing condition is reported first. Measured on
-2026-10-26 at 02:38 and 02:54 UTC (us-east-1), each case twice.
+2026-10-26 at 02:38, 02:54 and 03:33 UTC (us-east-1), each case twice.
 
 Dual-target against Amazon DynamoDB and extenddb.
 """
@@ -89,6 +89,8 @@ REFUSED = [
     ("index_of_missing", {}, "ADD #z[0] :one", ONE),
     ("under_index_past_end", LIST_OF_ONE, "ADD #l[5].#a :one", ONE),
     ("under_list_member_missing_map", {"l": {"L": [{"M": {}}]}}, "ADD #l[0].#a.#b :one", ONE),
+    ("index_past_end_of_maps", {"m": {"M": {"l": {"L": [{"M": {}}]}}}}, "ADD #m.#l[3].#a :one", ONE),
+    ("index_of_empty_list", {"l": {"L": []}}, "ADD #l[0].#a :one", ONE),
     ("with_set_before", {}, "SET #x = :one ADD #z.#a :one", ONE),
     ("with_set_after", {}, "ADD #z.#a :one SET #x = :one", ONE),
     ("second_of_two", {"x": {"N": "1"}}, "ADD #x :one, #z.#a :one", ONE),
