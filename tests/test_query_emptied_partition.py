@@ -100,17 +100,24 @@ def test_a_partition_with_one_item_left(dynamodb_client, table):
         assert [i["sk"]["S"] for i in resp["Items"]] == ["c"], kw
 
 
+def _wait_for_index_count(client, query, count):
+    # The index is eventually consistent.
+    for _ in range(40):
+        resp = client.query(**query)
+        if resp["Count"] == count:
+            return
+        time.sleep(0.5)
+    raise AssertionError(f"index Count {resp['Count']}, expected {count}")
+
+
 def test_index_query_of_an_emptied_partition(dynamodb_client, table):
-    _fill_and_empty(dynamodb_client, table, "emptied-gsi")
     query = {"TableName": table, "IndexName": "by-g", "KeyConditionExpression": "g = :g",
              "ExpressionAttributeValues": {":g": {"S": "g-emptied-gsi"}}}
-    # The index is eventually consistent; wait for the deletes to reach it.
-    for _ in range(40):
-        resp = dynamodb_client.query(**query)
-        if resp["Count"] == 0:
-            break
-        time.sleep(0.5)
-    assert resp["Count"] == 0
+    _fill_and_empty(dynamodb_client, table, "emptied-gsi", keep=("a", "b", "c"))
+    _wait_for_index_count(dynamodb_client, query, 3)
+    for sk in ("a", "b", "c"):
+        dynamodb_client.delete_item(TableName=table, Key={"pk": {"S": "emptied-gsi"}, "sk": {"S": sk}})
+    _wait_for_index_count(dynamodb_client, query, 0)
     assert dynamodb_client.query(**query, ScanIndexForward=False)["Count"] == 0
 
 
