@@ -3,13 +3,14 @@
 
 """Key schemas whose attributes are missing from AttributeDefinitions.
 
-Amazon DynamoDB, measured on 2026-10-25 and 2026-10-26 at 01:30 UTC
-(us-east-1), each request twice, on CreateTable and on an UpdateTable GSI
-Create:
+Amazon DynamoDB, measured on 2026-10-25 and 2026-10-26 at 01:27, 01:29,
+02:27 and 02:34 UTC (us-east-1), each request twice, on CreateTable and on
+an UpdateTable GSI Create:
 
+- A table billing fault is reported first.
 - A name defined twice answers ``Attribute Name is duplicated: <name>``,
-  naming the first name whose second definition comes first, before every
-  key check.
+  naming the first name whose second definition comes first, before a
+  missing key.
 - The table's key schema is checked first, then each LSI's, then each GSI's.
   A schema with more keys than there are definitions answers ``Invalid
   KeySchema: Some index key attribute have no definition``. Otherwise a key
@@ -31,6 +32,7 @@ Dual-target against Amazon DynamoDB and extenddb.
 from __future__ import annotations
 
 import re
+import time
 
 import pytest
 from botocore.exceptions import ClientError
@@ -170,6 +172,23 @@ def test_create_table_checks_each_key_schema_in_turn(dynamodb_client, case, spec
         assert _listed(message) == (keys, names)
 
 
+BILLING = ("One or more parameter values were invalid: Neither ReadCapacityUnits nor WriteCapacityUnits "
+           "can be specified when BillingMode is PAY_PER_REQUEST")
+
+
+@pytest.mark.parametrize(("spec", "table_keys"), [
+    ("pk:S pk:S", ks("pk")),
+    ("pk:S x:S", ks("pk", "sk")),
+    ("pk:S", ks("pk", "sk")),
+], ids=["duplicate", "missing_key", "fewer_definitions"])
+def test_create_table_reports_a_billing_fault_first(dynamodb_client, spec, table_keys):
+    def call():
+        dynamodb_client.create_table(
+            TableName="never-created-key-definitions", AttributeDefinitions=defs(spec), KeySchema=table_keys,
+            BillingMode="PAY_PER_REQUEST", ProvisionedThroughput={"ReadCapacityUnits": 1, "WriteCapacityUnits": 1})
+    assert _message(call) == BILLING
+
+
 @pytest.mark.parametrize(("spec", "table_keys", "gsis", "name"), [
     ("pk:S pk:S", ks("pk"), [], "pk"),
     ("pk:S pk:N", ks("pk"), [], "pk"),
@@ -180,6 +199,17 @@ def test_create_table_checks_each_key_schema_in_turn(dynamodb_client, case, spec
 def test_create_table_refuses_a_name_defined_twice(dynamodb_client, spec, table_keys, gsis, name):
     message = _message(_create(dynamodb_client, spec, table_keys, gsis))
     assert message == f"Attribute Name is duplicated: {name}"
+
+
+def _wait_for_index(client, table, index, timeout=120.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        desc = client.describe_table(TableName=table)["Table"]
+        status = {i["IndexName"]: i["IndexStatus"] for i in desc.get("GlobalSecondaryIndexes", [])}
+        if desc["TableStatus"] == "ACTIVE" and status.get(index) == "ACTIVE":
+            return
+        time.sleep(0.5)
+    raise TimeoutError(f"{index} on {table} not ACTIVE after {timeout} s")
 
 
 def test_update_table_keeps_the_type_of_a_redefined_table_key(dynamodb_client):
@@ -196,3 +226,6 @@ def test_update_table_keeps_the_type_of_a_redefined_table_key(dynamodb_client):
         desc = dynamodb_client.describe_table(TableName=name)["Table"]
         stored = {d["AttributeName"]: d["AttributeType"] for d in desc["AttributeDefinitions"]}
         assert stored == {"pk": "S", "g": "S"}
+        # The table cannot be deleted while the index is being created.
+        _wait_for_index(dynamodb_client, name, "by-g")
+        dynamodb_client.put_item(TableName=name, Item={"pk": {"S": "a"}, "g": {"S": "b"}})
