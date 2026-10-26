@@ -35,8 +35,9 @@ fn enabling_a_stream_without_a_view_type_is_refused() {
 
 /// A created index whose key attribute is not in AttributeDefinitions is
 /// refused with the sentence the service picks by the member's shape
-/// (measured 2026-10-25): absent names the index, present but lacking the
-/// key lists the key and the definitions, empty has its own sentence.
+/// (measured 2026-10-25 and 2026-10-26): absent names the index; fewer
+/// definitions than keys, including none, has the key schema sentence;
+/// otherwise the sentence lists every key and every definition.
 #[test]
 fn a_created_gsi_on_an_undefined_key_attribute_is_refused_by_member_shape() {
     let input = |defs: Option<Value>| -> UpdateTableInput {
@@ -72,13 +73,21 @@ fn a_created_gsi_on_an_undefined_key_attribute_is_refused_by_member_shape() {
         message(Some(
             serde_json::json!([{ "AttributeName": "g", "AttributeType": "S" }])
         )),
-        "One or more parameter values were invalid: Some index key attributes are not defined in AttributeDefinitions. Keys: [r], AttributeDefinitions: [g]"
+        "Invalid KeySchema: Some index key attribute have no definition"
     );
     assert_eq!(
-        message(Some(
-            serde_json::json!([{ "AttributeName": "other", "AttributeType": "S" }])
-        )),
-        "One or more parameter values were invalid: Some index key attributes are not defined in AttributeDefinitions. Keys: [g], AttributeDefinitions: [other]"
+        message(Some(serde_json::json!([
+            { "AttributeName": "pk", "AttributeType": "S" },
+            { "AttributeName": "g", "AttributeType": "S" },
+        ]))),
+        "One or more parameter values were invalid: Some index key attributes are not defined in AttributeDefinitions. Keys: [g, r], AttributeDefinitions: [pk, g]"
+    );
+    assert_eq!(
+        message(Some(serde_json::json!([
+            { "AttributeName": "g", "AttributeType": "S" },
+            { "AttributeName": "g", "AttributeType": "S" },
+        ]))),
+        "Attribute Name is duplicated: g"
     );
     validate_gsi_updates(&input(Some(serde_json::json!([
         { "AttributeName": "g", "AttributeType": "S" },

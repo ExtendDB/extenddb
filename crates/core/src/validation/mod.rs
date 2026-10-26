@@ -1,8 +1,10 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
+mod key_definitions;
 pub mod number;
 pub mod vector_item;
 
+pub use key_definitions::{validate_key_schema_defined, validate_unique_attribute_definitions};
 pub use vector_item::{
     MAX_HASH_KEY_SIZE, MAX_INLINE_FILTER_SIZE, validate_vector_write,
     validate_vector_write_changed, vector_components, vector_norm,
@@ -101,8 +103,10 @@ pub fn validate_create_table(
     validate_key_schema(input, limits.allow_multipart_table_keys)?;
     validate_gsi_key_schemas(input)?;
     validate_lsi_key_schemas(input)?;
-    validate_attribute_definitions(input)?;
+    // The service reports a table billing fault before any definition fault
+    // (measured 2026-10-26).
     validate_provisioned_throughput(input)?;
+    validate_attribute_definitions(input)?;
     validate_gsi_provisioned_throughput(input)?;
     validate_gsi_throughput_minimum(input)?;
     validate_gsi_count(input, limits)?;
@@ -943,14 +947,16 @@ fn validate_attribute_definitions(input: &CreateTableInput) -> Result<(), Dynamo
         }
     }
 
-    // Every key attribute must have a definition
-    for attr in &key_attrs {
-        if !def_names.contains(attr) {
-            return Err(DynamoDbError::ValidationException(format!(
-                "One or more parameter values were invalid: Some index key attributes are not defined in AttributeDefinitions. Keys: [{attr}], AttributeDefinitions: [{}]",
-                format_attr_defs(&input.attribute_definitions)
-            )));
-        }
+    // Every key attribute must have a definition: the table's key schema, then
+    // each LSI's, then each GSI's (measured order, see key_definitions.rs).
+    validate_unique_attribute_definitions(&input.attribute_definitions)?;
+    let defs = &input.attribute_definitions;
+    validate_key_schema_defined(&input.key_schema, defs)?;
+    for lsi in input.local_secondary_indexes.iter().flatten() {
+        validate_key_schema_defined(&lsi.key_schema, defs)?;
+    }
+    for gsi in input.global_secondary_indexes.iter().flatten() {
+        validate_key_schema_defined(&gsi.key_schema, defs)?;
     }
 
     // Every definition must be used by a key
@@ -964,13 +970,6 @@ fn validate_attribute_definitions(input: &CreateTableInput) -> Result<(), Dynamo
     }
 
     Ok(())
-}
-
-fn format_attr_defs(defs: &[AttributeDefinition]) -> String {
-    defs.iter()
-        .map(|d| d.attribute_name.clone())
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 /// Validate table-level throughput against the effective billing mode.

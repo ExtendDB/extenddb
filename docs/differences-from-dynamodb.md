@@ -48,6 +48,7 @@ adaptation when switching between ExtendDB and the real service.
 |------|----------|------|
 | Table creation delay | Returns `CREATING` immediately; transitions to `ACTIVE` typically within seconds. Same behavior for on-demand and provisioned | Configurable via `control_plane_delay_seconds` runtime setting (default: 5s) |
 | DeletionProtectionEnabled | Enforced | Enforced (accepted and stored, DeleteTable rejects when enabled) |
+| Order of the lists in `Some index key attributes are not defined in AttributeDefinitions. Keys: [...], AttributeDefinitions: [...]` (CreateTable, UpdateTable GSI Create) | Every key of the schema and every definition, in an order that follows neither the request nor the alphabet and does not depend on the attribute types (measured 2026-10-26: definitions `[pk, r]` render `[r, pk]`, keys `hk, rk` render `[rk, hk]`) | The same keys and definitions, the keys in key schema order and the definitions in request order. A client that reads the first element of `Keys` can see a different name |
 
 ## Time to Live (TTL)
 
