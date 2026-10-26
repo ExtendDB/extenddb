@@ -751,11 +751,12 @@ impl CassandraEngine {
         // Step 9: Enforce limit and detect pagination
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         let actual_limit = limit.map_or(1_000_000_usize, |l| l.max(0) as usize);
-        let skipped_rows = fetched_rows - items.len();
-        if skipped_rows > 0 && fetched_rows > actual_limit {
-            // The skipped rows took places in the LIMIT, so this read cannot
-            // tell whether items follow. Read again with room for them.
-            let wider_limit = i64::try_from(actual_limit + skipped_rows).unwrap_or(i64::MAX);
+        if items.is_empty() && fetched_rows > actual_limit {
+            // Every row of a read that filled its LIMIT held no item, so there
+            // is no item to continue from. Read again with twice the room; a
+            // further read happens only if all of those rows hold no item too.
+            let wider_limit =
+                i64::try_from(actual_limit.saturating_mul(2).max(1)).unwrap_or(i64::MAX);
             // Through the trait method, whose boxed future breaks the
             // recursion in this function's own future type.
             let (mut wider_items, wider_key) = extenddb_storage::DataEngine::query(
@@ -778,7 +779,10 @@ impl CassandraEngine {
                 .map(|item| extenddb_core::types::extract_key(item, &key_info.key_schema));
             return Ok((wider_items, last_key));
         }
-        let has_more = items.len() > actual_limit;
+        // A read that filled its LIMIT may have items after it, even when
+        // rows without an item leave this page short; the caller reads on
+        // from the last item.
+        let has_more = fetched_rows > actual_limit;
 
         let final_items: Vec<Item> = items.into_iter().take(actual_limit).collect();
 
