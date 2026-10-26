@@ -103,8 +103,10 @@ pub fn validate_create_table(
     validate_key_schema(input, limits.allow_multipart_table_keys)?;
     validate_gsi_key_schemas(input)?;
     validate_lsi_key_schemas(input)?;
-    validate_attribute_definitions(input)?;
+    // The service reports a table billing fault before any definition fault
+    // (measured 2026-10-26).
     validate_provisioned_throughput(input)?;
+    validate_attribute_definitions(input)?;
     validate_gsi_provisioned_throughput(input)?;
     validate_gsi_throughput_minimum(input)?;
     validate_gsi_count(input, limits)?;

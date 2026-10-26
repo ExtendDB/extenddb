@@ -8,7 +8,9 @@
 //!
 //! - A name defined twice answers `Attribute Name is duplicated: <name>`,
 //!   naming the first name whose second definition comes first in the list.
-//!   This comes before every key check.
+//!   The service checks it after the table billing checks, the one-name-twice
+//!   rule and the length rule below, and before the other key schema checks;
+//!   ExtendDB checks it after all key schema shape checks.
 //! - Each key schema is then checked in turn: the table's, each LSI's, each
 //!   GSI's. A schema with more keys than there are definitions answers
 //!   `Invalid KeySchema: Some index key attribute have no definition`. A
@@ -18,6 +20,8 @@
 //!
 //! The service lists the keys and definitions in an order that follows neither
 //! the request nor the alphabet; ExtendDB lists them in request order.
+
+use std::collections::HashSet;
 
 use crate::error::DynamoDbError;
 use crate::types::{AttributeDefinition, KeySchemaElement};
@@ -30,11 +34,9 @@ use crate::types::{AttributeDefinition, KeySchemaElement};
 pub fn validate_unique_attribute_definitions(
     defs: &[AttributeDefinition],
 ) -> Result<(), DynamoDbError> {
-    for (i, def) in defs.iter().enumerate() {
-        if defs[..i]
-            .iter()
-            .any(|earlier| earlier.attribute_name == def.attribute_name)
-        {
+    let mut seen = HashSet::with_capacity(defs.len());
+    for def in defs {
+        if !seen.insert(def.attribute_name.as_str()) {
             return Err(DynamoDbError::ValidationException(format!(
                 "Attribute Name is duplicated: {}",
                 def.attribute_name
@@ -60,8 +62,10 @@ pub fn validate_key_schema_defined(
             "Invalid KeySchema: Some index key attribute have no definition".to_owned(),
         ));
     }
-    let defined = |name: &str| defs.iter().any(|d| d.attribute_name == name);
-    if key_schema.iter().all(|k| defined(&k.attribute_name)) {
+    if key_schema
+        .iter()
+        .all(|k| defs.iter().any(|d| d.attribute_name == k.attribute_name))
+    {
         return Ok(());
     }
     let keys: Vec<&str> = key_schema
