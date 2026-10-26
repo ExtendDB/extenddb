@@ -42,15 +42,9 @@ def nlist(wrappers: int) -> dict:
 
 
 def wrappers(value: dict) -> int:
-    depth = 0
-    while True:
-        if value.get("M"):
-            value = next(iter(value["M"].values()))
-        elif value.get("L"):
-            value = value["L"][0]
-        else:
-            return depth
-        depth += 1
+    """Most wrappers on any branch; an empty map or list adds none."""
+    children = list(value.get("M", {}).values()) or value.get("L", [])
+    return 1 + max(wrappers(c) for c in children) if children else 0
 
 
 def path(j: int) -> str:
@@ -138,6 +132,21 @@ def test_update_past_the_limit_is_refused(dynamodb_client, table, case, base, ex
     err = exc_info.value.response["Error"]
     assert (err["Code"], err["Message"]) == ("ValidationException", MESSAGE)
     assert _stored_wrappers(dynamodb_client, table, key) == after
+
+
+def test_an_add_that_would_create_maps_past_the_limit_is_refused(dynamodb_client, table):
+    # The service refuses this path for its 33 elements (measured 2026-10-26
+    # at 01:26 UTC) and ExtendDB for the depth of the maps ADD would create,
+    # so only the code and the stored item are compared.
+    key = _put(dynamodb_client, table, "add-deep", nmap(30))
+    with pytest.raises(ClientError) as exc_info:
+        dynamodb_client.update_item(
+            TableName=table, Key=key, UpdateExpression=f"ADD {path(29)}.#a.#b.#c :one",
+            ExpressionAttributeNames={**NAMES, "#a": "a", "#b": "b", "#c": "c"},
+            ExpressionAttributeValues={":one": {"N": "1"}},
+        )
+    assert exc_info.value.response["Error"]["Code"] == "ValidationException"
+    assert _stored_wrappers(dynamodb_client, table, key) == 30
 
 
 def test_a_failing_condition_is_reported_before_the_depth(dynamodb_client, table):
