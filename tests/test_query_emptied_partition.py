@@ -8,7 +8,8 @@ its shape, on the table and on a global secondary index, and a GetItem of a
 deleted item with no Item. A partition with one item left answers that item.
 A global secondary index added by UpdateTable to a table holding such a
 partition becomes ACTIVE and holds only the items that exist. Measured on
-2026-10-26 at 06:48, 06:52, 06:59 and 07:09 UTC (us-east-1), each case twice.
+2026-10-26 at 06:48, 06:52, 06:59, 07:09 and 08:00 UTC (us-east-1), each case
+twice.
 
 Dual-target against Amazon DynamoDB and extenddb.
 """
@@ -156,3 +157,15 @@ def test_an_index_added_later_skips_an_emptied_partition(dynamodb_client):
             )["Count"]
 
         assert (count("y"), count("x")) == (1, 0)
+
+
+def test_a_hash_only_table_whose_item_was_deleted(dynamodb_client):
+    with scoped_table(dynamodb_client) as name:
+        dynamodb_client.put_item(TableName=name, Item={"pk": {"S": "k"}, "x": {"S": "x"}})
+        dynamodb_client.delete_item(TableName=name, Key={"pk": {"S": "k"}})
+        query = {"TableName": name, "KeyConditionExpression": "pk = :p",
+                 "ExpressionAttributeValues": {":p": {"S": "k"}}}
+        for kw in ({}, {"ConsistentRead": True}, {"Select": "COUNT"}):
+            assert dynamodb_client.query(**query, **kw)["Count"] == 0, kw
+        assert "Item" not in dynamodb_client.get_item(TableName=name, Key={"pk": {"S": "k"}}, ConsistentRead=True)
+        assert dynamodb_client.scan(TableName=name, ConsistentRead=True)["Count"] == 0
