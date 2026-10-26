@@ -880,10 +880,7 @@ async fn delete_table_waits_for_a_claimed_queue_row_then_drops_everything() {
 }
 
 /// UpdateItem that sets a GSI key attribute to the wrong type is refused, as the
-/// service, PutItem, and TransactWriteItems already refuse it. The call goes to
-/// the storage engine directly, past the engine's statement pass that reports a
-/// literal operand with the per-index `Type mismatch for Index Key` wording, so
-/// the refusal here carries the wording of the check on the written item.
+/// service, PutItem, and TransactWriteItems already refuse it.
 #[tokio::test]
 async fn update_item_rejects_a_wrong_typed_gsi_key() {
     let test = "update_item_rejects_a_wrong_typed_gsi_key";
@@ -918,10 +915,87 @@ async fn update_item_rejects_a_wrong_typed_gsi_key() {
     let Err(extenddb_storage::error::StorageError::Validation(msg)) = result else {
         panic!("a wrong-typed index key on UpdateItem was not a ValidationException");
     };
+    assert!(msg.contains("Type mismatch for Index Key g"), "{msg}");
+    s.cleanup().await;
+}
+
+/// The same UpdateItem while UpdateTable is still building the GSI, carrying the
+/// key info cached before the UpdateTable, as every write does until it returns.
+/// That key info lists no index, so the engine's statement check passes it; the
+/// storage layer's catalog read lists the CREATING index, and the refusal is the
+/// service's per-index wording for a literal operand, not the wording for a value
+/// computed from the item. The build is held open by a client holding one base
+/// row: the backfill passes over it and then waits for its lock.
+#[tokio::test]
+async fn update_item_during_a_gsi_build_names_the_index_for_a_wrong_typed_literal() {
+    let test = "update_item_during_a_gsi_build_names_the_index_for_a_wrong_typed_literal";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let s = scratch().await;
+    let cached = create_table(&s).await;
+    put(&s, &cached, item(1, Some("held"), None)).await;
+    put(&s, &cached, item(2, Some("a"), None)).await;
+    let table_id = data_table_id(&s.db).await;
+    let mut holder = s.db.begin().await.expect("begin the holder");
+    sqlx::query(&format!(
+        "SELECT 1 FROM \"_ddb_{table_id}\" WHERE pk = 'p1' AND sk_n = 1 FOR UPDATE"
+    ))
+    .execute(&mut *holder)
+    .await
+    .expect("hold a base row");
+
+    let mut build = Box::pin(add_gsi(&s, false));
+    let early = tokio::time::timeout(Duration::from_secs(3), &mut build).await;
     assert!(
-        msg.contains("attempted to update the secondary index key to unsupported type"),
-        "{msg}"
+        early.is_err(),
+        "UpdateTable returned while its backfill waited on a held row"
     );
+    assert_eq!(ids(&s.db).await.2, "CREATING");
+
+    let actions = extenddb_core::expression::parse_update(
+        &extenddb_core::expression::tokenize("SET g = :v").expect("tokenize"),
+    )
+    .expect("parse");
+    let maps = ExpressionMaps::new(
+        std::collections::HashMap::new(),
+        std::collections::HashMap::from([("v".to_owned(), AttributeValue::N("9".to_owned()))]),
+    );
+    let result = s
+        .engine
+        .update_item(
+            &cached,
+            &item(2, None, None),
+            &actions,
+            false,
+            false,
+            None,
+            &maps,
+            None,
+        )
+        .await;
+    let Err(extenddb_storage::error::StorageError::Validation(msg)) = result else {
+        panic!("a wrong-typed index key during the build was not a ValidationException");
+    };
+    assert_eq!(
+        msg,
+        "One or more parameter values were invalid: Type mismatch for Index Key g \
+         Expected: S Actual: N IndexName: gidx"
+    );
+
+    holder.commit().await.expect("release the held row");
+    tokio::time::timeout(Duration::from_secs(30), &mut build)
+        .await
+        .expect("UpdateTable finished once the row was released");
+    drop(build);
+    assert_eq!(ids(&s.db).await.2, "ACTIVE");
+    let g: Option<String> = sqlx::query_scalar(&format!(
+        "SELECT item_data->'g'->>'S' FROM \"_ddb_{table_id}\" WHERE pk = 'p2' AND sk_n = 2"
+    ))
+    .fetch_one(&s.db)
+    .await
+    .expect("read the refused item");
+    assert_eq!(g.as_deref(), Some("a"), "the refused update wrote nothing");
     s.cleanup().await;
 }
 
