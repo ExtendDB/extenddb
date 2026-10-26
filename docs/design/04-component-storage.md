@@ -672,17 +672,37 @@ This column-on-tables approach is sufficient while control plane operations map 
 Until those requirements arise, the single-column approach avoids the complexity of a separate job queue while providing
 full crash recovery.
 
-### 6.2 GSI Backfill on CreateIndex
+### 6.2 GSI backfill when UpdateTable adds an index
 
-When `UpdateTable` adds a new GSI to a table with existing data:
+When `UpdateTable` adds a new GSI to a table with existing data, the PostgreSQL backend
+(`crates/storage-postgres/src/data/gsi_build.rs`, which has the full ordering argument):
 
-1. Set the new index status to `CREATING` in `indexes`
-2. Spawn a background task that scans the base table in batches (configurable batch size, default 1000)
-3. For each batch, INSERT the projected attributes into the new GSI table
-4. On completion, set index status to `ACTIVE`
-5. During backfill, writes to the base table also write to the new GSI table (the write path checks index status and
-includes `CREATING` indexes)
-6. Queries against a `CREATING` index return `ResourceNotFoundException` (matching DynamoDB behavior)
+1. Creates the GSI's data table, then commits its `indexes` row as `CREATING`. Every write reads the catalog,
+   so from that commit on writes maintain the index the same way as an `ACTIVE` one, inline or through the
+   propagation queue.
+2. Waits one second, then takes `LOCK TABLE ... IN SHARE MODE` on the base table and releases it at once. The
+   lock waits for writes already in flight; writes arriving meanwhile queue behind it, each holding a data pool
+   connection, so the request carries a lock timeout (one second over `deadlock_timeout`) and is retried a few
+   times with growing pauses. The wait and a time check on the write side (a write that took more than 500 ms
+   from its catalog read re-reads it and queues a repair for any GSI it missed; a write with no transaction
+   queues that repair after its own statement, and loses it if the process dies in between) together cover
+   writes that read the catalog just before the index row committed: the catalog and the data tables are
+   separate databases, so no transaction can tell those writes the index exists.
+3. Scans the base table in keyset pages (256 rows, `FOR SHARE SKIP LOCKED`, skipped rows taken one at a time
+   afterwards), writing each item's current state into the index, then deletes index rows whose item is gone.
+4. Sets the status to `ACTIVE`. A build that fails for a transient reason leaves the index `CREATING`, and a
+   background worker finishes it; one that would fail every time removes the index and fails the request.
+
+Queued GSI updates apply the item's state at apply time rather than the image the row carried, so a queue row
+applied late, twice, or after the backfill wrote a newer state cannot leave the index behind the table. The
+worker reads the base row under `FOR SHARE` for that, so a queued update and a concurrent write to the same item
+now wait for each other where before they did not meet.
+
+`UpdateTable` returns after the build. While a GSI is `CREATING`, a Query or Scan naming it is answered as if the
+table had no such index (the service's response), and a GSI Create, or a Delete of another GSI, on the table is
+refused with LimitExceededException. A Delete of the building GSI and a throughput Update are not refused. DeleteTable stops the propagation queue for the table (a `vector_index_holds` row, which the
+claim query honours) and deletes its pending rows before it drops any data table, so a worker holding a claimed row
+and waiting on the base table cannot deadlock with the drop.
 
 ## 7. Pagination Token Encoding
 
