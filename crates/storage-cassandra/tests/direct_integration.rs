@@ -25,8 +25,6 @@ mod authorization_store;
 mod backup_engine;
 #[path = "direct/cassandra_engine.rs"]
 mod cassandra_engine;
-#[path = "direct/connection_pool_size.rs"]
-mod connection_pool_size;
 #[path = "direct/delete_item.rs"]
 mod delete_item;
 #[path = "direct/groups.rs"]
