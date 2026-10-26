@@ -15,12 +15,14 @@ use super::resolver::{ExpressionMaps, resolve_element_name};
 /// scalar is 32 levels, the service's limit.
 const MAX_WRAPPERS: usize = 31;
 
-/// Refuse an updated item whose SET targets now nest beyond the limit.
+/// Refuse an updated item whose SET or ADD targets now nest beyond the limit.
 ///
-/// Only the top-level attributes a SET writes are checked. REMOVE, ADD and
-/// DELETE cannot deepen a value, and an attribute the update does not touch
-/// is left alone, so an item stored deeper than the limit before this check
-/// existed stays updatable through its other attributes.
+/// Only the top-level attributes a SET or an ADD writes are checked, each
+/// once however many actions write into it. ADD is checked because it
+/// creates the missing maps on its path. REMOVE and DELETE cannot deepen a
+/// value, and an attribute the update does not touch is left alone, so an
+/// item stored deeper than the limit before this check existed stays
+/// updatable through its other attributes.
 ///
 /// # Errors
 ///
@@ -32,14 +34,20 @@ pub(super) fn validate_written_nesting_depth(
     item: &BTreeMap<String, AttributeValue>,
     maps: &ExpressionMaps,
 ) -> Result<(), DynamoDbError> {
+    let mut written = Vec::new();
     for action in actions {
-        let UpdateAction::Set { path, .. } = action else {
+        let (UpdateAction::Set { path, .. } | UpdateAction::Add { path, .. }) = action else {
             continue;
         };
         let Some(first) = path.first() else {
             continue;
         };
         let name = resolve_element_name(first, maps)?;
+        if !written.contains(&name) {
+            written.push(name);
+        }
+    }
+    for name in &written {
         if item
             .get(name.as_ref())
             .is_some_and(|v| wrappers_exceed(v, 0))
@@ -55,13 +63,16 @@ pub(super) fn validate_written_nesting_depth(
 /// Whether `value`, sitting under `above` wrappers, has more than
 /// [`MAX_WRAPPERS`] wrappers on any path down to a scalar.
 fn wrappers_exceed(value: &AttributeValue, above: usize) -> bool {
-    let children: Box<dyn Iterator<Item = &AttributeValue>> = match value {
-        AttributeValue::M(map) => Box::new(map.values()),
-        AttributeValue::L(list) => Box::new(list.iter()),
-        _ => return false,
-    };
     let here = above + 1;
-    here > MAX_WRAPPERS || children.into_iter().any(|v| wrappers_exceed(v, here))
+    match value {
+        AttributeValue::M(map) => {
+            here > MAX_WRAPPERS || map.values().any(|v| wrappers_exceed(v, here))
+        }
+        AttributeValue::L(list) => {
+            here > MAX_WRAPPERS || list.iter().any(|v| wrappers_exceed(v, here))
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -124,5 +135,22 @@ mod tests {
         assert!(check("SET x = :v", &item).is_ok());
         assert!(check("REMOVE #m.k", &item).is_ok());
         assert!(is_nesting_error(check("SET #m.k = :v", &item)));
+        assert!(check("DELETE #m.k :v", &item).is_ok());
+    }
+
+    #[test]
+    fn an_add_target_is_checked() {
+        let over = BTreeMap::from([("m".to_owned(), nmap(32))]);
+        assert!(is_nesting_error(check("ADD #m.k :v", &over)));
+        let at = BTreeMap::from([("m".to_owned(), nmap(31))]);
+        assert!(check("ADD #m.k :v", &at).is_ok());
+    }
+
+    #[test]
+    fn two_actions_into_one_attribute_are_checked_as_one() {
+        let over = BTreeMap::from([("m".to_owned(), nmap(32))]);
+        assert!(is_nesting_error(check("SET #m.k = :v, #m.j = :v", &over)));
+        let at = BTreeMap::from([("m".to_owned(), nmap(31))]);
+        assert!(check("SET #m.k = :v, #m.j = :v ADD #m.i :v", &at).is_ok());
     }
 }
