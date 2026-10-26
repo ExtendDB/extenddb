@@ -20,6 +20,7 @@ mod resolver;
 mod search_condition;
 mod tokenizer;
 mod update_evaluator;
+mod update_nesting;
 mod update_parser;
 
 pub use ast::{ArithOp, CompareOp, Expr, PathElement, UpdateAction};
