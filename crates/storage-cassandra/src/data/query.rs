@@ -3,7 +3,6 @@
 
 //! Query implementation for Cassandra backend.
 
-use cdrs_tokio::types::IntoRustByName;
 use extenddb_core::expression::{CompareOp, ExpressionMaps, KeyCondition, SortKeyCondition};
 use extenddb_core::types::{Item, ScalarAttributeType, TableKeyInfo};
 use extenddb_storage::error::StorageError;
@@ -727,16 +726,21 @@ impl CassandraEngine {
             rows_result
         };
 
-        // Step 8: Parse results. A partition whose items have all been deleted
-        // still holds its static columns (`partition_max_delete_timestamp`),
-        // and Cassandra answers a partition read with one row carrying only
-        // those, with no `item_data`. That row is no item.
+        // Step 8: Parse results. A row without `item_data` holds no item:
+        // a partition whose items have all been deleted answers a partition
+        // read with one row of its static columns
+        // (`partition_max_delete_timestamp`), and a TTL claim or a transaction
+        // prepare on an absent key writes a row with only `prepared_txn_id`.
+        let fetched_rows = rows.len();
         let items: Vec<Item> = rows
             .into_iter()
             .map(|row| {
-                let item_data: Option<String> = row.get_by_name("item_data").map_err(|error| {
-                    StorageError::Internal(format!("query parse item_data failed: {error}"))
-                })?;
+                let item_data: Option<String> =
+                    cdrs_tokio::types::IntoRustByName::get_by_name(&row, "item_data").map_err(
+                        |error| {
+                            StorageError::Internal(format!("query parse item_data failed: {error}"))
+                        },
+                    )?;
                 item_data.map(json_to_item).transpose()
             })
             .collect::<Result<Vec<_>, _>>()?
@@ -747,6 +751,33 @@ impl CassandraEngine {
         // Step 9: Enforce limit and detect pagination
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         let actual_limit = limit.map_or(1_000_000_usize, |l| l.max(0) as usize);
+        let skipped_rows = fetched_rows - items.len();
+        if skipped_rows > 0 && fetched_rows > actual_limit {
+            // The skipped rows took places in the LIMIT, so this read cannot
+            // tell whether items follow. Read again with room for them.
+            let wider_limit = i64::try_from(actual_limit + skipped_rows).unwrap_or(i64::MAX);
+            // Through the trait method, whose boxed future breaks the
+            // recursion in this function's own future type.
+            let (mut wider_items, wider_key) = extenddb_storage::DataEngine::query(
+                self,
+                key_info,
+                key_condition,
+                expression_maps,
+                forward,
+                Some(wider_limit),
+                exclusive_start_key,
+                index_name,
+            )
+            .await?;
+            if wider_items.len() <= actual_limit {
+                return Ok((wider_items, wider_key));
+            }
+            wider_items.truncate(actual_limit);
+            let last_key = wider_items
+                .last()
+                .map(|item| extenddb_core::types::extract_key(item, &key_info.key_schema));
+            return Ok((wider_items, last_key));
+        }
         let has_more = items.len() > actual_limit;
 
         let final_items: Vec<Item> = items.into_iter().take(actual_limit).collect();

@@ -20,7 +20,7 @@ import time
 
 import pytest
 
-from conftest import scoped_table
+from conftest import _is_real_dynamodb, scoped_table
 
 
 @pytest.fixture(scope="module")
@@ -61,9 +61,9 @@ def _query(client, table, pk, **kw):
 SHAPES = [
     ("plain", {}),
     ("consistent", {"ConsistentRead": True}),
-    ("limit_1", {"Limit": 1}),
-    ("descending", {"ScanIndexForward": False}),
-    ("count", {"Select": "COUNT"}),
+    ("limit_1", {"Limit": 1, "ConsistentRead": True}),
+    ("descending", {"ScanIndexForward": False, "ConsistentRead": True}),
+    ("count", {"Select": "COUNT", "ConsistentRead": True}),
 ]
 
 
@@ -81,6 +81,7 @@ def test_query_with_a_sort_key_condition(dynamodb_client, table):
     resp = dynamodb_client.query(
         TableName=table, KeyConditionExpression="pk = :p AND sk >= :a",
         ExpressionAttributeValues={":p": {"S": "emptied-sk"}, ":a": {"S": "a"}},
+        ConsistentRead=True,
     )
     assert resp["Count"] == 0
 
@@ -138,8 +139,9 @@ def test_an_index_added_later_skips_an_emptied_partition(dynamodb_client):
                 "Projection": {"ProjectionType": "ALL"},
             }}],
         )
-        # The service took 520 s and 1,011 s to build this index.
-        deadline = time.monotonic() + 1500
+        # The service took 520 s and 1,011 s to build this index; extenddb
+        # builds it in seconds.
+        deadline = time.monotonic() + (1500 if _is_real_dynamodb() else 120)
         while time.monotonic() < deadline:
             desc = dynamodb_client.describe_table(TableName=name)["Table"]
             if desc["TableStatus"] == "ACTIVE" and all(
@@ -165,7 +167,7 @@ def test_a_hash_only_table_whose_item_was_deleted(dynamodb_client):
         dynamodb_client.delete_item(TableName=name, Key={"pk": {"S": "k"}})
         query = {"TableName": name, "KeyConditionExpression": "pk = :p",
                  "ExpressionAttributeValues": {":p": {"S": "k"}}}
-        for kw in ({}, {"ConsistentRead": True}, {"Select": "COUNT"}):
+        for kw in ({}, {"ConsistentRead": True}, {"Select": "COUNT", "ConsistentRead": True}):
             assert dynamodb_client.query(**query, **kw)["Count"] == 0, kw
         assert "Item" not in dynamodb_client.get_item(TableName=name, Key={"pk": {"S": "k"}}, ConsistentRead=True)
         assert dynamodb_client.scan(TableName=name, ConsistentRead=True)["Count"] == 0
