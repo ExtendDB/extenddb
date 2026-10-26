@@ -1705,10 +1705,13 @@ impl MongoEngine {
             // Each numeric ADD is `<field> = toString(toDecimal(field
             // or 0) + delta)`; `$unset` is expressed as `<field> =
             // "$$REMOVE"`; SET actions are literal assignments. `_v`
-            // is bumped in the same stage.
+            // is bumped in the same stage. `$literal` makes each SET value a
+            // constant: a `$` string or member name is not read as an
+            // expression, and a document value replaces the attribute instead
+            // of merging into the embedded document it replaces.
             let mut stage: Document = Document::new();
             for (k, v) in &set_doc {
-                stage.insert(k, v.clone());
+                stage.insert(k, doc! { "$literal": v.clone() });
             }
             for k in unset_doc.keys() {
                 stage.insert(k, "$$REMOVE");
