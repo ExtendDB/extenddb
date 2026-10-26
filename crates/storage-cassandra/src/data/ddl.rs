@@ -498,8 +498,15 @@ pub(crate) async fn backfill_gsi(
         let mut batch_has_rows = false;
 
         for row in &rows {
-            let item_json: String =
-                crate::cassandra_util::get_column(row, "item_data", "backfill_gsi")?;
+            // A partition whose items have all been deleted answers with one
+            // row of static columns and no `item_data`; it holds no item.
+            let item_json: Option<String> =
+                cdrs_tokio::types::IntoRustByName::get_by_name(row, "item_data").map_err(|e| {
+                    StorageError::Internal(format!("backfill_gsi parse item_data failed: {e}"))
+                })?;
+            let Some(item_json) = item_json else {
+                continue;
+            };
             let item = super::json_to_item(item_json)?;
 
             if !item_has_index_keys(&item, index_key_schema) {

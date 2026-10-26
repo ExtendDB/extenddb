@@ -3,6 +3,7 @@
 
 //! Query implementation for Cassandra backend.
 
+use cdrs_tokio::types::IntoRustByName;
 use extenddb_core::expression::{CompareOp, ExpressionMaps, KeyCondition, SortKeyCondition};
 use extenddb_core::types::{Item, ScalarAttributeType, TableKeyInfo};
 use extenddb_storage::error::StorageError;
@@ -726,15 +727,22 @@ impl CassandraEngine {
             rows_result
         };
 
-        // Step 8: Parse results
+        // Step 8: Parse results. A partition whose items have all been deleted
+        // still holds its static columns (`partition_max_delete_timestamp`),
+        // and Cassandra answers a partition read with one row carrying only
+        // those, with no `item_data`. That row is no item.
         let items: Vec<Item> = rows
             .into_iter()
             .map(|row| {
-                let json_str: String =
-                    cassandra_util::get_column(&row, "item_data", "query parse")?;
-                json_to_item(json_str)
+                let item_data: Option<String> = row.get_by_name("item_data").map_err(|error| {
+                    StorageError::Internal(format!("query parse item_data failed: {error}"))
+                })?;
+                item_data.map(json_to_item).transpose()
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect();
 
         // Step 9: Enforce limit and detect pagination
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
