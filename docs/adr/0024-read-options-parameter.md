@@ -2,7 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-10-25
-- Deciders: @lhnng
+- Deciders: @LeeroyHannigan
 
 ## Context
 
