@@ -53,6 +53,8 @@ mod table_engine;
 mod transact_get_items;
 #[path = "direct/transact_write_items.rs"]
 mod transact_write_items;
+#[path = "direct/transact_write_rollback_after_commit.rs"]
+mod transact_write_rollback_after_commit;
 #[path = "direct/transact_write_stream_batch_limit.rs"]
 mod transact_write_stream_batch_limit;
 #[path = "direct/transact_write_stream_images.rs"]

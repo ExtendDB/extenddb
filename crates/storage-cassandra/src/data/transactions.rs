@@ -1740,14 +1740,20 @@ impl CassandraEngine {
 
     /// Helper to commit a Put or Update operation.
     ///
-    /// Clears `created_to_prepare` as well as `prepared_txn_id`: the column
-    /// marks a row that exists only because a PREPARE planted it, and the
-    /// commit phase reads it to decide whether the mutation has an old image
-    /// (see `commit_old_image`). Left set, it would make the next transacted
-    /// write on this key record an insert over a committed item. Rows committed
-    /// by a release before this clearing still carry the flag; the commit-time
-    /// read tells them apart by `last_committed_txn_timestamp`, which only a
-    /// commit writes.
+    /// Clears `created_to_prepare` as well as `prepared_txn_id`. The column
+    /// marks a row that exists only because a PREPARE planted it, and rollback
+    /// deletes such a row: `rollback_single_operation` and `recover_rollback_op`
+    /// run `DELETE .. IF prepared_txn_id = ? AND created_to_prepare = true`
+    /// before they fall back to clearing `prepared_txn_id`. A committed row that
+    /// kept the flag would match that DELETE when a later transaction that
+    /// touched the key was cancelled, and the committed item would be lost.
+    /// Clearing the flag here makes the DELETE skip the row.
+    ///
+    /// Rows committed before this clearing existed still carry the flag, and a
+    /// cancelled transaction still deletes them. The commit phase reads the
+    /// flag too, to decide whether a mutation has an old image (see
+    /// `commit_old_image`), and tells those rows apart by
+    /// `last_committed_txn_timestamp`, which only a commit writes.
     async fn commit_put_or_update(
         &self,
         key_info: &TableKeyInfo,
