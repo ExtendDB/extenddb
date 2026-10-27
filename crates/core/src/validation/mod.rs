@@ -579,9 +579,7 @@ pub fn validate_vector_index_updates(
         .sum::<usize>();
     if actions > 1 {
         return Err(DynamoDbError::LimitExceededException(
-            "Subscriber limit exceeded: Only 1 online index can be created or deleted \
-             simultaneously per table"
-                .to_owned(),
+            crate::types::ONLINE_INDEX_LIMIT.to_owned(),
         ));
     }
     Ok(())

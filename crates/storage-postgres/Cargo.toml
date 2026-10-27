@@ -35,4 +35,5 @@ aes-gcm = { workspace = true }
 async-trait = { workspace = true }
 zeroize = { workspace = true }
 urlencoding = { workspace = true }
+libc = { workspace = true }
 

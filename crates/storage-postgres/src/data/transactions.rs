@@ -101,6 +101,10 @@ impl PostgresEngine {
         // set would make a transaction skip an index another request has just
         // created. One read per table also keeps a multi-op transaction from
         // re-asking for the same answer.
+        //
+        // The stamp is for GSIs created between this read and the commit; see
+        // `gsi_build::fix_up_stale_write`.
+        let mut stamp: Option<super::gsi_build::WriteStamp> = None;
         let mut table_indexes: HashMap<String, Vec<IndexMeta>> = HashMap::new();
         let mut table_vector_metas: HashMap<
             String,
@@ -110,7 +114,10 @@ impl PostgresEngine {
             let name = transact_op_table_name(op);
             if !table_indexes.contains_key(name) {
                 let tid = transact_op_table_id(op);
-                let (indexes, vector_metas) = fetch_write_path_indexes(tid, &self.pool).await?;
+                let (indexes, vector_metas, read_at) =
+                    fetch_write_path_indexes(tid, &self.pool).await?;
+                // The earliest read bounds every table's staleness.
+                stamp.get_or_insert(read_at);
                 table_indexes.insert(name.to_owned(), indexes);
                 table_vector_metas.insert(name.to_owned(), vector_metas);
             }
@@ -242,6 +249,25 @@ impl PostgresEngine {
             }
         }
 
+        // GSIs created since the index read, if this transaction took long enough
+        // that a backfill may have passed its items. Read once per table.
+        let mut missed: HashMap<String, Vec<IndexMeta>> = HashMap::new();
+        if stamp.is_some_and(|s| s.elapsed() > super::gsi_build::GRACE_WRITE) {
+            for op in ops {
+                let name = transact_op_table_name(op);
+                if !missed.contains_key(name) {
+                    let found = super::gsi_build::missed_gsis(
+                        &self.pool,
+                        transact_op_table_id(op),
+                        &table_indexes[name],
+                    )
+                    .await
+                    .map_err(cancel_all)?;
+                    missed.insert(name.to_owned(), found);
+                }
+            }
+        }
+
         // Persist async GSI work inside the transaction.
         let mut needs_notify = false;
         for (op, (old_item, new_item)) in ops.iter().zip(op_items.iter()) {
@@ -285,7 +311,18 @@ impl PostgresEngine {
             )
             .await
             .map_err(cancel_all)?;
-            if n > 0 || vector_n > 0 {
+            let repair_n = match (
+                missed.get(transact_op_table_name(op)),
+                new_item.as_ref().or(old_item.as_ref()),
+            ) {
+                (Some(m), Some(item)) if !m.is_empty() => {
+                    super::gsi_build::queue_repairs(&mut tx, key_info, m, item)
+                        .await
+                        .map_err(cancel_all)?
+                }
+                _ => 0,
+            };
+            if n > 0 || vector_n > 0 || repair_n > 0 {
                 needs_notify = true;
             }
         }
@@ -383,7 +420,7 @@ fn transact_op_table_id<'a>(op: &'a TransactWriteOp<'_>) -> &'a str {
 /// cancellation reasons (BLOCKER #3 fix).
 /// Build [`validation::IndexKeyRef`] views over the table's indexes for
 /// secondary-index key validation.
-fn index_key_refs(indexes: &[IndexMeta]) -> Vec<validation::IndexKeyRef<'_>> {
+pub(super) fn index_key_refs(indexes: &[IndexMeta]) -> Vec<validation::IndexKeyRef<'_>> {
     indexes
         .iter()
         .map(|idx| validation::IndexKeyRef {
@@ -444,10 +481,12 @@ async fn execute_transact_write_op(
             // per-item cancellation reason; an empty index key is up-front input
             // validation (a top-level ValidationException).
             let idx_refs = index_key_refs(indexes);
-            validation::validate_index_key_types(item, &idx_refs, &key_info.attribute_definitions)
-                .map_err(|e| {
-                    TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))
-                })?;
+            validation::validate_index_key_types(
+                item,
+                &idx_refs,
+                super::index::fresh_attr_defs(indexes, &key_info.attribute_definitions),
+            )
+            .map_err(|e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())))?;
             validation::validate_index_key_not_empty(
                 item,
                 &idx_refs,
@@ -528,7 +567,6 @@ async fn execute_transact_write_op(
                 sync_indexes(
                     tx,
                     &key_info.key_schema,
-                    &key_info.attribute_definitions,
                     indexes,
                     existing.as_ref(),
                     Some(item),
@@ -578,7 +616,6 @@ async fn execute_transact_write_op(
                 sync_indexes(
                     tx,
                     &key_info.key_schema,
-                    &key_info.attribute_definitions,
                     indexes,
                     existing.as_ref(),
                     None,
@@ -635,7 +672,7 @@ async fn execute_transact_write_op(
                 validation::validate_index_key_types(
                     &item,
                     &idx_refs,
-                    &key_info.attribute_definitions,
+                    super::index::fresh_attr_defs(indexes, &key_info.attribute_definitions),
                 )
                 .map_err(|e| {
                     TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))
@@ -712,7 +749,6 @@ async fn execute_transact_write_op(
                 sync_indexes(
                     tx,
                     &key_info.key_schema,
-                    &key_info.attribute_definitions,
                     indexes,
                     existing.as_ref(),
                     Some(&item),

@@ -56,7 +56,7 @@ impl SqliteEngine {
             extenddb_core::validation::validate_index_keys(
                 &item,
                 &index_refs,
-                &key_info.attribute_definitions,
+                super::index::fresh_attr_defs(&indexes, &key_info.attribute_definitions),
             )
             .map_err(|e| StorageError::Validation(e.to_string()))?;
         }
