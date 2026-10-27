@@ -4,20 +4,23 @@
 //! `BatchWriteItem` operation handler.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::ExpressionMaps;
+use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{
     BatchWriteItemInput, BatchWriteItemOutput, Item, KeySchemaElement, ReturnItemCollectionMetrics,
-    WriteRequest, extract_key, item_size_bytes,
+    TableKeyInfo, WriteRequest, extract_key, item_size_bytes,
 };
 use extenddb_core::validation::{
     validate_attribute_name_sizes, validate_batch_item_keys, validate_batch_key_only,
     validate_item_nesting_depth, validate_item_size, validate_key_sizes,
 };
 
+use extenddb_storage::DataEngine;
 use extenddb_storage::error::StorageError;
 
 use crate::OperationContext;
@@ -68,6 +71,46 @@ pub async fn handle_batch_write_item(
         }
     }
 
+    // Read every table's key info before anything is written. A lookup that
+    // failed is reported where `check_batch` reaches its table, so the first
+    // fault reported is the one the checks reach first.
+    let tables: Vec<(&String, &Vec<WriteRequest>)> = input.request_items.iter().collect();
+    let mut lookups = Vec::with_capacity(tables.len());
+    for (table_name, _) in &tables {
+        lookups.push(ctx.table_key_info_uncached(table_name).await);
+    }
+
+    write_batch(
+        &*ctx.storage,
+        &ctx.limits,
+        &ctx.region,
+        &input,
+        &tables,
+        lookups,
+    )
+    .await
+}
+
+/// Check the whole batch, then write it.
+///
+/// The table lookups, the duplicate-key check and the validation of every
+/// request run before the first write, in the order the tables and requests
+/// are listed. A fault in any of them rejects the batch with nothing applied,
+/// wherever the faulty request sits, which is what the `BatchWriteItem` API
+/// reference documents for these faults. The writes run only after that, so a
+/// write that cannot be applied now never leaves a later request unchecked,
+/// and a request that is applied is never followed by a rejection of the
+/// batch.
+async fn write_batch(
+    data: &dyn DataEngine,
+    limits: &LimitsConfig,
+    region: &Arc<str>,
+    input: &BatchWriteItemInput,
+    tables: &[(&String, &Vec<WriteRequest>)],
+    lookups: Vec<Result<TableKeyInfo, StorageError>>,
+) -> Result<DispatchResult, DynamoDbError> {
+    let key_infos = check_batch(tables, lookups, limits)?;
+
     let empty_maps = ExpressionMaps::default();
     let mut all_icm: HashMap<String, Vec<extenddb_core::types::ItemCollectionMetrics>> =
         HashMap::new();
@@ -91,56 +134,36 @@ pub async fn handle_batch_write_item(
     // returned in the UnprocessedItems response parameter." The whole batch is
     // rejected only for the request faults the same page lists (a missing
     // table, a key that does not match the schema, duplicate keys, too many
-    // requests, an item or request over the size limit), and the one error for
-    // a batch that applied nothing is a throttle, which this server does not
-    // account for. So a batch that could apply none of its requests also
-    // answers 200 with every request in UnprocessedItems, and the answer to
-    // one contended request does not depend on where it sat in the batch.
+    // requests, an item or request over the size limit). `check_batch` has
+    // found every one of those before the first write, wherever the faulty
+    // request sits, so a deferral below never hides one and a rejected batch
+    // never has an applied request. The one error for a batch that applied
+    // nothing is a throttle, which this server does not account for. So a
+    // batch that could apply none of its requests also answers 200 with every
+    // request in UnprocessedItems, and the answer to one contended request
+    // does not depend on where it sat in the batch.
     let mut unprocessed: HashMap<String, Vec<WriteRequest>> = HashMap::new();
     let mut applied = 0usize;
-    let tables: Vec<(&String, &Vec<WriteRequest>)> = input.request_items.iter().collect();
 
-    'tables: for (table_index, (table_name, reqs)) in tables.iter().enumerate() {
+    'tables: for (table_index, ((table_name, reqs), key_info)) in
+        tables.iter().zip(&key_infos).enumerate()
+    {
         let table_name = *table_name;
-        let key_info = ctx
-            .table_key_info_uncached(table_name)
-            .await
-            .map_err(storage_err_to_dynamo)?;
-
-        // Validate: no duplicate keys within the same table (using key schema)
-        validate_no_duplicate_keys(reqs, &key_info.key_schema)?;
-
-        let view_type = stream_capture::stream_view_type(&key_info);
+        let view_type = stream_capture::stream_view_type(key_info);
 
         for (request_index, wr) in reqs.iter().enumerate() {
             let stream = view_type.map(|vt| extenddb_storage::StreamCapture {
                 view_type: vt,
                 user_identity: None,
-                region: ctx.region.clone(),
+                region: region.clone(),
             });
             let need_old_for_stream = stream.is_some();
 
             let (item_or_key, item_wcu, written) = if let Some(put) = &wr.put_request {
-                validate_batch_item_keys(
-                    &put.item,
-                    &key_info.key_schema,
-                    &key_info.attribute_definitions,
-                )?;
-                validate_item_nesting_depth(&put.item)?;
-                validate_item_size(&put.item, ctx.limits.max_item_size_bytes)?;
-                validate_attribute_name_sizes(&put.item, &ctx.limits)?;
-                validate_key_sizes(&put.item, &key_info.key_schema, &ctx.limits)?;
-                extenddb_core::validation::validate_vector_write(
-                    &put.item,
-                    &key_info.vector_indexes,
-                    &key_info.attribute_definitions,
-                )?;
-
                 let item_wcu = capacity_helpers::write_capacity_units(item_size_bytes(&put.item));
-                let written = ctx
-                    .storage
+                let written = data
                     .put_item(
-                        &key_info,
+                        key_info,
                         put.item.clone(),
                         need_old_for_stream || want_index_cc,
                         None,
@@ -154,19 +177,12 @@ pub async fn handle_batch_write_item(
                     written.map(|old| (old, Some(&put.item))),
                 )
             } else if let Some(del) = &wr.delete_request {
-                validate_batch_key_only(
-                    &del.key,
-                    &key_info.key_schema,
-                    &key_info.attribute_definitions,
-                )?;
-
                 // TODO(fidelity): DynamoDB charges WCU based on old item size for deletes,
                 // but old item size is not available here. Using key size as lower bound.
                 let item_wcu = capacity_helpers::write_capacity_units(item_size_bytes(&del.key));
-                let written = ctx
-                    .storage
+                let written = data
                     .delete_item(
-                        &key_info,
+                        key_info,
                         &del.key,
                         need_old_for_stream || want_index_cc,
                         None,
@@ -176,7 +192,7 @@ pub async fn handle_batch_write_item(
                     .await;
                 (&del.key, item_wcu, written.map(|old| (old, None)))
             } else {
-                // Rejected by the validation above.
+                // Rejected by the shape check in `handle_batch_write_item`.
                 continue;
             };
 
@@ -188,7 +204,7 @@ pub async fn handle_batch_write_item(
                         error = %e,
                         "BatchWriteItem: write not applied after {applied} committed; the rest of the batch is reported in UnprocessedItems"
                     );
-                    unprocessed = remaining_requests(&tables, table_index, request_index);
+                    unprocessed = remaining_requests(tables, table_index, request_index);
                     break 'tables;
                 }
                 Err(e) => return Err(storage_err_to_dynamo(e)),
@@ -197,7 +213,7 @@ pub async fn handle_batch_write_item(
 
             collect_icm_if_needed(
                 input.return_item_collection_metrics,
-                &key_info,
+                key_info,
                 item_or_key,
                 table_name,
                 &mut all_icm,
@@ -209,7 +225,7 @@ pub async fn handle_batch_write_item(
                     old_item.as_ref(),
                     new_item,
                     false,
-                    &key_info,
+                    key_info,
                 );
                 let g = per_table_gsi.entry(table_name.clone()).or_default();
                 for (name, cu) in gsi {
@@ -312,6 +328,60 @@ fn remaining_requests(
     out
 }
 
+/// Take every table's key info and validate every request, before the first
+/// write. Returns the key info per table, in the order of `tables`.
+///
+/// Faults are reported in the order the writes used to reach them: for each
+/// table in turn, its lookup, the duplicate-key check, then its requests in
+/// order. The first fault rejects the whole batch.
+fn check_batch(
+    tables: &[(&String, &Vec<WriteRequest>)],
+    lookups: Vec<Result<TableKeyInfo, StorageError>>,
+    limits: &LimitsConfig,
+) -> Result<Vec<TableKeyInfo>, DynamoDbError> {
+    let mut key_infos = Vec::with_capacity(tables.len());
+    for ((_, reqs), lookup) in tables.iter().zip(lookups) {
+        let key_info = lookup.map_err(storage_err_to_dynamo)?;
+        validate_no_duplicate_keys(reqs, &key_info.key_schema)?;
+        for wr in reqs.iter() {
+            validate_request(wr, &key_info, limits)?;
+        }
+        key_infos.push(key_info);
+    }
+    Ok(key_infos)
+}
+
+/// Validate one write request against its table.
+fn validate_request(
+    wr: &WriteRequest,
+    key_info: &TableKeyInfo,
+    limits: &LimitsConfig,
+) -> Result<(), DynamoDbError> {
+    if let Some(put) = &wr.put_request {
+        validate_batch_item_keys(
+            &put.item,
+            &key_info.key_schema,
+            &key_info.attribute_definitions,
+        )?;
+        validate_item_nesting_depth(&put.item)?;
+        validate_item_size(&put.item, limits.max_item_size_bytes)?;
+        validate_attribute_name_sizes(&put.item, limits)?;
+        validate_key_sizes(&put.item, &key_info.key_schema, limits)?;
+        extenddb_core::validation::validate_vector_write(
+            &put.item,
+            &key_info.vector_indexes,
+            &key_info.attribute_definitions,
+        )?;
+    } else if let Some(del) = &wr.delete_request {
+        validate_batch_key_only(
+            &del.key,
+            &key_info.key_schema,
+            &key_info.attribute_definitions,
+        )?;
+    }
+    Ok(())
+}
+
 /// Validate that no two write requests in the same table target the same key.
 ///
 /// `DynamoDB` returns `ValidationException` for duplicate keys within a single
@@ -361,6 +431,11 @@ fn collect_icm_if_needed(
         all_icm.entry(table_name.to_owned()).or_default().push(m);
     }
 }
+
+#[cfg(test)]
+mod scripted;
+#[cfg(test)]
+mod write_batch_tests;
 
 #[cfg(test)]
 mod tests {
