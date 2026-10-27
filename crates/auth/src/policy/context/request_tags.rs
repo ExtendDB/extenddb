@@ -67,7 +67,11 @@ impl RequestContext {
     /// Resolve `aws:RequestTag/<sub_key>` against the tags the request carries.
     ///
     /// The tag name in the condition key is matched under Unicode case folding,
-    /// as the principal-tag and resource-tag keys are on this path. The engine
+    /// as the principal-tag and resource-tag keys are on this path. The service
+    /// matches names that differ in the case of one character (`Étag` and
+    /// `étag`) and does not fold the sharp s to `ss`, which this lookup does, so
+    /// `Straße` and `STRASSE` are one name here and two on the service (measured
+    /// 2026-10-27 with `iam simulate-custom-policy`). The engine
     /// stores every spelling the request names as its own tag, so a request
     /// carrying `Env=prod` and `env=dev` stores both. When two or more stored
     /// spellings fold to the policy's name, the key has one value only if they

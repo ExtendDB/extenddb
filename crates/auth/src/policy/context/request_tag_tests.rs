@@ -250,24 +250,25 @@ fn an_empty_request_tag_value_is_a_present_key() {
 }
 
 #[test]
-fn request_tag_names_fold_beyond_ascii() {
-    // Full case folding maps the sharp s to ss, so Straße and STRASSE are one
-    // tag name, as they are for a principal tag or a resource tag. The
-    // service's answer for a non-ASCII request tag name was not measured.
-    let ctx = ctx_with(&[("Straße", "x")], &["Straße"]);
-    for key in [
-        "aws:RequestTag/Straße",
-        "aws:RequestTag/STRASSE",
-        "aws:RequestTag/strasse",
-    ] {
-        assert_eq!(ctx.resolve_key(key), Some(vec!["x"]), "{key}");
-    }
-    let ctx = ctx_with(&[("STRASSE", "x")], &["STRASSE"]);
-    assert_eq!(ctx.resolve_key("aws:RequestTag/straße"), Some(vec!["x"]));
-    // Two spellings that fold to one name and carry differing values are ambiguous.
-    let ctx = ctx_with(&[("Straße", "x"), ("STRASSE", "y")], &["Straße", "STRASSE"]);
-    assert_eq!(ctx.resolve_key("aws:RequestTag/strasse"), None);
-    assert!(ctx.is_unresolvable_key("aws:RequestTag/strasse"));
+fn request_tag_names_match_beyond_ascii_case() {
+    // A tag name that differs from the policy's only in the case of a non-ASCII
+    // letter matches: a Deny on aws:RequestTag/Étag applies to a request that
+    // carries étag (iam simulate-custom-policy, 2026-10-27, two samples).
+    //
+    // ExtendDB folds the sharp s to ss as well, so Straße and STRASSE are one
+    // name here. On the service they are two: the same Deny does not apply to
+    // the other spelling, on iam simulate-custom-policy and on a resource policy
+    // on a DynamoDB table (2026-10-27, two samples each). That difference is
+    // not asserted here.
+    let ctx = ctx_with(&[("étag", "x")], &["étag"]);
+    assert_eq!(ctx.resolve_key("aws:RequestTag/étag"), Some(vec!["x"]));
+    assert_eq!(ctx.resolve_key("aws:RequestTag/Étag"), Some(vec!["x"]));
+    let ctx = ctx_with(&[("Étag", "x")], &["Étag"]);
+    assert_eq!(ctx.resolve_key("aws:RequestTag/étag"), Some(vec!["x"]));
+    // Two spellings that differ in case and carry differing values are ambiguous.
+    let ctx = ctx_with(&[("Étag", "x"), ("étag", "y")], &["Étag", "étag"]);
+    assert_eq!(ctx.resolve_key("aws:RequestTag/étag"), None);
+    assert!(ctx.is_unresolvable_key("aws:RequestTag/étag"));
 }
 
 #[test]
