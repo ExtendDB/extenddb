@@ -322,7 +322,7 @@ fn request_tag_names_match_beyond_ascii_case() {
     // name here. On the service they are two: the same Deny does not apply to
     // the other spelling, on iam simulate-custom-policy and on a resource policy
     // on a DynamoDB table (2026-10-27, two samples each). That difference is
-    // not asserted here.
+    // pinned in sharp_s_and_ss_are_one_request_tag_name.
     let ctx = ctx_with(&[("étag", "x")], &["étag"]);
     assert_eq!(ctx.resolve_key("aws:RequestTag/étag"), Some(vec!["x"]));
     assert_eq!(ctx.resolve_key("aws:RequestTag/Étag"), Some(vec!["x"]));
@@ -332,6 +332,29 @@ fn request_tag_names_match_beyond_ascii_case() {
     let ctx = ctx_with(&[("Étag", "x"), ("étag", "y")], &["Étag", "étag"]);
     assert_eq!(ctx.resolve_key("aws:RequestTag/étag"), None);
     assert!(ctx.is_unresolvable_key("aws:RequestTag/étag"));
+}
+
+#[test]
+fn sharp_s_and_ss_are_one_request_tag_name() {
+    // Known divergence from the service, kept until the folding rule is decided.
+    // The lookup folds names with full Unicode case folding, which maps the sharp
+    // s to ss, so Straße and STRASSE are one name here. The service does not
+    // equate them (measured 2026-10-27): a Deny on aws:RequestTag/STRASSE applies
+    // to a tag named STRASSE or strasse and does not apply to one named Straße,
+    // on iam simulate-custom-policy and on a resource policy on a DynamoDB table,
+    // two samples each. This test pins the ExtendDB side in both directions, so a
+    // change to the folding rule fails it and the test is then updated with the
+    // decision.
+    let ctx = ctx_with(&[("Straße", "1")], &["Straße"]);
+    assert_eq!(
+        ctx.request_tag_values("STRASSE"),
+        RequestTagLookup::Value("1")
+    );
+    let ctx = ctx_with(&[("STRASSE", "1")], &["STRASSE"]);
+    assert_eq!(
+        ctx.request_tag_values("Straße"),
+        RequestTagLookup::Value("1")
+    );
 }
 
 #[test]
