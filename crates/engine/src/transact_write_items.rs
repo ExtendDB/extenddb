@@ -445,13 +445,19 @@ fn parse_write_expressions(
         None => None,
     };
     let condition = match condition_expression {
-        Some(expr) if !expr.is_empty() => Some(crate::expression_helpers::parse_condition_checked(
-            expr,
-            &maps,
-            limits,
-            true,
-            ExpressionKind::Condition,
-        )?),
+        // A ConditionCheck's expression is required, so an empty string is
+        // parsed and refused as empty (measured 2026-10-27: `Invalid
+        // ConditionExpression: The expression can not be empty;`). Put,
+        // Delete and Update treat an empty string as no condition.
+        Some(expr) if twi.condition_check.is_some() || !expr.is_empty() => {
+            Some(crate::expression_helpers::parse_condition_checked(
+                expr,
+                &maps,
+                limits,
+                true,
+                ExpressionKind::Condition,
+            )?)
+        }
         _ => None,
     };
     // Transactions accept names/values with no expression (unlike single-item
@@ -564,7 +570,8 @@ async fn prepare_write_op(
             .await
             .map_err(storage_err_to_dynamo)?;
         let Some(condition) = condition else {
-            // Unreachable: parse_write_expressions parsed the required expression.
+            // `parse_write_expressions` returns a condition for every
+            // ConditionCheck, an empty expression included, or its error.
             return Err(DynamoDbError::ValidationException(
                 "ConditionCheck requires a ConditionExpression".to_owned(),
             ));

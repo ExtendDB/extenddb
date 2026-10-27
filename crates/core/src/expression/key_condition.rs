@@ -479,17 +479,17 @@ fn parse_key_clause_inner(tokens: &[Token], pos: &mut usize) -> Result<RawClause
         ));
     }
 
-    // begins_with(path, :val). The name is matched as written: Amazon
-    // DynamoDB refuses `Begins_With(sk, :v)` with `Invalid function name;
-    // function: Begins_With`, and any other identifier followed by `(` the
-    // same way.
+    // begins_with(path, :val). The name is matched as written. Any other
+    // identifier followed by `(` is refused with the text the service gives
+    // it, which depends on the name (see `key_condition_function_refusal`).
     if let Token::Ident(name) = &tokens[*pos]
         && *pos + 1 < tokens.len()
         && tokens[*pos + 1] == Token::LParen
     {
         if name != "begins_with" {
             return Err(validation_err(&format!(
-                "Invalid KeyConditionExpression: Invalid function name; function: {name}"
+                "Invalid KeyConditionExpression: {}",
+                super::semantics::key_condition_function_refusal(name)
             )));
         }
         *pos += 1; // skip function name
