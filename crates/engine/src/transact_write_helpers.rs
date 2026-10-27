@@ -4,7 +4,7 @@
 //! Helper types and functions for `TransactWriteItems`.
 //!
 //! Extracted from `transact_write_items.rs` to keep both files under the
-//! 500-line limit.
+//! 600-line limit.
 
 use std::collections::HashMap;
 
@@ -347,6 +347,9 @@ pub(crate) fn key_pass_failure(
 /// service reports `Nesting Levels have exceeded supported limits` as a
 /// `ValidationError` reason on every such item, after the duplicate check and
 /// alongside the other items' condition results (measured 2026-10-27).
+/// ExtendDB reports the reason in the same position but gives `None` for the
+/// other items, where the service gives `ConditionalCheckFailed` for an item
+/// whose condition was false; the differences document carries the row.
 pub(crate) fn stored_value_nesting_reasons(
     prepared: &[PreparedOp],
 ) -> Option<Vec<CancellationReason>> {

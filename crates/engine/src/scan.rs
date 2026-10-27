@@ -70,7 +70,8 @@ pub async fn handle_scan(
 
     // Limit and the Segment range checks come first, then the Filter and
     // Projection expressions and the Segment pairing checks, all before the
-    // existence check; index resolution, Select and the key checks stay after it.
+    // existence check; index resolution, the Select checks that need the index
+    // and the key checks stay after it.
 
     // --- Legacy vs expression mutual exclusivity checks ---
     let has_fe = input.filter_expression.is_some();
