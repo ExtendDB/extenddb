@@ -16,7 +16,8 @@ use crate::request_limits;
 use crate::serialize_output;
 use crate::stream_capture;
 use crate::transact_write_helpers::{
-    PreparedOp, compute_fingerprint, validate_client_request_token, validate_no_key_updates,
+    PreparedOp, compute_fingerprint, key_pass_failure, validate_client_request_token,
+    validate_value_map_nesting,
 };
 use crate::{DispatchMetrics, DispatchResult};
 use extenddb_core::error::DynamoDbError;
@@ -25,8 +26,7 @@ use extenddb_core::types::{
     CancellationReason, Item, TransactWriteItem, TransactWriteItemsInput, TransactWriteItemsOutput,
 };
 use extenddb_core::validation::{
-    validate_attribute_name_sizes, validate_attribute_values_nesting_depth,
-    validate_item_nesting_depth, validate_item_size, validate_key_not_empty,
+    validate_attribute_name_sizes, validate_item_nesting_depth, validate_item_size,
 };
 
 /// Handle a `TransactWriteItems` request.
@@ -78,16 +78,20 @@ pub async fn handle_transact_write_items(
 
     // Validation runs in the order the service applies it, each phase over
     // every item before the next phase starts:
-    //   1. per item, in order: expression grammar, the semantic walk, unused
-    //      names and values, then the item's size (top-level ValidationException),
+    //   1. per item, in order, with no table needed: the nesting of the item's
+    //      ExpressionAttributeValues, expression grammar, the semantic walk,
+    //      unused names and values, then for a Put the attribute name size,
+    //      the item size and the item nesting (top-level ValidationException),
     //   2. table lookup (ResourceNotFoundException),
     //   3. the 4 MB request total (top-level ValidationException),
-    //   4. key schema and key size (TransactionCanceledException with a
-    //      ValidationError reason on the first offending item and None on
-    //      every other; conditions are not evaluated when any item fails here),
+    //   4. the key pass, per item in order: a key that does not fit the schema
+    //      or a key attribute named in an Update (TransactionCanceledException
+    //      with a ValidationError reason on the first offending item and None
+    //      on every other; conditions are not evaluated when any item fails
+    //      here), then an empty key value (top-level ValidationException),
     //   5. duplicate targets (top-level ValidationException).
-    // Measured against DynamoDB for #108; a request with two defects reports
-    // the earlier phase's error whichever item carries it.
+    // Measured against DynamoDB; a request with two defects reports the
+    // earlier phase's error whichever item carries it.
     let parsed: Vec<ParsedExpressions> = input
         .transact_items
         .iter()
@@ -112,20 +116,17 @@ pub async fn handle_transact_write_items(
         ));
     }
 
-    // Key schema preflight: a key whose type does not match the schema, or a
-    // key over the size limit, cancels the transaction with a ValidationError
-    // reason on the FIRST offending item and None on every other item, even
-    // when several keys fail (measured: items 1 and 3 mistyped report
-    // [ValidationError, None, None]). (An EMPTY key value, by contrast, is a
-    // top-level ValidationException and is handled in prepare_write_op.)
-    // Running this before duplicate detection and before any condition is
-    // evaluated matches the service: the other items report None, not
+    // The key pass: one item after another, the first failing item decides.
+    // Inside an item a key that does not fit the schema (wrong type, missing
+    // or extra attribute, over the size limit) comes first, then a key
+    // attribute named in an Update, both as a ValidationError reason on that
+    // item and None on every other even when several fail (measured: items 1
+    // and 3 mistyped report [ValidationError, None, None]); an empty key
+    // value comes last and is a top-level ValidationException. Running this
+    // before duplicate detection and before any condition is evaluated
+    // matches the service: the other items report None, not
     // ConditionalCheckFailed.
-    if let Some((index, reason)) = prepared
-        .iter()
-        .enumerate()
-        .find_map(|(i, op)| op.key_schema_reason(&ctx.limits).map(|r| (i, r)))
-    {
+    if let Some((index, reason)) = key_pass_failure(&prepared, &ctx.limits)? {
         let reasons: Vec<extenddb_core::types::CancellationReason> = (0..prepared.len())
             .map(|i| {
                 if i == index {
@@ -376,7 +377,8 @@ struct ParsedExpressions {
     actions: Option<Vec<UpdateAction>>,
 }
 
-/// Phase 1 of `TransactWriteItems` validation: the expressions of one item.
+/// Phase 1 of `TransactWriteItems` validation: everything about one item that
+/// needs no table.
 ///
 /// Runs for every item before any table is looked up, so a malformed
 /// expression on item three is reported ahead of a missing table on item one.
@@ -421,12 +423,20 @@ fn parse_write_expressions(
         ));
     };
 
+    // The nesting of every ExpressionAttributeValues value, used or not, is
+    // the first thing the service checks about an item (measured: it beats
+    // the same item's syntax error, undefined reference and unused value, and
+    // a later item's expression errors, and yields to an earlier item's).
+    validate_value_map_nesting(values)?;
+
     // Inside a transaction the service checks an Update item's
     // UpdateExpression (syntax, the ordered semantic walk, overlapping paths)
     // before its ConditionExpression, the reverse of UpdateItem; then the
-    // unused names and values; then the item's size (measured 2026-10-14:
-    // an oversize Put with an unused value reports the value, and an
-    // oversize item one reports its size ahead of the next item's defects).
+    // unused names and values; then, for a Put, the attribute name size, the
+    // item's size and the item's nesting (measured: an oversize Put with an
+    // unused value reports the value, an oversize item one reports its size
+    // ahead of the next item's defects, and one item with all three defects
+    // reports the name first and the nesting last).
     let maps = build_expression_maps(names, values);
     let actions = match update_expression {
         Some(expr) => Some(crate::expression_helpers::parse_update_expr_checked(
@@ -459,7 +469,9 @@ fn parse_write_expressions(
         )?;
     }
     if let Some(put) = &twi.put {
+        validate_attribute_name_sizes(&put.item, limits)?;
         validate_item_size(&put.item, limits.max_item_size_bytes)?;
+        validate_item_nesting_depth(&put.item)?;
     }
     Ok(ParsedExpressions {
         maps,
@@ -468,8 +480,9 @@ fn parse_write_expressions(
     })
 }
 
-/// Phase 2 of `TransactWriteItems` validation: look the table up and validate
-/// the item or key against it, returning a `PreparedOp`.
+/// Phase 2 of `TransactWriteItems` validation: look the table up and build
+/// the `PreparedOp`. Nothing is validated against the table here; the key
+/// pass runs once every table is known (see `key_pass_failure`).
 async fn prepare_write_op(
     twi: &TransactWriteItem,
     exprs: ParsedExpressions,
@@ -486,9 +499,6 @@ async fn prepare_write_op(
             .table_key_info_uncached(&put.table_name)
             .await
             .map_err(storage_err_to_dynamo)?;
-        validate_item_nesting_depth(&put.item)?;
-        validate_attribute_name_sizes(&put.item, &ctx.limits)?;
-        validate_key_not_empty(&put.item, &key_info.key_schema)?;
         let stream =
             stream_capture::stream_view_type(&key_info).map(|vt| extenddb_storage::StreamCapture {
                 view_type: vt,
@@ -510,10 +520,6 @@ async fn prepare_write_op(
             .table_key_info_uncached(&del.table_name)
             .await
             .map_err(storage_err_to_dynamo)?;
-        // Empty or oversize key values are up-front input validation in
-        // DynamoDB (a top-level ValidationException), unlike a key type
-        // mismatch which surfaces as a per-item cancellation reason.
-        validate_key_not_empty(&del.key, &key_info.key_schema)?;
         let stream =
             stream_capture::stream_view_type(&key_info).map(|vt| extenddb_storage::StreamCapture {
                 view_type: vt,
@@ -535,27 +541,6 @@ async fn prepare_write_op(
             .table_key_info_uncached(&upd.table_name)
             .await
             .map_err(storage_err_to_dynamo)?;
-        // Empty or oversize key values are up-front input validation in
-        // DynamoDB (a top-level ValidationException), unlike a key type
-        // mismatch which surfaces as a per-item cancellation reason.
-        validate_key_not_empty(&upd.key, &key_info.key_schema)?;
-        let actions = actions.unwrap_or_default();
-        validate_no_key_updates(&actions, &key_info, &maps)?;
-
-        // Validate nesting depth of EAV values that get stored via SET actions.
-        {
-            let mut placeholders: Vec<String> = Vec::new();
-            for action in &actions {
-                if let extenddb_core::expression::UpdateAction::Set { value, .. } = action {
-                    extenddb_core::expression::collect_value_placeholders(value, &mut placeholders);
-                }
-            }
-            let stored: Vec<&extenddb_core::types::AttributeValue> = placeholders
-                .iter()
-                .filter_map(|name| maps.values.get(name))
-                .collect();
-            validate_attribute_values_nesting_depth(stored)?;
-        }
         let stream =
             stream_capture::stream_view_type(&key_info).map(|vt| extenddb_storage::StreamCapture {
                 view_type: vt,
@@ -565,7 +550,7 @@ async fn prepare_write_op(
         return Ok(PreparedOp::Update {
             key_info,
             key: upd.key.clone(),
-            actions,
+            actions: actions.unwrap_or_default(),
             condition,
             maps,
             return_values_on_ccf: upd.return_values_on_condition_check_failure,
@@ -578,10 +563,6 @@ async fn prepare_write_op(
             .table_key_info_uncached(&cc.table_name)
             .await
             .map_err(storage_err_to_dynamo)?;
-        // Empty or oversize key values are up-front input validation in
-        // DynamoDB (a top-level ValidationException), unlike a key type
-        // mismatch which surfaces as a per-item cancellation reason.
-        validate_key_not_empty(&cc.key, &key_info.key_schema)?;
         let Some(condition) = condition else {
             // Unreachable: parse_write_expressions parsed the required expression.
             return Err(DynamoDbError::ValidationException(
