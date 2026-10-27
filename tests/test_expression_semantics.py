@@ -616,7 +616,7 @@ class TestReadExpressionReferences:
                                                            ExpressionAttributeValues={":q": S}, Limit=0),
                 P + "Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1")
         _expect(lambda: dynamodb_client.scan(TableName=empty, FilterExpression="x = :q", Segment=0),
-                "The TotalSegments parameter is required but was not present in the request when Segment parameter is present")
+                F + UNDEF_VALUE.format(":q"))
         _expect(lambda: dynamodb_client.scan(TableName=empty, ProjectionExpression="#p", ExpressionAttributeValues={":u": N}),
                 "ExpressionAttributeValues can only be specified when using expressions: FilterExpression is null")
 

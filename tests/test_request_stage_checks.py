@@ -98,7 +98,7 @@ class TestKeyConditionFunctionNames:
             ("pk = :p AND contains(sk, :v)", {":p": S, ":v": S}, NOT_AN_OPERATOR),
             ("pk = :p AND attribute_exists(sk)", {":p": S}, NOT_AN_OPERATOR),
             ("pk = :p AND attribute_not_exists(sk)", {":p": S}, NOT_AN_OPERATOR),
-            ("pk = :p AND attribute_type(sk, :t)", {":p": S, ":t": S}, NOT_AN_OPERATOR),
+            ("pk = :p AND attribute_type(sk, :t)", {":p": S, ":t": {"S": "S"}}, NOT_AN_OPERATOR),
             ("contains(pk, :v) AND sk = :s", {":v": S, ":s": S}, NOT_AN_OPERATOR),
             ("pk = :p AND size(sk) > :n", {":p": S, ":n": N}, NESTED),
             ("pk = :p AND foo(sk, :v)", {":p": S, ":v": S}, KEY_CONDITION + "Invalid function name; function: foo"),
@@ -226,3 +226,57 @@ class TestEmptyExpressionStrings:
             lambda: client.update_item(TableName=table, Key=KEY, UpdateExpression=""),
             "1 validation error detected: Invalid UpdateExpression: The expression can not be empty;",
         )
+
+
+class TestScanSegmentChecks:
+    """Segment and TotalSegments go together; the service checks that after the
+    expressions and the unused names, and before the table lookup."""
+
+    TOTAL_REQUIRED = (
+        "The TotalSegments parameter is required but was not present in the request "
+        "when Segment parameter is present"
+    )
+    SEGMENT_REQUIRED = (
+        "The Segment parameter is required but was not present in the request "
+        "when parameter TotalSegments is present"
+    )
+    ZERO_BASED = "The Segment parameter is zero-based and must be less than parameter TotalSegments"
+    UNDEFINED_VALUE = "Invalid FilterExpression: " + UNDEF_VALUE.format(":q")
+
+    def test_the_messages(self, dynamodb_client, table):
+        _refused(lambda: dynamodb_client.scan(TableName=table, Segment=0), self.TOTAL_REQUIRED)
+        _refused(lambda: dynamodb_client.scan(TableName=table, TotalSegments=2), self.SEGMENT_REQUIRED)
+        # The service ends its text there; ExtendDB adds the two values.
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.scan(TableName=table, Segment=5, TotalSegments=3)
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException", err
+        assert err["Message"].startswith(self.ZERO_BASED), err
+
+    def test_they_come_after_the_expressions(self, dynamodb_client, table):
+        for pair in ({"Segment": 0}, {"TotalSegments": 2}, {"Segment": 5, "TotalSegments": 3}):
+            _refused(
+                lambda: dynamodb_client.scan(TableName=table, FilterExpression="x = :q", **pair),
+                self.UNDEFINED_VALUE,
+            )
+        _refused(
+            lambda: dynamodb_client.scan(
+                TableName=table,
+                FilterExpression="x = :v",
+                ExpressionAttributeValues={":v": N, ":u": N},
+                Segment=0,
+            ),
+            "Value provided in ExpressionAttributeValues unused in expressions: keys: {:u}",
+        )
+        _refused(
+            lambda: dynamodb_client.scan(TableName=table, ProjectionExpression="#p", Segment=0),
+            "Invalid ProjectionExpression: " + UNDEF_NAME.format("#p"),
+        )
+
+    def test_they_come_before_the_table_lookup(self, dynamodb_client, missing_table):
+        _refused(lambda: dynamodb_client.scan(TableName=missing_table, Segment=0), self.TOTAL_REQUIRED)
+
+    def test_limit_still_comes_first(self, dynamodb_client_no_validation, table):
+        client = dynamodb_client_no_validation
+        _refused(lambda: client.scan(TableName=table, Segment=0, Limit=0), LIMIT)
+        _refused(lambda: client.scan(TableName=table, Segment=5, TotalSegments=3, Limit=0), LIMIT)
