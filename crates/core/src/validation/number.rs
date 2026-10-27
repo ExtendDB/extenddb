@@ -22,8 +22,11 @@ pub fn validate_and_normalize_number(s: &str) -> Result<String, DynamoDbError> {
         None => (false, s.strip_prefix('+').unwrap_or(s)),
     };
 
+    // DynamoDB reads the exponent as a signed 64-bit integer: one outside that
+    // range is malformed (`1E9223372036854775808`), one inside it is range
+    // checked below (`1E2147483648` is an overflow).
     let (mantissa_str, explicit_exp) = match rest.split_once(['e', 'E']) {
-        Some((m, e)) => (m, e.parse::<i32>().map_err(|_| numeric_value_err(s))?),
+        Some((m, e)) => (m, e.parse::<i64>().map_err(|_| numeric_value_err(s))?),
         None => (rest, 0),
     };
 
@@ -53,8 +56,10 @@ pub fn validate_and_normalize_number(s: &str) -> Result<String, DynamoDbError> {
     // Combine into a single digit string and track where the decimal point is.
     // The value is: <int_part>.<frac_part> * 10^explicit_exp
     // Which equals: <all_digits> * 10^(explicit_exp - frac_part.len())
+    // The exponent arithmetic is done in i128: an i64 exponent plus or minus a
+    // digit count cannot leave that range.
     let all_digits = format!("{int_part}{frac_part}");
-    let point_offset = explicit_exp - frac_part.len() as i32;
+    let point_offset = i128::from(explicit_exp) - digit_count(frac_part);
 
     // Strip leading zeros to get significant digits
     let sig_start = all_digits
@@ -63,6 +68,16 @@ pub fn validate_and_normalize_number(s: &str) -> Result<String, DynamoDbError> {
     let significant = &all_digits[sig_start..];
 
     if significant.is_empty() {
+        // DynamoDB range checks a zero on its exponent less its fraction
+        // digits (`0E126` is an overflow, `0.0E-130` an underflow). Only a zero
+        // whose exponent does not fit in an i32 is checked here, since those
+        // were already refused: a zero refused here keeps its raw spelling in
+        // `AttributeValue`, and only the PutItem item and UpdateItem's update
+        // values are validated afterwards (#618), so the other operations, and
+        // UpdateItem's key, would store and look up `0E126` as a key of its own.
+        if i32::try_from(explicit_exp).is_err() {
+            check_magnitude(point_offset)?;
+        }
         return Ok("0".to_owned());
     }
 
@@ -81,20 +96,16 @@ pub fn validate_and_normalize_number(s: &str) -> Result<String, DynamoDbError> {
     // The exponent for the normalized form:
     // value = all_digits_as_integer * 10^point_offset
     //       = significant_as_integer * 10^point_offset  (leading zeros don't change value)
-    //       = sig_trimmed_as_integer * 10^(point_offset + trailing_zeros)
-    let trailing_zeros = significant.len() - sig_end;
-    let exp = point_offset + trailing_zeros as i32;
+    //       = sig_trimmed_as_integer * 10^(point_offset + the trailing zeros of significant)
+    let exp = point_offset + digit_count(&significant[sig_end..]);
 
     // Magnitude: the number is sig_trimmed * 10^exp, so its order of magnitude
     // is sig_trimmed.len() - 1 + exp
-    let magnitude_exp = sig_trimmed.len() as i32 - 1 + point_offset + trailing_zeros as i32;
+    check_magnitude(digit_count(sig_trimmed) - 1 + exp)?;
 
-    if magnitude_exp > MAX_EXPONENT {
-        return Err(overflow_err());
-    }
-    if magnitude_exp < MIN_EXPONENT {
-        return Err(underflow_err());
-    }
+    // The magnitude is in range and `sig_trimmed` has at most 38 digits, so
+    // `exp` is between MIN_EXPONENT - 37 and MAX_EXPONENT and fits in an i32.
+    let exp = i32::try_from(exp).map_err(|_| overflow_err())?;
 
     // Format the normalized number
     // sig_trimmed represents an integer, and we multiply by 10^exp
@@ -106,6 +117,23 @@ pub fn validate_and_normalize_number(s: &str) -> Result<String, DynamoDbError> {
     }
 
     Ok(result)
+}
+
+/// The length of an ASCII digit string, as an i128 for the exponent arithmetic.
+fn digit_count(digits: &str) -> i128 {
+    // A `usize` always fits in an `i128`.
+    i128::try_from(digits.len()).unwrap_or(i128::MAX)
+}
+
+/// Refuse an order of magnitude outside `DynamoDB`'s supported range.
+fn check_magnitude(magnitude_exp: i128) -> Result<(), DynamoDbError> {
+    if magnitude_exp > i128::from(MAX_EXPONENT) {
+        return Err(overflow_err());
+    }
+    if magnitude_exp < i128::from(MIN_EXPONENT) {
+        return Err(underflow_err());
+    }
+    Ok(())
 }
 
 /// Format digits * 10^exp as a plain decimal string (no scientific notation).
@@ -330,5 +358,136 @@ mod tests {
             err.to_string(),
             "The parameter cannot be converted to a numeric value"
         );
+    }
+
+    // Every value in these tests was sent to DynamoDB's PutItem twice on
+    // 2026-10-27, with the same answer both times. Each test expects
+    // DynamoDB's answer, except the last, which says why.
+    const OVERFLOW: &str =
+        "Number overflow. Attempting to store a number with magnitude larger than supported range";
+    const UNDERFLOW: &str = "Number underflow. Attempting to store a number with magnitude smaller than supported range";
+
+    fn assert_refused(input: &str, want: &str) {
+        match validate_and_normalize_number(input) {
+            Ok(n) => panic!("{input:?} accepted as {n:?}, want {want:?}"),
+            Err(e) => assert_eq!(e.to_string(), want, "{input:?}"),
+        }
+    }
+
+    #[test]
+    fn magnitude_counts_every_significant_digit() {
+        for n in [
+            "12E124", "99E124", "10E124", "100E123", "1.2E-130", "10E-131",
+        ] {
+            assert!(validate_and_normalize_number(n).is_ok(), "{n:?}");
+        }
+        for n in ["12E125", "10E125"] {
+            assert_refused(n, OVERFLOW);
+        }
+        for n in ["1.2E-131", "10E-132"] {
+            assert_refused(n, UNDERFLOW);
+        }
+    }
+
+    #[test]
+    fn exponent_near_i32_limits_is_an_overflow_or_underflow() {
+        for n in [
+            "10E2147483647",
+            "100E2147483647",
+            "12E2147483647",
+            "-10E2147483647",
+            "1E+2147483647",
+            "0.1E2147483647",
+            "1E2147483647",
+        ] {
+            assert_refused(n, OVERFLOW);
+        }
+        for n in [
+            "1.5E-2147483648",
+            "-1.5E-2147483648",
+            "0.01E-2147483648",
+            "1E-2147483648",
+        ] {
+            assert_refused(n, UNDERFLOW);
+        }
+    }
+
+    #[test]
+    fn exponent_is_read_as_i64() {
+        for n in [
+            "1E2147483648",
+            "1E4294967296",
+            "1E9223372036854775807",
+            "10E9223372036854775807",
+        ] {
+            assert_refused(n, OVERFLOW);
+        }
+        for n in [
+            "1E-2147483649",
+            "1E-9223372036854775808",
+            "0.1E-9223372036854775808",
+        ] {
+            assert_refused(n, UNDERFLOW);
+        }
+        for n in [
+            "1E9223372036854775808",
+            "1E-9223372036854775809",
+            "1E99999999999999999999",
+        ] {
+            assert_refused(
+                n,
+                &format!("The parameter cannot be converted to a numeric value: {n}"),
+            );
+        }
+    }
+
+    #[test]
+    fn zero_with_exponent_outside_i32_is_range_checked() {
+        // DynamoDB accepts each of these as 0.
+        for n in [
+            "0E125",
+            "0.0E126",
+            "000.0E126",
+            "-0.0E126",
+            "0E-130",
+            "0.0E-129",
+            "0E0",
+            "0.0",
+        ] {
+            assert_eq!(validate_and_normalize_number(n).unwrap(), "0", "{n:?}");
+        }
+        // A zero whose exponent does not fit in an i32. DynamoDB also refuses a
+        // zero such as `0E126` whose exponent fits; see the comment in
+        // `validate_and_normalize_number` for why those are not checked.
+        for n in ["0E2147483648", "0E9223372036854775806"] {
+            assert_refused(n, OVERFLOW);
+        }
+        for n in ["0E-9223372036854775807", "0E-9223372036854775808"] {
+            assert_refused(n, UNDERFLOW);
+        }
+    }
+
+    // DynamoDB refuses these zeros (`0E126` overflow, `0.0E-130` underflow).
+    // They stay accepted as 0 until every operation validates numbers (#618):
+    // refusing them here would make BatchWriteItem and the other operations
+    // that skip validation store and look up `0E126` as a key of its own.
+    // Remove this test and add the rows to the one above when #618 is fixed.
+    #[test]
+    fn zero_with_i32_exponent_stays_accepted_until_618() {
+        for n in [
+            "0E126",
+            "00E126",
+            "-0E126",
+            "0E2147483647",
+            "00.000E2147483647",
+            "0.0E-130",
+            "0E-131",
+            "-0E-131",
+            "0.00E-131",
+            "0E-2147483648",
+            "0.0E-2147483648",
+        ] {
+            assert_eq!(validate_and_normalize_number(n).unwrap(), "0", "{n:?}");
+        }
     }
 }
