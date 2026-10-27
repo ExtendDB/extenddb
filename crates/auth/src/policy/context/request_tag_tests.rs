@@ -230,6 +230,69 @@ fn policy_variable_naming_aws_tagkeys_is_left_literal_for_every_tag_order() {
     }
 }
 
+/// An `AssumeRoleContext` for an IAM user caller with the given principal tags
+/// and session tags.
+fn assume_role_ctx(principal: &[(&str, &str)], session: &[(&str, &str)]) -> AssumeRoleContext {
+    let owned = |tags: &[(&str, &str)]| -> HashMap<String, String> {
+        tags.iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    };
+    AssumeRoleContext {
+        principal_tags: owned(principal),
+        external_id: None,
+        session_name: Some("probe".to_owned()),
+        principal_arn: "arn:aws:iam::123456789012:user/alice".to_owned(),
+        principal_account: Some("123456789012".to_owned()),
+        request_tags: owned(session),
+        region: Some("us-east-1".to_owned()),
+        secure_transport: true,
+        principal_type: Some("User".to_owned()),
+        username: Some("alice".to_owned()),
+        source_ip: None,
+        user_agent: None,
+        userid: None,
+        resource_account: Some("123456789012".to_owned()),
+        current_time: "2026-01-01T00:00:00Z".to_owned(),
+        epoch_time: "1767225600".to_owned(),
+    }
+}
+
+#[test]
+fn trust_policy_variable_naming_aws_tagkeys_is_left_literal() {
+    use crate::policy::condition::{ConditionMatch, evaluate_statement_conditions};
+    use crate::policy::document::{Condition, ConditionOperator};
+
+    // AssumeRoleContext reports aws:TagKeys as multivalued, so a trust policy
+    // condition value ${aws:TagKeys} stays literal text. Expanded, it would be
+    // the first session tag key in the map's iteration order, which a test
+    // cannot choose. One context holds both session tag keys in one map, and
+    // each of its two principal tags holds one key, so an expansion to either
+    // key matches the condition on the principal tag that holds it.
+    let compare_with_tag_keys = |principal_tag: &str| {
+        [Condition {
+            operator: ConditionOperator::StringEquals,
+            key: format!("aws:PrincipalTag/{principal_tag}"),
+            values: vec!["${aws:TagKeys}".to_owned()],
+        }]
+    };
+    let session = [("env", "x"), ("owner", "x")];
+    let ctx = assume_role_ctx(&[("key_env", "env"), ("key_owner", "owner")], &session);
+    for tag in ["key_env", "key_owner"] {
+        assert_eq!(
+            evaluate_statement_conditions(&compare_with_tag_keys(tag), &ctx),
+            ConditionMatch::NoMatch,
+            "${{aws:TagKeys}} expanded to the session tag key in {tag}"
+        );
+    }
+    // The variable is text, so it equals the same text.
+    let ctx = assume_role_ctx(&[("team", "${aws:TagKeys}")], &session);
+    assert_eq!(
+        evaluate_statement_conditions(&compare_with_tag_keys("team"), &ctx),
+        ConditionMatch::Match
+    );
+}
+
 #[test]
 fn an_empty_request_tag_value_is_a_present_key() {
     use crate::policy::condition::evaluate_condition;
