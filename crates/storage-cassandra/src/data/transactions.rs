@@ -1855,10 +1855,12 @@ impl CassandraEngine {
     /// index sync receives, which a put leaves as `None`; the stream record's
     /// own old image is already baked into `stream_stmt`.
     ///
-    /// The statements run as `secondary_effect_batches` groups them, which is
-    /// one batch holding the index rows and the record together. The queue row
-    /// an asynchronous GSI takes (`enqueue_async_indexes`) is written on the
-    /// session outside that batch, as it was before the record joined it.
+    /// The statements run as `secondary_effect_batches` groups them: one batch
+    /// holding the index rows and the record together, or the index batch
+    /// followed by the record as a batch of its own when the two are too large
+    /// to share one. The queue row an asynchronous GSI takes
+    /// (`enqueue_async_indexes`) is written on the session outside that batch,
+    /// as it was before the record joined it.
     async fn commit_secondary_effects(
         &self,
         key_info: &TableKeyInfo,
@@ -1906,17 +1908,13 @@ impl CassandraEngine {
             .await?;
         }
 
-        for batch in secondary_effect_batches(batch, stream_stmt) {
-            self.session
-                .batch(
-                    batch
-                        .build()
-                        .map_err(|e| StorageError::Internal(e.to_string()))?,
-                )
-                .await
-                .map_err(|e| {
-                    StorageError::Internal(format!("commit_secondary_effects batch: {e}"))
-                })?;
+        let index_batch = batch
+            .build()
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        for batch in secondary_effect_batches(index_batch, stream_stmt) {
+            self.session.batch(batch).await.map_err(|e| {
+                StorageError::Internal(format!("commit_secondary_effects batch: {e}"))
+            })?;
         }
 
         if async_enqueued > 0 {

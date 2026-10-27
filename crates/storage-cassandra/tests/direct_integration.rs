@@ -53,10 +53,14 @@ mod table_engine;
 mod transact_get_items;
 #[path = "direct/transact_write_items.rs"]
 mod transact_write_items;
+#[path = "direct/transact_write_stream_batch_limit.rs"]
+mod transact_write_stream_batch_limit;
 #[path = "direct/transact_write_stream_images.rs"]
 mod transact_write_stream_images;
 #[path = "direct/transact_write_stream_records.rs"]
 mod transact_write_stream_records;
+#[path = "direct/transact_write_stream_size_sweep.rs"]
+mod transact_write_stream_size_sweep;
 #[path = "direct/transaction_ledger.rs"]
 mod transaction_ledger;
 #[path = "direct/users.rs"]
