@@ -142,9 +142,15 @@ mod tests {
             .collect()
     }
 
+    /// An index batch with every setting the record batch has to carry over set
+    /// to a value other than its default.
     fn index_batch() -> QueryBatch {
         BatchQueryBuilder::new()
             .with_consistency(Consistency::LocalQuorum)
+            .with_serial_consistency(Consistency::LocalSerial)
+            .with_timestamp(1_700_000_000_000_000)
+            .with_keyspace("ks".to_owned())
+            .with_now_in_seconds(1_700_000_000)
             .add_query(
                 "INSERT INTO ks.index_rows (a) VALUES (1)".to_owned(),
                 QueryValues::SimpleValues(vec![]),
@@ -218,7 +224,8 @@ mod tests {
     }
 
     /// A record too large to share a batch with the index rows runs after
-    /// them, alone, with the index batch's consistency.
+    /// them, alone, with the index batch's type and settings: consistency,
+    /// serial consistency, timestamp, keyspace and now_in_seconds.
     #[test]
     fn a_30000_byte_record_runs_as_a_second_batch_after_the_index_rows() {
         let record = record_of_len(30_000);
@@ -235,8 +242,33 @@ mod tests {
             vec![record],
             "the record is last and alone"
         );
-        assert_eq!(batches[1].request.consistency, Consistency::LocalQuorum);
-        assert_eq!(batches[1].request.batch_type, batches[0].request.batch_type);
+        let index = &batches[0].request;
+        let record_batch = &batches[1].request;
+        assert!(
+            index.serial_consistency.is_some()
+                && index.timestamp.is_some()
+                && index.keyspace.is_some()
+                && index.now_in_seconds.is_some(),
+            "the index batch must set every field, or the comparisons below match on defaults"
+        );
+        assert_eq!(record_batch.consistency, Consistency::LocalQuorum);
+        assert_eq!(record_batch.batch_type, index.batch_type);
+        assert_eq!(
+            record_batch.serial_consistency, index.serial_consistency,
+            "the record batch must keep the serial consistency"
+        );
+        assert_eq!(
+            record_batch.timestamp, index.timestamp,
+            "the record batch must keep the timestamp"
+        );
+        assert_eq!(
+            record_batch.keyspace, index.keyspace,
+            "the record batch must keep the keyspace"
+        );
+        assert_eq!(
+            record_batch.now_in_seconds, index.now_in_seconds,
+            "the record batch must keep now_in_seconds"
+        );
     }
 
     /// The record shares the batch up to the budget and runs alone one byte
