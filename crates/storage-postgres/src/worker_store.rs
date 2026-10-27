@@ -91,51 +91,18 @@ impl PostgresEngine {
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-            let dropped = async {
-                let mut data_tx = self
-                    .data_pool
-                    .begin()
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-                // CreateBackup holds ACCESS SHARE through its item read. Do not
-                // let a DROP waiting for that lock stall every transition in
-                // this worker pass; a timeout rolls this transaction back and
-                // leaves the catalog row DELETING for a later retry.
-                sqlx::query("SET LOCAL lock_timeout = '3s'")
-                    .execute(&mut *data_tx)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-                for idx_id in &index_ids {
-                    Self::drop_index_data_table(&mut data_tx, idx_id).await?;
-                }
-                for idx_id in &vector_index_ids {
-                    Self::drop_vector_data_table(&mut data_tx, idx_id).await?;
-                }
-                Self::drop_data_table(&mut data_tx, table_id).await?;
-
-                // Drop any still-pending GSI propagation rows for this table in
-                // the same transaction that drops the tables, so workers don't
-                // waste a claim→deserialize→attempt→skip cycle on orphaned rows.
-                sqlx::query("DELETE FROM gsi_pending WHERE table_id = $1")
-                    .bind(table_id)
-                    .execute(&mut *data_tx)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-                // The table is gone, so no vector build can release this hold;
-                // leaving it would block later claims for the table id.
-                sqlx::query("DELETE FROM vector_index_holds WHERE table_id = $1")
-                    .bind(table_id)
-                    .execute(&mut *data_tx)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-                data_tx
-                    .commit()
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-                Ok::<(), StorageError>(())
-            }
+            // See `drop_table_storage` for why the queue is stopped before
+            // anything is dropped. CreateBackup holds ACCESS SHARE through its
+            // item read; the lock timeout keeps a DROP waiting for that lock from
+            // stalling every transition in this worker pass. A failure leaves
+            // the catalog row DELETING for a later retry.
+            let dropped = Self::drop_table_storage(
+                &self.data_pool,
+                table_id,
+                &index_ids,
+                &vector_index_ids,
+                Some("3s"),
+            )
             .await;
 
             if let Err(e) = dropped {

@@ -1478,6 +1478,7 @@ dependencies = [
  "extenddb-core",
  "extenddb-storage",
  "futures",
+ "libc",
  "pgvector",
  "rand 0.9.4",
  "serde",

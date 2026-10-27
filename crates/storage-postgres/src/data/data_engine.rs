@@ -56,6 +56,7 @@ impl DataEngine for PostgresEngine {
                 stream.as_ref(),
             )
             .await
+            .map_err(|e| table_gone(e, &key_info.table_name))
         })
     }
 
@@ -72,7 +73,11 @@ impl DataEngine for PostgresEngine {
     ) -> BoxFuture<'_, Result<Option<Item>, StorageError>> {
         let key_info = key_info.clone();
         let key = key.clone();
-        Box::pin(async move { self.get_item_impl(&key_info, &key).await })
+        Box::pin(async move {
+            self.get_item_impl(&key_info, &key)
+                .await
+                .map_err(|e| table_gone(e, &key_info.table_name))
+        })
     }
 
     fn delete_item(
@@ -99,6 +104,7 @@ impl DataEngine for PostgresEngine {
                 stream.as_ref(),
             )
             .await
+            .map_err(|e| table_gone(e, &key_info.table_name))
         })
     }
 
@@ -131,6 +137,7 @@ impl DataEngine for PostgresEngine {
                 stream.as_ref(),
             )
             .await
+            .map_err(|e| table_gone(e, &key_info.table_name))
         })
     }
 
@@ -162,6 +169,7 @@ impl DataEngine for PostgresEngine {
                 index_name.as_deref(),
             )
             .await
+            .map_err(|e| read_target_gone(e, &key_info.table_name, index_name.as_deref()))
         })
     }
 
@@ -189,6 +197,7 @@ impl DataEngine for PostgresEngine {
                 index_name.as_deref(),
             )
             .await
+            .map_err(|e| read_target_gone(e, &key_info.table_name, index_name.as_deref()))
         })
     }
 
@@ -239,7 +248,13 @@ impl DataEngine for PostgresEngine {
                 .iter()
                 .map(|(key_info, key)| TransactGetOp { key_info, key })
                 .collect();
-            self.transact_get_items_impl(&borrowed_ops).await
+            let tables: Vec<(&str, &str)> = owned_ops
+                .iter()
+                .map(|(k, _)| (k.table_id.as_str(), k.table_name.as_str()))
+                .collect();
+            self.transact_get_items_impl(&borrowed_ops)
+                .await
+                .map_err(|e| table_gone_among(e, &tables))
         })
     }
 
@@ -388,6 +403,17 @@ impl DataEngine for PostgresEngine {
                     },
                 )
                 .collect();
+            let tables: Vec<(&str, &str)> = borrowed_ops
+                .iter()
+                .map(|op| match op {
+                    TransactWriteOp::Put { key_info, .. }
+                    | TransactWriteOp::Delete { key_info, .. }
+                    | TransactWriteOp::Update { key_info, .. }
+                    | TransactWriteOp::ConditionCheck { key_info, .. } => {
+                        (key_info.table_id.as_str(), key_info.table_name.as_str())
+                    }
+                })
+                .collect();
             self.transact_write_items_impl(
                 &borrowed_ops,
                 idempotency
@@ -399,6 +425,7 @@ impl DataEngine for PostgresEngine {
                     }),
             )
             .await
+            .map_err(|e| table_gone_among(e, &tables))
         })
     }
 
@@ -410,5 +437,118 @@ impl DataEngine for PostgresEngine {
             self.cleanup_expired_idempotency_tokens_impl(max_age_seconds)
                 .await
         })
+    }
+}
+
+/// A data table that is gone mid-request is a table that is gone.
+///
+/// A request that resolved the table just before a DeleteTable committed reaches
+/// the data database after the drop, and PostgreSQL answers 42P01. The service
+/// answers ResourceNotFoundException for a table being deleted, which is what
+/// `TableNotFound` becomes on the wire; passing the 42P01 through was a 500.
+fn table_gone(e: StorageError, table_name: &str) -> StorageError {
+    if data_table_missing(&e) {
+        StorageError::TableNotFound(table_name.to_owned())
+    } else {
+        e
+    }
+}
+
+/// [`table_gone`] for a transaction over several tables: the table named is the
+/// one whose data table the error names, or the first one if the error names an
+/// index table (dropped with its table) or is not specific.
+fn table_gone_among(e: StorageError, tables: &[(&str, &str)]) -> StorageError {
+    if !data_table_missing(&e) {
+        return e;
+    }
+    let StorageError::Internal(msg) = &e else {
+        return e;
+    };
+    let name = tables
+        .iter()
+        .find(|(id, _)| msg.contains(&format!("_ddb_{id}\"")))
+        .or(tables.first())
+        .map(|(_, name)| (*name).to_owned());
+    match name {
+        Some(name) => StorageError::TableNotFound(name),
+        None => e,
+    }
+}
+
+/// [`table_gone`] for a Query or Scan, which may name an index: a 42P01 there can
+/// be the index's table, dropped by a GSI delete that committed after the index
+/// was resolved, and the service answers that as an index it does not have.
+fn read_target_gone(e: StorageError, table_name: &str, index_name: Option<&str>) -> StorageError {
+    match index_name {
+        Some(index) if data_table_missing(&e) => StorageError::IndexNotFound(index.to_owned()),
+        _ => table_gone(e, table_name),
+    }
+}
+
+/// Whether an error is PostgreSQL's undefined_table for one of this backend's
+/// data tables. Many write paths render the error with `to_string()`, which keeps
+/// the message and drops the SQLSTATE, so the message is matched as well: it
+/// names the relation, and every data table's name starts `_ddb_`.
+fn data_table_missing(e: &StorageError) -> bool {
+    match e {
+        StorageError::Internal(msg) => {
+            crate::gsi_queue::is_undefined_table(e)
+                || (msg.contains("relation \"_ddb_") && msg.contains("does not exist"))
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod table_gone_tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_data_table_is_a_missing_table_with_or_without_the_sqlstate() {
+        for msg in [
+            "SQLSTATE 42P01: error returned from database: relation \"_ddb_abc\" does not exist",
+            "error returned from database: relation \"_ddb_abc\" does not exist",
+        ] {
+            let e = table_gone(StorageError::Internal(msg.to_owned()), "t");
+            assert!(
+                matches!(e, StorageError::TableNotFound(ref n) if n == "t"),
+                "{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_errors_pass_through() {
+        let e = table_gone(StorageError::Internal("deadlock detected".to_owned()), "t");
+        assert!(matches!(e, StorageError::Internal(_)));
+        let e = table_gone(
+            StorageError::Internal("relation \"settings\" does not exist".to_owned()),
+            "t",
+        );
+        assert!(matches!(e, StorageError::Internal(_)), "not a data table");
+    }
+
+    #[test]
+    fn a_transaction_names_the_table_whose_data_table_is_gone() {
+        let tables = [("id-a", "a"), ("id-b", "b")];
+        let e = table_gone_among(
+            StorageError::Internal("relation \"_ddb_id-b\" does not exist".to_owned()),
+            &tables,
+        );
+        assert!(matches!(e, StorageError::TableNotFound(ref n) if n == "b"));
+        let e = table_gone_among(
+            StorageError::Internal("relation \"_ddb_some-index\" does not exist".to_owned()),
+            &tables,
+        );
+        assert!(matches!(e, StorageError::TableNotFound(ref n) if n == "a"));
+        let e = table_gone_among(StorageError::Internal("deadlock".to_owned()), &tables);
+        assert!(matches!(e, StorageError::Internal(_)));
+    }
+
+    #[test]
+    fn a_missing_index_table_on_a_read_of_an_index_is_a_missing_index() {
+        let msg = "relation \"_ddb_idx\" does not exist".to_owned();
+        let e = read_target_gone(StorageError::Internal(msg), "t", Some("gsi1"));
+        assert!(matches!(e, StorageError::IndexNotFound(ref n) if n == "gsi1"));
     }
 }
