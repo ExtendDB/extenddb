@@ -5,10 +5,10 @@
 
 The BatchWriteItem API reference has DynamoDB reject the whole batch, with a
 400, for a request fault (a key that does not match the table's schema,
-duplicate keys, a table that does not exist). None of the batch's requests is
-applied, wherever the faulty request sits: the checks run for the whole batch
-before the first write, so a valid request listed ahead of the faulty one is
-not applied either.
+duplicate keys, an item over 400 KB, a table that does not exist). None of the
+batch's requests is applied, wherever the faulty request sits: the checks run
+for the whole batch before the first write, so a valid request listed ahead of
+the faulty one is not applied either.
 
 The tests need no contention: a valid request first and a faulty one second
 is enough to tell a handler that checks the whole batch from one that checks
@@ -55,6 +55,17 @@ def _put_with_wrong_key_type() -> dict:
 
 def _delete(pk: str) -> dict:
     return {"DeleteRequest": {"Key": {"pk": {"S": pk}}}}
+
+
+def _put_over_the_item_size_limit(pk: str) -> dict:
+    """A put of 401 KB, past the item limit of 400 KB (409,600 bytes)."""
+    item = {"pk": {"S": pk}, "pad": {"S": "x" * (401 * 1024)}}
+    return {"PutRequest": {"Item": item}}
+
+
+def _delete_with_an_extra_key_attribute(pk: str) -> dict:
+    """A delete whose key carries an attribute that is not part of the key."""
+    return {"DeleteRequest": {"Key": {"pk": {"S": pk}, "extra": {"S": "x"}}}}
 
 
 def _exists(client, table: str, pk: str) -> bool:
@@ -138,3 +149,22 @@ def test_valid_put_with_duplicate_keys_in_another_table_is_not_applied(
 
         assert code == "ValidationException"
         assert not _exists(dynamodb_client, table_a, pk)
+
+
+@pytest.mark.parametrize(
+    "faulty_request",
+    [_put_over_the_item_size_limit, _delete_with_an_extra_key_attribute],
+    ids=["item_over_400_kb", "delete_with_an_extra_key_attribute"],
+)
+def test_valid_put_before_an_oversized_item_or_a_malformed_delete_is_not_applied(
+    dynamodb_client, table_a, faulty_request
+):
+    pk = f"valid-{uuid.uuid4().hex[:8]}"
+    faulty_pk = f"faulty-{uuid.uuid4().hex[:8]}"
+
+    code = _rejected(
+        dynamodb_client, {table_a: [_put(pk), faulty_request(faulty_pk)]}
+    )
+
+    assert code == "ValidationException"
+    assert not _exists(dynamodb_client, table_a, pk)
