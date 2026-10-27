@@ -4,8 +4,10 @@
 
 The shard iterator carries the stream ARN the request is authorized against.
 The records read resolves the shard against that stream, so an iterator that
-pairs an allowed stream ARN with another stream's shard reads nothing, and an
-iterator reads only while its ARN is the table's current stream.
+pairs an allowed stream ARN with another stream's shard reads nothing. The
+storage-level tests cover an iterator whose ARN is no longer the table's
+current stream; the wire test here has the table keep its ARN across a disable
+and an enable.
 
 These tests require an ExtendDB endpoint (DYNAMODB_ENDPOINT): Amazon DynamoDB
 serves streams on a separate endpoint and its iterator tokens are opaque, so
@@ -144,14 +146,8 @@ class TestShardBelongsToIteratorStream:
         self, dynamodb_client, streams_client
     ):
         """An iterator issued before the stream was disabled and enabled again
-        reads nothing that was written to the stream that replaced it.
-
-        While the table keeps its stream ARN across the cycle, the old
-        iterators read the same records a fresh iterator on each shard reads.
-        When the re-enabled stream has a new ARN (as on the service, measured
-        2026-10-25), the old stream is closed with its own shard ids: an old
-        iterator answers 200, returns none of the keys written after the
-        re-enable, and its shard id is not one of the new stream's."""
+        keeps reading while the table keeps its stream ARN: across the four
+        shards it reads the same records a fresh iterator on each shard reads."""
         name, old_arn = _create_stream_table(dynamodb_client)
         try:
             old_shards = _shards(streams_client, old_arn)
@@ -163,6 +159,8 @@ class TestShardBelongsToIteratorStream:
             dynamodb_client.update_table(TableName=name, StreamSpecification=STREAM_SPEC)
             wait_for_active(dynamodb_client, name)
             new_arn = dynamodb_client.describe_table(TableName=name)["Table"]["LatestStreamArn"]
+            # A re-enabled stream with a new ARN, as on the service, becomes reachable with #515.
+            assert new_arn == old_arn, f"re-enabling made a new stream ARN: {new_arn}"
             new_keys = {f"n{i}" for i in range(8)}
             for key in sorted(new_keys):
                 dynamodb_client.put_item(TableName=name, Item={"pk": {"S": key}})
@@ -181,22 +179,10 @@ class TestShardBelongsToIteratorStream:
             old_pages = {
                 s: streams_client.get_records(ShardIterator=it) for s, it in old_its.items()
             }
-            if new_arn == old_arn:
-                # The table kept its stream: the old iterators read, across the
-                # four shards, exactly what the fresh iterators read.
-                old_seqs = sorted(
-                    r["dynamodb"]["SequenceNumber"]
-                    for p in old_pages.values()
-                    for r in p["Records"]
-                )
-                assert old_seqs == sorted(r["dynamodb"]["SequenceNumber"] for r in new_records)
-            else:
-                # The old stream was replaced: its shards are not the new
-                # stream's, and its iterators return none of the new keys.
-                assert not set(old_shards) & set(new_shards)
-                for page in old_pages.values():
-                    old_keys = {r["dynamodb"]["Keys"]["pk"]["S"] for r in page["Records"]}
-                    assert not old_keys & new_keys
+            old_seqs = sorted(
+                r["dynamodb"]["SequenceNumber"] for p in old_pages.values() for r in p["Records"]
+            )
+            assert old_seqs == sorted(r["dynamodb"]["SequenceNumber"] for r in new_records)
         finally:
             dynamodb_client.delete_table(TableName=name)
             wait_for_deleted(dynamodb_client, name)
