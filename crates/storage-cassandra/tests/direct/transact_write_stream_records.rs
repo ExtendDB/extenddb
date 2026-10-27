@@ -122,27 +122,32 @@ async fn test_transact_write_records_one_stream_record_per_mutation() {
     }
     let engine = setup_engine().await;
     let table = TestTable::new(&engine, "TxnStreamAllVerbs", false).await;
+    one_stream_record_per_mutation(&engine, &table, item_with, key_for).await;
+}
+
+/// The scenario of the test above on a table of any key shape. `item` and `key`
+/// build the item and the key for an id, with whatever sort key or index
+/// attribute the table needs. Returns the records the transaction wrote.
+pub(crate) async fn one_stream_record_per_mutation(
+    engine: &CassandraEngine,
+    table: &TestTable,
+    item: impl Fn(&str, &str) -> Item,
+    key: impl Fn(&str) -> Item,
+) -> Vec<(String, String, serde_json::Value)> {
     let maps = ExpressionMaps::default();
 
     // Seed the keys the Update and the Delete act on, without a capture, so the
     // only records in the table are the transaction's.
     for (id, val) in [("upd-1", "before"), ("del-1", "doomed")] {
         engine
-            .put_item(
-                &table.key_info,
-                item_with(id, val),
-                false,
-                None,
-                &maps,
-                None,
-            )
+            .put_item(&table.key_info, item(id, val), false, None, &maps, None)
             .await
             .unwrap();
     }
 
-    let put_item = item_with("put-1", "created");
-    let update_key = key_for("upd-1");
-    let delete_key = key_for("del-1");
+    let put_item = item("put-1", "created");
+    let update_key = key("upd-1");
+    let delete_key = key("del-1");
     let (actions, update_maps) = set_val_action("after");
     let view = capture(StreamViewType::NewAndOldImages);
 
@@ -177,7 +182,7 @@ async fn test_transact_write_records_one_stream_record_per_mutation() {
     engine.transact_write_items(&ops, None).await.unwrap();
 
     let records = records_for_keys(
-        &engine,
+        engine,
         &table.key_info.account_id,
         &table.key_info.table_id,
         &["put-1", "upd-1", "del-1"],
@@ -219,6 +224,7 @@ async fn test_transact_write_records_one_stream_record_per_mutation() {
             "record carries the capture's view type"
         );
     }
+    records
 }
 
 /// Two mutations on the same streamed table record two records, ordered as the
