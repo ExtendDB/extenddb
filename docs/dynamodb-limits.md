@@ -179,9 +179,9 @@ The following unenforced limits are tracked in `docs/technical-debt.md`:
 4. **BatchGetItem response size** (16 MB) — requires aggregate response size tracking
 5. **BatchWriteItem request size** (16 MB) — requires aggregate request size tracking
 6. **Transaction request size** (4 MB) — requires aggregate request size tracking
-8. **Shard iterator lifetime** (15 minutes) — requires timestamp tracking on shard iterators
-9. **Tag count per resource** (50) — requires count validation in TagResource
-10. **Tag key/value length** (128/256 chars) — requires length validation in TagResource
+7. **Shard iterator lifetime** (15 minutes) — requires timestamp tracking on shard iterators
+8. **Tag count per resource** (50) — requires count validation in TagResource
+9. **Tag key/value length** (128/256 chars) — requires length validation in TagResource
 
 ---
 

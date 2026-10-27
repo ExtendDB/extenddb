@@ -369,7 +369,7 @@ pub async fn handle_get_records(
 /// The answer for a token that carries no stream ARN, the same one
 /// [`classify_shard_iterator`] gives the authorization layer. A token with a
 /// timestamp comes from a build before the ARN was carried and is expired; one
-/// without a timestamp is not a token this server issued and is invalid.
+/// without a timestamp is invalid.
 fn no_stream_arn_error(it: &ShardIterator) -> DynamoDbError {
     if it.created_at.is_some() {
         DynamoDbError::ExpiredIteratorException(SHARD_ITERATOR_EXPIRED_MESSAGE.to_owned())
