@@ -68,8 +68,9 @@ pub async fn handle_scan(
     )?;
     let input: ScanInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
-    // Validate Filter/Projection expressions before the existence
-    // check; index resolution, Segment/Limit/Select and key checks stay after.
+    // Limit and Segment, then the Filter and Projection expressions, are
+    // checked before the existence check; index resolution, Select and the
+    // key checks stay after it.
 
     // --- Legacy vs expression mutual exclusivity checks ---
     let has_fe = input.filter_expression.is_some();
