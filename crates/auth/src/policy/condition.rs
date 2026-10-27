@@ -246,8 +246,15 @@ pub fn evaluate_statement_conditions(
 /// Expand IAM policy variables in a string value.
 ///
 /// Replaces `${variable}` patterns with their resolved values from the context.
-/// Supported variables: `aws:PrincipalTag/*` and any key the context can
-/// resolve. Unresolvable variables are left as-is (IAM behavior).
+/// Supported variables: `aws:PrincipalTag/*` and any single-valued key the
+/// context can resolve. A variable that names an unresolvable key stays
+/// literal (IAM behavior), and so does one that names a multivalued key
+/// (`aws:TagKeys`, `dynamodb:LeadingKeys`, `dynamodb:Attributes`): a set of
+/// values has no one value to expand to. IAM leaves such a variable as text
+/// (measured 2026-10-27: a Deny on `aws:ResourceTag/team` equal to
+/// `${aws:TagKeys}` applies to no request, whatever order the request lists
+/// its tag keys in, and the same Deny under `StringNotEquals` applies to
+/// every request).
 fn expand_policy_variables(value: &str, context: &impl ConditionContext) -> String {
     if !value.contains("${") {
         return value.to_owned();
@@ -261,13 +268,18 @@ fn expand_policy_variables(value: &str, context: &impl ConditionContext) -> Stri
         let after_start = &rest[start + 2..];
         if let Some(end) = after_start.find('}') {
             let var_name = &after_start[..end];
-            if let Some(vals) = context.resolve_key(var_name) {
-                // Use the first value for single-valued expansion.
+            let resolved = if context.is_multivalued_key(var_name) {
+                None
+            } else {
+                context.resolve_key(var_name)
+            };
+            if let Some(vals) = resolved {
+                // A single-valued key resolves to one value.
                 if let Some(v) = vals.first() {
                     result.push_str(v);
                 }
             } else {
-                // Unresolvable — leave the variable literal.
+                // Unresolvable or multivalued: leave the variable literal.
                 result.push_str(&rest[start..start + 3 + end]);
             }
             rest = &after_start[end + 1..];

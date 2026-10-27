@@ -206,6 +206,31 @@ fn ambiguous_request_tag_as_a_policy_variable_fails_the_statement_closed() {
 }
 
 #[test]
+fn policy_variable_naming_aws_tagkeys_is_left_literal_for_every_tag_order() {
+    use crate::policy::condition::{ConditionMatch, evaluate_statement_conditions};
+    use crate::policy::document::{Condition, ConditionOperator};
+
+    // A Deny on aws:ResourceTag/team equal to ${aws:TagKeys} on a table tagged
+    // team=env. The variable names a multivalued key, so it stays literal and
+    // the statement applies to neither order of the request's tag keys.
+    let deny = [Condition {
+        operator: ConditionOperator::StringEquals,
+        key: "aws:ResourceTag/team".to_owned(),
+        values: vec!["${aws:TagKeys}".to_owned()],
+    }];
+    for keys in [["env", "owner"], ["owner", "env"]] {
+        let mut ctx = ctx_with(&[("env", "x"), ("owner", "x")], &keys);
+        ctx.resource_tags
+            .insert("team".to_owned(), "env".to_owned());
+        assert_eq!(
+            evaluate_statement_conditions(&deny, &ctx),
+            ConditionMatch::NoMatch,
+            "tag keys {keys:?}"
+        );
+    }
+}
+
+#[test]
 fn principal_and_resource_tag_lookup_keep_the_exact_first_rule() {
     // Only aws:RequestTag changed. The neighbouring tag keys still resolve a
     // byte-exact stored key first and otherwise the smallest fold-matching key.

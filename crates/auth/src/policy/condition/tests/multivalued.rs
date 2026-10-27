@@ -297,6 +297,55 @@ fn policy_variable_unresolvable_left_literal() {
     ));
 }
 
+#[test]
+fn policy_variable_naming_aws_tagkeys_is_left_literal() {
+    // A multivalued key has no single value to expand to. The condition value
+    // ${aws:TagKeys} is text that no tag key equals, so a Deny comparing
+    // aws:ResourceTag/team with it applies to no request, whichever tag key the
+    // request lists first. IAM answers the same (SimulateCustomPolicy,
+    // 2026-10-27).
+    let team_is_tag_keys = cond(
+        ConditionOperator::StringEquals,
+        "aws:ResourceTag/team",
+        vec!["${aws:TagKeys}"],
+    );
+    for keys in [vec!["env", "owner"], vec!["owner", "env"]] {
+        let ctx = TestContext::new()
+            .with("aws:ResourceTag/team", vec!["env"])
+            .with("aws:TagKeys", keys.clone());
+        assert!(
+            !evaluate_condition(&team_is_tag_keys, &ctx),
+            "${{aws:TagKeys}} expanded for the keys {keys:?}"
+        );
+    }
+    // The variable is text, so it equals the same text.
+    let ctx = TestContext::new()
+        .with("aws:ResourceTag/team", vec!["${aws:TagKeys}"])
+        .with("aws:TagKeys", vec!["env", "owner"]);
+    assert!(evaluate_condition(&team_is_tag_keys, &ctx));
+}
+
+#[test]
+fn policy_variables_naming_the_dynamodb_multivalued_keys_are_left_literal() {
+    for key in ["dynamodb:LeadingKeys", "dynamodb:Attributes"] {
+        let variable = format!("${{{key}}}");
+        let ctx = TestContext::new()
+            .with("k", vec!["pk1"])
+            .with(key, vec!["pk1", "pk2"]);
+        assert!(
+            !evaluate_condition(
+                &cond(
+                    ConditionOperator::StringEquals,
+                    "k",
+                    vec![variable.as_str()]
+                ),
+                &ctx
+            ),
+            "{variable} expanded to its first value"
+        );
+    }
+}
+
 // --- ForAllValues with negative operators ---
 
 #[test]
