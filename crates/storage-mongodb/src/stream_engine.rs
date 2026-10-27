@@ -306,11 +306,11 @@ impl StreamEngine for MongoEngine {
             // is bounded by `limit` rather than by the 16 MB document cap (the
             // server coalesces the `$lookup` with the `$unwind` and never
             // materializes the array). A shard of the named table with no
-            // records returns one document without `record_data`, and a shard
-            // that is not that table's (another table, or another account)
-            // returns no document. Whether the shard belongs to the stream the
-            // ARN's label names is decided in Rust from the table's label and
-            // the shard id (`shard_in_stream`).
+            // records returns one document with `has_record` false, and a
+            // shard that is not that table's (another table, or another
+            // account) returns no document. Whether the shard belongs to the
+            // stream the ARN's label names is decided in Rust from the table's
+            // label and the shard id (`shard_in_stream`).
             let table_doc = self
                 .catalog_db
                 .collection::<Document>("tables")
@@ -353,6 +353,7 @@ impl StreamEngine for MongoEngine {
                 doc! { "$project": {
                     "_id": 0,
                     "shard_id": 1,
+                    "has_record": { "$ne": [{ "$type": "$records" }, "missing"] },
                     "record_data": "$records.record_data",
                 } },
             ];
@@ -373,16 +374,7 @@ impl StreamEngine for MongoEngine {
                 return Err(extenddb_storage::util::stream_does_not_exist());
             }
 
-            let records: Vec<StreamRecord> = docs
-                .into_iter()
-                .filter_map(|mut d| d.remove("record_data"))
-                .map(|record_bson| {
-                    let json_val: serde_json::Value = bson::from_bson(record_bson)
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
-                    serde_json::from_value(json_val)
-                        .map_err(|e| StorageError::Internal(e.to_string()))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let records = record_docs::records_from_docs(docs)?;
 
             let last_seq = records.last().map(|r| r.dynamodb.sequence_number.clone());
             Ok((records, last_seq))
@@ -809,6 +801,11 @@ mod tests {
         assert!(s2 < s3);
     }
 }
+
+/// The records in the result of the `get_stream_records` aggregation; see the
+/// module documentation.
+#[path = "stream_record_docs.rs"]
+mod record_docs;
 
 /// Live `get_stream_records` tests against a MongoDB server; see the module
 /// documentation.

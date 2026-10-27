@@ -317,3 +317,78 @@ async fn records_live_another_tables_shard_with_the_same_label_is_not_found() {
     assert_eq!(records.len(), 1);
     f.finish().await;
 }
+
+/// A record document that lacks `record_data` is an `Internal` error, not an
+/// idle page: the aggregation marks every joined record, so the read tells it
+/// from the shard document that has no record to read.
+#[tokio::test]
+#[ignore = "needs a MongoDB server in EXTENDDB_TEST_MONGODB_URI"]
+async fn records_live_a_record_document_without_record_data_is_an_internal_error() {
+    let f = Fixture::new().await;
+    let table_id = f.stream_table(ACCOUNT, "t", LABEL).await;
+    let arn = stream_arn(REGION, ACCOUNT, "t", LABEL);
+    let shard_id = super::build_shard_id(&table_id, 0);
+    f.write_records(&shard_id, &table_id, &[1], 10).await;
+    f.engine
+        .data_db
+        .collection::<Document>("stream_records")
+        .insert_one(doc! {
+            "sequence_number": format!("{:021}", 2),
+            "shard_id": &shard_id,
+            "table_id": &table_id,
+            "event_name": "INSERT",
+            "created_at": bson::DateTime::now(),
+        })
+        .await
+        .expect("a record document without record_data");
+
+    // The page before the broken document reads; the page that reaches it fails.
+    let (records, last) = f
+        .engine
+        .get_stream_records(ACCOUNT, &arn, &shard_id, None, 1)
+        .await
+        .expect("the first record reads");
+    assert_eq!(records.len(), 1);
+    match f
+        .engine
+        .get_stream_records(ACCOUNT, &arn, &shard_id, last.as_deref(), 10)
+        .await
+    {
+        Err(StorageError::Internal(msg)) => assert_eq!(msg, "Missing record_data"),
+        other => panic!("expected Internal(Missing record_data), got {other:?}"),
+    }
+    f.finish().await;
+}
+
+/// A shard with no record to read is an empty page, not an error. The
+/// aggregation keeps the shard document and marks it as carrying no record, so
+/// the read tells it from a record document that lacks `record_data`.
+#[tokio::test]
+#[ignore = "needs a MongoDB server in EXTENDDB_TEST_MONGODB_URI"]
+async fn records_live_an_idle_shard_reads_an_empty_page() {
+    let f = Fixture::new().await;
+    let table_id = f.stream_table(ACCOUNT, "t", LABEL).await;
+    let arn = stream_arn(REGION, ACCOUNT, "t", LABEL);
+    let written = super::build_shard_id(&table_id, 0);
+    let idle = super::build_shard_id(&table_id, 1);
+    f.write_records(&written, &table_id, &[1, 2], 10).await;
+
+    let last_written = format!("{:021}", 2);
+    for (case, shard, after) in [
+        ("a shard that never had a record", &idle, None),
+        (
+            "a bound at the last record",
+            &written,
+            Some(last_written.as_str()),
+        ),
+    ] {
+        let (records, last) = f
+            .engine
+            .get_stream_records(ACCOUNT, &arn, shard, after, 10)
+            .await
+            .unwrap_or_else(|e| panic!("{case}: {e:?}"));
+        assert!(records.is_empty(), "{case}: no record to read");
+        assert_eq!(last, None, "{case}: no last sequence number");
+    }
+    f.finish().await;
+}
