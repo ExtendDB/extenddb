@@ -1,0 +1,103 @@
+name: Project review status
+# When a reviewer picks up a PR, move its card on the ExtendDB Roadmap board
+# (org Project 3) to Status = Review. Issues the PR closes ("Closes #N") move too.
+#
+# Triggers:
+#   - a reviewer is requested on the PR
+#   - a reviewer submits a review (comment, approve, or request changes)
+#
+# Needs repo secret PROJECT_TOKEN: a fine-grained token, resource owner ExtendDB,
+# Organization permissions -> Projects: Read and write.
+# The default GITHUB_TOKEN cannot write to org Projects.
+on:
+  # pull_request_target runs in the base repo, so the secret is available for
+  # fork PRs too. Safe here: this job never checks out or runs PR code.
+  pull_request_target:
+    types: [review_requested]
+  pull_request_review:
+    types: [submitted]
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  move-to-review:
+    # pull_request_review from a fork gets no secrets, so skip it there; the
+    # review_requested event already covers those PRs.
+    if: >-
+      github.event_name == 'pull_request_target' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 5
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PROJECT_TOKEN }}
+          script: |
+            const ORG = 'ExtendDB';
+            const PROJECT_NUMBER = 3;
+            const STATUS_FIELD = 'Status';
+            const TARGET = 'Review';
+            // Never pull a card backwards out of these.
+            const KEEP = new Set(['Review', 'Done']);
+
+            const pr = context.payload.pull_request;
+            if (pr.draft) { core.info('Draft PR, skipping.'); return; }
+
+            // Board, Status field and the Review option, looked up by name.
+            const { organization: { projectV2: project } } = await github.graphql(`
+              query($org: String!, $num: Int!) {
+                organization(login: $org) {
+                  projectV2(number: $num) {
+                    id
+                    field(name: "${STATUS_FIELD}") {
+                      ... on ProjectV2SingleSelectField { id options { id name } }
+                    }
+                  }
+                }
+              }`, { org: ORG, num: PROJECT_NUMBER });
+            const option = project.field.options.find(o => o.name === TARGET);
+            if (!option) { core.setFailed(`No "${TARGET}" status on the board.`); return; }
+
+            // The PR's own card plus the cards of issues it closes.
+            const { node } = await github.graphql(`
+              query($id: ID!) {
+                node(id: $id) {
+                  ... on PullRequest {
+                    projectItems(first: 20) { nodes { ...item } }
+                    closingIssuesReferences(first: 20) {
+                      nodes { number projectItems(first: 20) { nodes { ...item } } }
+                    }
+                  }
+                }
+              }
+              fragment item on ProjectV2Item {
+                id
+                project { id }
+                fieldValueByName(name: "${STATUS_FIELD}") {
+                  ... on ProjectV2ItemFieldSingleSelectValue { name }
+                }
+              }`, { id: pr.node_id });
+
+            const items = [
+              ...node.projectItems.nodes,
+              ...node.closingIssuesReferences.nodes.flatMap(i => i.projectItems.nodes),
+            ].filter(i => i.project.id === project.id);
+
+            if (items.length === 0) { core.info('Not on the board, nothing to do.'); return; }
+
+            for (const item of items) {
+              const current = item.fieldValueByName?.name;
+              if (KEEP.has(current)) { core.info(`${item.id} is ${current}, leaving it.`); continue; }
+              await github.graphql(`
+                mutation($p: ID!, $i: ID!, $f: ID!, $o: String!) {
+                  updateProjectV2ItemFieldValue(input: {
+                    projectId: $p, itemId: $i, fieldId: $f,
+                    value: { singleSelectOptionId: $o }
+                  }) { projectV2Item { id } }
+                }`, { p: project.id, i: item.id, f: project.field.id, o: option.id });
+              core.info(`${item.id}: ${current ?? 'none'} -> ${TARGET}`);
+            }
