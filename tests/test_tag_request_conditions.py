@@ -8,10 +8,16 @@ authorization reference (dynamodb v1.5) lists them on: `TagResource` and
 `CreateTable` populate both, `UntagResource` populates `aws:TagKeys`, and every
 other operation populates neither.
 
-Every expected answer here comes from a measurement of IAM's evaluation of the
-two keys with `iam simulate-custom-policy` on 2026-10-24: which operator forms a
-Deny fires under, which context values match, and what happens when the key is
-absent.
+The operator semantics come from `iam simulate-custom-policy` runs on
+2026-10-24: which operator forms a Deny fires under, which context values match,
+and what happens when the key is absent. Three tests encode ExtendDB's own
+behaviour where no IAM measurement exists. A tag key repeated in one request
+reads its last value, which TagResource stores
+(`test_request_tag_duplicate_key_reads_its_last_value`). A request that names one
+tag under two spellings with differing values fails closed
+(`test_request_tag_case_variant_keys_with_differing_values_are_refused` and
+`test_ambiguous_request_tag_as_a_policy_variable_is_refused`), because IAM
+refuses a simulated context of that shape.
 
 Prerequisites:
   - extenddb running with `auth.provider = "builtin"` on EXTENDDB_TEST_ENDPOINT
@@ -320,8 +326,8 @@ class TestTagRequestConditions:
         assert self._stored_tags()["owner"] == "prod"
 
     def test_request_tag_duplicate_key_reads_its_last_value(self):
-        # Each backend's tag write upserts in request order, so the last value
-        # is the one stored; authorization reads the same one.
+        # TagResource upserts in request order on SQLite, PostgreSQL and MongoDB,
+        # so the last value is the one stored; authorization reads the same one.
         client, _ = self._restricted(_deny({"StringEquals": {"aws:RequestTag/env": "prod"}}))
         self._assert_denied(
             client.tag_resource,
