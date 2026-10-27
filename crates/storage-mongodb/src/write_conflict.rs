@@ -37,8 +37,8 @@ pub(crate) fn transaction_error(e: mongodb::error::Error) -> StorageError {
     }
 }
 
-/// The error for a single-item write that lost every one of its `attempts`
-/// to concurrent writers.
+/// The error for a single-item write that could not commit in `attempts`
+/// attempts, the last of which failed with `cause`.
 ///
 /// Amazon DynamoDB applies concurrent writes to one item one after another
 /// and answers each with 200; it answers `TransactionConflictException` to a
@@ -52,14 +52,28 @@ pub(crate) fn transaction_error(e: mongodb::error::Error) -> StorageError {
 /// modes retry a 503 on their own, whereas a 400 `TransactionConflictException`
 /// is handed to the application.
 ///
+/// The attempts end on any error a re-run may clear, which is not always a
+/// conflict with another writer (a primary step-down or a snapshot error ends
+/// them as well), so the message carries the driver's text for the last
+/// failure instead of naming a cause. The engine logs it with the warning it
+/// writes for a 503 and does not send it to the client.
+///
 /// Every single-item write path uses this one error, so the three operations
 /// answer the same way to the same contention. `TransactWriteItems` keeps
 /// `TransactionCanceledException` with a per-operation `TransactionConflict`
 /// reason, which is what the service answers for a transaction.
-pub(crate) fn retry_budget_exhausted(operation: &str, attempts: u32) -> StorageError {
+pub(crate) fn retry_budget_exhausted(operation: &str, attempts: u32, cause: &str) -> StorageError {
     StorageError::Transient(format!(
-        "{operation}: the write lost {attempts} attempts to concurrent writers; retry the request"
+        "{operation}: could not commit in {attempts} attempts: {cause}"
     ))
+}
+
+/// Note that attempt `attempt` of `operation` ended in an error that a re-run
+/// may clear: one debug line, and the cause back to the caller, which keeps the
+/// last one for [`retry_budget_exhausted`].
+pub(crate) fn retrying(operation: &str, attempt: u32, cause: String) -> String {
+    tracing::debug!(operation, attempt, error = %cause, "re-running a write transaction");
+    cause
 }
 
 #[cfg(test)]
@@ -120,13 +134,22 @@ mod tests {
     }
 
     #[test]
-    fn an_exhausted_budget_is_transient_and_names_the_operation() {
-        match retry_budget_exhausted("DeleteItem", 50) {
-            StorageError::Transient(msg) => {
-                assert!(msg.starts_with("DeleteItem: "), "{msg}");
-                assert!(msg.contains("lost 50 attempts"), "{msg}");
-            }
+    fn an_exhausted_budget_is_transient_and_names_the_operation_and_the_cause() {
+        let cause = "Command failed: WriteConflict (code 112) on the stream counter";
+        match retry_budget_exhausted("DeleteItem", 50, cause) {
+            StorageError::Transient(msg) => assert_eq!(
+                msg,
+                format!("DeleteItem: could not commit in 50 attempts: {cause}")
+            ),
             other => panic!("want Transient, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_retry_hands_its_cause_back_for_the_exhaustion_message() {
+        assert_eq!(
+            retrying("PutItem", 3, "snapshot too old".to_owned()),
+            "snapshot too old"
+        );
     }
 }
