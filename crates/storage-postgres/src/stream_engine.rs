@@ -14,6 +14,7 @@ use futures::future::BoxFuture;
 use sqlx::PgPool;
 
 use crate::PostgresEngine;
+use crate::stream_records_sql::{STREAM_RECORDS_AFTER, STREAM_RECORDS_FROM_START};
 
 /// Number of fixed shards per stream (hash-based assignment).
 const SHARDS_PER_STREAM: u32 = 4;
@@ -211,13 +212,14 @@ impl StreamEngine for PostgresEngine {
             // be a different server, so the stream resolves in two round
             // trips: the table the ARN names (catalog pool: its id and current
             // stream label), then the shard and its records in one query
-            // (data pool). The shard row drives the data query with the
-            // records LEFT JOINed: a shard of the named table with no records
-            // returns one row with a NULL record, and a shard that is not that
-            // table's (another table, or another account) returns no rows.
-            // Whether the shard belongs to the stream the ARN's label names is
-            // decided in Rust from the table's label and the shard id
-            // (`shard_in_stream`).
+            // (data pool). The shard row drives the data query and the page of
+            // records is a LEFT JOIN LATERAL subquery that carries its own
+            // ORDER BY and LIMIT (`stream_records_sql`): a shard of the named
+            // table with no records returns one row with a NULL record, and a
+            // shard that is not that table's (another table, or another
+            // account) returns no rows. Whether the shard belongs to the stream
+            // the ARN's label names is decided in Rust from the table's label
+            // and the shard id (`shard_in_stream`).
             let table: Option<(String, Option<String>)> = sqlx::query_as(
                 "SELECT table_id, stream_label FROM tables \
                  WHERE account_id = $1 AND table_name = $2",
@@ -233,33 +235,22 @@ impl StreamEngine for PostgresEngine {
 
             let rows: Vec<(String, Option<serde_json::Value>)> = if let Some(after) = after_sequence
             {
-                sqlx::query_as(
-                    "SELECT s.shard_id, r.record_data FROM stream_shards s \
-                     LEFT JOIN stream_records r \
-                       ON r.shard_id = s.shard_id AND r.sequence_number > $3 \
-                     WHERE s.shard_id = $1 AND s.table_id = $2 \
-                     ORDER BY r.sequence_number LIMIT $4",
-                )
-                .bind(&shard_id)
-                .bind(&table_id)
-                .bind(&after)
-                .bind(limit)
-                .fetch_all(&self.data_pool)
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?
+                sqlx::query_as(STREAM_RECORDS_AFTER)
+                    .bind(&shard_id)
+                    .bind(&table_id)
+                    .bind(&after)
+                    .bind(limit)
+                    .fetch_all(&self.data_pool)
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?
             } else {
-                sqlx::query_as(
-                    "SELECT s.shard_id, r.record_data FROM stream_shards s \
-                     LEFT JOIN stream_records r ON r.shard_id = s.shard_id \
-                     WHERE s.shard_id = $1 AND s.table_id = $2 \
-                     ORDER BY r.sequence_number LIMIT $3",
-                )
-                .bind(&shard_id)
-                .bind(&table_id)
-                .bind(limit)
-                .fetch_all(&self.data_pool)
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?
+                sqlx::query_as(STREAM_RECORDS_FROM_START)
+                    .bind(&shard_id)
+                    .bind(&table_id)
+                    .bind(limit)
+                    .fetch_all(&self.data_pool)
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?
             };
             let Some((row_shard_id, _)) = rows.first() else {
                 return Err(extenddb_storage::util::stream_not_found(&stream_arn));

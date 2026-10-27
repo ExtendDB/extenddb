@@ -10,6 +10,11 @@
 //! accounts, a new label on the same shards) so that one predicate alone
 //! decides the answer.
 //!
+//! The same file pins the cost of a page. The record read is a lateral
+//! subquery with its own `ORDER BY` and `LIMIT`, and `EXPLAIN (ANALYZE)` of the
+//! statements the engine runs shows the scans of `stream_records` visiting no
+//! more rows than the page holds, however many records follow the bound.
+//!
 //! Needs `EXTENDDB_TEST_PG_CONNECTION_STRING` (host-only, e.g.
 //! `postgres://user:pass@127.0.0.1:5432`); skips otherwise. Each test builds
 //! its own scratch database and drops it afterwards.
@@ -21,9 +26,12 @@ use extenddb_core::types::{
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::stream_arn;
 use extenddb_storage::{StreamEngine, StreamRecordsResult, TableEngine};
+use extenddb_storage_postgres::stream_records_sql::{
+    STREAM_RECORDS_AFTER, STREAM_RECORDS_FROM_START,
+};
 use extenddb_storage_postgres::{PostgresConfig, PostgresEngine};
-use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+use sqlx::{PgPool, Row};
 
 const ACCOUNT: &str = "111111111111";
 const OTHER_ACCOUNT: &str = "222222222222";
@@ -95,6 +103,31 @@ impl Scratch {
             .await
             .expect("seed a record");
         }
+    }
+
+    /// Records numbered 1 to `total` in one statement, then `ANALYZE`, so the
+    /// planner sees the statistics a shard that has been written for a while
+    /// has.
+    async fn write_run(&self, shard_id: &str, table_id: &str, total: u64) {
+        let seqs: Vec<String> = (1..=total).map(|n| format!("{n:021}")).collect();
+        let docs: Vec<String> = (1..=total).map(record_json).collect();
+        sqlx::query(
+            "INSERT INTO stream_records (shard_id, sequence_number, table_id, event_name, \
+             record_data, created_at) \
+             SELECT $1, t.seq, $2, 'INSERT', t.doc::jsonb, NOW() \
+             FROM unnest($3::text[], $4::text[]) AS t(seq, doc)",
+        )
+        .bind(shard_id)
+        .bind(table_id)
+        .bind(&seqs)
+        .bind(&docs)
+        .execute(&self.db)
+        .await
+        .expect("seed a run of records");
+        sqlx::query("ANALYZE stream_records")
+            .execute(&self.db)
+            .await
+            .expect("analyze the records");
     }
 
     async fn relabel(&self, table_id: &str, label: &str) {
@@ -241,6 +274,42 @@ fn assert_stream_not_found(result: StreamRecordsResult, arn: &str) {
     }
 }
 
+/// The plan `EXPLAIN (ANALYZE, FORMAT JSON)` reports for `statement`, run on
+/// `conn`.
+async fn plan_of(conn: &mut sqlx::PgConnection, statement: &str) -> serde_json::Value {
+    let row = sqlx::raw_sql(&format!("EXPLAIN (ANALYZE, FORMAT JSON) {statement}"))
+        .fetch_one(conn)
+        .await
+        .expect("explain the statement");
+    let document: serde_json::Value = row.try_get(0).expect("the plan document");
+    document[0]["Plan"].clone()
+}
+
+/// The rows the plan's scans of `stream_records` visited: the rows each scan
+/// returned plus the rows a filter or an index recheck discarded, over all
+/// loops of the scan.
+fn stream_records_rows_visited(plan: &serde_json::Value) -> f64 {
+    let mut visited = 0.0;
+    let mut nodes = vec![plan];
+    while let Some(node) = nodes.pop() {
+        if node["Relation Name"] == "stream_records" {
+            let per_loop: f64 = [
+                "Actual Rows",
+                "Rows Removed by Filter",
+                "Rows Removed by Index Recheck",
+            ]
+            .iter()
+            .filter_map(|key| node[*key].as_f64())
+            .sum();
+            visited += per_loop * node["Actual Loops"].as_f64().unwrap_or(1.0);
+        }
+        if let Some(children) = node["Plans"].as_array() {
+            nodes.extend(children);
+        }
+    }
+    visited
+}
+
 /// Two tables of one account share a stream label: a shard of table `b`
 /// under table `a`'s ARN is refused, so the table name alone decides.
 #[tokio::test]
@@ -373,5 +442,153 @@ async fn an_earlier_label_on_the_same_shards_is_not_found() {
         .await
         .expect("new label reads");
     assert_eq!(records.len(), 2);
+    s.cleanup().await;
+}
+
+/// Five pages of one shard, read one after the other, return every record once
+/// in sequence order with none skipped or repeated at a page boundary, and the
+/// read after the last page finds the shard idle.
+#[tokio::test]
+async fn five_pages_read_every_record_once_in_sequence_order() {
+    if base_conn().is_none() {
+        eprintln!("SKIP: EXTENDDB_TEST_PG_CONNECTION_STRING is not set");
+        return;
+    }
+    const PAGE: i64 = 20;
+    let s = scratch().await;
+    let (table_id, shard) = s.stream_table(ACCOUNT, "t", LABEL).await;
+    s.write_run(&shard, &table_id, 100).await;
+    let arn = stream_arn(REGION, ACCOUNT, "t", LABEL);
+
+    let mut after: Option<String> = None;
+    let mut seen = Vec::new();
+    for page in 1..=5 {
+        let (records, last) = s
+            .engine
+            .get_stream_records(ACCOUNT, &arn, &shard, after.as_deref(), PAGE)
+            .await
+            .expect("a page reads");
+        assert_eq!(records.len(), 20, "page {page}");
+        seen.extend(records.iter().map(|r| r.dynamodb.sequence_number.clone()));
+        after = last;
+    }
+    let expected: Vec<String> = (1..=100).map(|n| format!("{n:021}")).collect();
+    assert_eq!(seen, expected);
+
+    let (records, last) = s
+        .engine
+        .get_stream_records(ACCOUNT, &arn, &shard, after.as_deref(), PAGE)
+        .await
+        .expect("the read after the last page");
+    assert!(records.is_empty());
+    assert_eq!(last, None);
+    s.cleanup().await;
+}
+
+/// A shard of the stream with nothing to read answers an empty page, not the
+/// not-found error, with and without a sequence bound: the join keeps the
+/// shard row when no record follows the bound.
+#[tokio::test]
+async fn an_idle_shard_reads_an_empty_page_with_and_without_a_bound() {
+    if base_conn().is_none() {
+        eprintln!("SKIP: EXTENDDB_TEST_PG_CONNECTION_STRING is not set");
+        return;
+    }
+    let s = scratch().await;
+    let (table_id, shard) = s.stream_table(ACCOUNT, "t", LABEL).await;
+    let arn = stream_arn(REGION, ACCOUNT, "t", LABEL);
+    let bound = |n: u64| Some(format!("{n:021}"));
+
+    // No record in the shard yet, then a bound that follows no record.
+    for after in [None, bound(5)] {
+        let (records, last) = s
+            .engine
+            .get_stream_records(ACCOUNT, &arn, &shard, after.as_deref(), 10)
+            .await
+            .expect("a shard without records reads");
+        assert!(records.is_empty());
+        assert_eq!(last, None);
+    }
+
+    // Records 1 and 2 are written: a bound on the last record reads nothing,
+    // and a bound before it reads that record.
+    s.write_records(&shard, &table_id, &[1, 2]).await;
+    let (records, last) = s
+        .engine
+        .get_stream_records(ACCOUNT, &arn, &shard, bound(2).as_deref(), 10)
+        .await
+        .expect("a bound on the last record reads");
+    assert!(records.is_empty());
+    assert_eq!(last, None);
+    let (records, last) = s
+        .engine
+        .get_stream_records(ACCOUNT, &arn, &shard, bound(1).as_deref(), 10)
+        .await
+        .expect("a bound before the last record reads");
+    assert_eq!(records.len(), 1);
+    assert_eq!(last, bound(2));
+    s.cleanup().await;
+}
+
+/// A page costs the page size, not the records that follow the bound. The
+/// statements run under `EXPLAIN (ANALYZE)`, in the plan chosen for the
+/// parameters and in the generic plan a reused prepared statement may settle
+/// on, from the start of a shard of five pages and after its second page. The
+/// scans of `stream_records` may visit no more rows than the page holds.
+#[tokio::test]
+async fn a_page_visits_at_most_the_page_size_of_the_shards_records() {
+    if base_conn().is_none() {
+        eprintln!("SKIP: EXTENDDB_TEST_PG_CONNECTION_STRING is not set");
+        return;
+    }
+    const PAGE: u32 = 200;
+    let s = scratch().await;
+    let (table_id, shard) = s.stream_table(ACCOUNT, "t", LABEL).await;
+    s.write_run(&shard, &table_id, 5 * u64::from(PAGE)).await;
+    let after = format!("{:021}", 2 * PAGE);
+    let cases = [
+        (
+            "from the start",
+            STREAM_RECORDS_FROM_START,
+            format!("('{shard}', '{table_id}', {PAGE})"),
+        ),
+        (
+            "after two pages",
+            STREAM_RECORDS_AFTER,
+            format!("('{shard}', '{table_id}', '{after}', {PAGE})"),
+        ),
+    ];
+
+    let mut conn = s.db.acquire().await.expect("a connection");
+    for mode in ["force_custom_plan", "force_generic_plan"] {
+        sqlx::raw_sql(&format!("SET plan_cache_mode = {mode}"))
+            .execute(&mut *conn)
+            .await
+            .expect("set the plan mode");
+        for (name, statement, arguments) in &cases {
+            sqlx::raw_sql(&format!("PREPARE page_probe AS {statement}"))
+                .execute(&mut *conn)
+                .await
+                .expect("prepare the statement");
+            let plan = plan_of(&mut conn, &format!("EXECUTE page_probe{arguments}")).await;
+            sqlx::raw_sql("DEALLOCATE page_probe")
+                .execute(&mut *conn)
+                .await
+                .expect("deallocate the statement");
+
+            assert_eq!(
+                plan["Actual Rows"].as_f64(),
+                Some(f64::from(PAGE)),
+                "{mode}, {name}: the statement returns a full page:\n{plan:#}"
+            );
+            let visited = stream_records_rows_visited(&plan);
+            assert!(
+                visited <= f64::from(PAGE),
+                "{mode}, {name}: the scans of stream_records visited {visited} rows for a \
+                 page of {PAGE}:\n{plan:#}"
+            );
+        }
+    }
+    drop(conn);
     s.cleanup().await;
 }

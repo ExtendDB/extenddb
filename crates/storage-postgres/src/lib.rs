@@ -25,6 +25,8 @@ mod migrations;
 mod operations;
 mod pg_util;
 mod stream_engine;
+#[doc(hidden)]
+pub mod stream_records_sql;
 mod table_engine;
 mod table_helpers;
 mod ttl_worker;
