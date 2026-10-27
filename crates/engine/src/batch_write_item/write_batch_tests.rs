@@ -2,83 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! `write_batch` against a `DataEngine` double: what is checked before the
-//! first write, and what a write that cannot be applied now leaves behind.
+//! first write.
 
-use extenddb_core::types::{AttributeDefinition, KeySchemaElement, KeyType, ScalarAttributeType};
-use serde_json::{Value, json};
+use serde_json::json;
 
-use super::scripted::Scripted;
+use super::scripted::{
+    Scripted, answered, found, put, put_with_wrong_key_type, rejected, run, table,
+};
 use super::*;
-
-// --- fixtures ---------------------------------------------------------------
-
-/// A hash-only table keyed by a string `pk`.
-fn table(name: &str) -> TableKeyInfo {
-    let key_schema = vec![KeySchemaElement {
-        attribute_name: "pk".to_owned(),
-        key_type: KeyType::Hash,
-    }];
-    TableKeyInfo {
-        table_name: name.to_owned(),
-        account_id: "123456789012".to_owned(),
-        table_id: format!("id-{name}"),
-        key_schema: key_schema.clone(),
-        base_key_schema: key_schema,
-        attribute_definitions: vec![AttributeDefinition {
-            attribute_name: "pk".to_owned(),
-            attribute_type: ScalarAttributeType::S,
-        }],
-        has_lsi: false,
-        global_secondary_indexes: vec![],
-        local_secondary_indexes: vec![],
-        stream_specification: None,
-        vector_indexes: vec![],
-    }
-}
-
-fn put(pk: &str) -> Value {
-    json!({"PutRequest": {"Item": {"pk": {"S": pk}}}})
-}
-
-/// A put whose partition key is a number, against a table keyed by a string.
-fn put_with_wrong_key_type() -> Value {
-    json!({"PutRequest": {"Item": {"pk": {"N": "1"}}}})
-}
-
-/// Run `write_batch` on `request_items`, taking the tables in the order of
-/// `order` with one entry of `lookups` for each.
-async fn run(
-    data: &Scripted,
-    request_items: Value,
-    order: &[&str],
-    lookups: Vec<Result<TableKeyInfo, StorageError>>,
-) -> Result<DispatchResult, DynamoDbError> {
-    let input: BatchWriteItemInput =
-        serde_json::from_value(json!({ "RequestItems": request_items })).unwrap();
-    let tables: Vec<(&String, &Vec<WriteRequest>)> = order
-        .iter()
-        .map(|name| input.request_items.get_key_value(*name).unwrap())
-        .collect();
-    let region: Arc<str> = Arc::from("us-east-1");
-    write_batch(
-        data,
-        &LimitsConfig::default(),
-        &region,
-        &input,
-        &tables,
-        lookups,
-    )
-    .await
-}
-
-fn rejected(result: Result<DispatchResult, DynamoDbError>) -> DynamoDbError {
-    match result {
-        Err(e) => e,
-        Ok(r) => panic!("the batch must be rejected, got {}", r.body),
-    }
-}
-
-// --- tests ------------------------------------------------------------------
 
 /// The first write cannot be applied now and the second request is invalid.
 /// The `BatchWriteItem` reference has the service reject the whole batch for
@@ -89,7 +20,7 @@ async fn an_invalid_request_after_a_deferred_write_rejects_the_batch() {
     let data = Scripted::new(vec![Err(StorageError::Transient("lost".to_owned()))]);
     let items = json!({"t": [put("a"), put_with_wrong_key_type()]});
 
-    let err = rejected(run(&data, items, &["t"], vec![Ok(table("t"))]).await);
+    let err = rejected(run(&data, items, &["t"], found(&["t"])).await);
 
     assert!(
         matches!(err, DynamoDbError::ValidationException(_)),
@@ -105,9 +36,8 @@ async fn an_invalid_request_after_a_deferred_write_rejects_the_batch() {
 async fn an_invalid_request_in_a_later_table_rejects_the_batch_with_nothing_written() {
     let data = Scripted::new(vec![]);
     let items = json!({"t1": [put("a")], "t2": [put_with_wrong_key_type()]});
-    let lookups = vec![Ok(table("t1")), Ok(table("t2"))];
 
-    let err = rejected(run(&data, items, &["t1", "t2"], lookups).await);
+    let err = rejected(run(&data, items, &["t1", "t2"], found(&["t1", "t2"])).await);
 
     assert!(
         matches!(err, DynamoDbError::ValidationException(_)),
@@ -141,9 +71,8 @@ async fn a_missing_later_table_rejects_the_batch_with_nothing_written() {
 async fn duplicate_keys_in_a_later_table_reject_the_batch_with_nothing_written() {
     let data = Scripted::new(vec![]);
     let items = json!({"t1": [put("a")], "t2": [put("b"), put("b")]});
-    let lookups = vec![Ok(table("t1")), Ok(table("t2"))];
 
-    let err = rejected(run(&data, items, &["t1", "t2"], lookups).await);
+    let err = rejected(run(&data, items, &["t1", "t2"], found(&["t1", "t2"])).await);
 
     assert!(
         matches!(err, DynamoDbError::ValidationException(_)),
@@ -158,11 +87,8 @@ async fn duplicate_keys_in_a_later_table_reject_the_batch_with_nothing_written()
 async fn a_valid_batch_writes_each_request_with_its_own_table() {
     let data = Scripted::new(vec![]);
     let items = json!({"t1": [put("a"), put("b")], "t2": [put("c")]});
-    let lookups = vec![Ok(table("t1")), Ok(table("t2"))];
 
-    let out = run(&data, items, &["t1", "t2"], lookups)
-        .await
-        .unwrap_or_else(|e| panic!("the batch must be applied: {e:?}"));
+    let out = answered(run(&data, items, &["t1", "t2"], found(&["t1", "t2"])).await);
 
     assert_eq!(out.body["UnprocessedItems"], json!({}));
     assert_eq!(data.writes(), ["t1/a", "t1/b", "t2/c"]);
@@ -182,9 +108,7 @@ async fn a_request_that_lost_to_a_transaction_is_left_unprocessed() {
     let data = Scripted::new(vec![Ok(()), Err(held)]);
     let items = json!({"t": [put("side"), put("held")]});
 
-    let out = run(&data, items, &["t"], vec![Ok(table("t"))])
-        .await
-        .unwrap_or_else(|e| panic!("the batch must answer 200: {e:?}"));
+    let out = answered(run(&data, items, &["t"], found(&["t"])).await);
 
     assert_eq!(out.body["UnprocessedItems"], json!({"t": [put("held")]}));
     assert_eq!(data.writes(), ["t/side", "t/held"]);

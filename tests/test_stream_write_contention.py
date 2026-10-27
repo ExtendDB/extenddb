@@ -195,17 +195,18 @@ def test_batch_writes_racing_puts_on_a_stream_table_never_fail(
     dynamodb_client, raw_client, streams_client, stream_table
 ):
     """BatchWriteItem (the raced key plus a side key) racing PutItem on the
-    raced key: no batch call fails, a batch that did not apply every request
-    lists the rest in UnprocessedItems, and replaying those lands each side
-    item once.
+    raced key: no batch call fails, a request the server could not apply is
+    listed in UnprocessedItems while the other request of the batch applies,
+    and replaying those lands each side item once.
 
     Each batch round sends the raced put first or the side put first, so both
     orders are covered. A request the server could not apply now belongs in
-    UnprocessedItems whether or not an earlier request in the same batch
-    committed; a batch that fails as a whole because the contended request
-    happened to come first is the failure this covers. The PutItem arm may
-    answer 503 ServiceUnavailable once a put has spent its retry budget,
-    which the SDKs retry.
+    UnprocessedItems whether it came first or second; a batch that fails as a
+    whole because the contended request happened to come first is the failure
+    this covers. A put that has spent its retry budget answers 503
+    ServiceUnavailable on the PutItem arm, and so does a batch of which no
+    request could be applied; the SDKs retry both, and the batch arm retries
+    it here.
     """
     prefix = f"batch-{uuid.uuid4().hex[:8]}-"
     raced = {"pk": {"S": f"{prefix}raced"}}
@@ -226,12 +227,21 @@ def test_batch_writes_racing_puts_on_a_stream_table_never_fail(
                     # server may not be able to apply is the first in the
                     # batch and nothing has committed when it fails. Odd
                     # rounds put the side key first. Both answer 200 with the
-                    # rest of the batch in UnprocessedItems.
+                    # request that could not be applied in UnprocessedItems
+                    # and the other request applied. A batch of which no
+                    # request could be applied answers 503 ServiceUnavailable,
+                    # which the SDKs retry, so the loop retries it too.
                     pending = (
                         [raced_req, side_req] if raced_first else [side_req, raced_req]
                     )
                     while pending:
-                        r = raw_client.batch_write_item(RequestItems={stream_table: pending})
+                        try:
+                            r = raw_client.batch_write_item(RequestItems={stream_table: pending})
+                        except ClientError as e:
+                            if _error_code(e) != "503 ServiceUnavailable":
+                                raise
+                            time.sleep(0.01)
+                            continue
                         left = r.get("UnprocessedItems", {}).get(stream_table, [])
                         records += len(pending) - len(left)
                         if left:

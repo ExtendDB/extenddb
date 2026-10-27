@@ -124,24 +124,35 @@ async fn write_batch(
     let mut per_table_gsi: HashMap<String, HashMap<String, f64>> = HashMap::new();
     let mut per_table_lsi: HashMap<String, HashMap<String, f64>> = HashMap::new();
 
-    // Requests the batch did not apply: the first write that failed because
-    // the backend could not apply it now, and every request after it. Amazon
-    // DynamoDB tolerates the failure of individual requests in a batch and
-    // reports them in UnprocessedItems for the client to replay, whether or
-    // not an earlier request in the same batch was applied: "If any requested
-    // operations fail because the table's provisioned throughput is exceeded
-    // or an internal processing failure occurs, the failed operations are
-    // returned in the UnprocessedItems response parameter." The whole batch is
-    // rejected only for the request faults the same page lists (a missing
-    // table, a key that does not match the schema, duplicate keys, too many
-    // requests, an item or request over the size limit). `check_batch` has
-    // found every one of those before the first write, wherever the faulty
-    // request sits, so a deferral below never hides one and a rejected batch
-    // never has an applied request. The one error for a batch that applied
-    // nothing is a throttle, which this server does not account for. So a
-    // batch that could apply none of its requests also answers 200 with every
-    // request in UnprocessedItems, and the answer to one contended request
-    // does not depend on where it sat in the batch.
+    // Requests the batch did not apply: each write that failed because the
+    // backend could not apply it now. Amazon DynamoDB tolerates the failure of
+    // individual requests in a batch and reports them in UnprocessedItems for
+    // the client to replay: "If any requested operations fail because the
+    // table's provisioned throughput is exceeded or an internal processing
+    // failure occurs, the failed operations are returned in the
+    // UnprocessedItems response parameter." A failed request does not stop the
+    // others. Measured on 2026-10-27 in us-east-1, with a TransactWriteItems
+    // holding the items: a batch of two requests in which one was on a held
+    // item answered 200 with that request in UnprocessedItems and the other
+    // request applied, whichever came first. So every request is tried, and
+    // the answer to one contended request does not depend on where it sat in
+    // the batch.
+    //
+    // A batch of which no request applied is an error. The same measurement
+    // answered 500 InternalServerError for batches whose requests were all on
+    // held items (one request or two), and never 200 with every request
+    // unprocessed. This server answers 503 ServiceUnavailable, which the SDKs
+    // retry with backoff, so a client's UnprocessedItems loop cannot spin on a
+    // batch that makes no progress. Each failed request spends its own retry
+    // budget first, so a batch of 25 contended requests can spend 25 budgets
+    // before it answers.
+    //
+    // The whole batch is rejected only for the request faults the same page
+    // lists (a missing table, a key that does not match the schema, duplicate
+    // keys, too many requests, an item or request over the size limit).
+    // `check_batch` has found every one of those before the first write,
+    // wherever the faulty request sits, so a deferral below never hides one
+    // and a rejected batch never has an applied request.
     let mut unprocessed: HashMap<String, Vec<WriteRequest>> = HashMap::new();
     let mut applied = 0usize;
 
@@ -202,10 +213,22 @@ async fn write_batch(
                     tracing::warn!(
                         table = %table_name,
                         error = %e,
-                        "BatchWriteItem: write not applied after {applied} committed; the rest of the batch is reported in UnprocessedItems"
+                        "BatchWriteItem: write not applied after {applied} committed; it is reported in UnprocessedItems if another request of the batch applies"
                     );
-                    unprocessed = remaining_requests(tables, table_index, request_index);
-                    break 'tables;
+                    if matches!(e, StorageError::Connection(_)) {
+                        // The backend is unreachable and the requests after
+                        // this one would wait on it as well: leave them, and
+                        // this one, for the client.
+                        for (name, rest) in remaining_requests(tables, table_index, request_index) {
+                            unprocessed.entry(name).or_default().extend(rest);
+                        }
+                        break 'tables;
+                    }
+                    unprocessed
+                        .entry(table_name.clone())
+                        .or_default()
+                        .push(wr.clone());
+                    continue;
                 }
                 Err(e) => return Err(storage_err_to_dynamo(e)),
             };
@@ -237,6 +260,13 @@ async fn write_batch(
                 }
             }
         }
+    }
+
+    if applied == 0 && !unprocessed.is_empty() {
+        tracing::warn!("BatchWriteItem: no request of the batch could be applied");
+        return Err(DynamoDbError::ServiceUnavailable(
+            "Service is temporarily unavailable".to_owned(),
+        ));
     }
 
     // With INDEXES, each per-table entry carries the arms the batch actually
@@ -288,8 +318,8 @@ async fn write_batch(
     })
 }
 
-/// Whether a failed write leaves the rest of the batch for the client to
-/// replay instead of failing the batch.
+/// Whether a failed write leaves that request for the client to replay
+/// instead of failing the batch.
 ///
 /// These are the errors a replay may clear: the backend could not apply the
 /// request now, because the write lost every retry against concurrent writers
@@ -318,7 +348,8 @@ fn is_deferrable(e: &StorageError) -> bool {
 
 /// The requests from `tables[table_index][request_index]` on, in batch order:
 /// the request that was not applied and every request after it, in its table
-/// and in the tables that follow.
+/// and in the tables that follow. These are the requests left unattempted
+/// when a connection error ends the batch.
 fn remaining_requests(
     tables: &[(&String, &Vec<WriteRequest>)],
     table_index: usize,
@@ -441,6 +472,8 @@ fn collect_icm_if_needed(
 
 #[cfg(test)]
 mod scripted;
+#[cfg(test)]
+mod write_batch_deferral_tests;
 #[cfg(test)]
 mod write_batch_tests;
 

@@ -1,18 +1,22 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! A `DataEngine` double for the `write_batch` tests: it answers each write
-//! from a script and records the writes it received.
+//! A `DataEngine` double for the `write_batch` tests, and the fixtures that run
+//! `write_batch` on it: it answers each write from a script and records the
+//! writes it received.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use extenddb_core::expression::{Expr, ExpressionMaps, KeyCondition, UpdateAction};
-use extenddb_core::types::{AttributeValue, Item};
+use extenddb_core::types::{
+    AttributeDefinition, AttributeValue, Item, KeySchemaElement, KeyType, ScalarAttributeType,
+};
 use extenddb_storage::{
     BoxedFuture, IdempotencyKey, ItemPairResult, QueryResult, StreamCapture, TransactGetOp,
     TransactWriteOp,
 };
+use serde_json::{Value, json};
 
 use super::*;
 
@@ -158,4 +162,98 @@ impl DataEngine for Scripted {
     ) -> BoxedFuture<'_, Result<u64, StorageError>> {
         unused()
     }
+}
+
+// --- fixtures ---------------------------------------------------------------
+
+/// A hash-only table keyed by a string `pk`.
+pub(super) fn table(name: &str) -> TableKeyInfo {
+    let key_schema = vec![KeySchemaElement {
+        attribute_name: "pk".to_owned(),
+        key_type: KeyType::Hash,
+    }];
+    TableKeyInfo {
+        table_name: name.to_owned(),
+        account_id: "123456789012".to_owned(),
+        table_id: format!("id-{name}"),
+        key_schema: key_schema.clone(),
+        base_key_schema: key_schema,
+        attribute_definitions: vec![AttributeDefinition {
+            attribute_name: "pk".to_owned(),
+            attribute_type: ScalarAttributeType::S,
+        }],
+        has_lsi: false,
+        global_secondary_indexes: vec![],
+        local_secondary_indexes: vec![],
+        stream_specification: None,
+        vector_indexes: vec![],
+    }
+}
+
+/// One successful lookup for each of `names`.
+pub(super) fn found(names: &[&str]) -> Vec<Result<TableKeyInfo, StorageError>> {
+    names.iter().map(|n| Ok(table(n))).collect()
+}
+
+pub(super) fn put(pk: &str) -> Value {
+    json!({"PutRequest": {"Item": {"pk": {"S": pk}}}})
+}
+
+/// A put whose partition key is a number, against a table keyed by a string.
+pub(super) fn put_with_wrong_key_type() -> Value {
+    json!({"PutRequest": {"Item": {"pk": {"N": "1"}}}})
+}
+
+/// Run `write_batch` on `request_items`, taking the tables in the order of
+/// `order` with one entry of `lookups` for each.
+pub(super) async fn run(
+    data: &Scripted,
+    request_items: Value,
+    order: &[&str],
+    lookups: Vec<Result<TableKeyInfo, StorageError>>,
+) -> Result<DispatchResult, DynamoDbError> {
+    run_body(
+        data,
+        json!({ "RequestItems": request_items }),
+        order,
+        lookups,
+    )
+    .await
+}
+
+/// Like [`run`], for a request body that carries more than `RequestItems`.
+pub(super) async fn run_body(
+    data: &Scripted,
+    body: Value,
+    order: &[&str],
+    lookups: Vec<Result<TableKeyInfo, StorageError>>,
+) -> Result<DispatchResult, DynamoDbError> {
+    let input: BatchWriteItemInput = serde_json::from_value(body).unwrap();
+    let tables: Vec<(&String, &Vec<WriteRequest>)> = order
+        .iter()
+        .map(|name| input.request_items.get_key_value(*name).unwrap())
+        .collect();
+    let region: Arc<str> = Arc::from("us-east-1");
+    write_batch(
+        data,
+        &LimitsConfig::default(),
+        &region,
+        &input,
+        &tables,
+        lookups,
+    )
+    .await
+}
+
+/// The error of a batch that must have been rejected.
+pub(super) fn rejected(result: Result<DispatchResult, DynamoDbError>) -> DynamoDbError {
+    match result {
+        Err(e) => e,
+        Ok(r) => panic!("the batch must be rejected, got {}", r.body),
+    }
+}
+
+/// The body of a batch that must have been answered with a 200.
+pub(super) fn answered(result: Result<DispatchResult, DynamoDbError>) -> DispatchResult {
+    result.unwrap_or_else(|e| panic!("the batch must answer 200: {e:?}"))
 }
