@@ -78,8 +78,8 @@ impl RequestContext {
     /// all carry the same value; otherwise it is ambiguous, and the caller
     /// fails the statement closed rather than pick one spelling and let the
     /// other value through. IAM refuses a request context carrying two case
-    /// variants of one tag name, so the service's own answer for a request of
-    /// this shape is not measured.
+    /// variants of one tag name (not measured on the service), so the service's
+    /// own answer for a request of this shape is not measured.
     pub(super) fn request_tag_values(&self, sub_key: &str) -> RequestTagLookup<'_> {
         self.request_tags
             .as_ref()

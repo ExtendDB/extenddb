@@ -3,8 +3,10 @@
 
 """A tag key repeated within one TagResource request reads its last value.
 
-ExtendDB accepts a request that names a tag key twice and stores the last value:
-every backend's TagResource walks the list in request order and upserts each key.
+ExtendDB accepts a request that names a tag key twice and stores the last value
+on SQLite, PostgreSQL and MongoDB: TagResource walks the list in request order
+and upserts each key. Cassandra was not run; it writes one INSERT per tag, and
+the order of two writes to one key was not checked.
 Authorization reads the same value, so a Deny on `aws:RequestTag/<key>` applies
 when the last value is the one it names and does not apply when only an earlier
 value is. The hosted service refuses a repeated key with `ValidationException`

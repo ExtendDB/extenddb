@@ -542,8 +542,8 @@ pub trait ConditionContext {
     /// Returns `true` if `key` is a multivalued (set-valued) condition key.
     /// Arity is a property of the key, not the number of values present.
     /// `RequestContext` reports `dynamodb:Attributes`, `dynamodb:LeadingKeys` and
-    /// `aws:TagKeys` as multivalued; all other keys (and all trust-policy keys)
-    /// are single-valued.
+    /// `aws:TagKeys` as multivalued; all other keys are single-valued, except
+    /// that `AssumeRoleContext` also reports `aws:TagKeys` as multivalued.
     fn is_multivalued_key(&self, key: &str) -> bool;
 }
 ```

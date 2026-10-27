@@ -17,7 +17,7 @@ reads its last value, which TagResource stores
 tag under two spellings with differing values fails closed
 (`test_request_tag_case_variant_keys_with_differing_values_are_refused` and
 `test_ambiguous_request_tag_as_a_policy_variable_is_refused`), because IAM
-refuses a simulated context of that shape.
+refuses a simulated context of that shape (not measured on the service).
 
 Prerequisites:
   - extenddb running with `auth.provider = "builtin"` on EXTENDDB_TEST_ENDPOINT
@@ -341,7 +341,8 @@ class TestTagRequestConditions:
         # spellings with differing values has no single value for
         # aws:RequestTag/env. The key then fails closed: the Deny blocks in
         # either order and nothing is stored. IAM refuses a simulated context of
-        # this shape, so the service's own answer for it is unmeasured.
+        # this shape (not measured on the service), so the service's own answer
+        # for it is unmeasured.
         client, _ = self._restricted(_deny({"StringEquals": {"aws:RequestTag/env": "prod"}}))
         for tags in (
             [{"Key": "Env", "Value": "prod"}, {"Key": "env", "Value": "dev"}],
