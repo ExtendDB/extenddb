@@ -733,12 +733,12 @@ second-precision form.
 
 **Transient-conflict detection.** `is_transient_write_conflict` returns
 true for the `TransientTransactionError` label or a raw `WriteConflict`
-(code 112). Under snapshot isolation both mean "your write lost to a
-concurrent writer and nothing was applied; retry the whole transaction."
-It does not match the `UnknownTransactionCommitResult` label: under that
-label the commit may already have applied, so the body is never re-run,
-and `classify_commit_error` retries `commitTransaction` in place, which is
-idempotent.
+(code 112). Under snapshot isolation both mean nothing was applied and the
+transaction may be re-run; a conflict with a concurrent writer is the
+usual cause. It does not match the `UnknownTransactionCommitResult` label:
+under that label the commit may already have applied, so the body is never
+re-run, and `classify_commit_error` retries `commitTransaction` in place,
+which is idempotent.
 
 **Retry loop.** Session-scoped writes (Put / Delete / Update / TWI) wrap
 the transaction body in a `for attempt in 0..TRANSIENT_RETRY_ATTEMPTS`
@@ -768,9 +768,11 @@ read fails its filter and retries.
 **Exhaustion behavior.** Single-item retry exhaustion (PutItem,
 DeleteItem, UpdateItem) returns `StorageError::Transient`, built by
 `write_conflict::retry_budget_exhausted`. Its message reads
-`<operation>: could not commit in <N> attempts: <last driver error>`; the
-engine logs it and answers HTTP 503 `ServiceUnavailable`, which the SDKs
-retry. The server counts that 503 as a system error, not under
+`<operation>: could not commit in <N> attempts: <last error>` and carries
+the last error that ended an attempt: the driver's text, or a fixed
+sentence after an UpdateItem version miss. The engine logs it and answers
+HTTP 503 `ServiceUnavailable`, which the SDKs retry. The server counts
+that 503 as a system error, not under
 `TransactionConflict`. `TransactWriteItems` exhaustion surfaces as
 `StorageError::TransactionCanceled` with a synthetic per-op
 `TransactionConflict` reason so wire consumers see the DDB-canonical

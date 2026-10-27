@@ -54,9 +54,9 @@ pub(crate) fn transaction_error(e: mongodb::error::Error) -> StorageError {
 ///
 /// The attempts end on any error a re-run may clear, which is not always a
 /// conflict with another writer (a primary step-down or a snapshot error ends
-/// them as well), so the message carries the driver's text for the last
-/// failure instead of naming a cause. The engine logs it with the warning it
-/// writes for a 503 and does not send it to the client.
+/// them as well), so the message carries the text of the last error that
+/// ended an attempt instead of naming a cause. The engine logs it with the
+/// warning it writes for a 503 and does not send it to the client.
 ///
 /// Every single-item write path uses this one error, so the three operations
 /// answer the same way to the same contention. `TransactWriteItems` keeps

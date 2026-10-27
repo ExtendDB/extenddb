@@ -210,9 +210,10 @@ pub fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> Dynamo
             // A single-item write met an in-flight TransactWriteItems on the
             // same item and the backend did not wait it out. The service
             // answers TransactionConflictException to a single-item write only
-            // while a TransactWriteItems holds the item; a write that lost to
-            // other single-item writers is reported as Transient (503). Never
-            // InternalServerError.
+            // while a TransactWriteItems holds the item. The MongoDB backend
+            // reports a write that lost to other single-item writers as
+            // Transient (503); Cassandra reports it as TransactionConflict.
+            // Never InternalServerError.
             DynamoDbError::TransactionConflictException(msg)
         }
         StorageError::Internal(msg) => {

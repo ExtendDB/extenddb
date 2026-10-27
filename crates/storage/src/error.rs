@@ -74,8 +74,9 @@ pub enum StorageError {
     ///
     /// The MongoDB backend also returns it for a single-item write that could
     /// not commit in its 50 attempts; the message names the operation, the
-    /// attempt count and the last driver error. The engine logs the message
-    /// and answers HTTP 503 `ServiceUnavailable`, which the SDKs retry.
+    /// attempt count and the last error that ended an attempt. The engine logs
+    /// the message and answers HTTP 503 `ServiceUnavailable`, which the SDKs
+    /// retry.
     #[error("{0}")]
     Transient(String),
     #[error(

@@ -95,14 +95,15 @@ async fn a_valid_batch_writes_each_request_with_its_own_table() {
     assert_eq!(data.writes(), ["t1/a", "t1/b", "t2/c"]);
 }
 
-/// The Cassandra backend raises `TransactionConflict` from a put when a
-/// transaction or an expiration claim holds the item (the storage tests in
-/// `ttl_integration.rs` pin that error). The service leaves such a request in
-/// UnprocessedItems and keeps the request that applied: a batch of two
-/// requests racing a TransactWriteItems on one of the items answered 200 with
-/// the held item's request unprocessed and the other applied, in either
-/// order (us-east-1, 2026-10-27, two samples of 640 raced batches). No
-/// BatchWriteItem call answered TransactionConflictException.
+/// The Cassandra backend raises `TransactionConflict` from a put on a table
+/// with TTL enabled when a transaction or an expiration claim holds the item
+/// (the storage tests in `ttl_integration.rs` pin that error); without TTL the
+/// put returns `TransactionCanceled`, which is not deferred. The service
+/// leaves such a request in UnprocessedItems and keeps the request that
+/// applied: a batch of two requests racing a TransactWriteItems on one of the
+/// items answered 200 with the held item's request unprocessed and the other
+/// applied, in either order (us-east-1, 2026-10-27, two samples of 640 raced
+/// batches). No BatchWriteItem call answered TransactionConflictException.
 #[tokio::test]
 async fn a_request_that_lost_to_a_transaction_is_left_unprocessed() {
     let held = StorageError::TransactionConflict("held".to_owned());

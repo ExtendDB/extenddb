@@ -94,13 +94,20 @@ pub async fn handle_batch_write_item(
 /// Check the whole batch, then write it.
 ///
 /// The table lookups, the duplicate-key check and the validation of every
-/// request run before the first write, in the order the tables and requests
-/// are listed. A fault in any of them rejects the batch with nothing applied,
+/// request run before the first write. The requests of a table are checked in
+/// the order they are listed. The tables come from a `HashMap` and are
+/// checked in the order it yields them, so which of two table faults is
+/// reported is not defined. A request fault found by any of these checks
+/// rejects the batch with nothing applied,
 /// wherever the faulty request sits, which is what the `BatchWriteItem` API
-/// reference documents for these faults. The writes run only after that, so a
-/// write that cannot be applied now never leaves a later request unchecked,
-/// and a request that is applied is never followed by a rejection of the
-/// batch.
+/// reference documents for these faults. The limits on the number of tables
+/// and requests are checked before this function runs, in
+/// `check_batch_counts`, and the limit on the request size by the HTTP layer.
+/// The writes run only after the checks, so a write that cannot be applied now
+/// never leaves a later request unchecked, and no request fault is found after
+/// a request has been applied. A storage error that a replay does not clear
+/// (see `is_deferrable`) can still fail the batch after earlier requests were
+/// applied.
 async fn write_batch(
     data: &dyn DataEngine,
     limits: &LimitsConfig,
@@ -147,12 +154,16 @@ async fn write_batch(
     // budget first, so a batch of 25 contended requests can spend 25 budgets
     // before it answers.
     //
-    // The whole batch is rejected only for the request faults the same page
-    // lists (a missing table, a key that does not match the schema, duplicate
-    // keys, too many requests, an item or request over the size limit).
-    // `check_batch` has found every one of those before the first write,
-    // wherever the faulty request sits, so a deferral below never hides one
-    // and a rejected batch never has an applied request.
+    // The request faults the same page lists reject the whole batch before
+    // anything is written. `check_batch` finds a missing table, a key that
+    // does not match the schema, duplicate keys and an item over the size
+    // limit, wherever the faulty request sits. `check_batch_counts` finds too
+    // many requests and the HTTP layer finds a request over the size limit,
+    // both before this function runs. So a deferral below never hides a
+    // request fault, and a batch rejected for a request fault has no applied
+    // request. A storage error that a replay does not clear (see
+    // `is_deferrable`) still fails the batch after earlier requests were
+    // applied.
     let mut unprocessed: HashMap<String, Vec<WriteRequest>> = HashMap::new();
     let mut applied = 0usize;
 
@@ -322,8 +333,10 @@ async fn write_batch(
 /// instead of failing the batch.
 ///
 /// These are the errors a replay may clear: the backend could not apply the
-/// request now, because the write lost every retry against concurrent writers
-/// or because the connection failed. A fault in the request itself
+/// request now. `Transient` is a failure expected to clear on retry (a
+/// MongoDB write that lost every attempt to concurrent writers is one
+/// example), `TransactionConflict` is a transaction that holds the item, and
+/// `Connection` is a failed connection. A fault in the request itself
 /// (validation, a missing table, a condition) fails the batch as before, and
 /// so does an internal error: the documentation lists an internal processing
 /// failure among the causes of UnprocessedItems, but a storage fault here is
@@ -371,7 +384,10 @@ fn remaining_requests(
 ///
 /// Faults are reported in the order the writes used to reach them: for each
 /// table in turn, its lookup, the duplicate-key check, then its requests in
-/// order. The first fault rejects the whole batch.
+/// the order they are listed. `tables` comes from a `HashMap`, so the tables
+/// are visited in the order the map yields them, and which of two table
+/// faults is reported is not defined. The first fault rejects the whole
+/// batch.
 fn check_batch(
     tables: &[(&String, &Vec<WriteRequest>)],
     lookups: Vec<Result<TableKeyInfo, StorageError>>,
