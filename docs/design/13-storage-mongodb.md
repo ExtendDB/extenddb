@@ -732,17 +732,29 @@ second-precision form.
 ### 5.6 Write conflict handling
 
 **Transient-conflict detection.** `is_transient_write_conflict` returns
-true for any of: the `TransientTransactionError` label, the
-`UnknownTransactionCommitResult` label, or a raw `WriteConflict` (code
-112). Under snapshot isolation these all mean "your write lost to a
-concurrent writer; retry the whole transaction."
+true for the `TransientTransactionError` label or a raw `WriteConflict`
+(code 112). Under snapshot isolation both mean "your write lost to a
+concurrent writer and nothing was applied; retry the whole transaction."
+It does not match the `UnknownTransactionCommitResult` label: under that
+label the commit may already have applied, so the body is never re-run,
+and `classify_commit_error` retries `commitTransaction` in place, which is
+idempotent.
 
 **Retry loop.** Session-scoped writes (Put / Delete / Update / TWI) wrap
 the transaction body in a `for attempt in 0..TRANSIENT_RETRY_ATTEMPTS`
 loop (50 attempts). Each attempt starts a fresh transaction, runs the
 body, and either commits, aborts and retries (transient), or aborts and
-returns (fatal). Retries sleep with jittered exponential backoff
-(`backoff_sleep`, base 50 µs).
+returns (fatal). Retries sleep with jittered exponential backoff:
+`backoff_sleep` waits a uniform 0 to 50 µs × 2^min(attempt, 8), which is at
+most 12.8 ms from the ninth attempt on and sums to at most about 550 ms
+over the 50 attempts (275 ms expected). Tokio's timer ticks every
+millisecond and rounds a sleep up to the next tick, so for the first five
+attempts (longest jitter under 1 ms) the wait is set by the tick, not by
+the jitter. The helpers that run inside the transaction (index entry
+writes, the stream shard lookup, the stream sequence counter draw and the
+stream record insert) map a transient conflict to `StorageError::Transient`
+through `write_conflict::transaction_error`, and the transaction body
+turns that into a re-run like a conflict on the data collection.
 
 **UpdateItem's OCC guard on top.** `UpdateItem` uses a `_v` version filter.
 In snapshot mode, the transaction supplies the point-in-time view used to
@@ -753,9 +765,13 @@ signal from `Transient`) and the loop restarts. The native fast path always
 emits `$inc: {_v: 1}` so a concurrent slow-path update racing against a stale
 read fails its filter and retries.
 
-**Exhaustion behavior.** Single-item retry exhaustion returns
-`StorageError::Internal` (rare in practice; the retry ceiling is high).
-`TransactWriteItems` exhaustion surfaces as
+**Exhaustion behavior.** Single-item retry exhaustion (PutItem,
+DeleteItem, UpdateItem) returns `StorageError::Transient`, built by
+`write_conflict::retry_budget_exhausted`. Its message reads
+`<operation>: could not commit in <N> attempts: <last driver error>`; the
+engine logs it and answers HTTP 503 `ServiceUnavailable`, which the SDKs
+retry. The server counts that 503 as a system error, not under
+`TransactionConflict`. `TransactWriteItems` exhaustion surfaces as
 `StorageError::TransactionCanceled` with a synthetic per-op
 `TransactionConflict` reason so wire consumers see the DDB-canonical
 error string instead of a bare HTTP 500.
