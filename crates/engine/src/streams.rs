@@ -279,10 +279,11 @@ pub fn classify_shard_iterator(token: &str) -> ShardIteratorClass {
 /// # Errors
 ///
 /// Returns [`DynamoDbError::ExpiredIteratorException`] if the iterator is older
-/// than 15 minutes or carries no stream ARN.
+/// than 15 minutes, or carries a timestamp and no stream ARN.
 /// Returns [`DynamoDbError::ResourceNotFoundException`] if the stream does not
 /// exist for the caller's account or the shard is not one of its shards.
-/// Returns [`DynamoDbError::ValidationException`] on invalid iterator.
+/// Returns [`DynamoDbError::ValidationException`] on an invalid iterator,
+/// which includes one with neither a stream ARN nor a timestamp.
 pub async fn handle_get_records(
     body: Value,
     ctx: &OperationContext,
@@ -308,16 +309,15 @@ pub async fn handle_get_records(
 
     // The request was authorized against the stream ARN carried in the token.
     // The storage read below resolves the shard against that stream (table
-    // name and stream label, within the caller's account) in the same round
-    // trip as the records, so a forged token that pairs an authorized stream
-    // ARN with another stream's shard id reads nothing and gets the "stream
-    // does not exist" answer. A token with no stream ARN was issued by a build
-    // before the ARN was carried; the authorization layer answers it as
-    // expired, and the engine gives the same answer when called directly.
+    // name and stream label, within the caller's account) as part of the read:
+    // SQLite in the statement that reads the records, PostgreSQL, MongoDB and
+    // Cassandra after reading the table. A forged token that pairs an
+    // authorized stream ARN with another stream's shard id reads nothing and
+    // gets the "stream does not exist" answer. A token with no stream ARN gets
+    // the answer the authorization layer gives it (`classify_shard_iterator`);
+    // the layer is skipped in developer mode, so the engine answers the same.
     let Some(stream_arn) = it.stream_arn.as_deref() else {
-        return Err(DynamoDbError::ExpiredIteratorException(
-            SHARD_ITERATOR_EXPIRED_MESSAGE.to_owned(),
-        ));
+        return Err(no_stream_arn_error(&it));
     };
 
     let limit = get_records_limit(input.limit)?;
@@ -364,6 +364,18 @@ pub async fn handle_get_records(
         next_shard_iterator: next_iterator,
     };
     serialize_output(&output)
+}
+
+/// The answer for a token that carries no stream ARN, the same one
+/// [`classify_shard_iterator`] gives the authorization layer. A token with a
+/// timestamp comes from a build before the ARN was carried and is expired; one
+/// without a timestamp is not a token this server issued and is invalid.
+fn no_stream_arn_error(it: &ShardIterator) -> DynamoDbError {
+    if it.created_at.is_some() {
+        DynamoDbError::ExpiredIteratorException(SHARD_ITERATOR_EXPIRED_MESSAGE.to_owned())
+    } else {
+        DynamoDbError::ValidationException("Invalid ShardIterator".to_owned())
+    }
 }
 
 /// `GetRecords` with a `Limit` over 1000 (measured 2026-10-25 with 1001).
@@ -476,9 +488,8 @@ mod tests {
 
     #[test]
     fn stream_does_not_exist_maps_to_resource_not_found() {
-        // `get_stream_records` and `validate_shard` answer a stream ARN that
-        // names no stream, and `get_stream_records` a shard that is not one of
-        // the stream's, with this error.
+        // The answer for a stream ARN that names no stream, and for a shard
+        // that is not one of the stream's (`get_stream_records`).
         match super::storage_to_dynamo(extenddb_storage::util::stream_does_not_exist()) {
             super::DynamoDbError::ResourceNotFoundException(msg) => {
                 assert_eq!(msg, "Requested resource not found: Stream does not exist");
@@ -552,5 +563,35 @@ mod tests {
             super::classify_shard_iterator(&bad_ts),
             super::ShardIteratorClass::Invalid
         ));
+    }
+
+    #[test]
+    fn a_token_without_a_stream_arn_gets_the_answer_the_authorization_layer_gives() {
+        // Two and three fields have no timestamp (invalid), four fields with a
+        // timestamp come from before the ARN was carried (expired), and a
+        // timestamp that is not a number is invalid.
+        for token in [
+            b64("shardId-5|AFTER_SEQUENCE_NUMBER"),
+            b64("shardId-3|AFTER_SEQUENCE_NUMBER|7"),
+            b64("shardId-2|AFTER_SEQUENCE_NUMBER|7|1000"),
+            b64("shardId-4|AFTER_SEQUENCE_NUMBER|7|notanumber"),
+        ] {
+            let it = super::decode_shard_iterator(&token).expect("the token decodes");
+            let expected = match super::classify_shard_iterator(&token) {
+                super::ShardIteratorClass::Expired => {
+                    super::DynamoDbError::ExpiredIteratorException(
+                        super::SHARD_ITERATOR_EXPIRED_MESSAGE.to_owned(),
+                    )
+                }
+                super::ShardIteratorClass::Invalid => {
+                    super::DynamoDbError::ValidationException("Invalid ShardIterator".to_owned())
+                }
+                super::ShardIteratorClass::Stream(_) => panic!("the token carries no stream ARN"),
+            };
+            assert_eq!(
+                format!("{:?}", super::no_stream_arn_error(&it)),
+                format!("{expected:?}")
+            );
+        }
     }
 }

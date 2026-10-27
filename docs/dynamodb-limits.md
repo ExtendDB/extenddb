@@ -95,7 +95,7 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 |-------|---------------|--------|-------|
 | Simultaneous shard readers | 2 (1 for global tables) | Not enforced | No concurrent reader tracking |
 | Max write capacity with streams (provisioned) | 40,000 WCU | Enforced | Same as table WCU limit |
-| GetRecords: max records per call | 1,000 | Not enforced | No per-call record count limit |
+| GetRecords: max records per call | 1,000 | Enforced | A `Limit` under 1 answers `1 validation error detected: Value at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1`, a `Limit` over 1000 answers `One or more parameter values were invalid: Limit should be less than or equal to 1000` (both measured 2026-10-25) |
 | Shard iterator lifetime | 15 minutes | Not enforced | No shard iterator expiration |
 
 ## API-Level Limits
@@ -162,12 +162,12 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 | Query/Scan | 2 | 0 | 5 | 0 |
 | Batch Operations | 3 | 0 | 2 | 0 |
 | Transactions | 3 | 0 | 1 | 0 |
-| Streams | 1 | 0 | 3 | 0 |
+| Streams | 2 | 0 | 2 | 0 |
 | API-Level | 1 | 0 | 3 | 1 |
 | Import/Export/Backup | 2 | 2 | 0 | 7 |
 | Global Tables | 0 | 0 | 0 | 2 |
 | Contributor Insights | 0 | 0 | 0 | 1 |
-| **Total** | **31** | **3** | **16** | **13** |
+| **Total** | **32** | **3** | **15** | **13** |
 
 ### Unenforced Limits Requiring Tracking
 
@@ -179,7 +179,6 @@ The following unenforced limits are tracked in `docs/technical-debt.md`:
 4. **BatchGetItem response size** (16 MB) — requires aggregate response size tracking
 5. **BatchWriteItem request size** (16 MB) — requires aggregate request size tracking
 6. **Transaction request size** (4 MB) — requires aggregate request size tracking
-7. **GetRecords max per call** (1,000) — requires record count limit in streams
 8. **Shard iterator lifetime** (15 minutes) — requires timestamp tracking on shard iterators
 9. **Tag count per resource** (50) — requires count validation in TagResource
 10. **Tag key/value length** (128/256 chars) — requires length validation in TagResource
