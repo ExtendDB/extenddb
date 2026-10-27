@@ -146,14 +146,12 @@ fn record_json(seq: u64, blob: usize) -> serde_json::Value {
     })
 }
 
-fn assert_stream_not_found(result: extenddb_storage::StreamRecordsResult, arn: &str) {
-    let StorageError::TableNotFound(expected) = extenddb_storage::util::stream_not_found(arn)
-    else {
-        unreachable!("stream_not_found is a TableNotFound error")
-    };
+fn assert_stream_not_found(result: extenddb_storage::StreamRecordsResult) {
     match result {
-        Err(StorageError::TableNotFound(msg)) => assert_eq!(msg, expected),
-        other => panic!("expected the stream not-found error, got {other:?}"),
+        Err(StorageError::TableNotFound(msg)) => {
+            assert_eq!(msg, extenddb_storage::util::STREAM_DOES_NOT_EXIST);
+        }
+        other => panic!("expected the stream does not exist error, got {other:?}"),
     }
 }
 
@@ -225,7 +223,6 @@ async fn records_live_an_earlier_label_on_the_same_shards_is_not_found() {
         f.engine
             .get_stream_records(ACCOUNT, &old_arn, &shard_id, None, 10)
             .await,
-        &old_arn,
     );
     let new_arn = stream_arn(REGION, ACCOUNT, "t", LATER_LABEL);
     let (records, _) = f
@@ -265,7 +262,6 @@ async fn records_live_another_accounts_same_named_stream_is_not_found() {
                 f.engine
                     .get_stream_records(caller, &arn, foreign_shard, None, 10)
                     .await,
-                &arn,
             );
             // The control: the caller's own shard reads under either spelling
             // of the account, since storage binds the caller's account and
@@ -302,19 +298,16 @@ async fn records_live_another_tables_shard_with_the_same_label_is_not_found() {
         f.engine
             .get_stream_records(ACCOUNT, &arn_a, &super::build_shard_id(&b_id, 0), None, 10)
             .await,
-        &arn_a,
     );
     assert_stream_not_found(
         f.engine
             .get_stream_records(ACCOUNT, &arn_b, &super::build_shard_id(&a_id, 0), None, 10)
             .await,
-        &arn_b,
     );
     assert_stream_not_found(
         f.engine
             .get_stream_records(ACCOUNT, &arn_a, "shardId-forged-000000000000", None, 10)
             .await,
-        &arn_a,
     );
     let (records, _) = f
         .engine

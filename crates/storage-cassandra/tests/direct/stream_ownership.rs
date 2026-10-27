@@ -124,14 +124,12 @@ fn arn_of(key_info: &TableKeyInfo, label: &str) -> String {
     stream_arn(REGION, &key_info.account_id, &key_info.table_name, label)
 }
 
-fn assert_stream_not_found(result: StreamRecordsResult, arn: &str) {
-    let StorageError::TableNotFound(expected) = extenddb_storage::util::stream_not_found(arn)
-    else {
-        unreachable!("stream_not_found is a TableNotFound error")
-    };
+fn assert_stream_not_found(result: StreamRecordsResult) {
     match result {
-        Err(StorageError::TableNotFound(msg)) => assert_eq!(msg, expected),
-        other => panic!("expected the stream not-found error, got {other:?}"),
+        Err(StorageError::TableNotFound(msg)) => {
+            assert_eq!(msg, extenddb_storage::util::STREAM_DOES_NOT_EXIST);
+        }
+        other => panic!("expected the stream does not exist error, got {other:?}"),
     }
 }
 
@@ -160,13 +158,11 @@ async fn test_another_tables_shard_with_the_same_label_is_not_found() {
         engine
             .get_stream_records(&a.account_id, &arn_a, &shard_b, None, 10)
             .await,
-        &arn_a,
     );
     assert_stream_not_found(
         engine
             .get_stream_records(&a.account_id, &arn_b, &shard_a, None, 10)
             .await,
-        &arn_b,
     );
     assert_stream_not_found(
         engine
@@ -178,7 +174,6 @@ async fn test_another_tables_shard_with_the_same_label_is_not_found() {
                 10,
             )
             .await,
-        &arn_a,
     );
     // The control: table A's own shard reads under A's ARN.
     let (records, _) = engine
@@ -223,7 +218,6 @@ async fn test_another_accounts_same_named_stream_is_not_found() {
                 engine
                     .get_stream_records(&caller.account_id, &arn, foreign_shard, None, 10)
                     .await,
-                &arn,
             );
             let (records, _) = engine
                 .get_stream_records(&caller.account_id, &arn, own_shard, None, 10)
@@ -258,7 +252,6 @@ async fn test_an_earlier_label_on_the_same_shards_is_not_found() {
         engine
             .get_stream_records(&t.account_id, &old_arn, &shard, None, 10)
             .await,
-        &old_arn,
     );
     let (records, _) = engine
         .get_stream_records(&t.account_id, &arn_of(&t, LATER_LABEL), &shard, None, 10)

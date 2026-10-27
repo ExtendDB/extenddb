@@ -96,8 +96,8 @@ impl CassandraEngine {
     }
 
     /// The table id of the stream `stream_arn` names within `account_id`, or
-    /// the stream not-found error when no table of that account carries that
-    /// name and stream label.
+    /// the "stream does not exist" error when no table of that account carries
+    /// that name and stream label.
     async fn stream_table_id(
         &self,
         account_id: &str,
@@ -108,7 +108,7 @@ impl CassandraEngine {
             Some((table_id, label)) if label.as_deref() == Some(stream_label.as_str()) => {
                 Ok(table_id)
             }
-            _ => Err(extenddb_storage::util::stream_not_found(stream_arn)),
+            _ => Err(extenddb_storage::util::stream_does_not_exist()),
         }
     }
 }
@@ -154,14 +154,14 @@ impl StreamEngine for CassandraEngine {
             // that table id, and the stream's when `shard_in_stream` says so
             // from the table's label and the shard id; otherwise (another
             // table, another account, or an earlier stream label on the same
-            // table) the answer is the stream not-found error and the records
-            // read are discarded. The keyspace follows from the caller's
+            // table) the answer is the "stream does not exist" error and the
+            // records read are discarded. The keyspace follows from the caller's
             // account, so no table id is parsed out of the shard id.
             let (table_name, stream_label) = parse_stream_arn(&stream_arn)?;
             let Some((table_id, table_label)) =
                 self.stream_table_row(&account_id, &table_name).await?
             else {
-                return Err(extenddb_storage::util::stream_not_found(&stream_arn));
+                return Err(extenddb_storage::util::stream_does_not_exist());
             };
             let keyspace = self.account_keyspace_for(&account_id);
 
@@ -212,7 +212,7 @@ impl StreamEngine for CassandraEngine {
             if shard_table_id.as_deref() != Some(table_id.as_str())
                 || !shard_in_stream(&table_id, &shard_id, table_label.as_deref(), &stream_label)
             {
-                return Err(extenddb_storage::util::stream_not_found(&stream_arn));
+                return Err(extenddb_storage::util::stream_does_not_exist());
             }
 
             let rows = result
@@ -560,7 +560,7 @@ impl StreamEngine for CassandraEngine {
                 .is_some_and(|r| !r.is_empty());
 
             if !found {
-                return Err(extenddb_storage::util::stream_not_found(&stream_arn));
+                return Err(extenddb_storage::util::shard_not_in_stream(&stream_arn));
             }
             Ok(())
         })

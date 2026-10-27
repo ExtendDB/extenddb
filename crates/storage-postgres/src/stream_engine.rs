@@ -230,7 +230,7 @@ impl StreamEngine for PostgresEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
             let Some((table_id, table_label)) = table else {
-                return Err(extenddb_storage::util::stream_not_found(&stream_arn));
+                return Err(extenddb_storage::util::stream_does_not_exist());
             };
 
             let rows: Vec<(String, Option<serde_json::Value>)> = if let Some(after) = after_sequence
@@ -253,7 +253,7 @@ impl StreamEngine for PostgresEngine {
                     .map_err(|e| StorageError::Internal(e.to_string()))?
             };
             let Some((row_shard_id, _)) = rows.first() else {
-                return Err(extenddb_storage::util::stream_not_found(&stream_arn));
+                return Err(extenddb_storage::util::stream_does_not_exist());
             };
             if !shard_in_stream(
                 &table_id,
@@ -261,7 +261,7 @@ impl StreamEngine for PostgresEngine {
                 table_label.as_deref(),
                 &stream_label,
             ) {
-                return Err(extenddb_storage::util::stream_not_found(&stream_arn));
+                return Err(extenddb_storage::util::stream_does_not_exist());
             }
 
             let records: Vec<StreamRecord> = rows
@@ -571,7 +571,7 @@ impl StreamEngine for PostgresEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
             let Some(table_id) = table_id else {
-                return Err(extenddb_storage::util::stream_not_found(&stream_arn));
+                return Err(extenddb_storage::util::stream_does_not_exist());
             };
 
             let exists: Option<(i32,)> =
@@ -583,7 +583,7 @@ impl StreamEngine for PostgresEngine {
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
             if exists.is_none() {
-                return Err(extenddb_storage::util::stream_not_found(&stream_arn));
+                return Err(extenddb_storage::util::shard_not_in_stream(&stream_arn));
             }
             Ok(())
         })

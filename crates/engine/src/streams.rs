@@ -310,10 +310,10 @@ pub async fn handle_get_records(
     // The storage read below resolves the shard against that stream (table
     // name and stream label, within the caller's account) in the same round
     // trip as the records, so a forged token that pairs an authorized stream
-    // ARN with another stream's shard id reads nothing and gets the stream
-    // not-found answer. A token with no stream ARN was issued by a build before
-    // the ARN was carried; the authorization layer answers it as expired, and
-    // the engine gives the same answer when called directly.
+    // ARN with another stream's shard id reads nothing and gets the "stream
+    // does not exist" answer. A token with no stream ARN was issued by a build
+    // before the ARN was carried; the authorization layer answers it as
+    // expired, and the engine gives the same answer when called directly.
     let Some(stream_arn) = it.stream_arn.as_deref() else {
         return Err(DynamoDbError::ExpiredIteratorException(
             SHARD_ITERATOR_EXPIRED_MESSAGE.to_owned(),
@@ -462,16 +462,27 @@ mod tests {
 
     #[test]
     fn stream_not_found_maps_to_resource_not_found_with_the_arn() {
-        // `get_stream_records` answers a shard that is not the iterator's
-        // stream's with the storage not-found error; the wire answer is the
-        // ResourceNotFoundException `validate_shard` produced for GetRecords
-        // before the check moved into the read.
+        // `describe_stream` answers a stream ARN that names no stream with the
+        // storage not-found error that carries the ARN.
         let arn = "arn:aws:dynamodb:us-east-1:1:table/T/stream/2026-10-20T16:17:40.188";
         match super::storage_to_dynamo(extenddb_storage::util::stream_not_found(arn)) {
             super::DynamoDbError::ResourceNotFoundException(msg) => assert_eq!(
                 msg,
                 format!("Requested resource not found: Stream: {arn} not found")
             ),
+            other => panic!("expected ResourceNotFoundException, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_does_not_exist_maps_to_resource_not_found() {
+        // `get_stream_records` and `validate_shard` answer a stream ARN that
+        // names no stream, and `get_stream_records` a shard that is not one of
+        // the stream's, with this error.
+        match super::storage_to_dynamo(extenddb_storage::util::stream_does_not_exist()) {
+            super::DynamoDbError::ResourceNotFoundException(msg) => {
+                assert_eq!(msg, "Requested resource not found: Stream does not exist");
+            }
             other => panic!("expected ResourceNotFoundException, got {other:?}"),
         }
     }

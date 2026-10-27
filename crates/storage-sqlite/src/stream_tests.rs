@@ -99,14 +99,12 @@ async fn write_records(engine: &SqliteEngine, shard_id: &str, table_id: &str, se
     }
 }
 
-fn assert_stream_not_found(result: extenddb_storage::StreamRecordsResult, arn: &str) {
-    let StorageError::TableNotFound(expected) = extenddb_storage::util::stream_not_found(arn)
-    else {
-        unreachable!("stream_not_found is a TableNotFound error")
-    };
+fn assert_stream_not_found(result: extenddb_storage::StreamRecordsResult) {
     match result {
-        Err(StorageError::TableNotFound(msg)) => assert_eq!(msg, expected),
-        other => panic!("expected the stream not-found error, got {other:?}"),
+        Err(StorageError::TableNotFound(msg)) => {
+            assert_eq!(msg, extenddb_storage::util::STREAM_DOES_NOT_EXIST);
+        }
+        other => panic!("expected the stream does not exist error, got {other:?}"),
     }
 }
 
@@ -173,20 +171,17 @@ async fn another_streams_shard_under_an_allowed_arn_is_not_found() {
         engine
             .get_stream_records(ACCOUNT, &arn_a, &shard(&b_id, 0), None, 10)
             .await,
-        &arn_a,
     );
     assert_stream_not_found(
         engine
             .get_stream_records(ACCOUNT, &arn_b, &shard(&a_id, 0), None, 10)
             .await,
-        &arn_b,
     );
     // A shard id that exists for no table.
     assert_stream_not_found(
         engine
             .get_stream_records(ACCOUNT, &arn_a, "shardId-forged-0000000000000000", None, 10)
             .await,
-        &arn_a,
     );
     // The control: stream A's own shard reads.
     let (records, _) = engine
@@ -208,7 +203,6 @@ async fn another_accounts_stream_is_not_found_under_its_own_arn() {
         engine
             .get_stream_records(ACCOUNT, &arn, &shard(&other_id, 0), None, 10)
             .await,
-        &arn,
     );
 }
 
@@ -236,7 +230,6 @@ async fn another_accounts_same_named_stream_is_not_found() {
                 engine
                     .get_stream_records(caller, &arn, &shard(foreign, 0), None, 10)
                     .await,
-                &arn,
             );
             // The control: the caller's own shard reads under either spelling
             // of the account, since storage binds the caller's account and
@@ -276,7 +269,6 @@ async fn an_earlier_stream_label_on_the_same_shards_is_not_found() {
         engine
             .get_stream_records(ACCOUNT, &old_arn, &shard_id, None, 10)
             .await,
-        &old_arn,
     );
     let new_arn = stream_arn(REGION, ACCOUNT, "t", "2026-02-02T00:00:00.000");
     let (records, _) = engine

@@ -169,7 +169,7 @@ impl StreamEngine for SqliteEngine {
                 }
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
             let Some((table_id, table_label, row_shard_id, _)) = rows.first() else {
-                return Err(extenddb_storage::util::stream_not_found(&stream_arn));
+                return Err(extenddb_storage::util::stream_does_not_exist());
             };
             if !shard_in_stream(
                 table_id,
@@ -177,7 +177,7 @@ impl StreamEngine for SqliteEngine {
                 table_label.as_deref(),
                 &stream_label,
             ) {
-                return Err(extenddb_storage::util::stream_not_found(&stream_arn));
+                return Err(extenddb_storage::util::stream_does_not_exist());
             }
 
             let records: Vec<StreamRecord> = rows
@@ -475,7 +475,7 @@ impl StreamEngine for SqliteEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
             let Some(table_id) = table_id else {
-                return Err(extenddb_storage::util::stream_not_found(&stream_arn));
+                return Err(extenddb_storage::util::stream_does_not_exist());
             };
             let exists: Option<(i64,)> =
                 sqlx::query_as("SELECT 1 FROM stream_shards WHERE shard_id = ? AND table_id = ?")
@@ -485,7 +485,7 @@ impl StreamEngine for SqliteEngine {
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
             if exists.is_none() {
-                return Err(extenddb_storage::util::stream_not_found(&stream_arn));
+                return Err(extenddb_storage::util::shard_not_in_stream(&stream_arn));
             }
             Ok(())
         })

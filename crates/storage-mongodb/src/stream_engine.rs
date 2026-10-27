@@ -320,7 +320,7 @@ impl StreamEngine for MongoEngine {
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
             let Some(table_doc) = table_doc else {
-                return Err(extenddb_storage::util::stream_not_found(&stream_arn_val));
+                return Err(extenddb_storage::util::stream_does_not_exist());
             };
             let table_id = table_doc
                 .get_str("table_id")
@@ -367,10 +367,10 @@ impl StreamEngine for MongoEngine {
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
             let Some(row_shard_id) = docs.first().and_then(|d| d.get_str("shard_id").ok()) else {
-                return Err(extenddb_storage::util::stream_not_found(&stream_arn_val));
+                return Err(extenddb_storage::util::stream_does_not_exist());
             };
             if !shard_in_stream(&table_id, row_shard_id, table_label, &stream_label) {
-                return Err(extenddb_storage::util::stream_not_found(&stream_arn_val));
+                return Err(extenddb_storage::util::stream_does_not_exist());
             }
 
             let records: Vec<StreamRecord> = docs
@@ -714,7 +714,7 @@ impl StreamEngine for MongoEngine {
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
 
             let Some(table_doc) = table_doc else {
-                return Err(extenddb_storage::util::stream_not_found(&stream_arn_val));
+                return Err(extenddb_storage::util::stream_does_not_exist());
             };
 
             let table_id = table_doc.get_str("table_id").unwrap_or_default();
@@ -726,7 +726,7 @@ impl StreamEngine for MongoEngine {
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
 
             if exists.is_none() {
-                return Err(extenddb_storage::util::stream_not_found(&stream_arn_val));
+                return Err(extenddb_storage::util::shard_not_in_stream(&stream_arn_val));
             }
             Ok(())
         })

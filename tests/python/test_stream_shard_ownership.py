@@ -23,7 +23,7 @@ import botocore.config
 import pytest
 from botocore.exceptions import ClientError
 
-from helpers import stream_not_found_message, unique_name, wait_for_active, wait_for_deleted
+from helpers import STREAM_DOES_NOT_EXIST, unique_name, wait_for_active, wait_for_deleted
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("DYNAMODB_ENDPOINT", "").strip(),
@@ -111,7 +111,7 @@ class TestShardBelongsToIteratorStream:
                 streams_client.get_records(ShardIterator=forged)
             err = exc.value.response["Error"]
             assert err["Code"] == "ResourceNotFoundException", err
-            assert err["Message"] == stream_not_found_message(arn_a), err
+            assert err["Message"] == STREAM_DOES_NOT_EXIST, err
 
             raw = f"shardId-forged-0000000000000000|AFTER_SEQUENCE_NUMBER||{now}|{arn_a}"
             forged = base64.standard_b64encode(raw.encode()).decode()
@@ -119,7 +119,7 @@ class TestShardBelongsToIteratorStream:
                 streams_client.get_records(ShardIterator=forged)
             err = exc.value.response["Error"]
             assert err["Code"] == "ResourceNotFoundException", err
-            assert err["Message"] == stream_not_found_message(arn_a), err
+            assert err["Message"] == STREAM_DOES_NOT_EXIST, err
 
             # Control: the shard reads under its own stream's iterator, and
             # stream A's own shard reads (nothing was written to A).

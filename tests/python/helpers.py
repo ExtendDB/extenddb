@@ -73,8 +73,13 @@ def unique_name(prefix: str = "test") -> str:
     return f"{prefix}-{uuid.uuid4().hex[:12]}"
 
 
-def stream_not_found_message(stream_arn: str) -> str:
-    """The sentence a streams call answers for a stream ARN that names no stream
-    of the caller's account, or a shard that is not that stream's (measured on
-    DescribeStream 2026-10-24: no trailing period)."""
+# What GetShardIterator answers for a stream ARN that names no stream of the
+# caller's account (measured 2026-10-24). GetRecords answers the same for such
+# an ARN and for a shard that is not one of that stream's shards.
+STREAM_DOES_NOT_EXIST = "Requested resource not found: Stream does not exist"
+
+
+def describe_stream_not_found_message(stream_arn: str) -> str:
+    """What DescribeStream answers for a stream ARN that names no stream of the
+    caller's account (measured 2026-10-24): the ARN, and no trailing period."""
     return f"Requested resource not found: Stream: {stream_arn} not found"

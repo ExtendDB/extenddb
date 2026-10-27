@@ -608,7 +608,7 @@ pub trait StreamEngine: Send + Sync {
     /// resolve the shard against the table and stream label that ARN names,
     /// scoped to `account_id`, in the same round trip as the records read, and
     /// return `StorageError::TableNotFound` with the message
-    /// `Requested resource not found: Stream: <arn> not found.` when the
+    /// `Requested resource not found: Stream does not exist` when the
     /// stream does not exist for that account or the shard is not one of that
     /// stream's shards. A shard of another table, another account, or an
     /// earlier stream label on the same table therefore yields no records.
