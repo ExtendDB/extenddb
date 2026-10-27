@@ -300,6 +300,13 @@ async fn write_batch(
 /// not cleared by replaying the request, and a client's UnprocessedItems loop
 /// would spin on it. An internal error keeps answering HTTP 500, which is
 /// what it answered before this handler deferred anything.
+///
+/// `TransactionConflict` is deferred because the service treats it that way.
+/// Measured on 2026-10-27 in us-east-1 with client retries off, while a
+/// TransactWriteItems held the items: a batch of two requests in which one
+/// was on a held item answered 200 with that request in UnprocessedItems and
+/// the other request applied, whichever of the two came first, and no
+/// BatchWriteItem call answered TransactionConflictException.
 fn is_deferrable(e: &StorageError) -> bool {
     matches!(
         e,
