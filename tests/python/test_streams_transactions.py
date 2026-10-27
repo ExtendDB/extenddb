@@ -11,7 +11,7 @@ Assertions are per key. Records for one key share a shard and carry ascending
 sequence numbers there, while records for different keys land in different
 shards, whose sequence numbers are not comparable.
 
-These tests require a extenddb endpoint (DYNAMODB_ENDPOINT) because real
+These tests require an extenddb endpoint (DYNAMODB_ENDPOINT) because real
 DynamoDB uses a separate Streams endpoint.
 """
 

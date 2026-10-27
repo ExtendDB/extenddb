@@ -33,14 +33,15 @@ async fn transacted_put(engine: &CassandraEngine, table: &TestTable, item: &Item
     engine.transact_write_items(&ops, None).await.unwrap();
 }
 
-/// Write the row shape a PREPARE leaves behind: `created_to_prepare` set, with
-/// `item_data` carrying a placeholder rather than a committed item, and no
-/// `prepared_txn_id`.
+/// Write a row shaped like the one a PREPARE plants for an absent key:
+/// `created_to_prepare` set and `item_data` holding a placeholder rather than a
+/// committed item, with no `last_committed_txn_timestamp`. The transaction under
+/// test then PREPAREs this row like any other, which sets `prepared_txn_id`.
 ///
 /// A commit-time read of `item_data` alone cannot tell this row from a row
-/// holding a committed item, and PREPARE's own read cannot tell it either. It
-/// is also the shape a single-item write that commits inside the PREPARE window
-/// leaves, which is why the record's old image is decided from the flag.
+/// holding a committed item, and PREPARE's own read cannot tell it either. The
+/// record's old image is decided from the flag and the commit timestamp
+/// instead.
 async fn plant_prepare_created_row(engine: &CassandraEngine, table: &TestTable, item: &Item) {
     let keyspace = format!("extenddb_ttl_test_account_{}", table.key_info.account_id);
     let data_table = format!("items_{}", table.key_info.table_id.replace('-', "_"));

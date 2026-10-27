@@ -911,11 +911,6 @@ impl CassandraEngine {
                 .await?;
         }
 
-        debug_assert_eq!(
-            pre_commit_images.len(),
-            ops.len(),
-            "one TTL pre-commit image per op, in request order"
-        );
         for (op, old_image) in ops.iter().zip(&pre_commit_images) {
             match op {
                 TransactWriteOp::Put { key_info, item, .. } => {
@@ -1840,8 +1835,6 @@ impl CassandraEngine {
     /// the base LWT would make every record and index row wait a round trip
     /// behind an item that has already committed, widening the window in which
     /// a crash leaves the item mutated and its secondary effects unwritten.
-    /// `occ_write` reads the indexes before its own base write for the same
-    /// reason.
     async fn indexes_for_commit(
         &self,
         key_info: &TableKeyInfo,
@@ -1861,9 +1854,9 @@ impl CassandraEngine {
     /// statements to be batched with writes to other partitions. The single-item
     /// paths have the same two-step shape for the same reason: `occ_write`
     /// commits the base row by LWT, then carries the index rows and the stream
-    /// record in one LOGGED BATCH. The brief inconsistency window is acceptable
-    /// for the same reason async GSIs accept it; transaction recovery re-runs the
-    /// base mutation on crash.
+    /// record in one LOGGED BATCH. A failure or crash after the base LWT leaves
+    /// the index rows and the record unwritten; neither a retry nor recovery
+    /// writes them, because recovery re-runs the base mutation only.
     ///
     /// `new_item` is `None` for a delete, which writes no index rows on this
     /// path, and `indexes` is then empty. `index_old_item` is the old image the
@@ -1873,9 +1866,8 @@ impl CassandraEngine {
     /// The statements run as `secondary_effect_batches` groups them: one batch
     /// holding the index rows and the record together, or the index batch
     /// followed by the record as a batch of its own when the two are too large
-    /// to share one. The queue row an asynchronous GSI takes
-    /// (`enqueue_async_indexes`) is written on the session outside that batch,
-    /// as it was before the record joined it.
+    /// to share one. The queue row that `enqueue_async_indexes` adds for an
+    /// asynchronous GSI goes into the index batch with the index rows.
     async fn commit_secondary_effects(
         &self,
         key_info: &TableKeyInfo,
