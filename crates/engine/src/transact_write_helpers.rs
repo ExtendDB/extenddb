@@ -9,14 +9,19 @@
 use std::collections::HashMap;
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::expression::{ExpressionMaps, PathElement, UpdateAction};
+use extenddb_core::expression::{
+    ExpressionMaps, PathElement, UpdateAction, collect_value_placeholders,
+};
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{
     AttributeValue, CancellationReason, ReturnItemCollectionMetrics,
     ReturnValuesOnConditionCheckFailure, TableKeyInfo, attribute_value_size, extract_key,
     item_size_bytes,
 };
-use extenddb_core::validation::{validate_attribute_values_nesting_depth, validate_key_not_empty};
+use extenddb_core::validation::{
+    validate_attribute_values_nesting_depth, validate_expression_value_nesting_depth,
+    validate_key_not_empty,
+};
 use extenddb_storage::TransactWriteOp;
 use hmac::{Hmac, Mac};
 use serde_json::Value;
@@ -304,30 +309,84 @@ impl PreparedOp {
 ///
 /// One item after another, the first failing item decides. Inside an item the
 /// order is the service's (measured): a key that does not fit the schema, then
-/// a key attribute named in an `Update`, both returned as the index and
-/// cancellation reason of that item, then an empty key value, returned as a
-/// top-level `ValidationException`.
+/// a key attribute named in an `Update`, both returned as the cancellation
+/// reasons of the transaction (the failing item's reason, `None` for every
+/// other item), then an empty key value, returned as a top-level
+/// `ValidationException`.
 pub(crate) fn key_pass_failure(
     prepared: &[PreparedOp],
     limits: &LimitsConfig,
-) -> Result<Option<(usize, CancellationReason)>, DynamoDbError> {
+) -> Result<Option<Vec<CancellationReason>>, DynamoDbError> {
     for (index, op) in prepared.iter().enumerate() {
         if let Some(reason) = op
             .key_schema_reason(limits)
             .or_else(|| op.key_update_reason())
         {
-            return Ok(Some((index, reason)));
+            return Ok(Some(
+                (0..prepared.len())
+                    .map(|i| {
+                        if i == index {
+                            reason.clone()
+                        } else {
+                            CancellationReason::none()
+                        }
+                    })
+                    .collect(),
+            ));
         }
         op.validate_key_value_not_empty()?;
     }
     Ok(None)
 }
 
+/// The cancellation reasons for `Update` items that store a value nested as
+/// deep as an item may not hold, or `None` when no item does.
+///
+/// The value passes the `ExpressionAttributeValues` check
+/// (`validate_value_map_nesting`) and breaks the item limit once stored. The
+/// service reports `Nesting Levels have exceeded supported limits` as a
+/// `ValidationError` reason on every such item, after the duplicate check and
+/// alongside the other items' condition results (measured 2026-10-27).
+pub(crate) fn stored_value_nesting_reasons(
+    prepared: &[PreparedOp],
+) -> Option<Vec<CancellationReason>> {
+    let offends = |op: &PreparedOp| {
+        let PreparedOp::Update { actions, maps, .. } = op else {
+            return false;
+        };
+        let mut placeholders: Vec<String> = Vec::new();
+        for action in actions {
+            if let UpdateAction::Set { value, .. } = action {
+                collect_value_placeholders(value, &mut placeholders);
+            }
+        }
+        validate_attribute_values_nesting_depth(
+            placeholders.iter().filter_map(|name| maps.values.get(name)),
+        )
+        .is_err()
+    };
+    let flags: Vec<bool> = prepared.iter().map(offends).collect();
+    flags.iter().any(|&f| f).then(|| {
+        flags
+            .into_iter()
+            .map(|f| {
+                if f {
+                    CancellationReason::validation_error(
+                        "Nesting Levels have exceeded supported limits".to_owned(),
+                    )
+                } else {
+                    CancellationReason::none()
+                }
+            })
+            .collect()
+    })
+}
+
 /// Check the nesting of every `ExpressionAttributeValues` value of one item,
-/// used or not, as the service does at the start of that item's validation.
-/// The message names the offending placeholder; keys are visited in sorted
-/// order so the one reported is deterministic when several values are too
-/// deep.
+/// used or not, as the service does at the start of that item's validation
+/// (see `validate_expression_value_nesting_depth` for the threshold). The
+/// message names the offending placeholder; keys are visited in sorted order
+/// so the one reported is deterministic when several values are too deep.
 pub(crate) fn validate_value_map_nesting(
     values: Option<&HashMap<String, AttributeValue>>,
 ) -> Result<(), DynamoDbError> {
@@ -337,7 +396,7 @@ pub(crate) fn validate_value_map_nesting(
     let mut keys: Vec<&String> = values.keys().collect();
     keys.sort();
     for key in keys {
-        match validate_attribute_values_nesting_depth(std::iter::once(&values[key])) {
+        match validate_expression_value_nesting_depth(&values[key]) {
             Ok(()) => {}
             Err(DynamoDbError::ValidationException(inner)) => {
                 return Err(DynamoDbError::ValidationException(format!(

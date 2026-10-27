@@ -1987,6 +1987,26 @@ where
     Ok(())
 }
 
+/// Validate the nesting of one `ExpressionAttributeValues` value of a
+/// transaction item. The service accepts a value with as many wrappers as an
+/// item may hold plus one, and refuses one more (measured 2026-10-27: a
+/// `ConditionCheck` value 32 `M` wrappers deep is accepted, 33 is refused,
+/// while a `Put` item attribute 32 deep is refused). A value that is stored
+/// then meets the item limit, which is checked separately.
+pub fn validate_expression_value_nesting_depth(
+    value: &AttributeValue,
+) -> Result<(), DynamoDbError> {
+    match value {
+        AttributeValue::M(map) => map
+            .values()
+            .try_for_each(|v| check_attribute_value_depth(v, 0)),
+        AttributeValue::L(list) => list
+            .iter()
+            .try_for_each(|v| check_attribute_value_depth(v, 0)),
+        _ => Ok(()),
+    }
+}
+
 fn check_attribute_value_depth(
     value: &AttributeValue,
     current_depth: usize,

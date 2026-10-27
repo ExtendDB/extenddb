@@ -16,8 +16,8 @@ use crate::request_limits;
 use crate::serialize_output;
 use crate::stream_capture;
 use crate::transact_write_helpers::{
-    PreparedOp, compute_fingerprint, key_pass_failure, validate_client_request_token,
-    validate_value_map_nesting,
+    PreparedOp, compute_fingerprint, key_pass_failure, stored_value_nesting_reasons,
+    validate_client_request_token, validate_value_map_nesting,
 };
 use crate::{DispatchMetrics, DispatchResult};
 use extenddb_core::error::DynamoDbError;
@@ -89,7 +89,9 @@ pub async fn handle_transact_write_items(
     //      with a ValidationError reason on the first offending item and None
     //      on every other; conditions are not evaluated when any item fails
     //      here), then an empty key value (top-level ValidationException),
-    //   5. duplicate targets (top-level ValidationException).
+    //   5. duplicate targets (top-level ValidationException),
+    //   6. a value an Update stores that is as deep as an item may not hold
+    //      (ValidationError reason on that item).
     // Measured against DynamoDB; a request with two defects reports the
     // earlier phase's error whichever item carries it.
     let parsed: Vec<ParsedExpressions> = input
@@ -126,16 +128,7 @@ pub async fn handle_transact_write_items(
     // before duplicate detection and before any condition is evaluated
     // matches the service: the other items report None, not
     // ConditionalCheckFailed.
-    if let Some((index, reason)) = key_pass_failure(&prepared, &ctx.limits)? {
-        let reasons: Vec<extenddb_core::types::CancellationReason> = (0..prepared.len())
-            .map(|i| {
-                if i == index {
-                    reason.clone()
-                } else {
-                    extenddb_core::types::CancellationReason::none()
-                }
-            })
-            .collect();
+    if let Some(reasons) = key_pass_failure(&prepared, &ctx.limits)? {
         return Err(storage_err_to_dynamo(
             extenddb_storage::error::StorageError::TransactionCanceled(reasons),
         ));
@@ -148,6 +141,14 @@ pub async fn handle_transact_write_items(
                 "Transaction request cannot include multiple operations on one item".to_owned(),
             ));
         }
+    }
+
+    // A value an Update stores that is as deep as an item may not hold is a
+    // ValidationError reason on that item (see `stored_value_nesting_reasons`).
+    if let Some(reasons) = stored_value_nesting_reasons(&prepared) {
+        return Err(storage_err_to_dynamo(
+            extenddb_storage::error::StorageError::TransactionCanceled(reasons),
+        ));
     }
 
     // Build storage operations
