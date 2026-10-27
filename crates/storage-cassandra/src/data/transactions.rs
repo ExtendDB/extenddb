@@ -1491,25 +1491,26 @@ impl CassandraEngine {
                 stream,
                 ..
             } => {
-                let stream_stmt = if stream.is_some() {
-                    // The item carries the key attributes, so it resolves the
-                    // row by itself.
+                // The old image is the row as it stands before the base write.
+                // The item carries the key attributes, so it resolves the row
+                // by itself.
+                let old_image = if stream.is_some() {
                     let (row, created_to_prepare) = self
                         .fetch_row_for_transaction(key_info, item, Some(txn_id))
                         .await?;
-                    let old_image = commit_old_image(row, created_to_prepare);
-                    self.transact_stream_statement(
-                        key_info,
-                        stream.as_ref(),
-                        old_image.as_ref(),
-                        Some(item),
-                    )
+                    commit_old_image(row, created_to_prepare)
                 } else {
                     None
                 };
                 let indexes = self.indexes_for_commit(key_info).await?;
                 self.commit_put_or_update(key_info, item, txn_id_bytes.clone(), txn_timestamp)
                     .await?;
+                let stream_stmt = self.transact_stream_statement(
+                    key_info,
+                    stream.as_ref(),
+                    old_image.as_ref(),
+                    Some(item),
+                );
                 self.commit_secondary_effects(key_info, None, Some(item), &indexes, stream_stmt)
                     .await
             }
@@ -1529,6 +1530,11 @@ impl CassandraEngine {
                 expression::apply_update_validated(actions, &mut final_item, maps, &[], &[])
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
+                let indexes = self.indexes_for_commit(key_info).await?;
+                self.commit_put_or_update(key_info, &final_item, txn_id_bytes, txn_timestamp)
+                    .await?;
+                // `existing` was read before the base write, so it is still the
+                // old image.
                 let stream_stmt = if stream.is_some() {
                     let old_image = commit_old_image(existing.clone(), created_to_prepare);
                     self.transact_stream_statement(
@@ -1540,9 +1546,6 @@ impl CassandraEngine {
                 } else {
                     None
                 };
-                let indexes = self.indexes_for_commit(key_info).await?;
-                self.commit_put_or_update(key_info, &final_item, txn_id_bytes, txn_timestamp)
-                    .await?;
                 self.commit_secondary_effects(
                     key_info,
                     existing.as_ref(),
@@ -1558,20 +1561,12 @@ impl CassandraEngine {
                 stream,
                 ..
             } => {
-                // A key that was already absent has no pre-image, and the record
-                // builder then returns no statement, so a transacted delete of a
-                // missing item records nothing, as the single-item delete does.
-                let stream_stmt = if stream.is_some() {
+                // The old image is the row as it stands before the delete.
+                let old_image = if stream.is_some() {
                     let (row, created_to_prepare) = self
                         .fetch_row_for_transaction(key_info, key, Some(txn_id))
                         .await?;
-                    let old_image = commit_old_image(row, created_to_prepare);
-                    self.transact_stream_statement(
-                        key_info,
-                        stream.as_ref(),
-                        old_image.as_ref(),
-                        None,
-                    )
+                    commit_old_image(row, created_to_prepare)
                 } else {
                     None
                 };
@@ -1667,6 +1662,15 @@ impl CassandraEngine {
                 check_lwt_applied(&result, "commit_single_operation").map_err(|_| {
                     StorageError::Internal("Transaction conflict during commit".to_owned())
                 })?;
+                // A key that was already absent has no pre-image, and the record
+                // builder then returns no statement, so a transacted delete of a
+                // missing item records nothing, as the single-item delete does.
+                let stream_stmt = self.transact_stream_statement(
+                    key_info,
+                    stream.as_ref(),
+                    old_image.as_ref(),
+                    None,
+                );
                 self.commit_secondary_effects(key_info, None, None, &[], stream_stmt)
                     .await
             }
@@ -1797,8 +1801,13 @@ impl CassandraEngine {
     /// Calls the same `stream_util::stream_record_statement` the single-item
     /// write paths call, with the same image pair, so a transacted write records
     /// the same event name, the same images for the table's view type, the same
-    /// shard assignment and the same sequence-number source as the equivalent
+    /// shard assignment and the same sequence-number clock as the equivalent
     /// `PutItem`, `UpdateItem` or `DeleteItem`.
+    ///
+    /// The statement takes its sequence number when it is built, so callers
+    /// build it once the base write has been applied. A number taken earlier
+    /// can be lower than the number of a record already published for a later
+    /// write on the same shard.
     fn transact_stream_statement(
         &self,
         key_info: &TableKeyInfo,

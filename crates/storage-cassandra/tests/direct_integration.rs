@@ -59,6 +59,8 @@ mod transact_write_stream_batch_limit;
 mod transact_write_stream_images;
 #[path = "direct/transact_write_stream_records.rs"]
 mod transact_write_stream_records;
+#[path = "direct/transact_write_stream_sequence.rs"]
+mod transact_write_stream_sequence;
 #[path = "direct/transact_write_stream_size_sweep.rs"]
 mod transact_write_stream_size_sweep;
 #[path = "direct/transaction_ledger.rs"]
