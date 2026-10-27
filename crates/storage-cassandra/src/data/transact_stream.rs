@@ -48,11 +48,15 @@ pub(super) fn commit_old_image(row: Option<Item>, created_to_prepare: bool) -> O
 ///
 /// The base row has already committed by the time these batches run, so a
 /// batch Cassandra rejects leaves the item written without its index rows or
-/// its record, and the caller answers with an error. Splitting keeps a large
-/// write from reaching that state. It costs the atomicity of the index rows
-/// and the record for those writes: a failure between the two batches leaves
-/// the index rows written and the record unwritten, and nothing writes the
-/// record afterwards.
+/// its record, and the caller answers with an error. Splitting keeps the
+/// record from being the statement that pushes a batch over the limit. It does
+/// not bound the index batch, which is sent whole: when the index rows write
+/// more than one partition and pass the limit by themselves (two synchronous
+/// GSIs, or one synchronous and one asynchronous GSI, from about 26 KB), the
+/// item is written without them. The split costs the atomicity of the index
+/// rows and the record for a record too large to share their batch: a failure
+/// between the two batches leaves the index rows written and the record
+/// unwritten, and nothing writes the record afterwards.
 ///
 /// The caller executes exactly what this returns, in order, so the grouping is
 /// asserted in unit tests rather than resting on the shape of the calling code.
