@@ -37,6 +37,13 @@ BATCH_WRITERS = 16
 BATCH_ROUNDS = 30
 UPDATE_WRITERS = 16
 UPDATE_OPS = 20
+TXN_WRITERS = 6
+TXN_ROUNDS = 10
+# Passes a writer makes at one batch or transaction before the test fails, and
+# the pause between two passes. A server that applies a request within a few
+# passes never reaches the limit.
+REPLAY_PASSES = 200
+REPLAY_PAUSE = 0.01
 
 
 @pytest.fixture(scope="module")
@@ -129,6 +136,12 @@ def _run_writers(count: int, body) -> list:
 
 def _error_code(e: ClientError) -> str:
     return f"{e.response['ResponseMetadata']['HTTPStatusCode']} {e.response['Error']['Code']}"
+
+
+def _backend() -> str:
+    """The backend under test as devtools/run-tests exports it with --backend
+    (the MongoDB and Cassandra runners always pass it); empty when unset."""
+    return os.environ.get("EXTENDDB_TEST_BACKEND", "").strip()
 
 
 def _stream_record_count(dynamodb_client, streams_client, table: str, prefix: str) -> int:
@@ -234,19 +247,30 @@ def test_batch_writes_racing_puts_on_a_stream_table_never_fail(
                     pending = (
                         [raced_req, side_req] if raced_first else [side_req, raced_req]
                     )
-                    while pending:
+                    # A server that never applies the requests ends the test
+                    # at the pass limit instead of looping until the job's
+                    # timeout.
+                    for _ in range(REPLAY_PASSES):
                         try:
                             r = raw_client.batch_write_item(RequestItems={stream_table: pending})
                         except ClientError as e:
                             if _error_code(e) != "503 ServiceUnavailable":
                                 raise
-                            time.sleep(0.01)
+                            time.sleep(REPLAY_PAUSE)
                             continue
                         left = r.get("UnprocessedItems", {}).get(stream_table, [])
                         records += len(pending) - len(left)
                         if left:
                             unprocessed_rounds += 1
                         pending = left
+                        if not pending:
+                            break
+                        time.sleep(REPLAY_PAUSE)
+                    else:
+                        raise AssertionError(
+                            f"{len(pending)} request(s) of a batch were still unapplied "
+                            f"after {REPLAY_PASSES} passes (writer {i}, round {n})"
+                        )
                 else:
                     raw_client.put_item(TableName=stream_table, Item={**raced, "w": w})
                     records += 1
@@ -284,11 +308,97 @@ def test_batch_writes_racing_puts_on_a_stream_table_never_fail(
     assert got == want, f"stream records {got}, writes applied {want}"
 
 
+def test_transactions_on_a_stream_table_all_commit(
+    dynamodb_client, raw_client, streams_client, stream_table
+):
+    """TransactWriteItems over disjoint keys on a stream table: every call
+    answers 200, each operation is applied once, and the stream holds one
+    record per operation that changed an item.
+
+    Each transaction puts a new item, deletes an item created for it before the
+    writers start, and adds to a counter that only its writer touches, so no
+    two transactions share an item and the service answers 200 to every call.
+    On the MongoDB backend the transactions still conflict with each other on
+    the sequence counters of the stream shards, and a transaction that meets
+    such a conflict has to run again; a server that reports the conflict as an
+    error, whether 500 or 503, fails here.
+
+    After 50 attempts the MongoDB backend cancels a transaction with a
+    TransactionConflict reason on every operation (the answer for sustained
+    contention in docs/differences-from-dynamodb.md). Nothing was applied, so
+    the writer sends the transaction again, up to REPLAY_PASSES times, and the
+    checks at the end show each transaction applied once.
+    """
+    prefix = f"txn-{uuid.uuid4().hex[:8]}-"
+    for i in range(TXN_WRITERS):
+        for n in range(TXN_ROUNDS):
+            raw_client.put_item(TableName=stream_table, Item={"pk": {"S": f"{prefix}del-{i}-{n}"}})
+
+    def body(i: int) -> list[str]:
+        failures: list[str] = []
+        for n in range(TXN_ROUNDS):
+            items = [
+                {
+                    "Put": {
+                        "TableName": stream_table,
+                        "Item": {"pk": {"S": f"{prefix}put-{i}-{n}"}},
+                    }
+                },
+                {
+                    "Delete": {
+                        "TableName": stream_table,
+                        "Key": {"pk": {"S": f"{prefix}del-{i}-{n}"}},
+                    }
+                },
+                {
+                    "Update": {
+                        "TableName": stream_table,
+                        "Key": {"pk": {"S": f"{prefix}upd-{i}"}},
+                        "UpdateExpression": "ADD #c :one",
+                        "ExpressionAttributeNames": {"#c": "c"},
+                        "ExpressionAttributeValues": {":one": {"N": "1"}},
+                    }
+                },
+            ]
+            for _ in range(REPLAY_PASSES):
+                try:
+                    raw_client.transact_write_items(TransactItems=items)
+                    break
+                except ClientError as e:
+                    reasons = [r.get("Code") for r in e.response.get("CancellationReasons", [])]
+                    if reasons and set(reasons) == {"TransactionConflict"}:
+                        time.sleep(REPLAY_PAUSE)
+                        continue
+                    failures.append(f"{_error_code(e)} {reasons}")
+                    break
+            else:
+                failures.append(f"cancelled by conflicts in {REPLAY_PASSES} passes")
+        return failures
+
+    out = _run_writers(TXN_WRITERS, body)
+    failures = [f for fails in out for f in fails]
+    assert not failures, (
+        f"{len(failures)} of {TXN_WRITERS * TXN_ROUNDS} transactions failed: "
+        f"{sorted(set(failures))}"
+    )
+    # A transaction that ran again is applied once: each counter holds its
+    # writer's number of rounds.
+    for i in range(TXN_WRITERS):
+        item = dynamodb_client.get_item(
+            TableName=stream_table, Key={"pk": {"S": f"{prefix}upd-{i}"}}, ConsistentRead=True
+        )["Item"]
+        assert item["c"]["N"] == str(TXN_ROUNDS), item
+    # The setup puts, then a put, a delete and an update per transaction.
+    want = TXN_WRITERS * TXN_ROUNDS * (1 + 3)
+    got = _wait_for_record_count(dynamodb_client, streams_client, stream_table, prefix, want)
+    assert got == want, f"stream records {got}, writes that changed an item {want}"
+
+
 def test_update_item_contention_is_never_a_transaction_conflict(
     dynamodb_client, raw_client, stream_gsi_table
 ):
     """16 writers on one key: UpdateItem never answers 400
-    TransactionConflictException.
+    TransactionConflictException, except on Cassandra.
 
     Amazon DynamoDB applies this shape and answers 200 to every call (measured
     on 2026-10-23 against the service, client retries off, on a table with a
@@ -298,7 +408,9 @@ def test_update_item_contention_is_never_a_transaction_conflict(
     TransactWriteItems holds the item, and no caller here sends one. A write
     this backend could not apply inside its retry budget answers 503
     ServiceUnavailable, which the SDKs retry, the same answer PutItem and
-    DeleteItem give to the same contention.
+    DeleteItem give to the same contention. Cassandra settles a lost
+    optimistic-concurrency race with 400 TransactionConflictException, which
+    this test accepts when EXTENDDB_TEST_BACKEND names it.
 
     The writes that were accepted are checked too: the counter equals the
     number of calls that answered 200, and every marker a caller was told
@@ -358,13 +470,21 @@ def test_update_item_contention_is_never_a_transaction_conflict(
     list_out = _run_writers(UPDATE_WRITERS, list_body)
 
     outcomes = [o for part, _ in add_out + list_out for o in part]
-    conflicts = [o for o in outcomes if "TransactionConflict" in o]
+    # Cassandra settles a lost optimistic-concurrency race with 400
+    # TransactionConflictException once its retries are spent
+    # (tests/test_concurrency.py). Such a call counts as not applied there, so
+    # the counter and marker checks below still apply. Neither the service nor
+    # any other backend answers it to this shape.
+    answers = {"200", "503 ServiceUnavailable"}
+    if _backend() == "cassandra":
+        answers.add("400 TransactionConflictException")
+    conflicts = [o for o in outcomes if "TransactionConflict" in o and o not in answers]
     assert not conflicts, (
         f"{len(conflicts)} of {len(outcomes)} UpdateItem calls answered "
         f"{sorted(set(conflicts))}; the service answers 200 to this shape and "
         "a write this backend could not apply answers 503"
     )
-    unexpected = sorted({o for o in outcomes if o not in ("200", "503 ServiceUnavailable")})
+    unexpected = sorted({o for o in outcomes if o not in answers})
     assert not unexpected, f"unexpected answers: {unexpected}"
 
     applied = sum(1 for part, _ in add_out for o in part if o == "200")
