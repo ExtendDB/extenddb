@@ -19,7 +19,7 @@ use crate::transact_write_stream_records::{
 };
 
 /// `item` with the sort key `sort`.
-fn with_sort(mut item: Item, sort: &AttributeValue) -> Item {
+pub(crate) fn with_sort(mut item: Item, sort: &AttributeValue) -> Item {
     item.insert("sort".to_owned(), sort.clone());
     item
 }
