@@ -231,6 +231,39 @@ fn policy_variable_naming_aws_tagkeys_is_left_literal_for_every_tag_order() {
 }
 
 #[test]
+fn request_tag_lookups_do_not_scan_the_request_tags() {
+    // A request body can carry tens of thousands of tags and a policy can read
+    // aws:RequestTag/<name> in many conditions. Each lookup probes the index
+    // built with the context, so 3,000 lookups against 20,000 tags take
+    // milliseconds. Folding every tag name on every lookup folds 60 million
+    // names, which takes seconds even in a release build.
+    let tags: HashMap<String, String> = (0..20_000)
+        .map(|i| (format!("t{i}"), "v".to_owned()))
+        .collect();
+    let ctx = RequestContext::build(
+        HashMap::new(),
+        HashMap::new(),
+        false,
+        RequestParams {
+            request_tags: Some(tags),
+            ..Default::default()
+        },
+    );
+    let started = std::time::Instant::now();
+    for i in 0..1_500 {
+        let key = format!("aws:RequestTag/absent{i}");
+        assert_eq!(ctx.resolve_key(&key), None);
+        assert!(!ctx.is_unresolvable_key(&key));
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "3,000 lookups against 20,000 tags took {elapsed:?}"
+    );
+    assert_eq!(ctx.resolve_key("aws:RequestTag/t19999"), Some(vec!["v"]));
+}
+
+#[test]
 fn principal_and_resource_tag_lookup_keep_the_exact_first_rule() {
     // Only aws:RequestTag changed. The neighbouring tag keys still resolve a
     // byte-exact stored key first and otherwise the smallest fold-matching key.

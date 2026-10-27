@@ -158,16 +158,24 @@ pub(crate) async fn authorize_request(
     // aws:RequestTag/<key>, empty for every operation that carries no tag set).
     // The tag keys go in here, not in one operation's branch, so a tag-taking
     // operation reaching any branch below carries them.
+    //
+    // A branch that authorizes once moves the tag set into its params. Only the
+    // three operations that carry a tag set populate it, and each authorizes
+    // against one resource, so the loops over several targets below clone an
+    // empty set.
     let (request_tags, request_tag_keys) =
         crate::request_tags::tag_condition_keys(operation, input);
-    let base_params = || extenddb_auth::policy::context::RequestParams {
-        region: Some(state.region.to_string()),
-        secure_transport: state.tls_enabled,
-        source_ip: source_ip.map(ToOwned::to_owned),
-        user_agent: user_agent.map(ToOwned::to_owned),
-        request_tags: request_tags.clone(),
-        request_tag_keys: request_tag_keys.clone(),
-        ..Default::default()
+    let base_params = |request_tags: Option<std::collections::HashMap<String, String>>,
+                       request_tag_keys: Option<Vec<String>>| {
+        extenddb_auth::policy::context::RequestParams {
+            region: Some(state.region.to_string()),
+            secure_transport: state.tls_enabled,
+            source_ip: source_ip.map(ToOwned::to_owned),
+            user_agent: user_agent.map(ToOwned::to_owned),
+            request_tags,
+            request_tag_keys,
+            ..Default::default()
+        }
     };
 
     // DescribeEndpoints needs a signed request (SigV4 verification already ran
@@ -236,7 +244,7 @@ pub(crate) async fn authorize_request(
             "GetRecords",
             &resource_arn,
             false,
-            base_params(),
+            base_params(request_tags, request_tag_keys),
         )
         .await?;
         return Ok(authorized_key_info);
@@ -303,7 +311,7 @@ pub(crate) async fn authorize_request(
                 operation,
                 &resource_arn,
                 false,
-                base_params(),
+                base_params(request_tags, request_tag_keys),
             )
             .await?;
         } else {
@@ -316,7 +324,7 @@ pub(crate) async fn authorize_request(
                     authz_resource::table_resource_arn(&target.table, &state.region, account_id);
                 let params = extenddb_auth::policy::context::RequestParams {
                     leading_keys: target.leading_keys,
-                    ..base_params()
+                    ..base_params(request_tags.clone(), request_tag_keys.clone())
                 };
                 authorization::check_authorization(
                     state.authz_cache.as_ref(),
@@ -363,7 +371,7 @@ pub(crate) async fn authorize_request(
                 .get("ReturnConsumedCapacity")
                 .and_then(|v| v.as_str())
                 .map(ToOwned::to_owned),
-            ..base_params()
+            ..base_params(request_tags, request_tag_keys)
         };
         let (action, resource_arn) = &targets[0];
         authorization::check_authorization(
@@ -386,7 +394,7 @@ pub(crate) async fn authorize_request(
                 action,
                 resource_arn,
                 false,
-                base_params(),
+                base_params(request_tags.clone(), request_tag_keys.clone()),
             )
             .await?;
         }

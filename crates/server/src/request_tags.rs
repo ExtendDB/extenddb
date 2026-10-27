@@ -49,8 +49,9 @@ pub(crate) fn tag_condition_keys(
                 return (None, None);
             };
             // The type the engine deserializes `Tags` into, so both readers
-            // accept the same shapes.
-            let Ok(tags) = serde_json::from_value::<Vec<extenddb_core::types::Tag>>(raw.clone())
+            // accept the same shapes. Reading through the reference leaves the
+            // array in `input` uncopied.
+            let Ok(tags) = <Vec<extenddb_core::types::Tag> as serde::Deserialize>::deserialize(raw)
             else {
                 return (None, None);
             };

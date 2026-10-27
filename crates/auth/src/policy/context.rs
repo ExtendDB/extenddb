@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use request_tags::RequestTagLookup;
+use request_tags::{RequestTagIndex, RequestTagLookup};
 
 /// Trait for resolving condition keys during policy evaluation.
 ///
@@ -276,10 +276,10 @@ pub struct RequestContext {
     pub current_time: String,
     /// The request time formatted for `aws:EpochTime` (whole seconds).
     pub epoch_time: String,
-    /// The tags the request carries, resolved as `aws:RequestTag/<key>`.
-    /// `None` for an operation that carries no tag values, where the service
-    /// leaves the key absent.
-    pub request_tags: Option<HashMap<String, String>>,
+    /// The tags the request carries, indexed by case-folded name and resolved
+    /// as `aws:RequestTag/<key>`. `None` for an operation that carries no tag
+    /// values, where the service leaves the key absent.
+    pub request_tags: Option<RequestTagIndex>,
     /// The tag keys the request names, resolved as `aws:TagKeys`, in request
     /// order. `None` for an operation that names no tag key, where the service
     /// leaves the key absent.
@@ -327,7 +327,7 @@ impl RequestContext {
             // An operation that carries a tag set but an empty one populates
             // neither key: the service has no tag key to put in aws:TagKeys and
             // no value to put in aws:RequestTag/<key>, so both read absent.
-            request_tags: params.request_tags.filter(|t| !t.is_empty()),
+            request_tags: RequestTagIndex::from_tags(params.request_tags),
             request_tag_keys: params.request_tag_keys.filter(|k| !k.is_empty()),
         }
     }
