@@ -1,3 +1,4 @@
+// Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! `get_stream_records` resolves the shard against the stream the iterator

@@ -1,3 +1,4 @@
+# Copyright 2026 ExtendDB contributors
 # SPDX-License-Identifier: Apache-2.0
 
 """GetRecords reads only from a shard of the stream its iterator names.
