@@ -3,8 +3,6 @@
 
 //! `delete_item` implementation for the Cassandra backend.
 
-use cdrs_tokio::consistency::Consistency;
-use cdrs_tokio::query::BatchQueryBuilder;
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_core::expression::{Expr, ExpressionMaps};
 use extenddb_core::types::{Item, TableKeyInfo};
@@ -16,6 +14,7 @@ use super::ddl::data_table_name;
 use super::index::fetch_indexes_for_table;
 use super::{json_to_item, query_with_pk_sk};
 use crate::CassandraEngine;
+use crate::cassandra_util::{lwt_params, query_optional_at, read_params, write_params};
 use crate::stream_util::stream_record_statement;
 
 /// Lifetime of the base-row claim an ordinary request holds while it commits
@@ -219,8 +218,14 @@ impl CassandraEngine {
                 "SELECT item_data, version, prepared_txn_id FROM {data_keyspace}.{ddb_table} WHERE pk = ? AND {sk_col} = ?"
             );
 
-            let old_result =
-                query_with_pk_sk(&self.session, &select_query, pk_text.as_ref(), &sk).await?;
+            let old_result = query_with_pk_sk(
+                &self.session,
+                &select_query,
+                pk_text.as_ref(),
+                &sk,
+                |values| read_params(true, values),
+            )
+            .await?;
 
             let body = old_result
                 .response_body()
@@ -361,14 +366,21 @@ impl CassandraEngine {
                 && ttl_config.is_none()
                 && ttl_claim.is_none()
             {
-                query_with_pk_sk(&self.session, &delete_cql, pk_text.as_ref(), &sk).await?;
+                query_with_pk_sk(
+                    &self.session,
+                    &delete_cql,
+                    pk_text.as_ref(),
+                    &sk,
+                    write_params,
+                )
+                .await?;
             } else {
                 use super::index::sk_to_value;
                 let delete_qv = cdrs_tokio::query::QueryValues::SimpleValues(vec![
                     cdrs_tokio::types::value::Value::from(pk_text.as_str()),
                     sk_to_value(&sk),
                 ]);
-                let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
+                let mut batch = crate::cassandra_util::batch_builder();
                 if ttl_claim.is_some() {
                     batch = batch.with_timestamp(mutation_timestamp);
                 }
@@ -468,10 +480,11 @@ impl CassandraEngine {
                 "SELECT item_data, version, prepared_txn_id FROM {data_keyspace}.{ddb_table} WHERE pk = ?"
             );
 
-            let row = crate::cassandra_util::query_optional(
+            let row = query_optional_at(
                 &self.session,
                 &select_query,
                 cdrs_tokio::query_values!(pk_text.as_str()),
+                true,
                 "delete_item",
             )
             .await?;
@@ -611,14 +624,17 @@ impl CassandraEngine {
                 && ttl_claim.is_none()
             {
                 self.session
-                    .query_with_values(&delete_cql, cdrs_tokio::query_values!(pk_text.as_str()))
+                    .query_with_params(
+                        &delete_cql,
+                        write_params(cdrs_tokio::query_values!(pk_text.as_str())),
+                    )
                     .await
                     .map_err(|e| StorageError::Internal(format!("Delete failed: {e}")))?;
             } else {
                 let delete_qv = cdrs_tokio::query::QueryValues::SimpleValues(vec![
                     cdrs_tokio::types::value::Value::from(pk_text.as_str()),
                 ]);
-                let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
+                let mut batch = crate::cassandra_util::batch_builder();
                 if ttl_claim.is_some() {
                     batch = batch.with_timestamp(mutation_timestamp);
                 }
@@ -748,19 +764,22 @@ impl CassandraEngine {
                  WHERE pk = ? AND {} = ?",
                 sk_column(sk_type)
             );
-            query_with_pk_sk(&self.session, &query, pk.as_str(), &sk)
-                .await?
-                .response_body()
-                .ok()
-                .and_then(cdrs_tokio::frame::message_response::ResponseBody::into_rows)
-                .and_then(|rows| rows.into_iter().next())
+            query_with_pk_sk(&self.session, &query, pk.as_str(), &sk, |values| {
+                read_params(true, values)
+            })
+            .await?
+            .response_body()
+            .ok()
+            .and_then(cdrs_tokio::frame::message_response::ResponseBody::into_rows)
+            .and_then(|rows| rows.into_iter().next())
         } else {
             let query =
                 format!("SELECT item_data, prepared_txn_id FROM {keyspace}.{table} WHERE pk = ?");
-            crate::cassandra_util::query_optional(
+            query_optional_at(
                 &self.session,
                 &query,
                 cdrs_tokio::query_values!(pk.as_str()),
+                true,
                 "ensure_ttl_work_claim",
             )
             .await?
@@ -931,9 +950,7 @@ impl CassandraEngine {
         // with now-derived micros keeps it also above any older write.
         let restore_timestamp =
             (effects_timestamp_ms * 1_000 + 1).max(chrono::Utc::now().timestamp_micros());
-        let mut batch = BatchQueryBuilder::new()
-            .with_consistency(Consistency::LocalQuorum)
-            .with_timestamp(restore_timestamp);
+        let mut batch = crate::cassandra_util::batch_builder().with_timestamp(restore_timestamp);
         // old = None: this is a pure re-upsert of the current image's rows.
         super::index::sync_indexes(
             &mut batch,
@@ -996,9 +1013,8 @@ impl CassandraEngine {
         // identical cells at an identical timestamp, and so restoration (which
         // stamps strictly above this) beats these tombstones by construction
         // rather than by cross-coordinator clock luck.
-        let mut batch = BatchQueryBuilder::new()
-            .with_consistency(Consistency::LocalQuorum)
-            .with_timestamp(delete_timestamp_ms * 1_000);
+        let mut batch =
+            crate::cassandra_util::batch_builder().with_timestamp(delete_timestamp_ms * 1_000);
         let mut has_effects = !indexes.is_empty();
         if !indexes.is_empty() {
             super::index::sync_indexes(
@@ -1391,7 +1407,10 @@ impl CassandraEngine {
 
         let result = self
             .session
-            .query_with_values(&query_null, cdrs_tokio::query_values!(now_ms, pk))
+            .query_with_params(
+                &query_null,
+                lwt_params(cdrs_tokio::query_values!(now_ms, pk)),
+            )
             .await
             .map_err(|e| {
                 tracing::error!("update_partition_max_delete_timestamp (null): {e}");
@@ -1419,9 +1438,9 @@ impl CassandraEngine {
             );
 
             self.session
-                .query_with_values(
+                .query_with_params(
                     &query_compare,
-                    cdrs_tokio::query_values!(now_ms, pk, now_ms),
+                    lwt_params(cdrs_tokio::query_values!(now_ms, pk, now_ms)),
                 )
                 .await
                 .map_err(|e| {
@@ -1476,10 +1495,7 @@ impl CassandraEngine {
         stream: Option<&extenddb_storage::StreamCapture>,
         sys_delay: u64,
     ) -> Result<(), StorageError> {
-        use cdrs_tokio::consistency::Consistency;
-        use cdrs_tokio::query::BatchQueryBuilder;
-
-        let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
+        let mut batch = crate::cassandra_util::batch_builder();
 
         if !indexes.is_empty() {
             super::index::sync_indexes(

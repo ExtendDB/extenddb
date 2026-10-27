@@ -20,7 +20,7 @@ use extenddb_storage::util::{
 use std::sync::Arc;
 
 use super::ddl::{all_sort_key_info, index_table_name};
-use crate::cassandra_util::{CassandraSession, get_column, query_rows};
+use crate::cassandra_util::{CassandraSession, get_column, query_rows_at};
 
 /// Metadata for a single index, used during write-path GSI/LSI sync.
 #[derive(Clone)]
@@ -47,7 +47,7 @@ pub async fn fetch_indexes_for_table(
 /// [`fetch_indexes_for_table`] at `LOCAL_QUORUM`.
 ///
 /// For paths where a stale-empty answer is acted on destructively or treated
-/// as "nothing to restore": at the default consistency a lagging replica can
+/// as "nothing to restore": at `LOCAL_ONE` a lagging replica can
 /// omit an index, and a must-complete restoration that trusts that omission
 /// leaves a live item permanently missing an index row.
 pub async fn fetch_indexes_for_table_quorum(
@@ -69,23 +69,15 @@ async fn fetch_indexes_for_table_at(
          FROM {catalog_keyspace}.indexes WHERE table_id = ?"
     );
 
-    let rows = if quorum {
-        crate::cassandra_util::query_rows_quorum(
-            session,
-            &query,
-            query_values!(table_id),
-            "fetch_indexes_for_table",
-        )
-        .await?
-    } else {
-        query_rows(
-            session,
-            &query,
-            query_values!(table_id),
-            "fetch_indexes_for_table",
-        )
-        .await?
-    };
+    // `quorum` reads at `LOCAL_QUORUM`, otherwise at `LOCAL_ONE`.
+    let rows = query_rows_at(
+        session,
+        &query,
+        query_values!(table_id),
+        quorum,
+        "fetch_indexes_for_table",
+    )
+    .await?;
 
     rows.into_iter()
         .map(|row| {
@@ -136,10 +128,11 @@ pub async fn fetch_index_by_name(
          FROM {catalog_keyspace}.indexes WHERE table_id = ? AND index_name = ?"
     );
 
-    let rows = query_rows(
+    let rows = query_rows_at(
         session,
         &query,
         query_values!(table_id, index_name),
+        false,
         "fetch_index_by_name",
     )
     .await?;
@@ -368,10 +361,11 @@ pub(crate) async fn enqueue_async_indexes(
                 "SELECT last_ready_at FROM {account_keyspace}.gsi_pending \
                  WHERE worker_partition = ? LIMIT 1"
             );
-            let rows = crate::cassandra_util::query_rows::<StorageError>(
+            let rows = query_rows_at::<StorageError>(
                 session,
                 &cql,
                 query_values!(worker_partition),
+                false,
                 "enqueue_async_indexes",
             )
             .await?;
@@ -412,7 +406,7 @@ pub(crate) async fn enqueue_async_indexes(
             cdrs_tokio::types::value::Value::from(context_json.as_str()),
         ]);
 
-        let old = std::mem::replace(batch, BatchQueryBuilder::new());
+        let old = std::mem::replace(batch, crate::cassandra_util::batch_builder());
         *batch = old.add_query(insert_cql, insert_qv);
 
         enqueued += 1;
@@ -486,7 +480,7 @@ pub(crate) fn delete_index_row_multi(
         where_cols.join(" AND ")
     );
     let qv = cdrs_tokio::query::QueryValues::SimpleValues(values);
-    let old = std::mem::replace(batch, BatchQueryBuilder::new());
+    let old = std::mem::replace(batch, crate::cassandra_util::batch_builder());
     *batch = old.add_query(cql, qv);
     Ok(())
 }
@@ -556,7 +550,7 @@ pub(crate) fn insert_index_row_multi(
         placeholders
     );
     let qv = cdrs_tokio::query::QueryValues::SimpleValues(values);
-    let old = std::mem::replace(batch, BatchQueryBuilder::new());
+    let old = std::mem::replace(batch, crate::cassandra_util::batch_builder());
     *batch = old.add_query(cql, qv);
     Ok(())
 }
@@ -589,10 +583,11 @@ pub(crate) async fn delete_indexes_for_table(
     // Collect index IDs
     let index_query = format!("SELECT index_id FROM {catalog_keyspace}.indexes WHERE table_id = ?");
 
-    let rows = query_rows(
+    let rows = query_rows_at(
         session,
         &index_query,
         query_values!(table_id),
+        false,
         "delete_indexes_for_table",
     )
     .await?;
@@ -606,7 +601,7 @@ pub(crate) async fn delete_indexes_for_table(
     // Delete index metadata from catalog
     let delete_query = format!("DELETE FROM {catalog_keyspace}.indexes WHERE table_id = ?");
 
-    crate::cassandra_util::execute(
+    crate::cassandra_util::execute_quorum(
         session,
         &delete_query,
         query_values!(table_id),

@@ -176,10 +176,11 @@ pub struct VectorSearch<'a> {
 /// the read reflects every write acknowledged before it started. `false`: the
 /// read may miss recently acknowledged writes. A backend that serves every
 /// read from the copy that took the write meets both by ignoring the value;
-/// every in-tree backend does that today. A backend with followers can serve
-/// `false` from a follower (a `secondaryPreferred` read on MongoDB, a
-/// streaming replica on PostgreSQL); a quorum backend needs read and write
-/// levels that intersect for `true`.
+/// the SQLite, PostgreSQL and MongoDB backends do that today. A backend with
+/// followers can serve `false` from a follower (a `secondaryPreferred` read on
+/// MongoDB, a streaming replica on PostgreSQL); a quorum backend needs read
+/// and write levels that intersect for `true`, which the Cassandra backend
+/// gets from `LOCAL_QUORUM` reads and `LOCAL_QUORUM` writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct ReadOptions {

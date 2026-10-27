@@ -143,7 +143,7 @@ fn same_queue_key(left: &TtlEntry, right: &TtlEntry) -> bool {
 /// `&mut` needs a swap. Doing that inline at each call site buried the statements
 /// being built.
 fn push_query(batch: &mut BatchQueryBuilder, cql: String, values: cdrs_tokio::query::QueryValues) {
-    let previous = std::mem::replace(batch, BatchQueryBuilder::new());
+    let previous = std::mem::replace(batch, crate::cassandra_util::batch_builder());
     *batch = previous.add_query(cql, values);
 }
 
@@ -319,8 +319,7 @@ pub(crate) async fn record_ttl_repair(
     // account deletion + same-id recreation safe in a multi-host fleet — a
     // process-lifetime "already registered" cache on any one host would go
     // stale the moment another host dropped and recreated the keyspace.
-    let batch = cdrs_tokio::query::BatchQueryBuilder::new()
-        .with_consistency(cdrs_tokio::consistency::Consistency::LocalQuorum)
+    let batch = crate::cassandra_util::batch_builder()
         .add_query(
             format!(
                 "INSERT INTO {account_keyspace}.ttl_repair_inflight_partitions \
@@ -987,10 +986,11 @@ pub(crate) async fn load_due_ttl_work(
         "SELECT bucket, shard FROM {account_keyspace}.{TTL_BUCKET_TABLE} \
          WHERE table_id = ? AND generation = ? AND bucket <= ?"
     );
-    let bucket_rows = crate::cassandra_util::query_rows(
+    let bucket_rows = crate::cassandra_util::query_rows_at(
         &engine.session,
         &bucket_query,
         cdrs_tokio::query_values!(table_id, generation_bytes.clone(), current_bucket),
+        false,
         "load_due_ttl_buckets",
     )
     .await?;
@@ -1276,10 +1276,11 @@ pub(crate) async fn clear_ttl_entries(
         "SELECT generation, bucket, shard FROM {account_keyspace}.{TTL_BUCKET_TABLE} \
          WHERE table_id = ?"
     );
-    let rows = crate::cassandra_util::query_rows(
+    let rows = crate::cassandra_util::query_rows_at(
         &engine.session,
         &bucket_query,
         cdrs_tokio::query_values!(table_id),
+        false,
         "clear_ttl_entries",
     )
     .await?;
@@ -1294,14 +1295,14 @@ pub(crate) async fn clear_ttl_entries(
         );
         engine
             .session
-            .query_with_values(
+            .query_with_params(
                 &delete,
-                cdrs_tokio::query_values!(
+                crate::cassandra_util::write_params(cdrs_tokio::query_values!(
                     table_id,
                     cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec()),
                     bucket,
                     shard
-                ),
+                )),
             )
             .await
             .map_err(|error| StorageError::Internal(format!("Clear TTL partition: {error}")))?;
@@ -1310,7 +1311,10 @@ pub(crate) async fn clear_ttl_entries(
         format!("DELETE FROM {account_keyspace}.{TTL_BUCKET_TABLE} WHERE table_id = ?");
     engine
         .session
-        .query_with_values(&delete_buckets, cdrs_tokio::query_values!(table_id))
+        .query_with_params(
+            &delete_buckets,
+            crate::cassandra_util::write_params(cdrs_tokio::query_values!(table_id)),
+        )
         .await
         .map_err(|error| StorageError::Internal(format!("Clear TTL buckets: {error}")))?;
     Ok(())
@@ -1377,7 +1381,7 @@ mod tests {
         let mut item = Item::new();
         item.insert("id".to_owned(), AttributeValue::S("a".to_owned()));
         item.insert("ttl".to_owned(), AttributeValue::N("123".to_owned()));
-        let mut batch = BatchQueryBuilder::new();
+        let mut batch = crate::cassandra_util::batch_builder();
         add_ttl_queue_mutations(
             &mut batch,
             "account_keyspace",
@@ -1418,7 +1422,7 @@ mod tests {
         let mut new = old.clone();
         new.insert("ttl".to_owned(), AttributeValue::N("456".to_owned()));
 
-        let mut batch = BatchQueryBuilder::new();
+        let mut batch = crate::cassandra_util::batch_builder();
         add_ttl_queue_mutations(
             &mut batch,
             "account_keyspace",

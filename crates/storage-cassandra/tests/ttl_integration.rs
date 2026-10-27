@@ -3,8 +3,13 @@
 
 //! Integration tests for Cassandra TTL against a live Cassandra.
 //!
-//! Requires Cassandra on 127.0.0.1:9042. There is no Cassandra CI workflow, so
+//! Requires Cassandra on 127.0.0.1:9042, or on the `host:port` that
+//! `EXTENDDB_TEST_CASSANDRA_ADDR` names. There is no Cassandra CI workflow, so
 //! these are run locally.
+
+// The suites set up and inspect Cassandra state with driver calls at the
+// driver default; the lint in `clippy.toml` guards `src/data/` only.
+#![allow(clippy::disallowed_methods)]
 
 #[path = "common/mod.rs"]
 mod helpers;

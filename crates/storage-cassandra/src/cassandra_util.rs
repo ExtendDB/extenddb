@@ -5,8 +5,11 @@
 
 use cdrs_tokio::cluster::TcpConnectionManager;
 use cdrs_tokio::cluster::session::Session;
+use cdrs_tokio::consistency::Consistency;
+use cdrs_tokio::frame::Envelope;
 use cdrs_tokio::load_balancing::RoundRobinLoadBalancingStrategy;
 use cdrs_tokio::query::QueryValues;
+use cdrs_tokio::statement::{StatementParams, StatementParamsBuilder};
 use cdrs_tokio::transport::TransportTcp;
 use cdrs_tokio::types::rows::Row;
 use std::sync::Arc;
@@ -17,24 +20,145 @@ pub type CassandraSession = Session<
     RoundRobinLoadBalancingStrategy<TransportTcp, TcpConnectionManager>,
 >;
 
-/// Execute a lightweight transaction with explicit regional quorum and serial
-/// consistency. TTL claims and lifecycle metadata use this rather than the
-/// driver's default consistency.
+// ══════════════════════════════════════════════════════════════════════════════
+// Statement consistency for the data path
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// Every statement under `data/` states its level through `read_params`,
+// `write_params` or `lwt_params`; schema statements in `data/ddl.rs` are the
+// one exception. `clippy.toml` disallows the driver calls that run at the
+// driver default, `Consistency::One`, and `data/mod.rs` turns that lint on for
+// the data path.
+
+/// The level a data-path read runs at for a request's `ConsistentRead`.
+///
+/// Base-row writes and lightweight transactions are acknowledged at
+/// `LOCAL_QUORUM` ([`write_params`], [`lwt_params`]). A `LOCAL_QUORUM` read
+/// intersects that write set within the datacenter, because a quorum plus a
+/// quorum exceeds the replication factor, so a `true` read reflects every
+/// write acknowledged before it started. `LOCAL_ONE` reads one replica and
+/// may miss recently acknowledged writes, which is the contract for `false`.
+#[must_use]
+pub const fn read_consistency(consistent_read: bool) -> Consistency {
+    if consistent_read {
+        Consistency::LocalQuorum
+    } else {
+        Consistency::LocalOne
+    }
+}
+
+/// Parameters for a data-path read at [`read_consistency`].
+#[must_use]
+pub fn read_params(consistent_read: bool, values: QueryValues) -> StatementParams {
+    StatementParamsBuilder::new()
+        .with_consistency(read_consistency(consistent_read))
+        .with_values(values)
+        .build()
+}
+
+/// Parameters for a data-path write with no `IF` clause, acknowledged at
+/// `LOCAL_QUORUM`.
+#[must_use]
+pub fn write_params(values: QueryValues) -> StatementParams {
+    StatementParamsBuilder::new()
+        .with_consistency(Consistency::LocalQuorum)
+        .with_values(values)
+        .build()
+}
+
+/// A batch of plain writes, acknowledged at `LOCAL_QUORUM`. `Session::batch`
+/// sends the builder's own consistency, and `BatchQueryBuilder::new()` starts
+/// at the driver default, so every batch of the data path is built here.
+#[must_use]
+#[allow(clippy::disallowed_methods)] // the one place a batch builder is created
+pub fn batch_builder() -> cdrs_tokio::query::BatchQueryBuilder {
+    cdrs_tokio::query::BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum)
+}
+
+/// Parameters for a lightweight transaction (a statement with an `IF`
+/// clause): the Paxos round runs at `LOCAL_SERIAL` and the commit is
+/// acknowledged at `LOCAL_QUORUM`.
+#[must_use]
+pub fn lwt_params(values: QueryValues) -> StatementParams {
+    StatementParamsBuilder::new()
+        .with_consistency(Consistency::LocalQuorum)
+        .with_serial_consistency(Consistency::LocalSerial)
+        .with_values(values)
+        .build()
+}
+
+/// Execute one statement with parameters from [`read_params`],
+/// [`write_params`] or [`lwt_params`] and return the response envelope, from
+/// which a lightweight transaction's `[applied]` column is read with
+/// [`lwt_applied`].
+///
+/// # Errors
+/// Returns an error if Cassandra does not execute the statement at the stated
+/// level.
+pub async fn execute_at<E: FromDbError>(
+    session: &CassandraSession,
+    query: &str,
+    params: StatementParams,
+    context: &str,
+) -> Result<Envelope, E> {
+    session
+        .query_with_params(query, params)
+        .await
+        .map_err(|e| E::db_error(format!("{context}: {e}")))
+}
+
+/// Execute a data-path read at [`read_consistency`] and return all rows.
+///
+/// # Errors
+/// Returns an error if the Cassandra query fails or the response cannot be parsed.
+pub async fn query_rows_at<E: FromDbError>(
+    session: &CassandraSession,
+    query: &str,
+    values: QueryValues,
+    consistent_read: bool,
+    context: &str,
+) -> Result<Vec<Row>, E> {
+    let result = session
+        .query_with_params(query, read_params(consistent_read, values))
+        .await
+        .map_err(|e| {
+            tracing::error!("{context} query failed: {e}");
+            E::db_error(format!("{context}: {e}"))
+        })?;
+
+    let body = result.response_body().map_err(|e| {
+        tracing::error!("{context} response_body failed: {e}");
+        E::db_error(format!("{context} response_body: {e}"))
+    })?;
+
+    Ok(body.into_rows().unwrap_or_default())
+}
+
+/// [`query_rows_at`], returning the first row, if any.
+///
+/// # Errors
+/// Returns an error if the Cassandra query fails or the response cannot be parsed.
+pub async fn query_optional_at<E: FromDbError>(
+    session: &CassandraSession,
+    query: &str,
+    values: QueryValues,
+    consistent_read: bool,
+    context: &str,
+) -> Result<Option<Row>, E> {
+    let rows = query_rows_at(session, query, values, consistent_read, context).await?;
+    Ok(rows.into_iter().next())
+}
+
+/// Execute a lightweight transaction at [`lwt_params`]: a statement with an
+/// `IF` clause runs with these parameters, through this helper or through
+/// `query_with_params` and the `data/mod.rs` helpers.
 pub async fn query_lwt(
     session: &CassandraSession,
     query: &str,
     values: QueryValues,
-) -> Result<cdrs_tokio::frame::Envelope, extenddb_storage::error::StorageError> {
-    use cdrs_tokio::consistency::Consistency;
-    use cdrs_tokio::statement::StatementParamsBuilder;
-
-    let params = StatementParamsBuilder::new()
-        .with_consistency(Consistency::LocalQuorum)
-        .with_serial_consistency(Consistency::LocalSerial)
-        .with_values(values)
-        .build();
+) -> Result<Envelope, extenddb_storage::error::StorageError> {
     session
-        .query_with_params(query, params)
+        .query_with_params(query, lwt_params(values))
         .await
         .map_err(|error| {
             extenddb_storage::error::StorageError::Internal(format!("LWT query failed: {error}"))
@@ -85,7 +209,11 @@ pub fn is_fk_violation(_err: &cdrs_tokio::error::Error) -> bool {
 // Phase 1: Core Query Helpers
 // ══════════════════════════════════════════════════════════════════════════════
 
-/// Execute a query and return all rows with standardized error handling.
+/// Execute a query at the driver's default consistency, `ONE`, and return all
+/// rows with standardized error handling.
+///
+/// For catalog, metadata and backup reads outside the data path. A read under
+/// `data/` states its level with [`query_rows_at`] instead.
 ///
 /// # Errors
 /// Returns an error if the Cassandra query fails or the response cannot be parsed.
@@ -111,7 +239,8 @@ pub async fn query_rows<E: FromDbError>(
     Ok(body.into_rows().unwrap_or_default())
 }
 
-/// Execute a query at `LOCAL_QUORUM` and return all rows.
+/// Execute a query at `LOCAL_QUORUM` and return all rows: [`query_rows_at`]
+/// with `consistent_read` set.
 ///
 /// [`query_rows`] uses the driver's default consistency, which is `ONE`. Use
 /// this instead wherever an *empty* result is treated as authoritative and acted
@@ -124,32 +253,13 @@ pub async fn query_rows_quorum<E: FromDbError>(
     values: QueryValues,
     context: &str,
 ) -> Result<Vec<Row>, E> {
-    use cdrs_tokio::consistency::Consistency;
-    use cdrs_tokio::statement::StatementParamsBuilder;
-
-    let params = StatementParamsBuilder::new()
-        .with_consistency(Consistency::LocalQuorum)
-        .with_values(values)
-        .build();
-    let result = session
-        .query_with_params(query, params)
-        .await
-        .map_err(|e| {
-            tracing::error!("{context} quorum query failed: {e}");
-            E::db_error(format!("{context}: {e}"))
-        })?;
-
-    let body = result.response_body().map_err(|e| {
-        tracing::error!("{context} response_body failed: {e}");
-        E::db_error(format!("{context} response_body: {e}"))
-    })?;
-
-    Ok(body.into_rows().unwrap_or_default())
+    query_rows_at(session, query, values, true, context).await
 }
 
 /// Execute a query and return the first row, if any.
 ///
-/// Similar to `sqlx::query().fetch_optional()`.
+/// Similar to `sqlx::query().fetch_optional()`. Runs at the driver's default
+/// consistency like [`query_rows`]; under `data/` use [`query_optional_at`].
 ///
 /// # Errors
 /// Returns an error if the Cassandra query fails or the response cannot be parsed.
@@ -163,7 +273,8 @@ pub async fn query_optional<E: FromDbError>(
     Ok(rows.drain(..).next())
 }
 
-/// Execute a non-query statement (INSERT/UPDATE/DELETE).
+/// Execute a non-query statement (INSERT/UPDATE/DELETE) at the driver's
+/// default consistency; under `data/` use [`execute_quorum`].
 ///
 /// # Errors
 /// Returns an error if the Cassandra statement fails.
@@ -184,10 +295,10 @@ pub async fn execute<E: FromDbError>(
     Ok(())
 }
 
-/// Execute a non-query statement at `LOCAL_QUORUM`.
+/// Execute a non-query statement at [`write_params`] (`LOCAL_QUORUM`).
 ///
-/// Use this for writes that are prerequisites for a later quorum operation or
-/// whose loss would make an absence decision unsafe.
+/// A plain write of the data path runs with [`write_params`]; this helper
+/// runs one that returns no rows. A batch runs through [`batch_builder`].
 ///
 /// # Errors
 /// Returns an error if Cassandra does not acknowledge the statement at quorum.
@@ -197,15 +308,8 @@ pub async fn execute_quorum<E: FromDbError>(
     values: QueryValues,
     context: &str,
 ) -> Result<(), E> {
-    use cdrs_tokio::consistency::Consistency;
-    use cdrs_tokio::statement::StatementParamsBuilder;
-
-    let params = StatementParamsBuilder::new()
-        .with_consistency(Consistency::LocalQuorum)
-        .with_values(values)
-        .build();
     session
-        .query_with_params(query, params)
+        .query_with_params(query, write_params(values))
         .await
         .map_err(|error| {
             tracing::error!("{context} quorum execute failed: {error}");
@@ -343,6 +447,12 @@ pub fn lwt_applied(
     })
 }
 
+/// Execute a lightweight transaction at the driver's default consistency and
+/// return whether it applied.
+///
+/// For catalog and management writes outside the data path; a conditional
+/// write under `data/` runs with [`lwt_params`] instead, through
+/// [`query_lwt`], [`execute_at`] or `query_with_params`.
 ///
 /// Parses the `[applied]` column from the Cassandra LWT response.
 /// Use for `INSERT ... IF NOT EXISTS` and `UPDATE ... IF ...` statements.
@@ -375,4 +485,48 @@ pub async fn apply_lwt<E: FromDbError>(
         .and_then(|rows| rows.into_iter().next())
         .and_then(|row| row.get_r_by_name("[applied]").ok())
         .unwrap_or(false))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bound() -> QueryValues {
+        cdrs_tokio::query_values!("pk", 7_i64)
+    }
+
+    #[test]
+    fn consistent_read_selects_local_quorum_and_eventual_selects_local_one() {
+        assert_eq!(read_consistency(true), Consistency::LocalQuorum);
+        assert_eq!(read_consistency(false), Consistency::LocalOne);
+    }
+
+    #[test]
+    fn read_params_carry_the_read_level_and_no_serial_level() {
+        for (consistent_read, level) in [
+            (true, Consistency::LocalQuorum),
+            (false, Consistency::LocalOne),
+        ] {
+            let params = read_params(consistent_read, bound()).query_params;
+            assert_eq!(params.consistency, level);
+            assert_eq!(params.serial_consistency, None);
+            assert_eq!(params.values, Some(bound()));
+        }
+    }
+
+    #[test]
+    fn write_params_are_local_quorum_with_no_serial_level() {
+        let params = write_params(bound()).query_params;
+        assert_eq!(params.consistency, Consistency::LocalQuorum);
+        assert_eq!(params.serial_consistency, None);
+        assert_eq!(params.values, Some(bound()));
+    }
+
+    #[test]
+    fn lwt_params_commit_at_local_quorum_and_run_paxos_at_local_serial() {
+        let params = lwt_params(bound()).query_params;
+        assert_eq!(params.consistency, Consistency::LocalQuorum);
+        assert_eq!(params.serial_consistency, Some(Consistency::LocalSerial));
+        assert_eq!(params.values, Some(bound()));
+    }
 }

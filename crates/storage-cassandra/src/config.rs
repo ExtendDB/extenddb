@@ -22,10 +22,26 @@ pub struct CassandraStorageConfig {
     pub keyspace_prefix: String,
 
     /// Replication factor for keyspaces (default: 3)
+    ///
+    /// Writes, and reads with `ConsistentRead: true`, need a local quorum
+    /// (`LOCAL_QUORUM`): `replication_factor / 2 + 1` replicas up in
+    /// `datacenter`, two of three at the default. Reads with
+    /// `ConsistentRead: false` need one (`LOCAL_ONE`). At 1, every statement
+    /// needs the one replica. The setting applies to keyspaces created after
+    /// it changes; an existing keyspace keeps its factor until altered
+    /// (ADR-0025).
     #[serde(default = "default_replication_factor")]
     pub replication_factor: u32,
 
     /// Datacenter name for `NetworkTopologyStrategy` (default: "datacenter1")
+    ///
+    /// Every keyspace replicates to this one datacenter, and `LOCAL_QUORUM`
+    /// and `LOCAL_ONE` are evaluated in the coordinator's datacenter. The
+    /// driver sends statements to every node it discovers, so the contact
+    /// points and their peers must all be in this datacenter; a coordinator
+    /// elsewhere refuses every `LOCAL_QUORUM` and `LOCAL_ONE` statement, which
+    /// is every data-path statement except the four schema statements in
+    /// `ddl.rs`.
     #[serde(default = "default_datacenter")]
     pub datacenter: String,
 

@@ -1,0 +1,21 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# The Cassandra data path states the consistency level of every statement it
+# runs. Each entry below runs a statement at the driver default, `ONE`, or
+# builds parameters or a batch at it. The extenddb-storage-cassandra crate
+# allows them outside `src/data/`, and `src/data/mod.rs` turns the lint back on
+# for the data path, where the only allow is on a schema statement.
+disallowed-methods = [
+    { path = "cdrs_tokio::cluster::session::Session::query_with_values", reason = "the data path states its consistency: use cassandra_util::{query_rows_at, query_optional_at, execute_quorum, query_lwt}, or query_with_params / execute_at with read_params, write_params or lwt_params" },
+    { path = "cdrs_tokio::cluster::session::Session::query", reason = "the data path states its consistency: use cassandra_util::{query_rows_at, query_optional_at, execute_quorum, query_lwt}, or query_with_params / execute_at with read_params, write_params or lwt_params" },
+    { path = "cdrs_tokio::query::BatchQueryBuilder::new", reason = "a batch starts at the driver default: the data path builds batches with cassandra_util::batch_builder" },
+    { path = "cdrs_tokio::cluster::session::Session::exec", reason = "the data path states its consistency: run a prepared statement through execute_at with read_params, write_params or lwt_params" },
+    { path = "cdrs_tokio::cluster::session::Session::exec_with_values", reason = "the data path states its consistency: run a prepared statement through execute_at with read_params, write_params or lwt_params" },
+    { path = "cdrs_tokio::cluster::session::Session::paged", reason = "the data path states its consistency: page with query_rows_at and a paging state in the parameters" },
+    { path = "cdrs_tokio::statement::StatementParamsBuilder::new", reason = "the data path builds statement parameters only through cassandra_util::{read_params, write_params, lwt_params}" },
+    { path = "extenddb_storage_cassandra::cassandra_util::query_rows", reason = "runs at the driver default: the data path uses query_rows_at" },
+    { path = "extenddb_storage_cassandra::cassandra_util::query_optional", reason = "runs at the driver default: the data path uses query_optional_at" },
+    { path = "extenddb_storage_cassandra::cassandra_util::execute", reason = "runs at the driver default: the data path uses execute_quorum" },
+    { path = "extenddb_storage_cassandra::cassandra_util::apply_lwt", reason = "runs at the driver default: the data path uses query_lwt or execute_at with lwt_params" },
+]

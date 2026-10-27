@@ -3,12 +3,17 @@
 
 //! Direct storage-trait integration tests, ported from the original
 //! extenddb-cassandra-plugin repository (its tests/rust suite). They exercise
-//! the Cassandra engine's trait implementations directly against a live node
-//! at 127.0.0.1:9042 — no HTTP server in between — and skip themselves when
-//! no Cassandra is reachable (see helpers::skip_without_cassandra).
+//! the Cassandra engine's trait implementations directly, with no HTTP server
+//! in between, against a live node at 127.0.0.1:9042 or the `host:port` in
+//! `EXTENDDB_TEST_CASSANDRA_ADDR`, and skip themselves when no Cassandra is
+//! reachable (see helpers::skip_without_cassandra).
 //!
 //! One binary, one module per area, sharing tests/common/mod.rs, which is the
 //! in-tree descendant of the plug-in repo's helpers.rs.
+
+// The suites set up and inspect Cassandra state with driver calls at the
+// driver default; the lint in `clippy.toml` guards `src/data/` only.
+#![allow(clippy::disallowed_methods)]
 
 #[path = "common/mod.rs"]
 mod helpers;
@@ -25,6 +30,8 @@ mod authorization_store;
 mod backup_engine;
 #[path = "direct/cassandra_engine.rs"]
 mod cassandra_engine;
+#[path = "direct/consistent_read.rs"]
+mod consistent_read;
 #[path = "direct/delete_item.rs"]
 mod delete_item;
 #[path = "direct/groups.rs"]
