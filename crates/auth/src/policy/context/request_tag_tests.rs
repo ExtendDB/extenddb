@@ -231,6 +231,46 @@ fn policy_variable_naming_aws_tagkeys_is_left_literal_for_every_tag_order() {
 }
 
 #[test]
+fn an_empty_request_tag_value_is_a_present_key() {
+    use crate::policy::condition::evaluate_condition;
+    use crate::policy::document::{Condition, ConditionOperator};
+
+    // An empty tag value is a value, so the key is present: Null:false matches
+    // and Null:true does not.
+    let ctx = ctx_with(&[("env", "")], &["env"]);
+    assert_eq!(ctx.resolve_key("aws:RequestTag/env"), Some(vec![""]));
+    assert!(!ctx.is_unresolvable_key("aws:RequestTag/env"));
+    let null = |value: &str| Condition {
+        operator: ConditionOperator::Null,
+        key: "aws:RequestTag/env".to_owned(),
+        values: vec![value.to_owned()],
+    };
+    assert!(evaluate_condition(&null("false"), &ctx));
+    assert!(!evaluate_condition(&null("true"), &ctx));
+}
+
+#[test]
+fn request_tag_names_fold_beyond_ascii() {
+    // Full case folding maps the sharp s to ss, so Straße and STRASSE are one
+    // tag name, as they are for a principal tag or a resource tag. The
+    // service's answer for a non-ASCII request tag name was not measured.
+    let ctx = ctx_with(&[("Straße", "x")], &["Straße"]);
+    for key in [
+        "aws:RequestTag/Straße",
+        "aws:RequestTag/STRASSE",
+        "aws:RequestTag/strasse",
+    ] {
+        assert_eq!(ctx.resolve_key(key), Some(vec!["x"]), "{key}");
+    }
+    let ctx = ctx_with(&[("STRASSE", "x")], &["STRASSE"]);
+    assert_eq!(ctx.resolve_key("aws:RequestTag/straße"), Some(vec!["x"]));
+    // Two spellings that fold to one name and carry differing values are ambiguous.
+    let ctx = ctx_with(&[("Straße", "x"), ("STRASSE", "y")], &["Straße", "STRASSE"]);
+    assert_eq!(ctx.resolve_key("aws:RequestTag/strasse"), None);
+    assert!(ctx.is_unresolvable_key("aws:RequestTag/strasse"));
+}
+
+#[test]
 fn request_tag_lookups_do_not_scan_the_request_tags() {
     // A request body can carry tens of thousands of tags and a policy can read
     // aws:RequestTag/<name> in many conditions. Each lookup probes the index

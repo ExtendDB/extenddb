@@ -27,10 +27,16 @@ use serde_json::Value;
 /// when the operation does not populate that key, which leaves it absent in
 /// policy evaluation.
 ///
-/// A duplicated tag key takes the LAST value in the request, which is the value
-/// the request would store: every backend's `tag_resource` walks the tag list
-/// in request order and upserts each key, so the last occurrence wins. Reading
-/// it the same way keeps authorization and the engine on one value.
+/// A duplicated tag key takes the LAST value in the request. `TagResource`
+/// stores that value on SQLite, PostgreSQL and MongoDB: `tag_resource` walks the
+/// tag list in request order and upserts each key, so the last occurrence wins
+/// (Cassandra writes one `INSERT` per tag, and the order of two writes to one key
+/// was not checked). Reading the request the same way keeps authorization and
+/// `TagResource` on one value. `CreateTable` inserts its tags with a plain
+/// `INSERT` on SQLite and PostgreSQL, so a repeated key aborts the request with
+/// a server error before anything is stored, and the value authorization reads
+/// is never written. The hosted service refuses a repeated key on both
+/// operations with `ValidationException` (measured 2026-10-27).
 ///
 /// `Tags` is read as the engine reads it, as a `Vec<Tag>`. serde accepts a tag
 /// as an object (`{"Key": "k", "Value": "v"}`) and as a two-element array
@@ -136,7 +142,16 @@ mod tests {
 
     #[test]
     fn list_tags_of_resource_populates_neither_key() {
-        let out = tag_condition_keys("ListTagsOfResource", &json!({"ResourceArn": "arn"}));
+        // The body carries the tag fields of the operations that populate the
+        // keys, so an arm that read them for ListTagsOfResource would show here.
+        let out = tag_condition_keys(
+            "ListTagsOfResource",
+            &json!({
+                "ResourceArn": "arn",
+                "Tags": [{"Key": "env", "Value": "prod"}],
+                "TagKeys": ["env"]
+            }),
+        );
         assert!(out.0.is_none() && out.1.is_none());
     }
 
