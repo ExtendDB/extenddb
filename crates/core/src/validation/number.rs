@@ -3,9 +3,17 @@
 
 use crate::error::DynamoDbError;
 
+pub mod operations;
+
 const MAX_SIGNIFICANT_DIGITS: usize = 38;
 const MAX_EXPONENT: i32 = 125;
 const MIN_EXPONENT: i32 = -130;
+
+/// The largest and smallest magnitude, the precision less the scale, that
+/// `DynamoDB` accepts: one more than the largest and smallest order of
+/// magnitude, so 126 for 9.99E125 and -129 for 1E-130.
+pub(super) const MAX_MAGNITUDE: i64 = MAX_EXPONENT as i64 + 1;
+pub(super) const MIN_MAGNITUDE: i64 = MIN_EXPONENT as i64 + 1;
 
 /// Validate and normalize a `DynamoDB` number string.
 pub fn validate_and_normalize_number(s: &str) -> Result<String, DynamoDbError> {
@@ -70,13 +78,13 @@ pub fn validate_and_normalize_number(s: &str) -> Result<String, DynamoDbError> {
     if significant.is_empty() {
         // DynamoDB range checks a zero on its exponent less its fraction
         // digits (`0E126` is an overflow, `0.0E-130` an underflow). Only a zero
-        // whose exponent does not fit in an i32 is checked here, since those
-        // were already refused: a zero refused here keeps its raw spelling in
-        // `AttributeValue`, and only the PutItem item and UpdateItem's update
-        // values are validated afterwards (#618), so the other operations, and
-        // UpdateItem's key, would store and look up `0E126` as a key of its own.
+        // whose exponent does not fit in an i32 is checked here. A refused
+        // zero keeps its raw spelling in `AttributeValue`, as every refused
+        // number does, and Query, Scan (#544, #562) and ImportTable do not
+        // validate numbers yet: refusing `0E126` here would make them look it
+        // up and store it as a key of its own instead of `0` (#618).
         if i32::try_from(explicit_exp).is_err() {
-            check_magnitude(point_offset)?;
+            check_zero_magnitude(explicit_exp, frac_part)?;
         }
         return Ok("0".to_owned());
     }
@@ -131,6 +139,36 @@ fn check_magnitude(magnitude_exp: i128) -> Result<(), DynamoDbError> {
         return Err(overflow_err());
     }
     if magnitude_exp < i128::from(MIN_EXPONENT) {
+        return Err(underflow_err());
+    }
+    Ok(())
+}
+
+/// Range check a zero on its magnitude, its precision (1 for a zero) less its
+/// scale, where the scale is the number of fraction digits less the exponent.
+/// The scale saturates at the 64-bit limits and the magnitude wraps, which
+/// gives the service's answer for every such zero measured on 2026-10-27
+/// (us-east-1, each value twice):
+///
+/// - `0E9223372036854775807` is an underflow: without fraction digits, its
+///   magnitude wraps past the 64-bit maximum. Measured on `GetItem`,
+///   `DeleteItem`, `UpdateItem`, `BatchGetItem`, `PutItem` and the `PutItem`
+///   and `DeleteItem` condition values. `0E9223372036854775806`, one less,
+///   does not wrap and is an overflow (measured on `PutItem`).
+///   `0.0E9223372036854775807`, with one fraction digit, does not wrap and is
+///   an overflow (`GetItem`).
+/// - `0.00E-9223372036854775808` and `0.000E-9223372036854775808` are
+///   underflows, as every zero whose exponent is below the 32-bit range is:
+///   their scale saturates instead of wrapping (`GetItem`).
+fn check_zero_magnitude(explicit_exp: i64, frac_part: &str) -> Result<(), DynamoDbError> {
+    let scale = i64::try_from(frac_part.len())
+        .unwrap_or(i64::MAX)
+        .saturating_sub(explicit_exp);
+    let magnitude = 1_i64.wrapping_sub(scale);
+    if magnitude > MAX_MAGNITUDE {
+        return Err(overflow_err());
+    }
+    if magnitude < MIN_MAGNITUDE {
         return Err(underflow_err());
     }
     Ok(())
@@ -456,24 +494,41 @@ mod tests {
         ] {
             assert_eq!(validate_and_normalize_number(n).unwrap(), "0", "{n:?}");
         }
-        // A zero whose exponent does not fit in an i32. DynamoDB also refuses a
-        // zero such as `0E126` whose exponent fits; see the comment in
-        // `validate_and_normalize_number` for why those are not checked.
-        for n in ["0E2147483648", "0E9223372036854775806"] {
+        // A zero whose exponent does not fit in an i32. DynamoDB refuses each;
+        // the rows with fraction digits and the 64-bit minimum or maximum
+        // exponent were sent to its GetItem, twice each.
+        for n in [
+            "0E2147483648",
+            "0E9223372036854775806",
+            "0.0E9223372036854775807",
+        ] {
             assert_refused(n, OVERFLOW);
         }
-        for n in ["0E-9223372036854775807", "0E-9223372036854775808"] {
+        for n in [
+            "0E-9223372036854775807",
+            "0E-9223372036854775808",
+            // The scale saturates at the 64-bit minimum exponent instead of
+            // wrapping, so these are underflows, as on the service.
+            "0.00E-9223372036854775808",
+            "0.000E-9223372036854775808",
+            // The magnitude, 1 less the scale, wraps past the 64-bit maximum,
+            // as it does on the service: `0E9223372036854775806` above is an
+            // overflow and this an underflow.
+            "0E9223372036854775807",
+        ] {
             assert_refused(n, UNDERFLOW);
         }
     }
 
-    // DynamoDB refuses these zeros (`0E126` overflow, `0.0E-130` underflow).
-    // They stay accepted as 0 until every operation validates numbers (#618):
-    // refusing them here would make BatchWriteItem and the other operations
-    // that skip validation store and look up `0E126` as a key of its own.
-    // Remove this test and add the rows to the one above when #618 is fixed.
+    // DynamoDB refuses each of these zeros: `0E126` and the next four are a
+    // `Number overflow`, `0.0E-130` and the rest a `Number underflow`. They
+    // stay accepted as 0 until Query and Scan (#544, #562) and ImportTable
+    // validate numbers, which #618 still tracks: a zero refused by this
+    // function keeps its raw spelling, and those paths would then look up and
+    // store `0E126` as a key of its own. Move these rows to the refused lists
+    // above when they do.
     #[test]
-    fn zero_with_i32_exponent_stays_accepted_until_618() {
+    fn zero_with_i32_exponent_stays_accepted_until_query_scan_and_import_validate() {
         for n in [
             "0E126",
             "00E126",

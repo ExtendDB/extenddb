@@ -94,6 +94,14 @@ pub async fn handle_put_item(
         }
     })?;
 
+    // A number the service cannot read or a value nested too deep in the item
+    // is reported ahead of the mixed-parameter check, the expression checks,
+    // the table lookup and the key schema checks (measured 2026-10-27).
+    // Numbers come first, as before this check; the service's order follows
+    // the request body, which `Item` does not keep.
+    // The later `validate_put_item` repeats both and cannot fail after this.
+    extenddb_core::validation::number::operations::put_item_item(&input)?;
+
     // Reject mixing legacy and expression parameters, then EAN/EAV supplied
     // without a referencing expression.
     let has_expression = input
@@ -109,6 +117,12 @@ pub async fn handle_put_item(
         ],
         &[("ConditionExpression", has_expression)],
     )?;
+    // The ExpressionAttributeValues follow the mixed-parameter check and
+    // precede the other expression checks and the table lookup (measured
+    // 2026-10-27). A value nested too deep comes ahead of a malformed number,
+    // as before this check; the service answered either on two sends.
+    // The later nesting check repeats this one and cannot fail after it.
+    extenddb_core::validation::number::operations::put_item_values(&input)?;
     extenddb_core::expression::validate_expression_param_usage(
         input.expression_attribute_names.as_ref(),
         has_expression,
