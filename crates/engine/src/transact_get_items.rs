@@ -101,6 +101,9 @@ pub async fn handle_transact_get_items(
             // No projection: transactions accept names with no expression.
             projections.push(None);
         }
+        // A number the service cannot read in the key comes after this item's
+        // projection checks and before the next item's (measured 2026-10-27).
+        validation::number::operations::transact_get_item(tgi)?;
     }
 
     // Reject oversized primary keys as a per-item cancellation, matching real
