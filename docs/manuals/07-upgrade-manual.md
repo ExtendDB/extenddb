@@ -340,7 +340,13 @@ issue #533). Three decisions change for stored policies:
    NotResource` written that way no longer grants the team's table.
 2. A condition value naming a multivalued key, such as `${dynamodb:LeadingKeys}`
    or `${aws:TagKeys}` in a trust policy, is no longer expanded to the key's first
-   value; the text is compared as written, so such a condition no longer matches.
+   value; the text is compared as written. Under a positive operator such as
+   `StringEquals` the condition no longer matches, and under a negated operator
+   such as `StringNotEquals` it now matches. For example, an `Allow` with the
+   condition `StringNotEquals` on `aws:PrincipalTag/team` and the value
+   `${dynamodb:LeadingKeys}` now grants a caller tagged `team=blue` whose request
+   has the leading key `blue`, where it did not, and a `Deny` with that condition
+   now applies to the same request.
 3. A condition value written as `${key, 'default'}` now expands to `default` when
    the request does not carry `key`. Before, the whole text was compared.
 
@@ -358,8 +364,10 @@ policies, permissions boundaries and session policies, and, for the two conditio
 value changes, role trust policies. Search the stored policies for `${`
 (`extenddb manage list-user-policies`, `list-group-policies` and
 `list-role-policies`) and check each match against the cases above before
-upgrading, in particular an `Allow` that now grants and a `Deny NotResource` that
-now spares a table. No catalog migration is required.
+upgrading, in particular an `Allow` that now grants (a `Resource` pattern with a
+variable, or a negated condition whose value names a multivalued key), a `Deny`
+that now applies (the same two forms), and a `Deny NotResource` that now spares
+a table. No catalog migration is required.
 
 ### v0.1.14 LeadingKeys now enforced on Query, batch and transaction operations
 
