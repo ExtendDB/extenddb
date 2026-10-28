@@ -40,7 +40,7 @@ Refreshed: v0.0.118 (P115)
 ## Standing Items (need human decision)
 
 - ⬜ **22 unapproved license dependencies** — Unicode-3.0, CDLA-Permissive-2.0, MPL-2.0. All pre-existing. Human approved as-is (P99 session).
-- ⬜ **Policy-variable expansion spec/code/AWS divergence** — `05-component-auth.md` §6.5 and `01-requirements.md` (REQ-ABAC-006) state variable substitution is deferred/literal, but `condition.rs::expand_policy_variables` **is** implemented and applied to Condition values only, not Resource ARNs (`evaluator.rs::resource_matches`/`arn_match` do not expand). AWS expands in both. Three-way inconsistent (spec vs code vs AWS). Fail-closed (a `${var}` in a Resource ARN silently fails to match), so not a leak. Resolve by either (a) documenting the implemented condition-value expansion and marking resource-ARN expansion deferred, or (b) completing REQ-ABAC-006. Needs human direction. (BR-7085)
+- ⬜ **Policy-variable gaps in condition values (#534)**: a condition value in a `2008-10-17` or no-`Version` document is still expanded, where IAM treats it as literal text, and `${*}` in a condition value is left as text, where IAM expands it to `*`. Variables in `Resource` and `NotResource` patterns expand as IAM does (PR #535), and `05-component-auth.md` and `01-requirements.md` (REQ-ABAC-006) describe the expansion. (BR-7085)
 
 
 ## Recently Completed
