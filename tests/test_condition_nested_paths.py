@@ -4,10 +4,16 @@
 """Conditions on nested map members and list elements, on UpdateItem and DeleteItem.
 
 The item holds ``m = {k: "inner", n: [10, "b"], mm: {k: "deep"}}`` and
-``l = [{k: "first"}, "s"]``. Every expected answer was measured against Amazon
-DynamoDB on 2026-10-25 at 20:51 and 20:52 UTC (us-east-1), each request twice:
-a holding condition applies the write and a failing one answers
-ConditionalCheckFailedException.
+``l = [{k: "first"}, "s"]``. Every expected answer in HOLDS, FAILS and the
+DeleteItem tests was measured against Amazon DynamoDB on 2026-10-25 at 20:51
+and 20:52 UTC (us-east-1), each request twice: a holding condition applies the
+write and a failing one answers ConditionalCheckFailedException.
+
+The item also holds ``t``, a map whose members are named ``M``, ``L``, ``S``
+and ``0``. The first three are type tags, the names of the fields a stored
+value sits under, and the last reads as a list index in a MongoDB path. The
+rows in DERIVED_HOLDS were not measured on the service; their expected
+answers come from ExtendDB's in-Rust condition evaluator.
 
 On MongoDB, a condition on a table with no index and no stream is compiled to
 a MongoDB filter while the server's cache records that the table has no index.
@@ -28,7 +34,20 @@ from botocore.exceptions import ClientError
 
 from conftest import scoped_table
 
-NAMES = {"#m": "m", "#k": "k", "#n": "n", "#mm": "mm", "#l": "l", "#z": "z", "#u": "u"}
+NAMES = {
+    "#m": "m",
+    "#k": "k",
+    "#n": "n",
+    "#mm": "mm",
+    "#l": "l",
+    "#z": "z",
+    "#u": "u",
+    "#t": "t",
+    "#M": "M",
+    "#L": "L",
+    "#S": "S",
+    "#zero": "0",
+}
 VALUES = {
     ":x": {"S": "z"},
     ":inner": {"S": "inner"},
@@ -41,6 +60,10 @@ VALUES = {
     ":M": {"S": "M"},
     ":other": {"S": "other"},
     ":s": {"S": "s"},
+    ":tm": {"S": "tm"},
+    ":tl": {"S": "tl"},
+    ":ts": {"S": "ts"},
+    ":t0": {"S": "t0"},
 }
 
 ITEM = {
@@ -53,6 +76,14 @@ ITEM = {
         }
     },
     "l": {"L": [{"M": {"k": {"S": "first"}}}, {"S": "s"}]},
+    "t": {
+        "M": {
+            "M": {"S": "tm"},
+            "L": {"S": "tl"},
+            "S": {"S": "ts"},
+            "0": {"S": "t0"},
+        }
+    },
 }
 
 HOLDS = [
@@ -78,6 +109,13 @@ FAILS = [
     "attribute_exists(#l.#k)",
     "attribute_exists(#m[0])",
     "#m.#k = :other OR #m.#mm.#k = :other OR #l[0].#k = :other",
+]
+
+DERIVED_HOLDS = [
+    "#t.#M = :tm",
+    "#t.#L = :tl",
+    "#t.#S = :ts",
+    "#t.#zero = :t0",
 ]
 
 
@@ -127,7 +165,7 @@ def _update(client, table, key, condition):
     )
 
 
-@pytest.mark.parametrize("condition", HOLDS)
+@pytest.mark.parametrize("condition", HOLDS + DERIVED_HOLDS)
 def test_update_with_holding_nested_condition_applies(dynamodb_client, table, key, condition):
     _update(dynamodb_client, table, key, condition)
     assert _get(dynamodb_client, table, key)["u"] == {"S": "z"}

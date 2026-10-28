@@ -264,25 +264,34 @@ fn test_attribute_type() {
     assert_eq!(filter, doc! { "item_data.field.S": { "$exists": true } });
 }
 
-fn path(elements: &[&str]) -> Expr {
-    Expr::Path(
-        elements
-            .iter()
-            .map(|e| match e.parse::<usize>() {
-                Ok(i) => PathElement::Index(i),
-                Err(_) => PathElement::Attribute((*e).to_string()),
-            })
-            .collect(),
-    )
+/// Path elements written as strings: an all-digit string is a list index and
+/// anything else is a name. A member whose name is all digits is written as
+/// `PathElement::Attribute` and passed to `path` or `exists_at` directly.
+fn parse(elements: &[&str]) -> Vec<PathElement> {
+    elements
+        .iter()
+        .map(|e| match e.parse::<usize>() {
+            Ok(i) => PathElement::Index(i),
+            Err(_) => PathElement::Attribute((*e).to_string()),
+        })
+        .collect()
 }
 
-fn exists(elements: &[&str]) -> Document {
+fn path(elements: Vec<PathElement>) -> Expr {
+    Expr::Path(elements)
+}
+
+fn exists_at(elements: Vec<PathElement>) -> Document {
     let maps = make_maps(vec![("m", "m"), ("k", "k")], vec![]);
     let expr = Expr::Function {
         name: "attribute_exists".to_string(),
         args: vec![path(elements)],
     };
     condition_to_filter(&expr, &maps).unwrap()
+}
+
+fn exists(elements: &[&str]) -> Document {
+    exists_at(parse(elements))
 }
 
 #[test]
@@ -313,13 +322,31 @@ fn map_members_and_list_elements_use_the_typed_fields() {
 }
 
 #[test]
+fn members_named_like_a_type_tag_or_an_index_are_keys_of_the_map() {
+    // The fields of a stored value are named by its type tag (`M`, `L`,
+    // `S`, ...) and a digit segment of a MongoDB path can address an array
+    // element, so a member with one of these names is still reached through
+    // the enclosing map's `M` field.
+    let member = |name: &str| {
+        exists_at(vec![
+            PathElement::Attribute("m".to_string()),
+            PathElement::Attribute(name.to_string()),
+        ])
+    };
+    assert_eq!(member("M"), doc! { "item_data.m.M.M": { "$exists": true } });
+    assert_eq!(member("L"), doc! { "item_data.m.M.L": { "$exists": true } });
+    assert_eq!(member("S"), doc! { "item_data.m.M.S": { "$exists": true } });
+    assert_eq!(member("0"), doc! { "item_data.m.M.0": { "$exists": true } });
+}
+
+#[test]
 fn comparison_on_a_map_member_uses_the_typed_field() {
     let maps = make_maps(
         vec![("m", "m"), ("k", "k")],
         vec![(":v", AttributeValue::S("inner".to_string()))],
     );
     let expr = Expr::Compare {
-        left: Box::new(path(&["#m", "#k"])),
+        left: Box::new(path(parse(&["#m", "#k"]))),
         op: CompareOp::Eq,
         right: Box::new(Expr::Placeholder(":v".to_string())),
     };
