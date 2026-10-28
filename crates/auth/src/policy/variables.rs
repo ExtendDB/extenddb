@@ -9,7 +9,9 @@
 //!
 //! - `${key}`: the value of `key` in the request context. A multivalued key
 //!   is never a variable: it resolves as if the request did not carry it,
-//!   with one value or several (measured, issue #533 review cells C1 and D1).
+//!   with one value or several (measured with `dynamodb:LeadingKeys` holding
+//!   one value and two, in `Resource` and in a condition value; PR #535 body
+//!   table).
 //! - `${key, 'default'}`: the value of `key`, or `default` when the request
 //!   does not carry `key`.
 //! - `${*}`, `${?}`, `${$}`: a literal `*`, `?` or `$`.

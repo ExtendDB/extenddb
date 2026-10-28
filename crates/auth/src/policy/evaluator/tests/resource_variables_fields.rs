@@ -38,7 +38,8 @@ fn leading_keys(values: Vec<&str>) -> Ctx {
     Ctx::empty().with(LEADING_KEYS, values)
 }
 
-// --- A multivalued key is never a variable (cells C1, D1) ---
+// --- A multivalued key is never a variable (`dynamodb:LeadingKeys` with one
+// value and with two, PR #535 body table) ---
 
 #[test]
 fn a_deny_on_a_multivalued_key_variable_denies_no_table() {
@@ -84,7 +85,9 @@ fn a_condition_value_naming_a_multivalued_key_is_not_expanded() {
     }
 }
 
-// --- Variables before the fifth colon expand (cells C2, D3) ---
+// --- Variables before the fifth colon expand (`aws:RequestedRegion` in the
+// region field, `aws:PrincipalAccount` in the account field, PR #535 body
+// table) ---
 
 #[test]
 fn a_variable_in_the_region_field_expands() {
@@ -106,7 +109,8 @@ fn a_variable_in_the_account_field_expands() {
     );
 }
 
-// --- A ':' inside a value stays in its field (cells C3, D2) ---
+// --- A ':' inside a value stays in its field (a region tag value
+// `us-east-1:123456789012`, and `team=blue:x`, PR #535 body table) ---
 
 #[test]
 fn a_colon_in_a_region_field_value_does_not_separate_fields() {
@@ -133,7 +137,8 @@ fn a_colon_in_a_resource_field_value_matches_the_same_name() {
     );
 }
 
-// --- Wildcards beside a variable (cells C9, D4) ---
+// --- Wildcards beside a variable (`table/${aws:PrincipalTag/team}*` with no
+// `team` tag, and `table/b?${aws:PrincipalTag/team}`, PR #535 body table) ---
 
 #[test]
 fn an_unresolved_variable_before_a_wildcard_matches_nothing() {
