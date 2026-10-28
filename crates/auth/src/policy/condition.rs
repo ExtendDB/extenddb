@@ -442,7 +442,9 @@ fn compare_single(op: &ConditionOperator, context_value: &str, value: &Condition
 /// `Version` (not measured).
 fn null_holds(policy_value: &str, key_absent: bool) -> bool {
     if policy_value.contains("${") {
-        return policy_value.eq_ignore_ascii_case("true") == key_absent;
+        // A text that contains `${` is never `true`, so it reads as `false`:
+        // the key must be present.
+        return !key_absent;
     }
     (policy_value == "true" && key_absent) || (policy_value == "false" && !key_absent)
 }
@@ -457,8 +459,9 @@ fn null_holds(policy_value: &str, key_absent: bool) -> bool {
 /// the text without expanding it whatever the `Version` (not measured).
 fn bool_matches(context_value: &str, policy_value: &str) -> bool {
     if policy_value.contains("${") {
-        return context_value.eq_ignore_ascii_case("true")
-            == policy_value.eq_ignore_ascii_case("true");
+        // A text that contains `${` is never `true`, so it reads as `false`
+        // and matches a request value that is not `true`.
+        return !context_value.eq_ignore_ascii_case("true");
     }
     context_value.eq_ignore_ascii_case(policy_value)
 }
