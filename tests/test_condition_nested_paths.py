@@ -13,8 +13,9 @@ The item also holds ``t``, a map whose members are named ``M``, ``L``, ``S``
 and ``0``, and ``g = ["g0", "g1", ["g20", "g21"]]``, a list inside a list.
 The first three member names of ``t`` are type tags, the names of the fields
 a stored value sits under, and the last reads as a list index in a MongoDB
-path. The rows in DERIVED_HOLDS were not measured on the service; their
-expected answers come from ExtendDB's in-Rust condition evaluator.
+path. The rows in DERIVED_HOLDS were first encoded from ExtendDB's in-Rust
+condition evaluator and then measured on the service on 2026-10-28 (see the
+note under the list); the list keeps its name.
 
 On MongoDB, a condition on a table with no index and no stream is compiled to
 a MongoDB filter while the server's cache records that the table has no index.
@@ -122,6 +123,10 @@ DERIVED_HOLDS = [
     "#t.#zero = :t0",
     "#g[2][1] = :g21",
 ]
+# Measured on Amazon DynamoDB on 2026-10-28 with this item, these names and
+# values, two samples each: every row applied the update; with :other in place
+# of the value, #t.#M and #g[2][1] answered ConditionalCheckFailedException and
+# left the item unchanged. The list keeps its name for the parametrize ids.
 
 
 def _maps(*exprs: str) -> dict:
