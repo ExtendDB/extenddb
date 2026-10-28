@@ -325,9 +325,12 @@ deployment, even when no catalog migration is required.
 `Resource` or `NotResource` pattern is now expanded from the request before the
 pattern is matched, as IAM does. Before this release the pattern was compared as
 literal text and matched no table. Text from a variable value or a default is
-matched literally, a variable whose key the request does not carry makes the
-pattern match nothing, and a `2008-10-17` document, or one with no `Version`,
-still matches the pattern as written. Three decisions change for stored policies:
+matched literally, a variable whose key the request does not carry, with no
+default, makes the pattern match nothing, and a `2008-10-17` document, or one
+with no `Version`, still matches the pattern as written. With a default, the
+default is used: `table/${aws:PrincipalTag/team, 'none'}` matches `table/none`
+when the request has no `team` tag (measured with the IAM policy simulator,
+issue #533). Three decisions change for stored policies:
 
 1. A pattern with a variable now matches the table it names. `Allow
    table/${aws:username}` now grants the caller's own table, where it granted
