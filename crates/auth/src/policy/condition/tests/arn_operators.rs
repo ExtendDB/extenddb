@@ -1,11 +1,13 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Arn* operator tests. Every expectation here was measured on live IAM with
-//! `iam simulate-custom-policy` (2026-10-23): ArnEquals evaluates the same as
-//! ArnLike and ArnNotEquals the same as ArnNotLike, `*` and `?` match in every
-//! ARN field, matching is case sensitive in every field, and both sides must
-//! have the same number of `:`-separated fields.
+//! Arn* operator tests. IAM, as measured with `iam simulate-custom-policy`
+//! on 2026-10-23 and 2026-10-28, evaluates ArnEquals the same as ArnLike and
+//! ArnNotEquals the same as ArnNotLike: `*` and `?` match in every ARN field,
+//! matching is case sensitive in every field, and both sides must have the
+//! same number of `:`-separated fields. The rows measured are in the
+//! description of PR #471. Not every assertion here is a measured row: some
+//! apply a measured property to more patterns or values.
 
 use super::*;
 

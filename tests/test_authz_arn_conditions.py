@@ -299,10 +299,13 @@ class TestTrustPolicyArnEqualsWildcard:
 
     def test_allow_gated_on_arn_not_equals_does_not_grant_non_arn_caller(self):
         """IAM: a context value that is not an ARN matches neither ArnNotEquals
-        nor ArnNotLike (simulate-custom-policy, value ``notanarn`` and
-        ``arn:aws:dynamodb`` against a wildcard pattern: implicitDeny for all
-        four Arn operators). The AssumeRole caller ARN is a request field, so a
-        non-ARN value reaches the trust evaluator here."""
+        nor ArnNotLike (simulate-custom-policy on 2026-10-28, values
+        ``notanarn`` and ``arn:aws:dynamodb`` against wildcard patterns such
+        as ``table/*``: implicitDeny for all four Arn operators; the rows are
+        in the description of PR #471). ``arn:aws:iam`` here has the same
+        three-field shape as the measured ``arn:aws:dynamodb``. The AssumeRole
+        caller ARN is a request field, so a non-ARN value reaches the trust
+        evaluator here."""
         for op in ("ArnNotEquals", "ArnNotLike"):
             trust = _policy(self._stmt("Allow", {"AWS": "*"}, {op: {
                 "aws:PrincipalArn": f"arn:aws:iam::{self.account_id}:user/zzz-*"}}))

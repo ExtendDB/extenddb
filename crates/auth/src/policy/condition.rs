@@ -317,10 +317,15 @@ fn is_arn_operator(op: &ConditionOperator) -> bool {
 /// value in the set is not an ARN, whatever the pattern and whatever the set
 /// qualifier. Measured with simulate-custom-policy on 2026-10-23 with the
 /// values [`arn:aws:dynamodb:us-east-1:123456789012:table/Tother`,
-/// `notanarn`]: bare, `ForAnyValue:` and `ForAllValues:` forms of ArnEquals,
-/// ArnNotEquals, ArnLike and ArnNotLike all returned implicitDeny, both with
-/// a pattern that matches the ARN value (`table/*`) and with one that does
-/// not (`table/Z*`). `ForAnyValue:` checks this before comparing per value,
+/// `notanarn`]: the `ForAnyValue:` and `ForAllValues:` forms of ArnEquals,
+/// ArnNotEquals, ArnLike and ArnNotLike returned implicitDeny with a pattern
+/// that matches the ARN value (`table/*`) and with one that does not
+/// (`table/Z*`), and the bare form returned implicitDeny with `table/*`. On
+/// 2026-10-28, with `aws:TagKeys` holding [`.../table/V`, `notanarn`], the
+/// two set forms with and without `IfExists` returned implicitDeny for both
+/// patterns, and the two set forms without `IfExists` returned implicitDeny
+/// with `j*` over [`junk`]. The rows are in the description of PR #471.
+/// `ForAnyValue:` checks this before comparing per value,
 /// so `ForAnyValue:ArnEquals` does not pass on the one well-formed value and
 /// `ForAnyValue:ArnNotEquals` does not pass on a non-matching pattern.
 /// `ForAllValues:` needs no such check: a value that is not an ARN fails
@@ -383,16 +388,18 @@ fn compare_single(op: &ConditionOperator, context_value: &str, policy_value: &st
         ConditionOperator::Bool => context_value.eq_ignore_ascii_case(policy_value),
         // IAM evaluates ArnEquals exactly as ArnLike and ArnNotEquals exactly
         // as ArnNotLike: `*` and `?` match in every ARN field, matching is
-        // case sensitive, and both sides need the same number of fields.
+        // case sensitive, and both sides need the same number of fields,
+        // except that a bare `*` pattern matches any six-field value
+        // (`arn_match` returns before it compares fields; derived, since the
+        // simulator refuses `*` against an ARN).
         // A context value that is not an ARN (fewer than six fields) matches
         // neither the positive nor the negative operator, so a Deny on
         // ArnNotEquals does not apply to a malformed value; under
         // `ForAnyValue:` `arn_operator_sees_non_arn` applies the same rule to
-        // the whole set before this per-value comparison. Measured with
-        // simulate-custom-policy across all four operators, with and without
-        // IfExists, under ForAnyValue and ForAllValues, with a wildcard in
-        // each of the six fields, with field-count and case differences, with
-        // non-ARN values, and with a policy variable in the value.
+        // the whole set before this per-value comparison. The rows measured
+        // with simulate-custom-policy are in the description of PR #471; the
+        // non-ARN rule was measured for all four operators on 2026-10-28 with
+        // the values `notanarn` and `arn:aws:dynamodb`.
         ConditionOperator::ArnEquals | ConditionOperator::ArnLike => {
             super::matcher::is_arn(context_value)
                 && super::matcher::arn_match(policy_value, context_value)
