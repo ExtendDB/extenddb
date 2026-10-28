@@ -15,18 +15,44 @@ use serde_json::Value;
 use crate::OperationContext;
 use crate::serialize_output;
 
+/// Largest `Limit` `DescribeStream` accepts. The API Reference gives the
+/// range 1 to 100 ("The upper limit is 100", minimum value 1,
+/// <https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_streams_DescribeStream.html>);
+/// the service's refusals are quoted in `streams/describe_limit_tests.rs`.
+const DESCRIBE_STREAM_LIMIT_MAX: i64 = 100;
+
 /// Handle `DescribeStream`.
 ///
 /// # Errors
 ///
 /// Returns [`DynamoDbError::ResourceNotFoundException`] if the stream does not exist.
-/// Returns [`DynamoDbError::ValidationException`] on invalid input.
+/// Returns [`DynamoDbError::ValidationException`] on invalid input, including
+/// a `Limit` below 1 or above 100.
 pub async fn handle_describe_stream(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
     let input: DescribeStreamInput = serde_json::from_value(body)
         .map_err(|e| DynamoDbError::SerializationException(e.to_string()))?;
+
+    // Limit bounds as the service enforces them (measured 2026-10-22,
+    // DescribeStream with Limit 0, -1, 101 and 1000 against us-east-1; the
+    // raw responses are quoted in streams/describe_limit_tests.rs).
+    if let Some(limit) = input.limit {
+        if limit < 1 {
+            return Err(DynamoDbError::ValidationException(
+                "1 validation error detected: Value at 'limit' failed to satisfy \
+                 constraint: Member must have value greater than or equal to 1"
+                    .to_owned(),
+            ));
+        }
+        if limit > DESCRIBE_STREAM_LIMIT_MAX {
+            return Err(DynamoDbError::ValidationException(format!(
+                "One or more parameter values were invalid: Limit cannot be greater than \
+                 the maximum: {DESCRIBE_STREAM_LIMIT_MAX}"
+            )));
+        }
+    }
 
     let desc = ctx
         .storage
@@ -461,3 +487,9 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod test_storage;
+
+#[cfg(test)]
+mod describe_limit_tests;
