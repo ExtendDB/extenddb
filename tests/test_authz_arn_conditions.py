@@ -16,6 +16,7 @@ Prerequisites:
 
 from __future__ import annotations
 
+import contextlib
 import os
 import uuid
 from typing import Any
@@ -25,7 +26,7 @@ import pytest
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
 
-from conftest import wait_for_active
+from conftest import wait_for_active, wait_for_deleted
 from management_helpers import ManagementClient
 
 ALLOW = 201
@@ -81,17 +82,10 @@ def account_id(mgmt) -> str:
     resp = mgmt.create_account(acct_id, f"arncond-{acct_id}")
     assert resp.status_code == 201, resp.text
     yield acct_id
-    mgmt.delete_account(acct_id)
-
-
-def _create_user_with_key(mgmt: ManagementClient, account_id: str,
-                          user_name: str) -> tuple[str, str]:
-    resp = mgmt.create_user(account_id, user_name, "TestPass123!")
-    assert resp.status_code == 201, resp.text
-    resp = mgmt.create_access_key(account_id, user_name)
-    assert resp.status_code == 201, resp.text
-    creds = resp.json()
-    return creds["access_key_id"], creds["secret_access_key"]
+    # The delete is refused while the account owns a table, so this assertion
+    # reports a table that a test left behind.
+    resp = mgmt.delete_account(acct_id)
+    assert resp.status_code == 204, resp.text
 
 
 def _policy(*statements: dict) -> dict:
@@ -110,13 +104,36 @@ class TestIdentityPolicyArnEqualsWildcard:
         self.mgmt = mgmt
         self.account_id = account_id
         self.region = region
+        # Each user and table registers its delete here as soon as it exists.
+        # After the test the stack runs every delete in reverse order, also
+        # when the test or an earlier delete raised.
+        with contextlib.ExitStack() as cleanup:
+            self.cleanup = cleanup
+            yield
 
-    def _admin_table(self) -> tuple[Any, str]:
-        admin = f"arn-adm-{uuid.uuid4().hex[:8]}"
-        ak, sk = _create_user_with_key(self.mgmt, self.account_id, admin)
-        resp = self.mgmt.put_user_policy(self.account_id, admin, "full", _policy(ALLOW_ALL))
-        assert resp.status_code == 204
-        client = _make_client(self.endpoint, ak, sk, self.region)
+    def _new_user(self, user: str, policy: dict) -> Any:
+        resp = self.mgmt.create_user(self.account_id, user, "TestPass123!")
+        assert resp.status_code == 201, resp.text
+        self.cleanup.callback(self._delete_user, user)
+        resp = self.mgmt.create_access_key(self.account_id, user)
+        assert resp.status_code == 201, resp.text
+        creds = resp.json()
+        resp = self.mgmt.put_user_policy(self.account_id, user, "p", policy)
+        assert resp.status_code == 204, resp.text
+        return _make_client(self.endpoint, creds["access_key_id"],
+                            creds["secret_access_key"], self.region)
+
+    def _delete_user(self, user: str) -> None:
+        resp = self.mgmt.delete_user(self.account_id, user)
+        assert resp.status_code == 204, resp.text
+
+    @staticmethod
+    def _delete_table(client: Any, table: str) -> None:
+        client.delete_table(TableName=table)
+        wait_for_deleted(client, table)
+
+    def _admin_table(self) -> str:
+        client = self._new_user(f"arn-adm-{uuid.uuid4().hex[:8]}", _policy(ALLOW_ALL))
         table = f"arnc-{uuid.uuid4().hex[:8]}"
         client.create_table(
             TableName=table,
@@ -124,16 +141,13 @@ class TestIdentityPolicyArnEqualsWildcard:
             KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
             BillingMode="PAY_PER_REQUEST",
         )
+        self.cleanup.callback(self._delete_table, client, table)
         wait_for_active(client, table)
         client.put_item(TableName=table, Item={"pk": {"S": "k1"}, "data": {"S": "v1"}})
-        return client, table
+        return table
 
-    def _user(self, prefix: str, policy: dict) -> tuple[str, Any]:
-        user = f"{prefix}-{uuid.uuid4().hex[:8]}"
-        ak, sk = _create_user_with_key(self.mgmt, self.account_id, user)
-        resp = self.mgmt.put_user_policy(self.account_id, user, "p", policy)
-        assert resp.status_code == 204, resp.text
-        return user, _make_client(self.endpoint, ak, sk, self.region)
+    def _user(self, prefix: str, policy: dict) -> Any:
+        return self._new_user(f"{prefix}-{uuid.uuid4().hex[:8]}", policy)
 
     def _get_denied(self, client: Any, table: str) -> None:
         with pytest.raises(ClientError) as exc_info:
@@ -145,92 +159,67 @@ class TestIdentityPolicyArnEqualsWildcard:
         assert out["Item"]["data"]["S"] == "v1"
 
     def test_deny_arn_equals_wildcard_blocks(self):
-        admin_client, table = self._admin_table()
+        table = self._admin_table()
         user_prefix = f"arn-deny-{uuid.uuid4().hex[:6]}"
         pattern = f"arn:aws:iam::{self.account_id}:user/{user_prefix}*"
-        user, client = self._user(user_prefix, _policy(
+        client = self._user(user_prefix, _policy(
             ALLOW_ALL,
             {"Effect": "Deny", "Action": "dynamodb:GetItem", "Resource": "*",
              "Condition": {"ArnEquals": {"aws:PrincipalArn": pattern}}}))
-        try:
-            # The caller's ARN matches the wildcard, so the Deny applies to
-            # GetItem; PutItem is outside the Deny and still allowed.
-            self._get_denied(client, table)
-            client.put_item(TableName=table, Item={"pk": {"S": "k2"}})
-        finally:
-            admin_client.delete_table(TableName=table)
-            self.mgmt.delete_user(self.account_id, user)
+        # The caller's ARN matches the wildcard, so the Deny applies to
+        # GetItem; PutItem is outside the Deny and still allowed.
+        self._get_denied(client, table)
+        client.put_item(TableName=table, Item={"pk": {"S": "k2"}})
 
     def test_deny_arn_equals_question_mark_blocks(self):
-        admin_client, table = self._admin_table()
+        table = self._admin_table()
         user_prefix = f"arn-q-{uuid.uuid4().hex[:6]}"
-        user, client = self._user(user_prefix, _policy(ALLOW_ALL, {
+        client = self._user(user_prefix, _policy(ALLOW_ALL, {
             "Effect": "Deny", "Action": "dynamodb:GetItem", "Resource": "*",
             "Condition": {"ArnEquals": {"aws:PrincipalArn": "arn:aws:iam::" + "?" * 12 + ":user/*"}}}))
-        try:
-            self._get_denied(client, table)
-        finally:
-            admin_client.delete_table(TableName=table)
-            self.mgmt.delete_user(self.account_id, user)
+        self._get_denied(client, table)
 
     def test_deny_arn_equals_other_wildcard_is_inert(self):
-        admin_client, table = self._admin_table()
-        user, client = self._user("arn-inert", _policy(ALLOW_ALL, {
+        table = self._admin_table()
+        client = self._user("arn-inert", _policy(ALLOW_ALL, {
             "Effect": "Deny", "Action": "dynamodb:GetItem", "Resource": "*",
             "Condition": {"ArnEquals": {
                 "aws:PrincipalArn": f"arn:aws:iam::{self.account_id}:user/zzz-*"}}}))
-        try:
-            self._get_ok(client, table)
-        finally:
-            admin_client.delete_table(TableName=table)
-            self.mgmt.delete_user(self.account_id, user)
+        self._get_ok(client, table)
 
     def test_allow_gated_on_arn_equals_wildcard_grants(self):
-        admin_client, table = self._admin_table()
+        table = self._admin_table()
         user_prefix = f"arn-allow-{uuid.uuid4().hex[:6]}"
-        user, client = self._user(user_prefix, _policy({
+        client = self._user(user_prefix, _policy({
             "Effect": "Allow", "Action": "dynamodb:GetItem", "Resource": "*",
             "Condition": {"ArnEquals": {
                 "aws:PrincipalArn": f"arn:aws:iam::{self.account_id}:user/{user_prefix}*"}}}))
-        try:
-            self._get_ok(client, table)
-        finally:
-            admin_client.delete_table(TableName=table)
-            self.mgmt.delete_user(self.account_id, user)
+        self._get_ok(client, table)
 
     def test_allow_gated_on_arn_equals_wildcard_case_mismatch_does_not_grant(self):
-        admin_client, table = self._admin_table()
+        table = self._admin_table()
         user_prefix = f"arn-case-{uuid.uuid4().hex[:6]}"
-        user, client = self._user(user_prefix, _policy({
+        client = self._user(user_prefix, _policy({
             "Effect": "Allow", "Action": "dynamodb:GetItem", "Resource": "*",
             "Condition": {"ArnEquals": {
                 "aws:PrincipalArn": f"arn:aws:iam::{self.account_id}:user/{user_prefix.upper()}*"}}}))
-        try:
-            self._get_denied(client, table)
-        finally:
-            admin_client.delete_table(TableName=table)
-            self.mgmt.delete_user(self.account_id, user)
+        self._get_denied(client, table)
 
     def test_deny_arn_not_equals_wildcard(self):
         # ArnNotEquals against a wildcard the caller matches is false, so the
         # Deny is inert; against a wildcard the caller does not match it holds.
-        admin_client, table = self._admin_table()
+        table = self._admin_table()
         user_prefix = f"arn-ne-{uuid.uuid4().hex[:6]}"
-        user, client = self._user(user_prefix, _policy(ALLOW_ALL, {
+        client = self._user(user_prefix, _policy(ALLOW_ALL, {
             "Effect": "Deny", "Action": "dynamodb:GetItem", "Resource": "*",
             "Condition": {"ArnNotEquals": {
                 "aws:PrincipalArn": f"arn:aws:iam::{self.account_id}:user/{user_prefix}*"}}}))
-        other, other_client = self._user("arn-ne-other", _policy(ALLOW_ALL, {
+        other_client = self._user("arn-ne-other", _policy(ALLOW_ALL, {
             "Effect": "Deny", "Action": "dynamodb:GetItem", "Resource": "*",
             "Condition": {"ArnNotEquals": {
                 "aws:PrincipalArn": f"arn:aws:iam::{self.account_id}:user/{user_prefix}*"}}}))
-        try:
-            self._get_ok(client, table)
-            self._get_denied(other_client, table)
-        finally:
-            admin_client.delete_table(TableName=table)
-            self.mgmt.delete_user(self.account_id, user)
-            self.mgmt.delete_user(self.account_id, other)
+        self._get_ok(client, table)
+        self._get_denied(other_client, table)
 
 
 class TestTrustPolicyArnEqualsWildcard:
