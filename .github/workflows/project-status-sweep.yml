@@ -1,0 +1,67 @@
+name: Project status sweep
+# Every 5 minutes, set Status on the ExtendDB Roadmap board (org Project 3)
+# from the real state of each open issue and PR. The rules are in
+# .github/scripts/project-status-sweep.js.
+#
+# Why a sweep and not PR events: it runs only from the default branch, so no
+# fork can start it, and it needs no pull_request_target (which GitHub turns
+# off by default for public repos from 2026-12-02).
+#
+# Setup (repo admin, once):
+#   1. GitHub App owned by ExtendDB, installed on this repo only, with
+#      Organization: Projects read/write; Repository: Issues, Pull requests,
+#      Metadata read. No webhook.
+#   2. Environment "project-board", deployment branches: main only.
+#      In it: variable PROJECT_APP_CLIENT_ID and secret PROJECT_APP_PRIVATE_KEY.
+#   3. Keep the board's built-in "Pull request merged" and "Item closed"
+#      workflows on (they set Done). Turn off "Item added to project" for PRs.
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Log the changes without making them
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: project-status-sweep
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    # Forks inherit the schedule; only run here.
+    if: github.repository == 'ExtendDB/extenddb'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Secrets live in this environment, which only main can deploy to.
+    environment: project-board
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.PROJECT_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PROJECT_APP_PRIVATE_KEY }}
+          owner: ExtendDB
+          repositories: extenddb
+          permission-organization-projects: write
+          permission-issues: read
+          permission-pull-requests: read
+
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          DRY_RUN: ${{ inputs.dry_run == true }}
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const sweep = require(`${process.env.GITHUB_WORKSPACE}/.github/scripts/project-status-sweep.js`);
+            await sweep({ github, core, dryRun: process.env.DRY_RUN === 'true' });
