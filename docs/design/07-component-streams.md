@@ -91,6 +91,18 @@ DynamoDB retains stream records for 24 hours. Options:
 
 **Recommended:** Application-level background task (same pattern as TTL cleanup), configurable retention period (default: 24 hours).
 
+### 4.5 Enable and Disable
+
+A table has a sequence of streams. `UpdateTable StreamEnabled=false` closes the current one: the stored specification is cleared (DescribeTable omits `StreamSpecification`), `LatestStreamArn` and `LatestStreamLabel` keep naming the closed stream, DescribeStream reports it `DISABLED` with its original view type, and every open shard gets an `EndingSequenceNumber` (its last record's sequence number, or its starting number when it holds none). `StreamEnabled=true` afterwards creates a new stream: a new label later than the previous one, four new shard ids, the requested view type. The closed stream stays describable and listed; ListStreams lists every stream of a table, newest first. Enabling a table whose stream is enabled, and disabling a table with no enabled stream, are refused with `ValidationException`.
+
+Each stream's identity is carried in its shard ids, `shardId-{table_id}-{label_millis:013}{view_type:1}{index:02}`, so no backend stores a stream table. Shard ids from before this scheme (`shardId-{table_id}-{index}`, and the `shardId-{table_name}-{index}` form SQLite and PostgreSQL wrote before v0.1.14) belong to the table's current stream. Writes record only to open shards. The rules shared by the four backends live in `extenddb_storage::stream_lineage`; each backend reads its table row and shard rows and calls them.
+
+On Cassandra the write paths compute a record's partition from the table id and partition key alone, inside the data write's LOGGED BATCH, so records stay in one partition per shard index and a stream's shard is a range of that partition: after its `StartingSequenceNumber`, up to its `EndingSequenceNumber` once closed. A new stream's shard starts where the closed one on the same index ended.
+
+A stream change travels alone: an `UpdateTable` that carries `StreamSpecification` beside `BillingMode` or `ProvisionedThroughput` is refused with `You cannot modify stream status while updating table IOPS`, beside any `GlobalSecondaryIndexUpdates` entry with `You cannot create or delete index while changing stream status`, and nothing is applied. A table created with `StreamSpecification {StreamEnabled: false}` stores nothing of it.
+
+Writes racing a disable. The service's rule (measured 2026-10-24, 569 writes against one disable): every write accepted before the stream reports `DISABLED` lands in the closed stream before its shard's `EndingSequenceNumber`, and a write after that records nothing. ExtendDB closes the shards in the `UpdateTable` call. On SQLite the engine write lock serialises the close against every write. On PostgreSQL the write path reads the open shards `FOR SHARE` in its data transaction and the close locks them `FOR UPDATE` before taking the ending numbers, in one data transaction, so a write that read the open set commits before the ending number is taken and a later write re-evaluates the closed rows and records nothing. On Cassandra a new stream's shards start at a clock value drawn at enable time, above every sequence issued before, so a write of the closed stream that commits after the close falls between the old shard's ending number and the new shard's starting number and is read by neither stream (the sequence is drawn in the write's LOGGED BATCH, which the close cannot wait for). On MongoDB the window is one write transaction wide: a write whose transaction read the shard as open and commits after the close lands past the ending number; closing the gap needs the write transaction to touch the shard document and the stream path to classify the resulting write conflict as retryable, which it does not today. On every backend a write that found no open shard because its key info pre-dated the disable is acknowledged and recorded in no stream; the service records every write it acknowledges while the disable is in progress. A table toggled many times accumulates four closed shard rows per cycle; nothing sweeps a live table's closed shards. On PostgreSQL, MongoDB and Cassandra an enable commits its catalog row before inserting its shards, so a disable that reads the row in between closes whatever shards exist at that instant; the enable re-reads the row after its inserts and closes its own shards when the row no longer says enabled with its label, so a stream never reports `DISABLED` with open shards.
+
 ## 5. Integration Points
 
 ### 5.1 Write Path Integration
@@ -158,7 +170,7 @@ GetRecords handler:
 | Cross-instance stream consistency | Deferred | Relevant for multi-instance deployments |
 | Stream record deduplication | Deferred | Relevant for at-least-once delivery guarantees |
 | Kinesis adapter compatibility | Deferred | DynamoDB Streams has a Kinesis-compatible adapter |
-| Stream enable/disable lifecycle | Deferred | What happens to in-flight records when streams are disabled |
+| Stream enable/disable lifecycle | Decided | See 4.5: disable closes the shards, enable creates a new stream |
 
 ---
 

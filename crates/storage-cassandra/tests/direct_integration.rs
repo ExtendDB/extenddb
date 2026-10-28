@@ -45,6 +45,8 @@ mod roles;
 mod scan;
 #[path = "direct/settings_store.rs"]
 mod settings_store;
+#[path = "direct/stream_disable.rs"]
+mod stream_disable;
 #[path = "direct/streams.rs"]
 mod streams;
 #[path = "direct/table_engine.rs"]

@@ -45,6 +45,7 @@ pub async fn handle_update_table(
         ],
     )?;
 
+    crate::require_stream_enabled_member(&body)?;
     let mut input: UpdateTableInput =
         serde_json::from_value(body).map_err(crate::deserialize_error)?;
     input.resolve_table_throughput_mode();
@@ -112,6 +113,16 @@ pub async fn handle_update_table(
             "StreamViewType must be specified when StreamEnabled is true".to_owned(),
         ));
     }
+    // A disable carries no view type (measured 2026-10-24 on a never-streamed
+    // table and on an enabled one alike; checked before the no-stream rule).
+    if let Some(spec) = &input.stream_specification
+        && !spec.stream_enabled
+        && spec.stream_view_type.is_some()
+    {
+        return Err(DynamoDbError::ValidationException(
+            "One or more parameter values were invalid: If stream is being disabled, then UpdateViewType must not be specified".to_owned(),
+        ));
+    }
 
     // Switching to PROVISIONED requires explicit throughput values.
     if matches!(input.billing_mode, Some(BillingMode::Provisioned))
@@ -141,6 +152,40 @@ pub async fn handle_update_table(
     }
 
     validate_gsi_updates(&input)?;
+
+    // A stream change travels alone. Measured 2026-10-24: beside BillingMode or
+    // ProvisionedThroughput the service refuses with the IOPS sentence, beside
+    // any GlobalSecondaryIndexUpdates entry with the index sentence, and
+    // applies nothing. The per-index definition checks above come first, and
+    // the already-enabled refusal (`Table already has an enabled stream`) comes
+    // before the IOPS sentence, so the table's stored specification is read
+    // here when a companion change is present. DeletionProtectionEnabled beside
+    // a stream change is refused with the service's only-operation sentence
+    // (measured 2026-10-24); the general rule for DeletionProtection beside any
+    // other change is PR #474's and is not claimed here. TableClass and
+    // OnDemandThroughput beside a stream change are not measured and stay
+    // accepted.
+    if let Some(companion) = stream_change_companion(&input) {
+        let existing = ctx
+            .storage
+            .describe_table(
+                &ctx.account_id,
+                extenddb_core::types::DescribeTableInput {
+                    table_name: input.table_name.clone(),
+                },
+            )
+            .await
+            .map_err(|e| update_table_err_to_dynamo(e, &input.table_name))?;
+        if let Some(spec) = &input.stream_specification {
+            extenddb_storage::stream_lineage::stream_change(
+                &input.table_name,
+                existing.stream_specification.as_ref(),
+                spec,
+            )
+            .map_err(|e| update_table_err_to_dynamo(e, &input.table_name))?;
+        }
+        return Err(DynamoDbError::ValidationException(companion.to_owned()));
+    }
 
     // A created GSI's projected attributes count toward the table's limit
     // together with the indexes it already has: the total CreateTable checks,
@@ -201,6 +246,37 @@ pub async fn handle_update_table(
         table_description: desc,
     };
     serialize_output(&output)
+}
+
+/// The sentence the service refuses a stream change with when the same
+/// `UpdateTable` also changes the table's billing or throughput, creates or
+/// deletes an index, or changes deletion protection. `None` when the request
+/// carries no stream change or no such companion. With both the billing and
+/// the index companion present the IOPS sentence is answered (measured); the
+/// deletion-protection sentence's order against the other two is not measured
+/// and comes last.
+fn stream_change_companion(input: &UpdateTableInput) -> Option<&'static str> {
+    input.stream_specification.as_ref()?;
+    if input.billing_mode.is_some() || input.provisioned_throughput.is_some() {
+        return Some(
+            "One or more parameter values were invalid: You cannot modify stream status while updating table IOPS",
+        );
+    }
+    if input
+        .global_secondary_index_updates
+        .as_ref()
+        .is_some_and(|u| !u.is_empty())
+    {
+        return Some(
+            "One or more parameter values were invalid: You cannot create or delete index while changing stream status",
+        );
+    }
+    if input.deletion_protection_enabled.is_some() {
+        return Some(
+            "One or more parameter values were invalid: DeletionProtection modification must be the only operation in the request",
+        );
+    }
+    None
 }
 
 /// The per-entry rules for `GlobalSecondaryIndexUpdates`, checked before any
@@ -347,157 +423,5 @@ fn update_table_err_to_dynamo(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use extenddb_storage::error::StorageError;
-
-    #[test]
-    fn a_created_gsi_throughput_below_one_is_refused() {
-        let input = |pt: Value| -> UpdateTableInput {
-            serde_json::from_value(serde_json::json!({
-                "TableName": "t",
-                "AttributeDefinitions": [{ "AttributeName": "g", "AttributeType": "S" }],
-                "GlobalSecondaryIndexUpdates": [{ "Create": {
-                    "IndexName": "gix",
-                    "KeySchema": [{ "AttributeName": "g", "KeyType": "HASH" }],
-                    "Projection": { "ProjectionType": "ALL" },
-                    "ProvisionedThroughput": pt,
-                }}],
-            }))
-            .unwrap()
-        };
-        for (read, write) in [(0, 0), (0, 1), (1, 0), (-1, 5)] {
-            let pt = serde_json::json!({ "ReadCapacityUnits": read, "WriteCapacityUnits": write });
-            match validate_gsi_updates(&input(pt)).unwrap_err() {
-                DynamoDbError::ValidationException(m) => {
-                    assert!(m.ends_with("for index: gix"), "{m}");
-                }
-                other => panic!("({read}, {write}): {other:?}"),
-            }
-        }
-        let ok = serde_json::json!({ "ReadCapacityUnits": 1, "WriteCapacityUnits": 1 });
-        validate_gsi_updates(&input(ok)).unwrap();
-    }
-
-    #[test]
-    fn projected_total_counts_kept_indexes_and_created_ones() {
-        use extenddb_core::types::{
-            GlobalSecondaryIndexUpdate, GsiDescription, LsiDescription, Projection, ProjectionType,
-            TableDescription,
-        };
-        let include = |n: usize| Projection {
-            projection_type: ProjectionType::Include,
-            non_key_attributes: Some((0..n).map(|i| format!("a{i}")).collect()),
-        };
-        let existing = TableDescription {
-            global_secondary_indexes: Some(vec![
-                GsiDescription {
-                    index_name: "kept".to_owned(),
-                    key_schema: Vec::new(),
-                    projection: include(30),
-                    index_status: "ACTIVE".to_owned(),
-                    provisioned_throughput: None,
-                    index_size_bytes: 0,
-                    item_count: 0,
-                    index_arn: String::new(),
-                },
-                GsiDescription {
-                    index_name: "dropped".to_owned(),
-                    key_schema: Vec::new(),
-                    projection: include(50),
-                    index_status: "ACTIVE".to_owned(),
-                    provisioned_throughput: None,
-                    index_size_bytes: 0,
-                    item_count: 0,
-                    index_arn: String::new(),
-                },
-            ]),
-            local_secondary_indexes: Some(vec![LsiDescription {
-                index_name: "lsi".to_owned(),
-                key_schema: Vec::new(),
-                projection: include(20),
-                index_size_bytes: 0,
-                item_count: 0,
-                index_arn: String::new(),
-            }]),
-            ..Default::default()
-        };
-        let create = |n: usize| -> GlobalSecondaryIndexUpdate {
-            serde_json::from_value(serde_json::json!({ "Create": {
-                "IndexName": "new", "KeySchema": [],
-                "Projection": serde_json::to_value(include(n)).unwrap(),
-            }}))
-            .unwrap()
-        };
-        let delete: GlobalSecondaryIndexUpdate =
-            serde_json::from_value(serde_json::json!({ "Delete": { "IndexName": "dropped" } }))
-                .unwrap();
-
-        assert_eq!(projected_after_gsi_updates(&existing, &[create(1)]), 101);
-        assert_eq!(
-            projected_after_gsi_updates(&existing, &[create(1), delete]),
-            51
-        );
-        assert!(
-            extenddb_core::validation::validate_projected_attribute_total(
-                projected_after_gsi_updates(&existing, &[create(1)])
-            )
-            .is_err()
-        );
-    }
-
-    /// A backend that cannot serve the request reports a 400, not a 500.
-    ///
-    /// This arm was missing while CreateTable had it, so the same refusal
-    /// answered differently depending on which operation carried it. It matters
-    /// for a backend whose vector capability is decided at runtime rather than at
-    /// compile time: its refusal arrives through this path.
-    #[test]
-    fn an_unsupported_feature_is_a_validation_exception() {
-        let err = update_table_err_to_dynamo(
-            StorageError::Unsupported("Vector indexes are not supported here".to_owned()),
-            "t",
-        );
-        match err {
-            DynamoDbError::ValidationException(msg) => {
-                assert_eq!(msg, "Vector indexes are not supported here");
-            }
-            other => panic!("expected ValidationException, got {other:?}"),
-        }
-    }
-
-    /// The backend's whole message survives, unwrapped and unprefixed, because
-    /// the service's own wording for this case names both the table and the index
-    /// and no layer above the backend knows either.
-    #[test]
-    fn a_resource_in_use_refusal_keeps_the_backend_message() {
-        let measured = extenddb_core::types::vector_index_delete_in_allocation_phase("t", "vidx");
-        let err = update_table_err_to_dynamo(StorageError::IndexesInUse(measured.clone()), "t");
-        match err {
-            DynamoDbError::ResourceInUseException(msg) => assert_eq!(msg, measured),
-            other => panic!("expected ResourceInUseException, got {other:?}"),
-        }
-    }
-
-    /// The measured whole string, byte for byte, from probe P2 on 2026-08-19.
-    #[test]
-    fn the_allocation_phase_refusal_is_the_measured_whole_string() {
-        assert_eq!(
-            extenddb_core::types::vector_index_delete_in_allocation_phase(
-                "eddbprobe-backfill",
-                "vidx2"
-            ),
-            "Attempt to change a resource which is still in use: Index creation is in resource \
-             allocation phase. Retry deletion during backfilling phase or when the index is \
-             active. Table: eddbprobe-backfill Index: vidx2"
-        );
-    }
-
-    /// A genuine fault still reports a 500 and is still logged as one.
-    #[test]
-    fn an_internal_failure_is_still_an_internal_server_error() {
-        let err =
-            update_table_err_to_dynamo(StorageError::Internal("disk on fire".to_owned()), "t");
-        assert!(matches!(err, DynamoDbError::InternalServerError(_)));
-    }
-}
+#[path = "update_table_tests.rs"]
+mod tests;

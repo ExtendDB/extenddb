@@ -13,21 +13,17 @@
 use futures::TryStreamExt;
 use futures::future::BoxFuture;
 use mongodb::bson::DateTime as BsonDateTime;
-use mongodb::bson::{self, Document, doc};
+use mongodb::bson::{Document, doc};
 use mongodb::options::FindOptions;
 
-use extenddb_core::types::{
-    DescribeStreamInput, SequenceNumberRange, Shard, StreamDescription, StreamEventName,
-    StreamRecord, StreamStatus, StreamSummary, StreamViewType,
-};
+use extenddb_core::types::{DescribeStreamInput, StreamDescription, StreamEventName, StreamRecord};
 use extenddb_storage::StreamEngine;
 use extenddb_storage::error::StorageError;
+use extenddb_storage::stream_lineage;
 use extenddb_storage::util::{parse_stream_arn, stream_arn};
 use extenddb_storage::{StreamListResult, StreamRecordsResult};
 
 use crate::MongoEngine;
-
-const SHARDS_PER_STREAM: u32 = 4;
 
 /// Map a `StreamEventName` to its DynamoDB wire-format string.
 ///
@@ -41,69 +37,7 @@ pub(crate) fn event_name_ddb_str(name: StreamEventName) -> &'static str {
     }
 }
 
-/// Build the mongo `stream_shards.shard_id` for a given table_id + shard index.
-///
-/// **Security invariant (RFC-0003 §5.3, §8.2):** shard_id must incorporate
-/// the table's globally-unique `table_id` (a UUID), not the caller-visible
-/// `table_name`. Table names are only unique per-account, so two accounts
-/// creating "orders" tables would generate colliding shard_ids under a
-/// name-derived scheme, letting one account's `GetRecords(shard_id)` read
-/// the other's stream records. `table_id` is a per-table-instance UUID that
-/// resets on `DeleteTable + CreateTable` — the recreated table gets fresh
-/// shard_ids, so leftover stream records from the deleted table never
-/// resurface either.
-///
-/// UUIDs are not guessable, so an attacker cannot synthesize a shard_id
-/// belonging to another tenant without first observing it (which itself
-/// requires an authenticated path scoped to that tenant's account).
-pub(crate) fn build_shard_id(table_id: &str, shard_index: u32) -> String {
-    format!("shardId-{table_id}-{shard_index:012}")
-}
-
 impl MongoEngine {
-    /// Initialize stream shards for a table. Only creates shard documents;
-    /// the caller is responsible for setting `stream_label` on the table doc.
-    ///
-    /// Uses the table's UUID (`table_id`), not `table_name`, in the shard_id
-    /// — see `build_shard_id` for the security rationale.
-    pub(crate) async fn init_stream_shards(&self, table_id: &str) -> Result<(), StorageError> {
-        let shards_coll = self.data_db.collection::<Document>("stream_shards");
-        for i in 0..SHARDS_PER_STREAM {
-            let shard_id = build_shard_id(table_id, i);
-            let start_seq = format!("{:021}", 0);
-            let insert_res = shards_coll
-                .insert_one(doc! {
-                    "shard_id": &shard_id,
-                    "table_id": table_id,
-                    "starting_sequence_number": &start_seq,
-                    "created_at": BsonDateTime::now(),
-                })
-                .await;
-            if let Err(e) = insert_res {
-                // Treat a duplicate `shard_id` as idempotent no-op: two
-                // concurrent `UpdateTable(stream_enabled=true)` calls
-                // can both observe "no shards yet" under snapshot
-                // isolation and both reach this insert; the unique
-                // index on `stream_shards.shard_id` (`bootstrapper.rs`)
-                // means one of them lands E11000. RFC-0003 §10.3
-                // requires repeated `UpdateTable` calls with the same
-                // specification to not corrupt state — swallowing
-                // this E11000 makes the redundant call a no-op rather
-                // than a wire-visible 500.
-                let is_dup = matches!(
-                    *e.kind,
-                    mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(
-                        mongodb::error::WriteError { code: 11000, .. }
-                    ))
-                );
-                if !is_dup {
-                    return Err(StorageError::Internal(e.to_string()));
-                }
-            }
-        }
-        Ok(())
-    }
-
     /// Draw the next sequence number for a shard *inside* the given
     /// transaction session.
     ///
@@ -153,13 +87,18 @@ impl MongoEngine {
     /// *inside* the given transaction session. Pairs with
     /// `next_sequence_number_in_session` so the shard set the write is
     /// routed to is read at the same snapshot as the sequence draw.
+    ///
+    /// Only the open shards count: they belong to the table's enabled
+    /// stream. `None` when there are none, because the stream was disabled
+    /// after the caller read the table's key info; the write then records
+    /// nothing.
     pub(crate) async fn assign_shard_in_session(
         &self,
         account_id: &str,
         table_name: &str,
         partition_key: &str,
         session: &mut mongodb::ClientSession,
-    ) -> Result<String, StorageError> {
+    ) -> Result<Option<String>, StorageError> {
         let tables_coll = self.catalog_db.collection::<Document>("tables");
         let table_doc = tables_coll
             .find_one(doc! { "_id": { "account_id": account_id, "table_name": table_name } })
@@ -172,7 +111,9 @@ impl MongoEngine {
         let shards_coll = self.data_db.collection::<Document>("stream_shards");
         let opts = FindOptions::builder().sort(doc! { "shard_id": 1 }).build();
         let mut cursor = shards_coll
-            .find(doc! { "table_id": table_id })
+            .find(
+                doc! { "table_id": table_id, "ending_sequence_number": mongodb::bson::Bson::Null },
+            )
             .with_options(opts)
             .session(&mut *session)
             .await
@@ -183,21 +124,18 @@ impl MongoEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        if shard_docs.is_empty() {
-            return Err(StorageError::Internal(format!(
-                "No stream shards for table {table_name}"
-            )));
-        }
-
         let shard_ids: Vec<&str> = shard_docs
             .iter()
             .filter_map(|d| d.get_str("shard_id").ok())
             .collect();
+        if shard_ids.is_empty() {
+            return Ok(None);
+        }
 
         let hash = crc32fast::hash(partition_key.as_bytes());
         #[allow(clippy::cast_possible_truncation)]
         let idx = (hash as usize) % shard_ids.len();
-        Ok(shard_ids[idx].to_owned())
+        Ok(Some(shard_ids[idx].to_owned()))
     }
 
     /// Delete every stream_shards document for a given table_id, and every
@@ -391,118 +329,26 @@ impl StreamEngine for MongoEngine {
         let exclusive_start_shard_id = input.exclusive_start_shard_id.clone();
         Box::pin(async move {
             let (table_name, stream_label) = parse_stream_arn(&stream_arn_val)?;
-
-            let tables_coll = self.catalog_db.collection::<Document>("tables");
-            let table_doc = tables_coll
-                .find_one(doc! {
-                    "_id": { "account_id": &account_id, "table_name": &table_name },
-                    "stream_label": &stream_label,
-                })
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?
-                .ok_or_else(|| {
-                    StorageError::TableNotFound(format!(
-                        "Requested resource not found: Stream: {stream_arn_val} not found."
-                    ))
-                })?;
-
+            let (table, table_doc) = self
+                .stream_table_row(&account_id, &table_name)
+                .await?
+                .ok_or_else(|| stream_lineage::stream_not_found(&stream_arn_val))?;
             let key_schema = table_doc
                 .get("key_schema")
-                .and_then(|b| bson::from_bson(b.clone()).ok())
+                .and_then(|b| mongodb::bson::from_bson(b.clone()).ok())
                 .ok_or_else(|| StorageError::Internal("Missing key_schema".to_owned()))?;
-
-            let stream_view_type = table_doc
-                .get("stream_specification")
-                .and_then(|b| {
-                    let json: serde_json::Value = bson::from_bson(b.clone()).ok()?;
-                    json.get("StreamViewType")
-                        .and_then(|sv| serde_json::from_value::<StreamViewType>(sv.clone()).ok())
-                })
-                .unwrap_or(StreamViewType::KeysOnly);
-
-            let table_status = table_doc.get_str("table_status").unwrap_or("ACTIVE");
-            let table_id = table_doc.get_str("table_id").unwrap_or_default();
-
-            let limit = limit.unwrap_or(100);
-            let shards_coll = self.data_db.collection::<Document>("stream_shards");
-
-            let filter = if let Some(ref start) = exclusive_start_shard_id {
-                doc! {
-                    "table_id": table_id,
-                    "shard_id": { "$gt": start },
-                }
-            } else {
-                doc! { "table_id": table_id }
-            };
-
-            let opts = FindOptions::builder()
-                .sort(doc! { "shard_id": 1 })
-                .limit(limit + 1)
-                .build();
-
-            let cursor = shards_coll
-                .find(filter)
-                .with_options(opts)
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            let shard_docs: Vec<Document> = cursor
-                .try_collect()
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            #[allow(clippy::cast_sign_loss)]
-            let limit_usize = limit as usize;
-            let last_shard = if shard_docs.len() > limit_usize {
-                shard_docs.get(limit_usize - 1).and_then(|d| {
-                    d.get_str("shard_id")
-                        .ok()
-                        .map(std::borrow::ToOwned::to_owned)
-                })
-            } else {
-                None
-            };
-
-            let shards: Vec<Shard> = shard_docs
-                .into_iter()
-                .take(limit_usize)
-                .filter_map(|d| {
-                    Some(Shard {
-                        shard_id: d.get_str("shard_id").ok()?.to_owned(),
-                        parent_shard_id: d
-                            .get_str("parent_shard_id")
-                            .ok()
-                            .map(std::borrow::ToOwned::to_owned),
-                        sequence_number_range: SequenceNumberRange {
-                            starting_sequence_number: d
-                                .get_str("starting_sequence_number")
-                                .ok()?
-                                .to_owned(),
-                            ending_sequence_number: d
-                                .get_str("ending_sequence_number")
-                                .ok()
-                                .map(std::borrow::ToOwned::to_owned),
-                        },
-                    })
-                })
-                .collect();
-
-            let stream_status = if table_status == "DELETING" {
-                StreamStatus::Disabling
-            } else {
-                StreamStatus::Enabled
-            };
-
-            Ok(StreamDescription {
-                stream_arn: stream_arn_val,
-                stream_label,
-                stream_status,
-                stream_view_type,
-                table_name,
+            let shards = self
+                .stream_shard_rows(std::slice::from_ref(&table.table_id))
+                .await?;
+            stream_lineage::describe_stream(
+                stream_arn_val,
+                &table,
                 key_schema,
-                shards,
-                last_evaluated_shard_id: last_shard,
-            })
+                stream_label,
+                &shards,
+                limit,
+                exclusive_start_shard_id.as_deref(),
+            )
         })
     }
 
@@ -518,73 +364,21 @@ impl StreamEngine for MongoEngine {
         let exclusive_start_stream_arn =
             exclusive_start_stream_arn.map(std::borrow::ToOwned::to_owned);
         Box::pin(async move {
-            let tables_coll = self.catalog_db.collection::<Document>("tables");
-
-            let mut filter = doc! {
-                "_id.account_id": &account_id,
-                "stream_label": { "$ne": null },
-            };
-
-            if let Some(ref tn) = table_name {
-                filter.insert("_id.table_name", tn.as_str());
-            }
-
-            if let Some(ref start_arn) = exclusive_start_stream_arn {
-                let (start_table, start_label) = parse_stream_arn(start_arn)?;
-                if table_name.is_some() {
-                    filter.insert("stream_label", doc! { "$gt": &start_label });
-                } else {
-                    filter.insert(
-                        "$or",
-                        bson::bson!([
-                            { "_id.table_name": { "$gt": &start_table } },
-                            { "_id.table_name": &start_table, "stream_label": { "$gt": &start_label } }
-                        ]),
-                    );
-                }
-            }
-
-            let opts = FindOptions::builder()
-                .sort(doc! { "_id.table_name": 1, "stream_label": 1 })
-                .limit(limit + 1)
-                .build();
-
-            let cursor = tables_coll
-                .find(filter)
-                .with_options(opts)
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            let docs: Vec<Document> = cursor
-                .try_collect()
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            #[allow(clippy::cast_sign_loss)]
-            let limit_usize = limit as usize;
-
-            let summaries: Vec<StreamSummary> = docs
-                .iter()
-                .take(limit_usize)
-                .filter_map(|d| {
-                    let id = d.get_document("_id").ok()?;
-                    let tn = id.get_str("table_name").ok()?;
-                    let label = d.get_str("stream_label").ok()?;
-                    Some(StreamSummary {
-                        stream_arn: stream_arn(&self.region, &account_id, tn, label),
-                        stream_label: label.to_owned(),
-                        table_name: tn.to_owned(),
-                    })
-                })
-                .collect();
-
-            let last_arn = if docs.len() > limit_usize {
-                summaries.last().map(|s| s.stream_arn.clone())
-            } else {
-                None
-            };
-
-            Ok((summaries, last_arn))
+            let start = exclusive_start_stream_arn
+                .as_deref()
+                .map(parse_stream_arn)
+                .transpose()?;
+            let tables = self.stream_table_rows(&account_id).await?;
+            let ids: Vec<String> = tables.iter().map(|t| t.table_id.clone()).collect();
+            let shards = self.stream_shard_rows(&ids).await?;
+            stream_lineage::list_streams(
+                &tables,
+                &shards,
+                table_name.as_deref(),
+                limit,
+                start,
+                |t, l| stream_arn(&self.region, &account_id, t, l),
+            )
         })
     }
 
@@ -625,8 +419,9 @@ impl StreamEngine for MongoEngine {
 
             let shards_coll = self.data_db.collection::<Document>("stream_shards");
             let opts = FindOptions::builder().sort(doc! { "shard_id": 1 }).build();
+            // Only the open shards: they belong to the table's enabled stream.
             let cursor = shards_coll
-                .find(doc! { "table_id": table_id })
+                .find(doc! { "table_id": table_id, "ending_sequence_number": mongodb::bson::Bson::Null })
                 .with_options(opts)
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -698,36 +493,20 @@ impl StreamEngine for MongoEngine {
         let shard_id = shard_id.to_owned();
         Box::pin(async move {
             let (table_name, stream_label) = parse_stream_arn(&stream_arn_val)?;
-
-            let tables_coll = self.catalog_db.collection::<Document>("tables");
-            let table_doc = tables_coll
-                .find_one(doc! {
-                    "_id": { "account_id": &account_id, "table_name": &table_name },
-                    "stream_label": &stream_label,
-                })
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            let Some(table_doc) = table_doc else {
-                return Err(StorageError::TableNotFound(format!(
-                    "Requested resource not found: Stream: {stream_arn_val} not found."
-                )));
+            let table = self.stream_table_row(&account_id, &table_name).await?;
+            let shards = match &table {
+                Some((t, _)) => {
+                    self.stream_shard_rows(std::slice::from_ref(&t.table_id))
+                        .await?
+                }
+                None => Vec::new(),
             };
-
-            let table_id = table_doc.get_str("table_id").unwrap_or_default();
-
-            let shards_coll = self.data_db.collection::<Document>("stream_shards");
-            let exists = shards_coll
-                .find_one(doc! { "shard_id": &shard_id, "table_id": table_id })
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            if exists.is_none() {
-                return Err(StorageError::TableNotFound(format!(
-                    "Requested resource not found: Stream: {stream_arn_val} not found."
-                )));
-            }
-            Ok(())
+            stream_lineage::validate_shard(
+                table.as_ref().map(|(t, _)| t),
+                &stream_label,
+                &shards,
+                &shard_id,
+            )
         })
     }
 
@@ -771,16 +550,28 @@ mod tests {
         assert_eq!(event_name_ddb_str(StreamEventName::Remove), "REMOVE");
     }
 
+    const LABEL: &str = "2026-10-24T08:54:14.037";
+
+    fn shard(table_id: &str, index: u32) -> String {
+        stream_lineage::shard_id(
+            table_id,
+            LABEL,
+            extenddb_core::types::StreamViewType::KeysOnly,
+            index,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn shard_id_embeds_table_id_not_table_name() {
         let table_id = "550e8400-e29b-41d4-a716-446655440000";
         assert_eq!(
-            build_shard_id(table_id, 0),
-            "shardId-550e8400-e29b-41d4-a716-446655440000-000000000000"
+            shard(table_id, 0),
+            "shardId-550e8400-e29b-41d4-a716-446655440000-1792832054037100"
         );
         assert_eq!(
-            build_shard_id(table_id, 3),
-            "shardId-550e8400-e29b-41d4-a716-446655440000-000000000003"
+            shard(table_id, 3),
+            "shardId-550e8400-e29b-41d4-a716-446655440000-1792832054037103"
         );
     }
 
@@ -792,19 +583,14 @@ mod tests {
         // shard.
         let table_a = "550e8400-e29b-41d4-a716-446655440000";
         let table_b = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
-        assert_ne!(build_shard_id(table_a, 0), build_shard_id(table_b, 0));
+        assert_ne!(shard(table_a, 0), shard(table_b, 0));
     }
 
     #[test]
     fn shard_id_format_is_stable_across_shards_of_same_table() {
         // Same table_id, different shard index → deterministic ordering.
         let table_id = "550e8400-e29b-41d4-a716-446655440000";
-        let s0 = build_shard_id(table_id, 0);
-        let s1 = build_shard_id(table_id, 1);
-        let s2 = build_shard_id(table_id, 2);
-        let s3 = build_shard_id(table_id, 3);
-        assert!(s0 < s1);
-        assert!(s1 < s2);
-        assert!(s2 < s3);
+        let ids: Vec<String> = (0..4).map(|i| shard(table_id, i)).collect();
+        assert!(ids.windows(2).all(|w| w[0] < w[1]));
     }
 }

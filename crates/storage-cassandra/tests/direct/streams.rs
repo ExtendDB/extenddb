@@ -406,7 +406,15 @@ async fn test_validate_shard_ok() {
         &key_info.table_name,
         &stream_label,
     );
-    let shard_id = shard_for("any-pk", &key_info.table_id);
+    // The stream's own shard id for the partition the record lands in.
+    let index = crc32fast::hash(b"any-pk") % 4;
+    let shard_id = extenddb_storage::stream_lineage::shard_id(
+        &key_info.table_id,
+        &stream_label,
+        StreamViewType::NewAndOldImages,
+        index,
+    )
+    .unwrap();
 
     engine
         .validate_shard(&key_info.account_id, &arn, &shard_id)
