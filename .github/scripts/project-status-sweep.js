@@ -6,18 +6,24 @@
  * .github/workflows/project-status-sweep.yml. It reads every open issue and
  * pull request on the board and sets Status from their real state:
  *
- *   Todo         issue with no assignee and no open linked PR
- *   In Progress  issue assigned or with an open linked PR; any PR not yet
- *                reviewed, a draft PR, or one with changes requested
- *   Review       PR reviewed by someone other than its author (not a bot)
+ *   Todo         issue with no assignee and no trusted open linked PR
+ *   In Progress  issue assigned or with a trusted open linked PR; any PR that
+ *                is a draft, not yet reviewed, or has changes requested
+ *   Review       PR reviewed by a person other than its author (bots ignored);
+ *                an issue whose trusted linked PR is in Review
+ *
+ * A PR whose only human review was dismissed still counts as reviewed: a
+ * person did look at it.
  *
  * It never touches:
  *   - closed or merged items (the board's built-in workflows set Done)
- *   - draft (board-only) items and archived items
+ *   - draft (board-only), inaccessible and archived items
  *   - a card whose Status is not one of the three above (e.g. Done, Blocked)
- *   - a card a person moved by hand, until its issue or PR changes again
+ *   - a card a person moved by hand, until the issue, the PR, or the issue's
+ *     trusted linked PR changes again. "By hand" is read from the item's
+ *     timeline (the last status-change event on this board was by a User).
  *
- * Fork safety: an issue only follows a linked PR whose author is an
+ * Trust: an issue only follows a linked PR whose author is an
  * owner/member/collaborator, or that a maintainer linked from the sidebar.
  * A "Closes #N" in an outside PR's body cannot move anyone else's card.
  */
@@ -29,8 +35,10 @@ const STATUS_FIELD = 'Status';
 const MANAGED = ['Todo', 'In Progress', 'Review'];
 const TRUSTED = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
 const REVIEW_STATES = new Set(['APPROVED', 'CHANGES_REQUESTED', 'COMMENTED', 'DISMISSED']);
+const LINKED_LIMIT = 10;
 
 const rank = (status) => MANAGED.indexOf(status);
+const latest = (...times) => times.filter(Boolean).sort().at(-1);
 
 const QUERY = `
 query($org: String!, $num: Int!, $after: String) {
@@ -47,24 +55,26 @@ query($org: String!, $num: Int!, $after: String) {
           id
           isArchived
           status: fieldValueByName(name: "${STATUS_FIELD}") {
-            ... on ProjectV2ItemFieldSingleSelectValue {
-              name
-              updatedAt
-              creator { login __typename }
-            }
+            ... on ProjectV2ItemFieldSingleSelectValue { name }
           }
           content {
             __typename
-            ... on PullRequest { ...pr }
+            ... on PullRequest {
+              ...pr
+              moves: timelineItems(last: 10, itemTypes: [PROJECT_V2_ITEM_STATUS_CHANGED_EVENT]) { ...prMoves }
+            }
             ... on Issue {
               number
               state
               updatedAt
               assignees { totalCount }
-              linked: closedByPullRequestsReferences(first: 10, includeClosedPrs: false) {
+              moves: timelineItems(last: 10, itemTypes: [PROJECT_V2_ITEM_STATUS_CHANGED_EVENT]) { ...issueMoves }
+              linked: closedByPullRequestsReferences(first: ${LINKED_LIMIT}, includeClosedPrs: false) {
+                totalCount
                 nodes { ...pr }
               }
-              manual: closedByPullRequestsReferences(first: 10, includeClosedPrs: false, userLinkedOnly: true) {
+              manual: closedByPullRequestsReferences(first: ${LINKED_LIMIT}, includeClosedPrs: false, userLinkedOnly: true) {
+                totalCount
                 nodes { id }
               }
             }
@@ -73,6 +83,9 @@ query($org: String!, $num: Int!, $after: String) {
       }
     }
   }
+}
+fragment prMoves on PullRequestTimelineItemsConnection {
+  nodes { ... on ProjectV2ItemStatusChangedEvent { createdAt actor { __typename } project { number } } }
 }
 fragment pr on PullRequest {
   id
@@ -85,6 +98,13 @@ fragment pr on PullRequest {
   reviews(last: 30) {
     nodes { state submittedAt author { login __typename } }
   }
+  verdicts: latestOpinionatedReviews(first: 50) {
+    nodes { state author { login __typename } }
+  }
+}
+# Issues and PRs have differently named timeline connection types.
+fragment issueMoves on IssueTimelineItemsConnection {
+  nodes { ... on ProjectV2ItemStatusChangedEvent { createdAt actor { __typename } project { number } } }
 }`;
 
 const UPDATE = `
@@ -94,34 +114,39 @@ mutation($p: ID!, $i: ID!, $f: ID!, $o: String!) {
   }) { projectV2Item { id } }
 }`;
 
+/** Is this review by a person who is not the PR's author? */
+const byOtherHuman = (review, author) =>
+  review.author?.__typename === 'User' && review.author.login !== author;
+
 /** Status a pull request's card should have. */
 function prStatus(pr) {
   if (pr.isDraft) return 'In Progress';
   const author = pr.author?.login;
-  const reviews = [...(pr.reviews?.nodes ?? [])]
-    .filter((r) => r.submittedAt) // pending reviews have no submittedAt
-    .sort((a, b) => a.submittedAt.localeCompare(b.submittedAt));
 
-  let reviewed = false;
-  const decision = new Map(); // reviewer -> their latest non-comment verdict
-  for (const r of reviews) {
-    // Only people count: skip bots (code scanning, Copilot) and the author's own replies.
-    if (r.author?.__typename !== 'User' || r.author.login === author) continue;
-    if (!REVIEW_STATES.has(r.state)) continue;
-    reviewed = true;
-    if (r.state !== 'COMMENTED') decision.set(r.author.login, r.state);
-  }
-  if ([...decision.values()].includes('CHANGES_REQUESTED')) return 'In Progress';
+  // One current verdict per reviewer (dismissed ones are already dropped).
+  const verdicts = (pr.verdicts?.nodes ?? []).filter((r) => byOtherHuman(r, author));
+  if (verdicts.some((r) => r.state === 'CHANGES_REQUESTED')) return 'In Progress';
+  if (verdicts.length > 0) return 'Review';
+
+  // No verdict yet: any submitted human review (comment, dismissed) still counts.
+  const reviewed = (pr.reviews?.nodes ?? []).some(
+    (r) => r.submittedAt && REVIEW_STATES.has(r.state) && byOtherHuman(r, author),
+  );
   return reviewed ? 'Review' : 'In Progress';
+}
+
+/** Open linked PRs an issue may follow. */
+function trustedOpenPrs(issue) {
+  const manual = new Set((issue.manual?.nodes ?? []).map((p) => p.id));
+  return (issue.linked?.nodes ?? []).filter(
+    (pr) => pr.state === 'OPEN' && (TRUSTED.has(pr.authorAssociation) || manual.has(pr.id)),
+  );
 }
 
 /** Status an issue's card should have. */
 function issueStatus(issue) {
-  const manual = new Set((issue.manual?.nodes ?? []).map((p) => p.id));
   let best = issue.assignees.totalCount > 0 ? 'In Progress' : 'Todo';
-  for (const pr of issue.linked?.nodes ?? []) {
-    if (pr.state !== 'OPEN') continue;
-    if (!TRUSTED.has(pr.authorAssociation) && !manual.has(pr.id)) continue;
+  for (const pr of trustedOpenPrs(issue)) {
     // Any trusted open PR means work has started, at least In Progress.
     const s = prStatus(pr);
     if (rank(s) > rank(best)) best = s;
@@ -129,20 +154,30 @@ function issueStatus(issue) {
   return best;
 }
 
+/** Last status change on this board, from the issue's or PR's timeline. */
+function lastMove(content) {
+  return (content.moves?.nodes ?? []).filter((e) => e.project?.number === PROJECT_NUMBER).at(-1);
+}
+
 /** Decide what to do with one board item: { target } or { skip: reason }. */
 function decide(item) {
   if (item.isArchived) return { skip: 'archived' };
   const c = item.content;
-  if (!c || (c.__typename !== 'PullRequest' && c.__typename !== 'Issue')) return { skip: 'draft item' };
+  if (!c || (c.__typename !== 'PullRequest' && c.__typename !== 'Issue')) {
+    return { skip: 'draft or inaccessible item' };
+  }
   if (c.state !== 'OPEN') return { skip: 'closed' };
 
   const current = item.status?.name ?? null;
   if (current !== null && rank(current) === -1) return { skip: `status "${current}" not managed` };
 
-  // A person set this status by hand: keep it until the issue or PR changes again.
-  const setter = item.status?.creator;
-  if (setter?.__typename === 'User' && c.updatedAt <= item.status.updatedAt) {
-    return { skip: 'set by hand' };
+  // A person moved this card: keep it until the work changes again.
+  const move = lastMove(c);
+  if (move?.actor?.__typename === 'User') {
+    const changedAt = c.__typename === 'Issue'
+      ? latest(c.updatedAt, ...trustedOpenPrs(c).map((p) => p.updatedAt))
+      : c.updatedAt;
+    if (changedAt <= move.createdAt) return { skip: 'set by hand' };
   }
 
   const target = c.__typename === 'PullRequest' ? prStatus(c) : issueStatus(c);
@@ -167,11 +202,17 @@ async function sweep({ github, core, dryRun = false }) {
     const p = data.organization.projectV2;
     project ??= p;
     for (const item of p.items.nodes) {
+      const c = item.content;
+      for (const key of ['linked', 'manual']) {
+        const conn = c?.[key];
+        if (conn && conn.totalCount > conn.nodes.length) {
+          core.warning(`issue #${c.number}: only the first ${conn.nodes.length} of ${conn.totalCount} linked PRs were read.`);
+        }
+      }
       const d = decide(item);
       if (d.skip) {
         skipped[d.skip] = (skipped[d.skip] ?? 0) + 1;
       } else {
-        const c = item.content;
         changes.push({
           itemId: item.id,
           label: `${c.__typename === 'PullRequest' ? 'PR' : 'issue'} #${c.number}`,

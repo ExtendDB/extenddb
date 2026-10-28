@@ -1,7 +1,7 @@
 name: Project status sweep
-# Every 5 minutes, set Status on the ExtendDB Roadmap board (org Project 3)
-# from the real state of each open issue and PR. The rules are in
-# .github/scripts/project-status-sweep.js.
+# About every 5 minutes (GitHub may delay scheduled runs), set Status on the
+# ExtendDB Roadmap board (org Project 3) from the real state of each open
+# issue and PR. The rules are in .github/scripts/project-status-sweep.js.
 #
 # Why a sweep and not PR events: it runs only from the default branch, so no
 # fork can start it, and it needs no pull_request_target (which GitHub turns
@@ -13,8 +13,10 @@ name: Project status sweep
 #      Metadata read. No webhook.
 #   2. Environment "project-board", deployment branches: main only.
 #      In it: variable PROJECT_APP_CLIENT_ID and secret PROJECT_APP_PRIVATE_KEY.
-#   3. Keep the board's built-in "Pull request merged" and "Item closed"
-#      workflows on (they set Done). Turn off "Item added to project" for PRs.
+#   3. Board workflows: keep "Item closed" and "Pull request merged" (they set
+#      Done). Turn off "Pull request linked to issue": the sweep replaces it
+#      and, unlike it, ignores PRs from outside contributors.
+#   4. Run this workflow once with dry_run and read the log.
 on:
   schedule:
     - cron: '*/5 * * * *'
@@ -28,8 +30,9 @@ on:
 permissions:
   contents: read
 
+# Dry runs get their own group so a scheduled run cannot replace a pending one.
 concurrency:
-  group: project-status-sweep
+  group: project-status-sweep${{ inputs.dry_run && '-dry' || '' }}
   cancel-in-progress: false
 
 jobs:
@@ -38,15 +41,20 @@ jobs:
     if: github.repository == 'ExtendDB/extenddb'
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # Secrets live in this environment, which only main can deploy to.
-    environment: project-board
+    # Secrets live in this environment, which only main can use.
+    # deployment: false keeps that, without a deployment record every run.
+    environment:
+      name: project-board
+      deployment: false
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out sweep script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           sparse-checkout: .github/scripts
           persist-credentials: false
 
-      - id: app-token
+      - name: Mint App token
+        id: app-token
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ vars.PROJECT_APP_CLIENT_ID }}
@@ -57,7 +65,8 @@ jobs:
           permission-issues: read
           permission-pull-requests: read
 
-      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      - name: Sweep board
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           DRY_RUN: ${{ inputs.dry_run == true }}
         with:
