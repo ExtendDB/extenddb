@@ -18,6 +18,8 @@ const TABLE_STAR: &str = "arn:aws:dynamodb:us-east-1:123456789012:table/*";
 const Z_STAR: &str = "arn:aws:dynamodb:us-east-1:123456789012:table/Z*";
 /// The ARN member of the sets measured on 2026-10-28.
 const TABLE_V: &str = "arn:aws:dynamodb:us-east-1:123456789012:table/V";
+/// The second member of the all-ARN set measured on 2026-10-28.
+const TABLE_OTHER: &str = "arn:aws:dynamodb:us-east-1:123456789012:table/OTHER";
 
 /// Single-valued key present with value `V`; condition over `pattern`.
 fn single(op: ConditionOperator, pattern: &str) -> bool {
@@ -134,10 +136,23 @@ fn arn_operators_absent_key_for_all_values_passes() {
 
 // --- multivalued key [V, OTHER] ---
 
+/// A bare Arn operator on a multi-valued key is false even when every member
+/// satisfies it, so per-value evaluation would answer true in each row here.
+/// Measured on 2026-10-28 with `aws:TagKeys` as a string list holding
+/// [`table/V`, `table/OTHER`]: ArnEquals and ArnLike with `table/*` (both
+/// members match) and ArnNotEquals and ArnNotLike with `table/T*` (neither
+/// member matches) were implicitDeny.
 #[test]
 fn arn_operators_bare_on_multivalued_never_match() {
-    for op in [ArnEquals, ArnNotEquals, ArnLike, ArnNotLike] {
-        assert!(!multi(op, T_STAR));
+    let set = vec![TABLE_V, TABLE_OTHER];
+    for op in [ArnEquals, ArnLike] {
+        assert!(
+            !set_of(op.clone(), TABLE_STAR, set.clone()),
+            "{op:?} table/*"
+        );
+    }
+    for op in [ArnNotEquals, ArnNotLike] {
+        assert!(!set_of(op.clone(), T_STAR, set.clone()), "{op:?} table/T*");
     }
 }
 
