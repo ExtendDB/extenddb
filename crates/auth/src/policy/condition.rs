@@ -263,10 +263,17 @@ fn expand_policy_variables(
 }
 
 /// Whether `op` expands policy variables in its values: the string and ARN
-/// operators, with or without a set qualifier or `IfExists`. IAM documents
-/// variables for string comparisons and ARNs; `NumericEquals` and `Bool` were
-/// measured to compare a variable as written, and the date, address and `Null`
-/// operators are treated the same way.
+/// operators, with or without a set qualifier or `IfExists`.
+///
+/// IAM's condition operator reference lists policy variables as supported for
+/// the string, Boolean and ARN operators and not supported for the numeric,
+/// date, binary and IP address operators, and says a variable cannot be used
+/// with `Null`. The IAM policy simulator expands a variable for the string and
+/// ARN operators only: it compares a `NumericEquals` value written as a
+/// variable as written, and reads a `Bool` or `Null` one as the boolean `false`
+/// (`bool_matches`, `null_holds`), although IAM Access Analyzer reports those
+/// two as `INVALID_VARIABLE_FOR_OPERATOR`. The date and address operators are
+/// treated as the numeric ones; that is not measured.
 fn operator_expands_variables(op: &ConditionOperator) -> bool {
     match op {
         ConditionOperator::ForAllValues(inner)
