@@ -318,8 +318,10 @@ pub enum ConditionValue {
     Literal(String),
     /// The value with its variables, defaults and escapes expanded.
     Expanded {
-        /// The expanded text, compared by the string equality, numeric, date,
-        /// boolean and address operators.
+        /// The expanded text, compared by `StringEquals`, `StringNotEquals`
+        /// and their `IgnoreCase` forms. Only the string and ARN operators
+        /// expand a value, so no other operator receives this variant, and the
+        /// Like and Arn operators match `tokens`.
         text: String,
         /// The expanded text with the `*` and `?` the policy wrote marked as
         /// wildcards, matched by `StringLike`, `StringNotLike` and the four

@@ -7,7 +7,9 @@
 //! `Allow dynamodb:*` on `*` beside a `Deny dynamodb:GetItem` on `*` with the
 //! condition under test, action `dynamodb:GetItem`. Cells E1 to E9b are
 //! measured; the tests after them apply the nearest measured rule to shapes
-//! the cells do not cover and say so.
+//! the cells do not cover and say so. The cells measured on 2026-10-25,
+//! including a wildcard that comes from a substituted value, are in
+//! `condition_variables_operators.rs`.
 
 use super::*;
 
@@ -266,17 +268,6 @@ fn derived_set_operator_escaped_star_is_literal() {
     let ctx = Ctx::empty().with("dynamodb:LeadingKeys", vec!["abc", "axy"]);
     assert_eq!(get(&p, &ctx), AuthzDecision::Allow);
     let ctx = Ctx::empty().with("dynamodb:LeadingKeys", vec!["abc", "a*"]);
-    assert_eq!(get(&p, &ctx), AuthzDecision::Deny);
-}
-
-#[test]
-fn derived_variable_value_wildcards_are_literal_in_string_like() {
-    // Rule 2 for a wildcard that comes from a variable value rather than an
-    // escape, the same as a Resource pattern (issue #533).
-    let p = deny_if(V2012, "StringLike", OWNER, "${aws:PrincipalTag/team}");
-    let ctx = owner("abc").with(TEAM, vec!["a*"]);
-    assert_eq!(get(&p, &ctx), AuthzDecision::Allow);
-    let ctx = owner("a*").with(TEAM, vec!["a*"]);
     assert_eq!(get(&p, &ctx), AuthzDecision::Deny);
 }
 
