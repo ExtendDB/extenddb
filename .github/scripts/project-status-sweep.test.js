@@ -56,7 +56,7 @@ const item = (content, status, over = {}) => ({
 const linked = (...prs) => ({ totalCount: prs.length, nodes: prs });
 
 // A fake octokit: serves board pages, records writes, can be told to fail.
-function fakeGithub({ pages, workflows = [], failUpdates = 0, linkedById = {}, failLinked = false, failWorkflows = false }) {
+function fakeGithub({ pages, workflows = [], failUpdates = 0, linkedById = {}, failLinked = false, failWorkflows = false, failCard = false }) {
   const writes = [];
   let page = 0;
   let updateFailures = failUpdates;
@@ -68,8 +68,12 @@ function fakeGithub({ pages, workflows = [], failUpdates = 0, linkedById = {}, f
         writes.push({ kind: 'status', item: vars.i, option: vars.o });
         return {};
       }
-      if (query.includes('addProjectV2DraftIssue')) { writes.push({ kind: 'heartbeat-add', title: vars.t }); return {}; }
-      if (query.includes('updateProjectV2DraftIssue')) { writes.push({ kind: 'heartbeat-update', id: vars.d, title: vars.t }); return {}; }
+      if (query.includes('DraftIssue(input')) {
+        if (failCard) throw new Error('card write refused');
+        const kind = query.includes('addProjectV2DraftIssue') ? 'heartbeat-add' : 'heartbeat-update';
+        writes.push({ kind, id: vars.d, title: vars.t, body: vars.b });
+        return {};
+      }
       if (query.includes('workflows(')) {
         if (failWorkflows) throw new Error('forbidden');
         return { organization: { projectV2: { workflows: { nodes: workflows } } } };
@@ -286,7 +290,6 @@ test('a clean run moves cards, writes the health card and reports ok', async () 
   const gh = fakeGithub({ pages: [boardPage([item(pr({ number: 5 }), 'Todo')])] });
   const { result, core } = await run(gh);
   assert.equal(result.outcome, 'ok');
-  assert.equal(core.outputs.outcome, 'ok');
   assert.deepEqual(gh.writes[0], { kind: 'status', item: 'ITEM_5', option: 'OPT_In Progress' });
   assert.equal(gh.writes[1].kind, 'heartbeat-add');
   assert.match(gh.writes[1].title, /^Board sweep: OK, last run 2026-10-28 03:20 UTC$/);
@@ -312,11 +315,49 @@ test('updates the existing health card instead of adding another', async () => {
   assert.equal(gh.writes[0].id, 'DRAFT_HB');
 });
 
-test('a dry run writes nothing, not even the health card', async () => {
+test('a dry run changes no Status, and lists its plan on the health card only', async () => {
   const gh = fakeGithub({ pages: [boardPage([item(pr({ number: 5 }), 'Todo')])] });
   const { result } = await run(gh, { dryRun: true });
-  assert.equal(gh.writes.length, 0);
-  assert.equal(result.changes.length, 1);
+  assert.deepEqual(gh.writes.map((w) => w.kind), ['heartbeat-add']);
+  assert.match(gh.writes[0].title, /^Board sweep: DRY RUN, last run /);
+  assert.match(gh.writes[0].body, /PR #5: Todo -> In Progress/);
+  assert.equal(result.moves.length, 1);
+});
+
+// ---- Privacy: the Actions log is public, the board is not ------------------------
+
+test('the public log names no issue, PR, status or draft; the private card has the details', async () => {
+  const field = { id: 'F', options: OPTIONS.filter((o) => o.name !== 'Review') };
+  const nodes = [
+    item(pr({ number: 501, verdicts: { nodes: [verdict(user('bob'), 'APPROVED')] } }), 'Todo'),
+    item(issue({ number: 602, assignees: { totalCount: 1 } }), 'Todo'),
+    item(pr({ number: 703 }), 'Todo'),
+    item({ __typename: 'DraftIssue', id: 'D1', title: 'Secret launch plan' }, 'Todo'),
+    item(null, 'Todo'),
+  ];
+  const gh = fakeGithub({
+    pages: [boardPage(nodes, { field })],
+    workflows: [{ name: 'Pull request linked to issue', enabled: true }],
+    failUpdates: 3,
+  });
+  const { core } = await run(gh);
+  const publicLog = [...core.info, ...core.warning, ...core.failed].join('\n');
+  for (const leak of ['#501', '#602', '#703', 'Todo', 'In Progress', 'Review', 'draft', 'Secret', 'linked to issue', 'inaccessible', 'boom']) {
+    assert.ok(!publicLog.includes(leak), `public log leaked "${leak}": ${publicLog}`);
+  }
+  const card = gh.writes.find((w) => w.kind === 'heartbeat-add');
+  for (const detail of ['PR #501', 'issue #602', 'PR #703: Todo -> In Progress', 'Pull request linked to issue', 'draft item 1', 'boom']) {
+    assert.ok(card.body.includes(detail), `card is missing "${detail}"`);
+  }
+});
+
+test('a health card that cannot be written fails the run without details', async () => {
+  const gh = fakeGithub({ pages: [boardPage([item(pr({ number: 5 }), 'Todo')])], failCard: true });
+  const { result, core } = await run(gh);
+  assert.equal(result.outcome, 'failed');
+  assert.equal(result.cardWritten, false);
+  assert.equal(core.failed.length, 1);
+  assert.ok(!core.failed[0].includes('#5') && !core.failed[0].includes('card write refused'));
 });
 
 test('a failing update is retried, then succeeds', async () => {

@@ -8,9 +8,12 @@ name: Project status sweep
 # branch, so no fork can start it, and it needs no pull_request_target (which
 # GitHub turns off by default for public repos from 2026-12-02).
 #
-# Health: the sweep rewrites a "Board sweep: ..." draft card on the board each
-# run. The report job opens one issue when a run is failed or degraded,
-# updates it while the problem lasts, and closes it on the next clean run.
+# Privacy: this repo is public, so this workflow's logs are public; the board
+# is not. The log gets one line of totals. Every detail goes to a "Board
+# sweep: ..." draft card on the board, rewritten each run (see the script).
+# A run goes red, and GitHub emails whoever last edited this file's schedule,
+# when card updates fail or that card cannot be written. Anything else that
+# needs attention shows only in the card's title: NEEDS ATTENTION.
 #
 # Setup (repo admin, once):
 #   1. GitHub App owned by ExtendDB with Organization: Projects read/write;
@@ -23,7 +26,8 @@ name: Project status sweep
 #      while any is on.
 #   4. Optional: single-select board field "Auto status" with option "Off".
 #      Cards set to Off are never moved.
-#   5. Run this workflow once with dry_run and read the log.
+#   5. Run this workflow once with dry_run and read the board's
+#      "Board sweep: DRY RUN ..." card.
 on:
   schedule:
     - cron: '*/5 * * * *'
@@ -32,7 +36,7 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: Log the changes without making them
+        description: Write the planned moves to the board's health card only
         type: boolean
         default: false
 
@@ -56,9 +60,6 @@ jobs:
     environment:
       name: project-board
       deployment: false
-    outputs:
-      outcome: ${{ steps.sweep.outputs.outcome }}
-      summary: ${{ steps.sweep.outputs.summary }}
     steps:
       - name: Check out sweep script
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -80,7 +81,6 @@ jobs:
           permission-pull-requests: read
 
       - name: Sweep board
-        id: sweep
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           DRY_RUN: ${{ inputs.dry_run == true }}
@@ -95,65 +95,3 @@ jobs:
               dryRun: process.env.DRY_RUN === 'true',
               runUrl: process.env.RUN_URL,
             });
-
-  report:
-    # Raise or clear one alert issue. Skipped for dry runs.
-    needs: sweep
-    if: always() && github.repository == 'ExtendDB/extenddb' && inputs.dry_run != true
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      issues: write
-    steps:
-      - name: Raise or clear alert
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        env:
-          RESULT: ${{ needs.sweep.result }}
-          OUTCOME: ${{ needs.sweep.outputs.outcome }}
-          SUMMARY: ${{ needs.sweep.outputs.summary }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        with:
-          script: |
-            const TITLE = 'Roadmap board sweep needs attention';
-            const { RESULT, OUTCOME, SUMMARY, RUN_URL } = process.env;
-            const { owner, repo } = context.repo;
-
-            // Cancelled runs (e.g. replaced by a newer one) say nothing about health.
-            if (RESULT === 'cancelled' || RESULT === 'skipped') return;
-            const healthy = RESULT === 'success' && OUTCOME === 'ok';
-
-            const open = (await github.paginate(github.rest.issues.listForRepo, {
-              owner, repo, state: 'open', creator: 'github-actions[bot]', per_page: 100,
-            })).find((i) => i.title === TITLE && !i.pull_request);
-
-            if (healthy) {
-              if (open) {
-                await github.rest.issues.createComment({
-                  owner, repo, issue_number: open.number, body: `Back to normal: ${RUN_URL}`,
-                });
-                await github.rest.issues.update({
-                  owner, repo, issue_number: open.number, state: 'closed', state_reason: 'completed',
-                });
-              }
-              return;
-            }
-
-            const detail = SUMMARY
-              || `The sweep job ended with "${RESULT}" before it could report. `
-               + 'Usually this is the GitHub App token: check the App is installed, '
-               + 'and that PROJECT_APP_CLIENT_ID / PROJECT_APP_PRIVATE_KEY in the '
-               + '"project-board" environment are current.';
-            const body = [
-              'The scheduled sweep that keeps the Roadmap board Status current reported a problem.',
-              'This issue is updated while the problem lasts and closed automatically after a clean run.',
-              '',
-              `Latest run: ${RUN_URL}`,
-              '',
-              detail,
-            ].join('\n');
-
-            if (open) {
-              await github.rest.issues.update({ owner, repo, issue_number: open.number, body });
-            } else {
-              await github.rest.issues.create({ owner, repo, title: TITLE, body });
-            }

@@ -30,10 +30,17 @@
  * owner/member/collaborator, or that a maintainer linked from the sidebar.
  * A "Closes #N" in an outside PR's body cannot move anyone else's card.
  *
- * Health: every real run rewrites one board-only draft card titled
- * "Board sweep: ..." with the outcome and time, so a stopped or failing sweep
- * is visible on the board. The outcome is also a step output
- * (ok / degraded / failed) that the workflow's report job turns into an alert.
+ * Privacy: this runs in a public repo, so its Actions log is public while the
+ * board is not. The log gets one line of totals only: no issue or PR numbers,
+ * no statuses, no draft counts, no board settings. Every detail (each move,
+ * each problem, what was skipped) goes to one board-only draft card titled
+ * "Board sweep: ...", which only org members can see.
+ *
+ * Health: that card is rewritten on every run with the outcome and time, so a
+ * stopped or failing sweep is visible on the board. Dry runs write only that
+ * card. A run fails (red, and GitHub emails the workflow's owner) when card
+ * updates fail or the card itself cannot be written; other problems are
+ * "degraded": the run stays green and the card title says NEEDS ATTENTION.
  */
 
 const ORG = 'ExtendDB';
@@ -291,22 +298,40 @@ async function conflictingWorkflows(github) {
     .map((w) => w.name);
 }
 
-/** Rewrite (or create) the board's health card. Never throws. */
-async function writeHeartbeat({ github, core, project, heartbeat, outcome, summary, now, sleep }) {
-  const stamp = now.toISOString().slice(0, 16).replace('T', ' ');
-  const label = outcome === 'ok' ? 'OK' : 'NEEDS ATTENTION';
-  const title = `${HEARTBEAT_PREFIX} ${label}, last run ${stamp} UTC`;
+/**
+ * Rewrite (or create) the board's health card. Never throws. Errors are not
+ * logged in detail: the log is public.
+ */
+async function writeHeartbeat({ github, project, heartbeat, title, body, sleep }) {
   try {
     if (heartbeat) {
-      await withRetry(() => github.graphql(UPDATE_DRAFT, { d: heartbeat.id, t: title, b: summary }), sleep);
+      await withRetry(() => github.graphql(UPDATE_DRAFT, { d: heartbeat.id, t: title, b: body }), sleep);
     } else {
-      await withRetry(() => github.graphql(ADD_DRAFT, { p: project.id, t: title, b: summary }), sleep);
+      await withRetry(() => github.graphql(ADD_DRAFT, { p: project.id, t: title, b: body }), sleep);
     }
     return true;
-  } catch (err) {
-    core.warning(`Could not update the "${HEARTBEAT_PREFIX}" card: ${err.message}`);
+  } catch {
     return false;
   }
+}
+
+const MAX_CARD_LINES = 300;
+
+/** Private health-card body: every detail of the run. */
+function cardBody({ outcome, dryRun, moves, problems, skipped, cost, runUrl }) {
+  const lines = moves.slice(0, MAX_CARD_LINES);
+  return [
+    `Outcome: **${outcome}**${dryRun ? ' (dry run: no Status was changed)' : ''}`,
+    ...(runUrl ? [`Run: ${runUrl}`] : []),
+    '',
+    ...(problems.length ? ['**Problems**', ...problems.map((p) => `- ${p}`), ''] : []),
+    `**${dryRun ? 'Would move' : 'Moved'}** (${moves.length})`,
+    ...(lines.length ? lines.map((m) => `- ${m}`) : ['- none']),
+    ...(moves.length > lines.length ? [`- ...and ${moves.length - lines.length} more`] : []),
+    '',
+    `**Left alone**: ${Object.entries(skipped).map(([k, v]) => `${k} ${v}`).join(', ') || 'none'}`,
+    `Query cost: ${cost}`,
+  ].join('\n');
 }
 
 /**
@@ -380,10 +405,11 @@ async function sweep({ github, core, dryRun = false, runUrl = '', now = new Date
       problems.push(`Board workflows that also set Status are on: ${conflicts.join(', ')}. Turn them off.`);
     }
   } catch (err) {
-    core.info(`Could not read board workflows (${err.message}); skipping that check.`);
+    // Not a problem worth flagging: the token may simply lack that read.
   }
 
   let failed = 0;
+  const moves = [];
   if (!project.field) {
     problems.push(`No "${STATUS_FIELD}" single-select field on the board; nothing changed.`);
     changes.length = 0;
@@ -395,47 +421,51 @@ async function sweep({ github, core, dryRun = false, runUrl = '', now = new Date
       ch.to = null;
       continue;
     }
-    if (dryRun) {
-      core.info(`[dry run] ${ch.label}: ${ch.from} -> ${ch.to}`);
-      continue;
+    if (!dryRun) {
+      try {
+        await withRetry(
+          () => github.graphql(UPDATE, { p: project.id, i: ch.itemId, f: project.field.id, o: option.id }),
+          sleep,
+        );
+      } catch (err) {
+        failed += 1;
+        problems.push(`${ch.label}: update to ${ch.to} failed after ${RETRIES + 1} tries (${err.message}).`);
+        ch.to = null;
+        continue;
+      }
     }
-    try {
-      await withRetry(
-        () => github.graphql(UPDATE, { p: project.id, i: ch.itemId, f: project.field.id, o: option.id }),
-        sleep,
-      );
-      core.info(`${ch.label}: ${ch.from} -> ${ch.to}`);
-    } catch (err) {
-      failed += 1;
-      ch.to = null;
-      core.warning(`${ch.label}: update failed after ${RETRIES + 1} tries: ${err.message}`);
-    }
-  }
-  if (failed) problems.push(`${failed} card update(s) failed after retries.`);
-
-  const moved = changes.filter((c) => c.to).length;
-  const outcome = failed ? 'failed' : problems.length ? 'degraded' : 'ok';
-  for (const p of problems) core.warning(p);
-
-  const summary = [
-    `Outcome: **${outcome}**${dryRun ? ' (dry run)' : ''}`,
-    `${dryRun ? 'Would move' : 'Moved'} ${moved} card(s); query cost ${cost}.`,
-    `Left alone: ${Object.entries(skipped).map(([k, v]) => `${k} ${v}`).join(', ') || 'none'}.`,
-    ...(problems.length ? ['', 'Problems:', ...problems.map((p) => `- ${p}`)] : []),
-    ...(runUrl ? ['', `Run: ${runUrl}`] : []),
-  ].join('\n');
-  core.info(summary);
-
-  if (!dryRun && project) {
-    const ok = await writeHeartbeat({ github, core, project, heartbeat, outcome, summary, now, sleep });
-    if (!ok && outcome === 'ok') problems.push('Could not update the board health card.');
+    moves.push(`${ch.label}: ${ch.from} -> ${ch.to}`);
   }
 
-  const finalOutcome = failed ? 'failed' : problems.length ? 'degraded' : 'ok';
-  core.setOutput('outcome', finalOutcome);
-  core.setOutput('summary', summary);
-  if (finalOutcome === 'failed') core.setFailed(`${failed} card update(s) failed.`);
-  return { outcome: finalOutcome, problems, changes, skipped, failed };
+  // The health card is the only alert channel, so failing to write it fails the run.
+  let outcome = failed ? 'failed' : problems.length ? 'degraded' : 'ok';
+  const stamp = now.toISOString().slice(0, 16).replace('T', ' ');
+  const label = dryRun ? 'DRY RUN' : outcome === 'ok' ? 'OK' : 'NEEDS ATTENTION';
+  const cardWritten = project
+    ? await writeHeartbeat({
+      github,
+      project,
+      heartbeat,
+      title: `${HEARTBEAT_PREFIX} ${label}, last run ${stamp} UTC`,
+      body: cardBody({ outcome, dryRun, moves, problems, skipped, cost, runUrl }),
+      sleep,
+    })
+    : false;
+  if (!cardWritten) outcome = 'failed';
+
+  // Public log: totals only. Details are on the private card.
+  const issues = problems.length + (cardWritten ? 0 : 1);
+  core.info(
+    `Sweep ${outcome}${dryRun ? ' (dry run)' : ''}: ${moves.length} card(s) ${dryRun ? 'would move' : 'moved'}, `
+    + `${issues} problem(s), query cost ${cost}. Details are on the board's "${HEARTBEAT_PREFIX}" card.`,
+  );
+  if (outcome === 'degraded') core.warning(`${problems.length} problem(s); see the board's "${HEARTBEAT_PREFIX}" card.`);
+  if (outcome === 'failed') {
+    core.setFailed(cardWritten
+      ? `${failed} card update(s) failed; see the board's "${HEARTBEAT_PREFIX}" card.`
+      : `Could not write the board's "${HEARTBEAT_PREFIX}" card; check the GitHub App's install and permissions.`);
+  }
+  return { outcome, problems, changes, moves, skipped, failed, cardWritten };
 }
 
 module.exports = sweep;
