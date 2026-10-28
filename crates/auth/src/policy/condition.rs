@@ -53,7 +53,9 @@ pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext
                 // No Arn set check here, unlike `ForAnyValue`: a value that
                 // is not an ARN fails `compare_single` for every Arn operator,
                 // so the `all` below is already false for any non-empty
-                // policy value list.
+                // policy value list. With an empty list the negative form is
+                // true, as IAM evaluates it (simulate-custom-policy,
+                // 2026-10-28).
                 Some(vals) => {
                     if is_negative_operator(base_op) {
                         // Negative operators: each context value must satisfy the
@@ -330,7 +332,10 @@ fn is_arn_operator(op: &ConditionOperator) -> bool {
 /// `ForAnyValue:ArnNotEquals` does not pass on a non-matching pattern.
 /// `ForAllValues:` needs no such check: a value that is not an ARN fails
 /// `compare_single` against every policy value, so per-value evaluation
-/// already returns false there for any non-empty policy value list.
+/// already returns false there for any non-empty policy value list. With an
+/// empty policy value list `ForAllValues:` with a negative Arn operator is
+/// true and `ForAnyValue:` is false, as IAM evaluates them (measured
+/// 2026-10-28; pinned in `tests/arn_operators.rs`).
 fn arn_operator_sees_non_arn(op: &ConditionOperator, context_values: &[&str]) -> bool {
     is_arn_operator(op) && !context_values.iter().all(|cv| super::matcher::is_arn(cv))
 }

@@ -780,7 +780,9 @@ fn unwrap_if_exists(op: &ConditionOperator) -> (bool, &ConditionOperator) {
 /// it before comparing per value. ForAllValues needs no check, because a
 /// value that is not an ARN fails compare_single against every policy value
 /// (so `all` is false for a non-empty policy value list), and neither does
-/// the bare form, which is false on a multivalued key.
+/// the bare form, which is false on a multivalued key. With an empty policy
+/// value list, which the write paths accept, ForAllValues with a negative
+/// Arn operator is true and ForAnyValue is false, as IAM evaluates them.
 fn arn_operator_sees_non_arn(op: &ConditionOperator, context_values: &[&str]) -> bool {
     is_arn_operator(op) && !context_values.iter().all(|cv| is_arn(cv))
 }

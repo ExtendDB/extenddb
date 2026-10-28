@@ -484,6 +484,51 @@ fn arn_operators_empty_and_whitespace_value_match_neither() {
     }
 }
 
+/// An empty policy value list, which every write path accepts. Measured with
+/// `iam simulate-custom-policy` on 2026-10-28, two samples per cell, over
+/// `aws:PrincipalArn` holding [ARN, `notanarn`], one ARN, one non-ARN, and
+/// absent: `ForAllValues:` with a negative operator is true in every case,
+/// with or without `IfExists`; with a positive operator it is false on a
+/// present key and true on an absent one; `ForAnyValue:` is false in every
+/// case. The set-level rule for a non-ARN member does not reach the empty
+/// list: `ForAllValues:ArnNotEquals` with `[]` stays true over [V, `notanarn`].
+#[test]
+fn arn_operators_empty_policy_value_list() {
+    let present = TestContext::new().with("dynamodb:LeadingKeys", vec![V, "notanarn"]);
+    let absent_ctx = TestContext::new();
+    let key = "dynamodb:LeadingKeys";
+    for op in [ArnNotEquals, ArnNotLike] {
+        for form in [for_all(op.clone()), for_all(if_exists(op.clone()))] {
+            assert!(
+                evaluate_condition(&cond(form.clone(), key, vec![]), &present),
+                "{form:?} with [] over [V, notanarn]"
+            );
+            assert!(
+                evaluate_condition(&cond(form.clone(), key, vec![]), &absent_ctx),
+                "{form:?} with [] over an absent key"
+            );
+        }
+    }
+    for op in [ArnEquals, ArnLike] {
+        for form in [for_all(op.clone()), for_all(if_exists(op.clone()))] {
+            assert!(
+                !evaluate_condition(&cond(form.clone(), key, vec![]), &present),
+                "{form:?} with [] over [V, notanarn]"
+            );
+            assert!(
+                evaluate_condition(&cond(form.clone(), key, vec![]), &absent_ctx),
+                "{form:?} with [] over an absent key"
+            );
+        }
+    }
+    for op in [ArnEquals, ArnNotEquals, ArnLike, ArnNotLike] {
+        assert!(
+            !evaluate_condition(&cond(for_any(op.clone()), key, vec![]), &present),
+            "ForAnyValue:{op:?} with [] over [V, notanarn]"
+        );
+    }
+}
+
 /// Rows v6-noarn-prefix, v6-noarn-prefix-anypattern and v6-upper-arn-prefix:
 /// a six-field value whose first field is not `arn` is compared as an ARN.
 /// The positive operators fail on the first field; the negative ones hold.
