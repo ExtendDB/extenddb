@@ -83,7 +83,7 @@ Policy sources collected for evaluation:
 - **Auth before JSON parse**: SigV4 signature verification runs before the request body is parsed. Invalid signatures are rejected with constant-time comparison before any business logic executes.
 - **Concurrent policy fetching**: Identity policies, group policies, and permissions boundaries are fetched concurrently from PostgreSQL. All must succeed for evaluation to proceed.
 - **Constant-time rejection for inactive keys**: Inactive or expired access keys are rejected without timing differences that could reveal key existence.
-- **Policy document validation on write**: Policy documents are validated for JSON structure and size-capped (6,144 bytes) when attached via the management API. Invalid documents are rejected before storage.
+- **Policy document validation on write**: Policy documents are validated for JSON structure and size-capped (6,144 bytes) when attached via the management API. Invalid documents are rejected before storage. A `Version` other than the string `2012-10-17` or `2008-10-17` is refused; only a `2012-10-17` document expands policy variables.
 - **Expression depth and token limits**: Expression parsing enforces configurable depth (default 150) and token limits (default 4,096) to prevent resource exhaustion.
 
 ### Supported Condition Operators
@@ -117,7 +117,7 @@ Set operators and `IfExists` can be combined: `ForAllValues:StringEqualsIfExists
 | `dynamodb:FullTableScan` | Boolean | `true` for Scan operations |
 | `dynamodb:EnclosingOperation` | String | The enclosing operation for batch/transact sub-operations |
 
-Policy variables (e.g., `${aws:PrincipalTag/Team}`) are expanded in condition values.
+Policy variables (e.g., `${aws:PrincipalTag/Team}`) are expanded in condition values. The `${key, 'default'}` form expands to `default` when the request does not carry `key`. A multivalued key such as `dynamodb:LeadingKeys` is not expanded.
 
 ### Access Control Patterns
 
@@ -141,7 +141,7 @@ Resources are identified by ARN: `arn:aws:dynamodb:<region>:<account-id>:table/<
 
 - `Effect`: Allow, Deny
 - `Action` / `NotAction`: DynamoDB actions (e.g., `dynamodb:PutItem`, `dynamodb:*`)
-- `Resource` / `NotResource`: ARN patterns with wildcards
+- `Resource` / `NotResource`: ARN patterns with wildcards. In a `2012-10-17` document, `${key}` policy variables in the pattern are expanded from the request before matching (for example `arn:aws:dynamodb:*:*:table/${aws:username}`); a wildcard written after a variable still matches; `${key, 'default'}` falls back to `default`; `${*}`, `${?}` and `${$}` stand for literal characters; a variable whose key the request does not carry, or that names a multivalued key such as `dynamodb:LeadingKeys` that the request carries, makes the pattern match nothing (a written default is used only when the key is absent); a `:` inside a substituted value does not separate ARN fields. A `2008-10-17` document, or one with no `Version`, matches the pattern as written, as IAM does.
 - `Condition`: Full condition block support (see operators and keys above)
 
 ## Transport Security

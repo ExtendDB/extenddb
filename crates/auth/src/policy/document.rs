@@ -13,8 +13,10 @@ use std::fmt;
 /// A parsed IAM policy document.
 #[derive(Debug, Clone)]
 pub struct PolicyDocument {
-    /// Policy version string (e.g., "2012-10-17").
-    pub version: String,
+    /// The `Version` string (e.g., "2012-10-17"); `None` when the document has
+    /// no `Version` or its value is not a string. Writes accept only
+    /// `2012-10-17` and `2008-10-17`; a stored document may hold any value.
+    pub version: Option<String>,
     /// The policy statements.
     pub statements: Vec<Statement>,
 }
@@ -172,7 +174,7 @@ impl PolicyDocument {
             )));
         }
         let raw: Value = serde_json::from_str(json).map_err(|e| PolicyParseError(e.to_string()))?;
-        let version = raw["Version"].as_str().unwrap_or("2012-10-17").to_owned();
+        let version = raw["Version"].as_str().map(ToOwned::to_owned);
         let statements = parse_statements(&raw["Statement"])?;
         validate_statement_cidrs(&statements)?;
         Ok(Self {
@@ -185,17 +187,21 @@ impl PolicyDocument {
     /// a managed or boundary policy) and apply the checks the service applies
     /// only when a policy is written.
     ///
-    /// Everything `from_json` checks, plus the `Sid` charset. The `Sid` check
-    /// runs at write only: a `Sid` is a statement label that does not affect
-    /// evaluation, so a policy stored before this check existed must keep
-    /// parsing on the request path rather than fail the principal closed.
+    /// Everything `from_json` checks, plus the `Version` value and the `Sid`
+    /// charset. Both run at write only, so a policy stored before either check
+    /// existed keeps parsing on the request path rather than failing the
+    /// principal closed: a `Sid` is a label that does not affect evaluation,
+    /// and a stored document with another `Version` matches its `Resource`
+    /// patterns as written, as it did before.
     ///
     /// # Errors
     ///
-    /// Returns `PolicyParseError` if `from_json` rejects the document or a
-    /// statement `Sid` is outside the service's charset.
+    /// Returns `PolicyParseError` if `from_json` rejects the document, its
+    /// `Version` is not `2012-10-17` or `2008-10-17`, or a statement `Sid` is
+    /// outside the service's charset.
     pub fn from_json_for_write(json: &str) -> Result<Self, PolicyParseError> {
         let doc = Self::from_json(json)?;
+        super::variables::validate_version(json)?;
         validate_statement_sids(&doc.statements)?;
         Ok(doc)
     }
@@ -503,7 +509,7 @@ mod tests {
             }]
         }"#;
         let doc = PolicyDocument::from_json(json).unwrap();
-        assert_eq!(doc.version, "2012-10-17");
+        assert_eq!(doc.version.as_deref(), Some("2012-10-17"));
         assert_eq!(doc.statements.len(), 1);
         assert_eq!(doc.statements[0].effect, Effect::Allow);
         assert!(matches!(

@@ -109,6 +109,14 @@ fn strip_prefix_ci<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
 /// IAM absent-key semantics. The slice stays so a future global key the service
 /// begins populating before ExtendDB resolves it can be made to fail closed by
 /// listing it.
+///
+/// Two places read the set, through `is_unresolvable_key`: a condition whose
+/// key is listed fails closed (`condition::evaluate_condition_match`), and so
+/// does a `Resource` or `NotResource` pattern whose `${key}` variable names a
+/// listed key (`variables::resource_pattern_is_unresolvable`). A variable that
+/// names a listed key inside a condition value is left as written, as an
+/// unresolved variable is there, so listing a key does not make such a
+/// condition fail closed.
 const FAIL_CLOSED_GLOBAL_KEYS: &[&str] = &[];
 
 /// Whether an unresolved condition key must fail closed for the context that
