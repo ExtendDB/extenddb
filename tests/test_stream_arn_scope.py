@@ -37,6 +37,10 @@ partition's shape first, then the account, then the region.
   |----------------------------------------------------|-------------------------------------|
   | empty partition, in another account or the         | ValidationException                 |
   |   caller's                                         |   "Invalid StreamArn"               |
+  | empty service, in another account (21:51 UTC,      | ValidationException                 |
+  |   DescribeStream and GetShardIterator)             |   "Invalid StreamArn"               |
+  | empty service, in the caller's account (21:51      | ValidationException                 |
+  |   UTC, DescribeStream and GetShardIterator)        |   "Invalid StreamArn"               |
   | another account with an empty region, with         | AccessDeniedException               |
   |   us-west-2, or with every other field the         |   "Access is denied"                |
   |   caller's                                         |                                     |
@@ -241,6 +245,8 @@ def _variants(stream_arn: str, region: str, account_id: str) -> dict[str, str]:
     v["region_empty"] = stream_arn.replace(f":{region}:", "::", 1)
     v["account_other_and_partition_empty"] = v["account_other"].replace("arn:aws:", "arn::", 1)
     v["account_other_and_region_empty"] = v["account_other"].replace(f":{region}:", "::", 1)
+    v["service_empty"] = stream_arn.replace(":dynamodb:", "::", 1)
+    v["account_other_and_service_empty"] = v["account_other"].replace(":dynamodb:", "::", 1)
     return v
 
 
@@ -364,8 +370,8 @@ class TestStreamArnScope:
                 self._assert_err(err, "AccessDeniedException", ACCESS_IS_DENIED, (who, "account_empty", op))
 
     def test_partition_then_account_then_region(self):
-        """The seven DescribeStream cells measured on 2026-10-28 (the order
-        table above): an empty partition is "Invalid StreamArn" even in another
+        """The order cells measured on 2026-10-28 (the order table above): an
+        empty partition or service is "Invalid StreamArn" even in another
         account; another account is "Access is denied" whatever the region
         field holds; the caller's account with an empty or another region is
         "Invalid StreamArn". Measured as an admin. GetShardIterator takes the
@@ -375,6 +381,8 @@ class TestStreamArnScope:
         cells = (
             ("account_other_and_partition_empty", "ValidationException", INVALID_STREAM_ARN),
             ("partition_empty", "ValidationException", INVALID_STREAM_ARN),
+            ("account_other_and_service_empty", "ValidationException", INVALID_STREAM_ARN),
+            ("service_empty", "ValidationException", INVALID_STREAM_ARN),
             ("account_other_and_region_empty", "AccessDeniedException", ACCESS_IS_DENIED),
             ("account_other_and_region_other", "AccessDeniedException", ACCESS_IS_DENIED),
             ("account_other", "AccessDeniedException", ACCESS_IS_DENIED),

@@ -175,20 +175,23 @@ mod tests {
 
     type Check = fn(Result<(), DynamoDbError>, &str, &str);
 
-    /// The seven StreamArn cells measured live on DescribeStream on 2026-10-28
-    /// (the order table in the module docstring of
-    /// `tests/test_stream_arn_scope.py`), each with the answer it expects: an
-    /// empty partition is "Invalid StreamArn" even in another account, another
-    /// account is "Access is denied" whatever the region field holds, and the
-    /// caller's account with an empty or another region is "Invalid StreamArn".
-    fn measured_order() -> [(String, Check); 7] {
+    /// The nine StreamArn cells measured live on 2026-10-28 (the order table in
+    /// the module docstring of `tests/test_stream_arn_scope.py`), each with the
+    /// answer it expects: an empty partition or service is "Invalid StreamArn"
+    /// even in another account, another account is "Access is denied" whatever
+    /// the region field holds, and the caller's account with an empty or
+    /// another region is "Invalid StreamArn".
+    fn measured_order() -> [(String, Check); 9] {
         let other = |arn: String| arn.replace(A, "111111111111");
         let no_partition = STREAM.replace("arn:aws:", "arn::");
+        let no_service = STREAM.replace(":dynamodb:", "::");
         let no_region = STREAM.replace("us-east-1", "");
         let west = STREAM.replace("us-east-1", "us-west-2");
         [
             (other(no_partition.clone()), assert_invalid_stream_arn),
             (no_partition, assert_invalid_stream_arn),
+            (other(no_service.clone()), assert_invalid_stream_arn),
+            (no_service, assert_invalid_stream_arn),
             (other(no_region.clone()), assert_access_denied),
             (other(west.clone()), assert_access_denied),
             (other(STREAM.to_owned()), assert_access_denied),
