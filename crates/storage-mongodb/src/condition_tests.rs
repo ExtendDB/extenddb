@@ -318,6 +318,11 @@ fn map_members_and_list_elements_use_the_typed_fields() {
         exists(&["l", "0"]),
         doc! { "item_data.l.L.0": { "$exists": true } }
     );
+    // A list inside a list: each index gets its own `L` field.
+    assert_eq!(
+        exists(&["l", "2", "1"]),
+        doc! { "item_data.l.L.2.L.1": { "$exists": true } }
+    );
     assert_eq!(exists(&["m"]), doc! { "item_data.m": { "$exists": true } });
 }
 

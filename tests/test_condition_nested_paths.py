@@ -10,10 +10,11 @@ and 20:52 UTC (us-east-1), each request twice: a holding condition applies the
 write and a failing one answers ConditionalCheckFailedException.
 
 The item also holds ``t``, a map whose members are named ``M``, ``L``, ``S``
-and ``0``. The first three are type tags, the names of the fields a stored
-value sits under, and the last reads as a list index in a MongoDB path. The
-rows in DERIVED_HOLDS were not measured on the service; their expected
-answers come from ExtendDB's in-Rust condition evaluator.
+and ``0``, and ``g = ["g0", "g1", ["g20", "g21"]]``, a list inside a list.
+The first three member names of ``t`` are type tags, the names of the fields
+a stored value sits under, and the last reads as a list index in a MongoDB
+path. The rows in DERIVED_HOLDS were not measured on the service; their
+expected answers come from ExtendDB's in-Rust condition evaluator.
 
 On MongoDB, a condition on a table with no index and no stream is compiled to
 a MongoDB filter while the server's cache records that the table has no index.
@@ -47,6 +48,7 @@ NAMES = {
     "#L": "L",
     "#S": "S",
     "#zero": "0",
+    "#g": "g",
 }
 VALUES = {
     ":x": {"S": "z"},
@@ -64,6 +66,7 @@ VALUES = {
     ":tl": {"S": "tl"},
     ":ts": {"S": "ts"},
     ":t0": {"S": "t0"},
+    ":g21": {"S": "g21"},
 }
 
 ITEM = {
@@ -84,6 +87,7 @@ ITEM = {
             "0": {"S": "t0"},
         }
     },
+    "g": {"L": [{"S": "g0"}, {"S": "g1"}, {"L": [{"S": "g20"}, {"S": "g21"}]}]},
 }
 
 HOLDS = [
@@ -116,6 +120,7 @@ DERIVED_HOLDS = [
     "#t.#L = :tl",
     "#t.#S = :ts",
     "#t.#zero = :t0",
+    "#g[2][1] = :g21",
 ]
 
 
