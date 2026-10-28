@@ -14,13 +14,15 @@ as the ADD removes its attribute (2026-10-26 at 00:55 UTC).
 
 On MongoDB an unconditional update that asks for no old values and no
 consumed capacity, on a table with no index and no stream, is built as a
-native update while the server records that the table has no index. A write
-on the session-scoped read-modify-write path renews that record and it lasts
-60 seconds from the last such write; a native update does not renew it. With
-a numeric ADD the native update is an aggregation pipeline, where a `$`
-string reads as a field path. Each test gets a table of its own and writes
-an item before its update. That write takes the session-scoped path and
-records that the table has no index, so the update runs as the pipeline.
+native update while the server records that the table has no index. The
+first write on the session-scoped read-modify-write path that finds no such
+record, or one older than 60 seconds, reads the index catalog and records the
+answer; no write renews the record during its 60 seconds. With a numeric ADD
+the native update is an aggregation pipeline, where a `$` string reads as a
+field path. Each test gets a table of its own and writes an item before its
+update. That write takes the session-scoped path and records that the table
+has no index, so the update runs as a native update, which is the pipeline
+when it has the ADD.
 
 Dual-target against Amazon DynamoDB and extenddb.
 """

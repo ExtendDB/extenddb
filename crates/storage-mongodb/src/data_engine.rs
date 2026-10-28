@@ -4435,14 +4435,16 @@ transaction_read_concern = "majority""#,
     fn native_update_pipeline_sets_each_value_as_a_literal() {
         let names = std::collections::HashMap::from([
             ("s".to_owned(), "s".to_owned()),
+            ("p".to_owned(), "p".to_owned()),
             ("n".to_owned(), "n".to_owned()),
         ]);
         let values = std::collections::HashMap::from([
             ("dollar".to_owned(), AttributeValue::S("$item_data".into())),
+            ("plain".to_owned(), AttributeValue::S("x".into())),
             ("one".to_owned(), AttributeValue::N("1".into())),
         ]);
         let maps = ExpressionMaps::new(names, values);
-        let tokens = expression::tokenize("SET #s = :dollar ADD #n :one").unwrap();
+        let tokens = expression::tokenize("SET #s = :dollar, #p = :plain ADD #n :one").unwrap();
         let actions = expression::parse_update(&tokens).unwrap();
 
         let Some(NativeUpdate::Pipeline { pipeline, .. }) =
@@ -4451,7 +4453,15 @@ transaction_read_concern = "majority""#,
             panic!("a SET with a numeric ADD builds a pipeline update");
         };
         let stage = pipeline[0].get_document("$set").unwrap();
+        // Every SET value is wrapped, not only the ones whose text reads as a
+        // field path: a plain string under a `$literal` stays a string, and
+        // without the wrapper a later read of a non-string attribute fails.
         let want = doc! { "$literal": { "S": "$item_data" } };
         assert_eq!(stage.get("item_data.s"), Some(&bson::Bson::Document(want)));
+        let want_plain = doc! { "$literal": { "S": "x" } };
+        assert_eq!(
+            stage.get("item_data.p"),
+            Some(&bson::Bson::Document(want_plain))
+        );
     }
 }
