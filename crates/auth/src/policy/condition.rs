@@ -436,7 +436,10 @@ fn compare_single(op: &ConditionOperator, context_value: &str, value: &Condition
 /// matches nothing. `Null` does not expand a policy variable. IAM reads a value
 /// written as one as a boolean, `false` unless the text is `true` ignoring
 /// case, so the key must be present whatever the variable's value or default
-/// (measured with the IAM policy simulator, cells N1a to N1f).
+/// (measured with the IAM policy simulator, cells N1a to N1f). The cells are
+/// `2012-10-17` documents; a `2008-10-17` or no-`Version` document is read the
+/// same way, since IAM reads the text without expanding it whatever the
+/// `Version` (not measured).
 fn null_holds(policy_value: &str, key_absent: bool) -> bool {
     if policy_value.contains("${") {
         return policy_value.eq_ignore_ascii_case("true") == key_absent;
@@ -449,7 +452,9 @@ fn null_holds(policy_value: &str, key_absent: bool) -> bool {
 /// policy variable. IAM reads a value written as one as a boolean, `false`
 /// unless the text is `true` ignoring case, so it matches a request value that
 /// is not `true` whatever the variable's value (measured with the IAM policy
-/// simulator, cells N2a to N2e).
+/// simulator, cells N2a to N2e). The cells are `2012-10-17` documents; a
+/// `2008-10-17` or no-`Version` document is read the same way, since IAM reads
+/// the text without expanding it whatever the `Version` (not measured).
 fn bool_matches(context_value: &str, policy_value: &str) -> bool {
     if policy_value.contains("${") {
         return context_value.eq_ignore_ascii_case("true")

@@ -387,7 +387,7 @@ migration is required.
 
 ### v0.1.15: IAM policy variables in condition values
 
-**What changed.** Policy variables in condition values now follow IAM's rules, each measured with the IAM policy simulator (issue #534). Only a `2012-10-17` document expands them, and in that document only the string and ARN operators do. Decisions change for stored policies in these cases:
+**What changed.** Policy variables in condition values now follow IAM's rules (issue #534), as measured with the IAM policy simulator for the string, ARN, numeric, `Bool` and `Null` operators in `2012-10-17` documents and for `StringEquals` in `2008-10-17` and no-`Version` documents; the date and address operators follow the numeric case. Only a `2012-10-17` document expands a variable, and in that document only the string and ARN operators do. Decisions change for stored policies in these cases:
 
 1. A `2008-10-17` document, or one with no `Version`, no longer expands a variable in a condition value: `${aws:username}` is the literal text. This covers user, group and role policies, permissions boundaries, session policies and role trust policies. In such a document a `Deny` with the condition `StringEquals` on `aws:ResourceTag/owner` and the value `${aws:username}` no longer applies to the caller's own table, and the same `Deny` written with `StringNotEquals` now applies to it.
 2. `${*}`, `${?}` and `${$}` now stand for the characters `*`, `?` and `$`, and the result is not expanded again. Before, the escape was compared as its text, so `StringEquals` with the value `${*}` matched the text `${*}`; now it matches `*`. In `StringLike` and `ArnLike` the escaped character matches only itself, while a `*` or `?` written in the policy is still a wildcard.
