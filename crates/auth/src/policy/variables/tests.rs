@@ -60,6 +60,8 @@ fn only_version_2012_expands_variables() {
 
 #[test]
 fn a_write_refuses_a_version_that_is_not_one_of_the_two_values() {
+    // The rule and its message are ExtendDB's own. Whether IAM refuses these
+    // values at write, and with what message, was not measured.
     let stmt = r#""Statement":[{"Effect":"Allow","Action":"dynamodb:*","Resource":"*"}]"#;
     for version in [
         r#""2012-10-18""#,

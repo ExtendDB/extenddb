@@ -61,8 +61,8 @@ impl PolicyDocument {
 /// document with no error.
 /// `PolicyDocument::from_json_for_write` calls this, so a stored document with
 /// another value keeps parsing. A document with no `Version` passes here,
-/// because each write path refuses it first. The message IAM returns for such
-/// a document was not measured.
+/// because each write path refuses it first. Whether IAM refuses such a
+/// document at write, and with what message, was not measured.
 pub(super) fn validate_version(json: &str) -> Result<(), PolicyParseError> {
     let raw: Value = serde_json::from_str(json).map_err(|e| PolicyParseError(e.to_string()))?;
     match raw.get("Version") {

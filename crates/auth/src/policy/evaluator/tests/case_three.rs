@@ -8,6 +8,11 @@
 //! `NotResource` of a `2012-10-17` document; a `2008-10-17` or no-`Version`
 //! document matches such a pattern as written. A variable naming the key in a
 //! condition value is compared as written, with or without a default.
+//!
+//! Every expectation here is an ExtendDB rule with no service measurement:
+//! the service has a value for such a key, so there is no service case to
+//! compare with, and no key is listed in `FAIL_CLOSED_GLOBAL_KEYS` in this
+//! build.
 
 use super::*;
 

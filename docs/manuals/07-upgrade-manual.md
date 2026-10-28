@@ -347,27 +347,36 @@ issue #533). Three decisions change for stored policies:
    `${dynamodb:LeadingKeys}` now grants a caller tagged `team=blue` whose request
    has the leading key `blue`, where it did not, and a `Deny` with that condition
    now applies to the same request.
-3. A condition value written as `${key, 'default'}` now expands to `default` when
-   the request does not carry `key`. Before, the whole text was compared.
+3. A condition value written as `${key, 'default'}` now expands to the request's
+   value for `key`, or to `default` when the request does not carry `key`.
+   Before, the whole text was compared as written. For example, an `Allow` with
+   the condition `StringEquals` on `aws:ResourceTag/owner` and the value
+   `${aws:username, 'anon'}` now grants `alice` a table tagged `owner=alice`, and
+   a caller with no user name a table tagged `owner=anon`; before, it granted
+   neither.
 
 **Policy writes check `Version`.** Writing a user, group or role policy or a
 permissions boundary, through the management API or the console, now refuses a
 document whose `Version` is not the string `2012-10-17` or `2008-10-17`, for
 example `"2012-10-18"` or the number `20121017`, with `Invalid policy document:
-policy parse error: invalid Version ...`. A document already stored with such a
-value keeps evaluating, with its `Resource` patterns matched as written. A
-session policy passed to `AssumeRole` is not checked.
+policy parse error: invalid Version ...`, or for a permissions boundary `Invalid
+permissions boundary document: policy parse error: invalid Version ...`. A
+document already stored with such a value keeps evaluating, with its `Resource`
+patterns matched as written. A session policy passed to `AssumeRole` is checked
+only for its `Version` and `Statement` members.
 
 **Who is affected.** Any deployment with a stored policy whose `Resource`,
 `NotResource` or condition values contain `${`: inline user, group and role
 policies, permissions boundaries and session policies, and, for the two condition
 value changes, role trust policies. Search the stored policies for `${`
 (`extenddb manage list-user-policies`, `list-group-policies` and
-`list-role-policies`) and check each match against the cases above before
-upgrading, in particular an `Allow` that now grants (a `Resource` pattern with a
-variable, or a negated condition whose value names a multivalued key), a `Deny`
-that now applies (the same two forms), and a `Deny NotResource` that now spares
-a table. No catalog migration is required.
+`list-role-policies` print inline policies, `get-user-boundary` and
+`get-role-boundary` permissions boundaries, and `list-roles` trust policies) and
+check each match against the cases above before upgrading, in particular an
+`Allow` that now grants (a `Resource` pattern with a variable, or a negated
+condition whose value names a multivalued key), a `Deny` that now applies (the
+same two forms), and a `Deny NotResource` that now spares a table. No catalog
+migration is required.
 
 ### v0.1.14 LeadingKeys now enforced on Query, batch and transaction operations
 
