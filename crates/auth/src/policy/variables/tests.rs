@@ -317,43 +317,145 @@ fn unclosed_brace_is_literal_text() {
 
 // --- expand_condition_value ---
 
+fn text_of(value: &ConditionValue) -> Option<&str> {
+    value.text()
+}
+
 #[test]
 fn condition_value_expands_variable_and_default() {
     let ctx = team_blue();
+    let v = expand_condition_value("team-${aws:PrincipalTag/team}", true, &ctx);
+    assert_eq!(text_of(&v), Some("team-blue"));
+    assert!(matches!(v, ConditionValue::Expanded { .. }));
     assert_eq!(
-        expand_condition_value("team-${aws:PrincipalTag/team}", &ctx),
-        "team-blue"
+        text_of(&expand_condition_value(
+            "${aws:username, 'anon'}",
+            true,
+            &ctx
+        )),
+        Some("anon")
     );
     assert_eq!(
-        expand_condition_value("${aws:username, 'anon'}", &ctx),
-        "anon"
-    );
-    assert_eq!(
-        expand_condition_value("${aws:PrincipalTag/team, 'none'}", &ctx),
-        "blue"
+        text_of(&expand_condition_value(
+            "${aws:PrincipalTag/team, 'none'}",
+            true,
+            &ctx
+        )),
+        Some("blue")
     );
 }
 
 #[test]
-fn condition_value_leaves_unresolved_and_escapes_literal() {
+fn condition_value_unresolved_variable_matches_nothing() {
     let ctx = Ctx::empty();
+    let v = expand_condition_value("${aws:username}", true, &ctx);
+    assert_eq!(v, ConditionValue::Unresolved);
+    assert_eq!(v.text(), None);
+    assert!(!v.wildcard_matches("${aws:username}"));
+    assert!(!v.wildcard_matches("anything"));
+    assert!(!v.arn_matches(BLUE));
+    // One unresolved variable among resolved text is still unresolved.
     assert_eq!(
-        expand_condition_value("${aws:username}", &ctx),
-        "${aws:username}"
+        expand_condition_value("a-${aws:username}-b", true, &ctx),
+        ConditionValue::Unresolved
     );
+}
+
+#[test]
+fn condition_value_escapes_expand_to_literal_characters() {
+    let ctx = Ctx::empty();
+    let v = expand_condition_value("a${*}b${?}c${$}", true, &ctx);
+    assert_eq!(text_of(&v), Some("a*b?c$"));
+    // The escaped characters are literal for the Like operators.
+    assert!(v.wildcard_matches("a*b?c$"));
+    assert!(!v.wildcard_matches("aXbYc$"));
+    // The result of an escape is not expanded again.
+    let v = expand_condition_value("a${$}{x}", true, &ctx);
+    assert_eq!(text_of(&v), Some("a${x}"));
+    assert!(matches!(v, ConditionValue::Expanded { .. }));
+}
+
+#[test]
+fn condition_value_written_wildcards_stay_wildcards_when_expanded() {
+    let ctx = team_blue();
+    // `*` written in the policy is a wildcard; `*` from an escape is not.
+    let v = expand_condition_value("${aws:PrincipalTag/team}-*${*}", true, &ctx);
+    assert_eq!(text_of(&v), Some("blue-**"));
+    assert!(v.wildcard_matches("blue-anything*"));
+    assert!(v.wildcard_matches("blue-*"));
+    assert!(!v.wildcard_matches("blue-anything"));
+    // ArnLike: a written `*` in the resource field spans `/`, an escaped one
+    // is the character.
+    let v = expand_condition_value(
+        "arn:aws:dynamodb:*:*:table/${aws:PrincipalTag/team}/*${*}",
+        true,
+        &ctx,
+    );
+    assert!(v.arn_matches("arn:aws:dynamodb:us-east-1:1:table/blue/index/x*"));
+    assert!(!v.arn_matches("arn:aws:dynamodb:us-east-1:1:table/blue/index/x"));
+    // A `:` or `*` inside a variable value stays literal in its field.
+    let ctx = Ctx::empty().with(TEAM, &["a*b"]);
+    let v = expand_condition_value("${aws:PrincipalTag/team}", true, &ctx);
+    assert!(v.wildcard_matches("a*b"));
+    assert!(!v.wildcard_matches("aXb"));
+}
+
+#[test]
+fn condition_value_is_literal_without_expansion_or_without_variables() {
+    let ctx = team_blue();
+    // A document that does not expand compares the text as written, and its
+    // `*` and `?` are wildcards.
+    let v = expand_condition_value("${aws:PrincipalTag/team}", false, &ctx);
     assert_eq!(
-        expand_condition_value("a${*}b${?}c${$}", &ctx),
-        "a${*}b${?}c${$}"
+        v,
+        ConditionValue::Literal("${aws:PrincipalTag/team}".to_owned())
     );
-    assert_eq!(expand_condition_value("plain", &ctx), "plain");
-    assert_eq!(expand_condition_value("${open", &ctx), "${open");
+    let v = expand_condition_value("a${*}", false, &ctx);
+    assert_eq!(text_of(&v), Some("a${*}"));
+    assert!(v.wildcard_matches("a${*}"));
+    assert!(v.wildcard_matches("a${anything}"));
+    assert!(!v.wildcard_matches("a*"));
+    // No `${` at all: literal whatever the document.
+    assert_eq!(
+        expand_condition_value("plain", true, &ctx),
+        ConditionValue::Literal("plain".to_owned())
+    );
+    let v = expand_condition_value("a*", true, &ctx);
+    assert!(v.wildcard_matches("abc"));
+    assert!(expand_condition_value("arn:aws:dynamodb:*:*:table/*", true, &ctx).arn_matches(BLUE));
+    // A `${` with no closing brace is plain text.
+    assert_eq!(
+        text_of(&expand_condition_value("${open", true, &ctx)),
+        Some("${open")
+    );
 }
 
 #[test]
 fn condition_value_present_key_without_values_is_empty() {
     let ctx = Ctx::empty().with(TEAM, &[]);
     assert_eq!(
-        expand_condition_value("x${aws:PrincipalTag/team}y", &ctx),
-        "xy"
+        text_of(&expand_condition_value(
+            "x${aws:PrincipalTag/team}y",
+            true,
+            &ctx
+        )),
+        Some("xy")
     );
+}
+
+#[test]
+fn arn_value_lacks_fields_counts_only_colons_written_outside_references() {
+    assert!(arn_value_lacks_fields("${aws:ResourceTag/owner}"));
+    // Four written `:` and one inside the reference.
+    assert!(arn_value_lacks_fields(
+        "arn:aws:iam::${aws:PrincipalTag/acct}"
+    ));
+    assert!(!arn_value_lacks_fields(
+        "arn:aws:iam::123456789012:user/${aws:username}"
+    ));
+    assert!(!arn_value_lacks_fields(
+        "arn:aws:iam::${aws:PrincipalAccount}:user/alice"
+    ));
+    // No variable: the value is compared as written.
+    assert!(!arn_value_lacks_fields("user/alice"));
 }

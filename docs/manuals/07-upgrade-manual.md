@@ -340,17 +340,24 @@ issue #533). Three decisions change for stored policies:
    NotResource` written that way no longer grants the team's table.
 2. A condition value naming a multivalued key, such as `${dynamodb:LeadingKeys}`
    or `${aws:TagKeys}` in a trust policy, is no longer expanded to the key's first
-   value; the text is compared as written. Under a positive operator such as
-   `StringEquals` the condition no longer matches, and under a negated operator
+   value. In a `2012-10-17` document the value now matches nothing when the
+   request carries the key, and a written default is used only when the request
+   does not carry it; a `2008-10-17` document, or one with no `Version`, compares
+   the text as written (item 1 of the next entry). Under a positive operator such
+   as `StringEquals` the condition no longer matches, and under a negated operator
    such as `StringNotEquals` it now matches. For example, an `Allow` with the
    condition `StringNotEquals` on `aws:PrincipalTag/team` and the value
    `${dynamodb:LeadingKeys}` now grants a caller tagged `team=blue` whose request
    has the leading key `blue`, where it did not, and a `Deny` with that condition
    now applies to the same request.
-3. A condition value written as `${key, 'default'}` now expands to the request's
-   value for `key`, or to `default` when the request does not carry `key`.
-   Before, the whole text was compared as written. For example, an `Allow` with
-   the condition `StringEquals` on `aws:ResourceTag/owner` and the value
+3. A condition value written as `${key, 'default'}` in a `2012-10-17` document
+   now expands, under the string and ARN operators, to the request's value for
+   `key`, or to `default` when the request does not carry `key`. `Null` and
+   `Bool` read such a value as the boolean `false` whatever the default (item 6
+   of the next entry), and the numeric and date operators compare it as written,
+   as does a `2008-10-17` document or one with no `Version`. Before, the whole
+   text was compared as written. For example, an `Allow` with the condition
+   `StringEquals` on `aws:ResourceTag/owner` and the value
    `${aws:username, 'anon'}` now grants `alice` a table tagged `owner=alice`, and
    a caller with no user name a table tagged `owner=anon`; before, it granted
    neither.
@@ -377,6 +384,22 @@ check each match against the cases above before upgrading, in particular an
 condition whose value names a multivalued key), a `Deny` that now applies (the
 same two forms), and a `Deny NotResource` that now spares a table. No catalog
 migration is required.
+
+### v0.1.15: IAM policy variables in condition values
+
+**What changed.** Policy variables in condition values now follow IAM's rules (issue #534), as measured with the IAM policy simulator for the string, ARN, numeric, `Bool` and `Null` operators in `2012-10-17` documents and for `StringEquals` in `2008-10-17` and no-`Version` documents; the date and address operators follow the numeric case. Only a `2012-10-17` document expands a variable, and in that document only the string and ARN operators do. Decisions change for stored policies in these cases:
+
+1. A `2008-10-17` document, or one with no `Version`, no longer expands a variable in a condition value: `${aws:username}` is the literal text. This covers user, group and role policies, permissions boundaries, session policies and role trust policies. In such a document a `Deny` with the condition `StringEquals` on `aws:ResourceTag/owner` and the value `${aws:username}` no longer applies to the caller's own table, and the same `Deny` written with `StringNotEquals` now applies to it.
+2. `${*}`, `${?}` and `${$}` now stand for the characters `*`, `?` and `$`, and the result is not expanded again. Before, the escape was compared as its text, so `StringEquals` with the value `${*}` matched the text `${*}`; now it matches `*`. In `StringLike` and `ArnLike` the escaped character matches only itself, while a `*` or `?` written in the policy is still a wildcard.
+3. A `*` or `?` that comes from a variable value is now matched as that character in `StringLike` and `ArnLike`, where it was a wildcard. A `Deny` with `StringLike` on `aws:ResourceTag/owner` and the value `${aws:PrincipalTag/team}` no longer applies to a caller tagged `team=a*` on a table tagged `owner=abc`.
+4. A variable with no default whose key the request does not carry now matches nothing. Before, its text `${...}` was compared, so the decision changes only for the request values that text matched: a positive operator such as `StringEquals` no longer matches them, and a negated operator such as `StringNotEquals` now holds for them. Under `StringEquals` those are the request values equal to the text. Under `StringLike` or `ArnLike`, when a `*` or `?` is also written in the value, such as `${aws:username}*`, they are every request value the text matches as a pattern.
+5. A numeric or date value written as a variable is no longer expanded and is compared as written, which matches no request value. A `Deny` with `NumericGreaterThan` on `aws:MultiFactorAuthAge` and the value `${aws:PrincipalTag/maxAge}`, or with `DateGreaterThan` on `aws:CurrentTime` and the value `${aws:PrincipalTag/expiry}`, no longer applies. Outside role trust policies an IP address value written as a variable does not parse, as before, because it is not a CIDR. In a role trust policy it is no longer expanded and matches no request.
+6. A `Bool` or `Null` value written as a variable is no longer replaced by the variable's value. IAM reads the text as the boolean `false` whatever the variable holds, and ExtendDB now does the same: `Null` holds when the key is present, and `Bool` holds when the request value is `false`. A `Deny` with `Null` on `aws:PrincipalTag/team` and the value `${aws:PrincipalTag/flag}` now applies to every caller that has a `team` tag, and a `Deny` with `Bool` on `aws:SecureTransport` and the same value now applies to every request made without TLS. Before, both decisions followed the value of the caller's `flag` tag, and with no `flag` tag neither `Deny` applied.
+7. In an `Arn*` operator, a value that contains `${` needs the five `:` that separate an ARN's six fields written in the policy, as in `arn:aws:iam::123456789012:user/${aws:username}`. The IAM policy simulator refuses a `2012-10-17` policy whose value has fewer, such as `${aws:ResourceTag/blockedPrincipal}`, and ExtendDB now fails that condition closed in a document of any `Version`, since IAM checks a value's fields whatever the `Version`. A `Deny` with it applies to every request its action, resource and other conditions match, and an `Allow` with it grants nothing. Before, the substituted ARN was compared as a whole, so such a `Deny` applied only to the principal the tag named, and an `Allow` written with `ArnNotLike` granted every other principal. Only the `ArnLike` `Deny` and the `ArnNotLike` `Allow` in `2012-10-17` documents were sent to the simulator; the `ArnEquals` and `ArnNotEquals` forms, the forms with a set qualifier or `IfExists`, and `2008-10-17` and no-`Version` policies follow the same rule without a measurement. To compare a principal with an ARN stored whole in a tag, use `StringEquals`, which compares the expanded text in a `2012-10-17` document.
+
+**Who is affected.** Any deployment with a stored policy whose condition values contain `${`: user, group and role policies, permissions boundaries, session policies and role trust policies. Search the stored policies for `${` (`extenddb manage list-user-policies`, `list-group-policies` and `list-role-policies` print inline policies, `get-user-boundary` and `get-role-boundary` permissions boundaries, and `list-roles` trust policies) and check each match against the cases above before upgrading. The shapes that change are a variable in a `2008-10-17` or no-`Version` document, an escape, a variable under `StringLike` or `ArnLike`, a string or ARN value with a variable that has no default and whose key a request may not carry, a numeric, date, `Bool` or `Null` value written as a variable, and an `Arn*` value that contains `${` and has fewer than five written `:`. No catalog migration is required.
+
+---
 
 ### v0.1.14 LeadingKeys now enforced on Query, batch and transaction operations
 

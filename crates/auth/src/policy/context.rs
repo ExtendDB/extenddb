@@ -114,9 +114,9 @@ fn strip_prefix_ci<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
 /// key is listed fails closed (`condition::evaluate_condition_match`), and so
 /// does a `Resource` or `NotResource` pattern whose `${key}` variable names a
 /// listed key (`variables::resource_pattern_is_unresolvable`). A variable that
-/// names a listed key inside a condition value is left as written, as an
-/// unresolved variable is there, so listing a key does not make such a
-/// condition fail closed.
+/// names a listed key inside a condition value of a `2012-10-17` document
+/// makes the value match nothing, as an unresolved variable does there, so
+/// listing a key does not make such a condition fail closed.
 const FAIL_CLOSED_GLOBAL_KEYS: &[&str] = &[];
 
 /// Whether an unresolved condition key must fail closed for the context that

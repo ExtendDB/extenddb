@@ -284,12 +284,22 @@ fn policy_variable_no_expansion_needed() {
 }
 
 #[test]
-fn policy_variable_unresolvable_left_literal() {
+fn policy_variable_unresolvable_matches_nothing() {
     let ctx = TestContext::new().with("k", vec!["${aws:PrincipalTag/Missing}"]);
-    // Unresolvable variable stays literal — matches if context has the literal
-    assert!(evaluate_condition(
+    // A variable whose key the request does not carry matches nothing, even
+    // the literal text of the variable (measured, issue #534 cell E9).
+    assert!(!evaluate_condition(
         &cond(
             ConditionOperator::StringEquals,
+            "k",
+            vec!["${aws:PrincipalTag/Missing}"]
+        ),
+        &ctx
+    ));
+    // The negated operator holds against it (cell E9b).
+    assert!(evaluate_condition(
+        &cond(
+            ConditionOperator::StringNotEquals,
             "k",
             vec!["${aws:PrincipalTag/Missing}"]
         ),

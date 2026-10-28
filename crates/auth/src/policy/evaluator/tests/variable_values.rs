@@ -4,14 +4,18 @@
 //! Text that comes from a variable value or a default: it is not expanded a
 //! second time, and a `*` or `?` in it is not a wildcard. Also the two
 //! condition-value rules, the `${key, 'default'}` form and no expansion for a
-//! multivalued key, under the set operators, `IfExists` and `Null`.
+//! multivalued key, under the set operators and `IfExists`, and the same two
+//! value shapes under `Null`, which expands no variable and reads the value
+//! as the boolean `false`.
 //!
-//! None of these expectations was measured on its own. Each follows from a
+//! The `Null` cases have the shapes of cells N1f and N1a, measured with the
+//! IAM policy simulator on 2026-10-28 (`condition_variables_operators.rs`).
+//! No other expectation here was measured on its own. Each follows from a
 //! rule the PR #535 body table measured with the IAM policy simulator on
 //! 2026-10-24: text from a value is matched literally (`team=bl*` matches only
 //! `table/bl*`), and a condition value naming `dynamodb:LeadingKeys` is not
 //! expanded under `StringEquals`. The default form in a condition value was
-//! not measured.
+//! measured under `StringEquals` only (cell E8, `condition_variables.rs`).
 
 use super::*;
 
@@ -145,8 +149,10 @@ fn the_default_form_expands_under_set_operators_and_if_exists() {
 }
 
 #[test]
-fn the_default_form_expands_in_a_null_condition() {
-    // With no `flag` tag the value is `false`, so the Allow needs `team`.
+fn a_null_value_written_with_a_default_reads_as_false() {
+    // `Null` expands no variable. The text `${aws:PrincipalTag/flag, 'false'}`
+    // is not `true`, so it reads as `false` and the Allow needs `team`; the
+    // default is not used. With `team` this is cell N1f.
     let p = allow_get_if(
         "Null",
         "aws:PrincipalTag/team",
@@ -174,11 +180,14 @@ fn a_multivalued_key_in_a_condition_value_is_not_expanded_under_any_form() {
         let p = deny_get_if(operator, key, "${dynamodb:LeadingKeys}");
         assert_eq!(get(&p, "T", &ctx), AuthzDecision::Allow, "{operator}");
     }
-    // Under `Null`, the first value `false` would say that `team` is present,
-    // which it is, and the Deny would apply.
+    // `Null` expands no variable. The text `${dynamodb:LeadingKeys}` is not
+    // `true`, so it reads as `false`, which says that `team` is present. It
+    // is, and the Deny applies, as in cell N1a; the leading key is not read.
+    // Expanded to its first value, the text would be `true`, which says that
+    // `team` is absent, and the Deny would not apply.
     let null = Ctx::empty()
-        .with("dynamodb:LeadingKeys", vec!["false"])
+        .with("dynamodb:LeadingKeys", vec!["true"])
         .with("aws:PrincipalTag/team", vec!["blue"]);
     let p = deny_get_if("Null", "aws:PrincipalTag/team", "${dynamodb:LeadingKeys}");
-    assert_eq!(get(&p, "T", &null), AuthzDecision::Allow, "Null");
+    assert_eq!(get(&p, "T", &null), AuthzDecision::Deny, "Null");
 }

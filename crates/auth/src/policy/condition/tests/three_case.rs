@@ -18,13 +18,19 @@ fn present_key_matches_or_not() {
         "aws:PrincipalArn",
         vec!["arn:a"],
     );
-    assert_eq!(evaluate_condition_match(&eq, &ctx), ConditionMatch::Match);
+    assert_eq!(
+        evaluate_condition_match(&eq, true, &ctx),
+        ConditionMatch::Match
+    );
     let ne = cond(
         ConditionOperator::StringEquals,
         "aws:PrincipalArn",
         vec!["arn:b"],
     );
-    assert_eq!(evaluate_condition_match(&ne, &ctx), ConditionMatch::NoMatch);
+    assert_eq!(
+        evaluate_condition_match(&ne, true, &ctx),
+        ConditionMatch::NoMatch
+    );
 }
 
 #[test]
@@ -38,7 +44,7 @@ fn absent_key_keeps_iam_semantics() {
         vec!["x"],
     );
     assert_eq!(
-        evaluate_condition_match(&pos, &ctx),
+        evaluate_condition_match(&pos, true, &ctx),
         ConditionMatch::NoMatch
     );
     let neg = cond(
@@ -46,7 +52,10 @@ fn absent_key_keeps_iam_semantics() {
         "aws:PrincipalTag/team",
         vec!["x"],
     );
-    assert_eq!(evaluate_condition_match(&neg, &ctx), ConditionMatch::Match);
+    assert_eq!(
+        evaluate_condition_match(&neg, true, &ctx),
+        ConditionMatch::Match
+    );
 }
 
 #[test]
@@ -62,7 +71,7 @@ fn unresolvable_key_is_unresolvable_for_every_operator() {
     ] {
         let c = cond(op, "aws:PrincipalOrgID", vec!["o-1"]);
         assert_eq!(
-            evaluate_condition_match(&c, &ctx),
+            evaluate_condition_match(&c, true, &ctx),
             ConditionMatch::Unresolvable
         );
     }
@@ -80,7 +89,10 @@ fn resolved_unresolvable_key_uses_its_value() {
         "aws:PrincipalArn",
         vec!["arn:a"],
     );
-    assert_eq!(evaluate_condition_match(&c, &ctx), ConditionMatch::Match);
+    assert_eq!(
+        evaluate_condition_match(&c, true, &ctx),
+        ConditionMatch::Match
+    );
 }
 
 #[test]
@@ -103,7 +115,7 @@ fn statement_nomatch_dominates_unresolvable() {
         ),
     ];
     assert_eq!(
-        evaluate_statement_conditions(&conds, &ctx),
+        evaluate_statement_conditions(&conds, true, &ctx),
         ConditionMatch::NoMatch
     );
 }
@@ -126,7 +138,7 @@ fn statement_unresolvable_when_only_unresolvable_present() {
         ),
     ];
     assert_eq!(
-        evaluate_statement_conditions(&conds, &ctx),
+        evaluate_statement_conditions(&conds, true, &ctx),
         ConditionMatch::Unresolvable
     );
 }
@@ -140,12 +152,12 @@ fn statement_all_match() {
         vec!["contractors"],
     )];
     assert_eq!(
-        evaluate_statement_conditions(&conds, &ctx),
+        evaluate_statement_conditions(&conds, true, &ctx),
         ConditionMatch::Match
     );
     // An empty condition block always matches.
     assert_eq!(
-        evaluate_statement_conditions(&[], &ctx),
+        evaluate_statement_conditions(&[], true, &ctx),
         ConditionMatch::Match
     );
 }
