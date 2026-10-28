@@ -637,14 +637,15 @@ To get the intended behaviour, write the condition on `aws:ResourceTag/<key>`.
 
 **What changed.** `ArnEquals` and `ArnNotEquals` now match `*` and `?` in each ARN field, as `ArnLike` and `ArnNotLike` already did and as IAM evaluates all four. Before this release the two Equals operators compared strings exactly. An Arn condition over a context value that is not an ARN (fewer than six `:`-separated fields) is now false under every operator, including `ArnNotEquals` and `ArnNotLike`, and in `ForAnyValue:` and `ForAllValues:` forms it is false when any value in the set is not an ARN. No catalog migration is required.
 
-**Who is affected.** A policy whose `ArnEquals` or `ArnNotEquals` value contains `*` or `?`, in an identity policy, a permissions boundary or a role trust policy:
+**Who is affected.** A policy that uses an Arn operator in an identity policy, a permissions boundary, a session policy or a role trust policy, in these cases:
 
 - A `Deny` with a wildcarded `ArnEquals` now blocks the callers it names, and an `Allow` gated on one now grants to them.
 - A `Deny` with a wildcarded `ArnNotEquals` now exempts the callers the wildcard matches; before, it applied to every caller.
-- A bare `*` value now matches every ARN. An `Allow` gated on `ArnEquals: "*"` grants to every caller, and a `Deny` gated on `ArnNotEquals: "*"` no longer applies. IAM refuses a policy with a bare `*` Arn value, so a policy copied from AWS cannot contain one, but ExtendDB accepts it at write. Replace either shape before upgrading if you wrote it by hand.
-- An Arn operator over a key whose value is not an ARN, such as `aws:ResourceTag/<key>`, is now false, so a `Deny` written that way no longer applies.
+- A bare `*` value now matches every ARN. An `Allow` gated on `ArnEquals: "*"` grants to every caller, and a `Deny` gated on it applies to every caller. A `Deny` gated on `ArnNotEquals: "*"` no longer applies, and an `Allow` gated on it no longer grants. AWS IAM Access Analyzer reports a bare `*` Arn value as an error, and the IAM policy simulator refuses to evaluate one against an ARN, but ExtendDB accepts it at write. Replace any of these shapes before upgrading if you wrote it by hand.
+- An Arn operator over a key whose value is not an ARN, such as `aws:ResourceTag/<key>`, is now false, so a `Deny` written that way no longer applies and an `Allow` gated on one no longer grants.
+- `dynamodb:LeadingKeys`, `dynamodb:Attributes` and `aws:TagKeys` hold values the caller or the admin chooses: the partition key values in a request (every key in a batch), the attribute names in a projection, and the session tag keys in an AssumeRole call. Each value can be ARN-shaped or not. A `ForAnyValue:` or `ForAllValues:` Arn condition over one of these keys is now false while any value in the set is not an ARN. A `Deny` gated on `ForAnyValue:ArnNotLike` with `arn:aws:dynamodb:us-east-1:123456789012:table/Z*` on `dynamodb:LeadingKeys` no longer applies to a request whose partition key values include one that is not an ARN, and `ForAnyValue:ArnLike` with `j*` on the same key no longer holds for the partition key value `junk`.
 
-A policy whose Arn values are literal ARNs evaluates as before.
+A policy whose Arn values are literal ARNs, applied to a context value that is an ARN, evaluates as before.
 
 ---
 
