@@ -16,6 +16,8 @@ const T_Q: &str = "arn:aws:dynamodb:us-east-1:123456789012:table/T?ther";
 const T_EXACT: &str = "arn:aws:dynamodb:us-east-1:123456789012:table/T";
 const TABLE_STAR: &str = "arn:aws:dynamodb:us-east-1:123456789012:table/*";
 const Z_STAR: &str = "arn:aws:dynamodb:us-east-1:123456789012:table/Z*";
+/// The ARN member of the sets measured on 2026-10-28.
+const TABLE_V: &str = "arn:aws:dynamodb:us-east-1:123456789012:table/V";
 
 /// Single-valued key present with value `V`; condition over `pattern`.
 fn single(op: ConditionOperator, pattern: &str) -> bool {
@@ -372,9 +374,20 @@ fn multi_malformed(op: ConditionOperator, pattern: &str) -> bool {
     evaluate_condition(&cond(op, "dynamodb:LeadingKeys", vec![pattern]), &ctx)
 }
 
+/// Multi-valued key (`dynamodb:LeadingKeys` in the test context) holding
+/// `values`.
+fn set_of(op: ConditionOperator, pattern: &str, values: Vec<&str>) -> bool {
+    let ctx = TestContext::new().with("dynamodb:LeadingKeys", values);
+    evaluate_condition(&cond(op, "dynamodb:LeadingKeys", vec![pattern]), &ctx)
+}
+
 /// A multi-valued key with one value that is not an ARN fails every Arn
 /// operator in every set form, whether or not the pattern matches the
-/// well-formed value: 20 rows, all implicitDeny.
+/// well-formed value: 20 rows, all implicitDeny. The `IfExists` set forms
+/// were measured on 2026-10-28 with `aws:TagKeys` as a string list holding
+/// [`table/V`, `notanarn`]: `ForAnyValue:` and `ForAllValues:` with each of
+/// the four operators and `IfExists`, patterns `table/*` and `table/Z*`, 16
+/// rows, all implicitDeny.
 #[test]
 fn arn_operators_multivalued_with_non_arn_value_never_match() {
     for op in [ArnEquals, ArnNotEquals, ArnLike, ArnNotLike] {
@@ -395,6 +408,17 @@ fn arn_operators_multivalued_with_non_arn_value_never_match() {
             !multi_malformed(for_all(op.clone()), Z_STAR),
             "ForAllValues {op:?} table/Z*"
         );
+        for pattern in [TABLE_STAR, Z_STAR] {
+            let set = vec![TABLE_V, "notanarn"];
+            assert!(
+                !set_of(for_any(if_exists(op.clone())), pattern, set.clone()),
+                "ForAnyValue {op:?}IfExists {pattern}"
+            );
+            assert!(
+                !set_of(for_all(if_exists(op.clone())), pattern, set),
+                "ForAllValues {op:?}IfExists {pattern}"
+            );
+        }
     }
 }
 
