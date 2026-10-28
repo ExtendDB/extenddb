@@ -131,9 +131,11 @@ fn strip_prefix_ci<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
 ///
 /// Two places read the set, through `is_unresolvable_key`. A condition fails
 /// closed when its key is listed, or when one of its values names a listed key
-/// through a `${key}` or `${key, 'default'}` variable
-/// (`condition::evaluate_condition_match`). A `Resource` or `NotResource`
-/// pattern whose variable names a listed key fails closed in the same way
+/// through a `${key}` or `${key, 'default'}` variable in a `2012-10-17`
+/// document under a string or ARN operator, where the value is expanded
+/// (`condition::evaluate_condition_match`); a value that is not expanded
+/// reads no key. A `Resource` or `NotResource` pattern whose variable names a
+/// listed key fails closed in the same way
 /// (`variables::resource_pattern_is_unresolvable`). In both, a default written
 /// beside a listed key is not used, because the service would have a value
 /// for the key.

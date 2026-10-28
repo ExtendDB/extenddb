@@ -7,8 +7,10 @@
 //! same holds when the key is named by a `${key}` variable in `Resource` or
 //! `NotResource` of a `2012-10-17` document; a `2008-10-17` or no-`Version`
 //! document matches such a pattern as written. A variable naming the key in a
-//! condition value fails the condition closed in the same way, with or without
-//! a default.
+//! condition value of a `2012-10-17` document fails the condition closed in
+//! the same way, with or without a default, under the string and ARN
+//! operators, which expand the value. A `2008-10-17` or no-`Version` document,
+//! and the other operators, do not expand the value, so it reads no key.
 //!
 //! Every expectation here is an ExtendDB rule with no service measurement:
 //! the service has a value for such a key, so there is no service case to
@@ -285,7 +287,8 @@ fn get_t_as_blue(policies: &[PolicyDocument], ctx: Ctx) -> AuthzDecision {
 fn a_condition_value_naming_an_unresolvable_key_fails_closed_with_or_without_a_default() {
     // As for the Deny gated on the key in a Condition above: the variable has
     // no value to expand to, and the default is not used, because the service
-    // would have a value for the key. The Deny applies whatever the operator.
+    // would have a value for the key. The Deny applies whatever the string or
+    // ARN operator.
     for (operator, value) in [
         ("StringEquals", "${aws:PrincipalOrgID}"),
         ("StringEquals", "${aws:PrincipalOrgID, 'blue'}"),
