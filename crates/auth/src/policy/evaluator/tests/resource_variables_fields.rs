@@ -87,6 +87,49 @@ fn a_condition_value_naming_a_multivalued_key_is_not_expanded() {
     }
 }
 
+// --- A multivalued key with a default: the default is used only when the
+// request does not carry the key. Measured with the IAM policy simulator on
+// 2026-10-28 with `aws:TagKeys` as `[x, y]`, `[x]` and absent, against
+// `table/${aws:TagKeys, 'x'}` in `Resource` (implicitDeny, implicitDeny,
+// allowed) and against `${aws:TagKeys, 'x'}` as a `StringEquals` condition
+// value with `aws:PrincipalTag/team` = `x` (the same three answers). Run here
+// on `dynamodb:LeadingKeys`, the multivalued key the test context declares. ---
+
+#[test]
+fn a_multivalued_key_variable_with_a_default_matches_only_when_the_key_is_absent() {
+    let p = vec![parse(&format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{
+            "Effect":"Allow","Action":"dynamodb:GetItem","Resource":"{P}:table/${{dynamodb:LeadingKeys, 'x'}}"
+        }}]}}"#
+    ))];
+    for values in [vec!["x", "y"], vec!["x"]] {
+        assert_eq!(
+            get(&p, &format!("{P}:table/x"), &leading_keys(values)),
+            AuthzDecision::Deny
+        );
+    }
+    assert_eq!(
+        get(&p, &format!("{P}:table/x"), &Ctx::empty()),
+        AuthzDecision::Allow
+    );
+}
+
+#[test]
+fn a_condition_value_naming_a_multivalued_key_with_a_default_uses_it_only_when_absent() {
+    let p = vec![parse(
+        r#"{"Version":"2012-10-17","Statement":[{
+            "Effect":"Allow","Action":"dynamodb:GetItem","Resource":"*",
+            "Condition":{"StringEquals":{"aws:PrincipalTag/team":"${dynamodb:LeadingKeys, 'x'}"}}
+        }]}"#,
+    )];
+    for values in [vec!["x", "y"], vec!["x"]] {
+        let ctx = leading_keys(values).with("aws:PrincipalTag/team", vec!["x"]);
+        assert_eq!(get(&p, &format!("{P}:table/x"), &ctx), AuthzDecision::Deny);
+    }
+    let ctx = Ctx::empty().with("aws:PrincipalTag/team", vec!["x"]);
+    assert_eq!(get(&p, &format!("{P}:table/x"), &ctx), AuthzDecision::Allow);
+}
+
 // --- Variables before the fifth colon expand (`aws:RequestedRegion` in the
 // region field, `aws:PrincipalAccount` in the account field, PR #535 body
 // table) ---
