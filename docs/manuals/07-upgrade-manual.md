@@ -340,17 +340,24 @@ issue #533). Three decisions change for stored policies:
    NotResource` written that way no longer grants the team's table.
 2. A condition value naming a multivalued key, such as `${dynamodb:LeadingKeys}`
    or `${aws:TagKeys}` in a trust policy, is no longer expanded to the key's first
-   value; the text is compared as written. Under a positive operator such as
-   `StringEquals` the condition no longer matches, and under a negated operator
+   value. In a `2012-10-17` document the value now matches nothing when the
+   request carries the key, and a written default is used only when the request
+   does not carry it; a `2008-10-17` document, or one with no `Version`, compares
+   the text as written (item 1 of the next entry). Under a positive operator such
+   as `StringEquals` the condition no longer matches, and under a negated operator
    such as `StringNotEquals` it now matches. For example, an `Allow` with the
    condition `StringNotEquals` on `aws:PrincipalTag/team` and the value
    `${dynamodb:LeadingKeys}` now grants a caller tagged `team=blue` whose request
    has the leading key `blue`, where it did not, and a `Deny` with that condition
    now applies to the same request.
-3. A condition value written as `${key, 'default'}` now expands to the request's
-   value for `key`, or to `default` when the request does not carry `key`.
-   Before, the whole text was compared as written. For example, an `Allow` with
-   the condition `StringEquals` on `aws:ResourceTag/owner` and the value
+3. A condition value written as `${key, 'default'}` in a `2012-10-17` document
+   now expands, under the string and ARN operators, to the request's value for
+   `key`, or to `default` when the request does not carry `key`. `Null` and
+   `Bool` read such a value as the boolean `false` whatever the default (item 6
+   of the next entry), and the numeric and date operators compare it as written,
+   as does a `2008-10-17` document or one with no `Version`. Before, the whole
+   text was compared as written. For example, an `Allow` with the condition
+   `StringEquals` on `aws:ResourceTag/owner` and the value
    `${aws:username, 'anon'}` now grants `alice` a table tagged `owner=alice`, and
    a caller with no user name a table tagged `owner=anon`; before, it granted
    neither.
@@ -377,6 +384,22 @@ check each match against the cases above before upgrading, in particular an
 condition whose value names a multivalued key), a `Deny` that now applies (the
 same two forms), and a `Deny NotResource` that now spares a table. No catalog
 migration is required.
+
+### v0.1.15: IAM policy variables in condition values
+
+**What changed.** Policy variables in condition values now follow IAM's rules, each measured with the IAM policy simulator (issue #534). Only a `2012-10-17` document expands them, and in that document only the string and ARN operators do. Decisions change for stored policies in these cases:
+
+1. A `2008-10-17` document, or one with no `Version`, no longer expands a variable in a condition value: `${aws:username}` is the literal text. This covers user, group and role policies, permissions boundaries, session policies and role trust policies. In such a document a `Deny` with the condition `StringEquals` on `aws:ResourceTag/owner` and the value `${aws:username}` no longer applies to the caller's own table, and the same `Deny` written with `StringNotEquals` now applies to it.
+2. `${*}`, `${?}` and `${$}` now stand for the characters `*`, `?` and `$`, and the result is not expanded again. Before, the escape was compared as its text, so `StringEquals` with the value `${*}` matched the text `${*}`; now it matches `*`. In `StringLike`, `ArnLike` and `ArnEquals` the escaped character matches only itself, while a `*` or `?` written in the policy is still a wildcard.
+3. A `*` or `?` that comes from a variable value is now matched as that character in `StringLike`, `ArnLike` and `ArnEquals`, where it was a wildcard. A `Deny` with `StringLike` on `aws:ResourceTag/owner` and the value `${aws:PrincipalTag/team}` no longer applies to a caller tagged `team=a*` on a table tagged `owner=abc`.
+4. A variable with no default whose key the request does not carry now matches nothing. Before, its text `${...}` was compared, so the decision changes only for a request value equal to that text: a positive operator such as `StringEquals` no longer matches it, and a negated operator such as `StringNotEquals` now holds for it.
+5. A numeric or date value written as a variable is no longer expanded and is compared as written, which matches no request value. A `Deny` with `NumericGreaterThan` on `aws:MultiFactorAuthAge` and the value `${aws:PrincipalTag/maxAge}`, or with `DateGreaterThan` on `aws:CurrentTime` and the value `${aws:PrincipalTag/expiry}`, no longer applies. Outside role trust policies an IP address value written as a variable does not parse, as before, because it is not a CIDR. In a role trust policy it is no longer expanded and matches no request.
+6. A `Bool` or `Null` value written as a variable is no longer replaced by the variable's value. IAM reads the text as the boolean `false` whatever the variable holds, and ExtendDB now does the same: `Null` holds when the key is present, and `Bool` holds when the request value is `false`. A `Deny` with `Null` on `aws:PrincipalTag/team` and the value `${aws:PrincipalTag/flag}` now applies to every caller that has a `team` tag, and a `Deny` with `Bool` on `aws:SecureTransport` and the same value now applies to every request made without TLS. Before, both decisions followed the value of the caller's `flag` tag, and with no `flag` tag neither `Deny` applied.
+7. In an `Arn*` operator, a value with a variable needs the five `:` that separate an ARN's six fields written in the policy, as in `arn:aws:iam::123456789012:user/${aws:username}`. The IAM policy simulator refuses a policy whose value has fewer, such as `${aws:ResourceTag/blockedPrincipal}`, and ExtendDB now fails that condition closed. A `Deny` with it applies to every request its action, resource and other conditions match, and an `Allow` with it grants nothing. Before, the substituted ARN was compared as a whole, so such a `Deny` applied only to the principal the tag named, and an `Allow` written with `ArnNotLike` granted every other principal. To compare a principal with an ARN stored whole in a tag, use `StringEquals`, which compares the expanded text.
+
+**Who is affected.** Any deployment with a stored policy whose condition values contain `${`: user, group and role policies, permissions boundaries, session policies and role trust policies. Search the stored policies for `${` (`extenddb manage list-user-policies`, `list-group-policies` and `list-role-policies` print inline policies, `get-user-boundary` and `get-role-boundary` permissions boundaries, and `list-roles` trust policies) and check each match against the cases above before upgrading. The shapes that change are a variable in a `2008-10-17` or no-`Version` document, an escape, a variable under `StringLike`, `ArnLike` or `ArnEquals`, a numeric, date, `Bool` or `Null` value written as a variable, and an `Arn*` value that is a variable with fewer than five written `:`. No catalog migration is required.
+
+---
 
 ### v0.1.14 LeadingKeys now enforced on Query, batch and transaction operations
 
@@ -712,9 +735,9 @@ A policy whose Arn values are literal ARNs, applied to a context value that is a
 
 **What changed.** `aws:TagKeys` and `aws:RequestTag/<key>` now resolve on the three operations that carry a tag set, as the AWS service authorization reference lists them. `TagResource` and `CreateTable` populate both keys from `Tags`: `aws:RequestTag/<key>` holds the value of the tag named `<key>`, and `aws:TagKeys` lists the tag keys in request order. `UntagResource` populates `aws:TagKeys` from `TagKeys` and leaves `aws:RequestTag/<key>` absent. Every other operation leaves both keys absent, `ListTagsOfResource` included, and so does a request whose tag list is empty. Before this release both keys were absent on every data-plane request, so a statement that named either key did not depend on the tags of a tag operation.
 
-`aws:TagKeys` is a multivalued key. A bare operator on it, one with no `ForAnyValue:` or `ForAllValues:` prefix, never matches while the key is present, as for `dynamodb:Attributes` and `dynamodb:LeadingKeys`. Tag names in `aws:RequestTag/<key>` match without regard to case, under Unicode case folding. That folding also equates the sharp s with `ss`, which the service does not (measured 2026-10-27), so a `Deny` on `aws:RequestTag/STRASSE` applies to a tag named `Straße` on ExtendDB and not on the service, and an `Allow` gated on `aws:RequestTag/STRASSE` grants a request carrying `Straße` on ExtendDB where the service would not (inferred from the same measurement; the Allow direction was not run). A request that names one tag under two spellings that fold to one name, with differing values, fails the statement closed: a `Deny` that reads the key blocks and an `Allow` that reads it does not grant. A condition value `${aws:TagKeys}` stays literal text, because a multivalued key has no single value to put there.
+`aws:TagKeys` is a multivalued key. A bare operator on it, one with no `ForAnyValue:` or `ForAllValues:` prefix, never matches while the key is present, as for `dynamodb:Attributes` and `dynamodb:LeadingKeys`. Tag names in `aws:RequestTag/<key>` match without regard to case, under Unicode case folding. That folding also equates the sharp s with `ss`, which the service does not (measured 2026-10-27), so a `Deny` on `aws:RequestTag/STRASSE` applies to a tag named `Straße` on ExtendDB and not on the service, and an `Allow` gated on `aws:RequestTag/STRASSE` grants a request carrying `Straße` on ExtendDB where the service would not (inferred from the same measurement; the Allow direction was not run). A request that names one tag under two spellings that fold to one name, with differing values, fails the statement closed: a `Deny` that reads the key blocks and an `Allow` that reads it does not grant. The variable `${aws:TagKeys}` in a condition value has no value, because a multivalued key has no single value to put there: a positive operator such as `StringEquals` is false against it and a negated one such as `StringNotEquals` true, even for a request value equal to its text, as IAM evaluates it (measured with the IAM policy simulator on 2026-10-31).
 
-**Who is affected.** Any deployment with a policy statement that names `aws:TagKeys` or `aws:RequestTag/<key>` in a condition: inline user, group and role policies, user and role permissions boundaries, and session policies. Role trust policies already resolved both keys from the session tags of the `AssumeRole` call. One trust-policy case changes: a condition value `${aws:TagKeys}` stays literal text there too, where it used to expand to one session tag key in hash order. A statement that was inert on tag operations now applies to `TagResource`, `UntagResource` and `CreateTable`:
+**Who is affected.** Any deployment with a policy statement that names `aws:TagKeys` or `aws:RequestTag/<key>` in a condition: inline user, group and role policies, user and role permissions boundaries, and session policies. Role trust policies already resolved both keys from the session tags of the `AssumeRole` call. One trust-policy case changes: the variable `${aws:TagKeys}` in a condition value has no value there too, where it used to expand to one session tag key in hash order. A statement that was inert on tag operations now applies to `TagResource`, `UntagResource` and `CreateTable`:
 
 - A `Deny` written to block a tag key or tag value now blocks the requests that carry it. `ForAnyValue:StringEquals` on `aws:TagKeys` and `StringEquals` on `aws:RequestTag/<key>` did not match before.
 - An `Allow` gated on `ForAllValues:StringEquals` on `aws:TagKeys` used to grant for any tag keys, because the absent key satisfied it. It now grants only when every tag key in the request is in the list.
