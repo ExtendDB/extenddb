@@ -7,7 +7,8 @@
 //! same holds when the key is named by a `${key}` variable in `Resource` or
 //! `NotResource` of a `2012-10-17` document; a `2008-10-17` or no-`Version`
 //! document matches such a pattern as written. A variable naming the key in a
-//! condition value is compared as written, with or without a default.
+//! condition value of a `2012-10-17` document makes the value match nothing,
+//! with or without a default, and the condition does not fail closed.
 //!
 //! Every expectation here is an ExtendDB rule with no service measurement:
 //! the service has a value for such a key, so there is no service case to
@@ -241,13 +242,14 @@ fn get_t_as_blue(policies: &[PolicyDocument], ctx: Ctx) -> AuthzDecision {
 }
 
 #[test]
-fn a_condition_value_naming_an_unresolvable_key_is_compared_as_written() {
+fn a_condition_value_naming_an_unresolvable_key_matches_nothing() {
     let p = allow_all_and(
         r#"{"Effect":"Deny","Action":"dynamodb:GetItem","Resource":"*",
             "Condition":{"StringEquals":{"aws:PrincipalTag/team":"${aws:PrincipalOrgID, 'blue'}"}}}"#,
     );
-    // Unresolvable: the value is compared as written, which is not `blue`, so
-    // the Deny does not apply. The default is not used.
+    // Unresolvable: the value matches nothing, as for an absent key with no
+    // default, so it does not match `blue` and the Deny does not apply; the
+    // condition does not fail closed. The default is not used.
     let unresolvable = Ctx::empty().unresolvable("aws:PrincipalOrgID");
     assert_eq!(get_t_as_blue(&p, unresolvable), AuthzDecision::Allow);
     // Absent: the default `blue` is used and the Deny applies.
