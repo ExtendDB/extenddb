@@ -29,9 +29,12 @@ before the IAM decision:
   | a label the table never had                        | IAM decision first (noperm, exact   |
   |                                                    |   denied); then ResourceNotFound    |
 
-The order of those StreamArn checks, measured on DescribeStream on 2026-10-28
-(20:47 to 20:48 UTC, us-east-1, as an admin, two samples per row): the
-partition's shape first, then the account, then the region.
+The order of those StreamArn checks, measured on 2026-10-28 in us-east-1 as an
+admin, two samples per row: the shape first (an empty partition or service
+field), then the account, then the region. The empty-partition, account and
+region rows were measured on DescribeStream from 20:47 to 20:48 UTC and on
+GetShardIterator at 21:51 UTC; the empty-service rows on both operations at
+21:51 UTC.
 
   | StreamArn                                          | answer                              |
   |----------------------------------------------------|-------------------------------------|
@@ -370,13 +373,13 @@ class TestStreamArnScope:
                 self._assert_err(err, "AccessDeniedException", ACCESS_IS_DENIED, (who, "account_empty", op))
 
     def test_partition_then_account_then_region(self):
-        """The order cells measured on 2026-10-28 (the order table above): an
-        empty partition or service is "Invalid StreamArn" even in another
-        account; another account is "Access is denied" whatever the region
-        field holds; the caller's account with an empty or another region is
-        "Invalid StreamArn". Measured as an admin. GetShardIterator takes the
-        same check and is asserted with the same answers, not measured for
-        these cells."""
+        """The order cells measured on 2026-10-28 (the order table above), on
+        DescribeStream and GetShardIterator: an empty partition or service is
+        "Invalid StreamArn" even in another account; another account is
+        "Access is denied" whatever the region field holds; the caller's
+        account with an empty or another region is "Invalid StreamArn".
+        Measured as an admin; GetShardIterator and the empty service at 21:51
+        UTC."""
         admin = self._principal(ALLOW_ALL)
         cells = (
             ("account_other_and_partition_empty", "ValidationException", INVALID_STREAM_ARN),

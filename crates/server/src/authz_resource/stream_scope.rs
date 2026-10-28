@@ -38,9 +38,9 @@ pub(super) fn check_stream_arn_account(arn: &str, account_id: &str) -> Result<()
 /// before the IAM decision, as the service does for DescribeStream and
 /// GetShardIterator (measured live 2026-10-23, identical for an admin, a
 /// no-permissions user, a user allowed the exact stream ARN and a user with a
-/// Deny on it). The checks run in the service's order, measured on
-/// DescribeStream on 2026-10-28; both measurements are tabled in the module
-/// docstring of `tests/test_stream_arn_scope.py`:
+/// Deny on it). The checks run in the service's order, measured as an admin on
+/// DescribeStream and GetShardIterator on 2026-10-28; both measurements are
+/// tabled in the module docstring of `tests/test_stream_arn_scope.py`:
 ///
 /// 1. not a stream ARN (a table ARN, an extra or missing field, a trailing
 ///    slash), or an empty partition, service or account field:
@@ -52,7 +52,9 @@ pub(super) fn check_stream_arn_account(arn: &str, account_id: &str) -> Result<()
 ///    server's (empty, `us-west-2`, `US-EAST-1`): `ValidationException`
 ///    `Invalid StreamArn`.
 ///
-/// An empty service field is not among the measured cells; it stays in step 1.
+/// The order was measured on DescribeStream from 20:47 to 20:48 UTC and on
+/// GetShardIterator at 21:51 UTC. An empty service field, measured on both
+/// operations at 21:51 UTC, is step 1's refusal in another account too.
 ///
 /// The stream engine resolves a stream by table name and label within the
 /// caller's account, so a stream ARN that passes here names exactly the stream
@@ -200,9 +202,10 @@ mod tests {
         ]
     }
 
-    /// The StreamArn checks run in the measured order: the partition's shape,
-    /// then the account, then the region. GetShardIterator takes the same
-    /// check; the 2026-10-28 cells were measured on DescribeStream.
+    /// The StreamArn checks run in the measured order on DescribeStream and
+    /// GetShardIterator: an empty partition or service field, then the
+    /// account, then the region (measured on both operations on 2026-10-28,
+    /// GetShardIterator and the empty service at 21:51 UTC).
     #[test]
     fn stream_arn_checks_follow_the_measured_order() {
         for (arn, check) in measured_order() {
