@@ -8,7 +8,7 @@ Refreshed: v0.0.118 (P115)
 - ⬜ **Tagging rate limiting** — extenddb should implement `LimitExceededException` for rapid tag operations to match real DynamoDB behavior. 5 tagging tests fail against real DynamoDB due to this. (P114 follow-up)
 - ⬜ **Key-vs-item size gap** — batch/transact delete/update WCU uses key size, not old item size. Minor fidelity gap.
 - ⬜ **`f64` equality in `NumericEquals`/`NumericNotEquals`** — `policy/condition.rs` compares parsed numeric condition values with `f64` equality, violating the numeric-safety rule (and clippy `float_cmp`). Verify against AWS numeric-condition semantics (AWS treats these as arbitrary-precision decimals) and switch to `BigDecimal`/integer comparison. (BR-7085 follow-up)
-- ⬜ **Non-`2012-10-17` policy `Version` accepted with warning** — extenddb accepts policy documents with an unrecognized `Version` string and logs a warning; real AWS rejects them with a `MalformedPolicyDocument` error. Confirm intended behavior and align. (BR-7085 follow-up)
+- ⬜ **Policy `Version` refused at write, message not measured**: the identity-policy, permissions-boundary and console writes refuse a `Version` other than the string `2012-10-17` or `2008-10-17`. Not yet compared with the service: the message IAM returns for such a document, and what STS does with one in an `AssumeRole` session policy, where ExtendDB checks only that the member exists. (BR-7085 follow-up)
 
 ## Test Gaps
 

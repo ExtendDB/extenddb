@@ -36,8 +36,9 @@
 //! a region-field value `us-east-1:123456789012` matches no table ARN).
 
 use super::context::ConditionContext;
-use super::document::PolicyDocument;
+use super::document::{PolicyDocument, PolicyParseError};
 use super::matcher::arn_match;
+use serde_json::Value;
 
 impl PolicyDocument {
     /// Whether `${key}` policy variables in `Resource` and `NotResource`
@@ -49,6 +50,27 @@ impl PolicyDocument {
     #[must_use]
     pub fn expands_policy_variables(&self) -> bool {
         self.version.as_deref() == Some("2012-10-17")
+    }
+}
+
+/// Refuse a `Version` that is not the string `2012-10-17` or `2008-10-17`,
+/// the two values of IAM's policy grammar.
+///
+/// The value decides whether `Resource` and `NotResource` variables expand,
+/// so a mistyped `Version` would otherwise turn that off for the whole
+/// document with no error.
+/// `PolicyDocument::from_json_for_write` calls this, so a stored document with
+/// another value keeps parsing. A document with no `Version` passes here,
+/// because each write path refuses it first. The message IAM returns for such
+/// a document was not measured.
+pub(super) fn validate_version(json: &str) -> Result<(), PolicyParseError> {
+    let raw: Value = serde_json::from_str(json).map_err(|e| PolicyParseError(e.to_string()))?;
+    match raw.get("Version") {
+        None => Ok(()),
+        Some(Value::String(v)) if v == "2012-10-17" || v == "2008-10-17" => Ok(()),
+        Some(other) => Err(PolicyParseError(format!(
+            "invalid Version (must be the string 2012-10-17 or 2008-10-17): {other}"
+        ))),
     }
 }
 

@@ -58,6 +58,39 @@ fn only_version_2012_expands_variables() {
     assert!(!none.expands_policy_variables());
 }
 
+#[test]
+fn a_write_refuses_a_version_that_is_not_one_of_the_two_values() {
+    let stmt = r#""Statement":[{"Effect":"Allow","Action":"dynamodb:*","Resource":"*"}]"#;
+    for version in [
+        r#""2012-10-18""#,
+        r#""2012-10-17 ""#,
+        "20121017",
+        "null",
+        r#"["2012-10-17"]"#,
+        r#""2012-10-17T""#,
+    ] {
+        let json = format!(r#"{{"Version":{version},{stmt}}}"#);
+        let refused = PolicyDocument::from_json_for_write(&json)
+            .err()
+            .map(|e| e.0);
+        let expected =
+            format!("invalid Version (must be the string 2012-10-17 or 2008-10-17): {version}");
+        assert_eq!(refused, Some(expected), "{version}");
+        // A stored document holding the value still parses, and does not expand.
+        let stored = PolicyDocument::from_json(&json).unwrap();
+        assert!(!stored.expands_policy_variables(), "{version}");
+    }
+    for version in ["2012-10-17", "2008-10-17"] {
+        let json = format!(r#"{{"Version":"{version}",{stmt}}}"#);
+        assert!(
+            PolicyDocument::from_json_for_write(&json).is_ok(),
+            "{version}"
+        );
+    }
+    // A missing Version is refused by each write path before parsing.
+    assert!(PolicyDocument::from_json_for_write(&format!("{{{stmt}}}")).is_ok());
+}
+
 // --- parse_reference ---
 
 #[test]
