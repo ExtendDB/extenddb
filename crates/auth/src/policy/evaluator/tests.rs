@@ -62,3 +62,4 @@ mod combined;
 mod core;
 mod resource_variables;
 mod resource_variables_fields;
+mod variable_values;
