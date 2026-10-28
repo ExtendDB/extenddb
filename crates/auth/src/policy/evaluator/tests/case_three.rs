@@ -5,7 +5,8 @@
 //! cannot resolve (case 3): a Deny fails closed and blocks, an Allow gated on
 //! it does not grant, and the negated-operator-on-absent rule cannot fire. The
 //! same holds when the key is named by a `${key}` variable in `Resource` or
-//! `NotResource`.
+//! `NotResource`. A variable naming the key in a condition value is compared
+//! as written, with or without a default.
 
 use super::*;
 
@@ -195,4 +196,31 @@ fn a_pattern_that_decides_alone_wins_over_an_unresolvable_one() {
         r#"{{"Effect":"Deny","Action":"dynamodb:GetItem","Resource":"{TABLE}${{aws:PrincipalTag/team}}${{aws:PrincipalOrgID}}"}}"#
     ));
     assert_eq!(get_t(&absent), AuthzDecision::Allow);
+}
+
+// --- A `${key}` variable in a condition value naming such a key ---
+
+/// GetItem on table `T` by a caller tagged `team=blue`, with `ctx` for the
+/// other keys.
+fn get_t_as_blue(policies: &[PolicyDocument], ctx: Ctx) -> AuthzDecision {
+    let ctx = ctx.with("aws:PrincipalTag/team", vec!["blue"]);
+    evaluate_policies(policies, None, None, "dynamodb:GetItem", RES, &ctx)
+}
+
+#[test]
+fn a_condition_value_naming_an_unresolvable_key_is_compared_as_written() {
+    let p = allow_all_and(
+        r#"{"Effect":"Deny","Action":"dynamodb:GetItem","Resource":"*",
+            "Condition":{"StringEquals":{"aws:PrincipalTag/team":"${aws:PrincipalOrgID, 'blue'}"}}}"#,
+    );
+    // Unresolvable: the value is compared as written, which is not `blue`, so
+    // the Deny does not apply. The default is not used.
+    let unresolvable = Ctx::empty().unresolvable("aws:PrincipalOrgID");
+    assert_eq!(get_t_as_blue(&p, unresolvable), AuthzDecision::Allow);
+    // Absent: the default `blue` is used and the Deny applies.
+    assert_eq!(get_t_as_blue(&p, Ctx::empty()), AuthzDecision::Deny);
+    // Present: the key's value is used, not the default.
+    let org = |value| Ctx::empty().with("aws:PrincipalOrgID", vec![value]);
+    assert_eq!(get_t_as_blue(&p, org("blue")), AuthzDecision::Deny);
+    assert_eq!(get_t_as_blue(&p, org("red")), AuthzDecision::Allow);
 }
