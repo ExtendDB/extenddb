@@ -3,10 +3,19 @@
 
 //! Policy variables in `Resource` and `NotResource` (issue #533).
 //!
-//! One test per row of the issue's table, each measured with the IAM policy
-//! simulator on 2026-10-24 with `dynamodb:GetItem`, plus the escapes, the
-//! default form in a condition value, the `2008-10-17` and no-`Version`
-//! documents for `NotResource`, and the boundary and session policy paths.
+//! The tests `row1` to `row11` repeat the rows of the issue's table, and
+//! `row12` the `${*}` case measured with them, with the IAM policy simulator
+//! on 2026-10-24 and `dynamodb:GetItem`. Three more repeat cases measured
+//! the same day for the PR #535 body table:
+//! `not_resource_unresolved_variable_applies_to_every_resource`,
+//! `allow_not_resource_with_unresolved_variable_grants_every_table` and
+//! `default_form_without_a_space_expands_when_key_absent`. A check on a
+//! second target or context beside the measured one is derived: `red-x` in
+//! `row4`, `table/blue` and the present-key checks in `row11`, and `table/*`
+//! in `row12`. The other tests follow from those rules and were not
+//! measured: the `${?}` and `${$}` escapes, `NotResource` in a `2008-10-17`
+//! or no-`Version` document, the default form in a condition value, and the
+//! boundary, session policy and `explicit_deny_matches_arc` paths.
 
 use super::*;
 
@@ -156,7 +165,7 @@ fn row11_default_form_expands_when_key_absent() {
     assert_eq!(get(&p, "none", &team_blue()), AuthzDecision::Allow);
 }
 
-// --- Row 12: ${*} is a literal star, not a wildcard (measured) ---
+// --- Row 12: ${*} is a literal star (`table/x` measured, `table/*` derived) ---
 
 #[test]
 fn row12_escaped_star_in_resource_is_literal() {
@@ -198,8 +207,8 @@ fn not_resource_no_version_matches_text_as_written() {
 
 #[test]
 fn not_resource_unresolved_variable_applies_to_every_resource() {
-    // Derived from the measured rule, not measured: a pattern with an
-    // unresolved variable matches nothing, so every resource is outside it.
+    // Measured (PR #535 body table): with no `team` tag the pattern matches
+    // nothing, so every resource is outside it and the Deny applies.
     let p = allow_all_deny_get(
         Some("2012-10-17"),
         "NotResource",

@@ -3,8 +3,10 @@
 
 //! Policy variables in `Resource`: multivalued keys, variables outside the
 //! resource field, a `:` inside a value, and the wildcards beside a variable
-//! (issue #533). Every expected decision was measured with the IAM policy
-//! simulator on 2026-10-24 with `dynamodb:GetItem`.
+//! (issue #533). Every test repeats a case measured with the IAM policy
+//! simulator on 2026-10-24 with `dynamodb:GetItem` (PR #535 body table). Two
+//! checks beside a measured one are derived: `table/red` with one
+//! `dynamodb:LeadingKeys` value, and `table/blue` in the `blue:x` test.
 
 use super::*;
 
