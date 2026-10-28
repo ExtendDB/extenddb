@@ -6,8 +6,9 @@
 The CLI reads the catalog directly, so these tests run `extenddb init` into an
 isolated deployment and drive the `settings` command against it; no server is
 started. The SQLite class runs when the binary is a SQLite build; the
-PostgreSQL class runs when EXTENDDB_TEST_PG_CONNECTION_STRING is set (the
-same gate as the CLI lifecycle tests). Each skips otherwise.
+PostgreSQL class runs when EXTENDDB_TEST_PG_CONNECTION_STRING is set. Each
+skips otherwise. The CLI lifecycle tests read the same variable and fail when
+it is unset.
 
 Expected behaviour: `list` prints `••••••••` for `encryption_key` and for
 `data_database_connection_string` (PostgreSQL), the same mask the management
