@@ -35,6 +35,12 @@ CREATE TABLE IF NOT EXISTS tables (
     table_class TEXT,
     sse_specification JSONB,
     on_demand_throughput JSONB,
+    -- WarmThroughput as the client set it (see
+    -- extenddb_core::types::WarmThroughputRecord). Stored and reported only:
+    -- nothing pre-warms or scales on it, and it has no effect on throughput,
+    -- throttling or storage. A catalog created before this column existed
+    -- gets it from the shape step in migrations.rs.
+    warm_throughput JSONB,
     PRIMARY KEY (account_id, table_name),
     CONSTRAINT tables_table_id_unique UNIQUE (table_id)
 );
@@ -54,6 +60,8 @@ CREATE TABLE IF NOT EXISTS indexes (
     index_status TEXT NOT NULL DEFAULT 'ACTIVE',
     provisioned_throughput JSONB,
     propagation_delay_ms INTEGER,
+    -- Same stored-only WarmThroughput record as tables.warm_throughput.
+    warm_throughput JSONB,
     PRIMARY KEY (table_id, index_name),
     CONSTRAINT indexes_table_id_fkey
         FOREIGN KEY (table_id) REFERENCES tables(table_id) ON DELETE CASCADE,

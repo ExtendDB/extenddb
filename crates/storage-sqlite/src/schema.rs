@@ -65,6 +65,11 @@ CREATE TABLE IF NOT EXISTS tables (
     table_class TEXT,
     sse_specification TEXT,
     on_demand_throughput TEXT,
+    -- WarmThroughput as the client set it (JSON, see
+    -- extenddb_core::types::WarmThroughputRecord). Stored and reported only:
+    -- nothing pre-warms or scales on it, and it has no effect on throughput,
+    -- throttling or storage.
+    warm_throughput TEXT,
     PRIMARY KEY (account_id, table_name),
     CONSTRAINT tables_table_id_unique UNIQUE (table_id)
 );
@@ -84,6 +89,8 @@ CREATE TABLE IF NOT EXISTS indexes (
     index_status TEXT NOT NULL DEFAULT 'ACTIVE',
     provisioned_throughput TEXT,
     propagation_delay_ms INTEGER,
+    -- Same stored-only WarmThroughput record as tables.warm_throughput.
+    warm_throughput TEXT,
     PRIMARY KEY (table_id, index_name),
     CONSTRAINT indexes_table_id_fkey
         FOREIGN KEY (table_id) REFERENCES tables(table_id) ON DELETE CASCADE,
@@ -508,6 +515,7 @@ async fn refuse_unwritable_catalog(pool: &SqlitePool) -> OpResult<()> {
 async fn converge_table_shapes(pool: &SqlitePool) -> OpResult<()> {
     migrate_backup_items(pool).await?;
     migrate_table_restores(pool).await?;
+    migrate_warm_throughput_columns(pool).await?;
     Ok(())
 }
 
@@ -535,7 +543,38 @@ pub async fn pending_shape_migrations(pool: &SqlitePool) -> OpResult<Vec<String>
     if table_restores_lacks_source_table_arn(pool).await? {
         pending.push("add table_restores.source_table_arn".to_owned());
     }
+    for table in WARM_THROUGHPUT_TABLES {
+        if lacks_warm_throughput(pool, table).await? {
+            pending.push(format!("add {table}.warm_throughput"));
+        }
+    }
     Ok(pending)
+}
+
+/// The catalog tables that carry a stored `WarmThroughput` record.
+const WARM_THROUGHPUT_TABLES: [&str; 2] = ["tables", "indexes"];
+
+async fn lacks_warm_throughput(pool: &SqlitePool, table: &'static str) -> OpResult<bool> {
+    Ok(table_exists(pool, table).await? && !has_column(pool, table, "warm_throughput").await?)
+}
+
+/// Add `warm_throughput` to `tables` and `indexes` created by an earlier
+/// 0.0.4 build. Rows it wrote keep NULL, which DescribeTable reports as the
+/// defaults for the billing mode.
+async fn migrate_warm_throughput_columns(pool: &SqlitePool) -> OpResult<()> {
+    for table in WARM_THROUGHPUT_TABLES {
+        if !lacks_warm_throughput(pool, table).await? {
+            continue;
+        }
+        tracing::info!("catalog upgrade: adding {table}.warm_throughput");
+        sqlx::query(&format!(
+            "ALTER TABLE {table} ADD COLUMN warm_throughput TEXT"
+        ))
+        .execute(pool)
+        .await
+        .map_err(|e| OpError::Internal(format!("add {table}.warm_throughput: {e}")))?;
+    }
+    Ok(())
 }
 
 async fn has_column(pool: &SqlitePool, table: &'static str, column: &str) -> OpResult<bool> {

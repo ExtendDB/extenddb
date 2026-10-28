@@ -65,6 +65,7 @@ async fn setup_stream_table(
         tags: None,
         table_class: None,
         deletion_protection_enabled: None,
+        warm_throughput: None,
     };
 
     let desc = engine.create_table(&account_id, input).await.unwrap();

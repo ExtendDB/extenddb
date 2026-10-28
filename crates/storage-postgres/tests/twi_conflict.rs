@@ -365,6 +365,7 @@ async fn gsi_table(s: &Scratch) -> TableKeyInfo {
             non_key_attributes: None,
         },
         provisioned_throughput: None,
+        warm_throughput: None,
     };
     s.engine
         .create_table(

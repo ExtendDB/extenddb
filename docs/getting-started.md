@@ -292,6 +292,10 @@ By default, control plane operations (CreateTable, DeleteTable) emulate real Dyn
     control_plane_delay_seconds 10
 ```
 
+### Warm Throughput
+
+`WarmThroughput` on `CreateTable`, `UpdateTable` and `GlobalSecondaryIndexUpdates` is stored and reported on `DescribeTable` with the shape, defaults (12000 read and 4000 write units on an on-demand table, the provisioned units on a provisioned one) and validation of Amazon DynamoDB, and `Status` reads `UPDATING` for the control plane delay after a change, then `ACTIVE`. Nothing acts on the values: there is no pre-warming and no scaling at the database level, and they have no effect on throughput, throttling or storage.
+
 ### Credential Import
 
 Controls whether `extenddb manage import-access-key` is allowed (default: `true`).

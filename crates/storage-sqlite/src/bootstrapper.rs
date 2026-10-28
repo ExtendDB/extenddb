@@ -675,9 +675,14 @@ mod migrate_report_tests {
             bootstrap.read_catalog_version().await.expect("version"),
             Some(bootstrap.expected_catalog_version())
         );
+        // The 0.0.3 schema also predates the stored WarmThroughput columns.
         assert_eq!(
             bootstrap.pending_data_migrations().await.expect("pending"),
-            vec!["rebuild backup_items (2 rows)".to_owned()]
+            vec![
+                "rebuild backup_items (2 rows)".to_owned(),
+                "add tables.warm_throughput".to_owned(),
+                "add indexes.warm_throughput".to_owned(),
+            ]
         );
         bootstrap.run_data_migrations().await.expect("apply");
         assert!(

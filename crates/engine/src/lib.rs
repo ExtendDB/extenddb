@@ -20,6 +20,7 @@ mod describe_table;
 mod expected;
 mod expression_helpers;
 mod get_item;
+mod gsi_updates;
 mod import_export;
 mod import_export_io;
 mod index_helpers;
@@ -41,6 +42,7 @@ mod ttl;
 mod update_item;
 mod update_table;
 mod vector_gate;
+mod warm_throughput;
 
 pub use batch_get_item::handle_batch_get_item;
 pub use batch_write_item::handle_batch_write_item;

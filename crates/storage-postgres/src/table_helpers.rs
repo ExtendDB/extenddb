@@ -8,7 +8,7 @@ use extenddb_core::types::{
     ProvisionedThroughputDescription, SseDescription, SseType, TableDescription, TableStatus,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{index_arn, stream_arn};
+use extenddb_storage::util::{index_arn, parse_warm_throughput_record, stream_arn};
 use extenddb_storage::vector_catalog::{VectorIndexCatalogRow, vector_index_descriptions};
 
 use crate::PostgresEngine;
@@ -34,6 +34,7 @@ pub(crate) struct TableRow {
     pub table_class: Option<String>,
     pub sse_specification: Option<serde_json::Value>,
     pub on_demand_throughput: Option<serde_json::Value>,
+    pub warm_throughput: Option<serde_json::Value>,
 }
 
 /// Row type for index metadata queries.
@@ -46,6 +47,7 @@ pub(crate) struct IndexRow {
     pub projection: serde_json::Value,
     pub index_status: String,
     pub provisioned_throughput: Option<serde_json::Value>,
+    pub warm_throughput: Option<serde_json::Value>,
 }
 
 /// A `vector_indexes` catalog row, in `FromRow` field order.
@@ -112,7 +114,8 @@ impl PostgresEngine {
                       EXTRACT(EPOCH FROM creation_date_time)::FLOAT8 as creation_epoch,
                       table_size_bytes, item_count, table_arn, table_id,
                       deletion_protection_enabled, stream_label,
-                      table_class, sse_specification, on_demand_throughput
+                      table_class, sse_specification, on_demand_throughput,
+                      warm_throughput
                FROM tables WHERE account_id = $1 AND table_name = $2",
         )
         .bind(account_id)
@@ -125,7 +128,7 @@ impl PostgresEngine {
 
         let index_rows: Vec<IndexRow> = sqlx::query_as(
             r"SELECT index_name, index_id, index_type, key_schema, projection,
-                      index_status, provisioned_throughput
+                      index_status, provisioned_throughput, warm_throughput
                FROM indexes WHERE table_id = $1",
         )
         .bind(&row.table_id)
@@ -193,6 +196,10 @@ impl PostgresEngine {
                     .transpose()
                     .map_err(|e: serde_json::Error| StorageError::Internal(e.to_string()))?;
 
+                let warm_json = idx
+                    .warm_throughput
+                    .as_ref()
+                    .map(serde_json::Value::to_string);
                 gsis.push(GsiDescription {
                     index_name: idx.index_name.clone(),
                     key_schema: ks,
@@ -213,6 +220,8 @@ impl PostgresEngine {
                         &row.table_name,
                         &idx.index_name,
                     ),
+                    warm_throughput: None,
+                    warm_throughput_record: parse_warm_throughput_record(warm_json.as_deref())?,
                 });
             } else {
                 lsis.push(LsiDescription {
@@ -330,6 +339,9 @@ impl PostgresEngine {
             on_demand_throughput: row
                 .on_demand_throughput
                 .and_then(|v| serde_json::from_value(v).ok()),
+            warm_throughput_record: parse_warm_throughput_record(
+                row.warm_throughput.map(|v| v.to_string()).as_deref(),
+            )?,
             // Vector indexes are read separately and applied by the caller: this
             // builder takes `index_rows` only, and the two callers differ in
             // whether they need them. `build_table_description` fills them in;

@@ -7,7 +7,9 @@ use extenddb_core::types::{
     AttributeDefinition, BillingMode, KeySchemaElement, TableDescription, UpdateTableInput,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{building_refuses, effective_attribute_definitions};
+use extenddb_storage::util::{
+    building_refuses, effective_attribute_definitions, warm_throughput_record_for_create,
+};
 
 use crate::PostgresEngine;
 use crate::data::gsi_build::{
@@ -430,6 +432,10 @@ impl PostgresEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
         }
 
+        // WarmThroughput on the table and on updated indexes: stored as sent,
+        // nothing acts on it. Validated by the engine against the current values.
+        Self::store_warm_throughput_updates(&mut tx, account_id, &table_id, &input).await?;
+
         // Apply GSI updates (create/delete).
         let mut created_index_ids: Vec<String> = Vec::new();
         let mut deleted_index_ids: Vec<String> = Vec::new();
@@ -465,12 +471,20 @@ impl PostgresEngine {
                         .transpose()
                         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
+                    let gsi_warm = warm_throughput_record_for_create(
+                        create.warm_throughput.as_ref(),
+                        Self::control_plane_delay_secs(&mut tx).await?,
+                    )
+                    .as_ref()
+                    .map(serde_json::to_value)
+                    .transpose()
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
                     let index_id = uuid::Uuid::new_v4().to_string();
                     sqlx::query(
                         r"INSERT INTO indexes
                            (table_id, index_name, index_id, index_type, key_schema, projection,
-                            index_status, provisioned_throughput)
-                           VALUES ($1, $2, $3, 'GSI', $4, $5, 'CREATING', $6)",
+                            index_status, provisioned_throughput, warm_throughput)
+                           VALUES ($1, $2, $3, 'GSI', $4, $5, 'CREATING', $6, $7)",
                     )
                     .bind(&table_id)
                     .bind(&create.index_name)
@@ -478,6 +492,7 @@ impl PostgresEngine {
                     .bind(&gsi_ks)
                     .bind(&gsi_proj)
                     .bind(&gsi_pt)
+                    .bind(&gsi_warm)
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -1086,6 +1101,11 @@ impl PostgresEngine {
                 ),
             }
         }
+
+        // The build outlasts a new GSI's WarmThroughput UPDATING window; start
+        // it again so the response reports it as the service does.
+        self.restart_created_gsi_warm_throughput(&table_id, &input)
+            .await?;
 
         self.build_table_description(account_id, &input.table_name)
             .await

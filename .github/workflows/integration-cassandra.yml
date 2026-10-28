@@ -145,8 +145,10 @@ jobs:
         run: pip install -r requirements.txt
       - name: Build release (cassandra backend)
         run: cargo build --release --no-default-features --features cassandra
+      - name: Install Terraform (pinned version, checksum asserted)
+        run: echo "TERRAFORM=$(tests/terraform/install-terraform.sh "$RUNNER_TEMP/terraform")" >> "$GITHUB_ENV"
       - name: Run Cassandra pytest suite
-        run: devtools/run-cassandra-tests -- --pytest --comprehensive --parallel
+        run: devtools/run-cassandra-tests -- --pytest --comprehensive --terraform --parallel
 
   cassandra-rust:
     runs-on: extenddb_ubuntu-2404_4-core
