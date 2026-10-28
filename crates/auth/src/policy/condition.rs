@@ -8,8 +8,8 @@
 //! set operators ForAllValues/ForAnyValue with optional `IfExists` suffix.
 
 use super::context::ConditionContext;
-use super::document::{Condition, ConditionOperator};
-use super::variables::ConditionValue;
+use super::document::{Condition, ConditionOperator, base_operator};
+use super::variables::{ConditionValue, arn_value_lacks_fields};
 
 /// Evaluate a single condition against a context.
 ///
@@ -193,7 +193,8 @@ pub enum ConditionMatch {
     /// A condition is not satisfied; the statement does not apply.
     NoMatch,
     /// A condition depends on a key the service populates but this context
-    /// cannot resolve. The statement fails closed.
+    /// cannot resolve, or has an `Arn*` value that IAM refuses because it
+    /// cannot have the six fields of an ARN. The statement fails closed.
     Unresolvable,
 }
 
@@ -210,8 +211,12 @@ pub enum ConditionMatch {
 /// pattern of that shape does not. Without `expand_variables`, and under an
 /// operator that does not expand variables ([`operator_expands_variables`]),
 /// the value is not expanded and reads no
-/// key. Otherwise returns `Match` or `NoMatch` from the ordinary evaluation,
-/// so cases 1 and 2 are unchanged.
+/// key. It also returns `Unresolvable` when the document expands variables and
+/// a value of an `Arn*` operator, with or without a set qualifier or
+/// `IfExists`, holds a `${...}` reference and fewer than five `:` written
+/// outside its references, such as `${aws:ResourceTag/owner}`. Otherwise
+/// returns `Match` or `NoMatch` from the ordinary evaluation, so cases 1 and 2
+/// are unchanged.
 pub fn evaluate_condition_match(
     condition: &Condition,
     expand_variables: bool,
@@ -221,6 +226,22 @@ pub fn evaluate_condition_match(
         || (expand_variables
             && operator_expands_variables(&condition.operator)
             && reads_unresolvable_variable(condition, context))
+    {
+        return ConditionMatch::Unresolvable;
+    }
+    // The IAM policy simulator refuses a policy with such an ARN value
+    // (`InvalidInput`) and IAM Access Analyzer reports `MISSING_ARN_FIELD`, so
+    // IAM gives no decision to match. Failing closed makes a `Deny` apply and
+    // keeps an `Allow` from granting.
+    if expand_variables
+        && matches!(
+            base_operator(&condition.operator),
+            ConditionOperator::ArnEquals
+                | ConditionOperator::ArnNotEquals
+                | ConditionOperator::ArnLike
+                | ConditionOperator::ArnNotLike
+        )
+        && condition.values.iter().any(|v| arn_value_lacks_fields(v))
     {
         return ConditionMatch::Unresolvable;
     }
