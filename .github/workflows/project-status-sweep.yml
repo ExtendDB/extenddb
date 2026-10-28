@@ -24,6 +24,8 @@ name: Project status sweep
 #   4. Optional: single-select board field "Auto status" with option "Off".
 #      Cards set to Off are never moved.
 #   5. Run this workflow once with dry_run and read the log.
+#   6. Turn it on: repo variable PROJECT_SWEEP_ENABLED = true. Until then only
+#      manual runs do anything. Delete the variable to pause the sweep.
 on:
   schedule:
     - cron: '*/5 * * * *'
@@ -48,7 +50,12 @@ concurrency:
 jobs:
   sweep:
     # Forks inherit the schedule; only run here.
-    if: github.repository == 'ExtendDB/extenddb'
+    # On/off switch: scheduled and issue-triggered runs only happen while the
+    # repo variable PROJECT_SWEEP_ENABLED is 'true'. Manual runs always work, so
+    # a dry run is possible while it is off. Unset it to pause the sweep.
+    if: >-
+      github.repository == 'ExtendDB/extenddb' &&
+      (github.event_name == 'workflow_dispatch' || vars.PROJECT_SWEEP_ENABLED == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # Secrets live in this environment, which only main can use.
@@ -97,9 +104,12 @@ jobs:
             });
 
   report:
-    # Raise or clear one alert issue. Skipped for dry runs.
+    # Raise or clear one alert issue. Skipped for dry runs and while the sweep
+    # is switched off (no runner is started for nothing).
     needs: sweep
-    if: always() && github.repository == 'ExtendDB/extenddb' && inputs.dry_run != true
+    if: >-
+      always() && github.repository == 'ExtendDB/extenddb' &&
+      inputs.dry_run != true && needs.sweep.result != 'skipped'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
