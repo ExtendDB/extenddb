@@ -6,7 +6,9 @@
 //! `IfExists` and the set qualifiers with an unresolved variable. Every
 //! expected decision was measured with the IAM policy simulator on
 //! 2026-10-25 (`Allow dynamodb:*` on `*` beside a `Deny dynamodb:GetItem` on
-//! `*` with the condition under test).
+//! `*` with the condition under test). The `Null` and `Bool` cells N1a to N1f
+//! and N2a to N2e were measured the same way on 2026-10-28, two samples each;
+//! N1f is an `Allow dynamodb:GetItem` with the condition and nothing else.
 
 use super::*;
 
@@ -33,7 +35,7 @@ fn get(policies: &[PolicyDocument], ctx: &Ctx) -> AuthzDecision {
     evaluate_policies(policies, None, None, "dynamodb:GetItem", BLUE, ctx)
 }
 
-// --- Only the string and ARN operators expand a variable (cells C4a, C4b) ---
+// --- Only the string and ARN operators expand a variable (cell C4a) ---
 
 #[test]
 fn numeric_equals_compares_a_variable_as_written() {
@@ -44,13 +46,69 @@ fn numeric_equals_compares_a_variable_as_written() {
     assert_eq!(get(&p, &ctx), AuthzDecision::Allow);
 }
 
+// --- `Null` and `Bool` read a variable as the boolean `false` (N1a to N2e) ---
+
+fn allow_only(condition: &str) -> Vec<PolicyDocument> {
+    vec![parse(&format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{
+            "Effect":"Allow","Action":"dynamodb:GetItem","Resource":"*",
+            "Condition":{condition}
+        }}]}}"#
+    ))]
+}
+
+/// The cells whose decision differs from the one IAM gave.
+fn differ(cells: &[(&'static str, Vec<PolicyDocument>, Ctx, AuthzDecision)]) -> Vec<&'static str> {
+    cells
+        .iter()
+        .filter(|(_, policies, ctx, iam)| get(policies, ctx) != *iam)
+        .map(|(cell, ..)| *cell)
+        .collect()
+}
+
 #[test]
-fn bool_compares_a_variable_as_written() {
-    let p = deny_if(r#"{"Bool":{"aws:SecureTransport":"${aws:PrincipalTag/flag}"}}"#);
-    let ctx = Ctx::empty()
-        .with("aws:PrincipalTag/flag", vec!["true"])
-        .with("aws:SecureTransport", vec!["true"]);
-    assert_eq!(get(&p, &ctx), AuthzDecision::Allow);
+fn null_reads_a_variable_as_false() {
+    use AuthzDecision::{Allow, Deny};
+    // `Null` on `team` holds when `team` is present, whatever `flag` holds.
+    let null = |value: &str| format!(r#"{{"Null":{{"aws:PrincipalTag/team":"{value}"}}}}"#);
+    let flag = "${aws:PrincipalTag/flag}";
+    let flag_or_false = "${aws:PrincipalTag/flag, 'false'}";
+    let team = || Ctx::empty().with("aws:PrincipalTag/team", vec!["blue"]);
+    let flag_true = |ctx: Ctx| ctx.with("aws:PrincipalTag/flag", vec!["true"]);
+    let cells = [
+        ("N1a", deny_if(&null(flag)), team(), Deny),
+        ("N1b", deny_if(&null(flag_or_false)), team(), Deny),
+        ("N1c", deny_if(&null(flag)), flag_true(team()), Deny),
+        ("N1d", deny_if(&null(flag)), flag_true(Ctx::empty()), Allow),
+        ("N1e", deny_if(&null(flag)), Ctx::empty(), Allow),
+        ("N1f", allow_only(&null(flag_or_false)), team(), Allow),
+    ];
+    let wrong = differ(&cells);
+    assert!(wrong.is_empty(), "differ from IAM: {wrong:?}");
+}
+
+#[test]
+fn bool_reads_a_variable_as_false() {
+    use AuthzDecision::{Allow, Deny};
+    // `Bool` holds when `aws:SecureTransport` is `false`, whatever `flag`
+    // holds. N2c is cell C4b, measured on 2026-10-25.
+    let p = || deny_if(r#"{"Bool":{"aws:SecureTransport":"${aws:PrincipalTag/flag}"}}"#);
+    let request = |secure: &str, flag: Option<&str>| {
+        let ctx = Ctx::empty().with("aws:SecureTransport", vec![secure]);
+        match flag {
+            Some(flag) => ctx.with("aws:PrincipalTag/flag", vec![flag]),
+            None => ctx,
+        }
+    };
+    let cells = [
+        ("N2a", p(), request("false", Some("false")), Deny),
+        ("N2b", p(), request("false", Some("true")), Deny),
+        ("N2c", p(), request("true", Some("true")), Allow),
+        ("N2d", p(), request("true", Some("false")), Allow),
+        ("N2e", p(), request("false", None), Deny),
+    ];
+    let wrong = differ(&cells);
+    assert!(wrong.is_empty(), "differ from IAM: {wrong:?}");
 }
 
 // --- A wildcard inside a substituted value is literal (cells C1, C2f, C2g) ---

@@ -47,8 +47,10 @@ pub fn evaluate_condition_with(
 ) -> bool {
     let context_values = context.resolve_key(&condition.key);
     let is_multivalued = context.is_multivalued_key(&condition.key);
-    // Only the string and ARN operators expand policy variables; a numeric or
-    // `Bool` value written as a variable is compared as written (measured).
+    // Only the string and ARN operators expand policy variables (measured). A
+    // numeric value written as a variable is compared as written, and a `Bool`
+    // or `Null` value written as one is read as the boolean `false`
+    // (`bool_matches`, `null_holds`).
     let expand_variables = expand_variables && operator_expands_variables(&condition.operator);
 
     // Expand policy variables (e.g. `${aws:PrincipalTag/Team}`) in condition values.
@@ -64,7 +66,7 @@ pub fn evaluate_condition_with(
             expanded_values
                 .first()
                 .and_then(ConditionValue::text)
-                .is_some_and(|v| (v == "true" && key_absent) || (v == "false" && !key_absent))
+                .is_some_and(|v| null_holds(v, key_absent))
         }
         ConditionOperator::ForAllValues(inner) => {
             let (_absent_passes, base_op) = unwrap_if_exists(inner);
@@ -401,7 +403,7 @@ fn compare_single(op: &ConditionOperator, context_value: &str, value: &Condition
         ConditionOperator::DateGreaterThanEquals => {
             compare_dates(context_value, policy_value, |a, b| a >= b)
         }
-        ConditionOperator::Bool => context_value.eq_ignore_ascii_case(policy_value),
+        ConditionOperator::Bool => bool_matches(context_value, policy_value),
         ConditionOperator::ArnEquals => context_value == policy_value,
         ConditionOperator::ArnNotEquals => context_value != policy_value,
         ConditionOperator::ArnLike => value.arn_matches(context_value),
@@ -420,6 +422,33 @@ fn compare_single(op: &ConditionOperator, context_value: &str, value: &Condition
         // Null, ForAllValues, ForAnyValue, IfExists handled by caller
         _ => false,
     }
+}
+
+/// Whether `Null` with the policy value `policy_value` holds: `true` means the
+/// key must be absent and `false` that it must be present, and any other text
+/// matches nothing. `Null` does not expand a policy variable. IAM reads a value
+/// written as one as a boolean, `false` unless the text is `true` ignoring
+/// case, so the key must be present whatever the variable's value or default
+/// (measured with the IAM policy simulator, cells N1a to N1f).
+fn null_holds(policy_value: &str, key_absent: bool) -> bool {
+    if policy_value.contains("${") {
+        return policy_value.eq_ignore_ascii_case("true") == key_absent;
+    }
+    (policy_value == "true" && key_absent) || (policy_value == "false" && !key_absent)
+}
+
+/// Whether `Bool` with the policy value `policy_value` matches the request
+/// value: the two texts are equal ignoring case. `Bool` does not expand a
+/// policy variable. IAM reads a value written as one as a boolean, `false`
+/// unless the text is `true` ignoring case, so it matches a request value that
+/// is not `true` whatever the variable's value (measured with the IAM policy
+/// simulator, cells N2a to N2e).
+fn bool_matches(context_value: &str, policy_value: &str) -> bool {
+    if policy_value.contains("${") {
+        return context_value.eq_ignore_ascii_case("true")
+            == policy_value.eq_ignore_ascii_case("true");
+    }
+    context_value.eq_ignore_ascii_case(policy_value)
 }
 
 /// Parse two strings as f64 and compare them.
