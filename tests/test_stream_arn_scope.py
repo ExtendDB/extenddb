@@ -29,6 +29,20 @@ before the IAM decision:
   | a label the table never had                        | IAM decision first (noperm, exact   |
   |                                                    |   denied); then ResourceNotFound    |
 
+The order of those StreamArn checks, measured on DescribeStream on 2026-10-28
+(20:47 to 20:48 UTC, us-east-1, as an admin, two samples per row): the
+partition's shape first, then the account, then the region.
+
+  | StreamArn                                          | answer                              |
+  |----------------------------------------------------|-------------------------------------|
+  | empty partition, in another account or the         | ValidationException                 |
+  |   caller's                                         |   "Invalid StreamArn"               |
+  | another account with an empty region, with         | AccessDeniedException               |
+  |   us-west-2, or with every other field the         |   "Access is denied"                |
+  |   caller's                                         |                                     |
+  | the caller's account with an empty region or       | ValidationException                 |
+  |   us-west-2                                        |   "Invalid StreamArn"               |
+
 ResourceArn (ListTagsOfResource, TagResource, UntagResource):
 
   | spelling                                          | answer                              |
@@ -199,7 +213,8 @@ def table(auth_env, mgmt, account_id, region):
 
 
 def _variants(stream_arn: str, region: str, account_id: str) -> dict[str, str]:
-    """The spellings measured in probes F2-1 and W1-1, keyed by their names."""
+    """The spellings measured on 2026-10-23 and 2026-10-28 (module docstring),
+    keyed by their names."""
     other_region = "us-west-2" if region != "us-west-2" else "us-east-1"
     table_arn = stream_arn.split("/stream/")[0]
     v = {
@@ -222,6 +237,10 @@ def _variants(stream_arn: str, region: str, account_id: str) -> dict[str, str]:
         f":{account_id}:", f":{OTHER_ACCOUNT}:", 1)
     v["account_other_and_region_other"] = v["account_other"].replace(
         f":{region}:", f":{other_region}:", 1)
+    v["partition_empty"] = stream_arn.replace("arn:aws:", "arn::", 1)
+    v["region_empty"] = stream_arn.replace(f":{region}:", "::", 1)
+    v["account_other_and_partition_empty"] = v["account_other"].replace("arn:aws:", "arn::", 1)
+    v["account_other_and_region_empty"] = v["account_other"].replace(f":{region}:", "::", 1)
     return v
 
 
@@ -343,6 +362,29 @@ class TestStreamArnScope:
             for op in TAG_OPS:
                 err = p.error(op, arn, self.shard_id)
                 self._assert_err(err, "AccessDeniedException", ACCESS_IS_DENIED, (who, "account_empty", op))
+
+    def test_partition_then_account_then_region(self):
+        """The seven DescribeStream cells measured on 2026-10-28 (the order
+        table above): an empty partition is "Invalid StreamArn" even in another
+        account; another account is "Access is denied" whatever the region
+        field holds; the caller's account with an empty or another region is
+        "Invalid StreamArn". Measured as an admin. GetShardIterator takes the
+        same check and is asserted with the same answers, not measured for
+        these cells."""
+        admin = self._principal(ALLOW_ALL)
+        cells = (
+            ("account_other_and_partition_empty", "ValidationException", INVALID_STREAM_ARN),
+            ("partition_empty", "ValidationException", INVALID_STREAM_ARN),
+            ("account_other_and_region_empty", "AccessDeniedException", ACCESS_IS_DENIED),
+            ("account_other_and_region_other", "AccessDeniedException", ACCESS_IS_DENIED),
+            ("account_other", "AccessDeniedException", ACCESS_IS_DENIED),
+            ("region_empty", "ValidationException", INVALID_STREAM_ARN),
+            ("region_other", "ValidationException", INVALID_STREAM_ARN),
+        )
+        for label, code, message in cells:
+            for op in STREAM_OPS:
+                err = admin.error(op, self.variants[label], self.shard_id)
+                self._assert_err(err, code, message, ("admin", label, op))
 
     # -- #451: another partition, region or service ---------------------------
 

@@ -185,15 +185,6 @@ fn tag_resource_arn(arn: &str, region: &str, account_id: &str) -> String {
     }
 }
 
-/// The resource kind a strictly validated ARN-bearing request field must name.
-/// Only stream and backup fields are validated before authorization; an export
-/// `TableArn` is checked only for parseability (see `validate_operation_arns`).
-#[derive(Clone, Copy)]
-enum ArnKind {
-    Stream,
-    Backup,
-}
-
 /// Messages DynamoDB returns, before the IAM decision, for a request field
 /// whose ARN is not a valid resource ARN of the kind the field requires
 /// (measured live, `live-r2/arn-kinds-live.json`).
@@ -202,11 +193,11 @@ const INVALID_BACKUP_ARN_MESSAGE: &str = "Invalid Backup ARN";
 const INVALID_EXPORT_TABLE_ARN_MESSAGE: &str =
     "One or more parameter values were invalid: tableArn is not a valid ARN";
 
-/// True when `arn` is a well-formed DynamoDB resource ARN of `kind`: it parses
-/// to that kind and its partition, service, region, and account are all
-/// non-empty. The field checks catch an empty-partition ARN
-/// (`arn::dynamodb:...`), which the service rejects with `Invalid StreamArn`.
-fn arn_is_kind(arn: &str, kind: ArnKind) -> bool {
+/// True when `arn` is a well-formed DynamoDB backup ARN: it parses to a backup
+/// and its partition, service, region, and account are all non-empty. A
+/// `StreamArn` takes [`check_stream_arn_scope`] instead, which runs the account
+/// check between its field checks in the order the service does.
+fn arn_is_backup(arn: &str) -> bool {
     let Some(f) = extenddb_core::arn::fields(arn) else {
         return false;
     };
@@ -215,20 +206,11 @@ fn arn_is_kind(arn: &str, kind: ArnKind) -> bool {
         return false;
     }
     matches!(
-        (parse_resource_identity(arn), kind),
-        (
-            Some(ResourceId {
-                sub: Some(Sub::Stream(_)),
-                ..
-            }),
-            ArnKind::Stream
-        ) | (
-            Some(ResourceId {
-                sub: Some(Sub::Backup(_)),
-                ..
-            }),
-            ArnKind::Backup
-        )
+        parse_resource_identity(arn),
+        Some(ResourceId {
+            sub: Some(Sub::Backup(_)),
+            ..
+        })
     )
 }
 
@@ -243,9 +225,11 @@ fn arn_is_kind(arn: &str, kind: ArnKind) -> bool {
 ///   a well-formed stream (resp. backup) ARN of the correct kind, including a
 ///   table ARN, an `xrn:` ARN, or an empty partition, is refused before
 ///   authorization with `Invalid StreamArn` (resp. `Invalid Backup ARN`). A
-///   well-formed stream ARN must also be in this deployment's scope
-///   ([`check_stream_arn_scope`]): another account is `AccessDeniedException`,
-///   another partition, service or region is `Invalid StreamArn`.
+///   stream ARN is checked by [`check_stream_arn_scope`] in the service's
+///   order: its shape, then the account (another account is
+///   `AccessDeniedException` whatever the region field holds), then the
+///   partition, service and region values (another value, or an empty region,
+///   is `Invalid StreamArn`).
 /// - An export `TableArn` is validated loosely: only an UNPARSEABLE value (a
 ///   repeated `table/` segment such as `.../table/a/stream/table/b`, a bare
 ///   `table/x`, or an `xrn:` ARN) is refused before authorization, with
@@ -275,20 +259,12 @@ pub(crate) fn validate_operation_arns(
     match operation {
         "DescribeStream" | "GetShardIterator" => {
             if let Some(arn) = present("StreamArn") {
-                if !arn_is_kind(arn, ArnKind::Stream) {
-                    return Err(DynamoDbError::ValidationException(
-                        INVALID_STREAM_ARN_MESSAGE.to_owned(),
-                    ));
-                }
                 check_stream_arn_scope(arn, region, account_id)?;
             }
         }
         "DescribeBackup" | "DeleteBackup" => {
             if let Some(arn) = present("BackupArn")
-                && !arn_is_kind(
-                    extenddb_core::backup_format::trim_backup_arn(arn),
-                    ArnKind::Backup,
-                )
+                && !arn_is_backup(extenddb_core::backup_format::trim_backup_arn(arn))
             {
                 return Err(DynamoDbError::ValidationException(
                     INVALID_BACKUP_ARN_MESSAGE.to_owned(),

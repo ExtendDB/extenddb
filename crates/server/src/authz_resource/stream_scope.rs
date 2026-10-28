@@ -7,15 +7,18 @@
 
 use extenddb_core::error::DynamoDbError;
 
-use super::{INVALID_STREAM_ARN_MESSAGE, PARTITION, SERVICE};
+use super::{
+    INVALID_STREAM_ARN_MESSAGE, PARTITION, ResourceId, SERVICE, Sub, parse_resource_identity,
+};
 
 /// Refuse a stream ARN whose account is not the caller's with
 /// `AccessDeniedException` "Access is denied". The service answers this before
 /// the IAM decision, for every principal, on `StreamArn` (DescribeStream,
 /// GetShardIterator) and on a tag operation's `ResourceArn` alike, and before
-/// it looks at the partition, region or label (measured live 2026-10-23,
+/// it compares the partition, region or label (measured live 2026-10-23,
 /// probe F2-1: another 12-digit account, `abc`, and another account combined
-/// with `aws-cn`, `us-west-2` or an unknown label).
+/// with `aws-cn`, `us-west-2` or an unknown label). On `StreamArn` an empty
+/// partition is refused before this check ([`check_stream_arn_scope`]).
 pub(super) fn check_stream_arn_account(arn: &str, account_id: &str) -> Result<(), DynamoDbError> {
     let Some(f) = extenddb_core::arn::fields(arn) else {
         return Err(DynamoDbError::ValidationException(
@@ -30,18 +33,24 @@ pub(super) fn check_stream_arn_account(arn: &str, account_id: &str) -> Result<()
     Ok(())
 }
 
-/// Refuse a well-formed `StreamArn` that names a stream outside this
-/// deployment's scope, before the IAM decision, as the service does for
-/// DescribeStream and GetShardIterator (measured live 2026-10-23, probe F2-1,
-/// identical for an admin, a no-permissions user, a user allowed the exact
-/// stream ARN and a user with a Deny on it):
+/// Refuse a `StreamArn` that is not a stream ARN in this deployment's scope,
+/// before the IAM decision, as the service does for DescribeStream and
+/// GetShardIterator (measured live 2026-10-23, probe F2-1, identical for an
+/// admin, a no-permissions user, a user allowed the exact stream ARN and a user
+/// with a Deny on it). The checks run in the service's order (measured on
+/// DescribeStream 2026-10-28):
 ///
-/// - an account other than the caller's: `AccessDeniedException`
-///   ([`check_stream_arn_account`]), checked first;
-/// - a partition other than `aws` (`aws-cn`, `aws-us-gov`), a service other
-///   than `dynamodb` (`DynamoDB`, `DYNAMODB`), or a region other than this
-///   server's (`us-west-2`, `US-EAST-1`): `ValidationException`
-///   `Invalid StreamArn`.
+/// 1. not a stream ARN (a table ARN, an extra or missing field, a trailing
+///    slash), or an empty partition, service or account field:
+///    `ValidationException` `Invalid StreamArn`, for any account;
+/// 2. an account other than the caller's: `AccessDeniedException`
+///    ([`check_stream_arn_account`]), whatever the region field holds;
+/// 3. a partition other than `aws` (`aws-cn`, `aws-us-gov`), a service other
+///    than `dynamodb` (`DynamoDB`, `DYNAMODB`), or a region other than this
+///    server's (empty, `us-west-2`, `US-EAST-1`): `ValidationException`
+///    `Invalid StreamArn`.
+///
+/// An empty service field is not among the measured cells; it stays in step 1.
 ///
 /// The stream engine resolves a stream by table name and label within the
 /// caller's account, so a stream ARN that passes here names exactly the stream
@@ -58,16 +67,27 @@ pub(super) fn check_stream_arn_scope(
     region: &str,
     account_id: &str,
 ) -> Result<(), DynamoDbError> {
-    check_stream_arn_account(arn, account_id)?;
-    let Some(f) = extenddb_core::arn::fields(arn) else {
-        return Err(DynamoDbError::ValidationException(
+    let invalid = || {
+        Err(DynamoDbError::ValidationException(
             INVALID_STREAM_ARN_MESSAGE.to_owned(),
-        ));
+        ))
     };
+    let is_stream = matches!(
+        parse_resource_identity(arn),
+        Some(ResourceId {
+            sub: Some(Sub::Stream(_)),
+            ..
+        })
+    );
+    let Some(f) = extenddb_core::arn::fields(arn).filter(|_| is_stream) else {
+        return invalid();
+    };
+    if f.partition.is_empty() || f.service.is_empty() || f.account.is_empty() {
+        return invalid();
+    }
+    check_stream_arn_account(arn, account_id)?;
     if f.partition != PARTITION || f.service != SERVICE || f.region != region {
-        return Err(DynamoDbError::ValidationException(
-            INVALID_STREAM_ARN_MESSAGE.to_owned(),
-        ));
+        return invalid();
     }
     Ok(())
 }
@@ -150,6 +170,42 @@ mod tests {
             STREAM.replace("us-east-1", "us-west-2"),
             STREAM.replace("us-east-1", "US-EAST-1"),
         ]
+    }
+
+    type Check = fn(Result<(), DynamoDbError>, &str, &str);
+
+    /// The seven StreamArn cells measured live on DescribeStream on 2026-10-28
+    /// (the order table in the module docstring of
+    /// `tests/test_stream_arn_scope.py`), each with the answer it expects: an
+    /// empty partition is "Invalid StreamArn" even in another account, another
+    /// account is "Access is denied" whatever the region field holds, and the
+    /// caller's account with an empty or another region is "Invalid StreamArn".
+    fn measured_order() -> [(String, Check); 7] {
+        let other = |arn: String| arn.replace(A, "111111111111");
+        let no_partition = STREAM.replace("arn:aws:", "arn::");
+        let no_region = STREAM.replace("us-east-1", "");
+        let west = STREAM.replace("us-east-1", "us-west-2");
+        [
+            (other(no_partition.clone()), assert_invalid_stream_arn),
+            (no_partition, assert_invalid_stream_arn),
+            (other(no_region.clone()), assert_access_denied),
+            (other(west.clone()), assert_access_denied),
+            (other(STREAM.to_owned()), assert_access_denied),
+            (no_region, assert_invalid_stream_arn),
+            (west, assert_invalid_stream_arn),
+        ]
+    }
+
+    /// The StreamArn checks run in the measured order: the partition's shape,
+    /// then the account, then the region. GetShardIterator takes the same
+    /// check; the 2026-10-28 cells were measured on DescribeStream.
+    #[test]
+    fn stream_arn_checks_follow_the_measured_order() {
+        for (arn, check) in measured_order() {
+            for op in ["DescribeStream", "GetShardIterator"] {
+                check(stream_arn_check(op, &arn), op, &arn);
+            }
+        }
     }
 
     /// The service answers a stream ARN in another account with
