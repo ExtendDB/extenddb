@@ -168,8 +168,9 @@ pub enum ConditionMatch {
     /// A condition is not satisfied; the statement does not apply.
     NoMatch,
     /// A condition depends on a key the service populates but this context
-    /// cannot resolve, or has an `Arn*` value that IAM refuses because it
-    /// cannot have the six fields of an ARN. The statement fails closed.
+    /// cannot resolve, or has an `Arn*` value that contains `${` and cannot
+    /// have the six fields of an ARN, which IAM refuses in a document of any
+    /// `Version`. The statement fails closed.
     Unresolvable,
 }
 
@@ -177,9 +178,9 @@ pub enum ConditionMatch {
 ///
 /// Returns [`ConditionMatch::Unresolvable`] when the key is unresolved and the
 /// context reports it as service-populated (case 3). It also returns
-/// `Unresolvable` when the document expands variables and a value of an `Arn*`
-/// operator, with or without a set qualifier or `IfExists`, holds a `${...}`
-/// reference and fewer than five `:` written outside its references, such as
+/// `Unresolvable`, whatever `expand_variables` says, when a value of an `Arn*`
+/// operator, with or without a set qualifier or `IfExists`, contains `${` and
+/// has fewer than five `:` written outside its `${...}` references, such as
 /// `${aws:ResourceTag/owner}`. Otherwise returns `Match` or `NoMatch` from the
 /// ordinary evaluation, so cases 1 and 2 are unchanged.
 pub fn evaluate_condition_match(
@@ -194,16 +195,15 @@ pub fn evaluate_condition_match(
     // The IAM policy simulator refuses a policy with such an ARN value
     // (`InvalidInput`) and IAM Access Analyzer reports `MISSING_ARN_FIELD`, so
     // IAM gives no decision to match. Failing closed makes a `Deny` apply and
-    // keeps an `Allow` from granting.
-    if expand_variables
-        && matches!(
-            base_operator(&condition.operator),
-            ConditionOperator::ArnEquals
-                | ConditionOperator::ArnNotEquals
-                | ConditionOperator::ArnLike
-                | ConditionOperator::ArnNotLike
-        )
-        && condition.values.iter().any(|v| arn_value_lacks_fields(v))
+    // keeps an `Allow` from granting. IAM checks the value's fields whatever
+    // the document's `Version`, so the rule does not read `expand_variables`.
+    if matches!(
+        base_operator(&condition.operator),
+        ConditionOperator::ArnEquals
+            | ConditionOperator::ArnNotEquals
+            | ConditionOperator::ArnLike
+            | ConditionOperator::ArnNotLike
+    ) && condition.values.iter().any(|v| arn_value_lacks_fields(v))
     {
         return ConditionMatch::Unresolvable;
     }

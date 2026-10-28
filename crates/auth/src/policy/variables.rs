@@ -393,8 +393,8 @@ pub fn expand_condition_value(
     ConditionValue::Expanded { text, tokens }
 }
 
-/// Whether the `Arn*` condition value `value` holds a `${...}` reference and
-/// has fewer than five `:` written outside its references, as
+/// Whether the `Arn*` condition value `value` contains `${` and has fewer
+/// than five `:` written outside its `${...}` references, as
 /// `${aws:ResourceTag/owner}` has none. Only a written `:` separates ARN
 /// fields here, so such a value cannot have the six fields of an ARN. The IAM
 /// policy simulator refuses a policy with such a value (`InvalidInput`) and
