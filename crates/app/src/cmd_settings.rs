@@ -222,4 +222,18 @@ mod tests {
         );
         assert_eq!(extenddb_config::MASK, "\u{2022}".repeat(8));
     }
+
+    #[test]
+    fn no_writable_key_matches_a_redaction_pattern() {
+        // `set` prints the value it wrote, and both `set` and the management
+        // API write it to the `extenddb::audit::settings` log, unmasked. That
+        // is safe only while no key in `KNOWN_KEYS` is one `should_redact`
+        // matches.
+        for (key, _) in KNOWN_KEYS {
+            assert!(
+                !config::should_redact(key),
+                "writable key {key} matches a redaction pattern"
+            );
+        }
+    }
 }
