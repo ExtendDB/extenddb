@@ -5,8 +5,9 @@
 //! cannot resolve (case 3): a Deny fails closed and blocks, an Allow gated on
 //! it does not grant, and the negated-operator-on-absent rule cannot fire. The
 //! same holds when the key is named by a `${key}` variable in `Resource` or
-//! `NotResource`. A variable naming the key in a condition value is compared
-//! as written, with or without a default.
+//! `NotResource` of a `2012-10-17` document; a `2008-10-17` or no-`Version`
+//! document matches such a pattern as written. A variable naming the key in a
+//! condition value is compared as written, with or without a default.
 
 use super::*;
 
@@ -234,6 +235,33 @@ fn a_multivalued_key_the_context_reports_unresolvable_fails_closed_in_resource()
             evaluate_policies(&deny, None, None, "dynamodb:GetItem", RES, &ctx),
             AuthzDecision::Deny,
             "Deny {element} {resource}"
+        );
+    }
+}
+
+#[test]
+fn an_unresolvable_key_in_a_2008_or_no_version_document_is_matched_as_written() {
+    // Only a `2012-10-17` document expands variables, so here the pattern is
+    // text: it names the table `${aws:PrincipalOrgID}` and no other, and the
+    // Deny does not fail closed.
+    let ctx = Ctx::empty().unresolvable("aws:PrincipalOrgID");
+    let literal = format!("{TABLE}${{aws:PrincipalOrgID}}");
+    for (label, version) in [
+        ("2008-10-17", r#""Version":"2008-10-17","#),
+        ("no Version", ""),
+    ] {
+        let deny = parse(&format!(
+            r#"{{{version}"Statement":[{{"Effect":"Deny","Action":"dynamodb:GetItem","Resource":"{literal}"}}]}}"#
+        ));
+        let p = [
+            only(r#"{"Effect":"Allow","Action":"dynamodb:*","Resource":"*"}"#),
+            deny,
+        ];
+        assert_eq!(get_t(&p), AuthzDecision::Allow, "{label}");
+        assert_eq!(
+            evaluate_policies(&p, None, None, "dynamodb:GetItem", &literal, &ctx),
+            AuthzDecision::Deny,
+            "{label}"
         );
     }
 }
