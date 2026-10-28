@@ -727,8 +727,8 @@ pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext
             match context_values {
                 None => true,  // ForAllValues with absent key is vacuously true
                                // (same result whether or not IfExists is present)
-                // An Arn operator over a set with a value that is not an ARN is false
-                Some(vals) if arn_operator_sees_non_arn(base_op, &vals) => false,
+                // No Arn set check: a value that is not an ARN fails
+                // compare_single for every Arn operator, so `all` is false
                 Some(vals) => vals.iter().all(|cv| {
                     condition.values.iter().any(|pv| compare_single(base_op, cv, pv))
                 })
@@ -776,7 +776,11 @@ fn unwrap_if_exists(op: &ConditionOperator) -> (bool, &ConditionOperator) {
 /// Helper: true when `op` is an Arn operator and any context value is not an
 /// ARN (`is_arn`). IAM evaluates the condition as false for the whole set in
 /// that case, in the bare, ForAnyValue and ForAllValues forms (measured with
-/// simulate-custom-policy on the values [V, "notanarn"]).
+/// simulate-custom-policy on the values [V, "notanarn"]). ForAnyValue checks
+/// it before comparing per value. ForAllValues needs no check, because a
+/// value that is not an ARN fails compare_single against every policy value
+/// (so `all` is false for a non-empty policy value list), and neither does
+/// the bare form, which is false on a multivalued key.
 fn arn_operator_sees_non_arn(op: &ConditionOperator, context_values: &[&str]) -> bool {
     is_arn_operator(op) && !context_values.iter().all(|cv| is_arn(cv))
 }

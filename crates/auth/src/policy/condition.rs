@@ -50,7 +50,10 @@ pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext
             let (_absent_passes, base_op) = unwrap_if_exists(inner);
             match context_values {
                 None => true,
-                Some(vals) if arn_operator_sees_non_arn(base_op, &vals) => false,
+                // No Arn set check here, unlike `ForAnyValue`: a value that
+                // is not an ARN fails `compare_single` for every Arn operator,
+                // so the `all` below is already false for any non-empty
+                // policy value list.
                 Some(vals) => {
                     if is_negative_operator(base_op) {
                         // Negative operators: each context value must satisfy the
@@ -317,9 +320,12 @@ fn is_arn_operator(op: &ConditionOperator) -> bool {
 /// `notanarn`]: bare, `ForAnyValue:` and `ForAllValues:` forms of ArnEquals,
 /// ArnNotEquals, ArnLike and ArnNotLike all returned implicitDeny, both with
 /// a pattern that matches the ARN value (`table/*`) and with one that does
-/// not (`table/Z*`). The set operators check this before comparing per value,
+/// not (`table/Z*`). `ForAnyValue:` checks this before comparing per value,
 /// so `ForAnyValue:ArnEquals` does not pass on the one well-formed value and
 /// `ForAnyValue:ArnNotEquals` does not pass on a non-matching pattern.
+/// `ForAllValues:` needs no such check: a value that is not an ARN fails
+/// `compare_single` against every policy value, so per-value evaluation
+/// already returns false there for any non-empty policy value list.
 fn arn_operator_sees_non_arn(op: &ConditionOperator, context_values: &[&str]) -> bool {
     is_arn_operator(op) && !context_values.iter().all(|cv| super::matcher::is_arn(cv))
 }
@@ -380,9 +386,9 @@ fn compare_single(op: &ConditionOperator, context_value: &str, policy_value: &st
         // case sensitive, and both sides need the same number of fields.
         // A context value that is not an ARN (fewer than six fields) matches
         // neither the positive nor the negative operator, so a Deny on
-        // ArnNotEquals does not apply to a malformed value; over a set of
-        // values `arn_operator_sees_non_arn` applies the same rule to the
-        // whole set before this per-value comparison. Measured with
+        // ArnNotEquals does not apply to a malformed value; under
+        // `ForAnyValue:` `arn_operator_sees_non_arn` applies the same rule to
+        // the whole set before this per-value comparison. Measured with
         // simulate-custom-policy across all four operators, with and without
         // IfExists, under ForAnyValue and ForAllValues, with a wildcard in
         // each of the six fields, with field-count and case differences, with
