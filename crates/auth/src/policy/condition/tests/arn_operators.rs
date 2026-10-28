@@ -279,6 +279,24 @@ fn arn_equals_field_count_must_agree() {
     assert!(!single_value(ArnEquals, TABLE_STAR, "arn:aws:dynamodb"));
 }
 
+/// A bare `*` policy value. Over `notanarn` and over `arn:aws:dynamodb` all
+/// four operators were implicitDeny (simulate-custom-policy, 2026-10-28,
+/// `aws:SourceArn` as a string). Over an ARN the simulator refuses the value
+/// (InvalidInput), so the first two assertions are derived, not measured:
+/// Access Analyzer reports `ArnEquals: "*"` as an error (MISSING_ARN_FIELD)
+/// and as equivalent to `Null: false`, and `ArnNotEquals: "*"` as equivalent
+/// to `Null: true`; over a present value those are true and false.
+#[test]
+fn arn_operators_bare_star_value() {
+    assert!(single(ArnEquals, "*"));
+    assert!(!single(ArnNotEquals, "*"));
+    for op in [ArnEquals, ArnNotEquals, ArnLike, ArnNotLike] {
+        for v in ["notanarn", "arn:aws:dynamodb"] {
+            assert!(!single_value(op.clone(), "*", v), "{op:?} * {v}");
+        }
+    }
+}
+
 /// Matrix rows x-nonarn-value, x-nonarn-pattern, x-partial-arn-value and
 /// x-value-fewer-fields-exact: a context value with fewer than six fields
 /// matches neither the positive nor the negative operator. ArnNotEquals and
