@@ -442,3 +442,20 @@ fn condition_value_present_key_without_values_is_empty() {
         Some("xy")
     );
 }
+
+#[test]
+fn arn_value_lacks_fields_counts_only_colons_written_outside_references() {
+    assert!(arn_value_lacks_fields("${aws:ResourceTag/owner}"));
+    // Four written `:` and one inside the reference.
+    assert!(arn_value_lacks_fields(
+        "arn:aws:iam::${aws:PrincipalTag/acct}"
+    ));
+    assert!(!arn_value_lacks_fields(
+        "arn:aws:iam::123456789012:user/${aws:username}"
+    ));
+    assert!(!arn_value_lacks_fields(
+        "arn:aws:iam::${aws:PrincipalAccount}:user/alice"
+    ));
+    // No variable: the value is compared as written.
+    assert!(!arn_value_lacks_fields("user/alice"));
+}

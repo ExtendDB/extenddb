@@ -8,8 +8,8 @@
 //! set operators ForAllValues/ForAnyValue with optional `IfExists` suffix.
 
 use super::context::ConditionContext;
-use super::document::{Condition, ConditionOperator};
-use super::variables::ConditionValue;
+use super::document::{Condition, ConditionOperator, base_operator};
+use super::variables::{ConditionValue, arn_value_lacks_fields};
 
 /// Evaluate a single condition against a context.
 ///
@@ -166,21 +166,42 @@ pub enum ConditionMatch {
     /// A condition is not satisfied; the statement does not apply.
     NoMatch,
     /// A condition depends on a key the service populates but this context
-    /// cannot resolve. The statement fails closed.
+    /// cannot resolve, or has an `Arn*` value that IAM refuses because it
+    /// cannot have the six fields of an ARN. The statement fails closed.
     Unresolvable,
 }
 
 /// Evaluate one condition three-valued.
 ///
 /// Returns [`ConditionMatch::Unresolvable`] when the key is unresolved and the
-/// context reports it as service-populated (case 3). Otherwise returns `Match`
-/// or `NoMatch` from the ordinary evaluation, so cases 1 and 2 are unchanged.
+/// context reports it as service-populated (case 3). It also returns
+/// `Unresolvable` when the document expands variables and a value of an `Arn*`
+/// operator, with or without a set qualifier or `IfExists`, holds a `${...}`
+/// reference and fewer than five `:` written outside its references, such as
+/// `${aws:ResourceTag/owner}`. Otherwise returns `Match` or `NoMatch` from the
+/// ordinary evaluation, so cases 1 and 2 are unchanged.
 pub fn evaluate_condition_match(
     condition: &Condition,
     expand_variables: bool,
     context: &impl ConditionContext,
 ) -> ConditionMatch {
     if context.resolve_key(&condition.key).is_none() && context.is_unresolvable_key(&condition.key)
+    {
+        return ConditionMatch::Unresolvable;
+    }
+    // The IAM policy simulator refuses a policy with such an ARN value
+    // (`InvalidInput`) and IAM Access Analyzer reports `MISSING_ARN_FIELD`, so
+    // IAM gives no decision to match. Failing closed makes a `Deny` apply and
+    // keeps an `Allow` from granting.
+    if expand_variables
+        && matches!(
+            base_operator(&condition.operator),
+            ConditionOperator::ArnEquals
+                | ConditionOperator::ArnNotEquals
+                | ConditionOperator::ArnLike
+                | ConditionOperator::ArnNotLike
+        )
+        && condition.values.iter().any(|v| arn_value_lacks_fields(v))
     {
         return ConditionMatch::Unresolvable;
     }

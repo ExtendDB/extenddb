@@ -391,6 +391,25 @@ pub fn expand_condition_value(
     ConditionValue::Expanded { text, tokens }
 }
 
+/// Whether the `Arn*` condition value `value` holds a `${...}` reference and
+/// has fewer than five `:` written outside its references, as
+/// `${aws:ResourceTag/owner}` has none. Only a written `:` separates ARN
+/// fields here, so such a value cannot have the six fields of an ARN. The IAM
+/// policy simulator refuses a policy with such a value (`InvalidInput`) and
+/// IAM Access Analyzer reports `MISSING_ARN_FIELD` (measured 2026-10-28).
+#[must_use]
+pub(super) fn arn_value_lacks_fields(value: &str) -> bool {
+    value.contains("${")
+        && parts(value)
+            .iter()
+            .map(|part| match part {
+                Part::Text(text) => text.matches(':').count(),
+                Part::Ref(..) => 0,
+            })
+            .sum::<usize>()
+            < 5
+}
+
 /// Match an expanded ARN pattern against an ARN value with the field rule of
 /// [`arn_match`].
 fn arn_match_tokens(pattern: &[Token], value: &str) -> bool {
