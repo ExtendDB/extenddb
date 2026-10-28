@@ -18,6 +18,12 @@ const REDACTED_CONFIG_KEYS: &[&str] = &[
     "token",
 ];
 
+/// The text printed in place of a redacted value: eight U+2022 bullets.
+///
+/// The console settings page, the management settings API and the `settings`
+/// CLI print this constant, so the three surfaces show the same mask.
+pub const MASK: &str = "••••••••";
+
 /// Return `true` if a configuration or settings key's value must be redacted
 /// before it is displayed.
 ///
@@ -29,10 +35,10 @@ pub fn should_redact(key: &str) -> bool {
     REDACTED_CONFIG_KEYS.iter().any(|p| lower.contains(p))
 }
 
-/// Return `"••••••••"` if `key` matches a redaction pattern, else `val`.
+/// Return [`MASK`] if `key` matches a redaction pattern, else `val`.
 fn redact_if_sensitive(key: &str, val: &str) -> String {
     if should_redact(key) {
-        "••••••••".to_owned()
+        MASK.to_owned()
     } else {
         val.to_owned()
     }

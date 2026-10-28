@@ -7,21 +7,18 @@
 //! down. Validation logic is shared with the management API via `ops::KNOWN_KEYS`
 //! and `ops::READONLY_KEYS`. Secret values (the encryption key, connection
 //! strings carrying a password) are masked the same way the management API
-//! masks them, through `extenddb_config::should_redact`; `get --show-secret`
-//! prints the stored value.
+//! masks them: `extenddb_config::should_redact` picks the keys and
+//! `extenddb_config::MASK` is the text printed; `get --show-secret` prints the
+//! stored value.
 
 use clap::{Args, Subcommand};
 
 use extenddb_storage::management_store::SettingsStore;
 
-use extenddb_config as config;
+use extenddb_config::{self as config, MASK};
 
 // Re-use validation constants from the ops layer.
 use extenddb_server::management::ops_settings::{KNOWN_KEYS, READONLY_KEYS};
-
-/// The mask printed in place of a secret value, identical to the management
-/// API and console mask.
-const MASK: &str = "••••••••";
 
 #[derive(Args)]
 pub struct SettingsArgs {
@@ -215,10 +212,14 @@ mod tests {
     }
 
     #[test]
-    fn mask_matches_management_api_mask() {
-        // The management API prints the same eight-bullet mask; the two
-        // surfaces must agree so a copied value is recognisable as masked.
-        assert_eq!(MASK, "••••••••");
-        assert_eq!(MASK.chars().count(), 8);
+    fn secret_prints_the_shared_mask() {
+        // The CLI prints the constant the management API and the console
+        // print, and that constant is the eight U+2022 bullets the admin guide
+        // and the wire tests expect.
+        assert_eq!(
+            display_value("encryption_key", KEY, false),
+            extenddb_config::MASK
+        );
+        assert_eq!(extenddb_config::MASK, "\u{2022}".repeat(8));
     }
 }

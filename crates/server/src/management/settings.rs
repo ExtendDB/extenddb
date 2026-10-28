@@ -15,9 +15,9 @@ use super::ManagementState;
 use super::auth::authenticate_admin;
 use super::ops_settings;
 
-// Redaction patterns live in one place, `extenddb_config::should_redact`, so
-// the API, the console and the `settings` CLI mask the same keys.
-use extenddb_config::should_redact;
+// Redaction patterns and the mask live in one place, `extenddb_config`, so the
+// API, the console and the `settings` CLI mask the same keys with the same text.
+use extenddb_config::{MASK, should_redact};
 
 #[derive(Serialize)]
 struct SettingEntry {
@@ -46,7 +46,7 @@ pub async fn list_settings(
                 .into_iter()
                 .map(|(key, value)| SettingEntry {
                     value: if should_redact(&key) {
-                        "••••••••".to_owned()
+                        MASK.to_owned()
                     } else {
                         value
                     },
@@ -74,7 +74,7 @@ pub async fn get_setting(
     match state.catalog_store.get_setting(&key).await {
         Ok(Some(value)) => {
             let display_value = if should_redact(&key) {
-                "••••••••".to_owned()
+                MASK.to_owned()
             } else {
                 value
             };
@@ -110,7 +110,7 @@ pub async fn set_setting(
     match ops_settings::set_setting(&*state.catalog_store, &key, &body.value).await {
         Ok(()) => {
             let display_value = if should_redact(&key) {
-                "••••••••".to_owned()
+                MASK.to_owned()
             } else {
                 body.value
             };
