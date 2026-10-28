@@ -94,21 +94,22 @@ mod tests {
                 let other_acct = if idx == 0 { &acct_b } else { &acct_a };
                 let other_keyspace = engine.account_keyspace(other_acct);
                 for table in EXPECTED_DATA_TABLES {
-                    if !table_exists(&session, &keyspace, table).await {
-                        let in_other = table_exists(&session, &other_keyspace, table).await;
-                        let where_it_went = if in_other {
-                            format!(
-                                "it exists in the other account's keyspace {other_keyspace} \
-                                     — concurrent creation's interleaved USE placed it there"
-                            )
-                        } else {
-                            "it is absent from both keyspaces".to_owned()
-                        };
-                        panic!(
-                            "round {round}: account {label} ({acct}) keyspace {keyspace} is \
-                             missing table `{table}`; {where_it_went} (issue #408)"
-                        );
+                    if table_exists(&session, &keyspace, table).await {
+                        continue;
                     }
+                    // Name the table and the account label only: keyspace names
+                    // embed the account id, which must not reach the log.
+                    let cause = if table_exists(&session, &other_keyspace, table).await {
+                        "it exists in the other account's keyspace, so a concurrent \
+                         migration's USE redirected the DDL"
+                    } else {
+                        "it is in neither keyspace, so the migration did not create it \
+                         or a concurrent USE sent it to a third keyspace"
+                    };
+                    panic!(
+                        "round {round}: account {label} is missing table `{table}`; {cause} \
+                         (issue #408). To debug, list where the table was created."
+                    );
                 }
             }
         }
