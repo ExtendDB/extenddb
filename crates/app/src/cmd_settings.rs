@@ -224,7 +224,7 @@ mod tests {
     }
 
     #[test]
-    fn no_writable_key_matches_a_redaction_pattern() {
+    fn no_known_key_matches_a_redaction_pattern() {
         // `set` prints the value it wrote, and both `set` and the management
         // API write it to the `extenddb::audit::settings` log, unmasked. That
         // is safe only while no key in `KNOWN_KEYS` is one `should_redact`
