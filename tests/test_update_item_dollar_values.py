@@ -42,6 +42,11 @@ CASES = {
     "m_dotted_member_names": {
         "M": {"a.b": {"S": "v"}, "$c.d": {"S": "$e"}, "f": {"M": {"g.h": {"N": "2"}}}}
     },
+    # Unlike m_dotted_member_names, this map holds no `$`. In the pipeline stage
+    # MongoDB 7.0.45 refuses it as it is (error 40183, "cannot use dotted field
+    # name 'a.b' in a sub object") and stores it as sent inside `$literal`
+    # (measured on 2026-10-27 with the stage this server builds).
+    "m_dotted_member_name_only": {"M": {"a.b": {"S": "v"}}},
     "n_value": {"N": "5"},
     "bool_value": {"BOOL": True},
     "null_value": {"NULL": True},
