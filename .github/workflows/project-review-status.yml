@@ -1,34 +1,43 @@
-name: Project review status
-# When a reviewer picks up a PR, move its card on the ExtendDB Roadmap board
-# (org Project 3) to Status = Review. Issues the PR closes ("Closes #N") move too.
+name: Project status automation
+# Keeps Status on the ExtendDB org Project board (number 3) in step with the
+# work. Issues a PR closes ("Closes #N") move together with the PR.
 #
-# Triggers:
-#   - a reviewer is requested on the PR
-#   - a reviewer submits a review (comment, approve, or request changes)
+#   Todo         nobody has started
+#   In Progress  issue assigned, or a PR opened for it
+#   Review       a reviewer is requested, or a review is submitted
+#   Done         set by the board's built-in "merged" / "closed" workflows
+#
+# Cards only move forward (Todo -> In Progress -> Review); this workflow never
+# moves anything out of Done. Two backward steps:
+#   - changes requested on a PR: Review -> In Progress
+#   - last assignee removed from an issue: In Progress -> Todo
+# Turn OFF the board's built-in "Code changes requested" workflow; this covers it.
 #
 # Needs repo secret PROJECT_TOKEN: a fine-grained token, resource owner ExtendDB,
 # Organization permissions -> Projects: Read and write.
 # The default GITHUB_TOKEN cannot write to org Projects.
 on:
+  issues:
+    types: [assigned, unassigned]
   # pull_request_target runs in the base repo, so the secret is available for
   # fork PRs too. Safe here: this job never checks out or runs PR code.
   pull_request_target:
-    types: [review_requested]
+    types: [opened, reopened, ready_for_review, review_requested]
   pull_request_review:
     types: [submitted]
 
 permissions: {}
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  group: ${{ github.workflow }}-${{ github.event.issue.number || github.event.pull_request.number }}
   cancel-in-progress: false
 
 jobs:
-  move-to-review:
+  update-status:
     # pull_request_review from a fork gets no secrets, so skip it there; the
     # review_requested event already covers those PRs.
     if: >-
-      github.event_name == 'pull_request_target' ||
+      github.event_name != 'pull_request_review' ||
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 5
@@ -39,59 +48,92 @@ jobs:
           script: |
             const ORG = 'ExtendDB';
             const PROJECT_NUMBER = 3;
-            const STATUS_FIELD = 'Status';
-            const TARGET = 'Review';
-            // Never pull a card backwards out of these.
-            const KEEP = new Set(['Review', 'Done']);
+            const FIELD = 'Status';
+            const ORDER = ['Todo', 'In Progress', 'Review', 'Done'];
+            const rank = s => (s == null ? -1 : ORDER.indexOf(s));
 
-            const pr = context.payload.pull_request;
-            if (pr.draft) { core.info('Draft PR, skipping.'); return; }
+            const { eventName, payload } = context;
+            const action = payload.action;
 
-            // Board, Status field and the Review option, looked up by name.
+            // Work out the target status, and which node (issue or PR) it applies to.
+            // allowBack: the one status we may step back FROM for this event.
+            let target, nodeId, isPr, allowBack = null;
+            if (eventName === 'issues') {
+              nodeId = payload.issue.node_id; isPr = false;
+              if (action === 'assigned') target = 'In Progress';
+              else if (payload.issue.assignees.length === 0) { target = 'Todo'; allowBack = 'In Progress'; }
+              else { core.info('Issue still has assignees, nothing to do.'); return; }
+            } else {
+              const pr = payload.pull_request;
+              nodeId = pr.node_id; isPr = true;
+              if (eventName === 'pull_request_review' && payload.review.state === 'changes_requested') {
+                // Author has work to do again: Review -> In Progress.
+                target = 'In Progress'; allowBack = 'Review';
+              }
+              const reviewing = action === 'review_requested' || eventName === 'pull_request_review'
+                || (action === 'ready_for_review' && (pr.requested_reviewers?.length || 0) > 0);
+              if (target) { /* set above */ }
+              else if (reviewing && !pr.draft) target = 'Review';
+              else target = 'In Progress';
+            }
+
+            // Board, Status field and option ids, looked up by name.
             const { organization: { projectV2: project } } = await github.graphql(`
               query($org: String!, $num: Int!) {
                 organization(login: $org) {
                   projectV2(number: $num) {
                     id
-                    field(name: "${STATUS_FIELD}") {
+                    field(name: "${FIELD}") {
                       ... on ProjectV2SingleSelectField { id options { id name } }
                     }
                   }
                 }
               }`, { org: ORG, num: PROJECT_NUMBER });
-            const option = project.field.options.find(o => o.name === TARGET);
-            if (!option) { core.setFailed(`No "${TARGET}" status on the board.`); return; }
+            const option = project.field.options.find(o => o.name === target);
+            if (!option) { core.setFailed(`No "${target}" status on the board.`); return; }
 
-            // The PR's own card plus the cards of issues it closes.
-            const { node } = await github.graphql(`
-              query($id: ID!) {
-                node(id: $id) {
-                  ... on PullRequest {
-                    projectItems(first: 20) { nodes { ...item } }
-                    closingIssuesReferences(first: 20) {
-                      nodes { number projectItems(first: 20) { nodes { ...item } } }
+            const itemFrag = `fragment item on ProjectV2Item {
+              id
+              project { id }
+              fieldValueByName(name: "${FIELD}") {
+                ... on ProjectV2ItemFieldSingleSelectValue { name }
+              }
+            }`;
+            let items;
+            if (isPr) {
+              const { node } = await github.graphql(`
+                query($id: ID!) {
+                  node(id: $id) {
+                    ... on PullRequest {
+                      projectItems(first: 20) { nodes { ...item } }
+                      closingIssuesReferences(first: 20) {
+                        nodes { projectItems(first: 20) { nodes { ...item } } }
+                      }
                     }
                   }
-                }
-              }
-              fragment item on ProjectV2Item {
-                id
-                project { id }
-                fieldValueByName(name: "${STATUS_FIELD}") {
-                  ... on ProjectV2ItemFieldSingleSelectValue { name }
-                }
-              }`, { id: pr.node_id });
-
-            const items = [
-              ...node.projectItems.nodes,
-              ...node.closingIssuesReferences.nodes.flatMap(i => i.projectItems.nodes),
-            ].filter(i => i.project.id === project.id);
-
+                } ${itemFrag}`, { id: nodeId });
+              items = [
+                ...node.projectItems.nodes,
+                ...node.closingIssuesReferences.nodes.flatMap(i => i.projectItems.nodes),
+              ];
+            } else {
+              const { node } = await github.graphql(`
+                query($id: ID!) {
+                  node(id: $id) { ... on Issue { projectItems(first: 20) { nodes { ...item } } } }
+                } ${itemFrag}`, { id: nodeId });
+              items = node.projectItems.nodes;
+            }
+            items = items.filter(i => i.project.id === project.id);
             if (items.length === 0) { core.info('Not on the board, nothing to do.'); return; }
 
             for (const item of items) {
-              const current = item.fieldValueByName?.name;
-              if (KEEP.has(current)) { core.info(`${item.id} is ${current}, leaving it.`); continue; }
+              const current = item.fieldValueByName?.name ?? null;
+              const forward = rank(target) > rank(current);
+              const back = allowBack !== null && current === allowBack;
+              if (current === 'Done' || !(forward || back)) {
+                core.info(`${item.id} is ${current}, leaving it.`);
+                continue;
+              }
               await github.graphql(`
                 mutation($p: ID!, $i: ID!, $f: ID!, $o: String!) {
                   updateProjectV2ItemFieldValue(input: {
@@ -99,5 +141,5 @@ jobs:
                     value: { singleSelectOptionId: $o }
                   }) { projectV2Item { id } }
                 }`, { p: project.id, i: item.id, f: project.field.id, o: option.id });
-              core.info(`${item.id}: ${current ?? 'none'} -> ${TARGET}`);
+              core.info(`${item.id}: ${current ?? 'none'} -> ${target}`);
             }
