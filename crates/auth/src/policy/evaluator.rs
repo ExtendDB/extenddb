@@ -11,7 +11,7 @@ use super::condition::{ConditionMatch, evaluate_statement_conditions};
 use super::context::ConditionContext;
 use super::document::{ActionMatch, Effect, PolicyDocument, ResourceMatch, Statement};
 use super::matcher::wildcard_match_ignore_case;
-use super::variables::resource_pattern_matches;
+use super::variables::{resource_pattern_is_unresolvable, resource_pattern_matches};
 
 /// The result of policy evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,6 +201,11 @@ fn action_matches(statement: &Statement, request_action: &str) -> bool {
 /// variable matches nothing. For `Resource` the statement then does not
 /// apply; for `NotResource` every resource is outside the pattern, so the
 /// statement applies to all of them.
+///
+/// When no pattern matches and one names a key the service populates but the
+/// context cannot resolve, the statement fails closed, as a condition on such
+/// a key does: a `Deny` applies and an `Allow` does not grant, for `Resource`
+/// and `NotResource` alike.
 fn resource_matches(
     policy: &PolicyDocument,
     statement: &Statement,
@@ -213,9 +218,19 @@ fn resource_matches(
             .iter()
             .any(|p| resource_pattern_matches(p, request_resource, expand, context))
     };
+    let unresolvable = |patterns: &[String]| {
+        patterns
+            .iter()
+            .any(|p| resource_pattern_is_unresolvable(p, expand, context))
+    };
+    let deny = statement.effect == Effect::Deny;
     match &statement.resource_match {
-        ResourceMatch::Resources(patterns) => any_match(patterns),
-        ResourceMatch::NotResources(patterns) => !any_match(patterns),
+        ResourceMatch::Resources(patterns) => {
+            any_match(patterns) || (deny && unresolvable(patterns))
+        }
+        ResourceMatch::NotResources(patterns) => {
+            !any_match(patterns) && (deny || !unresolvable(patterns))
+        }
     }
 }
 

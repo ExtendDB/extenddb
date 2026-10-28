@@ -3,7 +3,9 @@
 
 //! Identity-policy evaluation of a key the service populates but the context
 //! cannot resolve (case 3): a Deny fails closed and blocks, an Allow gated on
-//! it does not grant, and the negated-operator-on-absent rule cannot fire.
+//! it does not grant, and the negated-operator-on-absent rule cannot fire. The
+//! same holds when the key is named by a `${key}` variable in `Resource` or
+//! `NotResource`.
 
 use super::*;
 
@@ -119,4 +121,118 @@ fn resolved_principal_arn_allows_normally() {
         evaluate_policies(&[policy], None, None, "dynamodb:GetItem", RES, &ctx),
         AuthzDecision::Allow
     );
+}
+
+// --- A `${key}` variable in Resource or NotResource naming such a key ---
+
+const TABLE: &str = "arn:aws:dynamodb:us-east-1:123456789012:table/";
+
+fn only(statement: &str) -> PolicyDocument {
+    parse(&format!(
+        r#"{{"Version":"2012-10-17","Statement":[{statement}]}}"#
+    ))
+}
+
+/// `Allow dynamodb:*` on `*` beside `statement`.
+fn allow_all_and(statement: &str) -> Vec<PolicyDocument> {
+    vec![
+        only(r#"{"Effect":"Allow","Action":"dynamodb:*","Resource":"*"}"#),
+        only(statement),
+    ]
+}
+
+/// GetItem on table `T` with `aws:PrincipalOrgID` unresolvable.
+fn get_t(policies: &[PolicyDocument]) -> AuthzDecision {
+    let ctx = Ctx::empty().unresolvable("aws:PrincipalOrgID");
+    evaluate_policies(policies, None, None, "dynamodb:GetItem", RES, &ctx)
+}
+
+#[test]
+fn deny_naming_an_unresolvable_key_in_resource_blocks_fail_closed() {
+    // As for the Deny gated on the key in a Condition above. The default is
+    // not used, because the service would have a value for the key.
+    for resource in ["${aws:PrincipalOrgID}", "${aws:PrincipalOrgID, 'none'}"] {
+        let p = allow_all_and(&format!(
+            r#"{{"Effect":"Deny","Action":"dynamodb:GetItem","Resource":"{TABLE}{resource}"}}"#
+        ));
+        assert_eq!(get_t(&p), AuthzDecision::Deny, "{resource}");
+    }
+    let p = allow_all_and(&format!(
+        r#"{{"Effect":"Deny","Action":"dynamodb:GetItem","NotResource":"{TABLE}${{aws:PrincipalOrgID}}"}}"#
+    ));
+    assert_eq!(get_t(&p), AuthzDecision::Deny);
+}
+
+#[test]
+fn allow_naming_an_unresolvable_key_in_resource_does_not_grant() {
+    // Read as an absent key, the default would grant `table/T` and the
+    // NotResource would grant every table.
+    for (element, resource) in [
+        ("Resource", "${aws:PrincipalOrgID, 'T'}"),
+        ("NotResource", "${aws:PrincipalOrgID}"),
+    ] {
+        let p = [only(&format!(
+            r#"{{"Effect":"Allow","Action":"dynamodb:GetItem","{element}":"{TABLE}{resource}"}}"#
+        ))];
+        assert_eq!(get_t(&p), AuthzDecision::Deny, "{element} {resource}");
+    }
+}
+
+#[test]
+fn a_pattern_that_decides_alone_wins_over_an_unresolvable_one() {
+    // `table/T` in the list decides whatever the unresolvable key holds, and
+    // so does an absent key with no default, which makes its pattern match
+    // nothing, before or after the unresolvable variable.
+    let allow = [only(&format!(
+        r#"{{"Effect":"Allow","Action":"dynamodb:GetItem","Resource":["{TABLE}${{aws:PrincipalOrgID}}","{TABLE}T"]}}"#
+    ))];
+    assert_eq!(get_t(&allow), AuthzDecision::Allow);
+    let spared = allow_all_and(&format!(
+        r#"{{"Effect":"Deny","Action":"dynamodb:GetItem","NotResource":["{TABLE}T","{TABLE}${{aws:PrincipalOrgID}}"]}}"#
+    ));
+    assert_eq!(get_t(&spared), AuthzDecision::Allow);
+    for resource in [
+        "${aws:PrincipalTag/team}${aws:PrincipalOrgID}",
+        "${aws:PrincipalOrgID}${aws:PrincipalTag/team}",
+    ] {
+        let absent = allow_all_and(&format!(
+            r#"{{"Effect":"Deny","Action":"dynamodb:GetItem","Resource":"{TABLE}{resource}"}}"#
+        ));
+        assert_eq!(get_t(&absent), AuthzDecision::Allow, "{resource}");
+    }
+}
+
+#[test]
+fn a_multivalued_key_the_context_reports_unresolvable_fails_closed_in_resource() {
+    // The unresolvable rule comes before the multivalued one, so the default
+    // is not used: a Deny applies and an Allow does not grant. Read as an
+    // absent multivalued key, the default `T` would grant `table/T` and the
+    // NotResource would grant every table.
+    let ctx = Ctx::empty().unresolvable("dynamodb:LeadingKeys");
+    for (element, resource) in [
+        ("Resource", "${dynamodb:LeadingKeys, 'T'}"),
+        ("NotResource", "${dynamodb:LeadingKeys}"),
+    ] {
+        let allow = [only(&format!(
+            r#"{{"Effect":"Allow","Action":"dynamodb:GetItem","{element}":"{TABLE}{resource}"}}"#
+        ))];
+        assert_eq!(
+            evaluate_policies(&allow, None, None, "dynamodb:GetItem", RES, &ctx),
+            AuthzDecision::Deny,
+            "Allow {element} {resource}"
+        );
+    }
+    for (element, resource) in [
+        ("Resource", "${dynamodb:LeadingKeys}"),
+        ("NotResource", "${dynamodb:LeadingKeys, 'T'}"),
+    ] {
+        let deny = allow_all_and(&format!(
+            r#"{{"Effect":"Deny","Action":"dynamodb:GetItem","{element}":"{TABLE}{resource}"}}"#
+        ));
+        assert_eq!(
+            evaluate_policies(&deny, None, None, "dynamodb:GetItem", RES, &ctx),
+            AuthzDecision::Deny,
+            "Deny {element} {resource}"
+        );
+    }
 }
