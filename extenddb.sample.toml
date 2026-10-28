@@ -27,6 +27,32 @@
 # port = 18443                 # HTTP port
 # region = "us-east-1"         # AWS region for ARN generation
 # run_dir = "~/.extenddb/run"  # Directory for PID file (~ is expanded to $HOME)
+# dev_allowed_hosts = "app.test,api.test"
+                                # Developer-mode builds only. A single string of
+                                # comma-separated bare host names (no port, scheme
+                                # or wildcard) a browser request may use, beyond an
+                                # IP address, localhost and any .localhost name. A
+                                # dev-mode server refuses a browser request (one
+                                # carrying an Origin or Sec-Fetch-Site header) whose
+                                # host is none of these, and checks every request to
+                                # /management and /metrics the same way, with or
+                                # without those headers. This keeps a page whose
+                                # name resolves to the loopback address from driving
+                                # the local server. A listed name is trusted for
+                                # browser requests as localhost is, so list
+                                # a name that resolves to the loopback address only
+                                # when you control that resolution where the browser
+                                # runs, such as a hosts-file entry, and do not list
+                                # a single-label Compose service name for a browser
+                                # on the host. A client in another container needs
+                                # no listed name for /management or /metrics if it
+                                # uses an IP address, such as the dev container's,
+                                # or runs extenddb manage --endpoint
+                                # http://127.0.0.1:18080 in the dev container
+                                # through docker exec. Entries that are not bare
+                                # host names are dropped with a startup warning.
+                                # Ignored by a production build. Environment
+                                # override: EXTENDDB__SERVER__DEV_ALLOWED_HOSTS.
 
 [storage]
 # backend = "postgres"         # Storage backend: "postgres" (default), "mongodb", or "sqlite".
