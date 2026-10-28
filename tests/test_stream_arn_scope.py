@@ -10,11 +10,11 @@ StreamArn in another account, partition or region, or with an upper-cased
 service or region, was served as the caller's own stream.
 
 Every expected answer below was measured against live DynamoDB on 2026-10-23
-(12:22 to 12:27 UTC, probes F2-1 and F2-2; UntagResource and the
-GetShardIterator unknown-label recheck in probe W1-1) for four principals: an
-admin (Allow dynamodb:* on *), a user with no stream permissions, a user
-allowed exactly the canonical stream ARN, and a user with Allow * plus a Deny
-on the canonical stream ARN.
+(12:22 to 12:27 UTC, and UntagResource from 14:03 to 14:09 UTC with a recheck
+of GetShardIterator on an unknown label in that second run) for four
+principals: an admin (Allow dynamodb:* on *), a user with no stream
+permissions, a user allowed exactly the canonical stream ARN, and a user with
+Allow * plus a Deny on the canonical stream ARN.
 
 StreamArn (DescribeStream, GetShardIterator), the same for every principal, so
 before the IAM decision:

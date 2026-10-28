@@ -15,10 +15,11 @@ use super::{
 /// `AccessDeniedException` "Access is denied". The service answers this before
 /// the IAM decision, for every principal, on `StreamArn` (DescribeStream,
 /// GetShardIterator) and on a tag operation's `ResourceArn` alike, and before
-/// it compares the partition, region or label (measured live 2026-10-23,
-/// probe F2-1: another 12-digit account, `abc`, and another account combined
-/// with `aws-cn`, `us-west-2` or an unknown label). On `StreamArn` an empty
-/// partition is refused before this check ([`check_stream_arn_scope`]).
+/// it compares the partition, region or label (measured live 2026-10-23, in
+/// the module docstring of `tests/test_stream_arn_scope.py`: another 12-digit
+/// account, `abc`, and another account combined with `aws-cn`, `us-west-2` or
+/// an unknown label). On `StreamArn` an empty partition is refused before this
+/// check ([`check_stream_arn_scope`]).
 pub(super) fn check_stream_arn_account(arn: &str, account_id: &str) -> Result<(), DynamoDbError> {
     let Some(f) = extenddb_core::arn::fields(arn) else {
         return Err(DynamoDbError::ValidationException(
@@ -35,10 +36,11 @@ pub(super) fn check_stream_arn_account(arn: &str, account_id: &str) -> Result<()
 
 /// Refuse a `StreamArn` that is not a stream ARN in this deployment's scope,
 /// before the IAM decision, as the service does for DescribeStream and
-/// GetShardIterator (measured live 2026-10-23, probe F2-1, identical for an
-/// admin, a no-permissions user, a user allowed the exact stream ARN and a user
-/// with a Deny on it). The checks run in the service's order (measured on
-/// DescribeStream 2026-10-28):
+/// GetShardIterator (measured live 2026-10-23, identical for an admin, a
+/// no-permissions user, a user allowed the exact stream ARN and a user with a
+/// Deny on it). The checks run in the service's order, measured on
+/// DescribeStream on 2026-10-28; both measurements are tabled in the module
+/// docstring of `tests/test_stream_arn_scope.py`:
 ///
 /// 1. not a stream ARN (a table ARN, an extra or missing field, a trailing
 ///    slash), or an empty partition, service or account field:

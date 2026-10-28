@@ -36,21 +36,29 @@
 //! service, region, and account of a supplied ARN and act within this
 //! deployment's account, so a caller who respells those fields would otherwise
 //! evade a Deny written against the canonical ARN. Canonicalizing here closes
-//! that bypass: a Deny on the real resource always matches.
+//! that bypass: a Deny on the real resource always matches. A tag operation's
+//! stream ARN is not canonicalized. It is authorized as sent, and the engine's
+//! `validate_resource_arn` refuses it after the IAM decision, before any tag
+//! row is read or written, unless its partition, service, region and account
+//! are this deployment's.
 //!
 //! A stream ARN is held to a stricter rule than canonicalization (issues #450
-//! and #451; measured live 2026-10-23, probes F2-1 and F2-2). Its account must
-//! be the caller's: another account is `AccessDeniedException` "Access is
-//! denied" before the IAM decision, on `StreamArn`, on a tag operation's
-//! `ResourceArn` and inside a `GetRecords` iterator alike
-//! ([`check_stream_arn_account`]). Its partition, service and region must be
-//! this deployment's: on `StreamArn` (DescribeStream, GetShardIterator) and in
-//! a `GetRecords` iterator another spelling is refused before the IAM decision
-//! with `Invalid StreamArn` ([`check_stream_arn_scope`]); on a tag operation's
+//! and #451; measured live 2026-10-23 and 2026-10-28, tabled in the module
+//! docstring of `tests/test_stream_arn_scope.py`). Its account must be the
+//! caller's: another account is `AccessDeniedException` "Access is denied"
+//! before the IAM decision, on `StreamArn` and on a tag operation's
+//! `ResourceArn` ([`check_stream_arn_account`]). Its partition, service and
+//! region must be this deployment's: on `StreamArn` (DescribeStream,
+//! GetShardIterator) another spelling is refused before the IAM decision with
+//! `Invalid StreamArn` ([`check_stream_arn_scope`]); on a tag operation's
 //! `ResourceArn` the IAM decision runs first, on the ARN as sent, and the
-//! engine refuses the spelling afterwards with the same message. So a
-//! respelled stream ARN is never served as the caller's own stream, and a
-//! stream ARN that reaches the engine spells the stream the engine reads.
+//! engine refuses the spelling afterwards with the same message. A `GetRecords`
+//! iterator whose stream ARN is out of scope in any field, the account
+//! included, is refused before the IAM decision with ValidationException
+//! `Invalid ShardIterator` ([`getrecords_resource`]); GetShardIterator issues
+//! no such iterator. So a respelled stream ARN is never served as the
+//! caller's own stream, and a stream ARN that reaches the engine spells the
+//! stream the engine reads.
 //!
 //! Fail-closed: a missing or unparseable resource field never falls back to
 //! `table/*`. It yields the field value verbatim (often empty), which an
@@ -171,9 +179,10 @@ fn backup_arn_field(input: &Value) -> String {
 /// deployment. A stream ARN is authorized as sent: the service evaluates the
 /// IAM decision on the spelling the caller gave (a no-permissions principal's
 /// denial names `arn:aws-cn:...` as sent, and a principal allowed the exact
-/// canonical ARN is denied the `aws-cn` spelling; measured 2026-10-23, probe
-/// F2-1), and the engine refuses another partition, service or region after
-/// authorization with `Invalid StreamArn`. A foreign-service ARN is left
+/// canonical ARN is denied the `aws-cn` spelling; measured 2026-10-23, module
+/// docstring of `tests/test_stream_arn_scope.py`), and the engine refuses
+/// another partition, service or region after authorization with
+/// `Invalid StreamArn`. A foreign-service ARN is left
 /// verbatim so authorization denies it, matching the service (measured, arn-1
 /// table).
 fn tag_resource_arn(arn: &str, region: &str, account_id: &str) -> String {
@@ -215,8 +224,9 @@ fn arn_is_backup(arn: &str) -> bool {
 }
 
 /// Validate ARN-bearing fields before the IAM decision, matching the service
-/// (measured live, `live-r2/arn-kinds-live.json` and
-/// `arn-r3/review/rv3-2/live-matrix.json`).
+/// (measured live, `live-r2/arn-kinds-live.json`; for `StreamArn`, the tables
+/// in the module docstring of `tests/test_stream_arn_scope.py`, measured
+/// 2026-10-23 and 2026-10-28).
 ///
 /// The two field families differ, as the service does:
 ///
@@ -425,7 +435,8 @@ fn backup_wildcard(region: &str, account_id: &str) -> String {
 /// A stream ARN's account is also checked here ([`check_stream_arn_account`]):
 /// the service answers `AccessDeniedException` "Access is denied" for a stream
 /// ARN in another account on ListTagsOfResource and TagResource, to every
-/// principal, before the IAM decision (measured 2026-10-23, probe F2-1). Its
+/// principal, before the IAM decision (measured 2026-10-23, module docstring
+/// of `tests/test_stream_arn_scope.py`). Its
 /// partition, service and region are not checked here: the service runs the
 /// IAM decision on the ARN as sent and refuses `aws-cn`, `DYNAMODB` or
 /// `us-west-2` afterwards with `Invalid StreamArn`, which the engine's
