@@ -127,8 +127,7 @@ mod tests {
         validate_operation_arns(op, &json!({ "StreamArn": arn }), R, A)
     }
 
-    /// Names the result's variant for a failure message without printing the
-    /// error's text, which carries the account id from the checked ARN.
+    /// Names the result's variant for a failure message.
     fn variant(r: &Result<(), DynamoDbError>) -> &'static str {
         match r {
             Ok(()) => "Ok",

@@ -1198,8 +1198,6 @@ mod tests {
         let err_msg = |op: &str, input: Value| match validate_operation_arns(op, &input, R, A) {
             Err(DynamoDbError::ValidationException(m)) => Some(m),
             Ok(()) => None,
-            // The error's text is not printed: it carries the account id
-            // from the checked ARN.
             Err(_) => panic!("unexpected non-validation error for {op}"),
         };
 
