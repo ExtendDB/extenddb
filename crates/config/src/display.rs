@@ -139,7 +139,7 @@ pub fn build_config_entries(cfg: &AppConfig) -> Vec<(String, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::display_pool_limit;
+    use super::{display_pool_limit, should_redact};
 
     #[test]
     fn explicit_pool_limit_is_displayed() {
@@ -152,5 +152,29 @@ mod tests {
             display_pool_limit(None),
             "from connection string / driver default"
         );
+    }
+
+    /// Each of the five patterns redacts as the whole key and as part of a
+    /// longer key, in any letter case; a key that contains none of them does
+    /// not. The admin guide's settings section names all five.
+    #[test]
+    fn should_redact_matches_each_pattern_in_any_case() {
+        for key in [
+            "encryption_key",
+            "Encryption_KEY",
+            "connection_string",
+            "storage.Connection_String",
+            "password",
+            "DATA_DB_Password",
+            "secret",
+            "Client_SECRET",
+            "token",
+            "session_Token",
+        ] {
+            assert!(should_redact(key), "{key} must redact");
+        }
+        for key in ["log_level", "Log_Level", "catalog_version"] {
+            assert!(!should_redact(key), "{key} must not redact");
+        }
     }
 }
