@@ -319,6 +319,45 @@ Catalog upgrades change the schema; behavior changes alter how the running serve
 interprets existing data or configuration. Review these before upgrading a live
 deployment, even when no catalog migration is required.
 
+### v0.1.15: IAM policy variables expand in `Resource` and `NotResource`
+
+**What changed.** In a `2012-10-17` policy document, a `${key}` variable in a
+`Resource` or `NotResource` pattern is now expanded from the request before the
+pattern is matched, as IAM does. Before this release the pattern was compared as
+literal text and matched no table. Text from a variable value or a default is
+matched literally, a variable whose key the request does not carry makes the
+pattern match nothing, and a `2008-10-17` document, or one with no `Version`,
+still matches the pattern as written. Three decisions change for stored policies:
+
+1. A pattern with a variable now matches the table it names. `Allow
+   table/${aws:username}` now grants the caller's own table, where it granted
+   nothing. `Deny table/${aws:PrincipalTag/team}` now denies the team's table,
+   where it denied nothing. `Deny NotResource table/${aws:PrincipalTag/team}` now
+   spares the team's table, where it denied every table, and an `Allow
+   NotResource` written that way no longer grants the team's table.
+2. A condition value naming a multivalued key, such as `${dynamodb:LeadingKeys}`
+   or `${aws:TagKeys}` in a trust policy, is no longer expanded to the key's first
+   value; the text is compared as written, so such a condition no longer matches.
+3. A condition value written as `${key, 'default'}` now expands to `default` when
+   the request does not carry `key`. Before, the whole text was compared.
+
+**Policy writes check `Version`.** Writing a user, group or role policy or a
+permissions boundary, through the management API or the console, now refuses a
+document whose `Version` is not the string `2012-10-17` or `2008-10-17`, for
+example `"2012-10-18"` or the number `20121017`, with `Invalid policy document:
+policy parse error: invalid Version ...`. A document already stored with such a
+value keeps evaluating, with its `Resource` patterns matched as written. A
+session policy passed to `AssumeRole` is not checked.
+
+**Who is affected.** Any deployment with a stored policy whose `Resource`,
+`NotResource` or condition values contain `${`: inline user, group and role
+policies, permissions boundaries and session policies, and, for the two condition
+value changes, role trust policies. Search the stored policies for `${`
+(`extenddb manage list-user-policies`, `list-group-policies` and
+`list-role-policies`) and check each match against the cases above before
+upgrading, in particular an `Allow` that now grants and a `Deny NotResource` that
+now spares a table. No catalog migration is required.
+
 ### v0.1.14 LeadingKeys now enforced on Query, batch and transaction operations
 
 **What changed.** `dynamodb:LeadingKeys` is now evaluated on `Query`,
