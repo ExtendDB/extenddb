@@ -9,6 +9,7 @@
 //! `*` with the condition under test). The `Null` and `Bool` cells N1a to N1f
 //! and N2a to N2e were measured the same way on 2026-10-28, two samples each;
 //! N1f is an `Allow dynamodb:GetItem` with the condition and nothing else.
+//! `bool_reads_a_request_value_true_in_any_case_as_true` is not measured.
 
 use super::*;
 
@@ -109,6 +110,18 @@ fn bool_reads_a_variable_as_false() {
     ];
     let wrong = differ(&cells);
     assert!(wrong.is_empty(), "differ from IAM: {wrong:?}");
+}
+
+#[test]
+fn bool_reads_a_request_value_true_in_any_case_as_true() {
+    // Not measured. Cell N2c with the request value spelled `TRUE`: the
+    // request value is read as `true` ignoring case, as a `Bool` value without
+    // a variable compares it, so the Deny does not apply.
+    let p = deny_if(r#"{"Bool":{"aws:SecureTransport":"${aws:PrincipalTag/flag}"}}"#);
+    let ctx = Ctx::empty()
+        .with("aws:SecureTransport", vec!["TRUE"])
+        .with("aws:PrincipalTag/flag", vec!["true"]);
+    assert_eq!(get(&p, &ctx), AuthzDecision::Allow);
 }
 
 // --- A wildcard inside a substituted value is literal (cells C1, C2f, C2g) ---
