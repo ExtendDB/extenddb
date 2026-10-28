@@ -272,6 +272,41 @@ fn derived_set_operator_escaped_star_is_literal() {
 }
 
 #[test]
+fn derived_date_and_address_values_with_a_variable_are_not_expanded() {
+    use crate::policy::condition::{ConditionMatch, evaluate_statement_conditions};
+    use crate::policy::document::parse_conditions;
+    // IAM's operator reference lists policy variables as not supported for
+    // the date and IP address operators. The value is compared as written, the
+    // rule measured for `NumericEquals` (cell C4a), so it parses as neither a
+    // date nor an address and the condition does not match.
+    let p = deny_if(
+        V2012,
+        "DateEquals",
+        "aws:CurrentTime",
+        "${aws:PrincipalTag/when}",
+    );
+    let ctx = Ctx::empty()
+        .with("aws:CurrentTime", vec!["2026-10-28T00:00:00Z"])
+        .with("aws:PrincipalTag/when", vec!["2026-10-28T00:00:00Z"]);
+    assert_eq!(get(&p, &ctx), AuthzDecision::Allow, "DateEquals");
+    // An identity policy with this `IpAddress` value does not parse (a
+    // malformed CIDR). A trust policy's conditions go through
+    // `parse_conditions` alone, so the trust evaluator reaches this value.
+    let conditions = parse_conditions(&serde_json::json!({
+        "IpAddress": {"aws:SourceIp": "${aws:PrincipalTag/net}"}
+    }))
+    .unwrap();
+    let ctx = Ctx::empty()
+        .with("aws:SourceIp", vec!["10.1.2.3"])
+        .with("aws:PrincipalTag/net", vec!["10.0.0.0/8"]);
+    assert_eq!(
+        evaluate_statement_conditions(&conditions, true, &ctx),
+        ConditionMatch::NoMatch,
+        "IpAddress"
+    );
+}
+
+#[test]
 fn version_2008_string_like_wildcards_still_match() {
     // Rule 1 leaves written wildcards as wildcards: only variable expansion is
     // off in a 2008-10-17 document.
