@@ -36,6 +36,24 @@ pub(crate) fn success_response(body: &Value, request_id: &str) -> Response {
 /// REQ-ERR-001: `__type` with prefix. REQ-ERR-002: message field.
 /// REQ-ERR-003: Omit `message` when empty (real `DynamoDB` behavior, verified 2026-05-04).
 pub(crate) fn error_response(error: &DynamoDbError, request_id: &str) -> Response {
+    let status =
+        StatusCode::from_u16(error.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    error_response_with_status(error, request_id, status)
+}
+
+/// Build the same wire-format error body as [`error_response`] but with an
+/// explicit HTTP status instead of the error's own catalog status.
+///
+/// The dev-mode host guard refuses a browser request with HTTP 403 while still
+/// returning the JSON error body the `DynamoDB` API uses, so it sets the status
+/// itself. `AccessDeniedException` carries a 400 in the real `DynamoDB` catalog;
+/// here the guard pairs it with 403, which is why the status cannot come from
+/// the error.
+pub(crate) fn error_response_with_status(
+    error: &DynamoDbError,
+    request_id: &str,
+    status: StatusCode,
+) -> Response {
     // Fix #14: Use full_error_type() which includes the prefix
     let mut body = serde_json::json!({
         "__type": error.full_error_type(),
@@ -57,8 +75,6 @@ pub(crate) fn error_response(error: &DynamoDbError, request_id: &str) -> Respons
     let body_bytes =
         serde_json::to_vec(&body).unwrap_or_else(|_| SERIALIZATION_FAILURE_BODY.to_vec());
     let crc = crc32fast::hash(&body_bytes);
-    let status =
-        StatusCode::from_u16(error.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
     (
         status,

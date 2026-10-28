@@ -78,6 +78,13 @@ pub fn build_config_entries(cfg: &AppConfig) -> Vec<(String, String)> {
                 .map_or("none".into(), |b| b.to_string()),
         ),
         (
+            "server.dev_allowed_hosts".into(),
+            cfg.server
+                .dev_allowed_hosts
+                .clone()
+                .unwrap_or_else(|| "none".into()),
+        ),
+        (
             format!("storage.{backend}.connection_string"),
             r("connection_string", cfg.storage.connection_config()),
         ),

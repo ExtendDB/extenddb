@@ -27,6 +27,28 @@ use axum::routing::{get, post};
 
 use session::SessionStore;
 
+/// Render a standalone 403 page for a browser request the dev-mode host guard
+/// refused before any session exists. `message` is the guard's own text, which
+/// names the host and the setting; it is HTML-escaped here.
+pub(crate) fn host_refused_page(message: &str) -> String {
+    let content = format!(
+        r#"<div style="max-width:560px;margin:3rem auto">
+<div class="card">
+<h1>Request refused</h1>
+{alert}
+</div>
+</div>"#,
+        alert = html::alert_error(message),
+    );
+    html::layout_full(
+        "Request refused",
+        r#"<nav><span class="brand">extenddb Console</span></nav>"#,
+        &content,
+        None,
+        None,
+    )
+}
+
 /// Shared state for console handlers.
 pub struct ConsoleState {
     pub sessions: SessionStore,
