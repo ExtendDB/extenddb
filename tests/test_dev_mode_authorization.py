@@ -210,7 +210,9 @@ def stream_table(dynamodb_client, endpoint_url, unique_table_name):
 class TestDevModeKeepsStreamArnScope:
     """The stream ARN refusals run before the dev-mode return (#450, #451).
     The expected answers are the service's, measured 2026-10-23 and tabled in
-    the module docstring of tests/test_stream_arn_scope.py."""
+    the module docstring of tests/test_stream_arn_scope.py, except "Shard
+    iterator has expired" for a pre-upgrade token, which is this server's
+    upgrade answer."""
 
     def test_stream_arn_outside_scope_is_refused(self, stream_table):
         arn, shard_id, streams = stream_table

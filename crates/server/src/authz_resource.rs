@@ -29,26 +29,30 @@
 //! | `ListTables` | `ListTables` | `table/*` |
 //! | item/table ops | same | the table ARN (from `TableName`, name or ARN) |
 //!
-//! Every resource ARN produced here is CANONICAL for this deployment: the
-//! partition, service, region, and account are fixed to this server's, and only
-//! the resource identity (table name and optional sub-resource) is taken from
-//! the request. ExtendDB's stream and backup resolvers ignore the partition,
-//! service, region, and account of a supplied ARN and act within this
-//! deployment's account, so a caller who respells those fields would otherwise
-//! evade a Deny written against the canonical ARN. Canonicalizing here closes
-//! that bypass: a Deny on the real resource always matches. A tag operation's
-//! stream ARN is not canonicalized. It is authorized as sent, and the engine's
-//! `validate_resource_arn` refuses it after the IAM decision, before any tag
-//! row is read or written, unless its partition, service, region and account
-//! are this deployment's.
+//! Every resource ARN produced here, except a tag operation's stream ARN, is
+//! CANONICAL for this deployment: the partition, service, region, and account
+//! are fixed to this server's, and only the resource identity (table name and
+//! optional sub-resource) is taken from the request. ExtendDB's stream and
+//! backup resolvers ignore the partition, service, region, and account of a
+//! supplied ARN and act within this deployment's account, so a caller who
+//! respells those fields would otherwise evade a Deny written against the
+//! canonical ARN. Canonicalizing here closes that bypass: a Deny on the real
+//! resource matches every canonical ARN. A tag operation's stream ARN is
+//! authorized as sent, so a Deny on the real stream ARN does not match a
+//! respelled one; the engine's `validate_resource_arn` refuses it after the IAM
+//! decision, before any tag row is read or written, unless its partition,
+//! service, region and account are this deployment's.
 //!
 //! A stream ARN is held to a stricter rule than canonicalization (issues #450
 //! and #451; measured live 2026-10-23 and 2026-10-28, tabled in the module
 //! docstring of `tests/test_stream_arn_scope.py`). Its account must be the
-//! caller's: another account is `AccessDeniedException` "Access is denied"
-//! before the IAM decision, on `StreamArn` and on a tag operation's
-//! `ResourceArn` ([`check_stream_arn_account`]). Its partition, service and
-//! region must be this deployment's: on `StreamArn` (DescribeStream,
+//! caller's: a well-formed stream ARN in another account is
+//! `AccessDeniedException` "Access is denied" before the IAM decision, on
+//! `StreamArn` and on a tag operation's `ResourceArn`
+//! ([`check_stream_arn_account`]). On `StreamArn` the shape step runs first, so
+//! a value that is not a stream ARN, or has an empty partition, service or
+//! account field, is `Invalid StreamArn` in any account. Its partition, service
+//! and region must be this deployment's: on `StreamArn` (DescribeStream,
 //! GetShardIterator) another spelling is refused before the IAM decision with
 //! `Invalid StreamArn` ([`check_stream_arn_scope`]); on a tag operation's
 //! `ResourceArn` the IAM decision runs first, on the ARN as sent, and the
