@@ -805,7 +805,7 @@ impl MongoEngine {
             && !return_old
             && stream.is_none()
             && self.gsi_cache_get_fresh(&key_info.table_id) == Some(false)
-            && let Some(mongo_update) = self.try_build_native_update(actions, maps)
+            && let Some(mongo_update) = Self::try_build_native_update(actions, maps)
         {
             let (fast_filter, took_fast) = match mongo_update {
                 NativeUpdate::Doc(d) => {
@@ -1630,7 +1630,6 @@ impl MongoEngine {
     /// because mongo serializes doc-scoped write locks around the
     /// pipeline's read + compute + write, no OCC retry needed.
     fn try_build_native_update(
-        &self,
         actions: &[UpdateAction],
         maps: &ExpressionMaps,
     ) -> Option<NativeUpdate> {
@@ -4430,5 +4429,29 @@ transaction_read_concern = "majority""#,
         let path = vec![PathElement::Attribute("name".to_owned())];
 
         assert_eq!(native_attribute_name(&path, &maps), Some("name".to_owned()));
+    }
+
+    #[test]
+    fn native_update_pipeline_sets_each_value_as_a_literal() {
+        let names = std::collections::HashMap::from([
+            ("s".to_owned(), "s".to_owned()),
+            ("n".to_owned(), "n".to_owned()),
+        ]);
+        let values = std::collections::HashMap::from([
+            ("dollar".to_owned(), AttributeValue::S("$item_data".into())),
+            ("one".to_owned(), AttributeValue::N("1".into())),
+        ]);
+        let maps = ExpressionMaps::new(names, values);
+        let tokens = expression::tokenize("SET #s = :dollar ADD #n :one").unwrap();
+        let actions = expression::parse_update(&tokens).unwrap();
+
+        let Some(NativeUpdate::Pipeline { pipeline, .. }) =
+            MongoEngine::try_build_native_update(&actions, &maps)
+        else {
+            panic!("a SET with a numeric ADD builds a pipeline update");
+        };
+        let stage = pipeline[0].get_document("$set").unwrap();
+        let want = doc! { "$literal": { "S": "$item_data" } };
+        assert_eq!(stage.get("item_data.s"), Some(&bson::Bson::Document(want)));
     }
 }
