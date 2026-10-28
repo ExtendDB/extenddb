@@ -19,9 +19,12 @@
 //! value, a default or an escape is matched literally, so a tag value or an
 //! escaped `*` cannot widen a pattern. A variable whose key the request does
 //! not carry, with no default, makes the pattern match nothing. Both rules
-//! were measured with the IAM policy simulator (issue #533). Only a document
-//! whose `Version` is `2012-10-17` expands variables; the caller decides that
-//! with [`PolicyDocument::expands_policy_variables`].
+//! were measured with the IAM policy simulator (issue #533). A variable whose
+//! key the service populates but the context cannot resolve (a key listed in
+//! `context::FAIL_CLOSED_GLOBAL_KEYS`) leaves the match unknown, and the
+//! evaluator fails closed on it as it does on such a key in a condition.
+//! Only a document whose `Version` is `2012-10-17` expands variables; the
+//! caller decides that with [`PolicyDocument::expands_policy_variables`].
 //!
 //! ARN matching here follows the same field rule as
 //! [`super::matcher::arn_match`]: the first five `:` separate fields, the
@@ -133,28 +136,44 @@ fn parts(value: &str) -> Vec<Part<'_>> {
     out
 }
 
+/// Why a variable has no text to substitute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Missing {
+    /// The request does not carry the key and no default was written.
+    Absent,
+    /// The service populates the key but the context cannot resolve it
+    /// (`ConditionContext::is_unresolvable_key`). A default is not used,
+    /// because the service would have a value.
+    Unresolvable,
+}
+
 /// The request's value for `key`: the value of a present single-valued key,
-/// the default when the key is absent and a default was written, `None` when
-/// the key is absent and no default was written. A present key with no values
-/// expands to the empty string. A multivalued key is treated as absent.
+/// or the default when the key is absent and a default was written. A present
+/// key with no values expands to the empty string. A multivalued key is
+/// treated as absent.
 fn resolve<'a>(
     name: &str,
     default: Option<&'a str>,
     context: &'a impl ConditionContext,
-) -> Option<&'a str> {
+) -> Result<&'a str, Missing> {
     if context.is_multivalued_key(name) {
-        return default;
+        return default.ok_or(Missing::Absent);
     }
     match context.resolve_key(name) {
-        Some(values) => Some(values.first().copied().unwrap_or("")),
-        None => default,
+        Some(values) => Ok(values.first().copied().unwrap_or("")),
+        None if context.is_unresolvable_key(name) => Err(Missing::Unresolvable),
+        None => default.ok_or(Missing::Absent),
     }
 }
 
-/// Expand `pattern` into tokens. Returns `None` when a variable names a key
-/// the request does not carry and gives no default.
-fn expand_tokens(pattern: &str, context: &impl ConditionContext) -> Option<Vec<Token>> {
+/// Expand `pattern` into tokens. Fails with [`Missing::Absent`] when a
+/// variable names a key the request does not carry and gives no default,
+/// since that alone makes the pattern match nothing, and otherwise with
+/// [`Missing::Unresolvable`] when a variable names a key the context cannot
+/// resolve.
+fn expand_tokens(pattern: &str, context: &impl ConditionContext) -> Result<Vec<Token>, Missing> {
     let mut tokens = Vec::with_capacity(pattern.len());
+    let mut unresolvable = false;
     for part in parts(pattern) {
         match part {
             Part::Text(text) => tokens.extend(text.bytes().map(|b| match b {
@@ -165,20 +184,28 @@ fn expand_tokens(pattern: &str, context: &impl ConditionContext) -> Option<Vec<T
             })),
             Part::Ref(_, Reference::Escape(byte)) => tokens.push(Token::Byte(byte)),
             Part::Ref(_, Reference::Key { name, default }) => {
-                let value = resolve(name, default, context)?;
-                tokens.extend(value.bytes().map(Token::Byte));
+                match resolve(name, default, context) {
+                    Ok(value) => tokens.extend(value.bytes().map(Token::Byte)),
+                    Err(Missing::Unresolvable) => unresolvable = true,
+                    Err(Missing::Absent) => return Err(Missing::Absent),
+                }
             }
         }
     }
-    Some(tokens)
+    if unresolvable {
+        Err(Missing::Unresolvable)
+    } else {
+        Ok(tokens)
+    }
 }
 
 /// Whether the `Resource` or `NotResource` pattern `pattern` matches
 /// `resource_arn`.
 ///
 /// With `expand` false, or when `pattern` has no `${`, this is exactly
-/// [`arn_match`]. Otherwise variables are expanded first and a pattern with an
-/// unresolved variable matches nothing.
+/// [`arn_match`]. Otherwise variables are expanded first, and a pattern with
+/// an unresolved variable matches nothing, as does one that
+/// [`resource_pattern_is_unresolvable`] reports.
 #[must_use]
 pub fn resource_pattern_matches(
     pattern: &str,
@@ -189,17 +216,34 @@ pub fn resource_pattern_matches(
     if !expand || !pattern.contains("${") {
         return arn_match(pattern, resource_arn);
     }
-    match expand_tokens(pattern, context) {
-        Some(tokens) => arn_match_tokens(&tokens, resource_arn),
-        None => false,
-    }
+    expand_tokens(pattern, context).is_ok_and(|tokens| arn_match_tokens(&tokens, resource_arn))
+}
+
+/// Whether expanding `pattern` stops on a variable whose key the service
+/// populates but the context cannot resolve, so whether the pattern matches
+/// is unknown. A pattern that also names an absent key with no default is not
+/// reported: it matches nothing whatever the other value is.
+///
+/// The caller fails closed on such a pattern, as on a condition key the
+/// context cannot resolve: a `Deny` applies and an `Allow` does not grant.
+#[must_use]
+pub fn resource_pattern_is_unresolvable(
+    pattern: &str,
+    expand: bool,
+    context: &impl ConditionContext,
+) -> bool {
+    expand
+        && pattern.contains("${")
+        && expand_tokens(pattern, context) == Err(Missing::Unresolvable)
 }
 
 /// Expand variables in a condition value.
 ///
 /// `${key}` and `${key, 'default'}` are replaced by their value; a variable
 /// whose key the request does not carry, with no default, is left as written,
-/// and so are the `${*}`, `${?}` and `${$}` escapes, as before.
+/// and so are the `${*}`, `${?}` and `${$}` escapes, as before. A variable
+/// whose key the context cannot resolve is also left as written, with or
+/// without a default; a condition value does not fail closed on it.
 #[must_use]
 pub fn expand_condition_value(value: &str, context: &impl ConditionContext) -> String {
     if !value.contains("${") {
