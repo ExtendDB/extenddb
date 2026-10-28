@@ -174,4 +174,11 @@ fn a_multivalued_key_in_a_condition_value_is_not_expanded_under_any_form() {
         let p = deny_get_if(operator, key, "${dynamodb:LeadingKeys}");
         assert_eq!(get(&p, "T", &ctx), AuthzDecision::Allow, "{operator}");
     }
+    // Under `Null`, the first value `false` would say that `team` is present,
+    // which it is, and the Deny would apply.
+    let null = Ctx::empty()
+        .with("dynamodb:LeadingKeys", vec!["false"])
+        .with("aws:PrincipalTag/team", vec!["blue"]);
+    let p = deny_get_if("Null", "aws:PrincipalTag/team", "${dynamodb:LeadingKeys}");
+    assert_eq!(get(&p, "T", &null), AuthzDecision::Allow, "Null");
 }

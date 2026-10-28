@@ -200,7 +200,9 @@ pub fn evaluate_statement_conditions(
 /// Replaces `${variable}` and `${variable, 'default'}` patterns with their
 /// resolved values from the context (see [`super::variables`]). Supported
 /// variables: `aws:PrincipalTag/*` and any key the context can resolve.
-/// Unresolvable variables with no default are left as-is (IAM behavior).
+/// Unresolved variables with no default are left as-is (IAM behavior). A
+/// variable naming a key the context cannot resolve is also left as-is, with
+/// or without a default; see [`super::variables::expand_condition_value`].
 fn expand_policy_variables(value: &str, context: &impl ConditionContext) -> String {
     super::variables::expand_condition_value(value, context)
 }
