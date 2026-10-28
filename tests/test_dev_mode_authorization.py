@@ -231,6 +231,28 @@ class TestDevModeKeepsStreamArnScope:
                 err = _error(call, sent)
                 assert (err["Code"], err.get("Message")) == (code, message), (op, sent, err)
 
+    def test_tag_resource_arn_with_trailing_slash_is_refused(self, dynamodb_client, stream_table):
+        """The issued stream ARN with a trailing slash, as a tag operation's
+        ResourceArn, is not a DynamoDB resource ARN: the service answers this
+        for every principal, so the shape check runs before the dev-mode
+        return. Without it TagResource writes a tag under that ARN."""
+        sent = stream_table[0] + "/"
+        expected = {
+            "Code": "ValidationException",
+            "Message": (
+                "One or more parameter values were invalid: "
+                f"Provided Arn is not a DynamoDB resource arn: {sent}"
+            ),
+        }
+        calls = {
+            "TagResource": lambda: dynamodb_client.tag_resource(
+                ResourceArn=sent, Tags=[{"Key": "k", "Value": "v"}]),
+            "ListTagsOfResource": lambda: dynamodb_client.list_tags_of_resource(ResourceArn=sent),
+        }
+        for op, call in calls.items():
+            err = _error(call)
+            assert err == expected, (op, err)
+
     def test_getrecords_token_not_issued_here_is_refused(self, stream_table):
         """A token is base64 of `shard|type|seq|ts|stream_arn`. One naming
         another account is "Invalid ShardIterator"; GetShardIterator issues no
