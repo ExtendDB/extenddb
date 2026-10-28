@@ -8,10 +8,12 @@
 //! before matching. The forms are:
 //!
 //! - `${key}`: the value of `key` in the request context. A multivalued key
-//!   is never a variable: it resolves as if the request did not carry it,
-//!   with one value or several (measured with `dynamodb:LeadingKeys` holding
-//!   one value and two, in `Resource` and in a condition value; PR #535 body
-//!   table).
+//!   is never a variable: when the request carries it, with one value or
+//!   several, the pattern matches nothing, default or not; a written default
+//!   is used only when the request does not carry the key (measured with
+//!   `dynamodb:LeadingKeys` holding one value and two, in `Resource` and in a
+//!   condition value, PR #535 body table; and with `aws:TagKeys` present and
+//!   absent against `${aws:TagKeys, 'x'}` on 2026-10-28).
 //! - `${key, 'default'}`: the value of `key`, or `default` when the request
 //!   does not carry `key`.
 //! - `${*}`, `${?}`, `${$}`: a literal `*`, `?` or `$`.
@@ -173,15 +175,21 @@ enum Missing {
 
 /// The request's value for `key`: the value of a present single-valued key,
 /// or the default when the key is absent and a default was written. A present
-/// key with no values expands to the empty string. A multivalued key is
-/// treated as absent.
+/// key with no values expands to the empty string. A multivalued key is never
+/// a value: when the request carries it the pattern matches nothing, default
+/// or not, and when it is absent a written default is used (IAM policy
+/// simulator, 2026-10-28, `aws:TagKeys` as `[x, y]`, `[x]` and absent against
+/// `table/${aws:TagKeys, 'x'}`: implicitDeny, implicitDeny, allowed).
 fn resolve<'a>(
     name: &str,
     default: Option<&'a str>,
     context: &'a impl ConditionContext,
 ) -> Result<&'a str, Missing> {
     if context.is_multivalued_key(name) {
-        return default.ok_or(Missing::Absent);
+        return match context.resolve_key(name) {
+            Some(_) => Err(Missing::Absent),
+            None => default.ok_or(Missing::Absent),
+        };
     }
     match context.resolve_key(name) {
         Some(values) => Ok(values.first().copied().unwrap_or("")),
