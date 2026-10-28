@@ -208,6 +208,30 @@ fn not_resource_unresolved_variable_applies_to_every_resource() {
     assert_eq!(get(&p, "blue", &Ctx::empty()), AuthzDecision::Deny);
 }
 
+#[test]
+fn allow_not_resource_with_unresolved_variable_grants_every_table() {
+    // Measured: an `Allow` alone, with no `team` tag. The pattern matches
+    // nothing, so every table is outside it and the Allow grants both.
+    let p = vec![parse(&format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{
+            "Effect":"Allow","Action":"dynamodb:GetItem","NotResource":"{ARN}${{aws:PrincipalTag/team}}"
+        }}]}}"#
+    ))];
+    assert_eq!(get(&p, "blue", &Ctx::empty()), AuthzDecision::Allow);
+    assert_eq!(get(&p, "red", &Ctx::empty()), AuthzDecision::Allow);
+}
+
+#[test]
+fn default_form_without_a_space_expands_when_key_absent() {
+    // Measured: no space after the comma.
+    let p = allow_all_deny_get(
+        Some("2012-10-17"),
+        "Resource",
+        "${aws:PrincipalTag/team,'none'}",
+    );
+    assert_eq!(get(&p, "none", &Ctx::empty()), AuthzDecision::Deny);
+}
+
 // --- Default form in a condition value ---
 
 #[test]

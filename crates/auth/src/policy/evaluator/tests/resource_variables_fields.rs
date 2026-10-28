@@ -155,3 +155,19 @@ fn a_question_mark_written_beside_a_variable_is_a_wildcard() {
         AuthzDecision::Deny
     );
 }
+
+// --- A wildcard inside a value is literal ---
+
+#[test]
+fn a_wildcard_in_a_value_matches_only_the_same_text() {
+    let p = deny_get_on(&format!("{P}:table/${{aws:PrincipalTag/team}}"));
+    let ctx = Ctx::empty().with("aws:PrincipalTag/team", vec!["bl*"]);
+    assert_eq!(
+        get(&p, &format!("{P}:table/blue"), &ctx),
+        AuthzDecision::Allow
+    );
+    assert_eq!(
+        get(&p, &format!("{P}:table/bl*"), &ctx),
+        AuthzDecision::Deny
+    );
+}
