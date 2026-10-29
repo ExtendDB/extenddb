@@ -654,11 +654,11 @@ async fn test_list_streams_includes_stream_enabled_table() {
     assert!(streams.iter().any(|s| s.stream_arn == expected_arn));
 }
 
-/// `created_at`, the sequence number's millisecond prefix, and the record's
-/// `ApproximateCreationDateTime` all derive from one clock read: for every
-/// stored record `created_at_ms <= hlc_ms` and `created_at_ms / 1000` equals
-/// the record's timestamp. Covers a plain write and a service-identity
-/// deletion (the TTL worker's shape).
+/// `created_at` and `ApproximateCreationDateTime` derive from one clock
+/// read, and the sequence prefix is that reading or a later clamped value.
+/// For every stored record `created_at_ms <= hlc_ms`, and
+/// `created_at_ms / 1000` equals the record's timestamp. Covers plain
+/// writes and a service-identity deletion through `delete_item`.
 #[tokio::test]
 async fn test_stream_record_created_at_matches_the_record_and_sequence() {
     if crate::helpers::skip_without_cassandra() {
