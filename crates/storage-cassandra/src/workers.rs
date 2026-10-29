@@ -470,17 +470,34 @@ pub(crate) async fn poll_gsi_backfill_recovery(
         };
 
         for account_ks in &keyspaces {
-            if let Err(e) = recover_stale_backfills(&engine, account_ks, stale_threshold).await {
+            if let Err(e) =
+                recover_stale_backfills(&engine, account_ks, stale_threshold, None).await
+            {
                 tracing::warn!("gsi_recovery: {account_ks}: {e}");
             }
         }
     }
 }
 
+/// One scan of the recovery worker, limited to the `CREATING` indexes of one
+/// table. Hidden because no deployment path calls it: a direct test drives the
+/// worker's claim with it, and the table filter keeps the scan off the indexes
+/// the tests running beside it stage.
+#[doc(hidden)]
+pub async fn recover_stale_gsi_backfills_of_table(
+    engine: &Arc<CassandraEngine>,
+    account_ks: &str,
+    table_id: &str,
+    stale_threshold: Duration,
+) -> Result<(), extenddb_storage::error::StorageError> {
+    recover_stale_backfills(engine, account_ks, stale_threshold, Some(table_id)).await
+}
+
 async fn recover_stale_backfills(
     engine: &Arc<CassandraEngine>,
     account_ks: &str,
     stale_threshold: Duration,
+    only_table: Option<&str>,
 ) -> Result<(), extenddb_storage::error::StorageError> {
     use cdrs_tokio::types::IntoRustByName as _;
 
@@ -513,6 +530,9 @@ async fn recover_stale_backfills(
         }
 
         let table_id: String = crate::cassandra_util::get_column(&row, "table_id", "gsi_recovery")?;
+        if only_table.is_some_and(|t| t != table_id) {
+            continue;
+        }
         let index_name: String =
             crate::cassandra_util::get_column(&row, "index_name", "gsi_recovery")?;
         let index_id: String = crate::cassandra_util::get_column(&row, "index_id", "gsi_recovery")?;

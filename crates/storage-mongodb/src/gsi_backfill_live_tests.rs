@@ -1,19 +1,20 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Live MongoDB test: a GSI added by `UpdateTable` walks the service's two
-//! `CREATING` phases (measured 2026-10-26, see `extenddb_storage::gsi_backfill`).
+//! Live MongoDB tests: a GSI added by `UpdateTable` walks the service's two
+//! `CREATING` phases (measured 2026-10-26, see `extenddb_storage::gsi_backfill`),
+//! and a backfill resumed after a restart stays in its second phase.
 //!
 //! Needs a replica set, read from `EXTENDDB_TEST_MONGODB_URI`, and is
 //! `#[ignore]`d like the backup live tests; run it with
-//! `cargo test -p extenddb-storage-mongodb --lib -- --ignored live_gsi_`. It
-//! uses its own catalog and data databases and drops them when it passes.
+//! `cargo test -p extenddb-storage-mongodb --lib -- --ignored live_gsi_`. Each
+//! test uses its own catalog and data databases and drops them when it passes.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use extenddb_core::expression::ExpressionMaps;
-use extenddb_core::types::{AttributeValue, DescribeTableInput};
+use extenddb_core::types::{AttributeValue, DescribeTableInput, TableKeyInfo};
 use extenddb_storage::error::StorageError;
 use extenddb_storage::{DataEngine, TableEngine};
 use mongodb::bson::{Document, doc};
@@ -44,38 +45,15 @@ async fn engine() -> MongoEngine {
     }
 }
 
-/// What DescribeTable says about `gidx`: its status and its serialised
-/// `Backfilling` member, or `None` before the catalog row is visible.
-async fn gsi_state(engine: &MongoEngine) -> Option<(String, Option<serde_json::Value>)> {
-    let desc = engine
-        .describe_table(
-            ACCOUNT,
-            DescribeTableInput {
-                table_name: TABLE.to_owned(),
-            },
-        )
-        .await
-        .expect("describe the table");
-    let gsi = desc
-        .global_secondary_indexes?
-        .into_iter()
-        .find(|g| g.index_name == "gidx")?;
-    let wire = serde_json::to_value(&gsi).expect("serialise the GSI description");
-    Some((gsi.index_status, wire.get("Backfilling").cloned()))
-}
-
-#[tokio::test]
-#[ignore = "needs EXTENDDB_TEST_MONGODB_URI"]
-async fn live_gsi_added_by_update_table_walks_both_creating_phases() {
-    let engine = engine().await;
+/// A three-item table with the phase hold set to `hold_ms`, then `gidx`
+/// added by `UpdateTable`, which returns at once on this backend: the index
+/// is `CREATING` until the backfill worker builds it.
+async fn table_with_a_new_gsi(engine: &MongoEngine, hold_ms: u32) -> TableKeyInfo {
     let settings = engine.catalog_db.collection::<Document>("settings");
     settings
         .insert_one(doc! { "_id": "control_plane_delay_seconds", "value": "0" })
         .await
         .expect("settings");
-    let worker = tokio::spawn(crate::ttl_worker::gsi_backfill_worker(Arc::new(
-        engine.clone(),
-    )));
 
     let input: extenddb_core::types::CreateTableInput = serde_json::from_value(serde_json::json!({
         "TableName": TABLE,
@@ -112,12 +90,11 @@ async fn live_gsi_added_by_update_table_walks_both_creating_phases() {
     settings
         .insert_one(doc! {
             "_id": extenddb_core::settings_keys::gsi_creating_phase_delay_key(TABLE),
-            "value": "2000",
+            "value": hold_ms.to_string(),
         })
         .await
         .expect("set the phase hold");
 
-    // UpdateTable returns at once on this backend; the worker builds the index.
     let update: extenddb_core::types::UpdateTableInput =
         serde_json::from_value(serde_json::json!({
             "TableName": TABLE,
@@ -133,45 +110,82 @@ async fn live_gsi_added_by_update_table_walks_both_creating_phases() {
         .update_table(ACCOUNT, update)
         .await
         .expect("UpdateTable succeeds");
+    key_info
+}
 
-    // Phases seen, in order: 1 is Backfilling false, 2 is true, 3 is ACTIVE.
-    // A reading counts only when DescribeTable agrees before and after the
-    // read, so a phase change between the two calls cannot pair one phase's
-    // description with the other's refusal.
+/// What DescribeTable says about `gidx`: its status and its serialised
+/// `Backfilling` member, or `None` before the catalog row is visible.
+async fn gsi_state(engine: &MongoEngine) -> Option<(String, Option<serde_json::Value>)> {
+    let desc = engine
+        .describe_table(
+            ACCOUNT,
+            DescribeTableInput {
+                table_name: TABLE.to_owned(),
+            },
+        )
+        .await
+        .expect("describe the table");
+    let gsi = desc
+        .global_secondary_indexes?
+        .into_iter()
+        .find(|g| g.index_name == "gidx")?;
+    let wire = serde_json::to_value(&gsi).expect("serialise the GSI description");
+    Some((gsi.index_status, wire.get("Backfilling").cloned()))
+}
+
+/// The phase of `gidx`: 1 is `Backfilling` false, 2 is true, 3 is ACTIVE.
+///
+/// Reads the index between two DescribeTable calls and checks the read gets
+/// the answer the description implies. `None` when the index is not visible
+/// yet, or when the two calls disagree, so a phase change between them cannot
+/// pair one phase's description with the other's refusal.
+async fn phase(engine: &MongoEngine, key_info: &TableKeyInfo) -> Option<u8> {
+    let before = gsi_state(engine).await?;
+    let read = engine
+        .index_info_by_table_id(&key_info.table_id, "gidx")
+        .await;
+    if gsi_state(engine).await.as_ref() != Some(&before) {
+        return None;
+    }
+    Some(match before {
+        (status, Some(serde_json::Value::Bool(false))) if status == "CREATING" => {
+            assert!(
+                matches!(read, Err(StorageError::IndexNotFound(ref n)) if n == "gidx"),
+                "before the backfill a read is told there is no such index: {read:?}"
+            );
+            1
+        }
+        (status, Some(serde_json::Value::Bool(true))) if status == "CREATING" => {
+            assert!(
+                matches!(read, Err(StorageError::Validation(ref m)) if m == BACKFILLING),
+                "during the backfill a read gets the backfilling sentence: {read:?}"
+            );
+            2
+        }
+        (status, None) if status == "ACTIVE" => {
+            read.expect("an ACTIVE index resolves");
+            3
+        }
+        other => panic!("a state the service does not report: {other:?}"),
+    })
+}
+
+#[tokio::test]
+#[ignore = "needs EXTENDDB_TEST_MONGODB_URI"]
+async fn live_gsi_added_by_update_table_walks_both_creating_phases() {
+    let engine = engine().await;
+    let worker = tokio::spawn(crate::ttl_worker::gsi_backfill_worker(Arc::new(
+        engine.clone(),
+    )));
+    let key_info = table_with_a_new_gsi(&engine, 2000).await;
+
     let mut seen: Vec<u8> = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(60);
     while seen.last() != Some(&3) {
         assert!(Instant::now() < deadline, "no ACTIVE state; seen {seen:?}");
-        let before = gsi_state(&engine).await;
-        let read = engine
-            .index_info_by_table_id(&key_info.table_id, "gidx")
-            .await;
-        if before.is_none() || gsi_state(&engine).await != before {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            continue;
-        }
-        let phase = match before.expect("checked above") {
-            (status, Some(serde_json::Value::Bool(false))) if status == "CREATING" => {
-                assert!(
-                    matches!(read, Err(StorageError::IndexNotFound(ref n)) if n == "gidx"),
-                    "before the backfill a read is told there is no such index: {read:?}"
-                );
-                1
-            }
-            (status, Some(serde_json::Value::Bool(true))) if status == "CREATING" => {
-                assert!(
-                    matches!(read, Err(StorageError::Validation(ref m)) if m == BACKFILLING),
-                    "during the backfill a read gets the backfilling sentence: {read:?}"
-                );
-                2
-            }
-            (status, None) if status == "ACTIVE" => {
-                read.expect("an ACTIVE index resolves");
-                3
-            }
-            other => panic!("a state the service does not report: {other:?}"),
-        };
-        if seen.last() != Some(&phase) {
+        if let Some(phase) = phase(&engine, &key_info).await
+            && seen.last() != Some(&phase)
+        {
             assert!(
                 seen.last().is_none_or(|&last| last < phase),
                 "phase {phase} after {seen:?}"
@@ -181,6 +195,65 @@ async fn live_gsi_added_by_update_table_walks_both_creating_phases() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_eq!(seen, vec![1, 2, 3], "each phase is observed, in order");
+
+    worker.abort();
+    engine.catalog_db.drop().await.expect("drop catalog");
+    engine.data_db.drop().await.expect("drop data");
+}
+
+/// A process that dies during a backfill leaves the index document marked as
+/// backfilling. The worker of the next process resumes the job from that
+/// mark: the index reports its second phase before and during the resumed
+/// backfill, and the job goes straight to its scan instead of starting the
+/// first phase again, which with the hold set would wait it twice more.
+#[tokio::test]
+#[ignore = "needs EXTENDDB_TEST_MONGODB_URI"]
+async fn live_gsi_job_resumed_after_a_restart_keeps_its_second_phase() {
+    const HOLD_MS: u32 = 30_000;
+    let engine = engine().await;
+    // No worker yet: the index stays as UpdateTable left it until the mark
+    // below stands in for a worker that set it and then died.
+    let key_info = table_with_a_new_gsi(&engine, HOLD_MS).await;
+    assert_eq!(
+        phase(&engine, &key_info).await,
+        Some(1),
+        "as UpdateTable left it"
+    );
+    let marked = engine
+        .catalog_db
+        .collection::<Document>("indexes")
+        .update_one(
+            doc! {
+                "_id": { "table_id": &key_info.table_id, "index_name": "gidx" },
+                "index_status": "CREATING",
+            },
+            doc! { "$set": { "backfilling": true } },
+        )
+        .await
+        .expect("mark the backfill as started");
+    assert_eq!(marked.matched_count, 1, "the CREATING index document");
+    assert_eq!(
+        phase(&engine, &key_info).await,
+        Some(2),
+        "after the restart"
+    );
+
+    let started = Instant::now();
+    let worker = tokio::spawn(crate::ttl_worker::gsi_backfill_worker(Arc::new(
+        engine.clone(),
+    )));
+    loop {
+        match phase(&engine, &key_info).await {
+            Some(3) => break,
+            Some(2) | None => {}
+            Some(other) => panic!("phase {other} while the resumed job ran"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(u64::from(HOLD_MS) / 2),
+            "the resumed job waited on the phase hold"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     worker.abort();
     engine.catalog_db.drop().await.expect("drop catalog");
