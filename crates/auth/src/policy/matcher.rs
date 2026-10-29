@@ -330,6 +330,9 @@ pub fn ip_in_cidr(cidr: &str, addr: &str) -> Option<bool> {
 }
 
 #[cfg(test)]
+mod utf16_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -366,49 +369,6 @@ mod tests {
     fn question_mark() {
         assert!(wildcard_match("s?s", "sis"));
         assert!(!wildcard_match("s?s", "sass"));
-    }
-
-    /// Measured with the IAM policy simulator, in a Resource pattern: `?`
-    /// matched the one-unit `\u{e9}` and `\u{65e5}` and `??` did not;
-    /// against the two-unit `\u{1f600}`, `?` did not match, `??` did and
-    /// `????` did not. In a `StringLike` condition `p??/*` matched
-    /// `p\u{1f600}/x` and `p?/*` did not.
-    #[test]
-    fn question_mark_takes_one_utf16_unit() {
-        assert!(wildcard_match("user-?", "user-\u{e9}"));
-        assert!(!wildcard_match("user-??", "user-\u{e9}"));
-        assert!(wildcard_match("?", "\u{65e5}"));
-        assert!(!wildcard_match("??", "\u{65e5}"));
-        assert!(!wildcard_match("???", "\u{65e5}"));
-        assert!(wildcard_match("team/??", "team/\u{65e5}\u{672c}"));
-        assert!(!wildcard_match("team/?", "team/\u{65e5}\u{672c}"));
-        assert!(!wildcard_match("?", "\u{1f600}"));
-        assert!(wildcard_match("??", "\u{1f600}"));
-        assert!(!wildcard_match("????", "\u{1f600}"));
-        assert!(wildcard_match("p??/*", "p\u{1f600}/x"));
-        assert!(!wildcard_match("p?/*", "p\u{1f600}/x"));
-        assert!(arn_match(
-            "arn:aws:dynamodb:us-east-1:123456789012:table/?",
-            "arn:aws:dynamodb:us-east-1:123456789012:table/\u{e9}"
-        ));
-        assert!(wildcard_match_ignore_case("A?C", "a\u{e9}c"));
-        assert!(wildcard_match_ignore_case("A??C", "a\u{1f600}c"));
-    }
-
-    #[test]
-    fn star_backtracks_by_utf16_units() {
-        assert!(wildcard_match("*?b", "\u{e9}b"));
-        assert!(wildcard_match("a*\u{e9}", "a\u{e9}\u{e9}\u{e9}"));
-        assert!(wildcard_match("*\u{e9}?", "x\u{e9}\u{e9}"));
-        assert!(wildcard_match("*?", "\u{65e5}"));
-        assert!(!wildcard_match("*??", "\u{65e5}"));
-        assert!(!wildcard_match("*\u{e9}", "\u{e8}"));
-        // Measured with the IAM policy simulator: `*??bc` does not match
-        // `\u{65e5}bc`, one unit before `bc`, and matches `\u{1f600}bc`, two
-        // units; `*?bc` matches `\u{1f600}bc`.
-        assert!(!wildcard_match("*??bc", "\u{65e5}bc"));
-        assert!(wildcard_match("*??bc", "\u{1f600}bc"));
-        assert!(wildcard_match("*?bc", "\u{1f600}bc"));
     }
 
     #[test]
