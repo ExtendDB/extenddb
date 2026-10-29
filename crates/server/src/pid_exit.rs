@@ -6,10 +6,18 @@
 //! shutdown path that otherwise removes the file. A backend ends the process
 //! that way when it can no longer hold the catalog for serving (PostgreSQL,
 //! when its serving registration is lost). `exit` runs the C library's
-//! `atexit` handlers, so the file is removed from one.
+//! `atexit` handlers, so the file is removed from one. `atexit` is declared
+//! here rather than taken from `libc`, which this crate depends on only on
+//! Unix; every target's C runtime provides it, the Windows CRT included.
 
+use std::ffi::c_int;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+
+unsafe extern "C" {
+    /// The C standard library's `atexit`.
+    fn atexit(callback: extern "C" fn()) -> c_int;
+}
 
 /// The PID file this process wrote; set once.
 static PID_FILE: OnceLock<PathBuf> = OnceLock::new();
@@ -22,7 +30,7 @@ pub(crate) fn remove_at_exit(path: &Path) {
         // SAFETY: `remove_pid_file` is a plain `extern "C"` function that
         // takes no arguments, as `atexit` requires; it only reads a static
         // set before registration and removes a file.
-        let _ = unsafe { libc::atexit(remove_pid_file) };
+        let _ = unsafe { atexit(remove_pid_file) };
     }
 }
 
