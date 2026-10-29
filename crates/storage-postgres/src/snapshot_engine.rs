@@ -643,14 +643,11 @@ fn cursor_stream(
                 }
                 let mut items = Vec::with_capacity(rows.len());
                 for (data,) in rows {
-                    match serde_json::from_str::<Item>(&data) {
+                    match decode_row(&data) {
                         Ok(item) => items.push(item),
                         Err(e) => {
                             state.abandon();
-                            return Some((
-                                Err(StorageError::Internal(format!("Parse item: {e}"))),
-                                state,
-                            ));
+                            return Some((Err(e), state));
                         }
                     }
                 }
@@ -658,6 +655,16 @@ fn cursor_stream(
             }
         },
     ))
+}
+
+/// One cursor row, `item_data::text`, as the item it stores. `item_data` holds
+/// every string through the escape of U+0000 and U+0001 (`data::item_to_json`),
+/// so the row is decoded by `data::json_to_item`, as every other reader of the
+/// column decodes it.
+fn decode_row(data: &str) -> Result<Item, StorageError> {
+    let value: serde_json::Value = serde_json::from_str(data)
+        .map_err(|e| StorageError::Internal(format!("Parse item: {e}")))?;
+    crate::data::json_to_item(value)
 }
 
 /// Two SQLSTATEs mean the server discarded the snapshot's rows before the
@@ -678,4 +685,28 @@ pub fn map_fetch_error(e: &sqlx::Error) -> StorageError {
         return StorageError::SnapshotExpired(db.message().to_owned());
     }
     db_err(e)
+}
+
+#[cfg(test)]
+mod tests {
+    use extenddb_core::types::{AttributeValue, Item};
+
+    use super::decode_row;
+
+    #[test]
+    fn a_row_decodes_to_the_item_it_stores() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "m\u{1}".to_owned(),
+            AttributeValue::S("\u{1}\u{2}".to_owned()),
+        );
+        let mut item = Item::new();
+        item.insert("pk".to_owned(), AttributeValue::S("a\u{0}b".to_owned()));
+        item.insert("k\u{0}".to_owned(), AttributeValue::M(map));
+        let stored = crate::data::item_to_json(&item)
+            .expect("stored form")
+            .to_string();
+        assert!(!stored.contains("\\u0000"), "{stored}");
+        assert_eq!(decode_row(&stored).expect("decode"), item);
+    }
 }

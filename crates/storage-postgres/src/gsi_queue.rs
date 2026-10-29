@@ -26,11 +26,11 @@
 
 use std::sync::Arc;
 
+use crate::data::key_text::composite_pk_to_text;
 use extenddb_core::types::{
     AttributeDefinition, AttributeValue, Item, KeySchemaElement, Projection,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::composite_pk_to_text;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tokio::sync::Notify;
@@ -322,16 +322,9 @@ pub(crate) async fn enqueue_gsi_pending(
     delay_ms: u64,
     context: &PendingApplyContext,
 ) -> Result<(), StorageError> {
-    let old_json = old_item
-        .map(serde_json::to_value)
-        .transpose()
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
-    let new_json = new_item
-        .map(serde_json::to_value)
-        .transpose()
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
-    let context_json =
-        serde_json::to_value(context).map_err(|e| StorageError::Internal(e.to_string()))?;
+    let old_json = old_item.map(crate::data::item_to_json).transpose()?;
+    let new_json = new_item.map(crate::data::item_to_json).transpose()?;
+    let context_json = crate::data::to_stored_json(context)?;
 
     // Route all updates for a given base item to one worker.
     // The base key is immutable over an item's lifetime; `new_item` carries it
@@ -584,16 +577,9 @@ fn decode_row(
     new_json: Option<serde_json::Value>,
     ctx_json: serde_json::Value,
 ) -> Result<(Option<Item>, Option<Item>, PendingApplyContext), StorageError> {
-    let old_item: Option<Item> = old_json
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
-    let new_item: Option<Item> = new_json
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
-    let context: PendingApplyContext =
-        serde_json::from_value(ctx_json).map_err(|e| StorageError::Internal(e.to_string()))?;
+    let old_item: Option<Item> = old_json.map(crate::data::json_to_item).transpose()?;
+    let new_item: Option<Item> = new_json.map(crate::data::json_to_item).transpose()?;
+    let context: PendingApplyContext = crate::data::stored_json_to(ctx_json)?;
     Ok((old_item, new_item, context))
 }
 

@@ -277,10 +277,17 @@ impl VectorSearchEngine for PostgresEngine {
                 .bind(partition.into_bytes())
                 .bind(top_k)
                 .bind(query_norm);
+            // The stored item carries the same escape as every other item_data
+            // column, so the filter's attribute name and value must be compared
+            // in stored form.
             for (name, value) in &filters {
-                let value_json = serde_json::to_string(value)
-                    .map_err(|e| StorageError::Internal(format!("filter value: {e}")))?;
-                query = query.bind(name).bind(value_json);
+                let value_json = serde_json::to_value(value)
+                    .map(extenddb_storage::util::escape_json_strings)
+                    .map_err(|e| StorageError::Internal(format!("filter value: {e}")))?
+                    .to_string();
+                query = query
+                    .bind(extenddb_storage::util::escape_control(name).into_owned())
+                    .bind(value_json);
             }
 
             let rows = query.fetch_all(&self.data_pool).await.map_err(|e| {
@@ -298,7 +305,7 @@ impl VectorSearchEngine for PostgresEngine {
 
             let mut hits = Vec::with_capacity(rows.len());
             for (ordered, embedding, item_json) in rows {
-                let mut item: extenddb_core::types::Item = serde_json::from_value(item_json)
+                let mut item: extenddb_core::types::Item = crate::data::json_to_item(item_json)
                     .map_err(|e| StorageError::Internal(format!("stored item: {e}")))?;
                 // Reinstated from the stored f32s rather than from a second copy in
                 // the payload, so what comes back is the narrowed value that was
