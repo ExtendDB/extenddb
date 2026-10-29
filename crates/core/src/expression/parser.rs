@@ -20,7 +20,9 @@
 //! ```
 
 use super::ast::{CompareOp, Expr};
+use super::kind::ExpressionKind;
 use super::parser_common;
+use super::syntax_error::{is_operator_or_keyword, syntax_error};
 use super::tokenizer::Token;
 use crate::error::DynamoDbError;
 
@@ -42,12 +44,36 @@ pub fn parse_condition_with_depth_limit(
     tokens: &[Token],
     max_depth: usize,
 ) -> Result<Expr, DynamoDbError> {
+    parse_condition_from(tokens, "", max_depth)
+}
+
+/// Parse a condition expression whose tokens came from `source`, so a syntax
+/// error can quote the source window around the offending token as Amazon
+/// `DynamoDB` does (`Syntax error; token: "=", near: "= = :v"`). An empty
+/// `source` joins the token texts instead.
+///
+/// # Errors
+///
+/// Returns `ValidationException` for syntax errors or depth exceeded.
+pub fn parse_condition_from(
+    tokens: &[Token],
+    source: &str,
+    max_depth: usize,
+) -> Result<Expr, DynamoDbError> {
     parser_common::check_redundant_parens(tokens)
         .map_err(|body| validation_err(&format!("Invalid ConditionExpression: {body}")))?;
     let mut pos = 0;
     let mut depth = 0;
-    let expr = parse_or(tokens, &mut pos, &mut depth, max_depth)?;
+    let expr = parse_or(tokens, source, &mut pos, &mut depth, max_depth)?;
     if pos < tokens.len() {
+        // A token after a complete condition. Measured 2026-10-25 for an
+        // operator (`#v = :v =`) and a path (`#v = :v #v = :v`); other tokens
+        // keep the previous text.
+        if is_operator_or_keyword(&tokens[pos])
+            || matches!(tokens[pos], Token::Ident(_) | Token::NameRef(_))
+        {
+            return Err(syntax_error(ExpressionKind::Condition, source, tokens, pos));
+        }
         return Err(validation_err(&format!(
             "Invalid ConditionExpression: unexpected token at position {pos}"
         )));
@@ -57,14 +83,15 @@ pub fn parse_condition_with_depth_limit(
 
 fn parse_or(
     tokens: &[Token],
+    src: &str,
     pos: &mut usize,
     depth: &mut usize,
     max_depth: usize,
 ) -> Result<Expr, DynamoDbError> {
-    let mut left = parse_and(tokens, pos, depth, max_depth)?;
+    let mut left = parse_and(tokens, src, pos, depth, max_depth)?;
     while *pos < tokens.len() && tokens[*pos] == Token::Or {
         *pos += 1;
-        let right = parse_and(tokens, pos, depth, max_depth)?;
+        let right = parse_and(tokens, src, pos, depth, max_depth)?;
         left = Expr::Or(Box::new(left), Box::new(right));
     }
     Ok(left)
@@ -72,14 +99,15 @@ fn parse_or(
 
 fn parse_and(
     tokens: &[Token],
+    src: &str,
     pos: &mut usize,
     depth: &mut usize,
     max_depth: usize,
 ) -> Result<Expr, DynamoDbError> {
-    let mut left = parse_not(tokens, pos, depth, max_depth)?;
+    let mut left = parse_not(tokens, src, pos, depth, max_depth)?;
     while *pos < tokens.len() && tokens[*pos] == Token::And {
         *pos += 1;
-        let right = parse_not(tokens, pos, depth, max_depth)?;
+        let right = parse_not(tokens, src, pos, depth, max_depth)?;
         left = Expr::And(Box::new(left), Box::new(right));
     }
     Ok(left)
@@ -87,6 +115,7 @@ fn parse_and(
 
 fn parse_not(
     tokens: &[Token],
+    src: &str,
     pos: &mut usize,
     depth: &mut usize,
     max_depth: usize,
@@ -99,23 +128,29 @@ fn parse_not(
                 "Invalid ConditionExpression: expression nesting depth exceeded",
             ));
         }
-        let expr = parse_not(tokens, pos, depth, max_depth)?;
+        let expr = parse_not(tokens, src, pos, depth, max_depth)?;
         *depth -= 1;
         return Ok(Expr::Not(Box::new(expr)));
     }
-    parse_primary(tokens, pos, depth, max_depth)
+    parse_primary(tokens, src, pos, depth, max_depth)
 }
 
 fn parse_primary(
     tokens: &[Token],
+    src: &str,
     pos: &mut usize,
     depth: &mut usize,
     max_depth: usize,
 ) -> Result<Expr, DynamoDbError> {
     if *pos >= tokens.len() {
-        return Err(validation_err(
-            "Invalid ConditionExpression: unexpected end of expression",
-        ));
+        if tokens.is_empty() {
+            return Err(validation_err(
+                "Invalid ConditionExpression: unexpected end of expression",
+            ));
+        }
+        // Input ends where a condition is required (`#v = :v AND`): measured
+        // 2026-10-25 as token "<EOF>" with the last token as the window.
+        return Err(syntax_error(ExpressionKind::Condition, src, tokens, *pos));
     }
 
     // Parenthesized expression
@@ -127,7 +162,7 @@ fn parse_primary(
                 "Invalid ConditionExpression: expression nesting depth exceeded",
             ));
         }
-        let expr = parse_or(tokens, pos, depth, max_depth)?;
+        let expr = parse_or(tokens, src, pos, depth, max_depth)?;
         *depth -= 1;
         parser_common::expect_token(tokens, pos, &Token::RParen, ")", "ConditionExpression")?;
         return Ok(expr);
@@ -140,17 +175,17 @@ fn parse_primary(
             && *pos + 1 < tokens.len()
             && tokens[*pos + 1] == Token::LParen
         {
-            return parse_function_call(tokens, pos);
+            return parse_function_call(tokens, src, pos);
         }
     }
 
     // Operand — then check for comparator, BETWEEN, or IN
-    let left = parse_operand(tokens, pos)?;
+    let left = parse_operand(tokens, src, pos)?;
 
     if *pos < tokens.len() {
         if let Some(op) = try_comparator(&tokens[*pos]) {
             *pos += 1;
-            let right = parse_operand(tokens, pos)?;
+            let right = parse_operand(tokens, src, pos)?;
             return Ok(Expr::Compare {
                 left: Box::new(left),
                 op,
@@ -161,9 +196,9 @@ fn parse_primary(
         // BETWEEN operand AND operand
         if tokens[*pos] == Token::Between {
             *pos += 1;
-            let low = parse_operand(tokens, pos)?;
+            let low = parse_operand(tokens, src, pos)?;
             parser_common::expect_token(tokens, pos, &Token::And, "AND", "ConditionExpression")?;
-            let high = parse_operand(tokens, pos)?;
+            let high = parse_operand(tokens, src, pos)?;
             return Ok(Expr::Between {
                 operand: Box::new(left),
                 low: Box::new(low),
@@ -175,10 +210,10 @@ fn parse_primary(
         if tokens[*pos] == Token::In {
             *pos += 1;
             parser_common::expect_token(tokens, pos, &Token::LParen, "(", "ConditionExpression")?;
-            let mut list = vec![parse_operand(tokens, pos)?];
+            let mut list = vec![parse_operand(tokens, src, pos)?];
             while *pos < tokens.len() && tokens[*pos] == Token::Comma {
                 *pos += 1;
-                list.push(parse_operand(tokens, pos)?);
+                list.push(parse_operand(tokens, src, pos)?);
             }
             parser_common::expect_token(tokens, pos, &Token::RParen, ")", "ConditionExpression")?;
             return Ok(Expr::In {
@@ -194,11 +229,10 @@ fn parse_primary(
     ))
 }
 
-fn parse_operand(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbError> {
+fn parse_operand(tokens: &[Token], src: &str, pos: &mut usize) -> Result<Expr, DynamoDbError> {
     if *pos >= tokens.len() {
-        return Err(validation_err(
-            "Invalid ConditionExpression: expected operand",
-        ));
+        // Input ends where an operand is required (`#v = :v AND NOT`).
+        return Err(syntax_error(ExpressionKind::Condition, src, tokens, *pos));
     }
 
     match &tokens[*pos] {
@@ -213,7 +247,7 @@ fn parse_operand(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbErro
                 && *pos + 1 < tokens.len()
                 && tokens[*pos + 1] == Token::LParen
             {
-                return parse_function_call(tokens, pos);
+                return parse_function_call(tokens, src, pos);
             }
             let elements = parser_common::parse_path(tokens, pos)?;
             Ok(Expr::Path(elements))
@@ -222,13 +256,22 @@ fn parse_operand(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbErro
             let elements = parser_common::parse_path(tokens, pos)?;
             Ok(Expr::Path(elements))
         }
+        // An operator or keyword where an operand is required (`#v = = :v`,
+        // `#v = :v AND AND #v = :v`, `AND #v = :v`): measured 2026-10-25.
+        token if is_operator_or_keyword(token) => {
+            Err(syntax_error(ExpressionKind::Condition, src, tokens, *pos))
+        }
         _ => Err(validation_err(
             "Invalid ConditionExpression: expected attribute path or value placeholder",
         )),
     }
 }
 
-fn parse_function_call(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbError> {
+fn parse_function_call(
+    tokens: &[Token],
+    src: &str,
+    pos: &mut usize,
+) -> Result<Expr, DynamoDbError> {
     let name = match &tokens[*pos] {
         Token::Ident(n) => n.to_ascii_lowercase(),
         _ => {
@@ -243,10 +286,10 @@ fn parse_function_call(tokens: &[Token], pos: &mut usize) -> Result<Expr, Dynamo
 
     let mut args = Vec::new();
     if *pos < tokens.len() && tokens[*pos] != Token::RParen {
-        args.push(parse_operand(tokens, pos)?);
+        args.push(parse_operand(tokens, src, pos)?);
         while *pos < tokens.len() && tokens[*pos] == Token::Comma {
             *pos += 1;
-            args.push(parse_operand(tokens, pos)?);
+            args.push(parse_operand(tokens, src, pos)?);
         }
     }
 
@@ -448,11 +491,12 @@ mod tests {
 
     #[test]
     fn parse_trailing_tokens_rejected() {
+        // An operand after a complete condition: measured 2026-10-25 (d11,
+        // `#v = :v #v = :v` answers token "#v", near ":v #v =").
         let tokens = tokenize("a = :v b").unwrap();
         let err = parse_condition(&tokens).unwrap_err();
-        assert!(
-            matches!(err, DynamoDbError::ValidationException(msg) if msg.contains("unexpected token"))
-        );
+        assert!(matches!(err, DynamoDbError::ValidationException(msg)
+            if msg == "Invalid ConditionExpression: Syntax error; token: \"b\", near: \":v b\""));
     }
 
     #[test]

@@ -74,25 +74,11 @@ pub async fn handle_put_item(
     )?;
     crate::validate_put_delete_return_values(&body)?;
 
-    let input: PutItemInput = serde_json::from_value(body).map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("parameter values were invalid")
-            || msg.contains("may not be empty")
-            || msg.contains("contains duplicates")
-            || msg.contains("Null attribute value")
-            || msg.contains("validation error detected")
-            || msg.contains("must not be empty")
-            || msg.contains("Syntax error; key")
-            || msg.contains("AttributeValue is empty")
-            || msg.contains("AttributeValue has more than one datatypes set")
-        {
-            DynamoDbError::ValidationException(msg)
-        } else {
-            DynamoDbError::SerializationException(format!(
-                "Start of structure or map found where not expected: {e}"
-            ))
-        }
-    })?;
+    // The shared classifier also recognises the placeholder map errors
+    // (`contains invalid key`, `contains invalid value`): a too-long
+    // ExpressionAttributeNames or ExpressionAttributeValues key is a
+    // ValidationException, as on every other handler (measured 2026-10-25).
+    let input: PutItemInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
     // Reject mixing legacy and expression parameters, then EAN/EAV supplied
     // without a referencing expression.

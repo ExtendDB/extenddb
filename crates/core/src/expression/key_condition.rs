@@ -14,7 +14,9 @@
 //! - No OR, NOT, nested conditions, or other functions
 
 use super::ast::{CompareOp, Expr, PathElement};
+use super::kind::ExpressionKind;
 use super::parser_common;
+use super::syntax_error::{is_operator_or_keyword, syntax_error};
 use super::tokenizer::Token;
 use crate::error::DynamoDbError;
 
@@ -37,193 +39,6 @@ pub struct KeyCondition {
     pub sk_condition: Option<SortKeyCondition>,
     /// Additional RANGE key equality conditions for multi-RANGE key schemas.
     pub extra_sk_conditions: Vec<(Vec<PathElement>, Expr)>,
-}
-
-impl KeyCondition {
-    /// Correct PK/SK assignment using the table's key schema.
-    ///
-    /// For single-attribute keys: when both the PK and SK conditions are equality
-    /// comparisons, the parser cannot distinguish which is which without knowing
-    /// the key schema. This method resolves `#name` references and swaps PK/SK
-    /// if the current PK path actually refers to the sort key attribute.
-    ///
-    /// For multi-part keys: all equality conditions are initially parsed as
-    /// PK + SK pairs. This method reclassifies them based on the key schema,
-    /// moving HASH attribute conditions to `extra_pk_conditions` and keeping
-    /// the RANGE condition as `sk_condition`.
-    ///
-    /// Call this after parsing and before passing to the storage layer.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ValidationException` if a `#name` reference cannot be resolved.
-    pub fn resolve_pk_sk(
-        &mut self,
-        pk_attr: &str,
-        names: &std::collections::HashMap<String, String>,
-    ) -> Result<(), DynamoDbError> {
-        // Only ambiguous when SK is an Eq comparison (both clauses were Eq).
-        let sk_is_eq = matches!(
-            self.sk_condition,
-            Some(SortKeyCondition::Compare {
-                op: CompareOp::Eq,
-                ..
-            })
-        );
-        if !sk_is_eq {
-            return Ok(());
-        }
-
-        // Resolve the current PK path's top-level attribute name.
-        let pk_name = match self.pk_path.first() {
-            Some(PathElement::Attribute(name)) => {
-                if let Some(ref_name) = name.strip_prefix('#') {
-                    names.get(ref_name).map(String::as_str).ok_or_else(|| {
-                        DynamoDbError::ValidationException(format!(
-                            "An expression attribute name used in the document path \
-                             is not defined; attribute name: #{ref_name}"
-                        ))
-                    })?
-                } else {
-                    name.as_str()
-                }
-            }
-            _ => return Ok(()),
-        };
-
-        // If the current PK path already matches the actual PK attribute, no swap needed.
-        if pk_name == pk_attr {
-            return Ok(());
-        }
-
-        // Swap: current PK is actually the SK, and the SK condition holds the real PK.
-        if let Some(SortKeyCondition::Compare {
-            path: sk_path,
-            op: CompareOp::Eq,
-            value: sk_value,
-        }) = self.sk_condition.take()
-        {
-            let old_pk_path = std::mem::replace(&mut self.pk_path, sk_path);
-            let old_pk_value = std::mem::replace(&mut self.pk_value, sk_value);
-            self.sk_condition = Some(SortKeyCondition::Compare {
-                path: old_pk_path,
-                op: CompareOp::Eq,
-                value: old_pk_value,
-            });
-        }
-
-        Ok(())
-    }
-
-    /// Reclassify conditions for multi-part key schemas.
-    ///
-    /// Given the full set of HASH attribute names, moves any equality conditions
-    /// on HASH attributes from `sk_condition` into `extra_pk_conditions`.
-    /// The remaining non-HASH equality or range condition stays as `sk_condition`.
-    ///
-    /// Call this after `resolve_pk_sk()` for multi-part key queries.
-    pub fn resolve_multipart(
-        &mut self,
-        hash_attrs: &[&str],
-        names: &std::collections::HashMap<String, String>,
-    ) -> Result<(), DynamoDbError> {
-        if hash_attrs.len() <= 1 {
-            return Ok(());
-        }
-
-        // Collect all equality conditions (pk + extra_pk + sk if Eq)
-        let mut all_eq: Vec<(Vec<PathElement>, Expr)> = Vec::new();
-        all_eq.push((self.pk_path.clone(), self.pk_value.clone()));
-        all_eq.append(&mut self.extra_pk_conditions);
-
-        let mut sk_non_eq: Option<SortKeyCondition> = None;
-
-        if let Some(sk) = self.sk_condition.take() {
-            match sk {
-                SortKeyCondition::Compare {
-                    path,
-                    op: CompareOp::Eq,
-                    value,
-                } => {
-                    all_eq.push((path, value));
-                }
-                other => {
-                    sk_non_eq = Some(other);
-                }
-            }
-        }
-
-        // Classify each equality condition as HASH or RANGE.
-        // Index by position in hash_attrs so we can reorder to key schema order.
-        let mut pk_by_position: Vec<(usize, Vec<PathElement>, Expr)> = Vec::new();
-        let mut sk_eqs: Vec<(Vec<PathElement>, Expr)> = Vec::new();
-
-        for (path, value) in all_eq {
-            let attr_name = resolve_path_attr(&path, names)?;
-            if let Some(pos) = hash_attrs.iter().position(|a| *a == attr_name.as_str()) {
-                pk_by_position.push((pos, path, value));
-            } else {
-                sk_eqs.push((path, value));
-            }
-        }
-
-        // Sort PK conditions by key schema order to ensure composite PK
-        // concatenation matches the write path regardless of expression order.
-        pk_by_position.sort_by_key(|(pos, _, _)| *pos);
-
-        // Assign first PK condition as primary, rest as extra
-        let mut pk_iter = pk_by_position
-            .into_iter()
-            .map(|(_, path, value)| (path, value));
-        if let Some((first_path, first_value)) = pk_iter.next() {
-            self.pk_path = first_path;
-            self.pk_value = first_value;
-            self.extra_pk_conditions = pk_iter.collect();
-        }
-
-        // Assign SK conditions: non-eq condition takes priority as primary SK,
-        // otherwise first equality RANGE condition is primary, rest are extra.
-        if let Some(non_eq) = sk_non_eq {
-            self.sk_condition = Some(non_eq);
-            self.extra_sk_conditions = sk_eqs;
-        } else if let Some((path, value)) = sk_eqs.first().cloned() {
-            self.sk_condition = Some(SortKeyCondition::Compare {
-                path,
-                op: CompareOp::Eq,
-                value,
-            });
-            self.extra_sk_conditions = sk_eqs.into_iter().skip(1).collect();
-        } else {
-            self.sk_condition = None;
-            self.extra_sk_conditions = Vec::new();
-        }
-
-        Ok(())
-    }
-}
-
-/// Resolve a path's top-level attribute name, handling `#name` references.
-fn resolve_path_attr(
-    path: &[PathElement],
-    names: &std::collections::HashMap<String, String>,
-) -> Result<String, DynamoDbError> {
-    match path.first() {
-        Some(PathElement::Attribute(name)) => {
-            if let Some(ref_name) = name.strip_prefix('#') {
-                names.get(ref_name).cloned().ok_or_else(|| {
-                    DynamoDbError::ValidationException(format!(
-                        "An expression attribute name used in the document path \
-                         is not defined; attribute name: #{ref_name}"
-                    ))
-                })
-            } else {
-                Ok(name.clone())
-            }
-        }
-        _ => Err(DynamoDbError::ValidationException(
-            "Invalid key condition path".to_owned(),
-        )),
-    }
 }
 
 /// Sort key condition variants.
@@ -258,24 +73,48 @@ pub enum SortKeyCondition {
 ///
 /// Returns `ValidationException` for syntax errors or unsupported constructs.
 pub fn parse_key_condition(tokens: &[Token]) -> Result<KeyCondition, DynamoDbError> {
+    parse_key_condition_from(tokens, "")
+}
+
+/// Parse a `KeyConditionExpression` whose tokens came from `source`, so a
+/// syntax error can quote the source window around the offending token as
+/// Amazon `DynamoDB` does (`pk = = :v` answers `Syntax error; token: "=",
+/// near: "= = :v"`; `pk = :v AND` answers `token: "<EOF>", near: "AND"`,
+/// measured 2026-10-25). An empty `source` joins the token texts instead.
+///
+/// # Errors
+///
+/// Returns `ValidationException` for syntax errors or unsupported constructs.
+pub fn parse_key_condition_from(
+    tokens: &[Token],
+    source: &str,
+) -> Result<KeyCondition, DynamoDbError> {
     parser_common::check_redundant_parens(tokens)
         .map_err(|body| validation_err(&format!("Invalid KeyConditionExpression: {body}")))?;
 
     // Strip outer parentheses: "(pk = :pk AND sk > :sk)" → "pk = :pk AND sk > :sk"
-    let tokens = if tokens.len() >= 2
+    let all = tokens;
+    let (tokens, offset) = if tokens.len() >= 2
         && tokens[0] == Token::LParen
         && tokens[tokens.len() - 1] == Token::RParen
         && outer_parens_match(tokens)
     {
-        &tokens[1..tokens.len() - 1]
+        (&tokens[1..tokens.len() - 1], 1)
     } else {
-        tokens
+        (tokens, 0)
+    };
+    // Syntax errors quote the window from the full token list, so a position
+    // inside the stripped slice is shifted back by the stripped parenthesis.
+    let src = Source {
+        text: source,
+        all,
+        offset,
     };
 
     let mut pos = 0;
     let mut clauses = Vec::new();
 
-    clauses.push(parse_key_clause(tokens, &mut pos)?);
+    clauses.push(parse_key_clause(tokens, &src, &mut pos)?);
 
     while pos < tokens.len() {
         if tokens[pos] != Token::And {
@@ -284,7 +123,7 @@ pub fn parse_key_condition(tokens: &[Token]) -> Result<KeyCondition, DynamoDbErr
             ));
         }
         pos += 1;
-        clauses.push(parse_key_clause(tokens, &mut pos)?);
+        clauses.push(parse_key_clause(tokens, &src, &mut pos)?);
     }
 
     if pos < tokens.len() {
@@ -304,6 +143,27 @@ pub fn parse_key_condition(tokens: &[Token]) -> Result<KeyCondition, DynamoDbErr
         1 => classify_single(clauses.remove(0)),
         2 => classify_pair(clauses.remove(0), clauses.remove(0)),
         _ => classify_multi(clauses),
+    }
+}
+
+/// The expression text and full token list a clause parser reports syntax
+/// errors against; `offset` is the number of tokens stripped before the slice
+/// being parsed.
+struct Source<'a> {
+    text: &'a str,
+    all: &'a [Token],
+    offset: usize,
+}
+
+impl Source<'_> {
+    /// The service's syntax error for the token at `pos` of the parsed slice.
+    fn syntax_error(&self, pos: usize) -> DynamoDbError {
+        syntax_error(
+            ExpressionKind::KeyCondition,
+            self.text,
+            self.all,
+            pos + self.offset,
+        )
     }
 }
 
@@ -449,17 +309,25 @@ fn raw_to_sk(clause: RawClause) -> SortKeyCondition {
     }
 }
 
-fn parse_key_clause(tokens: &[Token], pos: &mut usize) -> Result<RawClause, DynamoDbError> {
+fn parse_key_clause(
+    tokens: &[Token],
+    src: &Source<'_>,
+    pos: &mut usize,
+) -> Result<RawClause, DynamoDbError> {
     if *pos >= tokens.len() {
-        return Err(validation_err(
-            "Invalid KeyConditionExpression: unexpected end of expression",
-        ));
+        if tokens.is_empty() {
+            return Err(validation_err(
+                "Invalid KeyConditionExpression: unexpected end of expression",
+            ));
+        }
+        // Input ends where a clause is required (`pk = :v AND`).
+        return Err(src.syntax_error(*pos));
     }
 
     // Allow one level of parentheses around a single clause
     if tokens[*pos] == Token::LParen {
         *pos += 1;
-        let clause = parse_key_clause_inner(tokens, pos)?;
+        let clause = parse_key_clause_inner(tokens, src, pos)?;
         if *pos < tokens.len() && tokens[*pos] == Token::RParen {
             *pos += 1;
             return Ok(clause);
@@ -469,14 +337,16 @@ fn parse_key_clause(tokens: &[Token], pos: &mut usize) -> Result<RawClause, Dyna
         ));
     }
 
-    parse_key_clause_inner(tokens, pos)
+    parse_key_clause_inner(tokens, src, pos)
 }
 
-fn parse_key_clause_inner(tokens: &[Token], pos: &mut usize) -> Result<RawClause, DynamoDbError> {
+fn parse_key_clause_inner(
+    tokens: &[Token],
+    src: &Source<'_>,
+    pos: &mut usize,
+) -> Result<RawClause, DynamoDbError> {
     if *pos >= tokens.len() {
-        return Err(validation_err(
-            "Invalid KeyConditionExpression: unexpected end of expression",
-        ));
+        return Err(src.syntax_error(*pos));
     }
 
     // begins_with(path, :val)
@@ -487,15 +357,15 @@ fn parse_key_clause_inner(tokens: &[Token], pos: &mut usize) -> Result<RawClause
     {
         *pos += 1; // skip function name
         parser_common::expect_token(tokens, pos, &Token::LParen, "(", "KeyConditionExpression")?;
-        let path = parse_key_operand_path(tokens, pos)?;
+        let path = parse_key_operand_path(tokens, src, pos)?;
         parser_common::expect_token(tokens, pos, &Token::Comma, ",", "KeyConditionExpression")?;
-        let prefix = parse_key_value(tokens, pos)?;
+        let prefix = parse_key_value(tokens, src, pos)?;
         parser_common::expect_token(tokens, pos, &Token::RParen, ")", "KeyConditionExpression")?;
         return Ok(RawClause::BeginsWith(path, prefix));
     }
 
     // path op :value | :value op path | path BETWEEN :lo AND :hi
-    let left = parse_key_operand(tokens, pos)?;
+    let left = parse_key_operand(tokens, src, pos)?;
 
     if *pos >= tokens.len() {
         return Err(validation_err(
@@ -518,7 +388,7 @@ fn parse_key_clause_inner(tokens: &[Token], pos: &mut usize) -> Result<RawClause
             }
             *pos += 1;
 
-            let path = parse_key_operand_path(tokens, pos)?;
+            let path = parse_key_operand_path(tokens, src, pos)?;
             // Key conditions are stored path-first, so reverse the operator when
             // the source expression puts the value placeholder on the left.
             let op = reverse_comparator(op);
@@ -534,9 +404,9 @@ fn parse_key_clause_inner(tokens: &[Token], pos: &mut usize) -> Result<RawClause
     // BETWEEN
     if tokens[*pos] == Token::Between {
         *pos += 1;
-        let low = parse_key_value(tokens, pos)?;
+        let low = parse_key_value(tokens, src, pos)?;
         parser_common::expect_token(tokens, pos, &Token::And, "AND", "KeyConditionExpression")?;
-        let high = parse_key_value(tokens, pos)?;
+        let high = parse_key_value(tokens, src, pos)?;
         return Ok(RawClause::Between(path, low, high));
     }
 
@@ -553,7 +423,7 @@ fn parse_key_clause_inner(tokens: &[Token], pos: &mut usize) -> Result<RawClause
     }
     *pos += 1;
 
-    let value = parse_key_value(tokens, pos)?;
+    let value = parse_key_value(tokens, src, pos)?;
 
     if op == CompareOp::Eq {
         Ok(RawClause::Eq(path, value))
@@ -562,11 +432,13 @@ fn parse_key_clause_inner(tokens: &[Token], pos: &mut usize) -> Result<RawClause
     }
 }
 
-fn parse_key_operand(tokens: &[Token], pos: &mut usize) -> Result<KeyOperand, DynamoDbError> {
+fn parse_key_operand(
+    tokens: &[Token],
+    src: &Source<'_>,
+    pos: &mut usize,
+) -> Result<KeyOperand, DynamoDbError> {
     if *pos >= tokens.len() {
-        return Err(validation_err(
-            "Invalid KeyConditionExpression: unexpected end of expression",
-        ));
+        return Err(src.syntax_error(*pos));
     }
 
     match &tokens[*pos] {
@@ -575,9 +447,11 @@ fn parse_key_operand(tokens: &[Token], pos: &mut usize) -> Result<KeyOperand, Dy
             Ok(KeyOperand::Path(path))
         }
         Token::Placeholder(_) => {
-            let value = parse_key_value(tokens, pos)?;
+            let value = parse_key_value(tokens, src, pos)?;
             Ok(KeyOperand::Value(value))
         }
+        // An operator or keyword where an operand is required (`AND pk = :v`).
+        token if is_operator_or_keyword(token) => Err(src.syntax_error(*pos)),
         _ => Err(validation_err(
             "Invalid KeyConditionExpression: expected attribute path or value placeholder",
         )),
@@ -586,27 +460,30 @@ fn parse_key_operand(tokens: &[Token], pos: &mut usize) -> Result<KeyOperand, Dy
 
 fn parse_key_operand_path(
     tokens: &[Token],
+    src: &Source<'_>,
     pos: &mut usize,
 ) -> Result<Vec<PathElement>, DynamoDbError> {
     if *pos >= tokens.len() {
-        return Err(validation_err(
-            "Invalid KeyConditionExpression: expected attribute path",
-        ));
+        return Err(src.syntax_error(*pos));
     }
 
     match &tokens[*pos] {
         Token::Ident(_) | Token::NameRef(_) => parser_common::parse_path(tokens, pos),
+        token if is_operator_or_keyword(token) => Err(src.syntax_error(*pos)),
         _ => Err(validation_err(
             "Invalid KeyConditionExpression: expected attribute path",
         )),
     }
 }
 
-fn parse_key_value(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbError> {
+fn parse_key_value(
+    tokens: &[Token],
+    src: &Source<'_>,
+    pos: &mut usize,
+) -> Result<Expr, DynamoDbError> {
     if *pos >= tokens.len() {
-        return Err(validation_err(
-            "Invalid KeyConditionExpression: expected value",
-        ));
+        // Input ends where a value is required (`pk =`).
+        return Err(src.syntax_error(*pos));
     }
     match &tokens[*pos] {
         Token::Placeholder(name) => {
@@ -614,6 +491,9 @@ fn parse_key_value(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbEr
             *pos += 1;
             Ok(expr)
         }
+        // An operator or keyword where a value is required (`pk = = :v`,
+        // measured 2026-10-25: token "=", near "= = :v").
+        token if is_operator_or_keyword(token) => Err(src.syntax_error(*pos)),
         _ => Err(validation_err(
             "Invalid KeyConditionExpression: key condition values must be expression attribute value placeholders",
         )),
@@ -667,328 +547,5 @@ fn validation_err(msg: &str) -> DynamoDbError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::expression::tokenize;
-    use std::collections::HashMap;
-
-    #[test]
-    fn key_condition_redundant_parens_rejected_with_canonical_message() {
-        for expr in ["((pk = :v))", "((#pk = :pk)) AND (#sk = :sk)"] {
-            let tokens = tokenize(expr).unwrap();
-            let err = parse_key_condition(&tokens).unwrap_err();
-            assert!(
-                matches!(&err, DynamoDbError::ValidationException(msg)
-                    if msg == "Invalid KeyConditionExpression: The expression has redundant parentheses;"),
-                "expr {expr}: got {err:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn key_condition_valid_parens_accepted() {
-        for expr in [
-            "(pk = :v)",
-            "(#pk = :pk) AND (#sk = :sk)",
-            "(#pk = :pk AND #sk = :sk)",
-            "(#pk = :pk AND (#sk = :sk))",
-        ] {
-            let tokens = tokenize(expr).unwrap();
-            assert!(
-                parse_key_condition(&tokens).is_ok(),
-                "expr {expr} should parse"
-            );
-        }
-    }
-
-    #[test]
-    fn resolve_pk_sk_swaps_when_reversed() {
-        // "sk = :sk AND pk = :pk" — parser assigns first Eq as PK
-        let tokens = tokenize("sk = :sk AND pk = :pk").unwrap();
-        let mut kc = parse_key_condition(&tokens).unwrap();
-        assert_eq!(kc.pk_path, vec![PathElement::Attribute("sk".to_owned())]);
-
-        kc.resolve_pk_sk("pk", &HashMap::new()).unwrap();
-        assert_eq!(kc.pk_path, vec![PathElement::Attribute("pk".to_owned())]);
-        match &kc.sk_condition {
-            Some(SortKeyCondition::Compare {
-                path,
-                op: CompareOp::Eq,
-                ..
-            }) => {
-                assert_eq!(path, &vec![PathElement::Attribute("sk".to_owned())]);
-            }
-            other => panic!("expected Eq SK condition, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn resolve_pk_sk_no_swap_when_correct() {
-        let tokens = tokenize("pk = :pk AND sk = :sk").unwrap();
-        let mut kc = parse_key_condition(&tokens).unwrap();
-        assert_eq!(kc.pk_path, vec![PathElement::Attribute("pk".to_owned())]);
-
-        kc.resolve_pk_sk("pk", &HashMap::new()).unwrap();
-        assert_eq!(kc.pk_path, vec![PathElement::Attribute("pk".to_owned())]);
-    }
-
-    #[test]
-    fn resolve_pk_sk_with_name_refs() {
-        let tokens = tokenize("#s = :sk AND #p = :pk").unwrap();
-        let mut kc = parse_key_condition(&tokens).unwrap();
-
-        let mut names = HashMap::new();
-        names.insert("s".to_owned(), "sortkey".to_owned());
-        names.insert("p".to_owned(), "partkey".to_owned());
-
-        kc.resolve_pk_sk("partkey", &names).unwrap();
-        assert_eq!(kc.pk_path, vec![PathElement::Attribute("#p".to_owned())]);
-    }
-
-    #[test]
-    fn resolve_pk_sk_noop_for_non_eq_sk() {
-        // "pk = :pk AND sk > :val" — SK is not Eq, no ambiguity
-        let tokens = tokenize("pk = :pk AND sk > :val").unwrap();
-        let mut kc = parse_key_condition(&tokens).unwrap();
-        kc.resolve_pk_sk("pk", &HashMap::new()).unwrap();
-        assert_eq!(kc.pk_path, vec![PathElement::Attribute("pk".to_owned())]);
-    }
-
-    #[test]
-    fn resolve_pk_sk_noop_for_single_clause() {
-        let tokens = tokenize("pk = :pk").unwrap();
-        let mut kc = parse_key_condition(&tokens).unwrap();
-        kc.resolve_pk_sk("pk", &HashMap::new()).unwrap();
-        assert_eq!(kc.pk_path, vec![PathElement::Attribute("pk".to_owned())]);
-    }
-
-    #[test]
-    fn parse_three_clause_multipart() {
-        // pk1 = :v1 AND pk2 = :v2 AND sk = :v3
-        let tokens = tokenize("pk1 = :v1 AND pk2 = :v2 AND sk = :v3").unwrap();
-        let kc = parse_key_condition(&tokens).unwrap();
-        // First clause is pk_path, one extra_pk, one sk
-        assert_eq!(kc.pk_path, vec![PathElement::Attribute("pk1".to_owned())]);
-        assert_eq!(kc.extra_pk_conditions.len(), 1);
-        assert!(kc.sk_condition.is_some());
-    }
-
-    #[test]
-    fn parse_four_clause_multipart() {
-        let tokens = tokenize("a = :a AND b = :b AND c = :c AND d = :d").unwrap();
-        let kc = parse_key_condition(&tokens).unwrap();
-        assert_eq!(kc.pk_path, vec![PathElement::Attribute("a".to_owned())]);
-        assert_eq!(kc.extra_pk_conditions.len(), 2);
-        assert!(kc.sk_condition.is_some());
-    }
-
-    #[test]
-    fn parse_multipart_with_range_condition() {
-        // pk1 = :v1 AND pk2 = :v2 AND sk > :v3
-        let tokens = tokenize("pk1 = :v1 AND pk2 = :v2 AND sk > :v3").unwrap();
-        let kc = parse_key_condition(&tokens).unwrap();
-        assert_eq!(kc.pk_path, vec![PathElement::Attribute("pk1".to_owned())]);
-        // pk2 is in extra_pk_conditions (will be reclassified by resolve_multipart)
-        assert_eq!(kc.extra_pk_conditions.len(), 1);
-        match &kc.sk_condition {
-            Some(SortKeyCondition::Compare {
-                op: CompareOp::Gt, ..
-            }) => {}
-            other => panic!("expected Gt SK condition, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_reversed_sort_key_comparison() {
-        let tokens = tokenize("pk = :pk AND :lo <= sk").unwrap();
-        let kc = parse_key_condition(&tokens).unwrap();
-
-        assert_eq!(kc.pk_path, vec![PathElement::Attribute("pk".to_owned())]);
-        match &kc.sk_condition {
-            Some(SortKeyCondition::Compare {
-                path,
-                op: CompareOp::Ge,
-                value: Expr::Placeholder(name),
-            }) => {
-                assert_eq!(path, &vec![PathElement::Attribute("sk".to_owned())]);
-                assert_eq!(name, "lo");
-            }
-            other => panic!("expected reversed Ge SK condition, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_reversed_partition_key_equality() {
-        let tokens = tokenize(":pk = pk").unwrap();
-        let kc = parse_key_condition(&tokens).unwrap();
-
-        assert_eq!(kc.pk_path, vec![PathElement::Attribute("pk".to_owned())]);
-        assert_eq!(kc.pk_value, Expr::Placeholder("pk".to_owned()));
-    }
-
-    #[test]
-    fn reverse_comparator_maps_each_operator_and_is_involutive() {
-        use CompareOp::{Eq, Ge, Gt, Le, Lt, Ne};
-
-        let cases = [(Eq, Eq), (Ne, Ne), (Lt, Gt), (Le, Ge), (Gt, Lt), (Ge, Le)];
-
-        for (op, reversed) in cases {
-            assert_eq!(reverse_comparator(op), reversed);
-            assert_eq!(reverse_comparator(reverse_comparator(op)), op);
-        }
-    }
-
-    #[test]
-    fn resolve_multipart_reclassifies() {
-        let tokens = tokenize("pk1 = :v1 AND pk2 = :v2 AND sk1 = :v3").unwrap();
-        let mut kc = parse_key_condition(&tokens).unwrap();
-        let names = HashMap::new();
-        kc.resolve_multipart(&["pk1", "pk2"], &names).unwrap();
-
-        // After resolve_multipart, pk_path + extra_pk should have pk1 and pk2
-        let pk_count = 1 + kc.extra_pk_conditions.len();
-        assert_eq!(pk_count, 2);
-        // sk_condition should be the sk1 equality
-        assert!(kc.sk_condition.is_some());
-    }
-
-    #[test]
-    fn resolve_multipart_with_range() {
-        let tokens = tokenize("pk1 = :v1 AND pk2 = :v2 AND sk1 > :v3").unwrap();
-        let mut kc = parse_key_condition(&tokens).unwrap();
-        let names = HashMap::new();
-        kc.resolve_multipart(&["pk1", "pk2"], &names).unwrap();
-
-        assert_eq!(1 + kc.extra_pk_conditions.len(), 2);
-        match &kc.sk_condition {
-            Some(SortKeyCondition::Compare {
-                op: CompareOp::Gt, ..
-            }) => {}
-            other => panic!("expected Gt SK condition, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn resolve_multipart_reorders_to_schema_order() {
-        // Expression order: pk2, pk1, sk — reversed from key schema order [pk1, pk2]
-        let tokens = tokenize("pk2 = :v2 AND pk1 = :v1 AND sk = :v3").unwrap();
-        let mut kc = parse_key_condition(&tokens).unwrap();
-        let names = HashMap::new();
-        kc.resolve_multipart(&["pk1", "pk2"], &names).unwrap();
-
-        // After resolve_multipart, pk_path should be pk1 (first in schema)
-        assert_eq!(kc.pk_path, vec![PathElement::Attribute("pk1".to_owned())]);
-        // extra_pk_conditions should have pk2
-        assert_eq!(kc.extra_pk_conditions.len(), 1);
-        assert_eq!(
-            kc.extra_pk_conditions[0].0,
-            vec![PathElement::Attribute("pk2".to_owned())]
-        );
-    }
-
-    #[test]
-    fn resolve_multipart_multi_range() {
-        // 2 HASH + 2 RANGE, all equality conditions
-        let tokens = tokenize("pk1 = :v1 AND pk2 = :v2 AND sk1 = :v3 AND sk2 = :v4").unwrap();
-        let mut kc = parse_key_condition(&tokens).unwrap();
-        let names = HashMap::new();
-        kc.resolve_multipart(&["pk1", "pk2"], &names).unwrap();
-
-        // 2 PK conditions
-        assert_eq!(1 + kc.extra_pk_conditions.len(), 2);
-        // Primary SK condition is sk1
-        match &kc.sk_condition {
-            Some(SortKeyCondition::Compare {
-                path,
-                op: CompareOp::Eq,
-                ..
-            }) => {
-                assert_eq!(path, &vec![PathElement::Attribute("sk1".to_owned())]);
-            }
-            other => panic!("expected Eq SK condition on sk1, got {other:?}"),
-        }
-        // Extra SK condition is sk2
-        assert_eq!(kc.extra_sk_conditions.len(), 1);
-        assert_eq!(
-            kc.extra_sk_conditions[0].0,
-            vec![PathElement::Attribute("sk2".to_owned())]
-        );
-    }
-
-    const NESTED_KEY_ERR: &str = "Invalid KeyConditionExpression: KeyConditionExpressions cannot have conditions on nested attributes";
-
-    #[test]
-    fn nested_dot_path_on_key_rejected() {
-        for expr in [
-            "pk.foo = :v",
-            "pk = :p AND sk.foo = :v",
-            "begins_with(sk.foo, :v)",
-            "foo.bar = :v",
-        ] {
-            let tokens = tokenize(expr).unwrap();
-            let err = parse_key_condition(&tokens).unwrap_err();
-            assert!(
-                matches!(&err, DynamoDbError::ValidationException(msg) if msg == NESTED_KEY_ERR),
-                "expr {expr}: got {err:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn nested_path_in_all_clause_shapes_rejected() {
-        // Exercises every `raw_clause_path` arm (Compare/Between/BeginsWith) and a
-        // 3-clause multi-part shape with a nested middle clause. Multi-part keys
-        // are an ExtendDB extension real DynamoDB cannot express, hence a
-        // parser-level test. The reject loop runs before classification, so a
-        // nested clause in any position is rejected up front.
-        for expr in [
-            "pk.foo > :v",                            // single non-eq (Compare arm)
-            "pk = :p AND sk.foo BETWEEN :a AND :b",   // Between arm
-            "pk = :p AND begins_with(sk[0], :v)",     // BeginsWith arm, index
-            "pk = :p AND :v < sk.foo",                // reversed value-first
-            "pk1 = :v1 AND pk2.x = :v2 AND sk = :v3", // multi-part, nested middle
-        ] {
-            let tokens = tokenize(expr).unwrap();
-            let err = parse_key_condition(&tokens).unwrap_err();
-            assert!(
-                matches!(&err, DynamoDbError::ValidationException(msg) if msg == NESTED_KEY_ERR),
-                "expr {expr}: got {err:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn index_path_on_key_rejected() {
-        for expr in ["pk[0] = :v", "pk = :p AND sk[0] = :v"] {
-            let tokens = tokenize(expr).unwrap();
-            let err = parse_key_condition(&tokens).unwrap_err();
-            assert!(
-                matches!(&err, DynamoDbError::ValidationException(msg) if msg == NESTED_KEY_ERR),
-                "expr {expr}: got {err:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn nested_path_via_name_placeholder_rejected() {
-        // The check is structural (path length), so it fires before #name
-        // resolution.
-        let tokens = tokenize("#d.foo = :v").unwrap();
-        let err = parse_key_condition(&tokens).unwrap_err();
-        assert!(
-            matches!(&err, DynamoDbError::ValidationException(msg) if msg == NESTED_KEY_ERR),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn top_level_key_paths_accepted() {
-        for expr in ["pk = :v", "pk = :p AND sk = :s", "#pk = :p AND #sk = :s"] {
-            let tokens = tokenize(expr).unwrap();
-            assert!(
-                parse_key_condition(&tokens).is_ok(),
-                "expr {expr} should parse"
-            );
-        }
-    }
-}
+#[path = "key_condition_tests.rs"]
+mod tests;
