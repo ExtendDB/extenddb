@@ -4,9 +4,10 @@
 
 ## Current Status
 
-Catalog 0.0.4 is current. **Every existing PostgreSQL, SQLite, and Cassandra deployment must run `extenddb migrate`** to reach it. PostgreSQL and SQLite servers refuse to start against a catalog version they were not built for; a Cassandra server starts anyway and serves tables and items, but CreateBackup, RestoreTableFromBackup, and DeleteBackup are refused with a `ValidationException` naming `extenddb migrate --yes` until the catalog is migrated (see [Cassandra](#cassandra)). MongoDB's catalog version does not change in this release.
+Catalog 0.0.5 is current on PostgreSQL; 0.0.4 is current on SQLite and Cassandra. **Every existing PostgreSQL deployment must run `extenddb migrate` with every server stopped** to reach 0.0.5 (see [Catalog 0.0.5](#catalog-005-postgresql-current)). **Every existing PostgreSQL, SQLite, and Cassandra deployment must run `extenddb migrate`** to reach 0.0.4. <!-- version-literal-ok: names the current version per backend -->
+<!-- The sentence below predates 0.0.5 and describes the 0.0.4 step. --> PostgreSQL and SQLite servers refuse to start against a catalog version they were not built for; a Cassandra server starts anyway and serves tables and items, but CreateBackup, RestoreTableFromBackup, and DeleteBackup are refused with a `ValidationException` naming `extenddb migrate --yes` until the catalog is migrated (see [Cassandra](#cassandra)). MongoDB's catalog version does not change in this release.
 
-See [Catalog 0.0.4](#catalog-004-current) below for what changes and the exact sequence. <!-- version-literal-ok: names the current version and the history below -->
+See [Catalog 0.0.4](#catalog-004) below for what changes and the exact sequence. <!-- version-literal-ok: names the current version and the history below -->
 
 ## How Catalog Upgrades Work
 
@@ -202,7 +203,28 @@ To discard data written after the upgrade as well, restore `<data-db>` from its 
 
 ## Version History
 
-### Catalog 0.0.4 (Current)
+### Catalog 0.0.5 (PostgreSQL, Current)
+
+Changes no schema. It marks a change in the stored form of the seven catalog columns that carry attribute names: `tables.key_schema`, `tables.attribute_definitions`, `indexes.key_schema`, `indexes.projection`, `backups.key_schema`, `backups.attribute_definitions` and `backup_definitions.definition`. From this release those documents are written through an order-preserving escape (U+0000 stored as U+0001 U+0001, U+0001 stored as U+0001 U+0002), so a key attribute name, an index key attribute name or a projected attribute name may contain U+0000, as it may on DynamoDB. PostgreSQL `jsonb` cannot hold U+0000, which is why the escape exists. The migration `004_escape_catalog_control_chars.sql` re-encodes every stored document that holds a raw U+0001 once, before it moves the version, so a name an earlier release stored raw reads back unchanged. A document without U+0001 is left as it is; on most deployments the migration rewrites no rows.
+
+The re-encode is not repeatable: an escaped U+0001 and a raw U+0001 pair are the same bytes, so `extenddb migrate --yes` refuses to run it while any other session is connected to the catalog database, naming the sessions (`N other connection(s) hold the catalog database: ...`). Stop every ExtendDB server first. If the only other sessions are idle ones held by a connection pooler, set `EXTENDDB_MIGRATE_IGNORE_CONNECTIONS=1` to skip the check. The check leaves out sessions whose `application_name` is `extenddb-migrate`, the name the migrate command sets on its own connections, so a server's configured connection string must not carry that name. Each table is rewritten in its own transaction with a progress marker, so a run interrupted by a crash resumes with the tables not yet done. `extenddb init` records the migration on a fresh catalog.
+
+```bash
+extenddb stop --config extenddb.toml                               # every server, every host
+pg_dump -h <host> -U <admin> <catalog-db> > catalog_backup_$(date +%Y%m%d).sql
+export EXTENDDB_PG_PASSWORD='<admin password>'
+extenddb migrate --config extenddb.toml --pg-user <admin>          # exit 3, prints the plan
+extenddb migrate --config extenddb.toml --pg-user <admin> --yes    # re-encodes, applies 004
+extenddb serve --config extenddb.toml
+```
+
+The preview reports `Pending: catalog 0.0.4 -> 0.0.5; data migrations [catalog 004_escape_catalog_control_chars.sql].` and exits 3. <!-- version-literal-ok: names both ends of the upgrade -->
+
+Downgrade: after this release, a table whose key attribute, index key or projected attribute names contain U+0000 or U+0001 on PostgreSQL is not readable by an earlier release. An earlier binary refuses to start against a 0.0.5 catalog (`Catalog version mismatch: expected 0.0.4, found 0.0.5`); if it were started against the data anyway it would read the escaped form as literal data (`p<U+0001><U+0001>k` for a name `p<U+0000>k`) and `GetItem` by the real name would answer `Missing the key ...`. Roll back by restoring the catalog saved before the upgrade. Names without those two characters are stored as before and are unaffected. <!-- version-literal-ok: history -->
+
+SQLite, MongoDB and Cassandra store attribute names without an escape and keep their catalog versions in this release.
+
+### Catalog 0.0.4
 
 Adds the table definition a backup records and the registration of a running restore:
 

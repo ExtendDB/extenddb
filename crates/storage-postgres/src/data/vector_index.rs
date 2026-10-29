@@ -42,6 +42,8 @@ use pgvector::Vector;
 
 use super::{all_sort_key_info, vector_table_name};
 
+use crate::catalog_json::from_catalog_json;
+
 /// Read the vector index metadata for a table from the catalog.
 ///
 /// Every field the write path needs, including the index id that names the data
@@ -1095,10 +1097,8 @@ pub async fn rebuild_stuck_vector_indexes(
             );
             continue;
         };
-        let base_key_schema: Vec<KeySchemaElement> =
-            serde_json::from_value(ks_json).map_err(|e| StorageError::Internal(e.to_string()))?;
-        let attribute_definitions: Vec<AttributeDefinition> =
-            serde_json::from_value(ad_json).map_err(|e| StorageError::Internal(e.to_string()))?;
+        let base_key_schema: Vec<KeySchemaElement> = from_catalog_json(ks_json)?;
+        let attribute_definitions: Vec<AttributeDefinition> = from_catalog_json(ad_json)?;
         let dimensions = u32::try_from(dimensions)
             .map_err(|_| StorageError::Internal("vector dimensions out of range".to_owned()))?;
 

@@ -3,6 +3,7 @@
 
 //! `StreamEngine` trait implementation for `PostgresEngine`.
 
+use crate::catalog_json::from_catalog_json;
 use extenddb_core::types::{
     SequenceNumberRange, Shard, StreamDescription, StreamRecord, StreamStatus, StreamSummary,
     StreamViewType,
@@ -304,8 +305,7 @@ impl StreamEngine for PostgresEngine {
             let (ks_json, _ad_json, stream_spec_json, table_status, table_id) =
                 row.ok_or_else(|| extenddb_storage::util::stream_not_found(&stream_arn))?;
 
-            let key_schema = serde_json::from_value(ks_json)
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let key_schema = from_catalog_json(ks_json)?;
 
             let stream_view_type = stream_spec_json
                 .and_then(|v| {

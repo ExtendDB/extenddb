@@ -12,6 +12,7 @@ use extenddb_storage::util::{index_arn, stream_arn};
 use extenddb_storage::vector_catalog::{VectorIndexCatalogRow, vector_index_descriptions};
 
 use crate::PostgresEngine;
+use crate::catalog_json::from_catalog_json;
 use crate::data;
 
 /// Row type for table metadata queries.
@@ -191,10 +192,8 @@ impl PostgresEngine {
         let mut lsis: Vec<LsiDescription> = Vec::new();
 
         for idx in index_rows {
-            let ks = serde_json::from_value(idx.key_schema)
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            let proj = serde_json::from_value(idx.projection)
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let ks = from_catalog_json(idx.key_schema)?;
+            let proj = from_catalog_json(idx.projection)?;
 
             if idx.index_type == "GSI" {
                 // F-1 fallback: old data may be stored as ProvisionedThroughput
@@ -257,10 +256,8 @@ impl PostgresEngine {
             }
         }
 
-        let key_schema = serde_json::from_value(row.key_schema)
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-        let attr_defs = serde_json::from_value(row.attribute_definitions)
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let key_schema = from_catalog_json(row.key_schema)?;
+        let attr_defs = from_catalog_json(row.attribute_definitions)?;
         let stream_spec = row
             .stream_specification
             .map(serde_json::from_value)

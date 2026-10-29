@@ -108,6 +108,12 @@ pub(crate) async fn authorize_request(
     source_ip: Option<&str>,
     user_agent: Option<&str>,
 ) -> Result<extenddb_engine::AuthorizedKeyInfo, DynamoDbError> {
+    // A table name outside the service's character pattern, in TableName or
+    // nested in RequestItems or TransactItems, is refused here, before the key
+    // info and resource tag lookups below bind it as a database parameter (see
+    // `table_name_gate`).
+    crate::table_name_gate::check_table_name_chars(operation, input)?;
+
     let table_name = extract_table_name(input);
     let mut authorized_key_info = extenddb_engine::AuthorizedKeyInfo::new();
 

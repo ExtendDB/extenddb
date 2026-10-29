@@ -12,6 +12,8 @@ mod admin_store;
 mod authorization_store;
 mod backup_engine;
 mod bootstrapper;
+mod catalog_escape;
+mod catalog_json;
 mod catalog_store;
 pub mod config;
 mod create_table;
@@ -182,7 +184,13 @@ use sqlx::postgres::PgPoolOptions;
 ///
 /// The tuple is the single source of truth. Use `CATALOG_VERSION.to_string()`
 /// wherever a string representation is needed.
-pub const CATALOG_VERSION: CatalogVersion = CatalogVersion::new(0, 0, 4);
+///
+/// 0.0.5 changed no schema: it marks the stored form of the catalog columns
+/// that carry attribute names (`catalog_json`), introduced with catalog
+/// migration `004_escape_catalog_control_chars.sql`, so that a binary from an
+/// earlier release refuses a migrated catalog instead of reading escaped names
+/// as literal data.
+pub const CATALOG_VERSION: CatalogVersion = CatalogVersion::new(0, 0, 5);
 
 /// Minimum number of connections allowed per pool.
 ///

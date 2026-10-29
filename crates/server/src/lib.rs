@@ -8,6 +8,7 @@
 //! with correct headers (x-amzn-RequestId, x-amz-crc32, Content-Type).
 //! Supports TLS via `axum-server` with rustls when configured.
 
+pub(crate) mod arn_gate;
 pub(crate) mod authorization;
 pub mod authz_cache;
 pub(crate) mod authz_resource;
@@ -24,6 +25,7 @@ mod request_helpers;
 mod request_tags;
 mod response;
 mod serve;
+mod table_name_gate;
 mod throttle_helpers;
 mod workers;
 
