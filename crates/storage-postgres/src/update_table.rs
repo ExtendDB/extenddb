@@ -93,6 +93,17 @@ async fn ensure_index_name_free(
     Ok(())
 }
 
+/// The refusal `UpdateTable` gives a table whose catalog status is not
+/// `ACTIVE`. Both status reads in `update_table_impl` (the unlocked pre-read
+/// and the `FOR UPDATE` read) call this, so a status that gets its own sentence
+/// gets it from both reads by construction.
+fn refuse_unless_active(status: &str, table_name: &str) -> Result<(), StorageError> {
+    if status == "ACTIVE" {
+        return Ok(());
+    }
+    Err(StorageError::TableNotActive(table_name.to_owned()))
+}
+
 impl PostgresEngine {
     /// Core implementation of `update_table` (REQ-CTRL-003).
     pub(crate) async fn update_table_impl(
@@ -101,11 +112,52 @@ impl PostgresEngine {
         input: UpdateTableInput,
     ) -> Result<TableDescription, StorageError> {
         Self::validate_account_id(account_id)?;
+        // READ COMMITTED is pinned here rather than inherited from the server's
+        // default_transaction_isolation: the status pre-read below is this
+        // transaction's first statement, and under REPEATABLE READ it would fix
+        // the snapshot the FOR UPDATE read then has to use, so a row updated
+        // after that snapshot would make the locked read fail with 40001
+        // instead of returning the current version.
         let mut tx = self
             .pool
-            .begin()
+            .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        // Refuse a table whose status is already not ACTIVE without waiting for
+        // the row lock.
+        //
+        // The delete poller claims a DELETING catalog row with FOR UPDATE SKIP
+        // LOCKED and holds that row lock while its data drop waits out a 3 s
+        // lock_timeout. The locked read below queued behind the poller's attempt
+        // for as long as it ran, then read DELETING and refused, so the refusal
+        // took up to the poller's whole wait to arrive. A plain SELECT takes no
+        // row lock and never queues behind one, so this read answers in the time
+        // of one round trip.
+        //
+        // It only shortens a refusal; it does not decide the request. A table it
+        // reads as ACTIVE falls through to the locked read, whose status check is
+        // the one the request acts on, so a status that changes between the two
+        // reads is still caught there. A missing row is left to the locked read
+        // as well: a CreateTable committing between the two reads has to be seen,
+        // and the locked read reports TableNotFound for a table still absent.
+        // Both reads are READ COMMITTED, so each takes its own snapshot and the
+        // second sees whatever committed after the first.
+        //
+        // Both reads refuse through `refuse_unless_active`, so this read gives
+        // the same answer the locked read would have given; it exists to
+        // shorten the wait, not to change the answer.
+        let early_status: Option<String> = sqlx::query_scalar(
+            "SELECT table_status FROM tables WHERE account_id = $1 AND table_name = $2",
+        )
+        .bind(account_id)
+        .bind(&input.table_name)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        if let Some(status) = early_status.as_deref() {
+            refuse_unless_active(status, &input.table_name)?;
+        }
 
         // Lock the row and fetch table_id, key_schema, attribute_definitions and
         // the stored billing mode.
@@ -131,9 +183,7 @@ impl PostgresEngine {
 
         let (status, table_id, ks_json, ad_json, stored_billing_mode) =
             row.ok_or_else(|| StorageError::TableNotFound(input.table_name.clone()))?;
-        if status != "ACTIVE" {
-            return Err(StorageError::TableNotActive(input.table_name.clone()));
-        }
+        refuse_unless_active(&status, &input.table_name)?;
 
         // A table holding vector indexes cannot leave PAY_PER_REQUEST. Same
         // message as CreateTable's rejection, and the same rule seen from the
