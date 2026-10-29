@@ -148,6 +148,26 @@ fn validate_index_propagation_delay_ms(value: &str) -> Result<(), &'static str> 
     }
 }
 
+/// The validator for a writable key: one of [`KNOWN_KEYS`], or a table's
+/// `gsi_creating_phase_delay_ms:<table-name>` hold. The management API and
+/// `extenddb settings set` both look keys up here, so they accept the same
+/// keys.
+#[must_use]
+pub fn writable_key_validator(key: &str) -> Option<Validator> {
+    KNOWN_KEYS
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, validator)| *validator)
+        // A test lever for the same reason as the vector ones above: the two
+        // CREATING phases of a GSI build last milliseconds on a test-sized table,
+        // so the measured refusal for each cannot be observed from a client unless
+        // a test can lengthen them. Scoped to one table; same bound and validator.
+        .or_else(|| {
+            is_gsi_creating_phase_delay_key(key)
+                .then_some(validate_backfill_batch_delay_ms as Validator)
+        })
+}
+
 /// Set a runtime setting with validation.
 ///
 /// Validates the key and value, then delegates the write to the
@@ -167,18 +187,7 @@ pub async fn set_setting(
         return Err(OpError::Validation(format!("Setting '{key}' is read-only")));
     }
 
-    let known = KNOWN_KEYS
-        .iter()
-        .find(|(k, _)| *k == key)
-        .map(|(_, validator)| *validator)
-        // A test lever for the same reason as the vector ones above: the two
-        // CREATING phases of a GSI build last milliseconds on a test-sized table,
-        // so the measured refusal for each cannot be observed from a client unless
-        // a test can lengthen them. Scoped to one table; same bound and validator.
-        .or_else(|| {
-            is_gsi_creating_phase_delay_key(key)
-                .then_some(validate_backfill_batch_delay_ms as Validator)
-        });
+    let known = writable_key_validator(key);
     #[cfg(feature = "mongodb-test-hooks")]
     let known = known
         .or_else(|| {
