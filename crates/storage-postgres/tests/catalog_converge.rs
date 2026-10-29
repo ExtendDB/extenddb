@@ -599,10 +599,15 @@ async fn serve_refuses_an_unreadable_catalog_version_with_the_shared_refusal() {
         return;
     }
     let s = Scratch::new(
-        "003_tampered_version.sql",
-        "UPDATE settings SET value = 'garbage' WHERE key = 'catalog_version';",
+        "003_backup_definitions.sql",
+        include_str!("../migrations/003_backup_definitions.sql"),
     )
     .await;
+    // After the setup, whose 004 step stamps the current version.
+    sqlx::query("UPDATE settings SET value = 'garbage' WHERE key = 'catalog_version'")
+        .execute(&s.catalog)
+        .await
+        .expect("make the stored version unreadable");
     assert_eq!(s.catalog_version().await, "garbage");
     let expected = extenddb_storage::util::check_stored_catalog_version(
         Some("garbage"),
