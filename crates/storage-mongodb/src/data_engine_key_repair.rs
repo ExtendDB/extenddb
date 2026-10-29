@@ -18,7 +18,9 @@
 //! sets the rate; each batch is one in-transaction read, one delete and one
 //! insert. The batch is atomic, so a process killed mid-repair leaves every
 //! document either as it was or rebuilt, and the next start finishes the
-//! remainder.
+//! remainder. A batch whose transaction cannot run is rebuilt one document
+//! per transaction, so one document another writer holds, or one that cannot
+//! be rebuilt at all, leaves the rest of the batch repaired.
 //!
 //! The documents are re-read inside the transaction rather than taken from
 //! the scan, so a client that writes to a document between the scan and the
@@ -49,6 +51,17 @@ const REPAIR_BATCH: usize = 500;
 
 /// Repaired documents between progress lines.
 const PROGRESS_EVERY: u64 = 10_000;
+
+/// How many times a single-document rebuild waits for a writer that holds its
+/// document, and how long each wait is.
+///
+/// A process killed mid-repair leaves its last transaction holding that
+/// batch's documents until the server expires it, which takes up to
+/// `transactionLifetimeLimitSeconds` (60 s by default). The repair runs in the
+/// background and nothing waits on it, so it waits the locks out instead of
+/// counting those documents failed and leaving them for the next start.
+const CONFLICT_WAITS: u32 = 40;
+const CONFLICT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// What a repair run did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -192,7 +205,8 @@ impl MongoEngine {
         log_progress(before, summary);
     }
 
-    /// Rebuild the document at `id` in its own transaction.
+    /// Rebuild the document at `id` in its own transaction, waiting out a
+    /// writer that holds it rather than leaving it for the next start.
     async fn repair_one(
         &self,
         coll: &mongodb::Collection<Document>,
@@ -202,37 +216,40 @@ impl MongoEngine {
         attribute_definitions: &[AttributeDefinition],
         summary: &mut KeyRepairSummary,
     ) {
-        let bad = match coll.find_one(doc! { "_id": id.clone() }).await {
-            Ok(Some(bad)) => bad,
-            // Gone, so another process repaired or deleted it.
-            Ok(None) => return,
-            Err(e) => {
-                tracing::error!("key repair: table {table_id}: cannot read document {id:?}: {e}");
-                summary.documents_failed += 1;
-                return;
-            }
-        };
-        if !is_stored_without_key(&bad) {
-            return;
-        }
-        let repaired = match repaired_document(&bad, key_schema, attribute_definitions) {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::error!(
-                    "key repair: table {table_id}: cannot rebuild document {id:?}: {e}"
-                );
-                summary.documents_failed += 1;
-                return;
-            }
-        };
-        match self.replace_document(coll, &bad, repaired).await {
-            Ok(true) => summary.documents_repaired += 1,
-            Ok(false) => {}
-            Err(e) => {
-                tracing::error!(
-                    "key repair: table {table_id}: cannot rewrite document {id:?}: {e}"
-                );
-                summary.documents_failed += 1;
+        let one = std::slice::from_ref(id);
+        for waited in 0..=CONFLICT_WAITS {
+            match self
+                .replace_batch(coll, one, key_schema, attribute_definitions)
+                .await
+            {
+                Ok(outcome) => {
+                    if waited > 0 && outcome.repaired > 0 {
+                        tracing::info!(
+                            "key repair: table {table_id}: document {id:?} rewritten after \
+                             waiting {} s for the writer holding it",
+                            waited * CONFLICT_WAIT.as_secs() as u32
+                        );
+                    }
+                    summary.documents_repaired += outcome.repaired;
+                    summary.documents_failed += outcome.failed.len() as u64;
+                    for (failed_id, reason) in outcome.failed {
+                        tracing::error!(
+                            "key repair: table {table_id}: cannot rebuild document \
+                             {failed_id:?}: {reason}"
+                        );
+                    }
+                    return;
+                }
+                Err(StorageError::TransactionConflict(_)) if waited < CONFLICT_WAITS => {
+                    tokio::time::sleep(CONFLICT_WAIT).await;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "key repair: table {table_id}: cannot rewrite document {id:?}: {e}"
+                    );
+                    summary.documents_failed += 1;
+                    return;
+                }
             }
         }
     }
@@ -286,68 +303,6 @@ impl MongoEngine {
         ))
     }
 
-    /// Delete `bad` by its `_id` and insert `repaired` in one transaction.
-    /// Returns false when `bad` was gone already (another process repaired or
-    /// deleted it), in which case nothing is inserted.
-    async fn replace_document(
-        &self,
-        coll: &mongodb::Collection<Document>,
-        bad: &Document,
-        repaired: Document,
-    ) -> Result<bool, StorageError> {
-        let bad_id = bad
-            .get("_id")
-            .cloned()
-            .ok_or_else(|| StorageError::Internal("document has no _id".to_owned()))?;
-        let mut session = self
-            .client
-            .start_session()
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-        let tx_options = self.write_transaction_options();
-        for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
-            session
-                .start_transaction()
-                .with_options(tx_options.clone())
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            let body = async {
-                let deleted = coll
-                    .delete_one(doc! { "_id": bad_id.clone() })
-                    .session(&mut session)
-                    .await?;
-                if deleted.deleted_count == 0 {
-                    return Ok::<bool, mongodb::error::Error>(false);
-                }
-                coll.insert_one(repaired.clone())
-                    .session(&mut session)
-                    .await?;
-                Ok(true)
-            }
-            .await;
-            match body {
-                Ok(false) => {
-                    let _ = session.abort_transaction().await;
-                    return Ok(false);
-                }
-                Ok(true) => match self.commit_write_transaction(&mut session, None).await? {
-                    CommitOutcome::Committed => return Ok(true),
-                    CommitOutcome::RerunBody => backoff_sleep(attempt).await,
-                },
-                Err(e) if is_transient_write_conflict(&e) => {
-                    let _ = session.abort_transaction().await;
-                    backoff_sleep(attempt).await;
-                }
-                Err(e) => {
-                    let _ = session.abort_transaction().await;
-                    return Err(StorageError::Internal(e.to_string()));
-                }
-            }
-        }
-        Err(StorageError::TransactionConflict(
-            "key repair: too many concurrent write conflicts, giving up".to_owned(),
-        ))
-    }
 }
 
 /// `table_id`, key schema and attribute definitions of a catalog `tables` row.
