@@ -11,6 +11,17 @@
 //! row in one call and never sets `DELETING` itself; the abandoned-restore
 //! sweep does. The window is produced here by setting the row's status
 //! directly.
+//!
+//! The catalog keyspace is shared by every test in this binary, and the
+//! control-plane sweep (`process_control_plane_transitions`) removes any
+//! `DELETING` row whose `status_transition_at` has passed, then clears the
+//! table's TTL entries in the account keyspace. A fresh table carries its
+//! activation deadline in that column, so a row left as `DELETING` with it
+//! would be swept by whichever test runs the sweep next; after this test's
+//! account keyspace is dropped, that sweep fails on the missing keyspace and
+//! takes an unrelated test down with it. `set_status` therefore clears the
+//! column, as activation does, which keeps the row out of the sweep, and each
+//! test removes its row before it returns.
 
 use extenddb_core::types::{DeleteTableInput, UpdateTableInput};
 use extenddb_storage::TableEngine;
@@ -21,9 +32,12 @@ use crate::helpers::{TestAccount, TestTable, setup_engine, test_config};
 
 const TABLE: &str = "DeletingWindowTable";
 
+/// Sets the row's status and clears its transition deadline, so the
+/// control-plane sweep leaves the row alone for the rest of the test.
 async fn set_status(engine: &CassandraEngine, account_id: &str, status: &str) {
     let query = format!(
-        "UPDATE {}.tables SET table_status = ? WHERE account_id = ? AND table_name = ? IF EXISTS",
+        "UPDATE {}.tables SET table_status = ?, status_transition_at = null \
+         WHERE account_id = ? AND table_name = ? IF EXISTS",
         engine.catalog_keyspace()
     );
     engine
@@ -31,6 +45,20 @@ async fn set_status(engine: &CassandraEngine, account_id: &str, status: &str) {
         .query_with_values(&query, cdrs_tokio::query_values!(status, account_id, TABLE))
         .await
         .expect("set the table status");
+}
+
+/// Removes the catalog row the test set to a non-ACTIVE status; the account
+/// keyspace goes with the `TestAccount`.
+async fn remove_row(engine: &CassandraEngine, account_id: &str) {
+    let query = format!(
+        "DELETE FROM {}.tables WHERE account_id = ? AND table_name = ? IF EXISTS",
+        engine.catalog_keyspace()
+    );
+    engine
+        .session()
+        .query_with_values(&query, cdrs_tokio::query_values!(account_id, TABLE))
+        .await
+        .expect("remove the table row");
 }
 
 async fn status_of(engine: &CassandraEngine, account_id: &str) -> Option<String> {
@@ -103,6 +131,7 @@ async fn a_second_delete_table_during_the_window_is_table_being_deleted() {
         status_of(&engine, &account.account_id).await.as_deref(),
         Some("DELETING")
     );
+    remove_row(&engine, &account.account_id).await;
 }
 
 /// UpdateTable during the window reports the table as being deleted, not with
@@ -122,6 +151,7 @@ async fn update_table_during_the_window_is_table_being_deleted() {
         matches!(&err, StorageError::TableBeingDeleted(name) if name == TABLE),
         "expected TableBeingDeleted({TABLE:?}), got {err:?}"
     );
+    remove_row(&engine, &account.account_id).await;
 }
 
 /// A CREATING table keeps the existing answer: the new sentence is for
@@ -142,4 +172,5 @@ async fn update_table_on_a_creating_table_keeps_table_not_active() {
         matches!(&err, StorageError::TableNotActive(name) if name == TABLE),
         "expected TableNotActive({TABLE:?}), got {err:?}"
     );
+    remove_row(&engine, &account.account_id).await;
 }
