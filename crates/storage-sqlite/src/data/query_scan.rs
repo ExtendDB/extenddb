@@ -51,107 +51,20 @@ impl SqliteEngine {
             (data_table_name(&key_info.table_id), false)
         };
 
-        // Partition key (composite via netstring when multi-HASH).
-        let pk_text = if key_condition.extra_pk_conditions.is_empty() {
-            pk_to_text(&resolve_expr_to_av(&key_condition.pk_value, maps)?)?.into_owned()
-        } else {
-            let mut parts =
-                vec![pk_to_text(&resolve_expr_to_av(&key_condition.pk_value, maps)?)?.into_owned()];
-            for (_, value) in &key_condition.extra_pk_conditions {
-                parts.push(pk_to_text(&resolve_expr_to_av(value, maps)?)?.into_owned());
-            }
-            encode_netstring_composite(&parts)
-        };
-
-        let sk_info_val = sk_info(&key_info.key_schema, &key_info.attribute_definitions);
-        let all_sks = all_sort_key_info(&key_info.key_schema, &key_info.attribute_definitions);
-        let base_sk_info: Option<(String, ScalarAttributeType)> = if index_name.is_some() {
-            sk_info(&key_info.base_key_schema, &key_info.attribute_definitions)
-                .map(|(n, t)| (n.to_owned(), t))
-        } else {
-            None
-        };
-
-        let mut sql = format!("SELECT item_data FROM {ddb_table} WHERE pk = ?");
-        let mut binds: Vec<BoundValue> = vec![BoundValue::Text(pk_text)];
-
-        // Each RANGE condition applies to the column of the attribute it
-        // names. On a multi-RANGE index the non-equality condition can name a
-        // later RANGE attribute and the first one is an equality in
-        // `extra_sk_conditions`. A sort-key condition that names no RANGE
-        // attribute applies to the first one.
-        let range_column = |path: &[PathElement]| -> Option<(usize, ScalarAttributeType)> {
-            let name = resolve_attr_name(path, maps)?;
-            all_sks
-                .iter()
-                .position(|(n, _)| *n == name)
-                .map(|pos| (pos, all_sks[pos].1))
-        };
-        if let Some(sk_cond) = &key_condition.sk_condition
-            && let Some((pos, sk_type)) = range_column(sk_cond.path())
-                .or_else(|| sk_info_val.map(|(_, sk_type)| (0, sk_type)))
-        {
-            let (sk_sql, sk_binds) =
-                build_sk_sql_and_binds(sk_cond, &sk_column_n(pos, sk_type), sk_type, maps)?;
-            sql.push_str(&sk_sql);
-            for v in &sk_binds {
-                binds.push(sk_bound(v));
-            }
-        }
-
-        // RANGE equalities that are not the sort-key condition. A name that is
-        // not a RANGE attribute has no column and is skipped.
-        for (path, value) in &key_condition.extra_sk_conditions {
-            if let Some((pos, sk_type)) = range_column(path) {
-                let _ = write!(sql, " AND {} = ?", sk_column_n(pos, sk_type));
-                binds.push(sk_bound(&parse_sk(
-                    &resolve_expr_to_av(value, maps)?,
-                    sk_type,
-                )?));
-            }
-        }
-
-        // Pagination.
-        if exclusive_start_key.is_some() && sk_info_val.is_none() && index_name.is_none() {
-            return Ok((Vec::new(), None));
-        }
-        if let Some(start_key) = exclusive_start_key {
-            append_query_pagination(
-                &mut sql,
-                &mut binds,
-                start_key,
-                &all_sks,
-                base_sk_info.as_ref(),
-                key_info,
-                index_name.is_some(),
-                is_lsi,
-                forward,
-            )?;
-        }
-
-        // ORDER BY: the same columns the page cursor compares, every one in the
-        // direction of ScanIndexForward, so a reverse Query is the exact mirror
-        // of the forward one (as DynamoDB's is) and the cursor predicate is a
-        // row comparison over the key index.
-        let order_cols = query_order_columns(
-            &all_sks,
-            base_sk_info.as_ref(),
-            index_name.is_some(),
+        let Some((sql, binds)) = query_statement(
+            &ddb_table,
             is_lsi,
-        );
-        if !order_cols.is_empty() {
-            let dir = if forward { "ASC" } else { "DESC" };
-            let ordered = order_cols
-                .iter()
-                .map(|c| format!("{c} {dir}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let _ = write!(sql, " ORDER BY {ordered}");
-        }
-
-        let fetch_limit = limit.map_or(1_000_001, |l| l + 1);
-        let _ = write!(sql, " LIMIT {fetch_limit}");
-
+            key_info,
+            key_condition,
+            maps,
+            forward,
+            limit,
+            exclusive_start_key,
+            index_name.is_some(),
+        )?
+        else {
+            return Ok((Vec::new(), None));
+        };
         let rows = execute_dynamic_query(&sql, binds, &self.pool).await?;
         finalize(rows, limit, &key_info.key_schema)
     }
@@ -305,6 +218,123 @@ impl SqliteEngine {
     }
 }
 
+/// The statement and binds for one Query page on `ddb_table` (a data table or
+/// an index table). `None` when the page is known to be empty without a read:
+/// a start key on a hash-only base table, whose partition holds one item.
+///
+/// Separate from [`SqliteEngine::query_impl`] so the plan tests can run
+/// `EXPLAIN QUERY PLAN` on exactly the statement a Query sends.
+#[allow(clippy::too_many_arguments)]
+fn query_statement(
+    ddb_table: &str,
+    is_lsi: bool,
+    key_info: &TableKeyInfo,
+    key_condition: &KeyCondition,
+    maps: &ExpressionMaps,
+    forward: bool,
+    limit: Option<i64>,
+    exclusive_start_key: Option<&Item>,
+    is_index: bool,
+) -> Result<Option<(String, Vec<BoundValue>)>, StorageError> {
+    // Partition key (composite via netstring when multi-HASH).
+    let pk_text = if key_condition.extra_pk_conditions.is_empty() {
+        pk_to_text(&resolve_expr_to_av(&key_condition.pk_value, maps)?)?.into_owned()
+    } else {
+        let mut parts =
+            vec![pk_to_text(&resolve_expr_to_av(&key_condition.pk_value, maps)?)?.into_owned()];
+        for (_, value) in &key_condition.extra_pk_conditions {
+            parts.push(pk_to_text(&resolve_expr_to_av(value, maps)?)?.into_owned());
+        }
+        encode_netstring_composite(&parts)
+    };
+
+    let sk_info_val = sk_info(&key_info.key_schema, &key_info.attribute_definitions);
+    let all_sks = all_sort_key_info(&key_info.key_schema, &key_info.attribute_definitions);
+    let base_sk_info: Option<(String, ScalarAttributeType)> = if is_index {
+        sk_info(&key_info.base_key_schema, &key_info.attribute_definitions)
+            .map(|(n, t)| (n.to_owned(), t))
+    } else {
+        None
+    };
+
+    let mut sql = format!("SELECT item_data FROM {ddb_table} WHERE pk = ?");
+    let mut binds: Vec<BoundValue> = vec![BoundValue::Text(pk_text.clone())];
+
+    // Each RANGE condition applies to the column of the attribute it
+    // names. On a multi-RANGE index the non-equality condition can name a
+    // later RANGE attribute and the first one is an equality in
+    // `extra_sk_conditions`. A sort-key condition that names no RANGE
+    // attribute applies to the first one.
+    let range_column = |path: &[PathElement]| -> Option<(usize, ScalarAttributeType)> {
+        let name = resolve_attr_name(path, maps)?;
+        all_sks
+            .iter()
+            .position(|(n, _)| *n == name)
+            .map(|pos| (pos, all_sks[pos].1))
+    };
+    if let Some(sk_cond) = &key_condition.sk_condition
+        && let Some((pos, sk_type)) =
+            range_column(sk_cond.path()).or_else(|| sk_info_val.map(|(_, sk_type)| (0, sk_type)))
+    {
+        let (sk_sql, sk_binds) =
+            build_sk_sql_and_binds(sk_cond, &sk_column_n(pos, sk_type), sk_type, maps)?;
+        sql.push_str(&sk_sql);
+        for v in &sk_binds {
+            binds.push(sk_bound(v));
+        }
+    }
+
+    // RANGE equalities that are not the sort-key condition. A name that is
+    // not a RANGE attribute has no column and is skipped.
+    for (path, value) in &key_condition.extra_sk_conditions {
+        if let Some((pos, sk_type)) = range_column(path) {
+            let _ = write!(sql, " AND {} = ?", sk_column_n(pos, sk_type));
+            binds.push(sk_bound(&parse_sk(
+                &resolve_expr_to_av(value, maps)?,
+                sk_type,
+            )?));
+        }
+    }
+
+    // Pagination.
+    if exclusive_start_key.is_some() && sk_info_val.is_none() && !is_index {
+        return Ok(None);
+    }
+    if let Some(start_key) = exclusive_start_key {
+        append_query_pagination(
+            &mut sql,
+            &mut binds,
+            start_key,
+            &pk_text,
+            &all_sks,
+            base_sk_info.as_ref(),
+            key_info,
+            is_index,
+            is_lsi,
+            forward,
+        )?;
+    }
+
+    // ORDER BY: the same columns the page cursor compares, every one in the
+    // direction of ScanIndexForward, so a reverse Query is the exact mirror
+    // of the forward one (as DynamoDB's is) and the cursor predicate is a
+    // row comparison over the key index.
+    let order_cols = query_order_columns(&all_sks, base_sk_info.as_ref(), is_index);
+    if !order_cols.is_empty() {
+        let dir = if forward { "ASC" } else { "DESC" };
+        let ordered = order_cols
+            .iter()
+            .map(|c| format!("{c} {dir}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = write!(sql, " ORDER BY {ordered}");
+    }
+
+    let fetch_limit = limit.map_or(1_000_001, |l| l + 1);
+    let _ = write!(sql, " LIMIT {fetch_limit}");
+    Ok(Some((sql, binds)))
+}
+
 /// Resolve a key-condition path's attribute name, handling `#name` references.
 fn resolve_attr_name(path: &[PathElement], maps: &ExpressionMaps) -> Option<String> {
     match path.first() {
@@ -424,20 +454,21 @@ fn base_pk_from_start_key(
 /// lexicographically over all of them.
 ///
 /// - Base table with a sort key: the sort key.
-/// - LSI: the index sort key, then the base sort key (every row shares the
-///   queried partition key, so the base sort key alone identifies a row).
-/// - GSI with a sort key: the index sort key columns, then the FULL base
-///   primary key. Rows in a GSI partition are unique on (index SK, base PK,
-///   base SK), not on (index SK, base SK): many base partitions can project
-///   the same index SK and the same base SK, and comparing base SK alone made
-///   a page-two query return nothing whenever the rows sharing an index SK
-///   also shared a base SK.
+/// - Index with a sort key (GSI or LSI): the index sort key columns, then the
+///   FULL base primary key. Rows in a GSI partition are unique on (index SK,
+///   base PK, base SK), not on (index SK, base SK): many base partitions can
+///   project the same index SK and the same base SK, and comparing base SK
+///   alone made a page-two query return nothing whenever the rows sharing an
+///   index SK also shared a base SK. In an LSI partition `base_pk` equals the
+///   queried `pk` on every row, so it does not change the order, but it keeps
+///   the `ORDER BY` identical to `idx_order_*` on `(pk, sk, base_pk,
+///   base_sk)`. Without it SQLite reads the index in index sort key order
+///   only and sorts the rest in a temporary B-tree.
 /// - Hash-only index: the full base primary key.
 fn query_order_columns(
     range_keys: &[(&str, ScalarAttributeType)],
     base_sk_info: Option<&(String, ScalarAttributeType)>,
     is_index: bool,
-    is_lsi: bool,
 ) -> Vec<String> {
     let base_sk = base_sk_info.map(|(_, t)| format!("base_{}", sk_column(*t)));
     let mut cols = Vec::with_capacity(range_keys.len() + 2);
@@ -454,9 +485,7 @@ fn query_order_columns(
     if !is_index {
         return cols;
     }
-    if !is_lsi {
-        cols.push("base_pk".to_owned());
-    }
+    cols.push("base_pk".to_owned());
     cols.extend(base_sk);
     cols
 }
@@ -474,11 +503,21 @@ fn query_order_columns(
 /// a hash-only index partition (measured 2026-09-17). Where the tie-breaker
 /// was the whole order (a hash-only index) an ascending cursor under a
 /// descending `ORDER BY` repeated the first page's items and skipped the rest.
+///
+/// `partition_key` is the queried partition key text. An LSI binds it as the
+/// cursor's `base_pk`, because every row of the partition carries it there.
+/// `base_pk` then compares equal on every row, and only the base sort key
+/// separates a row from the cursor. The statement does not read the start
+/// key's partition key: the bind keeps the page inside the queried partition.
+/// DynamoDB refuses a start key that names another partition with a
+/// ValidationException; that check belongs to request validation, not to this
+/// statement. A GSI binds the start key's base partition key.
 #[allow(clippy::too_many_arguments)]
 fn append_query_pagination(
     sql: &mut String,
     binds: &mut Vec<BoundValue>,
     start_key: &Item,
+    partition_key: &str,
     range_keys: &[(&str, ScalarAttributeType)],
     base_sk_info: Option<&(String, ScalarAttributeType)>,
     key_info: &TableKeyInfo,
@@ -486,7 +525,7 @@ fn append_query_pagination(
     is_lsi: bool,
     forward: bool,
 ) -> Result<(), StorageError> {
-    let cols = query_order_columns(range_keys, base_sk_info, is_index, is_lsi);
+    let cols = query_order_columns(range_keys, base_sk_info, is_index);
     if cols.is_empty() {
         return Ok(());
     }
@@ -514,11 +553,11 @@ fn append_query_pagination(
             cursor.push(sk_bind(sk_name, sk_type)?);
         }
         if is_index {
-            if !is_lsi {
-                cursor.push(BoundValue::Text(base_pk_from_start_key(
-                    start_key, key_info,
-                )?));
-            }
+            cursor.push(BoundValue::Text(if is_lsi {
+                partition_key.to_owned()
+            } else {
+                base_pk_from_start_key(start_key, key_info)?
+            }));
             if let Some((base_name, base_type)) = base_sk_info {
                 cursor.push(sk_bind(base_name, *base_type)?);
             }
@@ -641,6 +680,19 @@ mod tests {
         forward: bool,
         key: &Item,
     ) -> (String, Vec<String>) {
+        paginate_in(sk, base_sk, is_index, is_lsi, forward, key, "p")
+    }
+
+    /// [`paginate`] with the queried partition key given explicitly.
+    fn paginate_in(
+        sk: Option<(&str, ScalarAttributeType)>,
+        base_sk: Option<ScalarAttributeType>,
+        is_index: bool,
+        is_lsi: bool,
+        forward: bool,
+        key: &Item,
+        partition_key: &str,
+    ) -> (String, Vec<String>) {
         let ki = key_info(base_sk);
         let base_sk_info = base_sk.map(|t| ("bsk".to_owned(), t));
         let mut sql = String::new();
@@ -649,6 +701,7 @@ mod tests {
             &mut sql,
             &mut binds,
             key,
+            partition_key,
             sk.as_slice(),
             base_sk_info.as_ref(),
             &ki,
@@ -719,21 +772,43 @@ mod tests {
     }
 
     #[test]
-    fn lsi_cursor_is_the_index_sort_key_then_the_base_sort_key() {
+    fn lsi_cursor_compares_the_ordering_index_columns() {
+        // idx_order_* is (pk, sk, base_pk, base_sk). A cursor and ORDER BY
+        // that skip base_pk leave SQLite an index that orders the index sort
+        // key only, and it sorts the rest in a temporary B-tree.
         let key = start_key(&[("lsk", "l"), ("bpk", "p"), ("bsk", "s")]);
+        let want_binds = vec!["l".to_owned(), "p".to_owned(), "s".to_owned()];
         assert_eq!(
             paginate(Some(("lsk", S)), Some(S), true, true, true, &key),
             (
-                " AND (sk_s, base_sk_s) > (?, ?)".to_owned(),
-                vec!["l".to_owned(), "s".to_owned()]
+                " AND (sk_s, base_pk, base_sk_s) > (?, ?, ?)".to_owned(),
+                want_binds.clone()
             )
         );
         assert_eq!(
             paginate(Some(("lsk", S)), Some(S), true, true, false, &key),
             (
-                " AND (sk_s, base_sk_s) < (?, ?)".to_owned(),
-                vec!["l".to_owned(), "s".to_owned()]
+                " AND (sk_s, base_pk, base_sk_s) < (?, ?, ?)".to_owned(),
+                want_binds
             )
+        );
+    }
+
+    #[test]
+    fn lsi_cursor_binds_the_queried_partition_key_as_base_pk() {
+        // Every row of an LSI partition stores the queried partition key as
+        // base_pk, and the cursor binds that value, not the start key's
+        // partition key, so the page stays inside the queried partition. A
+        // GSI binds the start key's base partition key.
+        let key = start_key(&[("lsk", "l"), ("bpk", "other"), ("bsk", "s")]);
+        assert_eq!(
+            paginate_in(Some(("lsk", S)), Some(S), true, true, true, &key, "p").1,
+            vec!["l".to_owned(), "p".to_owned(), "s".to_owned()]
+        );
+        let key = start_key(&[("gsk", "g"), ("bpk", "other"), ("bsk", "s")]);
+        assert_eq!(
+            paginate_in(Some(("gsk", S)), Some(S), true, false, true, &key, "g").1,
+            vec!["g".to_owned(), "other".to_owned(), "s".to_owned()]
         );
     }
 
@@ -809,7 +884,7 @@ mod tests {
                 ])
             };
             let base_sk_info = base_sk.map(|t| ("bsk".to_owned(), t));
-            let cols = query_order_columns(sk.as_slice(), base_sk_info.as_ref(), is_index, is_lsi);
+            let cols = query_order_columns(sk.as_slice(), base_sk_info.as_ref(), is_index);
             let marks = vec!["?"; cols.len()].join(", ");
             let (cols_sql, marks_sql) = if cols.len() == 1 {
                 (cols[0].clone(), "?".to_owned())
@@ -832,7 +907,7 @@ mod tests {
             assert_eq!(fwd_binds, rev_binds);
         }
         // A hash-only base table has nothing to resume within a partition.
-        assert!(query_order_columns(&[], None, false, false).is_empty());
+        assert!(query_order_columns(&[], None, false).is_empty());
         let (sql, binds) = paginate(None, None, false, false, true, &start_key(&[("bpk", "p")]));
         assert!(sql.is_empty());
         assert!(binds.is_empty());
@@ -847,7 +922,7 @@ mod tests {
         let range_keys = [("a", S), ("b", N), ("c", S)];
         let base_sk_info = Some(("bsk".to_owned(), S));
         assert_eq!(
-            query_order_columns(&range_keys, base_sk_info.as_ref(), true, false),
+            query_order_columns(&range_keys, base_sk_info.as_ref(), true),
             vec!["sk_s", "sk2_n", "sk3_s", "base_pk", "base_sk_s"]
         );
         let ki = key_info(Some(S));
@@ -860,6 +935,7 @@ mod tests {
                 &mut sql,
                 &mut binds,
                 &key,
+                "h",
                 &range_keys,
                 base_sk_info.as_ref(),
                 &ki,
@@ -881,3 +957,15 @@ mod tests {
         }
     }
 }
+
+/// The plan SQLite chooses for the statement an index Query sends.
+///
+/// Each index table whose index has a sort key has an ordering index
+/// `idx_order_*` on `(pk, sk*, base_pk, base_sk*)`. A Query whose `ORDER BY`
+/// is that index minus the constant `pk` is a walk of the index; one that
+/// skips a column of it makes SQLite sort the rows the walk reads, shown as
+/// `USE TEMP B-TREE FOR ... ORDER BY` in `EXPLAIN QUERY PLAN`. The rows come
+/// back in the same order either way, so these tests read the plan; the
+/// multi-RANGE GSI case also checks the rows of its pages.
+#[cfg(test)]
+mod plan_tests;
