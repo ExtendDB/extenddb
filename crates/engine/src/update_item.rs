@@ -62,20 +62,6 @@ pub async fn handle_update_item(
 
     extenddb_core::validation::validate_table_name(&input.table_name, &ctx.limits)?;
 
-    // Amazon DynamoDB enforces the nesting-depth limit on EVERY
-    // ExpressionAttributeValue, condition-only placeholders included: a
-    // 32-level value referenced solely by a ConditionExpression answers the
-    // nesting ValidationException rather than evaluating the condition.
-    // An earlier measurement had condition-only values exempt, and some
-    // regions did behave that way; re-measured 2026-08-24, both us-east-1 and
-    // eu-west-2 apply the limit to the whole map, so the per-placeholder walk
-    // this replaced is gone. A 31-level value still passes and the condition
-    // evaluates normally. It comes before every expression check, the unused
-    // names and values, the table lookup and the key (measured 2026-10-26).
-    if let Some(values) = &input.expression_attribute_values {
-        extenddb_core::validation::validate_attribute_values_nesting_depth(values.values())?;
-    }
-
     // Validate Update/Condition expressions (and AttributeUpdates
     // desugaring) before the existence check; key, item-content nesting, and
     // the no-key-update checks stay after (post-existence on Amazon DynamoDB).
@@ -102,6 +88,21 @@ pub async fn handle_update_item(
             ("ConditionExpression", has_condition),
         ],
     )?;
+
+    // Amazon DynamoDB enforces the nesting-depth limit on EVERY
+    // ExpressionAttributeValue, condition-only placeholders included: a
+    // 32-level value referenced solely by a ConditionExpression answers the
+    // nesting ValidationException rather than evaluating the condition.
+    // An earlier measurement had condition-only values exempt, and some
+    // regions did behave that way; re-measured 2026-08-24, both us-east-1 and
+    // eu-west-2 apply the limit to the whole map, so the per-placeholder walk
+    // this replaced is gone. A 31-level value still passes and the condition
+    // evaluates normally. It comes after the check for legacy and expression
+    // parameters used together and before the unused names and values, every
+    // expression check, the table lookup and the key (measured 2026-10-26).
+    if let Some(values) = &input.expression_attribute_values {
+        extenddb_core::validation::validate_attribute_values_nesting_depth(values.values())?;
+    }
 
     // Desugar legacy AttributeUpdates into UpdateExpression if present.
     let (effective_update_expr, extra_expr_values, extra_expr_names) =

@@ -138,9 +138,11 @@ pub async fn handle_put_item(
     // alike, while 31 levels is accepted. TransactWriteItems deliberately does
     // NOT get this check: the same 32-level condition-only value is accepted
     // inside a transaction on every sub-op shape (also measured). It comes
-    // before the ConditionExpression and the table lookup (measured
-    // 2026-10-26).
+    // after an invalid number in the Item and before the ConditionExpression
+    // and the table lookup (measured 2026-10-26), so the Item's numbers are
+    // checked here first; `validate_put_item` checks them again later.
     if let Some(values) = &input.expression_attribute_values {
+        extenddb_core::validation::validate_item_numbers(&input.item)?;
         extenddb_core::validation::validate_attribute_values_nesting_depth(values.values())?;
     }
 
