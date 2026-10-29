@@ -67,6 +67,7 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 | Condition expression size | 4 KB | Enforced | `check_expression_size`, `LimitsConfig::max_expression_length_bytes` |
 | Update expression size | 4 KB | Enforced | `check_expression_size`, `LimitsConfig::max_expression_length_bytes` |
 | Key condition expression size | 4 KB | Enforced | `check_expression_size`, `LimitsConfig::max_expression_length_bytes` |
+| Document path length in an expression | 32 elements (each attribute name and list index counts as one) | Enforced | Every expression kind: `Invalid <Kind>: The document path has too many nesting levels; nesting levels: <n>`. Checked path by path in the order the paths appear, after each path's `#name` references, so an undefined `#name` in an earlier path or inside the long path is reported first, as on the service. A syntax error anywhere in the expression is reported first. ExtendDB checks reserved words on the whole expression before any path, where the service checks them in the same walk, so a long path followed by a reserved word answers the reserved word error |
 | Expression attribute names | 2 MB total | Not enforced | Per-entry key/value validated (`serde_helpers`); no aggregate size validation |
 | Expression attribute values | 2 MB total | Not enforced | Per-entry key/value validated (`serde_helpers`); no aggregate size validation |
 
