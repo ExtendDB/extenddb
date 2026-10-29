@@ -1250,7 +1250,7 @@ pub(crate) async fn handle_restore_table_to_point_in_time(
 }
 
 /// Convert storage errors to `DynamoDB` errors.
-fn storage_err_to_dynamo(e: StorageError) -> DynamoDbError {
+pub(crate) fn storage_err_to_dynamo(e: StorageError) -> DynamoDbError {
     match e {
         StorageError::TableNotFound(msg) => DynamoDbError::ResourceNotFoundException(msg),
         StorageError::TableAlreadyExists(msg)
@@ -1278,6 +1278,9 @@ fn storage_err_to_dynamo(e: StorageError) -> DynamoDbError {
         StorageError::Unsupported(msg) => DynamoDbError::ValidationException(msg),
         StorageError::LimitExceeded(msg) => DynamoDbError::LimitExceededException(msg),
         StorageError::BackupInUse(msg) => DynamoDbError::BackupInUseException(msg),
+        // A backend-classified client error passes through unchanged, before
+        // the catch-all that reports a storage fault.
+        StorageError::Service(e) => e,
         other => {
             tracing::error!(internal_error = %other, "backup storage error");
             DynamoDbError::InternalServerError("Internal server error".to_owned())
@@ -1286,5 +1289,7 @@ fn storage_err_to_dynamo(e: StorageError) -> DynamoDbError {
 }
 
 mod overrides;
+#[cfg(test)]
+mod service_error_tests;
 #[cfg(test)]
 mod tests;

@@ -309,7 +309,7 @@ fn projected_after_gsi_updates(
 /// yet returns `Unsupported` or `IndexesInUse` from `update_table`, and the
 /// vector capability gate refuses vector requests before the backend is called
 /// at all, so a wire test cannot provoke either one today.
-fn update_table_err_to_dynamo(
+pub(crate) fn update_table_err_to_dynamo(
     e: extenddb_storage::error::StorageError,
     table_name: &str,
 ) -> DynamoDbError {
@@ -339,6 +339,10 @@ fn update_table_err_to_dynamo(
         // request. The backend supplies the whole message because only it knows
         // the state.
         StorageError::IndexesInUse(msg) => DynamoDbError::ResourceInUseException(msg),
+        // The backend already classified this failure into the service error
+        // vocabulary and chose the client-facing message. Pass it through
+        // unchanged; it is not a storage fault, so it is not logged as one.
+        StorageError::Service(e) => e,
         other => {
             tracing::error!(internal_error = %other, "storage internal error");
             DynamoDbError::InternalServerError("Internal server error".to_owned())
@@ -350,6 +354,50 @@ fn update_table_err_to_dynamo(
 mod tests {
     use super::*;
     use extenddb_storage::error::StorageError;
+
+    // A backend-classified error reaches the client unchanged through the
+    // UpdateTable mapper, keeping both its variant and its message.
+
+    #[test]
+    fn service_service_unavailable_passes_through() {
+        let err = update_table_err_to_dynamo(
+            StorageError::Service(DynamoDbError::ServiceUnavailable(
+                "retry shortly".to_owned(),
+            )),
+            "t",
+        );
+        match err {
+            DynamoDbError::ServiceUnavailable(msg) => assert_eq!(msg, "retry shortly"),
+            other => panic!("expected ServiceUnavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_capacity_error_passes_through() {
+        let err = update_table_err_to_dynamo(
+            StorageError::Service(DynamoDbError::ProvisionedThroughputExceededException(
+                "capacity".to_owned(),
+            )),
+            "t",
+        );
+        match err {
+            DynamoDbError::ProvisionedThroughputExceededException(msg) => {
+                assert_eq!(msg, "capacity");
+            }
+            other => panic!("expected ProvisionedThroughputExceededException, got {other:?}"),
+        }
+    }
+
+    // Control: an unclassified driver error is still redacted behind the fixed
+    // string, with the driver text absent from the client message.
+    #[test]
+    fn internal_driver_text_is_redacted() {
+        let err = update_table_err_to_dynamo(StorageError::Internal("driver text".to_owned()), "t");
+        match err {
+            DynamoDbError::InternalServerError(msg) => assert_eq!(msg, "Internal server error"),
+            other => panic!("expected InternalServerError, got {other:?}"),
+        }
+    }
 
     #[test]
     fn a_created_gsi_throughput_below_one_is_refused() {
