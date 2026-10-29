@@ -4,7 +4,8 @@
 //! Wildcard and ARN matching for IAM policy evaluation.
 //!
 //! `wildcard_match` supports `*` (zero or more characters) and `?` (exactly one
-//! character). `arn_match` splits an ARN into its first five fields plus the
+//! character), counting characters in UTF-16 code units as IAM does. `arn_match`
+//! splits an ARN into its first five fields plus the
 //! resource field (everything after the fifth `:`) as one field, and matches
 //! each field with `wildcard_match`, so `*` and `?` in the resource field span
 //! `:` and `/`.
@@ -12,7 +13,8 @@
 /// Match a pattern against a value. Supports `*` and `?` wildcards.
 /// Comparison is case-sensitive.
 ///
-/// Uses a greedy algorithm with O(1) heap allocation.
+/// Uses a greedy algorithm. ASCII input is matched without allocating; other
+/// input is converted to UTF-16 first.
 ///
 /// Used for `StringLike` condition evaluation (case-sensitive per AWS IAM).
 ///
@@ -27,7 +29,7 @@
 /// ```
 #[must_use]
 pub fn wildcard_match(pattern: &str, value: &str) -> bool {
-    wildcard_match_impl(pattern.as_bytes(), value.as_bytes(), false)
+    wildcard_match_impl(pattern, value, false)
 }
 
 /// Match a pattern against a value with case-insensitive comparison.
@@ -45,10 +47,49 @@ pub fn wildcard_match(pattern: &str, value: &str) -> bool {
 /// ```
 #[must_use]
 pub fn wildcard_match_ignore_case(pattern: &str, value: &str) -> bool {
-    wildcard_match_impl(pattern.as_bytes(), value.as_bytes(), true)
+    wildcard_match_impl(pattern, value, true)
 }
 
-fn wildcard_match_impl(p: &[u8], v: &[u8], ignore_case: bool) -> bool {
+/// IAM counts what `?` and `*` match in UTF-16 code units, measured with the
+/// IAM policy simulator: a character outside the Basic Multilingual Plane,
+/// such as an emoji, is two units and takes `??`. An ASCII byte is one unit,
+/// so ASCII input is matched as bytes, with no conversion.
+fn wildcard_match_impl(pattern: &str, value: &str, ignore_case: bool) -> bool {
+    if pattern.is_ascii() && value.is_ascii() {
+        return match_units(pattern.as_bytes(), value.as_bytes(), ignore_case);
+    }
+    let p: Vec<u16> = pattern.encode_utf16().collect();
+    let v: Vec<u16> = value.encode_utf16().collect();
+    match_units(&p, &v, ignore_case)
+}
+
+/// One unit of a pattern or a value: an ASCII byte or a UTF-16 code unit.
+trait Unit: Copy + Eq {
+    const STAR: Self;
+    const QUESTION: Self;
+    fn eq_folding_ascii(self, other: Self) -> bool;
+}
+
+impl Unit for u8 {
+    const STAR: Self = b'*';
+    const QUESTION: Self = b'?';
+    fn eq_folding_ascii(self, other: Self) -> bool {
+        self.eq_ignore_ascii_case(&other)
+    }
+}
+
+impl Unit for u16 {
+    const STAR: Self = 0x2A; // '*'
+    const QUESTION: Self = 0x3F; // '?'
+    fn eq_folding_ascii(self, other: Self) -> bool {
+        match (u8::try_from(self), u8::try_from(other)) {
+            (Ok(a), Ok(b)) => a.eq_ignore_ascii_case(&b),
+            _ => self == other,
+        }
+    }
+}
+
+fn match_units<T: Unit>(p: &[T], v: &[T], ignore_case: bool) -> bool {
     let (plen, vlen) = (p.len(), v.len());
 
     let mut pi = 0; // pattern index
@@ -57,27 +98,23 @@ fn wildcard_match_impl(p: &[u8], v: &[u8], ignore_case: bool) -> bool {
     let mut match_from = 0; // value index when last '*' was hit
 
     while vi < vlen {
-        if pi < plen && p[pi] == b'*' {
+        if pi < plen && p[pi] == T::STAR {
             last_star = pi + 1;
             match_from = vi;
             pi += 1;
-        } else if pi < plen && p[pi] == b'?' {
-            // `?` is one character, as in IAM: it takes the whole UTF-8
-            // sequence of a multibyte character, not one byte of it.
-            pi += 1;
-            vi += utf8_len(v[vi]);
         } else if pi < plen
-            && if ignore_case {
-                p[pi].eq_ignore_ascii_case(&v[vi])
-            } else {
-                p[pi] == v[vi]
-            }
+            && (p[pi] == T::QUESTION
+                || if ignore_case {
+                    p[pi].eq_folding_ascii(v[vi])
+                } else {
+                    p[pi] == v[vi]
+                })
         {
             pi += 1;
             vi += 1;
         } else if last_star != usize::MAX {
-            // Backtrack: let the last '*' consume one more character.
-            match_from += utf8_len(v[match_from]);
+            // Backtrack: let the last '*' consume one more unit.
+            match_from += 1;
             vi = match_from;
             pi = last_star;
         } else {
@@ -86,23 +123,11 @@ fn wildcard_match_impl(p: &[u8], v: &[u8], ignore_case: bool) -> bool {
     }
 
     // Consume trailing '*' in pattern.
-    while pi < plen && p[pi] == b'*' {
+    while pi < plen && p[pi] == T::STAR {
         pi += 1;
     }
 
     pi == plen
-}
-
-/// The length of the UTF-8 sequence a lead byte starts. Both sides of a match
-/// are `str`, so the value index sits on a character boundary whenever this is
-/// called; a continuation byte, which cannot start a character, counts as one.
-fn utf8_len(lead: u8) -> usize {
-    match lead {
-        0xF0..=0xFF => 4,
-        0xE0..=0xEF => 3,
-        0xC0..=0xDF => 2,
-        _ => 1,
-    }
 }
 
 /// Match an ARN pattern against an ARN value, the way IAM does.
@@ -343,36 +368,47 @@ mod tests {
         assert!(!wildcard_match("s?s", "sass"));
     }
 
-    /// Measured with the IAM policy simulator: a `?` in a Resource pattern
-    /// matches the two-byte `\u{e9}` and `??` does not, and `StringLike`
-    /// `p?/*` matches `p\u{e9}/`.
+    /// Measured with the IAM policy simulator, in a Resource pattern: `?`
+    /// matched the one-unit `\u{e9}` and `\u{65e5}` and `??` did not;
+    /// against the two-unit `\u{1f600}`, `?` did not match, `??` did and
+    /// `????` did not. In a `StringLike` condition `p??/*` matched
+    /// `p\u{1f600}/x` and `p?/*` did not.
     #[test]
-    fn question_mark_takes_one_multibyte_character() {
+    fn question_mark_takes_one_utf16_unit() {
         assert!(wildcard_match("user-?", "user-\u{e9}"));
         assert!(!wildcard_match("user-??", "user-\u{e9}"));
+        assert!(wildcard_match("?", "\u{65e5}"));
+        assert!(!wildcard_match("??", "\u{65e5}"));
+        assert!(!wildcard_match("???", "\u{65e5}"));
         assert!(wildcard_match("team/??", "team/\u{65e5}\u{672c}"));
         assert!(!wildcard_match("team/?", "team/\u{65e5}\u{672c}"));
-        assert!(wildcard_match("p?/*", "p\u{e9}/orders"));
-        assert!(wildcard_match("?", "\u{1f600}"));
+        assert!(!wildcard_match("?", "\u{1f600}"));
+        assert!(wildcard_match("??", "\u{1f600}"));
+        assert!(!wildcard_match("????", "\u{1f600}"));
+        assert!(wildcard_match("p??/*", "p\u{1f600}/x"));
+        assert!(!wildcard_match("p?/*", "p\u{1f600}/x"));
         assert!(arn_match(
             "arn:aws:dynamodb:us-east-1:123456789012:table/?",
             "arn:aws:dynamodb:us-east-1:123456789012:table/\u{e9}"
         ));
         assert!(wildcard_match_ignore_case("A?C", "a\u{e9}c"));
+        assert!(wildcard_match_ignore_case("A??C", "a\u{1f600}c"));
     }
 
     #[test]
-    fn star_backtracks_by_whole_characters() {
+    fn star_backtracks_by_utf16_units() {
         assert!(wildcard_match("*?b", "\u{e9}b"));
         assert!(wildcard_match("a*\u{e9}", "a\u{e9}\u{e9}\u{e9}"));
         assert!(wildcard_match("*\u{e9}?", "x\u{e9}\u{e9}"));
         assert!(wildcard_match("*?", "\u{65e5}"));
         assert!(!wildcard_match("*??", "\u{65e5}"));
         assert!(!wildcard_match("*\u{e9}", "\u{e8}"));
-        // Three characters cannot fill `??bc`. A star that stepped back by
-        // one byte would start `?` inside the three-byte character and
-        // match its last two bytes as two characters.
+        // Measured with the IAM policy simulator: `*??bc` does not match
+        // `\u{65e5}bc`, one unit before `bc`, and matches `\u{1f600}bc`, two
+        // units; `*?bc` matches `\u{1f600}bc`.
         assert!(!wildcard_match("*??bc", "\u{65e5}bc"));
+        assert!(wildcard_match("*??bc", "\u{1f600}bc"));
+        assert!(wildcard_match("*?bc", "\u{1f600}bc"));
     }
 
     #[test]
