@@ -393,7 +393,7 @@ mod tests {
         let tables = [&first.key_info, &second.key_info];
         let mut keyspaces = Vec::new();
         let mut data = Vec::new();
-        for ki in tables {
+        for (label, ki) in ["first", "second"].into_iter().zip(tables) {
             activate(&engine, ki).await;
             for n in 0..3 {
                 let item = std::collections::BTreeMap::from([
@@ -409,8 +409,7 @@ mod tests {
             assert_eq!(
                 described(&engine, &ki.account_id, &ki.table_name).await,
                 ("CREATING".to_owned(), Some(serde_json::Value::Bool(false))),
-                "UpdateTable leaves {}'s index before its backfill",
-                ki.table_name
+                "UpdateTable leaves the {label} account's index before its backfill"
             );
             keyspaces.push(engine.account_keyspace(&ki.account_id));
             data.push(extenddb_storage_cassandra::data::ddl::index_table_name(
