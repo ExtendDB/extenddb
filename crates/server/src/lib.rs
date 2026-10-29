@@ -19,6 +19,7 @@ pub mod key_info_cache;
 mod leading_keys;
 pub mod management;
 mod metrics_endpoint;
+mod pid_exit;
 pub mod rate_limit;
 mod request_helpers;
 mod request_tags;
@@ -27,7 +28,7 @@ mod serve;
 mod throttle_helpers;
 mod workers;
 
-pub use serve::{BuildInfo, LogTarget, ServeParams, log_to_syslog_raw, serve};
+pub use serve::{BuildInfo, CatalogRefusal, LogTarget, ServeParams, log_to_syslog_raw, serve};
 
 use std::path::PathBuf;
 use std::sync::Arc;

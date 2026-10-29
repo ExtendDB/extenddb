@@ -94,9 +94,11 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
         );
     }
 
-    // Validate backend is supported and get catalog version (fail fast before binding port)
+    // Fail fast, before binding the port, when no backend is installed.
     let backend = &app_config.storage.backend;
-    let catalog_version = extenddb_storage::operations::catalog_version()?;
+    extenddb_storage::backend_name()
+        .ok_or_else(|| anyhow::anyhow!("no storage backend installed"))?;
+    let catalog_version = extenddb_storage::migrations::binary_catalog_label();
 
     let port = args.port.unwrap_or(app_config.server.port);
 
@@ -263,18 +265,28 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
         }
     }
 
-    tokio::runtime::Builder::new_multi_thread()
+    let mut params = ServeParams::new(app_config, std_listener, pid_file, build)
+        .with_log_target(if args.foreground {
+            LogTarget::Stderr
+        } else {
+            LogTarget::Syslog
+        })
+        .with_dev_mode(cfg!(feature = "dev-mode"));
+    if config_exists {
+        params = params.with_config_path(&args.config);
+    }
+    let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(extenddb_server::serve(
-            ServeParams::new(app_config, std_listener, pid_file, build)
-                .with_log_target(if args.foreground {
-                    LogTarget::Stderr
-                } else {
-                    LogTarget::Syslog
-                })
-                .with_dev_mode(cfg!(feature = "dev-mode")),
-        ))
+        .block_on(extenddb_server::serve(params));
+    // `serve` has printed the refusal; end with its code, which `migrate`
+    // and `verify` use for the same status.
+    if let Err(e) = &result
+        && let Some(refusal) = e.downcast_ref::<extenddb_server::CatalogRefusal>()
+    {
+        std::process::exit(i32::from(refusal.exit_code));
+    }
+    result
 }
 
 /// The five wordmark rows (figlet slant), without trailing newlines.

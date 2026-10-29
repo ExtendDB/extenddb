@@ -108,6 +108,9 @@ pub struct ServeParams {
     /// Only a `dev-mode` build of the app crate ever sets this, and it enforces
     /// the loopback-only bind before handing over the listener.
     pub dev_mode: bool,
+    /// The config file `serve` was started with, named in the command a
+    /// catalog refusal prints. `None` when it started from built-in defaults.
+    pub config_path: Option<String>,
 }
 
 impl ServeParams {
@@ -126,6 +129,7 @@ impl ServeParams {
             log_target: LogTarget::Syslog,
             build,
             dev_mode: false,
+            config_path: None,
         }
     }
 
@@ -143,7 +147,32 @@ impl ServeParams {
         self.dev_mode = dev_mode;
         self
     }
+
+    /// Name the config file in the command a catalog refusal prints.
+    #[must_use]
+    pub fn with_config_path(mut self, config_path: impl Into<String>) -> Self {
+        self.config_path = Some(config_path.into());
+        self
+    }
 }
+
+/// `serve` stopped on the catalog's status before it opened the database:
+/// the message names the status and the command that resolves it, and the
+/// process should end with `exit_code` (the exit codes `migrate` and
+/// `verify` use for the same status).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogRefusal {
+    pub exit_code: u8,
+    pub message: String,
+}
+
+impl std::fmt::Display for CatalogRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CatalogRefusal {}
 
 /// Run the ExtendDB server on the pre-bound listener in `params` until shutdown.
 ///
@@ -197,9 +226,9 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         log_target,
         build,
         dev_mode,
+        config_path,
     } = params;
-    let catalog_version =
-        extenddb_storage::operations::catalog_version().unwrap_or_else(|_| "unknown".to_string());
+    let catalog_version = extenddb_storage::migrations::binary_catalog_label();
 
     // Write the PID file, when the caller asked for one, so `extenddb status`,
     // `extenddb stop`, and `start_server`'s graceful shutdown cleanup work. When
@@ -210,6 +239,7 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     if let Some(ref path) = pid_file {
         std::fs::write(path, format!("{}\n", std::process::id()))
             .map_err(|e| anyhow::anyhow!("Failed to write PID file {}: {e}", path.display()))?;
+        crate::pid_exit::remove_at_exit(path);
     }
 
     // Init logging (REQ-LOG-003, REQ-LOG-006) — the caller chose the target via
@@ -289,6 +319,7 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         extenddb_storage::server_components::ServerComponentsOptions::default();
 
     component_options.bootstrap_if_uninitialized = dev_mode;
+    component_options.release = build.version;
 
     // Wire the node's own bind address as the instance ID so each ExtendDB node
     // has a distinct node ID (to support logical clocks for sequences, etc.).
@@ -296,12 +327,34 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         .storage
         .set_instance_id(&format!("{}:{}", app_config.server.bind_addr, port));
 
-    let components = extenddb_storage::create_server_components(
+    let components = match extenddb_storage::create_server_components(
         app_config.storage.as_trait(),
         &app_config.server.region,
         component_options,
     )
-    .await?;
+    .await
+    {
+        Ok(components) => components,
+        Err(extenddb_storage::server_components::BackendError::Catalog(error)) => {
+            use extenddb_storage::migrations::{Target, advice, installed};
+            // A server started without a config file (a dev server configured
+            // by `EXTENDDB__` variables) advises `migrate` without one, which
+            // reads the same variables.
+            let advice = advice::AdviceFor::new(
+                build.version,
+                config::redact_password(app_config.storage.connection_config()),
+                installed(),
+                &Target::at(app_config.storage.connection_config()),
+                config_path.as_deref(),
+            );
+            return Err(CatalogRefusal {
+                exit_code: error.exit_code(),
+                message: advice::error_message(&error, &advice.advice()),
+            }
+            .into());
+        }
+        Err(other) => return Err(other.into()),
+    };
 
     let storage = components.engine;
     let catalog_store = components.catalog_store;
@@ -313,12 +366,15 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     // whose stored policies still name the dynamodb: form must be rewritten by
     // `extenddb migrate --yes` before this binary serves it. `migrate`, `init`
     // and every fresh-catalog bootstrap record a settings marker; refuse to
-    // start when it is missing. One settings-row read, no policy scan.
-    if catalog_store
-        .get_setting(extenddb_core::settings_keys::RESOURCE_TAG_MIGRATION)
-        .await
-        .map_err(|e| anyhow::anyhow!("reading the resource-tag migration marker: {e:?}"))?
-        .is_none()
+    // start when it is missing. One settings-row read, no policy scan. A
+    // backend on the migration runner read the catalog's status in its
+    // factory instead, and migration 1 deletes the marker.
+    if extenddb_storage::migrations::installed().is_none()
+        && catalog_store
+            .get_setting(extenddb_core::settings_keys::RESOURCE_TAG_MIGRATION)
+            .await
+            .map_err(|e| anyhow::anyhow!("reading the resource-tag migration marker: {e:?}"))?
+            .is_none()
     {
         anyhow::bail!(
             "this catalog has not had the resource-tag condition-key migration applied. \

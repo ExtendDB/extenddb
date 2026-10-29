@@ -7,19 +7,21 @@ Drives a real SQLite deployment through its lifecycle on its own data
 directory and port, independent of the server the integration job already
 started:
 
-  1. init (a fresh catalog carries the migration marker) and serve; the first
-     start of a fresh catalog logs no migration line.
-  2. store an inline user policy, a group policy, a permissions boundary and a
-     role trust policy using every operator shape of dynamodb:ResourceTag,
-     plus a conditional allow used for the decision check, through the
-     management API.
-  3. stop, run `migrate` without --yes: it lists each rewrite with a count and
-     exits non-zero, and nothing on disk changes (read back with the sqlite3
-     module).
-  4. run `migrate --yes`, restart, and confirm a GetItem gated on the resource
-     tag that was denied before the migration is allowed after it.
-  5. delete the marker row with the sqlite3 module and confirm serve refuses to
-     start, naming `extenddb migrate --yes`.
+  1. init and serve; the first start of a fresh catalog logs no migration
+     line.
+  2. store an inline user policy, a group policy and a permissions boundary
+     using every operator shape of dynamodb:ResourceTag, plus a conditional
+     allow used for the decision check, through the management API.
+  3. stop, and make the catalog read as one a release before 1.0 left: an
+     empty migration ledger, a dotted catalog_version and the old marker row.
+  4. run `migrate` without --yes: it lists the pending migrations, the
+     condition-key rewrite included, and exits 3, and nothing on disk changes
+     (read back with the sqlite3 module).
+  5. run `migrate --yes`: it names each rewritten policy with its key count;
+     restart, and confirm a GetItem gated on the resource tag that was denied
+     before the migration is allowed after it.
+  6. write the marker row again, as a release before 1.0 does, and confirm
+     serve refuses with exit 5 naming `--reconverge`, which repairs it.
 
 The binary is found the way tests/lifecycle_helpers.py does, falling back to
 target/release/extenddb, so the SQLite integration job runs it against the
@@ -51,6 +53,10 @@ from botocore.exceptions import ClientError
 from lifecycle_helpers import EXTENDDB_BINARY
 
 MIGRATION_MARKER_KEY = "resource_tag_migration"
+
+# Exit codes `serve` and `migrate` share.
+EXIT_PENDING = 3
+EXIT_ATTENTION = 5
 
 # This test stands up its own deployment, so it must not inherit admin
 # credentials or an endpoint from an outer harness (devtools/run-tests and the
@@ -284,6 +290,38 @@ def deployment(tmp_path):
     server.stop()
 
 
+def _as_released_catalog(sqlite_path: str) -> None:
+    """Make a catalog this binary created read as one a release before 1.0
+    left: no ledger rows (the runner reads an empty ledger as it reads a
+    missing one), a dotted catalog_version, and the marker row every released
+    baseline seeded. The runner then applies every migration, the
+    condition-key rewrite included, as it does on a released catalog."""
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        conn.execute("DELETE FROM extenddb_migrations")
+        conn.execute(
+            "UPDATE settings SET value = '0.0.3' WHERE key = 'catalog_version'"
+        )
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, 'applied')",
+            (MIGRATION_MARKER_KEY,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _sqlite_ledger_ids(sqlite_path: str) -> list[int]:
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        return [
+            r[0]
+            for r in conn.execute("SELECT id FROM extenddb_migrations ORDER BY id")
+        ]
+    finally:
+        conn.close()
+
+
 def _sqlite_policy_docs(sqlite_path: str) -> list[str]:
     conn = sqlite3.connect(sqlite_path)
     try:
@@ -301,8 +339,8 @@ def test_resource_tag_migration_wire(deployment):
     sqlite_path = deployment["sqlite_path"]
     region = "us-east-1"
 
-    # 1. First start of a fresh catalog: marker is seeded, so serve starts and
-    #    logs nothing about the migration.
+    # 1. The first start of a fresh catalog, which init migrated, logs
+    #    nothing about the condition-key migration.
     server.start()
     log = server.read_log()
     assert "resource-tag condition-key migration" not in log, log
@@ -365,56 +403,66 @@ def test_resource_tag_migration_wire(deployment):
         scoped_client.get_item(TableName=table, Key={"pk": {"S": "k1"}})
     assert exc.value.response["Error"]["Code"] == "AccessDeniedException"
 
-    # 2. Stop and run migrate WITHOUT --yes: it lists the rewrites with counts
-    #    and exits 3 (work pending, as distinct from an error), and nothing on
-    #    disk changes.
+    # 2. Stop, and make the catalog read as one a release before 1.0 left.
     server.stop()
+    _as_released_catalog(sqlite_path)
     before_docs = _sqlite_policy_docs(sqlite_path)
     assert any("dynamodb:ResourceTag" in d for d in before_docs)
 
+    # 3. migrate WITHOUT --yes lists the pending migrations and exits 3 (work
+    #    pending, as distinct from an error), and nothing on disk changes.
     dry = _run("migrate", "--config", deployment["config"])
-    assert dry.returncode == 3, dry.stdout + dry.stderr
     out = dry.stdout + dry.stderr
-    assert "Rewrite:" in out, out
-    assert "resource-tag condition-key rewrites" in out, out
+    assert dry.returncode == EXIT_PENDING, out
+    assert "2 resource_tag_condition_keys (catalog, breaking)" in out, out
     assert "run again with --yes to apply" in out, out
-    # The listing names policies and key counts, never a policy body.
-    assert "key(s))" in out, out
-    # Nothing changed on disk.
     assert _sqlite_policy_docs(sqlite_path) == before_docs
+    assert _sqlite_ledger_ids(sqlite_path) == []
 
-    # 3. migrate --yes rewrites and records the marker.
+    # 4. migrate --yes rewrites, naming each policy with its key count and
+    #    never a policy body, and deletes the old marker.
     applied = _run("migrate", "--yes", "--config", deployment["config"])
-    assert applied.returncode == 0, applied.stdout + applied.stderr
+    out = applied.stdout + applied.stderr
+    assert applied.returncode == 0, out
+    assert "rewrote account" in out and "key(s))" in out, out
+    assert "policy tagpolicy" in out and "policy shapes" in out, out
     after_docs = _sqlite_policy_docs(sqlite_path)
     assert all("dynamodb:ResourceTag" not in d for d in after_docs), after_docs
     assert any("aws:ResourceTag" in d for d in after_docs)
+    assert _sqlite_marker(sqlite_path) == []
 
-    # 4. Restart and confirm the decision flipped: the rewritten aws:ResourceTag
+    # 5. Restart and confirm the decision flipped: the rewritten aws:ResourceTag
     #    policy now resolves the tag, so GetItem on the env=prod table is allowed.
     server.start()
     scoped_client = _client(endpoint, scoped_ak, scoped_sk, region)
     got = scoped_client.get_item(TableName=table, Key={"pk": {"S": "k1"}})
     assert got["Item"]["v"]["S"] == "hi"
 
-    # A second migrate is idempotent: nothing left to rewrite, marker present.
+    # A second migrate finds nothing to apply.
     server.stop()
     again = _run("migrate", "--config", deployment["config"])
     assert again.returncode == 0, again.stdout + again.stderr
-    assert "No dynamodb:ResourceTag condition keys found." in (again.stdout + again.stderr)
+    assert "Up to date" in (again.stdout + again.stderr)
 
-    # 5. Delete the marker row with the sqlite3 module and confirm serve refuses.
+    # 6. A release before 1.0 writes the marker row again; serve refuses the
+    #    catalog with exit 5 and names --reconverge, which repairs it.
     conn = sqlite3.connect(sqlite_path)
     try:
-        conn.execute("DELETE FROM settings WHERE key = ?", (MIGRATION_MARKER_KEY,))
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, 'applied')",
+            (MIGRATION_MARKER_KEY,),
+        )
         conn.commit()
     finally:
         conn.close()
     refused = _run("serve", "--config", deployment["config"], "--foreground", timeout=60)
-    assert refused.returncode != 0
-    assert "extenddb migrate --yes" in (refused.stdout + refused.stderr), (
-        refused.stdout + refused.stderr
-    )
+    out = refused.stdout + refused.stderr
+    assert refused.returncode == EXIT_ATTENTION, out
+    assert "--yes --reconverge" in out, out
+    repaired = _run("migrate", "--yes", "--reconverge", "--config", deployment["config"])
+    assert repaired.returncode == 0, repaired.stdout + repaired.stderr
+    assert _sqlite_marker(sqlite_path) == []
+    server.start()
 
 
 def _sqlite_marker(sqlite_path: str) -> list:
@@ -458,10 +506,10 @@ def test_resource_tag_migration_collisions(deployment):
     upgrade, so the two conditions are one condition. migrate drops the
     dynamodb: key and the Deny keeps applying.
 
-    Different values: the two cannot share one JSON key. migrate leaves the
-    policy unchanged, exits non-zero and does not record the marker, so serve
-    keeps refusing the catalog until the policy is fixed and migrate is run
-    again. Recording the marker here would change the decision: under
+    Different values: the two cannot share one JSON key. migrate finds the
+    collision before it writes anything and exits 5, and serve refuses the
+    catalog with exit 5 until the policy is fixed and migrate is run again.
+    Applying the migration here would change the decision: under
     StringNotEquals the dynamodb: half, now absent, always matches.
     """
     from management_helpers import ManagementClient
@@ -527,44 +575,41 @@ def test_resource_tag_migration_collisions(deployment):
     admin_client.put_item(TableName=table, Item={"pk": {"S": "k1"}})
     server.stop()
 
-    # Simulate a catalog created before the migration existed.
-    conn = sqlite3.connect(sqlite_path)
-    try:
-        conn.execute("DELETE FROM settings WHERE key = ?", (MIGRATION_MARKER_KEY,))
-        conn.commit()
-    finally:
-        conn.close()
+    # A catalog a release before 1.0 left, with both policies stored on it.
+    _as_released_catalog(sqlite_path)
+    same_before = _sqlite_policy(sqlite_path, "hedged-same")
 
+    # The collision is found before anything is written: no ledger rows, and
+    # both policies as they were, the mergeable one included.
     applied = _run("migrate", "--yes", "--config", deployment["config"])
     out = applied.stdout + applied.stderr
-    assert applied.returncode != 0, out
-    assert "NEEDS ATTENTION" in out, out
-    attention = [line for line in out.splitlines() if "NEEDS ATTENTION" in line]
-    assert any("hedged-split" in line for line in attention), out
-    assert not any("hedged-same" in line for line in attention), out
-    assert _sqlite_marker(sqlite_path) == []
-    # The different-value policy is unchanged; the same-value one keeps only
-    # the aws: key.
+    assert applied.returncode == EXIT_ATTENTION, out
+    assert "policy hedged-split" in out, out
+    assert "policy hedged-same" not in out, out
+    assert _sqlite_ledger_ids(sqlite_path) == []
     assert _sqlite_policy(sqlite_path, "hedged-split") == split_doc
-    same = _sqlite_policy(sqlite_path, "hedged-same")
-    assert same["Statement"][1]["Condition"] == {
-        "StringEquals": {"aws:ResourceTag/env": "prod"}
-    }
+    assert _sqlite_policy(sqlite_path, "hedged-same") == same_before
 
     refused = _run("serve", "--config", deployment["config"], "--foreground", timeout=60)
-    assert refused.returncode != 0
-    assert "extenddb migrate --yes" in (refused.stdout + refused.stderr), (
-        refused.stdout + refused.stderr
-    )
+    out = refused.stdout + refused.stderr
+    assert refused.returncode == EXIT_ATTENTION, out
+    assert "policy hedged-split" in out, out
+    assert "extenddb migrate --config" in out, out
 
     # Fix the different-value policy by hand (keep the aws: form) and run
-    # migrate again: it completes and records the marker.
+    # migrate again: it applies, and the same-value policy keeps only the
+    # aws: key.
     fixed = json.loads(json.dumps(split_doc))
     del fixed["Statement"][0]["Condition"]["StringNotEquals"]["dynamodb:ResourceTag/env"]
     _sqlite_set_policy(sqlite_path, "hedged-split", fixed)
     again = _run("migrate", "--yes", "--config", deployment["config"])
     assert again.returncode == 0, again.stdout + again.stderr
-    assert _sqlite_marker(sqlite_path) != []
+    assert _sqlite_ledger_ids(sqlite_path) != []
+    assert _sqlite_marker(sqlite_path) == []
+    same = _sqlite_policy(sqlite_path, "hedged-same")
+    assert same["Statement"][1]["Condition"] == {
+        "StringEquals": {"aws:ResourceTag/env": "prod"}
+    }
 
     # The same-value Deny still applies after the upgrade.
     server.start()
