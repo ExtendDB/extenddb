@@ -1015,6 +1015,13 @@ async fn index_row_exists(
 /// that failed with its error; builds before it are ACTIVE, and the caller
 /// abandons it and the ones after it. A build whose index was deleted while it
 /// ran, or that someone else published first, is not a failure.
+///
+/// Each build is recorded in `backfills` from the start of its backfill until
+/// it is published or abandoned, which is what DescribeTable reports as
+/// `Backfilling: true`; before that the index reports `false`. `hold` is the
+/// table's `gsi_creating_phase_delay_ms` test hold, waited once before the
+/// barrier and once more inside each build's recorded phase.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_gsis(
     catalog: &sqlx::PgPool,
     data: &sqlx::PgPool,
@@ -1022,12 +1029,14 @@ pub(crate) async fn build_gsis(
     base_ks: &[KeySchemaElement],
     attr_defs: &[AttributeDefinition],
     builds: &[GsiBuild],
+    backfills: &extenddb_storage::gsi_backfill::GsiBackfills,
+    hold: Duration,
 ) -> Result<usize, (usize, StorageError)> {
     if builds.is_empty() {
         return Ok(0);
     }
     let mut published_here = 0usize;
-    tokio::time::sleep(GRACE_PUBLISH).await;
+    tokio::time::sleep(GRACE_PUBLISH + hold).await;
     if let Err(e) = write_barrier(data, table_id).await {
         // A table deleted during the wait is not a failed build.
         let mut gone = true;
@@ -1044,6 +1053,11 @@ pub(crate) async fn build_gsis(
         return Err((0, e));
     }
     for (i, b) in builds.iter().enumerate() {
+        // Dropped at the end of this iteration, after the publish below.
+        let _backfilling = backfills.start(&b.def.index_id);
+        if !hold.is_zero() {
+            tokio::time::sleep(hold).await;
+        }
         let filled = backfill(data, table_id, &b.def, base_ks, attr_defs).await;
         let published = match filled {
             Ok(counts) => {
@@ -1302,6 +1316,8 @@ async fn reconcile_pass(
             &base_ks,
             &attr_defs,
             std::slice::from_ref(&build),
+            &engine.gsi_backfills,
+            Duration::ZERO,
         )
         .await
         {

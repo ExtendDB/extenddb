@@ -223,6 +223,10 @@ impl PostgresEngine {
                     index_name: idx.index_name.clone(),
                     key_schema: ks,
                     projection: proj,
+                    backfilling: extenddb_storage::gsi_backfill::backfilling_member(
+                        &idx.index_status,
+                        self.gsi_backfills.started(&idx.index_id),
+                    ),
                     index_status: idx.index_status,
                     provisioned_throughput: pt.or(Some(ProvisionedThroughputDescription {
                         read_capacity_units: 0,

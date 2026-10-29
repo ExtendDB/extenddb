@@ -383,6 +383,7 @@ impl MongoEngine {
                     key_schema: gsi.key_schema.clone(),
                     projection: gsi.projection.clone(),
                     index_status: index_status.to_string(),
+                    backfilling: None,
                     provisioned_throughput: gsi.provisioned_throughput.as_ref().map(|pt| {
                         ProvisionedThroughputDescription {
                             read_capacity_units: pt.read_capacity_units,
@@ -1318,6 +1319,16 @@ impl MongoEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?
             .ok_or_else(|| StorageError::IndexNotFound(index_name.to_string()))?;
 
+        // A GSI still being built is not readable: its collection is partial.
+        // The service refuses a Query or Scan naming one in two ways, by phase;
+        // see `extenddb_storage::gsi_backfill`.
+        if index_doc.get_str("index_status") == Ok("CREATING") {
+            return Err(extenddb_storage::gsi_backfill::creating_read_refusal(
+                index_name,
+                crate::gsi_backfill_phase::started(&index_doc),
+            ));
+        }
+
         let index_id = index_doc
             .get_str("index_id")
             .map_err(|_| StorageError::Internal("missing index_id".to_string()))?
@@ -1570,14 +1581,13 @@ impl MongoEngine {
                             last_decrease_date_time: None,
                         }));
 
+                    let idx_status = idx_doc.get_str("index_status").unwrap_or("ACTIVE");
                     gsis.push(GsiDescription {
                         index_name: idx_name,
                         key_schema: idx_key_schema,
                         projection: idx_projection,
-                        index_status: idx_doc
-                            .get_str("index_status")
-                            .unwrap_or("ACTIVE")
-                            .to_string(),
+                        index_status: idx_status.to_string(),
+                        backfilling: crate::gsi_backfill_phase::member(idx_doc, idx_status),
                         provisioned_throughput: idx_pt,
                         index_size_bytes: 0,
                         item_count: 0,

@@ -1041,6 +1041,8 @@ impl PostgresEngine {
             let table_name = input.table_name.clone();
             let base_ks = base_key_schema.clone();
             let attr_defs = effective_attr_defs.clone();
+            let backfills = self.gsi_backfills.clone();
+            let hold = self.gsi_creating_phase_delay(&input.table_name).await;
             let task = tokio::spawn(async move {
                 let built = build_gsis(
                     &catalog,
@@ -1049,6 +1051,8 @@ impl PostgresEngine {
                     &base_ks,
                     &attr_defs,
                     &gsi_builds,
+                    &backfills,
+                    hold,
                 )
                 .await;
                 let Err((first_failed, e)) = built else {

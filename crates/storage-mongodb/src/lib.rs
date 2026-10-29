@@ -17,6 +17,9 @@ pub mod config;
 mod credential_store;
 mod data;
 mod data_engine;
+#[cfg(test)]
+mod gsi_backfill_live_tests;
+mod gsi_backfill_phase;
 mod management_store;
 mod metadata_engine;
 mod operations;

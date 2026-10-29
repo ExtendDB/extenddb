@@ -218,11 +218,19 @@ impl CassandraEngine {
 
             if index_type == "GSI" {
                 let pt_str: Option<String> = row.get_r_by_name("provisioned_throughput").ok();
+                // The recovery worker writes the heartbeat when it takes the
+                // index up for its backfill, so a heartbeat on a CREATING index
+                // means the backfill has started.
+                let heartbeat: Option<i64> = row.get_by_name("backfill_heartbeat").ok().flatten();
 
                 gsis.push(GsiDescription {
                     index_name: index_name.clone(),
                     key_schema: ks,
                     projection: proj,
+                    backfilling: extenddb_storage::gsi_backfill::backfilling_member(
+                        &index_status,
+                        heartbeat.is_some(),
+                    ),
                     index_status,
                     provisioned_throughput: gsi_throughput_description(pt_str.as_deref()),
                     index_size_bytes: 0,

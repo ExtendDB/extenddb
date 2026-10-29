@@ -542,7 +542,7 @@ async fn recover_stale_backfills(
             match crate::cassandra_util::query_optional::<extenddb_storage::error::StorageError>(
                 &engine.session,
                 &format!(
-                    "SELECT key_schema, attribute_definitions \
+                    "SELECT key_schema, attribute_definitions, table_name \
                  FROM {catalog_ks}.tables WHERE table_id = ? ALLOW FILTERING"
                 ),
                 cdrs_tokio::query_values!(table_id.as_str()),
@@ -591,6 +591,14 @@ async fn recover_stale_backfills(
             "gsi_recovery: recovering stale backfill for index '{index_name}' \
              (table_id={table_id}, index_id={index_id})"
         );
+        let base_table_name: String =
+            crate::cassandra_util::get_column(&base_row, "table_name", "gsi_recovery_base")?;
+        let Some(hold) =
+            crate::gsi_backfill_phase::claim(engine, &table_id, &index_name, &base_table_name)
+                .await
+        else {
+            continue;
+        };
 
         // Drop and recreate the data table so we start from a clean slate.
         if let Err(e) = engine.drop_index_data_table(account_ks, &index_id).await {
@@ -635,6 +643,7 @@ async fn recover_stale_backfills(
         let index_id_owned = index_id.clone();
         let index_name_owned = index_name.clone();
         tokio::spawn(async move {
+            tokio::time::sleep(hold).await;
             let result = crate::data::ddl::backfill_gsi(
                 &session,
                 &account_ks_owned,

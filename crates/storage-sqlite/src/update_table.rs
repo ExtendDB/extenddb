@@ -715,6 +715,19 @@ impl SqliteEngine {
                 if let Some(create) = &update.create {
                     let idx_id = created[ci].clone();
                     ci += 1;
+                    // The row committed above as CREATING reports `Backfilling:
+                    // false` until the record below is taken, and `true` from then
+                    // until the flip to ACTIVE. The test hold lengthens each phase;
+                    // it runs under the engine write lock, so it also delays every
+                    // other write in this process while it lasts.
+                    let hold = self.gsi_creating_phase_delay(&input.table_name).await;
+                    if !hold.is_zero() {
+                        tokio::time::sleep(hold).await;
+                    }
+                    let _backfilling = self.gsi_backfills.start(&idx_id);
+                    if !hold.is_zero() {
+                        tokio::time::sleep(hold).await;
+                    }
                     let result = async {
                         let mut data_tx = self
                             .pool

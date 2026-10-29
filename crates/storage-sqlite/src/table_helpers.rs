@@ -44,7 +44,6 @@ pub(crate) struct TableRow {
 #[derive(sqlx::FromRow)]
 pub(crate) struct IndexRow {
     pub index_name: String,
-    #[allow(dead_code)]
     pub index_id: String,
     pub index_type: String,
     pub key_schema: String,
@@ -221,6 +220,10 @@ impl SqliteEngine {
                     index_name: idx.index_name.clone(),
                     key_schema: ks,
                     projection: proj,
+                    backfilling: extenddb_storage::gsi_backfill::backfilling_member(
+                        &idx.index_status,
+                        self.gsi_backfills.started(&idx.index_id),
+                    ),
                     index_status: idx.index_status,
                     provisioned_throughput: pt.or(Some(zero_throughput())),
                     index_size_bytes: 0,

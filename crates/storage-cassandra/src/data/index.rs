@@ -125,6 +125,12 @@ async fn fetch_indexes_for_table_at(
 /// Fetch a single index by `table_id` and `index_name` (hot path for query routing).
 ///
 /// Uses the `PRIMARY KEY ((table_id), index_name)` for efficient single-row lookup.
+///
+/// A GSI still being built is not readable: its table is partial. The service
+/// refuses a Query or Scan naming one in two ways, by phase (see
+/// `extenddb_storage::gsi_backfill`). The recovery worker writes
+/// `backfill_heartbeat` when it takes the index up for its backfill (see
+/// `crate::gsi_backfill_phase`), so a heartbeat means the backfill has started.
 pub async fn fetch_index_by_name(
     table_id: &str,
     index_name: &str,
@@ -132,7 +138,8 @@ pub async fn fetch_index_by_name(
     catalog_keyspace: &str,
 ) -> Result<IndexMeta, StorageError> {
     let query = format!(
-        "SELECT index_id, index_type, key_schema, projection, propagation_delay_ms \
+        "SELECT index_id, index_type, key_schema, projection, propagation_delay_ms, \
+         index_status, backfill_heartbeat \
          FROM {catalog_keyspace}.indexes WHERE table_id = ? AND index_name = ?"
     );
 
@@ -148,6 +155,15 @@ pub async fn fetch_index_by_name(
         .into_iter()
         .next()
         .ok_or_else(|| StorageError::IndexNotFound(format!("Index {index_name} not found")))?;
+
+    let index_status: Option<String> = row.get_by_name("index_status").ok().flatten();
+    if index_status.as_deref() == Some("CREATING") {
+        let heartbeat: Option<i64> = row.get_by_name("backfill_heartbeat").ok().flatten();
+        return Err(extenddb_storage::gsi_backfill::creating_read_refusal(
+            index_name,
+            heartbeat.is_some(),
+        ));
+    }
 
     let index_id: String = get_column(&row, "index_id", "fetch_index_by_name")?;
     let index_type: String = get_column(&row, "index_type", "fetch_index_by_name")?;
