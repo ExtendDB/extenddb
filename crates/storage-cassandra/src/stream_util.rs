@@ -72,11 +72,22 @@ impl HybridClock {
                 );
             }
             self.logical_counter += 1;
-            // Counter exhausted: wait for next millisecond.
-            // Requires ~1B writes/sec/node — will never occur in practice.
+            // Counter exhausted. On an unclamped clock this needs a million
+            // writes inside one millisecond. Under a forward clamp the counter
+            // accumulates for the whole clamp interval, so a backwards clock
+            // step of D ms reaches this branch at a million writes per D ms.
+            // The sleep lets an unclamped wall clock move on so the physical
+            // component stays close to real time; ordering is carried by the
+            // floor below, not by the sleep.
             if self.logical_counter > 999_999 {
                 std::thread::sleep(std::time::Duration::from_millis(1));
-                self.last_timestamp_ms = chrono::Utc::now().timestamp_millis();
+                // The re-read can still sit behind `last_timestamp_ms` when
+                // the clock was clamped forward by an earlier backwards step.
+                // The physical component must move past the millisecond that
+                // already issued counter 999_999, so it never goes below
+                // `last_timestamp_ms + 1`.
+                let reread_ms = chrono::Utc::now().timestamp_millis();
+                self.last_timestamp_ms = reread_ms.max(self.last_timestamp_ms + 1);
                 self.logical_counter = 0;
             }
         }
@@ -325,5 +336,50 @@ mod tests {
             s.starts_with("shardId-my-table-id-"),
             "unexpected format: {s}"
         );
+    }
+
+    /// Counter overflow under a forward clamp. The clock was clamped 5 s ahead
+    /// of the wall clock by an earlier backwards step; the counter is driven to
+    /// the limit so the next call takes the overflow branch. The re-read inside
+    /// that branch is still behind the clamp, and the sequence issued after the
+    /// overflow must sort after the one issued before it.
+    #[test]
+    fn sequence_advances_across_overflow_under_forward_clamp() {
+        let mut clock = HybridClock::new(3);
+        let clamp_ms = chrono::Utc::now().timestamp_millis() + 5_000;
+        clock.last_timestamp_ms = clamp_ms;
+        clock.logical_counter = 999_998;
+
+        let before = clock.generate();
+        assert_eq!(
+            &before[13..19],
+            "999999",
+            "the call before overflow issues the last counter value: {before}"
+        );
+        let before_prefix: i64 = before[..13].parse().unwrap();
+        assert_eq!(before_prefix, clamp_ms, "the clamp is still in force");
+
+        let after = clock.generate();
+        let after_prefix: i64 = after[..13].parse().unwrap();
+        assert!(
+            after > before,
+            "the sequence after overflow sorts after the one before it: {before} < {after}"
+        );
+        assert_eq!(
+            after_prefix,
+            clamp_ms + 1,
+            "the physical component moves one millisecond past the clamped value"
+        );
+        assert_eq!(
+            &after[13..19],
+            "000000",
+            "the counter resets after overflow"
+        );
+        assert_eq!(clock.logical_counter, 0);
+
+        // The clamp stays in force for the next call as well.
+        let next = clock.generate();
+        assert!(next > after, "{after} < {next}");
+        assert_eq!(&next[..13], &after[..13]);
     }
 }
