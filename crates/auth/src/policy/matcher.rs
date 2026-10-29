@@ -61,19 +61,23 @@ fn wildcard_match_impl(p: &[u8], v: &[u8], ignore_case: bool) -> bool {
             last_star = pi + 1;
             match_from = vi;
             pi += 1;
+        } else if pi < plen && p[pi] == b'?' {
+            // `?` is one character, as in IAM: it takes the whole UTF-8
+            // sequence of a multibyte character, not one byte of it.
+            pi += 1;
+            vi += utf8_len(v[vi]);
         } else if pi < plen
-            && (p[pi] == b'?'
-                || if ignore_case {
-                    p[pi].eq_ignore_ascii_case(&v[vi])
-                } else {
-                    p[pi] == v[vi]
-                })
+            && if ignore_case {
+                p[pi].eq_ignore_ascii_case(&v[vi])
+            } else {
+                p[pi] == v[vi]
+            }
         {
             pi += 1;
             vi += 1;
         } else if last_star != usize::MAX {
             // Backtrack: let the last '*' consume one more character.
-            match_from += 1;
+            match_from += utf8_len(v[match_from]);
             vi = match_from;
             pi = last_star;
         } else {
@@ -87,6 +91,18 @@ fn wildcard_match_impl(p: &[u8], v: &[u8], ignore_case: bool) -> bool {
     }
 
     pi == plen
+}
+
+/// The length of the UTF-8 sequence a lead byte starts. Both sides of a match
+/// are `str`, so the value index sits on a character boundary whenever this is
+/// called; a continuation byte, which cannot start a character, counts as one.
+fn utf8_len(lead: u8) -> usize {
+    match lead {
+        0xF0..=0xFF => 4,
+        0xE0..=0xEF => 3,
+        0xC0..=0xDF => 2,
+        _ => 1,
+    }
 }
 
 /// Match an ARN pattern against an ARN value, the way IAM does.
@@ -325,6 +341,38 @@ mod tests {
     fn question_mark() {
         assert!(wildcard_match("s?s", "sis"));
         assert!(!wildcard_match("s?s", "sass"));
+    }
+
+    /// Measured with the IAM policy simulator: a `?` in a Resource pattern
+    /// matches the two-byte `\u{e9}` and `??` does not, and `StringLike`
+    /// `p?/*` matches `p\u{e9}/`.
+    #[test]
+    fn question_mark_takes_one_multibyte_character() {
+        assert!(wildcard_match("user-?", "user-\u{e9}"));
+        assert!(!wildcard_match("user-??", "user-\u{e9}"));
+        assert!(wildcard_match("team/??", "team/\u{65e5}\u{672c}"));
+        assert!(!wildcard_match("team/?", "team/\u{65e5}\u{672c}"));
+        assert!(wildcard_match("p?/*", "p\u{e9}/orders"));
+        assert!(wildcard_match("?", "\u{1f600}"));
+        assert!(arn_match(
+            "arn:aws:dynamodb:us-east-1:123456789012:table/?",
+            "arn:aws:dynamodb:us-east-1:123456789012:table/\u{e9}"
+        ));
+        assert!(wildcard_match_ignore_case("A?C", "a\u{e9}c"));
+    }
+
+    #[test]
+    fn star_backtracks_by_whole_characters() {
+        assert!(wildcard_match("*?b", "\u{e9}b"));
+        assert!(wildcard_match("a*\u{e9}", "a\u{e9}\u{e9}\u{e9}"));
+        assert!(wildcard_match("*\u{e9}?", "x\u{e9}\u{e9}"));
+        assert!(wildcard_match("*?", "\u{65e5}"));
+        assert!(!wildcard_match("*??", "\u{65e5}"));
+        assert!(!wildcard_match("*\u{e9}", "\u{e8}"));
+        // Three characters cannot fill `??bc`. A star that stepped back by
+        // one byte would start `?` inside the three-byte character and
+        // match its last two bytes as two characters.
+        assert!(!wildcard_match("*??bc", "\u{65e5}bc"));
     }
 
     #[test]
