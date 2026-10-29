@@ -30,6 +30,9 @@ mod key_names;
 #[path = "data_engine_live_tests_repair_keys.rs"]
 mod repair_keys;
 
+#[path = "data_engine_live_tests_txn_create.rs"]
+mod txn_create;
+
 fn uri() -> String {
     std::env::var("EXTENDDB_TEST_MONGODB_URI").expect(
         "set EXTENDDB_TEST_MONGODB_URI to a MongoDB replica set, e.g. \

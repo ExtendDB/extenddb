@@ -995,20 +995,11 @@ impl MongoEngine {
                     let opts = mongodb::options::ReplaceOptions::builder()
                         .upsert(true)
                         .build();
-                    // A duplicate-key error here means another writer
-                    // created the item after the find_one above. Run the
-                    // transaction again so that it reads that item and
-                    // applies the update to it.
-                    match coll
-                        .replace_one(key_filter.clone(), new_doc)
+                    coll.replace_one(key_filter.clone(), new_doc)
                         .with_options(opts)
                         .session(&mut session)
                         .await
-                    {
-                        Ok(_) => {}
-                        Err(e) if is_duplicate_key(&e) => return Err(TxErr::Transient),
-                        Err(e) => return Err(TxErr::from(e)),
-                    }
+                        .map_err(TxErr::from)?;
                 }
 
                 self.sync_indexes_in_session(
