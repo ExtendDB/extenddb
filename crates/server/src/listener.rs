@@ -15,7 +15,9 @@ use crate::ServerTlsConfig;
 /// Serve `app` on `listener` until a shutdown signal arrives.
 ///
 /// When `tls` is `Some`, the server serves HTTPS using `axum-server` with
-/// rustls. When `tls` is `None`, the server serves plaintext HTTP.
+/// rustls. When `tls` is `None`, the server serves plaintext HTTP. Both arms
+/// run on the same `axum-server` builder, so the request timeouts, the
+/// shutdown handle and `TCP_NODELAY` apply to every listener mode.
 pub(crate) async fn serve_app(
     listener: tokio::net::TcpListener,
     app: Router,
@@ -24,6 +26,22 @@ pub(crate) async fn serve_app(
     pid_file: Option<PathBuf>,
 ) -> Result<(), anyhow::Error> {
     let local_addr = listener.local_addr()?;
+
+    let handle = axum_server::Handle::new();
+    let shutdown_handle = handle.clone();
+    let shutdown_pid = pid_file.clone();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        shutdown_handle.graceful_shutdown(Some(Duration::from_secs(5)));
+        // P50: Log timeout but don't call std::process::exit — let the
+        // runtime shut down normally so destructors (including ZeroizeOnDrop) run.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        tracing::warn!("Graceful shutdown timed out, forcing PID file cleanup");
+        cleanup_pid_file(shutdown_pid.as_deref());
+    });
+
+    let std_listener = listener.into_std()?;
+    let make_service = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
 
     if let Some(tls_cfg) = tls {
         // P57 Bug 2 fix: rustls 0.23 requires an explicit CryptoProvider.
@@ -42,20 +60,6 @@ pub(crate) async fn serve_app(
         // the "Failed to load TLS certificates" entry.
         .map_err(|e| anyhow::anyhow!("Failed to load TLS certificates: {e}"))?;
 
-        let handle = axum_server::Handle::new();
-        let shutdown_handle = handle.clone();
-        let shutdown_pid = pid_file.clone();
-        tokio::spawn(async move {
-            shutdown_signal().await;
-            shutdown_handle.graceful_shutdown(Some(Duration::from_secs(5)));
-            // P50: Log timeout but don't call std::process::exit — let the
-            // runtime shut down normally so destructors (including ZeroizeOnDrop) run.
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            tracing::warn!("Graceful shutdown timed out, forcing PID file cleanup");
-            cleanup_pid_file(shutdown_pid.as_deref());
-        });
-
-        let std_listener = listener.into_std()?;
         // AI-2: Use a custom acceptor that peeks the first byte of each
         // connection. If it's plain HTTP (not 0x16 TLS ClientHello), write
         // a 301 redirect to HTTPS and reject the connection before the TLS
@@ -63,37 +67,20 @@ pub(crate) async fn serve_app(
         // confusing TLS handshake failure. The same acceptor sets
         // TCP_NODELAY on every accepted socket before the handshake.
         let redirect_acceptor = HttpsRedirectAcceptor { addr: local_addr };
-        let mut server = axum_server::from_tcp_rustls(std_listener, rustls_config)?
+        let server = axum_server::from_tcp_rustls(std_listener, rustls_config)?
             .map(|tls| tls.acceptor(redirect_acceptor))
             .handle(handle);
-        // HTTP/1: a connection that has not finished sending its request
-        // headers within `request_timeout` is closed; the same bound applies
-        // to the idle wait for the next request on a keep-alive connection.
-        server
-            .http_builder()
-            .http1()
-            .timer(hyper_util::rt::TokioTimer::new())
-            .header_read_timeout(request_timeout);
-        // HTTP/2: a connection that stops answering PING frames is closed.
-        // A client that sends the preface and then stalls holds the
-        // connection for at most interval plus timeout.
-        server
-            .http_builder()
-            .http2()
-            .timer(hyper_util::rt::TokioTimer::new())
-            .keep_alive_interval(Some(request_timeout))
-            .keep_alive_timeout(request_timeout);
-        server
-            .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+        with_request_timeouts(server, request_timeout)
+            .serve(make_service)
             .await?;
     } else {
         tracing::info!("extenddb listening on {local_addr}");
-        axum::serve(
-            nodelay_listener(listener),
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .with_graceful_shutdown(graceful_shutdown(pid_file.clone()))
-        .await?;
+        let server = axum_server::from_tcp(std_listener)?
+            .acceptor(NodelayAcceptor)
+            .handle(handle);
+        with_request_timeouts(server, request_timeout)
+            .serve(make_service)
+            .await?;
     }
 
     // Normal shutdown path — clean up PID file after connections drain.
@@ -102,16 +89,32 @@ pub(crate) async fn serve_app(
     Ok(())
 }
 
-async fn graceful_shutdown(pid_file: Option<PathBuf>) {
-    shutdown_signal().await;
-    // P50: Spawn a timeout task that cleans up the PID file if connections
-    // don't drain. Does NOT call std::process::exit — the runtime shuts down
-    // normally so destructors (including ZeroizeOnDrop) run.
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        tracing::warn!("Graceful shutdown timed out after 5s, forcing PID file cleanup");
-        cleanup_pid_file(pid_file.as_deref());
-    });
+/// Apply the per-connection request timeouts to a server, in either
+/// listener mode.
+///
+/// HTTP/1: a connection that has not finished sending its request headers
+/// within `request_timeout` is closed; the same bound applies to the idle
+/// wait for the next request on a keep-alive connection.
+///
+/// HTTP/2: a connection that stops answering PING frames is closed. A client
+/// that sends the preface and then stalls holds the connection for at most
+/// interval plus timeout.
+fn with_request_timeouts<A: axum_server::Address, Acc>(
+    mut server: axum_server::Server<A, Acc>,
+    request_timeout: Duration,
+) -> axum_server::Server<A, Acc> {
+    server
+        .http_builder()
+        .http1()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(request_timeout);
+    server
+        .http_builder()
+        .http2()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .keep_alive_interval(Some(request_timeout))
+        .keep_alive_timeout(request_timeout);
+    server
 }
 
 /// Remove the PID file if it exists. Best-effort — log but don't fail.
@@ -144,17 +147,24 @@ fn set_tcp_nodelay(stream: &tokio::net::TcpStream) {
     }
 }
 
-/// The plaintext listener: a `TcpListener` whose accepted sockets carry
-/// `TCP_NODELAY`.
-type NodelayListener = axum::serve::TapIo<tokio::net::TcpListener, fn(&mut tokio::net::TcpStream)>;
-
-/// Wrap the plaintext listener so every accepted socket carries `TCP_NODELAY`.
+/// The plaintext acceptor: sets `TCP_NODELAY` on every accepted socket (see
+/// [`set_tcp_nodelay`]) and hands it on unchanged.
 ///
-/// `axum::serve` does not set the option itself; `ListenerExt::tap_io` is its
-/// hook for per-connection socket options.
-fn nodelay_listener(listener: tokio::net::TcpListener) -> NodelayListener {
-    use axum::serve::ListenerExt;
-    listener.tap_io(|stream| set_tcp_nodelay(stream))
+/// `axum_server` 0.8 ships a `NoDelayAcceptor`, but it rejects the
+/// connection when the option cannot be set; this one logs and serves it,
+/// as the TLS acceptor does.
+#[derive(Clone)]
+struct NodelayAcceptor;
+
+impl<S: Send + 'static> axum_server::accept::Accept<tokio::net::TcpStream, S> for NodelayAcceptor {
+    type Stream = tokio::net::TcpStream;
+    type Service = S;
+    type Future = std::future::Ready<std::io::Result<(Self::Stream, Self::Service)>>;
+
+    fn accept(&self, stream: tokio::net::TcpStream, service: S) -> Self::Future {
+        set_tcp_nodelay(&stream);
+        std::future::ready(Ok((stream, service)))
+    }
 }
 
 /// AI-2: Acceptor that detects plain HTTP connections on the TLS port.
@@ -276,6 +286,38 @@ mod tests {
         (listener, client)
     }
 
+    /// The plaintext path: a connection that sends part of its request
+    /// headers and then stalls is closed once `request_timeout` passes,
+    /// as it is on the TLS path. The client reads EOF (or a reset) well
+    /// before a bound of several times the timeout; without the timer the
+    /// read blocks until that bound.
+    #[tokio::test]
+    async fn plaintext_listener_closes_a_stalled_header_phase() {
+        use tokio::io::AsyncReadExt;
+
+        let timeout = Duration::from_millis(300);
+        let (listener, mut client) = bind_and_connect().await;
+        let app = Router::new().route("/", axum::routing::get(|| async { "ok" }));
+        let server = tokio::spawn(serve_app(listener, app, timeout, None, None));
+
+        // A request line and one header, no terminating blank line.
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n")
+            .await
+            .expect("write partial headers");
+        let mut buf = [0u8; 64];
+        let outcome = tokio::time::timeout(timeout * 10, client.read(&mut buf)).await;
+        server.abort();
+        match outcome {
+            Ok(Ok(0)) | Ok(Err(_)) => {}
+            Ok(Ok(n)) => panic!("server answered {n} bytes instead of closing the connection"),
+            Err(_) => panic!(
+                "server held a stalled header phase open for {:?} on the plaintext listener",
+                timeout * 10
+            ),
+        }
+    }
+
     /// The TLS path: the acceptor that runs before the TLS handshake sets
     /// `TCP_NODELAY` on the accepted socket, read back from the socket the
     /// acceptor hands on.
@@ -305,16 +347,23 @@ mod tests {
         assert!(stream.nodelay().expect("read TCP_NODELAY"));
     }
 
-    /// The plaintext path: the listener handed to `axum::serve` sets
-    /// `TCP_NODELAY` on every socket it accepts.
+    /// The plaintext path: the acceptor sets `TCP_NODELAY` on every socket
+    /// it accepts.
     #[tokio::test]
     async fn plaintext_listener_sets_tcp_nodelay_on_accepted_sockets() {
-        use axum::serve::Listener;
+        use axum_server::accept::Accept;
 
         let (listener, client) = bind_and_connect().await;
-        let mut listener = nodelay_listener(listener);
-        let (accepted, peer) = listener.accept().await;
+        let (accepted, peer) = listener.accept().await.expect("accept");
         assert_eq!(peer, client.local_addr().expect("client addr"));
-        assert!(accepted.nodelay().expect("read TCP_NODELAY"));
+        assert!(
+            !accepted.nodelay().expect("read TCP_NODELAY"),
+            "a fresh accepted socket has Nagle on"
+        );
+        let (stream, ()) = NodelayAcceptor
+            .accept(accepted, ())
+            .await
+            .expect("the plaintext acceptor hands the socket on");
+        assert!(stream.nodelay().expect("read TCP_NODELAY"));
     }
 }
