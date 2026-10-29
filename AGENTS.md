@@ -275,7 +275,7 @@ Runtime settings (no restart required):
 
 ```bash
 extenddb settings --config extenddb.toml set log_level debug
-extenddb settings --config extenddb.toml list
+extenddb settings --config extenddb.toml list   # secrets are masked; `get --show-secret <key>` prints one
 ```
 
 ## TLS and Self-Signed Certificates

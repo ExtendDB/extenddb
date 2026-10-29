@@ -16,9 +16,9 @@ use axum::response::{Html, IntoResponse, Response};
 
 use crate::console::ConsoleState;
 use crate::console::html;
-// Redaction patterns live in `extenddb-config` so the console and the static
-// config display cannot drift apart.
-use extenddb_config::should_redact;
+// Redaction patterns and the mask live in `extenddb-config` so the console and
+// the static config display cannot drift apart.
+use extenddb_config::{MASK, should_redact};
 
 use super::{identity_label, is_admin, require_session};
 
@@ -72,7 +72,7 @@ pub async fn settings_page(State(state): State<Arc<ConsoleState>>, headers: Head
         for (key, value) in &state.config_entries {
             let ek = html::escape(key);
             let ev = if should_redact(key) {
-                "••••••••".to_owned()
+                MASK.to_owned()
             } else {
                 html::escape(value)
             };
@@ -115,7 +115,7 @@ pub async fn settings_page(State(state): State<Arc<ConsoleState>>, headers: Head
             (default.to_owned(), "default")
         };
         let ev = if should_redact(key) {
-            "••••••••".to_owned()
+            MASK.to_owned()
         } else {
             html::escape(&value)
         };
@@ -138,7 +138,7 @@ pub async fn settings_page(State(state): State<Arc<ConsoleState>>, headers: Head
         }
         let ek = html::escape(key);
         let ev = if should_redact(key) {
-            "••••••••".to_owned()
+            MASK.to_owned()
         } else {
             html::escape(value)
         };
