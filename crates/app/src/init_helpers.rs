@@ -250,7 +250,7 @@ bind_addr = "{bind_addr}"
 # region = "us-east-1"           # AWS region for ARN generation; requests must be signed for this region
 # run_dir = "{run_dir}"          # Directory for PID file
 # throttling_enabled = false     # Enable provisioned throughput throttling
-# request_timeout_secs = 30      # Close a connection whose headers or body stall this long
+# request_timeout_secs = 30      # Close a connection whose headers or body stall this long (1 to 86400)
 
 [server.tls]
 # TLS is mandatory. The server refuses to start with enabled = false.
