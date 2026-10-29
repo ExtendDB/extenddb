@@ -352,29 +352,27 @@ class TestRequestChecks:
 
     def test_duplicate_host_header_is_refused(self):
         # The service's front end refuses a request with two host headers
-        # before it reaches signing (400, connection closed).
-        import http.client  # noqa: PLC0415
-        import ssl  # noqa: PLC0415
-        from urllib.parse import urlparse  # noqa: PLC0415
-
+        # before it reaches signing (measured 2026-10-23 on POST /: 400,
+        # Connection: close, and an HTML error page instead of a JSON
+        # error). The body assertion runs against extenddb only, and it is
+        # what separates the listener's refusal from the handler's
+        # MissingAuthenticationToken, which answers 400 as well.
         u = urlparse(self.url)
-        ctx = ssl.create_default_context()
+        status, text, connection = self._raw_request(
+            "POST",
+            "/",
+            [
+                ("Host", u.netloc),
+                ("Host", "evil.example.com"),
+                ("X-Amz-Target", "DynamoDB_20120810.ListTables"),
+                ("Content-Type", "application/x-amz-json-1.0"),
+            ],
+            body=b"{}",
+        )
+        assert status == 400, (status, text[:200])
+        assert connection == "close", connection
         if self.endpoint_url is not None:
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-        conn = http.client.HTTPSConnection(u.hostname, u.port or 443, context=ctx, timeout=30)
-        conn.putrequest("POST", "/", skip_host=True, skip_accept_encoding=True)
-        conn.putheader("Host", u.netloc)
-        conn.putheader("Host", "evil.example.com")
-        conn.putheader("X-Amz-Target", "DynamoDB_20120810.ListTables")
-        conn.putheader("Content-Type", "application/x-amz-json-1.0")
-        conn.putheader("Content-Length", "2")
-        conn.endheaders()
-        conn.send(b"{}")
-        resp = conn.getresponse()
-        resp.read()
-        conn.close()
-        assert resp.status == 400
+            assert text == "400 Bad Request", text[:200]
 
     def _raw_request(self, method: str, path: str, headers: list[tuple[str, str]], body: bytes = b""):
         """Send one request with each header on its own line, repeats included.
