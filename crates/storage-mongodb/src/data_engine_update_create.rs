@@ -22,15 +22,39 @@
 //! the filter matches by equality. The `_id` collision is reported first and
 //! the filter does not name `_id`, so the server does not retry it and this
 //! module does: the item now exists, so the next attempt updates it.
+//!
+//! The `$setOnInsert` names each key attribute as the path
+//! `item_data.<attribute name>`, and MongoDB reads a dot in that path as a
+//! step into a sub-document. A key attribute named `a.b` would be inserted as
+//! `item_data: { a: { b: ... } }`, where PutItem stores the field `"a.b"`,
+//! and the same path conflicts with an update of an attribute named `a`.
+//! A table with a key attribute name that `key_names_are_plain_paths`
+//! rejects therefore does not take the native upsert; it takes the session
+//! path, which writes the document `item_to_document` builds.
 
 use bson::Document;
-use extenddb_core::types::{Item, TableKeyInfo};
+use extenddb_core::types::{Item, KeySchemaElement, TableKeyInfo};
 use extenddb_storage::error::StorageError;
 use mongodb::options::{FindOneAndUpdateOptions, ReturnDocument};
 
 use super::{TRANSIENT_RETRY_ATTEMPTS, backoff_sleep};
 use crate::MongoEngine;
 use crate::data::key_fields::insert_only_key_fields;
+
+/// Whether `name` is usable as one field name in a MongoDB update path. A dot
+/// would split it into nested fields and a leading `$` would read as an
+/// operator or positional path.
+pub(super) fn is_plain_path_name(name: &str) -> bool {
+    !name.contains('.') && !name.starts_with('$')
+}
+
+/// Whether every key attribute of `key_schema` is a plain path name, so that
+/// [`MongoEngine::upsert_native_update`] can write it as `item_data.<name>`.
+pub(super) fn key_names_are_plain_paths(key_schema: &[KeySchemaElement]) -> bool {
+    key_schema
+        .iter()
+        .all(|ks| is_plain_path_name(&ks.attribute_name))
+}
 
 /// Whether `e` is a duplicate-key error (E11000) as `findAndModify` reports
 /// it: a command error, where `insert_one` reports a write error.
@@ -85,6 +109,7 @@ impl MongoEngine {
 mod tests {
     use super::*;
     use bson::doc;
+    use extenddb_core::types::KeyType;
 
     fn command_error(code: i32) -> mongodb::error::Error {
         let command_error: mongodb::error::CommandError = bson::from_document(doc! {
@@ -112,5 +137,39 @@ mod tests {
         assert!(is_duplicate_key_command_error(&command_error(11000)));
         assert!(!is_duplicate_key_command_error(&command_error(112)));
         assert!(!is_duplicate_key_command_error(&write_error(11000)));
+    }
+
+    fn schema(names: &[(&str, KeyType)]) -> Vec<KeySchemaElement> {
+        names
+            .iter()
+            .map(|(name, key_type)| KeySchemaElement {
+                attribute_name: (*name).to_owned(),
+                key_type: *key_type,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_dot_or_a_leading_dollar_in_a_key_name_leaves_the_native_upsert() {
+        let plain = [("pk", KeyType::Hash), ("sk", KeyType::Range)];
+        assert!(key_names_are_plain_paths(&schema(&plain)));
+        assert!(key_names_are_plain_paths(&schema(&[(
+            "a$b",
+            KeyType::Hash
+        )])));
+
+        for hash in ["a.b", "$k", ".", "pk."] {
+            assert!(
+                !key_names_are_plain_paths(&schema(&[(hash, KeyType::Hash)])),
+                "hash key {hash:?}"
+            );
+        }
+        for range in ["s.k", "$s"] {
+            let keys = [("pk", KeyType::Hash), (range, KeyType::Range)];
+            assert!(
+                !key_names_are_plain_paths(&schema(&keys)),
+                "range key {range:?}"
+            );
+        }
     }
 }

@@ -78,6 +78,28 @@ def range_table(dynamodb_client):
 
 
 @pytest.fixture(scope="module")
+def dotted_hash_table(dynamodb_client):
+    """A table whose hash key name contains a dot."""
+    with scoped_table(
+        dynamodb_client,
+        attribute_definitions=[_s("a.b")],
+        key_schema=[_k("a.b", "HASH")],
+    ) as name:
+        yield name
+
+
+@pytest.fixture(scope="module")
+def dotted_range_table(dynamodb_client):
+    """A table whose range key name contains a dot."""
+    with scoped_table(
+        dynamodb_client,
+        attribute_definitions=[_s("pk"), _s("s.k")],
+        key_schema=[_k("pk", "HASH"), _k("s.k", "RANGE")],
+    ) as name:
+        yield name
+
+
+@pytest.fixture(scope="module")
 def raw_client(endpoint_url):
     """A client that never retries, so every failure is seen."""
     kwargs: dict = {
@@ -95,10 +117,19 @@ def raw_client(endpoint_url):
     return boto3.client(**kwargs)
 
 
+KEY_NAMES = {
+    "hash": ("pk", None),
+    "range": ("pk", "sk"),
+    "dotted_hash": ("a.b", None),
+    "dotted_range": ("pk", "s.k"),
+}
+
+
 def _key(table_kind: str, pk: str) -> dict:
-    key = {"pk": {"S": pk}}
-    if table_kind == "range":
-        key["sk"] = {"S": "s"}
+    hash_name, range_name = KEY_NAMES[table_kind]
+    key = {hash_name: {"S": pk}}
+    if range_name:
+        key[range_name] = {"S": "s"}
     return key
 
 
@@ -137,7 +168,7 @@ def _put_then_get(client, table: str, key: dict) -> None:
     assert _get(client, table, key) == put
 
 
-@pytest.mark.parametrize("table_kind", ["hash", "range"])
+@pytest.mark.parametrize("table_kind", ["hash", "range", "dotted_hash", "dotted_range"])
 def test_set_creates_the_item_with_its_key(request, dynamodb_client, table_kind):
     table = request.getfixturevalue(f"{table_kind}_table")
     _warm(dynamodb_client, table, table_kind)
@@ -145,6 +176,27 @@ def test_set_creates_the_item_with_its_key(request, dynamodb_client, table_kind)
     assert _create(dynamodb_client, table, key) == {}
     assert _get(dynamodb_client, table, key) == {**key, "w": {"S": "upd"}}
     _put_then_get(dynamodb_client, table, key)
+
+
+@pytest.mark.parametrize("table_kind", ["dotted_hash", "dotted_range"])
+def test_query_and_scan_return_an_item_created_on_a_dotted_key_table(
+    request, dynamodb_client, table_kind
+):
+    table = request.getfixturevalue(f"{table_kind}_table")
+    _warm(dynamodb_client, table, table_kind)
+    key = _key(table_kind, f"qs-{uuid.uuid4().hex}")
+    _create(dynamodb_client, table, key)
+    created = {**key, "w": {"S": "upd"}}
+    hash_name = next(iter(key))
+    resp = dynamodb_client.query(
+        TableName=table,
+        KeyConditionExpression="#h = :p",
+        ExpressionAttributeNames={"#h": hash_name},
+        ExpressionAttributeValues={":p": key[hash_name]},
+        ConsistentRead=True,
+    )
+    assert resp["Items"] == [created]
+    assert created in dynamodb_client.scan(TableName=table, ConsistentRead=True)["Items"]
 
 
 @pytest.mark.parametrize("table_kind", ["hash", "range"])

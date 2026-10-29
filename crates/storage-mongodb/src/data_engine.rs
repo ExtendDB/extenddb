@@ -47,7 +47,7 @@ fn native_attribute_name(path: &[PathElement], maps: &ExpressionMaps) -> Option<
         return None;
     };
     let attr_name = resolve_name_ref(raw_name, maps).ok()?;
-    (!attr_name.contains('.') && !attr_name.starts_with('$')).then(|| attr_name.into_owned())
+    update_create::is_plain_path_name(&attr_name).then(|| attr_name.into_owned())
 }
 
 #[derive(Clone, Copy)]
@@ -800,11 +800,15 @@ impl MongoEngine {
         // indexed attribute is $set to a new value or $unset (RFC-0003
         // §2.2). The GSI cache lets us avoid a catalog query in the
         // common (no-GSI) case; when the cache is stale-or-unknown
-        // we fall through to the slow path which is authoritative.
+        // we fall through to the slow path which is authoritative. Key
+        // attribute names that are not plain path names (a dot, a leading
+        // `$`) also take the slow path, because the upsert writes the key
+        // attributes as `item_data.<name>` (see `update_create`).
         if condition.is_none()
             && !return_old
             && stream.is_none()
             && self.gsi_cache_get_fresh(&key_info.table_id) == Some(false)
+            && update_create::key_names_are_plain_paths(&key_info.key_schema)
             && let Some(mongo_update) = Self::try_build_native_update(actions, maps)
         {
             let (fast_filter, took_fast) = match mongo_update {

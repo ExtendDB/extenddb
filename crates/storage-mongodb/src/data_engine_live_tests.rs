@@ -24,6 +24,9 @@ use super::key_repair::KeyRepairSummary;
 use crate::MongoEngine;
 use crate::data::{data_collection_name, document_to_item, item_to_document, pk_filter};
 
+#[path = "data_engine_live_tests_key_names.rs"]
+mod key_names;
+
 fn uri() -> String {
     std::env::var("EXTENDDB_TEST_MONGODB_URI").expect(
         "set EXTENDDB_TEST_MONGODB_URI to a MongoDB replica set, e.g. \
