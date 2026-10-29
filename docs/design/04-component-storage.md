@@ -15,8 +15,8 @@ The trait-based design allows new storage backends to be added by implementing t
 factory function, with no changes needed to the `engine` or `server` crates. The factory pattern enables runtime
 backend selection based on configuration.
 
-**Current status**: PostgreSQL is the only supported backend. The trait architecture and plugin infrastructure provide
-the foundation for future backend implementations.
+**Current status**: four backends implement the storage traits, in `storage-postgres`, `storage-sqlite`, `storage-mongodb`
+and `storage-cassandra`. Each binary is built with one of them.
 
 Backends accepted into the ExtendDB repository must satisfy the [Backend Acceptance Criteria](../rfcs/0003-backend-acceptance-criteria.md)
 (the DynamoDB-behavioral invariants for the storage layer) and the process defined in
