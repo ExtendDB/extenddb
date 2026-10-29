@@ -742,3 +742,111 @@ async fn test_stream_record_created_at_matches_the_record_and_sequence() {
         );
     }
 }
+
+/// A record written under a clamped clock (after a backwards step) carries a
+/// sequence prefix later than its `created_at`. The `AT_TIMESTAMP` seek must
+/// not return it for a `T` after its `created_at`, and must still return a
+/// record created at or after `T`.
+#[tokio::test]
+async fn test_at_timestamp_seek_skips_a_clamped_record_older_than_t() {
+    use extenddb_storage::StreamEngine;
+
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let table = TestTable::new(&engine, "StreamClampSeek", false).await;
+    let view = StreamViewType::NewAndOldImages;
+
+    let mut item = BTreeMap::new();
+    item.insert("id".to_string(), AttributeValue::S("pk-clamp".to_string()));
+    item.insert("val".to_string(), AttributeValue::S("real".to_string()));
+    engine
+        .put_item(
+            &table.key_info,
+            item,
+            false,
+            None,
+            &Default::default(),
+            Some(&capture(view)),
+        )
+        .await
+        .unwrap();
+
+    let shard_id = shard_for("pk-clamp", &table.key_info.table_id);
+    let keyspace = format!("extenddb_ttl_test_account_{}", table.key_info.account_id);
+    let rows = engine
+        .session_arc()
+        .query_with_values(
+            &format!(
+                "SELECT sequence_number, created_at, record_data FROM {keyspace}.stream_records \
+                 WHERE shard_id = ?"
+            ),
+            cdrs_tokio::query_values!(shard_id.as_str()),
+        )
+        .await
+        .unwrap()
+        .response_body()
+        .unwrap()
+        .into_rows()
+        .unwrap_or_default();
+    assert_eq!(rows.len(), 1);
+    let real_seq: String = rows[0].get_r_by_name("sequence_number").unwrap();
+    let real_created: i64 = rows[0].get_r_by_name("created_at").unwrap();
+    let data: String = rows[0].get_r_by_name("record_data").unwrap();
+
+    // Model the clamped record: sequence prefix 8 s after the real record,
+    // created_at 8 s before it. T sits between the two: after the clamped
+    // created_at, before the real record's.
+    let clamped_hlc = real_created + 8_000;
+    let clamped_created = real_created - 8_000;
+    let clamped_seq = format!("{clamped_hlc:013}{:06}{:04}", 0, 9999);
+    engine
+        .session_arc()
+        .query_with_values(
+            &format!(
+                "INSERT INTO {keyspace}.stream_records \
+                 (shard_id, sequence_number, table_id, event_name, record_data, created_at) \
+                 VALUES (?, ?, ?, 'Insert', ?, ?)"
+            ),
+            cdrs_tokio::query_values!(
+                shard_id.as_str(),
+                clamped_seq.as_str(),
+                table.key_info.table_id.as_str(),
+                data.as_str(),
+                clamped_created
+            ),
+        )
+        .await
+        .unwrap();
+
+    // T after the clamped created_at and before the real record: the real
+    // record qualifies, the clamped one does not.
+    let t = real_created - 1_000;
+    let got = engine
+        .first_sequence_number_at_or_after(&shard_id, t)
+        .await
+        .unwrap();
+    assert_eq!(
+        got.as_deref(),
+        Some(real_seq.as_str()),
+        "the real record is first at or after T"
+    );
+
+    // T after every created_at: nothing qualifies, even though the clamped
+    // sequence prefix clears the bound.
+    let t = real_created + 1_000;
+    let got = engine
+        .first_sequence_number_at_or_after(&shard_id, t)
+        .await
+        .unwrap();
+    assert_eq!(got, None, "a clamped record older than T is not returned");
+
+    // T before everything: the clamped record is the first, as its
+    // created_at is the oldest.
+    let got = engine
+        .first_sequence_number_at_or_after(&shard_id, clamped_created - 1)
+        .await
+        .unwrap();
+    assert!(got.is_some());
+}

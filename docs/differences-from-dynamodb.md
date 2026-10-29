@@ -49,6 +49,13 @@ adaptation when switching between ExtendDB and the real service.
 | Table creation delay | Returns `CREATING` immediately; transitions to `ACTIVE` typically within seconds. Same behavior for on-demand and provisioned | Configurable via `control_plane_delay_seconds` runtime setting (default: 5s) |
 | DeletionProtectionEnabled | Enforced | Enforced (accepted and stored, DeleteTable rejects when enabled) |
 
+## Streams
+
+| Area | DynamoDB | ExtendDB |
+|------|----------|------|
+| Shards | Shards open and close over time, with parent and child shards | A fixed number of shards per table (default 4), assigned by partition key hash; shards never close |
+| `AT_TIMESTAMP` iterator | The first record created at or after `Timestamp`, compared at millisecond precision; older than retention resolves to the oldest record; past the newest record resolves to after it; more than about a second in the future is a `ValidationException` | The same, on all four backends. The seek compares the record's stored creation time, taken from the same clock read as its `ApproximateCreationDateTime`. The future buffer is one second against the server clock |
+
 ## Time to Live (TTL)
 
 | Area | DynamoDB | ExtendDB |

@@ -27,6 +27,7 @@ mod pg_util;
 mod snapshot_engine;
 #[doc(hidden)]
 pub use snapshot_engine::map_fetch_error;
+mod stream_at_timestamp;
 mod stream_engine;
 #[doc(hidden)]
 pub mod stream_records_sql;

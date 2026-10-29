@@ -391,6 +391,15 @@ aws dynamodbstreams get-shard-iterator \
     --shard-id "shard-0" \
     --shard-iterator-type TRIM_HORIZON
 
+# Get a shard iterator positioned at the first record created at or after a
+# point in time (epoch seconds, fractional milliseconds allowed)
+aws dynamodbstreams get-shard-iterator \
+    --endpoint-url https://127.0.0.1:18443 \
+    --stream-arn "<stream-arn>" \
+    --shard-id "shard-0" \
+    --shard-iterator-type AT_TIMESTAMP \
+    --timestamp 1792764248.050
+
 # Read records
 aws dynamodbstreams get-records \
     --endpoint-url https://127.0.0.1:18443 \

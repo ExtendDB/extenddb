@@ -22,6 +22,7 @@ mod metadata_engine;
 mod operations;
 pub mod pushdown;
 mod snapshot_engine;
+mod stream_at_timestamp;
 mod stream_engine;
 mod table_engine;
 mod ttl_worker;
