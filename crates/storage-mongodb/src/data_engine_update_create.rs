@@ -12,8 +12,9 @@
 //! key text and the whole item (`item_to_document`). Every later PutItem on
 //! the key then fails on the immutable `_id` (issue #436).
 //! [`MongoEngine::upsert_native_update`] adds a `$setOnInsert` with the `_id`
-//! and the key attributes, so the created document is the one PutItem would
-//! have written, with `_v` 1 from the update's `$inc`.
+//! and the key attributes, so the created document is the one
+//! `item_to_document` builds for PutItem, plus `_v` 1 from the update's
+//! `$inc`.
 //!
 //! Two writers creating the same item at once each find no document and each
 //! insert; the second insert fails with a duplicate-key error on `_id`. The

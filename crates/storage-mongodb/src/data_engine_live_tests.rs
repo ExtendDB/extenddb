@@ -156,10 +156,13 @@ fn expected_document(item: &Item, key_info: &TableKeyInfo, v: i64) -> Document {
 
 /// An UpdateItem that creates the item, on the native fast path (SET with a
 /// placeholder, REMOVE) and on the transaction path (numeric ADD), stores the
-/// same document PutItem would store: `_id` as the key text, the key
-/// attributes in `item_data`, version 1. ALL_NEW returns the item with its
-/// key. A PutItem on the key then replaces the item and returns it as the old
-/// image.
+/// document `item_to_document` builds, plus `_v` 1: `_id` as the key text and
+/// the key attributes in `item_data`. For SET and ADD, ALL_NEW returns the
+/// item with its key, and a PutItem on the key replaces the item and returns
+/// it as the old image. For REMOVE the test pins the stored document and that
+/// a PutItem on the key succeeds. The service creates no item for a
+/// REMOVE-only update and its ALL_NEW answer for one is not measured, so the
+/// REMOVE case asserts neither the ALL_NEW answer nor the old image.
 #[tokio::test]
 #[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
 async fn live_update_item_that_creates_an_item_stores_its_key_like_put_item() {
@@ -212,11 +215,13 @@ async fn live_update_item_that_creates_an_item_stores_its_key_like_put_item() {
                 .await
                 .unwrap_or_else(|e| panic!("{table_id}: update: {e:?}"));
             assert_eq!(old, None, "{table_id}: no old image on creation");
-            assert_eq!(
-                new,
-                Some(want.clone()),
-                "{table_id}: ALL_NEW carries the key"
-            );
+            if *name != "remove" {
+                assert_eq!(
+                    new,
+                    Some(want.clone()),
+                    "{table_id}: ALL_NEW carries the key"
+                );
+            }
             assert_eq!(
                 stored(&engine, &key_info, &key).await,
                 expected_document(&want, &key_info, 1),
@@ -235,7 +240,9 @@ async fn live_update_item_that_creates_an_item_stores_its_key_like_put_item() {
                 )
                 .await
                 .unwrap_or_else(|e| panic!("{table_id}: put after update: {e:?}"));
-            assert_eq!(old, Some(want), "{table_id}: put returns the created item");
+            if *name != "remove" {
+                assert_eq!(old, Some(want), "{table_id}: put returns the created item");
+            }
             let after = stored(&engine, &key_info, &key).await;
             assert_eq!(
                 document_to_item(&after).expect("item"),
@@ -386,9 +393,9 @@ async fn store_without_key(
 }
 
 /// The repair rewrites a document stored without its key into the document
-/// PutItem would have written, keeping the attributes and the version. The
-/// item then reads with its key and a PutItem on it succeeds. Documents with
-/// their key are left alone, and a second run finds nothing.
+/// `item_to_document` builds, keeping the attributes and carrying `_v` over.
+/// The item then reads with its key and a PutItem on it succeeds. Documents
+/// with their key are left alone, and a second run finds nothing.
 #[tokio::test]
 #[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
 async fn live_repair_rewrites_documents_stored_without_their_key() {

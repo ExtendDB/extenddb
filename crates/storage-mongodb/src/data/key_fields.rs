@@ -4,11 +4,13 @@
 //! document from something other than a full item.
 //!
 //! [`item_to_document`] writes a base-table document as `{ _id, pk, sk_*,
-//! item_data, _v }`, with `_id` the key text and the key attributes inside
-//! `item_data`. An UpdateItem that creates an item through a native MongoDB
-//! upsert starts from the key filter (`pk` and `sk_*`) and the update
-//! operators, so it needs the `_id` and the `item_data` key attributes added
-//! with `$setOnInsert`: [`insert_only_key_fields`] builds that document.
+//! item_data }`, with `_id` the key text and the key attributes inside
+//! `item_data`. It writes no `_v`: the version is added by the UpdateItem
+//! write itself, as `$inc` on the native path. An UpdateItem that creates an
+//! item through a native MongoDB upsert starts from the key filter (`pk` and
+//! `sk_*`) and the update operators, so it needs the `_id` and the
+//! `item_data` key attributes added with `$setOnInsert`:
+//! [`insert_only_key_fields`] builds that document.
 //!
 //! Before that was done, such an upsert stored a document with a generated
 //! ObjectId `_id` and no key attributes in `item_data` (issue #436), and for
@@ -307,6 +309,46 @@ mod tests {
         let mut want = item_to_document(&want_item, &schema, &defs).expect("document");
         want.insert("_v", 3_i64);
         assert_eq!(repaired, want);
+    }
+
+    #[test]
+    fn repair_restores_numeric_and_binary_partition_keys() {
+        // The partition key text is stored as written, so a number below 1e-6
+        // keeps its plain form there.
+        let cases = [
+            (ScalarAttributeType::N, AttributeValue::N("42".to_owned())),
+            (
+                ScalarAttributeType::N,
+                AttributeValue::N("0.0000001".to_owned()),
+            ),
+            (
+                ScalarAttributeType::B,
+                AttributeValue::B(vec![0x01, 0xff, 0x10]),
+            ),
+        ];
+        for (pk_type, pk) in cases {
+            let schema = vec![key("pk", KeyType::Hash)];
+            let defs = vec![def("pk", pk_type)];
+            let want_item = item(&[
+                ("pk", pk.clone()),
+                ("w", AttributeValue::S("upd".to_owned())),
+            ]);
+            let mut want = item_to_document(&want_item, &schema, &defs).expect("document");
+            want.insert("_v", 2_i64);
+            let bad = doc! {
+                "_id": bson::oid::ObjectId::new(),
+                "pk": want.get("pk").cloned().expect("pk text"),
+                "item_data": { "w": { "S": "upd" } },
+                "_v": 2_i64,
+            };
+            let repaired = repaired_document(&bad, &schema, &defs).expect("repair");
+            assert_eq!(repaired, want, "{pk:?} partition key");
+            assert_eq!(
+                document_to_item(&repaired).expect("item"),
+                want_item,
+                "{pk:?} partition key item"
+            );
+        }
     }
 
     /// A number as a request carries it: `{"N": raw}` deserialised, which
