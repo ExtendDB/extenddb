@@ -45,6 +45,10 @@ mod query;
 mod roles;
 #[path = "direct/scan.rs"]
 mod scan;
+#[path = "direct/scan_rows_without_item.rs"]
+mod scan_rows_without_item;
+#[path = "direct/scan_sort_key_types.rs"]
+mod scan_sort_key_types;
 #[path = "direct/settings_store.rs"]
 mod settings_store;
 #[path = "direct/stream_ownership.rs"]
