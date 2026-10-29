@@ -105,7 +105,8 @@ impl HybridClock {
                 // The re-read can sit below the last prefix, after a backwards
                 // step during the wait or under a forward clamp, so the prefix
                 // moves at least one past the last one. It stays above every
-                // earlier reading and above every earlier sequence number.
+                // earlier reading, and the sequence number sorts after every
+                // earlier one.
                 self.last_timestamp_ms = reread().max(self.last_timestamp_ms + 1);
                 self.logical_counter = 0;
             }
@@ -407,6 +408,44 @@ mod tests {
         assert!(
             seq > previous,
             "the overflow sequence follows the previous one: {previous} < {seq}"
+        );
+    }
+
+    /// Overflow under a forward clamp: the last prefix sits 5 s ahead of the
+    /// call's reading and the re-read lands a further 5 s back. The prefix
+    /// moves to the last prefix plus one, not to the reading plus one, so the
+    /// sequence still follows the previous one and `created_at_ms` stays at
+    /// or below the prefix.
+    #[test]
+    fn overflow_under_a_forward_clamp_moves_the_prefix_past_the_last_one() {
+        let now_ms: i64 = 1_800_000_000_000;
+        let mut clock = HybridClock::new(5);
+        clock.last_timestamp_ms = now_ms + 5_000;
+        clock.logical_counter = 999_999;
+        let previous = format!("{:013}{:06}{:04}", now_ms + 5_000, 999_999, 5);
+        let mut reread_called = false;
+        let (seq, created_at_ms) = clock.generate_from(now_ms, || {
+            reread_called = true;
+            now_ms - 5_000
+        });
+        let hlc_ms: i64 = seq[..13].parse().unwrap();
+        assert!(reread_called, "the call takes the overflow branch");
+        assert_eq!(
+            created_at_ms, now_ms,
+            "created_at_ms is the call's own reading"
+        );
+        assert!(
+            created_at_ms <= hlc_ms,
+            "created_at_ms {created_at_ms} exceeds sequence prefix {hlc_ms} in {seq}"
+        );
+        assert!(
+            seq > previous,
+            "the overflow sequence follows the previous one: {previous} < {seq}"
+        );
+        assert_eq!(
+            hlc_ms,
+            now_ms + 5_001,
+            "the prefix moves to the last prefix plus one: {seq}"
         );
     }
 
