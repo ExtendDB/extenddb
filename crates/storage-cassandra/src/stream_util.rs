@@ -311,22 +311,29 @@ mod tests {
     /// The stored creation time never exceeds the millisecond prefix of the
     /// record's own sequence number, including when the clock is clamped to
     /// an earlier read (same-millisecond bursts and backwards steps both take
-    /// the clamp branch).
+    /// the clamp branch). On the clamp branch the returned value is the
+    /// call's own wall-clock reading, not the clamped prefix.
     #[test]
     fn created_at_never_exceeds_sequence_prefix() {
         let mut clock = HybridClock::new(7);
         // Force the clamp branch: pretend the last read was far in the future.
         clock.last_timestamp_ms = chrono::Utc::now().timestamp_millis() + 5_000;
         for _ in 0..1_000 {
+            let before = chrono::Utc::now().timestamp_millis();
             let (seq, created_at_ms) = clock.generate_with_created_at();
+            let after = chrono::Utc::now().timestamp_millis();
             let hlc_ms: i64 = seq[..13].parse().unwrap();
             assert!(
                 created_at_ms <= hlc_ms,
                 "created_at_ms {created_at_ms} exceeds sequence prefix {hlc_ms} in {seq}"
             );
+            assert!(
+                (before..=after).contains(&created_at_ms),
+                "created_at_ms {created_at_ms} must be the reading between {before} and \
+                 {after}, below the clamped prefix {hlc_ms}"
+            );
         }
-        // And on the normal branch the two agree exactly: created_at_ms is the
-        // wall-clock read itself, not the clamped value.
+        // On the normal branch the prefix is the reading itself.
         let mut fresh = HybridClock::new(7);
         let before = chrono::Utc::now().timestamp_millis();
         let (seq, created_at_ms) = fresh.generate_with_created_at();
@@ -339,18 +346,29 @@ mod tests {
         );
     }
 
-    /// The counter-overflow branch sleeps a millisecond and re-reads the
-    /// clock for the sequence prefix. The returned `created_at_ms` is still
-    /// the original read, so it stays at or below the prefix.
+    /// The counter-overflow branch re-reads the clock for the sequence
+    /// prefix. The readings are injected, so the branch runs on every run.
+    /// The returned `created_at_ms` is still the call's own reading, at or
+    /// below the new prefix.
     #[test]
     fn created_at_holds_across_counter_overflow() {
+        let now_ms: i64 = 1_800_000_000_000;
         let mut clock = HybridClock::new(42);
-        // Land on the same-millisecond path, then drive the counter to the
-        // limit so the next call takes the overflow branch.
-        let (first, _) = clock.generate_with_created_at();
+        let (first, _) =
+            clock.generate_from(now_ms, || unreachable!("no overflow on a fresh clock"));
         clock.logical_counter = 999_999;
-        let (seq, created_at_ms) = clock.generate_with_created_at();
+        let mut reread = false;
+        let (seq, created_at_ms) = clock.generate_from(now_ms, || {
+            reread = true;
+            now_ms + 1
+        });
+        assert!(reread, "the call takes the overflow branch");
         let hlc_ms: i64 = seq[..13].parse().unwrap();
+        assert_eq!(
+            created_at_ms, now_ms,
+            "created_at_ms is the call's own reading"
+        );
+        assert_eq!(hlc_ms, now_ms + 1, "the prefix moves to the re-read");
         assert!(
             created_at_ms <= hlc_ms,
             "overflow branch: created_at_ms {created_at_ms} exceeds prefix {hlc_ms} in {seq}"
