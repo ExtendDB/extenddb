@@ -864,7 +864,8 @@ Targets: `extenddb::audit::manage` (management ops), `extenddb::audit::settings`
 ### Metrics
 
 ```bash
-curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/metrics
+# Requires an admin user's name and password (HTTP Basic auth); answers 401 without them
+curl --cacert ~/.extenddb/tls/cert.pem -u admin:<pw> https://127.0.0.1:18443/metrics
 ```
 
 JSON metrics endpoint with DynamoDB CloudWatch-style metric names and dimensions. The response shape is `{ metrics, buckets, segments, source }`. See `docs/design/06-component-server.md` §7.2 for the full schema and metric list.
