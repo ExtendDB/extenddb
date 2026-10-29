@@ -29,7 +29,9 @@ use crate::types::{
 pub const MAX_PARTITION_KEY_CONDITIONS: usize = 1;
 
 /// Maximum number of inline-filter conditions allowed in a filter expression.
-pub const MAX_INLINE_FILTER_CONDITIONS: usize = 20;
+/// Measured against the live service 2026-10-29 in us-east-1: 19 conditions are
+/// accepted and the 20th is refused, the same 18 as the search schema cap.
+pub const MAX_INLINE_FILTER_CONDITIONS: usize = 18;
 
 /// Maximum total number of equality conditions in a filter expression.
 pub const MAX_SEARCH_CONDITIONS: usize =
@@ -100,6 +102,16 @@ pub fn validate_search_condition_expression(
     let mut index = 0;
 
     loop {
+        // The service counts as it parses: reaching one comparison past the limit
+        // is refused before that comparison's own checks (duplicate attribute,
+        // schema membership) run. Measured 2026-10-29 in us-east-1.
+        if conditions.len() >= MAX_SEARCH_CONDITIONS {
+            return Err(invalid(format!(
+                "Invalid SearchConditionExpression: SearchConditionExpression cannot have more than \
+                 {MAX_PARTITION_KEY_CONDITIONS} partition key and more than \
+                 {MAX_INLINE_FILTER_CONDITIONS} inline filter key comparisons"
+            )));
+        }
         let lhs = tokens
             .get(index)
             .ok_or_else(|| invalid("Invalid SearchConditionExpression"))?;
@@ -175,7 +187,8 @@ pub fn validate_search_condition_expression(
         // At most one condition per attribute.
         if conditions.iter().any(|c| c.attribute_name == attr_name) {
             return Err(invalid(
-                "SearchConditionExpression must only contain one condition per attribute",
+                "Invalid SearchConditionExpression: SearchConditionExpression must only \
+                 contain one condition per attribute",
             ));
         }
         conditions.push(SearchCondition {
@@ -188,14 +201,6 @@ pub fn validate_search_condition_expression(
             Some(tok) if tok.eq_ignore_ascii_case("AND") => index += 4,
             Some(_) => return Err(invalid("Invalid SearchConditionExpression")),
         }
-    }
-
-    if conditions.len() > MAX_SEARCH_CONDITIONS {
-        return Err(invalid(format!(
-            "Invalid SearchConditionExpression: SearchConditionExpression cannot have more than \
-             {MAX_PARTITION_KEY_CONDITIONS} partition key and more than \
-             {MAX_INLINE_FILTER_CONDITIONS} inline filter key attributes"
-        )));
     }
 
     // Every supplied value placeholder must be referenced by the expression.
@@ -508,24 +513,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_too_many_conditions() {
-        let expr = (0..=MAX_SEARCH_CONDITIONS)
-            .map(|i| format!("filter_{i} = :val_{i}"))
-            .collect::<Vec<_>>()
-            .join(" AND ");
-        let v: HashMap<String, AttributeValue> = (0..=MAX_SEARCH_CONDITIONS)
-            .map(|i| (format!(":val_{i}"), AttributeValue::S(format!("v{i}"))))
-            .collect();
-        let message = err(validate_search_condition_expression(&expr, None, Some(&v)));
-        assert!(message.contains("Invalid SearchConditionExpression"));
-        assert!(
-            message.contains(
-                "cannot have more than 1 partition key and more than 20 inline filter key"
-            )
-        );
-    }
-
-    #[test]
     fn accepts_partition_key_plus_inline_filters() {
         let n = names(&[
             ("#country", "Country"),
@@ -656,3 +643,7 @@ mod tests {
         validate_conditions_against_search_schema(&[], Some(&[]), &defs()).unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "search_condition_limit_tests.rs"]
+mod limit_tests;

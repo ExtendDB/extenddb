@@ -296,9 +296,9 @@ const MAX_SEARCH_SCHEMA_HASH: usize = 1;
 /// Maximum `INLINE_FILTER` elements in a vector index search schema.
 ///
 /// Measured against the live service 2026-08-06 as **18**, which is deliberately
-/// recorded rather than derived: the obvious inference from the query-side cap
-/// (`MAX_SEARCH_CONDITIONS`, one HASH plus twenty filters) gives twenty, and is
-/// wrong. The schema cap and the per-query cap are different numbers.
+/// recorded rather than derived. The query-side cap (`MAX_SEARCH_CONDITIONS`,
+/// one HASH plus eighteen filters, measured 2026-10-29) is the same number, but
+/// the two are checked at different points and are kept as separate constants.
 const MAX_SEARCH_SCHEMA_INLINE_FILTERS: usize = 18;
 
 /// Validate the shape of a vector index search schema.
