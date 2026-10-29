@@ -104,8 +104,9 @@ pub trait CredentialStore: Send + Sync {
 
 /// `SigV4` auth provider with local credential store.
 ///
-/// Parses the `Authorization` header, looks up the access key, decrypts the
-/// secret, verifies the `SigV4` signature, and validates the request timestamp.
+/// Parses the `Authorization` header, validates the request timestamp, checks
+/// the credential scope, looks up the access key, decrypts the secret and
+/// verifies the `SigV4` signature, in that order (the service's order).
 /// Handles both long-lived (AKIA*) and temporary (ASIA* + X-Amz-Security-Token)
 /// credentials. The credential scope must name this server's region.
 pub struct BuiltinAuthProvider<C: CredentialStore> {
@@ -144,8 +145,22 @@ impl<C: CredentialStore + 'static> AuthProvider for BuiltinAuthProvider<C> {
         // Parse Authorization header
         let parsed = sigv4::parse::parse_authorization(auth_header)?;
 
-        // Look up credential before timestamp validation — real DynamoDB returns
-        // an invalid-key error even when the timestamp is also expired.
+        // The service checks the request timestamp, then the credential
+        // scope, then looks the key up (measured 2026-10-23: an unknown key
+        // with a stale date answers the timestamp error, an unknown key with
+        // a wrong region answers the scope message, and a stale date with a
+        // wrong region answers the timestamp error). Neither check reads the
+        // stored credential, so running them first leaves the S-5 timing
+        // argument below unchanged.
+        //
+        // Validate timestamp (±15 minute window).
+        sigv4::verify::validate_timestamp(headers)?;
+
+        // The credential scope must name this server's region and the
+        // dynamodb service; the service reports both complaints in one
+        // message when both are wrong.
+        sigv4::verify::check_scope(&parsed, &self.region)?;
+
         let credential = self
             .credential_store
             .lookup_credential(&parsed.access_key_id)
@@ -157,18 +172,9 @@ impl<C: CredentialStore + 'static> AuthProvider for BuiltinAuthProvider<C> {
             })?;
 
         // S-5: Track inactive status but do NOT return early. Continue through
-        // timestamp validation and signature verification to ensure constant-time
-        // failure paths — no timing difference between inactive, invalid, and
-        // absent keys.
+        // signature verification to ensure constant-time failure paths — no
+        // timing difference between inactive, invalid, and absent keys.
         let is_inactive = !credential.is_active;
-
-        // Validate timestamp (±15 minute window) after credential lookup.
-        sigv4::verify::validate_timestamp(headers)?;
-
-        // The credential scope must name this server's region and the
-        // dynamodb service; the service reports both complaints in one
-        // message when both are wrong.
-        sigv4::verify::check_scope(&parsed, &self.region)?;
 
         // Session tokens. For a session credential the presented token must
         // match the stored one. For a long-term key no token may be presented:
@@ -238,300 +244,4 @@ impl<C: CredentialStore + 'static> AuthProvider for BuiltinAuthProvider<C> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::http::{HeaderMap, HeaderValue};
-
-    /// In-memory credential store for unit tests.
-    struct MockCredentialStore {
-        /// `Some(credential)` for found credentials, `None` for not found.
-        credential: Option<StoredCredential>,
-        /// If set, `lookup_credential` returns this error instead.
-        error: Option<&'static str>,
-    }
-
-    #[async_trait::async_trait]
-    impl CredentialStore for MockCredentialStore {
-        async fn lookup_credential(
-            &self,
-            _access_key_id: &str,
-        ) -> Result<Option<StoredCredential>, DynamoDbError> {
-            if let Some(msg) = self.error {
-                return Err(DynamoDbError::ExpiredTokenException(msg.to_owned()));
-            }
-            Ok(self.credential.clone())
-        }
-    }
-
-    fn make_headers_with_auth(access_key: &str, token: Option<&str>) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        // Use current time for the date to pass timestamp validation.
-        let now = time::OffsetDateTime::now_utc();
-        let date_str = format!(
-            "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
-            now.year(),
-            now.month() as u8,
-            now.day(),
-            now.hour(),
-            now.minute(),
-            now.second(),
-        );
-        let date_short = &date_str[..8];
-        // Signature is fake — these tests exercise error paths (expired token,
-        // unknown key) that trigger before signature verification in
-        // authenticate().
-        let auth = format!(
-            "AWS4-HMAC-SHA256 Credential={}/{}/us-east-1/dynamodb/aws4_request, \
-             SignedHeaders=content-type;host;x-amz-date;x-amz-target, \
-             Signature=0000000000000000000000000000000000000000000000000000000000000000",
-            access_key, date_short
-        );
-        headers.insert("authorization", HeaderValue::from_str(&auth).unwrap());
-        headers.insert("x-amz-date", HeaderValue::from_str(&date_str).unwrap());
-        headers.insert("host", HeaderValue::from_static("localhost:18443"));
-        headers.insert(
-            "content-type",
-            HeaderValue::from_static("application/x-amz-json-1.0"),
-        );
-        headers.insert(
-            "x-amz-target",
-            HeaderValue::from_static("DynamoDB_20120810.ListTables"),
-        );
-        if let Some(t) = token {
-            headers.insert("x-amz-security-token", HeaderValue::from_str(t).unwrap());
-        }
-        headers
-    }
-
-    #[tokio::test]
-    async fn expired_session_returns_expired_token_exception() {
-        // CB-12: The credential store returns ExpiredTokenException directly
-        // for expired sessions (fail-closed). The auth layer propagates it.
-        let store = MockCredentialStore {
-            credential: None,
-            error: Some("The security token included in the request is expired"),
-        };
-        let provider = BuiltinAuthProvider::new(store, "us-east-1");
-        let headers = make_headers_with_auth("ASIAEXTENDDB00000000", Some("test-token-value"));
-
-        let result = provider.authenticate(&headers, b"{}").await;
-        match result {
-            Err(DynamoDbError::ExpiredTokenException(msg)) => {
-                assert!(
-                    msg.contains("expired"),
-                    "Expected 'expired' in message: {msg}"
-                );
-            }
-            other => panic!("Expected ExpiredTokenException, got: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn nonexistent_key_returns_unrecognized_client() {
-        let store = MockCredentialStore {
-            credential: None,
-            error: None,
-        };
-        let provider = BuiltinAuthProvider::new(store, "us-east-1");
-        let headers = make_headers_with_auth("AKIAXXXXXXXXXXXXXXXX", None);
-
-        let result = provider.authenticate(&headers, b"{}").await;
-        match result {
-            Err(DynamoDbError::UnrecognizedClientException(msg)) => {
-                assert!(
-                    msg.contains("invalid"),
-                    "Expected 'invalid' in message: {msg}"
-                );
-            }
-            other => panic!("Expected UnrecognizedClientException, got: {other:?}"),
-        }
-    }
-
-    const SECRET: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
-
-    fn credential(is_session: bool) -> StoredCredential {
-        StoredCredential {
-            secret_key: SECRET.to_owned(),
-            account_id: "123456789012".to_owned(),
-            principal_name: "alice".to_owned(),
-            session_name: is_session.then(|| "sess".to_owned()),
-            is_session,
-            session_token: is_session.then(|| "stored-token".to_owned()),
-            is_active: true,
-            expires_at: None,
-        }
-    }
-
-    /// Headers for a request correctly signed by a client whose credential
-    /// scope names `region`. `token`, when present, is sent and signed.
-    fn signed_headers(
-        access_key: &str,
-        region: &str,
-        token: Option<&str>,
-        body: &[u8],
-    ) -> HeaderMap {
-        let mut headers = make_headers_with_auth(access_key, token);
-        headers.remove("authorization");
-        let date_str = headers["x-amz-date"].to_str().unwrap().to_owned();
-        let date_short = date_str[..8].to_owned();
-        let mut names = vec!["content-type", "host", "x-amz-date", "x-amz-target"];
-        if token.is_some() {
-            names.push("x-amz-security-token");
-        }
-        let signed = names.join(";");
-        let creq = sigv4::canonical::canonical_request("POST", "/", "", &headers, &signed, body);
-        let scope = format!("{date_short}/{region}/dynamodb/aws4_request");
-        let sts = sigv4::canonical::string_to_sign(&date_str, &scope, &creq);
-        let key = sigv4::signing_key::derive_signing_key(SECRET, &date_short, region, "dynamodb");
-        let sig = sigv4::signing_key::compute_signature(&key, &sts);
-        let auth = format!(
-            "AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={signed}, Signature={sig}"
-        );
-        headers.insert("authorization", HeaderValue::from_str(&auth).unwrap());
-        headers
-    }
-
-    fn provider(is_session: bool) -> BuiltinAuthProvider<MockCredentialStore> {
-        BuiltinAuthProvider::new(
-            MockCredentialStore {
-                credential: Some(credential(is_session)),
-                error: None,
-            },
-            "us-east-1",
-        )
-    }
-
-    #[tokio::test]
-    async fn correctly_signed_long_term_key_authenticates() {
-        let headers = signed_headers("AKIAEXTENDDB00000000", "us-east-1", None, b"{}");
-        let id = provider(false).authenticate(&headers, b"{}").await.unwrap();
-        assert!(matches!(id, AuthIdentity::User { .. }));
-    }
-
-    /// Measured 2026-09-16: a scope for another region is refused with this
-    /// exact message; the region is not named and the message ends with a space.
-    #[tokio::test]
-    async fn scope_for_another_region_is_rejected() {
-        let headers = signed_headers("AKIAEXTENDDB00000000", "us-west-2", None, b"{}");
-        match provider(false).authenticate(&headers, b"{}").await {
-            Err(DynamoDbError::InvalidSignatureException(msg)) => {
-                assert_eq!(msg, "Credential should be scoped to a valid region. ");
-            }
-            other => panic!("Expected InvalidSignatureException, got: {other:?}"),
-        }
-    }
-
-    /// A long-term key has no session token; presenting one is an invalid token.
-    #[tokio::test]
-    async fn session_token_with_a_long_term_key_is_rejected() {
-        let headers = signed_headers(
-            "AKIAEXTENDDB00000000",
-            "us-east-1",
-            Some("any-token"),
-            b"{}",
-        );
-        match provider(false).authenticate(&headers, b"{}").await {
-            Err(DynamoDbError::UnrecognizedClientException(msg)) => {
-                assert_eq!(msg, "The security token included in the request is invalid");
-            }
-            other => panic!("Expected UnrecognizedClientException, got: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn session_key_with_matching_token_authenticates() {
-        let headers = signed_headers(
-            "ASIAEXTENDDB00000000",
-            "us-east-1",
-            Some("stored-token"),
-            b"{}",
-        );
-        let id = provider(true).authenticate(&headers, b"{}").await.unwrap();
-        assert!(matches!(id, AuthIdentity::RoleSession { .. }));
-    }
-
-    /// Measured 2026-09-16: a presented token that does not resolve has no
-    /// trailing period; a missing token does.
-    #[tokio::test]
-    async fn session_key_token_messages_match_the_service() {
-        let wrong = signed_headers("ASIAEXTENDDB00000000", "us-east-1", Some("bogus"), b"{}");
-        match provider(true).authenticate(&wrong, b"{}").await {
-            Err(DynamoDbError::UnrecognizedClientException(msg)) => {
-                assert_eq!(msg, "The security token included in the request is invalid");
-            }
-            other => panic!("Expected UnrecognizedClientException, got: {other:?}"),
-        }
-        let missing = signed_headers("ASIAEXTENDDB00000000", "us-east-1", None, b"{}");
-        match provider(true).authenticate(&missing, b"{}").await {
-            Err(DynamoDbError::UnrecognizedClientException(msg)) => {
-                assert_eq!(
-                    msg,
-                    "The security token included in the request is invalid."
-                );
-            }
-            other => panic!("Expected UnrecognizedClientException, got: {other:?}"),
-        }
-    }
-
-    /// The scope region is compared byte for byte: region names are lowercase
-    /// and the service does not fold case either.
-    #[tokio::test]
-    async fn scope_region_comparison_is_exact() {
-        for other in ["US-EAST-1", "us-east-1 ", ""] {
-            let headers = signed_headers("AKIAEXTENDDB00000000", other, None, b"{}");
-            match provider(false).authenticate(&headers, b"{}").await {
-                Err(DynamoDbError::InvalidSignatureException(msg)) => {
-                    assert_eq!(
-                        msg, "Credential should be scoped to a valid region. ",
-                        "{other:?}"
-                    );
-                }
-                other_result => {
-                    panic!("{other:?}: expected InvalidSignatureException, got {other_result:?}")
-                }
-            }
-        }
-    }
-
-    /// An empty token header on a long-term key is a presented token, and is
-    /// rejected like any other; only an absent header passes.
-    #[tokio::test]
-    async fn empty_session_token_header_with_a_long_term_key_is_rejected() {
-        let headers = signed_headers("AKIAEXTENDDB00000000", "us-east-1", Some(""), b"{}");
-        match provider(false).authenticate(&headers, b"{}").await {
-            Err(DynamoDbError::UnrecognizedClientException(msg)) => {
-                assert_eq!(msg, "The security token included in the request is invalid");
-            }
-            other => panic!("Expected UnrecognizedClientException, got: {other:?}"),
-        }
-    }
-
-    /// Measured 2026-09-16: a scope wrong in both region and service reports
-    /// both sentences in one message, region first.
-    #[tokio::test]
-    async fn scope_wrong_in_region_and_service_reports_both() {
-        let mut headers = make_headers_with_auth("AKIAEXTENDDB00000000", None);
-        headers.remove("authorization");
-        let date_str = headers["x-amz-date"].to_str().unwrap().to_owned();
-        let date_short = date_str[..8].to_owned();
-        let signed = "content-type;host;x-amz-date;x-amz-target";
-        let creq = sigv4::canonical::canonical_request("POST", "/", "", &headers, signed, b"{}");
-        let scope = format!("{date_short}/us-west-2/s3/aws4_request");
-        let sts = sigv4::canonical::string_to_sign(&date_str, &scope, &creq);
-        let key = sigv4::signing_key::derive_signing_key(SECRET, &date_short, "us-west-2", "s3");
-        let sig = sigv4::signing_key::compute_signature(&key, &sts);
-        let auth = format!(
-            "AWS4-HMAC-SHA256 Credential=AKIAEXTENDDB00000000/{scope}, SignedHeaders={signed}, Signature={sig}"
-        );
-        headers.insert("authorization", HeaderValue::from_str(&auth).unwrap());
-        match provider(false).authenticate(&headers, b"{}").await {
-            Err(DynamoDbError::InvalidSignatureException(msg)) => {
-                assert_eq!(
-                    msg,
-                    "Credential should be scoped to a valid region. Credential should be scoped to correct service: 'dynamodb'. "
-                );
-            }
-            other => panic!("Expected InvalidSignatureException, got: {other:?}"),
-        }
-    }
-}
+mod tests;
