@@ -10,6 +10,12 @@ pub enum StorageError {
     TableAlreadyExists(String),
     #[error("Table is not in ACTIVE state: {0}")]
     TableNotActive(String),
+    /// A control-plane change (a second `DeleteTable`, an `UpdateTable`)
+    /// refused because the table is `DELETING`. Distinct from
+    /// [`Self::TableNotActive`] because the service words this status
+    /// differently from the others; the engine owns the sentence.
+    #[error("Table is being deleted: {0}")]
+    TableBeingDeleted(String),
     /// A table name taken by a `CREATING` restore target. Raised by
     /// `RestoreTableFromBackup` into that name (the engine answers
     /// `TableInUseException`), distinct from [`Self::TableAlreadyExists`].

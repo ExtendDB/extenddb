@@ -16,6 +16,49 @@ use futures::future::BoxFuture;
 
 use crate::store::SqliteEngine;
 
+/// Answer a statement that found the table's data table gone as a missing table.
+///
+/// The key info was read while the catalog row was `ACTIVE` or `DELETING`, and
+/// `DeleteTable` dropped the data table before the statement ran. SQLite
+/// reports the dropped table as `no such table`. DynamoDB answers a request on
+/// a table that is gone with `ResourceNotFoundException`, so the error is
+/// `TableNotFound` here rather than an internal error. A data-plane statement
+/// also names the shared `stream_shards`, `stream_records`, `gsi_pending` and
+/// `vector_index_holds` tables, and an index table a concurrent GSI delete has
+/// just dropped; a missing one of those is reported the same way, so an
+/// unapplied migration shows as `ResourceNotFoundException` on the wire and as
+/// the named table in the server log.
+fn dropped_table_as_not_found(key_info: &TableKeyInfo, e: StorageError) -> StorageError {
+    if super::index::is_no_such_table(&e) {
+        StorageError::TableNotFound(key_info.table_name.clone())
+    } else {
+        e
+    }
+}
+
+/// The transaction form of [`dropped_table_as_not_found`]: a transaction's
+/// statements name every table in it, so the first operation's table stands
+/// for the request. DynamoDB answers a transaction on a table that is gone
+/// with `ResourceNotFoundException` without naming the table.
+fn transaction_dropped_table_as_not_found(
+    first: Option<&TableKeyInfo>,
+    e: StorageError,
+) -> StorageError {
+    match first {
+        Some(key_info) => dropped_table_as_not_found(key_info, e),
+        None => e,
+    }
+}
+
+fn transact_write_op_key_info<'a>(op: &'a TransactWriteOp<'_>) -> &'a TableKeyInfo {
+    match op {
+        TransactWriteOp::Put { key_info, .. }
+        | TransactWriteOp::Delete { key_info, .. }
+        | TransactWriteOp::Update { key_info, .. }
+        | TransactWriteOp::ConditionCheck { key_info, .. } => key_info,
+    }
+}
+
 impl DataEngine for SqliteEngine {
     /// Declares vector support by handing over the implementation. `Some(self)`
     /// only compiles because `SqliteEngine` implements `VectorSearchEngine`, so
@@ -47,6 +90,7 @@ impl DataEngine for SqliteEngine {
                 stream.as_ref(),
             )
             .await
+            .map_err(|e| dropped_table_as_not_found(&key_info, e))
         })
     }
 
@@ -57,7 +101,11 @@ impl DataEngine for SqliteEngine {
     ) -> BoxFuture<'_, Result<Option<Item>, StorageError>> {
         let key_info = key_info.clone();
         let key = key.clone();
-        Box::pin(async move { self.get_item_impl(&key_info, &key).await })
+        Box::pin(async move {
+            self.get_item_impl(&key_info, &key)
+                .await
+                .map_err(|e| dropped_table_as_not_found(&key_info, e))
+        })
     }
 
     fn delete_item(
@@ -84,6 +132,7 @@ impl DataEngine for SqliteEngine {
                 stream.as_ref(),
             )
             .await
+            .map_err(|e| dropped_table_as_not_found(&key_info, e))
         })
     }
 
@@ -116,6 +165,7 @@ impl DataEngine for SqliteEngine {
                 stream.as_ref(),
             )
             .await
+            .map_err(|e| dropped_table_as_not_found(&key_info, e))
         })
     }
 
@@ -145,6 +195,7 @@ impl DataEngine for SqliteEngine {
                 index_name.as_deref(),
             )
             .await
+            .map_err(|e| dropped_table_as_not_found(&key_info, e))
         })
     }
 
@@ -170,6 +221,7 @@ impl DataEngine for SqliteEngine {
                 index_name.as_deref(),
             )
             .await
+            .map_err(|e| dropped_table_as_not_found(&key_info, e))
         })
     }
 
@@ -209,7 +261,10 @@ impl DataEngine for SqliteEngine {
                 .iter()
                 .map(|(key_info, key)| TransactGetOp { key_info, key })
                 .collect();
-            self.transact_get_items_impl(&borrowed).await
+            let first = owned.first().map(|(key_info, _)| key_info);
+            self.transact_get_items_impl(&borrowed)
+                .await
+                .map_err(|e| transaction_dropped_table_as_not_found(first, e))
         })
     }
 
@@ -228,6 +283,7 @@ impl DataEngine for SqliteEngine {
         });
         Box::pin(async move {
             let borrowed: Vec<TransactWriteOp> = owned.iter().map(OwnedWriteOp::as_op).collect();
+            let first = borrowed.first().map(transact_write_op_key_info);
             self.transact_write_items_impl(
                 &borrowed,
                 idempotency.as_ref().map(|(a, t, f)| IdempotencyKey {
@@ -237,6 +293,7 @@ impl DataEngine for SqliteEngine {
                 }),
             )
             .await
+            .map_err(|e| transaction_dropped_table_as_not_found(first, e))
         })
     }
 
