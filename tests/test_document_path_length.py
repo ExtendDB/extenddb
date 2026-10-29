@@ -12,8 +12,8 @@ The service checks a path's ``#name`` references before its length, path by
 path in the order the paths appear, and finishes the checks of the
 FilterExpression before the ProjectionExpression and of the
 ConditionExpression before the UpdateExpression. Measured on 2026-10-26 at
-02:26, 02:29, 03:38, 03:39, 04:21, 04:40, 04:41 and 04:43 UTC (us-east-1), each case
-twice.
+02:26, 02:29, 03:38, 03:39, 04:21, 04:40, 04:41, 04:43, 05:15 and 05:20 UTC
+(us-east-1), each case twice.
 
 PutItem, UpdateItem and DeleteItem prefix every expression error with
 ``1 validation error detected: ``; the other operations do not. That prefix
@@ -231,6 +231,43 @@ def test_a_value_nested_too_deep_is_reported_first(dynamodb_client, table, key):
     )) == ("ValidationException", NESTING)
     assert _single_item_error(lambda: _update(dynamodb_client, table, key, "SET #m = :d,", names={"#m": "m"},
                                               values={":d": deep_value()})) == ("ValidationException", NESTING)
+
+
+MIXING = "Can not use both expression and non-expression parameters in the same request: "
+BAD_NUMBER = "The parameter cannot be converted to a numeric value: abc"
+
+
+# (case, extra UpdateItem arguments, non-expression and expression parameters named)
+MIXED = [
+    ("attribute_updates", {"UpdateExpression": "SET #m = :d",
+                           "AttributeUpdates": {"y": {"Action": "PUT", "Value": {"S": "v"}}}},
+     "{AttributeUpdates}", "{UpdateExpression}"),
+    ("expected", {"UpdateExpression": "SET #m = :d", "Expected": {"x": {"Exists": False}}},
+     "{Expected}", "{UpdateExpression}"),
+    ("conditional_operator", {"UpdateExpression": "SET #m = :d", "ConditionalOperator": "AND"},
+     "{ConditionalOperator}", "{UpdateExpression}"),
+    ("attribute_updates_and_condition", {"ConditionExpression": "#m <> :d",
+                                         "AttributeUpdates": {"y": {"Action": "PUT", "Value": {"S": "v"}}}},
+     "{AttributeUpdates}", "{ConditionExpression}"),
+]
+
+
+@pytest.mark.parametrize(("case", "args", "legacy", "expression"), MIXED, ids=[c[0] for c in MIXED])
+def test_mixed_parameters_come_before_a_value_nested_too_deep(dynamodb_client, table, key, case, args, legacy,
+                                                               expression):
+    assert _single_item_error(lambda: dynamodb_client.update_item(
+        TableName=table, Key=key, ExpressionAttributeNames={"#m": "m"},
+        ExpressionAttributeValues={":d": deep_value()}, **args,
+    )) == ("ValidationException",
+           f"{MIXING}Non-expression parameters: {legacy} Expression parameters: {expression}")
+
+
+@pytest.mark.parametrize("bad", [{"N": "abc"}, {"M": {"z": {"N": "abc"}}}], ids=["top_level", "nested"])
+def test_an_invalid_number_in_the_item_comes_before_a_value_nested_too_deep(dynamodb_client, table, key, bad):
+    assert _single_item_error(lambda: dynamodb_client.put_item(
+        TableName=table, Item={**key, "y": bad}, ConditionExpression="#m <> :d",
+        ExpressionAttributeNames={"#m": "m"}, ExpressionAttributeValues={":d": deep_value()},
+    )) == ("ValidationException", BAD_NUMBER)
 
 
 def test_between_bounds_are_checked_whatever_the_item(dynamodb_client, table, key):
