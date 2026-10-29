@@ -13,17 +13,26 @@
 /// `migrate --yes` refuse every upgrade from a release without that migration.
 const MIGRATE_APPLICATION_NAME: &str = "extenddb-migrate";
 
-/// `connection` with `application_name=extenddb-migrate` added to its query
-/// string when it is a PostgreSQL URL. Other backends' connection strings and a
-/// URL that already names an application are returned unchanged.
+/// `connection` with its `application_name` set to `extenddb-migrate` when it is
+/// a PostgreSQL URL. An `application_name` already in the query string is
+/// replaced: the exclusive-access check skips only sessions with this exact
+/// name, so a URL that keeps an operator's name would make `migrate --yes`
+/// count its own sessions as foreign and refuse. Other backends' connection
+/// strings are returned unchanged.
 pub(crate) fn with_migrate_application_name(connection: &str) -> String {
     let is_postgres =
         connection.starts_with("postgres://") || connection.starts_with("postgresql://");
-    if !is_postgres || connection.contains("application_name=") {
+    if !is_postgres {
         return connection.to_owned();
     }
-    let separator = if connection.contains('?') { '&' } else { '?' };
-    format!("{connection}{separator}application_name={MIGRATE_APPLICATION_NAME}")
+    let (base, query) = connection.split_once('?').unwrap_or((connection, ""));
+    let mut params: Vec<&str> = query
+        .split('&')
+        .filter(|p| !p.is_empty() && !p.starts_with("application_name="))
+        .collect();
+    let ours = format!("application_name={MIGRATE_APPLICATION_NAME}");
+    params.push(&ours);
+    format!("{base}?{}", params.join("&"))
 }
 
 #[cfg(test)]
@@ -51,9 +60,17 @@ mod application_name_tests {
     }
 
     #[test]
-    fn an_existing_application_name_is_kept() {
-        let given = "postgresql://db/cat?application_name=ops";
-        assert_eq!(with_migrate_application_name(given), given);
+    fn an_existing_application_name_is_replaced() {
+        assert_eq!(
+            with_migrate_application_name("postgresql://db/cat?application_name=ops"),
+            "postgresql://db/cat?application_name=extenddb-migrate"
+        );
+        assert_eq!(
+            with_migrate_application_name(
+                "postgresql://db/cat?sslmode=require&application_name=ops&connect_timeout=5"
+            ),
+            "postgresql://db/cat?sslmode=require&connect_timeout=5&application_name=extenddb-migrate"
+        );
     }
 
     #[test]
