@@ -58,9 +58,14 @@ pub(crate) fn format_epoch_seconds(secs: f64) -> String {
 /// precision, 24 characters): `2026-10-15T12:00:00.438Z`. Same width as the
 /// default, so rows written before and after this formatter was introduced
 /// sort together as text in time order.
+///
+/// A value outside the range `time` can represent (beyond the year 9999)
+/// cannot come from a `SystemTime` reading; should one arrive, the row is
+/// stamped with the current time, as the PostgreSQL engine does, so the
+/// retention sweep treats it as a fresh record rather than one from 1970.
 pub(crate) fn format_epoch_millis(ms: i64) -> String {
     let dt = OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000)
-        .unwrap_or(OffsetDateTime::UNIX_EPOCH);
+        .unwrap_or_else(|_| OffsetDateTime::now_utc());
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
         dt.year(),
@@ -131,6 +136,24 @@ mod tests {
         // behaviour too.
         let cutoff = format_timestamp(OffsetDateTime::from_unix_timestamp(1_792_765_146).unwrap());
         assert!(s.as_str() > cutoff.as_str(), "{s} vs {cutoff}");
+    }
+
+    /// A millisecond value `time` cannot represent is stamped with the current
+    /// time in the same shape, as the PostgreSQL engine stamps it, so the row
+    /// is not dated 1970 and swept at the next retention pass.
+    #[test]
+    fn epoch_millis_out_of_range_is_stamped_now() {
+        let before = OffsetDateTime::now_utc();
+        let s = format_epoch_millis(i64::MAX);
+        let after = OffsetDateTime::now_utc();
+        assert_eq!(s.len(), 24);
+        assert!(!s.starts_with("1970-"), "{s}");
+        let lo = format_epoch_millis((before.unix_timestamp_nanos() / 1_000_000) as i64);
+        let hi = format_epoch_millis((after.unix_timestamp_nanos() / 1_000_000) as i64);
+        assert!(
+            lo.as_str() <= s.as_str() && s.as_str() <= hi.as_str(),
+            "{lo} <= {s} <= {hi}"
+        );
     }
 
     #[test]
