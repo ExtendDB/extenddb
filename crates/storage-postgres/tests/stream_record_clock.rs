@@ -8,6 +8,10 @@
 //! waits inside its transaction, on a row lock here, stores a `created_at`
 //! that is earlier than the record's own timestamp by the length of the wait.
 //! The retention sweep filters on `created_at`, so the two values must agree.
+//! The one reading is the database's `clock_timestamp()`, the clock the
+//! sweep's `NOW()` cutoff is taken on, so the test also bounds it with
+//! database clock reads taken before the lock is released and after the
+//! write returns.
 //!
 //! Needs `EXTENDDB_TEST_PG_CONNECTION_STRING` (host-only, e.g.
 //! `postgres://user:pass@127.0.0.1:5432`); skips otherwise. Each test builds
@@ -209,12 +213,11 @@ async fn wait_for_lock_waiters(db: &PgPool, own_pid: i32, n: i64) {
     panic!("{n} backends never waited on a lock");
 }
 
-/// Stored `(created_at as epoch seconds, ApproximateCreationDateTime)` for
-/// every record in the scratch database.
-async fn stored_times(db: &PgPool) -> Vec<(i64, i64)> {
-    let rows: Vec<(f64, serde_json::Value)> = sqlx::query_as(
-        "SELECT EXTRACT(EPOCH FROM created_at)::float8, record_data FROM stream_records \
-         ORDER BY sequence_number",
+/// Stored `(created_at, ApproximateCreationDateTime)` for every record in the
+/// scratch database, in sequence order.
+async fn stored_times(db: &PgPool) -> Vec<(time::OffsetDateTime, i64)> {
+    let rows: Vec<(time::OffsetDateTime, serde_json::Value)> = sqlx::query_as(
+        "SELECT created_at, record_data FROM stream_records ORDER BY sequence_number",
     )
     .fetch_all(db)
     .await
@@ -224,9 +227,7 @@ async fn stored_times(db: &PgPool) -> Vec<(i64, i64)> {
             let approx = data["dynamodb"]["ApproximateCreationDateTime"]
                 .as_i64()
                 .expect("ApproximateCreationDateTime is an integer");
-            #[allow(clippy::cast_possible_truncation)]
-            let created_secs = created.floor() as i64;
-            (created_secs, approx)
+            (created, approx)
         })
         .collect()
 }
@@ -285,14 +286,23 @@ async fn created_at_matches_the_record_timestamp_when_the_write_waited() {
         // Past the next second boundary and then some, so NOW() and the
         // record's own clock read fall in different seconds.
         tokio::time::sleep(Duration::from_millis(2_100)).await;
+        let released_at: time::OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&mut *holder)
+            .await
+            .expect("read the database clock before the release");
         holder.commit().await.expect("release the row");
+        released_at
     };
-    let (result, ()) = tokio::time::timeout(Duration::from_secs(30), async {
+    let (result, released_at) = tokio::time::timeout(Duration::from_secs(30), async {
         tokio::join!(write, release)
     })
     .await
     .expect("the write finished");
     result.expect("the write succeeded");
+    let written_by: time::OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&s.db)
+        .await
+        .expect("read the database clock after the write");
 
     // A service-identity deletion, the TTL worker's shape, through the same
     // helper.
@@ -317,9 +327,10 @@ async fn created_at_matches_the_record_timestamp_when_the_write_waited() {
 
     let times = stored_times(&s.db).await;
     assert_eq!(times.len(), 3, "seed, late, and remove records: {times:?}");
-    for (created_secs, approx) in &times {
+    for (created_at, approx) in &times {
         assert_eq!(
-            created_secs, approx,
+            created_at.unix_timestamp(),
+            *approx,
             "created_at second must equal ApproximateCreationDateTime: {times:?}"
         );
     }
@@ -327,6 +338,13 @@ async fn created_at_matches_the_record_timestamp_when_the_write_waited() {
     assert!(
         times[1].1 - times[0].1 >= 2,
         "the late record carries the post-wait time: {times:?}"
+    );
+    // Its created_at is a database clock read taken after the lock was
+    // released and before the write returned.
+    let late = times[1].0;
+    assert!(
+        released_at <= late && late <= written_by,
+        "created_at {late} must be a database clock read between {released_at} and {written_by}"
     );
 
     s.cleanup().await;

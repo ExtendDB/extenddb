@@ -337,17 +337,20 @@ pub(super) async fn write_stream_record_in_tx(
     let idx = (hash as usize) % shards.len();
     let shard_id = &shards[idx].0;
 
-    // Generate monotonic sequence number within the transaction (CB-21).
-    let (seq_val,): (i64,) = sqlx::query_as("SELECT nextval('stream_seq')")
-        .fetch_one(&mut **tx)
-        .await
-        .map_err(db_error)?;
+    // Generate monotonic sequence number within the transaction (CB-21). The
+    // same statement takes the record's one clock read: clock_timestamp() is
+    // the database clock when this statement runs, after the write's locking
+    // reads, while the column default (NOW()) is the transaction start, which
+    // in a long transaction sits seconds before the record. created_at and
+    // ApproximateCreationDateTime both derive from this reading, and the
+    // retention sweep compares created_at with the database's NOW(), so the
+    // retention window is measured on the database clock alone.
+    let (seq_val, created_at): (i64, time::OffsetDateTime) =
+        sqlx::query_as("SELECT nextval('stream_seq'), clock_timestamp()")
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(db_error)?;
     let seq = format!("{seq_val:021}");
-
-    // One wall-clock read feeds both the record's ApproximateCreationDateTime
-    // and the created_at column. The column default (NOW()) is the transaction
-    // start time, which in a long transaction sits seconds before the record.
-    let created_at = time::OffsetDateTime::now_utc();
     let approximate_creation_date_time = created_at.unix_timestamp();
 
     let record = StreamRecord {
