@@ -533,11 +533,15 @@ Not pushable: any operand of type `N` (numbers stored as strings; `"10"
 count), `BETWEEN` / `IN` (pending proptest coverage; the compiler emits
 them, the analyzer refuses them), and `NOT` around anything else.
 
-Property tests (`tests/pushdown_parity.rs`) generate random items and
-expressions, compile the filter, and check that a pure-Rust BSON
-interpreter and `evaluate_condition` agree on match/no-match — the
-regression harness that lets the analyzer's certification be extended
-safely.
+Property tests (`tests/pushdown_parity.rs`) generate random items, whose
+attributes can hold maps and lists nested two deep with members named
+from `a`, `b`, `M`, `L`, `S` and `0`, and conditions on paths of up to
+three elements; when the item has an attribute, about three in four of
+the paths are replaced by paths the item has (about three in five of all
+generated paths, since one item in five is empty). They
+compile each condition and check that a pure-Rust BSON interpreter and
+`evaluate_condition` agree on match or no match. This is the regression
+harness that lets the analyzer's certification be extended safely.
 
 ### 5.3 Query and Scan
 
