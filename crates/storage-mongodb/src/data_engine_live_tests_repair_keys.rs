@@ -72,6 +72,7 @@ async fn live_repair_keeps_a_small_numeric_sort_key_writable() {
         summary,
         KeyRepairSummary {
             tables_scanned: 0,
+            tables_failed: 0,
             documents_repaired: NUMBERS.len() as u64,
             documents_failed: 0,
         }

@@ -33,6 +33,9 @@ mod repair_keys;
 #[path = "data_engine_live_tests_txn_create.rs"]
 mod txn_create;
 
+#[path = "data_engine_live_tests_repair_pass.rs"]
+mod repair_pass;
+
 fn uri() -> String {
     std::env::var("EXTENDDB_TEST_MONGODB_URI").expect(
         "set EXTENDDB_TEST_MONGODB_URI to a MongoDB replica set, e.g. \
@@ -434,6 +437,7 @@ async fn live_repair_rewrites_documents_stored_without_their_key() {
             summary,
             KeyRepairSummary {
                 tables_scanned: 0,
+                tables_failed: 0,
                 documents_repaired: 1,
                 documents_failed: 0,
             },
@@ -527,6 +531,7 @@ async fn live_repair_rewrites_a_document_stored_with_no_item_data() {
             summary,
             KeyRepairSummary {
                 tables_scanned: 0,
+                tables_failed: 0,
                 documents_repaired: 1,
                 documents_failed: 0,
             },
@@ -612,6 +617,7 @@ async fn live_repair_spans_more_than_one_batch() {
         summary,
         KeyRepairSummary {
             tables_scanned: 0,
+            tables_failed: 0,
             documents_repaired: COUNT as u64,
             documents_failed: 0,
         }
@@ -685,6 +691,7 @@ async fn live_repair_reads_the_key_schema_from_the_catalog() {
         summary,
         KeyRepairSummary {
             tables_scanned: 1,
+            tables_failed: 0,
             documents_repaired: 1,
             documents_failed: 0,
         }

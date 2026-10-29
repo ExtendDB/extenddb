@@ -33,6 +33,19 @@
 //! document's key answer as they did before this repair existed. Progress is
 //! logged every [`PROGRESS_EVERY`] documents and once at the end. A failure
 //! on one document is logged and skipped; the summary reports it.
+//!
+//! A scan that stops on an error, as it does when a table is dropped while the
+//! pass runs, is logged, and the pass goes on to the next table. The summary
+//! counts it, and the documents that scan had not reached wait for the next
+//! start. The scan projects `_id` only, so the `_id` index answers it without
+//! reading a document.
+//!
+//! A client write to a key whose document a repair transaction holds waits for
+//! that transaction, and a foreground write sets no `maxTimeMS`. Normally the
+//! wait is one batch commit. A process killed mid-batch leaves its transaction
+//! open until the server expires it (`transactionLifetimeLimitSeconds`, 60 s
+//! by default), and writes to the up to [`REPAIR_BATCH`] keys of that batch
+//! wait that long.
 
 use std::sync::Arc;
 
@@ -68,6 +81,9 @@ const CONFLICT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 pub struct KeyRepairSummary {
     /// Tables whose data collection was scanned.
     pub tables_scanned: u64,
+    /// Tables among those whose scan stopped on an error. The documents that
+    /// scan had not reached wait for the next start; each stop is logged.
+    pub tables_failed: u64,
     /// Documents rewritten with their key.
     pub documents_repaired: u64,
     /// Documents left as they were because they could not be rebuilt or
@@ -78,7 +94,7 @@ pub struct KeyRepairSummary {
 impl KeyRepairSummary {
     #[must_use]
     pub fn is_clean(&self) -> bool {
-        self.documents_repaired == 0 && self.documents_failed == 0
+        self.documents_repaired == 0 && self.documents_failed == 0 && self.tables_failed == 0
     }
 }
 
@@ -86,8 +102,9 @@ impl std::fmt::Display for KeyRepairSummary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} tables scanned, {} documents stored without their key repaired, {} failed",
-            self.tables_scanned, self.documents_repaired, self.documents_failed
+            "{} tables scanned, {} stopped by an error, {} documents stored without their key \
+             repaired, {} failed",
+            self.tables_scanned, self.tables_failed, self.documents_repaired, self.documents_failed
         )
     }
 }
@@ -115,8 +132,16 @@ impl MongoEngine {
                 }
             };
             summary.tables_scanned += 1;
-            self.repair_table(&table_id, &key_schema, &attribute_definitions, &mut summary)
-                .await?;
+            if let Err(e) = self
+                .repair_table(&table_id, &key_schema, &attribute_definitions, &mut summary)
+                .await
+            {
+                tracing::error!(
+                    "key repair: table {table_id}: the scan stopped ({e}); the documents it \
+                     had not reached wait for the next start"
+                );
+                summary.tables_failed += 1;
+            }
         }
         Ok(summary)
     }
@@ -134,6 +159,7 @@ impl MongoEngine {
             .collection::<Document>(&data_collection_name(table_id));
         let mut cursor = coll
             .find(doc! { "_id": { "$type": "objectId" } })
+            .projection(doc! { "_id": 1 })
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
         // The rebuilt documents have the key text as their `_id`, outside the
@@ -475,7 +501,7 @@ pub(crate) fn spawn_key_repair(engine: Arc<MongoEngine>) -> tokio::task::JoinHan
                     "startup key repair finished: {repair}, {seconds:.2} s, \
                      {rate:.0} documents a second"
                 );
-                if repair.documents_failed == 0 {
+                if repair.documents_failed == 0 && repair.tables_failed == 0 {
                     tracing::info!("{line}");
                 } else {
                     tracing::warn!("{line}");
