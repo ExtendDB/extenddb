@@ -41,6 +41,12 @@
 //! additionally bounding the "next partitions" query with the segment's upper
 //! token bound.
 //!
+//! ## Rows that hold no item
+//!
+//! The scan skips rows that hold no item (see `scan_rows`). A page they leave
+//! short still carries a LastEvaluatedKey when its read filled the LIMIT, and
+//! a full read of nothing but such rows reads on after its last row.
+//!
 //! ## Known limitation
 //!
 //! Token-based pagination can, in theory, skip partition keys that hash to the
@@ -49,7 +55,6 @@
 //! the "token range pagination" approach approved in the workplan.
 
 use cdrs_tokio::query::QueryValues;
-use cdrs_tokio::types::IntoRustByName;
 use cdrs_tokio::types::blob::Blob;
 use cdrs_tokio::types::value::Value;
 use extenddb_core::types::{Item, ScalarAttributeType, TableKeyInfo};
@@ -59,7 +64,9 @@ use std::sync::Arc;
 
 use super::ddl::{data_table_name, index_table_name};
 use super::index::fetch_index_by_name;
-use super::json_to_item;
+use super::scan_rows::{
+    RUN_READ_ROWS, read_after_position, read_on_after_position, row_position, rows_to_items,
+};
 use crate::cassandra_util::{self, CassandraSession};
 
 /// Compute the inclusive `[lower, upper]` token bounds for a parallel-scan
@@ -154,7 +161,6 @@ impl crate::CassandraEngine {
         };
 
         let account_keyspace = self.account_keyspace(&key_info.account_id);
-        let select_prefix = format!("SELECT item_data FROM {account_keyspace}.{table_name}");
 
         // Sort-key info for the scanned table/index, and (for index scans) the
         // base table's sort key — both are clustering columns on the index table.
@@ -163,6 +169,20 @@ impl crate::CassandraEngine {
             sk_info(&key_info.base_key_schema, &key_info.attribute_definitions)
         } else {
             None
+        };
+
+        // A base-table read also selects the primary key columns, so that a
+        // read whose rows all hold no item can go on after its last row.
+        let resume_sk_type = sk_info_opt
+            .filter(|_| index_name.is_none())
+            .map(|(_, sk_type)| sk_type);
+        let select_prefix = if index_name.is_none() {
+            let sk_col = resume_sk_type
+                .map(|sk_type| format!(", {}", sk_column(sk_type)))
+                .unwrap_or_default();
+            format!("SELECT item_data, pk{sk_col} FROM {account_keyspace}.{table_name}")
+        } else {
+            format!("SELECT item_data FROM {account_keyspace}.{table_name}")
         };
 
         let token_bounds = segment_token_bounds(segment, total_segments);
@@ -220,22 +240,41 @@ impl crate::CassandraEngine {
             }
         };
 
-        // Parse item_data JSON into items.
-        let items: Vec<Item> = rows
-            .into_iter()
-            .map(|row| {
-                let item_data: Option<String> = row.get_by_name("item_data").map_err(|error| {
-                    StorageError::Internal(format!("scan parse item_data failed: {error}"))
-                })?;
-                item_data.map(json_to_item).transpose()
-            })
-            .collect::<Result<Vec<_>, StorageError>>()?
-            .into_iter()
-            .flatten()
-            .collect();
+        // Rows without item_data are skipped; a full read of nothing but such
+        // rows reads on after its last row (see "Rows that hold no item").
+        let mut rows = rows;
+        let mut read_limit = fetch_limit;
+        let mut ceiling = RUN_READ_ROWS.max(fetch_limit);
+        let (items, full) = loop {
+            let full = rows.len() >= read_limit;
+            let resume = match rows.last() {
+                Some(row) if full && index_name.is_none() => {
+                    Some(row_position(row, resume_sk_type)?)
+                }
+                _ => None,
+            };
+            let items = rows_to_items(rows)?;
+            match resume {
+                Some((pk_text, clustering)) if items.is_empty() => {
+                    read_limit = read_limit.saturating_mul(2).min(ceiling);
+                    rows = read_on_after_position(
+                        &session,
+                        &select_prefix,
+                        &pk_text,
+                        clustering.as_ref(),
+                        token_upper,
+                        &mut read_limit,
+                        &mut ceiling,
+                    )
+                    .await?;
+                }
+                _ => break (items, full),
+            }
+        };
 
         // Enforce the limit and derive the LastEvaluatedKey from the last item.
-        let has_more = items.len() > actual_limit;
+        // A full read may have items after it even when this page is short.
+        let has_more = full || items.len() > actual_limit;
         let final_items: Vec<Item> = items.into_iter().take(actual_limit).collect();
 
         let last_key = if has_more {
@@ -346,18 +385,9 @@ impl crate::CassandraEngine {
         // Partition key text of the resume row (single or composite HASH key).
         let pk_text = composite_pk_to_text(start_key, scan_key_schema)?;
 
-        let mut all_rows = Vec::new();
-
-        // "Next partitions" upper token bound (bound parameter, if segmented).
-        let token_clause: &str = if token_upper.is_some() {
-            " AND token(pk) <= ?"
-        } else {
-            ""
-        };
-
-        // ── Query 1: finish the resume partition (only if there are clustering
-        //    columns to advance past — i.e. the table/index has a sort key, or an
-        //    index carries base-table key clustering columns). ──────────────────
+        // Query 1 finishes the resume partition only if there are clustering
+        // columns to advance past: the table or index has a sort key, or an
+        // index carries base-table key clustering columns.
         let q1_clustering = self.build_resume_clustering(
             key_info,
             sk_info_opt,
@@ -366,44 +396,15 @@ impl crate::CassandraEngine {
             start_key,
         )?;
 
-        if let Some((clustering_predicate, clustering_binds)) = q1_clustering {
-            let query1 = format!(
-                "{select_prefix} WHERE pk = ? AND {clustering_predicate} LIMIT {fetch_limit}"
-            );
-            let mut values: Vec<Value> = Vec::with_capacity(1 + clustering_binds.len());
-            values.push(Value::from(pk_text.as_str()));
-            values.extend(clustering_binds);
-            let rows1 = cassandra_util::query_rows::<StorageError>(
-                session,
-                &query1,
-                QueryValues::SimpleValues(values),
-                "scan_finish_partition",
-            )
-            .await?;
-            all_rows.extend(rows1);
-        }
-
-        // ── Query 2: subsequent partitions in token order. ──────────────────────
-        if all_rows.len() < fetch_limit {
-            let remaining = fetch_limit - all_rows.len();
-            let query2 = format!(
-                "{select_prefix} WHERE token(pk) > token(?){token_clause} LIMIT {remaining}"
-            );
-            let mut values: Vec<Value> = vec![Value::from(pk_text.as_str())];
-            if let Some(hi) = token_upper {
-                values.push(Value::from(hi));
-            }
-            let rows2 = cassandra_util::query_rows::<StorageError>(
-                session,
-                &query2,
-                QueryValues::SimpleValues(values),
-                "scan_next_partitions",
-            )
-            .await?;
-            all_rows.extend(rows2);
-        }
-
-        Ok(all_rows)
+        read_after_position(
+            session,
+            select_prefix,
+            &pk_text,
+            q1_clustering.as_ref(),
+            token_upper,
+            fetch_limit,
+        )
+        .await
     }
 
     /// Build the clustering-comparison predicate for query 1 of pagination
