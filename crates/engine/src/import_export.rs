@@ -297,13 +297,12 @@ pub async fn handle_export_table(
         }
 
         for item in &items {
-            let wrapper = serde_json::json!({"Item": item});
-            let mut line = serde_json::to_string(&wrapper).map_err(|e| {
+            // One encoding for the export line and the backup data file.
+            let line = extenddb_core::backup_format::encode_item_line(item).map_err(|e| {
                 tracing::error!(internal_error = %e, "failed to serialize export item");
                 DynamoDbError::InternalServerError("Internal server error".to_owned())
             })?;
-            line.push('\n');
-            tokio::io::AsyncWriteExt::write_all(&mut file, line.as_bytes())
+            tokio::io::AsyncWriteExt::write_all(&mut file, &line)
                 .await
                 .map_err(|_| {
                     DynamoDbError::ValidationException("Cannot write export file".to_owned())
