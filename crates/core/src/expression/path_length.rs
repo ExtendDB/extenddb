@@ -9,8 +9,10 @@
 //! nesting levels: <n>`. It checks a path's `#name` references first and then
 //! its length, path by path in the order the paths appear, so an undefined
 //! `#name` in an earlier path or inside the long path is reported instead
-//! (measured 2026-10-26, us-east-1). The callers run the check where they
-//! resolve each path's names.
+//! (measured 2026-10-26, us-east-1). The semantic walk and the projection
+//! resolution run the check right after each path's names; the key condition
+//! parser runs it before the names are checked, ahead of its nested-attribute
+//! refusal.
 
 use super::ast::PathElement;
 
