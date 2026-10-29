@@ -121,6 +121,12 @@ impl GsiBackfills {
     /// way round, a call could read the row as `CREATING` just before the flip
     /// and the set just after the id was removed, and report the first phase
     /// for an index whose backfill had finished.
+    ///
+    /// SQLite has two exceptions, both after a failure. Its record lasts as
+    /// long as the build inside UpdateTable, so when the flip to `ACTIVE`
+    /// fails, or the cleanup `DELETE` after a failed build fails, the id is
+    /// removed while the row stays `CREATING`, and the index reports the first
+    /// phase until the startup reconciler rebuilds it.
     #[must_use]
     pub fn snapshot(&self) -> HashSet<String> {
         self.lock().clone()
