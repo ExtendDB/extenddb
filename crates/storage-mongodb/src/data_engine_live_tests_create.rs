@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Live MongoDB tests for the document an UpdateItem writes when it creates an
-//! item (issue #436), on the native fast path and on the transaction path.
+//! item (issue #436), on the native fast path and on the transaction path, and
+//! for the removal-only UpdateItem on a missing key, which writes no document
+//! (issue #478).
 //!
 //! The tests read the replica set URI from `EXTENDDB_TEST_MONGODB_URI` and are
 //! `#[ignore]`d, like the tests in the parent module.
@@ -14,22 +16,18 @@ use extenddb_storage::error::StorageError;
 use super::{
     expected_document, finish, item_key, maps, n, path, s, scratch_engine, stored, table, with,
 };
-use crate::data::{data_collection_name, document_to_item};
+use crate::data::{data_collection_name, document_to_item, pk_filter};
 
 /// An UpdateItem that creates the item, on the native fast path (SET with a
-/// placeholder, REMOVE) and on the transaction path (numeric ADD), stores the
+/// placeholder) and on the transaction path (numeric ADD), stores the
 /// document `item_to_document` builds, plus `_v` 1: `_id` as the key text and
-/// the key attributes in `item_data`. For SET and ADD, ALL_NEW returns the
-/// item with its key, and a PutItem on the key replaces the item and returns
-/// it as the old image. For REMOVE the test pins the stored document and that
-/// a PutItem on the key succeeds. The service creates no item for a
-/// REMOVE-only update and its ALL_NEW answer for one is not measured, so the
-/// REMOVE case asserts neither the ALL_NEW answer nor the old image.
+/// the key attributes in `item_data`. ALL_NEW returns the item with its key,
+/// and a PutItem on the key replaces the item and returns it as the old image.
 #[tokio::test]
 #[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
 async fn live_update_item_that_creates_an_item_stores_its_key_like_put_item() {
     let engine = scratch_engine().await;
-    let cases: [(&str, Vec<UpdateAction>, AttributeValue, Item); 3] = [
+    let cases: [(&str, Vec<UpdateAction>, AttributeValue, Item); 2] = [
         (
             "set",
             vec![UpdateAction::Set {
@@ -38,12 +36,6 @@ async fn live_update_item_that_creates_an_item_stores_its_key_like_put_item() {
             }],
             s("upd"),
             with(Item::new(), "w", s("upd")),
-        ),
-        (
-            "remove",
-            vec![UpdateAction::Remove { path: path("w") }],
-            s("unused"),
-            Item::new(),
         ),
         (
             "add",
@@ -77,13 +69,11 @@ async fn live_update_item_that_creates_an_item_stores_its_key_like_put_item() {
                 .await
                 .unwrap_or_else(|e| panic!("{table_id}: update: {e:?}"));
             assert_eq!(old, None, "{table_id}: no old image on creation");
-            if *name != "remove" {
-                assert_eq!(
-                    new,
-                    Some(want.clone()),
-                    "{table_id}: ALL_NEW carries the key"
-                );
-            }
+            assert_eq!(
+                new,
+                Some(want.clone()),
+                "{table_id}: ALL_NEW carries the key"
+            );
             assert_eq!(
                 stored(&engine, &key_info, &key).await,
                 expected_document(&want, &key_info, 1),
@@ -102,9 +92,7 @@ async fn live_update_item_that_creates_an_item_stores_its_key_like_put_item() {
                 )
                 .await
                 .unwrap_or_else(|e| panic!("{table_id}: put after update: {e:?}"));
-            if *name != "remove" {
-                assert_eq!(old, Some(want), "{table_id}: put returns the created item");
-            }
+            assert_eq!(old, Some(want), "{table_id}: put returns the created item");
             let after = stored(&engine, &key_info, &key).await;
             assert_eq!(
                 document_to_item(&after).expect("item"),
@@ -112,6 +100,65 @@ async fn live_update_item_that_creates_an_item_stores_its_key_like_put_item() {
                 "{table_id}: put replaced the item"
             );
         }
+    }
+    finish(engine).await;
+}
+
+/// A REMOVE-only UpdateItem on a missing key, on the native fast path (the
+/// table helper records that the table has no GSI), writes nothing: no old
+/// or new image and no document (issue #478). A PutItem on the key then
+/// creates the item.
+#[tokio::test]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_remove_only_update_on_a_missing_key_writes_nothing() {
+    let engine = scratch_engine().await;
+    for range in [false, true] {
+        let table_id = format!("remove-{}", if range { "range" } else { "hash" });
+        let key_info = table(&engine, &table_id, range);
+        let key = item_key(range);
+        let remove = vec![UpdateAction::Remove { path: path("w") }];
+        let images = engine
+            .update_item_impl(
+                &key_info,
+                &key,
+                &remove,
+                false,
+                true,
+                None,
+                &maps(s("x")),
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{table_id}: update: {e:?}"));
+        assert_eq!(images, (None, None), "{table_id}: no image");
+        let filter =
+            pk_filter(&key, &key_info.key_schema, &key_info.attribute_definitions).expect("filter");
+        let doc = engine
+            .data_db
+            .collection::<Document>(&data_collection_name(&key_info.table_id))
+            .find_one(filter)
+            .await
+            .expect("read back");
+        assert_eq!(doc, None, "{table_id}: no document");
+
+        let put = with(key.clone(), "w", s("put"));
+        engine
+            .put_item_impl(
+                &key_info,
+                put.clone(),
+                true,
+                None,
+                &ExpressionMaps::default(),
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{table_id}: put: {e:?}"));
+        let after = stored(&engine, &key_info, &key).await;
+        assert_eq!(
+            document_to_item(&after).expect("item"),
+            put,
+            "{table_id}: put"
+        );
     }
     finish(engine).await;
 }
