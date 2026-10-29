@@ -5,9 +5,12 @@
 
 Amazon DynamoDB writes nothing for such a request: no item is created, no
 stream record is emitted, and the response carries no Attributes under any
-ReturnValues. SET and ADD, and an update with no actions at all, still create
-the item. Measured 2026-10-24 in us-east-1 on a hash table and a hash and
-range table (issue #478).
+ReturnValues. SET and ADD, alone or mixed with a removal, and an update with
+no actions at all, still create the item. On a table with a GSI and an LSI no
+index entry appears, ItemCollectionMetrics is reported from the key, and
+ReturnConsumedCapacity INDEXES charges the table only. Measured 2026-10-24 in
+us-east-1 on a hash table, a hash and range table, and a hash and range table
+with a GSI and an LSI (issue #478).
 """
 
 from __future__ import annotations
@@ -237,6 +240,32 @@ class TestUpdatesThatStillCreate:
         assert resp["Attributes"] == {**key, "b": {"S": "x"}}
         assert _get(dynamodb_client, name, key)["Item"] == {**key, "b": {"S": "x"}}
 
+    def test_remove_plus_add(self, dynamodb_client, table):
+        name, new_key = table
+        key = new_key()
+        resp = dynamodb_client.update_item(
+            TableName=name,
+            Key=key,
+            UpdateExpression="REMOVE a ADD n :v",
+            ExpressionAttributeValues={":v": {"N": "1"}},
+            ReturnValues="ALL_NEW",
+        )
+        assert resp["Attributes"] == {**key, "n": {"N": "1"}}
+        assert _get(dynamodb_client, name, key)["Item"] == {**key, "n": {"N": "1"}}
+
+    def test_delete_from_set_plus_add(self, dynamodb_client, table):
+        name, new_key = table
+        key = new_key()
+        resp = dynamodb_client.update_item(
+            TableName=name,
+            Key=key,
+            UpdateExpression="DELETE s :s ADD n :n",
+            ExpressionAttributeValues={":s": {"SS": ["x"]}, ":n": {"N": "1"}},
+            ReturnValues="ALL_NEW",
+        )
+        assert resp["Attributes"] == {**key, "n": {"N": "1"}}
+        assert _get(dynamodb_client, name, key)["Item"] == {**key, "n": {"N": "1"}}
+
     def test_legacy_delete_plus_put(self, dynamodb_client, table):
         name, new_key = table
         key = new_key()
@@ -274,6 +303,171 @@ class TestUpdatesThatStillCreate:
         )
         assert resp["Attributes"] == key
         assert _get(dynamodb_client, name, key)["Item"] == key
+
+
+class TestAfterAWriteToTheTable:
+    """The same requests on a table that has already taken a write.
+
+    A backend may serve updates on a table it has written to through a
+    different path from the first one, so each test writes a control item
+    first, then sends the removal-only update on a missing key."""
+
+    def _write_control(self, client, name, new_key):
+        control = new_key()
+        client.update_item(
+            TableName=name,
+            Key=control,
+            UpdateExpression="SET a = :v",
+            ExpressionAttributeValues={":v": {"S": "x"}},
+        )
+        return control
+
+    def _scan_keys(self, client, name, keys):
+        pks = [k["pk"]["S"] for k in keys]
+        resp = client.scan(
+            TableName=name,
+            FilterExpression="pk IN (:k0, :k1)",
+            ExpressionAttributeValues={":k0": {"S": pks[0]}, ":k1": {"S": pks[1]}},
+            ConsistentRead=True,
+        )
+        return sorted(item["pk"]["S"] for item in resp["Items"])
+
+    def test_remove_after_a_write(self, dynamodb_client, table):
+        name, new_key = table
+        control = self._write_control(dynamodb_client, name, new_key)
+        key = new_key()
+        resp = dynamodb_client.update_item(
+            TableName=name, Key=key, UpdateExpression="REMOVE a", ReturnValues="ALL_NEW"
+        )
+        _assert_nothing_written(dynamodb_client, name, key, resp)
+        assert self._scan_keys(dynamodb_client, name, [control, key]) == [control["pk"]["S"]]
+
+    def test_conditional_remove_after_a_write(self, dynamodb_client, table):
+        name, new_key = table
+        control = self._write_control(dynamodb_client, name, new_key)
+        key = new_key()
+        resp = dynamodb_client.update_item(
+            TableName=name,
+            Key=key,
+            UpdateExpression="REMOVE a",
+            ConditionExpression="attribute_not_exists(pk)",
+            ReturnValues="ALL_NEW",
+        )
+        _assert_nothing_written(dynamodb_client, name, key, resp)
+        assert self._scan_keys(dynamodb_client, name, [control, key]) == [control["pk"]["S"]]
+
+
+# ---------------------------------------------------------------------------
+# A table with a GSI and an LSI: no index entry, and the capacity and item
+# collection metrics the service returns for a removal-only update.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def index_table(dynamodb_client):
+    with scoped_table(
+        dynamodb_client,
+        attribute_definitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+            {"AttributeName": "g1pk", "AttributeType": "S"},
+            {"AttributeName": "l1sk", "AttributeType": "S"},
+        ],
+        key_schema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+        GlobalSecondaryIndexes=[
+            {
+                "IndexName": "gsi1",
+                "KeySchema": [{"AttributeName": "g1pk", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        ],
+        LocalSecondaryIndexes=[
+            {
+                "IndexName": "lsi1",
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "l1sk", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        ],
+    ) as name:
+        dynamodb_client.put_item(
+            TableName=name,
+            Item={
+                "pk": {"S": "present"},
+                "sk": {"S": "s1"},
+                "g1pk": {"S": "g-present"},
+                "l1sk": {"S": "l-present"},
+            },
+        )
+        yield name
+
+
+def _index_key():
+    return {"pk": {"S": f"r-{uuid.uuid4().hex[:12]}"}, "sk": {"S": "s1"}}
+
+
+class TestTableWithSecondaryIndexes:
+    def test_removing_index_keys_creates_no_item_or_index_entry(
+        self, dynamodb_client, index_table
+    ):
+        key = _index_key()
+        resp = dynamodb_client.update_item(
+            TableName=index_table,
+            Key=key,
+            UpdateExpression="REMOVE g1pk, l1sk",
+            ReturnValues="ALL_NEW",
+        )
+        _assert_nothing_written(dynamodb_client, index_table, key, resp)
+        lsi = dynamodb_client.query(
+            TableName=index_table,
+            IndexName="lsi1",
+            KeyConditionExpression="pk = :p",
+            ExpressionAttributeValues={":p": key["pk"]},
+        )
+        assert lsi["Count"] == 0
+        gsi = dynamodb_client.scan(
+            TableName=index_table,
+            IndexName="gsi1",
+            FilterExpression="pk = :p",
+            ExpressionAttributeValues={":p": key["pk"]},
+        )
+        assert gsi["Count"] == 0
+
+    def test_item_collection_metrics_come_from_the_key(self, dynamodb_client, index_table):
+        key = _index_key()
+        resp = dynamodb_client.update_item(
+            TableName=index_table,
+            Key=key,
+            UpdateExpression="REMOVE a",
+            ReturnItemCollectionMetrics="SIZE",
+        )
+        assert resp["ItemCollectionMetrics"] == {
+            "ItemCollectionKey": {"pk": key["pk"]},
+            "SizeEstimateRangeGB": [0.0, 1.0],
+        }
+        _assert_nothing_written(dynamodb_client, index_table, key, resp)
+
+    def test_consumed_capacity_indexes_charges_the_table_only(
+        self, dynamodb_client, index_table
+    ):
+        key = _index_key()
+        resp = dynamodb_client.update_item(
+            TableName=index_table,
+            Key=key,
+            UpdateExpression="REMOVE g1pk",
+            ReturnConsumedCapacity="INDEXES",
+        )
+        assert resp["ConsumedCapacity"] == {
+            "CapacityUnits": 1.0,
+            "Table": {"CapacityUnits": 1.0},
+            "TableName": index_table,
+        }
+        _assert_nothing_written(dynamodb_client, index_table, key, resp)
 
 
 # ---------------------------------------------------------------------------
