@@ -53,6 +53,26 @@ pub(crate) fn format_epoch_seconds(secs: f64) -> String {
     )
 }
 
+/// Format epoch milliseconds in the shape the `stream_records.created_at`
+/// column default produces (`strftime('%Y-%m-%dT%H:%M:%fZ')`, millisecond
+/// precision, 24 characters): `2026-10-15T12:00:00.438Z`. Same width as the
+/// default, so rows written before and after this formatter was introduced
+/// sort together as text in time order.
+pub(crate) fn format_epoch_millis(ms: i64) -> String {
+    let dt = OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000)
+        .unwrap_or(OffsetDateTime::UNIX_EPOCH);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        dt.year(),
+        u8::from(dt.month()),
+        dt.day(),
+        dt.hour(),
+        dt.minute(),
+        dt.second(),
+        dt.millisecond()
+    )
+}
+
 /// Epoch seconds, sub-second precision, of a catalog timestamp; 0 if it does
 /// not parse.
 #[allow(clippy::cast_precision_loss)] // epoch seconds fit f64's mantissa
@@ -92,6 +112,26 @@ pub(crate) fn is_fk_violation(e: &sqlx::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Same shape and width as the `stream_records.created_at` column default
+    /// (`strftime('%Y-%m-%dT%H:%M:%fZ')`), so rows from before and after the
+    /// explicit bind sort together as text.
+    #[test]
+    fn epoch_millis_matches_the_column_default_shape() {
+        let s = format_epoch_millis(1_792_765_147_123);
+        assert_eq!(s, "2026-10-23T14:19:07.123Z");
+        assert_eq!(s.len(), 24);
+        // Text order equals time order against a default-shaped neighbour.
+        assert!(s.as_str() < "2026-10-23T14:19:07.124Z");
+        assert!(s.as_str() > "2026-10-23T14:19:06.999Z");
+        // Against the retention cutoff (RFC 3339 from the `time` crate, no
+        // fraction on a whole second) the comparison is decided by the second
+        // digits in every case but the cutoff's own second, where `Z` sorts
+        // after `.`; that edge predates this formatter and is the default's
+        // behaviour too.
+        let cutoff = format_timestamp(OffsetDateTime::from_unix_timestamp(1_792_765_146).unwrap());
+        assert!(s.as_str() > cutoff.as_str(), "{s} vs {cutoff}");
+    }
 
     #[test]
     fn sqlite_url_variants() {

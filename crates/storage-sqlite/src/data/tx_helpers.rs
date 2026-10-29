@@ -230,13 +230,16 @@ pub(super) async fn write_stream_record_in_tx(
     let shard_id = shards[idx].0.clone();
 
     let seq = format!("{:021}", next_stream_seq(tx).await?);
-    let approximate_creation_date_time = i64::try_from(
+    // One wall-clock read feeds both the record's ApproximateCreationDateTime
+    // and the created_at column, so the two never disagree.
+    let created_at_ms = i64::try_from(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs(),
+            .as_millis(),
     )
     .unwrap_or(i64::MAX);
+    let approximate_creation_date_time = created_at_ms.div_euclid(1_000);
 
     let record = StreamRecord {
         event_id: uuid::Uuid::new_v4().to_string(),
@@ -259,14 +262,15 @@ pub(super) async fn write_stream_record_in_tx(
         serde_json::to_string(&record).map_err(|e| StorageError::Internal(e.to_string()))?;
 
     sqlx::query(
-        "INSERT INTO stream_records (shard_id, sequence_number, table_id, event_name, record_data) \
-         VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO stream_records (shard_id, sequence_number, table_id, event_name, record_data, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(&shard_id)
     .bind(&seq)
     .bind(&key_info.table_id)
     .bind(format!("{:?}", record.event_name))
     .bind(&record_json)
+    .bind(crate::sqlite_util::format_epoch_millis(created_at_ms))
     .execute(&mut **tx)
     .await
     .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -376,5 +380,118 @@ mod idempotency_tests {
         // Regression: a DIFFERENT account reusing the same token value must be
         // independent — not a replay and not a mismatch.
         check(&pool, "acctB", "tok", "fpX").await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod stream_clock_tests {
+    //! The stored `created_at` and the record's own `ApproximateCreationDateTime`
+    //! come from one clock read on the engine write path.
+
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use extenddb_core::expression::ExpressionMaps;
+    use extenddb_core::types::{AttributeValue, Item, StreamViewType};
+    use extenddb_storage::{DataEngine, StreamCapture, TableEngine};
+    use serde_json::json;
+
+    use crate::SqliteEngine;
+
+    const ACCOUNT: &str = "123456789012";
+
+    async fn engine() -> SqliteEngine {
+        let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
+            .await
+            .expect("engine");
+        crate::schema::apply(&engine.pool).await.expect("schema");
+        sqlx::query("UPDATE settings SET value = '0' WHERE key = 'control_plane_delay_seconds'")
+            .execute(&engine.pool)
+            .await
+            .expect("delay");
+        sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
+            .bind(ACCOUNT)
+            .execute(&engine.pool)
+            .await
+            .expect("account");
+        engine
+    }
+
+    #[tokio::test]
+    async fn stored_created_at_matches_the_record_timestamp() {
+        let engine = engine().await;
+        let input: extenddb_core::types::CreateTableInput = serde_json::from_value(json!({
+            "TableName": "t_clock",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST",
+            "StreamSpecification": {"StreamEnabled": true, "StreamViewType": "NEW_AND_OLD_IMAGES"}
+        }))
+        .expect("input");
+        engine.create_table(ACCOUNT, input).await.expect("create");
+        let key_info = engine
+            .table_key_info(ACCOUNT, "t_clock")
+            .await
+            .expect("key info");
+        let capture = StreamCapture {
+            view_type: StreamViewType::NewAndOldImages,
+            user_identity: None,
+            region: Arc::from("us-east-1"),
+        };
+        let maps = ExpressionMaps::default();
+        for v in ["one", "two", "three"] {
+            let item: Item = BTreeMap::from([
+                ("pk".to_owned(), AttributeValue::S("k".to_owned())),
+                ("v".to_owned(), AttributeValue::S(v.to_owned())),
+            ]);
+            engine
+                .put_item(&key_info, item, false, None, &maps, Some(&capture))
+                .await
+                .expect("put");
+        }
+        // Expiry of the item deletes it with a service identity, the TTL
+        // worker's shape, through the same helper.
+        engine
+            .delete_item(
+                &key_info,
+                &BTreeMap::from([("pk".to_owned(), AttributeValue::S("k".to_owned()))]),
+                false,
+                None,
+                &maps,
+                Some(&StreamCapture {
+                    view_type: StreamViewType::NewAndOldImages,
+                    user_identity: Some(extenddb_core::types::UserIdentity {
+                        identity_type: "Service".to_owned(),
+                        principal_id: "dynamodb.amazonaws.com".to_owned(),
+                    }),
+                    region: Arc::from("us-east-1"),
+                }),
+            )
+            .await
+            .expect("delete");
+
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT created_at, record_data FROM stream_records ORDER BY sequence_number",
+        )
+        .fetch_all(&engine.pool)
+        .await
+        .expect("read back");
+        assert_eq!(rows.len(), 4, "{rows:?}");
+        for (created_at, data) in &rows {
+            // Same shape as the column default: 24 characters, millisecond
+            // fraction, trailing Z.
+            assert_eq!(created_at.len(), 24, "{created_at}");
+            let record: serde_json::Value = serde_json::from_str(data).expect("record json");
+            let approx = record["dynamodb"]["ApproximateCreationDateTime"]
+                .as_i64()
+                .expect("ApproximateCreationDateTime");
+            let stored_secs = crate::sqlite_util::timestamp_epoch_seconds(created_at).floor();
+            #[allow(clippy::cast_possible_truncation)]
+            let stored_secs = stored_secs as i64;
+            assert_eq!(
+                stored_secs, approx,
+                "created_at {created_at} second must equal ApproximateCreationDateTime {approx}"
+            );
+        }
     }
 }

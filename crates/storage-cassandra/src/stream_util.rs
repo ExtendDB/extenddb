@@ -58,6 +58,18 @@ impl HybridClock {
     /// Returns a 23-digit zero-padded string. Lexicographic ordering matches
     /// temporal ordering.
     pub fn generate(&mut self) -> String {
+        self.generate_with_created_at().0
+    }
+
+    /// Generate the next sequence number and the wall-clock reading it was
+    /// derived from, as `(sequence_number, created_at_ms)`.
+    ///
+    /// Stream records store both values. Taking them from one read keeps
+    /// `created_at_ms <= hlc_ms` for every record: the clock clamps its
+    /// physical component upward on a backwards step but never below the
+    /// reading, so a record's stored creation time never exceeds the
+    /// timestamp prefix of its own sequence number.
+    pub fn generate_with_created_at(&mut self) -> (String, i64) {
         let now_ms = chrono::Utc::now().timestamp_millis();
 
         if now_ms > self.last_timestamp_ms {
@@ -92,10 +104,11 @@ impl HybridClock {
             }
         }
 
-        format!(
+        let seq = format!(
             "{:013}{:06}{:04}",
             self.last_timestamp_ms, self.logical_counter, self.node_id
-        )
+        );
+        (seq, now_ms)
     }
 }
 
@@ -161,13 +174,14 @@ pub fn stream_record_statement(
     hlc: &Arc<Mutex<HybridClock>>,
     retention_seconds: u32,
 ) -> Option<String> {
+    let (sequence_number, created_at_ms) = hlc
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .generate_with_created_at();
     let identity = StreamRecordIdentity {
         event_id: uuid::Uuid::new_v4().to_string(),
-        sequence_number: hlc
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .generate(),
-        created_at_ms: chrono::Utc::now().timestamp_millis(),
+        sequence_number,
+        created_at_ms,
     };
     stream_record_statement_with_identity(
         account_keyspace,
@@ -285,6 +299,68 @@ mod tests {
         let c = clock.generate();
         assert!(a < b, "sequence numbers must be ordered: {a} < {b}");
         assert!(b < c, "sequence numbers must be ordered: {b} < {c}");
+    }
+
+    /// The stored creation time never exceeds the millisecond prefix of the
+    /// record's own sequence number, including when the clock is clamped to
+    /// an earlier read (same-millisecond bursts and backwards steps both take
+    /// the clamp branch).
+    #[test]
+    fn created_at_never_exceeds_sequence_prefix() {
+        let mut clock = HybridClock::new(7);
+        // Force the clamp branch: pretend the last read was far in the future.
+        clock.last_timestamp_ms = chrono::Utc::now().timestamp_millis() + 5_000;
+        for _ in 0..1_000 {
+            let (seq, created_at_ms) = clock.generate_with_created_at();
+            let hlc_ms: i64 = seq[..13].parse().unwrap();
+            assert!(
+                created_at_ms <= hlc_ms,
+                "created_at_ms {created_at_ms} exceeds sequence prefix {hlc_ms} in {seq}"
+            );
+        }
+        // And on the normal branch the two agree exactly: created_at_ms is the
+        // wall-clock read itself, not the clamped value.
+        let mut fresh = HybridClock::new(7);
+        let before = chrono::Utc::now().timestamp_millis();
+        let (seq, created_at_ms) = fresh.generate_with_created_at();
+        let after = chrono::Utc::now().timestamp_millis();
+        let hlc_ms: i64 = seq[..13].parse().unwrap();
+        assert_eq!(created_at_ms, hlc_ms);
+        assert!(
+            (before..=after).contains(&created_at_ms),
+            "created_at_ms {created_at_ms} is the wall clock read between {before} and {after}"
+        );
+    }
+
+    /// The counter-overflow branch sleeps a millisecond and re-reads the
+    /// clock for the sequence prefix. The returned `created_at_ms` is still
+    /// the original read, so it stays at or below the prefix.
+    #[test]
+    fn created_at_holds_across_counter_overflow() {
+        let mut clock = HybridClock::new(42);
+        // Land on the same-millisecond path, then drive the counter to the
+        // limit so the next call takes the overflow branch.
+        let (first, _) = clock.generate_with_created_at();
+        clock.logical_counter = 999_999;
+        let (seq, created_at_ms) = clock.generate_with_created_at();
+        let hlc_ms: i64 = seq[..13].parse().unwrap();
+        assert!(
+            created_at_ms <= hlc_ms,
+            "overflow branch: created_at_ms {created_at_ms} exceeds prefix {hlc_ms} in {seq}"
+        );
+        assert_eq!(
+            clock.logical_counter, 0,
+            "the counter resets after overflow"
+        );
+        assert_eq!(
+            &seq[13..19],
+            "000000",
+            "the counter field resets in the sequence"
+        );
+        assert!(
+            seq > first,
+            "the overflow sequence follows the previous one: {first} < {seq}"
+        );
     }
 
     #[test]
