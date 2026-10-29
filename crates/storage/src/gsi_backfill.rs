@@ -19,7 +19,7 @@
 //! DescribeTable and to [`creating_read_refusal`] for Query and Scan, so the
 //! description and the refusal cannot disagree.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -68,35 +68,52 @@ pub fn phase_delay(value: Option<&str>) -> Duration {
 /// For a backend whose build runs inside the server process and records no
 /// progress in its catalog (PostgreSQL and SQLite). One process serves a
 /// catalog, which is the supported deployment, so the process running a build
-/// is also the one answering DescribeTable for it. A count rather than a flag,
-/// because two builds of one index can overlap (a recovery pass beside the
-/// build that `UpdateTable` started) and the first to finish must not clear the
-/// other's entry. Clones share the set.
+/// is also the one answering DescribeTable for it.
+///
+/// An id stays in the set until its index leaves `CREATING`: a build removes it
+/// once it has published the index, found it deleted, or removed it after a
+/// failure that would recur. A build that fails for a passing reason leaves it,
+/// so the index keeps reporting `Backfilling: true` and the backfilling refusal
+/// while it waits for the retry, which records it again; the service is not
+/// known to go back to the first phase. Index ids are not reused, so an id left
+/// behind by an index that another path deleted is never read again. Clones
+/// share the set.
 #[derive(Clone, Debug, Default)]
-pub struct GsiBackfills(Arc<Mutex<HashMap<String, usize>>>);
+pub struct GsiBackfills(Arc<Mutex<HashSet<String>>>);
 
 impl GsiBackfills {
-    /// Record that a backfill of `index_id` has started. The record is removed
-    /// when the returned guard drops, which a build does once it has published
-    /// the index or given up on it.
+    /// Record that a backfill of `index_id` has started. The record stays
+    /// until [`Self::finish`] removes it.
+    pub fn start(&self, index_id: &str) {
+        self.lock().insert(index_id.to_owned());
+    }
+
+    /// Remove the record of `index_id`, once its index has left `CREATING`.
+    pub fn finish(&self, index_id: &str) {
+        self.lock().remove(index_id);
+    }
+
+    /// [`Self::start`], and [`Self::finish`] when the returned guard drops, for
+    /// a build that deletes its index in the same call whenever it fails.
     #[must_use]
-    pub fn start(&self, index_id: &str) -> BackfillGuard {
-        *self.lock().entry(index_id.to_owned()).or_insert(0) += 1;
+    pub fn start_scoped(&self, index_id: &str) -> BackfillGuard {
+        self.start(index_id);
         BackfillGuard {
             set: self.clone(),
             index_id: index_id.to_owned(),
         }
     }
 
-    /// Whether a backfill of `index_id` is running in this process.
+    /// Whether a backfill of `index_id` has started in this process and its
+    /// index is still `CREATING`.
     #[must_use]
     pub fn started(&self, index_id: &str) -> bool {
-        self.lock().contains_key(index_id)
+        self.lock().contains(index_id)
     }
 
-    fn lock(&self) -> MutexGuard<'_, HashMap<String, usize>> {
-        // A panic while the lock was held leaves a map of counts that is still
-        // usable, so a poisoned lock is taken as it is.
+    fn lock(&self) -> MutexGuard<'_, HashSet<String>> {
+        // A panic while the lock was held leaves a set that is still usable, so
+        // a poisoned lock is taken as it is.
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -110,13 +127,7 @@ pub struct BackfillGuard {
 
 impl Drop for BackfillGuard {
     fn drop(&mut self) {
-        let mut running = self.set.lock();
-        if let Some(n) = running.get_mut(&self.index_id) {
-            *n -= 1;
-            if *n == 0 {
-                running.remove(&self.index_id);
-            }
-        }
+        self.set.finish(&self.index_id);
     }
 }
 
@@ -149,24 +160,26 @@ mod tests {
     }
 
     #[test]
-    fn a_record_lasts_as_long_as_its_guard() {
+    fn a_record_lasts_until_finish() {
         let running = GsiBackfills::default();
         assert!(!running.started("i1"));
-        let guard = running.start("i1");
+        running.start("i1");
         assert!(running.clone().started("i1"));
         assert!(!running.started("i2"));
-        drop(guard);
+        // A second build of the same index (the retry after a passing failure)
+        // records it again; one finish ends it, because finish is called only
+        // once the index has left CREATING.
+        running.start("i1");
+        running.finish("i1");
         assert!(!running.started("i1"));
     }
 
     #[test]
-    fn overlapping_builds_of_one_index_keep_it_started_until_both_end() {
+    fn a_scoped_record_lasts_as_long_as_its_guard() {
         let running = GsiBackfills::default();
-        let first = running.start("i1");
-        let second = running.start("i1");
-        drop(first);
+        let guard = running.start_scoped("i1");
         assert!(running.started("i1"));
-        drop(second);
+        drop(guard);
         assert!(!running.started("i1"));
     }
 

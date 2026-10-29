@@ -724,7 +724,9 @@ impl SqliteEngine {
                     if !hold.is_zero() {
                         tokio::time::sleep(hold).await;
                     }
-                    let _backfilling = self.gsi_backfills.start(&idx_id);
+                    // The record ends with this block. A build that fails below
+                    // deletes its row, so no CREATING index is left to report.
+                    let _backfilling = self.gsi_backfills.start_scoped(&idx_id);
                     if !hold.is_zero() {
                         tokio::time::sleep(hold).await;
                     }

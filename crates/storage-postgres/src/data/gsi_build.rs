@@ -969,6 +969,7 @@ pub(crate) async fn remove_failed_build(
     data: &sqlx::PgPool,
     table_id: &str,
     build: &GsiBuild,
+    backfills: &extenddb_storage::gsi_backfill::GsiBackfills,
 ) {
     // By id, not name: the name may already belong to a newer index.
     let deleted = sqlx::query(
@@ -981,10 +982,14 @@ pub(crate) async fn remove_failed_build(
     .await;
     match deleted {
         Ok(r) if r.rows_affected() == 1 => {
+            backfills.finish(&build.def.index_id);
             tokio::time::sleep(GRACE_PUBLISH).await;
             drop_gsi_tables(data, std::slice::from_ref(build)).await;
         }
-        Ok(_) => {}
+        // No CREATING row: the index was published or deleted meanwhile.
+        Ok(_) => backfills.finish(&build.def.index_id),
+        // The row may still be CREATING, so its record stays for the recovery
+        // pass that will take it up.
         Err(e) => tracing::error!(
             index_id = %build.def.index_id,
             "could not remove the catalog row of a failed GSI build: {e}"
@@ -1017,10 +1022,12 @@ async fn index_row_exists(
 /// ran, or that someone else published first, is not a failure.
 ///
 /// Each build is recorded in `backfills` from the start of its backfill until
-/// it is published or abandoned, which is what DescribeTable reports as
-/// `Backfilling: true`; before that the index reports `false`. `hold` is the
-/// table's `gsi_creating_phase_delay_ms` test hold, waited once before the
-/// barrier and once more inside each build's recorded phase.
+/// its index leaves `CREATING`, which is what DescribeTable reports as
+/// `Backfilling: true`; before that the index reports `false`. A build that
+/// returns an error leaves the record for the caller: a passing failure keeps
+/// it for the retry, and `remove_failed_build` removes it with the index.
+/// `hold` is the table's `gsi_creating_phase_delay_ms` test hold, waited once
+/// before the barrier and once more inside each build's recorded phase.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_gsis(
     catalog: &sqlx::PgPool,
@@ -1047,14 +1054,20 @@ pub(crate) async fn build_gsis(
             }
         }
         if gone {
+            for b in builds {
+                backfills.finish(&b.def.index_id);
+            }
             drop_gsi_tables(data, builds).await;
             return Ok(0);
         }
         return Err((0, e));
     }
     for (i, b) in builds.iter().enumerate() {
-        // Dropped at the end of this iteration, after the publish below.
-        let _backfilling = backfills.start(&b.def.index_id);
+        // Kept until the index leaves CREATING: removed below once the index
+        // is published or gone, and by `remove_failed_build` after a failure
+        // that would recur. A passing failure returns with it in place, so the
+        // index stays in its second phase until the retry publishes it.
+        backfills.start(&b.def.index_id);
         if !hold.is_zero() {
             tokio::time::sleep(hold).await;
         }
@@ -1081,13 +1094,17 @@ pub(crate) async fn build_gsis(
             Err(e) => Err(e),
         };
         match published {
-            Ok(true) => published_here += 1,
+            Ok(true) => {
+                backfills.finish(&b.def.index_id);
+                published_here += 1;
+            }
             outcome => {
                 // Either the flip found no CREATING row or the build failed. If the
                 // row is gone the index was deleted (or its table was) while this
                 // ran: drop what the delete may have raced past, and move on.
                 match index_row_exists(catalog, table_id, &b.def.index_id).await {
                     Ok(false) => {
+                        backfills.finish(&b.def.index_id);
                         drop_gsi_tables(data, std::slice::from_ref(b)).await;
                         tracing::info!(
                             index_id = %b.def.index_id,
@@ -1098,7 +1115,10 @@ pub(crate) async fn build_gsis(
                         let e = match outcome {
                             Err(e) => e,
                             // Present but not CREATING: someone else published it.
-                            Ok(_) => continue,
+                            Ok(_) => {
+                                backfills.finish(&b.def.index_id);
+                                continue;
+                            }
                         };
                         return Err((i, e));
                     }
@@ -1353,7 +1373,14 @@ async fn reconcile_pass(
                     index_id = %index_id,
                     "GSI build fails on every attempt; removing the index: {e}"
                 );
-                remove_failed_build(&engine.pool, &engine.data_pool, &table_id, &build).await;
+                remove_failed_build(
+                    &engine.pool,
+                    &engine.data_pool,
+                    &table_id,
+                    &build,
+                    &engine.gsi_backfills,
+                )
+                .await;
                 if let Some(b) = backoff.as_mut() {
                     b.succeeded(&index_id);
                 }

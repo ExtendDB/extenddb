@@ -1078,7 +1078,7 @@ impl PostgresEngine {
                         "Failed to build GSI '{}' on '{table_name}', removing it: {e}",
                         b.index_name,
                     );
-                    remove_failed_build(&catalog, &data, &build_table_id, b).await;
+                    remove_failed_build(&catalog, &data, &build_table_id, b, &backfills).await;
                 }
                 Err(e)
             });
