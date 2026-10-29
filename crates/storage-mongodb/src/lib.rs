@@ -137,19 +137,18 @@ fn server_components_factory(
             Err(e) => tracing::error!("Failed to sweep stale backup claims: {e}"),
         }
 
-        // An UpdateItem on a build before the fix for issue #436 could create
-        // an item whose document has no key. Rewrite any such document before
-        // serving, so that reads return the key and PutItem on it succeeds
-        // (see `data_engine::key_repair`). Each rewrite is its own
-        // transaction, so running this while another process serves the same
-        // data is safe.
-        match engine.repair_items_stored_without_key().await {
-            Ok(repair) if repair.is_clean() => {}
-            Ok(repair) => tracing::warn!("startup key repair: {repair}"),
-            Err(e) => tracing::error!("Failed to repair items stored without their key: {e}"),
-        }
-
         let engine = Arc::new(engine);
+
+        // An UpdateItem on a build before the fix for issue #436 could create
+        // an item whose document has no key. Rewrite any such document, so
+        // that reads return the key and PutItem on it succeeds (see
+        // `data_engine::key_repair`). This runs in the background: the pass
+        // costs time in proportion to the number of affected documents, and
+        // the listener must not wait for it. A key the pass has not reached
+        // yet answers as it did before the repair existed, and each batch is
+        // its own transaction, so running this while another process serves
+        // the same data is safe.
+        data_engine::key_repair::spawn_key_repair(engine.clone());
 
         // Create one shared catalog/management client. MongoDB Client clones
         // share the underlying pool, so max_catalog_connections limits the
