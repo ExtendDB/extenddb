@@ -557,12 +557,12 @@ async fn recover_stale_backfills(
             }
         };
 
-        // Fetch base table key_schema + attribute_definitions.
+        // Fetch the base table's account, key_schema and attribute_definitions.
         let base_row =
             match crate::cassandra_util::query_optional::<extenddb_storage::error::StorageError>(
                 &engine.session,
                 &format!(
-                    "SELECT key_schema, attribute_definitions, table_name \
+                    "SELECT account_id, key_schema, attribute_definitions, table_name \
                  FROM {catalog_ks}.tables WHERE table_id = ? ALLOW FILTERING"
                 ),
                 cdrs_tokio::query_values!(table_id.as_str()),
@@ -582,6 +582,17 @@ async fn recover_stale_backfills(
                     continue;
                 }
             };
+
+        // The catalog scan returns the CREATING indexes of every account, and
+        // the worker runs it once per account keyspace. Only the scan of the
+        // keyspace that holds the base table can build the index, so the
+        // others leave the row alone: a claim written by one of them would
+        // make the scan that can build the index find it taken and skip it.
+        let owner: String =
+            crate::cassandra_util::get_column(&base_row, "account_id", "gsi_recovery_base")?;
+        if engine.account_keyspace(&owner) != account_ks {
+            continue;
+        }
 
         let base_ks_json: String =
             crate::cassandra_util::get_column(&base_row, "key_schema", "gsi_recovery_base")?;
