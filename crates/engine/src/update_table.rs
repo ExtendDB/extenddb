@@ -103,22 +103,12 @@ pub async fn handle_update_table(
         ));
     }
 
-    // Validate: enabling streams requires a view type.
-    if let Some(spec) = &input.stream_specification
-        && spec.stream_enabled
-        && spec.stream_view_type.is_none()
-    {
-        return Err(DynamoDbError::ValidationException(
-            "StreamViewType must be specified when StreamEnabled is true".to_owned(),
-        ));
-    }
-
     // Switching to PROVISIONED requires explicit throughput values.
     if matches!(input.billing_mode, Some(BillingMode::Provisioned))
         && input.provisioned_throughput.is_none()
     {
         return Err(DynamoDbError::ValidationException(
-            "One or more parameter values were invalid: ProvisionedThroughput must be specified when changing BillingMode to PROVISIONED".to_owned(),
+            "One or more parameter values were invalid: ProvisionedThroughput must be specified when BillingMode is PROVISIONED".to_owned(),
         ));
     }
 
@@ -141,6 +131,7 @@ pub async fn handle_update_table(
     }
 
     validate_gsi_updates(&input)?;
+    validate_stream_specification(&input)?;
 
     // A created GSI's projected attributes count toward the table's limit
     // together with the indexes it already has: the total CreateTable checks,
@@ -203,6 +194,25 @@ pub async fn handle_update_table(
     serialize_output(&output)
 }
 
+/// Enabling a stream requires a view type. The sentence is the service's
+/// (measured 2026-10-24 on a never-streamed table and on a table whose stream
+/// is enabled). The service reports a defective index Create and a missing
+/// ProvisionedThroughput before this (measured 2026-10-25), and this before
+/// the table lookup, so the call sits after the billing and index rules and
+/// before the backend call, where it also precedes the already-enabled
+/// refusal. The `CreateTable` form has its own sentence.
+fn validate_stream_specification(input: &UpdateTableInput) -> Result<(), DynamoDbError> {
+    if let Some(spec) = &input.stream_specification
+        && spec.stream_enabled
+        && spec.stream_view_type.is_none()
+    {
+        return Err(DynamoDbError::ValidationException(
+            "One or more parameter values were invalid: If stream is being enabled then UpdateViewType is required".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// The per-entry rules for `GlobalSecondaryIndexUpdates`, checked before any
 /// storage read: each entry has exactly one of Create, Update, or Delete,
 /// and a Create has a valid name, a key schema of defined attributes, and
@@ -239,24 +249,47 @@ fn validate_gsi_updates(input: &UpdateTableInput) -> Result<(), DynamoDbError> {
                         "One or more parameter values were invalid: KeySchema must not be empty for GSI creation".to_owned(),
                     ));
                 }
-                // Validate that all key attributes are defined in AttributeDefinitions
-                let attr_defs = input.attribute_definitions.as_deref().unwrap_or(&[]);
-                for ks in &create.key_schema {
-                    if !attr_defs
-                        .iter()
-                        .any(|ad| ad.attribute_name == ks.attribute_name)
-                    {
+                // Every key attribute must be in AttributeDefinitions. The
+                // service's sentence depends on the member's shape (measured
+                // 2026-10-25): absent names the index; present but lacking
+                // the key lists the keys and the definitions (the CreateTable
+                // sentence, whose CreateTable copy lives in core's validation
+                // and is not shared with this path); an empty list has its
+                // own sentence.
+                let missing: Vec<&str> = match &input.attribute_definitions {
+                    None => {
                         return Err(DynamoDbError::ValidationException(format!(
-                            "One or more parameter values were invalid: Some index key attributes are not defined in AttributeDefinitions. \
-                             Keys: [{}], AttributeDefinitions: [{}]",
-                            ks.attribute_name,
-                            attr_defs
-                                .iter()
-                                .map(|ad| ad.attribute_name.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", ")
+                            "One or more parameter values were invalid: AttributeDefinitions is not specified for index: {}",
+                            create.index_name
                         )));
                     }
+                    Some(defs) if defs.is_empty() => {
+                        return Err(DynamoDbError::ValidationException(
+                            "Invalid KeySchema: Some index key attribute have no definition"
+                                .to_owned(),
+                        ));
+                    }
+                    Some(defs) => create
+                        .key_schema
+                        .iter()
+                        .filter(|ks| !defs.iter().any(|ad| ad.attribute_name == ks.attribute_name))
+                        .map(|ks| ks.attribute_name.as_str())
+                        .collect(),
+                };
+                if let Some(first_missing) = missing.first() {
+                    let defined: Vec<&str> = input
+                        .attribute_definitions
+                        .as_deref()
+                        .unwrap_or(&[])
+                        .iter()
+                        .map(|ad| ad.attribute_name.as_str())
+                        .collect();
+                    return Err(DynamoDbError::ValidationException(format!(
+                        "One or more parameter values were invalid: Some index key attributes are not defined in AttributeDefinitions. \
+                         Keys: [{}], AttributeDefinitions: [{}]",
+                        first_missing,
+                        defined.join(", ")
+                    )));
                 }
             }
             if let Some(delete) = &update.delete {
@@ -347,157 +380,5 @@ fn update_table_err_to_dynamo(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use extenddb_storage::error::StorageError;
-
-    #[test]
-    fn a_created_gsi_throughput_below_one_is_refused() {
-        let input = |pt: Value| -> UpdateTableInput {
-            serde_json::from_value(serde_json::json!({
-                "TableName": "t",
-                "AttributeDefinitions": [{ "AttributeName": "g", "AttributeType": "S" }],
-                "GlobalSecondaryIndexUpdates": [{ "Create": {
-                    "IndexName": "gix",
-                    "KeySchema": [{ "AttributeName": "g", "KeyType": "HASH" }],
-                    "Projection": { "ProjectionType": "ALL" },
-                    "ProvisionedThroughput": pt,
-                }}],
-            }))
-            .unwrap()
-        };
-        for (read, write) in [(0, 0), (0, 1), (1, 0), (-1, 5)] {
-            let pt = serde_json::json!({ "ReadCapacityUnits": read, "WriteCapacityUnits": write });
-            match validate_gsi_updates(&input(pt)).unwrap_err() {
-                DynamoDbError::ValidationException(m) => {
-                    assert!(m.ends_with("for index: gix"), "{m}");
-                }
-                other => panic!("({read}, {write}): {other:?}"),
-            }
-        }
-        let ok = serde_json::json!({ "ReadCapacityUnits": 1, "WriteCapacityUnits": 1 });
-        validate_gsi_updates(&input(ok)).unwrap();
-    }
-
-    #[test]
-    fn projected_total_counts_kept_indexes_and_created_ones() {
-        use extenddb_core::types::{
-            GlobalSecondaryIndexUpdate, GsiDescription, LsiDescription, Projection, ProjectionType,
-            TableDescription,
-        };
-        let include = |n: usize| Projection {
-            projection_type: ProjectionType::Include,
-            non_key_attributes: Some((0..n).map(|i| format!("a{i}")).collect()),
-        };
-        let existing = TableDescription {
-            global_secondary_indexes: Some(vec![
-                GsiDescription {
-                    index_name: "kept".to_owned(),
-                    key_schema: Vec::new(),
-                    projection: include(30),
-                    index_status: "ACTIVE".to_owned(),
-                    provisioned_throughput: None,
-                    index_size_bytes: 0,
-                    item_count: 0,
-                    index_arn: String::new(),
-                },
-                GsiDescription {
-                    index_name: "dropped".to_owned(),
-                    key_schema: Vec::new(),
-                    projection: include(50),
-                    index_status: "ACTIVE".to_owned(),
-                    provisioned_throughput: None,
-                    index_size_bytes: 0,
-                    item_count: 0,
-                    index_arn: String::new(),
-                },
-            ]),
-            local_secondary_indexes: Some(vec![LsiDescription {
-                index_name: "lsi".to_owned(),
-                key_schema: Vec::new(),
-                projection: include(20),
-                index_size_bytes: 0,
-                item_count: 0,
-                index_arn: String::new(),
-            }]),
-            ..Default::default()
-        };
-        let create = |n: usize| -> GlobalSecondaryIndexUpdate {
-            serde_json::from_value(serde_json::json!({ "Create": {
-                "IndexName": "new", "KeySchema": [],
-                "Projection": serde_json::to_value(include(n)).unwrap(),
-            }}))
-            .unwrap()
-        };
-        let delete: GlobalSecondaryIndexUpdate =
-            serde_json::from_value(serde_json::json!({ "Delete": { "IndexName": "dropped" } }))
-                .unwrap();
-
-        assert_eq!(projected_after_gsi_updates(&existing, &[create(1)]), 101);
-        assert_eq!(
-            projected_after_gsi_updates(&existing, &[create(1), delete]),
-            51
-        );
-        assert!(
-            extenddb_core::validation::validate_projected_attribute_total(
-                projected_after_gsi_updates(&existing, &[create(1)])
-            )
-            .is_err()
-        );
-    }
-
-    /// A backend that cannot serve the request reports a 400, not a 500.
-    ///
-    /// This arm was missing while CreateTable had it, so the same refusal
-    /// answered differently depending on which operation carried it. It matters
-    /// for a backend whose vector capability is decided at runtime rather than at
-    /// compile time: its refusal arrives through this path.
-    #[test]
-    fn an_unsupported_feature_is_a_validation_exception() {
-        let err = update_table_err_to_dynamo(
-            StorageError::Unsupported("Vector indexes are not supported here".to_owned()),
-            "t",
-        );
-        match err {
-            DynamoDbError::ValidationException(msg) => {
-                assert_eq!(msg, "Vector indexes are not supported here");
-            }
-            other => panic!("expected ValidationException, got {other:?}"),
-        }
-    }
-
-    /// The backend's whole message survives, unwrapped and unprefixed, because
-    /// the service's own wording for this case names both the table and the index
-    /// and no layer above the backend knows either.
-    #[test]
-    fn a_resource_in_use_refusal_keeps_the_backend_message() {
-        let measured = extenddb_core::types::vector_index_delete_in_allocation_phase("t", "vidx");
-        let err = update_table_err_to_dynamo(StorageError::IndexesInUse(measured.clone()), "t");
-        match err {
-            DynamoDbError::ResourceInUseException(msg) => assert_eq!(msg, measured),
-            other => panic!("expected ResourceInUseException, got {other:?}"),
-        }
-    }
-
-    /// The measured whole string, byte for byte, from probe P2 on 2026-08-19.
-    #[test]
-    fn the_allocation_phase_refusal_is_the_measured_whole_string() {
-        assert_eq!(
-            extenddb_core::types::vector_index_delete_in_allocation_phase(
-                "eddbprobe-backfill",
-                "vidx2"
-            ),
-            "Attempt to change a resource which is still in use: Index creation is in resource \
-             allocation phase. Retry deletion during backfilling phase or when the index is \
-             active. Table: eddbprobe-backfill Index: vidx2"
-        );
-    }
-
-    /// A genuine fault still reports a 500 and is still logged as one.
-    #[test]
-    fn an_internal_failure_is_still_an_internal_server_error() {
-        let err =
-            update_table_err_to_dynamo(StorageError::Internal("disk on fire".to_owned()), "t");
-        assert!(matches!(err, DynamoDbError::InternalServerError(_)));
-    }
-}
+#[path = "update_table_tests.rs"]
+mod tests;
