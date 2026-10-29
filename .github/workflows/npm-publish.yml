@@ -164,6 +164,25 @@ jobs:
             echo "sha=$SHA"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Check out the tagged commit for the migration gate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          ref: ${{ steps.meta.outputs.sha }}
+          persist-credentials: false
+
+      - name: Gate - the release freezes the catalog migrations it ships
+        # The platform packages ship the sqlite,dev-mode build of the tag,
+        # whose dev server applies SQLite migrations to a catalog behind it.
+        # As in release-image.yml: RELEASED_THROUGH must reach the last
+        # migration id. A tag before the migration framework passes.
+        run: |
+          set -euo pipefail
+          if [[ -e crates/storage/src/migrations/registry.rs ]]; then
+            python3 devtools/check-released-through
+          else
+            echo "the tagged commit has no catalog migration registry"
+          fi
+
   build:
     needs: gate
     # The matrix lives in npm-build-matrix.yml, shared with the pull-request

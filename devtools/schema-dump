@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+"""Print the schema of a catalog as text, one object per line, in a fixed
+order, so a fresh install can be compared with docs/schema/<backend>.txt.
+
+    devtools/schema-dump sqlite <database file>
+    devtools/schema-dump postgres <base URL, no database> <catalog db> <data db>
+
+On PostgreSQL the dump lists tables, columns, indexes, constraints,
+sequences, functions, triggers, views and types; the per-table `_ddb_*`
+tables are left out, because no migration creates them, and so are the
+objects an extension owns (pgvector's functions and types), so a server with
+pgvector and one without print the same file. A migration that creates any
+other kind of object adds a query for it here. On SQLite every schema object
+is listed; a fresh install has no per-table objects.
+"""
+import sqlite3
+import sys
+
+
+def sqlite_schema(path: str) -> list[str]:
+    # Read-write: a read-only connection cannot open a WAL database whose
+    # -shm file does not exist. Nothing here writes.
+    conn = sqlite3.connect(path)
+    rows = conn.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master "
+        "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+    ).fetchall()
+    conn.close()
+    return [
+        f"{kind} {name} on {table}: {' '.join((sql or '').split())}"
+        for kind, name, table, sql in rows
+    ]
+
+
+POSTGRES_QUERIES = [
+    (
+        "table",
+        """SELECT c.relname, '' FROM pg_class c
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+           WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')
+             AND c.relname NOT LIKE '\\_ddb\\_%'
+           ORDER BY 1""",
+    ),
+    (
+        "column",
+        """SELECT c.relname || '.' || a.attname,
+                  format_type(a.atttypid, a.atttypmod)
+                  || CASE WHEN a.attnotnull THEN ' NOT NULL' ELSE '' END
+                  || COALESCE(' DEFAULT ' || pg_get_expr(d.adbin, d.adrelid), '')
+                  || CASE WHEN a.attcollation <> t.typcollation
+                          THEN ' COLLATE ' || quote_ident(co.collname) ELSE '' END
+           FROM pg_attribute a
+           JOIN pg_class c ON c.oid = a.attrelid
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+           JOIN pg_type t ON t.oid = a.atttypid
+           LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+           LEFT JOIN pg_collation co ON co.oid = a.attcollation
+           WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')
+             AND c.relname NOT LIKE '\\_ddb\\_%'
+             AND a.attnum > 0 AND NOT a.attisdropped
+           ORDER BY c.relname, a.attnum""",
+    ),
+    (
+        "index",
+        """SELECT indexname, indexdef FROM pg_indexes
+           WHERE schemaname = 'public' AND tablename NOT LIKE '\\_ddb\\_%'
+           ORDER BY 1""",
+    ),
+    (
+        "constraint",
+        """SELECT c.relname || '.' || k.conname, pg_get_constraintdef(k.oid)
+           FROM pg_constraint k
+           JOIN pg_class c ON c.oid = k.conrelid
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+           WHERE n.nspname = 'public' AND c.relname NOT LIKE '\\_ddb\\_%'
+           ORDER BY 1""",
+    ),
+    (
+        "sequence",
+        """SELECT sequencename, data_type || ' START ' || start_value
+                  || ' INCREMENT ' || increment_by
+           FROM pg_sequences WHERE schemaname = 'public' ORDER BY 1""",
+    ),
+    (
+        "function",
+        """SELECT p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')', ''
+           FROM pg_proc p
+           WHERE p.pronamespace = 'public'::regnamespace
+             AND NOT EXISTS (SELECT 1 FROM pg_depend d
+                             WHERE d.objid = p.oid AND d.deptype = 'e')
+           ORDER BY 1""",
+    ),
+    (
+        "view",
+        """SELECT c.relname, pg_get_viewdef(c.oid) FROM pg_class c
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+           WHERE n.nspname = 'public' AND c.relkind IN ('v', 'm')
+             AND NOT EXISTS (SELECT 1 FROM pg_depend d
+                             WHERE d.objid = c.oid AND d.deptype = 'e')
+           ORDER BY 1""",
+    ),
+    (
+        "type",
+        # Enums, domains, ranges and standalone composite types; a table's
+        # own row type is not listed.
+        """SELECT t.typname, t.typtype::text || COALESCE(' ' || (
+                      SELECT string_agg(e.enumlabel, ',' ORDER BY e.enumsortorder)
+                      FROM pg_enum e WHERE e.enumtypid = t.oid), '')
+           FROM pg_type t
+           WHERE t.typnamespace = 'public'::regnamespace
+             AND t.typtype IN ('e', 'd', 'r', 'm', 'c')
+             AND (t.typtype <> 'c' OR EXISTS (SELECT 1 FROM pg_class c
+                                              WHERE c.oid = t.typrelid AND c.relkind = 'c'))
+             AND NOT EXISTS (SELECT 1 FROM pg_depend d
+                             WHERE d.objid = t.oid AND d.deptype = 'e')
+           ORDER BY 1""",
+    ),
+    (
+        "trigger",
+        """SELECT c.relname || '.' || t.tgname, pg_get_triggerdef(t.oid)
+           FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+           WHERE n.nspname = 'public' AND NOT t.tgisinternal
+             AND c.relname NOT LIKE '\\_ddb\\_%'
+           ORDER BY 1""",
+    ),
+]
+
+
+def postgres_schema(base: str, database: str) -> list[str]:
+    import psycopg2  # in requirements.txt
+
+    conn = psycopg2.connect(f"{base.rstrip('/')}/{database}")
+    conn.set_session(readonly=True, autocommit=True)
+    lines = []
+    with conn.cursor() as cur:
+        for kind, query in POSTGRES_QUERIES:
+            cur.execute(query)
+            for name, text in cur.fetchall():
+                lines.append(f"{kind} {name}: {' '.join(text.split())}".rstrip(": "))
+    conn.close()
+    return lines
+
+
+def main(argv: list[str]) -> None:
+    if len(argv) == 2 and argv[0] == "sqlite":
+        print("\n".join(sqlite_schema(argv[1])))
+    elif len(argv) == 4 and argv[0] == "postgres":
+        base, catalog, data = argv[1:]
+        for store, database in (("catalog", catalog), ("data", data)):
+            print(f"# {store} database")
+            print("\n".join(postgres_schema(base, database)))
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
