@@ -52,3 +52,5 @@ libc = { workspace = true }
 
 [dev-dependencies]
 extenddb-cache = { workspace = true, features = ["test-util"] }
+# Self-signed certificates for the TLS listener tests.
+rcgen = { workspace = true }

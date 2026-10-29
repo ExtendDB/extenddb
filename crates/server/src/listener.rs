@@ -65,10 +65,14 @@ pub(crate) async fn serve_app(
         // a 301 redirect to HTTPS and reject the connection before the TLS
         // handshake. This gives users a helpful redirect instead of a
         // confusing TLS handshake failure. The same acceptor sets
-        // TCP_NODELAY on every accepted socket before the handshake.
-        let redirect_acceptor = HttpsRedirectAcceptor { addr: local_addr };
+        // TCP_NODELAY on every accepted socket before the handshake, and
+        // bounds the wait for that first byte by `request_timeout`.
+        let redirect_acceptor = HttpsRedirectAcceptor {
+            addr: local_addr,
+            first_byte_timeout: request_timeout,
+        };
         let server = axum_server::from_tcp_rustls(std_listener, rustls_config)?
-            .map(|tls| tls.acceptor(redirect_acceptor))
+            .map(|tls| FirstByteAcceptor::new(tls.acceptor(redirect_acceptor), request_timeout))
             .handle(handle);
         with_request_timeouts(server, request_timeout)
             .serve(make_service)
@@ -76,7 +80,7 @@ pub(crate) async fn serve_app(
     } else {
         tracing::info!("extenddb listening on {local_addr}");
         let server = axum_server::from_tcp(std_listener)?
-            .acceptor(NodelayAcceptor)
+            .acceptor(FirstByteAcceptor::new(NodelayAcceptor, request_timeout))
             .handle(handle);
         with_request_timeouts(server, request_timeout)
             .serve(make_service)
@@ -99,6 +103,11 @@ pub(crate) async fn serve_app(
 /// HTTP/2: a connection that stops answering PING frames is closed. A client
 /// that sends the preface and then stalls holds the connection for at most
 /// interval plus timeout.
+///
+/// Neither timer runs until the connection has delivered its first bytes:
+/// `hyper_util`'s auto builder reads the stream to tell HTTP/2 from HTTP/1
+/// before either protocol's timer starts, and that read has no bound of its
+/// own. [`FirstByteAcceptor`] bounds it.
 fn with_request_timeouts<A: axum_server::Address, Acc>(
     mut server: axum_server::Server<A, Acc>,
     request_timeout: Duration,
@@ -115,6 +124,165 @@ fn with_request_timeouts<A: axum_server::Address, Acc>(
         .keep_alive_interval(Some(request_timeout))
         .keep_alive_timeout(request_timeout);
     server
+}
+
+/// Acceptor wrapper that bounds the wait for the start of a request.
+///
+/// Runs the inner acceptor (TLS handshake, `TCP_NODELAY`) and hands the
+/// resulting stream on inside a [`FirstByteDeadline`]. A client that
+/// connects (and, on the TLS listener, completes the handshake) and then
+/// sends nothing, or sends only a prefix of the 24-byte HTTP/2 preface, is
+/// closed once `timeout` passes.
+#[derive(Clone)]
+struct FirstByteAcceptor<A> {
+    inner: A,
+    timeout: Duration,
+}
+
+impl<A> FirstByteAcceptor<A> {
+    fn new(inner: A, timeout: Duration) -> Self {
+        Self { inner, timeout }
+    }
+}
+
+impl<A, I, S> axum_server::accept::Accept<I, S> for FirstByteAcceptor<A>
+where
+    A: axum_server::accept::Accept<I, S>,
+    A::Future: Send + 'static,
+    A::Stream: Send + 'static,
+    A::Service: Send + 'static,
+{
+    type Stream = FirstByteDeadline<A::Stream>;
+    type Service = A::Service;
+    type Future = std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = std::io::Result<(Self::Stream, Self::Service)>> + Send,
+        >,
+    >;
+
+    fn accept(&self, stream: I, service: S) -> Self::Future {
+        let inner = self.inner.accept(stream, service);
+        let timeout = self.timeout;
+        Box::pin(async move {
+            let (stream, service) = inner.await?;
+            Ok((FirstByteDeadline::new(stream, timeout), service))
+        })
+    }
+}
+
+/// The HTTP/2 client preface. `hyper_util`'s auto builder reads a new
+/// connection until it holds these 24 bytes or a byte that differs from
+/// them, and only then hands the stream to HTTP/1 or HTTP/2, whose own
+/// timers start at that point.
+const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// IO adapter that bounds the version sniff on a new connection.
+///
+/// The deadline starts when the adapter is built (after accept, or after the
+/// TLS handshake). It is dropped once the bytes read so far decide the
+/// protocol: a byte that differs from the HTTP/2 preface, or the whole
+/// preface. Until then a pending read also polls the deadline, so the
+/// connection task wakes when it fires and the read fails with `TimedOut`;
+/// `hyper_util` then drops the connection. Writes pass through unchanged.
+pub(crate) struct FirstByteDeadline<S> {
+    inner: S,
+    deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    /// Bytes read so far that match the preface prefix, while undecided.
+    preface_matched: usize,
+}
+
+impl<S> FirstByteDeadline<S> {
+    fn new(inner: S, timeout: Duration) -> Self {
+        Self {
+            inner,
+            deadline: Some(Box::pin(tokio::time::sleep(timeout))),
+            preface_matched: 0,
+        }
+    }
+
+    /// Feed newly read bytes to the sniff; returns true once the protocol is
+    /// decided (the auto builder stops reading at the same point).
+    fn sniff_decided(&mut self, new_bytes: &[u8]) -> bool {
+        for &b in new_bytes {
+            if self.preface_matched >= H2_PREFACE.len() || b != H2_PREFACE[self.preface_matched] {
+                return true;
+            }
+            self.preface_matched += 1;
+        }
+        self.preface_matched >= H2_PREFACE.len()
+    }
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for FirstByteDeadline<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use std::task::Poll;
+
+        let before = buf.filled().len();
+        let read = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if self.deadline.is_none() {
+            return read;
+        }
+        match read {
+            Poll::Ready(Ok(())) => {
+                let new_bytes = buf.filled()[before..].to_vec();
+                if self.sniff_decided(&new_bytes) {
+                    self.deadline = None;
+                }
+                Poll::Ready(Ok(()))
+            }
+            Poll::Pending => {
+                let deadline = self.deadline.as_mut().expect("checked above");
+                match deadline.as_mut().poll(cx) {
+                    Poll::Ready(()) => Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "no request received within request_timeout_secs",
+                    ))),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+            other => other,
+        }
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for FirstByteDeadline<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
 }
 
 /// Remove the PID file if it exists. Best-effort — log but don't fail.
@@ -179,9 +347,13 @@ impl<S: Send + 'static> axum_server::accept::Accept<tokio::net::TcpStream, S> fo
 /// `axum_server` 0.8 ships a `NoDelayAcceptor`, but it cannot be stacked under
 /// this acceptor without a generic wrapper, so this acceptor sets the option
 /// itself, and logs instead of rejecting on failure.
+///
+/// The peek waits at most `first_byte_timeout` for the first byte, so a
+/// client that connects and sends nothing is dropped before the handshake.
 #[derive(Clone)]
 struct HttpsRedirectAcceptor {
     addr: std::net::SocketAddr,
+    first_byte_timeout: Duration,
 }
 
 impl<S: Send + 'static> axum_server::accept::Accept<tokio::net::TcpStream, S>
@@ -197,10 +369,19 @@ impl<S: Send + 'static> axum_server::accept::Accept<tokio::net::TcpStream, S>
 
     fn accept(&self, stream: tokio::net::TcpStream, service: S) -> Self::Future {
         let addr = self.addr;
+        let first_byte_timeout = self.first_byte_timeout;
         Box::pin(async move {
             set_tcp_nodelay(&stream);
             let mut peek_buf = [0u8; 1];
-            match stream.peek(&mut peek_buf).await {
+            let peeked = tokio::time::timeout(first_byte_timeout, stream.peek(&mut peek_buf))
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "no bytes received before the TLS handshake within request_timeout_secs",
+                    )
+                })?;
+            match peeked {
                 Ok(0) => {
                     // Connection closed before sending data.
                     Err(std::io::Error::new(
@@ -271,99 +452,4 @@ async fn shutdown_signal() {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::{TcpListener, TcpStream};
-
-    /// Bind a loopback listener and connect one client to it.
-    async fn bind_and_connect() -> (TcpListener, TcpStream) {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind loopback");
-        let addr = listener.local_addr().expect("local addr");
-        let client = TcpStream::connect(addr).await.expect("connect");
-        (listener, client)
-    }
-
-    /// The plaintext path: a connection that sends part of its request
-    /// headers and then stalls is closed once `request_timeout` passes,
-    /// as it is on the TLS path. The client reads EOF (or a reset) well
-    /// before a bound of several times the timeout; without the timer the
-    /// read blocks until that bound.
-    #[tokio::test]
-    async fn plaintext_listener_closes_a_stalled_header_phase() {
-        use tokio::io::AsyncReadExt;
-
-        let timeout = Duration::from_millis(300);
-        let (listener, mut client) = bind_and_connect().await;
-        let app = Router::new().route("/", axum::routing::get(|| async { "ok" }));
-        let server = tokio::spawn(serve_app(listener, app, timeout, None, None));
-
-        // A request line and one header, no terminating blank line.
-        client
-            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n")
-            .await
-            .expect("write partial headers");
-        let mut buf = [0u8; 64];
-        let outcome = tokio::time::timeout(timeout * 10, client.read(&mut buf)).await;
-        server.abort();
-        match outcome {
-            Ok(Ok(0)) | Ok(Err(_)) => {}
-            Ok(Ok(n)) => panic!("server answered {n} bytes instead of closing the connection"),
-            Err(_) => panic!(
-                "server held a stalled header phase open for {:?} on the plaintext listener",
-                timeout * 10
-            ),
-        }
-    }
-
-    /// The TLS path: the acceptor that runs before the TLS handshake sets
-    /// `TCP_NODELAY` on the accepted socket, read back from the socket the
-    /// acceptor hands on.
-    #[tokio::test]
-    async fn tls_acceptor_sets_tcp_nodelay_before_the_handshake() {
-        use axum_server::accept::Accept;
-
-        let (listener, mut client) = bind_and_connect().await;
-        // A TLS ClientHello starts with the handshake record type.
-        client
-            .write_all(&[0x16])
-            .await
-            .expect("write ClientHello byte");
-        let (accepted, _) = listener.accept().await.expect("accept");
-        assert!(
-            !accepted.nodelay().expect("read TCP_NODELAY"),
-            "a fresh accepted socket has Nagle on"
-        );
-
-        let acceptor = HttpsRedirectAcceptor {
-            addr: listener.local_addr().expect("local addr"),
-        };
-        let (stream, ()) = acceptor
-            .accept(accepted, ())
-            .await
-            .expect("a TLS ClientHello passes through to the TLS acceptor");
-        assert!(stream.nodelay().expect("read TCP_NODELAY"));
-    }
-
-    /// The plaintext path: the acceptor sets `TCP_NODELAY` on every socket
-    /// it accepts.
-    #[tokio::test]
-    async fn plaintext_listener_sets_tcp_nodelay_on_accepted_sockets() {
-        use axum_server::accept::Accept;
-
-        let (listener, client) = bind_and_connect().await;
-        let (accepted, peer) = listener.accept().await.expect("accept");
-        assert_eq!(peer, client.local_addr().expect("client addr"));
-        assert!(
-            !accepted.nodelay().expect("read TCP_NODELAY"),
-            "a fresh accepted socket has Nagle on"
-        );
-        let (stream, ()) = NodelayAcceptor
-            .accept(accepted, ())
-            .await
-            .expect("the plaintext acceptor hands the socket on");
-        assert!(stream.nodelay().expect("read TCP_NODELAY"));
-    }
-}
+mod tests;

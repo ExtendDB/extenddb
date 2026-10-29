@@ -1848,6 +1848,7 @@ dependencies = [
  "libc",
  "metrics",
  "rand 0.9.4",
+ "rcgen",
  "rustls",
  "serde",
  "serde_json",
