@@ -11,8 +11,6 @@
 use extenddb_storage::error::StorageError;
 use extenddb_storage::operations::{ConnectionParts, OperationsEngine};
 
-use crate::schema::CATALOG_VERSION;
-
 /// Backend operations for the SQLite engine.
 pub(crate) struct SqliteOperationsEngine;
 
@@ -52,8 +50,12 @@ impl OperationsEngine for SqliteOperationsEngine {
         Ok(())
     }
 
+    /// The highest migration this binary carries: the catalog is versioned
+    /// by its ledger, and its `catalog_version` row holds the same integer.
     fn catalog_version(&self) -> String {
-        CATALOG_VERSION.to_string()
+        extenddb_storage::migrations::MigrationId::LATEST
+            .number()
+            .to_string()
     }
 
     fn is_sensitive_key(&self, _key: &str) -> bool {

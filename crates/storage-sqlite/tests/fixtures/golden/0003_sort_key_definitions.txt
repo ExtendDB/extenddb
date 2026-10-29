@@ -1,0 +1,12 @@
+-- SELECT table_name, attribute_definitions FROM tables ORDER BY table_name
+cu_orders	[{"AttributeName":"gpk","AttributeType":"S"},{"AttributeName":"gsk","AttributeType":"N"},{"AttributeName":"lsk","AttributeType":"S"},{"AttributeName":"sk","AttributeType":"S"}]
+-- SELECT backup_arn, attribute_definitions FROM backups ORDER BY backup_arn
+arn:b1	[{"AttributeName":"gpk","AttributeType":"S"},{"AttributeName":"gsk","AttributeType":"N"},{"AttributeName":"lsk","AttributeType":"S"},{"AttributeName":"sk","AttributeType":"S"}]
+arn:b2	[{"AttributeName":"gpk","AttributeType":"S"},{"AttributeName":"gsk","AttributeType":"N"},{"AttributeName":"lsk","AttributeType":"S"}]
+arn:b3	[{"AttributeName":"gpk","AttributeType":"S"},{"AttributeName":"gsk","AttributeType":"N"},{"AttributeName":"lsk","AttributeType":"S"},{"AttributeName":"sk","AttributeType":"S"}]
+-- SELECT notes FROM extenddb_migrations WHERE id = 3
+restored cu_orders: sk (S)
+cu_orders: partition key definition(s) [pk] are absent; reads and writes are unaffected, but index key type validation cannot check them
+restored backup arn:b1 of cu_orders: sk (S)
+restored backup arn:b3 of cu_orders: sk (S)
+backup arn:b2 of cu_orders: sort key(s) [sk] have no attribute definition, and neither its items nor its source table give the type; restoring it fails until the definition is added

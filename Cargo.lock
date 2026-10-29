@@ -1987,6 +1987,7 @@ dependencies = [
  "extenddb-storage",
  "futures",
  "libc",
+ "log",
  "rand 0.9.4",
  "serde",
  "serde_json",
@@ -1995,6 +1996,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "zeroize",
 ]

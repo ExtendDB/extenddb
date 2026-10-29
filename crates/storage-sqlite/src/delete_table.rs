@@ -75,7 +75,7 @@ impl SqliteEngine {
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?
         .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(0.25);
+        .unwrap_or(crate::DEFAULT_CONTROL_PLANE_DELAY_SECONDS);
 
         let index_ids: Vec<String> = index_rows.iter().map(|r| r.index_id.clone()).collect();
         let table_id = row.table_id.clone();

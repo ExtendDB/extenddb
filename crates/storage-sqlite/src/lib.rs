@@ -33,6 +33,7 @@ mod delete_table;
 mod hooks;
 mod management_store;
 mod metadata;
+pub mod migrations;
 mod number_key;
 mod operations;
 mod schema;
@@ -51,17 +52,23 @@ mod worker;
 mod workers;
 
 /// Default secondary-index propagation delay (milliseconds) when the
-/// `index_propagation_delay_ms` setting is absent. Mirrors the value seeded by
-/// the catalog schema, and is the single definition used by both the live read
-/// on the write path and the background refresh worker.
+/// `index_propagation_delay_ms` setting is absent, as it is on a catalog the
+/// migrations created (releases before 1.0 seeded the same value). The single
+/// definition used by both the live read on the write path and the background
+/// refresh worker.
 pub(crate) const DEFAULT_INDEX_PROPAGATION_DELAY_MS: u64 = 10;
+
+/// Default control-plane delay (seconds) when the `control_plane_delay_seconds`
+/// setting is absent or unparseable: CreateTable, DeleteTable, the
+/// control-plane worker and the console's default all read this one value.
+pub(crate) const DEFAULT_CONTROL_PLANE_DELAY_SECONDS: f64 = 0.25;
 
 /// Read the propagation-delay setting, preferring the canonical key and falling back
 /// to the pre-rename one.
 ///
 /// A catalog created before the rename holds the operator's value under the old name,
-/// and the server refuses to start on a catalog-version mismatch rather than migrating,
-/// so no upgrade step ever rewrites that row. Reading past it would silently reset a
+/// and no catalog migration rewrites that row yet, though one could. Reading past it
+/// would silently reset a
 /// configured delay to the default; since 0 means synchronous, the silent change would
 /// be from strict to eventually consistent. `ORDER BY ... DESC` makes the preference
 /// deterministic when both rows exist.
@@ -73,7 +80,6 @@ pub use bootstrapper::SqliteBootstrapper;
 pub use catalog_store::SqliteCatalogStore;
 pub use config::SqliteConfig;
 pub use credential_store::SqliteCredentialStore;
-pub use schema::CATALOG_VERSION;
 pub use store::SqliteEngine;
 
 /// The SQLite backend, for installation via
@@ -93,8 +99,7 @@ pub fn backend() -> extenddb_storage::Backend {
         management_store: sqlite_management_store_factory,
         diagnostics_store: sqlite_diagnostics_store_factory,
         server_components: sqlite_server_components_factory,
-        // Migrates through its bootstrapper until it moves onto the runner.
-        catalog_migrations: None,
+        catalog_migrations: Some(&migrations::SqliteCatalogMigrations),
     }
 }
 
@@ -107,18 +112,12 @@ use extenddb_storage::settings_store::SettingsStoreError;
 use crate::sqlite_util::sqlite_url;
 
 /// Open a small catalog-only pool for the settings/diagnostics factories,
-/// applying the same PRAGMAs as the engine.
+/// with the pragmas of every SQLite pool.
 async fn catalog_pool(connection_string: &str) -> Result<sqlx::SqlitePool, sqlx::Error> {
     sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(4)
         .after_connect(|conn, _| {
-            Box::pin(async move {
-                use sqlx::Executor;
-                conn.execute("PRAGMA journal_mode = WAL").await?;
-                conn.execute("PRAGMA foreign_keys = ON").await?;
-                conn.execute("PRAGMA busy_timeout = 5000").await?;
-                Ok(())
-            })
+            Box::pin(async move { crate::sqlite_util::set_connection_pragmas(conn, true).await })
         })
         .connect(&sqlite_url(connection_string))
         .await
@@ -193,6 +192,7 @@ fn sqlite_diagnostics_store_factory(
 use std::sync::Arc;
 
 use extenddb_auth::CredentialStore;
+use extenddb_storage::migrations::{MigrationError, Runner};
 use extenddb_storage::server_components::{BackendError, ServerComponents};
 
 use crate::hooks::SqliteRuntimeHooks;
@@ -210,14 +210,29 @@ fn sqlite_server_components_factory(
     let region = region.to_owned();
     Box::pin(async move {
         // One server per database file, taken before the database is opened:
-        // startup recovery below assumes no other server is using it. A file
-        // database only; an in-memory one belongs to this process alone.
-        let serve_lock = serve_lock::ServeLock::acquire_for_location(&db_path)
-            .map_err(BackendError::InitializationFailed)?
+        // startup recovery below assumes no other server is using it, and a
+        // migration holds the same lock. A file database only; an in-memory
+        // one belongs to this process alone.
+        let serve_lock = serve_lock::ServeLock::try_acquire_for_location(&db_path)
+            .map_err(|failure| {
+                BackendError::Catalog(match failure {
+                    serve_lock::LockFailure::Held(m) => MigrationError::Locked(m),
+                    serve_lock::LockFailure::Failed(m) => MigrationError::Store(m),
+                })
+            })?
             .map(|lock| {
                 tracing::debug!("holding serve lock {}", lock.path().display());
                 std::sync::Arc::new(lock)
             });
+        // The catalog's status is read before the engine opens the file, so
+        // a server that refuses has written nothing. A dev build migrates
+        // instead, as `migrate --yes` would, copy included.
+        let dev = options.bootstrap_if_uninitialized;
+        if let Some(lock) = &serve_lock {
+            migrations::prepare_for_serve(&db_path, options.release, lock, dev)
+                .await
+                .map_err(BackendError::Catalog)?;
+        }
         let mut engine = SqliteEngine::new(&db_path, pool_size, &region, MAX_ITEM_SIZE_BYTES)
             .await
             .map_err(|e| BackendError::ConnectionFailed {
@@ -225,20 +240,28 @@ fn sqlite_server_components_factory(
                 details: e.to_string(),
             })?;
 
-        // In-memory databases do not persist across the `init` process, so the
-        // catalog must be bootstrapped here, at serve time, on the engine's own
-        // shared connection (a second pool would open a separate empty DB).
-        // A dev-mode build extends the same bootstrap to an uninitialized FILE
-        // database (`bootstrap_if_uninitialized`), so zero-config dev serve
-        // works with a persistent path too; every bootstrap step is guarded
-        // (IF NOT EXISTS / INSERT OR IGNORE), so re-running on an initialized
-        // file is a no-op. Production builds keep the explicit-`init` contract.
+        // An in-memory database exists only on the engine's single
+        // connection, so its catalog is created there, by the runner, every
+        // time the server starts.
         let in_memory = engine.in_memory;
-        if in_memory || options.bootstrap_if_uninitialized {
+        if in_memory {
+            let on_pool = migrations::SqliteMigrations::on_pool(engine.pool.clone(), &db_path)
+                .map_err(BackendError::Catalog)?;
+            let report = Runner::new(&on_pool, options.release)
+                .migrate()
+                .await
+                .map_err(BackendError::Catalog)?;
+            migrations::log_report(&report);
+        }
+
+        // The rows a server needs that `init` writes on a production
+        // deployment: written here for an in-memory database and in a dev
+        // build, which need no `init`. Each row is written only when absent.
+        if in_memory || dev {
             let admin_user = std::env::var("EXTENDDB_ADMIN_USER").ok();
             let admin_password = std::env::var("EXTENDDB_ADMIN_PASSWORD").ok();
             if let Some(password) = engine
-                .bootstrap_ephemeral(admin_user.as_deref(), admin_password.as_deref())
+                .bootstrap_dev_rows(admin_user.as_deref(), admin_password.as_deref())
                 .await
                 .map_err(|e| BackendError::InitializationFailed(e.to_string()))?
             {
@@ -250,43 +273,6 @@ fn sqlite_server_components_factory(
                 };
                 println!("\n  {durability}\n  Username: {user}\n  Password: {password}\n");
             }
-        }
-
-        engine.check_catalog_version().await.map_err(|e| match e {
-            extenddb_storage::error::StorageError::CatalogVersionMismatch { expected, found } => {
-                BackendError::CatalogVersionMismatch { expected, found }
-            }
-            // The unreadable-version refusal: printed as is, not as
-            // "Internal error: ...".
-            extenddb_storage::error::StorageError::Internal(refusal) => {
-                BackendError::InitializationFailed(refusal)
-            }
-            other => BackendError::InitializationFailed(other.to_string()),
-        })?;
-
-        // The version string matches, but a table can still be in an earlier
-        // 0.0.4 build's shape (on which every DescribeTable fails). Refuse, as
-        // for a version mismatch: the steps can rewrite a table (the
-        // backup_items rebuild locks the database for writes while it runs),
-        // so they run under `extenddb migrate --yes`, not at startup.
-        let pending = schema::pending_shape_migrations(&engine.pool)
-            .await
-            .map_err(|e| {
-                use extenddb_storage::management_store::OpError;
-                let (OpError::Validation(m)
-                | OpError::AlreadyExists(m)
-                | OpError::NotFound(m)
-                | OpError::HasDependents(m)
-                | OpError::Internal(m)
-                | OpError::Database { message: m, .. }) = e;
-                BackendError::InitializationFailed(m)
-            })?;
-        if !pending.is_empty() {
-            return Err(BackendError::InitializationFailed(format!(
-                "the catalog's tables need migration steps this server does not run at \
-                 startup: {}. Stop the server and run 'extenddb migrate --yes'.",
-                pending.join(", ")
-            )));
         }
 
         // Recover any in-flight control-plane transitions from a prior run.
@@ -434,70 +420,6 @@ mod serve_lock_tests {
             .await
             .expect("starts once the first is gone");
         drop(again);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
-#[cfg(test)]
-mod shape_gate_tests {
-    /// `serve` on a file database whose catalog version matches but whose
-    /// `table_restores` is in the earlier 0.0.4 shape refuses to start,
-    /// naming the step and `extenddb migrate --yes`; after the migrate step
-    /// it starts.
-    #[tokio::test]
-    async fn serve_refuses_a_file_database_with_pending_shape_migrations() {
-        let dir = std::env::temp_dir().join(format!(
-            "extenddb-shape-gate-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&dir).expect("dir");
-        let config = crate::config::SqliteConfig {
-            path: dir.join("db.sqlite").to_string_lossy().into_owned(),
-            pool_size: 2,
-        };
-        let mut bootstrap = extenddb_storage::server_components::ServerComponentsOptions::default();
-        bootstrap.bootstrap_if_uninitialized = true;
-        let plain = extenddb_storage::server_components::ServerComponentsOptions::default();
-
-        // A current database, then the earlier shape: no source_table_arn.
-        drop(
-            super::sqlite_server_components_factory(&config, "us-east-1", bootstrap)
-                .await
-                .expect("bootstrap a file database"),
-        );
-        {
-            let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", config.path))
-                .await
-                .expect("open");
-            sqlx::query("ALTER TABLE table_restores DROP COLUMN source_table_arn")
-                .execute(&pool)
-                .await
-                .expect("the earlier table_restores shape");
-            pool.close().await;
-        }
-        let Err(err) = super::sqlite_server_components_factory(&config, "us-east-1", plain).await
-        else {
-            panic!("serve started on the earlier shape");
-        };
-        assert!(
-            err.to_string()
-                .contains("add table_restores.source_table_arn"),
-            "{err}"
-        );
-        assert!(err.to_string().contains("extenddb migrate --yes"), "{err}");
-
-        let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", config.path))
-            .await
-            .expect("open");
-        crate::schema::apply_shape_migrations(&pool)
-            .await
-            .expect("migrate --yes");
-        pool.close().await;
-        drop(
-            super::sqlite_server_components_factory(&config, "us-east-1", plain)
-                .await
-                .expect("serve starts after migrate"),
-        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
