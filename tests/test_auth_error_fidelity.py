@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 from typing import Any
+from urllib.parse import urlparse
 
 import boto3
 import pytest
@@ -353,6 +354,96 @@ class TestRequestChecks:
         resp.read()
         conn.close()
         assert resp.status == 400
+
+    def _raw_request(self, method: str, path: str, headers: list[tuple[str, str]], body: bytes = b""):
+        """Send one request with each header on its own line, repeats included.
+
+        Returns (status, body text, Connection header). http.client sends the
+        headers in the order given, so a repeated name goes out twice.
+        """
+        import http.client  # noqa: PLC0415
+        import ssl  # noqa: PLC0415
+        from urllib.parse import urlparse  # noqa: PLC0415
+
+        u = urlparse(self.url)
+        ctx = ssl.create_default_context()
+        if self.endpoint_url is not None:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        conn = http.client.HTTPSConnection(u.hostname, u.port or 443, context=ctx, timeout=30)
+        conn.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
+        for k, v in headers:
+            conn.putheader(k, v)
+        if body or method == "POST":
+            conn.putheader("Content-Length", str(len(body)))
+        conn.endheaders()
+        if body:
+            conn.send(body)
+        resp = conn.getresponse()
+        text = resp.read().decode(errors="replace")
+        connection = resp.getheader("Connection")
+        conn.close()
+        return resp.status, text, connection
+
+    @pytest.mark.parametrize("path", ["/console/login", "/management/accounts", "/health"])
+    def test_duplicate_host_header_is_refused_on_every_route(self, path):
+        # The refusal is a property of the listener, not of the DynamoDB
+        # route: the console, the management API and the health check get
+        # the same 400 with the connection closed.
+        if self.endpoint_url is None:
+            pytest.skip("console and management routes exist on extenddb only")
+        u = urlparse(self.url)
+        status, text, connection = self._raw_request(
+            "GET", path, [("Host", u.netloc), ("Host", "evil.example.com")]
+        )
+        assert status == 400, (path, status, text[:200])
+        assert text == "400 Bad Request", (path, text[:200])
+        assert connection == "close", (path, connection)
+
+    @pytest.mark.parametrize("path", ["/console/login", "/management/accounts", "/health"])
+    def test_duplicate_authorization_header_is_refused_on_every_route(self, path):
+        if self.endpoint_url is None:
+            pytest.skip("console and management routes exist on extenddb only")
+        u = urlparse(self.url)
+        status, text, connection = self._raw_request(
+            "GET",
+            path,
+            [
+                ("Host", u.netloc),
+                ("Authorization", "Basic YWRtaW46eA=="),
+                ("Authorization", "Basic YWRtaW46eQ=="),
+            ],
+        )
+        assert status == 400, (path, status, text[:200])
+        assert text == "400 Bad Request", (path, text[:200])
+        assert connection == "close", (path, connection)
+
+    def test_duplicate_authorization_header_is_refused_on_the_data_plane(self):
+        # Measured against the service on 2026-10-23: two Authorization
+        # headers get the front end's 400 Bad Request with the connection
+        # closed, before authentication runs.
+        u = urlparse(self.url)
+        auth = (
+            "AWS4-HMAC-SHA256 Credential=AKIAEXAMPLEEXAMPLE01/20260101/us-east-1/dynamodb/aws4_request, "
+            "SignedHeaders=host;x-amz-date;x-amz-target, Signature=" + "0" * 64
+        )
+        status, text, connection = self._raw_request(
+            "POST",
+            "/",
+            [
+                ("Host", u.netloc),
+                ("X-Amz-Target", "DynamoDB_20120810.ListTables"),
+                ("Content-Type", "application/x-amz-json-1.0"),
+                ("X-Amz-Date", "20260101T000000Z"),
+                ("Authorization", auth),
+                ("Authorization", auth),
+            ],
+            body=b"{}",
+        )
+        assert status == 400, (status, text[:200])
+        assert connection == "close", connection
+        if self.endpoint_url is not None:
+            assert text == "400 Bad Request", text[:200]
 
     def test_session_token_with_a_long_term_key_is_rejected(self):
         _, _, env_token = _env_credentials()

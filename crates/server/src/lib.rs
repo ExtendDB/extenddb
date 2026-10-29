@@ -21,6 +21,7 @@ mod listener;
 pub mod management;
 mod metrics_endpoint;
 pub mod rate_limit;
+mod repeated_headers;
 mod request_helpers;
 mod request_tags;
 mod response;
@@ -209,11 +210,15 @@ pub async fn start_server(
             );
     }
 
-    // Apply security headers to all routes.
+    // Refuse a repeated host or authorization header on every route, then
+    // apply security headers to all routes (the refusal carries them too).
     // A body that stops delivering data for `request_timeout` errors out, so a
     // client that announces a Content-Length it never sends cannot hold the
     // connection open. The handler answers that error with 408.
     let app = app
+        .layer(axum::middleware::from_fn(
+            repeated_headers::refuse_repeated_headers,
+        ))
         .layer(security_layers)
         .layer(RequestBodyTimeoutLayer::new(request_timeout));
 
