@@ -22,6 +22,7 @@ use bson::{Bson, Document};
 use extenddb_core::types::{
     AttributeDefinition, AttributeValue, Item, KeySchemaElement, KeyType, ScalarAttributeType,
 };
+use extenddb_core::validation::number::validate_and_normalize_number;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::sk_info;
 
@@ -155,13 +156,28 @@ fn sk_value(
 ) -> Result<AttributeValue, StorageError> {
     match (sk_type, value) {
         (ScalarAttributeType::S, Bson::String(s)) => Ok(AttributeValue::S(s.clone())),
-        (ScalarAttributeType::N, Bson::Decimal128(d)) => Ok(AttributeValue::N(d.to_string())),
+        (ScalarAttributeType::N, Bson::Decimal128(d)) => {
+            Ok(AttributeValue::N(plain_number_text(&d.to_string())?))
+        }
         (ScalarAttributeType::B, Bson::String(hex)) => Ok(AttributeValue::B(hex_to_bytes(hex)?)),
         _ => Err(StorageError::Internal(format!(
             "{field} holds a {} value, not the sort key type",
             value.element_type() as u8
         ))),
     }
+}
+
+/// The text a request carries for a numeric sort key, from the display form
+/// of its stored `Decimal128`.
+///
+/// `Decimal128` displays a value below 1e-6 in exponent form (0.0000001 is
+/// `1E-7`), while a request's number is the plain decimal that
+/// `validate_and_normalize_number` produces, and PutItem builds the `_id`
+/// from that text. A document rebuilt with the exponent form in its `_id`
+/// would make every later PutItem on the key fail on the immutable `_id`.
+fn plain_number_text(display: &str) -> Result<String, StorageError> {
+    validate_and_normalize_number(display)
+        .map_err(|e| StorageError::Internal(format!("sort key is not a number: {e}")))
 }
 
 fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, StorageError> {
@@ -293,11 +309,36 @@ mod tests {
         assert_eq!(repaired, want);
     }
 
+    /// A number as a request carries it: `{"N": raw}` deserialised, which
+    /// normalises the text to the plain decimal that PutItem stores.
+    fn request_number(raw: &str) -> AttributeValue {
+        serde_json::from_value(serde_json::json!({ "N": raw })).expect("attribute value")
+    }
+
     #[test]
     fn repair_restores_string_numeric_and_binary_sort_keys() {
         let cases = [
             (ScalarAttributeType::S, AttributeValue::S("s1".to_owned())),
             (ScalarAttributeType::N, AttributeValue::N("12.5".to_owned())),
+            // `Decimal128` displays the next three in exponent form
+            // (`1E-7`, `-1.2345E-7`, `1E-30`), and the `_id` PutItem builds
+            // from them is the plain decimal.
+            (
+                ScalarAttributeType::N,
+                AttributeValue::N("0.0000001".to_owned()),
+            ),
+            (
+                ScalarAttributeType::N,
+                AttributeValue::N("-0.00000012345".to_owned()),
+            ),
+            (ScalarAttributeType::N, request_number("1E-30")),
+            // The same value as a request spells it.
+            (ScalarAttributeType::N, request_number("1E-7")),
+            // Plain below the switch to exponent form.
+            (
+                ScalarAttributeType::N,
+                AttributeValue::N("0.000001".to_owned()),
+            ),
             (
                 ScalarAttributeType::B,
                 AttributeValue::B(vec![0x01, 0xff, 0x10]),
@@ -321,11 +362,11 @@ mod tests {
                 "item_data": { "w": { "S": "upd" } },
             };
             let repaired = repaired_document(&bad, &schema, &defs).expect("repair");
-            assert_eq!(repaired, want, "{sk_type:?} sort key");
+            assert_eq!(repaired, want, "{sk_type:?} sort key {sk:?}");
             assert_eq!(
                 document_to_item(&repaired).expect("item"),
                 want_item,
-                "{sk_type:?} sort key item"
+                "{sk_type:?} sort key {sk:?}: item"
             );
         }
     }

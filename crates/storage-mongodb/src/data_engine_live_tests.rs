@@ -27,6 +27,9 @@ use crate::data::{data_collection_name, document_to_item, item_to_document, pk_f
 #[path = "data_engine_live_tests_key_names.rs"]
 mod key_names;
 
+#[path = "data_engine_live_tests_repair_keys.rs"]
+mod repair_keys;
+
 fn uri() -> String {
     std::env::var("EXTENDDB_TEST_MONGODB_URI").expect(
         "set EXTENDDB_TEST_MONGODB_URI to a MongoDB replica set, e.g. \
