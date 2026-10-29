@@ -152,14 +152,28 @@ impl MongoEngine {
                 ids.push(id.clone());
             }
             if ids.len() >= REPAIR_BATCH {
-                self.repair_batch(&coll, table_id, key_schema, attribute_definitions, &ids, summary)
-                    .await;
+                self.repair_batch(
+                    &coll,
+                    table_id,
+                    key_schema,
+                    attribute_definitions,
+                    &ids,
+                    summary,
+                )
+                .await;
                 ids.clear();
             }
         }
         if !ids.is_empty() {
-            self.repair_batch(&coll, table_id, key_schema, attribute_definitions, &ids, summary)
-                .await;
+            self.repair_batch(
+                &coll,
+                table_id,
+                key_schema,
+                attribute_definitions,
+                &ids,
+                summary,
+            )
+            .await;
         }
         Ok(())
     }
@@ -197,8 +211,15 @@ impl MongoEngine {
                     ids.len()
                 );
                 for id in ids {
-                    self.repair_one(coll, table_id, id, key_schema, attribute_definitions, summary)
-                        .await;
+                    self.repair_one(
+                        coll,
+                        table_id,
+                        id,
+                        key_schema,
+                        attribute_definitions,
+                        summary,
+                    )
+                    .await;
                 }
             }
         }
@@ -302,7 +323,6 @@ impl MongoEngine {
             "key repair: too many concurrent write conflicts, giving up".to_owned(),
         ))
     }
-
 }
 
 /// `table_id`, key schema and attribute definitions of a catalog `tables` row.
@@ -360,7 +380,10 @@ impl std::fmt::Display for BatchError {
         match self {
             Self::Mongo(e) => write!(f, "{e}"),
             Self::Counts { deleted, read } => {
-                write!(f, "deleted {deleted} of {read} documents read in the transaction")
+                write!(
+                    f,
+                    "deleted {deleted} of {read} documents read in the transaction"
+                )
             }
         }
     }
