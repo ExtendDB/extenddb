@@ -466,9 +466,12 @@ caller omits the key. ExtendDB resolves `aws:PrincipalArn`, `aws:PrincipalAccoun
 `aws:RequestedRegion`, `aws:CurrentTime`, `aws:EpochTime`, `aws:ViaAWSService`,
 `aws:PrincipalIsAWSService`, `aws:PrincipalTag/<key>` and `aws:ResourceTag/<key>`
 (tag keys matched case-insensitively) on a
-data-plane request. Every other `aws:` global key is absent, which is what the
-service does for a key it does not populate for this caller and for an unknown
-key.
+data-plane request. On the operations that carry a tag set it also resolves
+`aws:RequestTag/<key>` and `aws:TagKeys`: `TagResource` and `CreateTable` populate
+both from `Tags`, `UntagResource` populates `aws:TagKeys` from `TagKeys`, and
+every other operation leaves both absent. Every other `aws:` global key is
+absent, which is what the service does for a key it does not populate for this
+caller and for an unknown key.
 
 #### Global condition key resolution
 
@@ -493,9 +496,12 @@ Resolved (evaluated against the request value):
   `aws:EpochTime`.
 - `aws:ViaAWSService` and `aws:PrincipalIsAWSService` (both false for a direct
   caller).
-- `aws:PrincipalTag/<key>`, `aws:RequestTag/<key>` (trust path),
-  `aws:ResourceTag/<key>`, `aws:TagKeys`,
+- `aws:PrincipalTag/<key>`, `aws:ResourceTag/<key>`,
   `sts:ExternalId` (trust path).
+- `aws:RequestTag/<key>` and `aws:TagKeys`: from the session tags on the trust
+  path, and from the request's tags on a DynamoDB request that carries a tag set
+  (`TagResource` and `CreateTable` populate both keys, `UntagResource` populates
+  `aws:TagKeys`). Absent on every other operation.
 - Role-session only (absent for an IAM user, matching the service):
   `aws:TokenIssueTime` (the session issue time) and
   `aws:MultiFactorAuthPresent` (`false` for a session assumed without MFA).

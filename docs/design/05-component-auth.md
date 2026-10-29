@@ -541,17 +541,19 @@ pub trait ConditionContext {
 
     /// Returns `true` if `key` is a multivalued (set-valued) condition key.
     /// Arity is a property of the key, not the number of values present.
-    /// `RequestContext` reports `dynamodb:Attributes` and `dynamodb:LeadingKeys`
-    /// as multivalued; all other keys (and all trust-policy keys) are single-valued.
+    /// `RequestContext` reports `dynamodb:Attributes`, `dynamodb:LeadingKeys` and
+    /// `aws:TagKeys` as multivalued; all other keys are single-valued, except
+    /// that `AssumeRoleContext` also reports `aws:TagKeys` as multivalued.
     fn is_multivalued_key(&self, key: &str) -> bool;
 }
 ```
 
 **Condition-key arity (single-valued vs multivalued).** AWS classifies each
 condition key as single-valued or multivalued (`ArrayOfString`) in the service
-authorization reference. For DynamoDB, `dynamodb:Attributes` and
-`dynamodb:LeadingKeys` are multivalued; everything else extenddb resolves
-(`dynamodb:Select`, `dynamodb:ReturnValues`, tag keys, etc.) is single-valued.
+authorization reference. For DynamoDB, `dynamodb:Attributes`,
+`dynamodb:LeadingKeys` and `aws:TagKeys` are multivalued; everything else
+extenddb resolves (`dynamodb:Select`, `dynamodb:ReturnValues`,
+`aws:RequestTag/<key>`, etc.) is single-valued.
 A **bare** operator (one without a `ForAllValues:`/`ForAnyValue:` qualifier)
 applied to a multivalued key **never matches** — verified against real AWS IAM
 (BR-7085), and independent of how many values are present. Only the set-operator
