@@ -1,0 +1,7 @@
+CREATE INDEX "_ddb_I:seed_tbl/gsi1_base_key_idx" ON public."_ddb_I:seed_tbl/gsi1" USING btree (base_pk, base_sk_s) valid=true
+CREATE INDEX "_ddb_I:seed_tbl/lsi1_base_key_idx" ON public."_ddb_I:seed_tbl/lsi1" USING btree (base_pk, base_sk_s) valid=true
+notes:
+going index going_gsi: skipped, the table is being deleted
+lost index lost_gsi: skipped, its index table _ddb_I:lost/lost_gsi does not exist
+seed_tbl index gsi1: built _ddb_I:seed_tbl/gsi1_base_key_idx on (base_pk, base_sk_s)
+seed_tbl index lsi1: built _ddb_I:seed_tbl/lsi1_base_key_idx on (base_pk, base_sk_s)

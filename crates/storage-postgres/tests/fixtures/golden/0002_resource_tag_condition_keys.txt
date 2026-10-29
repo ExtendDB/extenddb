@@ -1,0 +1,15 @@
+boundary role r1: {"Version": "2012-10-17", "Statement": [{"Action": "dynamodb:*", "Effect": "Deny", "Resource": "*", "Condition": {"StringEquals": {"aws:ResourceTag/env": "prod"}}}]}
+boundary user tester: {"Version": "2012-10-17", "Statement": [{"Action": "dynamodb:*", "Effect": "Deny", "Resource": "*", "Condition": {"StringEquals": {"aws:ResourceTag/env": "prod"}}}]}
+policy group g1 gp: {"Version": "2012-10-17", "Statement": [{"Action": "dynamodb:*", "Effect": "Deny", "Resource": "*", "Condition": {"StringEquals": {"aws:ResourceTag/env": "prod"}}}]}
+policy role r1 rp: {"Version": "2012-10-17", "Statement": [{"Action": "dynamodb:*", "Effect": "Deny", "Resource": "*", "Condition": {"StringEquals": {"aws:ResourceTag/env": "prod"}}}]}
+policy user tester SelfServicePolicy: {"Version": "2012-10-17", "Statement": [{"Action": "dynamodb:*", "Effect": "Deny", "Resource": "*", "Condition": {"StringEquals": {"aws:ResourceTag/env": "prod"}}}]}
+policy user tester ddb: {"Version": "2012-10-17", "Statement": [{"Action": "dynamodb:*", "Effect": "Deny", "Resource": "*", "Condition": {"StringEquals": {"aws:ResourceTag/env": "prod"}}}]}
+session tok: {"Version": "2012-10-17", "Statement": [{"Action": "dynamodb:*", "Effect": "Deny", "Resource": "*", "Condition": {"StringEquals": {"aws:ResourceTag/env": "prod"}}}]}
+notes:
+rewrote account 123456789012 assumed-role/r1/s policy <session-policy> (1 key(s))
+rewrote account 123456789012 group/g1 policy gp (1 key(s))
+rewrote account 123456789012 role/r1 policy <permissions-boundary> (1 key(s))
+rewrote account 123456789012 role/r1 policy rp (1 key(s))
+rewrote account 123456789012 user/tester policy <permissions-boundary> (1 key(s))
+rewrote account 123456789012 user/tester policy SelfServicePolicy (1 key(s))
+rewrote account 123456789012 user/tester policy ddb (1 key(s))

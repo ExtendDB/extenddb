@@ -1,31 +1,43 @@
+// Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 //! `extenddb migrate` on a deployment whose data database is not named
 //! `<catalog-db>` minus `_catalog`.
 //!
 //! `init` records the data database name in the catalog's settings
-//! (`data_database_name`). The bootstrapper built from a config file and the
-//! `migrate` argument vector (no `--data-db`) must use that name, so the data
-//! migrations are checked and applied on the real data database; the
-//! derivation is only the fallback for a catalog with no recorded name, and
-//! an explicit `--data-db` wins over both.
+//! (`data_database_name`). The target the commands resolve from the catalog's
+//! connection string must use that name, so the status and the runner read
+//! and write the real data database; the derivation is only the fallback for
+//! a catalog with no recorded name, and an explicit `--data-db` wins over
+//! both.
 //!
 //! Requires `EXTENDDB_TEST_PG_CONNECTION_STRING` (a base URL
 //! `postgres://user:pass@host:port`, no database); without it every test
-//! reports a skip and passes. Each test creates its own databases and config
-//! file and removes them when its deployment is dropped, on a panic too. The
-//! config file carries the application password, as the one `init` writes
-//! does: the bootstrapper reads the catalog connection string from a file
-//! only and connects to the catalog with that password, so the file is
-//! written owner-readable and removed with the deployment.
+//! reports a skip and passes. Each test creates its own databases and removes
+//! them when its deployment is dropped, on a panic too.
 
 use extenddb_storage::bootstrapper::{BootstrapConfig, Bootstrapper};
+use extenddb_storage::migrations::{CatalogMigrations, CatalogStatus, Target};
 use extenddb_storage_postgres::PostgresBootstrapper;
+use extenddb_storage_postgres::migrations::{PostgresCatalogMigrations, resolve};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 
 fn base_conn() -> Option<String> {
     let conn = std::env::var("EXTENDDB_TEST_PG_CONNECTION_STRING").ok()?;
     (!conn.trim().is_empty()).then(|| conn.trim_end_matches('/').to_owned())
+}
+
+/// Report a skip, or fail when `EXTENDDB_TEST_PG_REQUIRED` says this job must
+/// run the PostgreSQL tests.
+fn skip_unless_required() {
+    let required =
+        std::env::var("EXTENDDB_TEST_PG_REQUIRED").is_ok_and(|v| !v.is_empty() && v != "0");
+    assert!(
+        !required,
+        "EXTENDDB_TEST_PG_CONNECTION_STRING is not set, and EXTENDDB_TEST_PG_REQUIRED says this \
+         job must run the PostgreSQL tests"
+    );
+    eprintln!("skipped: EXTENDDB_TEST_PG_CONNECTION_STRING not set");
 }
 
 struct Parts {
@@ -51,22 +63,6 @@ fn parts(base: &str) -> Parts {
     }
 }
 
-/// Write `contents` to a new file only its owner can read.
-fn write_private(path: &std::path::Path, contents: &str) {
-    use std::io::Write;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options
-        .open(path)
-        .and_then(|mut f| f.write_all(contents.as_bytes()))
-        .expect("config file");
-}
-
 /// A deployment initialised the way `init --catalog-db <c> --data-db <d>`
 /// does it, with a data database name unrelated to the catalog's. Dropping
 /// it drops its three databases and its config file.
@@ -76,12 +72,10 @@ struct Deployment {
     catalog_db: String,
     data_db: String,
     derived_db: String,
-    config_path: std::path::PathBuf,
 }
 
 impl Drop for Deployment {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.config_path);
         // Runs on a panic too, so it cannot await on the test's runtime: a
         // thread of its own with its own runtime and connection.
         let base = self.base.clone();
@@ -145,99 +139,65 @@ impl Deployment {
             .expect("connect");
         init.create_catalog_db().await.expect("catalog db");
         init.create_data_db().await.expect("data db");
-        init.run_catalog_migrations()
-            .await
-            .expect("catalog migrations");
+        let catalog: sqlx::postgres::PgConnectOptions =
+            format!("{base}/{catalog_db}").parse().expect("catalog URL");
+        extenddb_storage_postgres::migrations::migrate(
+            &extenddb_storage_postgres::migrations::PostgresTarget::new(catalog, data_db.clone()),
+            "test",
+            std::time::Duration::ZERO,
+        )
+        .await
+        .expect("catalog migrations");
         init.record_data_connection().await.expect("record");
-        init.run_data_migrations().await.expect("data migrations");
-        // The config file `migrate` reads: the catalog connection string only,
-        // as `init` writes it. Owner-readable, removed when `self` drops.
-        let target = std::env::var_os("CARGO_TARGET_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target")
-            });
-        let config_path = target.join(format!("{stem}.toml"));
-        write_private(
-            &config_path,
-            &format!(
-                "[storage]\nbackend = \"postgres\"\n\n[storage.postgres]\nconnection_string = \
-                 \"postgres://{}:{}@{}:{}/{catalog_db}\"\n",
-                p.user, p.pass, p.host, p.port
-            ),
-        );
         Self {
             base,
             admin,
             catalog_db,
             data_db,
             derived_db: stem,
-            config_path,
         }
     }
 
-    /// The argument vector `extenddb migrate` hands the bootstrapper.
-    fn migrate_args(&self, extra: &[&str]) -> Vec<String> {
-        let p = parts(&self.base);
-        let mut args = vec![
-            "extenddb".to_owned(),
-            "migrate".to_owned(),
-            "--config".to_owned(),
-            self.config_path.display().to_string(),
-            "--pg-user".to_owned(),
-            p.user,
-            "--pg-pass".to_owned(),
-            p.pass,
-        ];
-        args.extend(extra.iter().map(|s| (*s).to_owned()));
-        args
+    /// The catalog's connection string, as the config file `init` writes
+    /// gives it.
+    fn catalog_url(&self) -> String {
+        format!("{}/{}", self.base, self.catalog_db)
     }
 
-    async fn bootstrapper(&self, extra: &[&str]) -> PostgresBootstrapper {
-        PostgresBootstrapper::from_config(
-            self.config_path.to_str().expect("UTF-8 path"),
-            &self.migrate_args(extra),
-        )
-        .await
-        .expect("from_config")
+    /// The target `extenddb migrate` builds, with `data_db` as its
+    /// `--data-db`.
+    fn target(&self, data_db: Option<&str>) -> Target {
+        Target {
+            data_store: data_db.map(str::to_owned),
+            ..Target::at(self.catalog_url())
+        }
     }
 }
 
-/// Without `--data-db`, the bootstrapper `migrate` builds reaches the data
-/// database `init` recorded: `pending_data_migrations` reads that database's
-/// ledger (and finds it current) instead of failing on the derived name, and
-/// `migrate`'s one write to the data database, `run_data_migrations`, lands
-/// there. The derived database is never created.
+/// Without `--data-db`, the commands' target is the data database `init`
+/// recorded: the status reads that database's ledger (and finds it current)
+/// instead of failing on the derived name, which is never created. An
+/// explicit `--data-db` wins over the recorded name.
 #[tokio::test]
 async fn migrate_uses_the_data_database_name_init_recorded() {
     let Some(_) = base_conn() else {
-        eprintln!("skipped: EXTENDDB_TEST_PG_CONNECTION_STRING not set");
+        skip_unless_required();
         return;
     };
     let d = Deployment::new().await;
-    let stored: String =
-        sqlx::query_scalar("SELECT value FROM settings WHERE key = 'data_database_name'")
-            .fetch_one(
-                &PgPoolOptions::new()
-                    .max_connections(1)
-                    .connect(&format!("{}/{}", d.base, d.catalog_db))
-                    .await
-                    .expect("catalog"),
-            )
-            .await
-            .expect("recorded name");
-    assert_eq!(stored, d.data_db, "init records the data database name");
-
-    let migrate = d.bootstrapper(&[]).await;
-    let pending = migrate
-        .pending_data_migrations()
+    let resolved = resolve(&d.target(None))
         .await
-        .expect("pending data migrations on the recorded data database");
-    assert!(pending.is_empty(), "{pending:?}");
-    migrate
-        .run_data_migrations()
+        .expect("resolve")
+        .expect("the catalog database exists");
+    assert_eq!(resolved.data_database, d.data_db);
+    let status = PostgresCatalogMigrations
+        .status(&d.target(None))
         .await
-        .expect("data migrations");
+        .expect("status on the recorded data database");
+    assert!(
+        matches!(status, CatalogStatus::Current { .. }),
+        "{status:?}"
+    );
     let derived_exists: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)")
             .bind(&d.derived_db)
@@ -250,15 +210,32 @@ async fn migrate_uses_the_data_database_name_init_recorded() {
         d.derived_db
     );
 
-    // An explicit --data-db wins over the recorded name.
-    let explicit = d.bootstrapper(&["--data-db", &d.derived_db]).await;
-    let err = explicit
-        .pending_data_migrations()
+    let explicit = d.target(Some(&d.derived_db));
+    let err = PostgresCatalogMigrations
+        .status(&explicit)
         .await
         .expect_err("the derived database does not exist");
     assert!(
-        format!("{err:?}").contains(&d.derived_db),
-        "the error names the explicit database: {err:?}"
+        err.to_string().contains(&d.derived_db),
+        "the error names the explicit database: {err}"
+    );
+    // Once it exists, the explicit name wins over the database the catalog's
+    // connection string row names, on that row's server: the status reads
+    // its empty ledger instead of refusing the two names.
+    sqlx::query(&format!("CREATE DATABASE \"{}\"", d.derived_db))
+        .execute(&d.admin)
+        .await
+        .expect("create the derived database");
+    let status = PostgresCatalogMigrations.status(&explicit).await;
+    let _ = sqlx::query(&format!(
+        "DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)",
+        d.derived_db
+    ))
+    .execute(&d.admin)
+    .await;
+    assert!(
+        matches!(status, Ok(CatalogStatus::Behind { .. })),
+        "{status:?}"
     );
     drop(d);
 }
@@ -267,27 +244,32 @@ async fn migrate_uses_the_data_database_name_init_recorded() {
 #[tokio::test]
 async fn a_catalog_without_a_recorded_name_falls_back_to_the_derivation() {
     let Some(_) = base_conn() else {
-        eprintln!("skipped: EXTENDDB_TEST_PG_CONNECTION_STRING not set");
+        skip_unless_required();
         return;
     };
     let d = Deployment::new().await;
     let catalog = PgPoolOptions::new()
         .max_connections(1)
-        .connect(&format!("{}/{}", d.base, d.catalog_db))
+        .connect(&d.catalog_url())
         .await
         .expect("catalog");
     sqlx::query("DELETE FROM settings WHERE key = 'data_database_name'")
         .execute(&catalog)
         .await
         .expect("forget the name");
-    let migrate = d.bootstrapper(&[]).await;
-    let err = migrate
-        .pending_data_migrations()
+    catalog.close().await;
+    let resolved = resolve(&d.target(None))
+        .await
+        .expect("resolve")
+        .expect("the catalog database exists");
+    assert_eq!(resolved.data_database, d.derived_db);
+    let err = PostgresCatalogMigrations
+        .status(&d.target(None))
         .await
         .expect_err("the derived database does not exist");
     assert!(
-        format!("{err:?}").contains(&d.derived_db),
-        "the fallback is the derived name: {err:?}"
+        err.to_string().contains(&d.derived_db),
+        "the fallback is the derived name: {err}"
     );
     drop(d);
 }

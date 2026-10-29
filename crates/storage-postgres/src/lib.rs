@@ -21,7 +21,7 @@ mod delete_table;
 pub(crate) mod gsi_queue;
 mod management_store;
 mod metadata_engine;
-mod migrations;
+pub mod migrations;
 mod operations;
 mod pg_util;
 mod stream_engine;
@@ -146,23 +146,15 @@ pub fn backend() -> extenddb_storage::Backend {
             })
         },
         server_components: server_components_factory,
-        // Migrates through its bootstrapper until it moves onto the runner.
-        catalog_migrations: None,
+        catalog_migrations: Some(&migrations::PostgresCatalogMigrations),
     }
 }
 
 use std::sync::Arc;
 
-use extenddb_core::version::CatalogVersion;
 use extenddb_storage::error::StorageError;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
-
-/// Expected catalog version — compiled into the binary (REQ-CAT-006, D-9).
-///
-/// The tuple is the single source of truth. Use `CATALOG_VERSION.to_string()`
-/// wherever a string representation is needed.
-pub const CATALOG_VERSION: CatalogVersion = CatalogVersion::new(0, 0, 4);
 
 /// Minimum number of connections allowed per pool.
 ///
@@ -195,12 +187,18 @@ pub struct PostgresConfig {
 /// on the write path and the background refresh worker.
 pub(crate) const DEFAULT_INDEX_PROPAGATION_DELAY_MS: u64 = 10;
 
+/// Control-plane delay (seconds) when the `control_plane_delay_seconds`
+/// setting is absent: how long CreateTable and DeleteTable keep a table
+/// CREATING or DELETING. CreateTable, DeleteTable, the control-plane worker
+/// and the console's default all read it.
+pub const DEFAULT_CONTROL_PLANE_DELAY_SECONDS: f64 = 0.25;
+
 /// Read the propagation-delay setting, preferring the canonical key and falling back
 /// to the pre-rename one.
 ///
 /// A catalog created before the rename holds the operator's value under the old name,
-/// and the server refuses to start on a catalog-version mismatch rather than migrating,
-/// so no upgrade step ever rewrites that row. Reading past it would silently reset a
+/// and no catalog migration rewrites that row yet, though one could. Reading past it
+/// would silently reset a
 /// configured delay to the default; since 0 means synchronous, the silent change would
 /// be from strict to eventually consistent. `ORDER BY ... DESC` makes the preference
 /// deterministic when both rows exist.
@@ -250,6 +248,9 @@ pub struct PostgresEngine {
     /// Restores each account may run at once in this process; see
     /// `backup_engine::RestoreAccountSlots`.
     pub(crate) restore_account_slots: backup_engine::RestoreAccountSlots,
+    /// The serving registration a server holds for its life, so `migrate
+    /// --yes` refuses while it serves. `None` outside a server.
+    pub(crate) serving: Option<Arc<migrations::ServingRegistration>>,
 }
 
 impl PostgresEngine {
@@ -339,6 +340,7 @@ impl PostgresEngine {
             restore_server_slots: Arc::new(tokio::sync::Semaphore::new(server_slots)),
             restore_server_slot_count: server_slots,
             restore_account_slots: backup_engine::RestoreAccountSlots::default(),
+            serving: None,
         })
     }
 
@@ -404,110 +406,6 @@ impl PostgresEngine {
             ));
         }
         Ok(())
-    }
-
-    /// Validate catalog version matches the compiled-in expectation (REQ-CAT-007, D-10).
-    ///
-    /// Reads the version string from the `settings` table and parses it
-    /// strictly into a `CatalogVersion`. Rejects malformed strings.
-    ///
-    /// # Errors
-    ///
-    /// Returns `StorageError::CatalogNotInitialized` if the catalog tables don't exist.
-    /// Returns `StorageError::CatalogVersionMismatch` if the version doesn't match.
-    /// Returns `StorageError::Internal` if the stored version string is malformed, carrying
-    /// `check_stored_catalog_version`'s refusal text.
-    pub async fn check_catalog_version(&self) -> Result<(), StorageError> {
-        // Check table existence via information_schema (robust, not string-matching).
-        let exists: (bool,) = sqlx::query_as(
-            "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name = 'settings' AND table_schema = 'public')",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| StorageError::Connection(e.to_string()))?;
-
-        if !exists.0 {
-            return Err(StorageError::CatalogNotInitialized);
-        }
-
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT value FROM settings WHERE key = 'catalog_version'")
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| StorageError::Connection(e.to_string()))?;
-
-        let found_str = row.ok_or(StorageError::CatalogNotInitialized)?.0;
-
-        // An unreadable version gets the shared guard's refusal, the text
-        // `extenddb migrate` prints for the same catalog.
-        let found = found_str.parse::<CatalogVersion>().map_err(|e| {
-            StorageError::Internal(
-                extenddb_storage::util::check_stored_catalog_version(
-                    Some(&found_str),
-                    CATALOG_VERSION,
-                )
-                .err()
-                .unwrap_or_else(|| e.to_string()),
-            )
-        })?;
-
-        if found != CATALOG_VERSION {
-            return Err(StorageError::CatalogVersionMismatch {
-                expected: CATALOG_VERSION.to_string(),
-                found: found_str,
-            });
-        }
-
-        Ok(())
-    }
-
-    /// Everything `serve` checks and changes in the catalog before serving,
-    /// in order; returns the shape steps applied.
-    ///
-    /// 1. The version gate ([`Self::check_catalog_version`]).
-    /// 2. The ledger: a catalog migration file this binary carries that the
-    ///    catalog's `schema_history` does not record refuses startup, naming
-    ///    the files. The version alone does not show it: another migration of
-    ///    the same number (another branch's `003_*`) can have stamped the
-    ///    current version. Every catalog has a ledger (`001_schema.sql`
-    ///    creates it and the runner records each file it applies), so a
-    ///    catalog that ran every file lists none here.
-    /// 3. The startup shape steps (`migrations::converge_catalog_shapes_at_serve`):
-    ///    a catalog stamped with the current version by an earlier revision of
-    ///    a migration file is otherwise served in a shape on which every
-    ///    DescribeTable fails. Each step waits at most
-    ///    `migrations::SERVE_SHAPE_LOCK_TIMEOUT_SECS` for its lock. On a
-    ///    current catalog this only reads `information_schema`.
-    ///
-    /// # Errors
-    ///
-    /// `BackendError::CatalogVersionMismatch` from the gate;
-    /// `BackendError::InitializationFailed` for every other failure, with
-    /// the advice to run `extenddb migrate --yes` for steps 2 and 3.
-    pub async fn prepare_catalog_for_serve(&self) -> Result<Vec<String>, BackendError> {
-        self.check_catalog_version().await.map_err(|e| match e {
-            StorageError::CatalogVersionMismatch { expected, found } => {
-                BackendError::CatalogVersionMismatch { expected, found }
-            }
-            // The unreadable-version refusal: printed as is, not as
-            // "Internal error: ...".
-            StorageError::Internal(refusal) => BackendError::InitializationFailed(refusal),
-            _ => BackendError::InitializationFailed(e.to_string()),
-        })?;
-        let migrate =
-            "; stop the servers and run `extenddb migrate --yes` with the admin credentials";
-        let unrecorded = migrations::pending_catalog_migrations(&self.pool)
-            .await
-            .map_err(|e| BackendError::InitializationFailed(format!("{}{migrate}", op_msg(e))))?;
-        if !unrecorded.is_empty() {
-            return Err(BackendError::InitializationFailed(format!(
-                "the catalog does not record these catalog migration files as applied: {}{migrate}",
-                unrecorded.join(", ")
-            )));
-        }
-        migrations::converge_catalog_shapes_at_serve(&self.pool)
-            .await
-            .map_err(|e| BackendError::InitializationFailed(format!("{}{migrate}", op_msg(e))))
     }
 
     /// Query the data database name from the catalog for the startup banner (REQ-LOG-001).
@@ -617,20 +515,8 @@ impl PostgresEngine {
 
 use extenddb_auth::CredentialStore;
 use extenddb_storage::hooks::{ServerRuntimeHooks, WorkerContext};
+use extenddb_storage::migrations::{CatalogStatus, MigrationError, Target};
 use extenddb_storage::server_components::{BackendError, ServerComponents};
-
-/// The message of a management-store error, without its variant name.
-fn op_msg(e: extenddb_storage::management_store::OpError) -> String {
-    use extenddb_storage::management_store::OpError;
-    match e {
-        OpError::Validation(m)
-        | OpError::AlreadyExists(m)
-        | OpError::NotFound(m)
-        | OpError::HasDependents(m)
-        | OpError::Internal(m)
-        | OpError::Database { message: m, .. } => m,
-    }
-}
 
 /// Backend-specific runtime hooks for `PostgreSQL`.
 struct PostgresRuntimeHooks {
@@ -725,7 +611,7 @@ impl ServerRuntimeHooks for PostgresRuntimeHooks {
             workers::poll_gsi_delay(catalog_store_for_gsi, gsi_delay, token).await;
         });
 
-        vec![
+        let mut handles = vec![
             control_plane,
             table_size,
             stream_cleanup,
@@ -735,11 +621,87 @@ impl ServerRuntimeHooks for PostgresRuntimeHooks {
             gsi_builds,
             pool_metrics,
             gsi_poller,
-        ]
+        ];
+        if let Some(registration) = &self.engine.serving {
+            handles.push(tokio::spawn(stop_when_registration_lost(
+                registration.lost(),
+                ctx.shutdown.clone(),
+            )));
+        }
+        handles
     }
 
     fn backend_info(&self) -> Option<String> {
         Some(format!("data_db={}", self.data_db_name))
+    }
+}
+
+/// End the process with exit status 1 once the serving registration's
+/// connection is lost: the database has then freed the registration, and a
+/// migration could start under this server.
+async fn stop_when_registration_lost(
+    mut lost: tokio::sync::watch::Receiver<Option<String>>,
+    shutdown: extenddb_storage::hooks::CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => return,
+            changed = lost.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                let reason = lost.borrow().clone();
+                if let Some(reason) = reason {
+                    let message = format!(
+                        "extenddb fatal: {reason}; the server stops, because a migration can \
+                         start on the catalog once the serving registration is gone"
+                    );
+                    tracing::error!("{message}");
+                    eprintln!("{message}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+}
+
+/// Register as the catalog's server and read its status, before anything
+/// opens the engine: a server that refuses has written nothing. The
+/// registration is taken before the status is read, so a migration that
+/// starts in between waits for this server or makes it refuse.
+async fn register_and_check(
+    connection_string: &str,
+) -> Result<migrations::ServingRegistration, MigrationError> {
+    let target = Target::at(connection_string);
+    let Some(target) = migrations::resolve(&target).await? else {
+        return Err(MigrationError::Status(CatalogStatus::Uninitialized));
+    };
+    let registration = migrations::ServingRegistration::register(&target.catalog).await?;
+    let status = match migrations::catalog_status(&target).await {
+        Ok(status) => status,
+        Err(e) => {
+            registration.release().await;
+            return Err(e);
+        }
+    };
+    match status {
+        CatalogStatus::Current { .. } | CatalogStatus::AheadCompatible { .. } => {
+            if let Err(e) = migrations::require_data_connection_row(&target).await {
+                registration.release().await;
+                return Err(e);
+            }
+            if matches!(status, CatalogStatus::AheadCompatible { .. }) {
+                tracing::warn!(
+                    "{status}; serving it, because a binary may serve migrations it does not \
+                     know when every one of them is additive"
+                );
+            }
+            Ok(registration)
+        }
+        status => {
+            registration.release().await;
+            Err(MigrationError::Status(status))
+        }
     }
 }
 
@@ -759,6 +721,10 @@ fn server_components_factory(
     let max_catalog_connections = config.max_catalog_connections();
     let region = region.to_string();
     Box::pin(async move {
+        let registration = register_and_check(&connection_string)
+            .await
+            .map_err(BackendError::Catalog)?;
+
         // Build PostgresConfig from extracted values
         let pg_config = PostgresConfig {
             connection_string: connection_string.clone(),
@@ -767,17 +733,13 @@ fn server_components_factory(
         };
 
         // Create PostgresEngine
-        let engine = PostgresEngine::new(&pg_config, &region)
+        let mut engine = PostgresEngine::new(&pg_config, &region)
             .await
             .map_err(|e| BackendError::ConnectionFailed {
                 backend: "postgres".to_string(),
                 details: e.to_string(),
             })?;
-
-        // Version gate, unrecorded migration files, startup shape steps.
-        for step in engine.prepare_catalog_for_serve().await? {
-            tracing::warn!("converged the catalog shape at startup: {step}");
-        }
+        engine.serving = Some(Arc::new(registration));
 
         // Rebuild any vector index a crash left CREATING, before serving: an index
         // in that state is not searchable, and nothing else will repair it.

@@ -1690,6 +1690,9 @@ dependencies = [
  "extenddb-storage-mongodb",
  "extenddb-storage-postgres",
  "extenddb-storage-sqlite",
+ "sqlx",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -1956,6 +1959,7 @@ dependencies = [
  "extenddb-auth",
  "extenddb-core",
  "extenddb-storage",
+ "extenddb-storage-postgres",
  "futures",
  "libc",
  "pgvector",

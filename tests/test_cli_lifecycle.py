@@ -54,11 +54,11 @@ class TestCliLifecycle:
         assert os.path.isfile(os.path.join(cli_env["tls_dir"], "key.pem"))
 
     def test_data_migrations_tracked(self, cli_env):
-        """init records every data migration in the data DB's schema_history.
+        """init writes the legacy data ledger rows in the data DB's schema_history.
 
-        Validates the data-migration registry: migrations are tracked (so
-        `extenddb migrate` knows what is pending and never re-runs an applied
-        one), and the GSI-pending migration is among them.
+        Migration 1 records every legacy data migration file and the legacy
+        code migration there, so a release before 1.0 started against this
+        catalog finds nothing to replay.
         """
         import psycopg2
 
@@ -81,24 +81,19 @@ class TestCliLifecycle:
 
         assert "001_data_schema.sql" in tracked, tracked
         assert "002_gsi_pending.sql" in tracked, tracked
-        # Programmatic (code) migration for the GSI base-key index is tracked in
-        # the same ledger, so `migrate` treats it exactly like a SQL migration.
+        # The legacy code migration's row: v0.1.14 runs it whenever the name is
+        # missing.
         assert "003_gsi_base_key_index" in tracked, tracked
 
-    def test_migrate_applies_pending_data_migration(self, cli_env):
-        """`extenddb migrate` applies a pending *data* migration on an existing
-        deployment — not just catalog migrations.
+    def test_migrate_applies_a_migration_pending_in_the_data_database(self, cli_env):
+        """`extenddb migrate` applies a migration whose catalog body is recorded
+        and whose data body is not.
 
-        Regression: data migrations live in the data database's own
-        `schema_history`, independent of the catalog version. `migrate`
-        previously only ran catalog migrations and returned "up to date" when
-        the catalog version matched, so a release that only added a data
-        migration (e.g. `002_gsi_pending.sql`) was never applied on upgrade —
-        the `gsi_pending` table was missing and every async-GSI write failed.
-
-        Simulates a pre-002 deployment by dropping `gsi_pending` and its
-        ledger row, then asserts `migrate` re-applies it (and refuses without
-        `--yes`).
+        Each database has its own ledger, and a migration counts as applied only
+        when every database it touches records it. Simulates a deployment whose
+        data database lost migration 1 (its `gsi_pending` table and its ledger
+        row), then asserts the preview reports it, changes nothing, and that
+        `migrate --yes` applies it.
         """
         import psycopg2
 
@@ -114,47 +109,43 @@ class TestCliLifecycle:
         def _data_conn():
             return psycopg2.connect(PG_ADMIN_CONN + "/" + data_db)
 
-        # Simulate a deployment created before 002 existed.
         conn = _data_conn()
         try:
             conn.autocommit = True
             with conn.cursor() as cur:
                 cur.execute("DROP TABLE IF EXISTS gsi_pending")
-                cur.execute(
-                    "DELETE FROM schema_history WHERE filename = '002_gsi_pending.sql'"
-                )
+                cur.execute("DELETE FROM extenddb_migrations WHERE id = 1")
                 cur.execute("SELECT to_regclass('public.gsi_pending') IS NOT NULL")
                 assert cur.fetchone()[0] is False
         finally:
             conn.close()
 
-        # Without --yes, migrate must refuse while a data migration is pending.
-        refused = _run_extenddb(
+        # Without --yes, migrate reports the pending body and exits 3.
+        pending = _run_extenddb(
             "migrate", *_pg_args(),
             config=cli_env["config_path"],
             check=False,
         )
-        assert refused.returncode != 0, refused.stdout + refused.stderr
+        assert pending.returncode == 3, pending.stdout + pending.stderr
+        assert "1 baseline (data, breaking)" in pending.stdout, pending.stdout
 
-        # With --yes, migrate applies the pending data migration.
+        # With --yes, migrate applies it in the data database.
         applied = _run_extenddb(
             "migrate", "--yes", *_pg_args(),
             config=cli_env["config_path"],
             check=False,
         )
         assert applied.returncode == 0, applied.stdout + applied.stderr
+        assert "Applied 1 baseline" in applied.stdout, applied.stdout
 
         conn = _data_conn()
         try:
             with conn.cursor() as cur:
                 cur.execute("SELECT to_regclass('public.gsi_pending') IS NOT NULL")
                 assert cur.fetchone()[0] is True
-                cur.execute(
-                    "SELECT EXISTS(SELECT 1 FROM schema_history "
-                    "WHERE filename = '002_gsi_pending.sql')"
-                )
-                assert cur.fetchone()[0] is True
-                # The 002 schema must carry the per-index queue columns.
+                cur.execute("SELECT count(*) FROM extenddb_migrations WHERE id = 1")
+                assert cur.fetchone()[0] == 1
+                # The per-index queue columns.
                 cur.execute(
                     "SELECT column_name FROM information_schema.columns "
                     "WHERE table_name = 'gsi_pending'"
@@ -164,20 +155,18 @@ class TestCliLifecycle:
         finally:
             conn.close()
 
-    def test_migrate_applies_base_key_index_code_migration(self, cli_env):
-        """`extenddb migrate` applies the programmatic GSI base-key-index
-        migration (`003_gsi_base_key_index`) and never re-runs it.
+    def test_migrate_applies_the_base_key_index_migration(self, cli_env):
+        """`extenddb migrate` applies migration 4 (`index_table_base_key`), the
+        code body that gives every index table its base key index, and does not
+        run it again once recorded.
 
-        The base-key index makes GSI-propagation deletes (`WHERE base_pk = $1
+        The base key index makes GSI propagation deletes (`WHERE base_pk = $1
         AND base_sk_* = $2`) index scans instead of sequential scans. New tables
-        get it at creation time; this migration adds it to tables created before
-        the index existed. It is a *code* migration (it enumerates the
-        dynamically-named `_ddb_*` tables and uses `CREATE INDEX CONCURRENTLY`),
-        so this verifies it is wired into the same pending/apply/tracking flow as
-        the SQL migrations: pending is detected, `migrate` refuses without
-        `--yes`, applies with `--yes`, records the ledger row, and is idempotent
-        on a second run. (Index derivation itself is the same logic exercised at
-        table-creation time across the GSI integration suite.)
+        get it at creation; migration 4 adds it to tables created before the
+        index existed, building it with `CREATE INDEX CONCURRENTLY` outside a
+        transaction. This checks it goes through the same pending, apply and
+        ledger flow as the other migrations: reported as pending, applied with
+        `--yes`, recorded, and up to date on a second run.
         """
         import psycopg2
 
@@ -193,53 +182,40 @@ class TestCliLifecycle:
         def _data_conn():
             return psycopg2.connect(PG_ADMIN_CONN + "/" + data_db)
 
-        # Simulate a deployment created before 003 existed: drop only its ledger
-        # row so `migrate` sees the code migration as pending again.
+        # Remove only the data database's ledger row for migration 4.
         conn = _data_conn()
         try:
             conn.autocommit = True
             with conn.cursor() as cur:
-                cur.execute(
-                    "DELETE FROM schema_history "
-                    "WHERE filename = '003_gsi_base_key_index'"
-                )
-                cur.execute(
-                    "SELECT EXISTS(SELECT 1 FROM schema_history "
-                    "WHERE filename = '003_gsi_base_key_index')"
-                )
-                assert cur.fetchone()[0] is False
+                cur.execute("DELETE FROM extenddb_migrations WHERE id = 4")
         finally:
             conn.close()
 
-        # Without --yes, migrate must refuse while the code migration is pending.
-        refused = _run_extenddb(
+        pending = _run_extenddb(
             "migrate", *_pg_args(),
             config=cli_env["config_path"],
             check=False,
         )
-        assert refused.returncode != 0, refused.stdout + refused.stderr
-        assert "003_gsi_base_key_index" in (refused.stdout + refused.stderr)
+        assert pending.returncode == 3, pending.stdout + pending.stderr
+        assert "4 index_table_base_key (data, breaking)" in pending.stdout, pending.stdout
 
-        # With --yes, migrate applies and records the code migration.
         applied = _run_extenddb(
             "migrate", "--yes", *_pg_args(),
             config=cli_env["config_path"],
             check=False,
         )
         assert applied.returncode == 0, applied.stdout + applied.stderr
+        assert "Applied 4 index_table_base_key" in applied.stdout, applied.stdout
 
         conn = _data_conn()
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT EXISTS(SELECT 1 FROM schema_history "
-                    "WHERE filename = '003_gsi_base_key_index')"
-                )
-                assert cur.fetchone()[0] is True
+                cur.execute("SELECT count(*) FROM extenddb_migrations WHERE id = 4")
+                assert cur.fetchone()[0] == 1
         finally:
             conn.close()
 
-        # Idempotent: a second migrate finds nothing pending.
+        # A second migrate finds nothing pending.
         again = _run_extenddb(
             "migrate", "--yes", *_pg_args(),
             config=cli_env["config_path"],

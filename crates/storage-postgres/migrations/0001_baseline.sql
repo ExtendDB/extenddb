@@ -1,11 +1,26 @@
 -- Copyright 2026 ExtendDB contributors
 -- SPDX-License-Identifier: Apache-2.0
--- Consolidated catalog schema for extenddb (catalog version 0.0.2).
--- This is the complete schema applied on fresh installs.
+--
+-- Migration 1, baseline, PostgreSQL catalog database.
+--
+-- Creates the v1.0 catalog schema on an empty database and brings a catalog
+-- created by any released version to the same schema. It is the legacy
+-- catalog files 001, 002 and 003 in order, with every statement safe to run
+-- on a catalog that already has some or all of their objects:
+--
+-- * every CREATE uses IF NOT EXISTS, and the index names are 001's own, so a
+--   release that replays 001 against this catalog stops at its first index
+--   before it changes anything;
+-- * the three `tables` columns added to 001 after it shipped are added with
+--   ADD COLUMN IF NOT EXISTS, for catalogs created by v0.1.0 and v0.1.1;
+-- * the shape steps earlier builds ran from `migrate` and `serve` are here;
+-- * the stream sequence is set forward only, never below its current value.
+--
+-- No settings row is seeded: every one has an equal default in code. The
+-- runner writes the version and runs this file and its ledger row in one
+-- transaction, so the file has no transaction statements of its own.
 
-BEGIN;
-
--- Accounts — multi-account support (REQ-AUTH-005).
+-- Accounts.
 CREATE TABLE IF NOT EXISTS accounts (
     account_id TEXT PRIMARY KEY,
     account_name TEXT NOT NULL UNIQUE,
@@ -39,7 +54,13 @@ CREATE TABLE IF NOT EXISTS tables (
     CONSTRAINT tables_table_id_unique UNIQUE (table_id)
 );
 
-CREATE INDEX idx_tables_pending_transition
+-- Catalogs created by v0.1.0 and v0.1.1 lack these three columns, which
+-- CreateTable and DescribeTable name.
+ALTER TABLE tables ADD COLUMN IF NOT EXISTS table_class TEXT;
+ALTER TABLE tables ADD COLUMN IF NOT EXISTS sse_specification JSONB;
+ALTER TABLE tables ADD COLUMN IF NOT EXISTS on_demand_throughput JSONB;
+
+CREATE INDEX IF NOT EXISTS idx_tables_pending_transition
     ON tables (status_transition_at)
     WHERE status_transition_at IS NOT NULL;
 
@@ -69,19 +90,21 @@ CREATE TABLE IF NOT EXISTS tags (
     PRIMARY KEY (resource_arn, tag_key)
 );
 
--- Migration tracking.
+-- The ledger of releases before 1.0, kept so their `migrate` finds every
+-- file it knows recorded and runs none of them.
 CREATE TABLE IF NOT EXISTS schema_history (
     filename TEXT PRIMARY KEY,
     applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Settings (catalog version, data database connection, runtime config).
+-- Settings (version, data database connection, runtime config).
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
 
--- Stream shards.
+-- Stream shards. Unused in the catalog database: streams live in the data
+-- database. Kept because every released catalog has them.
 CREATE TABLE IF NOT EXISTS stream_shards (
     shard_id TEXT PRIMARY KEY,
     table_id TEXT NOT NULL REFERENCES tables(table_id) ON DELETE CASCADE,
@@ -91,9 +114,9 @@ CREATE TABLE IF NOT EXISTS stream_shards (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_stream_shards_table ON stream_shards (table_id);
+CREATE INDEX IF NOT EXISTS idx_stream_shards_table ON stream_shards (table_id);
 
--- Stream records.
+-- Stream records. Unused in the catalog database, as stream_shards.
 CREATE TABLE IF NOT EXISTS stream_records (
     shard_id TEXT NOT NULL REFERENCES stream_shards(shard_id) ON DELETE CASCADE,
     sequence_number TEXT NOT NULL,
@@ -104,7 +127,7 @@ CREATE TABLE IF NOT EXISTS stream_records (
     PRIMARY KEY (shard_id, sequence_number)
 );
 
-CREATE INDEX idx_stream_records_created ON stream_records (created_at);
+CREATE INDEX IF NOT EXISTS idx_stream_records_created ON stream_records (created_at);
 
 -- Admin users.
 CREATE TABLE IF NOT EXISTS admin_users (
@@ -219,17 +242,16 @@ CREATE TABLE IF NOT EXISTS iam_permissions_boundaries (
     PRIMARY KEY (account_id, principal_type, principal_name)
 );
 
--- Idempotency tokens for TransactWriteItems.
--- Vestigial in the catalog database: at runtime tokens are read and written via
--- the data database (see data_migrations 001 + 003, keyed on
--- (account_id, token)). This catalog copy is unused; do not wire it up.
+-- Idempotency tokens. Unused in the catalog database: the data database
+-- holds them, keyed on (account_id, token). Kept because every released
+-- catalog has it.
 CREATE TABLE IF NOT EXISTS idempotency_tokens (
     token       TEXT PRIMARY KEY,
     fingerprint TEXT NOT NULL,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_idempotency_tokens_created ON idempotency_tokens (created_at);
+CREATE INDEX IF NOT EXISTS idx_idempotency_tokens_created ON idempotency_tokens (created_at);
 
 -- Metrics (1-minute aggregation).
 CREATE TABLE IF NOT EXISTS metrics (
@@ -245,7 +267,7 @@ CREATE TABLE IF NOT EXISTS metrics (
     PRIMARY KEY (bucket, metric, table_name, index_name, operation)
 );
 
-CREATE INDEX idx_metrics_bucket ON metrics (bucket);
+CREATE INDEX IF NOT EXISTS idx_metrics_bucket ON metrics (bucket);
 
 -- Login attempt tracking.
 CREATE TABLE IF NOT EXISTS login_attempts (
@@ -255,10 +277,10 @@ CREATE TABLE IF NOT EXISTS login_attempts (
     source_ip     TEXT
 );
 
-CREATE INDEX idx_login_attempts_principal_time
+CREATE INDEX IF NOT EXISTS idx_login_attempts_principal_time
     ON login_attempts (principal, attempted_at DESC);
 
-CREATE INDEX idx_login_attempts_source_ip_time
+CREATE INDEX IF NOT EXISTS idx_login_attempts_source_ip_time
     ON login_attempts (source_ip, attempted_at DESC)
     WHERE source_ip IS NOT NULL;
 
@@ -281,7 +303,7 @@ CREATE TABLE IF NOT EXISTS backups (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX idx_backups_table ON backups (account_id, table_name);
+CREATE INDEX IF NOT EXISTS idx_backups_table ON backups (account_id, table_name);
 
 -- Backup items.
 CREATE TABLE IF NOT EXISTS backup_items (
@@ -291,7 +313,7 @@ CREATE TABLE IF NOT EXISTS backup_items (
     item_data JSONB NOT NULL
 );
 
-CREATE INDEX idx_backup_items_arn ON backup_items (backup_arn);
+CREATE INDEX IF NOT EXISTS idx_backup_items_arn ON backup_items (backup_arn);
 
 -- Continuous backups / PITR status.
 CREATE TABLE IF NOT EXISTS continuous_backups (
@@ -303,21 +325,84 @@ CREATE TABLE IF NOT EXISTS continuous_backups (
     PRIMARY KEY (account_id, table_name)
 );
 
--- Stream sequence (monotonic, starts at current epoch microseconds).
+-- Stream sequence: starts at the current epoch microseconds, and a run on a
+-- catalog that has one never moves it back.
 CREATE SEQUENCE IF NOT EXISTS stream_seq START 1;
 SELECT setval('stream_seq', GREATEST(
     (EXTRACT(EPOCH FROM now()) * 1000000)::BIGINT,
+    (SELECT last_value FROM stream_seq),
     1
 ));
 
--- Seed settings.
-INSERT INTO settings (key, value) VALUES ('catalog_version', '0.0.2')
-ON CONFLICT (key) DO NOTHING;
-INSERT INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0.25')
-ON CONFLICT (key) DO NOTHING;
-INSERT INTO settings (key, value) VALUES ('index_propagation_delay_ms', '10')
-ON CONFLICT (key) DO NOTHING;
-INSERT INTO settings (key, value) VALUES ('resource_tag_migration', 'applied')
-ON CONFLICT (key) DO NOTHING;
+-- Vector index metadata (legacy 002). Kept out of `indexes`: a vector index
+-- has no key schema. `search_schema` is nullable because the HASH element is
+-- optional. `backfilling` is false while CREATING before the scan starts,
+-- true while it runs, and NULL once ACTIVE. `skipped_item_count` counts items
+-- a backfill could not index. `build_owner` and `build_heartbeat_at` record
+-- which process builds the index.
+CREATE TABLE IF NOT EXISTS vector_indexes (
+    table_id            TEXT NOT NULL,
+    index_id            TEXT NOT NULL,
+    index_name          TEXT NOT NULL,
+    dimensions          INTEGER NOT NULL,
+    distance_function   TEXT NOT NULL,
+    vector_attribute    JSONB NOT NULL,
+    search_schema       JSONB,
+    projection          JSONB NOT NULL,
+    index_status        TEXT NOT NULL DEFAULT 'CREATING',
+    backfilling         BOOLEAN,
+    skipped_item_count  BIGINT,
+    build_owner         TEXT,
+    build_heartbeat_at  TIMESTAMPTZ,
+    PRIMARY KEY (table_id, index_name),
+    CONSTRAINT vector_indexes_table_id_fkey
+        FOREIGN KEY (table_id) REFERENCES tables(table_id) ON DELETE CASCADE,
+    CONSTRAINT chk_vector_dimensions_positive CHECK (dimensions > 0),
+    CONSTRAINT chk_vector_active_has_no_backfilling
+        CHECK (index_status <> 'ACTIVE' OR backfilling IS NULL)
+);
 
-COMMIT;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vector_indexes_index_id ON vector_indexes (index_id);
+
+-- The source table's vector index configuration at backup time; NULL for
+-- backups taken before vector indexes existed.
+ALTER TABLE backups ADD COLUMN IF NOT EXISTS vector_indexes JSONB;
+
+-- A backup's table definition (legacy 003): one row per backup, in the
+-- wire's shape behind a version marker. A backup without a row restores
+-- from its key schema and attribute definitions alone.
+CREATE TABLE IF NOT EXISTS backup_definitions (
+    backup_arn TEXT PRIMARY KEY REFERENCES backups(backup_arn) ON DELETE CASCADE,
+    definition JSONB NOT NULL
+);
+
+-- One row per table RestoreTableFromBackup created: the backup and source
+-- table it came from, and the restore's RestoreDateTime. Not a foreign key
+-- to backups: the summary keeps naming a backup deleted after the restore.
+-- restore_date_time has no default: the engine always passes the value.
+CREATE TABLE IF NOT EXISTS table_restores (
+    table_id TEXT PRIMARY KEY REFERENCES tables(table_id) ON DELETE CASCADE,
+    source_backup_arn TEXT NOT NULL,
+    source_table_arn TEXT NOT NULL,
+    restore_date_time TIMESTAMPTZ NOT NULL
+);
+
+-- A catalog that ran a pre-release revision of legacy 003 has table_restores
+-- without source_table_arn (added here as nullable: its rows have no value)
+-- and with a default on restore_date_time.
+ALTER TABLE table_restores ADD COLUMN IF NOT EXISTS source_table_arn TEXT;
+ALTER TABLE table_restores ALTER COLUMN restore_date_time DROP DEFAULT;
+
+CREATE INDEX IF NOT EXISTS idx_table_restores_backup ON table_restores (source_backup_arn);
+
+-- Releases before 1.0 refuse a catalog without this row and insert it again
+-- from their `migrate`; its presence beside a ledger tells v1.0 that one of
+-- them wrote to the catalog.
+DELETE FROM settings WHERE key = 'resource_tag_migration';
+
+-- Every legacy catalog file, recorded in the legacy ledger.
+INSERT INTO schema_history (filename) VALUES
+    ('001_schema.sql'),
+    ('002_vector_indexes.sql'),
+    ('003_backup_definitions.sql')
+ON CONFLICT (filename) DO NOTHING;

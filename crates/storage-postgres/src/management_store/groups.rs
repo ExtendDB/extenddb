@@ -5,6 +5,7 @@
 
 use extenddb_storage::management_store::{GroupDetail, OpError, OpResult};
 
+use super::database_error;
 use crate::catalog_store::PostgresCatalogStore;
 use crate::pg_util::{is_fk_violation, is_unique_violation};
 
@@ -70,10 +71,7 @@ impl PostgresCatalogStore {
         .bind(account_id)
         .fetch_all(self.pool())
         .await
-        .map_err(|e| {
-            tracing::error!("list_groups: {e}");
-            OpError::Internal("Database error".to_owned())
-        })
+        .map_err(|e| database_error("list_groups", &e))
     }
 
     pub(crate) async fn get_group_detail_impl(

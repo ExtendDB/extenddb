@@ -5,6 +5,7 @@
 
 use extenddb_storage::management_store::{OpError, OpResult, RoleDetail};
 
+use super::database_error;
 use crate::catalog_store::PostgresCatalogStore;
 use crate::pg_util::{is_fk_violation, is_unique_violation};
 
@@ -76,10 +77,7 @@ impl PostgresCatalogStore {
         .bind(account_id)
         .fetch_all(self.pool())
         .await
-        .map_err(|e| {
-            tracing::error!("list_roles: {e}");
-            OpError::Internal("Database error".to_owned())
-        })
+        .map_err(|e| database_error("list_roles", &e))
     }
 
     pub(crate) async fn get_role_detail_impl(

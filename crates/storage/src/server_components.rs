@@ -48,9 +48,6 @@ pub enum BackendError {
     /// Failed to connect to backend database
     ConnectionFailed { backend: String, details: String },
 
-    /// Catalog schema version mismatch
-    CatalogVersionMismatch { expected: String, found: String },
-
     /// Encryption key not found in settings table
     MissingEncryptionKey,
 
@@ -74,10 +71,6 @@ impl std::fmt::Display for BackendError {
             Self::ConnectionFailed { backend, details } => {
                 write!(f, "Failed to connect to {backend}: {details}")
             }
-            Self::CatalogVersionMismatch { expected, found } => write!(
-                f,
-                "Catalog version mismatch: expected {expected}, found {found}. Run 'extenddb migrate'"
-            ),
             Self::MissingEncryptionKey => write!(
                 f,
                 "Encryption key not found in settings table. Run 'extenddb init'"

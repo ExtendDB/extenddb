@@ -58,8 +58,12 @@ impl OperationsEngine for PostgresOperationsEngine {
         Ok(())
     }
 
+    /// The highest migration this binary carries: the catalog is versioned
+    /// by its ledger, and its `catalog_version` row holds the same integer.
     fn catalog_version(&self) -> String {
-        crate::CATALOG_VERSION.to_string()
+        extenddb_storage::migrations::MigrationId::LATEST
+            .number()
+            .to_string()
     }
 
     fn is_sensitive_key(&self, key: &str) -> bool {
