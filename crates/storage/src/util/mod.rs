@@ -10,9 +10,11 @@ mod arn;
 mod backup_id;
 mod catalog_version;
 mod key;
+mod shard_stream;
 
 pub use arn::{
-    ARN_PARTITION, format_stream_label, index_arn, new_stream_label, parse_stream_arn, stream_arn,
+    ARN_PARTITION, STREAM_DOES_NOT_EXIST, format_stream_label, index_arn, new_stream_label,
+    parse_stream_arn, shard_not_in_stream, stream_arn, stream_does_not_exist, stream_not_found,
     table_arn,
 };
 pub use backup_id::{
@@ -27,6 +29,7 @@ pub use key::{
     merge_attribute_definitions, parse_sk, pk_to_text, recover_sort_key_definitions, sk_column,
     sk_column_n, sk_info,
 };
+pub use shard_stream::shard_in_stream;
 
 /// Whether an UpdateTable's GSI actions must be refused because the GSIs named
 /// in `building` are `CREATING`: any Create, or a Delete of a GSI that is not

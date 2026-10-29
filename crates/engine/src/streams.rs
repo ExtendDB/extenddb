@@ -164,6 +164,16 @@ pub async fn handle_get_shard_iterator(
 /// Shard iterator expiration: 15 minutes (900 seconds), matching real `DynamoDB`.
 const SHARD_ITERATOR_EXPIRY_SECS: u64 = 900;
 
+/// The model's constraint sentence for a member value, as the service renders
+/// it for the streams API (no value quoted; measured 2026-10-24 on `shardId`,
+/// `exclusiveStartShardId`, `sequenceNumber`, `limit` and
+/// `exclusiveStartStreamArn`).
+fn constraint(member: &str, rule: &str) -> String {
+    format!(
+        "1 validation error detected: Value at '{member}' failed to satisfy constraint: Member must {rule}"
+    )
+}
+
 /// The message `DynamoDB` returns for an expired shard iterator (measured live,
 /// `live-r2/iter-live.json`: an iterator 990 seconds old returns
 /// `ExpiredIteratorException` with exactly this text). Shared so the
@@ -262,14 +272,18 @@ pub fn classify_shard_iterator(token: &str) -> ShardIteratorClass {
 
 /// Handle `GetRecords`.
 ///
-/// Decodes the shard iterator, checks expiration, reads records, and returns
+/// Decodes the shard iterator, checks expiration, reads records from the
+/// shard as one of the shards of the stream the iterator names, and returns
 /// a new iterator.
 ///
 /// # Errors
 ///
 /// Returns [`DynamoDbError::ExpiredIteratorException`] if the iterator is older
-/// than 15 minutes.
-/// Returns [`DynamoDbError::ValidationException`] on invalid iterator.
+/// than 15 minutes, or carries a timestamp and no stream ARN.
+/// Returns [`DynamoDbError::ResourceNotFoundException`] if the stream does not
+/// exist for the caller's account or the shard is not one of its shards.
+/// Returns [`DynamoDbError::ValidationException`] on an invalid iterator,
+/// which includes one with neither a stream ARN nor a timestamp.
 pub async fn handle_get_records(
     body: Value,
     ctx: &OperationContext,
@@ -293,18 +307,20 @@ pub async fn handle_get_records(
         }
     }
 
-    // Confirm the shard belongs to the stream named in the token before
-    // reading. The request is authorized against that stream ARN, so this
-    // stops a forged token that pairs an authorized stream ARN with another
-    // stream's shard id from reading the other stream's records.
-    if let Some(ref stream_arn) = it.stream_arn {
-        ctx.storage
-            .validate_shard(&ctx.account_id, stream_arn, &it.shard_id)
-            .await
-            .map_err(storage_to_dynamo)?;
-    }
+    // The request was authorized against the stream ARN carried in the token.
+    // The storage read below resolves the shard against that stream (table
+    // name and stream label, within the caller's account) as part of the read:
+    // SQLite in the statement that reads the records, PostgreSQL, MongoDB and
+    // Cassandra after reading the table. A forged token that pairs an
+    // authorized stream ARN with another stream's shard id reads nothing and
+    // gets the "stream does not exist" answer. A token with no stream ARN gets
+    // the answer the authorization layer gives it (`classify_shard_iterator`);
+    // the layer is skipped in developer mode, so the engine answers the same.
+    let Some(stream_arn) = it.stream_arn.as_deref() else {
+        return Err(no_stream_arn_error(&it));
+    };
 
-    let limit = input.limit.unwrap_or(1000).min(1000);
+    let limit = get_records_limit(input.limit)?;
 
     // All iterator types are resolved to AFTER_SEQUENCE_NUMBER at
     // GetShardIterator time. Empty seq means "read from beginning".
@@ -318,6 +334,7 @@ pub async fn handle_get_records(
         .storage
         .get_stream_records(
             &ctx.account_id,
+            stream_arn,
             &it.shard_id,
             after_sequence.as_deref(),
             limit,
@@ -338,7 +355,7 @@ pub async fn handle_get_records(
             "AFTER_SEQUENCE_NUMBER",
             &next_seq,
             now,
-            it.stream_arn.as_deref().unwrap_or(""),
+            stream_arn,
         ))
     };
 
@@ -347,6 +364,46 @@ pub async fn handle_get_records(
         next_shard_iterator: next_iterator,
     };
     serialize_output(&output)
+}
+
+/// The answer for a token that carries no stream ARN, the same one
+/// [`classify_shard_iterator`] gives the authorization layer. A token with a
+/// timestamp comes from a build before the ARN was carried and is expired; one
+/// without a timestamp is invalid.
+fn no_stream_arn_error(it: &ShardIterator) -> DynamoDbError {
+    if it.created_at.is_some() {
+        DynamoDbError::ExpiredIteratorException(SHARD_ITERATOR_EXPIRED_MESSAGE.to_owned())
+    } else {
+        DynamoDbError::ValidationException("Invalid ShardIterator".to_owned())
+    }
+}
+
+/// `GetRecords` with a `Limit` over 1000 (measured 2026-10-25 with 1001).
+pub const GET_RECORDS_LIMIT_TOO_LARGE: &str =
+    "One or more parameter values were invalid: Limit should be less than or equal to 1000";
+
+/// The largest `Limit` `GetRecords` accepts.
+const GET_RECORDS_MAX_LIMIT: i64 = 1000;
+
+/// The page size a `GetRecords` call asked for, or the service's refusal.
+///
+/// Measured 2026-10-25: `Limit` 0 and -1 get the model's constraint sentence,
+/// 1001 the parameter sentence; 1 and 1000 are accepted. The bounds are
+/// checked before storage runs, so the records read never carries a limit
+/// under 1, which the backends read as a shard that is not the stream's (no
+/// row) or refuse outright.
+fn get_records_limit(limit: Option<i64>) -> Result<i64, DynamoDbError> {
+    match limit {
+        Some(l) if l < 1 => Err(DynamoDbError::ValidationException(constraint(
+            "limit",
+            "have value greater than or equal to 1",
+        ))),
+        Some(l) if l > GET_RECORDS_MAX_LIMIT => Err(DynamoDbError::ValidationException(
+            GET_RECORDS_LIMIT_TOO_LARGE.to_owned(),
+        )),
+        Some(l) => Ok(l),
+        None => Ok(GET_RECORDS_MAX_LIMIT),
+    }
 }
 
 fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
@@ -415,6 +472,53 @@ mod tests {
         assert!(super::decode_shard_iterator("!!!not base64!!!").is_none());
     }
 
+    #[test]
+    fn stream_not_found_maps_to_resource_not_found_with_the_arn() {
+        // `describe_stream` answers a stream ARN that names no stream with the
+        // storage not-found error that carries the ARN.
+        let arn = "arn:aws:dynamodb:us-east-1:1:table/T/stream/2026-10-20T16:17:40.188";
+        match super::storage_to_dynamo(extenddb_storage::util::stream_not_found(arn)) {
+            super::DynamoDbError::ResourceNotFoundException(msg) => assert_eq!(
+                msg,
+                format!("Requested resource not found: Stream: {arn} not found")
+            ),
+            other => panic!("expected ResourceNotFoundException, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_does_not_exist_maps_to_resource_not_found() {
+        // The answer for a stream ARN that names no stream, and for a shard
+        // that is not one of the stream's (`get_stream_records`).
+        match super::storage_to_dynamo(extenddb_storage::util::stream_does_not_exist()) {
+            super::DynamoDbError::ResourceNotFoundException(msg) => {
+                assert_eq!(msg, "Requested resource not found: Stream does not exist");
+            }
+            other => panic!("expected ResourceNotFoundException, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_records_limit_bounds_carry_the_measured_sentences() {
+        let refused = |l: i64| match super::get_records_limit(Some(l)) {
+            Err(super::DynamoDbError::ValidationException(msg)) => msg,
+            other => panic!("expected ValidationException for Limit {l}, got {other:?}"),
+        };
+        for l in [0, -1] {
+            assert_eq!(
+                refused(l),
+                "1 validation error detected: Value at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"
+            );
+        }
+        assert_eq!(
+            refused(1001),
+            "One or more parameter values were invalid: Limit should be less than or equal to 1000"
+        );
+        assert_eq!(super::get_records_limit(Some(1)).unwrap(), 1);
+        assert_eq!(super::get_records_limit(Some(1000)).unwrap(), 1000);
+        assert_eq!(super::get_records_limit(None).unwrap(), 1000);
+    }
+
     fn b64(s: &str) -> String {
         base64::Engine::encode(&base64::engine::general_purpose::STANDARD, s)
     }
@@ -459,5 +563,35 @@ mod tests {
             super::classify_shard_iterator(&bad_ts),
             super::ShardIteratorClass::Invalid
         ));
+    }
+
+    #[test]
+    fn a_token_without_a_stream_arn_gets_the_answer_the_authorization_layer_gives() {
+        // Two and three fields have no timestamp (invalid), four fields with a
+        // timestamp come from before the ARN was carried (expired), and a
+        // timestamp that is not a number is invalid.
+        for token in [
+            b64("shardId-5|AFTER_SEQUENCE_NUMBER"),
+            b64("shardId-3|AFTER_SEQUENCE_NUMBER|7"),
+            b64("shardId-2|AFTER_SEQUENCE_NUMBER|7|1000"),
+            b64("shardId-4|AFTER_SEQUENCE_NUMBER|7|notanumber"),
+        ] {
+            let it = super::decode_shard_iterator(&token).expect("the token decodes");
+            let expected = match super::classify_shard_iterator(&token) {
+                super::ShardIteratorClass::Expired => {
+                    super::DynamoDbError::ExpiredIteratorException(
+                        super::SHARD_ITERATOR_EXPIRED_MESSAGE.to_owned(),
+                    )
+                }
+                super::ShardIteratorClass::Invalid => {
+                    super::DynamoDbError::ValidationException("Invalid ShardIterator".to_owned())
+                }
+                super::ShardIteratorClass::Stream(_) => panic!("the token carries no stream ARN"),
+            };
+            assert_eq!(
+                format!("{:?}", super::no_stream_arn_error(&it)),
+                format!("{expected:?}")
+            );
+        }
     }
 }

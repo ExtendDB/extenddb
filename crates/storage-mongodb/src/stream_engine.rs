@@ -22,7 +22,7 @@ use extenddb_core::types::{
 };
 use extenddb_storage::StreamEngine;
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{parse_stream_arn, stream_arn};
+use extenddb_storage::util::{parse_stream_arn, shard_in_stream, stream_arn};
 use extenddb_storage::{StreamListResult, StreamRecordsResult};
 
 use crate::MongoEngine;
@@ -285,95 +285,96 @@ impl StreamEngine for MongoEngine {
     fn get_stream_records(
         &self,
         account_id: &str,
+        stream_arn_val: &str,
         shard_id: &str,
         after_sequence: Option<&str>,
         limit: i64,
     ) -> BoxFuture<'_, StreamRecordsResult> {
         let account_id = account_id.to_owned();
+        let stream_arn_val = stream_arn_val.to_owned();
         let shard_id = shard_id.to_owned();
         let after_sequence = after_sequence.map(std::borrow::ToOwned::to_owned);
         Box::pin(async move {
-            // Ownership guard: only return records if the shard's backing table
-            // belongs to the calling account. `stream_shards`/`stream_records`
-            // live in the data database while the `tables` catalog (which
-            // carries account_id inside its compound `_id`) lives in the catalog
-            // database, so ownership is resolved in two steps across the two
-            // databases: shard_id -> table_id (data db), then table_id +
-            // account_id (catalog db). Mirrors the postgres backend.
-            let shards_coll = self.data_db.collection::<Document>("stream_shards");
-            let shard_doc = shards_coll
-                .find_one(doc! { "shard_id": &shard_id })
+            let (table_name, stream_label) = parse_stream_arn(&stream_arn_val)?;
+            // The `tables` catalog lives in the catalog database and
+            // `stream_shards`/`stream_records` in the data database, so the
+            // stream resolves in two round trips: the table the ARN names
+            // (catalog: its id and current stream label), then the shard and
+            // its records in one aggregation (data). The shard document drives
+            // the aggregation with the records joined by `$lookup` and
+            // unwound, so each record is its own output document and the page
+            // is bounded by `limit` rather than by the 16 MB document cap (the
+            // server coalesces the `$lookup` with the `$unwind` and never
+            // materializes the array). A shard of the named table with no
+            // records returns one document with `has_record` false, and a
+            // shard that is not that table's (another table, or another
+            // account) returns no document. Whether the shard belongs to the
+            // stream the ARN's label names is decided in Rust from the table's
+            // label and the shard id (`shard_in_stream`).
+            let table_doc = self
+                .catalog_db
+                .collection::<Document>("tables")
+                .find_one(doc! {
+                    "_id": { "account_id": &account_id, "table_name": &table_name },
+                })
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
-            let owned = match shard_doc.as_ref().and_then(|d| d.get_str("table_id").ok()) {
-                // Look the table up by its globally-unique `table_id` (a
-                // top-level field), then compare the owning account_id read out
-                // of the compound `_id` subdocument in Rust. account_id lives
-                // only inside the embedded `_id` doc; resolving ownership in
-                // Rust after a single table_id lookup keeps the check explicit
-                // and avoids depending on query-time behaviour of a partial
-                // `_id.account_id` path.
-                Some(table_id) => self
-                    .catalog_db
-                    .collection::<Document>("tables")
-                    .find_one(doc! { "table_id": table_id })
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?
-                    .as_ref()
-                    .and_then(|t| t.get_document("_id").ok())
-                    .and_then(|id| id.get_str("account_id").ok())
-                    .is_some_and(|owner| owner == account_id),
-                None => false,
+            let Some(table_doc) = table_doc else {
+                return Err(extenddb_storage::util::stream_does_not_exist());
             };
-            // A shard iterator that resolves to a shard the caller does not own
-            // (catalog step fails) or one that does not exist (data step fails)
-            // is rejected identically. Real DynamoDB returns
-            // `ValidationException: Invalid ShardIterator` for a GetRecords
-            // iterator it did not issue, and does not distinguish "exists but not
-            // yours" from "does not exist" — so neither do we.
-            if !owned {
-                return Err(StorageError::Validation("Invalid ShardIterator".to_owned()));
+            let table_id = table_doc
+                .get_str("table_id")
+                .map_err(|e| StorageError::Internal(e.to_string()))?
+                .to_owned();
+            let table_label = table_doc.get_str("stream_label").ok();
+
+            let mut record_match = doc! { "$eq": ["$shard_id", "$$shard"] };
+            if let Some(ref after) = after_sequence {
+                record_match = doc! { "$and": [
+                    record_match,
+                    { "$gt": ["$sequence_number", after] },
+                ] };
             }
-
-            let records_coll = self.data_db.collection::<Document>("stream_records");
-
-            let filter = if let Some(ref after) = after_sequence {
-                doc! {
-                    "shard_id": &shard_id,
-                    "sequence_number": { "$gt": after },
-                }
-            } else {
-                doc! { "shard_id": &shard_id }
-            };
-
-            let opts = FindOptions::builder()
-                .sort(doc! { "sequence_number": 1 })
-                .limit(limit)
-                .build();
-
-            let cursor = records_coll
-                .find(filter)
-                .with_options(opts)
+            let pipeline = vec![
+                doc! { "$match": { "shard_id": &shard_id, "table_id": &table_id } },
+                doc! { "$limit": 1 },
+                doc! { "$lookup": {
+                    "from": "stream_records",
+                    "let": { "shard": "$shard_id" },
+                    "pipeline": [
+                        { "$match": { "$expr": record_match } },
+                        { "$sort": { "sequence_number": 1 } },
+                        { "$limit": limit },
+                        { "$project": { "_id": 0, "record_data": 1 } },
+                    ],
+                    "as": "records",
+                } },
+                doc! { "$unwind": { "path": "$records", "preserveNullAndEmptyArrays": true } },
+                doc! { "$project": {
+                    "_id": 0,
+                    "shard_id": 1,
+                    "has_record": { "$ne": [{ "$type": "$records" }, "missing"] },
+                    "record_data": "$records.record_data",
+                } },
+            ];
+            let cursor = self
+                .data_db
+                .collection::<Document>("stream_shards")
+                .aggregate(pipeline)
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
-
             let docs: Vec<Document> = cursor
                 .try_collect()
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let Some(row_shard_id) = docs.first().and_then(|d| d.get_str("shard_id").ok()) else {
+                return Err(extenddb_storage::util::stream_does_not_exist());
+            };
+            if !shard_in_stream(&table_id, row_shard_id, table_label, &stream_label) {
+                return Err(extenddb_storage::util::stream_does_not_exist());
+            }
 
-            let records: Vec<StreamRecord> = docs
-                .into_iter()
-                .map(|d| {
-                    let record_bson = d
-                        .get("record_data")
-                        .ok_or_else(|| StorageError::Internal("Missing record_data".to_owned()))?;
-                    let json_val: serde_json::Value = bson::from_bson(record_bson.clone())
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
-                    serde_json::from_value(json_val)
-                        .map_err(|e| StorageError::Internal(e.to_string()))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let records = record_docs::records_from_docs(docs)?;
 
             let last_seq = records.last().map(|r| r.dynamodb.sequence_number.clone());
             Ok((records, last_seq))
@@ -400,11 +401,7 @@ impl StreamEngine for MongoEngine {
                 })
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?
-                .ok_or_else(|| {
-                    StorageError::TableNotFound(format!(
-                        "Requested resource not found: Stream: {stream_arn_val} not found."
-                    ))
-                })?;
+                .ok_or_else(|| extenddb_storage::util::stream_not_found(&stream_arn_val))?;
 
             let key_schema = table_doc
                 .get("key_schema")
@@ -709,9 +706,7 @@ impl StreamEngine for MongoEngine {
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
 
             let Some(table_doc) = table_doc else {
-                return Err(StorageError::TableNotFound(format!(
-                    "Requested resource not found: Stream: {stream_arn_val} not found."
-                )));
+                return Err(extenddb_storage::util::stream_does_not_exist());
             };
 
             let table_id = table_doc.get_str("table_id").unwrap_or_default();
@@ -723,9 +718,7 @@ impl StreamEngine for MongoEngine {
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
 
             if exists.is_none() {
-                return Err(StorageError::TableNotFound(format!(
-                    "Requested resource not found: Stream: {stream_arn_val} not found."
-                )));
+                return Err(extenddb_storage::util::shard_not_in_stream(&stream_arn_val));
             }
             Ok(())
         })
@@ -808,3 +801,14 @@ mod tests {
         assert!(s2 < s3);
     }
 }
+
+/// The records in the result of the `get_stream_records` aggregation; see the
+/// module documentation.
+#[path = "stream_record_docs.rs"]
+mod record_docs;
+
+/// Live `get_stream_records` tests against a MongoDB server; see the module
+/// documentation.
+#[cfg(test)]
+#[path = "stream_records_live_tests.rs"]
+mod records_live_tests;

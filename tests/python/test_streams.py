@@ -13,6 +13,7 @@ real DynamoDB uses a separate Streams endpoint.
 
 from __future__ import annotations
 
+import base64
 import os
 import time
 import uuid
@@ -22,7 +23,13 @@ import botocore.config
 import pytest
 from botocore.exceptions import ClientError
 
-from helpers import unique_name, wait_for_active, wait_for_deleted
+from helpers import (
+    STREAM_DOES_NOT_EXIST,
+    describe_stream_not_found_message,
+    unique_name,
+    wait_for_active,
+    wait_for_deleted,
+)
 
 # Streams tests only run against extenddb — real DynamoDB uses a separate endpoint.
 pytestmark = pytest.mark.skipif(
@@ -166,6 +173,76 @@ class TestDescribeStream:
             "ResourceNotFoundException",
             "ValidationException",
         )
+
+
+def _arn_with_another_label(stream_arn: str) -> str:
+    """The ARN of a stream the table never had: the last three digits of the
+    stream label (its milliseconds) changed."""
+    head, label = stream_arn.rsplit("/stream/", 1)
+    millis = "000" if label.endswith("999") else "999"
+    return f"{head}/stream/{label[:-3]}{millis}"
+
+
+def _forged_iterator(shard_id: str, stream_arn: str) -> str:
+    """A GetRecords iterator token that names `shard_id` and `stream_arn`."""
+    raw = f"{shard_id}|AFTER_SEQUENCE_NUMBER||{int(time.time())}|{stream_arn}"
+    return base64.standard_b64encode(raw.encode()).decode()
+
+
+class TestStreamNotFoundSentences:
+    """What each streams operation answers for a stream ARN that names no
+    stream of an existing table (a label the table never had).
+
+    DescribeStream and GetShardIterator were measured on the service on
+    2026-10-24. GetRecords answers as GetShardIterator does: the service's
+    iterator tokens are opaque, so a token that names such a stream cannot be
+    built against it and that answer is not measured.
+    """
+
+    def test_unknown_stream_arn_of_an_existing_table(
+        self, dynamodb_client, streams_client
+    ):
+        name, stream_arn = _create_stream_table(dynamodb_client)
+        try:
+            unknown = _arn_with_another_label(stream_arn)
+            shard_id = streams_client.describe_stream(StreamArn=stream_arn)[
+                "StreamDescription"
+            ]["Shards"][0]["ShardId"]
+            calls = {
+                "DescribeStream": lambda: streams_client.describe_stream(
+                    StreamArn=unknown
+                ),
+                "GetShardIterator": lambda: streams_client.get_shard_iterator(
+                    StreamArn=unknown,
+                    ShardId=shard_id,
+                    ShardIteratorType="TRIM_HORIZON",
+                ),
+                "GetRecords": lambda: streams_client.get_records(
+                    ShardIterator=_forged_iterator(shard_id, unknown)
+                ),
+            }
+
+            answers = {}
+            for operation, call in calls.items():
+                with pytest.raises(ClientError) as exc:
+                    call()
+                err = exc.value.response["Error"]
+                answers[operation] = (err["Code"], err["Message"])
+
+            assert answers == {
+                "DescribeStream": (
+                    "ResourceNotFoundException",
+                    describe_stream_not_found_message(unknown),
+                ),
+                "GetShardIterator": (
+                    "ResourceNotFoundException",
+                    STREAM_DOES_NOT_EXIST,
+                ),
+                "GetRecords": ("ResourceNotFoundException", STREAM_DOES_NOT_EXIST),
+            }
+        finally:
+            dynamodb_client.delete_table(TableName=name)
+            wait_for_deleted(dynamodb_client, name)
 
 
 class TestStreamRecords:

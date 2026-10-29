@@ -289,8 +289,8 @@ class TestExplicitDenyOnResourceArn:
 
     def test_getrecords_forged_shard_reads_nothing(self, table):
         # A token that names the allowed stream ARN but a shard that does not
-        # belong to it must not read: the engine confirms the shard belongs to
-        # the stream before reading. The real shard reads; the forged one errors.
+        # belong to it must not read: the storage read resolves the shard
+        # against that stream. The real shard reads; the forged one errors.
         s = self._ddb({"Version": "2012-10-17", "Statement": [
             {"Effect": "Allow", "Action": "dynamodb:*", "Resource": "*"}]}, "dynamodbstreams")
         desc = s.describe_stream(StreamArn=table["stream_arn"])["StreamDescription"]

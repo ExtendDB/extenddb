@@ -209,8 +209,8 @@ pub(crate) async fn authorize_request(
 
     // GetRecords carries its resource only inside the opaque shard iterator, not
     // in a request body field. Decode the iterator for the stream ARN and
-    // authorize against that specific stream, as the service does. The engine
-    // separately confirms the shard belongs to that stream before reading, so a
+    // authorize against that specific stream, as the service does. The storage
+    // read resolves the shard against that stream as part of the read, so a
     // token that names an allowed stream but a different stream's shard reads
     // nothing.
     //
