@@ -989,7 +989,8 @@ impl PostgresBootstrapper {
             | OpError::AlreadyExists(m)
             | OpError::NotFound(m)
             | OpError::HasDependents(m)
-            | OpError::Internal(m) => m,
+            | OpError::Internal(m)
+            | OpError::Database { message: m, .. } => m,
         };
         let mut store = Self::connect(config)
             .await

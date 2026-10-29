@@ -6,7 +6,7 @@
 // ── Error types ────────────────────────────────────────────────────────
 
 /// Error from a management or operational storage operation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpError {
     /// Input validation failed (caller should have caught this).
     Validation(String),
@@ -18,6 +18,26 @@ pub enum OpError {
     HasDependents(String),
     /// Internal storage error.
     Internal(String),
+    /// A database statement failed with this error code (PostgreSQL's
+    /// SQLSTATE). `message` is the driver's text, for logs and the
+    /// operator's commands; API responses never carry it.
+    Database { message: String, sqlstate: String },
+}
+
+impl OpError {
+    /// The database error code of the statement that failed, when the error
+    /// carries one.
+    #[must_use]
+    pub fn sqlstate(&self) -> Option<&str> {
+        match self {
+            Self::Database { sqlstate, .. } => Some(sqlstate),
+            Self::Validation(_)
+            | Self::AlreadyExists(_)
+            | Self::NotFound(_)
+            | Self::HasDependents(_)
+            | Self::Internal(_) => None,
+        }
+    }
 }
 
 /// Result alias for management operations.

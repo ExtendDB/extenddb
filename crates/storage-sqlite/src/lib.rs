@@ -93,6 +93,8 @@ pub fn backend() -> extenddb_storage::Backend {
         management_store: sqlite_management_store_factory,
         diagnostics_store: sqlite_diagnostics_store_factory,
         server_components: sqlite_server_components_factory,
+        // Migrates through its bootstrapper until it moves onto the runner.
+        catalog_migrations: None,
     }
 }
 
@@ -275,7 +277,8 @@ fn sqlite_server_components_factory(
                 | OpError::AlreadyExists(m)
                 | OpError::NotFound(m)
                 | OpError::HasDependents(m)
-                | OpError::Internal(m)) = e;
+                | OpError::Internal(m)
+                | OpError::Database { message: m, .. }) = e;
                 BackendError::InitializationFailed(m)
             })?;
         if !pending.is_empty() {

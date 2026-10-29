@@ -67,7 +67,8 @@ pub(crate) fn op_err(e: OpError) -> anyhow::Error {
         | OpError::AlreadyExists(m)
         | OpError::NotFound(m)
         | OpError::HasDependents(m)
-        | OpError::Internal(m) => anyhow::anyhow!(m),
+        | OpError::Internal(m)
+        | OpError::Database { message: m, .. } => anyhow::anyhow!(m),
     }
 }
 

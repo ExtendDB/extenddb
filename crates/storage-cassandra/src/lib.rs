@@ -252,6 +252,8 @@ pub fn backend() -> extenddb_storage::Backend {
             })
         },
         server_components: server_components_factory,
+        // Migrates through its bootstrapper until it moves onto the runner.
+        catalog_migrations: None,
     }
 }
 

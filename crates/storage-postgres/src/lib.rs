@@ -146,6 +146,8 @@ pub fn backend() -> extenddb_storage::Backend {
             })
         },
         server_components: server_components_factory,
+        // Migrates through its bootstrapper until it moves onto the runner.
+        catalog_migrations: None,
     }
 }
 
@@ -625,7 +627,8 @@ fn op_msg(e: extenddb_storage::management_store::OpError) -> String {
         | OpError::AlreadyExists(m)
         | OpError::NotFound(m)
         | OpError::HasDependents(m)
-        | OpError::Internal(m) => m,
+        | OpError::Internal(m)
+        | OpError::Database { message: m, .. } => m,
     }
 }
 

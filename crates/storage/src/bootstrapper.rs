@@ -179,6 +179,14 @@ pub trait Bootstrapper: Send + Sync {
     /// Return the catalog connection URL for config file generation.
     fn catalog_connection_url(&self) -> String;
 
+    /// The deployment `init` runs the catalog migrations on, with the values
+    /// this bootstrapper resolved from the command line and the config file,
+    /// so the backend derives none of them again. The default names the
+    /// catalog's connection URL alone.
+    fn init_target(&self) -> crate::migrations::Target {
+        crate::migrations::Target::at(self.catalog_connection_url())
+    }
+
     /// Generate the backend-specific configuration subsection for extenddb.toml.
     /// Returns only the [`storage.backend_name`] section content, not the [storage] header.
     fn generate_backend_config_section(&self) -> String;
@@ -311,10 +319,21 @@ pub mod helpers {
         Ok(())
     }
 
-    /// Extract a CLI argument value by flag name.
+    /// Extract a CLI argument value by flag name, given as `--flag value` or
+    /// `--flag=value`, as clap accepts both. The first occurrence wins; clap
+    /// refuses a flag given twice before a bootstrapper reads the arguments.
     #[must_use]
     pub fn extract_arg(args: &[String], flag: &str) -> Option<String> {
-        args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
+        let mut iter = args.iter();
+        while let Some(arg) = iter.next() {
+            if arg == flag {
+                return iter.next().cloned();
+            }
+            if let Some(value) = arg.strip_prefix(flag).and_then(|r| r.strip_prefix('=')) {
+                return Some(value.to_owned());
+            }
+        }
+        None
     }
 
     #[cfg(test)]
@@ -567,6 +586,19 @@ pub mod helpers {
 
             // Should return first occurrence
             assert_eq!(extract_arg(&args, "--host"), Some("first".to_string()));
+        }
+
+        /// clap accepts `--data-db=items`, so the bootstrapper reads it too;
+        /// a longer flag that starts with the name is not a match.
+        #[test]
+        fn test_extract_arg_equals_form() {
+            let args: Vec<String> = ["init", "--data-db=items", "--pg-user", "admin"]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect();
+            assert_eq!(extract_arg(&args, "--data-db"), Some("items".to_owned()));
+            assert_eq!(extract_arg(&args, "--pg-user"), Some("admin".to_owned()));
+            assert_eq!(extract_arg(&args, "--data"), None);
         }
     }
 }
