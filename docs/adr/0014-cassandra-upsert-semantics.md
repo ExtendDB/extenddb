@@ -1,4 +1,4 @@
-# ADR-0004: Natural UPSERT Semantics
+# ADR-0014: Natural UPSERT Semantics
 
 - Status: Accepted
 - Date: 2026-06-04

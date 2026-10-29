@@ -1,4 +1,4 @@
-# ADR-0007: DynamoDB Transaction Implementation on Cassandra
+# ADR-0017: DynamoDB Transaction Implementation on Cassandra
 
 - Status: Draft
 - Date: 2026-06-24
