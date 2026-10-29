@@ -1,20 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Live MongoDB tests for the pass that finds the documents to repair: how it
-//! reads each table and how it goes on after a table it cannot read.
+//! reads each table, how it goes on after a table it cannot read, and the task
+//! that `serve` starts to run it.
 //!
 //! The tests read the replica set URI from `EXTENDDB_TEST_MONGODB_URI` and are
 //! `#[ignore]`d, like the tests in the parent module.
+
+use std::sync::Arc;
 
 use bson::{Bson, Document, doc};
 use extenddb_core::types::TableKeyInfo;
 use futures::TryStreamExt;
 
 use super::{
-    KeyRepairSummary, finish, item_key, s, scratch_engine, store_many_without_key,
-    store_without_key, stored, table, with,
+    KeyRepairSummary, expected_document, finish, item_key, s, scratch_engine,
+    store_many_without_key, store_without_key, stored, table, with,
 };
 use crate::data::{data_collection_name, document_to_item};
+use crate::data_engine::key_repair::spawn_key_repair;
 
 /// A catalog `tables` row for `table_id` with the key schema of `key_info`.
 fn catalog_row(table_name: &str, table_id: &str, key_info: &TableKeyInfo) -> Document {
@@ -149,5 +153,48 @@ async fn live_repair_scan_is_answered_from_the_id_index() {
         0,
         "the scan is answered from the _id index: {scan:?}"
     );
+    finish(engine).await;
+}
+
+/// `spawn_key_repair`, the task `serve` starts (`lib.rs`), runs the whole
+/// pass: with a catalog table whose collection holds a document stored
+/// without its key, the document is rebuilt by the time the task finishes,
+/// and the task does finish. The other tests call `repair_table` and
+/// `repair_items_stored_without_key` directly.
+#[tokio::test]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_the_spawned_key_repair_rewrites_documents_stored_without_their_key() {
+    let engine = scratch_engine().await;
+    let key_info = table(&engine, "pass-spawned", false);
+    let key = item_key(false);
+    engine
+        .catalog_db
+        .collection::<Document>("tables")
+        .insert_one(catalog_row("spawned", &key_info.table_id, &key_info))
+        .await
+        .expect("catalog row");
+    store_without_key(&engine, &key_info, &key, Some("upd")).await;
+    assert!(
+        stored(&engine, &key_info, &key)
+            .await
+            .get_object_id("_id")
+            .is_ok(),
+        "planted in the shape the pre-fix upsert stored"
+    );
+
+    let engine = Arc::new(engine);
+    spawn_key_repair(engine.clone())
+        .await
+        .expect("the repair task finishes");
+
+    let want = with(key.clone(), "w", s("upd"));
+    assert_eq!(
+        stored(&engine, &key_info, &key).await,
+        expected_document(&want, &key_info, 1),
+        "the task repaired the document"
+    );
+    let engine = Arc::try_unwrap(engine)
+        .ok()
+        .expect("the finished task dropped its engine");
     finish(engine).await;
 }
