@@ -495,6 +495,39 @@ class TestRequestChecks:
         conn.close()
         assert resp.status == 200, text
 
+    @pytest.mark.parametrize(
+        "name,second_value",
+        [("X-Amz-Date", "20260101T000000Z"), ("X-Amz-Target", "DynamoDB_20120810.ListTables")],
+    )
+    def test_signed_header_repeated_after_signing_is_a_signature_mismatch(self, name, second_value):
+        # Measured against the service on 2026-10-23: a request signed over one
+        # X-Amz-Date or X-Amz-Target value and sent with that header twice gets
+        # InvalidSignatureException with a request id. The front end does not
+        # refuse these; the canonical headers join both values, so the
+        # signature no longer matches. The second X-Amz-Target value is the
+        # same string as the first.
+        access_key, secret_key, token = _env_credentials()
+        body_bytes = json.dumps({"Limit": 1}).encode("utf-8")
+        aws_req = AWSRequest(
+            method="POST",
+            url=self.url,
+            data=body_bytes,
+            headers={
+                "X-Amz-Target": "DynamoDB_20120810.ListTables",
+                "Content-Type": "application/x-amz-json-1.0",
+            },
+        )
+        SigV4Auth(Credentials(access_key, secret_key, token), "dynamodb", self.region).add_auth(aws_req)
+        u = urlparse(self.url)
+        headers = [("Host", u.netloc)]
+        headers += [(k, v) for k, v in aws_req.headers.items() if k.lower() != "host"]
+        headers.append((name, second_value))
+        status, text, _ = self._raw_request("POST", "/", headers, body=body_bytes)
+        assert status == 400, (status, text[:300])
+        payload = json.loads(text)
+        assert payload["__type"].endswith("InvalidSignatureException"), text
+        assert payload["message"].startswith("The request signature we calculated does not match"), text
+
     def test_unsigned_payload_literal_is_a_plain_signature_mismatch(self):
         # A client that signs the payload line as the S3 literal fails with the
         # ordinary mismatch: the service does not special-case the literal.
