@@ -1,0 +1,4 @@
+extenddb 0.1.5
+catalog 0.0.2 (postgres)
+commit bde5f1a0d20d7bcba2ba42e1480a094dd1201d82
+built 2026-08-13T22:13:46Z

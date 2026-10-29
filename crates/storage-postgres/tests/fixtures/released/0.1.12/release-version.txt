@@ -1,0 +1,5 @@
+extenddb 0.1.12
+catalog 0.0.3 (postgres)
+commit bdb7b3df4ace3b80a6e928f144036d056aec0327
+built 2026-09-17T09:33:52Z
+test-hooks disabled
