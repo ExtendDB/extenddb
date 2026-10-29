@@ -1573,11 +1573,23 @@ async fn test_restore_of_deleted_backup_is_not_found() {
 
 /// Catalog migrations V001-V004: the catalog shape before V005 added
 /// `backups_by_arn.definition/active_restores` and `tables.restore_*`.
-const CATALOG_THROUGH_V004: &[&str] = &[
-    include_str!("../../migrations/catalog/V001__initial_schema.cql"),
-    include_str!("../../migrations/catalog/V002__backup_restore.cql"),
-    include_str!("../../migrations/catalog/V003__account_scoped_idempotency.cql"),
-    include_str!("../../migrations/catalog/V004__ttl_backfill_cursor.cql"),
+const CATALOG_THROUGH_V004: &[(&str, &str)] = &[
+    (
+        "V001__initial_schema.cql",
+        include_str!("../../migrations/catalog/V001__initial_schema.cql"),
+    ),
+    (
+        "V002__backup_restore.cql",
+        include_str!("../../migrations/catalog/V002__backup_restore.cql"),
+    ),
+    (
+        "V003__account_scoped_idempotency.cql",
+        include_str!("../../migrations/catalog/V003__account_scoped_idempotency.cql"),
+    ),
+    (
+        "V004__ttl_backfill_cursor.cql",
+        include_str!("../../migrations/catalog/V004__ttl_backfill_cursor.cql"),
+    ),
 ];
 
 /// An engine on its own keyspace prefix (so its sweeps and workers touch no
@@ -1610,11 +1622,17 @@ async fn isolated_engine(
             .unwrap();
     }
     if through_v004 {
-        // Statement by statement, as the migration runner does, recording
-        // versions 1-4 in schema_history as the runner did for a 0.0.3 catalog.
-        session.query(format!("USE {catalog_ks}")).await.unwrap();
-        for file in CATALOG_THROUGH_V004 {
-            for statement in file.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        // Statement by statement, each qualified with the catalog keyspace by
+        // the function the migration runner uses, recording versions 1-4 in
+        // schema_history as the runner did for a 0.0.3 catalog.
+        for (filename, sql) in CATALOG_THROUGH_V004 {
+            let statements = extenddb_storage_cassandra::migrations::migration_statements(
+                &catalog_ks,
+                filename,
+                sql,
+            )
+            .expect(filename);
+            for statement in statements {
                 session.query(statement).await.expect("V001-V004 statement");
             }
         }
