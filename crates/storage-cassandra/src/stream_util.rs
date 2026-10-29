@@ -61,17 +61,27 @@ impl HybridClock {
         self.generate_with_created_at().0
     }
 
-    /// Generate the next sequence number and the wall-clock reading it was
-    /// derived from, as `(sequence_number, created_at_ms)`.
+    /// Generate the next sequence number and the wall-clock reading taken by
+    /// this call, as `(sequence_number, created_at_ms)`.
     ///
-    /// Stream records store both values. Taking them from one read keeps
-    /// `created_at_ms <= hlc_ms` for every record: the clock clamps its
-    /// physical component upward on a backwards step but never below the
-    /// reading, so a record's stored creation time never exceeds the
-    /// timestamp prefix of its own sequence number.
+    /// The sequence prefix is that reading or a later clamped value, so a
+    /// record's stored creation time never exceeds the timestamp prefix of
+    /// its own sequence number (`created_at_ms <= hlc_ms`). A reading at or
+    /// below the last prefix keeps the last prefix; when the counter
+    /// overflows, the prefix moves to the later of a fresh reading and the
+    /// last prefix plus one.
     pub fn generate_with_created_at(&mut self) -> (String, i64) {
         let now_ms = chrono::Utc::now().timestamp_millis();
+        self.generate_from(now_ms, || {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            chrono::Utc::now().timestamp_millis()
+        })
+    }
 
+    /// One clock step for the reading `now_ms`. `reread` is called only when
+    /// the counter overflows and returns the reading taken after the wait;
+    /// tests pass both readings in.
+    fn generate_from(&mut self, now_ms: i64, reread: impl FnOnce() -> i64) -> (String, i64) {
         if now_ms > self.last_timestamp_ms {
             self.last_timestamp_ms = now_ms;
             self.logical_counter = 0;
@@ -92,14 +102,11 @@ impl HybridClock {
             // component stays close to real time; ordering is carried by the
             // floor below, not by the sleep.
             if self.logical_counter > 999_999 {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-                // The re-read can still sit behind `last_timestamp_ms` when
-                // the clock was clamped forward by an earlier backwards step.
-                // The physical component must move past the millisecond that
-                // already issued counter 999_999, so it never goes below
-                // `last_timestamp_ms + 1`.
-                let reread_ms = chrono::Utc::now().timestamp_millis();
-                self.last_timestamp_ms = reread_ms.max(self.last_timestamp_ms + 1);
+                // The re-read can sit below the last prefix, after a backwards
+                // step during the wait or under a forward clamp, so the prefix
+                // moves at least one past the last one. It stays above every
+                // earlier reading and above every earlier sequence number.
+                self.last_timestamp_ms = reread().max(self.last_timestamp_ms + 1);
                 self.logical_counter = 0;
             }
         }
@@ -360,6 +367,28 @@ mod tests {
         assert!(
             seq > first,
             "the overflow sequence follows the previous one: {first} < {seq}"
+        );
+    }
+
+    /// When the wall clock steps back during the overflow wait, the re-read
+    /// lands below the call's own reading. The prefix still stays at or
+    /// above that reading, and the sequence still follows the previous one.
+    #[test]
+    fn overflow_prefix_stays_above_the_reading_when_the_reread_steps_back() {
+        let now_ms: i64 = 1_800_000_000_000;
+        let mut clock = HybridClock::new(3);
+        clock.last_timestamp_ms = now_ms;
+        clock.logical_counter = 999_999;
+        let previous = format!("{now_ms:013}{:06}{:04}", 999_999, 3);
+        let (seq, created_at_ms) = clock.generate_from(now_ms, || now_ms - 10);
+        let hlc_ms: i64 = seq[..13].parse().unwrap();
+        assert!(
+            created_at_ms <= hlc_ms,
+            "created_at_ms {created_at_ms} exceeds sequence prefix {hlc_ms} in {seq}"
+        );
+        assert!(
+            seq > previous,
+            "the overflow sequence follows the previous one: {previous} < {seq}"
         );
     }
 
