@@ -113,7 +113,9 @@ fn canonical(region: &str, account_id: &str, rid: &ResourceId) -> String {
         None => base,
         Some(Sub::Index(i)) => format!("{base}/index/{i}"),
         Some(Sub::Stream(s)) => format!("{base}/stream/{s}"),
-        Some(Sub::Backup(b)) => format!("{base}/backup/{b}"),
+        Some(Sub::Backup(b)) => extenddb_core::backup_format::format_backup_arn(
+            PARTITION, region, account_id, &rid.table, b,
+        ),
     }
 }
 
@@ -138,10 +140,7 @@ fn canonical_resource(arn: &str, region: &str, account_id: &str) -> String {
 /// act on `.../backup/<id>`.
 fn backup_arn_field(input: &Value) -> String {
     str_field(input, "BackupArn")
-        .map(|arn| {
-            arn.trim_matches(|c: char| c.is_ascii_whitespace())
-                .to_owned()
-        })
+        .map(|arn| extenddb_core::backup_format::trim_backup_arn(&arn).to_owned())
         .unwrap_or_default()
 }
 
@@ -258,7 +257,7 @@ pub(crate) fn validate_operation_arns(operation: &str, input: &Value) -> Result<
         "DescribeBackup" | "DeleteBackup" => {
             if let Some(arn) = present("BackupArn")
                 && !arn_is_kind(
-                    arn.trim_matches(|c: char| c.is_ascii_whitespace()),
+                    extenddb_core::backup_format::trim_backup_arn(arn),
                     ArnKind::Backup,
                 )
             {
