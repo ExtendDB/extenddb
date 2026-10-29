@@ -34,7 +34,73 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
+
+      # Local S3 endpoint for the backup-store conformance suite. moto is a
+      # pip package, so it needs no container image; MinIO no longer
+      # publishes pre-built images. moto and its direct dependencies are
+      # pinned in requirements-moto.txt, which also keys the pip cache. The
+      # suite fails rather than skips when EXTENDDB_TEST_S3_REQUIRED is set
+      # and the endpoint is unreachable.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-moto.txt
+      - name: Start S3 mock
+        run: |
+          pip install -r requirements-moto.txt
+          nohup moto_server -p 9000 > moto.log 2>&1 &
+          for _ in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:9000/ > /dev/null; then exit 0; fi
+            sleep 1
+          done
+          echo "moto_server did not start"; cat moto.log; exit 1
+
+      # The AWS_* variables are scoped to the backup-store crate so they do
+      # not leak into other crates' tests (the server warns about a stray
+      # AWS_ACCESS_KEY_ID in dev mode, and a test of that warning would see
+      # these).
+      - run: cargo test --locked --workspace --exclude extenddb-backup-store
+      - run: cargo test --locked -p extenddb-backup-store
+        env:
+          EXTENDDB_TEST_S3_REQUIRED: "1"
+          EXTENDDB_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+          EXTENDDB_TEST_S3_REGION: us-east-1
+          # moto accepts any credentials; these are not secrets.
+          AWS_ACCESS_KEY_ID: testing
+          AWS_SECRET_ACCESS_KEY: testing
+          AWS_REGION: us-east-1
+
+      # The owner-only rule's uid cells (a root, a subdirectory or an
+      # ancestor owned by another user) need chown, so those filesystem
+      # tests run only as root and skip elsewhere. One leg is enough: they
+      # exercise no toolchain-specific code. The step runs the conformance
+      # binary the previous step built, so nothing is compiled as root and
+      # target/ keeps no root-owned files. EXTENDDB_TEST_REQUIRE_ROOT makes
+      # those tests fail rather than skip if sudo does not give root; it is
+      # passed through env because sudo resets the environment. pipefail
+      # makes a failed cargo fail the assignment, not only the test -x.
+      - name: Filesystem store tests as root
+        if: matrix.toolchain == 'stable'
+        run: |
+          set -o pipefail
+          bin=$(cargo test --locked -p extenddb-backup-store \
+                  --test conformance --no-run --message-format=json \
+                | python3 -c 'import json, sys
+          for line in sys.stdin:
+              m = json.loads(line)
+              if (m.get("reason") == "compiler-artifact"
+                      and m["target"]["name"] == "conformance"
+                      and m.get("executable")):
+                  print(m["executable"])')
+          test -x "$bin"
+          sudo env EXTENDDB_TEST_REQUIRE_ROOT=1 "$bin" filesystem::
+
+      # A moto that died or hung mid-run leaves its only diagnostic in
+      # moto.log; the startup step prints it only when startup failed.
+      - name: Print the S3 mock's log
+        if: failure()
+        run: cat moto.log || true
 
   test:
     runs-on: extenddb_ubuntu-2404_4-core
