@@ -4,124 +4,44 @@
 
 ## Current Status
 
-Catalog 0.0.4 is current. **Every existing PostgreSQL, SQLite, and Cassandra deployment must run `extenddb migrate`** to reach it. PostgreSQL and SQLite servers refuse to start against a catalog version they were not built for; a Cassandra server starts anyway and serves tables and items, but CreateBackup, RestoreTableFromBackup, and DeleteBackup are refused with a `ValidationException` naming `extenddb migrate --yes` until the catalog is migrated (see [Cassandra](#cassandra)). MongoDB's catalog version does not change in this release.
+This release versions the PostgreSQL and SQLite catalogs by a migration ledger and carries catalog migrations 1 to 4, which `extenddb migrate --list` prints. **Every PostgreSQL and SQLite deployment created by a 0.1.x release runs `extenddb migrate --yes` once** before a server of this release starts on it: the server refuses a catalog with pending migrations. Migration 1 brings the catalog of every 0.1.x release to the v1.0 schema. Cassandra stays at catalog 0.0.4 and MongoDB at 0.0.2, and their sections below apply unchanged. <!-- version-literal-ok: names the Cassandra and MongoDB catalog versions -->
 
-See [Catalog 0.0.4](#catalog-004-current) below for what changes and the exact sequence. <!-- version-literal-ok: names the current version and the history below -->
+A backup that a 0.1.x release took can restore without its global and local secondary indexes: a SQLite backup taken by 0.1.14 records only the table's key schema and attribute definitions, and its restore creates the table with its items and no index. Take a new backup of each table after upgrading to v1.0, and keep the 0.1.x backups for their items only.
+
+The [general upgrade procedure](#general-upgrade-procedure) gives the sequence. The [version history](#version-history) records the 0.1.x catalog versions and what the 0.1.x binaries print.
 
 ## How Catalog Upgrades Work
 
 ### The Migration System
 
-Migrations are SQL files in `crates/storage-postgres/migrations/`, applied in filename order:
+Every backend shares one numbered list of catalog migrations, in `crates/storage/src/migrations/registry.rs`. For each id a backend declares the body it runs in each of its stores, a SQL file under `crates/storage-<backend>/migrations/` or code, or why the id does not apply to it. `extenddb migrate --yes` applies the pending bodies in id order, catalog store first, and commits each body with a row in that store's ledger, the `extenddb_migrations` table: the id, name, kind, checksum, notes, time, and the release that applied it. On PostgreSQL the catalog database and the data database each have a ledger; on SQLite the database file has one.
 
-```
-001_schema.sql            ← the complete initial schema
-002_vector_indexes.sql    ← vector index metadata, catalog 0.0.3 <!-- version-literal-ok: history -->
-003_backup_definitions.sql ← backup table definitions, catalog 0.0.4
-```
+The catalog's version is the highest id such that it and every lower id are recorded in every store its bodies touch. The `catalog_version` row in `settings` holds the same integer, written with each catalog row, for tools that read it. The `schema_history` tables of 0.1.x PostgreSQL catalogs stay in place and are not read.
 
-The `schema_history` table tracks which files have been applied. When `extenddb migrate` runs, it:
+Running `extenddb migrate --yes` on an up-to-date catalog changes nothing.
 
-1. Reads all migration files embedded in the binary (via `include_str!`)
-2. Checks `schema_history` for each filename
-3. Applies any unapplied migrations in order
-4. Records each applied filename in `schema_history`
+### The Catalog Status
 
-Running `extenddb migrate` on an up-to-date catalog is a no-op.
+`serve`, `migrate` and `verify` read the catalog's status from the ledgers, take no lock to do it, and act on it with the same exit codes:
 
-### The Catalog Version
+| Status | Meaning | `serve` | `migrate` | `migrate --yes` | `verify` |
+|--------|---------|---------|-----------|-----------------|----------|
+| Current | Every migration this binary carries is recorded | serves | 0 | 0 | 0 |
+| Behind | Migrations are pending | 3 | 3 | applies them, 0 | 3 |
+| AheadCompatible | The catalog has migrations this binary does not know, all additive | serves, with a warning | 0 | 0 | 0 |
+| AheadIncompatible | The catalog has a migration this binary does not know that is breaking | 4 | 4 | 4 | 4 |
+| NeedsAttention | A pending migration found data that a person must fix; each item is named | 5 | 5 | 5 | 5 |
+| Changed | A recorded checksum differs from this binary's body | 5 | 5 | 5 | 5 |
+| WrittenByOlderRelease | A 0.1.x release wrote to the catalog after it was migrated | 5 | 5 | 5; `--yes --reconverge` repairs it | 5 |
+| Uninitialized | Not a catalog; `extenddb init` creates one | 1 | 1 | 1 | 1 |
 
-A single row in the `settings` table stores the catalog version:
+Exit status 6 means the migration lock, or a running server, was still held when `--lock-timeout` ran out; run the command again once it is free. Every refusal prints the command that resolves it. A dev build's `serve` applies a Behind or Uninitialized catalog at startup instead of refusing it. The `serve` codes are those of `serve --foreground`; in daemon mode `serve` exits 1 and writes the refusal to syslog.
 
-```sql
-SELECT value FROM settings WHERE key = 'catalog_version';
--- '0.0.2'
-```
-
-The binary embeds an expected catalog version (`CATALOG_VERSION` constant in `crates/storage-postgres/src/lib.rs`). At startup, the server compares the database value against the binary's expectation. If they don't match, the server refuses to start and directs the operator to run `extenddb migrate`.
-
-### Version Semantics
-
-The catalog version follows semantic versioning:
-
-- **MAJOR**: Breaking schema changes that may require data migration or downtime
-- **MINOR**: New tables or columns (backward-compatible, additive)
-- **PATCH**: Index changes, constraint fixes, seed data updates
+A migration is additive when the previous release serves the catalog correctly with it applied, and breaking otherwise. Migrations 1 to 4 are breaking: do not run a 0.1.x server against a migrated catalog. A 0.1.x binary that writes to a migrated catalog (its `migrate --yes`, or a SQLite dev server) leaves it WrittenByOlderRelease.
 
 ## Writing a New Migration
 
-When you need to change the catalog schema, here's the process:
-
-### 1. Create the migration file
-
-Add a new SQL file with the next sequence number:
-
-```
-crates/storage-postgres/migrations/002_your_feature.sql
-```
-
-The file should be a single transaction:
-
-```sql
--- Copyright 2026 ExtendDB contributors
--- SPDX-License-Identifier: Apache-2.0
--- Migration 002: Brief description of what this adds/changes.
-
-BEGIN;
-
--- Your DDL here.
-ALTER TABLE tables ADD COLUMN IF NOT EXISTS new_column TEXT;
-
--- Bump the catalog version.
-UPDATE settings SET value = '0.1.0' WHERE key = 'catalog_version';
-
-COMMIT;
-```
-
-### 2. Register it in the migration runner
-
-Add the file to `CATALOG_MIGRATIONS` in `crates/storage-postgres/src/migrations.rs`:
-
-```rust
-pub(crate) const CATALOG_MIGRATIONS: &[(&str, &str)] = &[
-    (
-        "001_schema.sql",
-        include_str!("../../storage-postgres/migrations/001_schema.sql"),
-    ),
-    (
-        "002_your_feature.sql",
-        include_str!("../../storage-postgres/migrations/002_your_feature.sql"),
-    ),
-];
-```
-
-### 3. Bump the catalog version constant
-
-In `crates/storage-postgres/src/lib.rs`:
-
-```rust
-pub const CATALOG_VERSION: CatalogVersion = CatalogVersion::new(0, 1, 0);
-```
-
-This must match the version written by your migration's `UPDATE settings` statement.
-
-### 4. Update 001_schema.sql
-
-The consolidated schema file is what fresh installs get. Add your new column/table/index to `001_schema.sql` as well, and update its `INSERT INTO settings` to seed the new version. This way fresh installs get the final schema in one pass, while existing deployments get there via the incremental migration.
-
-### Design Considerations
-
-**Idempotency.** Use `IF NOT EXISTS`, `IF EXISTS`, and `ADD COLUMN IF NOT EXISTS` so migrations can be safely re-run.
-
-**Backward compatibility.** Prefer additive changes (new columns with defaults, new tables) over destructive ones (dropping columns, renaming tables). A running server on the old binary should survive the schema change until it's restarted with the new binary.
-
-**Transaction boundaries.** Wrap each migration in `BEGIN`/`COMMIT`. If any statement fails, the entire migration rolls back and the catalog stays at the previous version.
-
-**No data migrations in DDL files.** If a schema change requires backfilling data, do it in Rust code triggered by `extenddb migrate`, not in raw SQL. This gives you error handling, progress reporting, and the ability to batch large updates.
-
-**Test both paths.** Every migration must be tested two ways:
-1. Fresh install (`extenddb init`) — verifies `001_schema.sql` is correct
-2. Upgrade (`extenddb migrate` on a catalog at the previous version) — verifies the incremental migration works
+Writing a catalog migration is contributor work. The procedure, with a worked example and the tests to run on each backend, is in the [catalog migration section](../../CONTRIBUTING.md#adding-a-catalog-migration) of `CONTRIBUTING.md` in the repository root. `extenddb migrate --list` prints the migrations a PostgreSQL or SQLite binary carries, with each one's kind on its backend; a Cassandra or MongoDB binary refuses `--list`, because those backends still migrate through their bootstrappers.
 
 ## General Upgrade Procedure
 
@@ -152,24 +72,28 @@ cargo build --release
 4. **See what is pending, then apply it**
 
 ```bash
-export EXTENDDB_PG_PASSWORD='<admin password>'
-extenddb migrate --config extenddb.toml --pg-user <admin>
-extenddb migrate --config extenddb.toml --pg-user <admin> --yes
+extenddb migrate --config extenddb.toml
+extenddb migrate --config extenddb.toml --yes
 ```
 
-`migrate` connects as a PostgreSQL admin role, not as the application role in the config file. Without `--pg-user` it tries the operating-system user name, and without `EXTENDDB_PG_PASSWORD` it sends no password; the error then names the role it tried, for example `Error: Cannot connect to PostgreSQL at 127.0.0.1:5432 as admin user "alice": error returned from database: password authentication failed for user "alice". Pass the admin role with --pg-user <role> and its password in the EXTENDDB_PG_PASSWORD environment variable.`
+`migrate` connects as the application role in the config file, which does all the schema work. On PostgreSQL that role must own every table, view and sequence in the public schema of both databases, and may create tables there, as it does after `init`. A catalog restored by another role (for example from a `pg_dump --no-owner` dump loaded by an admin) is not owned by it, and such a dump carries no grants, so the role cannot read the restored tables either: the preview, `verify` and `migrate --yes` exit 1 with the database's `permission denied for table settings` followed by the catalog database's note. The data database's name is a row of the catalog's `settings`, which the role cannot read, so the commands do not guess it and print a line saying so after the note. Run the catalog database's statements first, and the next run prints the data database's note, or pass `migrate --data-db <name>` to see both notes at once. When the role can read the tables but does not own them, the preview and `verify` print a note per database, and `migrate --yes` refuses with exit status 1 before it takes the lock, printing one note per line. Each note names the objects the role does not own, with their owners, and the statements to run in that database, numbered in the order they run, each with the role that runs it. For each owner a `DO` block, run by that owner or by a superuser, changes the owner of that owner's objects with `ALTER ... OWNER TO` and of nothing else. Where no superuser exists, as on a managed service, PostgreSQL lets an owner give an object only to a role it is a member of, and only when that role may create objects in the object's schema. Call the role that owns the restored objects `<restoring role>`. When it is not a superuser, the note first prints `GRANT "<owner>" TO "<restoring role>"`, run by an administrator that may grant the application role (on PostgreSQL 16, a role with `ADMIN OPTION` on it, which the role that created it holds; the application role cannot grant itself to `<restoring role>`). Then it prints `GRANT CREATE ON SCHEMA public TO "<owner>"` when the application role may not create tables there, run by the public schema's owner, then the `DO` blocks, and last `REVOKE "<owner>" FROM "<restoring role>"`, which takes back the membership the `DO` blocks needed. Skip that last statement if `<restoring role>` was already a member of `<owner>`. A superuser can run every statement as printed. The note does not use `REASSIGN OWNED BY`, which would also give the role the old owner's other databases and its objects in other schemas. A migration that still fails on a privilege (`must be owner of table ...`) stops, commits nothing in that database, and prints the same note. `--pg-user <admin>`, with the password in `EXTENDDB_PG_PASSWORD`, names an admin role for one step only, creating the pgvector extension in the data database, on that database's server; without it `migrate --yes` reports whether pgvector is available and goes on.
 
-`migrate` finds the data database through the name `init` recorded in the catalog's `settings` (`data_database_name`), so a deployment initialised with `init --data-db <other-name>` migrates without further flags; when that recorded name differs from the one derived from the catalog database name, `migrate` prints it (`--- Data database '<name>' (recorded in the catalog's settings; ...)`), and a deployment with the usual name sees no such line. A catalog that has no recorded name (one initialised by a build that did not record it) falls back to the catalog database name without its `_catalog` suffix; if the data database is named otherwise, pass `--data-db <name>` to `migrate`, which also overrides a recorded name. A wrong name fails before anything is written: `Error: Cannot connect to <name>: error returned from database: database "<name>" does not exist`.
+`migrate` finds the data database through the name `init` recorded in the catalog's `settings` (`data_database_name`), and connects to it with the connection string `init` recorded beside it (`data_database_connection_string`), which the server connects with. A catalog that has no recorded name falls back to the catalog database name without its `_catalog` suffix. `--data-db <name>` overrides both and uses that database on the recorded connection string's server. When the two rows name different databases and `--data-db` is not given, `migrate`, `verify` and `serve` refuse with exit status 1 and name both; correct the row that is wrong.
 
-Without `--yes`, `migrate` prints what is pending and changes nothing. Its exit status says what it found:
+The PostgreSQL commands and `serve` work through PgBouncer in transaction mode and in session mode: no session sets a parameter at login other than `application_name`, which PgBouncer passes on to the server, and every other setting is sent inside the transaction that needs it.
 
-| Exit status | Meaning |
-|-------------|---------|
-| 0 | Nothing is pending (or, with `--yes`, everything pending was applied) |
-| 3 | Work is pending; run again with `--yes` to apply it |
-| 1 | An error: the connection failed, the catalog is newer than this binary or unreadable, or a migration failed |
+`migrate --yes` finds running servers through the key each one holds on the catalog database while it serves. In two layouts the key does not match the servers that run, and stopping every server before the upgrade (step 1) covers both:
 
-A script under `set -e` can run the preview as `extenddb migrate ... || [ $? -eq 3 ]`.
+- Behind PgBouncer, the TCP keepalives the serving session sets (30 s) run on the database's connection to PgBouncer, which stays up when a serving host dies. The database keeps that host's key until PgBouncer closes the dead host's connection, which PgBouncer's own keepalive settings decide: by default the operating system's, two hours idle on Linux. Until then `migrate --yes` exits 6 naming the dead server. Set `tcp_keepalive = 1`, `tcp_keepidle = 10`, `tcp_keepintvl = 5` and `tcp_keepcnt = 4` in PgBouncer's `[pgbouncer]` section for the same 30 s, or end the session with `SELECT pg_terminate_backend(<pid>)` on the pid `migrate` names.
+- After a failover of the catalog's server, the new primary holds no server's key, while a server that served through the old primary goes on serving through connections that reconnect to the new primary, until it counts its key as lost: at most 30 s after its last renewal. A `migrate --yes` in those 30 s does not see that server. Wait 30 s after a failover before you run `migrate --yes`, or stop the servers first.
+
+Without `--yes`, `migrate` reads the [catalog status](#the-catalog-status), prints each pending migration, and changes nothing; it takes no lock, so it runs beside a server. With `--yes` it takes the migration lock, waiting up to `--lock-timeout` seconds (60 by default) for running servers and other migrations, reads the status again under the lock, and applies what is pending. It refuses a store that is not a catalog with exit status 1 and the advice to run `extenddb init`. The exit statuses are those in the status table; a script under `set -e` can run the preview as `extenddb migrate ... || [ $? -eq 3 ]`.
+
+On PostgreSQL `migrate --yes` can also print:
+
+- `Waiting up to <n> s for the statements of an earlier migrator that stopped`: a migrator that was killed left a statement running in a database. The run waits until it ends, and after `--lock-timeout` exits 6 naming each session with `SELECT pg_cancel_backend(<pid>)` to end it; a statement that waits for a lock does not end by itself. The run looks for them in each database through its own connection to it, so a data database on another server is covered.
+- A line naming an index statement and the sessions it waits for: migration 4 builds its indexes with `CREATE INDEX CONCURRENTLY`, which waits for every transaction on the table. After 5 s it cancels the build and tries again, three times, and then stops naming the sessions; end them and run again.
+- `could not lock a table ... within 5 s, 4 times`: other sessions held locks on the tables a migration changes, which it names. Nothing of that migration was committed; stop those sessions and run again.
 
 5. **Verify**
 
@@ -202,7 +126,9 @@ To discard data written after the upgrade as well, restore `<data-db>` from its 
 
 ## Version History
 
-### Catalog 0.0.4 (Current)
+The catalog versions below are those of the 0.1.x releases, and the commands, output and procedures in them are those of the 0.1.x binaries. This release upgrades the catalog of any 0.1.x release with the [general upgrade procedure](#general-upgrade-procedure): its migration 1 applies the changes each version below made. <!-- version-literal-ok: history -->
+
+### Catalog 0.0.4 (the last 0.1.x catalog)
 
 Adds the table definition a backup records and the registration of a running restore:
 
@@ -235,7 +161,7 @@ On its first control-plane pass after the upgrade (at startup), the server remov
 
 #### SQLite
 
-The database is one file plus its `-wal` and `-shm` files beside it. Stop the server before copying them: `migrate` and `serve` take the same exclusive lock on `<database>.lock`, so `migrate` refuses to run while a server is up (`this command needs exclusive use of the SQLite database and cannot have it: another extenddb process is already using ...`). A stopped server can leave a non-empty `-wal` file, so copy all three.
+The database is one file plus its `-wal` and `-shm` files beside it. Stop the server before copying them: `migrate --yes` and `serve` take the same exclusive lock on `<database>.lock`, so while a server is up `migrate --yes` waits for up to `--lock-timeout` seconds (60 by default) and then exits 6 (`another extenddb process is already using ...`). `migrate` without `--yes` takes no lock, writes nothing, and runs beside a server. Before its first change `migrate --yes` copies the database to `<database>.pre-migration-<from>-to-<to>-<UTC time>` with the database's mode and prints the copy's path. A run that stops before it commits anything removes its copy, since the database is unchanged; a run that stops after a step committed keeps its copy and names it in its error, and nothing else removes a copy. A stopped server can leave a non-empty `-wal` file, so copy all three.
 
 ```bash
 extenddb stop --config extenddb.toml
@@ -254,7 +180,7 @@ catalog upgrade: rebuilt backup_items (80 rows) in 0.005s
 
 To roll back, stop the server, put the copied files back in place of the current ones (remove the current `-wal` and `-shm` first), and start the previous binary.
 
-On SQLite, `extenddb serve` refuses to start a file database whose tables are in a pre-release 0.0.4 shape and names the pending step; stop the server and run `extenddb migrate --yes`. <!-- version-literal-ok: names the pre-release shape -->
+On SQLite, `extenddb serve` reads the catalog's migration ledger before it opens the database and refuses a catalog with pending migrations, exiting 3 under `--foreground` with each pending migration and the `extenddb migrate --config <config> --yes` command to run (in daemon mode it exits 1 and writes the refusal to syslog); a dev build applies them at startup instead, taking the same copy.
 
 On startup the SQLite server removes any restore target left in `CREATING` by a server that stopped mid-copy, which is only safe because one server at a time can hold the file. A backup keeps a WAL read snapshot open while it copies; checkpoints cannot reclaim pages needed by that snapshot, so allow disk headroom for WAL growth proportional to the backup duration and concurrent write volume. Set `pool_size` to 3 or more (see the Admin Guide); the server runs at most `pool_size / 2 - 1` backups at once (4 with the default of 10) and answers `LimitExceededException` to a `CreateBackup` that waited 30 seconds for a slot. Running backups hold one connection each for their read snapshot plus one shared writer (`n` backups hold `n + 1` connections), so from `pool_size` 4 up a flood of backups leaves at least half the pool to other requests; with a `pool_size` of 2 or 3 the one admitted backup holds two of them. A GSI added by `UpdateTable` with `ProvisionedThroughput` on a `PROVISIONED` table made every `DescribeTable` of that table fail on earlier builds (`Internal("index pt: missing field NumberOfDecreasesToday")`); this build writes the index's throughput in the shape `DescribeTable` reads and reads the shape earlier builds wrote (as the same units with `NumberOfDecreasesToday` 0), so such a table is describable again after the upgrade without any change to the database file.
 
@@ -610,7 +536,7 @@ for any of these changes.
 
 **Who is affected.** Any deployment with an IAM policy that uses a `dynamodb:ResourceTag/` condition key or a `${dynamodb:ResourceTag/...}` policy variable: inline user, group and role policies, user and role permissions boundaries, and session policies. A policy that uses `aws:ResourceTag/` is not affected. Role trust policies are not affected: the AssumeRole path never resolved `dynamodb:ResourceTag/`, so a trust policy that names it behaved then as it does now.
 
-**Migration is required.** `extenddb serve` refuses to start on a catalog that has not been migrated, with an error that names `extenddb migrate --yes`. Run `extenddb migrate --yes` once per deployment before starting the new binary. On PostgreSQL, `migrate` connects as the admin user, so pass `--pg-user <admin>` and set `EXTENDDB_PG_PASSWORD`, as for `init`. The migration rewrites every stored `dynamodb:ResourceTag/<key>` condition key and `${dynamodb:ResourceTag/...}` policy variable to the `aws:ResourceTag/` form, keeping the operator, the tag key and the value unchanged. The rewrite preserves each policy's decision, because `aws:ResourceTag/` resolves from the same table tags the old `dynamodb:ResourceTag/` key read. The one difference is a `${dynamodb:ResourceTag/<key>}` policy variable on a table without that tag: neither form expands, and the literal text in the comparison changes from `${dynamodb:ResourceTag/<key>}` to `${aws:ResourceTag/<key>}`. The decision changes only for a request value equal to one of those literals. A freshly initialised deployment needs no migrate step; its catalog is already recorded as migrated.
+**Migration is required.** `extenddb serve` refuses to start on a catalog that has not been migrated, with an error that names `extenddb migrate --yes`. Run `extenddb migrate --yes` once per deployment before starting the new binary. On PostgreSQL, the 0.1.14 `migrate` connects as the admin user, so pass `--pg-user <admin>` and set `EXTENDDB_PG_PASSWORD`, as for `init`; from v1.0 the rewrite is catalog migration 2, which `migrate --yes` applies as the application role. The migration rewrites every stored `dynamodb:ResourceTag/<key>` condition key and `${dynamodb:ResourceTag/...}` policy variable to the `aws:ResourceTag/` form, keeping the operator, the tag key and the value unchanged. The rewrite preserves each policy's decision, because `aws:ResourceTag/` resolves from the same table tags the old `dynamodb:ResourceTag/` key read. The one difference is a `${dynamodb:ResourceTag/<key>}` policy variable on a table without that tag: neither form expands, and the literal text in the comparison changes from `${dynamodb:ResourceTag/<key>}` to `${aws:ResourceTag/<key>}`. The decision changes only for a request value equal to one of those literals. A freshly initialised deployment needs no migrate step: 0.1.14's `init` records the catalog as migrated, and from v1.0 `init` applies migration 2 with the others.
 
 **What `migrate` prints.** Without `--yes`, `migrate` lists each policy it would rewrite, one line per policy with the account, the principal, the policy name and the number of condition keys, and writes nothing. With `--yes`, it rewrites and records that the migration is complete. It runs on every `migrate`, so an interrupted run is finished by the next one. If a policy lookup fails, or a policy needs attention (below), `migrate` reports it, exits non-zero, and does not record completion, so a later run retries. Policy bodies are never printed.
 
@@ -649,7 +575,7 @@ To get the intended behaviour, write the condition on `aws:ResourceTag/<key>`.
 - A bare negated operator on `aws:TagKeys` (`StringNotEquals`, `StringNotLike`) matched on the absent key before. It no longer matches a request that carries tag keys. It still matches every operation that leaves the key absent, as IAM does (measured with `iam simulate-custom-policy` on 2026-10-24), so an `Allow` gated on it stops granting the tag requests and keeps granting the other operations.
 - A `Deny` gated on a bare negated operator on `aws:RequestTag/<key>` (`StringNotEquals`) matched on the absent key before, so it blocked every request its `Action` covered. It now stops blocking a `TagResource` or `CreateTable` request whose tag carries an allowed value, and still blocks a request that omits the tag.
 
-No catalog migration is required. Before upgrading a deployment that restricts tagging, check the policies of each account for the statements above.
+This change needs no catalog migration of its own. Before upgrading a deployment that restricts tagging, check the policies of each account for the statements above.
 
 ---
 

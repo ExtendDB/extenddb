@@ -142,20 +142,23 @@ are written mode 0600.
 
 ### Upgrade
 
-Back up PostgreSQL, stop or scale down incompatible serving versions, then run
-one migration Job with `EXTENDDB_PG_PASSWORD` injected from the orchestrator's
-secret store:
+Back up PostgreSQL, stop or scale down the serving containers, then run one
+migration Job with the serving image and its config:
 
 ```bash
 extenddb migrate \
   --config /var/lib/extenddb/extenddb.toml \
-  --yes \
-  --pg-user <bootstrap-user>
+  --yes
 ```
 
-The generated config stores the application connection but not the PostgreSQL
-bootstrap password, so the migration Job must receive that elevated credential
-separately. Do not give it to the serving container.
+The Job connects as the application role in the generated config, which does
+all the schema work, so it needs no credential the serving container lacks.
+To have it create the pgvector extension as well, add
+`--pg-user <bootstrap-user>` and inject `EXTENDDB_PG_PASSWORD` from the
+orchestrator's secret store into the Job only; without them the Job reports
+whether pgvector is available and goes on. A backup taken by a 0.1.x release
+can restore without its secondary indexes, so take a new backup of each table
+after the upgrade.
 
 ### Steady state
 

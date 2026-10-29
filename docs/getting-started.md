@@ -207,12 +207,15 @@ You should see all checks pass:
 
 ```
 === extenddb verify ===
+Config:           extenddb.toml
+Catalog database: extenddb_catalog
+
+--- Checking catalog migrations...
+  OK: Current: the catalog is at migration 4
 --- Checking catalog connection...
   OK: Connected to catalog.
---- Checking catalog version...
-  OK: Catalog version 0.0.4
 --- Checking data database...
-  OK: Connected to data database 'extenddb_catalog_data'.
+  OK: Connected to data database 'extenddb'.
 --- Enumerating tables...
   Tables: 0
   Indexes: 0
@@ -226,7 +229,7 @@ extenddb runs as a daemon (background process) and logs to syslog. On startup it
 
 ```bash
 ./target/release/extenddb serve --config extenddb.toml
-# extenddb 0.1.14 (catalog 0.0.4) starting on 127.0.0.1:18443
+# extenddb 0.1.14 (catalog migration 4) starting on 127.0.0.1:18443
 #   storage: postgres (postgresql://extenddb:***@localhost:5432/extenddb_catalog)
 ```
 
@@ -1305,7 +1308,7 @@ Each runner requires its tools to be installed. The runner checks prerequisites 
 ```bash
 ./target/release/extenddb version
 # extenddb 0.1.14
-# catalog 0.0.4 (postgres)
+# catalog migration 4 (postgres)
 # commit abc1234
 # built 2026-04-17T12:00:00Z
 ```

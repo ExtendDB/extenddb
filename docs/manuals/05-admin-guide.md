@@ -923,14 +923,9 @@ Error: error communicating with database
 
 Check that PostgreSQL is running and the connection string in `extenddb.toml` is correct.
 
-**Catalog version mismatch:**
+**The catalog has pending migrations, or is ahead of the binary:**
 
-<!-- version-literal-ok: the block below is an example mismatch error; 1.0.0 is the value found on disk, not a version claim -->
-```
-Error: catalog version mismatch: found 1.0.0, expected 0.0.4
-```
-
-Run `extenddb migrate --config extenddb.toml` to upgrade the catalog schema. The check is exact equality in both directions, so this also appears when a binary meets a catalog a newer build already migrated; in that case upgrade the binary rather than the catalog. `extenddb migrate` refuses a catalog newer than the binary (`catalog version X is newer than this binary's Y`) instead of stamping the older version onto it. See the Upgrade Manual for the version history and the stop / migrate / start sequence.
+On PostgreSQL and SQLite, `serve` reads the catalog's migration status before it opens the engine and refuses a catalog it cannot serve, printing the status and the command that resolves it. A catalog with pending migrations exits 3, for example `the catalog is at migration 3, and ExtendDB <release> needs migration 4`, followed by the pending migrations and `extenddb migrate --config extenddb.toml --yes`. A catalog that a newer release migrated with a breaking migration exits 4 and names that release's migrations; upgrade the binary rather than the catalog. The [Upgrade Manual](07-upgrade-manual.md#the-catalog-status) lists every status with its exit code and the stop / migrate / start sequence. On Cassandra and MongoDB the catalog checks are those of the 0.1.x releases; their sections of the Upgrade Manual describe them.
 
 ### Authentication Errors
 
