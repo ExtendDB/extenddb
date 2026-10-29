@@ -633,6 +633,38 @@ To get the intended behaviour, write the condition on `aws:ResourceTag/<key>`.
 
 **Sessions issued before the migration.** Session policies are stored in the catalog, so `migrate` rewrites them along with the identity policies. A session issued before the upgrade is evaluated with its rewritten policy once `migrate --yes` has run, and it does not need to be issued again. The new binary does not serve an unmigrated catalog, so no request is evaluated against the old policy text under the new rules.
 
+### IAM: `ArnEquals` and `ArnNotEquals` honour wildcards
+
+**What changed.** `ArnEquals` and `ArnNotEquals` now match `*` and `?` in each ARN field, as `ArnLike` and `ArnNotLike` already did and as IAM evaluates all four. Before this release the two Equals operators compared strings exactly. An Arn condition over a context value that is not an ARN (fewer than six `:`-separated fields) is now false under every operator, including `ArnNotEquals` and `ArnNotLike`, and in `ForAnyValue:` and `ForAllValues:` forms it is false when any value in the set is not an ARN and the policy lists at least one value (`ForAllValues:ArnNotEquals` or `ForAllValues:ArnNotLike` with an empty value list stays true, as in IAM). No catalog migration is required.
+
+**Who is affected.** A policy that uses an Arn operator in an identity policy, a permissions boundary, a session policy or a role trust policy, in these cases:
+
+- A `Deny` with a wildcarded `ArnEquals` now blocks the callers it names, and an `Allow` gated on one now grants to them.
+- A `Deny` with a wildcarded `ArnNotEquals` now exempts the callers the wildcard matches; before, it applied to every caller.
+- A bare `*` value now matches every ARN. An `Allow` gated on `ArnEquals: "*"` grants, and a `Deny` gated on it applies, whenever the key holds an ARN. A `Deny` gated on `ArnNotEquals: "*"` now applies only when the key is absent, and an `Allow` gated on it grants only then. AWS IAM Access Analyzer reports a bare `*` Arn value as an error, and the IAM policy simulator refuses to evaluate one against an ARN, but ExtendDB accepts it at write. Replace any of these shapes before upgrading if you wrote it by hand.
+- An Arn operator over a key whose value is not an ARN, such as `aws:ResourceTag/<key>`, is now false, so a `Deny` written that way no longer applies and an `Allow` gated on one no longer grants.
+- `dynamodb:LeadingKeys`, `dynamodb:Attributes` and `aws:TagKeys` hold values the caller or the admin chooses: the partition key values in a request (every key in a batch), the attribute names in a projection, and the session tag keys in an AssumeRole call. Each value can be ARN-shaped or not. A `ForAnyValue:` or `ForAllValues:` Arn condition over one of these keys is now false while any value in the set is not an ARN and the policy lists at least one value. A `Deny` gated on `ForAnyValue:ArnNotLike` with `arn:aws:dynamodb:us-east-1:123456789012:table/Z*` on `dynamodb:LeadingKeys` no longer applies to a request whose partition key values include one that is not an ARN, and `ForAnyValue:ArnLike` with `j*` on the same key no longer holds for the partition key value `junk`.
+
+A policy whose Arn values are literal ARNs, applied to a context value that is an ARN, evaluates as before.
+
+---
+
+### v0.1.15: IAM tag condition keys apply to TagResource, UntagResource and CreateTable
+
+**What changed.** `aws:TagKeys` and `aws:RequestTag/<key>` now resolve on the three operations that carry a tag set, as the AWS service authorization reference lists them. `TagResource` and `CreateTable` populate both keys from `Tags`: `aws:RequestTag/<key>` holds the value of the tag named `<key>`, and `aws:TagKeys` lists the tag keys in request order. `UntagResource` populates `aws:TagKeys` from `TagKeys` and leaves `aws:RequestTag/<key>` absent. Every other operation leaves both keys absent, `ListTagsOfResource` included, and so does a request whose tag list is empty. Before this release both keys were absent on every data-plane request, so a statement that named either key did not depend on the tags of a tag operation.
+
+`aws:TagKeys` is a multivalued key. A bare operator on it, one with no `ForAnyValue:` or `ForAllValues:` prefix, never matches while the key is present, as for `dynamodb:Attributes` and `dynamodb:LeadingKeys`. Tag names in `aws:RequestTag/<key>` match without regard to case, under Unicode case folding. That folding also equates the sharp s with `ss`, which the service does not (measured 2026-10-27), so a `Deny` on `aws:RequestTag/STRASSE` applies to a tag named `Straße` on ExtendDB and not on the service, and an `Allow` gated on `aws:RequestTag/STRASSE` grants a request carrying `Straße` on ExtendDB where the service would not (inferred from the same measurement; the Allow direction was not run). A request that names one tag under two spellings that fold to one name, with differing values, fails the statement closed: a `Deny` that reads the key blocks and an `Allow` that reads it does not grant. A condition value `${aws:TagKeys}` stays literal text, because a multivalued key has no single value to put there.
+
+**Who is affected.** Any deployment with a policy statement that names `aws:TagKeys` or `aws:RequestTag/<key>` in a condition: inline user, group and role policies, user and role permissions boundaries, and session policies. Role trust policies already resolved both keys from the session tags of the `AssumeRole` call. One trust-policy case changes: a condition value `${aws:TagKeys}` stays literal text there too, where it used to expand to one session tag key in hash order. A statement that was inert on tag operations now applies to `TagResource`, `UntagResource` and `CreateTable`:
+
+- A `Deny` written to block a tag key or tag value now blocks the requests that carry it. `ForAnyValue:StringEquals` on `aws:TagKeys` and `StringEquals` on `aws:RequestTag/<key>` did not match before.
+- An `Allow` gated on `ForAllValues:StringEquals` on `aws:TagKeys` used to grant for any tag keys, because the absent key satisfied it. It now grants only when every tag key in the request is in the list.
+- `Null` with value `true` on `aws:TagKeys` matched every request before. It no longer matches a request that carries tag keys, and `Null` with value `false` now matches it.
+- A bare negated operator on `aws:TagKeys` (`StringNotEquals`, `StringNotLike`) matched on the absent key before. It no longer matches a request that carries tag keys. It still matches every operation that leaves the key absent, as IAM does (measured with `iam simulate-custom-policy` on 2026-10-24), so an `Allow` gated on it stops granting the tag requests and keeps granting the other operations.
+- A `Deny` gated on a bare negated operator on `aws:RequestTag/<key>` (`StringNotEquals`) matched on the absent key before, so it blocked every request its `Action` covered. It now stops blocking a `TagResource` or `CreateTable` request whose tag carries an allowed value, and still blocks a request that omits the tag.
+
+No catalog migration is required. Before upgrading a deployment that restricts tagging, check the policies of each account for the statements above.
+
 ---
 
 ## License

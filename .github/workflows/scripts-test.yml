@@ -1,0 +1,35 @@
+name: Scripts test
+# Unit tests for the JavaScript under .github/scripts (Node's built-in runner,
+# no dependencies to install).
+on:
+  pull_request:
+    paths:
+      - '.github/scripts/**'
+      - '.github/workflows/scripts-test.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/scripts/**'
+      - '.github/workflows/scripts-test.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Run tests
+        # The shell expands the glob, so this works on every Node version.
+        run: node --test .github/scripts/*.test.js

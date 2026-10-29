@@ -44,7 +44,7 @@ jobs:
           --health-timeout 5s
           --health-retries 5
         ports:
-          - 5432:5432
+          - 127.0.0.1:5432:5432
 
     steps:
       - uses: actions/checkout@v6
@@ -230,7 +230,7 @@ jobs:
           --health-timeout 5s
           --health-retries 5
         ports:
-          - 5432:5432
+          - 127.0.0.1:5432:5432
 
     steps:
       - uses: actions/checkout@v6
@@ -301,15 +301,17 @@ jobs:
       # race tests hold a create open in an outside transaction, the
       # write-transaction conflict tests force a deadlock, and the backup restore
       # cases need catalog rows the current binary would not write; all need
-      # direct access. They build their own throwaway databases; the connection
-      # string is the server, not a database.
+      # direct access. The online GSI build tests reorder queue rows by hand and
+      # pause writers with a test hook. They build their own throwaway databases;
+      # the connection string is the server, not a database.
       - name: Run PostgreSQL storage-level tests
         env:
           EXTENDDB_TEST_PG_CONNECTION_STRING: postgresql://postgres:devpass@127.0.0.1:5432
         run: >-
           cargo test --release -p extenddb-storage-postgres
           --test vector_control_plane --test put_create_race --test twi_conflict
-          --test stream_shard_retention --test backup_restore
+          --test stream_shard_retention --test stream_shard_ownership --test stream_records_page_order --test backup_restore
+          --test gsi_online_build --test gsi_stale_writer
 
       # The daemonized server logs to syslog; dump it so server-side failures
       # are diagnosable from the job log.
@@ -337,7 +339,7 @@ jobs:
           --health-timeout 5s
           --health-retries 5
         ports:
-          - 5432:5432
+          - 127.0.0.1:5432:5432
 
     steps:
       - uses: actions/checkout@v6

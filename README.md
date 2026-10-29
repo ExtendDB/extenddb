@@ -181,7 +181,7 @@ extenddb healthcheck --config extenddb.toml    # Probe /health (exit 0 healthy, 
 extenddb verify --config extenddb.toml         # Validate deployment
 extenddb migrate --config extenddb.toml        # Apply schema migrations
 extenddb destroy --config extenddb.toml        # Tear down deployment
-extenddb settings --config extenddb.toml list  # List runtime settings
+extenddb settings --config extenddb.toml list  # List runtime settings (secrets masked)
 extenddb manage --user admin --password <pw> <subcommand>  # IAM management
 ```
 
@@ -257,6 +257,9 @@ ExtendDB uses two lightweight processes for tracking decisions:
   storage trait, auth model, on-disk format, public CLI, or any significant
   new feature or subsystem. Substantial changes go through an RFC before
   implementation.
+
+Adding a storage backend? Start with [RFC-0002: Backend Plugin Policy](docs/rfcs/0002-backend-plugin-policy.md)
+and the [Backend Acceptance Criteria](docs/rfcs/0003-backend-acceptance-criteria.md).
 
 Code in protected paths is reviewed via [`.github/CODEOWNERS`](.github/CODEOWNERS).
 

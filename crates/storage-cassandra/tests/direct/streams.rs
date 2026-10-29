@@ -22,7 +22,7 @@ fn capture(view_type: StreamViewType) -> StreamCapture {
 }
 
 /// Create a table with streams enabled and return its key_info + stream_label.
-async fn setup_stream_table(
+pub(crate) async fn setup_stream_table(
     engine: &CassandraEngine,
     table_name: &str,
 ) -> (extenddb_core::types::TableKeyInfo, String) {
@@ -139,7 +139,7 @@ async fn fetch_stream_records(
         .collect()
 }
 
-fn shard_for(pk: &str, table_id: &str) -> String {
+pub(crate) fn shard_for(pk: &str, table_id: &str) -> String {
     extenddb_storage_cassandra::stream_util::assign_shard_id(pk, table_id)
 }
 
@@ -492,7 +492,13 @@ async fn test_get_stream_records_returns_written_records() {
     use extenddb_storage::StreamEngine;
 
     let engine = setup_engine().await;
-    let (key_info, _) = setup_stream_table(&engine, "GetStreamRecords").await;
+    let (key_info, stream_label) = setup_stream_table(&engine, "GetStreamRecords").await;
+    let arn = extenddb_storage::util::stream_arn(
+        "us-east-1",
+        &key_info.account_id,
+        &key_info.table_name,
+        &stream_label,
+    );
 
     for i in 0..3u32 {
         let mut item = BTreeMap::new();
@@ -513,7 +519,7 @@ async fn test_get_stream_records_returns_written_records() {
 
     let shard_id = shard_for("pk-read", &key_info.table_id);
     let (records, last_seq) = engine
-        .get_stream_records(&key_info.account_id, &shard_id, None, 10)
+        .get_stream_records(&key_info.account_id, &arn, &shard_id, None, 10)
         .await
         .unwrap();
 
@@ -533,7 +539,13 @@ async fn test_get_stream_records_after_sequence_paginates() {
     use extenddb_storage::StreamEngine;
 
     let engine = setup_engine().await;
-    let (key_info, _) = setup_stream_table(&engine, "GetStreamRecordsPaginate").await;
+    let (key_info, stream_label) = setup_stream_table(&engine, "GetStreamRecordsPaginate").await;
+    let arn = extenddb_storage::util::stream_arn(
+        "us-east-1",
+        &key_info.account_id,
+        &key_info.table_name,
+        &stream_label,
+    );
 
     for i in 0..4u32 {
         let mut item = BTreeMap::new();
@@ -554,13 +566,19 @@ async fn test_get_stream_records_after_sequence_paginates() {
 
     let shard_id = shard_for("pk-page", &key_info.table_id);
     let (first_page, last_seq) = engine
-        .get_stream_records(&key_info.account_id, &shard_id, None, 2)
+        .get_stream_records(&key_info.account_id, &arn, &shard_id, None, 2)
         .await
         .unwrap();
     assert_eq!(first_page.len(), 2);
 
     let (second_page, _) = engine
-        .get_stream_records(&key_info.account_id, &shard_id, last_seq.as_deref(), 10)
+        .get_stream_records(
+            &key_info.account_id,
+            &arn,
+            &shard_id,
+            last_seq.as_deref(),
+            10,
+        )
         .await
         .unwrap();
     assert_eq!(second_page.len(), 2);

@@ -599,14 +599,20 @@ impl PostgresEngine {
         table_id: &str,
         index_name: &str,
     ) -> Result<IndexInfo, StorageError> {
-        let idx_row: Option<(String, String, serde_json::Value, serde_json::Value)> = sqlx::query_as(
-            "SELECT index_type, index_id, key_schema, projection FROM indexes WHERE table_id = $1 AND index_name = $2",
-        )
-        .bind(table_id)
-        .bind(index_name)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        // A GSI still being built is not readable: its table is partial, or not
+        // there yet. The service answers a Query or Scan naming one with "The
+        // table does not have the specified index", the same as for no index at
+        // all, which is what `IndexNotFound` becomes on the wire.
+        let idx_row: Option<(String, String, serde_json::Value, serde_json::Value)> =
+            sqlx::query_as(
+                "SELECT index_type, index_id, key_schema, projection FROM indexes \
+             WHERE table_id = $1 AND index_name = $2 AND index_status <> 'CREATING'",
+            )
+            .bind(table_id)
+            .bind(index_name)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let (idx_type_str, idx_id, ks_json, proj_json) =
             idx_row.ok_or_else(|| StorageError::IndexNotFound(index_name.to_owned()))?;
@@ -633,5 +639,88 @@ impl PostgresEngine {
             key_schema,
             projection,
         })
+    }
+}
+
+impl PostgresEngine {
+    /// Drop a deleted table's data tables and its queue rows, in an order that
+    /// cannot deadlock with the propagation queue.
+    ///
+    /// The worker claims a `gsi_pending` row, then takes `FOR SHARE` on the base
+    /// row (the state-based apply). A drop that takes the base table first and
+    /// then deletes the pending rows waits on the worker's claimed row while the
+    /// worker waits on the table: a cycle, and when this side is the victim the
+    /// catalog rows are already gone and the data tables stay behind.
+    ///
+    /// So the queue is stopped first. A `vector_index_holds` row for the table,
+    /// committed on its own so the claim query can see it, keeps the worker from
+    /// taking any more of the table's rows (the claim already honours holds, for
+    /// vector builds). Then the pending rows are deleted, which waits for the
+    /// claims already in flight to commit, each of which holds the base row only
+    /// until then. Only after that are the tables dropped, with nothing left that
+    /// could be waiting on them. The hold is removed in the same transaction as
+    /// the drops, so a table id that no longer exists is never left held; a
+    /// crash in between leaves a hold the recovery sweep clears by age (ten
+    /// minutes for a hold of this kind, which a drop waiting behind a long
+    /// client transaction can legitimately keep for a while).
+    ///
+    /// What this does not cover is a deadlock that does not go through the
+    /// queue: the drop waits on a client transaction that waits, through another
+    /// table, on a client transaction queued behind the drop. That is the same
+    /// exposure any DDL has here and was there before.
+    ///
+    /// With `lock_timeout`, every wait in the dropping transaction (the pending
+    /// rows' claims, a CreateBackup reading the table, a client transaction) is
+    /// bounded; a timeout fails the call with nothing dropped, and the hold
+    /// stays until the next attempt or the recovery sweep. The control plane
+    /// worker uses it so one table cannot stall a whole pass; DeleteTable itself
+    /// waits.
+    pub(crate) async fn drop_table_storage(
+        data: &sqlx::PgPool,
+        table_id: &str,
+        index_ids: &[String],
+        vector_index_ids: &[String],
+        lock_timeout: Option<&str>,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT INTO vector_index_holds (table_id, index_id) VALUES ($1, $1) \
+             ON CONFLICT (table_id, index_id) DO NOTHING",
+        )
+        .bind(table_id)
+        .execute(data)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let mut tx = data
+            .begin()
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        if let Some(timeout) = lock_timeout {
+            sqlx::query("SELECT set_config('lock_timeout', $1, true)")
+                .bind(timeout)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+        }
+        sqlx::query("DELETE FROM gsi_pending WHERE table_id = $1")
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        Self::drop_data_table(&mut tx, table_id).await?;
+        for idx_id in index_ids {
+            Self::drop_index_data_table(&mut tx, idx_id).await?;
+        }
+        for idx_id in vector_index_ids {
+            Self::drop_vector_data_table(&mut tx, idx_id).await?;
+        }
+        sqlx::query("DELETE FROM vector_index_holds WHERE table_id = $1")
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        Ok(())
     }
 }

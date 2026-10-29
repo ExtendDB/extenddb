@@ -865,9 +865,16 @@ async fn sweep_orphan_holds(
     engine: &crate::PostgresEngine,
     live: &[String],
 ) -> Result<(), StorageError> {
+    // A hold whose index_id is its own table_id is a DeleteTable stopping the
+    // queue while it drops the table (`drop_table_storage`). The drop can wait
+    // behind a long client transaction; sweeping its hold meanwhile only makes
+    // workers claim rows they then time out on, so such a hold gets longer.
     let swept = sqlx::query(
         "DELETE FROM vector_index_holds \
-         WHERE NOT (index_id = ANY($1)) AND created_at < NOW() - INTERVAL '1 minute'",
+         WHERE NOT (index_id = ANY($1)) \
+           AND created_at < NOW() - CASE WHEN index_id = table_id \
+                                         THEN INTERVAL '10 minutes' \
+                                         ELSE INTERVAL '1 minute' END",
     )
     .bind(live)
     .execute(&engine.data_pool)
@@ -982,7 +989,7 @@ pub async fn build_ownership(data: &sqlx::PgPool, index_id: &str) -> Option<Buil
     let mut conn = match <sqlx::PgConnection as sqlx::Connection>::connect_with(&options).await {
         Ok(conn) => conn,
         Err(e) => {
-            tracing::warn!("could not open a session for vector build ownership: {e}");
+            tracing::warn!("could not open a session for index build ownership: {e}");
             return None;
         }
     };
@@ -998,7 +1005,7 @@ pub async fn build_ownership(data: &sqlx::PgPool, index_id: &str) -> Option<Buil
         Ok(true) => Some(BuildOwner { _conn: conn }),
         Ok(false) => None,
         Err(e) => {
-            tracing::warn!("vector build ownership probe failed: {e}");
+            tracing::warn!("index build ownership probe failed: {e}");
             None
         }
     }

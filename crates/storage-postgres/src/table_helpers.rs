@@ -4,9 +4,8 @@
 //! Helper types and methods for `TableEngine` operations.
 
 use extenddb_core::types::{
-    AttributeDefinition, BillingMode, BillingModeSummary, GsiDescription, KeySchemaElement,
-    LsiDescription, Projection, ProvisionedThroughputDescription, SseDescription, SseType,
-    TableDescription, TableStatus,
+    BillingMode, BillingModeSummary, GsiDescription, LsiDescription,
+    ProvisionedThroughputDescription, SseDescription, SseType, TableDescription, TableStatus,
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{index_arn, stream_arn};
@@ -96,104 +95,6 @@ impl PostgresEngine {
     /// SQL table name for a GSI data table (static version for use outside `data` module).
     pub(crate) fn index_table_name_static(index_id: &str) -> String {
         data::index_table_name(index_id)
-    }
-
-    /// Backfill existing items from the base table into a newly created GSI.
-    ///
-    /// Uses batched reads with OFFSET/LIMIT to avoid loading all items into
-    /// memory at once (CB-19).
-    // S2: Parameters mirror the SQL schema dimensions (account, table, index,
-    // key schemas, attribute defs, projection). A wrapper struct would obscure
-    // the call site without adding clarity.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn backfill_gsi(
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        table_id: &str,
-        index_id: &str,
-        index_key_schema: &[KeySchemaElement],
-        attr_defs: &[AttributeDefinition],
-        base_key_schema: &[KeySchemaElement],
-        base_attr_defs: &[AttributeDefinition],
-        projection: &Projection,
-    ) -> Result<(), StorageError> {
-        const BATCH_SIZE: i64 = 500;
-
-        let base_table = data::data_table_name(table_id);
-        let idx_table = data::index_table_name(index_id);
-
-        let idx_sks = data::all_sort_key_info(index_key_schema, attr_defs);
-        let base_sks = data::all_sort_key_info(base_key_schema, base_attr_defs);
-
-        // Order by whatever key columns the base table actually has. A
-        // hash-only base table has no sort-key columns at all, so naming them
-        // unconditionally makes the backfill fail with "column sk_s does not
-        // exist" and the whole GSI add is rolled back.
-        let mut order_cols = vec!["pk".to_owned()];
-        for (i, _) in base_sks.iter().enumerate() {
-            if i == 0 {
-                order_cols.extend(["sk_s".to_owned(), "sk_n".to_owned(), "sk_b".to_owned()]);
-            } else {
-                let n = i + 1;
-                order_cols.extend([format!("sk{n}_s"), format!("sk{n}_n"), format!("sk{n}_b")]);
-            }
-        }
-        let sql = format!(
-            "SELECT item_data FROM {base_table} ORDER BY {} LIMIT $1 OFFSET $2",
-            order_cols.join(", ")
-        );
-        let mut offset: i64 = 0;
-        loop {
-            let rows: Vec<(serde_json::Value,)> = sqlx::query_as(&sql)
-                .bind(BATCH_SIZE)
-                .bind(offset)
-                .fetch_all(&mut **tx)
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            if rows.is_empty() {
-                break;
-            }
-
-            // BATCH_SIZE=500, always fits in i64.
-            let batch_len = i64::from(u16::try_from(rows.len()).unwrap_or(u16::MAX));
-
-            for (item_json,) in rows {
-                let item = data::json_to_item(item_json)?;
-
-                let has_all_keys = index_key_schema
-                    .iter()
-                    .all(|ks| item.contains_key(&ks.attribute_name));
-                if !has_all_keys {
-                    continue;
-                }
-
-                let projected = data::project_item_for_index(
-                    &item,
-                    index_key_schema,
-                    base_key_schema,
-                    projection,
-                );
-
-                data::insert_index_row_multi(
-                    tx,
-                    &idx_table,
-                    &item,
-                    &projected,
-                    index_key_schema,
-                    base_key_schema,
-                    &idx_sks,
-                    &base_sks,
-                )
-                .await?;
-            }
-
-            if batch_len < BATCH_SIZE {
-                break;
-            }
-            offset += batch_len;
-        }
-
-        Ok(())
     }
 
     // TODO(fidelity): These two queries are not in a transaction. Under concurrent

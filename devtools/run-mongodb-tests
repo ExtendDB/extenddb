@@ -135,7 +135,7 @@ trap cleanup EXIT
 
 echo "=== Starting MongoDB 7 replica set on host port $MONGO_PORT ==="
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-docker run -d --name "$CONTAINER_NAME" -p "$MONGO_PORT:27017" mongo:7 \
+docker run -d --name "$CONTAINER_NAME" -p "127.0.0.1:$MONGO_PORT:27017" mongo:7 \
     mongod --replSet rs0 --bind_ip_all --wiredTigerCacheSizeGB 1 >/dev/null
 
 # Wait for mongod to accept pings
@@ -249,6 +249,17 @@ fi
 # ---------------------------------------------------------------------------
 
 echo ""
+if [[ " ${RUN_TESTS_ARGS[*]} " == *" --rust"* ]]; then
+    # The storage-level MongoDB tests that need a live server (the stream
+    # records page over 16 MB and the shard ownership predicates) are
+    # #[ignore]d in the crate and read their server from this variable; this
+    # container is the one place in CI that has one.
+    echo "=== Running MongoDB storage-level live tests (records_live) ==="
+    echo ""
+    EXTENDDB_TEST_MONGODB_URI="mongodb://localhost:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
+        cargo test -p extenddb-storage-mongodb --lib -- --ignored records_live
+    echo ""
+fi
 echo "=== Running test suite via devtools/run-tests --backend mongodb ==="
 echo "  passthrough args: ${RUN_TESTS_ARGS[*]}"
 echo ""

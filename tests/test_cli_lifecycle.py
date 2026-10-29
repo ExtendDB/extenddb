@@ -341,6 +341,9 @@ class TestCliLifecycle:
             config=cli_env["config_path"],
             env_override={"EXTENDDB_ADMIN_PASSWORD": "TestPass1!"},
         )
+        # `init` writes the default port, whose PID file belongs to the shared
+        # test server; move this deployment to its own port before `stop`.
+        _patch_config_port(cli_env["config_path"], cli_env["port"])
         result = _run_extenddb("stop", config=cli_env["config_path"], check=False)
         # Should exit non-zero or report not running
         # (exact behavior depends on implementation)
