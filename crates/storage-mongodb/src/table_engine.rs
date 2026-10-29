@@ -156,7 +156,12 @@ impl MongoEngine {
         let deletion_protection = input.deletion_protection_enabled.unwrap_or(false);
 
         let now = time::OffsetDateTime::now_utc();
-        let creation_epoch = now.unix_timestamp() as f64;
+        // Keep the sub-second part. bson::DateTime stores milliseconds, and
+        // the transaction ConsumedCapacity order sorts tables by this value,
+        // so whole seconds make two tables created in the same second tie and
+        // fall back to name order, which the service does not do.
+        let creation_millis = now.unix_timestamp() * 1000 + i64::from(now.millisecond());
+        let creation_epoch = creation_millis as f64 / 1000.0;
 
         // Build the table metadata document
         let key_schema_bson =
@@ -243,7 +248,7 @@ impl MongoEngine {
             "stream_specification": stream_bson.unwrap_or(bson::Bson::Null),
             "table_status": table_status,
             "status_transition_at": status_transition_at,
-            "creation_date_time": bson::DateTime::from_millis((creation_epoch * 1000.0) as i64),
+            "creation_date_time": bson::DateTime::from_millis(creation_millis),
             "table_size_bytes": 0_i64,
             "item_count": 0_i64,
             "table_arn": &table_arn_val,
@@ -1268,6 +1273,10 @@ impl MongoEngine {
         let global_secondary_indexes = grouped.gsis;
         let local_secondary_indexes = grouped.lsis;
         let has_lsi = !local_secondary_indexes.is_empty();
+        let creation_date_time = table_doc
+            .get_datetime("creation_date_time")
+            .map(|dt| dt.timestamp_millis() as f64 / 1000.0)
+            .unwrap_or(0.0);
 
         let key_info = TableKeyInfo {
             table_name,
@@ -1280,6 +1289,7 @@ impl MongoEngine {
             global_secondary_indexes,
             local_secondary_indexes,
             stream_specification,
+            creation_date_time,
             // Fields for features this backend does not implement, vector
             // indexes today, take their defaults. Adding one to TableKeyInfo
             // then does not break this build.

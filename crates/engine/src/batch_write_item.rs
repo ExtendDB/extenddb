@@ -240,13 +240,16 @@ pub async fn handle_batch_write_item(
     // Per-item WCU already accumulated above (M-1: DynamoDB rounds per item, then sums).
     let wcu = total_wcu;
 
+    // With ReturnItemCollectionMetrics SIZE the service always returns the
+    // member: the populated map when a written table has a local secondary
+    // index, and `{}` when none does (measured 2026-10-14, as for
+    // TransactWriteItems). Without SIZE the member is absent.
     let output = BatchWriteItemOutput {
         unprocessed_items: HashMap::new(),
         consumed_capacity,
-        item_collection_metrics: if all_icm.is_empty() {
-            None
-        } else {
-            Some(all_icm)
+        item_collection_metrics: match input.return_item_collection_metrics {
+            ReturnItemCollectionMetrics::Size => Some(all_icm),
+            ReturnItemCollectionMetrics::None => None,
         },
     };
     let body = serialize_output(&output)?;

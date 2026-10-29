@@ -31,13 +31,15 @@ use super::{all_sort_key_info, data_table_name, index_table_name, vector_table_n
 const TEXT_KEY: &str = "TEXT COLLATE \"C\"";
 use crate::PostgresEngine;
 
-/// Row shape returned by the table-info query: (`key_schema`, `attr_defs`, status, `table_id`, `stream_spec`).
+/// Row shape returned by the table-info query: (`key_schema`, `attr_defs`,
+/// status, `table_id`, `stream_spec`, creation epoch seconds).
 type TableInfoRow = (
     serde_json::Value,
     serde_json::Value,
     String,
     String,
     Option<serde_json::Value>,
+    f64,
 );
 
 impl PostgresEngine {
@@ -407,7 +409,7 @@ impl PostgresEngine {
     ) -> Result<TableKeyInfo, StorageError> {
         let row: Option<TableInfoRow> = sqlx::query_as(
             "SELECT key_schema, attribute_definitions, table_status, table_id, \
-             stream_specification \
+             stream_specification, EXTRACT(EPOCH FROM creation_date_time)::FLOAT8 \
              FROM tables \
              WHERE account_id = $1 AND table_name = $2",
         )
@@ -417,7 +419,7 @@ impl PostgresEngine {
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let (ks_json, ad_json, status, table_id, stream_spec_json) =
+        let (ks_json, ad_json, status, table_id, stream_spec_json, creation_date_time) =
             row.ok_or_else(|| StorageError::TableNotFound(table_name.to_owned()))?;
 
         match status.as_str() {
@@ -470,6 +472,7 @@ impl PostgresEngine {
             // new core field should break this site and force a decision about
             // whether the write path needs it, rather than silently defaulting.
             vector_indexes,
+            creation_date_time,
         };
         // Catalog metadata that cannot describe its own sort key would make the
         // keyed read paths fall back to a partition-only lookup and return the

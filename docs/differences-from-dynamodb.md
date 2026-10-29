@@ -48,6 +48,7 @@ adaptation when switching between ExtendDB and the real service.
 |------|----------|------|
 | Table creation delay | Returns `CREATING` immediately; transitions to `ACTIVE` typically within seconds. Same behavior for on-demand and provisioned | Configurable via `control_plane_delay_seconds` runtime setting (default: 5s) |
 | DeletionProtectionEnabled | Enforced | Enforced (accepted and stored, DeleteTable rejects when enabled) |
+| Table ARN in `TableName` | Every data-plane and table operation accepts the table's ARN (`arn:aws:dynamodb:<region>:<account>:table/<name>`) in place of its name | Bare table names only; an ARN is reported as a missing table or an invalid name. An ExtendDB table ARN carries ExtendDB's account and region, so a table that streams or replicates to Amazon DynamoDB would answer to two ARNs for one logical table. Keeping names as the only identifier avoids that collision. Transactions that address one item by name and by ARN are therefore two different (missing) targets here, where the service rejects them as duplicates. With authorization on, the ARN form is authorized against the table it names before the engine reports it missing (see the Authentication and Authorization table above). |
 
 ## Time to Live (TTL)
 
@@ -94,6 +95,12 @@ adaptation when switching between ExtendDB and the real service.
 | Multi-part base table keys | Not supported | Preview extension (opt-in via `enable_multipart_keys` setting). Standard single/composite keys work identically. |
 | GSI throughput on a `PROVISIONED` table | Every GSI needs `ProvisionedThroughput` of at least 1 read and 1 write unit | A GSI `ProvisionedThroughput` below 1 (including 0/0) is `ValidationException` on `CreateTable` of a `PROVISIONED` table and on `UpdateTable`'s GSI `Create` ("ReadCapacityUnits and WriteCapacityUnits must both be greater than or equal to 1 for index: <name>"; the service's text was not captured). A GSI with no `ProvisionedThroughput` is still accepted on a `PROVISIONED` table, and `UpdateTable` to `PROVISIONED` leaves an on-demand table's GSIs without one; see the `BillingModeOverride` row under Backup and Restore for how a backup of such a table restores |
 | Projected attributes across all indexes | At most 100 | Enforced on `CreateTable` (and so on `RestoreTableFromBackup`, which validates its target the same way) and on `UpdateTable`'s GSI `Create`: every `NonKeyAttributes` entry of every GSI and LSI is counted, so an attribute projected into two indexes counts twice. Over 100 is `ValidationException` ("Number of projected attributes in all indexes exceeds limit of 100, projected: <n>"; the service's text was not captured) |
+
+## Query and Scan
+
+| Area | DynamoDB | ExtendDB |
+|------|----------|------|
+| Which entry of a legacy `ScanFilter`, `QueryFilter` or `KeyConditions` map is named when two or more entries are invalid | One of the invalid entries, with its own message. Measured 2026-10-23 and 2026-10-24 on 44 two- and three-entry maps: the entry named changed with the attribute names, with the order the entries were sent, and between two runs of the same request, so it is not a function of the request | The invalid entry that sorts first by attribute name, on every backend. One invalid entry is always named with the service's message; only the choice between several differs |
 
 ## Backup and Restore
 
@@ -148,6 +155,7 @@ The same on all four backends.
 | Provisioned throughput | Token bucket per table/partition | Token bucket per table/partition, matching DynamoDB's burst and refill behavior |
 | On-demand capacity | Automatic scaling | Fixed initial burst capacity (4000 WCU / 12000 RCU), no auto-scaling |
 | Throttling | Always on; throttles requests that exceed provisioned/burst capacity. No setting to disable | Configurable via `throttling_enabled` runtime setting (default: `true`) |
+| Order of `ConsumedCapacity` entries in `TransactGetItems` and `TransactWriteItems` responses | Undocumented. Measured 2026-10-23 with three tables whose names sort opposite to their creation order, in three request orders: both operations listed the tables by creation time, oldest first, whatever order the request named them in (a request naming the newest table first still returned the oldest first). The order follows neither the request nor the table names | One entry per table, by the table's creation time, oldest first; two tables with the same stored creation time are listed in name order. The precision of the stored time differs per backend, so the tie does too: nanoseconds on SQLite, microseconds on PostgreSQL, milliseconds on MongoDB and Cassandra. A MongoDB catalog row written by a build before this change holds whole seconds, so two tables created in the same second still tie there. Measured on SQLite, PostgreSQL and MongoDB; Cassandra reads the same catalog column and was not served in this round. The creation time comes from the catalog row the handlers already read for the key schema, so it costs no extra round-trip. Earlier builds ordered the entries by hash-map iteration, which varied between processes and backends |
 
 ## Operations Not Implemented
 
