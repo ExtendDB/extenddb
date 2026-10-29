@@ -131,6 +131,8 @@ impl PostgresEngine {
         account_id: &str,
         table_name: &str,
     ) -> Result<TableDescription, StorageError> {
+        // Before the catalog rows; see `GsiBackfills::snapshot`.
+        let started = self.gsi_backfills.snapshot();
         let row: Option<TableRow> = sqlx::query_as(
             r"SELECT table_name, key_schema, attribute_definitions, billing_mode,
                       provisioned_throughput, stream_specification, table_status,
@@ -169,7 +171,8 @@ impl PostgresEngine {
 
         let table_name_owned = row.table_name.clone();
         let table_id = row.table_id.clone();
-        let mut desc = self.build_table_description_from_row(account_id, row, index_rows)?;
+        let mut desc =
+            self.build_table_description_from_row(account_id, row, index_rows, &started)?;
         desc.restore_summary =
             Self::restore_summary_on(conn, &table_id, &desc.table_status).await?;
         desc.vector_indexes = vector_index_descriptions(
@@ -181,11 +184,16 @@ impl PostgresEngine {
         Ok(desc)
     }
 
+    /// `started` is a [`GsiBackfills::snapshot`] the caller took before it read
+    /// `index_rows`.
+    ///
+    /// [`GsiBackfills::snapshot`]: extenddb_storage::gsi_backfill::GsiBackfills::snapshot
     pub(crate) fn build_table_description_from_row(
         &self,
         account_id: &str,
         row: TableRow,
         index_rows: Vec<IndexRow>,
+        started: &std::collections::HashSet<String>,
     ) -> Result<TableDescription, StorageError> {
         let mut gsis: Vec<GsiDescription> = Vec::new();
         let mut lsis: Vec<LsiDescription> = Vec::new();
@@ -225,7 +233,7 @@ impl PostgresEngine {
                     projection: proj,
                     backfilling: extenddb_storage::gsi_backfill::backfilling_member(
                         &idx.index_status,
-                        self.gsi_backfills.started(&idx.index_id),
+                        started.contains(&idx.index_id),
                     ),
                     index_status: idx.index_status,
                     provisioned_throughput: pt.or(Some(ProvisionedThroughputDescription {

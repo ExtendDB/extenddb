@@ -157,6 +157,8 @@ impl SqliteEngine {
         account_id: &str,
         table_name: &str,
     ) -> Result<TableDescription, StorageError> {
+        // Before the catalog rows; see `GsiBackfills::snapshot`.
+        let started = self.gsi_backfills.snapshot();
         let row: Option<TableRow> = sqlx::query_as(&format!(
             "SELECT {TABLE_COLUMNS} FROM tables WHERE account_id = ? AND table_name = ?"
         ))
@@ -186,7 +188,8 @@ impl SqliteEngine {
 
         let table_name_owned = row.table_name.clone();
         let table_id = row.table_id.clone();
-        let mut desc = self.build_table_description_from_row(account_id, row, index_rows)?;
+        let mut desc =
+            self.build_table_description_from_row(account_id, row, index_rows, &started)?;
         desc.restore_summary =
             Self::restore_summary_on(conn, &table_id, &desc.table_status).await?;
         let catalog_rows = vector_rows
@@ -198,11 +201,16 @@ impl SqliteEngine {
         Ok(desc)
     }
 
+    /// `started` is a [`GsiBackfills::snapshot`] the caller took before it read
+    /// `index_rows`.
+    ///
+    /// [`GsiBackfills::snapshot`]: extenddb_storage::gsi_backfill::GsiBackfills::snapshot
     pub(crate) fn build_table_description_from_row(
         &self,
         account_id: &str,
         row: TableRow,
         index_rows: Vec<IndexRow>,
+        started: &std::collections::HashSet<String>,
     ) -> Result<TableDescription, StorageError> {
         let mut gsis: Vec<GsiDescription> = Vec::new();
         let mut lsis: Vec<LsiDescription> = Vec::new();
@@ -222,7 +230,7 @@ impl SqliteEngine {
                     projection: proj,
                     backfilling: extenddb_storage::gsi_backfill::backfilling_member(
                         &idx.index_status,
-                        self.gsi_backfills.started(&idx.index_id),
+                        started.contains(&idx.index_id),
                     ),
                     index_status: idx.index_status,
                     provisioned_throughput: pt.or(Some(zero_throughput())),

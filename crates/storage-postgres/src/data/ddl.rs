@@ -567,7 +567,9 @@ impl PostgresEngine {
     ) -> Result<IndexInfo, StorageError> {
         // A GSI still being built is not readable: its table is partial. The
         // service refuses a Query or Scan naming one in two ways, by phase; see
-        // `extenddb_storage::gsi_backfill`.
+        // `extenddb_storage::gsi_backfill`. The backfill set is read before the
+        // row; see `GsiBackfills::snapshot`.
+        let started = self.gsi_backfills.snapshot();
         let idx_row: Option<(String, String, serde_json::Value, serde_json::Value, String)> =
             sqlx::query_as(
                 "SELECT index_type, index_id, key_schema, projection, index_status \
@@ -584,7 +586,7 @@ impl PostgresEngine {
         if status == "CREATING" {
             return Err(extenddb_storage::gsi_backfill::creating_read_refusal(
                 index_name,
-                self.gsi_backfills.started(&idx_id),
+                started.contains(&idx_id),
             ));
         }
 

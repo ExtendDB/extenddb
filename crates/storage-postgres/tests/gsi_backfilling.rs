@@ -294,6 +294,67 @@ async fn a_gsi_added_by_update_table_walks_both_creating_phases() {
     s.cleanup().await;
 }
 
+/// From the end of its backfill to the flip to ACTIVE, the index is still in
+/// its second phase: the build keeps its record until the row has left
+/// CREATING, and DescribeTable and a read take the record set before the row.
+/// On this backend the hold sits between the backfill and the flip, so the
+/// test reads the index through that window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_index_stays_backfilling_from_the_end_of_its_backfill_to_the_flip() {
+    let Some(base) = base_conn() else {
+        eprintln!("SKIP: EXTENDDB_TEST_PG_CONNECTION_STRING is not set");
+        return;
+    };
+    let s = Scratch::new(&base, 1500).await;
+    let update = s.add_gsi();
+
+    // The backfill has written all three items once the index table holds
+    // them; nothing else writes to the table in this test.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let index_id: Option<(String,)> =
+            sqlx::query_as("SELECT index_id FROM indexes WHERE index_name = 'gidx'")
+                .fetch_optional(&s.db)
+                .await
+                .expect("read the index row");
+        let rows: Option<i64> = match index_id {
+            Some((id,)) => sqlx::query_scalar(&format!("SELECT count(*) FROM \"_ddb_{id}\""))
+                .fetch_one(&s.db)
+                .await
+                .ok(),
+            None => None,
+        };
+        if rows == Some(3) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the backfill never wrote the items"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let mut readings = 0;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match s.phase().await {
+            Some(3) => break,
+            Some(2) => readings += 1,
+            None => {}
+            Some(phase) => panic!("phase {phase} after the backfill wrote every item"),
+        }
+        assert!(Instant::now() < deadline, "no ACTIVE state");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(readings > 0, "no reading between the backfill and the flip");
+    update
+        .await
+        .expect("the UpdateTable task")
+        .expect("UpdateTable succeeds");
+
+    s.cleanup().await;
+}
+
 /// A build that fails for a passing reason leaves its index CREATING for the
 /// recovery pass. The index stays in its second phase through the wait and the
 /// retry, until the retry publishes it.

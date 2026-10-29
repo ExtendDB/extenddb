@@ -1027,7 +1027,8 @@ async fn index_row_exists(
 /// returns an error leaves the record for the caller: a passing failure keeps
 /// it for the retry, and `remove_failed_build` removes it with the index.
 /// `hold` is the table's `gsi_creating_phase_delay_ms` test hold, waited once
-/// before the barrier and once more inside each build's recorded phase.
+/// before the barrier and once more inside each build's recorded phase,
+/// between its backfill and its flip to ACTIVE.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_gsis(
     catalog: &sqlx::PgPool,
@@ -1068,10 +1069,12 @@ pub(crate) async fn build_gsis(
         // that would recur. A passing failure returns with it in place, so the
         // index stays in its second phase until the retry publishes it.
         backfills.start(&b.def.index_id);
-        if !hold.is_zero() {
+        let filled = backfill(data, table_id, &b.def, base_ks, attr_defs).await;
+        if filled.is_ok() && !hold.is_zero() {
+            // After the backfill, so the end of the second phase, from the last
+            // page to the flip, is the part the hold lengthens.
             tokio::time::sleep(hold).await;
         }
-        let filled = backfill(data, table_id, &b.def, base_ks, attr_defs).await;
         let published = match filled {
             Ok(counts) => {
                 tracing::debug!(

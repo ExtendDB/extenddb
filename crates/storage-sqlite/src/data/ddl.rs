@@ -527,7 +527,9 @@ impl SqliteEngine {
         // A GSI still being built is not readable: its table is partial, or not
         // there yet (a Query hit it with a 500 on main). The service refuses a
         // Query or Scan naming one in two ways, by phase; see
-        // `extenddb_storage::gsi_backfill`.
+        // `extenddb_storage::gsi_backfill`. The backfill set is read before the
+        // row; see `GsiBackfills::snapshot`.
+        let started = self.gsi_backfills.snapshot();
         let row: Option<(String, String, String, String, String)> = sqlx::query_as(
             "SELECT index_type, index_id, key_schema, projection, index_status \
              FROM indexes WHERE table_id = ? AND index_name = ?",
@@ -543,7 +545,7 @@ impl SqliteEngine {
         if status == "CREATING" {
             return Err(extenddb_storage::gsi_backfill::creating_read_refusal(
                 index_name,
-                self.gsi_backfills.started(&index_id),
+                started.contains(&index_id),
             ));
         }
 

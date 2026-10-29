@@ -111,6 +111,21 @@ impl GsiBackfills {
         self.lock().contains(index_id)
     }
 
+    /// The ids recorded now, for a reader to take before it reads the catalog
+    /// rows it pairs them with.
+    ///
+    /// A build removes an id only after the index's row has left `CREATING`,
+    /// so a set read first can be paired only with the same row or a newer
+    /// one. A `CREATING` row is then reported with a set that still holds its
+    /// id, and the answer never goes back to the first phase. Read the other
+    /// way round, a call could read the row as `CREATING` just before the flip
+    /// and the set just after the id was removed, and report the first phase
+    /// for an index whose backfill had finished.
+    #[must_use]
+    pub fn snapshot(&self) -> HashSet<String> {
+        self.lock().clone()
+    }
+
     fn lock(&self) -> MutexGuard<'_, HashSet<String>> {
         // A panic while the lock was held leaves a set that is still usable, so
         // a poisoned lock is taken as it is.
@@ -180,6 +195,18 @@ mod tests {
         let guard = running.start_scoped("i1");
         assert!(running.started("i1"));
         drop(guard);
+        assert!(!running.started("i1"));
+    }
+
+    #[test]
+    fn a_snapshot_keeps_the_ids_recorded_when_it_was_taken() {
+        let running = GsiBackfills::default();
+        running.start("i1");
+        let before = running.snapshot();
+        running.finish("i1");
+        running.start("i2");
+        assert!(before.contains("i1"));
+        assert!(!before.contains("i2"));
         assert!(!running.started("i1"));
     }
 
