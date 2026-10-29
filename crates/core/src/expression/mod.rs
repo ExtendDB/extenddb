@@ -14,6 +14,7 @@ mod key_condition;
 mod kind;
 mod parser;
 mod parser_common;
+mod path_length;
 mod projection;
 mod reserved_words;
 mod resolver;
@@ -28,6 +29,7 @@ pub use evaluator::{compare_orderable, evaluate_condition};
 pub use key_condition::{KeyCondition, SortKeyCondition, parse_key_condition};
 pub use kind::ExpressionKind;
 pub use parser::{parse_condition, parse_condition_with_depth_limit};
+pub use path_length::MAX_DOCUMENT_PATH_ELEMENTS;
 pub use projection::{Projection, parse_projection};
 pub use reserved_words::validate_no_reserved_words;
 pub use resolver::{
