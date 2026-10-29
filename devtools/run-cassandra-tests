@@ -29,8 +29,10 @@
 #
 # Prerequisites:
 #   - A Cassandra node reachable at the contact point (default 127.0.0.1:9042)
-#     with PasswordAuthenticator enabled. The official cassandra:4.1 image does
-#     not honour CASSANDRA_AUTHENTICATOR, so patch it after starting:
+#     with PasswordAuthenticator enabled. The Rust direct tests read
+#     EXTENDDB_TEST_CASSANDRA_CONTACT_POINT (default 127.0.0.1:9042), which
+#     --contact-points above doesn't set. The official cassandra:4.1 image
+#     does not honour CASSANDRA_AUTHENTICATOR, so patch it after starting:
 #       docker run -d --name cassandra -p 9042:9042 \
 #         -e CASSANDRA_CLUSTER_NAME=extenddb-ci \
 #         -e HEAP_NEWSIZE=128M -e MAX_HEAP_SIZE=1024M \
@@ -67,7 +69,7 @@ while [[ $# -gt 0 ]]; do
         --output)         OUTPUT_DIR="$2"; shift 2 ;;
         --keep)           KEEP=true; shift ;;
         --)               shift; RUN_TESTS_ARGS=("$@"); break ;;
-        -h|--help)        sed -n '5,35p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)        sed -n '5,47p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)                echo "error: unknown option: $1" >&2; exit 1 ;;
     esac
 done
