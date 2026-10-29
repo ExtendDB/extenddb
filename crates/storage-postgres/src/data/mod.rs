@@ -16,12 +16,14 @@ use extenddb_storage::error::StorageError;
 /// Includes `account_id` for multi-account isolation (Phase 12a).
 /// Table names are validated at the engine layer (alphanumeric + `_.-`),
 /// so this is safe for identifier construction.
-pub(crate) fn data_table_name(table_id: &str) -> String {
+#[must_use]
+pub fn data_table_name(table_id: &str) -> String {
     format!("\"_ddb_{table_id}\"")
 }
 
 /// SQL table name for a GSI/LSI data table.
-pub(crate) fn index_table_name(index_id: &str) -> String {
+#[must_use]
+pub fn index_table_name(index_id: &str) -> String {
     format!("\"_ddb_{index_id}\"")
 }
 
@@ -38,7 +40,8 @@ pub(crate) fn index_table_name(index_id: &str) -> String {
 /// for the same reason.
 ///
 /// The id is a server-generated UUID, so no client input reaches this identifier.
-pub(crate) fn vector_table_name(index_id: &str) -> String {
+#[must_use]
+pub fn vector_table_name(index_id: &str) -> String {
     format!("\"_ddb_vec_{index_id}\"")
 }
 
@@ -142,4 +145,8 @@ mod tx_helpers;
 mod update_item;
 pub mod vector_index;
 
+pub(crate) use ddl::{
+    LockHolders, delete_pending_queue_rows, drop_table_relations, lock_not_available,
+    lock_wait_failed, storage_in_use, table_storage_relations,
+};
 pub(crate) use index::{insert_index_rows_multi, item_has_index_keys, project_item_for_index};

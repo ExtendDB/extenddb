@@ -145,9 +145,6 @@ const CATALOG_SHAPE_STEPS: &[ShapeStep] = &[
 /// timeout the server refuses to start instead.
 pub(crate) const SERVE_SHAPE_LOCK_TIMEOUT_SECS: u64 = 5;
 
-/// SQLSTATE `lock_not_available`, which `lock_timeout` raises.
-const SQLSTATE_LOCK_NOT_AVAILABLE: &str = "55P03";
-
 async fn shape_step_needed(pool: &PgPool, step: &ShapeStep) -> OpResult<bool> {
     sqlx::query_scalar(step.needed)
         .fetch_one(pool)
@@ -198,11 +195,7 @@ pub(crate) async fn converge_catalog_shapes_at_serve(pool: &PgPool) -> OpResult<
             continue;
         }
         let fail = |e: sqlx::Error| {
-            let lock_timeout = e
-                .as_database_error()
-                .and_then(|d| d.code())
-                .is_some_and(|c| c == SQLSTATE_LOCK_NOT_AVAILABLE);
-            if lock_timeout {
+            if crate::data::lock_not_available(&e) {
                 OpError::Internal(format!(
                     "Catalog shape step ({}): could not lock the table within \
                      {SERVE_SHAPE_LOCK_TIMEOUT_SECS} s, another session holds it",
@@ -371,6 +364,30 @@ pub(crate) async fn run_data_code_migrations(
         record_migration(data_pool, name).await?;
     }
     Ok(())
+}
+
+/// Bring a fresh catalog database and a fresh data database (the same pool
+/// twice on the shared layout) to the current schema the way `extenddb
+/// migrate --yes` does: every catalog migration, every data migration, then
+/// the data code migrations, each recorded in its ledger. For test harnesses
+/// in this crate's own `tests/` directory, which otherwise copy the file
+/// lists and go stale when a migration is added here.
+///
+/// # Errors
+///
+/// Returns the first migration's error, formatted.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub async fn apply_all_migrations(catalog: &PgPool, data: &PgPool) -> Result<(), String> {
+    run_catalog_migrations(catalog)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    run_data_migrations(data)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    run_data_code_migrations(catalog, data)
+        .await
+        .map_err(|e| format!("{e:?}"))
 }
 
 /// Create the base-table-key index on every existing GSI/LSI table.

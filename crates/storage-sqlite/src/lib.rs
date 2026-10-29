@@ -37,6 +37,7 @@ mod number_key;
 mod operations;
 mod schema;
 mod serve_lock;
+mod snapshot_engine;
 mod sqlite_util;
 mod store;
 mod stream;

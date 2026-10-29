@@ -46,8 +46,9 @@ const BACKUP_SERVER_SLOTS_MAX: usize = 16;
 /// `LimitExceeded`.
 pub(crate) const BACKUP_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Backups the whole process may run at once, across accounts:
-/// `pool_size / 2 - 1`, clamped to `1..=16`.
+/// Backups and table snapshots the whole process may run at once, across
+/// accounts. The formula is stated once, on `SqliteConfig::pool_size`
+/// (`config.rs`); this computes it.
 ///
 /// A file-backed backup holds one pooled connection for its whole duration
 /// (the WAL snapshot its items are read from) and its batches and final
@@ -67,20 +68,26 @@ pub(crate) fn backup_server_slot_count(pool_size: u32) -> usize {
 
 /// Take a server slot for a backup, waiting at most `wait`; `LimitExceeded`
 /// when none frees up in time.
-async fn acquire_backup_permit(
+pub(crate) async fn acquire_backup_permit(
     slots: std::sync::Arc<tokio::sync::Semaphore>,
     slot_count: usize,
     wait: std::time::Duration,
 ) -> Result<tokio::sync::OwnedSemaphorePermit, StorageError> {
     tokio::time::timeout(wait, slots.acquire_owned())
         .await
-        .map_err(|_| {
-            StorageError::LimitExceeded(format!(
-                "Too many backups are in progress on this server (at most {slot_count} at once); \
-                 retry later"
-            ))
-        })?
+        .map_err(|_| slots_exhausted(slot_count))?
         .map_err(|e| StorageError::Internal(format!("backup slot: {e}")))
+}
+
+/// The refusal when every server slot is held. Backups and table snapshots
+/// (`snapshot_engine.rs`) share the slots, so the message names both: with
+/// snapshots holding every slot a `CreateBackup` is refused with no backup
+/// running.
+pub(crate) fn slots_exhausted(slot_count: usize) -> StorageError {
+    StorageError::LimitExceeded(format!(
+        "Too many backups or table snapshots are in progress on this server (at most \
+         {slot_count} at once); retry later"
+    ))
 }
 
 /// Read the next batch of `(cursor, item_data)` from `table` after
@@ -3500,10 +3507,7 @@ mod restore_tests {
             .expect("first");
         match acquire_backup_permit(slots.clone(), 1, Duration::from_millis(50)).await {
             Err(StorageError::LimitExceeded(m)) => {
-                assert!(
-                    m.contains("backups are in progress on this server (at most 1"),
-                    "{m}"
-                );
+                assert!(m.contains("in progress on this server (at most 1"), "{m}");
             }
             other => panic!("a full bound refuses: {:?}", other.err()),
         }
