@@ -188,6 +188,10 @@ impl<C: CredentialStore + 'static> AuthProvider for BuiltinAuthProvider<C> {
         // S-5: Compare the session token in constant time and defer the
         // rejection until after signature verification, so neither the token's
         // byte contents nor its presence changes the failure-path timing.
+        // A header value that is not visible ASCII cannot be compared with
+        // the stored token, and it is still a token the client presented, so
+        // presence is read from the header map and the value from its text.
+        let token_header_present = headers.contains_key("x-amz-security-token");
         let presented_token = headers
             .get("x-amz-security-token")
             .and_then(|v| v.to_str().ok());
@@ -196,7 +200,7 @@ impl<C: CredentialStore + 'static> AuthProvider for BuiltinAuthProvider<C> {
             let expected = credential.session_token.as_deref().unwrap_or("");
             sigv4::verify::constant_time_eq(token.as_bytes(), expected.as_bytes())
         } else {
-            presented_token.is_none()
+            !token_header_present
         };
 
         // Verify SigV4 signature — always, even for inactive keys (S-5).

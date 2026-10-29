@@ -265,6 +265,31 @@ async fn empty_session_token_header_with_a_long_term_key_is_rejected() {
     }
 }
 
+/// A token header whose value is not visible ASCII is a presented token
+/// too. It cannot be compared with a stored token, and for a long-term key
+/// the rule is that only an absent header passes, so the request is
+/// rejected rather than served as an unauthenticated-token request.
+#[tokio::test]
+async fn non_ascii_session_token_header_with_a_long_term_key_is_rejected() {
+    // Signed without a token, then the header is added unsigned: SigV4
+    // covers the signed headers only, so the signature stays valid.
+    let mut headers = signed_headers("AKIAEXTENDDB00000000", "us-east-1", None, b"{}");
+    headers.insert(
+        "x-amz-security-token",
+        HeaderValue::from_bytes(&[0xc3, 0xa9]).expect("a header value with a byte above 0x7f"),
+    );
+    assert!(
+        headers["x-amz-security-token"].to_str().is_err(),
+        "the test header must not be readable as a string"
+    );
+    match provider(false).authenticate(&headers, b"{}").await {
+        Err(DynamoDbError::UnrecognizedClientException(msg)) => {
+            assert_eq!(msg, "The security token included in the request is invalid");
+        }
+        other => panic!("Expected UnrecognizedClientException, got: {other:?}"),
+    }
+}
+
 /// Measured 2026-09-16: a scope wrong in both region and service reports
 /// both sentences in one message, region first.
 #[tokio::test]
