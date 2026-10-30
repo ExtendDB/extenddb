@@ -8,16 +8,17 @@
 //! with a policy value. This module holds how the live service matches such a
 //! value against an ARN, and the checks it applies to the value when a policy
 //! is written. Identity policies and role trust policies are checked
-//! differently. Every rule here was measured on live IAM on 2026-10-30; the
-//! rows are in the description of the pull request for issue #665.
+//! differently. The rules come from measurements on live IAM on 2026-10-30,
+//! whose rows are in the description of the pull request for issue #665. One
+//! evaluation question was not measured, and [`arn_condition_match`] names it.
 
 use serde_json::Value;
 
 use super::document::{Condition, ConditionOperator, PolicyParseError, Statement, base_operator};
 use super::matcher::wildcard_match;
 
-/// Code and message the live service returns when an identity, managed or
-/// boundary policy holds an Arn condition value that
+/// Code and message the live service returns when an identity policy or a
+/// permissions boundary holds an Arn condition value that
 /// [`is_valid_identity_arn_value`] rejects.
 pub const IDENTITY_ARN_VALUE_ERROR: &str =
     "MalformedPolicyDocument: The policy failed legacy parsing";
@@ -72,6 +73,12 @@ pub fn is_arn_operator_name(name: &str) -> bool {
 /// prefix of the account), `arn:aws:iam:us-east-1` (the role ARN's region is
 /// empty), `arn:aws:iam::<account>:` (empty resource), `<role ARN>:x` and
 /// `arn:aws:dynamodb:*`.
+///
+/// Not measured: how the service evaluates a pattern of two to five fields
+/// whose first field holds a wildcard, such as `*:aws:iam:*` or `ar?:aws:iam`.
+/// Identity policy writes accept such a pattern (measured), and this matcher
+/// treats it as matching nothing. The one measured pattern of that kind, `*:*`,
+/// matched nothing.
 #[must_use]
 pub fn arn_condition_match(pattern: &str, arn: &str) -> bool {
     let p_fields: Vec<&str> = pattern.splitn(6, ':').collect();
@@ -93,8 +100,9 @@ pub fn arn_condition_match(pattern: &str, arn: &str) -> bool {
 }
 
 /// Whether `value` passes the check the live service applies to an Arn
-/// condition value when an identity, managed or boundary policy is written
-/// (`CreatePolicy`, `PutRolePolicy`; the service calls it legacy parsing).
+/// condition value when an identity policy or a permissions boundary is
+/// written (measured with `CreatePolicy` and `PutRolePolicy`; the service
+/// calls it legacy parsing).
 ///
 /// The value is split on `:` into at most six fields. It is rejected when the
 /// first field does not match `arn` under `*` and `?` wildcards (case
@@ -107,6 +115,12 @@ pub fn arn_condition_match(pattern: &str, arn: &str) -> bool {
 /// Everything else is accepted, including values that are not full ARNs:
 /// `*`, `a*`, `*:*`, `arn`, `arn:*`, `arn:aws:iam`, `arn:aws:iam:*`, five
 /// fields, an empty region or resource, and a resource holding `:`.
+///
+/// Each rejection above was measured, twice per value, among them `arn:`,
+/// `arn::` and `arn:aws:` (an empty partition or service in a value of fewer
+/// than six fields), `${` in the service and in the region field, and values
+/// under the `ForAllValues:` operator forms. A whole-value variable such as
+/// `${aws:PrincipalArn}` is rejected too, because its first field is `${aws`.
 #[must_use]
 pub fn is_valid_identity_arn_value(value: &str) -> bool {
     let fields: Vec<&str> = value.splitn(6, ':').collect();

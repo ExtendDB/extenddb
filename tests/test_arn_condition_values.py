@@ -9,14 +9,15 @@ pull request for issue #665.
   whose first ``:`` field does not match ``arn``, whose partition or service
   field is empty, or whose service, region or account field holds ``/`` or
   ``${``, with MalformedPolicyDocument "The policy failed legacy parsing".
-  Other values are accepted, including values shorter than an ARN.
+  They accepted the values in IDENTITY_ACCEPTED, including values shorter
+  than an ARN.
 - Role trust policies (CreateRole, UpdateAssumeRolePolicy) reject a value that
-  does not split into six ``:`` fields, with a message naming the value, and
-  accept any six-field value, an empty partition included.
+  does not split into six ``:`` fields, a JSON number or boolean included,
+  with a message naming the value. They accepted every six-field value tried,
+  an empty partition included.
 - Requests from a role session showed how a value shorter than an ARN
-  matches: ``arn:aws:iam`` and ``arn:aws:iam:*`` match every iam ARN,
-  ``arn:aws:ia`` and ``arn`` match nothing, a bare ``*`` matches nothing, and
-  ``arn:aws:dynamodb:*`` does not match an iam ARN.
+  matches the role's ARN: ``arn:aws:iam`` and ``arn:aws:iam:*`` matched, and
+  ``arn:aws:ia``, ``arn``, a bare ``*`` and ``arn:aws:dynamodb:*`` did not.
 
 Prerequisites:
   - extenddb running with `auth.provider = "builtin"` on EXTENDDB_TEST_ENDPOINT
