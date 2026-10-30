@@ -50,7 +50,7 @@ calls in an async function (top-level `await` is ESM-only).
 | `dbPath` | data dir | SQLite file location (file mode only). |
 | `port` | ephemeral | Fixed port instead of an OS-assigned one. |
 | `binary` | bundled | Path to an `extenddb` binary, overriding the bundled one. |
-| `startupTimeoutMs` | `15000` | How long to wait for the server to become healthy. |
+| `startupTimeoutMs` | `15000` | How long to wait for the server to become healthy, counted from the last line of catalog migration progress it prints. |
 
 The returned object carries `endpoint`, `port`, `credentials`, `region`,
 `storage`, and `stop()`, which shuts the server down and resolves when the

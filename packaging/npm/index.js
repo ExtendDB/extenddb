@@ -5,10 +5,10 @@
 
 const { spawn } = require("node:child_process");
 const net = require("node:net");
-const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
 const fs = require("node:fs");
+const { waitForStartup } = require("./startup.js");
 
 // AWS's documented example credential: the dev server seeds it as the
 // well-known default signing credential (dev-mode builds only).
@@ -63,31 +63,6 @@ function freePort() {
   });
 }
 
-function waitHealthy(endpoint, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  return new Promise((resolve, reject) => {
-    const probe = () => {
-      const req = http.get(`${endpoint}/health`, (res) => {
-        res.resume();
-        if (res.statusCode === 200) return resolve();
-        retry();
-      });
-      req.on("error", retry);
-      req.setTimeout(1000, () => {
-        req.destroy();
-        retry();
-      });
-    };
-    const retry = () => {
-      if (Date.now() > deadline) {
-        return reject(new Error(`extenddb did not become healthy within ${timeoutMs}ms`));
-      }
-      setTimeout(probe, 100);
-    };
-    probe();
-  });
-}
-
 /**
  * Resolve the storage location from the options.
  *
@@ -123,7 +98,9 @@ function resolveStorage(options) {
  *   default ./.extenddb/data.db).
  * @param {number} [options.port]    Fixed port (default: ephemeral).
  * @param {string} [options.binary]  Path to the extenddb dev binary.
- * @param {number} [options.startupTimeoutMs]  Readiness timeout (default 15000).
+ * @param {number} [options.startupTimeoutMs]  Readiness timeout (default
+ *   15000), counted from the start or from the last catalog migration line
+ *   the server printed, whichever is later.
  * @returns {Promise<{endpoint: string, port: number, credentials: object,
  *                    region: string, storage: string, stop: () => Promise<void>}>}
  */
@@ -145,10 +122,6 @@ async function start(options = {}) {
     cwd,
     stdio: ["ignore", "ignore", "pipe"],
   });
-  let stderrTail = "";
-  child.stderr.on("data", (d) => {
-    stderrTail = (stderrTail + d.toString()).slice(-4000);
-  });
 
   const endpoint = `http://127.0.0.1:${port}`;
   const spawned = new Promise((_, reject) => {
@@ -169,12 +142,13 @@ async function start(options = {}) {
       }
       reject(err);
     });
-    child.on("exit", (code) =>
-      reject(new Error(`extenddb exited during startup (code ${code}): ${stderrTail}`))
-    );
   });
-  await Promise.race([waitHealthy(endpoint, options.startupTimeoutMs ?? 15000), spawned]);
-  child.removeAllListeners("exit");
+  // A dev server migrates an existing database before it serves; while it
+  // reports progress, the timeout waits.
+  await Promise.race([
+    waitForStartup(child, endpoint, options.startupTimeoutMs ?? 15000),
+    spawned,
+  ]);
 
   let stopped = false;
   const stop = () =>
