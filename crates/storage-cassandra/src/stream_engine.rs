@@ -24,7 +24,10 @@ impl CassandraEngine {
     /// (embedded in the shard ID) via the secondary index on `tables.table_id`.
     ///
     /// Shard ID format: `shardId-{table_id}-{index:012}`
-    async fn account_keyspace_for_shard(&self, shard_id: &str) -> Result<String, StorageError> {
+    pub(crate) async fn account_keyspace_for_shard(
+        &self,
+        shard_id: &str,
+    ) -> Result<String, StorageError> {
         // Strip "shardId-" prefix and trailing "-{12 digits}" to get table_id.
         let without_prefix = shard_id.strip_prefix("shardId-").ok_or_else(|| {
             StorageError::Internal(format!("Invalid shard_id format: {shard_id}"))
@@ -593,6 +596,18 @@ impl StreamEngine for CassandraEngine {
                 .into_iter()
                 .next()
                 .map(|row| row.get_r_by_name("sequence_number").unwrap_or_default()))
+        })
+    }
+
+    fn first_sequence_number_at_or_after(
+        &self,
+        shard_id: &str,
+        at_ms: i64,
+    ) -> BoxFuture<'_, Result<Option<String>, StorageError>> {
+        let shard_id = shard_id.to_owned();
+        Box::pin(async move {
+            self.first_sequence_number_at_or_after_impl(&shard_id, at_ms)
+                .await
         })
     }
 }

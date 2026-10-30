@@ -41,6 +41,7 @@ mod snapshot_engine;
 mod sqlite_util;
 mod store;
 mod stream;
+mod stream_at_timestamp;
 #[cfg(test)]
 mod stream_tests;
 mod table_engine;

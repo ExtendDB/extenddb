@@ -689,6 +689,19 @@ pub trait StreamEngine: Send + Sync {
         &self,
         shard_id: &str,
     ) -> BoxFuture<'_, Result<Option<String>, StorageError>>;
+
+    /// Sequence number of the first record in the shard whose creation time
+    /// is at or after `at_ms` (milliseconds since the Unix epoch), or `None`
+    /// when no stored record qualifies.
+    ///
+    /// Used by `GetShardIterator` with `AT_TIMESTAMP`. The comparison is
+    /// against the stored `created_at`, which every backend takes from the
+    /// same clock read as the record's `ApproximateCreationDateTime`.
+    fn first_sequence_number_at_or_after(
+        &self,
+        shard_id: &str,
+        at_ms: i64,
+    ) -> BoxFuture<'_, Result<Option<String>, StorageError>>;
 }
 
 /// Background worker operations that require storage access.

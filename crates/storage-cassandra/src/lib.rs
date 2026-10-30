@@ -28,6 +28,7 @@ pub mod migrations;
 pub mod operations;
 pub(crate) mod propagation_hold;
 mod snapshot_engine;
+pub mod stream_at_timestamp;
 mod stream_engine;
 pub mod stream_util;
 pub mod table_engine;
