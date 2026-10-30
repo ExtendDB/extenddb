@@ -466,25 +466,27 @@ fi
 # arguments, picks this shard's files, and records both lists under
 # $SHARD_DIR for the summary job's `devtools/test-shards check`. pytest then
 # loads devtools/pytest_shard.py, which keeps only those files. A shard with
-# no files of a suite runs nothing for it.
+# no files of a suite runs nothing for it. shard_suite SUITE CMD... leaves
+# the command to run in SHARD_CMD.
 SHARD_DIR="${EXTENDDB_SHARD_DIR:-discussions/shards}"
 shard_suite() {
-    local suite="$1"
-    local -n shard_cmd="$2"
-    local rc=0
+    local suite="$1" rc=0
+    shift
+    # "${@:4}" is the suite's arguments after "python3 -m pytest".
     "$SCRIPT_DIR/test-shards" prepare --shard "$SHARD" --out "$SHARD_DIR" \
         --backend "$BACKEND" --config "${CONFIG_PATH:-extenddb.toml}" \
-        "$suite" -- "${shard_cmd[@]:3}" || rc=$?
+        "$suite" -- "${@:4}" || rc=$?
+    SHARD_CMD=("$@")
     if (( rc == 0 )); then
         export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
         export EXTENDDB_SHARD_FILES="$SHARD_DIR/files-$suite.txt"
-        shard_cmd+=(-p pytest_shard)
+        SHARD_CMD+=(-p pytest_shard)
     elif (( rc == 10 )); then
         echo "  shard $SHARD has no $suite files; nothing to run"
-        shard_cmd=(true)
+        SHARD_CMD=(true)
     else
         echo "  ✗ devtools/test-shards prepare failed for the $suite suite"
-        shard_cmd=(false)
+        SHARD_CMD=(false)
     fi
 }
 
@@ -513,7 +515,7 @@ if $RUN_PYTEST; then
     if [[ -n "$FILTER" ]]; then
         PYTEST_ARGS+=(-k "$FILTER")
     fi
-    if [[ -n "$SHARD" ]]; then shard_suite main PYTEST_ARGS; fi
+    if [[ -n "$SHARD" ]]; then shard_suite main "${PYTEST_ARGS[@]}"; PYTEST_ARGS=("${SHARD_CMD[@]}"); fi
     if "${PYTEST_ARGS[@]}" 2>&1 | tee "$OUTFILE"; then
         echo "  ✓ Pytest passed"
     else
@@ -576,7 +578,7 @@ if $RUN_COMPREHENSIVE; then
     if [[ -n "$FILTER" ]]; then
         COMP_ARGS+=(-k "$FILTER")
     fi
-    if [[ -n "$SHARD" ]]; then shard_suite comprehensive COMP_ARGS; fi
+    if [[ -n "$SHARD" ]]; then shard_suite comprehensive "${COMP_ARGS[@]}"; COMP_ARGS=("${SHARD_CMD[@]}"); fi
     if "${COMP_ARGS[@]}" 2>&1 | tee "$OUTFILE"; then
         echo "  ✓ Comprehensive tests passed"
     else
@@ -597,7 +599,7 @@ if $RUN_PYTEST \
     if [[ -n "$FILTER" ]]; then
         CLI_ARGS+=(-k "$FILTER")
     fi
-    if [[ -n "$SHARD" ]]; then shard_suite cli CLI_ARGS; fi
+    if [[ -n "$SHARD" ]]; then shard_suite cli "${CLI_ARGS[@]}"; CLI_ARGS=("${SHARD_CMD[@]}"); fi
     if "${CLI_ARGS[@]}" 2>&1 | tee "$CLI_OUTFILE"; then
         echo "  ✓ CLI lifecycle tests passed"
     else
