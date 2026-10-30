@@ -20,6 +20,7 @@ use super::auth::authenticate_admin;
 use super::crypto::{
     encrypt_secret, generate_secret_key, generate_session_key_id, generate_session_token,
 };
+use extenddb_auth::policy::arn_value::holds_invalid_trust_arn_value;
 use extenddb_auth::policy::condition::{ConditionMatch, evaluate_statement_conditions};
 use extenddb_auth::policy::context::AssumeRoleContext;
 use extenddb_auth::policy::document::parse_conditions;
@@ -144,6 +145,16 @@ pub async fn assume_role(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+    // A trust policy stored before writes checked Arn condition values can hold
+    // one the check rejects. Its statement fails closed at evaluation; name the
+    // role so an operator can find the policy and rewrite it.
+    if let Some(v) = extenddb_auth::policy::arn_value::invalid_trust_arn_value(&trust_policy) {
+        tracing::warn!(
+            "trust policy of role {role_name} in account {account_id} holds Arn condition \
+             value {v:?}, which policy writes reject; its statement fails closed until the \
+             policy is rewritten"
+        );
+    }
 
     // Session tags passed on the call require sts:TagSession in the trust
     // policy, so the STS action set the decision checks depends on their
@@ -508,6 +519,10 @@ enum ConditionOutcome {
 fn evaluate_conditions(stmt: &Value, context: &AssumeRoleContext) -> ConditionOutcome {
     let normalized = normalize_condition_scalars(&stmt["Condition"]);
     match parse_conditions(&normalized) {
+        // An Arn condition value the trust write check rejects (fewer than six
+        // fields) can only be a value stored before that check. It fails
+        // closed like an unparseable block.
+        Ok(conds) if holds_invalid_trust_arn_value(&conds) => ConditionOutcome::Unparseable,
         Ok(conds) => match evaluate_statement_conditions(&conds, context) {
             ConditionMatch::Match => ConditionOutcome::Pass,
             ConditionMatch::NoMatch => ConditionOutcome::Fail,
@@ -715,9 +730,12 @@ const STS_TRUST_ACTIONS: [&str; 3] = ["sts:assumerole", "sts:tagsession", "sts:s
 /// `NotPrincipal`; a missing `Principal`; a bare string principal (including
 /// `"*"`); an `AWS` principal ARN containing a wildcard; a missing
 /// `Action`/`NotAction`; an action outside the STS trust set; a
-/// `Resource`/`NotResource` field; and a `Condition` with an unknown operator
-/// or invalid structure. Accepts a missing `Version`, a single-object
-/// `Statement`, numeric condition values and unknown condition keys.
+/// `Resource`/`NotResource` field; a `Condition` with an unknown operator
+/// or invalid structure; and an Arn condition value that does not split into
+/// six ARN fields, a number or boolean read as its text, whose error carries
+/// IAM's code and message. Accepts a missing `Version`, a single-object
+/// `Statement`, numeric condition values under other operators and unknown
+/// condition keys.
 pub(crate) fn validate_trust_policy(trust_policy: &Value) -> Result<(), String> {
     let Some(statements) = statements_vec(trust_policy) else {
         return Err("Trust policy must contain a Statement object or array".to_owned());
@@ -749,6 +767,15 @@ pub(crate) fn validate_trust_policy(trust_policy: &Value) -> Result<(), String> 
     }
     for stmt in &statements {
         validate_trust_statement(stmt)?;
+    }
+    // Measured on live IAM CreateRole and UpdateAssumeRolePolicy: an Arn
+    // condition value that does not split into six ARN fields is rejected with
+    // MalformedPolicyDocument and a message naming the value. A number or
+    // boolean is read as its text and rejected the same way. This error
+    // carries the service's code and message.
+    if let Some(msg) = extenddb_auth::policy::arn_value::trust_policy_arn_value_error(trust_policy)
+    {
+        return Err(msg);
     }
     Ok(())
 }
@@ -1015,6 +1042,9 @@ async fn fetch_caller_created_at(
 }
 
 #[cfg(test)]
+mod arn_trust_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -1049,7 +1079,7 @@ mod tests {
         }
     }
 
-    fn ctx() -> AssumeRoleContext {
+    pub(super) fn ctx() -> AssumeRoleContext {
         mk_ctx(HashMap::new(), None, HashMap::new())
     }
 

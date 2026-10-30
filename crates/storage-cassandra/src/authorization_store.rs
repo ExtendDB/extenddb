@@ -58,7 +58,7 @@ impl AuthorizationStore for CassandraCatalogStore {
         &self,
         account_id: &str,
         user_name: &str,
-    ) -> BoxFuture<'_, OpResult<Vec<String>>> {
+    ) -> BoxFuture<'_, OpResult<Vec<(String, String)>>> {
         let account_id = account_id.to_owned();
         let user_name = user_name.to_owned();
         let session = self.session().clone();
@@ -127,7 +127,7 @@ impl AuthorizationStore for CassandraCatalogStore {
                                 );
                                 OpError::Internal("Database error".to_owned())
                             })?;
-                        policies.push(policy_doc);
+                        policies.push((group_name.clone(), policy_doc));
                     }
                 }
             }

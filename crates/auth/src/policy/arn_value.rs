@@ -173,6 +173,13 @@ pub(super) fn validate_statement_arn_values(
     Ok(())
 }
 
+/// Whether `e` is the error `PolicyDocument::from_json` returns for an Arn
+/// condition value that [`is_valid_identity_arn_value`] rejects.
+#[must_use]
+pub fn is_arn_value_error(e: &PolicyParseError) -> bool {
+    e.0.starts_with(IDENTITY_ARN_VALUE_ERROR)
+}
+
 /// Whether a trust policy statement's parsed conditions hold an Arn condition
 /// value that [`is_valid_trust_arn_value`] rejects. The trust evaluator treats
 /// such a statement as unparseable, so a Deny blocks and an Allow does not
@@ -185,31 +192,32 @@ pub fn holds_invalid_trust_arn_value(conditions: &[Condition]) -> bool {
     })
 }
 
-/// The write error for a role trust policy holding an Arn condition string
-/// value that [`is_valid_trust_arn_value`] rejects, or `None`. Numbers and
-/// booleans are left to the existing value checks.
+/// The write error for a role trust policy holding an Arn condition value
+/// that [`is_valid_trust_arn_value`] rejects, or `None`.
+///
+/// A number or boolean is read as its JSON text, which never splits into six
+/// fields, so it is always rejected. The service rejected `123`, `true` and
+/// `1.5` under `ArnEquals` at `UpdateAssumeRolePolicy` (measured twice each on
+/// 2026-10-30), with that text in the message.
 #[must_use]
 pub fn trust_policy_arn_value_error(policy: &Value) -> Option<String> {
-    trust_arn_values(policy)
-        .into_iter()
-        .find(|(v, is_string)| *is_string && !is_valid_trust_arn_value(v))
-        .map(|(v, _)| format!("MalformedPolicyDocument: {}", trust_arn_value_message(&v)))
+    invalid_trust_arn_value(policy)
+        .map(|v| format!("MalformedPolicyDocument: {}", trust_arn_value_message(&v)))
 }
 
-/// The first Arn condition value in a stored role trust policy that
+/// The first Arn condition value in a role trust policy that
 /// [`is_valid_trust_arn_value`] rejects, read the way the trust evaluator reads
 /// it (a number or boolean as its JSON text), or `None`.
 #[must_use]
 pub fn invalid_trust_arn_value(policy: &Value) -> Option<String> {
     trust_arn_values(policy)
         .into_iter()
-        .find(|(v, _)| !is_valid_trust_arn_value(v))
-        .map(|(v, _)| v)
+        .find(|v| !is_valid_trust_arn_value(v))
 }
 
 /// Every scalar value under an Arn condition operator in a trust policy
-/// document, as text, each paired with whether it is a JSON string.
-fn trust_arn_values(policy: &Value) -> Vec<(String, bool)> {
+/// document, as text: a string as it is, a number or boolean as its JSON text.
+fn trust_arn_values(policy: &Value) -> Vec<String> {
     let statements: Vec<&Value> = match &policy["Statement"] {
         Value::Array(a) => a.iter().collect(),
         v @ Value::Object(_) => vec![v],
@@ -231,9 +239,9 @@ fn trust_arn_values(policy: &Value) -> Vec<(String, bool)> {
                 };
                 for item in items {
                     match item {
-                        Value::String(s) => out.push((s.clone(), true)),
-                        Value::Number(n) => out.push((n.to_string(), false)),
-                        Value::Bool(b) => out.push((b.to_string(), false)),
+                        Value::String(s) => out.push(s.clone()),
+                        Value::Number(n) => out.push(n.to_string()),
+                        Value::Bool(b) => out.push(b.to_string()),
                         _ => {}
                     }
                 }

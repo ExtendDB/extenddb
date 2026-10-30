@@ -38,12 +38,12 @@ impl AuthorizationStore for PostgresCatalogStore {
         &self,
         account_id: &str,
         user_name: &str,
-    ) -> BoxFuture<'_, OpResult<Vec<String>>> {
+    ) -> BoxFuture<'_, OpResult<Vec<(String, String)>>> {
         let account_id = account_id.to_owned();
         let user_name = user_name.to_owned();
         Box::pin(async move {
-            let rows: Vec<(serde_json::Value,)> = sqlx::query_as(
-                "SELECT p.policy_document \
+            let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
+                "SELECT gm.group_name, p.policy_document \
                  FROM iam_policies p \
                  JOIN iam_group_members gm ON p.account_id = gm.account_id \
                    AND p.principal_type = 'group' \
@@ -58,7 +58,10 @@ impl AuthorizationStore for PostgresCatalogStore {
                 tracing::error!("fetch_user_group_policies: {e}");
                 OpError::Internal("Database error".to_owned())
             })?;
-            Ok(rows.into_iter().map(|(v,)| v.to_string()).collect())
+            Ok(rows
+                .into_iter()
+                .map(|(group, v)| (group, v.to_string()))
+                .collect())
         })
     }
 

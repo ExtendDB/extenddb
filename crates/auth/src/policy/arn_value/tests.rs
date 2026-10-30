@@ -302,10 +302,25 @@ fn trust_write_error_carries_the_service_code_and_message() {
 }
 
 #[test]
-fn trust_write_check_leaves_numbers_to_the_value_checks() {
-    let doc = trust_doc(&json!({"ArnEquals": {"aws:PrincipalArn": 5}}));
-    assert_eq!(trust_policy_arn_value_error(&doc), None);
-    assert_eq!(invalid_trust_arn_value(&doc).as_deref(), Some("5"));
+fn trust_write_check_reads_a_number_or_boolean_as_its_text() {
+    // `UpdateAssumeRolePolicy` rejected 123, true and 1.5 under `ArnEquals`,
+    // twice each, with the value's text in the message.
+    for (value, text) in [
+        (json!(123), "123"),
+        (json!(true), "true"),
+        (json!(1.5), "1.5"),
+        (json!(["arn:aws:iam::123456789012:user/a", 123]), "123"),
+    ] {
+        let doc = trust_doc(&json!({"ArnEquals": {"aws:PrincipalArn": value}}));
+        assert_eq!(
+            trust_policy_arn_value_error(&doc),
+            Some(format!(
+                r#"MalformedPolicyDocument: value used for ARN condition is incorrect type: STRING\nstring: \"{text}\"\n"#
+            )),
+            "{text}"
+        );
+        assert_eq!(invalid_trust_arn_value(&doc).as_deref(), Some(text));
+    }
 }
 
 #[test]
