@@ -88,11 +88,12 @@ pub(crate) const INDEX_LOCK_BUDGET: Duration = Duration::from_secs(30);
 ///
 /// While the request waits, every new write to `indexes` (a `CreateTable`
 /// with indexes, a GSI add, a status change, the cascade of a
-/// `DeleteTable`) queues behind it, so this is the longest a server write
-/// waits on the command. A tenth of PostgreSQL's default `deadlock_timeout`
-/// (1 s), and well under the default `control_plane_delay_seconds` (0.25 s)
-/// that a `CreateTable` held this long eats into. The command holds no other
-/// lock while it waits, so it cannot be part of a deadlock.
+/// `DeleteTable`) queues behind it, so this, plus the one catalog read taken
+/// once the lock is granted, is the longest a server write waits on the
+/// command. A tenth of PostgreSQL's default `deadlock_timeout` (1 s), and
+/// well under the default `control_plane_delay_seconds` (0.25 s) that a
+/// `CreateTable` held this long eats into. The command holds no other lock
+/// while it waits, so it cannot be part of a deadlock.
 const INDEX_LOCK_ATTEMPT: Duration = Duration::from_millis(100);
 
 /// The pause between two attempts, in which the writers that queued behind
