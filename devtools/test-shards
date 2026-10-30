@@ -21,6 +21,15 @@ shards of one CI run together collected every test of the whole suite.
       suite's mean seconds per test. Weights only balance the shards: a wrong
       weight makes one shard slower, it cannot drop or repeat a file.
 
+  test-shards prepare --shard K/N --out DIR [--backend NAME] [--config PATH]
+                      SUITE -- PYTEST_ARGS...
+      What `devtools/run-tests --shard K/N` runs before each pytest suite:
+      collect the whole SUITE with PYTEST_ARGS into DIR/whole-SUITE.tsv, plan
+      shard K's files into DIR/files-SUITE.txt, collect what the shard will
+      run (PYTEST_ARGS plus `-p pytest_shard`) into DIR/ran-SUITE.tsv, and
+      write K/N to DIR/shard.txt. Exits 0 when the shard has files of SUITE,
+      10 when it has none (the caller runs nothing), 1 on any failure.
+
   test-shards check DIR...
       Each DIR holds the lists written by the legs of one sharded job, one
       subdirectory per leg (shard.txt, whole-SUITE.tsv, ran-SUITE.tsv), as
@@ -32,6 +41,7 @@ shards of one CI run together collected every test of the whole suite.
 import argparse
 import contextlib
 import os
+import subprocess
 import sys
 
 # The main suite runs under pytest-xdist; on the CI runners (4 vCPU) that is
@@ -258,11 +268,63 @@ def cmd_check(groups):
     return 1 if problems else 0
 
 
+# --- prepare ---------------------------------------------------------------
+
+EMPTY_SHARD = 10
+
+
+def cmd_prepare(argv):
+    if "--" not in argv:
+        raise SystemExit("usage: test-shards prepare --shard K/N --out DIR "
+                         "[--backend NAME] [--config PATH] SUITE -- "
+                         "PYTEST_ARGS...")
+    split = argv.index("--")
+    parser = argparse.ArgumentParser(prog="test-shards prepare")
+    parser.add_argument("--shard", required=True)
+    parser.add_argument("--out", required=True)
+    parser.add_argument("--backend", default="postgres")
+    parser.add_argument("--config")
+    parser.add_argument("--weights", default=DEFAULT_WEIGHTS)
+    parser.add_argument("suite")
+    args = parser.parse_args(argv[:split])
+    pytest_args = argv[split + 1:]
+    k, n = parse_shard(args.shard)
+    os.makedirs(args.out, exist_ok=True)
+    whole, ran, files = (os.path.join(args.out, f"{kind}-{args.suite}{ext}")
+                         for kind, ext in (("whole", ".tsv"), ("ran", ".tsv"),
+                                           ("files", ".txt")))
+
+    # Each collection runs in its own interpreter: pytest does not support
+    # two sessions importing the same test modules in one process.
+    def collect(out, extra, env=None):
+        return subprocess.call([sys.executable, os.path.abspath(__file__),
+                                "collect", out, "--", *extra, *pytest_args],
+                               env=env)
+
+    if collect(whole, []):
+        return 1
+    args.collected = [f"{args.suite}={whole}"]
+    if cmd_plan(args):
+        return 1
+    devtools = os.path.dirname(os.path.abspath(__file__))
+    path = os.environ.get("PYTHONPATH")
+    env = dict(os.environ, EXTENDDB_SHARD_FILES=files,
+               PYTHONPATH=f"{devtools}{os.pathsep}{path}" if path else devtools)
+    if collect(ran, ["-p", "pytest_shard"], env):
+        return 1
+    with open(os.path.join(args.out, "shard.txt"), "w", encoding="utf-8") as f:
+        f.write(f"{k}/{n}\n")
+    with open(files, encoding="utf-8") as f:
+        return 0 if f.read().strip() else EMPTY_SHARD
+
+
 def main(argv):
     if len(argv) > 1 and argv[1] == "collect":
         if len(argv) < 4 or argv[3] != "--":
             raise SystemExit("usage: test-shards collect OUT -- PYTEST_ARGS...")
         return cmd_collect(argv[2], argv[4:])
+    if len(argv) > 1 and argv[1] == "prepare":
+        return cmd_prepare(argv[2:])
     parser = argparse.ArgumentParser(prog="test-shards")
     sub = parser.add_subparsers(dest="command", required=True)
     plan = sub.add_parser("plan")
