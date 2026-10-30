@@ -1,21 +1,11 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! `extenddb catalog-check` against the data relations the engine creates.
-//!
-//! The check compares the relations in the data database with the names the
-//! catalog's ids give through the backend's own naming functions. These tests
-//! build a deployment the way `init` leaves it (catalog and data in separate
-//! databases), create a table with a GSI, an LSI and a vector index through
-//! the engine, and run the check and the drop through the backend's
-//! `DiagnosticsStore`, which is what the command calls.
-//!
-//! Requires `EXTENDDB_TEST_PG_CONNECTION_STRING` (a base URL
-//! `postgres://user:pass@host:port`, no database); without it every test
-//! reports a skip and passes. Each test creates its own databases and drops
-//! them when its deployment is dropped, on a panic too.
+//! A deployment for the `catalog_check` tests, and the catalog and data
+//! database operations they act with.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
 
 use extenddb_core::expression::ExpressionMaps;
 use extenddb_core::types::{
@@ -24,25 +14,24 @@ use extenddb_core::types::{
     TableKeyInfo, VectorAttribute, VectorIndexSpecification,
 };
 use extenddb_storage::bootstrapper::{BootstrapConfig, Bootstrapper};
-use extenddb_storage::diagnostics::{CatalogRelation, DiagnosticsStore, OrphanDrop};
 use extenddb_storage::{DataEngine, TableEngine};
 use extenddb_storage_postgres::{
     PostgresBootstrapper, PostgresCatalogStore, PostgresConfig, PostgresEngine, index_table_name,
     vector_table_name,
 };
-use sqlx::PgPool;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::{Connection, PgConnection, PgPool};
 
-const ACCOUNT: &str = "123456789012";
+pub(crate) const ACCOUNT: &str = "123456789012";
 const REGION: &str = "us-east-1";
-const TABLE: &str = "orders";
+pub(crate) const TABLE: &str = "orders";
 
-fn base_conn() -> Option<String> {
+pub(crate) fn base_conn() -> Option<String> {
     let conn = std::env::var("EXTENDDB_TEST_PG_CONNECTION_STRING").ok()?;
     (!conn.trim().is_empty()).then(|| conn.trim_end_matches('/').to_owned())
 }
 
-fn skip(test: &str) {
+pub(crate) fn skip(test: &str) {
     eprintln!("SKIP {test}: EXTENDDB_TEST_PG_CONNECTION_STRING is not set.");
 }
 
@@ -70,7 +59,8 @@ fn parts(base: &str) -> Parts {
 }
 
 /// One deployment at a time across the binary: each holds an engine pool
-/// with a floor of ten connections on a server other tests share.
+/// with a floor of ten connections on a server other tests share. It also
+/// keeps the check's pause point to the one test that arms it.
 async fn deployment_permit() -> tokio::sync::OwnedSemaphorePermit {
     static DEPLOYMENTS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
         std::sync::OnceLock::new();
@@ -84,14 +74,14 @@ async fn deployment_permit() -> tokio::sync::OwnedSemaphorePermit {
 
 /// A deployment initialised the way `init` does it: a catalog database and a
 /// separate data database, with the data connection recorded in the catalog.
-struct Deployment {
+pub(crate) struct Deployment {
     base: String,
     catalog_db: String,
     data_db: String,
-    catalog: PgPool,
-    data: PgPool,
-    engine: PostgresEngine,
-    diagnostics: PostgresCatalogStore,
+    pub(crate) catalog: PgPool,
+    pub(crate) data: PgPool,
+    pub(crate) engine: PostgresEngine,
+    pub(crate) diagnostics: PostgresCatalogStore,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
@@ -130,7 +120,7 @@ impl Drop for Deployment {
 }
 
 impl Deployment {
-    async fn new() -> Self {
+    pub(crate) async fn new() -> Self {
         let base = base_conn().expect("caller checks base_conn() first");
         let permit = deployment_permit().await;
         let stem = format!("eddb_cck_{}", uuid::Uuid::new_v4().simple())[..20].to_owned();
@@ -212,8 +202,41 @@ impl Deployment {
         }
     }
 
+    fn catalog_url(&self) -> String {
+        format!("{}/{}", self.base, self.catalog_db)
+    }
+
+    fn data_url(&self) -> String {
+        format!("{}/{}", self.base, self.data_db)
+    }
+
+    /// A second diagnostics store whose catalog sessions start every
+    /// transaction at `isolation` unless it sets its own, as a database or
+    /// role default would make them.
+    pub(crate) async fn diagnostics_at(&self, isolation: &str) -> PostgresCatalogStore {
+        // The server splits the startup options at spaces; a backslash keeps
+        // one inside the value.
+        let value = isolation.replace(' ', "\\ ");
+        let options = self
+            .catalog_url()
+            .parse::<PgConnectOptions>()
+            .expect("the catalog URL")
+            .options([("default_transaction_isolation", value)]);
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(options)
+            .await
+            .expect("a pool at the isolation level");
+        let level: String = sqlx::query_scalar("SHOW default_transaction_isolation")
+            .fetch_one(&pool)
+            .await
+            .expect("read the default isolation");
+        assert_eq!(level, isolation, "the sessions start at {isolation}");
+        PostgresCatalogStore::new(pool)
+    }
+
     /// Whether the data database can hold vector data.
-    async fn pgvector(&self) -> bool {
+    pub(crate) async fn pgvector(&self) -> bool {
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'vector')")
             .fetch_one(&self.data)
             .await
@@ -222,7 +245,7 @@ impl Deployment {
 
     /// Create `name` with GSI `gsi1`, LSI `lsi1` and, when pgvector is
     /// installed, vector index `vec1`; write three items.
-    async fn create_table_with_indexes(&self, name: &str) -> TableKeyInfo {
+    pub(crate) async fn create_table_with_indexes(&self, name: &str) -> TableKeyInfo {
         let string = |attr: &str| AttributeDefinition {
             attribute_name: attr.to_owned(),
             attribute_type: ScalarAttributeType::S,
@@ -299,7 +322,7 @@ impl Deployment {
     }
 
     /// The relations in the data database that carry the backend's prefix.
-    async fn storage_relations(&self) -> BTreeSet<String> {
+    pub(crate) async fn storage_relations(&self) -> BTreeSet<String> {
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT tablename::text FROM pg_tables \
              WHERE schemaname = current_schema() AND tablename LIKE '\\_ddb\\_%'",
@@ -312,7 +335,7 @@ impl Deployment {
 
     /// Create a relation that no catalog row names, with the prefix the
     /// engine uses, and return its name.
-    async fn plant_orphan(&self) -> String {
+    pub(crate) async fn plant_orphan(&self) -> String {
         let name = format!("_ddb_{}", uuid::Uuid::new_v4());
         sqlx::query(&format!(
             "CREATE TABLE \"{name}\" (pk TEXT PRIMARY KEY, item_data JSONB)"
@@ -327,7 +350,15 @@ impl Deployment {
         name
     }
 
-    async fn relation_exists(&self, name: &str) -> bool {
+    /// Drop `relation` from the data database, as a server's drop would.
+    pub(crate) async fn remove_relation(&self, relation: &str) {
+        sqlx::query(&format!("DROP TABLE \"{relation}\""))
+            .execute(&self.data)
+            .await
+            .expect("drop a data relation");
+    }
+
+    pub(crate) async fn relation_exists(&self, name: &str) -> bool {
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_tables WHERE tablename = $1)")
             .bind(name)
             .fetch_one(&self.data)
@@ -337,7 +368,7 @@ impl Deployment {
 
     /// The unquoted name of `table`'s secondary index `index` relation, from
     /// its catalog id.
-    async fn index_relation(&self, table: &str, index: &str) -> String {
+    pub(crate) async fn index_relation(&self, table: &str, index: &str) -> String {
         let (index_id,): (String,) = sqlx::query_as(
             "SELECT i.index_id FROM indexes i JOIN tables t ON t.table_id = i.table_id \
              WHERE t.account_id = $1 AND t.table_name = $2 AND i.index_name = $3",
@@ -352,7 +383,7 @@ impl Deployment {
     }
 
     /// The unquoted name of `table`'s vector index `index` relation.
-    async fn vector_relation(&self, table: &str, index: &str) -> String {
+    pub(crate) async fn vector_relation(&self, table: &str, index: &str) -> String {
         let (index_id,): (String,) = sqlx::query_as(
             "SELECT v.index_id FROM vector_indexes v JOIN tables t ON t.table_id = v.table_id \
              WHERE t.account_id = $1 AND t.table_name = $2 AND v.index_name = $3",
@@ -373,7 +404,7 @@ impl Deployment {
             .expect("count the rows")
     }
 
-    async fn set_status(&self, sql: &str, status: &str) {
+    pub(crate) async fn set_status(&self, sql: &str, status: &str) {
         sqlx::query(sql)
             .bind(status)
             .execute(&self.catalog)
@@ -383,7 +414,7 @@ impl Deployment {
 
     /// GetItem on every item written by `create_table_with_indexes`, and the
     /// row count of each index relation.
-    async fn assert_data_intact(&self, key_info: &TableKeyInfo) {
+    pub(crate) async fn assert_data_intact(&self, key_info: &TableKeyInfo) {
         for n in 0..3 {
             let got = self
                 .engine
@@ -401,6 +432,131 @@ impl Deployment {
             assert_eq!(self.row_count(&relation).await, 3, "vec1 rows");
         }
     }
+
+    /// Wait until a session waits for a `mode` lock on `relation` in the
+    /// database `pool` connects to (`pg_locks` shows the request ungranted).
+    pub(crate) async fn wait_for_lock_request(pool: &PgPool, relation: &str, mode: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_class c ON c.oid = l.relation \
+                 WHERE l.database = (SELECT oid FROM pg_database WHERE datname = current_database()) \
+                   AND c.relname = $1 AND l.mode = $2 AND NOT l.granted)",
+            )
+            .bind(relation)
+            .bind(mode)
+            .fetch_one(pool)
+            .await
+            .expect("read pg_locks");
+            if waiting {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no session waited for {mode} on {relation} within 10 s"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Start adding GSI `index` to `TABLE` the way `UpdateTable` does it:
+    /// lock the table row, insert the index row, and create and commit the
+    /// index's relation while the catalog transaction stays open.
+    pub(crate) async fn begin_index_add(&self, index: &str) -> IndexAdd {
+        let mut conn = PgConnection::connect(&self.catalog_url())
+            .await
+            .expect("a catalog session for the index add");
+        sqlx::query("BEGIN")
+            .execute(&mut conn)
+            .await
+            .expect("begin");
+        let (table_id,): (String,) = sqlx::query_as(
+            "SELECT table_id FROM tables WHERE account_id = $1 AND table_name = $2 FOR UPDATE",
+        )
+        .bind(ACCOUNT)
+        .bind(TABLE)
+        .fetch_one(&mut conn)
+        .await
+        .expect("lock the table row");
+        let index_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO indexes (table_id, index_name, index_id, index_type, key_schema, \
+             projection, index_status) VALUES ($1, $2, $3, 'GSI', \
+             '[{\"AttributeName\": \"gpk\", \"KeyType\": \"HASH\"}]', \
+             '{\"ProjectionType\": \"ALL\"}', 'CREATING')",
+        )
+        .bind(&table_id)
+        .bind(index)
+        .bind(&index_id)
+        .execute(&mut conn)
+        .await
+        .expect("insert the index row");
+        let relation = index_table_name(&index_id).trim_matches('"').to_owned();
+        let mut data = PgConnection::connect(&self.data_url())
+            .await
+            .expect("a data session for the index add");
+        sqlx::query(&format!(
+            "CREATE TABLE \"{relation}\" (pk TEXT PRIMARY KEY)"
+        ))
+        .execute(&mut data)
+        .await
+        .expect("create and commit the index relation");
+        data.close().await.expect("close the data session");
+        IndexAdd {
+            conn,
+            table_id,
+            relation,
+        }
+    }
+}
+
+/// A GSI add in flight, from [`Deployment::begin_index_add`].
+pub(crate) struct IndexAdd {
+    conn: PgConnection,
+    table_id: String,
+    pub(crate) relation: String,
+}
+
+impl IndexAdd {
+    /// The add's next step: write the table row, which needs `ROW EXCLUSIVE`
+    /// on `tables` (an `UpdateTable` whose new index keys on a new attribute
+    /// updates `attribute_definitions` here). Returns how long it took.
+    pub(crate) async fn write_table_row(&mut self) -> Result<Duration, sqlx::Error> {
+        let started = Instant::now();
+        sqlx::query(
+            "UPDATE tables SET attribute_definitions = attribute_definitions \
+             WHERE table_id = $1",
+        )
+        .bind(&self.table_id)
+        .execute(&mut self.conn)
+        .await?;
+        Ok(started.elapsed())
+    }
+
+    pub(crate) async fn commit(mut self) {
+        sqlx::query("COMMIT")
+            .execute(&mut self.conn)
+            .await
+            .expect("commit the index add");
+        self.conn.close().await.expect("close the catalog session");
+    }
+}
+
+/// A session of the data database holding `ACCESS SHARE` on `relation`, as
+/// a reader such as `pg_dump` holds it, until it is dropped.
+pub(crate) async fn hold_relation(d: &Deployment, relation: &str) -> PgConnection {
+    let mut conn = PgConnection::connect(&d.data_url())
+        .await
+        .expect("a data session for the holder");
+    sqlx::query("BEGIN")
+        .execute(&mut conn)
+        .await
+        .expect("begin");
+    sqlx::query(&format!("LOCK TABLE \"{relation}\" IN ACCESS SHARE MODE"))
+        .execute(&mut conn)
+        .await
+        .expect("hold the relation");
+    conn
 }
 
 fn key(n: u32) -> Item {
@@ -424,195 +580,4 @@ fn item(n: u32) -> Item {
         ),
     );
     it
-}
-
-/// A table with a GSI, an LSI and a vector index has every relation the
-/// engine created named by the catalog: nothing orphaned, nothing missing.
-#[tokio::test]
-async fn live_relations_are_neither_orphaned_nor_missing() {
-    let test = "live_relations_are_neither_orphaned_nor_missing";
-    if base_conn().is_none() {
-        return skip(test);
-    }
-    let d = Deployment::new().await;
-    d.create_table_with_indexes(TABLE).await;
-    let relations = d.storage_relations().await;
-    let expected = if d.pgvector().await { 4 } else { 3 };
-    assert_eq!(relations.len(), expected, "{relations:?}");
-
-    let check = d
-        .diagnostics
-        .check_storage_relations()
-        .await
-        .expect("check");
-    assert!(check.orphaned.is_empty(), "orphaned: {:?}", check.orphaned);
-    assert!(check.missing.is_empty(), "missing: {:?}", check.missing);
-}
-
-/// `--fix` drops the relation no catalog row names and nothing else: not the
-/// live table's relations, not a table created after the check, not a table
-/// without the backend's prefix. The live data is intact afterwards.
-#[tokio::test]
-async fn fix_drops_only_the_relation_no_catalog_row_names() {
-    let test = "fix_drops_only_the_relation_no_catalog_row_names";
-    if base_conn().is_none() {
-        return skip(test);
-    }
-    let d = Deployment::new().await;
-    let key_info = d.create_table_with_indexes(TABLE).await;
-    let live = d.storage_relations().await;
-    let orphan = d.plant_orphan().await;
-    sqlx::query("CREATE TABLE operator_notes (note TEXT)")
-        .execute(&d.data)
-        .await
-        .expect("an unrelated table");
-
-    let check = d
-        .diagnostics
-        .check_storage_relations()
-        .await
-        .expect("check");
-    assert_eq!(check.orphaned, vec![orphan.clone()]);
-    assert!(check.missing.is_empty(), "missing: {:?}", check.missing);
-
-    // A CreateTable that lands between the check and the drop: its relations
-    // were not in the listing, and a stale candidate list naming them must
-    // not get them dropped.
-    d.create_table_with_indexes("later").await;
-    let later: Vec<String> = d
-        .storage_relations()
-        .await
-        .difference(&live)
-        .filter(|r| **r != orphan)
-        .cloned()
-        .collect();
-    assert_eq!(later.len(), if d.pgvector().await { 4 } else { 3 });
-    let mut candidates = vec![orphan.clone(), "operator_notes".to_owned()];
-    candidates.extend(later.iter().cloned());
-
-    let outcomes = d
-        .diagnostics
-        .drop_orphaned_relations(candidates.clone())
-        .await
-        .expect("drop");
-    let names: Vec<&String> = outcomes.iter().map(|(n, _)| n).collect();
-    assert_eq!(names, candidates.iter().collect::<Vec<_>>());
-    assert_eq!(outcomes[0].1, OrphanDrop::Dropped, "{outcomes:?}");
-    assert_eq!(
-        outcomes[1].1,
-        OrphanDrop::Kept("not a data relation of this backend".to_owned()),
-        "{outcomes:?}"
-    );
-    for (name, outcome) in &outcomes[2..] {
-        match outcome {
-            OrphanDrop::Kept(reason) => assert!(
-                reason.starts_with("the catalog names it: ")
-                    && reason.ends_with(&format!("table {ACCOUNT}/later")),
-                "{name}: {reason}"
-            ),
-            other => panic!("{name}: {other:?}"),
-        }
-    }
-
-    assert!(!d.relation_exists(&orphan).await, "the orphan was dropped");
-    assert!(d.relation_exists("operator_notes").await);
-    let after = d.storage_relations().await;
-    assert!(live.is_subset(&after), "live relations survived: {after:?}");
-    assert!(later.iter().all(|r| after.contains(r)), "{after:?}");
-    d.assert_data_intact(&key_info).await;
-
-    let check = d
-        .diagnostics
-        .check_storage_relations()
-        .await
-        .expect("check again");
-    assert!(check.orphaned.is_empty(), "orphaned: {:?}", check.orphaned);
-    assert!(check.missing.is_empty(), "missing: {:?}", check.missing);
-}
-
-/// A relation the catalog names and the data database lacks is reported
-/// missing, with the index and table that own it; the relation that took
-/// its place is reported orphaned.
-#[tokio::test]
-async fn a_relation_the_catalog_names_is_reported_missing() {
-    let test = "a_relation_the_catalog_names_is_reported_missing";
-    if base_conn().is_none() {
-        return skip(test);
-    }
-    let d = Deployment::new().await;
-    d.create_table_with_indexes(TABLE).await;
-    let gsi = d.index_relation(TABLE, "gsi1").await;
-    assert!(d.relation_exists(&gsi).await, "{gsi}");
-    let elsewhere = format!("_ddb_{}", uuid::Uuid::new_v4());
-    sqlx::query(&format!("ALTER TABLE \"{gsi}\" RENAME TO \"{elsewhere}\""))
-        .execute(&d.data)
-        .await
-        .expect("rename the GSI relation");
-
-    let check = d
-        .diagnostics
-        .check_storage_relations()
-        .await
-        .expect("check");
-    assert_eq!(check.orphaned, vec![elsewhere.clone()]);
-    assert_eq!(
-        check.missing,
-        vec![CatalogRelation {
-            relation: gsi.clone(),
-            owner: format!("index gsi1 of table {ACCOUNT}/{TABLE}"),
-        }]
-    );
-
-    sqlx::query(&format!("ALTER TABLE \"{elsewhere}\" RENAME TO \"{gsi}\""))
-        .execute(&d.data)
-        .await
-        .expect("rename it back");
-    let check = d
-        .diagnostics
-        .check_storage_relations()
-        .await
-        .expect("check again");
-    assert!(check.orphaned.is_empty(), "orphaned: {:?}", check.orphaned);
-    assert!(check.missing.is_empty(), "missing: {:?}", check.missing);
-}
-
-/// Rows in every status name their relations: a table in CREATING, UPDATING
-/// or DELETING and an index or vector index in CREATING or DELETING keep
-/// their relations out of the orphan list. A DELETING row's relation is not
-/// reported missing either, since DeleteTable removes it.
-#[tokio::test]
-async fn rows_in_every_status_count_as_live() {
-    let test = "rows_in_every_status_count_as_live";
-    if base_conn().is_none() {
-        return skip(test);
-    }
-    let d = Deployment::new().await;
-    d.create_table_with_indexes(TABLE).await;
-    let table_status = "UPDATE tables SET table_status = $1";
-    let index_status = "UPDATE indexes SET index_status = $1";
-    let vector_status = "UPDATE vector_indexes SET index_status = $1";
-
-    for status in ["CREATING", "UPDATING", "DELETING"] {
-        d.set_status(table_status, status).await;
-        let check = d
-            .diagnostics
-            .check_storage_relations()
-            .await
-            .expect("check");
-        assert!(check.orphaned.is_empty(), "{status}: {:?}", check.orphaned);
-        assert!(check.missing.is_empty(), "{status}: {:?}", check.missing);
-    }
-    d.set_status(table_status, "ACTIVE").await;
-
-    for status in ["CREATING", "DELETING"] {
-        d.set_status(index_status, status).await;
-        d.set_status(vector_status, status).await;
-        let check = d
-            .diagnostics
-            .check_storage_relations()
-            .await
-            .expect("check");
-        assert!(check.orphaned.is_empty(), "{status}: {:?}", check.orphaned);
-        assert!(check.missing.is_empty(), "{status}: {:?}", check.missing);
-    }
 }
