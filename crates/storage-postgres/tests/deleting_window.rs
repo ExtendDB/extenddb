@@ -41,6 +41,9 @@ use extenddb_storage_postgres::{PostgresConfig, PostgresEngine};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 
+#[path = "deleting_window/ttl.rs"]
+mod ttl;
+
 const ACCOUNT: &str = "123456789012";
 const REGION: &str = "us-east-1";
 const TABLE: &str = "t_deleting_window";

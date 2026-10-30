@@ -209,9 +209,9 @@ impl SqliteEngine {
 #[cfg(test)]
 mod deleting_window_tests {
     use crate::SqliteEngine;
-    use extenddb_core::types::{DeleteTableInput, UpdateTableInput};
-    use extenddb_storage::TableEngine;
+    use extenddb_core::types::{DeleteTableInput, TimeToLiveStatus, UpdateTableInput};
     use extenddb_storage::error::StorageError;
+    use extenddb_storage::{MetadataEngine, TableEngine};
     use serde_json::json;
 
     const ACCOUNT: &str = "000000000000";
@@ -317,6 +317,82 @@ mod deleting_window_tests {
         assert!(
             matches!(&err, StorageError::TableNotActive(name) if name == "t"),
             "expected TableNotActive(\"t\"), got {err:?}"
+        );
+    }
+
+    /// UpdateTimeToLive during the window writes the catalog row, the way the
+    /// service runs its ordinary TTL rules there (measured 2026-10-25).
+    #[tokio::test]
+    async fn update_ttl_during_the_window_is_served() {
+        let engine = engine_with_deleting_table().await;
+        engine
+            .update_ttl(ACCOUNT, "t", "ttl", true)
+            .await
+            .expect("UpdateTimeToLive on a DELETING table");
+        let desc = engine
+            .describe_ttl(ACCOUNT, "t")
+            .await
+            .expect("the TTL description");
+        assert_eq!(desc.time_to_live_status, TimeToLiveStatus::Enabled);
+        assert_eq!(desc.attribute_name.as_deref(), Some("ttl"));
+        let status: String =
+            sqlx::query_scalar("SELECT table_status FROM tables WHERE table_name = 't'")
+                .fetch_one(&engine.pool)
+                .await
+                .expect("row still present");
+        assert_eq!(status, "DELETING", "the write must not change the status");
+    }
+
+    /// The disable direction is served in the window too, on the same admitted
+    /// status.
+    #[tokio::test]
+    async fn update_ttl_disable_during_the_window_is_served() {
+        let engine = engine_with_deleting_table().await;
+        engine
+            .update_ttl(ACCOUNT, "t", "ttl", true)
+            .await
+            .expect("the enable");
+        engine
+            .update_ttl(ACCOUNT, "t", "ttl", false)
+            .await
+            .expect("the disable");
+        let desc = engine
+            .describe_ttl(ACCOUNT, "t")
+            .await
+            .expect("the TTL description");
+        assert_eq!(desc.time_to_live_status, TimeToLiveStatus::Disabled);
+        assert_eq!(desc.attribute_name, None);
+    }
+
+    /// A CREATING table keeps the TTL refusal: the window admits DELETING only.
+    #[tokio::test]
+    async fn update_ttl_on_a_creating_table_keeps_table_not_active() {
+        let engine = engine_with_deleting_table().await;
+        sqlx::query("UPDATE tables SET table_status = 'CREATING' WHERE table_name = 't'")
+            .execute(&engine.pool)
+            .await
+            .expect("mark CREATING");
+        let err = engine
+            .update_ttl(ACCOUNT, "t", "ttl", true)
+            .await
+            .expect_err("UpdateTimeToLive on a CREATING table");
+        assert!(
+            matches!(&err, StorageError::TableNotActive(name) if name == "t"),
+            "expected TableNotActive(\"t\"), got {err:?}"
+        );
+    }
+
+    /// A table with no catalog row at all is still reported as absent.
+    #[tokio::test]
+    async fn update_ttl_on_a_missing_table_is_table_not_found() {
+        let engine = engine_with_deleting_table().await;
+        let err = engine
+            .update_ttl(ACCOUNT, "absent", "ttl", true)
+            .await
+            .expect_err("UpdateTimeToLive on a missing table");
+        assert!(
+            matches!(&err, StorageError::TableNotFound(name) if name == "absent"),
+            "expected TableNotFound(\"absent\"), got {err:?}"
         );
     }
 }

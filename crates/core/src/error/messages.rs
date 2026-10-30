@@ -44,6 +44,14 @@ pub enum ErrorMessageKey {
     /// Measured on the service 2026-10-24 for a second `DeleteTable` and for
     /// `UpdateTable` during the window.
     TableBeingDeleted,
+    /// `DescribeTimeToLive` refused because the table is `DELETING`. Measured
+    /// on the service 2026-10-25 on three tables, every call inside the window.
+    /// `UpdateTimeToLive` has no such refusal: it runs its ordinary rules.
+    DescribeTtlWhileDeleting,
+    /// `DescribeTimeToLive` refused because the table is `CREATING`: the
+    /// `DELETING` sentence with the state substituted. Measured on the service
+    /// 2026-10-26, five calls, each while `DescribeTable` read `CREATING`.
+    DescribeTtlWhileCreating,
     MissingKeySchema,
     KeySchemaTooMany,
     KeySchemaFirstNotHash,
@@ -91,6 +99,16 @@ pub fn error_message(key: ErrorMessageKey, args: &[&str]) -> String {
                 "Attempt to change a resource which is still in use: Table is being deleted: {}",
                 args[0]
             )
+        }
+        ErrorMessageKey::DescribeTtlWhileDeleting => {
+            "Cannot describe time to live while table is in DELETING state: \
+             Current table state is DELETING"
+                .to_owned()
+        }
+        ErrorMessageKey::DescribeTtlWhileCreating => {
+            "Cannot describe time to live while table is in CREATING state: \
+             Current table state is CREATING"
+                .to_owned()
         }
         ErrorMessageKey::MissingKeySchema => {
             "1 validation error detected: Value null at 'keySchema' failed to satisfy constraint: \

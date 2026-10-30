@@ -962,7 +962,11 @@ impl MetadataEngine for CassandraEngine {
                 crate::cassandra_util::get_column(&row, "table_id", "update_ttl_status")?;
             let previous_generation: Option<uuid::Uuid> =
                 row.get_by_name("ttl_generation").ok().flatten();
-            if status != "ACTIVE" {
+            // DELETING is admitted beside ACTIVE: the service runs
+            // UpdateTimeToLive's ordinary rules during the window and the write
+            // lands on the catalog row the delete then removes (measured
+            // 2026-10-25). The other non-ACTIVE statuses keep their refusal.
+            if status != "ACTIVE" && status != "DELETING" {
                 return Err(StorageError::TableNotActive(table_name));
             }
             if enabled {
@@ -1000,7 +1004,7 @@ impl MetadataEngine for CassandraEngine {
                     "UPDATE {}.tables SET ttl_attribute = ?, ttl_generation = ?, \
                      ttl_index_ready = false, ttl_backfill_cursor = null \
                      WHERE account_id = ? AND table_name = ? \
-                     IF table_status = 'ACTIVE' AND ttl_sweep_owner = null \
+                     IF table_status IN ('ACTIVE', 'DELETING') AND ttl_sweep_owner = null \
                      AND ttl_cleanup_generation = null \
                      AND ttl_attribute = null AND ttl_generation = null",
                     self.catalog_keyspace()
@@ -1011,7 +1015,7 @@ impl MetadataEngine for CassandraEngine {
                      ttl_cleanup_generation = ?, ttl_index_ready = false, \
                      ttl_backfill_cursor = null \
                      WHERE account_id = ? AND table_name = ? \
-                     IF table_status = 'ACTIVE' AND ttl_sweep_owner = null \
+                     IF table_status IN ('ACTIVE', 'DELETING') AND ttl_sweep_owner = null \
                      AND ttl_cleanup_generation = null \
                      AND ttl_attribute = ? AND ttl_generation = ?",
                     self.catalog_keyspace()
