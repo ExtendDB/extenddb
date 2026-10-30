@@ -1,4 +1,4 @@
-# ADR-0006: Index Data Table PRIMARY KEY Structure
+# ADR-0016: Index Data Table PRIMARY KEY Structure
 
 - Status: Accepted
 - Date: 2026-06-16
