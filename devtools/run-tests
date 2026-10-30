@@ -73,7 +73,8 @@ RELEASE=false
 FILTER=""
 CONFIG_PATH=""
 PARALLEL=""
-SHARD=""
+# --shard K/N; CI sets EXTENDDB_TEST_SHARD instead.
+SHARD="${EXTENDDB_TEST_SHARD:-}"
 BACKEND="postgres"
 
 usage() {
