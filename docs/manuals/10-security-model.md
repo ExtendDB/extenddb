@@ -176,7 +176,7 @@ The management web console (`/console/*`) implements:
 
 ## Provisioned Throughput Throttling
 
-extenddb includes a token bucket rate limiter for provisioned throughput enforcement. When `server.throttling_enabled = true` in `extenddb.toml`, read and write requests are throttled against the table's provisioned RCU/WCU limits. Requests that exceed the limit receive `ProvisionedThroughputExceededException` (HTTP 400), matching real DynamoDB behavior.
+extenddb includes a token bucket rate limiter for provisioned throughput enforcement. When `server.throttling_enabled = true` in `extenddb.toml`, read and write requests are throttled against the table's provisioned RCU/WCU limits. Requests that exceed the limit receive the throttle error the service sends for that bucket and billing mode (`ProvisionedThroughputExceededException` for provisioned capacity, `ThrottlingException` for an on-demand table at a hot key, at its default ceiling or at an `OnDemandThroughput` cap, `RequestLimitExceeded` for the account aggregate), HTTP 400, naming the throttled table and the limit in the reasons list where the service does (a hot-key read on an on-demand table carries none); see `differences-from-dynamodb.md`.
 
 Token buckets are purely in-memory operational state — not cached database state. They are recreated on server restart.
 

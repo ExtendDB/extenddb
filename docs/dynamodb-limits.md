@@ -17,8 +17,8 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 |-------|---------------|--------|-------|
 | Per-table RCU (provisioned) | 40,000 | Enforced | `LimitsConfig::per_table_max_rcu`, configurable |
 | Per-table WCU (provisioned) | 40,000 | Enforced | `LimitsConfig::per_table_max_wcu`, configurable |
-| Per-table read request units (on-demand) | 40,000 | N/A | ExtendDB does not throttle on-demand reads |
-| Per-table write request units (on-demand) | 40,000 | N/A | ExtendDB does not throttle on-demand writes |
+| Per-table read request units (on-demand) | 40,000 | Enforced | Default ceiling 12,000 RCU, or the `OnDemandThroughput` read cap when set; the bucket starts with one second of the rate and accumulates unused capacity up to 300 seconds of it |
+| Per-table write request units (on-demand) | 40,000 | Enforced | Default ceiling 4,000 WCU, or the `OnDemandThroughput` write cap when set; the bucket starts with one second of the rate and accumulates unused capacity up to 300 seconds of it |
 | Per-account RCU (provisioned) | 80,000 | Enforced | `LimitsConfig::per_account_max_rcu`, configurable |
 | Per-account WCU (provisioned) | 80,000 | Enforced | `LimitsConfig::per_account_max_wcu`, configurable |
 | Minimum throughput per table/GSI | 1 RCU / 1 WCU | Enforced | `validate_provisioned_throughput` rejects < 1 |
