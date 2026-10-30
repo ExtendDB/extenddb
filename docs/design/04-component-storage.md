@@ -419,6 +419,11 @@ The PostgreSQL backend uses two categories of tables:
 
 ### 5.2 Connection Pooling
 
+The sketch below is a proposal for a read replica mode, not code in this repository; section 5.3 states what the
+backend does today. It predates the split into a catalog pool and a data pool: its `pool` stands for today's
+`data_pool`. `PostgresStorageConfig` refuses unknown fields, so a configuration carrying `read_replica_url` or
+`read_replica_pool_size` stops the server at startup.
+
 ```rust
 use sqlx::postgres::PgPoolOptions;
 
