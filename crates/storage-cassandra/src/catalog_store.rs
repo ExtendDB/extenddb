@@ -406,9 +406,11 @@ impl RateLimitStore for CassandraCatalogStore {
     fn count_principal_failures(
         &self,
         principal: &str,
+        source_ip: &str,
         window_seconds: i64,
     ) -> BoxFuture<'_, OpResult<i64>> {
         let principal = principal.to_owned();
+        let source_ip = source_ip.to_owned();
         let session = self.session.clone();
         let catalog_keyspace = self.catalog_keyspace();
         Box::pin(async move {
@@ -417,12 +419,12 @@ impl RateLimitStore for CassandraCatalogStore {
             let query = format!(
                 "SELECT COUNT(*) FROM {catalog_keyspace}.login_attempts \
                  WHERE principal = ? AND attempted_at > ? AND success = false \
-                 ALLOW FILTERING"
+                 AND source_ip = ? ALLOW FILTERING"
             );
             let result = session
                 .query_with_values(
                     &query,
-                    cdrs_tokio::query_values!(principal.as_str(), cutoff_ms),
+                    cdrs_tokio::query_values!(principal.as_str(), cutoff_ms, source_ip.as_str()),
                 )
                 .await
                 .map_err(|e| {

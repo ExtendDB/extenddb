@@ -229,12 +229,7 @@ impl PostgresCatalogStore {
             return Ok(false);
         };
 
-        let pw = password.to_owned();
-        Ok(
-            tokio::task::spawn_blocking(move || bcrypt::verify(pw, &hash).unwrap_or(false))
-                .await
-                .unwrap_or(false),
-        )
+        extenddb_storage::password::verify_password(password.to_owned(), hash).await
     }
 
     pub(crate) async fn change_user_password_impl(

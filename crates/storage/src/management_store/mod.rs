@@ -89,10 +89,13 @@ pub trait MetricsStore: Send + Sync {
 
 /// Login rate limiting and account lockout storage.
 pub trait RateLimitStore: Send + Sync {
-    /// Count failed login attempts for a principal within the lookback window.
+    /// Count failed login attempts for a principal from one source IP within
+    /// the lookback window. Failures from other sources do not count, so a
+    /// third party cannot lock the principal out of its own address.
     fn count_principal_failures(
         &self,
         principal: &str,
+        source_ip: &str,
         window_seconds: i64,
     ) -> BoxFuture<'_, OpResult<i64>>;
 
