@@ -19,6 +19,9 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # The crate's own tests need `test-hooks`; a dev-dependency on itself turns
 # the feature on for test builds only.
 extenddb-storage-postgres = { path = ".", features = ["test-hooks"] }
+# The DELETING-window TTL rows call the engine's UpdateTimeToLive handler over a
+# PostgresEngine, to see which index statements it sends for such a table.
+extenddb-engine = { workspace = true }
 
 [dependencies]
 anyhow = { workspace = true }

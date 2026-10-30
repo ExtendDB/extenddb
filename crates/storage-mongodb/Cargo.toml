@@ -70,3 +70,6 @@ proptest = "1"
 # The crate's snapshot tests need `snapshot-test-hooks`; a dev-dependency on
 # itself turns it on for test builds only.
 extenddb-storage-mongodb = { path = ".", features = ["snapshot-test-hooks"] }
+# The DELETING-window rows call the engine's tag and TTL handlers over a
+# MongoEngine (crates/storage-mongodb/src/deleting_window_tests.rs).
+extenddb-engine.workspace = true

@@ -174,3 +174,52 @@ async fn update_table_on_a_creating_table_keeps_table_not_active() {
     );
     remove_row(&engine, &account.account_id).await;
 }
+
+/// UpdateTimeToLive during the window writes the catalog row, the way the
+/// service runs its ordinary TTL rules there (measured 2026-10-25), and leaves
+/// the status alone; the other non-ACTIVE statuses keep their refusal. The
+/// enable is undone before the row is removed so the account keyspace's TTL
+/// entries do not outlive the test.
+#[tokio::test]
+async fn update_ttl_during_the_window_is_served() {
+    use extenddb_core::types::TimeToLiveStatus;
+    use extenddb_storage::MetadataEngine;
+
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let (engine, account, _table) = open_window().await;
+
+    engine
+        .update_ttl(&account.account_id, TABLE, "ttl", true)
+        .await
+        .expect("UpdateTimeToLive on a DELETING table");
+    let desc = engine
+        .describe_ttl(&account.account_id, TABLE)
+        .await
+        .expect("the TTL description");
+    assert_eq!(desc.attribute_name.as_deref(), Some("ttl"));
+    assert_ne!(desc.time_to_live_status, TimeToLiveStatus::Disabled);
+    assert_eq!(
+        status_of(&engine, &account.account_id).await.as_deref(),
+        Some("DELETING"),
+        "the write must not change the status"
+    );
+
+    engine
+        .update_ttl(&account.account_id, TABLE, "ttl", false)
+        .await
+        .expect("the disable direction during the window");
+
+    set_status(&engine, &account.account_id, "CREATING").await;
+    let err = engine
+        .update_ttl(&account.account_id, TABLE, "ttl", true)
+        .await
+        .expect_err("UpdateTimeToLive on a CREATING table");
+    assert!(
+        matches!(&err, StorageError::TableNotActive(name) if name == TABLE),
+        "expected TableNotActive({TABLE:?}), got {err:?}"
+    );
+
+    remove_row(&engine, &account.account_id).await;
+}
