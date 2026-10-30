@@ -4,9 +4,10 @@
 # Seconds each test file (pytest suites) or tests/rust module (Rust
 # integration suite) took per backend, read from the job logs of the merge
 # group run for c5fe7818 on 2026-10-30. devtools/test-shards uses them only
-# to balance shards: a unit missing here is weighted by its test count, and
-# a stale value can make one shard slower but cannot drop a test, because the
-# CI summary jobs compare every shard's collected tests with the whole suite.
+# to balance shards: a file missing here is weighted by its test count, and
+# a stale value can make one shard slower but cannot drop a test, because CI
+# checks that the shards together collected every test of the whole suite
+# (devtools/test-shards check).
 #
 # suite	unit	postgres	sqlite	mongodb
 main	tests/test_abac.py	304	239	286
