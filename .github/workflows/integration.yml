@@ -375,6 +375,40 @@ jobs:
           EXTENDDB_EXPECT_VECTORS: "1"
         run: devtools/run-tests --extenddb --rust-integration --release
 
+      # The daemonized server logs to syslog; dump it so server-side failures
+      # are diagnosable from the job log.
+      - name: Dump server syslog on failure
+        if: failure()
+        run: sudo journalctl -t extenddb --no-pager -n 500 || true
+
+  # The PostgreSQL storage-level tests drive the storage layer directly and
+  # need only the database, not a running server, so they run beside
+  # run-rust-integration instead of after it.
+  run-postgres-storage-tests:
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 40
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: devpass
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 127.0.0.1:5432:5432
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
       # The control plane for vector indexes is not reachable over the wire while
       # this backend declares no vector search capability, so its tests drive the
       # storage layer directly against this job's PostgreSQL. The PutItem create
@@ -397,12 +431,6 @@ jobs:
           --test vector_control_plane --test put_create_race --test twi_conflict
           --test stream_shard_retention --test stream_shard_ownership --test stream_records_page_order --test backup_restore
           --test gsi_online_build --test gsi_stale_writer --test table_snapshot
-
-      # The daemonized server logs to syslog; dump it so server-side failures
-      # are diagnosable from the job log.
-      - name: Dump server syslog on failure
-        if: failure()
-        run: sudo journalctl -t extenddb --no-pager -n 500 || true
 
   # The runtime-detection proof: the same binary, against a PostgreSQL with no
   # pgvector, must refuse vector indexes over the wire. Today the job above runs
@@ -573,6 +601,7 @@ jobs:
         run-integration-sqlite,
         run-integration-dev-mode,
         run-rust-integration,
+        run-postgres-storage-tests,
         run-rust-integration-postgres-novector,
         run-rust-integration-sqlite,
       ]
@@ -583,6 +612,7 @@ jobs:
              [ "${{ needs.run-integration-sqlite.result }}" != "success" ] || \
              [ "${{ needs.run-integration-dev-mode.result }}" != "success" ] || \
              [ "${{ needs.run-rust-integration.result }}" != "success" ] || \
+             [ "${{ needs.run-postgres-storage-tests.result }}" != "success" ] || \
              [ "${{ needs.run-rust-integration-postgres-novector.result }}" != "success" ] || \
              [ "${{ needs.run-rust-integration-sqlite.result }}" != "success" ]; then
             exit 1
