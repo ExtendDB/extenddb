@@ -41,6 +41,33 @@ async fn other_tables_locked_by_the_index_lock_waiter(catalog: &PgPool) -> Vec<S
     }
 }
 
+/// Wait until a session of the catalog database started waiting for `SHARE`
+/// on `indexes` less than 20 ms ago, so that a commit sent at once reaches
+/// the server while that attempt still waits, not in the pause between two
+/// attempts, when the next attempt would start after the commit.
+async fn wait_for_a_fresh_index_lock_wait(catalog: &PgPool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let fresh: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_class c ON c.oid = l.relation \
+              WHERE l.database = (SELECT oid FROM pg_database WHERE datname = current_database()) \
+                AND c.relname = 'indexes' AND l.mode = 'ShareLock' AND NOT l.granted \
+                AND l.waitstart > clock_timestamp() - interval '20 milliseconds')",
+        )
+        .fetch_one(catalog)
+        .await
+        .expect("read pg_locks");
+        if fresh {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no session started waiting for ShareLock on indexes within 10 s"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
 /// `--fix` drops the relation no catalog row names and nothing else: not the
 /// live table's relations, not a table created after the check, not a table
 /// without the backend's prefix. The live data is intact afterwards.
@@ -153,8 +180,12 @@ async fn an_index_added_during_the_drop_keeps_its_relation(
             )
             .await
             .map(|r| r.map(|_| started.elapsed()));
-            // Open past several attempts, so the drop has to try again.
+            // Open past several attempts, so the drop has to try again, and
+            // committed while an attempt waits: the read that attempt takes
+            // once it is granted must see the row that committed during the
+            // wait, whatever isolation the session defaults to.
             tokio::time::sleep(Duration::from_millis(600)).await;
+            wait_for_a_fresh_index_lock_wait(&d.catalog).await;
             add.commit().await;
             (held, table_write, other_write)
         }
