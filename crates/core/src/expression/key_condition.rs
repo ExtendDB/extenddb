@@ -17,6 +17,9 @@ use super::ast::{CompareOp, Expr, PathElement};
 use super::parser_common;
 use super::tokenizer::Token;
 use crate::error::DynamoDbError;
+use crate::types::{
+    KeySchemaElement, KeyType, hash_key_elements, is_multipart_key_schema, range_key_elements,
+};
 
 /// Parsed key condition: partition key value expression(s) and optional sort key condition.
 ///
@@ -369,6 +372,93 @@ impl KeyCondition {
         self.extra_sk_conditions = range_eqs;
 
         Ok(())
+    }
+
+    /// Assign every clause to its key attribute under `key_schema`, the key
+    /// schema of the table or index the query reads.
+    ///
+    /// A multi-attribute key schema goes through
+    /// [`Self::resolve_multipart_with`], which classifies every clause by name,
+    /// applies the service's rules for such a schema and calls `value_check`
+    /// where the service reports a value of the wrong type. On any other key
+    /// schema `value_check` runs on every clause first, which is where the
+    /// service reports it for such a schema (measured 2026-10-21), and then
+    /// [`Self::resolve_pk_sk`] picks the partition key clause.
+    ///
+    /// The engine reads a `Query` key condition through this, and so does
+    /// authorization when it finds the partition key value for
+    /// `dynamodb:LeadingKeys`, so both read the same clause as the partition
+    /// key. On a multi-attribute key schema `pk_path` then names the first
+    /// HASH attribute.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::resolve_multipart_with`] on a multi-attribute key schema and
+    /// as [`Self::resolve_pk_sk`] on any other, plus whatever `value_check`
+    /// returns.
+    pub fn resolve_key_schema_with<F>(
+        &mut self,
+        key_schema: &[KeySchemaElement],
+        names: &std::collections::HashMap<String, String>,
+        mut value_check: F,
+    ) -> Result<(), DynamoDbError>
+    where
+        F: FnMut(&[PathElement], &Expr) -> Result<(), DynamoDbError>,
+    {
+        if is_multipart_key_schema(key_schema) {
+            let hash_attrs: Vec<&str> = hash_key_elements(key_schema)
+                .iter()
+                .map(|ks| ks.attribute_name.as_str())
+                .collect();
+            let range_attrs: Vec<&str> = range_key_elements(key_schema)
+                .iter()
+                .map(|ks| ks.attribute_name.as_str())
+                .collect();
+            return self.resolve_multipart_with(&hash_attrs, &range_attrs, names, value_check);
+        }
+        self.for_each_clause(&mut value_check)?;
+        match key_schema.iter().find(|ks| ks.key_type == KeyType::Hash) {
+            Some(hash) => self.resolve_pk_sk(&hash.attribute_name, names),
+            None => Ok(()),
+        }
+    }
+
+    /// [`Self::resolve_key_schema_with`] without a value check.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::resolve_key_schema_with`].
+    pub fn resolve_key_schema(
+        &mut self,
+        key_schema: &[KeySchemaElement],
+        names: &std::collections::HashMap<String, String>,
+    ) -> Result<(), DynamoDbError> {
+        self.resolve_key_schema_with(key_schema, names, |_, _| Ok(()))
+    }
+
+    /// Call `f` with the path and value of every clause: the partition key
+    /// clause, the extra HASH and RANGE equalities, and each operand of the
+    /// sort key condition.
+    fn for_each_clause<F>(&self, f: &mut F) -> Result<(), DynamoDbError>
+    where
+        F: FnMut(&[PathElement], &Expr) -> Result<(), DynamoDbError>,
+    {
+        f(&self.pk_path, &self.pk_value)?;
+        for (path, value) in &self.extra_pk_conditions {
+            f(path, value)?;
+        }
+        for (path, value) in &self.extra_sk_conditions {
+            f(path, value)?;
+        }
+        match &self.sk_condition {
+            Some(SortKeyCondition::Compare { path, value, .. }) => f(path, value),
+            Some(SortKeyCondition::Between { path, low, high }) => {
+                f(path, low)?;
+                f(path, high)
+            }
+            Some(SortKeyCondition::BeginsWith { path, prefix }) => f(path, prefix),
+            None => Ok(()),
+        }
     }
 }
 
@@ -1697,5 +1787,79 @@ mod tests {
             .unwrap();
         assert_eq!(sk_shape(&kc), Some(("s2".to_owned(), ">")));
         assert_eq!(extra_sk_names(&kc), vec!["s1"]);
+    }
+
+    fn key(name: &str, key_type: KeyType) -> KeySchemaElement {
+        KeySchemaElement {
+            attribute_name: name.to_owned(),
+            key_type,
+        }
+    }
+
+    #[test]
+    fn resolve_key_schema_reads_a_multi_attribute_schema_by_name() {
+        // Authorization reads the partition key value from `pk_path` after this
+        // call, so it must name the first HASH attribute for every clause order
+        // the engine serves.
+        let two_hash = [
+            key("g1", KeyType::Hash),
+            key("g2", KeyType::Hash),
+            key("gs", KeyType::Range),
+        ];
+        let two_range = [
+            key("h", KeyType::Hash),
+            key("a", KeyType::Range),
+            key("b", KeyType::Range),
+        ];
+        for (schema, expr) in [
+            (&two_hash[..], "g2 = :g AND g1 = :v AND gs = :x"),
+            (&two_hash[..], "gs = :x AND g1 = :v AND g2 = :g"),
+            (&two_hash[..], "g2 = :g AND g1 = :v AND gs > :lo"),
+            (&two_range[..], "a = :a AND h = :v AND b = :c"),
+            (&two_range[..], "b = :c AND h = :v AND a = :a"),
+            (&two_range[..], "b > :lo AND a = :a AND h = :v"),
+            (&two_range[..], "begins_with(b, :p) AND a = :a AND h = :v"),
+        ] {
+            let tokens = tokenize(expr).unwrap();
+            let mut kc = parse_key_condition(&tokens).unwrap();
+            kc.resolve_key_schema(schema, &HashMap::new())
+                .unwrap_or_else(|e| panic!("{expr}: {e:?}"));
+            let hash = &schema[0].attribute_name;
+            assert_eq!(
+                kc.pk_path,
+                vec![PathElement::Attribute(hash.clone())],
+                "{expr}"
+            );
+            assert_eq!(kc.pk_value, Expr::Placeholder("v".to_owned()), "{expr}");
+        }
+    }
+
+    #[test]
+    fn resolve_key_schema_checks_values_before_resolve_pk_sk() {
+        let schema = [key("pk", KeyType::Hash), key("sk", KeyType::Range)];
+        let tokens = tokenize("sk BETWEEN :lo AND :hi AND pk = :p").unwrap();
+        let mut kc = parse_key_condition(&tokens).unwrap();
+        let mut checked = Vec::new();
+        kc.resolve_key_schema_with(&schema, &HashMap::new(), |_, value| {
+            checked.push(format!("{value:?}"));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(checked.len(), 3, "{checked:?}");
+        assert_eq!(kc.pk_path, vec![PathElement::Attribute("pk".to_owned())]);
+
+        let tokens = tokenize("sk = :s AND pk = :p").unwrap();
+        let mut kc = parse_key_condition(&tokens).unwrap();
+        let err = kc
+            .resolve_key_schema_with(&schema, &HashMap::new(), |_, _| {
+                Err(validation_err("checked"))
+            })
+            .unwrap_err();
+        assert!(matches!(&err, DynamoDbError::ValidationException(msg) if msg == "checked"));
+        // The failed check left the parser's assignment in place.
+        assert_eq!(kc.pk_path, vec![PathElement::Attribute("sk".to_owned())]);
+
+        kc.resolve_key_schema(&schema, &HashMap::new()).unwrap();
+        assert_eq!(kc.pk_path, vec![PathElement::Attribute("pk".to_owned())]);
     }
 }

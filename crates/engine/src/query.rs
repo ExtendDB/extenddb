@@ -271,65 +271,38 @@ pub async fn handle_query(
     };
 
     let pk_attr = &query_key_info.key_schema[0].attribute_name;
-    if extenddb_core::types::is_multipart_key_schema(&query_key_info.key_schema) {
-        // A key schema with several HASH or several RANGE attributes: assign
-        // every clause by name, require an equality on each HASH attribute,
-        // and require the RANGE conditions to cover a leading run of the
-        // RANGE attributes with equalities before the last one.
-        let hash_attrs: Vec<&str> =
-            extenddb_core::types::hash_key_elements(&query_key_info.key_schema)
-                .iter()
-                .map(|ks| ks.attribute_name.as_str())
-                .collect();
-        let range_attrs: Vec<&str> =
-            extenddb_core::types::range_key_elements(&query_key_info.key_schema)
-                .iter()
-                .map(|ks| ks.attribute_name.as_str())
-                .collect();
-        // A wrong-typed value is reported after the structural rules and
-        // before the non-key rule (measured 2026-10-21), so the type check
-        // runs inside the classifier.
-        key_condition.resolve_multipart_with(
-            &hash_attrs,
-            &range_attrs,
-            &effective_maps.names,
-            |path, value| {
-                check_key_value_type(
-                    path,
-                    value,
-                    &query_key_info.attribute_definitions,
-                    effective_maps,
-                )
-            },
-        )?;
-        refuse_begins_with_on_number(
-            &key_condition,
-            &query_key_info.attribute_definitions,
-            effective_maps,
-        )?;
-    } else {
-        // On a single-attribute key schema the service reports a wrong-typed
-        // value ahead of the missing-key check (measured 2026-10-21: `pk = :n`
-        // on an S key with a second clause on a non-key attribute reports the
-        // type, not the missing key).
-        for_each_key_clause(&key_condition, |path, value| {
+    // Assign every clause to its key attribute through the classification
+    // authorization also uses to find dynamodb:LeadingKeys, so both read the
+    // same clause as the partition key. On a multi-attribute key schema (several
+    // HASH or several RANGE attributes) every clause is assigned by name, every
+    // HASH attribute needs an equality and the RANGE conditions must cover a
+    // leading run of the RANGE attributes with equalities before the last one.
+    // A wrong-typed value is reported where the service reports it: after those
+    // structural rules and before the non-key rule on a multi-attribute key
+    // schema, and ahead of the missing-key check on a single-attribute one
+    // (measured 2026-10-21: `pk = :n` on an S key with a second clause on a
+    // non-key attribute reports the type, not the missing key).
+    key_condition.resolve_key_schema_with(
+        &query_key_info.key_schema,
+        &effective_maps.names,
+        |path, value| {
             check_key_value_type(
                 path,
                 value,
                 &query_key_info.attribute_definitions,
                 effective_maps,
             )
-        })?;
-        refuse_begins_with_on_number(
-            &key_condition,
-            &query_key_info.attribute_definitions,
-            effective_maps,
-        )?;
-        // Correct PK/SK assignment when both clauses are equality comparisons.
-        // The parser can't distinguish PK from SK without the key schema.
-        key_condition.resolve_pk_sk(pk_attr, &effective_maps.names)?;
-
-        // Validate that the partition key is actually referenced in the condition.
+        },
+    )?;
+    refuse_begins_with_on_number(
+        &key_condition,
+        &query_key_info.attribute_definitions,
+        effective_maps,
+    )?;
+    // On a single-attribute key schema, validate that the partition key is
+    // actually referenced in the condition. The classifier has already required
+    // an equality on every HASH attribute of a multi-attribute one.
+    if !extenddb_core::types::is_multipart_key_schema(&query_key_info.key_schema) {
         let pk_resolved = resolve_path_attr_name(&key_condition.pk_path, &effective_maps.names);
         if pk_resolved.as_deref() != Some(pk_attr.as_str()) {
             return Err(DynamoDbError::ValidationException(format!(
@@ -591,36 +564,6 @@ fn resolve_path_attr_name(
             }
         }
         _ => None,
-    }
-}
-
-/// Call `f` with every clause of a key condition: the partition key clause,
-/// the extra HASH and RANGE equalities, and each operand of the sort key
-/// condition.
-fn for_each_key_clause<F>(
-    key_condition: &extenddb_core::expression::KeyCondition,
-    mut f: F,
-) -> Result<(), DynamoDbError>
-where
-    F: FnMut(&[PathElement], &extenddb_core::expression::Expr) -> Result<(), DynamoDbError>,
-{
-    use extenddb_core::expression::SortKeyCondition;
-
-    f(&key_condition.pk_path, &key_condition.pk_value)?;
-    for (path, value) in &key_condition.extra_pk_conditions {
-        f(path, value)?;
-    }
-    for (path, value) in &key_condition.extra_sk_conditions {
-        f(path, value)?;
-    }
-    match &key_condition.sk_condition {
-        Some(SortKeyCondition::Compare { path, value, .. }) => f(path, value),
-        Some(SortKeyCondition::Between { path, low, high }) => {
-            f(path, low)?;
-            f(path, high)
-        }
-        Some(SortKeyCondition::BeginsWith { path, prefix }) => f(path, prefix),
-        None => Ok(()),
     }
 }
 
