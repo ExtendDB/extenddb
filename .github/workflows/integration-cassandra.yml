@@ -6,7 +6,7 @@ on:
   pull_request:
   merge_group:
   push:
-    branches: [main, feat/storage-cassandra-in-tree]
+    branches: [main, feat/storage-cassandra-in-tree, ci/fast-required-checks]
 
 permissions:
   contents: read

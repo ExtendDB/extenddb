@@ -3,7 +3,7 @@ on:
   pull_request:
   merge_group:
   push:
-    branches: [main]
+    branches: [main, ci/fast-required-checks]
 
 permissions:
   contents: read
