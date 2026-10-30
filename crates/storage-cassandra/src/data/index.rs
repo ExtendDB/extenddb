@@ -572,11 +572,11 @@ pub(crate) fn sk_to_value(sk: &SortKeyValue) -> cdrs_tokio::types::value::Value 
     }
 }
 
-/// Delete index metadata and drop index data tables for a given table.
+/// Drop the index data tables of a table, then delete their index metadata.
 ///
-/// Called by:
-/// - `process_control_plane_transitions` when table is DELETING → deleted
-/// - `update_table` when GSI is deleted via `UpdateTable` API
+/// Called by `remove_claimed_table`, the removal both `DeleteTable` and the
+/// control-plane sweep run. The tables go first, so a drop that fails leaves
+/// the metadata naming the index ids for the next attempt to find.
 ///
 /// Returns list of index IDs that were deleted (for caller logging/tracking).
 pub(crate) async fn delete_indexes_for_table(
@@ -603,6 +603,13 @@ pub(crate) async fn delete_indexes_for_table(
         index_ids.push(index_id);
     }
 
+    // Drop index data tables
+    for index_id in &index_ids {
+        engine
+            .drop_index_data_table(account_keyspace, index_id)
+            .await?;
+    }
+
     // Delete index metadata from catalog
     let delete_query = format!("DELETE FROM {catalog_keyspace}.indexes WHERE table_id = ?");
 
@@ -613,13 +620,6 @@ pub(crate) async fn delete_indexes_for_table(
         "delete_indexes_for_table",
     )
     .await?;
-
-    // Drop index data tables
-    for index_id in &index_ids {
-        engine
-            .drop_index_data_table(account_keyspace, index_id)
-            .await?;
-    }
 
     Ok(index_ids)
 }

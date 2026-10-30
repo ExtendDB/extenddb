@@ -1103,7 +1103,8 @@ impl CassandraEngine {
 
     /// Remove restore targets whose copy is gone: a CREATING or DELETING
     /// target carrying a restore registration whose heartbeat is older than
-    /// `stale_after` (or absent). Returns the names removed.
+    /// `stale_after` (or absent), and no `status_transition_at`. Returns the
+    /// names removed.
     ///
     /// Each removal first claims the target with a lightweight transaction
     /// conditioned on the heartbeat it observed, setting DELETING, a fresh
@@ -1130,7 +1131,8 @@ impl CassandraEngine {
             // CREATING tables; restore targets are few and short-lived.
             let query = format!(
                 "SELECT account_id, table_name, table_id, table_status, \
-                 restore_source_backup_arn, restore_heartbeat FROM {catalog}.tables \
+                 restore_source_backup_arn, restore_heartbeat, \
+                 toUnixTimestamp(status_transition_at) AS deadline_ms FROM {catalog}.tables \
                  WHERE table_status = ? ALLOW FILTERING"
             );
             let rows = crate::cassandra_util::query_rows::<StorageError>(
@@ -1146,6 +1148,15 @@ impl CassandraEngine {
                 let Some(backup_arn) = backup_arn else {
                     continue;
                 };
+                // A restore target never carries a deadline, and a DeleteTable
+                // claim always writes one, so a row with a deadline belongs to
+                // that call or to the control-plane sweep that took it over. A
+                // restored table keeps its registration columns after
+                // activation, which is why the status alone cannot tell.
+                let deadline: Result<Option<i64>, _> = row.get_by_name("deadline_ms");
+                if !matches!(deadline, Ok(None)) {
+                    continue;
+                }
                 let heartbeat: Option<i64> = row.get_by_name("restore_heartbeat").ok().flatten();
                 if heartbeat.is_some_and(|at| at >= cutoff) {
                     continue;
