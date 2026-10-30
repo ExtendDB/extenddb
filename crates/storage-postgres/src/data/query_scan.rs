@@ -161,7 +161,12 @@ impl PostgresEngine {
         let sk_sql_info = if let (Some(sk_cond), Some((_, sk_type))) =
             (&key_condition.sk_condition, sk_info_val)
         {
-            Some(build_sk_sql(sk_cond, sk_column(sk_type), &mut param_idx))
+            Some(build_sk_sql(
+                sk_cond,
+                sk_column(sk_type),
+                maps,
+                &mut param_idx,
+            )?)
         } else {
             None
         };

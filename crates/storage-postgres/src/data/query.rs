@@ -12,7 +12,7 @@ use extenddb_core::types::{
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::SortKeyValue;
-use extenddb_storage::util::{parse_sk, pk_to_text, sk_info};
+use extenddb_storage::util::{parse_sk, pk_to_text, sk_info, string_prefix_upper_bound};
 
 /// Extra pagination bind values for index queries.
 ///
@@ -82,8 +82,9 @@ pub(crate) struct SkSqlInfo {
 pub(crate) fn build_sk_sql(
     sk_cond: &SortKeyCondition,
     sk_col: &str,
+    maps: &ExpressionMaps,
     param_idx: &mut u32,
-) -> SkSqlInfo {
+) -> Result<SkSqlInfo, StorageError> {
     // Apply COLLATE "C" for string sort key columns to get byte-order comparison.
     let collate = if sk_col == "sk_s" || sk_col.ends_with("_s") {
         " COLLATE \"C\""
@@ -102,7 +103,7 @@ pub(crate) fn build_sk_sql(
             };
             let frag = format!(" AND {sk_col}{collate} {sql_op} ${param_idx}");
             *param_idx += 1;
-            SkSqlInfo { fragment: frag }
+            Ok(SkSqlInfo { fragment: frag })
         }
         SortKeyCondition::Between { .. } => {
             let frag = format!(
@@ -111,9 +112,9 @@ pub(crate) fn build_sk_sql(
                 hi = *param_idx + 1
             );
             *param_idx += 2;
-            SkSqlInfo { fragment: frag }
+            Ok(SkSqlInfo { fragment: frag })
         }
-        SortKeyCondition::BeginsWith { .. } => {
+        SortKeyCondition::BeginsWith { prefix, .. } => {
             let is_binary = sk_col == "sk_b" || sk_col.ends_with("_b");
             if is_binary {
                 // For binary sort keys, bind both prefix and incremented-prefix
@@ -125,19 +126,47 @@ pub(crate) fn build_sk_sql(
                     hi = *param_idx + 1
                 );
                 *param_idx += 2;
-                SkSqlInfo { fragment: frag }
-            } else {
-                // For string sort keys, append the max Unicode code point.
-                // With COLLATE "C" (byte order), prefix || chr(1114111) is
-                // strictly greater than any string starting with prefix.
+                Ok(SkSqlInfo { fragment: frag })
+            } else if string_prefix_bounded(prefix, sk_col, maps)? {
+                // For string sort keys the exclusive upper bound is the next
+                // prefix in code point order, computed in Rust (see
+                // bind_sk_condition). With COLLATE "C" the comparison is in
+                // byte order, which is code point order.
                 let frag = format!(
-                    " AND {sk_col}{collate} >= ${p} AND {sk_col}{collate} < (${p} || chr(1114111))",
-                    p = *param_idx
+                    " AND {sk_col}{collate} >= ${lo} AND {sk_col}{collate} < ${hi}",
+                    lo = *param_idx,
+                    hi = *param_idx + 1
                 );
+                *param_idx += 2;
+                Ok(SkSqlInfo { fragment: frag })
+            } else {
+                // A prefix of only U+10FFFF has no upper bound.
+                let frag = format!(" AND {sk_col}{collate} >= ${p}", p = *param_idx);
                 *param_idx += 1;
-                SkSqlInfo { fragment: frag }
+                Ok(SkSqlInfo { fragment: frag })
             }
         }
+    }
+}
+
+/// Whether a string `begins_with` prefix has a finite upper bound, so the SQL
+/// carries a placeholder for it. [`bind_sk_condition`] binds that bound.
+///
+/// A numeric prefix on a numeric column is refused here: it passes `parse_sk`
+/// in [`bind_sk_condition`] and would bind one value for two placeholders.
+/// Other non-string prefixes are refused by `parse_sk` before anything is
+/// bound.
+fn string_prefix_bounded(
+    prefix: &Expr,
+    sk_col: &str,
+    maps: &ExpressionMaps,
+) -> Result<bool, StorageError> {
+    match resolve_expr_to_av(prefix, maps)? {
+        AttributeValue::S(s) => Ok(string_prefix_upper_bound(&s).is_some()),
+        AttributeValue::N(_) if sk_col.ends_with("_n") => Err(StorageError::Internal(
+            "begins_with is not supported on numeric sort keys".to_owned(),
+        )),
+        _ => Ok(true),
     }
 }
 
@@ -245,7 +274,14 @@ fn bind_sk_condition<'q>(
                 let q = bind_sk_value(query, &sk);
                 Ok(q.bind(upper))
             } else {
-                Ok(bind_sk_value(query, &sk))
+                let q = bind_sk_value(query, &sk);
+                match &sk {
+                    SortKeyValue::S(p) => match string_prefix_upper_bound(p) {
+                        Some(upper) => Ok(q.bind(upper)),
+                        None => Ok(q),
+                    },
+                    _ => Ok(q),
+                }
             }
         }
         SortKeyCondition::Between { low, high, .. } => {
@@ -354,4 +390,49 @@ pub(crate) async fn execute_scan_sql(
 /// Build a `LastEvaluatedKey` from an item by extracting key attributes.
 pub(crate) fn build_key(item: &Item, key_schema: &[KeySchemaElement]) -> Item {
     extract_key(item, key_schema)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use extenddb_core::expression::{Expr, ExpressionMaps, PathElement, SortKeyCondition};
+    use extenddb_core::types::AttributeValue;
+
+    use super::build_sk_sql;
+
+    fn begins_with(value: AttributeValue) -> (SortKeyCondition, ExpressionMaps) {
+        let cond = SortKeyCondition::BeginsWith {
+            path: vec![PathElement::Attribute("sk".to_owned())],
+            prefix: Expr::Placeholder(":v".to_owned()),
+        };
+        let maps = ExpressionMaps::new(HashMap::new(), HashMap::from([(":v".to_owned(), value)]));
+        (cond, maps)
+    }
+
+    #[test]
+    fn a_string_prefix_gets_an_upper_bound_placeholder_unless_it_has_none() {
+        let (cond, maps) = begins_with(AttributeValue::S("ab".to_owned()));
+        let mut idx = 2;
+        let info = build_sk_sql(&cond, "sk_s", &maps, &mut idx).unwrap();
+        assert_eq!(
+            info.fragment,
+            " AND sk_s COLLATE \"C\" >= $2 AND sk_s COLLATE \"C\" < $3"
+        );
+        assert_eq!(idx, 4);
+
+        let (cond, maps) = begins_with(AttributeValue::S("\u{10FFFF}".to_owned()));
+        let mut idx = 2;
+        let info = build_sk_sql(&cond, "sk_s", &maps, &mut idx).unwrap();
+        assert_eq!(info.fragment, " AND sk_s COLLATE \"C\" >= $2");
+        assert_eq!(idx, 3);
+    }
+
+    #[test]
+    fn a_numeric_prefix_on_a_numeric_column_is_refused_before_any_sql() {
+        let (cond, maps) = begins_with(AttributeValue::N("1".to_owned()));
+        let mut idx = 2;
+        assert!(build_sk_sql(&cond, "sk_n", &maps, &mut idx).is_err());
+        assert_eq!(idx, 2);
+    }
 }

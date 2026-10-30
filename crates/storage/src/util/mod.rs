@@ -10,6 +10,7 @@ mod arn;
 mod backup_id;
 mod catalog_version;
 mod key;
+mod prefix;
 mod shard_stream;
 
 pub use arn::{
@@ -29,6 +30,7 @@ pub use key::{
     merge_attribute_definitions, parse_sk, pk_to_text, recover_sort_key_definitions, sk_column,
     sk_column_n, sk_info,
 };
+pub use prefix::string_prefix_upper_bound;
 pub use shard_stream::shard_in_stream;
 
 /// Whether an UpdateTable's GSI actions must be refused because the GSIs named
