@@ -87,13 +87,13 @@ fn prepare(location: &str) -> Result<(), String> {
 
 #[cfg(unix)]
 fn prepare_with(location: &str, calls: &ModeCalls<'_>) -> Result<(), String> {
-    let Ok(Some(path)) = database_file(location) else {
+    let Some(opened) = opened_file(location) else {
         return Ok(());
     };
-    if open_creates_file(location) {
-        create_owner_only(&resolve_dangling_symlinks(&path), calls)?;
+    if opened.created {
+        create_owner_only(&resolve_dangling_symlinks(&opened.path), calls)?;
     }
-    restrict_files(&path, calls)
+    restrict_files(&opened.path, calls)
 }
 
 #[cfg(not(unix))]
@@ -114,9 +114,9 @@ fn restrict(location: &str) -> Result<(), String> {
 
 #[cfg(unix)]
 fn restrict_with(location: &str, calls: &ModeCalls<'_>) -> Result<(), String> {
-    match database_file(location) {
-        Ok(Some(path)) => restrict_files(&path, calls),
-        _ => Ok(()),
+    match opened_file(location) {
+        Some(opened) => restrict_files(&opened.path, calls),
+        None => Ok(()),
     }
 }
 
@@ -125,37 +125,57 @@ fn restrict(_location: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether connecting to `location` creates the database file when it is
-/// missing. sqlx reads the pairs after the first `?` as form-urlencoded and
-/// passes `SQLITE_OPEN_CREATE` for `mode=rwc` unless `mode=ro` is also given;
-/// a plain path always gets `mode=rwc` from `sqlite_url`. Two forms are left
-/// to SQLite because they can keep it from creating a file on disk: a `file:`
-/// URI with its own query (its `mode` can narrow the open) and a VFS outside
-/// the unix family.
+/// The file a connection to a location opens on disk.
 #[cfg(unix)]
-fn open_creates_file(location: &str) -> bool {
+struct OpenedFile {
+    path: PathBuf,
+    /// Whether the connection creates the file when it is missing.
+    created: bool,
+}
+
+/// The file a connection to `location` opens on disk, or `None` for a
+/// location left to the connection: in memory, unparseable, a remote `file:`
+/// authority, or a `file:` name with `vfs` or `immutable` in the query. sqlx
+/// wraps such a name in a second `file:` URI, so SQLite opens a relative path
+/// spelled `file:...`, not the file the URI names.
+///
+/// sqlx reads the pairs after the first `?` as form-urlencoded: any
+/// `mode=rwc` passes `SQLITE_OPEN_CREATE` unless a `mode=ro` is also given,
+/// and the last `vfs` and the last `immutable` win. A plain path always gets
+/// `mode=rwc` from `sqlite_url`. A `file:` URI's own query is then read as
+/// SQLite reads it (`sqlite_uri`), and the file is created only if SQLite
+/// would create it on disk, with a VFS in the unix family.
+#[cfg(unix)]
+fn opened_file(location: &str) -> Option<OpenedFile> {
+    let path = database_file(location).ok()??;
     let url = sqlite_url(location);
-    let Some((_, query)) = url.split_once('?') else {
-        return false;
-    };
-    let (mut rwc, mut ro, mut unix_vfs) = (false, false, true);
-    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
-        match &*key {
-            "mode" => {
-                rwc |= value == "rwc";
-                ro |= value == "ro";
+    let (mut rwc, mut ro, mut vfs, mut immutable) = (false, false, None, false);
+    if let Some((_, query)) = url.split_once('?') {
+        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            match &*key {
+                "mode" => {
+                    rwc |= value == "rwc";
+                    ro |= value == "ro";
+                }
+                "vfs" => vfs = Some(value),
+                "immutable" => immutable = matches!(&*value, "true" | "1"),
+                _ => {}
             }
-            "vfs" => unix_vfs &= value.starts_with("unix"),
-            _ => {}
         }
     }
-    if !rwc || ro || !unix_vfs {
-        return false;
+    let options = sqlx::sqlite::SqliteConnectOptions::from_str(&url).ok()?;
+    let name = options.get_filename().to_string_lossy();
+    let uri = name.strip_prefix("file:");
+    if uri.is_some() && (vfs.is_some() || immutable) {
+        return None;
     }
-    sqlx::sqlite::SqliteConnectOptions::from_str(&url).is_ok_and(|options| {
-        let name = options.get_filename().to_string_lossy();
-        !(name.starts_with("file:") && name.contains('?'))
-    })
+    let created = rwc
+        && !ro
+        && vfs.is_none_or(|vfs| vfs.starts_with("unix"))
+        && uri.is_none_or(|rest| {
+            crate::sqlite_uri::FileUri::parse(rest).is_ok_and(|uri| uri.creates_file())
+        });
+    Some(OpenedFile { path, created })
 }
 
 /// Create `path` with mode 0600 if nothing is there yet. `create_new` refuses

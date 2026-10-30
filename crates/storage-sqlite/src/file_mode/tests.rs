@@ -141,6 +141,21 @@ fn prepare_creates_nothing_when_the_connection_would_not() {
     .expect("prepare");
     prepare(":memory:").expect("prepare");
     prepare("sqlite::memory:").expect("prepare");
+    // A `file:` URI whose own query SQLite reads as no creation: `mode=rw`,
+    // `mode=memory`, a VFS outside the unix family, and `mode=ro` followed by
+    // `mode=rwc`, which asks for more access than `ro` allows and fails.
+    for (name, query) in [
+        ("rw.sqlite", "mode=rw"),
+        ("memory.sqlite", "mode=memory"),
+        ("memdb.sqlite", "vfs=memdb"),
+        ("escalate.sqlite", "mode=ro%26mode=rwc"),
+    ] {
+        let uri = format!(
+            "sqlite:file:{}%3F{query}?mode=rwc",
+            dir.join(name).display()
+        );
+        prepare(&uri).expect("prepare");
+    }
     restrict(&plain.to_string_lossy()).expect("restrict");
     assert_eq!(std::fs::read_dir(&dir).expect("read_dir").count(), 0);
     let _ = std::fs::remove_dir_all(&dir);
@@ -152,6 +167,15 @@ fn prepare_creates_nothing_when_the_connection_would_not() {
 /// `connect` calls `restrict`. With `set_in_setup`, the setup then sets
 /// those files to that mode.
 async fn connect_and_record(
+    db: &Path,
+    set_in_setup: Option<u32>,
+) -> (sqlx::SqlitePool, Vec<(&'static str, u32)>) {
+    connect_and_record_at(&db.to_string_lossy(), db, set_in_setup).await
+}
+
+/// As `connect_and_record`, connecting to `location`, which opens `db`.
+async fn connect_and_record_at(
+    location: &str,
     db: &Path,
     set_in_setup: Option<u32>,
 ) -> (sqlx::SqlitePool, Vec<(&'static str, u32)>) {
@@ -179,9 +203,7 @@ async fn connect_and_record(
                 })
             })
     };
-    let pool = connect(&db.to_string_lossy(), options)
-        .await
-        .expect("connect");
+    let pool = connect(location, options).await.expect("connect");
     let seen = seen.lock().expect("lock").clone();
     (pool, seen)
 }
@@ -486,5 +508,89 @@ fn prepare_creates_the_database_file_with_mode_0600() {
     super::prepare_with(&db.to_string_lossy(), &calls).expect("prepare");
     assert_eq!(*created_with.lock().expect("lock"), Some(mode(&reference)));
     assert_eq!(mode(&db), 0o600);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Location forms on which SQLite creates the database on disk: the last of
+/// several `vfs` values is `unix`, and a `file:` URI's own query does not
+/// narrow the open. The database and its sidecars are 0600 from the moment
+/// they exist, as the connection setup sees them.
+#[tokio::test]
+async fn forms_sqlite_creates_on_disk_start_at_0600() {
+    for form in [
+        "sqlite://{db}?mode=rwc&vfs=memdb&vfs=unix",
+        "sqlite:file:{db}%3Fcache=shared?mode=rwc",
+        "sqlite:file:{db}%3Fmode=rwc?mode=rwc",
+    ] {
+        let dir = temp_dir();
+        let db = dir.join("db.sqlite");
+        let location = form.replace("{db}", &db.to_string_lossy());
+        let (pool, seen) = connect_and_record_at(&location, &db, None).await;
+        assert_eq!(
+            seen,
+            [("", 0o600), ("-wal", 0o600), ("-shm", 0o600)],
+            "{location}"
+        );
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A `file:` URI whose path SQLite decodes (`%2520` reaches SQLite as `%20`,
+/// a space): `prepare` creates the file SQLite opens and no other, and
+/// `restrict` reaches it and its sidecars, which the setup leaves at 0644.
+#[tokio::test]
+async fn a_decoded_file_uri_path_names_the_file_sqlite_opens() {
+    let dir = temp_dir();
+    let db = dir.join("a b.sqlite");
+    let location = format!("sqlite:file:{}/a%2520b.sqlite?mode=rwc", dir.display());
+    let (pool, seen) = connect_and_record_at(&location, &db, Some(0o644)).await;
+    assert_eq!(seen, [("", 0o600), ("-wal", 0o600), ("-shm", 0o600)]);
+    for suffix in ["", "-wal", "-shm"] {
+        assert_eq!(mode(&sidecar(&db, suffix)), 0o600, "{suffix}");
+    }
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .expect("read_dir")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    assert_eq!(names, ["a b.sqlite", "a b.sqlite-shm", "a b.sqlite-wal"]);
+    pool.close().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Locations that name a path SQLite does not open: `mod%65=memory`, which
+/// sqlx reads as `mode=memory`, and a `file:` URI with `vfs` or `immutable`
+/// in the query, which sqlx wraps so that SQLite opens a relative path spelled
+/// `file:...`. `prepare` and `restrict` create nothing in the directory the
+/// path names, and the in-memory connection leaves nothing there either.
+#[tokio::test]
+async fn locations_sqlite_does_not_open_as_named_are_left_alone() {
+    let dir = temp_dir();
+    let db = dir.join("db.sqlite");
+    let in_memory = format!("sqlite://{}?mode=rwc&mod%65=memory", db.display());
+    for location in [
+        in_memory.clone(),
+        format!("sqlite:file:{}?mode=rwc&vfs=unix", db.display()),
+        format!("sqlite:file:{}?mode=rwc&immutable=1", db.display()),
+    ] {
+        prepare(&location).expect("prepare");
+        restrict(&location).expect("restrict");
+    }
+    let pool = connect(&in_memory, sqlx::sqlite::SqlitePoolOptions::new())
+        .await
+        .expect("connect");
+    sqlx::query("CREATE TABLE t (k INTEGER PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .expect("write");
+    pool.close().await;
+    assert_eq!(std::fs::read_dir(&dir).expect("read_dir").count(), 0);
     let _ = std::fs::remove_dir_all(&dir);
 }

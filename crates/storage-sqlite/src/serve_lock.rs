@@ -49,15 +49,12 @@ pub(crate) fn database_file(location: &str) -> Result<Option<PathBuf>, String> {
     let options = SqliteConnectOptions::from_str(&url)
         .map_err(|e| format!("cannot parse SQLite location {location:?}: {e}"))?;
     // `mode=memory` is recorded in a private field; read it off the query the
-    // same way sqlx does (form-urlencoded pairs after the first `?`).
-    let mode_memory = url
-        .split_once('?')
-        .map(|(_, q)| {
-            q.split('&')
-                .filter_map(|kv| kv.split_once('='))
-                .any(|(k, v)| k == "mode" && v == "memory")
-        })
-        .unwrap_or(false);
+    // same way sqlx does (form-urlencoded pairs after the first `?`, so an
+    // encoded key such as `mod%65` is `mode`).
+    let mode_memory = url.split_once('?').is_some_and(|(_, query)| {
+        url::form_urlencoded::parse(query.as_bytes())
+            .any(|(key, value)| key == "mode" && value == "memory")
+    });
     let filename = options.get_filename().to_string_lossy().into_owned();
     if mode_memory
         || filename == ":memory:"
@@ -68,35 +65,25 @@ pub(crate) fn database_file(location: &str) -> Result<Option<PathBuf>, String> {
     }
     // sqlx opens every name with SQLITE_OPEN_URI, so a `file:` name is a
     // SQLite URI: `file:/abs`, `file:rel`, `file:///abs`, `file://localhost/abs`,
-    // each with an optional `?query`. Anything else must be a plain path.
+    // each with an optional `?query`, and SQLite decodes `%HH` in its path.
+    // Anything else must be a plain path.
     let path = match filename.strip_prefix("file:") {
-        Some(rest) => {
-            let rest = rest.split('?').next().unwrap_or(rest);
-            let rest = rest.split('#').next().unwrap_or(rest);
-            match rest.strip_prefix("//") {
-                Some(after_slashes) => {
-                    let (authority, path) = after_slashes
-                        .find('/')
-                        .map_or((after_slashes, ""), |i| after_slashes.split_at(i));
-                    if !(authority.is_empty() || authority == "localhost") {
-                        return Err(format!(
-                            "cannot lock SQLite location {location:?}: `file:` URI authority \
-                             {authority:?} is not a local path"
-                        ));
-                    }
-                    path.to_owned()
-                }
-                None => rest.to_owned(),
-            }
-        }
-        None => filename,
+        Some(rest) => crate::sqlite_uri::FileUri::parse(rest)
+            .map_err(|authority| {
+                format!(
+                    "cannot lock SQLite location {location:?}: `file:` URI authority \
+                     {authority:?} is not a local path"
+                )
+            })?
+            .path(),
+        None => PathBuf::from(filename),
     };
-    if path.is_empty() {
+    if path.as_os_str().is_empty() {
         return Err(format!(
             "cannot lock SQLite location {location:?}: it names no database file"
         ));
     }
-    Ok(Some(PathBuf::from(path)))
+    Ok(Some(path))
 }
 
 /// Holds the lock until dropped.
@@ -323,6 +310,34 @@ mod database_file_tests {
         );
         assert_eq!(file("file:rel.sqlite"), Some(PathBuf::from("rel.sqlite")));
         assert!(database_file("file://otherhost/tmp/db.sqlite").is_err());
+    }
+
+    #[test]
+    fn a_file_uri_path_is_decoded_as_sqlite_decodes_it() {
+        // sqlx decodes `%25` to `%`; SQLite then decodes `%20` in the path.
+        assert_eq!(
+            file("sqlite:file:/tmp/a%2520b.sqlite?mode=rwc"),
+            Some(PathBuf::from("/tmp/a b.sqlite"))
+        );
+        assert_eq!(
+            file("file:/tmp/a%2520b.sqlite"),
+            Some(PathBuf::from("/tmp/a b.sqlite"))
+        );
+    }
+
+    #[test]
+    fn an_encoded_mode_key_is_read_as_sqlx_reads_it() {
+        assert_eq!(file("sqlite:///tmp/db.sqlite?mode=rwc&mod%65=memory"), None);
+    }
+
+    /// sqlx wraps a `file:` name in a second `file:` URI when the query sets
+    /// `vfs`, so SQLite opens something else; the lock stays where it was.
+    #[test]
+    fn a_file_uri_with_a_vfs_keeps_its_lock_path() {
+        assert_eq!(
+            file("sqlite:file:/tmp/db.sqlite?mode=rwc&vfs=unix"),
+            Some(PathBuf::from("/tmp/db.sqlite"))
+        );
     }
 
     #[test]
