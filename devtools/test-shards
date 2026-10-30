@@ -84,6 +84,11 @@ def cmd_collect(out, pytest_args):
                 rest = item.nodeid.partition("::")[2]
                 rows.append((path, f"{path}::{rest}" if rest else path))
 
+    # Tabs and newlines would split a row; escape them in every list alike.
+    def field(text):
+        return (text.replace("\\", "\\\\").replace("\t", "\\t")
+                .replace("\n", "\\n"))
+
     # pytest prints the collected ids; keep stdout for callers that read it.
     with contextlib.redirect_stdout(sys.stderr):
         rc = pytest.main(["--collect-only", "-q", *pytest_args],
@@ -95,7 +100,7 @@ def cmd_collect(out, pytest_args):
         return int(rc)
     with open(out, "w", encoding="utf-8") as f:
         for path, test_id in rows:
-            f.write(f"{path}\t{test_id}\n")
+            f.write(f"{field(path)}\t{field(test_id)}\n")
     print(f"test-shards: {len(rows)} tests collected into {out}",
           file=sys.stderr)
     return 0
@@ -295,11 +300,19 @@ def cmd_prepare(argv):
                                            ("files", ".txt")))
 
     # Each collection runs in its own interpreter: pytest does not support
-    # two sessions importing the same test modules in one process.
+    # two sessions importing the same test modules in one process. Its
+    # output is the whole collection tree, so it is shown only on failure.
     def collect(out, extra, env=None):
-        return subprocess.call([sys.executable, os.path.abspath(__file__),
-                                "collect", out, "--", *extra, *pytest_args],
-                               env=env)
+        proc = subprocess.run([sys.executable, os.path.abspath(__file__),
+                               "collect", out, "--", *extra, *pytest_args],
+                              env=env, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True)
+        if proc.returncode:
+            sys.stderr.write(proc.stdout)
+        else:
+            sys.stderr.writelines(line for line in proc.stdout.splitlines(True)
+                                  if line.startswith("test-shards:"))
+        return proc.returncode
 
     if collect(whole, []):
         return 1

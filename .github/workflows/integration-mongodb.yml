@@ -47,6 +47,8 @@ jobs:
           path: target/release/extenddb
           if-no-files-found: error
           retention-days: 1
+          # A re-run of a failed job uploads the same name again.
+          overwrite: true
 
   mongodb-pytest:
     # Dedicated ExtendDB runner group (Ubuntu 24.04, 4 vCPU / 16 GB, capped at
@@ -87,6 +89,8 @@ jobs:
           path: discussions/shards/
           if-no-files-found: warn
           retention-days: 1
+          # A re-run of a failed job uploads the same name again.
+          overwrite: true
 
   # SnapshotEngine consistency check against a disposable replica set. The
   # tests build their own per-test scratch databases (snap<uuid>_cat and

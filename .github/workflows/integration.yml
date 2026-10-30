@@ -44,6 +44,8 @@ jobs:
           path: target/release/extenddb
           if-no-files-found: error
           retention-days: 1
+          # A re-run of a failed job uploads the same name again.
+          overwrite: true
 
   build-sqlite:
     runs-on: extenddb_ubuntu-2404_4-core
@@ -66,6 +68,8 @@ jobs:
           path: target/release/extenddb
           if-no-files-found: error
           retention-days: 1
+          # A re-run of a failed job uploads the same name again.
+          overwrite: true
 
   run-integration:
     # Dedicated ExtendDB runner group (4 vCPU / 16 GB, capped at 20 concurrent),
@@ -168,6 +172,8 @@ jobs:
           path: discussions/shards/
           if-no-files-found: warn
           retention-days: 1
+          # A re-run of a failed job uploads the same name again.
+          overwrite: true
 
   run-integration-sqlite:
     runs-on: extenddb_ubuntu-2404_4-core
@@ -241,6 +247,8 @@ jobs:
           path: discussions/shards/
           if-no-files-found: warn
           retention-days: 1
+          # A re-run of a failed job uploads the same name again.
+          overwrite: true
 
   run-integration-dev-mode:
     # dev-mode was shipped with no CI coverage at all, which is how the batch and
