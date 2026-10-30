@@ -44,6 +44,7 @@
 
 use extenddb_core::expression::{CompareOp, Expr, ExpressionMaps, PathElement};
 use extenddb_core::types::AttributeValue;
+use extenddb_storage::util::needs_escape;
 
 /// Outcome of the pushdown analyzer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,7 +77,10 @@ pub fn is_pushable(expr: &Expr, maps: &ExpressionMaps) -> Pushable {
 /// Return why an expression contains a literal DynamoDB attribute name that
 /// cannot safely be emitted as a MongoDB field path. A dot would mean nested
 /// document traversal in MongoDB, while a leading `$` would be interpreted as
-/// an operator or otherwise have special meaning in a MongoDB path.
+/// an operator or otherwise have special meaning in a MongoDB path. A name
+/// containing U+0000 or U+0001 is stored under its escaped form (see
+/// `extenddb_storage::util::escape_control`), so the raw name would not match
+/// the stored field.
 fn unsafe_attribute_reason(expr: &Expr, maps: &ExpressionMaps) -> Option<&'static str> {
     match expr {
         Expr::Path(elements) => elements.iter().find_map(|element| match element {
@@ -90,6 +94,9 @@ fn unsafe_attribute_reason(expr: &Expr, maps: &ExpressionMaps) -> Option<&'stati
                     Some(name) if name.contains('.') => Some("literal attribute name contains '.'"),
                     Some(name) if name.starts_with('$') => {
                         Some("literal attribute name begins with '$'")
+                    }
+                    Some(name) if needs_escape(name) => {
+                        Some("literal attribute name contains U+0000 or U+0001")
                     }
                     Some(_) => None,
                     None => Some("attribute name alias is unresolved"),
@@ -391,6 +398,41 @@ mod tests {
             is_pushable(&expr, &maps),
             Pushable::No("literal attribute name begins with '$'")
         );
+    }
+
+    #[test]
+    fn nul_attribute_name_is_not_pushable() {
+        // The stored field name is the escaped form, so a raw path on a
+        // name containing U+0000 would never match; must fall back.
+        let expr = Expr::Compare {
+            left: Box::new(path("a\u{0}b")),
+            op: CompareOp::Eq,
+            right: Box::new(Expr::Placeholder(":value".into())),
+        };
+        let maps = maps_with(&[(":value", AttributeValue::S("value".into()))]);
+
+        assert_eq!(
+            is_pushable(&expr, &maps),
+            Pushable::No("literal attribute name contains U+0000 or U+0001")
+        );
+    }
+
+    #[test]
+    fn control_character_attribute_alias_is_not_pushable() {
+        for resolved in ["a\u{0}b", "a\u{1}b"] {
+            let expr = Expr::Compare {
+                left: Box::new(path("#name")),
+                op: CompareOp::Eq,
+                right: Box::new(Expr::Placeholder(":value".into())),
+            };
+            let maps = aliased_maps(resolved, AttributeValue::S("value".into()));
+
+            assert_eq!(
+                is_pushable(&expr, &maps),
+                Pushable::No("literal attribute name contains U+0000 or U+0001"),
+                "{resolved:?}"
+            );
+        }
     }
 
     #[test]

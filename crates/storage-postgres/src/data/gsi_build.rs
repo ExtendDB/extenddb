@@ -58,13 +58,14 @@ use extenddb_core::types::{
     TableKeyInfo,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{composite_pk_to_text, parse_sk, sk_column_n};
+use extenddb_storage::util::sk_column_n;
 use sqlx::Row as _;
 
 use super::index::{
     IndexMeta, db_error, delete_index_row_multi, fetch_indexes_for_table, insert_index_row_multi,
     project_item_for_index,
 };
+use super::key_text::{composite_pk_to_text, parse_sk};
 use super::{all_sort_key_info, data_table_name, index_table_name, json_to_item};
 use crate::gsi_queue::{GsiApplyContext, GsiIndexDef, PendingApplyContext, enqueue_gsi_pending};
 

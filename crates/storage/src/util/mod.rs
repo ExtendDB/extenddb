@@ -9,6 +9,7 @@
 mod arn;
 mod backup_id;
 mod catalog_version;
+mod control_chars;
 mod key;
 mod shard_stream;
 
@@ -23,6 +24,10 @@ pub use backup_id::{
     is_backup_resource_arn, new_backup_id, parse_backup_arn,
 };
 pub use catalog_version::check_stored_catalog_version;
+pub use control_chars::{
+    escape_control, escape_json_keys, escape_json_strings, needs_escape, unescape_control,
+    unescape_json_keys, unescape_json_strings,
+};
 pub use key::SortKeyValue;
 pub use key::{
     composite_pk_to_text, effective_attribute_definitions, encode_netstring_composite,

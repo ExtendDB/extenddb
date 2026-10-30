@@ -36,6 +36,7 @@ mod cmd_verify;
 mod init_helpers;
 mod manage_http;
 mod manage_types;
+mod migrate_connection;
 mod serve_helpers;
 mod util;
 
