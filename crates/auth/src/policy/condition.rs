@@ -54,6 +54,12 @@ pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext
             let (_absent_passes, base_op) = unwrap_if_exists(inner);
             match context_values {
                 None => true,
+                // No Arn set check here, unlike `ForAnyValue`: a value that
+                // is not an ARN fails `compare_single` for every Arn operator,
+                // so the `all` below is already false for any non-empty
+                // policy value list. With an empty list the negative form is
+                // true, as IAM evaluates it (simulate-custom-policy,
+                // 2026-10-28).
                 Some(vals) => {
                     if is_negative_operator(base_op) {
                         // Negative operators: each context value must satisfy the
@@ -81,6 +87,7 @@ pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext
             let (absent_passes, base_op) = unwrap_if_exists(inner);
             match context_values {
                 None => absent_passes,
+                Some(vals) if arn_operator_sees_non_arn(base_op, &vals) => false,
                 Some(vals) => {
                     if is_negative_operator(base_op) {
                         // Negative operators: at least one context value must
@@ -354,6 +361,45 @@ fn is_negative_operator(op: &ConditionOperator) -> bool {
     )
 }
 
+/// Returns true for the Arn condition operators.
+fn is_arn_operator(op: &ConditionOperator) -> bool {
+    matches!(
+        op,
+        ConditionOperator::ArnEquals
+            | ConditionOperator::ArnNotEquals
+            | ConditionOperator::ArnLike
+            | ConditionOperator::ArnNotLike
+    )
+}
+
+/// Whether `op` is an Arn operator and at least one of `context_values` is
+/// not an ARN by [`super::matcher::is_arn`].
+///
+/// IAM evaluates an Arn condition over a multi-valued key as false when any
+/// value in the set is not an ARN, whatever the pattern and whatever the set
+/// qualifier. Measured with simulate-custom-policy on 2026-10-23 with the
+/// values [`arn:aws:dynamodb:us-east-1:123456789012:table/Tother`,
+/// `notanarn`]: the `ForAnyValue:` and `ForAllValues:` forms of ArnEquals,
+/// ArnNotEquals, ArnLike and ArnNotLike returned implicitDeny with a pattern
+/// that matches the ARN value (`table/*`) and with one that does not
+/// (`table/Z*`), and the bare form returned implicitDeny with `table/*`. On
+/// 2026-10-28, with `aws:TagKeys` holding [`.../table/V`, `notanarn`], the
+/// two set forms with and without `IfExists` returned implicitDeny for both
+/// patterns, and the two set forms without `IfExists` returned implicitDeny
+/// with `j*` over [`junk`]. The rows are in the description of PR #471.
+/// `ForAnyValue:` checks this before comparing per value,
+/// so `ForAnyValue:ArnEquals` does not pass on the one well-formed value and
+/// `ForAnyValue:ArnNotEquals` does not pass on a non-matching pattern.
+/// `ForAllValues:` needs no such check: a value that is not an ARN fails
+/// `compare_single` against every policy value, so per-value evaluation
+/// already returns false there for any non-empty policy value list. With an
+/// empty policy value list `ForAllValues:` with a negative Arn operator is
+/// true and `ForAnyValue:` is false, as IAM evaluates them (measured
+/// 2026-10-28; pinned in `tests/arn_operators.rs`).
+fn arn_operator_sees_non_arn(op: &ConditionOperator, context_values: &[&str]) -> bool {
+    is_arn_operator(op) && !context_values.iter().all(|cv| super::matcher::is_arn(cv))
+}
+
 /// Compare a single context value against a single policy value.
 ///
 /// Returns `true` if the comparison holds for the given operator.
@@ -405,10 +451,28 @@ fn compare_single(op: &ConditionOperator, context_value: &str, policy_value: &st
             compare_dates(context_value, policy_value, |a, b| a >= b)
         }
         ConditionOperator::Bool => context_value.eq_ignore_ascii_case(policy_value),
-        ConditionOperator::ArnEquals => context_value == policy_value,
-        ConditionOperator::ArnNotEquals => context_value != policy_value,
-        ConditionOperator::ArnLike => super::matcher::arn_match(policy_value, context_value),
-        ConditionOperator::ArnNotLike => !super::matcher::arn_match(policy_value, context_value),
+        // IAM evaluates ArnEquals exactly as ArnLike and ArnNotEquals exactly
+        // as ArnNotLike: `*` and `?` match in every ARN field, matching is
+        // case sensitive, and both sides need the same number of fields,
+        // except that a bare `*` pattern matches any six-field value
+        // (`arn_match` returns before it compares fields; derived, since the
+        // simulator refuses `*` against an ARN).
+        // A context value that is not an ARN (fewer than six fields) matches
+        // neither the positive nor the negative operator, so a Deny on
+        // ArnNotEquals does not apply to a malformed value; under
+        // `ForAnyValue:` `arn_operator_sees_non_arn` applies the same rule to
+        // the whole set before this per-value comparison. The rows measured
+        // with simulate-custom-policy are in the description of PR #471; the
+        // non-ARN rule was measured for all four operators on 2026-10-28 with
+        // the values `notanarn` and `arn:aws:dynamodb`.
+        ConditionOperator::ArnEquals | ConditionOperator::ArnLike => {
+            super::matcher::is_arn(context_value)
+                && super::matcher::arn_match(policy_value, context_value)
+        }
+        ConditionOperator::ArnNotEquals | ConditionOperator::ArnNotLike => {
+            super::matcher::is_arn(context_value)
+                && !super::matcher::arn_match(policy_value, context_value)
+        }
         // IpAddress matches only when the caller address and the policy range
         // are the same family and the address is in the range. NotIpAddress
         // matches only when they are the same family and the address is not in

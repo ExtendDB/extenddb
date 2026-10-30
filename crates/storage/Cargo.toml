@@ -11,6 +11,9 @@ license.workspace = true
 # `test-util` exposes `migrations::check_released`, the checksum test each
 # backend crate runs on its migration table. Production code never enables it.
 test-util = []
+# Compiles the `snapshot_conformance` check that each backend's tests run
+# against a real database. Production builds do not compile it.
+test-hooks = []
 
 [dependencies]
 aes-gcm = { workspace = true }

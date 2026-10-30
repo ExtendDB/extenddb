@@ -71,6 +71,12 @@ pub enum StorageError {
     /// and the worker dropped claimed rows on transient errors.
     #[error("{0}")]
     Transient(String),
+    /// The backend discarded a consistent snapshot before the reader drained
+    /// it (`MongoDB` `SnapshotTooOld`, a `PostgreSQL` snapshot conflict on a hot
+    /// standby). The operation that held it must restart from the beginning;
+    /// nothing read so far may be combined with a fresh snapshot.
+    #[error("snapshot expired: {0}")]
+    SnapshotExpired(String),
     #[error("Connection error: {0}")]
     Connection(String),
     /// The backend does not implement the requested feature. Distinct from

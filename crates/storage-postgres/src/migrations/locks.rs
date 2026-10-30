@@ -309,11 +309,7 @@ async fn timed_out(
     what: &str,
 ) -> MigrationError {
     let _ = statement(conn, "ROLLBACK").await;
-    let timed_out = e
-        .as_database_error()
-        .and_then(|d| d.code())
-        .is_some_and(|c| c == "55P03");
-    if !timed_out {
+    if !crate::data::lock_not_available(&e) {
         return MigrationError::store("take the migration lock", e);
     }
     let names = match holders(conn, key).await {

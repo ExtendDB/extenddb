@@ -289,5 +289,59 @@ pub async fn migrate_holding(
     result
 }
 
+/// Bring a fresh catalog database and a fresh data database to the current
+/// schema, for the test harnesses in this crate's `tests/` directory, so they
+/// do not carry their own copy of the migration table.
+///
+/// With two databases this is [`migrate`], as `extenddb migrate --yes` runs
+/// it: every migration through the runner, each recorded in the ledger of
+/// the database it changed. When `catalog` and `data` reach one database
+/// (the layout the engine uses when the catalog has no
+/// `data_database_connection_string` row) the runner cannot apply both
+/// stores, because each database holds one ledger and both stores record
+/// migration 1 in it. There the file bodies of every migration are executed
+/// in id order, catalog first, as this crate's one-database tests execute
+/// the shipped files, and no ledger row is written. No code body runs on
+/// that layout: each one converts rows or tables that a fresh database does
+/// not have.
+///
+/// # Errors
+///
+/// Returns the first error, formatted.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub async fn apply_all_migrations(
+    catalog: &sqlx::PgPool,
+    data: &sqlx::PgPool,
+) -> Result<(), String> {
+    let catalog_options = (*catalog.connect_options()).clone();
+    let data_options = data.connect_options();
+    let one_database = catalog_options.get_host() == data_options.get_host()
+        && catalog_options.get_port() == data_options.get_port()
+        && catalog_options.get_database() == data_options.get_database();
+    if one_database {
+        for id in MigrationId::ALL {
+            for body in migration(id).bodies() {
+                if let extenddb_storage::migrations::Body::File { name, text } = &body.body {
+                    sqlx::raw_sql(text)
+                        .execute(catalog)
+                        .await
+                        .map_err(|e| format!("{name}: {e:?}"))?;
+                }
+            }
+        }
+        return Ok(());
+    }
+    let data_database = data_options.get_database().unwrap_or("postgres").to_owned();
+    migrate(
+        &PostgresTarget::new(catalog_options, data_database),
+        "test",
+        Duration::ZERO,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| format!("{e:?}"))
+}
+
 #[cfg(test)]
 mod tests;

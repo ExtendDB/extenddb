@@ -24,6 +24,9 @@ mod metadata_engine;
 pub mod migrations;
 mod operations;
 mod pg_util;
+mod snapshot_engine;
+#[doc(hidden)]
+pub use snapshot_engine::map_fetch_error;
 mod stream_engine;
 #[doc(hidden)]
 pub mod stream_records_sql;
@@ -74,6 +77,25 @@ pub use data::vector_index::rebuild_stuck_vector_indexes;
 /// Rebuild vector indexes a crash left mid-build. A startup step, exported because
 /// it is part of bringing a deployment up rather than an internal detail.
 pub use data::vector_index::reconcile_incomplete_vector_indexes;
+/// The relation names a table's storage uses, for tests that pin what a drop
+/// removes; the crate owns the format (`data/mod.rs`).
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use data::{data_table_name, index_table_name, vector_table_name};
+/// Hold a `DeleteTable` between its in-use probe and its drops, or (separate
+/// data database) between its catalog commit and its data commit; and shorten
+/// the bound on the drop retried after a failed data commit.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use delete_table::test_pause::{
+    DataDropRetryBound, DeleteTablePause, DeleteTablePoint, arm_delete_table_pause,
+    arm_delete_table_pause_at, shorten_data_drop_retry_bound_for_tests,
+};
+/// Every migration, as `extenddb migrate --yes` applies them, for the test
+/// harnesses in `tests/` so they do not carry their own copy of the lists.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use migrations::apply_all_migrations;
 
 /// The `PostgreSQL` storage backend.
 ///
@@ -251,6 +273,67 @@ pub struct PostgresEngine {
     /// The serving registration a server holds for its life, so `migrate
     /// --yes` refuses while it serves. `None` outside a server.
     pub(crate) serving: Option<Arc<migrations::ServingRegistration>>,
+    /// Bounds how many table snapshots may be open at once (one permit from
+    /// the open until the stream's transaction ends): half the pool
+    /// ([`snapshot_slot_count`]) on either layout.
+    ///
+    /// On one shared database an open and its stream use one connection and
+    /// one transaction for catalog and data, so the permits cap snapshots at
+    /// half the pool's connections and no open ever waits for a second
+    /// connection while holding one. With a separate data database an open
+    /// holds a catalog connection (the barrier) while it takes a data
+    /// connection, and the stream keeps the data connection; the permits cap
+    /// barriers at half the catalog pool and streams at half the data pool,
+    /// and the catalog-then-data order every path follows cannot form a
+    /// cycle.
+    ///
+    /// What the permits do not prevent: request load alone exhausting a pool
+    /// (an open then waits for its connection up to the acquire timeout like
+    /// any request), and restores, which take their own slots (half the
+    /// pool, at most 16: `backup_engine::restore_server_slot_count`), so
+    /// snapshots and restores together can hold the whole pool. On the separate layout requests that block on
+    /// the `tables` row an open holds `FOR SHARE` (`UpdateTable`,
+    /// `DeleteTable` of that table) hold catalog connections while they
+    /// wait; the open needs only a data connection by then, so they delay it
+    /// no further.
+    pub(crate) snapshot_open_slots: Arc<tokio::sync::Semaphore>,
+    /// Whether `data_pool` is the catalog pool (no separate data database).
+    /// The snapshot open uses one transaction on that layout, and
+    /// `DeleteTable` runs its in-use probe and its synchronous drop on the
+    /// connection it holds rather than taking a second from the same pool.
+    pub(crate) shared_data_pool: bool,
+    /// Drop attempts the control plane has made (`control_plane_pass`), a
+    /// `DELETING` table its probe found held and skipped counted as one, for
+    /// tests that count them. Shared by clones.
+    #[cfg(feature = "test-hooks")]
+    pub(crate) drop_attempts: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Table snapshots one engine may hold open at once: half the pool (at least
+/// five, since the pool is at least `MIN_POOL_SIZE`). Each open snapshot
+/// holds one connection of the pool its items come from (on one shared
+/// database, the one pool), so open snapshots leave at least half of it to
+/// requests; see `PostgresEngine::snapshot_open_slots` for what that does and
+/// does not prevent on each layout.
+fn snapshot_slot_count(pool_size: u32) -> usize {
+    usize::try_from((pool_size / 2).max(1)).unwrap_or(usize::MAX)
+}
+
+/// Stops the poller started by
+/// [`PostgresEngine::spawn_control_plane_poller_for_tests`] when dropped.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub struct ControlPlanePollerGuard {
+    token: extenddb_storage::CancellationToken,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(feature = "test-hooks")]
+impl Drop for ControlPlanePollerGuard {
+    fn drop(&mut self) {
+        self.token.cancel();
+        self.handle.abort();
+    }
 }
 
 impl PostgresEngine {
@@ -283,6 +366,7 @@ impl PostgresEngine {
 
         // P54 Bug 1: Read data database connection string from catalog settings.
         // Falls back to the catalog pool if no separate data database is configured.
+        let mut shared_data_pool = false;
         let data_pool = match sqlx::query_as::<_, (String,)>(
             "SELECT value FROM settings WHERE key = 'data_database_connection_string'",
         )
@@ -299,7 +383,10 @@ impl PostgresEngine {
                 .map_err(|e| {
                     StorageError::Connection(format!("data database connection failed: {e}"))
                 })?,
-            _ => pool.clone(),
+            _ => {
+                shared_data_pool = true;
+                pool.clone()
+            }
         };
 
         // P119: Read initial GSI propagation delay from settings table.
@@ -341,6 +428,12 @@ impl PostgresEngine {
             restore_server_slot_count: server_slots,
             restore_account_slots: backup_engine::RestoreAccountSlots::default(),
             serving: None,
+            snapshot_open_slots: Arc::new(tokio::sync::Semaphore::new(snapshot_slot_count(
+                pool_size,
+            ))),
+            shared_data_pool,
+            #[cfg(feature = "test-hooks")]
+            drop_attempts: Arc::default(),
         })
     }
 
@@ -391,6 +484,57 @@ impl PostgresEngine {
     #[must_use]
     pub fn control_plane_notify(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.control_plane_notify)
+    }
+
+    /// Run the control-plane poller `serve` runs (`spawn_workers`), on a
+    /// clone of this engine with a settings store on its catalog pool, until
+    /// the returned guard is dropped. For tests that need the production
+    /// wake-up path rather than calling `process_control_plane_transitions`
+    /// themselves.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn spawn_control_plane_poller_for_tests(&self) -> ControlPlanePollerGuard {
+        self.spawn_control_plane_poller_with_active_poll_for_tests(workers::ACTIVE_POLL)
+    }
+
+    /// [`Self::spawn_control_plane_poller_for_tests`] with the active loop's
+    /// retry interval set to `active_poll` instead of one second, so a test
+    /// can tell a pass run by a wake from one run by the timer.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn spawn_control_plane_poller_with_active_poll_for_tests(
+        &self,
+        active_poll: std::time::Duration,
+    ) -> ControlPlanePollerGuard {
+        let token = extenddb_storage::CancellationToken::new();
+        let handle = tokio::spawn(workers::poll_control_plane_transitions(
+            Arc::new(self.clone()),
+            self.control_plane_notify(),
+            Arc::new(PostgresCatalogStore::new(self.pool.clone())),
+            token.clone(),
+            active_poll,
+        ));
+        ControlPlanePollerGuard { token, handle }
+    }
+
+    /// Run the startup recovery `serve` runs before it starts the poller
+    /// (`server_components_factory`), on this engine.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub async fn recover_control_plane_at_startup_for_tests(&self) {
+        workers::recover_control_plane_at_startup(self).await;
+    }
+
+    /// Drop attempts this engine's control plane has made so far, a table
+    /// its probe found held and skipped counted as one.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn control_plane_drop_attempts_for_tests(&self) -> u64 {
+        self.drop_attempts
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Defense-in-depth: validate `account_id` before use in SQL identifiers.
@@ -544,6 +688,7 @@ impl ServerRuntimeHooks for PostgresRuntimeHooks {
                 cp_notify,
                 catalog_store,
                 token,
+                workers::ACTIVE_POLL,
             )
             .await;
         });
@@ -751,16 +896,10 @@ fn server_components_factory(
             Err(e) => tracing::error!("Failed to reconcile incomplete vector indexes: {e}"),
         }
 
-        // Recover control plane transitions (ignore errors)
-        match engine.process_control_plane_transitions().await {
-            Ok(ref t) if t.is_empty() => {}
-            Ok(transitions) => {
-                for (name, transition) in &transitions {
-                    tracing::info!("Recovered table '{name}': {transition}");
-                }
-            }
-            Err(e) => tracing::error!("Failed to recover control plane transitions: {e}"),
-        }
+        // Recover control plane transitions (errors are logged, not fatal).
+        // A drop deferred by a session still holding the table wakes the
+        // poller, which `spawn_workers` starts later.
+        workers::recover_control_plane_at_startup(&engine).await;
 
         // Start GSI workers
         let engine = engine.start_gsi_workers();

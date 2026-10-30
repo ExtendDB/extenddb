@@ -31,53 +31,114 @@ async fn read_index_propagation_delay<S: SettingsStore + ?Sized>(
         .await
 }
 
+/// How often the control-plane poller retries while active.
+pub(crate) const ACTIVE_POLL: Duration = Duration::from_secs(1);
+
+/// The control-plane poller `serve` runs (`spawn_workers`).
+///
+/// Idle, it waits for a wake on `notify` (`CreateTable`, `DeleteTable`, a table
+/// snapshot or in-catalog backup ending its read, startup recovery that left
+/// a drop deferred) or for its 60 s idle timeout, and then runs an active
+/// window of `control_plane_delay_seconds` + 5 s: a pass at once and one
+/// every `active_poll` (one second in `serve`). The window lasts past its end
+/// for as long as a `DELETING` row's drop is deferred because a session
+/// holds a lock on the table's data tables
+/// ([`crate::worker_store::ControlPlanePass::deferred_drops`]): only a
+/// snapshot stream and the in-catalog backup wake this poller when they
+/// release, and a plain transaction, `pg_dump` or a client read or write do
+/// not, so going idle while a drop is deferred would leave the row
+/// `DELETING` until the idle pass (up to 60 s after the holder is gone).
+///
+/// A pass probes each due `DELETING` table for holders and skips a held one
+/// without waiting on it, and drops a free one under
+/// `delete_table::SYNC_DROP_LOCK_TIMEOUT` (1 s), so a pass costs a probe per
+/// held table rather than a lock wait per held table. Staying active
+/// therefore bounds the time from a holder's release to its table's drop at
+/// about `active_poll` (plus the pass in progress, which is short), whatever
+/// the holder and however many other tables are held. A `CreateTable` that is
+/// due is activated at the start of the next pass on the same cadence.
+///
+/// While active it waits on `notify` as well as on its timer, so a wake runs
+/// the next pass at once rather than at the next poll, and restarts the
+/// window (as a wake while idle starts one). A release that wakes the
+/// poller therefore has the drop retried at once.
 pub(crate) async fn poll_control_plane_transitions<S: SettingsStore + ?Sized>(
     storage: Arc<PostgresEngine>,
     notify: Arc<tokio::sync::Notify>,
     settings: Arc<S>,
     token: CancellationToken,
+    active_poll: Duration,
 ) {
-    const ACTIVE_POLL: Duration = Duration::from_secs(1);
     const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
     const MARGIN_SECS: f64 = 5.0;
 
+    let window = |delay_secs: f64| Duration::from_secs_f64(delay_secs + MARGIN_SECS);
+    // `Some(deadline)` while active.
+    let mut deadline: Option<tokio::time::Instant> = None;
     loop {
-        // Idle: wait for a wake signal, an idle timeout (defensive sweep), or
-        // shutdown.
-        let shutting_down = tokio::select! {
-            () = token.cancelled() => true,
-            _ = tokio::time::timeout(IDLE_TIMEOUT, notify.notified()) => false,
-        };
-        if shutting_down {
-            return;
+        if deadline.is_some() {
+            let woken = tokio::select! {
+                () = token.cancelled() => return,
+                () = tokio::time::sleep(active_poll) => false,
+                () = notify.notified() => true,
+            };
+            if woken {
+                let delay_secs = read_control_plane_delay(&*settings).await;
+                deadline = Some(tokio::time::Instant::now() + window(delay_secs));
+            }
+        } else {
+            // Idle: a wake, the idle timeout (defensive sweep), or shutdown.
+            tokio::select! {
+                () = token.cancelled() => return,
+                _ = tokio::time::timeout(IDLE_TIMEOUT, notify.notified()) => {}
+            }
+            let delay_secs = read_control_plane_delay(&*settings).await;
+            deadline = Some(tokio::time::Instant::now() + window(delay_secs));
         }
 
-        // Read control_plane_delay_seconds from settings to compute active window
-        let delay_secs = read_control_plane_delay(&*settings).await;
-        let active_window = Duration::from_secs_f64(delay_secs + MARGIN_SECS);
-
-        // Active: poll every second for active_window
-        let deadline = tokio::time::Instant::now() + active_window;
-        loop {
-            match storage.process_control_plane_transitions().await {
-                Ok(ref t) if t.is_empty() => {}
-                Ok(transitions) => {
-                    for (name, transition) in &transitions {
-                        tracing::info!("Table '{name}': {transition}");
-                    }
+        match storage.control_plane_pass().await {
+            Ok(pass) => {
+                for (name, transition) in &pass.transitions {
+                    tracing::info!("Table '{name}': {transition}");
                 }
-                Err(e) => {
-                    tracing::warn!("Control plane transition poll failed: {e}");
-                    break;
+                let past_window = deadline.is_some_and(|d| tokio::time::Instant::now() >= d);
+                if pass.deferred_drops == 0 && past_window {
+                    deadline = None;
                 }
             }
-            if tokio::time::Instant::now() >= deadline {
-                break;
-            }
-            if !tick(&token, ACTIVE_POLL).await {
-                return;
+            Err(e) => {
+                tracing::warn!("Control plane transition poll failed: {e}");
+                deadline = None;
             }
         }
+    }
+}
+
+/// Startup recovery: one control-plane pass for the transitions a previous
+/// server process left (a CREATING table past its transition time, a
+/// DELETING row whose drop it never finished). When the pass had to defer a
+/// drop because a session still holds the table (a reader that outlived the
+/// restart: another server, `pg_dump`, a client transaction), the poller is
+/// woken so it starts in its active loop and retries every `active_poll`,
+/// rather than starting idle and leaving the row `DELETING` until its first
+/// idle pass 60 s later. The wake is stored by the `Notify` until the poller
+/// first waits.
+pub(crate) async fn recover_control_plane_at_startup(engine: &PostgresEngine) {
+    match engine.control_plane_pass().await {
+        Ok(pass) => {
+            for (name, transition) in &pass.transitions {
+                tracing::info!("Recovered table '{name}': {transition}");
+            }
+            if pass.deferred_drops > 0 {
+                tracing::info!(
+                    deferred = pass.deferred_drops,
+                    "DELETING table(s) still held by a session at startup; the control plane \
+                     retries the drop while active"
+                );
+                engine.control_plane_notify.notify_one();
+            }
+        }
+        Err(e) => tracing::error!("Failed to recover control plane transitions: {e}"),
     }
 }
 

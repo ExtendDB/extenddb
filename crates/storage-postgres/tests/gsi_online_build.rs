@@ -845,15 +845,16 @@ async fn delete_table_waits_for_a_claimed_queue_row_then_drops_everything() {
         early.is_err(),
         "DeleteTable finished while a claim for the table was still held"
     );
-    // With the claim held the queue is stopped and nothing has been dropped.
-    let held: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vector_index_holds WHERE table_id = $1 AND index_id = $1",
-    )
-    .bind(&table_id)
-    .fetch_one(&s.db)
-    .await
-    .expect("count the drop's hold");
-    assert_eq!(held, 1, "the drop stopped the queue for the table first");
+    // With the claim held nothing has been dropped and the catalog row is
+    // still there. On this layout (one database) the drop runs in
+    // DeleteTable's own transaction, its pending-row delete waiting on the
+    // claim, so nothing commits (no queue hold either) until the claim ends.
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM tables WHERE table_id = $1")
+        .bind(&table_id)
+        .fetch_one(&s.db)
+        .await
+        .expect("count the catalog row");
+    assert_eq!(rows, 1, "the catalog row stays until the drop commits");
     let base_exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
         .bind(format!("\"_ddb_{table_id}\""))
         .fetch_one(&s.db)

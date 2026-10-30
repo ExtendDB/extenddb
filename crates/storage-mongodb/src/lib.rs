@@ -21,6 +21,7 @@ mod management_store;
 mod metadata_engine;
 mod operations;
 pub mod pushdown;
+mod snapshot_engine;
 mod stream_engine;
 mod table_engine;
 mod ttl_worker;
@@ -538,9 +539,15 @@ pub(crate) fn majority_write_concern(
 /// concern other than `majority` in the connection string; this does not rely
 /// on it.
 fn catalog_database(client: &mongodb::Client) -> mongodb::Database {
+    catalog_database_named(client, "extenddb_catalog")
+}
+
+/// [`catalog_database`] under another name, for test fixtures that must run
+/// the production option set on a scratch database.
+pub(crate) fn catalog_database_named(client: &mongodb::Client, name: &str) -> mongodb::Database {
     use mongodb::options::{DatabaseOptions, ReadConcern, ReadPreference, SelectionCriteria};
     client.database_with_options(
-        "extenddb_catalog",
+        name,
         DatabaseOptions::builder()
             .selection_criteria(SelectionCriteria::ReadPreference(ReadPreference::Primary))
             .read_concern(ReadConcern::local())

@@ -114,9 +114,10 @@ impl SqliteEngine {
         if !in_memory && max_connections != pool_size {
             tracing::info!(
                 "SQLite pool_size {pool_size} raised to {max_connections} for a file-backed \
-                 database: a backup holds one reader connection for its whole duration while \
-                 its batches write through another. Set pool_size >= 3 so a running backup \
-                 does not contend with ordinary requests for connections"
+                 database: a backup or a table snapshot holds one reader connection for its \
+                 whole duration while writes go through another. Set pool_size >= 3 so a \
+                 running backup or snapshot does not contend with ordinary requests for \
+                 connections"
             );
         }
         let mut opts = SqlitePoolOptions::new()

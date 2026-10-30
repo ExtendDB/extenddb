@@ -22,9 +22,11 @@ impl SqliteEngine {
     ) -> Result<TableDescription, StorageError> {
         Self::validate_account_id(account_id)?;
 
+        // A DELETING row is fetched too: DeleteTable of a table that is
+        // already being deleted returns its description, as the service does.
         let row: Option<TableRow> = sqlx::query_as(&format!(
-            "SELECT {TABLE_COLUMNS} FROM tables \
-             WHERE account_id = ? AND table_name = ? AND table_status IN ('ACTIVE', 'CREATING')"
+            "SELECT {TABLE_COLUMNS} FROM tables WHERE account_id = ? AND table_name = ? \
+             AND table_status IN ('ACTIVE', 'CREATING', 'DELETING')"
         ))
         .bind(account_id)
         .bind(&input.table_name)
@@ -33,6 +35,22 @@ impl SqliteEngine {
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let row = row.ok_or_else(|| StorageError::TableNotFound(input.table_name.clone()))?;
+        if row.table_status == "DELETING" {
+            // Already scheduled for removal by the control-plane worker:
+            // nothing to change.
+            let index_rows: Vec<IndexRow> = sqlx::query_as(&format!(
+                "SELECT {INDEX_COLUMNS} FROM indexes WHERE table_id = ?"
+            ))
+            .bind(&row.table_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let desc = self.build_table_description_from_row(account_id, row, index_rows)?;
+            return Ok(TableDescription {
+                table_status: TableStatus::Deleting,
+                ..desc
+            });
+        }
         if row.deletion_protection_enabled {
             return Err(StorageError::DeletionProtected(row.table_arn.clone()));
         }

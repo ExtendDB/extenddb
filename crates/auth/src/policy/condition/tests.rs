@@ -70,6 +70,7 @@ fn cond(op: ConditionOperator, key: &str, values: Vec<&str>) -> Condition {
     }
 }
 
+mod arn_operators;
 mod multivalued;
 mod operators;
 mod resource_tag;

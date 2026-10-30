@@ -399,8 +399,12 @@ jobs:
       # EXTENDDB_TEST_PG_REQUIRED turns a test's skip for a missing connection
       # string into a failure.
       - name: Run PostgreSQL storage-level tests
+        # table_snapshot: the SnapshotEngine consistency check; it needs the
+        # shared page-size hook, compiled only into the crate's own test
+        # build, and scratch databases it creates and drops itself.
         env:
           EXTENDDB_TEST_PG_CONNECTION_STRING: postgresql://postgres:devpass@127.0.0.1:5432
+          # table_snapshot fails rather than skips without the string above.
           EXTENDDB_TEST_PG_REQUIRED: "1"
         run: cargo test --release -p extenddb-storage-postgres --tests
 

@@ -13,9 +13,7 @@ use extenddb_storage::migrations::MigrationError;
 use sqlx::PgPool;
 
 use super::connect::sql_error;
-
-/// SQLSTATE `lock_not_available`, which `lock_timeout` raises.
-const LOCK_NOT_AVAILABLE: &str = "55P03";
+use crate::data::SQLSTATE_LOCK_NOT_AVAILABLE as LOCK_NOT_AVAILABLE;
 
 /// SQLSTATE `insufficient_privilege`, which altering a table the role does
 /// not own raises.
