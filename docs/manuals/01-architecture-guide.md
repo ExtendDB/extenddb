@@ -182,21 +182,24 @@ expect.
 
 1. Parse CLI arguments and load configuration
 2. Bind TCP socket (port conflicts reported before forking)
-3. Fork to background via `daemonize`, writing a PID file to `run_dir`
+3. Read the catalog's status, and under `[server] catalog_upgrade = "apply"`
+   or `serve --migrate` apply its pending migrations. A catalog the server
+   cannot serve stops it here, before the fork, with the status's exit code
+4. Fork to background via `daemonize`, writing a PID file to `run_dir`
    (skipped entirely in `--foreground` mode, so no run directory is needed and
    the root filesystem can be read-only)
-4. Initialize logging — syslog when daemonized, stderr in `--foreground`
-5. Connect to the storage backend
-6. Verify catalog version matches binary expectation
-7. Start axum server on the pre-bound socket
+5. Initialize logging: syslog when daemonized, stderr in `--foreground`
+6. Connect to the storage backend
+7. Verify catalog version matches binary expectation
+8. Start axum server on the pre-bound socket
 
 Because `--foreground` writes no PID file, `extenddb stop` cannot signal a
 foreground server; stop it through whatever supervises it. `extenddb status`
 still reports it as running, with the PID shown as unknown. Pass
 `serve --foreground --write-pid-file` to write one anyway, which restores both
 commands at the cost of needing a writable `run_dir`.
-8. Spawn background tasks (log level polling, throttling polling, GSI delay polling, stream cleanup, TTL expiry, metrics persistence)
-9. On SIGTERM/SIGINT: drain connections (5s timeout), exit
+9. Spawn background tasks (log level polling, throttling polling, GSI delay polling, stream cleanup, TTL expiry, metrics persistence)
+10. On SIGTERM/SIGINT: drain connections (5s timeout), exit
 
 ## Catalog Model
 
@@ -205,8 +208,8 @@ extenddb uses a dual-database architecture:
 - **Catalog database** (e.g., `extenddb_catalog`): Stores table metadata, account/user/group/role/policy definitions, access keys, settings, stream metadata, and metrics. Shared across all accounts.
 - **Data database** (e.g., `extenddb_catalog_data`): Stores user items, GSI/LSI data, and stream records. Each table gets its own PostgreSQL table.
 
-On PostgreSQL, SQLite, Cassandra and MongoDB the catalog is versioned by its migration ledger, the `extenddb_migrations` table (on MongoDB a collection, in the catalog database and in the data database): the catalog version is the highest migration recorded in every store, migration 4 for this release, and `serve` reads the catalog's status at startup and refuses a catalog that is behind it or carries a breaking migration it does not know. On Cassandra every account keyspace has a ledger beside the catalog keyspace's.
-A mismatch between the binary's migrations and the catalog's ledger prevents a server from starting; run `extenddb migrate` to upgrade.
+On PostgreSQL, SQLite, Cassandra and MongoDB the catalog is versioned by its migration ledger, the `extenddb_migrations` table (on MongoDB a collection, in the catalog database and in the data database): the catalog version is the highest migration recorded in every store, migration 4 for this release, and `serve` reads the catalog's status at startup and refuses a catalog that carries a breaking migration it does not know, and one that is behind it unless it runs under `[server] catalog_upgrade = "apply"` or `--migrate`. On Cassandra every account keyspace has a ledger beside the catalog keyspace's.
+A mismatch between the binary's migrations and the catalog's ledger prevents a server from starting; run `extenddb migrate --yes` to upgrade a catalog that is behind, or start the server with `--migrate`.
 
 ## Pluggable Architecture
 

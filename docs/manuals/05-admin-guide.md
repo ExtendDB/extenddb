@@ -91,6 +91,8 @@ These settings require a server restart to take effect.
 | `bind_addr` | `127.0.0.1` | Network interface to bind |
 | `port` | `18443` | HTTP port |
 | `region` | `us-east-1` | AWS region for ARN generation. Baked into every backup ARN the server issues, so it must stay within `[a-z0-9-]` (a value outside that class makes the server's own backup ARNs "not valid"; the server logs a warning at startup). A backup ARN of the caller's account in another region is resolved in the server's region first, then as written; see the upgrade manual before changing this on a deployment with backups |
+| `catalog_upgrade` | `refuse` (`apply` in a dev build) | What `serve` does with a catalog behind the binary: `refuse` exits 3 and names the pending migrations, and `apply` runs them at startup as `migrate --yes` does. `serve --migrate` sets `apply` for one run. Every status `serve` cannot serve is refused under both values; see the [upgrade manual](07-upgrade-manual.md#applying-migrations-at-startup) |
+| `catalog_upgrade_lock_timeout` | `60` | Seconds `serve` waits under `apply` for the migration lock and for running servers before it exits 6; at most 86400 |
 
 #### [storage]
 
@@ -925,7 +927,7 @@ Check that PostgreSQL is running and the connection string in `extenddb.toml` is
 
 **The catalog has pending migrations, or is ahead of the binary:**
 
-On PostgreSQL, SQLite, Cassandra and MongoDB, `serve` reads the catalog's migration status before it opens the engine and refuses a catalog it cannot serve, printing the status and the command that resolves it. A catalog with pending migrations exits 3, for example `the catalog is at migration 3, and ExtendDB <release> needs migration 4`, followed by the pending migrations and `extenddb migrate --config extenddb.toml --yes`. A catalog that a newer release migrated with a breaking migration exits 4 and names that release's migrations; upgrade the binary rather than the catalog. The [Upgrade Manual](07-upgrade-manual.md#the-catalog-status) lists every status with its exit code and the stop / migrate / start sequence.
+On PostgreSQL, SQLite, Cassandra and MongoDB, `serve` reads the catalog's migration status before it opens the engine and refuses a catalog it cannot serve, printing the status and the command that resolves it. A catalog with pending migrations exits 3, for example `the catalog is at migration 3, and ExtendDB <release> needs migration 4`, followed by the pending migrations, `extenddb migrate --config extenddb.toml --yes` and `or start this server with --migrate`. Under `[server] catalog_upgrade = "apply"`, or started with `--migrate`, the server applies the pending migrations and serves. A catalog that a newer release migrated with a breaking migration exits 4 and names that release's migrations; upgrade the binary rather than the catalog. The [Upgrade Manual](07-upgrade-manual.md#the-catalog-status) lists every status with its exit code and the stop / migrate / start sequence.
 
 ### Authentication Errors
 

@@ -139,6 +139,8 @@ exists, treat backend failures as something clients retry through.
 
 For Kubernetes, run `extenddb init` as an init container or a one-time Job, then deploy extenddb as a Deployment with the generated `extenddb.toml` mounted as a ConfigMap or Secret.
 
+To upgrade on Kubernetes, run one replica with the Deployment strategy `Recreate`, and apply the new release's Deployment together with a migration Job that runs `extenddb migrate --yes` with the serving Secret. The Job's `migrate --yes` waits for the old pod's registration to end while that pod finishes its termination grace period. A pod of the new release that starts before the Job finishes exits 3, and Kubernetes restarts it. Do not run the Job as a Helm pre-upgrade hook: Helm runs the hook while the old pod still serves, so its `migrate --yes` would exit 6. Do not migrate in the pod either. Leave the `migrate` line out of the entrypoint above, and leave `catalog_upgrade` at its default, `refuse`, with no `EXTENDDB__SERVER__CATALOG_UPGRADE` in the pod's environment: a server answers no request while it migrates, and a liveness probe would restart the pod during a long migration. The [upgrade manual](07-upgrade-manual.md#deployment-recipes) describes the recipe and the upgrade from 0.1.x.
+
 ### Air-Gapped
 
 ExtendDB requires no internet connectivity. All functionality is self-contained in the binary. Build on a connected host, transfer the binary and `extenddb.toml` to the air-gapped environment, and run.
@@ -236,7 +238,7 @@ extenddb init \
 ### Upgrades
 
 - [ ] Test upgrades in a staging environment first
-- [ ] Run `extenddb migrate --config extenddb.toml` after binary upgrade
+- [ ] Run `extenddb migrate --config extenddb.toml --yes` after the binary upgrade, or start the new server once with `extenddb serve --migrate --config extenddb.toml` ([Upgrade Manual](07-upgrade-manual.md#applying-migrations-at-startup))
 - [ ] Verify catalog version matches: `extenddb verify --config extenddb.toml`
 
 ## systemd Service

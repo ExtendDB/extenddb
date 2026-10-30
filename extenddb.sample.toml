@@ -27,6 +27,9 @@
 # port = 18443                 # HTTP port
 # region = "us-east-1"         # AWS region for ARN generation
 # run_dir = "~/.extenddb/run"  # Directory for PID file (~ is expanded to $HOME)
+# catalog_upgrade = "refuse"   # A catalog behind this binary: "refuse" exits 3, "apply" runs its
+#                              # migrations at startup ("apply" by default in a dev build)
+# catalog_upgrade_lock_timeout = 60  # Seconds `serve` waits for the migration lock under "apply"
 
 [storage]
 # backend = "postgres"         # Storage backend: "postgres" (default), "mongodb", or "sqlite".
