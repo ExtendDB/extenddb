@@ -1731,6 +1731,46 @@ mod tests {
     }
 
     #[test]
+    fn the_count_is_refused_before_a_missing_hash_attribute_or_a_range_gap() {
+        // Each count case above has every key attribute, so they also pass
+        // with the count check moved after the missing-HASH and RANGE-gap
+        // checks. These lack the HASH attribute or leave a RANGE gap.
+        let count = |n: usize, attrs: usize| {
+            format!(
+                "The number of query conditions ({n}) exceeds the number of key attributes \
+                 defined in the schema ({attrs})"
+            )
+        };
+        for expr in [
+            "a = :a AND b = :b AND c = :c AND d = :d AND z1 = :z AND z2 = :y",
+            "h = :h AND b = :b AND c = :c AND d = :d AND z1 = :z AND z2 = :y",
+        ] {
+            let err = classify_one_hash(expr).unwrap_err();
+            let want = count(6, 5);
+            assert!(
+                matches!(&err, DynamoDbError::ValidationException(msg) if *msg == want),
+                "expr {expr}: got {err:?}"
+            );
+        }
+        let expr = "a = :a AND b = :b AND c = :c AND z1 = :z AND z2 = :y";
+        let err = classify_two_hash(expr).unwrap_err();
+        let want = count(5, 3);
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg) if *msg == want),
+            "expr {expr}: got {err:?}"
+        );
+        // The same five clauses on HASH `h` and RANGE `a`, `b`, `c`, `d` do not
+        // exceed its five key attributes, so the missing HASH attribute is
+        // reported.
+        let err = classify_one_hash(expr).unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg)
+                if msg == "HASH key attributes h must have equality conditions specified in the query"),
+            "expr {expr}: got {err:?}"
+        );
+    }
+
+    #[test]
     fn one_hash_multi_range_resolves_name_references() {
         let names: HashMap<String, String> = [("hh", "h"), ("aa", "a"), ("bb", "b")]
             .into_iter()
