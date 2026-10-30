@@ -154,6 +154,11 @@ config = "0.14"
 # Security
 zeroize = { version = "1.8", features = ["derive"] }
 
+# Unicode general categories (\p{L}, \p{N}, \p{Z}) for the tag key and value
+# grammar, shared by IAM tags and table tags; char::is_alphabetic and
+# is_numeric are not those sets.
+unicode-properties = "0.1.4"
+
 # Size-optimised profile for the `extenddb-dev` container image only.
 #
 # Deliberately NOT applied to `[profile.release]`: the production Postgres and
