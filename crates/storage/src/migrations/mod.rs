@@ -14,6 +14,8 @@
 //! - [`Runner::status`] computes the [`CatalogStatus`] that `serve`,
 //!   `migrate` and `verify` act on, and [`CatalogStatus::exit_code`] maps it
 //!   to the process exit status.
+//! - [`prepare_to_serve`] is what `serve` does with the status before it
+//!   opens the catalog, by its startup policy (`[server] catalog_upgrade`).
 //!
 //! A backend implements [`MigrationBackend`]: reading and writing its ledgers,
 //! running one body inside one store's commit, and whatever its store needs
@@ -28,6 +30,7 @@ mod ledger;
 mod record;
 mod registry;
 mod runner;
+mod startup;
 mod status;
 mod table;
 
@@ -41,7 +44,7 @@ pub use backend::{MigrationBackend, Step, StoreRef};
 pub use catalog::{
     AdminRole, CatalogMigrations, HeldLock, Listed, RunKind, StatusNote, Target, before_lock,
     binary_catalog_label, forget_locked, installed, policy_rewrite_lines, policy_rewrite_pending,
-    run_locked, run_with_status,
+    run_locked, run_with_lock, run_with_status,
 };
 #[cfg(any(test, feature = "test-util"))]
 pub use checksum::check_released;
@@ -51,6 +54,7 @@ pub use ledger::{CatalogTraces, LedgerColumns, LedgerRow, Outcome};
 pub use record::{LedgerWrites, in_transaction, record_rows, sql_ledger_ddl};
 pub use registry::{MigrationId, RELEASED_THROUGH};
 pub use runner::Runner;
+pub use startup::{Prepared, Startup, prepare_to_serve};
 pub use status::{
     AppliedStep, CatalogStatus, MigrationError, Pending, RunReport, behind_line, exit,
     stores_behind,

@@ -22,7 +22,7 @@ use extenddb_config as config;
 use extenddb_storage::migrations::advice::{self, Advice, AdviceFor};
 use extenddb_storage::migrations::{
     AdminRole, CatalogMigrations, CatalogStatus, Listed, MigrationError, MigrationId, Pending,
-    RunKind, RunReport, Target, before_lock, behind_line, exit, forget_locked, run_locked,
+    RunKind, RunReport, Target, before_lock, behind_line, exit, forget_locked, run_with_lock,
     stores_behind,
 };
 
@@ -312,10 +312,7 @@ async fn apply(
         "--- Taking the migration lock (waiting up to {} s for a server or another migration)...",
         lock_timeout.as_secs()
     );
-    let lock = migrations.lock(target, lock_timeout).await?;
-    let report = run_locked(migrations, target, &lock, release, kind).await;
-    migrations.release(lock).await;
-    let report = report?;
+    let report = run_with_lock(migrations, target, release, kind, lock_timeout).await?;
     print_report(&report, kind);
     if report.applied.is_empty() && kind == RunKind::Migrate {
         // A catalog ahead by additive migrations has nothing to apply and

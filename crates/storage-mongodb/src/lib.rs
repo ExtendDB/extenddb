@@ -303,9 +303,13 @@ pub fn backend() -> extenddb_storage::Backend {
             })
         },
         server_components: server_components_factory,
-        catalog_migrations: &migrations::MongoCatalogMigrations,
+        catalog_migrations: &CATALOG_MIGRATIONS,
     }
 }
+
+/// The catalog migrations of every deployment this backend serves.
+static CATALOG_MIGRATIONS: migrations::MongoCatalogMigrations =
+    migrations::MongoCatalogMigrations::new();
 
 // ============================================================================
 // MongoEngine

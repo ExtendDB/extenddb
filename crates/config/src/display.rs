@@ -85,6 +85,14 @@ pub fn build_config_entries(cfg: &AppConfig) -> Vec<(String, String)> {
                 .map_or("none".into(), |b| b.to_string()),
         ),
         (
+            "server.catalog_upgrade".into(),
+            cfg.server.catalog_upgrade.as_str().to_owned(),
+        ),
+        (
+            "server.catalog_upgrade_lock_timeout".into(),
+            cfg.server.catalog_upgrade_lock_timeout.to_string(),
+        ),
+        (
             format!("storage.{backend}.connection_string"),
             r("connection_string", cfg.storage.connection_config()),
         ),

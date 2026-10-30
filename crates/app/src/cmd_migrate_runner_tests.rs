@@ -100,6 +100,7 @@ const ADVICE: Advice<'static> = Advice {
     backup: "back up db",
     config: Some("extenddb.toml"),
     assignment: None,
+    serving: false,
 };
 
 fn behind() -> CatalogStatus {

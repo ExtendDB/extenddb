@@ -3,8 +3,9 @@
 
 //! The catalog migrations against a live node: migration 1's definitions,
 //! the status of keyspaces that are not catalogs, the ledger, the migration
-//! lock's lease, the serving registration and CreateAccount's account
-//! migrations. Each test uses keyspaces of its own prefix and drops them.
+//! lock's lease, the serving registration, CreateAccount's account
+//! migrations and the startup policy `serve` runs before it opens the
+//! catalog. Each test uses keyspaces of its own prefix and drops them.
 //! Skipped without a node unless `EXTENDDB_TEST_CASSANDRA=required`.
 //!
 //! With `EXTENDDB_BLESS_EXPECTED=1`,
@@ -17,6 +18,8 @@ mod helpers;
 #[path = "migrations/lock.rs"]
 mod lock;
 mod migrations_support;
+#[path = "migrations/startup.rs"]
+mod startup;
 
 use std::sync::Arc;
 

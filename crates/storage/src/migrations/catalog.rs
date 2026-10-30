@@ -185,6 +185,16 @@ pub trait CatalogMigrations: Send + Sync {
         false
     }
 
+    /// Whether the store at `target` exists only inside the server process
+    /// that opens it, as an in-memory SQLite database does: that server
+    /// creates the catalog when it starts, and no other process can read
+    /// its status, so `serve` reads none before it starts. Opens nothing;
+    /// `false` (the default) for every store another process can open.
+    fn in_process(&self, target: &Target) -> bool {
+        let _ = target;
+        false
+    }
+
     /// The catalog status. Takes no lock and writes nothing, so it runs
     /// beside a server.
     async fn status(&self, target: &Target) -> Result<CatalogStatus, MigrationError>;
@@ -397,6 +407,28 @@ pub async fn run_with_status(
         return Err(refusal);
     }
     migrations.run(lock, release, kind).await
+}
+
+/// Take the migration lock for `target`, waiting up to `timeout` for
+/// another migration and for running servers, run `kind` under it
+/// ([`run_locked`]), and release it on every exit path. `migrate --yes`
+/// and a server starting under `catalog_upgrade = "apply"` both run this.
+///
+/// # Errors
+///
+/// [`MigrationError::Locked`] (exit 6) when the lock or a running server
+/// outlasted `timeout`, or as [`run_locked`].
+pub async fn run_with_lock(
+    migrations: &dyn CatalogMigrations,
+    target: &Target,
+    release: &str,
+    kind: RunKind,
+    timeout: Duration,
+) -> Result<RunReport, MigrationError> {
+    let lock = migrations.lock(target, timeout).await?;
+    let report = run_locked(migrations, target, &lock, release, kind).await;
+    migrations.release(lock).await;
+    report
 }
 
 /// Delete the ledger rows of `id` under `lock`, which `migrations` took for

@@ -46,6 +46,17 @@ pub struct ServeArgs {
     /// always writes one.
     #[arg(long)]
     write_pid_file: bool,
+
+    /// Apply the catalog's pending migrations before serving, for this run
+    /// only, as `[server] catalog_upgrade = "apply"` does.
+    ///
+    /// The server takes the migration lock, waiting up to
+    /// `catalog_upgrade_lock_timeout` seconds (60 by default) for another
+    /// migration or a running server, and exits 6 if it is not free in time.
+    /// A catalog that needs a person, or that this binary cannot use, is
+    /// refused as without the flag.
+    #[arg(long)]
+    migrate: bool,
 }
 
 /// Bind the listening socket, daemonize, then start the tokio runtime.
@@ -91,6 +102,14 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
         anyhow::bail!(
             "Unknown auth provider '{}'. Only 'builtin' is supported.",
             app_config.auth.provider
+        );
+    }
+
+    if app_config.server.catalog_upgrade_lock_timeout > config::MAX_CATALOG_UPGRADE_LOCK_TIMEOUT {
+        anyhow::bail!(
+            "server.catalog_upgrade_lock_timeout is {} s; it may be at most {} s (a day)",
+            app_config.server.catalog_upgrade_lock_timeout,
+            config::MAX_CATALOG_UPGRADE_LOCK_TIMEOUT
         );
     }
 
@@ -190,6 +209,25 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
     }
     if cfg!(feature = "dev-mode") {
         print_dev_mode_banner(&app_config, args.foreground)?;
+    }
+
+    // The catalog's status, and under `apply` its migrations, before the
+    // fork, so that in daemon mode a refusal's exit code and message reach
+    // the invoking shell. The server checks the catalog again when it
+    // registers.
+    let upgrade = if args.migrate {
+        config::CatalogUpgrade::Apply
+    } else {
+        app_config.server.catalog_upgrade
+    };
+    let code = crate::serve_catalog::check_catalog(
+        &app_config,
+        upgrade,
+        build.version,
+        config_exists.then_some(args.config.as_str()),
+    )?;
+    if code != extenddb_storage::migrations::exit::OK {
+        std::process::exit(i32::from(code));
     }
 
     // D-3: A PID file lets `extenddb status` and `extenddb stop` find the
@@ -447,6 +485,16 @@ mod tests {
     #[test]
     fn foreground_flag_is_recognized() {
         let args = parse(&["extenddb-serve", "--foreground"]);
+        assert!(args.foreground);
+    }
+
+    /// `--migrate` applies the catalog's pending migrations for this run;
+    /// without it the server follows `[server] catalog_upgrade`.
+    #[test]
+    fn migrate_flag_is_recognized_and_off_by_default() {
+        assert!(!parse(&["extenddb-serve"]).migrate);
+        let args = parse(&["extenddb-serve", "--migrate", "--foreground"]);
+        assert!(args.migrate);
         assert!(args.foreground);
     }
 

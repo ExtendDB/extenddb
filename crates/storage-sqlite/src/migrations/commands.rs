@@ -51,6 +51,12 @@ impl CatalogMigrations for SqliteCatalogMigrations {
         std::env::var_os("EXTENDDB__STORAGE__SQLITE__PATH").is_some_and(|v| !v.is_empty())
     }
 
+    /// An in-memory database, which exists only on the connection of the
+    /// server that opened it.
+    fn in_process(&self, target: &Target) -> bool {
+        matches!(crate::serve_lock::database_file(&target.location), Ok(None))
+    }
+
     async fn status(&self, target: &Target) -> Result<CatalogStatus, MigrationError> {
         catalog_status(&target.location).await
     }
