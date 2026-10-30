@@ -383,6 +383,17 @@ fn print_dev_mode_banner(app_config: &config::AppConfig, foreground: bool) -> an
              EXTENDDB_DEV_SECRET_ACCESS_KEY to seed an additional credential."
         ));
     }
+    // The host rule the server enforces, so the operator sees it without
+    // reading the log. Dropped entries are named too.
+    let raw = app_config.server.dev_allowed_hosts.as_deref().unwrap_or("");
+    let (kept, dropped) = extenddb_server::parse_dev_allowed_hosts(raw);
+    lines.push(format!("  {}", extenddb_server::dev_host_rule_line(&kept)));
+    for entry in dropped {
+        lines.push(format!(
+            "  Note: {}",
+            extenddb_server::dev_host_dropped_entry_note(&entry)
+        ));
+    }
     // Same stream split as the main banner: stdout for the daemon parent,
     // stderr in foreground mode so supervisors capture one stream.
     for msg in lines {
