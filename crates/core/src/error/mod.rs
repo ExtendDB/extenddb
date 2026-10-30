@@ -6,6 +6,34 @@ pub use messages::{ErrorMessageKey, error_message, validation_error, validation_
 
 use crate::types::{CancellationReason, Item};
 
+/// The `ExpiredIteratorException` message for a shard iterator older than its
+/// 15-minute lifetime. The lifetime is documented under `GetShardIterator` in
+/// the API Reference ("A shard iterator expires 15 minutes after it is
+/// returned to the requester",
+/// <https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_streams_GetShardIterator.html>).
+///
+/// The message was measured on 2026-10-22 in us-east-1: two iterators, read
+/// with `GetRecords` 15 min 20 s and 16 min 30 s after `GetShardIterator`
+/// returned them, both answered HTTP 400 `ExpiredIteratorException` with
+/// this text. The first response is quoted in the
+/// `stream_errors_use_the_streams_namespace` test.
+pub const EXPIRED_ITERATOR_MESSAGE: &str = "Shard iterator has expired";
+
+/// The `TrimmedDataAccessException` message: the exception's description
+/// under Errors for `GetRecords` and `GetShardIterator` in the API Reference
+/// (<https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_streams_GetRecords.html>).
+/// It is not a captured response. No read below a shard's trim horizon was
+/// provoked on the service, so the text the service sends is unmeasured, and
+/// the same Errors entries give a different `message` text, "The data you
+/// are trying to access has been trimmed." The one measured Streams error
+/// whose Errors entry documents a `message` member,
+/// `ExpiredIteratorException`, sent "Shard iterator has expired", where the
+/// `GetRecords` entry documents "The provided iterator exceeds the maximum
+/// age allowed.", so a documented `message` member is not taken as the wire
+/// text.
+pub const TRIMMED_DATA_ACCESS_MESSAGE: &str =
+    "The operation attempted to read past the oldest stream record in a shard.";
+
 /// All Virtual `DynamoDB` error types with HTTP status codes.
 ///
 /// REQ-ERR-001 through REQ-ERR-004: error JSON format, status codes, and SDK retry behavior.
@@ -86,9 +114,22 @@ pub enum DynamoDbError {
     /// Returned when session credentials (ASIA*) have expired.
     #[error("{0}")]
     ExpiredTokenException(String),
-    /// Returned when a shard iterator has expired (older than 15 minutes).
+    /// Returned when a shard iterator has expired (older than the iterator
+    /// lifetime, 15 minutes on the service). Measured 2026-10-22: HTTP 400,
+    /// type `com.amazonaws.dynamodb.streams.v20120810#ExpiredIteratorException`,
+    /// message [`EXPIRED_ITERATOR_MESSAGE`]; the raw response is quoted in the
+    /// `stream_errors_use_the_streams_namespace` test.
     #[error("{0}")]
     ExpiredIteratorException(String),
+    /// Returned when a `GetRecords` iterator points before the shard's trim
+    /// horizon (records past the 24-hour retention period). HTTP 400, as the
+    /// API Reference gives it. The type is placed in the Streams namespace on
+    /// the assumption that it matches the measured `ExpiredIteratorException`;
+    /// the API Reference does not give the namespace and a trimmed read was
+    /// not provoked on the service. The message is the API Reference's
+    /// description ([`TRIMMED_DATA_ACCESS_MESSAGE`]), not a captured response.
+    #[error("{0}")]
+    TrimmedDataAccessException(String),
     #[error("{0}")]
     ServiceUnavailable(String),
     /// SP-ERR-002: Concurrent modification of the same item in a transaction.
@@ -146,6 +187,7 @@ impl DynamoDbError {
             | Self::AccessDeniedException(_)
             | Self::ExpiredTokenException(_)
             | Self::ExpiredIteratorException(_)
+            | Self::TrimmedDataAccessException(_)
             | Self::TransactionConflictException(_)
             | Self::ProvisionedThroughputExceededException(_)
             | Self::ThrottlingException(_)
@@ -196,6 +238,7 @@ impl DynamoDbError {
             Self::UnrecognizedClientException(_) => "UnrecognizedClientException",
             Self::ExpiredTokenException(_) => "ExpiredTokenException",
             Self::ExpiredIteratorException(_) => "ExpiredIteratorException",
+            Self::TrimmedDataAccessException(_) => "TrimmedDataAccessException",
             Self::ServiceUnavailable(_) => "ServiceUnavailable",
             Self::TransactionConflictException(_) => "TransactionConflictException",
             Self::ProvisionedThroughputExceededException(_) => {
@@ -224,9 +267,13 @@ impl DynamoDbError {
     ///   (`SerializationException`, `UnknownOperationException`,
     ///   `MissingAuthenticationToken`, `IncompleteSignature`,
     ///   `InvalidSignatureException`)
+    /// - `ExpiredIteratorException`, `TrimmedDataAccessException` →
+    ///   `com.amazonaws.dynamodb.streams.v20120810#` (the expiry measured
+    ///   2026-10-22, quoted in `stream_errors_use_the_streams_namespace`; the
+    ///   trimmed read assumed to match it, neither measured nor documented)
     /// - All other `DynamoDB` errors → `com.amazonaws.dynamodb.v20120810#`
     ///
-    /// Verified against real `DynamoDB` 2026-05-04.
+    /// The other rules were verified against real `DynamoDB` 2026-05-04.
     #[must_use]
     pub fn full_error_type(&self) -> String {
         let prefix = match self {
@@ -236,6 +283,9 @@ impl DynamoDbError {
             | Self::MissingAuthenticationToken(_)
             | Self::IncompleteSignature(_)
             | Self::InvalidSignatureException(_) => "com.amazon.coral.service#",
+            Self::ExpiredIteratorException(_) | Self::TrimmedDataAccessException(_) => {
+                "com.amazonaws.dynamodb.streams.v20120810#"
+            }
             _ => "com.amazonaws.dynamodb.v20120810#",
         };
         format!("{prefix}{}", self.error_type())
@@ -265,6 +315,7 @@ impl DynamoDbError {
             | Self::UnrecognizedClientException(m)
             | Self::ExpiredTokenException(m)
             | Self::ExpiredIteratorException(m)
+            | Self::TrimmedDataAccessException(m)
             | Self::ServiceUnavailable(m)
             | Self::TransactionConflictException(m)
             | Self::ProvisionedThroughputExceededException(m)
@@ -379,6 +430,10 @@ mod tests {
             (DynamoDbError::ValidationException(String::new()), 400),
             (DynamoDbError::ExpiredTokenException(String::new()), 400),
             (DynamoDbError::ExpiredIteratorException(String::new()), 400),
+            (
+                DynamoDbError::TrimmedDataAccessException(String::new()),
+                400,
+            ),
             (DynamoDbError::InvalidSignatureException(String::new()), 400),
         ];
         for (err, expected) in cases {
@@ -400,5 +455,45 @@ mod tests {
             "com.amazonaws.dynamodb.v20120810#TableAlreadyExistsException"
         );
         assert_eq!(err.message(), "Table already exists: t");
+    }
+
+    /// The two Streams errors carry the Streams API namespace, HTTP 400 and
+    /// the message the variant holds.
+    ///
+    /// The expired-iterator assertions pin a measured response. On
+    /// 2026-10-22 in us-east-1, `GetRecords` (`X-Amz-Target:
+    /// DynamoDBStreams_20120810.GetRecords`) with an iterator read 15 min
+    /// 20 s after `GetShardIterator` returned it answered, at 20:13:59 GMT:
+    ///
+    /// ```text
+    /// 400 {"__type":"com.amazonaws.dynamodb.streams.v20120810#ExpiredIteratorException","message":"Shard iterator has expired"}
+    /// ```
+    ///
+    /// The same iterator was served 14 min 30 s after it was returned. The
+    /// trimmed-read assertions pin an assumption instead: the namespace
+    /// follows the expired iterator's, and the message is the API
+    /// Reference's description of the exception.
+    #[test]
+    fn stream_errors_use_the_streams_namespace() {
+        let expired = DynamoDbError::ExpiredIteratorException(EXPIRED_ITERATOR_MESSAGE.to_owned());
+        assert_eq!(
+            expired.full_error_type(),
+            "com.amazonaws.dynamodb.streams.v20120810#ExpiredIteratorException"
+        );
+        assert_eq!(expired.status_code(), 400);
+        assert_eq!(expired.message(), "Shard iterator has expired");
+
+        let trimmed =
+            DynamoDbError::TrimmedDataAccessException(TRIMMED_DATA_ACCESS_MESSAGE.to_owned());
+        assert_eq!(
+            trimmed.full_error_type(),
+            "com.amazonaws.dynamodb.streams.v20120810#TrimmedDataAccessException"
+        );
+        assert_eq!(trimmed.status_code(), 400);
+        assert_eq!(trimmed.error_type(), "TrimmedDataAccessException");
+        assert_eq!(
+            trimmed.message(),
+            "The operation attempted to read past the oldest stream record in a shard."
+        );
     }
 }
