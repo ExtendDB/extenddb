@@ -1,0 +1,290 @@
+# catalog keyspace
+table access_keys
+table accounts
+table admin_users
+table backups_by_account
+table backups_by_arn
+table backups_by_table
+table continuous_backups
+table extenddb_migrations
+table extenddb_servers
+table iam_group_members
+table iam_groups
+table iam_permissions_boundaries
+table iam_policies
+table iam_role_tags
+table iam_roles
+table iam_sessions
+table iam_user_tags
+table iam_users
+table idempotency_tokens_by_account
+table indexes
+table login_attempts
+table metrics
+table schema_history
+table settings
+table tables
+table tags
+column access_keys.access_key_id: text partition_key 0
+column access_keys.account_id: text regular
+column access_keys.created_at: timestamp regular
+column access_keys.is_active: boolean regular
+column access_keys.secret_key_encrypted: blob regular
+column access_keys.user_name: text regular
+column accounts.account_id: text partition_key 0
+column accounts.account_name: text regular
+column accounts.created_at: timestamp regular
+column admin_users.admin_name: text partition_key 0
+column admin_users.created_at: timestamp regular
+column admin_users.password_hash: text regular
+column backups_by_account.account_id: text partition_key 0
+column backups_by_account.created_at: timestamp clustering 0 desc
+column backups_by_account.backup_arn: text clustering 1 asc
+column backups_by_account.backup_name: text regular
+column backups_by_account.backup_size_bytes: bigint regular
+column backups_by_account.table_arn: text regular
+column backups_by_account.table_id: text regular
+column backups_by_account.table_name: text regular
+column backups_by_arn.account_id: text partition_key 0
+column backups_by_arn.backup_arn: text partition_key 1
+column backups_by_arn.active_restores: map<text, text> regular
+column backups_by_arn.attribute_definitions: text regular
+column backups_by_arn.backup_name: text regular
+column backups_by_arn.backup_size_bytes: bigint regular
+column backups_by_arn.backup_status: text regular
+column backups_by_arn.backup_type: text regular
+column backups_by_arn.billing_mode: text regular
+column backups_by_arn.created_at: timestamp regular
+column backups_by_arn.definition: text regular
+column backups_by_arn.item_count: bigint regular
+column backups_by_arn.key_schema: text regular
+column backups_by_arn.provisioned_throughput: text regular
+column backups_by_arn.stream_specification: text regular
+column backups_by_arn.table_arn: text regular
+column backups_by_arn.table_created_at: timestamp regular
+column backups_by_arn.table_id: text regular
+column backups_by_arn.table_name: text regular
+column backups_by_table.account_id: text partition_key 0
+column backups_by_table.table_name: text partition_key 1
+column backups_by_table.created_at: timestamp clustering 0 desc
+column backups_by_table.backup_arn: text clustering 1 asc
+column backups_by_table.backup_name: text regular
+column backups_by_table.backup_size_bytes: bigint regular
+column backups_by_table.table_arn: text regular
+column backups_by_table.table_id: text regular
+column continuous_backups.account_id: text partition_key 0
+column continuous_backups.table_name: text clustering 0 asc
+column continuous_backups.pitr_enabled: boolean regular
+column extenddb_migrations.id: int partition_key 0
+column extenddb_migrations.applied_at: timestamp regular
+column extenddb_migrations.applied_by: text regular
+column extenddb_migrations.checksum: text regular
+column extenddb_migrations.kind: text regular
+column extenddb_migrations.name: text regular
+column extenddb_migrations.notes: text regular
+column extenddb_migrations.outcome: text regular
+column extenddb_servers.server_id: text partition_key 0
+column extenddb_servers.host: text regular
+column extenddb_servers.pid: int regular
+column extenddb_servers.release: text regular
+column extenddb_servers.started_at: text regular
+column iam_group_members.account_id: text partition_key 0
+column iam_group_members.group_name: text partition_key 1
+column iam_group_members.user_name: text clustering 0 asc
+column iam_groups.account_id: text partition_key 0
+column iam_groups.group_name: text clustering 0 asc
+column iam_groups.created_at: timestamp regular
+column iam_groups.group_arn: text regular
+column iam_permissions_boundaries.account_id: text partition_key 0
+column iam_permissions_boundaries.principal_type: text clustering 0 asc
+column iam_permissions_boundaries.principal_name: text clustering 1 asc
+column iam_permissions_boundaries.policy_document: text regular
+column iam_policies.account_id: text partition_key 0
+column iam_policies.principal_type: text clustering 0 asc
+column iam_policies.principal_name: text clustering 1 asc
+column iam_policies.policy_name: text clustering 2 asc
+column iam_policies.created_at: timestamp regular
+column iam_policies.policy_document: text regular
+column iam_role_tags.account_id: text partition_key 0
+column iam_role_tags.role_name: text partition_key 1
+column iam_role_tags.tag_key: text clustering 0 asc
+column iam_role_tags.tag_value: text regular
+column iam_roles.account_id: text partition_key 0
+column iam_roles.role_name: text clustering 0 asc
+column iam_roles.created_at: timestamp regular
+column iam_roles.permissions_boundary_arn: text regular
+column iam_roles.role_arn: text regular
+column iam_roles.trust_policy: text regular
+column iam_sessions.session_token: text partition_key 0
+column iam_sessions.access_key_id: text regular
+column iam_sessions.account_id: text regular
+column iam_sessions.created_at: timestamp regular
+column iam_sessions.expires_at: timestamp regular
+column iam_sessions.role_name: text regular
+column iam_sessions.secret_key_encrypted: blob regular
+column iam_sessions.session_name: text regular
+column iam_sessions.session_policy: text regular
+column iam_sessions.session_tags: text regular
+column iam_user_tags.account_id: text partition_key 0
+column iam_user_tags.user_name: text partition_key 1
+column iam_user_tags.tag_key: text clustering 0 asc
+column iam_user_tags.tag_value: text regular
+column iam_users.account_id: text partition_key 0
+column iam_users.user_name: text clustering 0 asc
+column iam_users.created_at: timestamp regular
+column iam_users.password_hash: text regular
+column iam_users.user_arn: text regular
+column idempotency_tokens_by_account.account_id: text partition_key 0
+column idempotency_tokens_by_account.token: text clustering 0 asc
+column idempotency_tokens_by_account.created_at: timestamp regular
+column idempotency_tokens_by_account.fingerprint: text regular
+column indexes.table_id: text partition_key 0
+column indexes.index_name: text clustering 0 asc
+column indexes.backfill_heartbeat: timestamp regular
+column indexes.index_id: text regular
+column indexes.index_status: text regular
+column indexes.index_type: text regular
+column indexes.key_schema: text regular
+column indexes.projection: text regular
+column indexes.propagation_delay_ms: int regular
+column indexes.provisioned_throughput: text regular
+column login_attempts.principal: text partition_key 0
+column login_attempts.attempted_at: timestamp clustering 0 desc
+column login_attempts.source_ip: text regular
+column login_attempts.success: boolean regular
+column metrics.bucket: timestamp partition_key 0
+column metrics.metric: text partition_key 1
+column metrics.table_name: text partition_key 2
+column metrics.index_name: text partition_key 3
+column metrics.operation: text partition_key 4
+column metrics.count: bigint regular
+column metrics.max: double regular
+column metrics.min: double regular
+column metrics.sum: double regular
+column schema_history.version: int partition_key 0
+column schema_history.applied_at: timestamp regular
+column schema_history.description: text regular
+column settings.key: text partition_key 0
+column settings.value: text regular
+column tables.account_id: text partition_key 0
+column tables.table_name: text clustering 0 asc
+column tables.attribute_definitions: text regular
+column tables.billing_mode: text regular
+column tables.created_at: timestamp regular
+column tables.deletion_protection_enabled: boolean regular
+column tables.item_count: bigint regular
+column tables.key_schema: text regular
+column tables.on_demand_throughput: text regular
+column tables.provisioned_throughput: text regular
+column tables.restore_date_time: timestamp regular
+column tables.restore_heartbeat: timestamp regular
+column tables.restore_owner: uuid regular
+column tables.restore_source_backup_arn: text regular
+column tables.restore_source_table_arn: text regular
+column tables.sse_specification: text regular
+column tables.status_transition_at: timestamp regular
+column tables.stream_label: text regular
+column tables.stream_specification: text regular
+column tables.table_arn: text regular
+column tables.table_class: text regular
+column tables.table_id: text regular
+column tables.table_size_bytes: bigint regular
+column tables.table_status: text regular
+column tables.ttl_attribute: text regular
+column tables.ttl_backfill_cursor: text regular
+column tables.ttl_cleanup_generation: uuid regular
+column tables.ttl_generation: uuid regular
+column tables.ttl_index_ready: boolean regular
+column tables.ttl_sweep_owner: uuid regular
+column tags.resource_arn: text partition_key 0
+column tags.tag_key: text clustering 0 asc
+column tags.tag_value: text regular
+index tables.tables_table_id_idx: COMPOSITES {'target': 'table_id'}
+# account keyspace
+table backup_items
+table extenddb_migrations
+table gsi_pending
+table index_propagation_holds
+table schema_history
+table stream_records
+table stream_shards
+table transaction_ledger
+table ttl_expiration_buckets
+table ttl_expirations
+table ttl_reconcile_pending
+table ttl_repair_inflight
+table ttl_repair_inflight_partitions
+column backup_items.backup_arn: text partition_key 0
+column backup_items.bucket: int partition_key 1
+column backup_items.item_index: bigint clustering 0 asc
+column backup_items.item_data: text regular
+column extenddb_migrations.id: int partition_key 0
+column extenddb_migrations.applied_at: timestamp regular
+column extenddb_migrations.applied_by: text regular
+column extenddb_migrations.checksum: text regular
+column extenddb_migrations.kind: text regular
+column extenddb_migrations.name: text regular
+column extenddb_migrations.notes: text regular
+column extenddb_migrations.outcome: text regular
+column gsi_pending.worker_partition: int partition_key 0
+column gsi_pending.ready_at: timestamp clustering 0 asc
+column gsi_pending.id: timeuuid clustering 1 asc
+column gsi_pending.last_ready_at: timestamp static
+column gsi_pending.index_context: text regular
+column gsi_pending.new_item: text regular
+column gsi_pending.old_item: text regular
+column gsi_pending.table_id: text regular
+column index_propagation_holds.table_id: text partition_key 0
+column index_propagation_holds.index_id: text clustering 0 asc
+column schema_history.version: int partition_key 0
+column schema_history.applied_at: timestamp regular
+column schema_history.description: text regular
+column stream_records.shard_id: text partition_key 0
+column stream_records.sequence_number: text clustering 0 asc
+column stream_records.created_at: timestamp regular
+column stream_records.event_name: text regular
+column stream_records.record_data: text regular
+column stream_records.table_id: text regular
+column stream_shards.shard_id: text partition_key 0
+column stream_shards.created_at: timestamp regular
+column stream_shards.ending_sequence_number: text regular
+column stream_shards.parent_shard_id: text regular
+column stream_shards.starting_sequence_number: text regular
+column stream_shards.table_id: text regular
+column transaction_ledger.txn_id: uuid partition_key 0
+column transaction_ledger.client_token: text regular
+column transaction_ledger.items_blob: text regular
+column transaction_ledger.request_fingerprint: text regular
+column transaction_ledger.started_at: bigint regular
+column transaction_ledger.state: text regular
+column ttl_expiration_buckets.table_id: text partition_key 0
+column ttl_expiration_buckets.generation: uuid clustering 0 asc
+column ttl_expiration_buckets.bucket: bigint clustering 1 asc
+column ttl_expiration_buckets.shard: int clustering 2 asc
+column ttl_expirations.table_id: text partition_key 0
+column ttl_expirations.generation: uuid partition_key 1
+column ttl_expirations.bucket: bigint partition_key 2
+column ttl_expirations.shard: int partition_key 3
+column ttl_expirations.expires_at: bigint clustering 0 asc
+column ttl_expirations.key_hash: text clustering 1 asc
+column ttl_expirations.key_data: text clustering 2 asc
+column ttl_expirations.state: text regular
+column ttl_expirations.work_data: text regular
+column ttl_expirations.work_id: uuid regular
+column ttl_reconcile_pending.worker_partition: int partition_key 0
+column ttl_reconcile_pending.id: timeuuid clustering 0 asc
+column ttl_reconcile_pending.account_id: text regular
+column ttl_reconcile_pending.key_data: text regular
+column ttl_reconcile_pending.table_id: text regular
+column ttl_reconcile_pending.table_name: text regular
+column ttl_repair_inflight.worker_partition: int partition_key 0
+column ttl_repair_inflight.repair_id: uuid clustering 0 asc
+column ttl_repair_inflight.account_id: text regular
+column ttl_repair_inflight.created_at: timestamp regular
+column ttl_repair_inflight.generation: uuid regular
+column ttl_repair_inflight.key_data: text regular
+column ttl_repair_inflight.table_id: text regular
+column ttl_repair_inflight.table_name: text regular
+column ttl_repair_inflight_partitions.worker_partition: int partition_key 0
+index stream_shards.stream_shards_table_id_idx: COMPOSITES {'target': 'table_id'}
+index transaction_ledger.idx_txn_started_at: COMPOSITES {'target': 'started_at'}

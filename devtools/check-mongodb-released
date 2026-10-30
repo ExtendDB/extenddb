@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+"""Released MongoDB catalogs upgraded by a release binary, compared with a
+fresh install seeded the same way:
+
+    devtools/check-mongodb-released <extenddb binary> [mongo port] [api port]
+
+The fresh install is `init`, then this binary's server, then the account,
+IAM user, policies and access key the fixtures carry, and the tables
+`cu_orders` and `cu_dotted` from
+crates/storage-mongodb/tests/fixtures/released/seed.py. Each fixture in that
+directory is loaded into a mongo:7 replica set of its own and upgraded:
+the migrate preview exits 3, `migrate --yes` 0, the preview and `verify` 0;
+then the server answers DescribeTable, a GSI query, a Scan and a PutItem
+with a new access key. Its catalog collections and indexes, its per-table
+collections and indexes (named after the tables and indexes the catalog
+records), and its settings keys must equal the fresh install's, apart from
+the lines accepted-differences.json lists for that state with a reason.
+
+Containers are named extenddb-check-released-<port>, publish only on
+127.0.0.1 and are removed at the end with the temporary directory.
+"""
+import json
+import os
+import shutil
+import sys
+import tempfile
+
+from catalog_checks import docker, expect_exit, finish, healthy, mongosh, report, run, start, start_mongo, stop
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+FIXTURES = os.path.realpath(os.path.join(HERE, "..", "crates", "storage-mongodb", "tests", "fixtures", "released"))
+STATES = ["0.1.12", "0.1.13", "0.1.14", "dotted-ttl"]
+ADMIN_PASSWORD = "FixtureAdminPassw0rd1"
+
+NORMALIZE = """
+const out = [];
+const cat = db.getSiblingDB("extenddb_catalog");
+const names = {};
+for (const t of cat.tables.find().toArray()) names[t.table_id] = "T_" + t._id.table_name;
+for (const i of cat.indexes.find().toArray()) {
+  names[i.index_id] = "I_" + names[i._id.table_id].slice(2) + "_" + i._id.index_name;
+}
+for (const dbName of ["extenddb_catalog", "extenddb_data"]) {
+  const d = db.getSiblingDB(dbName);
+  for (const c of d.getCollectionNames().sort()) {
+    const shown = c.startsWith("_ddb_") ? (names[c.slice(5)] || "unknown") : c;
+    const spec = d.getCollectionInfos({name: c})[0];
+    out.push(`collection ${dbName}.${shown} ${EJSON.stringify(spec.options)}`);
+    for (const i of d.getCollection(c).getIndexes()) {
+      const o = Object.assign({}, i); delete o.v; delete o.ns;
+      out.push(`index ${dbName}.${shown} ${EJSON.stringify(o)}`);
+    }
+  }
+}
+for (const s of cat.settings.find().sort({_id: 1}).toArray()) out.push(`setting ${s._id}`);
+print(out.sort().join("\\n"));
+"""
+
+
+class Deployment:
+    """A mongo:7 replica set with a config, a HOME and a run directory."""
+
+    def __init__(self, binary: str, port: int, api: int, work: str, tls: str | None = None) -> None:
+        self.binary, self.port, self.api = binary, port, api
+        self.container = f"extenddb-check-released-{port}"
+        self.dir = os.path.join(work, str(port))
+        os.makedirs(os.path.join(self.dir, "run"))
+        self.env = dict(os.environ, HOME=os.path.join(self.dir, "home"),
+                        EXTENDDB__SERVER__RUN_DIR=os.path.join(self.dir, "run"),
+                        EXTENDDB_ADMIN_USER="admin", EXTENDDB_ADMIN_PASSWORD=ADMIN_PASSWORD)
+        self.config = os.path.join(self.dir, "extenddb.toml")
+        uri = f"mongodb://127.0.0.1:{port}/?replicaSet=rs0&directConnection=true"
+        with open(self.config, "w", encoding="utf-8") as f:
+            f.write(f'[storage]\nbackend = "mongodb"\n\n[storage.mongodb]\nconnection_string = "{uri}"\n')
+        # A loaded fixture's server uses the certificate the fresh install's
+        # `init` made, where the default config looks for it.
+        if tls is not None:
+            shutil.copytree(tls, os.path.join(self.env["HOME"], ".extenddb", "tls"))
+
+    def cmd(self, *args: str) -> list[str]:
+        return [self.binary, *args, "--config", self.config]
+
+    def manage(self, *args: str) -> tuple[int, str]:
+        env = dict(self.env, EXTENDDB_PASSWORD=ADMIN_PASSWORD, EXTENDDB__SERVER__PORT=str(self.api))
+        return run([self.binary, "manage", "--user", "admin", "--config", self.config, *args], env)
+
+    def serve(self):
+        server = start(self.cmd("serve") + ["--foreground", "--port", str(self.api)], self.env,
+                       os.path.join(self.dir, "serve.log"))
+        return server, healthy(f"https://127.0.0.1:{self.api}/health", server, 60)
+
+    def access_key(self, label: str, account: bool) -> tuple[str, str] | None:
+        steps = [("create-account", "--account-id", "123456789012", "--account-name", "cu-seed"),
+                 ("create-user", "--account-id", "123456789012", "--user-name", "cu-tester"),
+                 ("put-user-policy", "--account-id", "123456789012", "--user-name", "cu-tester",
+                  "--policy-name", "dynamodb-full", "--policy-document",
+                  '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"dynamodb:*","Resource":"*"}]}')]
+        for step in steps if account else []:
+            code, out = self.manage(*step)
+            if not report(code == 0, f"{label}: manage {step[0]}", out):
+                return None
+        code, out = self.manage("create-access-key", "--account-id", "123456789012", "--user-name", "cu-tester")
+        if not report(code == 0, f"{label}: manage create-access-key", out):
+            return None
+        created = json.loads(out[out.index("{"):])
+        return created["access_key_id"], created["secret_access_key"]
+
+    def normalized(self) -> list[str]:
+        code, out = mongosh(self.container, self.port, NORMALIZE)
+        report(code == 0, f"read {self.container}", out)
+        return out.splitlines()
+
+
+def smoke(label: str, endpoint: str, key: str, secret: str) -> None:
+    import boto3
+    import urllib3
+    urllib3.disable_warnings()
+    ddb = boto3.client("dynamodb", endpoint_url=endpoint, region_name="us-east-1", aws_access_key_id=key,
+                       aws_secret_access_key=secret, verify=False)
+    try:
+        table = ddb.describe_table(TableName="cu_orders")["Table"]
+        query = ddb.query(TableName="cu_orders", IndexName="by_gpk", KeyConditionExpression="gpk = :g",
+                          ExpressionAttributeValues={":g": {"S": "g0"}})
+        scan = ddb.scan(TableName="cu_orders")
+        ddb.put_item(TableName="cu_orders", Item={"pk": {"S": "p9"}, "sk": {"S": "after"}, "gpk": {"S": "g1"},
+                                                  "gsk": {"N": "99"}, "lsk": {"S": "l"}})
+        report(table["TableStatus"] == "ACTIVE" and query["Count"] == 5 and scan["Count"] == 10,
+               f"{label}: DescribeTable, a GSI query ({query['Count']} items), a Scan ({scan['Count']} items) "
+               "and a PutItem after the upgrade")
+    except Exception as e:  # noqa: BLE001 - every failure is the check's result
+        report(False, f"{label}: the upgraded server answers the DynamoDB API", repr(e))
+
+
+def main(binary: str, port: int, api: int) -> int:
+    binary = os.path.realpath(binary)
+    with open(os.path.join(FIXTURES, "accepted-differences.json"), encoding="utf-8") as f:
+        accepted = json.load(f)
+    work = tempfile.mkdtemp()
+    deployments = []
+    try:
+        fresh = Deployment(binary, port, api, work)
+        deployments.append(fresh)
+        if not start_mongo(fresh.container, port):
+            return finish()
+        expect_exit(0, "fresh: init", [*fresh.cmd("init"), "--backend", "mongodb", "--overwrite"], fresh.env,
+                    timeout=120)
+        server, up = fresh.serve()
+        keys = fresh.access_key("fresh", account=True) if report(up, "fresh: the server is healthy") else None
+        if keys is not None:
+            for table, ttl in [("cu_orders", "expires"), ("cu_dotted", "exp.at")]:
+                code, out = run([sys.executable, os.path.join(FIXTURES, "seed.py"), f"https://127.0.0.1:{api}",
+                                 *keys, table, ttl], dict(os.environ))
+                report(code == 0, f"fresh: seed {table}", out)
+        stop(server)
+        reference = fresh.normalized()
+
+        for n, state in enumerate(STATES, start=1):
+            d = Deployment(binary, port + n, api + n, work, os.path.join(fresh.env["HOME"], ".extenddb", "tls"))
+            deployments.append(d)
+            if not start_mongo(d.container, d.port, mounts=(f"{FIXTURES}:/fixtures:ro",)):
+                continue
+            code, out = mongosh(d.container, d.port, f'const FIXTURE = "/fixtures/{state}.json"; load("/fixtures/load.js")')
+            report(code == 0 and "loaded" in out, f"{state}: load the fixture", out)
+            expect_exit(3, f"{state}: migrate preview", d.cmd("migrate"), d.env)
+            expect_exit(0, f"{state}: migrate --yes", d.cmd("migrate") + ["--yes"], d.env)
+            expect_exit(0, f"{state}: migrate preview after --yes", d.cmd("migrate"), d.env)
+            expect_exit(0, f"{state}: verify", d.cmd("verify"), d.env)
+            upgraded = d.normalized()
+            server, up = d.serve()
+            if report(up, f"{state}: the upgraded server is healthy"):
+                keys = d.access_key(state, account=False)
+                if keys is not None:
+                    smoke(state, f"https://127.0.0.1:{d.api}", *keys)
+            stop(server)
+            tables = {line.split()[1].split(".", 1)[1] for line in upgraded
+                      if line.startswith(("collection extenddb_data.T_", "collection extenddb_data.I_"))}
+            wanted = [line for line in reference
+                      if not line.startswith(("collection extenddb_data.T_", "collection extenddb_data.I_",
+                                              "index extenddb_data.T_", "index extenddb_data.I_"))
+                      or line.split()[1].split(".", 1)[1] in tables]
+            allowed = {entry["line"] for entry in accepted.get(state, [])}
+            only_upgraded = sorted(set(upgraded) - set(wanted) - allowed)
+            only_fresh = sorted(set(wanted) - set(upgraded) - allowed)
+            report(not only_upgraded and not only_fresh,
+                   f"{state}: the upgraded catalog equals a fresh install seeded the same way",
+                   "\n".join([f"only upgraded: {line}" for line in only_upgraded]
+                             + [f"only fresh: {line}" for line in only_fresh]))
+            unused = allowed - (set(upgraded) ^ set(wanted))
+            report(not unused, f"{state}: every accepted difference occurs", "\n".join(sorted(unused)))
+    finally:
+        for d in deployments:
+            docker("rm", "-f", "-v", d.container)
+        shutil.rmtree(work, ignore_errors=True)
+    return finish()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) not in (2, 3, 4):
+        sys.exit(__doc__)
+    sys.exit(main(
+        sys.argv[1],
+        int(sys.argv[2]) if len(sys.argv) > 2 else 27061,
+        int(sys.argv[3]) if len(sys.argv) > 3 else 18480,
+    ))
