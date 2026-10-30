@@ -267,9 +267,10 @@ mod search_schema_shape_tests {
         );
     }
 
-    /// Pins the measured number, because the obvious inference from the query-side
-    /// cap gives twenty and is wrong. A future edit "tidying" this to match the
-    /// query cap would break parity silently.
+    /// Pins the measured number. The query-side cap (`MAX_SEARCH_CONDITIONS`)
+    /// allows eighteen inline filters too, but it is a separate constant measured
+    /// separately, so a change to one must not be carried over to the other
+    /// without its own measurement.
     #[test]
     fn the_inline_filter_cap_is_eighteen_as_measured() {
         assert_eq!(MAX_SEARCH_SCHEMA_INLINE_FILTERS, 18);
