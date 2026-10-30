@@ -183,6 +183,12 @@
 # resolves elsewhere is rejected, so tenants sharing an instance cannot read or
 # overwrite each other's files. Export refuses to overwrite an existing file.
 #
+# On Unix, export files are created with mode 0600, and the directories the
+# server creates for import and export files are created with mode 0700: a
+# missing import or export root and any missing parent directories, created at
+# startup, and the account directory an export creates under each export root.
+# A directory that already exists keeps its mode.
+#
 # [import]
 # paths = ["/var/lib/extenddb/imports"]
 #

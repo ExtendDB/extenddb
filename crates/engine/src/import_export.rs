@@ -6,6 +6,7 @@
 //! extenddb imports from and exports to the local filesystem instead of S3.
 //! Both operations are synchronous — they complete before returning.
 
+use std::path::Path;
 use std::time::SystemTime;
 
 use serde_json::Value;
@@ -15,6 +16,7 @@ use crate::create_table::storage_err_to_dynamo;
 use crate::import_export_io::{
     ensure_account_dirs, read_items, validate_path, validate_path_parent,
 };
+use crate::private_fs::{create_private_dir_all, private_new_file_options};
 use crate::serialize_output;
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::types::{
@@ -240,7 +242,7 @@ pub async fn handle_export_table(
         &ctx.account_id,
     )?;
     if let Some(parent) = output_path.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(|_| {
+        create_private_dir_all(parent).map_err(|_| {
             DynamoDbError::ValidationException("Cannot create output directory".to_owned())
         })?;
     }
@@ -253,23 +255,7 @@ pub async fn handle_export_table(
         "import/export file access"
     );
 
-    // `create_new` refuses to write when anything already exists at the path,
-    // so an export cannot truncate a file it did not create. It also refuses an
-    // existing symlink, including a dangling one, rather than following it.
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&output_path)
-        .await
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                DynamoDbError::ValidationException(
-                    "Export file already exists; choose a different FilePath".to_owned(),
-                )
-            } else {
-                DynamoDbError::ValidationException("Cannot create export file".to_owned())
-            }
-        })?;
+    let mut file = create_export_file(&output_path).await?;
 
     let mut item_count: i64 = 0;
     let max_export_items = ctx.limits.max_export_item_count;
@@ -334,6 +320,24 @@ pub async fn handle_export_table(
 
     serialize_output(&extenddb_core::types::ExportTableToPointInTimeOutput {
         export_description: description,
+    })
+}
+
+/// Create the export file, owner-only on Unix because it holds the table's
+/// items.
+///
+/// `create_new` refuses to write when anything already exists at the path, so
+/// an export cannot truncate a file it did not create. It also refuses an
+/// existing symlink, including a dangling one, rather than following it.
+pub(crate) async fn create_export_file(path: &Path) -> Result<tokio::fs::File, DynamoDbError> {
+    private_new_file_options().open(path).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            DynamoDbError::ValidationException(
+                "Export file already exists; choose a different FilePath".to_owned(),
+            )
+        } else {
+            DynamoDbError::ValidationException("Cannot create export file".to_owned())
+        }
     })
 }
 

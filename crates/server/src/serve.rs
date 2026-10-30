@@ -470,25 +470,7 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
 
     // P53: Resolve import and export path lists. Supports both the new
     // [import]/[export] sections and the deprecated import_export_root.
-    let resolve_paths = |raw_paths: &[String],
-                         label: &str|
-     -> anyhow::Result<Vec<Arc<std::path::PathBuf>>> {
-        let mut resolved = Vec::new();
-        for raw in raw_paths {
-            let expanded = config::expand_tilde(raw);
-            let path = std::path::PathBuf::from(&expanded);
-            if !path.exists() {
-                std::fs::create_dir_all(&path)
-                    .map_err(|e| anyhow::anyhow!("Cannot create {label} path {expanded}: {e}"))?;
-            }
-            let canonical = path
-                .canonicalize()
-                .map_err(|e| anyhow::anyhow!("Cannot canonicalize {label} path {expanded}: {e}"))?;
-            resolved.push(Arc::new(canonical));
-        }
-        Ok(resolved)
-    };
-
+    //
     // Build effective path lists: a populated section wins, and the deprecated
     // import_export_root fills only a list a section left empty. Which surface
     // won decides what the diagnostics should say, so it is recorded.
@@ -501,10 +483,12 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         tracing::warn!("{notice}");
     }
 
-    let import_paths: Arc<[Arc<std::path::PathBuf>]> =
-        Arc::from(resolve_paths(&effective.import, "import")?);
-    let export_paths: Arc<[Arc<std::path::PathBuf>]> =
-        Arc::from(resolve_paths(&effective.export, "export")?);
+    let import_paths: Arc<[Arc<std::path::PathBuf>]> = Arc::from(
+        crate::import_export_roots::resolve_roots(&effective.import, "import")?,
+    );
+    let export_paths: Arc<[Arc<std::path::PathBuf>]> = Arc::from(
+        crate::import_export_roots::resolve_roots(&effective.export, "export")?,
+    );
 
     for notice in crate::import_export_paths::overlap_notices(
         &import_paths,

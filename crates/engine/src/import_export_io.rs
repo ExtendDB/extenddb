@@ -200,7 +200,7 @@ pub(crate) fn account_scoped_roots(
         .collect())
 }
 
-/// Create the calling account's subtree beneath each configured root.
+/// Create the calling account's subtree, owner-only, beneath each configured root.
 ///
 /// Export writes to a file that does not exist yet, so the account subtree has
 /// to exist before the path can be canonicalized and jailed. Creating it is
@@ -211,7 +211,7 @@ pub(crate) fn ensure_account_dirs(
     account_id: &str,
 ) -> Result<(), DynamoDbError> {
     for scoped in account_scoped_roots(jail_roots, account_id)? {
-        std::fs::create_dir_all(&scoped).map_err(|_| {
+        crate::private_fs::create_private_dir_all(&scoped).map_err(|_| {
             DynamoDbError::ValidationException(
                 "Cannot create the account export directory".to_owned(),
             )
