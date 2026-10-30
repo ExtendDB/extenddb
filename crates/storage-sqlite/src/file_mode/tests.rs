@@ -167,8 +167,7 @@ async fn connect_and_record(
                     conn.execute("PRAGMA journal_mode = WAL").await?;
                     conn.execute("CREATE TABLE IF NOT EXISTS t (k INTEGER PRIMARY KEY)")
                         .await?;
-                    let files =
-                        ["", "-wal", "-shm"].map(|suffix| (suffix, sidecar(&db, suffix)));
+                    let files = ["", "-wal", "-shm"].map(|suffix| (suffix, sidecar(&db, suffix)));
                     let modes = files.clone().map(|(suffix, file)| (suffix, mode(&file)));
                     seen.lock().expect("lock").extend(modes);
                     if let Some(setup_mode) = set_in_setup {
@@ -254,5 +253,149 @@ async fn prepare_creates_the_target_of_a_dangling_symlink() {
     restrict(&location).expect("restrict");
     assert_eq!(mode(&sidecar(&target, "-wal")), 0o600);
     pool.close().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Mode calls that record each existing file they are asked to change and
+/// fail the change, as `chmod` does on a read-only mount. Nothing outside the
+/// test's directory is touched, whoever runs the test.
+fn read_only_calls<'a>(existing: &'a dyn Fn(&Path) -> std::io::Result<()>) -> super::ModeCalls<'a> {
+    super::ModeCalls {
+        created: &super::set_created_owner_only,
+        existing,
+    }
+}
+
+/// Run `f` on another thread and fail the test if it does not return within
+/// ten seconds, so a call that blocks shows up as a failure, not a hang.
+fn within_ten_seconds(
+    f: impl FnOnce() -> Result<(), String> + Send + 'static,
+) -> Result<(), String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(10))
+        .expect("blocked for ten seconds")
+}
+
+/// A database path that names a directory (a config with the file name left
+/// off) is left to SQLite, which refuses it; the directory keeps its mode.
+#[test]
+fn a_directory_at_the_database_name_keeps_its_mode() {
+    let dir = temp_dir();
+    let db_dir = dir.join("dbdir");
+    std::fs::create_dir(&db_dir).expect("dbdir");
+    set_mode(&db_dir, 0o755);
+    for location in [
+        db_dir.to_string_lossy().into_owned(),
+        format!("{}/", db_dir.display()),
+    ] {
+        prepare(&location).expect("prepare");
+        restrict(&location).expect("restrict");
+        assert_eq!(mode(&db_dir), 0o755, "{location}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Only a regular file is changed. A symlink at a sidecar name is not
+/// followed (its target keeps its mode), and a FIFO or a socket there keeps
+/// its mode; the FIFO, which no writer ever opens, does not make the call
+/// wait. The database file itself is narrowed.
+#[test]
+fn only_regular_files_are_changed_and_nothing_waits() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = temp_dir();
+    let db = dir.join("db.sqlite");
+    std::fs::write(&db, b"").expect("db");
+    set_mode(&db, 0o644);
+    let decoy = dir.join("decoy.txt");
+    std::fs::write(&decoy, b"").expect("decoy");
+    set_mode(&decoy, 0o644);
+    let journal = sidecar(&db, "-journal");
+    std::os::unix::fs::symlink(&decoy, &journal).expect("symlink");
+    let fifo = sidecar(&db, "-wal");
+    let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("name");
+    // SAFETY: `mkfifo` reads the NUL-terminated name, which `name` owns for
+    // the duration of the call.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o644) }, 0, "mkfifo");
+    set_mode(&fifo, 0o644);
+    // A socket node, made with mknod because the test directory's path is
+    // longer than a socket address allows; Linux lets any user make one.
+    let socket = sidecar(&db, "-shm");
+    #[cfg(target_os = "linux")]
+    {
+        let name = std::ffi::CString::new(socket.as_os_str().as_bytes()).expect("name");
+        // SAFETY: `mknod` reads the NUL-terminated name, which `name` owns for
+        // the duration of the call.
+        let rc = unsafe { libc::mknod(name.as_ptr(), libc::S_IFSOCK | 0o644, 0) };
+        assert_eq!(rc, 0, "mknod");
+        set_mode(&socket, 0o644);
+    }
+
+    let location = db.to_string_lossy().into_owned();
+    let (for_prepare, for_restrict) = (location.clone(), location);
+    within_ten_seconds(move || prepare(&for_prepare)).expect("prepare");
+    within_ten_seconds(move || restrict(&for_restrict)).expect("restrict");
+
+    assert_eq!(mode(&db), 0o600);
+    assert_eq!(mode(&decoy), 0o644, "the symlink at -journal was followed");
+    let link = std::fs::symlink_metadata(&journal).expect("lstat -journal");
+    assert!(link.file_type().is_symlink(), "-journal replaced");
+    assert_eq!(mode(&fifo), 0o644, "the FIFO at -wal was changed");
+    #[cfg(target_os = "linux")]
+    assert_eq!(mode(&socket), 0o644, "the socket at -shm was changed");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A regular file wider than 0600 whose mode cannot be changed (here the
+/// change fails with EROFS) is an error naming the file, and stays as it was.
+#[test]
+fn a_file_that_cannot_be_narrowed_is_an_error() {
+    let dir = temp_dir();
+    let db = dir.join("db.sqlite");
+    std::fs::write(&db, b"").expect("db");
+    set_mode(&db, 0o644);
+    let fail = |_: &Path| Err(std::io::Error::from_raw_os_error(libc::EROFS));
+    let calls = read_only_calls(&fail);
+    let location = db.to_string_lossy().into_owned();
+    for result in [
+        super::prepare_with(&location, &calls),
+        super::restrict_with(&location, &calls),
+    ] {
+        let err = result.expect_err("a mode that cannot be set is accepted");
+        assert!(
+            err.starts_with("cannot set the mode of SQLite file ")
+                && err.contains(&*db.to_string_lossy())
+                && err.contains("Read-only file system"),
+            "{err}"
+        );
+    }
+    assert_eq!(mode(&db), 0o644);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Files already 0600, or narrower, are not changed at all, so a read-only
+/// mount whose files are already owner-only still opens.
+#[test]
+fn owner_only_files_are_left_alone() {
+    let dir = temp_dir();
+    let db = dir.join("db.sqlite");
+    for (suffix, file_mode) in [("", 0o600), ("-wal", 0o600), ("-shm", 0o400)] {
+        std::fs::write(sidecar(&db, suffix), b"").expect("create");
+        set_mode(&sidecar(&db, suffix), file_mode);
+    }
+    let asked = Mutex::new(Vec::new());
+    let fail = |file: &Path| {
+        asked.lock().expect("lock").push(file.to_path_buf());
+        Err(std::io::Error::from_raw_os_error(libc::EROFS))
+    };
+    let calls = read_only_calls(&fail);
+    let location = db.to_string_lossy().into_owned();
+    super::prepare_with(&location, &calls).expect("prepare");
+    super::restrict_with(&location, &calls).expect("restrict");
+    assert_eq!(*asked.lock().expect("lock"), Vec::<PathBuf>::new());
+    assert_eq!(mode(&db), 0o600);
+    assert_eq!(mode(&sidecar(&db, "-shm")), 0o400);
     let _ = std::fs::remove_dir_all(&dir);
 }
