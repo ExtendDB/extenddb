@@ -8,16 +8,16 @@
 //! (access-key secrets, password hashes), so neither the file nor its `-wal`,
 //! `-shm` and `-journal` files may be readable by other local users. SQLite's
 //! unix VFS creates a database file with mode 0644 less the umask, and creates
-//! each sidecar with the mode of the database file. So every pool opener on a
-//! file database calls [`prepare`] before it connects, which creates the
+//! each sidecar with the mode of the database file. So every pool on a file
+//! database is opened through [`connect`], which calls [`prepare`] before the
+//! pool's first connection and [`restrict`] after it. `prepare` creates the
 //! database file with mode 0600 (or sets an existing one to 0600) before the
-//! connection can create a sidecar from it, and [`restrict`] after it
-//! connects, which sets the file and every sidecar present to 0600 whoever
-//! created them.
+//! connection can create a sidecar from it; `restrict` sets the file and every
+//! sidecar present to 0600 whoever created them.
 //!
 //! As with the lock file in `serve_lock`, a mode that cannot be set is an
 //! error. The directory's mode is left alone. On platforms other than Unix
-//! both functions do nothing.
+//! `prepare` and `restrict` do nothing.
 
 #[cfg(unix)]
 use std::path::{Path, PathBuf};
@@ -26,13 +26,32 @@ use std::str::FromStr;
 
 #[cfg(unix)]
 use crate::serve_lock::{database_file, resolve_dangling_symlinks};
-#[cfg(unix)]
 use crate::sqlite_util::sqlite_url;
 
-/// Before a pool connects to `location`: create the database file with mode
-/// 0600 if the connection would create it, then set the file and any sidecar
-/// left by an earlier run to 0600, so the sidecars this connection creates
-/// take mode 0600 from the database file.
+/// Open a pool on `location` (a path, `:memory:` or a `sqlite:` URL) with
+/// `options`, keeping the database file and its sidecars owner read/write
+/// only.
+///
+/// # Errors
+///
+/// The pool cannot connect, or a file's mode cannot be set.
+pub(crate) async fn connect(
+    location: &str,
+    options: sqlx::sqlite::SqlitePoolOptions,
+) -> Result<sqlx::SqlitePool, String> {
+    prepare(location)?;
+    let pool = options
+        .connect(&sqlite_url(location))
+        .await
+        .map_err(|e| e.to_string())?;
+    restrict(location)?;
+    Ok(pool)
+}
+
+/// Before the pool connects to `location`: create the database file with
+/// mode 0600 if the connection would create it, then set the file and any
+/// sidecar left by an earlier run to 0600, so the sidecars this connection
+/// creates take mode 0600 from the database file.
 ///
 /// A location that names no file on this machine (in-memory, unparseable, a
 /// remote `file:` authority) is left to the connection, which reports it in
@@ -42,7 +61,7 @@ use crate::sqlite_util::sqlite_url;
 ///
 /// A file's mode cannot be set.
 #[cfg(unix)]
-pub(crate) fn prepare(location: &str) -> Result<(), String> {
+fn prepare(location: &str) -> Result<(), String> {
     let Ok(Some(path)) = database_file(location) else {
         return Ok(());
     };
@@ -53,18 +72,18 @@ pub(crate) fn prepare(location: &str) -> Result<(), String> {
 }
 
 #[cfg(not(unix))]
-pub(crate) fn prepare(_location: &str) -> Result<(), String> {
+fn prepare(_location: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// After a pool connects to `location`: set the database file and every
+/// After the pool connects to `location`: set the database file and every
 /// `-wal`, `-shm` and `-journal` file present to mode 0600.
 ///
 /// # Errors
 ///
 /// A file's mode cannot be set.
 #[cfg(unix)]
-pub(crate) fn restrict(location: &str) -> Result<(), String> {
+fn restrict(location: &str) -> Result<(), String> {
     match database_file(location) {
         Ok(Some(path)) => restrict_files(&path),
         _ => Ok(()),
@@ -72,7 +91,7 @@ pub(crate) fn restrict(location: &str) -> Result<(), String> {
 }
 
 #[cfg(not(unix))]
-pub(crate) fn restrict(_location: &str) -> Result<(), String> {
+fn restrict(_location: &str) -> Result<(), String> {
     Ok(())
 }
 
@@ -163,8 +182,9 @@ fn restrict_files(path: &Path) -> Result<(), String> {
 mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
 
-    use super::{prepare, restrict};
+    use super::{connect, prepare, restrict};
 
     fn temp_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -273,20 +293,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The rule the fix relies on: SQLite gives a new `-wal` or `-shm` file
-    /// the mode of the database file, so a database created at 0600 gets
-    /// 0600 sidecars without any chmod after the fact.
+    /// Open a pool through `connect` that switches to WAL and writes in its
+    /// connection setup, and return it with the modes of the database file
+    /// and its `-wal` and `-shm` files as that setup saw them, which is before
+    /// `connect` calls `restrict`.
+    async fn connect_and_record(db: &Path) -> (sqlx::SqlitePool, Vec<(&'static str, u32)>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let options = {
+            let (seen, db) = (Arc::clone(&seen), db.to_path_buf());
+            sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .after_connect(move |conn, _| {
+                    let (seen, db) = (Arc::clone(&seen), db.clone());
+                    Box::pin(async move {
+                        use sqlx::Executor;
+                        conn.execute("PRAGMA journal_mode = WAL").await?;
+                        conn.execute("CREATE TABLE IF NOT EXISTS t (k INTEGER PRIMARY KEY)")
+                            .await?;
+                        let modes = ["", "-wal", "-shm"]
+                            .map(|suffix| (suffix, mode(&sidecar(&db, suffix))));
+                        seen.lock().expect("lock").extend(modes);
+                        Ok(())
+                    })
+                })
+        };
+        let pool = connect(&db.to_string_lossy(), options)
+            .await
+            .expect("connect");
+        let seen = seen.lock().expect("lock").clone();
+        (pool, seen)
+    }
+
+    /// The database file `connect` creates, and the sidecars its connection
+    /// creates, are 0600 from the moment they exist.
     #[tokio::test]
-    async fn sidecars_created_after_prepare_take_mode_0600() {
+    async fn connect_creates_a_missing_database_and_its_sidecars_at_0600() {
         let dir = temp_dir();
         let db = dir.join("db.sqlite");
-        prepare(&db.to_string_lossy()).expect("prepare");
-        let pool = raw_wal_pool(&db).await;
-        for suffix in ["", "-wal", "-shm"] {
-            let file = sidecar(&db, suffix);
-            assert!(file.exists(), "{} missing", file.display());
-            assert_eq!(mode(&file), 0o600, "{}", file.display());
+        let (pool, seen) = connect_and_record(&db).await;
+        assert_eq!(seen, [("", 0o600), ("-wal", 0o600), ("-shm", 0o600)]);
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The rule the fix relies on, whatever the umask: SQLite gives a new
+    /// `-wal` or `-shm` file the mode of the database file. A database left
+    /// at 0644 with no sidecars is set to 0600 by `connect` before the
+    /// connection opens it, so the sidecars the connection creates are 0600.
+    #[tokio::test]
+    async fn connect_restricts_an_existing_database_before_sqlite_creates_its_sidecars() {
+        let dir = temp_dir();
+        let db = dir.join("db.sqlite");
+        raw_wal_pool(&db).await.close().await;
+        for suffix in ["-wal", "-shm"] {
+            let _ = std::fs::remove_file(sidecar(&db, suffix));
         }
+        set_mode(&db, 0o644);
+        let (pool, seen) = connect_and_record(&db).await;
+        assert_eq!(seen, [("", 0o600), ("-wal", 0o600), ("-shm", 0o600)]);
         pool.close().await;
         let _ = std::fs::remove_dir_all(&dir);
     }

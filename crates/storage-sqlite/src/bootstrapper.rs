@@ -105,8 +105,7 @@ impl SqliteBootstrapper {
     /// Open a short-lived single-connection pool with the standard PRAGMAs.
     /// For a real filesystem path, the parent directory is created first:
     /// `init --sqlite-path` may point into a directory that does not exist
-    /// yet, and bootstrapping it is exactly init's job. The database file is
-    /// created, and kept, owner read/write only; see `file_mode`.
+    /// yet, and bootstrapping it is exactly init's job.
     async fn pool(&self) -> OpResult<SqlitePool> {
         if self.path != ":memory:"
             && let Some(parent) = std::path::Path::new(&self.path).parent()
@@ -119,10 +118,7 @@ impl SqliteBootstrapper {
                 ))
             })?;
         }
-        let open_err =
-            |e: String| OpError::Internal(format!("open SQLite database '{}': {e}", self.path));
-        crate::file_mode::prepare(&self.path).map_err(open_err)?;
-        let pool = SqlitePoolOptions::new()
+        let options = SqlitePoolOptions::new()
             .max_connections(1)
             .after_connect(|conn, _| {
                 Box::pin(async move {
@@ -133,12 +129,10 @@ impl SqliteBootstrapper {
                     conn.execute("PRAGMA busy_timeout = 5000").await?;
                     Ok(())
                 })
-            })
-            .connect(&sqlite_url(&self.path))
+            });
+        crate::file_mode::connect(&self.path, options)
             .await
-            .map_err(|e| open_err(e.to_string()))?;
-        crate::file_mode::restrict(&self.path).map_err(open_err)?;
-        Ok(pool)
+            .map_err(|e| OpError::Internal(format!("open SQLite database '{}': {e}", self.path)))
     }
 }
 

@@ -48,7 +48,6 @@ use tokio::sync::Mutex;
 
 use crate::INDEX_PROPAGATION_DELAY_QUERY;
 use crate::schema::CATALOG_VERSION;
-use crate::sqlite_util::sqlite_url;
 
 /// The SQLite storage engine. Implements `StorageEngine` (all data/metadata/
 /// stream/worker/backup traits) over a single SQLite database.
@@ -99,7 +98,6 @@ impl SqliteEngine {
         region: &str,
         max_item_size_bytes: usize,
     ) -> Result<Self, StorageError> {
-        let url = sqlite_url(path_or_url);
         // Use the same parsed-location classifier as the serve lock. String
         // containment misclassifies file names such as `mode=memory.db`.
         let in_memory = crate::serve_lock::database_file(path_or_url)
@@ -123,15 +121,7 @@ impl SqliteEngine {
         }
         let mut opts = SqlitePoolOptions::new()
             .max_connections(max_connections)
-            .min_connections(1);
-        if in_memory {
-            opts = opts.idle_timeout(None).max_lifetime(None);
-        }
-        // The database file stores the AES encryption key alongside the data it
-        // protects (encrypted access-key secrets, password hashes), so the file
-        // and its sidecars are kept to owner read/write; see `file_mode`.
-        crate::file_mode::prepare(path_or_url).map_err(StorageError::Connection)?;
-        let pool = opts
+            .min_connections(1)
             .after_connect(|conn, _| {
                 Box::pin(async move {
                     use sqlx::Executor;
@@ -142,11 +132,16 @@ impl SqliteEngine {
                     conn.execute("PRAGMA cache_size = -32000").await?;
                     Ok(())
                 })
-            })
-            .connect(&url)
+            });
+        if in_memory {
+            opts = opts.idle_timeout(None).max_lifetime(None);
+        }
+        // The database file stores the AES encryption key alongside the data it
+        // protects (encrypted access-key secrets, password hashes), so the file
+        // and its sidecars are kept to owner read/write; see `file_mode`.
+        let pool = crate::file_mode::connect(path_or_url, opts)
             .await
-            .map_err(|e| StorageError::Connection(e.to_string()))?;
-        crate::file_mode::restrict(path_or_url).map_err(StorageError::Connection)?;
+            .map_err(StorageError::Connection)?;
 
         let initial_index_delay: u64 =
             sqlx::query_as::<_, (String,)>(INDEX_PROPAGATION_DELAY_QUERY)

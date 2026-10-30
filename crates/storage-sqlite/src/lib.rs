@@ -104,13 +104,10 @@ use extenddb_storage::management_store::{ManagementStore, SettingsStore};
 use extenddb_storage::management_store_factory::ManagementStoreError;
 use extenddb_storage::settings_store::SettingsStoreError;
 
-use crate::sqlite_util::sqlite_url;
-
 /// Open a small catalog-only pool for the settings/diagnostics factories,
 /// applying the same PRAGMAs and file modes as the engine.
 async fn catalog_pool(connection_string: &str) -> Result<sqlx::SqlitePool, String> {
-    file_mode::prepare(connection_string)?;
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+    let options = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(4)
         .after_connect(|conn, _| {
             Box::pin(async move {
@@ -120,12 +117,8 @@ async fn catalog_pool(connection_string: &str) -> Result<sqlx::SqlitePool, Strin
                 conn.execute("PRAGMA busy_timeout = 5000").await?;
                 Ok(())
             })
-        })
-        .connect(&sqlite_url(connection_string))
-        .await
-        .map_err(|e| e.to_string())?;
-    file_mode::restrict(connection_string)?;
-    Ok(pool)
+        });
+    file_mode::connect(connection_string, options).await
 }
 
 // ── Bootstrapper ───────────────────────────────────────────────────────
