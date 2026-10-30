@@ -7,15 +7,29 @@
 //! - Admin users: `admin_name:password` (Basic auth)
 //! - IAM users: `account_id/user_name:password` (Basic auth, for self-service)
 
+use std::net::SocketAddr;
+
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
+
+use crate::rate_limit::LoginRefusal;
 
 /// Maximum allowed length for the Authorization header (8 KB).
 const MAX_AUTH_HEADER_LEN: usize = 8 * 1024;
 
 /// WWW-Authenticate header value for 401 responses (RFC 7235).
 const WWW_AUTHENTICATE_BASIC: &str = "Basic realm=\"extenddb\"";
+
+/// The 401 answered to a wrong password or an unknown principal.
+fn invalid_credentials() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(axum::http::header::WWW_AUTHENTICATE, WWW_AUTHENTICATE_BASIC)],
+        "Invalid credentials",
+    )
+        .into_response()
+}
 
 /// Identifies the authenticated caller of a management API request.
 #[derive(Debug, Clone)]
@@ -35,13 +49,18 @@ pub enum CallerIdentity {
 /// tries IAM user auth (`account_id/user_name:password`).
 ///
 /// Returns the caller identity on success, or an error response on failure.
-/// Enforces per-principal lockout and per-IP rate limiting via the storage backend.
+///
+/// `peer` is the address of the connection the request arrived on. Failed
+/// attempts are counted per principal and peer address and per peer address
+/// (see [`crate::rate_limit`]); an attempt over either limit is answered 429
+/// before any password is checked. A wrong password is recorded as a failure;
+/// a storage error while checking it is answered 500 and recorded as nothing.
 #[allow(clippy::result_large_err)] // axum Response as rejection is this module's idiom
 pub async fn authenticate(
     headers: &HeaderMap,
     store: &dyn extenddb_storage::CatalogStore,
     rate_limiter: &dyn extenddb_storage::management_store::RateLimitStore,
-    source_ip: Option<&str>,
+    peer: SocketAddr,
 ) -> Result<CallerIdentity, Response> {
     let header = headers
         .get("authorization")
@@ -103,42 +122,35 @@ pub async fn authenticate(
             .into_response()
     })?;
 
-    // Rate limit / lockout check before attempting authentication.
-    if let Err(msg) =
-        crate::rate_limit::check_login_allowed(rate_limiter, username, source_ip).await
-    {
-        return Err((StatusCode::TOO_MANY_REQUESTS, msg).into_response());
-    }
+    // Reserve the attempt before any password is checked, so a burst cannot
+    // run more checks than the limits allow.
+    let attempt = match crate::rate_limit::begin_login(rate_limiter, username, peer).await {
+        Ok(attempt) => attempt,
+        Err(LoginRefusal::TooManyAttempts(msg)) => {
+            return Err((StatusCode::TOO_MANY_REQUESTS, msg).into_response());
+        }
+        Err(LoginRefusal::Internal) => {
+            return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
+    };
 
-    // Try admin auth first.
-    let result = try_admin_auth(username, password, store).await;
-    match result {
-        Ok(Some(identity)) => {
-            return Ok(identity);
+    // Try admin auth first. A storage error returns 500 without recording a
+    // failure: no password was checked, so nothing counts against the caller.
+    match try_admin_auth(username, password, store).await? {
+        AdminAuth::Authenticated(identity) => return Ok(identity),
+        AdminAuth::WrongPassword => {
+            attempt.record_failure(rate_limiter).await;
+            return Err(invalid_credentials());
         }
-        Err(e) => {
-            crate::rate_limit::record_failed_login(rate_limiter, username, source_ip).await;
-            return Err(e);
-        }
-        Ok(None) => {} // Admin not found, try IAM.
+        AdminAuth::NotFound => {} // Admin not found, try IAM.
     }
 
     // Try IAM user auth: username format is `account_id/user_name`.
-    let result = try_iam_user_auth(username, password, store).await;
-    match result {
-        Ok(Some(identity)) => Ok(identity),
-        Err(e) => {
-            crate::rate_limit::record_failed_login(rate_limiter, username, source_ip).await;
-            Err(e)
-        }
-        Ok(None) => {
-            crate::rate_limit::record_failed_login(rate_limiter, username, source_ip).await;
-            Err((
-                StatusCode::UNAUTHORIZED,
-                [(axum::http::header::WWW_AUTHENTICATE, WWW_AUTHENTICATE_BASIC)],
-                "Invalid credentials",
-            )
-                .into_response())
+    match try_iam_user_auth(username, password, store).await? {
+        Some(identity) => Ok(identity),
+        None => {
+            attempt.record_failure(rate_limiter).await;
+            Err(invalid_credentials())
         }
     }
 }
@@ -149,9 +161,9 @@ pub async fn authenticate_admin(
     headers: &HeaderMap,
     store: &dyn extenddb_storage::CatalogStore,
     rate_limiter: &dyn extenddb_storage::management_store::RateLimitStore,
-    source_ip: Option<&str>,
+    peer: SocketAddr,
 ) -> Result<String, Response> {
-    match authenticate(headers, store, rate_limiter, source_ip).await? {
+    match authenticate(headers, store, rate_limiter, peer).await? {
         CallerIdentity::Admin(name) => Ok(name),
         CallerIdentity::IamUser { .. } => {
             Err((StatusCode::FORBIDDEN, "Admin access required").into_response())
@@ -159,12 +171,23 @@ pub async fn authenticate_admin(
     }
 }
 
+/// Outcome of checking a password against the admin store.
+enum AdminAuth {
+    Authenticated(CallerIdentity),
+    /// The admin exists and the password is wrong; do not fall through to IAM.
+    WrongPassword,
+    /// No admin of that name; fall through to IAM user auth.
+    NotFound,
+}
+
+/// Check `password` for admin `username`. `Err` is the 500 answered to a
+/// storage error, including a timed-out wait for a bcrypt slot.
 #[allow(clippy::result_large_err)] // axum Response as rejection is this module's idiom
 async fn try_admin_auth(
     username: &str,
     password: &str,
     store: &dyn extenddb_storage::CatalogStore,
-) -> Result<Option<CallerIdentity>, Response> {
+) -> Result<AdminAuth, Response> {
     let result = store
         .verify_admin_password(username, password)
         .await
@@ -173,21 +196,16 @@ async fn try_admin_auth(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         })?;
 
-    match result {
-        Some(true) => Ok(Some(CallerIdentity::Admin(username.to_owned()))),
-        Some(false) => {
-            // Admin exists but password is wrong — don't fall through to IAM auth.
-            Err((
-                StatusCode::UNAUTHORIZED,
-                [(axum::http::header::WWW_AUTHENTICATE, WWW_AUTHENTICATE_BASIC)],
-                "Invalid credentials",
-            )
-                .into_response())
-        }
-        None => Ok(None), // Admin not found, fall through to IAM auth.
-    }
+    Ok(match result {
+        Some(true) => AdminAuth::Authenticated(CallerIdentity::Admin(username.to_owned())),
+        Some(false) => AdminAuth::WrongPassword,
+        None => AdminAuth::NotFound,
+    })
 }
 
+/// Check `password` for IAM user `account_id/user_name`. `Ok(None)` is a
+/// wrong password or an unknown user; `Err` is the 500 answered to a storage
+/// error.
 #[allow(clippy::similar_names)]
 #[allow(clippy::result_large_err)] // axum Response as rejection is this module's idiom
 async fn try_iam_user_auth(

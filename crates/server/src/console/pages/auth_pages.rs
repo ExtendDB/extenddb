@@ -14,7 +14,7 @@ use serde::Deserialize;
 use crate::console::ConsoleState;
 use crate::console::html;
 use crate::management::CallerIdentity;
-use crate::rate_limit;
+use crate::rate_limit::{self, LoginRefusal};
 
 use super::extract_session_token;
 
@@ -35,34 +35,40 @@ pub async fn login_submit(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Form(form): Form<LoginForm>,
 ) -> Response {
-    let source_ip = addr.ip().to_string();
+    // Reserve the attempt before any password is checked. Limits are per
+    // username and peer address, so failures from elsewhere do not lock this
+    // address out.
+    let attempt = match rate_limit::begin_login(&*state.catalog_store, &form.username, addr).await {
+        Ok(attempt) => attempt,
+        Err(LoginRefusal::TooManyAttempts(msg)) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Html(login_html(Some(msg), &state.listen_url)),
+            )
+                .into_response();
+        }
+        Err(LoginRefusal::Internal) => return internal_error(&state),
+    };
 
-    // Rate limit / lockout check before attempting authentication.
-    if let Err(msg) =
-        rate_limit::check_login_allowed(&*state.catalog_store, &form.username, Some(&source_ip))
-            .await
-    {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Html(login_html(Some(&msg), &state.listen_url)),
-        )
-            .into_response();
-    }
-
-    // Try admin auth first.
+    // Try admin auth first. A storage error (including a timed-out wait for
+    // a bcrypt slot) is answered 500 and recorded as nothing: no password
+    // was checked.
     let identity =
         match try_admin_login(&form.username, &form.password, &*state.catalog_store).await {
-            AdminLoginResult::Authenticated(id) => Some(id),
-            AdminLoginResult::WrongPassword => None, // Admin exists, wrong password — do NOT fall through.
-            AdminLoginResult::NotFound => {
-                // Admin not found — try IAM user auth.
-                try_iam_login(&form.username, &form.password, &*state.catalog_store).await
+            Err(()) => return internal_error(&state),
+            Ok(AdminLoginResult::Authenticated(id)) => Some(id),
+            Ok(AdminLoginResult::WrongPassword) => None, // Admin exists, wrong password: do NOT fall through.
+            Ok(AdminLoginResult::NotFound) => {
+                // Admin not found: try IAM user auth.
+                match try_iam_login(&form.username, &form.password, &*state.catalog_store).await {
+                    Err(()) => return internal_error(&state),
+                    Ok(identity) => identity,
+                }
             }
         };
 
     let Some(identity) = identity else {
-        rate_limit::record_failed_login(&*state.catalog_store, &form.username, Some(&source_ip))
-            .await;
+        attempt.record_failure(&*state.catalog_store).await;
         return (
             StatusCode::OK,
             Html(login_html(Some("Invalid credentials"), &state.listen_url)),
@@ -139,37 +145,52 @@ enum AdminLoginResult {
     NotFound,
 }
 
+/// The login page with a server error, answered when the store failed before
+/// or while the password was checked. Nothing is recorded against the caller.
+fn internal_error(state: &ConsoleState) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Html(login_html(
+            Some("Internal error. Please try again later."),
+            &state.listen_url,
+        )),
+    )
+        .into_response()
+}
+
+/// `Err(())` is a storage error; the caller answers 500 and records nothing.
 async fn try_admin_login(
     username: &str,
     password: &str,
     store: &dyn extenddb_storage::management_store::AdminStore,
-) -> AdminLoginResult {
-    let Ok(result) = store.verify_admin_password(username, password).await else {
-        return AdminLoginResult::NotFound;
-    };
-    match result {
+) -> Result<AdminLoginResult, ()> {
+    let result = store
+        .verify_admin_password(username, password)
+        .await
+        .map_err(|e| tracing::error!("Console login: DB error during admin auth: {e:?}"))?;
+    Ok(match result {
         Some(true) => AdminLoginResult::Authenticated(CallerIdentity::Admin(username.to_owned())),
         Some(false) => AdminLoginResult::WrongPassword,
         None => AdminLoginResult::NotFound,
-    }
+    })
 }
 
+/// `Ok(None)` is a wrong password or an unknown user; `Err(())` is a storage
+/// error, which the caller answers 500 and records as nothing.
 async fn try_iam_login(
     username: &str,
     password: &str,
     store: &dyn extenddb_storage::management_store::ManagementStore,
-) -> Option<CallerIdentity> {
-    let (acct_id, uname) = username.split_once('/')?;
+) -> Result<Option<CallerIdentity>, ()> {
+    let Some((acct_id, uname)) = username.split_once('/') else {
+        return Ok(None);
+    };
     let ok = store
         .verify_iam_user_password(acct_id, uname, password)
         .await
-        .ok()?;
-    if ok {
-        Some(CallerIdentity::IamUser {
-            account_id: acct_id.to_owned(),
-            user_name: uname.to_owned(),
-        })
-    } else {
-        None
-    }
+        .map_err(|e| tracing::error!("Console login: DB error during IAM user auth: {e:?}"))?;
+    Ok(ok.then(|| CallerIdentity::IamUser {
+        account_id: acct_id.to_owned(),
+        user_name: uname.to_owned(),
+    }))
 }

@@ -72,8 +72,7 @@ pub async fn verify_password(password: String, hash: String) -> OpResult<bool> {
             "password verification is overloaded; try again later".to_owned(),
         ));
     };
-    let _permit =
-        acquired.map_err(|_| OpError::Internal("bcrypt semaphore closed".to_owned()))?;
+    let _permit = acquired.map_err(|_| OpError::Internal("bcrypt semaphore closed".to_owned()))?;
     tokio::task::spawn_blocking(move || {
         let running = RUNNING.fetch_add(1, Ordering::SeqCst) + 1;
         HIGH_WATER.fetch_max(running, Ordering::SeqCst);
