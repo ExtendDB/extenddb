@@ -280,6 +280,7 @@ The console uses the `ManagementStore` trait for all data access — it never qu
 
 - Session-based authentication with 8-hour expiry
 - Sessions stored in-memory with random tokens in HttpOnly cookies (`SameSite=Strict`, `Path=/console`)
+- Each request reads the principal's password hash from the catalog and ends the session if the principal was deleted or its password changed
 - CSRF tokens on all state-changing POST handlers
 - Security headers: X-Content-Type-Options (nosniff), X-Frame-Options (DENY), Referrer-Policy (strict-origin-when-cross-origin)
 - Login rate limiting with account lockout on excessive failures
