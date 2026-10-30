@@ -282,17 +282,41 @@ pub async fn handle_query(
     // schema, and ahead of the missing-key check on a single-attribute one
     // (measured 2026-10-21: `pk = :n` on an S key with a second clause on a
     // non-key attribute reports the type, not the missing key).
+    //
+    // On a multi-attribute key schema the classifier refuses a clause on an
+    // attribute outside the key schema (`Query condition missed key schema
+    // element`), so the type check reads only the queried key schema's
+    // definitions there. For an index query the table's list also holds the
+    // base table's key and the other indexes' key attributes. Measured
+    // 2026-10-30 on a GSI with HASH `GSI2PK` and RANGE `GSI2SK`: `GSI2PK = :h
+    // AND PK = :k` answers `Query condition missed key schema element: GSI2SK`
+    // whether `:k` has the table's type for `PK` or not, so the service's type
+    // check does not see an attribute outside the queried key schema. The
+    // single-attribute path has no non-key rule yet: a clause on another
+    // attribute reaches storage, which applies it to the first RANGE
+    // attribute, so it keeps checking against the table's definitions, which
+    // refuse a value of the wrong type before storage does.
+    let multipart = extenddb_core::types::is_multipart_key_schema(&query_key_info.key_schema);
+    let key_schema_definitions: Vec<extenddb_core::types::AttributeDefinition> = query_key_info
+        .attribute_definitions
+        .iter()
+        .filter(|def| {
+            query_key_info
+                .key_schema
+                .iter()
+                .any(|ks| ks.attribute_name == def.attribute_name)
+        })
+        .cloned()
+        .collect();
+    let type_definitions = if multipart {
+        &key_schema_definitions
+    } else {
+        &query_key_info.attribute_definitions
+    };
     key_condition.resolve_key_schema_with(
         &query_key_info.key_schema,
         &effective_maps.names,
-        |path, value| {
-            check_key_value_type(
-                path,
-                value,
-                &query_key_info.attribute_definitions,
-                effective_maps,
-            )
-        },
+        |path, value| check_key_value_type(path, value, type_definitions, effective_maps),
     )?;
     refuse_begins_with_on_number(
         &key_condition,
@@ -302,7 +326,7 @@ pub async fn handle_query(
     // On a single-attribute key schema, validate that the partition key is
     // actually referenced in the condition. The classifier has already required
     // an equality on every HASH attribute of a multi-attribute one.
-    if !extenddb_core::types::is_multipart_key_schema(&query_key_info.key_schema) {
+    if !multipart {
         let pk_resolved = resolve_path_attr_name(&key_condition.pk_path, &effective_maps.names);
         if pk_resolved.as_deref() != Some(pk_attr.as_str()) {
             return Err(DynamoDbError::ValidationException(format!(
@@ -575,8 +599,10 @@ fn resolve_path_attr_name(
 /// BETWEEN bound, and the same on an index, all answer
 /// `One or more parameter values were invalid: Condition parameter type does
 /// not match schema type`, on single-attribute and multi-attribute key
-/// schemas alike. A clause on an attribute without a definition is not
-/// checked here; the classifier reports it.
+/// schemas alike. A clause on an attribute without a definition in
+/// `attribute_definitions` is not checked here. On a multi-attribute key
+/// schema the caller passes the queried key schema's definitions only, and the
+/// classifier reports a clause on any other attribute.
 fn check_key_value_type(
     path: &[PathElement],
     expr: &extenddb_core::expression::Expr,

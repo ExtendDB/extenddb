@@ -521,6 +521,40 @@ class TestRefusedKeyConditions:
             "schema type"
         )
 
+    @pytest.mark.parametrize(
+        "index,kce,values,missing",
+        [
+            (INDEX, "h = :h AND PK = :p", {":h": {"S": "o1"}, ":p": {"N": "1"}}, "a"),
+            (INDEX, "h = :h AND r = :r", {":h": {"S": "o1"}, ":r": {"S": "1"}}, "a"),
+            (
+                TWO_HASH_INDEX,
+                "h1 = :x AND h2 = :y AND a = :a",
+                {":x": {"S": "1"}, ":y": {"S": "2"}, ":a": {"N": "1"}},
+                "r",
+            ),
+        ],
+        ids=["base-table-key-n", "other-index-range-s", "two-hash-other-index-range-n"],
+    )
+    def test_a_value_on_an_attribute_outside_the_index_key_schema_is_not_type_checked(
+        self, dynamodb_client, multi_range_table, index, kce, values, missing
+    ):
+        # The table defines the attribute (the base table key, or the other
+        # index's key) with a different type, but the queried index's key schema
+        # does not hold it, so the non-key rule answers. Measured 2026-10-30 on a
+        # GSI with HASH GSI2PK and RANGE GSI2SK (one RANGE attribute):
+        # `GSI2PK = :h AND PK = :k` answers `Query condition missed key schema
+        # element: GSI2SK` with `:k` an S, PK's defined type, and with `:k` an N.
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.query(
+                TableName=multi_range_table,
+                IndexName=index,
+                KeyConditionExpression=kce,
+                ExpressionAttributeValues=values,
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException", err
+        assert err["Message"] == f"Query condition missed key schema element: {missing}"
+
 
     def test_begins_with_on_a_number_attribute_is_refused(self, dynamodb_client, multi_range_table):
         with pytest.raises(ClientError) as exc_info:
