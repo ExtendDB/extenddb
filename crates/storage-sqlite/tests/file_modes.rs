@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use extenddb_storage::bootstrapper::Bootstrapper;
 use extenddb_storage::server_components::{ServerComponents, ServerComponentsOptions};
 use extenddb_storage::{MetadataEngine, TableEngine};
-use extenddb_storage_sqlite::{SqliteBootstrapper, SqliteConfig};
+use extenddb_storage_sqlite::{SqliteBootstrapper, SqliteConfig, SqliteEngine};
 
 const ACCOUNT: &str = "000000000000";
 
@@ -309,5 +309,52 @@ async fn serve_and_migrate_restrict_files_left_at_0644() {
     set_every_mode(&dir, 0o644);
     migrate_reads(&path).await;
     assert_owner_only(&dir, "migrate over 0644 files", &[]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// Each opener alone, on a database path that does not exist yet, read before
+// any other pool opens the file: a later opener's narrowing cannot hide one
+// that skipped its own.
+
+/// The bootstrapper's pool, which `init` and `migrate` open for each step.
+#[tokio::test]
+async fn the_bootstrapper_pool_alone_creates_owner_only_files() {
+    let dir = deployment_dir();
+    let path = database_path(&dir);
+    SqliteBootstrapper::new(&path)
+        .run_catalog_migrations()
+        .await
+        .expect("run_catalog_migrations");
+    assert_owner_only(&dir, "the bootstrapper's pool", &[]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The engine's pool, which `serve` opens first.
+#[tokio::test]
+async fn the_engine_pool_alone_creates_owner_only_files() {
+    let dir = deployment_dir();
+    let path = database_path(&dir);
+    let engine = SqliteEngine::new(&path, 2, "us-east-1", 409_600)
+        .await
+        .expect("engine");
+    assert_owner_only(&dir, "the engine's pool", &["x.sqlite-wal", "x.sqlite-shm"]);
+    drop(engine);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The catalog pool, which `settings`, `verify` and the management and
+/// diagnostics stores open, here through the settings store factory. Only the
+/// database file exists when the factory returns: the pool's connection has
+/// run its PRAGMAs but no transaction, and SQLite opens the `-wal` and `-shm`
+/// files at the first transaction.
+#[tokio::test]
+async fn the_catalog_pool_alone_creates_owner_only_files() {
+    let dir = deployment_dir();
+    let path = database_path(&dir);
+    let store = (extenddb_storage_sqlite::backend().settings_store)(&path)
+        .await
+        .expect("settings store");
+    assert_owner_only(&dir, "the catalog pool", &[]);
+    drop(store);
     let _ = std::fs::remove_dir_all(&dir);
 }

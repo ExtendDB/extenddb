@@ -456,3 +456,35 @@ async fn narrowing_keeps_the_locks_of_an_open_connection() {
     pool.close().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `prepare` creates the database file with mode 0600, rather than a wider
+/// mode it narrows afterwards: the mode is read as the file is created, before
+/// `prepare` changes it, and compared with a file the test creates with mode
+/// 0600 under the same umask.
+#[test]
+fn prepare_creates_the_database_file_with_mode_0600() {
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = temp_dir();
+    let reference = dir.join("reference");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&reference)
+        .expect("reference");
+    let created_with = Mutex::new(None);
+    let record = |file: &std::fs::File| {
+        let created = file.metadata()?.permissions().mode() & 0o7777;
+        *created_with.lock().expect("lock") = Some(created);
+        super::set_created_owner_only(file)
+    };
+    let calls = super::ModeCalls {
+        created: &record,
+        existing: &super::set_existing_owner_only,
+    };
+    let db = dir.join("db.sqlite");
+    super::prepare_with(&db.to_string_lossy(), &calls).expect("prepare");
+    assert_eq!(*created_with.lock().expect("lock"), Some(mode(&reference)));
+    assert_eq!(mode(&db), 0o600);
+    let _ = std::fs::remove_dir_all(&dir);
+}
