@@ -53,29 +53,10 @@ pub fn evaluate_condition(
             let val = resolve_to_value(operand, item, maps)?;
             let lo = resolve_to_value(low, item, maps)?;
             let hi = resolve_to_value(high, item, maps)?;
-            // DynamoDB validates bounds when both are literal placeholders
-            if matches!(low.as_ref(), Expr::Placeholder(_))
-                && matches!(high.as_ref(), Expr::Placeholder(_))
-                && let (Some(l), Some(h)) = (lo.as_deref(), hi.as_deref())
-            {
-                let l_type = attribute_type_code(l);
-                let h_type = attribute_type_code(h);
-                if l_type != h_type {
-                    return Err(DynamoDbError::ValidationException(format!(
-                        "Invalid ConditionExpression: The BETWEEN operator requires same data type for lower and upper bounds; lower bound operand: AttributeValue: {{{}}}, upper bound operand: AttributeValue: {{{}}}",
-                        format_attribute_value(l),
-                        format_attribute_value(h)
-                    )));
-                }
-                let lpn = placeholder_numeric(low, maps);
-                let hpn = placeholder_numeric(high, maps);
-                if compare_values(l, h, CompareOp::Gt, lpn, hpn) {
-                    return Err(DynamoDbError::ValidationException(format!(
-                        "Invalid ConditionExpression: The BETWEEN operator requires upper bound to be greater than or equal to lower bound; lower bound operand: AttributeValue: {{{}}}, upper bound operand: AttributeValue: {{{}}}",
-                        format_attribute_value(l),
-                        format_attribute_value(h)
-                    )));
-                }
+            if let Some(msg) = between_bounds_fault(low, high, maps) {
+                return Err(DynamoDbError::ValidationException(format!(
+                    "Invalid ConditionExpression: {msg}"
+                )));
             }
             match (&val, &lo, &hi) {
                 (Some(v), Some(l), Some(h)) => {
@@ -125,6 +106,42 @@ fn resolve_to_value<'a>(
             "Invalid ConditionExpression: expected path or value".to_owned(),
         )),
     }
+}
+
+/// The service's sentence when both BETWEEN bounds are placeholders and they
+/// differ in type or the lower is above the upper, without the `Invalid
+/// <Kind>: ` label. The service checks this at request time, whatever the
+/// item (measured 2026-10-26).
+pub(crate) fn between_bounds_fault(
+    low: &Expr,
+    high: &Expr,
+    maps: &ExpressionMaps,
+) -> Option<String> {
+    let (Expr::Placeholder(l_name), Expr::Placeholder(h_name)) = (low, high) else {
+        return None;
+    };
+    let (Some(l), Some(h)) = (maps.values.get(l_name), maps.values.get(h_name)) else {
+        return None;
+    };
+    let bounds = format!(
+        "lower bound operand: AttributeValue: {{{}}}, upper bound operand: AttributeValue: {{{}}}",
+        format_attribute_value(l),
+        format_attribute_value(h)
+    );
+    if attribute_type_code(l) != attribute_type_code(h) {
+        return Some(format!(
+            "The BETWEEN operator requires same data type for lower and upper bounds; {bounds}"
+        ));
+    }
+    let (lpn, hpn) = (
+        placeholder_numeric(low, maps),
+        placeholder_numeric(high, maps),
+    );
+    compare_values(l, h, CompareOp::Gt, lpn, hpn).then(|| {
+        format!(
+            "The BETWEEN operator requires upper bound to be greater than or equal to lower bound; {bounds}"
+        )
+    })
 }
 
 /// Look up a pre-parsed `BigDecimal` for a placeholder expression.

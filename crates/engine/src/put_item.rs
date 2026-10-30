@@ -131,6 +131,21 @@ pub async fn handle_put_item(
 
     extenddb_core::validation::validate_table_name(&input.table_name, &ctx.limits)?;
 
+    // The nesting-depth limit applies to every ExpressionAttributeValue on the
+    // single-item write paths, condition-only placeholders included: measured
+    // 2026-08-24 (us-east-1), a 32-level value referenced solely by a
+    // ConditionExpression is rejected on PutItem, DeleteItem, and UpdateItem
+    // alike, while 31 levels is accepted. TransactWriteItems deliberately does
+    // NOT get this check: the same 32-level condition-only value is accepted
+    // inside a transaction on every sub-op shape (also measured). It comes
+    // after an invalid number in the Item and before the ConditionExpression
+    // and the table lookup (measured 2026-10-26), so the Item's numbers are
+    // checked here first; `validate_put_item` checks them again later.
+    if let Some(values) = &input.expression_attribute_values {
+        extenddb_core::validation::validate_item_numbers(&input.item)?;
+        extenddb_core::validation::validate_attribute_values_nesting_depth(values.values())?;
+    }
+
     // Validate expressions/`Expected` before the existence check,
     // so a malformed request to a missing table returns ValidationException,
     // not ResourceNotFoundException. Key/item-content checks stay after.
@@ -176,17 +191,6 @@ pub async fn handle_put_item(
         &key_info.key_schema,
         &key_info.attribute_definitions,
     )?;
-
-    // The nesting-depth limit applies to every ExpressionAttributeValue on the
-    // single-item write paths, condition-only placeholders included: measured
-    // 2026-08-24 (us-east-1), a 32-level value referenced solely by a
-    // ConditionExpression is rejected on PutItem, DeleteItem, and UpdateItem
-    // alike, while 31 levels is accepted. TransactWriteItems deliberately does
-    // NOT get this check: the same 32-level condition-only value is accepted
-    // inside a transaction on every sub-op shape (also measured).
-    if let Some(values) = &input.expression_attribute_values {
-        extenddb_core::validation::validate_attribute_values_nesting_depth(values.values())?;
-    }
 
     extenddb_core::validation::validate_vector_write(
         &input.item,

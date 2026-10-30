@@ -57,7 +57,13 @@ fn walk_condition(
             walk_condition_operand(operand, maps, kind)?;
             walk_condition_operand(low, maps, kind)?;
             walk_condition_operand(high, maps, kind)?;
-            validate_ordering_operand_types(expr, maps).map_err(|e| with_kind(e, kind))
+            validate_ordering_operand_types(expr, maps).map_err(|e| with_kind(e, kind))?;
+            // The bounds are checked at request time, so a condition that
+            // fails them is refused before the other expressions are checked.
+            match super::super::evaluator::between_bounds_fault(low, high, maps) {
+                Some(msg) => Err(validation(kind, &msg)),
+                None => Ok(()),
+            }
         }
         Expr::In { operand, list } => {
             walk_condition_operand(operand, maps, kind)?;

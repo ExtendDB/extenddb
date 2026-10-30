@@ -89,6 +89,21 @@ pub async fn handle_update_item(
         ],
     )?;
 
+    // Amazon DynamoDB enforces the nesting-depth limit on EVERY
+    // ExpressionAttributeValue, condition-only placeholders included: a
+    // 32-level value referenced solely by a ConditionExpression answers the
+    // nesting ValidationException rather than evaluating the condition.
+    // An earlier measurement had condition-only values exempt, and some
+    // regions did behave that way; re-measured 2026-08-24, both us-east-1 and
+    // eu-west-2 apply the limit to the whole map, so the per-placeholder walk
+    // this replaced is gone. A 31-level value still passes and the condition
+    // evaluates normally. It comes after the check for legacy and expression
+    // parameters used together and before the unused names and values, every
+    // expression check, the table lookup and the key (measured 2026-10-26).
+    if let Some(values) = &input.expression_attribute_values {
+        extenddb_core::validation::validate_attribute_values_nesting_depth(values.values())?;
+    }
+
     // Desugar legacy AttributeUpdates into UpdateExpression if present.
     let (effective_update_expr, extra_expr_values, extra_expr_names) =
         if let Some(attr_updates) = &input.attribute_updates {
@@ -208,19 +223,6 @@ pub async fn handle_update_item(
     // anything added later). The authoritative check is
     // `expression::apply_update_validated`, which every backend applies to the
     // evaluated image and which no expression form can bypass.
-
-    // Amazon DynamoDB enforces the nesting-depth limit on EVERY
-    // ExpressionAttributeValue, condition-only placeholders included: a
-    // 32-level value referenced solely by a ConditionExpression answers the
-    // nesting ValidationException rather than evaluating the condition.
-    // An earlier measurement had condition-only values exempt, and some
-    // regions did behave that way; re-measured 2026-08-24, both us-east-1 and
-    // eu-west-2 apply the limit to the whole map, so the per-placeholder walk
-    // this replaced is gone. A 31-level value still passes and the condition
-    // evaluates normally.
-    if let Some(values) = &input.expression_attribute_values {
-        extenddb_core::validation::validate_attribute_values_nesting_depth(values.values())?;
-    }
 
     // Validate that no update action targets a key attribute (REQ-DATA-003)
     validate_no_key_updates(&actions, &key_info, &maps)?;

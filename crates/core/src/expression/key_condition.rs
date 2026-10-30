@@ -297,6 +297,13 @@ pub fn parse_key_condition(tokens: &[Token]) -> Result<KeyCondition, DynamoDbErr
     // path (`attr.sub` or `attr[i]`) on a key is rejected, matching Amazon
     // DynamoDB. Runs after the reserved-word check and before key-schema checks.
     for clause in &clauses {
+        if let Some(msg) = super::path_length::too_many_levels(raw_clause_path(clause)) {
+            return Err(validation_err(&format!(
+                "Invalid KeyConditionExpression: {msg}"
+            )));
+        }
+    }
+    for clause in &clauses {
         reject_nested_key_path(raw_clause_path(clause))?;
     }
 
