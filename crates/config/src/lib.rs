@@ -90,6 +90,21 @@ impl Default for ServerConfig {
     }
 }
 
+impl ServerConfig {
+    /// Operator-facing warnings for server settings that work but cost
+    /// something: today a `region` outside `[a-z0-9-]`, which makes the
+    /// backup ARNs the server issues unresolvable (see
+    /// [`extenddb_storage::config::server_region_warning`]). Shown in the
+    /// `serve` banner; the same warning is logged when the storage components
+    /// are created.
+    #[must_use]
+    pub fn startup_warnings(&self) -> Vec<extenddb_storage::config::StartupWarning> {
+        extenddb_storage::config::server_region_warning(&self.region)
+            .into_iter()
+            .collect()
+    }
+}
+
 /// TLS configuration for HTTPS.
 ///
 /// TLS is always enabled. The `enabled` field is accepted for backward
@@ -146,9 +161,33 @@ impl StorageConfig {
         self.config.max_catalog_connections()
     }
 
+    /// Get the explicit data-pool override, if one was configured.
+    pub fn max_connections_override(&self) -> Option<u32> {
+        self.config.max_connections_override()
+    }
+
+    /// Get the explicit catalog-pool override, if one was configured.
+    pub fn max_catalog_connections_override(&self) -> Option<u32> {
+        self.config.max_catalog_connections_override()
+    }
+
+    /// Get operator-facing warnings for non-default storage settings.
+    pub fn startup_warnings(&self) -> Vec<extenddb_storage::config::StartupWarning> {
+        self.config.startup_warnings()
+    }
+
     /// Get a reference to the underlying trait object for factory calls.
-    pub fn as_trait(&self) -> &dyn extenddb_storage::config::StorageConfig {
+    pub fn as_trait(&self) -> &(dyn extenddb_storage::config::StorageConfig + 'static) {
         &*self.config
+    }
+
+    /// Set the node's instance identifier on the underlying config.
+    ///
+    /// Backends that need a per-node identity read this via
+    /// [`extenddb_storage::config::StorageConfig::instance_id`]. Call this
+    /// before passing the config to the backend factory.
+    pub fn set_instance_id(&mut self, instance_id: &str) {
+        self.config.set_instance_id(instance_id);
     }
 }
 
@@ -457,11 +496,21 @@ pub fn pid_file_path_default(port: u16) -> PathBuf {
 }
 
 mod display;
-pub use display::{build_config_entries, should_redact};
+pub use display::{MASK, build_config_entries, should_redact};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_region_outside_the_arn_class_is_a_startup_warning() {
+        let mut server = ServerConfig::default();
+        assert!(server.startup_warnings().is_empty(), "default region");
+        server.region = "LOCAL".to_owned();
+        let warnings = server.startup_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].title.contains("server.region"));
+    }
 
     #[test]
     fn expand_tilde_with_home() {

@@ -15,7 +15,8 @@ mod transaction;
 pub use attribute_value::AttributeValue;
 pub use backup::{
     BackupDescription, BackupDetails, BackupSummary, ContinuousBackupsDescription,
-    PointInTimeRecoveryDescription, SourceTableDetails,
+    GlobalSecondaryIndexInfo, LocalSecondaryIndexInfo, PointInTimeRecoveryDescription,
+    SourceTableDetails, SourceTableFeatureDetails,
 };
 pub use batch::{
     BatchGetItemInput, BatchGetItemOutput, BatchWriteItemInput, BatchWriteItemOutput,
@@ -55,17 +56,20 @@ pub use table::{
     DescribeTimeToLiveOutput, DistanceFunction, GlobalSecondaryIndexUpdate, GsiDescription,
     GsiInput, IndexStatus, ListTablesInput, ListTablesOutput, ListTagsOfResourceInput,
     ListTagsOfResourceOutput, LsiDescription, LsiInput, MAX_VECTOR_INDEXES_PER_TABLE,
-    OnDemandThroughput, Projection, ProjectionType, ProvisionedThroughput,
-    ProvisionedThroughputDescription, SearchSchemaElement, SearchSchemaElementType, SseDescription,
-    SseType, StreamSpecification, StreamViewType, TableDescription, TableStatus, Tag,
-    TagResourceInput, TimeToLiveDescription, TimeToLiveSpecification,
+    ONLINE_INDEX_LIMIT, OnDemandThroughput, Projection, ProjectionType, ProvisionedThroughput,
+    ProvisionedThroughputDescription, RestoreSummary, SearchSchemaElement, SearchSchemaElementType,
+    SseDescription, SseType, StreamSpecification, StreamViewType, TableDescription, TableStatus,
+    Tag, TagResourceInput, TimeToLiveDescription, TimeToLiveSpecification,
     TimeToLiveSpecificationOutput, TimeToLiveStatus, UntagResourceInput, UpdateGsiAction,
     UpdateTableInput, UpdateTableOutput, UpdateTimeToLiveInput, UpdateTimeToLiveOutput,
-    VECTOR_INDEX_ALREADY_EXISTS, VECTOR_INDEX_COUNT_LIMIT_CREATE, VECTOR_INDEX_COUNT_LIMIT_UPDATE,
-    VECTOR_INDEX_CREATE_IN_USE_PREFIX, VECTOR_INDEX_REQUIRES_PAY_PER_REQUEST,
-    VECTOR_SEARCH_SCHEMA_UNDECLARED, VectorAttribute, VectorIndexDescription,
-    VectorIndexSpecification, VectorIndexUpdate, vector_attribute_conflicting_definition,
-    vector_attribute_redefines_key,
+    VECTOR_INDEX_ALREADY_EXISTS, VECTOR_INDEX_BACKFILLING_SCAN_PREFIX,
+    VECTOR_INDEX_COUNT_LIMIT_CREATE, VECTOR_INDEX_COUNT_LIMIT_UPDATE,
+    VECTOR_INDEX_CREATE_IN_USE_PREFIX, VECTOR_INDEX_QUERY_NOT_SUPPORTED,
+    VECTOR_INDEX_REQUIRES_PAY_PER_REQUEST, VECTOR_INDEX_SCAN_NOT_SUPPORTED,
+    VECTOR_SEARCH_SCHEMA_UNDECLARED, VECTOR_TABLE_REQUIRES_PAY_PER_REQUEST_MODE, VectorAttribute,
+    VectorIndexDescription, VectorIndexSpecification, VectorIndexUpdate,
+    vector_attribute_conflicting_definition, vector_attribute_redefines_key,
+    vector_attribute_redefines_vector, vector_index_delete_in_allocation_phase,
 };
 pub use transaction::{
     CancellationReason, ItemResponse, TransactConditionCheck, TransactDelete, TransactGet,

@@ -193,14 +193,19 @@ async fn switching_vector_table_to_provisioned_is_rejected() {
     delete_table(&name).await;
 }
 
-/// Deleting one index and creating another in the same request against a
-/// full table passes, in EITHER action order, because the count is evaluated
-/// on the request's net effect rather than per action. The create-first case
-/// is the discriminating one: a per-action count sees the full table before
-/// the delete has freed a slot and wrongly refuses. DynamoDB's model is a set
-/// of index changes, so list order must not decide acceptance.
+/// Deleting one index and creating another in the same request is refused,
+/// in EITHER action order: the online-index machinery accepts one action per
+/// call, so a swap must be issued as two UpdateTable calls. Measured
+/// 2026-08-24 (us-east-1): a Delete+Create pair against a live table answers
+/// `LimitExceededException` with the subscriber-limit sentence, the same
+/// refusal GSIs give. An earlier version of this test asserted the swap must
+/// PASS, reasoning from the net-effect count rule; that reasoning applied to
+/// the per-table count limit, never to the one-action rule, and was not
+/// measured. The net-effect counting in storage remains correct for the
+/// hypothetical of a request that reaches it, but no multi-action request
+/// does any more.
 #[tokio::test]
-async fn swap_on_a_full_table_is_allowed() {
+async fn swap_in_one_call_is_refused() {
     if skip_unless_supported().await {
         return;
     }
@@ -223,12 +228,15 @@ async fn swap_on_a_full_table_is_allowed() {
     }}"#
     );
     let (status, text) = call("UpdateTable", &swap).await;
-    assert_eq!(
-        status, 200,
-        "delete+create swap on a full table failed: {text}"
+    assert_error(
+        status,
+        &text,
+        "LimitExceededException",
+        "Subscriber limit exceeded: Only 1 online index can be created or deleted \
+         simultaneously per table",
     );
 
-    // Create listed BEFORE the delete: still a net swap, must still pass.
+    // Create listed BEFORE the delete: same two actions, same refusal.
     let swap_create_first = format!(
         r#"{{
         "TableName": "{name}",
@@ -245,10 +253,99 @@ async fn swap_on_a_full_table_is_allowed() {
     }}"#
     );
     let (status, text) = call("UpdateTable", &swap_create_first).await;
-    assert_eq!(
-        status, 200,
-        "create-before-delete swap on a full table failed: {text}"
+    assert_error(
+        status,
+        &text,
+        "LimitExceededException",
+        "Subscriber limit exceeded: Only 1 online index can be created or deleted \
+         simultaneously per table",
     );
 
+    // The swap expressed as two sequential calls goes through: the delete
+    // frees the slot, then the create is a single action against a table of
+    // four.
+    let drop_one = format!(
+        r#"{{
+        "TableName": "{name}",
+        "VectorIndexUpdates": [{{"Delete": {{"IndexName": "vidx0"}}}}]
+    }}"#
+    );
+    let (status, text) = call("UpdateTable", &drop_one).await;
+    assert_eq!(status, 200, "single delete failed: {text}");
+    let (status, text) = call(
+        "UpdateTable",
+        &create_update_body(&name, "vidxNew", "embNew"),
+    )
+    .await;
+    assert_eq!(status, 200, "single create after delete failed: {text}");
+
+    delete_table(&name).await;
+}
+
+/// Adding a vector index to a table that is already PROVISIONED is refused, and
+/// the refusal is evaluated on the request's NET billing mode.
+///
+/// Measured 2026-08-19 (probe P12) against a live PROVISIONED table. Two facts,
+/// both asserted here:
+///
+///  * `UpdateTable` with a vector-index Create and no `BillingMode` member is
+///    refused with the same whole string `CreateTable` returns, so one constant
+///    serves both paths and both directions of the rule.
+///  * The same request plus `BillingMode: PAY_PER_REQUEST` is accepted. The check
+///    reads the request's net state, not the table's stored mode, which is the
+///    same net-effect evaluation the index-count limit uses.
+///
+/// The accepted case is the discriminating one: a guard written against the
+/// stored mode passes the refusal half and wrongly refuses this half.
+#[tokio::test]
+async fn adding_a_vector_index_to_a_provisioned_table_is_rejected() {
+    if skip_unless_supported().await {
+        return;
+    }
+    let name = table_name("vupd-prov-add");
+    let create = format!(
+        r#"{{
+        "TableName": "{name}",
+        "AttributeDefinitions": [{{"AttributeName": "pk", "AttributeType": "S"}}],
+        "KeySchema": [{{"AttributeName": "pk", "KeyType": "HASH"}}],
+        "BillingMode": "PROVISIONED",
+        "ProvisionedThroughput": {{"ReadCapacityUnits": 1, "WriteCapacityUnits": 1}}
+    }}"#
+    );
+    let (status, text) = call("CreateTable", &create).await;
+    assert_eq!(status, 200, "provisioned setup table failed: {text}");
+    wait_for_active(&name).await;
+
+    let (status, text) = call("UpdateTable", &create_update_body(&name, "vidx", "emb")).await;
+    assert_error(
+        status,
+        &text,
+        "ValidationException",
+        "One or more parameter values were invalid: Vector indexes are only supported for \
+         PAY_PER_REQUEST tables",
+    );
+
+    // The net-state case: switch to on-demand and create the index in one call.
+    let combined = format!(
+        r#"{{
+        "TableName": "{name}",
+        "BillingMode": "PAY_PER_REQUEST",
+        "VectorIndexUpdates": [{{"Create": {{
+            "IndexName": "vidx",
+            "VectorAttribute": {{"AttributeName": "emb"}},
+            "Dimensions": 4,
+            "DistanceFunction": "COSINE",
+            "Projection": {{"ProjectionType": "ALL"}}
+        }}}}]
+    }}"#
+    );
+    let (status, text) = call("UpdateTable", &combined).await;
+    assert_eq!(
+        status, 200,
+        "a switch to PAY_PER_REQUEST and a create in one request must be accepted: {text}"
+    );
+
+    // Wait the index out before deleting, so the table is not left mid-build.
+    wait_for_vector_index_active(&name, "vidx").await;
     delete_table(&name).await;
 }

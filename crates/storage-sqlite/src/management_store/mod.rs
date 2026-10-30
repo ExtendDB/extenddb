@@ -18,7 +18,7 @@ mod users;
 
 use extenddb_storage::management_store::{
     AccessKeyCreated, AccountDetail, GroupDetail, GroupListEntry, ManagementStore, OpError,
-    OpResult, RoleDetail, RoleListEntry, UserDetail, UserListEntry,
+    OpResult, RoleDetail, RoleListEntry, SessionPolicyEntry, UserDetail, UserListEntry,
 };
 use futures::future::BoxFuture;
 use time::OffsetDateTime;
@@ -554,6 +554,8 @@ impl ManagementStore for SqliteCatalogStore {
         let session_policy = session_policy.as_ref().map(ToString::to_string);
         let expires = format_timestamp(expires_at);
         Box::pin(async move {
+            // D1: every writer holds the write lock.
+            let _writer = self.lock_writes().await;
             sqlx::query(
                 "INSERT INTO iam_sessions \
                  (session_token, access_key_id, secret_key_encrypted, account_id, role_name, \
@@ -579,6 +581,69 @@ impl ManagementStore for SqliteCatalogStore {
         })
     }
 
+    // ── Session policies (resource-tag migration) ─────────────────
+
+    fn list_session_policies(&self) -> BoxFuture<'_, OpResult<Vec<SessionPolicyEntry>>> {
+        Box::pin(async move {
+            let rows: Vec<(String, String, String, String, Option<String>)> = sqlx::query_as(
+                "SELECT session_token, account_id, role_name, session_name, session_policy \
+                 FROM iam_sessions WHERE session_policy IS NOT NULL",
+            )
+            .fetch_all(self.pool())
+            .await
+            .map_err(|e| {
+                tracing::error!("list_session_policies: {e}");
+                OpError::Internal("Database error".to_owned())
+            })?;
+
+            let mut out = Vec::new();
+            for (session_token, account_id, role_name, session_name, policy) in rows {
+                let Some(text) = policy else { continue };
+                // A session policy that does not parse is a corrupt row. It
+                // cannot be evaluated under either key form, so no decision
+                // depends on the migration; report it and carry on.
+                match serde_json::from_str::<serde_json::Value>(&text) {
+                    Ok(policy) => out.push(SessionPolicyEntry {
+                        session_token,
+                        account_id,
+                        role_name,
+                        session_name,
+                        policy,
+                    }),
+                    Err(_) => tracing::warn!(
+                        account_id = %account_id,
+                        role_name = %role_name,
+                        session_name = %session_name,
+                        "stored session policy does not parse; skipped by the resource-tag migration"
+                    ),
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    fn update_session_policy(
+        &self,
+        session_token: &str,
+        document: &serde_json::Value,
+    ) -> BoxFuture<'_, OpResult<()>> {
+        let session_token = session_token.to_owned();
+        let document = document.to_string();
+        Box::pin(async move {
+            let _writer = self.lock_writes().await;
+            sqlx::query("UPDATE iam_sessions SET session_policy = ? WHERE session_token = ?")
+                .bind(&document)
+                .bind(&session_token)
+                .execute(self.pool())
+                .await
+                .map(|_| ())
+                .map_err(|e| {
+                    tracing::error!("update_session_policy: {e}");
+                    OpError::Internal("Database error".to_owned())
+                })
+        })
+    }
+
     // ── Caller tags (trust-policy evaluation) ──────────────────────
 
     fn fetch_caller_tags(
@@ -589,9 +654,10 @@ impl ManagementStore for SqliteCatalogStore {
         let account_id = account_id.to_owned();
         let resource = resource.to_owned();
         Box::pin(async move {
-            // Resolve the principal kind and name from the ARN resource part.
-            if let Some(rest) = resource.split(":user/").nth(1) {
-                let user_name = rest.trim_end_matches('/');
+            // The server passes the ARN resource part, e.g. `user/<name>`,
+            // `role/<name>`, or `assumed-role/<role>/<session>`. Match the same
+            // prefixes the other backends use so caller tags resolve on SQLite.
+            if let Some(user_name) = resource.strip_prefix("user/") {
                 return sqlx::query_as(
                     "SELECT tag_key, tag_value FROM iam_user_tags \
                      WHERE account_id = ? AND user_name = ? ORDER BY tag_key",
@@ -608,12 +674,14 @@ impl ManagementStore for SqliteCatalogStore {
 
             // assumed-role/RoleName/SessionName or role/RoleName → role tags.
             let role_name = resource
-                .split(":assumed-role/")
-                .nth(1)
-                .or_else(|| resource.split(":role/").nth(1))
+                .strip_prefix("assumed-role/")
+                .or_else(|| resource.strip_prefix("role/"))
                 .map(|rest| rest.split('/').next().unwrap_or(rest));
 
             if let Some(role_name) = role_name {
+                if role_name.is_empty() {
+                    return Ok(Vec::new());
+                }
                 return sqlx::query_as(
                     "SELECT tag_key, tag_value FROM iam_role_tags \
                      WHERE account_id = ? AND role_name = ? ORDER BY tag_key",
@@ -630,5 +698,185 @@ impl ManagementStore for SqliteCatalogStore {
 
             Ok(Vec::new())
         })
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use extenddb_storage::management_store::ManagementStore;
+    use extenddb_storage::policy_migration::migrate_resource_tag_condition_keys;
+    use serde_json::json;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn store() -> SqliteCatalogStore {
+        // One connection keeps the in-memory database alive for the test.
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory sqlite");
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&pool)
+            .await
+            .unwrap();
+        crate::schema::apply(&pool).await.expect("apply schema");
+        SqliteCatalogStore::new(pool)
+    }
+
+    fn policy(resource_tag_key: &str) -> serde_json::Value {
+        json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": "dynamodb:GetItem",
+                "Resource": "*",
+                "Condition": {"StringEquals": {resource_tag_key: "prod"}}
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn rewrites_inline_boundary_and_session_policies() {
+        let s = store().await;
+        s.create_account("111111111111", "acct").await.unwrap();
+        s.create_user("111111111111", "alice", None).await.unwrap();
+        s.put_policy(
+            "111111111111",
+            "user",
+            "alice",
+            "p1",
+            &policy("dynamodb:ResourceTag/env"),
+        )
+        .await
+        .unwrap();
+        s.set_user_boundary("111111111111", "alice", &policy("dynamodb:ResourceTag/env"))
+            .await
+            .unwrap();
+        s.create_role(
+            "111111111111",
+            "r1",
+            &json!({"Version": "2012-10-17", "Statement": []}),
+        )
+        .await
+        .unwrap();
+        s.store_session(
+            "tok-1",
+            "AKIAEXAMPLE000000001",
+            b"enc",
+            "111111111111",
+            "r1",
+            "sess",
+            &None,
+            &Some(policy("dynamodb:ResourceTag/env")),
+            time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+        )
+        .await
+        .unwrap();
+
+        // Detect mode writes nothing.
+        let detect = migrate_resource_tag_condition_keys(&s, false).await;
+        assert_eq!(detect.errors, 0);
+        assert_eq!(detect.rewritten.len(), 3, "inline + boundary + session");
+        assert!(detect.needs_attention.is_empty());
+        // Still on the old key.
+        let before = s
+            .list_policies("111111111111", "user", "alice")
+            .await
+            .unwrap();
+        let p1_before = before.iter().find(|(n, ..)| n == "p1").unwrap();
+        assert!(
+            p1_before
+                .1
+                .pointer("/Statement/0/Condition/StringEquals")
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("dynamodb:ResourceTag/env")
+        );
+
+        // Apply mode writes.
+        let applied = migrate_resource_tag_condition_keys(&s, true).await;
+        assert_eq!(applied.errors, 0);
+        assert_eq!(applied.rewritten.len(), 3);
+
+        let after = s
+            .list_policies("111111111111", "user", "alice")
+            .await
+            .unwrap();
+        let p1_after = after.iter().find(|(n, ..)| n == "p1").unwrap();
+        assert!(
+            p1_after
+                .1
+                .pointer("/Statement/0/Condition/StringEquals")
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("aws:ResourceTag/env")
+        );
+        let boundary = s
+            .get_user_boundary("111111111111", "alice")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            boundary
+                .pointer("/Statement/0/Condition/StringEquals")
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("aws:ResourceTag/env")
+        );
+        let sessions = s.list_session_policies().await.unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert!(
+            sessions[0]
+                .policy
+                .pointer("/Statement/0/Condition/StringEquals")
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("aws:ResourceTag/env")
+        );
+
+        // Idempotent: a second pass changes nothing.
+        let again = migrate_resource_tag_condition_keys(&s, true).await;
+        assert_eq!(again.errors, 0);
+        assert!(again.rewritten.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collision_is_reported_and_left_unchanged() {
+        let s = store().await;
+        s.create_account("222222222222", "acct").await.unwrap();
+        s.create_user("222222222222", "bob", None).await.unwrap();
+        let collide = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": "dynamodb:GetItem",
+                "Resource": "*",
+                "Condition": {"StringEquals": {
+                    "aws:ResourceTag/env": "prod",
+                    "dynamodb:ResourceTag/env": "dev"
+                }}
+            }]
+        });
+        s.put_policy("222222222222", "user", "bob", "p", &collide)
+            .await
+            .unwrap();
+
+        let report = migrate_resource_tag_condition_keys(&s, true).await;
+        assert_eq!(report.errors, 0);
+        assert!(report.rewritten.is_empty());
+        assert_eq!(report.needs_attention.len(), 1);
+        assert_eq!(report.needs_attention[0].principal, "user/bob");
+        // Unchanged on disk.
+        let stored = s
+            .list_policies("222222222222", "user", "bob")
+            .await
+            .unwrap();
+        let p = stored.iter().find(|(n, ..)| n == "p").unwrap();
+        assert_eq!(p.1, collide);
     }
 }

@@ -29,7 +29,7 @@ sudo apt-get update && sudo apt-get install -y mongodb-org
 
 ```bash
 docker run -d --name extenddb-mongo \
-    -p 27017:27017 \
+    -p 127.0.0.1:27017:27017 \
     mongo:7 --replSet rs0
 ```
 
@@ -139,8 +139,14 @@ backend = "mongodb"
 
 [storage.mongodb]
 connection_string = "mongodb://localhost:27017/?replicaSet=rs0"
-# max_pool_size = 20
+# max_connections = 50
+# max_catalog_connections = 20
 ```
+
+`max_connections` limits data-operation connections. The catalog and
+authentication clients share a separate pool controlled by
+`max_catalog_connections`, so size that value for their combined management
+and authorization concurrency.
 
 Or via environment variable:
 ```bash

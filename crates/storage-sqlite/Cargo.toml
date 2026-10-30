@@ -13,6 +13,9 @@ license.workspace = true
 # no file on disk). Without this feature the backend is file-backed and the path
 # must be configured as usual.
 memory = []
+# Compiles the snapshot page-size setter the consistency test uses and the
+# shared conformance check. Production builds do not compile them.
+test-hooks = ["extenddb-storage/test-hooks"]
 
 [dependencies]
 extenddb-core = { workspace = true }
@@ -35,3 +38,9 @@ rand = { workspace = true }
 bigdecimal = { workspace = true }
 crc32fast = { workspace = true }
 zeroize = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+# The crate's own tests need `test-hooks`; a dev-dependency on itself turns
+# the feature on for test builds only.
+extenddb-storage-sqlite = { path = ".", features = ["test-hooks"] }

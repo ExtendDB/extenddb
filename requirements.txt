@@ -13,4 +13,4 @@ requests==2.34.2
 
 # Documentation (PDF build via docs/build-docs.py)
 Markdown==3.10.2
-WeasyPrint==68.1
+WeasyPrint==70.0

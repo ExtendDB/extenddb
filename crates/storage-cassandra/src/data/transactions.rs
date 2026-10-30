@@ -1,0 +1,2452 @@
+// Copyright 2026 ExtendDB contributors
+// SPDX-License-Identifier: Apache-2.0
+
+//! DynamoDB transaction implementations for Cassandra backend.
+
+use super::transact_stream::{commit_old_image, secondary_effect_batches};
+use cdrs_tokio::consistency::Consistency;
+use cdrs_tokio::frame::Envelope;
+use cdrs_tokio::query::BatchQueryBuilder;
+use cdrs_tokio::types::IntoRustByName;
+use cdrs_tokio::types::value::Bytes;
+use extenddb_core::expression::{self, ExpressionMaps};
+use extenddb_core::types::{
+    AttributeValue, CancellationReason, Item, ReturnValuesOnConditionCheckFailure, TableKeyInfo,
+};
+use extenddb_core::validation;
+use extenddb_storage::StreamCapture;
+use extenddb_storage::TransactGetOp;
+use extenddb_storage::TransactWriteOp;
+use extenddb_storage::error::StorageError;
+use extenddb_storage::util::{SortKeyValue, composite_pk_to_text, parse_sk, sk_column, sk_info};
+use std::time::Duration;
+use uuid::Uuid;
+
+use crate::CassandraEngine;
+use crate::cassandra_util::{get_column, query_optional};
+use crate::data::ddl::data_table_name;
+use crate::data::transaction_ledger::{LedgerOp, TransactionState};
+use crate::data::{
+    query_with_item_ts_pk_sk_txnid, query_with_pk_sk_item_txnid_ts, query_with_pk_sk_txnid,
+    query_with_txnid_ts_pk_sk, select_by_pk,
+};
+
+/// Create a transaction conflict cancellation reason.
+fn transaction_conflict_reason() -> CancellationReason {
+    CancellationReason {
+        code: "TransactionConflict".to_owned(),
+        // Must match the canonical conflict message used by the core transaction
+        // type (crates/core) and wait_for_commit_and_read, which clients and the
+        // integration tests assert on. Keep these in sync.
+        message: Some("Transaction is ongoing for the item".to_owned()),
+        item: None,
+    }
+}
+
+/// A total-order sort key for the item a `TransactWriteOp` targets, used to pick
+/// a key-sorted PREPARE acquisition order (see `execute_prepare_phase`).
+/// `"{table_id}\u{0}{json key}"`: `Item` is a `BTreeMap`, so `serde_json`
+/// serializes it with sorted, deterministic key order; the table id prefix
+/// keeps items on different tables from interleaving by coincidence, and `\0`
+/// cannot appear in a table id. The engine layer rejects a transaction with
+/// duplicate target keys before this is reached, so within one transaction this
+/// is a total order with no ties.
+fn prepare_order_key(op: &TransactWriteOp<'_>) -> String {
+    let (table_id, key) = match op {
+        TransactWriteOp::Put { key_info, item, .. } => (&key_info.table_id, *item),
+        TransactWriteOp::Delete { key_info, key, .. }
+        | TransactWriteOp::Update { key_info, key, .. }
+        | TransactWriteOp::ConditionCheck { key_info, key, .. } => (&key_info.table_id, *key),
+    };
+    format!(
+        "{table_id}\u{0}{}",
+        serde_json::to_string(key).unwrap_or_default()
+    )
+}
+
+/// Map a `StorageError` raised while reading an item during PREPARE into a
+/// `CancellationReason`. A `TransactionConflict` (e.g. a concurrent transaction
+/// still holds the row, surfaced by `fetch_item_for_transaction` via
+/// `wait_for_commit_and_read`) must keep its code and message so the client sees
+/// `TransactionConflict`, not `ValidationError`. Everything else is a genuine
+/// validation/infra failure.
+fn prepare_read_error_reason(e: StorageError) -> CancellationReason {
+    match e {
+        StorageError::TransactionConflict(message) => CancellationReason {
+            code: "TransactionConflict".to_owned(),
+            message: Some(message),
+            item: None,
+        },
+        other => CancellationReason::validation_error(other.to_string()),
+    }
+}
+
+impl CassandraEngine {
+    /// Implementation of `DataEngine::transact_get_items`.
+    ///
+    /// Uses a two-phase read protocol to ensure serializability:
+    /// 1. Read all items with timestamps and `prepared_txn_id`
+    /// 2. Verify timestamps and `prepared_txn_id` haven't changed
+    pub(crate) async fn transact_get_items_impl(
+        &self,
+        ops: &[TransactGetOp<'_>],
+    ) -> Result<Vec<Option<Item>>, StorageError> {
+        // T2.1: Request parsing and validation
+        // Validate key types before reading
+        let mut reasons: Vec<CancellationReason> = Vec::with_capacity(ops.len());
+        let mut any_failed = false;
+        for op in ops {
+            match validation::validate_key_only(
+                op.key,
+                &op.key_info.key_schema,
+                &op.key_info.attribute_definitions,
+            ) {
+                Ok(()) => reasons.push(CancellationReason::none()),
+                Err(e) => {
+                    any_failed = true;
+                    reasons.push(CancellationReason::validation_error(e.to_string()));
+                }
+            }
+        }
+        if any_failed {
+            return Err(StorageError::TransactionCanceled(reasons));
+        }
+
+        // Verify all operations are in the same account (same keyspace)
+        if ops.len() > 1 {
+            let first_account = &ops[0].key_info.account_id;
+            for op in &ops[1..] {
+                if &op.key_info.account_id != first_account {
+                    return Err(StorageError::Validation(
+                        "Cross-account transactions not supported".to_owned(),
+                    ));
+                }
+            }
+        }
+
+        // T2.2: Two-phase read protocol
+        // Phase 1: Read all items with timestamps
+        let mut phase1_results = Vec::with_capacity(ops.len());
+        for op in ops {
+            let result = self.read_item_with_metadata(op).await?;
+            phase1_results.push(result);
+        }
+
+        // Check for prepared transactions in Phase 1 data
+        for (i, result) in phase1_results.iter().enumerate() {
+            if let Some((_, _, prepared_txn_id)) = result
+                && prepared_txn_id.is_some()
+            {
+                // Item is in a prepared transaction - conflict
+                let mut reasons = vec![CancellationReason::none(); ops.len()];
+                reasons[i] = transaction_conflict_reason();
+                return Err(StorageError::TransactionCanceled(reasons));
+            }
+        }
+
+        // Phase 2: Verify timestamps haven't changed
+        for (i, op) in ops.iter().enumerate() {
+            let phase1_metadata = &phase1_results[i];
+            let phase2_metadata = self.read_item_metadata_only(op).await?;
+
+            // Compare timestamps and prepared_txn_id
+            match (phase1_metadata, &phase2_metadata) {
+                (Some((_, ts1, prep1)), Some((ts2, prep2))) => {
+                    if ts1 != ts2 || prep1 != prep2 {
+                        // Timestamp changed or transaction started
+                        let mut reasons = vec![CancellationReason::none(); ops.len()];
+                        reasons[i] = transaction_conflict_reason();
+                        return Err(StorageError::TransactionCanceled(reasons));
+                    }
+                }
+                (None, Some(_)) => {
+                    // Item was created between phases
+                    let mut reasons = vec![CancellationReason::none(); ops.len()];
+                    reasons[i] = transaction_conflict_reason();
+                    return Err(StorageError::TransactionCanceled(reasons));
+                }
+                _ => {
+                    // Both None or phase2 is None (item deleted) - acceptable
+                }
+            }
+        }
+
+        // All verifications passed - return Phase 1 item data
+        Ok(phase1_results
+            .into_iter()
+            .map(|r| r.map(|(item, _, _)| item))
+            .collect())
+    }
+
+    /// Read an item with full metadata for Phase 1.
+    ///
+    /// Returns: Option<(Item, `last_committed_txn_timestamp`, `prepared_txn_id`)>
+    async fn read_item_with_metadata(
+        &self,
+        op: &TransactGetOp<'_>,
+    ) -> Result<Option<(Item, i64, Option<uuid::Uuid>)>, StorageError> {
+        let keyspace = self.account_keyspace(&op.key_info.account_id);
+        let table = data_table_name(&op.key_info.table_id);
+        let pk_text = composite_pk_to_text(op.key, &op.key_info.key_schema)?;
+        let (sk, sk_col) = resolve_sk_get(op)?;
+
+        let Some(row) = select_by_pk(
+            &self.session,
+            &keyspace,
+            &table,
+            "item_data, last_committed_txn_timestamp, prepared_txn_id",
+            pk_text.as_str(),
+            sk.as_ref(),
+            sk_col.as_deref(),
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+
+        let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
+        let Some(item_data) = item_data else {
+            return Ok(None);
+        };
+        let item: Item =
+            serde_json::from_str(&item_data).map_err(|e| StorageError::Internal(e.to_string()))?;
+        let last_committed: Option<i64> = row
+            .get_by_name("last_committed_txn_timestamp")
+            .ok()
+            .flatten();
+        let prepared_txn_id: Option<uuid::Uuid> = row.get_by_name("prepared_txn_id").ok().flatten();
+        Ok(Some((item, last_committed.unwrap_or(0), prepared_txn_id)))
+    }
+
+    async fn read_item_metadata_only(
+        &self,
+        op: &TransactGetOp<'_>,
+    ) -> Result<Option<(i64, Option<uuid::Uuid>)>, StorageError> {
+        let keyspace = self.account_keyspace(&op.key_info.account_id);
+        let table = data_table_name(&op.key_info.table_id);
+        let pk_text = composite_pk_to_text(op.key, &op.key_info.key_schema)?;
+        let (sk, sk_col) = resolve_sk_get(op)?;
+
+        let Some(row) = select_by_pk(
+            &self.session,
+            &keyspace,
+            &table,
+            "item_data, last_committed_txn_timestamp, prepared_txn_id",
+            pk_text.as_str(),
+            sk.as_ref(),
+            sk_col.as_deref(),
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+
+        let last_committed: Option<i64> = row
+            .get_by_name("last_committed_txn_timestamp")
+            .ok()
+            .flatten();
+        let prepared_txn_id: Option<uuid::Uuid> = row.get_by_name("prepared_txn_id").ok().flatten();
+        let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
+        if item_data.is_none() && prepared_txn_id.is_none() {
+            return Ok(None);
+        }
+        Ok(Some((last_committed.unwrap_or(0), prepared_txn_id)))
+    }
+
+    /// Implementation of `DataEngine::transact_write_items`.
+    ///
+    /// Implements a two-phase commit protocol using Lightweight Transactions (LWT):
+    /// 1. PREPARE: Mark all items with transaction ID using LWT
+    /// 2. COMMIT/ROLLBACK: Apply or revert changes atomically
+    pub(crate) async fn transact_write_items_impl(
+        &self,
+        ops: &[TransactWriteOp<'_>],
+        idempotency: Option<(&str, &str, &str)>,
+    ) -> Result<(), StorageError> {
+        // T4.1: Request parsing and ledger creation
+
+        // Validate: all operations in same account (same keyspace)
+        if ops.is_empty() {
+            return Ok(());
+        }
+
+        let first_account = transact_write_op_account_id(&ops[0]);
+        for op in &ops[1..] {
+            if transact_write_op_account_id(op) != first_account {
+                return Err(StorageError::Validation(
+                    "Cross-account transactions not supported".to_owned(),
+                ));
+            }
+        }
+
+        let account_keyspace = self.account_keyspace(first_account);
+
+        // Check the account-scoped idempotency token before creating the ledger.
+        if let Some((idempotency_account, token, fingerprint)) = idempotency {
+            if idempotency_account != first_account {
+                return Err(StorageError::Validation(
+                    "Idempotency account does not match transaction account".to_owned(),
+                ));
+            }
+            self.check_idempotency_token(
+                &self.catalog_keyspace(),
+                idempotency_account,
+                token,
+                fingerprint,
+            )
+            .await?;
+        }
+
+        // Generate unique transaction ID
+        let txn_id = Uuid::new_v4();
+        let started_at = crate::cassandra_util::now_millis();
+
+        // Build initial ledger ops (pk/sk known; item_data for UPDATE filled in after PREPARE)
+        let mut ledger_ops = Self::initial_ledger_ops(ops)?;
+        let initial_blob = serde_json::to_string(&ledger_ops)
+            .map_err(|e| StorageError::Internal(format!("serialize ledger ops: {e}")))?;
+
+        // Write ledger entry with state='preparing'
+        self.write_ledger_entry(
+            &account_keyspace,
+            txn_id,
+            TransactionState::Preparing,
+            started_at,
+            idempotency.map(|(_, token, _)| token),
+            idempotency.map(|(_, _, fingerprint)| fingerprint),
+            &initial_blob,
+        )
+        .await?;
+
+        // T4.2: PREPARE phase - returns computed item_data for UPDATE ops
+        let prepare_result = self.execute_prepare_phase(ops, txn_id, started_at).await;
+
+        match prepare_result {
+            Ok(computed_items) => {
+                // Fill in the UPDATE post-images and every op's pre-commit
+                // image now that PREPARE has read them.
+                for (ledger_op, (computed, pre_commit)) in
+                    ledger_ops.iter_mut().zip(computed_items.iter())
+                {
+                    if let Some(data) = computed {
+                        ledger_op.item_data = Some(data.clone());
+                    }
+                    ledger_op.pre_commit_item_data = pre_commit.clone();
+                }
+                // Update ledger blob with full data before transitioning to COMMITTING
+                self.update_ledger_blob(&account_keyspace, txn_id, &ledger_ops)
+                    .await?;
+                // T4.3: COMMIT phase
+                self.execute_commit_phase(&account_keyspace, ops, txn_id, started_at)
+                    .await
+            }
+            Err(reasons) => {
+                // T4.4: ROLLBACK phase
+                tracing::debug!(
+                    "transact_write: PREPARE failed ({} reasons), rolling back txn {txn_id}",
+                    reasons.len()
+                );
+                if let Err(e) = self
+                    .execute_rollback_phase(&account_keyspace, ops, txn_id)
+                    .await
+                {
+                    // Rollback failures are recoverable by the background worker.
+                    // Do not replace the original cancellation error.
+                    tracing::error!("transact_write: rollback failed for txn {txn_id}: {e}");
+                }
+                // B5: release the token so a retry with the same token can proceed.
+                if let Some((idempotency_account, token, _)) = idempotency {
+                    self.delete_idempotency_token(
+                        &self.catalog_keyspace(),
+                        idempotency_account,
+                        token,
+                    )
+                    .await;
+                }
+                Err(StorageError::TransactionCanceled(reasons))
+            }
+        }
+    }
+
+    /// Execute PREPARE phase: validate conditions and mark items with transaction ID.
+    ///
+    /// Returns `Ok(computed_items)` where each entry is `Some(item_data_json)` for
+    /// UPDATE ops (the post-mutation state) and `None` for all other op types.
+    ///
+    /// PREPARE acquires each op's prepare marker in a key-sorted order rather than
+    /// the caller's order. Two transactions touching the same items in opposite
+    /// request order (`[a, b]` vs `[b, a]`) would otherwise each grab one marker
+    /// and block on the other, both lose and retry, repeat — a livelock that
+    /// starved throughput to a couple of transactions per second under
+    /// contention. Acquiring in a globally consistent order means both
+    /// transactions contend for the same item first: one wins cleanly, the other
+    /// cancels immediately. The engine layer already rejects a transaction with
+    /// duplicate target keys before this is reached, so the sort key is a total
+    /// order over this transaction's ops with no ties.
+    ///
+    /// `reasons` and `computed` are still indexed by the caller's original
+    /// position — only the *order markers are acquired in* changes, not the
+    /// per-op results the client sees, which DynamoDB returns positionally.
+    async fn execute_prepare_phase(
+        &self,
+        ops: &[TransactWriteOp<'_>],
+        txn_id: Uuid,
+        txn_timestamp: i64,
+    ) -> Result<Vec<(Option<String>, Option<String>)>, Vec<CancellationReason>> {
+        let mut reasons: Vec<CancellationReason> = vec![CancellationReason::none(); ops.len()];
+        let mut computed: Vec<(Option<String>, Option<String>)> = vec![(None, None); ops.len()];
+        let mut any_failed = false;
+
+        let mut order: Vec<usize> = (0..ops.len()).collect();
+        order.sort_by(|&a, &b| prepare_order_key(&ops[a]).cmp(&prepare_order_key(&ops[b])));
+
+        for &i in &order {
+            match self
+                .prepare_single_operation(&ops[i], txn_id, txn_timestamp)
+                .await
+            {
+                Ok(item_data) => computed[i] = item_data,
+                Err(r) => {
+                    any_failed = true;
+                    reasons[i] = r;
+                }
+            }
+        }
+
+        if any_failed {
+            Err(reasons)
+        } else {
+            Ok(computed)
+        }
+    }
+
+    /// Serialize a pre-commit image for ledger persistence.
+    fn pre_commit_json(existing: Option<&Item>) -> Result<Option<String>, CancellationReason> {
+        existing
+            .map(|item| {
+                serde_json::to_string(item)
+                    .map_err(|e| CancellationReason::validation_error(e.to_string()))
+            })
+            .transpose()
+    }
+
+    /// Prepare a single transactional operation.
+    ///
+    /// Returns `Ok(Some(item_data_json))` for UPDATE (the post-mutation state),
+    /// `Ok(None)` for PUT/DELETE/CHECK, or `Err(reason)` on failure.
+    async fn prepare_single_operation(
+        &self,
+        op: &TransactWriteOp<'_>,
+        txn_id: Uuid,
+        txn_timestamp: i64,
+    ) -> Result<(Option<String>, Option<String>), CancellationReason> {
+        match op {
+            TransactWriteOp::Put {
+                key_info,
+                item,
+                condition,
+                maps,
+                return_values_on_ccf,
+                ..
+            } => {
+                // Validate item keys
+                validation::validate_item_keys(
+                    item,
+                    &key_info.key_schema,
+                    &key_info.attribute_definitions,
+                )
+                .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+
+                // Read existing item
+                let mut existing = self
+                    .fetch_item_for_transaction(key_info, item, None)
+                    .await
+                    .map_err(prepare_read_error_reason)?;
+
+                tracing::debug!(
+                    "prepare Put: table={} pk_keys={:?} existing={}",
+                    key_info.table_name,
+                    item.keys().collect::<Vec<_>>(),
+                    existing.is_some()
+                );
+
+                // Evaluate condition
+                let empty = Item::new();
+                eval_condition(
+                    *condition,
+                    existing.as_ref().unwrap_or(&empty),
+                    maps,
+                    *return_values_on_ccf,
+                    existing.as_ref(),
+                )?;
+
+                // For new items (PUT), check partition_max_delete_timestamp
+                if existing.is_none() {
+                    self.check_partition_max_delete_timestamp(key_info, item, txn_timestamp)
+                        .await?;
+                }
+
+                // Execute PREPARE, with create-race retry loop: on a
+                // TransactionConflict, wait for the conflicting writer to commit
+                // or roll back, then re-evaluate our condition (if any) against
+                // its result before retrying. This is always correct — a
+                // condition gets re-checked, and an unconditional write has
+                // nothing to re-check but must still succeed (DynamoDB does not
+                // let an unconditional write fail on contention) — regardless of
+                // whether the item was absent or already existed when we read it;
+                // "already existed" does not distinguish a late arrival to a
+                // multi-writer create race from steady-state contention. An
+                // earlier version of this comment proposed gating the wait on
+                // `existing.is_none()` or on `condition.is_some()` to avoid
+                // waiting on genuinely independent contention (e.g. two
+                // transactions racing to update long-lived counters in opposite
+                // orders — see `test_opposite_order_transactions_cancel_instead_of_failing`).
+                // Both gates broke multi-writer create races past the first hop
+                // or past the first writer (a late writer that only ever sees the
+                // item as already-created never retries at all). The actual fix
+                // for that latency problem is `execute_prepare_phase`'s key-sorted
+                // PREPARE acquisition order (see its doc comment): it removes the
+                // mutual-abort livelock that made repeated waits necessary in the
+                // first place, so a single wait-and-retry here resolves quickly.
+                let mut attempt = 0u32;
+                loop {
+                    attempt += 1;
+                    match self
+                        .prepare_item(key_info, item, txn_id, txn_timestamp, existing.is_none())
+                        .await
+                    {
+                        Ok(()) => break,
+                        Err(r) if r.code == "TransactionConflict" && attempt < 5 => {
+                            // Lost the INSERT IF NOT EXISTS race (new item), or
+                            // another transaction holds the prepare marker on an
+                            // existing row. Either way: wait for it to commit or
+                            // roll back, then re-evaluate our condition (if any).
+                            let committed = self.wait_for_commit_and_read(key_info, item).await?;
+                            match committed {
+                                Some(winner) => {
+                                    eval_condition(
+                                        *condition,
+                                        &winner,
+                                        maps,
+                                        *return_values_on_ccf,
+                                        Some(&winner),
+                                    )?;
+                                    // Condition passed against winner — overwrite.
+                                    existing = Some(winner);
+                                }
+                                None => {
+                                    // Winner rolled back; retry the insert.
+                                    existing = None;
+                                }
+                            }
+                        }
+                        // Retries exhausted: surface as a conflict, matching
+                        // DynamoDB's behaviour for persistent write contention.
+                        Err(r) => return Err(r),
+                    }
+                }
+                Ok((None, Self::pre_commit_json(existing.as_ref())?))
+            }
+            TransactWriteOp::Delete {
+                key_info,
+                key,
+                condition,
+                maps,
+                return_values_on_ccf,
+                ..
+            } => {
+                // Validate key
+                validation::validate_key_only(
+                    key,
+                    &key_info.key_schema,
+                    &key_info.attribute_definitions,
+                )
+                .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+
+                // Read existing item
+                let existing = self
+                    .fetch_item_for_transaction(key_info, key, None)
+                    .await
+                    .map_err(prepare_read_error_reason)?;
+
+                // Evaluate condition
+                let empty = Item::new();
+                eval_condition(
+                    *condition,
+                    existing.as_ref().unwrap_or(&empty),
+                    maps,
+                    *return_values_on_ccf,
+                    existing.as_ref(),
+                )?;
+
+                // A *conditional* Delete of an ABSENT item (e.g. delete-if
+                // attribute_not_exists(pk)) establishes a read-dependency on the
+                // item staying absent, exactly like a ConditionCheck. It must
+                // leave a conflict-detectable prepare marker so a concurrent
+                // transaction that creates the item collides and one of them
+                // cancels — otherwise two "delete-if-absent the other's key, then
+                // put my key" transactions both commit (write skew). Plant the
+                // same `created_to_prepare` INSERT ... IF NOT EXISTS marker
+                // ConditionCheck uses; it is a phantom row removed on commit (the
+                // Delete commit's `DELETE ... IF prepared_txn_id = ?`), on rollback,
+                // and in recovery (the generic created_to_prepare cleanup).
+                //
+                // Gated on `condition.is_some()`: an *unconditional* delete of a
+                // missing item is a no-op that must NOT plant a marker (DynamoDB
+                // lets two such deletes serialize without mutual cancellation —
+                // see test_deletes_of_missing_items_serialize). A delete of an
+                // item that already exists takes the plain UPDATE-IF marker on the
+                // real row below.
+                if condition.is_some() && existing.is_none() {
+                    self.check_partition_max_delete_timestamp(key_info, key, txn_timestamp)
+                        .await?;
+                    let mut attempt = 0u32;
+                    loop {
+                        attempt += 1;
+                        match self
+                            .prepare_item(key_info, key, txn_id, txn_timestamp, true)
+                            .await
+                        {
+                            Ok(()) => break,
+                            Err(r) if r.code == "TransactionConflict" && attempt < 5 => {
+                                // Another transaction created the key between our
+                                // read and prepare. Wait for it, then re-evaluate
+                                // the condition against the committed winner — if
+                                // the item now exists, a delete-if-not-exists
+                                // condition fails and this transaction cancels.
+                                let committed =
+                                    self.wait_for_commit_and_read(key_info, key).await?;
+                                match committed {
+                                    Some(winner) => {
+                                        eval_condition(
+                                            *condition,
+                                            &winner,
+                                            maps,
+                                            *return_values_on_ccf,
+                                            Some(&winner),
+                                        )?;
+                                        // Condition still holds against the winner,
+                                        // which now exists: no marker needed, the
+                                        // winner's row provides conflict detection.
+                                        break;
+                                    }
+                                    None => {
+                                        // Winner rolled back; retry the marker.
+                                    }
+                                }
+                            }
+                            Err(r) => return Err(r),
+                        }
+                    }
+                } else {
+                    // Delete of an existing item (mark the real row), or an
+                    // unconditional delete of a missing item (UPDATE-IF is a no-op,
+                    // leaving no marker — the serialize-only guarantee).
+                    self.prepare_item(key_info, key, txn_id, txn_timestamp, false)
+                        .await?;
+                }
+                Ok((None, Self::pre_commit_json(existing.as_ref())?))
+            }
+            TransactWriteOp::Update {
+                key_info,
+                key,
+                actions,
+                condition,
+                maps,
+                return_values_on_ccf,
+                ..
+            } => {
+                // Validate key
+                validation::validate_key_only(
+                    key,
+                    &key_info.key_schema,
+                    &key_info.attribute_definitions,
+                )
+                .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+
+                // Read existing item
+                let mut existing = self
+                    .fetch_item_for_transaction(key_info, key, None)
+                    .await
+                    .map_err(prepare_read_error_reason)?;
+
+                // Create item from key if not exists
+                let mut item = existing.clone().unwrap_or_else(|| (*key).clone());
+
+                // Evaluate condition against empty item if non-existent
+                let condition_item = if existing.is_some() {
+                    &item
+                } else {
+                    &std::collections::BTreeMap::new()
+                };
+                eval_condition(
+                    *condition,
+                    condition_item,
+                    maps,
+                    *return_values_on_ccf,
+                    existing.as_ref(),
+                )?;
+
+                // Apply update actions
+                expression::apply_update_validated(actions, &mut item, maps, &[], &[])
+                    .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+
+                // Validate item size
+                const MAX_ITEM_SIZE_BYTES: usize = 400 * 1024;
+                validation::validate_item_size(&item, MAX_ITEM_SIZE_BYTES)
+                    .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+
+                // For new items, check partition_max_delete_timestamp
+                if existing.is_none() {
+                    self.check_partition_max_delete_timestamp(key_info, &item, txn_timestamp)
+                        .await?;
+                }
+
+                // Execute PREPARE, with the same create-race retry loop as the
+                // Put arm above — see its comment for why there is no gate on
+                // `existing.is_none()`/`condition.is_some()`, and why
+                // `execute_prepare_phase`'s key-sorted PREPARE order is what
+                // actually keeps contended transactions fast.
+                let mut attempt = 0u32;
+                loop {
+                    attempt += 1;
+                    match self
+                        .prepare_item(key_info, key, txn_id, txn_timestamp, existing.is_none())
+                        .await
+                    {
+                        Ok(()) => break,
+                        Err(r) if r.code == "TransactionConflict" && attempt < 5 => {
+                            let committed = self.wait_for_commit_and_read(key_info, key).await?;
+                            if let Some(winner) = committed {
+                                eval_condition(
+                                    *condition,
+                                    &winner,
+                                    maps,
+                                    *return_values_on_ccf,
+                                    Some(&winner),
+                                )?;
+                                // Re-apply expression on top of winner's item.
+                                item = winner.clone();
+                                expression::apply_update_validated(
+                                    actions,
+                                    &mut item,
+                                    maps,
+                                    &[],
+                                    &[],
+                                )
+                                .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+                                existing = Some(winner);
+                            } else {
+                                // Winner rolled back; retry the insert.
+                                existing = None;
+                                item = (*key).clone();
+                                expression::apply_update_validated(
+                                    actions,
+                                    &mut item,
+                                    maps,
+                                    &[],
+                                    &[],
+                                )
+                                .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+                            }
+                        }
+                        // Retries exhausted: surface as a conflict, matching
+                        // DynamoDB's behaviour for persistent write contention.
+                        Err(r) => return Err(r),
+                    }
+                }
+
+                // Return the computed final item so the caller can update the ledger blob
+                let item_json = serde_json::to_string(&item)
+                    .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+                Ok((Some(item_json), Self::pre_commit_json(existing.as_ref())?))
+            }
+            TransactWriteOp::ConditionCheck {
+                key_info,
+                key,
+                condition,
+                maps,
+                return_values_on_ccf,
+            } => {
+                // Validate key
+                validation::validate_key_only(
+                    key,
+                    &key_info.key_schema,
+                    &key_info.attribute_definitions,
+                )
+                .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+
+                // Read existing item
+                let mut existing = self
+                    .fetch_item_for_transaction(key_info, key, None)
+                    .await
+                    .map_err(prepare_read_error_reason)?;
+
+                // Evaluate condition
+                let empty = Item::new();
+                let check_against = existing.as_ref().unwrap_or(&empty);
+                eval_condition(
+                    Some(condition),
+                    check_against,
+                    maps,
+                    *return_values_on_ccf,
+                    existing.as_ref(),
+                )?;
+
+                // A ConditionCheck on an ABSENT item must still leave a
+                // conflict-detectable prepare marker, so a concurrent transaction
+                // that creates the item collides and one of them cancels (otherwise
+                // two "check absent, then write the other's key" transactions both
+                // commit — write skew). Plant the same `created_to_prepare`
+                // INSERT ... IF NOT EXISTS marker Put/Update use. The marker is a
+                // phantom row with no real item; it is removed on commit (below in
+                // commit_single_operation's ConditionCheck arm) and on rollback (the
+                // created_to_prepare DELETE path). For an item that already exists,
+                // the existing prepared_txn_id fencing provides conflict detection,
+                // so no new marker is planted.
+                if existing.is_none() {
+                    self.check_partition_max_delete_timestamp(key_info, key, txn_timestamp)
+                        .await?;
+                    let mut attempt = 0u32;
+                    loop {
+                        attempt += 1;
+                        match self
+                            .prepare_item(key_info, key, txn_id, txn_timestamp, true)
+                            .await
+                        {
+                            Ok(()) => break,
+                            Err(r) if r.code == "TransactionConflict" && attempt < 5 => {
+                                // Another transaction created/grabbed the key between
+                                // our read and prepare. Wait for it, then re-evaluate
+                                // the condition against the committed winner.
+                                let committed =
+                                    self.wait_for_commit_and_read(key_info, key).await?;
+                                match committed {
+                                    Some(winner) => {
+                                        eval_condition(
+                                            Some(condition),
+                                            &winner,
+                                            maps,
+                                            *return_values_on_ccf,
+                                            Some(&winner),
+                                        )?;
+                                        // Condition still holds against the winner,
+                                        // which now exists: no marker needed, the
+                                        // winner's row provides conflict detection.
+                                        existing = Some(winner);
+                                        break;
+                                    }
+                                    None => {
+                                        // Winner rolled back; retry the insert marker.
+                                        existing = None;
+                                    }
+                                }
+                            }
+                            Err(r) => return Err(r),
+                        }
+                    }
+                }
+
+                Ok((None, Self::pre_commit_json(existing.as_ref())?))
+            }
+        }
+    }
+
+    /// Execute COMMIT phase: apply changes and update ledger.
+    ///
+    /// A stream record needs the image the item held before this transaction
+    /// touched it, to tell an insert from a modify and to carry OldImage. Each
+    /// arm reads it here, from the row together with its `created_to_prepare`
+    /// column, and applies the rule in `commit_old_image`: a row PREPARE
+    /// planted has no old image, otherwise the old image is the row's
+    /// `item_data`, which may itself be absent.
+    ///
+    /// The row's `item_data` alone would not do, because PREPARE plants a
+    /// placeholder row for a key that was absent, carrying the request's own
+    /// item for a Put and the bare key for an Update; `created_to_prepare` is
+    /// what tells that row from a pre-existing one. PREPARE's own read would
+    /// not do either: a single-item write that commits between PREPARE's read
+    /// and its marker LWT is accepted (the marker's `IF prepared_txn_id = null`
+    /// does not detect a write that left the column null), so PREPARE's image
+    /// is one write stale whenever that happens, and the record would claim a
+    /// transition that never took place. Reading at commit time costs one
+    /// round trip per streamed Put and Delete op; the Update arm reads the row
+    /// anyway.
+    async fn execute_commit_phase(
+        &self,
+        account_keyspace: &str,
+        ops: &[TransactWriteOp<'_>],
+        txn_id: Uuid,
+        txn_timestamp: i64,
+    ) -> Result<(), StorageError> {
+        // Update ledger state to 'committing'
+        self.update_ledger_state(account_keyspace, txn_id, TransactionState::Committing)
+            .await?;
+
+        // Capture the pre-commit image of every item on a TTL-enabled table.
+        // Reconciliation needs it to retire the expiration entry the item had
+        // *before* this transaction: unlike an ordinary write, a transactional
+        // write cannot carry the queue delete in the same batch as the base
+        // mutation, so without this a changed or removed TTL leaves its old
+        // entry behind until that entry's original due time.
+        let mut pre_commit_images: Vec<Option<Item>> = Vec::with_capacity(ops.len());
+        for op in ops {
+            let image = match op {
+                TransactWriteOp::Put { key_info, item, .. } => {
+                    self.pre_commit_ttl_image(key_info, item).await?
+                }
+                TransactWriteOp::Update { key_info, key, .. }
+                | TransactWriteOp::Delete { key_info, key, .. } => {
+                    self.pre_commit_ttl_image(key_info, key).await?
+                }
+                TransactWriteOp::ConditionCheck { .. } => None,
+            };
+            pre_commit_images.push(image);
+        }
+
+        // TODO: Execute COMMIT operations for each item in parallel
+        // For now, sequential execution
+        for op in ops {
+            self.commit_single_operation(op, txn_id, txn_timestamp)
+                .await?;
+        }
+
+        for (op, old_image) in ops.iter().zip(&pre_commit_images) {
+            match op {
+                TransactWriteOp::Put { key_info, item, .. } => {
+                    self.reconcile_ttl_transition(key_info, old_image.as_ref(), Some(item))
+                        .await?;
+                }
+                TransactWriteOp::Update { key_info, key, .. } => {
+                    let new_image = self.get_item_quorum(key_info, key).await?;
+                    self.reconcile_ttl_transition(key_info, old_image.as_ref(), new_image.as_ref())
+                        .await?;
+                }
+                TransactWriteOp::Delete { key_info, .. } => {
+                    self.reconcile_ttl_transition(key_info, old_image.as_ref(), None)
+                        .await?;
+                }
+                TransactWriteOp::ConditionCheck { .. } => {}
+            }
+        }
+
+        // Delete transaction from ledger
+        self.delete_ledger_entry(account_keyspace, txn_id).await?;
+
+        Ok(())
+    }
+
+    /// Execute ROLLBACK phase: clean up prepared items.
+    async fn execute_rollback_phase(
+        &self,
+        account_keyspace: &str,
+        ops: &[TransactWriteOp<'_>],
+        txn_id: Uuid,
+    ) -> Result<(), StorageError> {
+        // Update ledger state to 'rollback' (uses CANCELLING state)
+        self.update_ledger_state(account_keyspace, txn_id, TransactionState::Cancelling)
+            .await?;
+
+        // TODO: Execute ROLLBACK operations for each item in parallel
+        // For now, sequential execution
+        for op in ops {
+            if let Err(e) = self.rollback_single_operation(op, txn_id).await {
+                tracing::error!("execute_rollback_phase: rollback_single_operation failed: {e}");
+                // Continue rolling back other ops even if one fails, then return the error.
+                // For now, return immediately to preserve existing behaviour.
+                return Err(e);
+            }
+        }
+
+        // Delete transaction from ledger
+        self.delete_ledger_entry(account_keyspace, txn_id).await?;
+
+        Ok(())
+    }
+}
+
+/// Evaluate a condition expression, returning a `CancellationReason` on failure.
+fn eval_condition(
+    condition: Option<&extenddb_core::expression::Expr>,
+    item: &std::collections::BTreeMap<String, AttributeValue>,
+    maps: &ExpressionMaps,
+    return_values_on_ccf: ReturnValuesOnConditionCheckFailure,
+    existing: Option<&Item>,
+) -> Result<(), CancellationReason> {
+    if let Some(cond) = condition {
+        let passed = expression::evaluate_condition(cond, item, maps)
+            .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+        if !passed {
+            let item_to_return =
+                if return_values_on_ccf == ReturnValuesOnConditionCheckFailure::AllOld {
+                    existing.cloned()
+                } else {
+                    None
+                };
+            return Err(CancellationReason::condition_check_failed_with_item(
+                item_to_return,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Extract `account_id` from a `TransactWriteOp`.
+fn transact_write_op_account_id<'a>(op: &'a TransactWriteOp<'_>) -> &'a str {
+    match op {
+        TransactWriteOp::Put { key_info, .. }
+        | TransactWriteOp::Delete { key_info, .. }
+        | TransactWriteOp::Update { key_info, .. }
+        | TransactWriteOp::ConditionCheck { key_info, .. } => &key_info.account_id,
+    }
+}
+
+impl CassandraEngine {
+    /// Serialize `TransactWriteOps` to JSON for ledger storage.
+    /// Build initial `LedgerOp`s from the request ops.
+    ///
+    /// Written to the ledger before PREPARE starts. Contains pk/sk so a crash
+    /// during PREPARE can be rolled back. `item_data` for UPDATE is `None` here
+    /// and filled in after PREPARE succeeds (before transitioning to COMMITTING).
+    fn initial_ledger_ops(ops: &[TransactWriteOp<'_>]) -> Result<Vec<LedgerOp>, StorageError> {
+        ops.iter()
+            .map(|op| {
+                let (op_type, key_info, key) = match op {
+                    TransactWriteOp::Put { key_info, item, .. } => ("PUT", *key_info, *item),
+                    TransactWriteOp::Delete { key_info, key, .. } => ("DELETE", *key_info, *key),
+                    TransactWriteOp::Update { key_info, key, .. } => ("UPDATE", *key_info, *key),
+                    TransactWriteOp::ConditionCheck { key_info, key, .. } => {
+                        ("CHECK", *key_info, *key)
+                    }
+                };
+                let pk = composite_pk_to_text(key, &key_info.key_schema)?;
+                // Store sk_col/sk_val for recovery without type-checking the value.
+                // A type mismatch is caught later by validate_key_only in
+                // prepare_single_operation; failing here would surface as
+                // StorageError::Internal instead of TransactionCanceledException.
+                let (sk_col, sk_val) = if let Some((sk_name, sk_type)) =
+                    sk_info(&key_info.key_schema, &key_info.attribute_definitions)
+                {
+                    let sk_value = key
+                        .get(sk_name)
+                        .ok_or_else(|| StorageError::Internal("missing sort key".to_owned()))?;
+                    let col = sk_column(sk_type).to_owned();
+                    let val = match sk_value {
+                        AttributeValue::S(s) => s.clone(),
+                        AttributeValue::N(n) => n.clone(),
+                        AttributeValue::B(b) => {
+                            use base64::Engine as _;
+                            base64::engine::general_purpose::STANDARD.encode(b)
+                        }
+                        // Any other type will be caught by validate_key_only.
+                        _ => String::new(),
+                    };
+                    (Some(col), Some(val))
+                } else {
+                    (None, None)
+                };
+                // For PUT, item_data is known immediately.
+                // For UPDATE, item_data is filled in after PREPARE (update_ledger_blob).
+                // For DELETE and CHECK, item_data is never needed.
+                let item_data = if op_type == "PUT" {
+                    let item = match op {
+                        TransactWriteOp::Put { item, .. } => *item,
+                        _ => unreachable!(),
+                    };
+                    Some(
+                        serde_json::to_string(item)
+                            .map_err(|e| StorageError::Internal(e.to_string()))?,
+                    )
+                } else {
+                    None
+                };
+                Ok(LedgerOp {
+                    op: op_type.to_owned(),
+                    table_id: key_info.table_id.clone(),
+                    pk,
+                    sk_col,
+                    sk_val,
+                    item_data,
+                    pre_commit_item_data: None,
+                })
+            })
+            .collect()
+    }
+
+    /// Check and reserve an account-scoped idempotency token.
+    ///
+    /// Returns `Ok(())` when the token is freshly reserved.
+    /// Returns `Err(IdempotentReplay)` / `Err(IdempotentMismatch)` when already present.
+    async fn check_idempotency_token(
+        &self,
+        keyspace: &str,
+        account_id: &str,
+        token: &str,
+        fingerprint: &str,
+    ) -> Result<(), StorageError> {
+        let select_query = format!(
+            "SELECT fingerprint FROM {keyspace}.idempotency_tokens_by_account \
+             WHERE account_id = ? AND \"token\" = ?"
+        );
+
+        // Fast path: token already present (common on retry).
+        if let Some(row) = query_optional::<StorageError>(
+            &self.session,
+            &select_query,
+            cdrs_tokio::query_values!(account_id, token),
+            "check_idempotency_token",
+        )
+        .await?
+        {
+            let stored_fp: String = get_column(&row, "fingerprint", "check_idempotency_token")?;
+            return if stored_fp == fingerprint {
+                Err(StorageError::IdempotentReplay)
+            } else {
+                Err(StorageError::IdempotentMismatch)
+            };
+        }
+
+        // Reserve with LWT to handle concurrent requests racing on the same token.
+        let insert_query = format!(
+            "INSERT INTO {keyspace}.idempotency_tokens_by_account \
+             (account_id, \"token\", fingerprint, created_at) VALUES (?, ?, ?, ?) IF NOT EXISTS"
+        );
+        let now = crate::cassandra_util::now_millis();
+        let result = crate::cassandra_util::apply_lwt(
+            &self.session,
+            &insert_query,
+            cdrs_tokio::query_values!(account_id, token, fingerprint, now),
+            "check_idempotency_token insert",
+        )
+        .await?;
+
+        if !result {
+            // Lost the LWT race — read back to return the right error.
+            let row = query_optional::<StorageError>(
+                &self.session,
+                &select_query,
+                cdrs_tokio::query_values!(account_id, token),
+                "check_idempotency_token recheck",
+            )
+            .await?;
+            if let Some(row) = row {
+                let stored_fp: String =
+                    get_column(&row, "fingerprint", "check_idempotency_token recheck")?;
+                return if stored_fp == fingerprint {
+                    Err(StorageError::IdempotentReplay)
+                } else {
+                    Err(StorageError::IdempotentMismatch)
+                };
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Delete a previously reserved idempotency token.
+    ///
+    /// Called on every cancellation path to prevent token poisoning (B5): a
+    /// token reserved before the ledger is committed must be released if the
+    /// transaction is cancelled, so a retry with the same token can proceed.
+    async fn delete_idempotency_token(&self, keyspace: &str, account_id: &str, token: &str) {
+        let delete_query = format!(
+            "DELETE FROM {keyspace}.idempotency_tokens_by_account \
+             WHERE account_id = ? AND \"token\" = ?"
+        );
+        if let Err(e) = crate::cassandra_util::execute::<StorageError>(
+            &self.session,
+            &delete_query,
+            cdrs_tokio::query_values!(account_id, token),
+            "delete_idempotency_token",
+        )
+        .await
+        {
+            // Non-fatal: the token will eventually expire via Cassandra TTL.
+            // Log so it is visible in ops, but do not replace the original error.
+            tracing::warn!("delete_idempotency_token failed (token will expire): {e}");
+        }
+    }
+
+    /// Fetch an item for transaction (reads `item_data` and `prepared_txn_id`).
+    ///
+    /// If `skip_txn_id` is `Some(id)`, rows prepared by that transaction are
+    /// read directly (the caller owns that PREPARE and must not wait on itself).
+    async fn fetch_item_for_transaction(
+        &self,
+        key_info: &TableKeyInfo,
+        key: &Item,
+        skip_txn_id: Option<Uuid>,
+    ) -> Result<Option<Item>, StorageError> {
+        Ok(self
+            .fetch_row_for_transaction(key_info, key, skip_txn_id)
+            .await?
+            .0)
+    }
+
+    /// Fetch a row for transaction: its `item_data` and whether PREPARE created
+    /// the row, from `created_to_prepare`.
+    ///
+    /// The flag is `false` when there is no row, when the row was not planted by
+    /// a PREPARE, and when the row had to be read through
+    /// `wait_for_commit_and_read`, which returns another transaction's committed
+    /// item and therefore a real old image.
+    async fn fetch_row_for_transaction(
+        &self,
+        key_info: &TableKeyInfo,
+        key: &Item,
+        skip_txn_id: Option<Uuid>,
+    ) -> Result<(Option<Item>, bool), StorageError> {
+        let keyspace = self.account_keyspace(&key_info.account_id);
+        let table = data_table_name(&key_info.table_id);
+        let pk_text = composite_pk_to_text(key, &key_info.key_schema)?;
+        let (sk, sk_col) = resolve_sk(key_info, key)?;
+
+        let Some(row) = select_by_pk(
+            &self.session,
+            &keyspace,
+            &table,
+            "item_data, prepared_txn_id, created_to_prepare, last_committed_txn_timestamp",
+            pk_text.as_str(),
+            sk.as_ref(),
+            sk_col.as_deref(),
+        )
+        .await?
+        else {
+            return Ok((None, false));
+        };
+
+        // If a *different* transaction has this row in PREPARE state, wait for
+        // it to commit or roll back. Returning the PREPARE-state item
+        // (key-only placeholder) would cause condition expressions like
+        // attribute_not_exists(pk) to fail against stale data with no ALL_OLD.
+        let prepared_txn_id: Option<uuid::Uuid> = row.get_by_name("prepared_txn_id").ok().flatten();
+        if prepared_txn_id.is_some() && prepared_txn_id != skip_txn_id {
+            return self
+                .wait_for_commit_and_read(key_info, key)
+                .await
+                .map(|item| (item, false))
+                .map_err(|e| {
+                    // Preserve a TransactionConflict code and message (e.g. "Transaction
+                    // is ongoing for the item" from a wait timeout) instead of flattening
+                    // every reason to Internal, which callers surface as ValidationError.
+                    if e.code == "TransactionConflict" {
+                        StorageError::TransactionConflict(
+                            e.message
+                                .unwrap_or_else(|| "TransactionConflict".to_owned()),
+                        )
+                    } else {
+                        StorageError::Internal(e.message.unwrap_or_default())
+                    }
+                });
+        }
+
+        let created_to_prepare: Option<bool> = row.get_by_name("created_to_prepare").ok().flatten();
+        let last_committed: Option<i64> = row
+            .get_by_name("last_committed_txn_timestamp")
+            .ok()
+            .flatten();
+        // A row PREPARE planted has never had a transacted commit land on it:
+        // only commit_put_or_update and recover_commit_op write
+        // last_committed_txn_timestamp, and planting requires the row to be
+        // absent. A release before this branch did not clear the flag on
+        // commit, so a row it committed carries both; it is a committed item,
+        // not a placeholder.
+        let created_to_prepare = created_to_prepare == Some(true) && last_committed.is_none();
+
+        let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
+        let Some(item_data) = item_data else {
+            return Ok((None, created_to_prepare));
+        };
+        Ok((
+            Some(
+                serde_json::from_str(&item_data)
+                    .map_err(|e| StorageError::Internal(e.to_string()))?,
+            ),
+            created_to_prepare,
+        ))
+    }
+
+    /// Wait for a concurrently-prepared item to commit or roll back, then return
+    /// its committed state.
+    ///
+    /// After losing an `INSERT IF NOT EXISTS` LWT race, the winning transaction
+    /// may still be in PREPARE state. This method polls with a single SELECT of
+    /// `item_data, prepared_txn_id` until `prepared_txn_id` is NULL, then returns:
+    /// - `Ok(Some(item))` — winner committed; use as the re-read existing item.
+    /// - `Ok(None)` — winner rolled back and deleted the row; caller should retry
+    ///   the insert.
+    ///
+    /// Returns `Err` only on infrastructure failure.
+    async fn wait_for_commit_and_read(
+        &self,
+        key_info: &TableKeyInfo,
+        key: &Item,
+    ) -> Result<Option<Item>, CancellationReason> {
+        const MAX_POLLS: u32 = 20;
+        const POLL_SLEEP_MS: u64 = 50;
+
+        let keyspace = self.account_keyspace(&key_info.account_id);
+        let table = data_table_name(&key_info.table_id);
+        let pk_text = composite_pk_to_text(key, &key_info.key_schema)
+            .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+        let (sk, sk_col) = resolve_sk(key_info, key)
+            .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+
+        for _ in 0..MAX_POLLS {
+            let row = select_by_pk(
+                &self.session,
+                &keyspace,
+                &table,
+                "item_data, prepared_txn_id, last_committed_txn_timestamp",
+                pk_text.as_str(),
+                sk.as_ref(),
+                sk_col.as_deref(),
+            )
+            .await
+            .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+
+            let Some(row) = row else {
+                // Row gone — winner rolled back and deleted it.
+                return Ok(None);
+            };
+
+            let prepared_txn_id: Option<uuid::Uuid> =
+                row.get_by_name("prepared_txn_id").ok().flatten();
+            let last_committed: Option<i64> = row
+                .get_by_name("last_committed_txn_timestamp")
+                .ok()
+                .flatten();
+
+            // Only treat the row as committed when prepared_txn_id is NULL
+            // AND last_committed_txn_timestamp is set. This guards against a
+            // stale replica that has cleared prepared_txn_id but not yet
+            // propagated the updated item_data from commit_put_or_update.
+            if prepared_txn_id.is_none() && last_committed.is_some() {
+                let item_data: String = get_column::<String, StorageError>(
+                    &row,
+                    "item_data",
+                    "wait_for_commit_and_read",
+                )
+                .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+                let item: Item = serde_json::from_str(&item_data)
+                    .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+                return Ok(Some(item));
+            }
+
+            tokio::time::sleep(Duration::from_millis(POLL_SLEEP_MS)).await;
+        }
+
+        // Timed out waiting — treat as conflict.
+        Err(CancellationReason {
+            code: "TransactionConflict".to_owned(),
+            message: Some("Transaction is ongoing for the item".to_owned()),
+            item: None,
+        })
+    }
+
+    /// Check `partition_max_delete_timestamp` for new items.
+    async fn check_partition_max_delete_timestamp(
+        &self,
+        key_info: &TableKeyInfo,
+        key: &Item,
+        txn_timestamp: i64,
+    ) -> Result<(), CancellationReason> {
+        let account_keyspace = self.account_keyspace(&key_info.account_id);
+        let table_name = data_table_name(&key_info.table_id);
+
+        let pk_text = composite_pk_to_text(key, &key_info.key_schema)
+            .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+
+        let query = format!(
+            "SELECT partition_max_delete_timestamp FROM {account_keyspace}.{table_name} WHERE pk = ? LIMIT 1"
+        );
+
+        let result = self
+            .session
+            .query_with_values(&query, cdrs_tokio::query_values!(pk_text.as_str()))
+            .await
+            .map_err(|e| {
+                tracing::error!("check_partition_max_delete_timestamp: {e}");
+                CancellationReason::validation_error("Database error".to_owned())
+            })?;
+
+        let body = result.response_body().map_err(|e| {
+            tracing::error!("check_partition_max_delete_timestamp response_body: {e}");
+            CancellationReason::validation_error("Database error".to_owned())
+        })?;
+
+        let rows = body.into_rows().unwrap_or_default();
+        if let Some(row) = rows.into_iter().next() {
+            let max_ts: Option<i64> = row
+                .get_by_name("partition_max_delete_timestamp")
+                .ok()
+                .flatten();
+            if let Some(max_ts) = max_ts
+                && txn_timestamp <= max_ts
+            {
+                return Err(CancellationReason::validation_error(
+                    "Item was deleted at a later timestamp".to_owned(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// PREPARE an item: mark with transaction ID using LWT.
+    ///
+    /// For existing items: UPDATE with IF `prepared_txn_id` = null
+    /// For new items: INSERT with IF NOT EXISTS + `created_to_prepare=true`
+    async fn prepare_item(
+        &self,
+        key_info: &TableKeyInfo,
+        key: &Item,
+        txn_id: Uuid,
+        txn_timestamp: i64,
+        is_new_item: bool,
+    ) -> Result<(), CancellationReason> {
+        let keyspace = self.account_keyspace(&key_info.account_id);
+        let ddb_table = super::ddl::data_table_name(&key_info.table_id);
+        let pk_text = composite_pk_to_text(key, &key_info.key_schema)
+            .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+
+        let txn_id_bytes = Bytes::new(txn_id.as_bytes().to_vec());
+
+        let result = if let Some((sk_name, sk_type)) = sk_info(&key_info.key_schema, &key_info.attribute_definitions) {
+            let sk_value = key.get(sk_name).ok_or_else(|| {
+                CancellationReason::validation_error("missing sort key".to_owned())
+            })?;
+            let sk = parse_sk(sk_value, sk_type)
+                .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
+            let sk_col = sk_column(sk_type);
+
+            if is_new_item {
+                let item_text = serde_json::to_value(key)
+                    .map_err(|e| CancellationReason::validation_error(e.to_string()))?
+                    .to_string();
+                let query = format!(
+                    "INSERT INTO {keyspace}.{ddb_table} (pk, {sk_col}, item_data, prepared_txn_id, prepared_txn_timestamp, created_to_prepare) \
+                     VALUES (?, ?, ?, ?, ?, true) IF NOT EXISTS"
+                );
+                query_with_pk_sk_item_txnid_ts(&self.session, &query, pk_text.as_str(), &sk, &item_text, txn_id_bytes, txn_timestamp).await
+            } else {
+                let query = format!(
+                    "UPDATE {keyspace}.{ddb_table} SET prepared_txn_id = ?, prepared_txn_timestamp = ? \
+                     WHERE pk = ? AND {sk_col} = ? IF prepared_txn_id = null"
+                );
+                query_with_txnid_ts_pk_sk(&self.session, &query, txn_id_bytes, txn_timestamp, pk_text.as_str(), &sk).await
+            }
+        } else if is_new_item {
+            let item_text = serde_json::to_value(key)
+                .map_err(|e| CancellationReason::validation_error(e.to_string()))?
+                .to_string();
+            let query = format!(
+                "INSERT INTO {keyspace}.{ddb_table} (pk, item_data, prepared_txn_id, prepared_txn_timestamp, created_to_prepare) \
+                 VALUES (?, ?, ?, ?, true) IF NOT EXISTS"
+            );
+            self.session
+                .query_with_values(&query, cdrs_tokio::query_values!(pk_text.as_str(), item_text, txn_id_bytes, txn_timestamp))
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))
+        } else {
+            let query = format!(
+                "UPDATE {keyspace}.{ddb_table} SET prepared_txn_id = ?, prepared_txn_timestamp = ? \
+                 WHERE pk = ? IF prepared_txn_id = null"
+            );
+            self.session
+                .query_with_values(&query, cdrs_tokio::query_values!(txn_id_bytes, txn_timestamp, pk_text.as_str()))
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))
+        }
+        .map_err(|e| {
+            tracing::error!("prepare_item: {e}");
+            CancellationReason::validation_error("Database error".to_owned())
+        })?;
+
+        check_lwt_applied(&result, "prepare_item")?;
+        Ok(())
+    }
+
+    /// COMMIT a single operation: apply changes.
+    ///
+    /// For Put/Update: Write final `item_data`, clear `prepared_txn_id`, set `last_committed_txn_timestamp`
+    /// For Delete: Update `partition_max_delete_timestamp`, then delete the item
+    async fn commit_single_operation(
+        &self,
+        op: &TransactWriteOp<'_>,
+        txn_id: Uuid,
+        txn_timestamp: i64,
+    ) -> Result<(), StorageError> {
+        let txn_id_bytes = Bytes::new(txn_id.as_bytes().to_vec());
+
+        match op {
+            TransactWriteOp::Put {
+                key_info,
+                item,
+                stream,
+                ..
+            } => {
+                // The old image is the row as it stands before the base write.
+                // The item carries the key attributes, so it resolves the row
+                // by itself.
+                let old_image = if stream.is_some() {
+                    let (row, created_to_prepare) = self
+                        .fetch_row_for_transaction(key_info, item, Some(txn_id))
+                        .await?;
+                    commit_old_image(row, created_to_prepare)
+                } else {
+                    None
+                };
+                let indexes = self.indexes_for_commit(key_info).await?;
+                self.commit_put_or_update(key_info, item, txn_id_bytes.clone(), txn_timestamp)
+                    .await?;
+                let stream_stmt = self.transact_stream_statement(
+                    key_info,
+                    stream.as_ref(),
+                    old_image.as_ref(),
+                    Some(item),
+                );
+                self.commit_secondary_effects(key_info, None, Some(item), &indexes, stream_stmt)
+                    .await
+            }
+            TransactWriteOp::Update {
+                key_info,
+                key,
+                actions,
+                maps,
+                stream,
+                ..
+            } => {
+                // Re-fetch and re-apply update (idempotent)
+                let (existing, created_to_prepare) = self
+                    .fetch_row_for_transaction(key_info, key, Some(txn_id))
+                    .await?;
+                let mut final_item = existing.clone().unwrap_or_else(|| (*key).clone());
+                expression::apply_update_validated(actions, &mut final_item, maps, &[], &[])
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+                let indexes = self.indexes_for_commit(key_info).await?;
+                self.commit_put_or_update(key_info, &final_item, txn_id_bytes, txn_timestamp)
+                    .await?;
+                // `existing` was read before the base write, so it is still the
+                // old image.
+                let stream_stmt = if stream.is_some() {
+                    let old_image = commit_old_image(existing.clone(), created_to_prepare);
+                    self.transact_stream_statement(
+                        key_info,
+                        stream.as_ref(),
+                        old_image.as_ref(),
+                        Some(&final_item),
+                    )
+                } else {
+                    None
+                };
+                self.commit_secondary_effects(
+                    key_info,
+                    existing.as_ref(),
+                    Some(&final_item),
+                    &indexes,
+                    stream_stmt,
+                )
+                .await
+            }
+            TransactWriteOp::Delete {
+                key_info,
+                key,
+                stream,
+                ..
+            } => {
+                // The old image is the row as it stands before the delete.
+                let old_image = if stream.is_some() {
+                    let (row, created_to_prepare) = self
+                        .fetch_row_for_transaction(key_info, key, Some(txn_id))
+                        .await?;
+                    commit_old_image(row, created_to_prepare)
+                } else {
+                    None
+                };
+                let keyspace = self.account_keyspace(&key_info.account_id);
+                let ddb_table = super::ddl::data_table_name(&key_info.table_id);
+                let pk_text = composite_pk_to_text(key, &key_info.key_schema)?;
+
+                // Step 1: Update partition_max_delete_timestamp
+                // First, try to update if it's null (most common case - first delete in partition)
+                let update_max_ts_null_query = format!(
+                    "UPDATE {keyspace}.{ddb_table} SET partition_max_delete_timestamp = ? WHERE pk = ? \
+                     IF partition_max_delete_timestamp = null"
+                );
+
+                let result = self
+                    .session
+                    .query_with_values(
+                        &update_max_ts_null_query,
+                        cdrs_tokio::query_values!(txn_timestamp, pk_text.as_str()),
+                    )
+                    .await
+                    .map_err(|e| {
+                        tracing::error!(
+                            "commit_single_operation (delete update partition_max): {e}"
+                        );
+                        StorageError::Internal("Database error".to_owned())
+                    })?;
+
+                // If that failed (column already has a value), try updating only if our timestamp is higher
+                if check_lwt_applied(&result, "partition_max update").is_err() {
+                    let update_max_ts_query = format!(
+                        "UPDATE {keyspace}.{ddb_table} SET partition_max_delete_timestamp = ? WHERE pk = ? \
+                         IF partition_max_delete_timestamp < ?"
+                    );
+
+                    let _result2 = self
+                        .session
+                        .query_with_values(
+                            &update_max_ts_query,
+                            cdrs_tokio::query_values!(
+                                txn_timestamp,
+                                pk_text.as_str(),
+                                txn_timestamp
+                            ),
+                        )
+                        .await
+                        .map_err(|e| {
+                            tracing::error!(
+                                "commit_single_operation (delete update partition_max compare): {e}"
+                            );
+                            StorageError::Internal("Database error".to_owned())
+                        })?;
+                    // We don't check LWT here - if another transaction set a higher timestamp, that's fine
+                }
+
+                // Step 2: Delete the item with LWT check
+                let result = if let Some((sk_name, sk_type)) =
+                    sk_info(&key_info.key_schema, &key_info.attribute_definitions)
+                {
+                    let sk_value = key
+                        .get(sk_name)
+                        .ok_or_else(|| StorageError::Internal("missing sort key".to_owned()))?;
+                    let sk = parse_sk(sk_value, sk_type)?;
+                    let sk_col = sk_column(sk_type);
+                    let delete_query = format!(
+                        "DELETE FROM {keyspace}.{ddb_table} WHERE pk = ? AND {sk_col} = ? IF prepared_txn_id = ?"
+                    );
+                    query_with_pk_sk_txnid(
+                        &self.session,
+                        &delete_query,
+                        pk_text.as_str(),
+                        &sk,
+                        txn_id_bytes,
+                    )
+                    .await
+                } else {
+                    let delete_query = format!(
+                        "DELETE FROM {keyspace}.{ddb_table} WHERE pk = ? IF prepared_txn_id = ?"
+                    );
+                    self.session
+                        .query_with_values(
+                            &delete_query,
+                            cdrs_tokio::query_values!(pk_text.as_str(), txn_id_bytes),
+                        )
+                        .await
+                        .map_err(|e| StorageError::Internal(e.to_string()))
+                }
+                .map_err(|e| {
+                    tracing::error!("commit_single_operation (delete): {e}");
+                    StorageError::Internal("Database error".to_owned())
+                })?;
+
+                check_lwt_applied(&result, "commit_single_operation").map_err(|_| {
+                    StorageError::Internal("Transaction conflict during commit".to_owned())
+                })?;
+                // A key that was already absent has no pre-image, and the record
+                // builder then returns no statement, so a transacted delete of a
+                // missing item records nothing, as the single-item delete does.
+                let stream_stmt = self.transact_stream_statement(
+                    key_info,
+                    stream.as_ref(),
+                    old_image.as_ref(),
+                    None,
+                );
+                self.commit_secondary_effects(key_info, None, None, &[], stream_stmt)
+                    .await
+            }
+            TransactWriteOp::ConditionCheck { key_info, key, .. } => {
+                self.commit_condition_check(key_info, key, txn_id).await
+            }
+        }
+    }
+
+    /// COMMIT a ConditionCheck: remove the `created_to_prepare` marker left by
+    /// PREPARE for a check against an item that was absent (see
+    /// `prepare_single_operation`'s `ConditionCheck` arm). A ConditionCheck never
+    /// materializes a real item, so on commit the marker row — if any — must be
+    /// deleted rather than kept around as a phantom row with a cleared
+    /// `prepared_txn_id`, which would make the key look present to later readers.
+    /// A ConditionCheck against an item that already existed never plants a
+    /// marker, so the `IF ... AND created_to_prepare = true` guard is a no-op
+    /// there (nothing is deleted, nothing is harmed).
+    async fn commit_condition_check(
+        &self,
+        key_info: &TableKeyInfo,
+        key: &Item,
+        txn_id: Uuid,
+    ) -> Result<(), StorageError> {
+        let keyspace = self.account_keyspace(&key_info.account_id);
+        let ddb_table = super::ddl::data_table_name(&key_info.table_id);
+        let pk_text = composite_pk_to_text(key, &key_info.key_schema)?;
+        let txn_id_bytes = Bytes::new(txn_id.as_bytes().to_vec());
+
+        let result = if let Some((sk_name, sk_type)) =
+            sk_info(&key_info.key_schema, &key_info.attribute_definitions)
+        {
+            let sk_value = key
+                .get(sk_name)
+                .ok_or_else(|| StorageError::Internal("missing sort key".to_owned()))?;
+            let sk = parse_sk(sk_value, sk_type)?;
+            let sk_col = sk_column(sk_type);
+            let query = format!(
+                "DELETE FROM {keyspace}.{ddb_table} WHERE pk = ? AND {sk_col} = ? \
+                 IF prepared_txn_id = ? AND created_to_prepare = true"
+            );
+            query_with_pk_sk_txnid(&self.session, &query, pk_text.as_str(), &sk, txn_id_bytes).await
+        } else {
+            let query = format!(
+                "DELETE FROM {keyspace}.{ddb_table} WHERE pk = ? \
+                 IF prepared_txn_id = ? AND created_to_prepare = true"
+            );
+            self.session
+                .query_with_values(
+                    &query,
+                    cdrs_tokio::query_values!(pk_text.as_str(), txn_id_bytes),
+                )
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))
+        }
+        .map_err(|e| {
+            tracing::error!("commit_condition_check: {e}");
+            StorageError::Internal("Database error".to_owned())
+        })?;
+
+        // Either outcome is fine: applied means the phantom marker was removed;
+        // not-applied means there was no marker to remove (the checked item
+        // already existed, or was never prepared by this txn).
+        let _ = check_lwt_applied(&result, "commit_condition_check");
+        Ok(())
+    }
+
+    /// Helper to commit a Put or Update operation.
+    ///
+    /// Clears `created_to_prepare` as well as `prepared_txn_id`. The column
+    /// marks a row that exists only because a PREPARE planted it, and rollback
+    /// deletes such a row: `rollback_single_operation` and `recover_rollback_op`
+    /// run `DELETE .. IF prepared_txn_id = ? AND created_to_prepare = true`
+    /// before they fall back to clearing `prepared_txn_id`. A committed row that
+    /// kept the flag would match that DELETE when a later transaction that
+    /// touched the key was cancelled, and the committed item would be lost.
+    /// Clearing the flag here makes the DELETE skip the row.
+    ///
+    /// Rows committed before this clearing existed still carry the flag, and a
+    /// cancelled transaction still deletes them. The commit phase reads the
+    /// flag too, to decide whether a mutation has an old image (see
+    /// `commit_old_image`), and tells those rows apart by
+    /// `last_committed_txn_timestamp`, which only a commit writes.
+    async fn commit_put_or_update(
+        &self,
+        key_info: &TableKeyInfo,
+        final_item: &Item,
+        txn_id_bytes: Bytes,
+        txn_timestamp: i64,
+    ) -> Result<(), StorageError> {
+        let keyspace = self.account_keyspace(&key_info.account_id);
+        let ddb_table = super::ddl::data_table_name(&key_info.table_id);
+        let pk_text = composite_pk_to_text(final_item, &key_info.key_schema)?;
+
+        let item_json =
+            serde_json::to_value(final_item).map_err(|e| StorageError::Internal(e.to_string()))?;
+        let item_text = item_json.to_string();
+
+        let result = if let Some((sk_name, sk_type)) = sk_info(&key_info.key_schema, &key_info.attribute_definitions) {
+            let sk_value = final_item.get(sk_name)
+                .ok_or_else(|| StorageError::Internal("missing sort key".to_owned()))?;
+            let sk = parse_sk(sk_value, sk_type)?;
+            let sk_col = sk_column(sk_type);
+
+            let query = format!(
+                "UPDATE {keyspace}.{ddb_table} SET item_data = ?, prepared_txn_id = NULL, created_to_prepare = false, version = version + 1, last_committed_txn_timestamp = ? \
+                 WHERE pk = ? AND {sk_col} = ? IF prepared_txn_id = ?"
+            );
+            query_with_item_ts_pk_sk_txnid(&self.session, &query, &item_text, txn_timestamp, pk_text.as_str(), &sk, txn_id_bytes).await
+        } else {
+            let query = format!(
+                "UPDATE {keyspace}.{ddb_table} SET item_data = ?, prepared_txn_id = NULL, created_to_prepare = false, version = version + 1, last_committed_txn_timestamp = ? \
+                 WHERE pk = ? IF prepared_txn_id = ?"
+            );
+            self.session
+                .query_with_values(&query, cdrs_tokio::query_values!(item_text, txn_timestamp, pk_text.as_str(), txn_id_bytes))
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))
+        }
+        .map_err(|e| {
+            tracing::error!("commit_put_or_update: {e}");
+            StorageError::Internal("Database error".to_owned())
+        })?;
+
+        check_lwt_applied(&result, "commit_put_or_update")
+            .map_err(|_| StorageError::Internal("Transaction conflict during commit".to_owned()))?;
+        Ok(())
+    }
+
+    /// Build the stream record statement for one transacted mutation, or `None`
+    /// when the table has no stream enabled or the mutation records nothing (a
+    /// delete of a key that was already absent).
+    ///
+    /// Calls the same `stream_util::stream_record_statement` the single-item
+    /// write paths call, with the same image pair, so a transacted write records
+    /// the same event name, the same images for the table's view type, the same
+    /// shard assignment and the same sequence-number clock as the equivalent
+    /// `PutItem`, `UpdateItem` or `DeleteItem`.
+    ///
+    /// The statement takes its sequence number when it is built, so callers
+    /// build it once the base write has been applied. A number taken earlier
+    /// can be lower than the number of a record already published for a later
+    /// write on the same shard.
+    fn transact_stream_statement(
+        &self,
+        key_info: &TableKeyInfo,
+        stream: Option<&StreamCapture>,
+        old_item: Option<&Item>,
+        new_item: Option<&Item>,
+    ) -> Option<String> {
+        let capture = stream?;
+        crate::stream_util::stream_record_statement(
+            &self.account_keyspace(&key_info.account_id),
+            &key_info.table_id,
+            key_info,
+            old_item,
+            new_item,
+            capture,
+            &self.hlc,
+            self.stream_retention_seconds,
+        )
+    }
+
+    /// The table's index metadata, read before the base mutation commits.
+    ///
+    /// `fetch_indexes_for_table` is an uncached catalog read. Running it after
+    /// the base LWT would make every record and index row wait a round trip
+    /// behind an item that has already committed, widening the window in which
+    /// a crash leaves the item mutated and its secondary effects unwritten.
+    async fn indexes_for_commit(
+        &self,
+        key_info: &TableKeyInfo,
+    ) -> Result<Vec<super::index::IndexMeta>, StorageError> {
+        super::index::fetch_indexes_for_table(
+            &key_info.table_id,
+            &self.session,
+            &self.catalog_keyspace(),
+        )
+        .await
+    }
+
+    /// Run the secondary-effects LOGGED BATCH for one committed transactional
+    /// mutation: the LSI/GSI index rows and the stream record.
+    ///
+    /// Runs after the base-row LWT commit, since Cassandra does not allow LWT
+    /// statements to be batched with writes to other partitions. The single-item
+    /// paths have the same two-step shape for the same reason: `occ_write`
+    /// commits the base row by LWT, then carries the index rows and the stream
+    /// record in one LOGGED BATCH. A failure or crash after the base LWT leaves
+    /// the index rows and the record unwritten; neither a retry nor recovery
+    /// writes them, because recovery re-runs the base mutation only.
+    ///
+    /// `new_item` is `None` for a delete, which writes no index rows on this
+    /// path, and `indexes` is then empty. `index_old_item` is the old image the
+    /// index sync receives, which a put leaves as `None`; the stream record's
+    /// own old image is already baked into `stream_stmt`.
+    ///
+    /// The statements run as `secondary_effect_batches` groups them: one batch
+    /// holding the index rows and the record together, or the index batch
+    /// followed by the record as a batch of its own when the two are too large
+    /// to share one. The queue row that `enqueue_async_indexes` adds for an
+    /// asynchronous GSI goes into the index batch with the index rows.
+    async fn commit_secondary_effects(
+        &self,
+        key_info: &TableKeyInfo,
+        index_old_item: Option<&Item>,
+        new_item: Option<&Item>,
+        indexes: &[super::index::IndexMeta],
+        stream_stmt: Option<String>,
+    ) -> Result<(), StorageError> {
+        let data_keyspace = self.account_keyspace(&key_info.account_id);
+
+        if indexes.is_empty() && stream_stmt.is_none() {
+            return Ok(());
+        }
+
+        let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
+        let mut async_enqueued = 0;
+
+        if let Some(new_item) = new_item
+            && !indexes.is_empty()
+        {
+            let sys_delay = self
+                .gsi_default_delay_ms
+                .load(std::sync::atomic::Ordering::Relaxed);
+            super::index::sync_indexes(
+                &mut batch,
+                &data_keyspace,
+                &key_info.key_schema,
+                &key_info.attribute_definitions,
+                indexes,
+                index_old_item,
+                Some(new_item),
+                sys_delay,
+            )?;
+
+            async_enqueued = super::index::enqueue_async_indexes(
+                &self.session,
+                &mut batch,
+                &data_keyspace,
+                key_info,
+                indexes,
+                index_old_item,
+                Some(new_item),
+                sys_delay,
+            )
+            .await?;
+        }
+
+        let index_batch = batch
+            .build()
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        for batch in secondary_effect_batches(index_batch, stream_stmt) {
+            self.session.batch(batch).await.map_err(|e| {
+                StorageError::Internal(format!("commit_secondary_effects batch: {e}"))
+            })?;
+        }
+
+        if async_enqueued > 0 {
+            self.gsi_queue.notify_workers();
+        }
+
+        Ok(())
+    }
+
+    /// ROLLBACK a single operation: clean up prepared state.
+    ///
+    /// For items created during PREPARE (`created_to_prepare=true)`: DELETE the item
+    /// For existing items: Clear `prepared_txn_id` to restore unprepared state
+    async fn rollback_single_operation(
+        &self,
+        op: &TransactWriteOp<'_>,
+        txn_id: Uuid,
+    ) -> Result<(), StorageError> {
+        // A ConditionCheck on an item that existed at PREPARE time never writes a
+        // marker (the item's own prepared_txn_id fencing handles conflicts), so
+        // there is nothing to roll back for it. A ConditionCheck on an ABSENT item
+        // plants a created_to_prepare marker (see prepare_single_operation) and
+        // DOES need cleanup here — the generic logic below handles both: it reads
+        // the row (skipping this txn's own PREPARE), returns immediately if there
+        // is no row whatsoever, and otherwise deletes a created_to_prepare row or
+        // clears prepared_txn_id on a pre-existing one.
+        let key_info = match op {
+            TransactWriteOp::Put { key_info, .. }
+            | TransactWriteOp::Delete { key_info, .. }
+            | TransactWriteOp::Update { key_info, .. }
+            | TransactWriteOp::ConditionCheck { key_info, .. } => key_info,
+        };
+
+        let key = match op {
+            TransactWriteOp::Put { item, .. } => *item,
+            TransactWriteOp::Delete { key, .. } | TransactWriteOp::Update { key, .. } => *key,
+            TransactWriteOp::ConditionCheck { key, .. } => *key,
+        };
+
+        let keyspace = self.account_keyspace(&key_info.account_id);
+        let ddb_table = super::ddl::data_table_name(&key_info.table_id);
+        let pk_text = composite_pk_to_text(key, &key_info.key_schema)?;
+        let txn_id_bytes = Bytes::new(txn_id.as_bytes().to_vec());
+
+        // We need to check if this item was created during PREPARE (created_to_prepare=true)
+        // or if it was an existing item. Fetch the item to check.
+        let existing = self
+            .fetch_item_for_transaction(key_info, key, Some(txn_id))
+            .await?;
+
+        // If item doesn't exist, it's already been cleaned up (idempotent)
+        if existing.is_none() {
+            return Ok(());
+        }
+
+        // Try DELETE first (for items created during PREPARE with created_to_prepare=true).
+        // If that fails, fall back to clearing prepared_txn_id (for pre-existing items).
+        let delete_result = if let Some((sk_name, sk_type)) = sk_info(&key_info.key_schema, &key_info.attribute_definitions) {
+            let sk_value = key.get(sk_name)
+                .ok_or_else(|| StorageError::Internal("missing sort key".to_owned()))?;
+            let sk = parse_sk(sk_value, sk_type)?;
+            let sk_col = sk_column(sk_type);
+
+            let delete_query = format!(
+                "DELETE FROM {keyspace}.{ddb_table} WHERE pk = ? AND {sk_col} = ? IF prepared_txn_id = ? AND created_to_prepare = true"
+            );
+            let update_query = format!(
+                "UPDATE {keyspace}.{ddb_table} SET prepared_txn_id = null WHERE pk = ? AND {sk_col} = ? IF prepared_txn_id = ?"
+            );
+
+            let dr = query_with_pk_sk_txnid(&self.session, &delete_query, pk_text.as_str(), &sk, txn_id_bytes.clone())
+                .await
+                .map_err(|e| { tracing::error!("rollback delete: {e}"); e })?;
+            if check_lwt_applied(&dr, "rollback delete").is_ok() {
+                return Ok(());
+            }
+            query_with_pk_sk_txnid(&self.session, &update_query, pk_text.as_str(), &sk, txn_id_bytes).await
+        } else {
+            let delete_query = format!(
+                "DELETE FROM {keyspace}.{ddb_table} WHERE pk = ? IF prepared_txn_id = ? AND created_to_prepare = true"
+            );
+            let update_query = format!(
+                "UPDATE {keyspace}.{ddb_table} SET prepared_txn_id = null WHERE pk = ? IF prepared_txn_id = ?"
+            );
+
+            let dr = self.session
+                .query_with_values(&delete_query, cdrs_tokio::query_values!(pk_text.as_str(), txn_id_bytes.clone()))
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))
+                .map_err(|e| { tracing::error!("rollback delete: {e}"); e })?;
+            if check_lwt_applied(&dr, "rollback delete").is_ok() {
+                return Ok(());
+            }
+            self.session
+                .query_with_values(&update_query, cdrs_tokio::query_values!(pk_text.as_str(), txn_id_bytes))
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))
+        }
+        .map_err(|e| {
+            tracing::error!("rollback_single_operation: {e}");
+            StorageError::Internal("Database error".to_owned())
+        })?;
+
+        check_lwt_applied(&delete_result, "rollback update").unwrap_or(());
+        Ok(())
+    }
+
+    /// Recover a single stale transaction found by the recovery worker.
+    ///
+    /// Reads the ledger entry, parses `LedgerOp`s, then resumes COMMIT or
+    /// executes ROLLBACK depending on the recorded state.  Errors during
+    /// individual item operations are logged but do not abort recovery of the
+    /// remaining items; the ledger entry is deleted only when all items have
+    /// been processed successfully.
+    pub(crate) async fn recover_transaction(
+        &self,
+        keyspace: &str,
+        txn_id: Uuid,
+    ) -> Result<(), StorageError> {
+        let entry = match self.read_ledger_entry(keyspace, txn_id).await? {
+            Some(e) => e,
+            None => return Ok(()), // already cleaned up
+        };
+
+        let ops = entry.parse_ops()?;
+        let state = TransactionState::from_str(&entry.state);
+        let txn_timestamp = entry.started_at;
+
+        match state {
+            Some(TransactionState::Committing) => {
+                for op in &ops {
+                    if let Err(e) = self
+                        .recover_commit_op(keyspace, op, txn_id, txn_timestamp)
+                        .await
+                    {
+                        tracing::error!("recover_transaction commit op {txn_id}: {e}");
+                        return Err(e);
+                    }
+                }
+                for op in &ops {
+                    // The ledger persists the pre-commit image at PREPARE, so
+                    // recovery retires the queue entry the item had before the
+                    // transaction as well as registering the committed one —
+                    // the same transition the live commit path performs. That
+                    // covers DELETE ops too, which previously left their old
+                    // entry queued until its original due time. A ledger
+                    // written before the field exists deserializes it as None,
+                    // and recovery for it stays insert-only (the worker
+                    // revalidates before deleting anything, so the stale entry
+                    // is inert garbage, not a hazard).
+                    match op.op.as_str() {
+                        "PUT" | "UPDATE" => {
+                            self.reconcile_ttl_transition_by_table_id(
+                                &op.table_id,
+                                op.pre_commit_item_data.as_deref(),
+                                op.item_data.as_deref(),
+                            )
+                            .await?;
+                        }
+                        "DELETE" => {
+                            self.reconcile_ttl_transition_by_table_id(
+                                &op.table_id,
+                                op.pre_commit_item_data.as_deref(),
+                                None,
+                            )
+                            .await?;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // PREPARING or CANCELLING (or unknown) → rollback
+            _ => {
+                for op in &ops {
+                    if let Err(e) = self.recover_rollback_op(keyspace, op, txn_id).await {
+                        tracing::error!("recover_transaction rollback op {txn_id}: {e}");
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        self.delete_ledger_entry(keyspace, txn_id).await
+    }
+
+    /// Commit a single operation during recovery.
+    ///
+    /// PUT/UPDATE: write `item_data`, clear `prepared_txn_id`, set `last_committed_txn_timestamp`.
+    /// DELETE: update `partition_max_delete_timestamp`, then delete the row.
+    /// CHECK: delete the `created_to_prepare` marker if PREPARE planted one for an
+    /// absent item; no-op if the checked item already existed.
+    async fn recover_commit_op(
+        &self,
+        keyspace: &str,
+        op: &crate::data::transaction_ledger::LedgerOp,
+        txn_id: Uuid,
+        txn_timestamp: i64,
+    ) -> Result<(), StorageError> {
+        if op.op == "CHECK" {
+            // A ConditionCheck never materializes an item. If PREPARE planted a
+            // created_to_prepare marker (because the checked item was absent — see
+            // prepare_single_operation's ConditionCheck arm), commit must delete
+            // that phantom row rather than leave it behind. If the checked item
+            // already existed, no marker was planted and this DELETE's `IF ... AND
+            // created_to_prepare = true` guard simply does not apply — a no-op.
+            let table = data_table_name(&op.table_id);
+            let txn_id_bytes = Bytes::new(txn_id.as_bytes().to_vec());
+            let sk = ledger_sk(op)?;
+            let result = if let Some((sk_val, sk_col)) = &sk {
+                let dq = format!(
+                    "DELETE FROM {keyspace}.{table} WHERE pk = ? AND {sk_col} = ? \
+                     IF prepared_txn_id = ? AND created_to_prepare = true",
+                );
+                query_with_pk_sk_txnid(&self.session, &dq, &op.pk, sk_val, txn_id_bytes).await
+            } else {
+                let dq = format!(
+                    "DELETE FROM {keyspace}.{table} WHERE pk = ? \
+                     IF prepared_txn_id = ? AND created_to_prepare = true",
+                );
+                self.session
+                    .query_with_values(&dq, cdrs_tokio::query_values!(op.pk.as_str(), txn_id_bytes))
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))
+            }
+            .map_err(|e| {
+                tracing::error!("recover_commit_op CHECK: {e}");
+                StorageError::Internal("Database error".to_owned())
+            })?;
+            let _ = check_lwt_applied(&result, "recover_commit CHECK");
+            return Ok(());
+        }
+
+        let table = data_table_name(&op.table_id);
+        let txn_id_bytes = Bytes::new(txn_id.as_bytes().to_vec());
+        let sk = ledger_sk(op)?;
+
+        match op.op.as_str() {
+            "PUT" | "UPDATE" => {
+                let item_data = op.item_data.as_deref().ok_or_else(|| {
+                    StorageError::Internal(format!(
+                        "ledger op {} missing item_data for {}",
+                        op.op, txn_id
+                    ))
+                })?;
+
+                let result = if let Some((sk_val, sk_col)) = &sk {
+                    let query = format!(
+                        "UPDATE {keyspace}.{table} SET item_data = ?, prepared_txn_id = NULL, \
+                         created_to_prepare = false, version = version + 1, \
+                         last_committed_txn_timestamp = ? \
+                         WHERE pk = ? AND {sk_col} = ? IF prepared_txn_id = ?",
+                    );
+                    query_with_item_ts_pk_sk_txnid(
+                        &self.session,
+                        &query,
+                        item_data,
+                        txn_timestamp,
+                        &op.pk,
+                        sk_val,
+                        txn_id_bytes,
+                    )
+                    .await
+                } else {
+                    let query = format!(
+                        "UPDATE {keyspace}.{table} SET item_data = ?, prepared_txn_id = NULL, \
+                         created_to_prepare = false, version = version + 1, \
+                         last_committed_txn_timestamp = ? \
+                         WHERE pk = ? IF prepared_txn_id = ?",
+                    );
+                    self.session
+                        .query_with_values(
+                            &query,
+                            cdrs_tokio::query_values!(
+                                item_data,
+                                txn_timestamp,
+                                op.pk.as_str(),
+                                txn_id_bytes
+                            ),
+                        )
+                        .await
+                        .map_err(|e| StorageError::Internal(e.to_string()))
+                }
+                .map_err(|e| {
+                    tracing::error!("recover_commit_op PUT/UPDATE: {e}");
+                    StorageError::Internal("Database error".to_owned())
+                })?;
+
+                // LWT may not apply if item was already committed (idempotent)
+                let _ = check_lwt_applied(&result, "recover_commit PUT/UPDATE");
+                Ok(())
+            }
+            "DELETE" => {
+                // Step 1: update partition_max_delete_timestamp
+                let update_null = format!(
+                    "UPDATE {keyspace}.{table} SET partition_max_delete_timestamp = ? \
+                     WHERE pk = ? IF partition_max_delete_timestamp = null",
+                );
+                let r1 = self
+                    .session
+                    .query_with_values(
+                        &update_null,
+                        cdrs_tokio::query_values!(txn_timestamp, op.pk.as_str()),
+                    )
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))
+                    .map_err(|e| {
+                        tracing::error!("recover_commit_op delete max_ts null: {e}");
+                        e
+                    })?;
+
+                if check_lwt_applied(&r1, "recover_commit delete max_ts null").is_err() {
+                    let update_cmp = format!(
+                        "UPDATE {keyspace}.{table} SET partition_max_delete_timestamp = ? \
+                         WHERE pk = ? IF partition_max_delete_timestamp < ?",
+                    );
+                    let _ = self
+                        .session
+                        .query_with_values(
+                            &update_cmp,
+                            cdrs_tokio::query_values!(txn_timestamp, op.pk.as_str(), txn_timestamp),
+                        )
+                        .await
+                        .map_err(|e| StorageError::Internal(e.to_string()))
+                        .map_err(|e| {
+                            tracing::error!("recover_commit_op delete max_ts cmp: {e}");
+                            e
+                        })?;
+                }
+
+                // Step 2: delete the row
+                let result = if let Some((sk_val, sk_col)) = &sk {
+                    let query = format!(
+                        "DELETE FROM {keyspace}.{table} WHERE pk = ? AND {sk_col} = ? \
+                         IF prepared_txn_id = ?",
+                    );
+                    query_with_pk_sk_txnid(&self.session, &query, &op.pk, sk_val, txn_id_bytes)
+                        .await
+                } else {
+                    let query = format!(
+                        "DELETE FROM {keyspace}.{table} WHERE pk = ? IF prepared_txn_id = ?",
+                    );
+                    self.session
+                        .query_with_values(
+                            &query,
+                            cdrs_tokio::query_values!(op.pk.as_str(), txn_id_bytes),
+                        )
+                        .await
+                        .map_err(|e| StorageError::Internal(e.to_string()))
+                }
+                .map_err(|e| {
+                    tracing::error!("recover_commit_op DELETE: {e}");
+                    StorageError::Internal("Database error".to_owned())
+                })?;
+
+                let _ = check_lwt_applied(&result, "recover_commit DELETE");
+                Ok(())
+            }
+            other => Err(StorageError::Internal(format!(
+                "unknown op in ledger: {other}"
+            ))),
+        }
+    }
+
+    /// Rollback a single operation during recovery.
+    ///
+    /// Tries DELETE with `IF prepared_txn_id = ? AND created_to_prepare = true` first.
+    /// Falls back to clearing `prepared_txn_id` for pre-existing items.
+    /// CHECK: same as above — deletes a marker planted for an absent checked item,
+    /// a no-op if the checked item already existed.
+    async fn recover_rollback_op(
+        &self,
+        keyspace: &str,
+        op: &crate::data::transaction_ledger::LedgerOp,
+        txn_id: Uuid,
+    ) -> Result<(), StorageError> {
+        // CHECK falls through to the generic logic below: a created_to_prepare
+        // marker (planted when the checked item was absent) is deleted; a
+        // pre-existing checked item was never prepared, so neither the DELETE nor
+        // the prepared_txn_id-clear UPDATE below applies to it — both are no-ops.
+        let table = data_table_name(&op.table_id);
+        let txn_id_bytes = Bytes::new(txn_id.as_bytes().to_vec());
+        let sk = ledger_sk(op)?;
+
+        let (delete_result, update_query) = if let Some((sk_val, sk_col)) = &sk {
+            let dq = format!(
+                "DELETE FROM {keyspace}.{table} WHERE pk = ? AND {sk_col} = ? \
+                 IF prepared_txn_id = ? AND created_to_prepare = true",
+            );
+            let uq = format!(
+                "UPDATE {keyspace}.{table} SET prepared_txn_id = null \
+                 WHERE pk = ? AND {sk_col} = ? IF prepared_txn_id = ?",
+            );
+            let dr =
+                query_with_pk_sk_txnid(&self.session, &dq, &op.pk, sk_val, txn_id_bytes.clone())
+                    .await
+                    .map_err(|e| {
+                        tracing::error!("recover_rollback_op delete: {e}");
+                        StorageError::Internal("Database error".to_owned())
+                    })?;
+            (dr, uq)
+        } else {
+            let dq = format!(
+                "DELETE FROM {keyspace}.{table} WHERE pk = ? \
+                 IF prepared_txn_id = ? AND created_to_prepare = true",
+            );
+            let uq = format!(
+                "UPDATE {keyspace}.{table} SET prepared_txn_id = null \
+                 WHERE pk = ? IF prepared_txn_id = ?",
+            );
+            let dr = self
+                .session
+                .query_with_values(
+                    &dq,
+                    cdrs_tokio::query_values!(op.pk.as_str(), txn_id_bytes.clone()),
+                )
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))
+                .map_err(|e| {
+                    tracing::error!("recover_rollback_op delete: {e}");
+                    e
+                })?;
+            (dr, uq)
+        };
+
+        if check_lwt_applied(&delete_result, "recover_rollback delete").is_ok() {
+            return Ok(());
+        }
+
+        // Item was pre-existing - clear the transaction marker
+        let result = if let Some((sk_val, _sk_col)) = &sk {
+            query_with_pk_sk_txnid(&self.session, &update_query, &op.pk, sk_val, txn_id_bytes).await
+        } else {
+            self.session
+                .query_with_values(
+                    &update_query,
+                    cdrs_tokio::query_values!(op.pk.as_str(), txn_id_bytes),
+                )
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))
+        }
+        .map_err(|e| {
+            tracing::error!("recover_rollback_op update: {e}");
+            StorageError::Internal("Database error".to_owned())
+        })?;
+
+        let _ = check_lwt_applied(&result, "recover_rollback update");
+        Ok(())
+    }
+}
+
+/// Resolve sort key value and column name from `key_info` + item.
+fn resolve_sk(
+    key_info: &TableKeyInfo,
+    key: &Item,
+) -> Result<(Option<SortKeyValue>, Option<String>), StorageError> {
+    if let Some((sk_name, sk_type)) = sk_info(&key_info.key_schema, &key_info.attribute_definitions)
+    {
+        let sk_value = key
+            .get(sk_name)
+            .ok_or_else(|| StorageError::Internal("missing sort key".to_owned()))?;
+        let sk = parse_sk(sk_value, sk_type)?;
+        Ok((Some(sk), Some(sk_column(sk_type).to_owned())))
+    } else {
+        Ok((None, None))
+    }
+}
+
+/// Resolve sort key value and column name from a `TransactGetOp`.
+fn resolve_sk_get(
+    op: &TransactGetOp<'_>,
+) -> Result<(Option<SortKeyValue>, Option<String>), StorageError> {
+    resolve_sk(op.key_info, op.key)
+}
+
+/// Check if LWT was applied successfully.
+fn check_lwt_applied(result: &Envelope, context: &str) -> Result<(), CancellationReason> {
+    let body = result.response_body().map_err(|e| {
+        tracing::error!("{} response_body: {e}", context);
+        CancellationReason::validation_error("Database error".to_owned())
+    })?;
+
+    if let Some(rows) = body.into_rows()
+        && let Some(row) = rows.first()
+    {
+        let applied: bool = get_column::<bool, StorageError>(row, "[applied]", context)
+            .map_err(|_| transaction_conflict_reason())?;
+        if !applied {
+            return Err(transaction_conflict_reason());
+        }
+    }
+
+    Ok(())
+}
+
+/// Extract sort key from a `LedgerOp` as `Option<(SortKeyValue, col_name)>`.
+fn ledger_sk(
+    op: &crate::data::transaction_ledger::LedgerOp,
+) -> Result<Option<(SortKeyValue, String)>, StorageError> {
+    match (&op.sk_col, &op.sk_val) {
+        (Some(col), Some(val)) => Ok(Some((ledger_sk_to_sort_key(col, val)?, col.clone()))),
+        _ => Ok(None),
+    }
+}
+
+/// Reconstruct a `SortKeyValue` from the text representation stored in `LedgerOp`.
+///
+/// `sk_col` encodes the type ("`sk_s`" → S, "`sk_n`" → N, "`sk_b`" → B).
+fn ledger_sk_to_sort_key(sk_col: &str, sk_val: &str) -> Result<SortKeyValue, StorageError> {
+    match sk_col {
+        "sk_s" => Ok(SortKeyValue::S(sk_val.to_owned())),
+        "sk_n" => {
+            let d = sk_val.parse::<bigdecimal::BigDecimal>().map_err(|e| {
+                StorageError::Internal(format!("invalid numeric sk in ledger: {e}"))
+            })?;
+            Ok(SortKeyValue::N(d))
+        }
+        "sk_b" => {
+            use base64::Engine as _;
+            let b = base64::engine::general_purpose::STANDARD
+                .decode(sk_val)
+                .map_err(|e| StorageError::Internal(format!("invalid binary sk in ledger: {e}")))?;
+            Ok(SortKeyValue::B(b))
+        }
+        other => Err(StorageError::Internal(format!(
+            "unknown sk_col in ledger: {other}"
+        ))),
+    }
+}

@@ -103,7 +103,7 @@ pub(crate) struct GsiApplyContext {
 #[serde(untagged)]
 pub(crate) enum PendingApplyContext {
     Gsi(GsiApplyContext),
-    Vector(super::vector_index::VectorApplyContext),
+    Vector(extenddb_storage::vector_lifecycle::VectorApplyContext),
 }
 
 impl PendingApplyContext {
@@ -146,6 +146,22 @@ pub(crate) struct IndexMeta {
     /// Per-GSI propagation delay (ms). `None` = use system default; `Some(0)` =
     /// synchronous.
     pub(super) propagation_delay_ms: Option<i64>,
+    /// The table's attribute definitions, read with the index rows rather than
+    /// taken from the cached `TableKeyInfo`. An UpdateTable that adds a GSI adds
+    /// its key attributes' definitions too, and the engine drops its cached key
+    /// info only when the UpdateTable returns, so a write in between would build
+    /// the index row without the columns of a sort key it does not know the type
+    /// of.
+    pub(super) attribute_definitions: Vec<AttributeDefinition>,
+}
+
+/// The table's attribute definitions as of the write's index read, falling back
+/// to the cached set when the table has no secondary index to have carried them.
+pub(crate) fn fresh_attr_defs<'a>(
+    indexes: &'a [IndexMeta],
+    cached: &'a [AttributeDefinition],
+) -> &'a [AttributeDefinition] {
+    indexes.first().map_or(cached, |i| &i.attribute_definitions)
 }
 
 /// Fetch all index metadata for a table from the catalog.
@@ -153,9 +169,11 @@ pub(crate) async fn fetch_indexes_for_table(
     table_id: &str,
     pool: &sqlx::SqlitePool,
 ) -> Result<Vec<IndexMeta>, StorageError> {
-    let rows: Vec<(String, String, String, String, String, Option<i64>)> = sqlx::query_as(
-        "SELECT index_id, index_name, index_type, key_schema, projection, propagation_delay_ms \
-         FROM indexes WHERE table_id = ?",
+    type Row = (String, String, String, String, String, Option<i64>, String);
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT i.index_id, i.index_name, i.index_type, i.key_schema, i.projection, \
+                i.propagation_delay_ms, t.attribute_definitions \
+         FROM indexes i JOIN tables t ON t.table_id = i.table_id WHERE i.table_id = ?",
     )
     .bind(table_id)
     .fetch_all(pool)
@@ -163,7 +181,7 @@ pub(crate) async fn fetch_indexes_for_table(
     .map_err(crate::sqlite_util::map_sqlx_err)?;
 
     rows.into_iter()
-        .map(|(index_id, index_name, index_type, ks, proj, delay)| {
+        .map(|(index_id, index_name, index_type, ks, proj, delay, ad)| {
             Ok(IndexMeta {
                 index_id,
                 index_name,
@@ -173,6 +191,8 @@ pub(crate) async fn fetch_indexes_for_table(
                 projection: serde_json::from_str(&proj)
                     .map_err(|e| StorageError::Internal(e.to_string()))?,
                 propagation_delay_ms: delay,
+                attribute_definitions: serde_json::from_str(&ad)
+                    .map_err(|e| StorageError::Internal(e.to_string()))?,
             })
         })
         .collect()
@@ -213,7 +233,7 @@ pub(crate) async fn enqueue_async_indexes(
         }
         let context = GsiApplyContext {
             base_key_schema: key_info.key_schema.clone(),
-            attribute_definitions: key_info.attribute_definitions.clone(),
+            attribute_definitions: idx.attribute_definitions.clone(),
             index: GsiIndexDef {
                 index_id: idx.index_id.clone(),
                 key_schema: idx.key_schema.clone(),
@@ -364,7 +384,9 @@ pub(crate) async fn sync_indexes(
             continue; // Async GSI — applied later by the propagation worker.
         }
         let idx_table = index_table_name(&idx.index_id);
-        let idx_sks = all_sort_key_info(&idx.key_schema, attr_defs);
+        // The index's key types come from the write's own catalog read; see
+        // `IndexMeta::attribute_definitions`.
+        let idx_sks = all_sort_key_info(&idx.key_schema, &idx.attribute_definitions);
 
         if let Some(old) = old_item
             && item_has_index_keys(old, &idx.key_schema)
@@ -560,11 +582,11 @@ pub(crate) async fn apply_claimed_row(
 #[cfg(test)]
 mod pending_context_tests {
     use super::{GsiApplyContext, GsiIndexDef, PendingApplyContext};
-    use crate::data::vector_index::{VectorApplyContext, VectorIndexMeta};
     use extenddb_core::types::{
         AttributeDefinition, KeySchemaElement, KeyType, Projection, ProjectionType,
         ScalarAttributeType,
     };
+    use extenddb_storage::vector_lifecycle::{VectorApplyContext, VectorIndexMeta};
 
     /// A context written by a build that predates vector rows, verbatim. It must
     /// still deserialize.

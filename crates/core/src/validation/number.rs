@@ -53,8 +53,10 @@ pub fn validate_and_normalize_number(s: &str) -> Result<String, DynamoDbError> {
     // Combine into a single digit string and track where the decimal point is.
     // The value is: <int_part>.<frac_part> * 10^explicit_exp
     // Which equals: <all_digits> * 10^(explicit_exp - frac_part.len())
+    // The exponent arithmetic is done in i64: the explicit exponent may be at
+    // either end of i32, and adding a digit count to it overflows i32.
     let all_digits = format!("{int_part}{frac_part}");
-    let point_offset = explicit_exp - frac_part.len() as i32;
+    let point_offset = i64::from(explicit_exp).saturating_sub(len_i64(frac_part.len()));
 
     // Strip leading zeros to get significant digits
     let sig_start = all_digits
@@ -83,18 +85,23 @@ pub fn validate_and_normalize_number(s: &str) -> Result<String, DynamoDbError> {
     //       = significant_as_integer * 10^point_offset  (leading zeros don't change value)
     //       = sig_trimmed_as_integer * 10^(point_offset + trailing_zeros)
     let trailing_zeros = significant.len() - sig_end;
-    let exp = point_offset + trailing_zeros as i32;
+    let exp = point_offset.saturating_add(len_i64(trailing_zeros));
 
     // Magnitude: the number is sig_trimmed * 10^exp, so its order of magnitude
     // is sig_trimmed.len() - 1 + exp
-    let magnitude_exp = sig_trimmed.len() as i32 - 1 + point_offset + trailing_zeros as i32;
+    let magnitude_exp = (len_i64(sig_trimmed.len()) - 1).saturating_add(exp);
 
-    if magnitude_exp > MAX_EXPONENT {
+    if magnitude_exp > i64::from(MAX_EXPONENT) {
         return Err(overflow_err());
     }
-    if magnitude_exp < MIN_EXPONENT {
+    if magnitude_exp < i64::from(MIN_EXPONENT) {
         return Err(underflow_err());
     }
+    // In range: the magnitude is within [-130, 125] and there are at most 38
+    // significant digits, so `exp` is within [-167, 125].
+    let Ok(exp) = i32::try_from(exp) else {
+        return Err(overflow_err());
+    };
 
     // Format the normalized number
     // sig_trimmed represents an integer, and we multiply by 10^exp
@@ -106,6 +113,12 @@ pub fn validate_and_normalize_number(s: &str) -> Result<String, DynamoDbError> {
     }
 
     Ok(result)
+}
+
+/// A length as `i64` for the exponent arithmetic. A `str` is at most
+/// `isize::MAX` bytes, so this never saturates.
+fn len_i64(len: usize) -> i64 {
+    i64::try_from(len).unwrap_or(i64::MAX)
 }
 
 /// Format digits * 10^exp as a plain decimal string (no scientific notation).
@@ -317,6 +330,32 @@ mod tests {
                 err.to_string().contains("numeric value"),
                 "expected numeric-value message for {bad:?}, got: {err}"
             );
+        }
+    }
+
+    /// An exponent at either end of `i32` combined with the digits: the
+    /// magnitude is computed without overflow (a debug build panicked on
+    /// each of these, and a release build wrapped and reported overflow as
+    /// underflow and the reverse).
+    #[test]
+    fn exponents_at_the_ends_of_i32_classify_the_magnitude() {
+        let overflow = "Number overflow. Attempting to store a number with magnitude larger than supported range";
+        let underflow = "Number underflow. Attempting to store a number with magnitude smaller than supported range";
+        for (input, expected) in [
+            ("10E2147483647", overflow),
+            ("49E2147483647", overflow),
+            ("1E2147483647", overflow),
+            ("-10E2147483647", overflow),
+            ("0.1E-2147483648", underflow),
+            ("-.80e-2147483648", underflow),
+            ("1E-2147483648", underflow),
+            ("1.5E-2147483648", underflow),
+        ] {
+            let err = validate_and_normalize_number(input).unwrap_err();
+            assert_eq!(err.to_string(), expected, "{input}");
+        }
+        for zero in [".00E-2147483647", "0.0E-2147483648", "00.000E2147483647"] {
+            assert_eq!(validate_and_normalize_number(zero).unwrap(), "0", "{zero}");
         }
     }
 

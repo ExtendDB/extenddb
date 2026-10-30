@@ -7,6 +7,8 @@
 //! It defines the Virtual `DynamoDB` type system, request/response envelopes,
 //! validation logic, and error types shared across all other crates.
 
+pub mod arn;
+pub mod backup_format;
 pub mod error;
 pub mod expression;
 pub mod limits;

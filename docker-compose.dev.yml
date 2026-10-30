@@ -1,0 +1,37 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Compose file for the `extenddb-dev` image: a DynamoDB-compatible endpoint
+# over SQLite for local development and CI. No external database, no init
+# step, no bootstrap service — the image serves from built-in defaults.
+#
+#   docker compose -f docker-compose.dev.yml up extenddb-dev          # file-backed
+#   docker compose -f docker-compose.dev.yml up extenddb-dev-memory   # ephemeral
+#
+# Dev-mode serves plain HTTP with open authorization (SigV4 signatures are
+# still checked for shape). Containment lives at the publish boundary: both
+# services bind the host port to 127.0.0.1 only. Do not publish this port on a
+# shared or routable interface.
+
+services:
+  # File-backed: data survives container restarts on the named volume.
+  extenddb-dev:
+    image: ${EXTENDDB_DEV_IMAGE:-extenddb/extenddb-dev:latest}
+    ports:
+      - "127.0.0.1:18080:18080"
+    volumes:
+      - extenddb-dev-data:/var/lib/extenddb
+    restart: unless-stopped
+
+  # Ephemeral: everything lives in process memory and vanishes on stop.
+  # Started explicitly by service name; not part of the default `up`.
+  extenddb-dev-memory:
+    image: ${EXTENDDB_DEV_IMAGE:-extenddb/extenddb-dev:latest}
+    profiles: ["memory"]
+    environment:
+      EXTENDDB__STORAGE__SQLITE__PATH: ":memory:"
+    ports:
+      - "127.0.0.1:18081:18080"
+
+volumes:
+  extenddb-dev-data:

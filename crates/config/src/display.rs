@@ -1,14 +1,15 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
-//! Configuration display and redaction helpers for the console settings page.
+//! Configuration display and redaction helpers for the console settings page,
+//! the management settings API and the `extenddb settings` CLI.
 
 use crate::AppConfig;
 
 /// Keys whose values must be redacted in configuration displays.
 ///
-/// The single source of truth for redaction patterns. Consumers (including the
-/// console settings page) call [`should_redact`] rather than keeping their own
-/// copy of this list.
+/// The single source of truth for redaction patterns. Consumers (the console
+/// settings page, the management settings API and the `settings` CLI) call
+/// [`should_redact`] rather than keeping their own copy of this list.
 const REDACTED_CONFIG_KEYS: &[&str] = &[
     "connection_string",
     "encryption_key",
@@ -16,6 +17,12 @@ const REDACTED_CONFIG_KEYS: &[&str] = &[
     "secret",
     "token",
 ];
+
+/// The text printed in place of a redacted value: eight U+2022 bullets.
+///
+/// The console settings page, the management settings API and the `settings`
+/// CLI print this constant, so the three surfaces show the same mask.
+pub const MASK: &str = "••••••••";
 
 /// Return `true` if a configuration or settings key's value must be redacted
 /// before it is displayed.
@@ -28,13 +35,20 @@ pub fn should_redact(key: &str) -> bool {
     REDACTED_CONFIG_KEYS.iter().any(|p| lower.contains(p))
 }
 
-/// Return `"••••••••"` if `key` matches a redaction pattern, else `val`.
+/// Return [`MASK`] if `key` matches a redaction pattern, else `val`.
 fn redact_if_sensitive(key: &str, val: &str) -> String {
     if should_redact(key) {
-        "••••••••".to_owned()
+        MASK.to_owned()
     } else {
         val.to_owned()
     }
+}
+
+fn display_pool_limit(value: Option<u32>) -> String {
+    value.map_or_else(
+        || "from connection string / driver default".to_owned(),
+        |n| n.to_string(),
+    )
 }
 
 /// D9: Build static configuration entries for the console settings page.
@@ -45,6 +59,8 @@ fn redact_if_sensitive(key: &str, val: &str) -> String {
 pub fn build_config_entries(cfg: &AppConfig) -> Vec<(String, String)> {
     let r = redact_if_sensitive;
     let backend = &cfg.storage.backend;
+    let data_pool_size = display_pool_limit(cfg.storage.max_connections_override());
+    let catalog_pool_size = display_pool_limit(cfg.storage.max_catalog_connections_override());
     let mut entries = vec![
         ("server.bind_addr".into(), cfg.server.bind_addr.clone()),
         ("server.port".into(), cfg.server.port.to_string()),
@@ -72,13 +88,10 @@ pub fn build_config_entries(cfg: &AppConfig) -> Vec<(String, String)> {
             format!("storage.{backend}.connection_string"),
             r("connection_string", cfg.storage.connection_config()),
         ),
-        (
-            format!("storage.{backend}.pool_size"),
-            cfg.storage.max_connections().to_string(),
-        ),
+        (format!("storage.{backend}.pool_size"), data_pool_size),
         (
             format!("storage.{backend}.catalog_pool_size"),
-            cfg.storage.max_catalog_connections().to_string(),
+            catalog_pool_size,
         ),
         ("auth.provider".into(), cfg.auth.provider.clone()),
         ("logging.level".into(), cfg.logging.level.clone()),
@@ -128,4 +141,46 @@ pub fn build_config_entries(cfg: &AppConfig) -> Vec<(String, String)> {
     ]);
 
     entries
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{display_pool_limit, should_redact};
+
+    #[test]
+    fn explicit_pool_limit_is_displayed() {
+        assert_eq!(display_pool_limit(Some(31)), "31");
+    }
+
+    #[test]
+    fn absent_pool_limit_identifies_its_source() {
+        assert_eq!(
+            display_pool_limit(None),
+            "from connection string / driver default"
+        );
+    }
+
+    /// Each of the five patterns redacts as the whole key and as part of a
+    /// longer key, in any letter case; a key that contains none of them does
+    /// not. The admin guide's settings section names all five.
+    #[test]
+    fn should_redact_matches_each_pattern_in_any_case() {
+        for key in [
+            "encryption_key",
+            "Encryption_KEY",
+            "connection_string",
+            "storage.Connection_String",
+            "password",
+            "DATA_DB_Password",
+            "secret",
+            "Client_SECRET",
+            "token",
+            "session_Token",
+        ] {
+            assert!(should_redact(key), "{key} must redact");
+        }
+        for key in ["log_level", "Log_Level", "catalog_version"] {
+            assert!(!should_redact(key), "{key} must not redact");
+        }
+    }
 }

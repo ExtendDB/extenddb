@@ -8,6 +8,9 @@
 //! transaction afterward, with catalog cleanup if the data DDL fails. The
 //! control-plane delay (`control_plane_delay_seconds`) decides whether the
 //! table starts ACTIVE (delay 0) or CREATING with a scheduled transition.
+//!
+//! The restore path is the exception: see `defer_active` on
+//! [`SqliteEngine::create_table_impl`].
 
 use extenddb_core::types::{
     BillingMode, BillingModeSummary, CreateTableInput, GsiDescription, LsiDescription,
@@ -16,16 +19,61 @@ use extenddb_core::types::{
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{index_arn, stream_arn, table_arn};
 
-use crate::sqlite_util::{format_timestamp, is_unique_violation};
+use crate::sqlite_util::{format_epoch_seconds, format_timestamp, is_unique_violation};
 use crate::store::SqliteEngine;
 
+/// What a restore records about itself when its target is created.
+pub(crate) struct RestoreRegistration<'a> {
+    pub backup_arn: &'a str,
+    pub source_table_arn: &'a str,
+    /// Epoch seconds: the source backup's creation time.
+    pub restore_date_time: f64,
+}
+
 impl SqliteEngine {
+    /// Create a table. When `defer_active` is set (the restore path), the row
+    /// is written `CREATING` with **no** scheduled transition, so the
+    /// background control-plane worker cannot flip it to `ACTIVE` while the
+    /// caller is still populating it; the caller sets `ACTIVE` itself once the
+    /// data copy completes. Normal `CreateTable` passes `false` and gets the
+    /// usual timed transition.
     pub(crate) async fn create_table_impl(
         &self,
         account_id: &str,
         input: CreateTableInput,
+        defer_active: bool,
+    ) -> Result<TableDescription, StorageError> {
+        self.create_table_impl_inner(account_id, input, defer_active, None)
+            .await
+    }
+
+    /// Create a restore target and register the restore (source backup,
+    /// source table ARN, restore time) in the write transaction that also
+    /// re-checks the backup is AVAILABLE and owned by `account_id`.
+    pub(crate) async fn create_table_for_restore(
+        &self,
+        account_id: &str,
+        input: CreateTableInput,
+        registration: &RestoreRegistration<'_>,
+    ) -> Result<TableDescription, StorageError> {
+        self.create_table_impl_inner(account_id, input, true, Some(registration))
+            .await
+    }
+
+    async fn create_table_impl_inner(
+        &self,
+        account_id: &str,
+        input: CreateTableInput,
+        defer_active: bool,
+        restore: Option<&RestoreRegistration<'_>>,
     ) -> Result<TableDescription, StorageError> {
         Self::validate_account_id(account_id)?;
+        // D1: every writer holds the engine write lock. This method runs two
+        // write transactions (catalog rows, then data-table DDL); without the
+        // lock they contend with data-plane writers at the SQLite level, and a
+        // slow DDL commit can exhaust a concurrent writer's busy_timeout,
+        // surfacing as a 500 on an unrelated request.
+        let _writer = self.write_lock.lock().await;
         let table_id = uuid::Uuid::new_v4().to_string();
         let table_arn = table_arn(&self.region, account_id, &input.table_name);
         let billing_mode = input.billing_mode.unwrap_or(BillingMode::Provisioned);
@@ -76,7 +124,14 @@ impl SqliteEngine {
         let creation_ts = format_timestamp(now);
         #[allow(clippy::cast_precision_loss)]
         let creation_epoch = now.unix_timestamp() as f64;
-        let (initial_status, status_transition_at) = if delay_secs <= 0.0 {
+        let (initial_status, status_transition_at) = if defer_active {
+            // CREATING with no scheduled transition: the control-plane worker
+            // matches only rows with a non-NULL, matured `status_transition_at`
+            // (see `worker.rs`), so it can never flip this row mid-copy. The
+            // restore caller performs the single ACTIVE flip when the copy
+            // commits.
+            ("CREATING", None)
+        } else if delay_secs <= 0.0 {
             ("ACTIVE", None)
         } else {
             (
@@ -93,7 +148,63 @@ impl SqliteEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        sqlx::query(
+        if let Some(RestoreRegistration { backup_arn, .. }) = restore {
+            // A restore into a name that is itself a CREATING restore target
+            // is refused as such before the backup is checked, so a second
+            // restore of the same backup into the same name is
+            // TableBeingRestored (the service answers TableInUseException),
+            // not BackupInUse, as on PostgreSQL and Cassandra.
+            let target_in_progress: Option<String> = sqlx::query_scalar(
+                "SELECT r.source_backup_arn FROM tables t \
+                 JOIN table_restores r ON r.table_id = t.table_id \
+                 WHERE t.account_id = ? AND t.table_name = ? AND t.table_status = 'CREATING'",
+            )
+            .bind(account_id)
+            .bind(&input.table_name)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            if let Some(source_backup_arn) = target_in_progress {
+                return Err(StorageError::TableBeingRestored {
+                    table_name: input.table_name.clone(),
+                    backup_arn: source_backup_arn,
+                });
+            }
+            let available: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM backups WHERE backup_arn = ? \
+                 AND account_id = ? AND backup_status = 'AVAILABLE')",
+            )
+            .bind(backup_arn)
+            .bind(account_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            if !available {
+                return Err(StorageError::Validation(format!(
+                    "Backup not found: {backup_arn}"
+                )));
+            }
+            // One restore of a backup at a time, as the service: while a
+            // target restored from it is CREATING the backup is in use. Same
+            // predicate as DeleteBackup's, in the same kind of write
+            // transaction under the write lock, so two simultaneous restores
+            // cannot both pass.
+            let restoring: Option<String> = sqlx::query_scalar(
+                "SELECT t.table_name FROM table_restores r JOIN tables t ON t.table_id = r.table_id \
+                 WHERE r.source_backup_arn = ? AND t.table_status = 'CREATING' LIMIT 1",
+            )
+            .bind(backup_arn)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            if let Some(table) = restoring {
+                return Err(StorageError::BackupInUse(format!(
+                    "Backup is being used to restore table {table}: {backup_arn}"
+                )));
+            }
+        }
+
+        let inserted = sqlx::query(
             "INSERT INTO tables \
              (account_id, table_name, key_schema, attribute_definitions, billing_mode, \
               provisioned_throughput, stream_specification, table_status, creation_date_time, \
@@ -118,14 +229,52 @@ impl SqliteEngine {
         .bind(&sse_json)
         .bind(&on_demand_json)
         .execute(&mut *tx)
-        .await
-        .map_err(|e| {
-            if is_unique_violation(&e) {
-                StorageError::TableAlreadyExists(input.table_name.clone())
-            } else {
-                StorageError::Internal(e.to_string())
+        .await;
+        if let Err(e) = inserted {
+            if !is_unique_violation(&e) {
+                return Err(StorageError::Internal(e.to_string()));
             }
-        })?;
+            // A restore into a name that is itself a CREATING restore target
+            // is refused as such, naming that target's source backup (the
+            // service answers TableInUseException); any other taken name is
+            // TableAlreadyExists.
+            if restore.is_some() {
+                let existing: Option<(String, Option<String>)> = sqlx::query_as(
+                    "SELECT t.table_status, r.source_backup_arn FROM tables t \
+                     LEFT JOIN table_restores r ON r.table_id = t.table_id \
+                     WHERE t.account_id = ? AND t.table_name = ?",
+                )
+                .bind(account_id)
+                .bind(&input.table_name)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+                if let Some((status, Some(source_backup_arn))) = existing
+                    && status == "CREATING"
+                {
+                    return Err(StorageError::TableBeingRestored {
+                        table_name: input.table_name.clone(),
+                        backup_arn: source_backup_arn,
+                    });
+                }
+            }
+            return Err(StorageError::TableAlreadyExists(input.table_name.clone()));
+        }
+
+        if let Some(registration) = restore {
+            sqlx::query(
+                "INSERT INTO table_restores \
+                 (table_id, source_backup_arn, source_table_arn, restore_date_time) \
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(&table_id)
+            .bind(registration.backup_arn)
+            .bind(registration.source_table_arn)
+            .bind(format_epoch_seconds(registration.restore_date_time))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        }
 
         // GSI / LSI metadata.
         let mut gsi_ids: Vec<String> = Vec::new();
@@ -195,17 +344,24 @@ impl SqliteEngine {
         }
 
         // Vector indexes. A CreateTable's table is empty, so there is nothing to
-        // backfill: the index goes straight to ACTIVE with no `backfilling`
-        // member, which is the state the service reports for an index created
-        // this way. The UpdateTable path is the one that drives a real lifecycle.
+        // backfill and no `backfilling` member is ever reported on this path.
+        // The index's status tracks the TABLE's: measured against the service
+        // (2026-08-21, eu-west-2, three runs polling at 250ms), an index created
+        // with its table reports CREATING while the table is CREATING and
+        // reaches ACTIVE in the same DescribeTable poll as the table, with no
+        // observable gap in either direction. The control-plane worker flips
+        // both in one pass; see `process_control_plane_transitions`.
         let mut vector_ids: Vec<String> = Vec::new();
         if let Some(vis) = &input.vector_indexes {
             for vi in vis {
                 let vec_attr = serde_json::to_string(&vi.vector_attribute)
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
+                // An empty SearchSchema is stored as absent: it means the same as
+                // omitting the member, and the service never reports an empty
+                // list. The request paths collapse it too; this covers a caller
+                // that reaches the storage trait directly.
                 let search_schema = vi
-                    .search_schema
-                    .as_ref()
+                    .search_schema_for_storage()
                     .map(serde_json::to_string)
                     .transpose()
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -223,16 +379,15 @@ impl SqliteEngine {
                             "vector index reached storage without a projection".to_owned(),
                         )
                     })?;
-                let distance = serde_json::to_string(&vi.distance_function)
-                    .map_err(|e| StorageError::Internal(e.to_string()))?
-                    .trim_matches('"')
-                    .to_owned();
+                let distance = extenddb_storage::vector_catalog::distance_function_token(
+                    vi.distance_function,
+                )?;
                 let index_id = uuid::Uuid::new_v4().to_string();
                 sqlx::query(
                     "INSERT INTO vector_indexes \
                      (table_id, index_name, index_id, dimensions, distance_function, \
                       vector_attribute, search_schema, projection, index_status, backfilling) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', NULL)",
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
                 )
                 .bind(&table_id)
                 .bind(&vi.index_name)
@@ -242,6 +397,7 @@ impl SqliteEngine {
                 .bind(&vec_attr)
                 .bind(&search_schema)
                 .bind(&proj)
+                .bind(initial_status)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -448,7 +604,7 @@ impl SqliteEngine {
                         index_name: vi.index_name.clone(),
                         vector_attribute: vi.vector_attribute.clone(),
                         dimensions: vi.dimensions,
-                        search_schema: vi.search_schema.clone(),
+                        search_schema: vi.search_schema_for_storage().map(<[_]>::to_vec),
                         distance_function: vi.distance_function,
                         index_status: extenddb_core::types::IndexStatus::Active,
                         backfilling: None,
@@ -467,6 +623,7 @@ impl SqliteEngine {
             .filter(|v: &Vec<_>| !v.is_empty());
 
         Ok(TableDescription {
+            restore_summary: None,
             table_name: input.table_name,
             key_schema: input.key_schema,
             attribute_definitions: input.attribute_definitions,
@@ -484,6 +641,7 @@ impl SqliteEngine {
                 last_decrease_date_time: None,
             },
             billing_mode_summary,
+            table_throughput_mode_summary: None,
             global_secondary_indexes: gsis,
             local_secondary_indexes: lsis,
             stream_specification: input.stream_specification,

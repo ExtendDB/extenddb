@@ -9,7 +9,8 @@ use extenddb_storage::StreamCapture;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{composite_pk_to_text, parse_sk, pk_to_text, sk_column, sk_info};
 
-use super::index::{enqueue_async_indexes, fetch_indexes_for_table, sync_indexes};
+use super::gsi_build::fix_up_stale_write;
+use super::index::{enqueue_async_indexes, fetch_write_path_indexes, sync_indexes};
 use super::query::check_condition;
 use super::tx_helpers::write_stream_record_in_tx;
 use super::{data_table_name, json_to_item};
@@ -33,8 +34,26 @@ impl PostgresEngine {
         let item_json =
             serde_json::to_value(&item).map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        // Fetch indexes for GSI/LSI updates (D-4: sync + async split).
-        let indexes = fetch_indexes_for_table(&key_info.table_id, &self.pool).await?;
+        // Both index families in one catalog visit (D-4: sync + async split for the
+        // secondary indexes).
+        //
+        // Vector indexes come from this fresh read rather than from the cached key
+        // info, and the answer decides two things: whether this write needs a
+        // transaction at all, and what maintenance runs inside it. A cached empty
+        // set would send a write down the no-maintenance fast path and silently
+        // leave an index missing a row.
+        //
+        // What this does and does not remove. The defect being designed out is the
+        // cached membership gate, and that is gone: an index takes effect the moment
+        // its catalog row commits. What remains is a window between this read and
+        // the data transaction's commit, in which an index created concurrently is
+        // missed. No transaction can close it, because the catalog and the data
+        // tables are different databases. For a GSI it is closed by time instead:
+        // the read's stamp lets a write that was slow to commit queue a repair
+        // for any GSI it did not see (`gsi_build::fix_up_stale_write`), and a fast
+        // write is one the backfill sees. Vector indexes still have the window.
+        let (indexes, vector_metas, stamp) =
+            fetch_write_path_indexes(&key_info.table_id, &self.pool).await?;
 
         // Index key attributes present in the item must match their declared
         // scalar type and be non-empty, matching real DynamoDB. This is up-front
@@ -51,19 +70,32 @@ impl PostgresEngine {
             extenddb_core::validation::validate_index_keys(
                 &item,
                 &index_refs,
-                &key_info.attribute_definitions,
+                super::index::fresh_attr_defs(&indexes, &key_info.attribute_definitions),
             )
             .map_err(|e| StorageError::Validation(e.to_string()))?;
         }
 
-        let sys_delay = if indexes.is_empty() {
+        // Read whenever anything can propagate, secondary or vector. Gating this on
+        // the secondary set alone made a vector-only table ignore the configured
+        // delay and apply its vector index inline, while a TransactWriteItems on the
+        // same table read the delay unconditionally and enqueued: six write sites,
+        // two answers, on a setting the differences doc says covers both index kinds.
+        let sys_delay = if indexes.is_empty() && vector_metas.is_empty() {
             0
         } else {
             self.index_propagation_delay().await
         };
 
         // When there's a condition, return_old, indexes, or stream capture, we need a transaction
-        let needs_tx = condition.is_some() || return_old || !indexes.is_empty() || stream.is_some();
+        // A write that is already slow takes the transaction path even with no
+        // index to maintain, so that a repair for a GSI created meanwhile commits
+        // with the write (`gsi_build::fix_up_stale_write`) instead of after it.
+        let needs_tx = condition.is_some()
+            || return_old
+            || !indexes.is_empty()
+            || !vector_metas.is_empty()
+            || stream.is_some()
+            || stamp.elapsed() > super::gsi_build::GRACE_WRITE;
 
         if let Some((sk_name, sk_type)) =
             sk_info(&key_info.key_schema, &key_info.attribute_definitions)
@@ -85,25 +117,28 @@ impl PostgresEngine {
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-                let old: Option<(serde_json::Value,)> =
+                let mut old: Option<(serde_json::Value,)> =
                     bind_sk_fetch_optional!(&select_sql, pk_text.as_str(), &sk, &mut *tx)?;
 
-                if let Some((ref old_json,)) = old {
-                    let old_item: Item = json_to_item(old_json.clone())?;
-                    match check_condition(condition, &old_item, maps) {
-                        Ok(()) => {}
-                        Err(StorageError::ConditionFailed(_)) => {
-                            return Err(StorageError::ConditionFailed(Some(old_item)));
+                let mut attempt: u32 = 0;
+                loop {
+                    if let Some((ref old_json,)) = old {
+                        let old_item: Item = json_to_item(old_json.clone())?;
+                        match check_condition(condition, &old_item, maps) {
+                            Ok(()) => {}
+                            Err(StorageError::ConditionFailed(_)) => {
+                                return Err(StorageError::ConditionFailed(Some(old_item)));
+                            }
+                            Err(e) => return Err(e),
                         }
-                        Err(e) => return Err(e),
+                        // Row exists, condition passed: update in place.
+                        let update_sql = format!(
+                            "UPDATE {ddb_table} SET item_data = $3 WHERE pk = $1 AND {sk_col} = $2"
+                        );
+                        bind_sk_execute!(&update_sql, pk_text.as_str(), &sk, &item_json, &mut *tx)?;
+                        break;
                     }
-                    // Row exists, condition passed — update in place.
-                    let update_sql = format!(
-                        "UPDATE {ddb_table} SET item_data = $3 WHERE pk = $1 AND {sk_col} = $2"
-                    );
-                    bind_sk_execute!(&update_sql, pk_text.as_str(), &sk, &item_json, &mut *tx)?;
-                } else {
-                    // No existing item — condition checks against empty item
+                    // No existing item: the condition checks against an empty item
                     let empty = std::collections::BTreeMap::new();
                     match check_condition(condition, &empty, maps) {
                         Ok(()) => {}
@@ -112,21 +147,25 @@ impl PostgresEngine {
                         }
                         Err(e) => return Err(e),
                     }
-                    // Condition passed against empty — atomic insert, fail if someone beat us.
                     let insert_sql = format!(
                         "INSERT INTO {ddb_table} (pk, {sk_col}, item_data) VALUES ($1, $2, $3) \
                          ON CONFLICT (pk, {sk_col}) DO NOTHING"
                     );
                     let result =
                         bind_sk_execute!(&insert_sql, pk_text.as_str(), &sk, &item_json, &mut *tx)?;
-                    if result.rows_affected() == 0 {
-                        // Another transaction inserted between our SELECT and INSERT.
-                        // Fetch the winner to return with ConditionFailed.
-                        let winner: Option<(serde_json::Value,)> =
-                            bind_sk_fetch_optional!(&select_sql, pk_text.as_str(), &sk, &mut *tx)?;
-                        let winner_item = winner.map(|(v,)| json_to_item(v)).transpose()?;
-                        return Err(StorageError::ConditionFailed(winner_item));
+                    if result.rows_affected() == 1 {
+                        break;
                     }
+                    // Lost the create race. The winner has committed (the insert
+                    // waited for it if it was in flight). The locking read returns
+                    // its row, and this put overwrites it after checking its
+                    // condition against it. If a delete committed since, the read
+                    // returns no row and the insert is retried.
+                    attempt += 1;
+                    if attempt >= MAX_CREATE_RACE_ATTEMPTS {
+                        return Err(create_race_exhausted(attempt));
+                    }
+                    old = bind_sk_fetch_optional!(&select_sql, pk_text.as_str(), &sk, &mut *tx)?;
                 }
 
                 // Sync GSI/LSI update within transaction (D-4).
@@ -140,7 +179,6 @@ impl PostgresEngine {
                     sync_indexes(
                         &mut tx,
                         &key_info.key_schema,
-                        &key_info.attribute_definitions,
                         &indexes,
                         oi.as_ref(),
                         Some(&item),
@@ -167,7 +205,7 @@ impl PostgresEngine {
                 }
                 // Persist async GSI work inside the same transaction — one row
                 // per async index, each honoring its own propagation delay.
-                let async_enqueued = enqueue_async_indexes(
+                let mut async_enqueued = enqueue_async_indexes(
                     &mut tx,
                     key_info,
                     &indexes,
@@ -176,6 +214,34 @@ impl PostgresEngine {
                     sys_delay,
                 )
                 .await?;
+
+                // Vector indexes, read fresh from the catalog rather than from the
+                // cached key info, so a write cannot miss an index that was just
+                // created. The old image is needed even when no secondary index
+                // wanted it: the vector row is keyed by the base item, so a
+                // partition move is a delete of the previous row.
+                let old_for_vectors = match old_item_for_idx {
+                    Some(ref oi) => Some(oi.clone()),
+                    None => old
+                        .as_ref()
+                        .map(|(v,)| json_to_item(v.clone()))
+                        .transpose()?,
+                };
+                async_enqueued += crate::data::vector_index::maintain_vector_indexes(
+                    &mut tx,
+                    &vector_metas,
+                    &key_info.table_id,
+                    &key_info.key_schema,
+                    &key_info.attribute_definitions,
+                    old_for_vectors.as_ref(),
+                    Some(&item),
+                    sys_delay,
+                )
+                .await?;
+
+                async_enqueued +=
+                    fix_up_stale_write(&mut tx, &self.pool, stamp, key_info, &indexes, &item)
+                        .await?;
 
                 tx.commit()
                     .await
@@ -197,6 +263,7 @@ impl PostgresEngine {
                     "INSERT INTO {ddb_table} (pk, {sk_col}, item_data) VALUES ($1, $2, $3) \
                      ON CONFLICT (pk, {sk_col}) DO UPDATE SET item_data = EXCLUDED.item_data"
                 );
+                super::gsi_build::pause_before_autocommit_statement().await;
                 bind_sk_execute!(
                     &upsert_sql,
                     pk_text.as_str(),
@@ -204,6 +271,7 @@ impl PostgresEngine {
                     &item_json,
                     &self.data_pool
                 )?;
+                self.fix_up_autocommit(stamp, key_info, &item).await;
                 Ok(None)
             }
         } else {
@@ -218,30 +286,37 @@ impl PostgresEngine {
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-                let old: Option<(serde_json::Value,)> = sqlx::query_as(&select_sql)
-                    .bind(pk_text.as_str())
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-                if let Some((ref old_json,)) = old {
-                    let old_item: Item = json_to_item(old_json.clone())?;
-                    match check_condition(condition, &old_item, maps) {
-                        Ok(()) => {}
-                        Err(StorageError::ConditionFailed(_)) => {
-                            return Err(StorageError::ConditionFailed(Some(old_item)));
-                        }
-                        Err(e) => return Err(e),
-                    }
-                    // Row exists, condition passed — update in place.
-                    let update_sql = format!("UPDATE {ddb_table} SET item_data = $2 WHERE pk = $1");
-                    sqlx::query(&update_sql)
+                let fetch_old = async |tx: &mut sqlx::PgConnection| {
+                    sqlx::query_as::<_, (serde_json::Value,)>(&select_sql)
                         .bind(pk_text.as_str())
-                        .bind(&item_json)
-                        .execute(&mut *tx)
+                        .fetch_optional(tx)
                         .await
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
-                } else {
+                        .map_err(|e| StorageError::Internal(e.to_string()))
+                };
+                let mut old: Option<(serde_json::Value,)> = fetch_old(&mut tx).await?;
+
+                let mut attempt: u32 = 0;
+                loop {
+                    if let Some((ref old_json,)) = old {
+                        let old_item: Item = json_to_item(old_json.clone())?;
+                        match check_condition(condition, &old_item, maps) {
+                            Ok(()) => {}
+                            Err(StorageError::ConditionFailed(_)) => {
+                                return Err(StorageError::ConditionFailed(Some(old_item)));
+                            }
+                            Err(e) => return Err(e),
+                        }
+                        // Row exists, condition passed: update in place.
+                        let update_sql =
+                            format!("UPDATE {ddb_table} SET item_data = $2 WHERE pk = $1");
+                        sqlx::query(&update_sql)
+                            .bind(pk_text.as_str())
+                            .bind(&item_json)
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(|e| StorageError::Internal(e.to_string()))?;
+                        break;
+                    }
                     let empty = std::collections::BTreeMap::new();
                     match check_condition(condition, &empty, maps) {
                         Ok(()) => {}
@@ -250,7 +325,6 @@ impl PostgresEngine {
                         }
                         Err(e) => return Err(e),
                     }
-                    // Condition passed against empty — atomic insert, fail if someone beat us.
                     let insert_sql = format!(
                         "INSERT INTO {ddb_table} (pk, item_data) VALUES ($1, $2) \
                          ON CONFLICT (pk) DO NOTHING"
@@ -261,16 +335,15 @@ impl PostgresEngine {
                         .execute(&mut *tx)
                         .await
                         .map_err(|e| StorageError::Internal(e.to_string()))?;
-                    if result.rows_affected() == 0 {
-                        // Another transaction inserted between our SELECT and INSERT.
-                        let winner: Option<(serde_json::Value,)> = sqlx::query_as(&select_sql)
-                            .bind(pk_text.as_str())
-                            .fetch_optional(&mut *tx)
-                            .await
-                            .map_err(|e| StorageError::Internal(e.to_string()))?;
-                        let winner_item = winner.map(|(v,)| json_to_item(v)).transpose()?;
-                        return Err(StorageError::ConditionFailed(winner_item));
+                    if result.rows_affected() == 1 {
+                        break;
                     }
+                    // Lost the create race: overwrite the winner, as above.
+                    attempt += 1;
+                    if attempt >= MAX_CREATE_RACE_ATTEMPTS {
+                        return Err(create_race_exhausted(attempt));
+                    }
+                    old = fetch_old(&mut tx).await?;
                 }
 
                 // Sync GSI/LSI update within transaction (D-4).
@@ -284,7 +357,6 @@ impl PostgresEngine {
                     sync_indexes(
                         &mut tx,
                         &key_info.key_schema,
-                        &key_info.attribute_definitions,
                         &indexes,
                         oi.as_ref(),
                         Some(&item),
@@ -311,7 +383,7 @@ impl PostgresEngine {
                 }
                 // Persist async GSI work inside the same transaction — one row
                 // per async index, each honoring its own propagation delay.
-                let async_enqueued = enqueue_async_indexes(
+                let mut async_enqueued = enqueue_async_indexes(
                     &mut tx,
                     key_info,
                     &indexes,
@@ -320,6 +392,34 @@ impl PostgresEngine {
                     sys_delay,
                 )
                 .await?;
+
+                // Vector indexes, read fresh from the catalog rather than from the
+                // cached key info, so a write cannot miss an index that was just
+                // created. The old image is needed even when no secondary index
+                // wanted it: the vector row is keyed by the base item, so a
+                // partition move is a delete of the previous row.
+                let old_for_vectors = match old_item_for_idx {
+                    Some(ref oi) => Some(oi.clone()),
+                    None => old
+                        .as_ref()
+                        .map(|(v,)| json_to_item(v.clone()))
+                        .transpose()?,
+                };
+                async_enqueued += crate::data::vector_index::maintain_vector_indexes(
+                    &mut tx,
+                    &vector_metas,
+                    &key_info.table_id,
+                    &key_info.key_schema,
+                    &key_info.attribute_definitions,
+                    old_for_vectors.as_ref(),
+                    Some(&item),
+                    sys_delay,
+                )
+                .await?;
+
+                async_enqueued +=
+                    fix_up_stale_write(&mut tx, &self.pool, stamp, key_info, &indexes, &item)
+                        .await?;
 
                 tx.commit()
                     .await
@@ -341,12 +441,14 @@ impl PostgresEngine {
                     "INSERT INTO {ddb_table} (pk, item_data) VALUES ($1, $2) \
                      ON CONFLICT (pk) DO UPDATE SET item_data = EXCLUDED.item_data"
                 );
+                super::gsi_build::pause_before_autocommit_statement().await;
                 sqlx::query(&upsert_sql)
                     .bind(pk_text.as_str())
                     .bind(&item_json)
                     .execute(&self.data_pool)
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
+                self.fix_up_autocommit(stamp, key_info, &item).await;
                 Ok(None)
             }
         }
@@ -390,4 +492,18 @@ impl PostgresEngine {
 
         json_opt.map(json_to_item).transpose()
     }
+}
+
+/// Bound on insert retries when a put to a missing item keeps losing the
+/// create race to a winner that is deleted again before the re-read. Same
+/// bound as `UpdateItem`.
+const MAX_CREATE_RACE_ATTEMPTS: u32 = 5;
+
+/// The error after `MAX_CREATE_RACE_ATTEMPTS` lost create races. Like the one
+/// `UpdateItem` returns, it is an internal error (HTTP 500).
+fn create_race_exhausted(attempt: u32) -> StorageError {
+    StorageError::Internal(format!(
+        "PutItem could not create the item after {attempt} attempts: each insert lost the \
+         create race to a concurrent writer"
+    ))
 }

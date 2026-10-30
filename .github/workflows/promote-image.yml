@@ -35,6 +35,17 @@
 # highest released one, and `move_latest` is the explicit escape hatch for a
 # hotfix that must not become `latest`.
 
+# Two-wave promotion, one dispatch:
+#   wave 1 (approval 1, dockerhub environment): gates, then Docker Hub — the
+#     canonical registry — promotes and verifies alone, as the canary.
+#   wave 2 (approval 2, ghcr environment): GHCR and ECR promote together,
+#     only after the canary verified. GHCR writes are thereby gated by the
+#     ghcr environment's own reviewers (not bypassed via dockerhub's), and
+#     the ECR role's OIDC trust includes this environment.
+# All legs run the promote-registry composite action — one implementation of
+# signature-first, no-overwrite, and forward-only latest (judged against
+# each destination's own tags). The image is an allowlisted choice input.
+
 name: promote-image
 
 on:
@@ -53,17 +64,30 @@ on:
         description: 'Move `latest` to this digest. Uncheck for a back-line hotfix that must not become latest.'
         type: boolean
         default: true
+      image:
+        description: 'Which image to promote'
+        type: choice
+        options:
+          # extenddb-dev joins when its GHCR/ECR repositories exist and a
+          # signed dev candidate is produced upstream (see #283 review);
+          # ECR Public does not auto-create repositories on push.
+          - extenddb-postgres
+          - extenddb-mongodb
+        default: extenddb-postgres
 
 permissions:
   contents: read
 
 # Two promotions must never race on the same repository.
 concurrency:
-  group: promote-image-extenddb-postgres
+  group: promote-image-${{ inputs.image }}
   cancel-in-progress: false
 
 env:
-  IMAGE_REPO: docker.io/extenddb/extenddb-postgres
+  # inputs.image is a closed choice list; no free text reaches these paths.
+  IMAGE_REPO: docker.io/extenddb/${{ inputs.image }}
+  GHCR_REPO: ghcr.io/extenddb/${{ inputs.image }}
+  ECR_REPO: public.ecr.aws/extenddb/${{ inputs.image }}
 
 jobs:
   promote:
@@ -72,6 +96,12 @@ jobs:
     # Required reviewers + prevent-self-review + main-only branch rule: the
     # dispatcher cannot approve their own promotion.
     environment: dockerhub
+    outputs:
+      version: ${{ steps.results.outputs.version }}
+      digest: ${{ steps.results.outputs.digest }}
+      move_latest: ${{ steps.results.outputs.move_latest }}
+    permissions:
+      contents: read
     steps:
       - name: Check out main (ancestry and version gates need history)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
@@ -88,6 +118,12 @@ jobs:
           RAW_MOVE_LATEST: ${{ inputs.move_latest }}
         run: |
           set -euo pipefail
+          # Local allowlist enforcement: API-side choice enforcement is
+          # undocumented, so the security property is proven here.
+          case "${{ inputs.image }}" in
+            extenddb-postgres|extenddb-mongodb) ;;
+            *) echo "::error::image '${{ inputs.image }}' is not in the allowlist"; exit 1 ;;
+          esac
           if [[ ! "$RAW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::version '$RAW_VERSION' is not strict semver (MAJOR.MINOR.PATCH)"
             exit 1
@@ -154,7 +190,6 @@ jobs:
           set -euo pipefail
           if EXISTING=$(skopeo inspect --format '{{.Digest}}' "docker://${IMAGE_REPO}:${VERSION}" 2>/dev/null); then
             if [[ "$EXISTING" == "$DIGEST" ]]; then
-              echo "ALREADY_PROMOTED=true" >> "$GITHUB_ENV"
               echo "::notice::${IMAGE_REPO}:${VERSION} already exists with the exact verified digest; will only ensure latest"
             else
               echo "::error::${IMAGE_REPO}:${VERSION} already exists with different digest ${EXISTING}; released versions are immutable through this workflow"
@@ -178,8 +213,8 @@ jobs:
 
           # Compare only against released X.Y.Z tags. Candidate (sha-*) tags,
           # `latest` and anything else are not version lines. The promoted
-          # version is excluded so a re-run that only ensures `latest` (the
-          # ALREADY_PROMOTED path) is not blocked by its own tag.
+          # version is excluded so an idempotent re-run is not blocked by
+          # its own tag (the composite action no-ops on identical digests).
           #
           # `|| true` on the pipeline because grep exits 1 when it matches
           # nothing, which under `set -o pipefail` would kill the step on a
@@ -217,47 +252,110 @@ jobs:
           set -euo pipefail
           skopeo login docker.io -u "$DOCKERHUB_USERNAME" --password-stdin <<< "$DOCKERHUB_TOKEN"
 
-      - name: Promote by digest to the version tag (and latest when allowed)
-        run: |
-          set -euo pipefail
-          # Source is the immutable digest, not the tag, so what is promoted
-          # is byte-identical to what was verified. --preserve-digests fails
-          # rather than rewrite any manifest.
-          if [[ "${ALREADY_PROMOTED:-}" != "true" ]]; then
-            skopeo copy --all --preserve-digests \
-              "docker://${IMAGE_REPO}@${DIGEST}" \
-              "docker://${IMAGE_REPO}:${VERSION}"
-          fi
-          if [[ "$MOVE_LATEST" == "true" ]]; then
-            skopeo copy --all --preserve-digests \
-              "docker://${IMAGE_REPO}@${DIGEST}" \
-              "docker://${IMAGE_REPO}:latest"
-          fi
+      - name: Promote Docker Hub (shared per-registry rules)
+        uses: ./.github/actions/promote-registry
+        with:
+          src-repo: ${{ env.IMAGE_REPO }}
+          dst-repo: ${{ env.IMAGE_REPO }}
+          version: ${{ env.VERSION }}
+          digest: ${{ env.DIGEST }}
+          move-latest: ${{ env.MOVE_LATEST }}
 
-      - name: Verify the promotion
+      - name: Export wave-1 results for the mirror wave
+        id: results
         run: |
           set -euo pipefail
-          TAGS=("${VERSION}")
-          [[ "$MOVE_LATEST" == "true" ]] && TAGS+=(latest)
-          for t in "${TAGS[@]}"; do
-            GOT=$(skopeo inspect --format '{{.Digest}}' "docker://${IMAGE_REPO}:${t}")
-            if [[ "$GOT" != "$DIGEST" ]]; then
-              echo "::error::${IMAGE_REPO}:${t} resolves to ${GOT}, expected ${DIGEST}"
-              exit 1
-            fi
-          done
+          {
+            echo "version=${VERSION}"
+            echo "digest=${DIGEST}"
+            echo "move_latest=${MOVE_LATEST}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Log out
         if: always()
         run: skopeo logout docker.io || true
 
+  # Wave 2: mirrors promote together, only after the canonical registry
+  # verified. Runs under the ghcr environment so GHCR writes are approved by
+  # that environment's own reviewers; the ECR role's OIDC trust includes
+  # this environment (equally protected: same reviewers, main-only).
+  promote-mirrors:
+    needs: promote
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: ghcr
+    permissions:
+      contents: read
+      packages: write   # GHCR leg
+      id-token: write   # ECR leg (OIDC role)
+    env:
+      VERSION: ${{ needs.promote.outputs.version }}
+      DIGEST: ${{ needs.promote.outputs.digest }}
+      MOVE_LATEST: ${{ needs.promote.outputs.move_latest }}
+    steps:
+      - name: Check out (composite action lives in-repo)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Constant username: GHCR ignores it when the password is a GitHub
+        # token, and it keeps the operator identity out of the run block.
+        run: |
+          set -euo pipefail
+          skopeo login ghcr.io -u x-access-token --password-stdin <<< "$GHCR_TOKEN"
+
+      - name: Promote GHCR (shared per-registry rules)
+        uses: ./.github/actions/promote-registry
+        with:
+          src-repo: ${{ env.IMAGE_REPO }}
+          dst-repo: ${{ env.GHCR_REPO }}
+          version: ${{ env.VERSION }}
+          digest: ${{ env.DIGEST }}
+          move-latest: ${{ env.MOVE_LATEST }}
+
+      - name: Assume the ECR publisher role via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: arn:aws:iam::975306274793:role/ExtendDBEcrPublicGitHubPublisher
+          role-session-name: extenddb-promote-${{ github.run_id }}
+          aws-region: us-east-1
+
+      - name: Log in to ECR Public
+        run: |
+          set -euo pipefail
+          # Both credential stores: skopeo reads containers/auth.json, while
+          # cosign (go-containerregistry) reads ~/.docker/config.json. Without
+          # the docker login, cosign's signature read goes out ANONYMOUSLY and
+          # shares ECR Public's per-IP anonymous quota with every other GitHub
+          # runner — three "Data limit exceeded" failures on 2026-09-30.
+          TOKEN=$(aws ecr-public get-login-password --region us-east-1)
+          skopeo login public.ecr.aws -u AWS --password-stdin <<< "$TOKEN"
+          docker login public.ecr.aws -u AWS --password-stdin <<< "$TOKEN"
+          unset TOKEN
+
+      - name: Promote ECR Public (shared per-registry rules)
+        uses: ./.github/actions/promote-registry
+        with:
+          src-repo: ${{ env.IMAGE_REPO }}
+          dst-repo: ${{ env.ECR_REPO }}
+          version: ${{ env.VERSION }}
+          digest: ${{ env.DIGEST }}
+          move-latest: ${{ env.MOVE_LATEST }}
+
+      - name: Log out of the mirror registries
+        if: always()
+        run: |
+          skopeo logout ghcr.io || true
+          skopeo logout public.ecr.aws || true; docker logout public.ecr.aws >/dev/null 2>&1 || true
+
       - name: Summarise for the release checklist
+        if: always()
         run: |
           if [[ "$MOVE_LATEST" == "true" ]]; then
-            HEADING="Promoted to ${VERSION} and latest"
+            HEADING="Promoted to ${VERSION} and latest (all registries)"
             TAGLIST="\`${VERSION}\`, \`latest\`"
           else
-            HEADING="Promoted to ${VERSION} (latest untouched)"
+            HEADING="Promoted to ${VERSION} on all registries (latest untouched)"
             TAGLIST="\`${VERSION}\`"
           fi
           {
@@ -265,8 +363,7 @@ jobs:
             echo ""
             echo "| field | value |"
             echo "|---|---|"
-            echo "| repository | \`${IMAGE_REPO}\` |"
-            echo "| candidate | \`${TAG}\` |"
+            echo "| registries | \`${IMAGE_REPO}\`, \`${GHCR_REPO}\`, \`${ECR_REPO}\` |"
             echo "| digest | \`${DIGEST}\` |"
             echo "| tags | ${TAGLIST} |"
           } >> "$GITHUB_STEP_SUMMARY"

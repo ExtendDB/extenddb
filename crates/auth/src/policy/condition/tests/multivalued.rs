@@ -247,12 +247,12 @@ fn string_not_like_multiple_policy_values_no_match() {
 #[test]
 fn policy_variable_expansion_principal_tag() {
     let ctx = TestContext::new()
-        .with("dynamodb:ResourceTag/Team", vec!["Alpha"])
+        .with("aws:ResourceTag/Team", vec!["Alpha"])
         .with("aws:PrincipalTag/Team", vec!["Alpha"]);
     assert!(evaluate_condition(
         &cond(
             ConditionOperator::StringEquals,
-            "dynamodb:ResourceTag/Team",
+            "aws:ResourceTag/Team",
             vec!["${aws:PrincipalTag/Team}"]
         ),
         &ctx
@@ -262,12 +262,12 @@ fn policy_variable_expansion_principal_tag() {
 #[test]
 fn policy_variable_expansion_mismatch() {
     let ctx = TestContext::new()
-        .with("dynamodb:ResourceTag/Team", vec!["Beta"])
+        .with("aws:ResourceTag/Team", vec!["Beta"])
         .with("aws:PrincipalTag/Team", vec!["Alpha"]);
     assert!(!evaluate_condition(
         &cond(
             ConditionOperator::StringEquals,
-            "dynamodb:ResourceTag/Team",
+            "aws:ResourceTag/Team",
             vec!["${aws:PrincipalTag/Team}"]
         ),
         &ctx
@@ -295,6 +295,55 @@ fn policy_variable_unresolvable_left_literal() {
         ),
         &ctx
     ));
+}
+
+#[test]
+fn policy_variable_naming_aws_tagkeys_is_left_literal() {
+    // A multivalued key has no single value to expand to. The condition value
+    // ${aws:TagKeys} is text that no tag key equals, so a Deny comparing
+    // aws:ResourceTag/team with it applies to no request, whichever tag key the
+    // request lists first. IAM answers the same (SimulateCustomPolicy,
+    // 2026-10-27).
+    let team_is_tag_keys = cond(
+        ConditionOperator::StringEquals,
+        "aws:ResourceTag/team",
+        vec!["${aws:TagKeys}"],
+    );
+    for keys in [vec!["env", "owner"], vec!["owner", "env"]] {
+        let ctx = TestContext::new()
+            .with("aws:ResourceTag/team", vec!["env"])
+            .with("aws:TagKeys", keys.clone());
+        assert!(
+            !evaluate_condition(&team_is_tag_keys, &ctx),
+            "${{aws:TagKeys}} expanded for the keys {keys:?}"
+        );
+    }
+    // The variable is text, so it equals the same text.
+    let ctx = TestContext::new()
+        .with("aws:ResourceTag/team", vec!["${aws:TagKeys}"])
+        .with("aws:TagKeys", vec!["env", "owner"]);
+    assert!(evaluate_condition(&team_is_tag_keys, &ctx));
+}
+
+#[test]
+fn policy_variables_naming_the_dynamodb_multivalued_keys_are_left_literal() {
+    for key in ["dynamodb:LeadingKeys", "dynamodb:Attributes"] {
+        let variable = format!("${{{key}}}");
+        let ctx = TestContext::new()
+            .with("k", vec!["pk1"])
+            .with(key, vec!["pk1", "pk2"]);
+        assert!(
+            !evaluate_condition(
+                &cond(
+                    ConditionOperator::StringEquals,
+                    "k",
+                    vec![variable.as_str()]
+                ),
+                &ctx
+            ),
+            "{variable} expanded to its first value"
+        );
+    }
 }
 
 // --- ForAllValues with negative operators ---
@@ -372,4 +421,82 @@ fn for_any_value_string_not_equals_one_outside_set() {
         ),
         &ctx
     ));
+}
+
+#[test]
+fn bare_negated_op_absent_tagkeys_matches() {
+    // A bare negated operator on an ABSENT aws:TagKeys matches, as on an
+    // absent single-valued key. Measured on IAM with simulate-custom-policy on
+    // 2026-10-24: a Deny carrying a bare StringNotEquals,
+    // StringNotEqualsIgnoreCase or StringNotLike on the key fires when the key
+    // is absent, and an Allow gated the same way grants. ExtendDB populates
+    // aws:TagKeys on exactly the operations the service does, so its absence
+    // is the service's absence and IAM's answer applies.
+    let ctx = TestContext::new();
+    for op in [
+        ConditionOperator::StringNotEquals,
+        ConditionOperator::StringNotEqualsIgnoreCase,
+        ConditionOperator::StringNotLike,
+    ] {
+        assert!(
+            evaluate_condition(&cond(op, "aws:TagKeys", vec!["secret"]), &ctx),
+            "a bare negated operator on absent aws:TagKeys matches, as on IAM"
+        );
+    }
+    assert!(
+        !evaluate_condition(
+            &cond(
+                ConditionOperator::StringEquals,
+                "aws:TagKeys",
+                vec!["secret"]
+            ),
+            &ctx
+        ),
+        "a bare positive operator on absent aws:TagKeys does not match"
+    );
+}
+
+#[test]
+fn bare_negated_op_absent_dynamodb_keys_do_not_match() {
+    // IAM matches a bare negated operator on absent dynamodb:Attributes and
+    // dynamodb:LeadingKeys too, but ExtendDB leaves both absent on requests
+    // where the service populates them (Attributes on writes, AttributesToGet
+    // reads and batch and transaction targets; LeadingKeys on query shapes the
+    // extractor cannot pin). Matching there would grant an Allow the service
+    // refuses for the present key, so for these two keys an absent key keeps
+    // the no-match rule (BR-7085).
+    let ctx = TestContext::new();
+    for key in ["dynamodb:Attributes", "dynamodb:LeadingKeys"] {
+        for op in [
+            ConditionOperator::StringNotEquals,
+            ConditionOperator::StringNotEqualsIgnoreCase,
+            ConditionOperator::StringNotLike,
+            ConditionOperator::StringEquals,
+        ] {
+            assert!(
+                !evaluate_condition(&cond(op, key, vec!["ssn"]), &ctx),
+                "a bare operator on absent {key} does not match"
+            );
+        }
+    }
+}
+
+#[test]
+fn bare_op_multivalued_present_never_matches() {
+    // BR-7085, measured again on IAM 2026-10-24: with the key PRESENT, neither
+    // a bare positive nor a bare negative operator matches. The author must
+    // qualify with ForAllValues or ForAnyValue.
+    for key in ["dynamodb:Attributes", "dynamodb:LeadingKeys", "aws:TagKeys"] {
+        let ctx = TestContext::new().with(key, vec!["colour"]);
+        for op in [
+            ConditionOperator::StringEquals,
+            ConditionOperator::StringNotEquals,
+            ConditionOperator::StringNotEqualsIgnoreCase,
+        ] {
+            assert!(
+                !evaluate_condition(&cond(op, key, vec!["ssn"]), &ctx),
+                "a bare operator on present {key} does not match"
+            );
+        }
+    }
 }

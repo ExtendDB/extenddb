@@ -44,6 +44,80 @@ pub const LEGACY_GSI_PROPAGATION_DELAY_MS: &str = "gsi_propagation_delay_ms";
 /// or not the ordering is correct, which is worse than having no test.
 pub const VECTOR_BACKFILL_BATCH_DELAY_MS: &str = "vector_backfill_batch_delay_ms";
 
+/// Test-only gate for the MongoDB GSI backfill race tests.
+///
+/// A MongoDB test-hook build uses keys of the form
+/// `gsi_backfill_test_gate:<table-name>` and the values `armed`, `paused`,
+/// `release`, and `idle` to coordinate an external API test at the
+/// read-before-index-write boundary. The table suffix keeps parallel backfills
+/// from claiming one another's gate. Production MongoDB builds do not compile
+/// the hook.
+pub const GSI_BACKFILL_TEST_GATE: &str = "gsi_backfill_test_gate";
+
+/// Test-only gate for the MongoDB commit-retry tests.
+///
+/// A MongoDB test-hook build uses keys of the form
+/// `unknown_commit_test_gate:<table-name>` and the values `armed` and `idle`.
+/// While armed for a table, the next write commit of an UpdateItem on that
+/// table performs the real commit and then reports a synthetic error carrying
+/// the UnknownTransactionCommitResult label, once, then flips itself back to
+/// `idle`. This is the only way a test can place a client-visible write on the
+/// commit-outcome-unknown path deterministically: the real trigger is a
+/// network fault or election in the instant between sending commitTransaction
+/// and reading its reply, a window a test cannot hit on purpose. Production
+/// MongoDB builds do not compile the hook.
+pub const UNKNOWN_COMMIT_TEST_GATE: &str = "unknown_commit_test_gate";
+
+/// Minimum milliseconds an UpdateTable-created vector index stays in `CREATING`
+/// before its `ACTIVE` flip.
+///
+/// The service's online-index machinery never completes an added index
+/// instantly (~17 minutes observed for a 25-item table, eu-west-2, 2026-08-11),
+/// so the CREATING-with-`Backfilling` walk is always observable there. A local
+/// backfill over a small table finishes in milliseconds, which would collapse
+/// the documented lifecycle — `CREATING`/`Backfilling: false`, then `true`,
+/// then `ACTIVE` with the member absent — into a single unobservable instant.
+/// Holding the flip for a short floor keeps the walk observable to a client
+/// polling DescribeTable, the same reason `control_plane_delay_seconds` exists
+/// for table status. The default is 1000; zero disables the hold.
+pub const VECTOR_INDEX_MIN_CREATING_MS: &str = "vector_index_min_creating_ms";
+
+/// Milliseconds to hold a new vector index in the resource-allocation phase before
+/// its backfill starts.
+///
+/// Zero, and meant to stay zero outside tests, exactly like
+/// [`VECTOR_BACKFILL_BATCH_DELAY_MS`] above and for the same kind of reason. The
+/// service refuses a delete of an index that is still allocating resources, with a
+/// byte-exact `ResourceInUseException`, and accepts the same delete once the
+/// backfill is running. Both halves are measured behaviour, so both deserve a wire
+/// test.
+///
+/// Without this there is no deterministic way to observe the first half from a
+/// client: the allocation phase exists only between the catalog row's insert and
+/// the flip to `Backfilling: true`, the second of them inside the detached build task; the window is therefore a task
+/// spawn wide, so a test could only race it. A race that asserts a whole measured string is worse than
+/// no test, because it fails for reasons unrelated to the rule.
+///
+/// Unset, nothing waits and no branch is taken.
+pub const VECTOR_ALLOCATION_PHASE_DELAY_MS: &str = "vector_allocation_phase_delay_ms";
+
+/// Marker recording that the resource-tag condition-key migration has run on
+/// this catalog, or that the catalog was created after the migration existed
+/// and so has nothing to rewrite.
+///
+/// `extenddb migrate --yes` writes it after rewriting every stored policy from
+/// `dynamodb:ResourceTag/*` to `aws:ResourceTag/*` with no storage errors;
+/// `init` and every fresh-catalog bootstrap write it on a new catalog. `serve`
+/// reads this one row at startup and refuses to start when it is absent, naming
+/// `extenddb migrate --yes`, so a pre-migration catalog is never served under
+/// the new evaluator (which leaves `dynamodb:ResourceTag/*` absent). The value
+/// is informational; presence of the key is the signal.
+pub const RESOURCE_TAG_MIGRATION: &str = "resource_tag_migration";
+
+/// The value written for [`RESOURCE_TAG_MIGRATION`] when the migration is
+/// complete.
+pub const RESOURCE_TAG_MIGRATION_DONE: &str = "applied";
+
 /// Resolve a caller-supplied settings key to its canonical name.
 ///
 /// Accepting the old name keeps `extenddb settings set gsi_propagation_delay_ms 0`

@@ -5,10 +5,12 @@ resolver = "2"
 members = [
     "crates/core",
     "crates/cache",
+    "crates/backup-store",
     "crates/engine",
     "crates/storage",
     "crates/config",
     "crates/storage-postgres",
+    "crates/storage-cassandra",
     "crates/storage-mongodb",
     "crates/storage-sqlite",
     "crates/auth",
@@ -18,7 +20,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.6"
+version = "0.1.14"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -27,11 +29,13 @@ license = "Apache-2.0"
 # Internal crates
 extenddb-core = { path = "crates/core" }
 extenddb-cache = { path = "crates/cache" }
+extenddb-backup-store = { path = "crates/backup-store" }
 extenddb-engine = { path = "crates/engine" }
 extenddb-storage = { path = "crates/storage" }
 extenddb-config = { path = "crates/config" }
-extenddb-storage-postgres = { path = "crates/storage-postgres" }
+extenddb-storage-cassandra = { path = "crates/storage-cassandra" }
 extenddb-storage-mongodb = { path = "crates/storage-mongodb" }
+extenddb-storage-postgres = { path = "crates/storage-postgres" }
 extenddb-storage-sqlite = { path = "crates/storage-sqlite" }
 extenddb-auth = { path = "crates/auth" }
 extenddb-server = { path = "crates/server" }
@@ -57,19 +61,66 @@ axum = { version = "0.8", features = ["macros"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["compression-gzip", "cors", "set-header"] }
 hyper = { version = "1" }
+# URI parsing for the backup store's endpoint check; the same major hyper and
+# the AWS SDK already use.
+http = { version = "1" }
 urlencoding = { version = "2.1" }
 
 # Caching
 moka = { version = "0.12", features = ["future"] }
 
 # Database
+cdrs-tokio = { version = "9.0", features = ["derive"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "postgres", "json", "time", "uuid", "bigdecimal", "derive"] }
+# Vector column type for the PostgreSQL backend. The `sqlx` feature gives a typed
+# `Vector` that encodes and decodes pgvector's binary format, so embeddings keep
+# f32 bit-exactness instead of going through a hand-written text parser.
+#
+# Pinned to 0.4.1 as of 10/2026: 0.4.2 pulls in transitive dependency version bumps
+# so of which are problematic. Do not allow to float until those are resolved.
+pgvector = { version = "=0.4.1", default-features = false, features = ["sqlx"] }
 mongodb = "3"
 bson = "2.13"
 dashmap = "6"
 
+# Backup store
+# Exact pins: the aws-sdk crates release in lockstep, and these are the newest
+# versions whose declared minimum supported rustc fits the workspace
+# rust-version (1.88); later releases require a newer compiler. Their
+# transitive aws-* and aws-smithy-* crates are held in Cargo.lock at the
+# newest versions that build on 1.88 (set with
+# `cargo +1.88.0 update <crate>@<version> --precise <older>`). The resolver
+# fallback in .cargo/config.toml keeps a plain `cargo update` from moving
+# them past that, and the 1.88 leg of .github/workflows/test.yml fails if
+# they drift. The feature set is that of tests/rust/Cargo.toml plus `sso` on
+# aws-config, so a server whose credentials come from an SSO profile
+# (`sso_session` in the shared config) can reach the backup bucket.
+# tests/rust does not enable `sso`: its client takes explicit credentials
+# from the environment, falling back to the default chain without SSO.
+aws-config = { version = "=1.8.13", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client", "credentials-process", "sso"] }
+aws-sdk-s3 = { version = "=1.122.0", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
+# Already in the graph through aws-config; named directly so the S3 store can
+# read the S3-specific endpoint setting the way aws-sdk-s3 does.
+aws-types = { version = "=1.3.11", default-features = false }
+# Already in the graph through aws-config; named directly so the S3 store can
+# name the SDK's shared config file set when it reads the selected profile
+# the way aws-config's IMDS client and endpoint provider do.
+aws-runtime = { version = "=1.6.0", default-features = false }
+# Already in the graph through aws-smithy-runtime's default-https-client;
+# named directly so the S3 store can build the SDK's default HTTPS client
+# with proxies disabled for an http:// endpoint.
+aws-smithy-http-client = { version = "=1.1.9", default-features = false, features = ["rustls-aws-lc"] }
+# Already in the graph through aws-config and aws-sdk-s3; named directly so
+# the S3 store refuses at open the endpoints the SDK's URL parser refuses.
+url = { version = "=2.5.8" }
+bytes = "1"
+
 # Crypto & checksums
 crc32fast = "1"
+# Pinned to the versions already resolved in Cargo.lock.
+flate2 = "1.1.9"
+md-5 = "0.10.6"
+sha2 = "0.10.9"
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
 bigdecimal = { version = "0.4", features = ["serde"] }
@@ -78,6 +129,7 @@ aes-gcm = "0.10"
 rand = "0.9"
 
 # Time
+chrono = "0.4"
 time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
 
 # TLS
@@ -101,3 +153,15 @@ config = "0.14"
 
 # Security
 zeroize = { version = "1.8", features = ["derive"] }
+
+# Size-optimised profile for the `extenddb-dev` container image only.
+#
+# Deliberately NOT applied to `[profile.release]`: the production Postgres and
+# MongoDB binaries keep their debug symbols so a panic backtrace from a customer
+# deployment stays readable, and they keep the faster default codegen settings.
+# Nothing builds with this profile unless it passes `--profile release-slim`.
+[profile.release-slim]
+inherits = "release"
+strip = true
+lto = true
+codegen-units = 1

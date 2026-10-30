@@ -12,6 +12,7 @@ use extenddb_core::types::{
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{index_arn, stream_arn};
+use extenddb_storage::vector_catalog::{VectorIndexCatalogRow, vector_index_descriptions};
 
 use crate::data;
 use crate::sqlite_util::parse_timestamp;
@@ -53,6 +54,10 @@ pub(crate) struct IndexRow {
 }
 
 /// A `vector_indexes` catalog row, in `FromRow` field order.
+///
+/// Decoding stops at this struct: the rules that turn it into a wire shape are
+/// shared with the other backends in `extenddb_storage::vector_catalog`. The JSON
+/// columns are text here, so the conversion parses them into values.
 #[derive(sqlx::FromRow)]
 pub(crate) struct VectorIndexRow {
     pub index_name: String,
@@ -65,6 +70,30 @@ pub(crate) struct VectorIndexRow {
     pub projection: String,
     pub index_status: String,
     pub backfilling: Option<i64>,
+}
+
+impl VectorIndexRow {
+    /// Parse the text columns into the backend-neutral row the shared rules take.
+    pub(crate) fn into_catalog_row(self) -> Result<VectorIndexCatalogRow, StorageError> {
+        let json = |text: &str, column: &str| -> Result<serde_json::Value, StorageError> {
+            serde_json::from_str(text).map_err(|e| StorageError::Internal(format!("{column}: {e}")))
+        };
+        Ok(VectorIndexCatalogRow {
+            index_name: self.index_name,
+            dimensions: self.dimensions,
+            distance_function: self.distance_function,
+            vector_attribute: json(&self.vector_attribute, "vector_attribute")?,
+            search_schema: self
+                .search_schema
+                .as_deref()
+                .map(|text| json(text, "vector search_schema"))
+                .transpose()?,
+            projection: json(&self.projection, "vector projection")?,
+            index_status: self.index_status,
+            // Stored as an integer so the ACTIVE state is representable as NULL.
+            backfilling: self.backfilling.map(|b| b != 0),
+        })
+    }
 }
 
 /// Columns selected for a `VectorIndexRow`, in `FromRow` field order.
@@ -86,10 +115,46 @@ fn parse_json<T: serde::de::DeserializeOwned>(s: &str, ctx: &str) -> Result<T, S
     serde_json::from_str(s).map_err(|e| StorageError::Internal(format!("{ctx}: {e}")))
 }
 
+/// A GSI's stored `provisioned_throughput`. Written as a
+/// `ProvisionedThroughputDescription`; earlier builds stored the request's
+/// `ProvisionedThroughput` (no `NumberOfDecreasesToday`) for a GSI added by
+/// UpdateTable, which is read as the description with zero decreases so
+/// such a table stays describable after an upgrade.
+fn parse_gsi_throughput(s: &str) -> Result<ProvisionedThroughputDescription, StorageError> {
+    parse_json::<ProvisionedThroughputDescription>(s, "index pt").or_else(|e| {
+        let old: ProvisionedThroughput = parse_json(s, "index pt").map_err(|_| e)?;
+        Ok(ProvisionedThroughputDescription {
+            read_capacity_units: old.read_capacity_units,
+            write_capacity_units: old.write_capacity_units,
+            number_of_decreases_today: 0,
+            last_increase_date_time: None,
+            last_decrease_date_time: None,
+        })
+    })
+}
+
 impl SqliteEngine {
     /// Build a `TableDescription` by reading the catalog.
     pub(crate) async fn build_table_description(
         &self,
+        account_id: &str,
+        table_name: &str,
+    ) -> Result<TableDescription, StorageError> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        self.build_table_description_on(&mut conn, account_id, table_name)
+            .await
+    }
+
+    /// Build the description through one connection, so a caller holding a
+    /// read transaction (the snapshot engine) reads the catalog rows from the
+    /// same snapshot as everything else it reads.
+    pub(crate) async fn build_table_description_on(
+        &self,
+        conn: &mut sqlx::SqliteConnection,
         account_id: &str,
         table_name: &str,
     ) -> Result<TableDescription, StorageError> {
@@ -98,7 +163,7 @@ impl SqliteEngine {
         ))
         .bind(account_id)
         .bind(table_name)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
@@ -108,7 +173,7 @@ impl SqliteEngine {
             "SELECT {INDEX_COLUMNS} FROM indexes WHERE table_id = ?"
         ))
         .bind(&row.table_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *conn)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
@@ -116,14 +181,21 @@ impl SqliteEngine {
             "SELECT {VECTOR_INDEX_COLUMNS} FROM vector_indexes WHERE table_id = ?"
         ))
         .bind(&row.table_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *conn)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let table_name_owned = row.table_name.clone();
+        let table_id = row.table_id.clone();
         let mut desc = self.build_table_description_from_row(account_id, row, index_rows)?;
+        desc.restore_summary =
+            Self::restore_summary_on(conn, &table_id, &desc.table_status).await?;
+        let catalog_rows = vector_rows
+            .into_iter()
+            .map(VectorIndexRow::into_catalog_row)
+            .collect::<Result<Vec<_>, _>>()?;
         desc.vector_indexes =
-            self.vector_index_descriptions(account_id, &table_name_owned, vector_rows)?;
+            vector_index_descriptions(&self.region, account_id, &table_name_owned, catalog_rows)?;
         Ok(desc)
     }
 
@@ -143,7 +215,7 @@ impl SqliteEngine {
                 let pt = idx
                     .provisioned_throughput
                     .as_deref()
-                    .map(|s| parse_json::<ProvisionedThroughputDescription>(s, "index pt"))
+                    .map(parse_gsi_throughput)
                     .transpose()?;
                 gsis.push(GsiDescription {
                     index_name: idx.index_name.clone(),
@@ -256,6 +328,7 @@ impl SqliteEngine {
                 last_decrease_date_time: None,
             },
             billing_mode_summary,
+            table_throughput_mode_summary: None,
             global_secondary_indexes: (!gsis.is_empty()).then_some(gsis),
             local_secondary_indexes: (!lsis.is_empty()).then_some(lsis),
             stream_specification: stream_spec,
@@ -275,63 +348,6 @@ impl SqliteEngine {
             // adding one does not break this build.
             ..Default::default()
         })
-    }
-
-    /// Build the vector index descriptions for a table.
-    ///
-    /// Separate from `build_table_description_from_row` so the shared builder
-    /// keeps one signature for every caller. Applied on the describe path, which
-    /// is where a client reads an index definition in order to search it.
-    pub(crate) fn vector_index_descriptions(
-        &self,
-        account_id: &str,
-        table_name: &str,
-        vector_rows: Vec<VectorIndexRow>,
-    ) -> Result<Option<Vec<extenddb_core::types::VectorIndexDescription>>, StorageError> {
-        let mut vector_index_descs: Vec<extenddb_core::types::VectorIndexDescription> = Vec::new();
-        for vi in vector_rows {
-            // Deliberately fails rather than defaulting on a bad parse: a vector
-            // index we cannot describe faithfully must not be reported as if we
-            // could, because a client uses the description to build a search.
-            let vector_attribute = parse_json(&vi.vector_attribute, "vector_attribute")?;
-            let search_schema = vi
-                .search_schema
-                .as_deref()
-                .map(|s| parse_json(s, "vector search_schema"))
-                .transpose()?;
-            let projection = parse_json(&vi.projection, "vector projection")?;
-            let distance_function = parse_json(
-                &format!("\"{}\"", vi.distance_function),
-                "distance_function",
-            )?;
-            let index_status = parse_json(&format!("\"{}\"", vi.index_status), "vector status")?;
-            let desc = extenddb_core::types::VectorIndexDescription {
-                index_name: vi.index_name.clone(),
-                vector_attribute,
-                dimensions: u32::try_from(vi.dimensions).map_err(|_| {
-                    StorageError::Internal(format!(
-                        "vector dimensions out of range: {}",
-                        vi.dimensions
-                    ))
-                })?,
-                search_schema,
-                distance_function,
-                index_status,
-                backfilling: vi.backfilling.map(|b| b != 0),
-                index_size_bytes: 0,
-                item_count: 0,
-                index_arn: index_arn(&self.region, account_id, table_name, &vi.index_name),
-                projection: Some(projection),
-            };
-            // The readiness rule is core's, applied here so a backend bug cannot
-            // emit a description the wire contract forbids. Cheaper to catch on
-            // the way out than to debug from a client.
-            desc.validate_readiness()
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            vector_index_descs.push(desc);
-        }
-
-        Ok((!vector_index_descs.is_empty()).then_some(vector_index_descs))
     }
 
     /// Backfill existing base-table items into a newly created GSI, batched to
@@ -409,5 +425,34 @@ fn zero_throughput() -> ProvisionedThroughputDescription {
         number_of_decreases_today: 0,
         last_increase_date_time: None,
         last_decrease_date_time: None,
+    }
+}
+
+impl SqliteEngine {
+    /// The RestoreSummary of a table created by RestoreTableFromBackup, or
+    /// `None` for any other table. In progress until the table is ACTIVE.
+    /// Takes the connection so a snapshot reads it inside the transaction
+    /// that pinned its WAL snapshot.
+    async fn restore_summary_on(
+        conn: &mut sqlx::SqliteConnection,
+        table_id: &str,
+        status: &extenddb_core::types::TableStatus,
+    ) -> Result<Option<extenddb_core::types::RestoreSummary>, StorageError> {
+        let row: Option<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT source_backup_arn, restore_date_time, source_table_arn \
+             FROM table_restores WHERE table_id = ?",
+        )
+        .bind(table_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        Ok(row.map(
+            |(arn, at, source_table_arn)| extenddb_core::types::RestoreSummary {
+                source_backup_arn: Some(arn),
+                source_table_arn,
+                restore_date_time: crate::sqlite_util::timestamp_epoch_seconds(&at),
+                restore_in_progress: *status == extenddb_core::types::TableStatus::Creating,
+            },
+        ))
     }
 }

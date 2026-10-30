@@ -9,11 +9,13 @@ REQ-TEST-001, REQ-TEST-002, REQ-TEST-003, REQ-TEST-004
 
 from __future__ import annotations
 
+import contextlib
+import os
 import uuid
 
 import pytest
 from botocore.exceptions import ClientError
-from conftest import wait_for_active
+from conftest import _is_real_dynamodb, config_value, configured_backend, wait_for_active
 class TestCreateTable:
     """CreateTable operation tests."""
 
@@ -175,6 +177,111 @@ class TestDeleteTable:
             DeletionProtectionEnabled=False,
         )
 
+    def test_delete_of_a_deleting_table_returns_its_description(
+        self, create_and_cleanup_table, dynamodb_client, unique_table_name
+    ):
+        """DeleteTable of a table that is already DELETING returns the table's
+        description with TableStatus DELETING and no error, as the service does,
+        and leaves the table as it was.
+
+        On ExtendDB the DELETING state is written into the catalog directly: on
+        PostgreSQL a reader or writer holding the table leaves it there, and on
+        SQLite a control_plane_delay_seconds of 1 or more, neither of which a
+        test sharing the server can arrange without affecting other tests.
+        MongoDB and Cassandra remove a table in the request and never leave it
+        DELETING, so there the test does not apply.
+        """
+        create_and_cleanup_table(unique_table_name)
+        if _is_real_dynamodb():
+            dynamodb_client.delete_table(TableName=unique_table_name)
+            second = dynamodb_client.delete_table(TableName=unique_table_name)
+            assert second["TableDescription"]["TableStatus"] == "DELETING"
+            return
+        backend = configured_backend() or (
+            "postgres" if config_value("storage.postgres", "connection_string") else None
+        )
+        print(f"backend under test: {backend}")
+        if backend not in ("postgres", "sqlite"):
+            pytest.skip(f"backend {backend!r} never leaves a table DELETING")
+        with _catalog_connection(backend) as catalog:
+            _set_status(catalog, backend, unique_table_name, "DELETING")
+            try:
+                before = _status_row(catalog, backend, unique_table_name)
+                second = dynamodb_client.delete_table(TableName=unique_table_name)
+                desc = second["TableDescription"]
+                assert desc["TableStatus"] == "DELETING"
+                assert desc["TableName"] == unique_table_name
+                assert desc["TableArn"].endswith(f"table/{unique_table_name}")
+                assert desc["KeySchema"] == [{"AttributeName": "pk", "KeyType": "HASH"}]
+                described = dynamodb_client.describe_table(TableName=unique_table_name)
+                assert described["Table"]["TableStatus"] == "DELETING"
+                assert _status_row(catalog, backend, unique_table_name) == before, (
+                    "the second DeleteTable changed the table"
+                )
+            finally:
+                # Back to ACTIVE, so the fixture's DeleteTable removes it.
+                _set_status(catalog, backend, unique_table_name, "ACTIVE")
+
+
+@contextlib.contextmanager
+def _catalog_connection(backend: str):
+    """A DB-API connection on the running server's catalog, from its config."""
+    if backend == "postgres":
+        import psycopg2
+
+        url = config_value("storage.postgres", "connection_string")
+        assert url, "no [storage.postgres] connection_string in the server's config"
+        conn = psycopg2.connect(url)
+        conn.autocommit = True
+    else:
+        import sqlite3
+
+        path = config_value("storage.sqlite", "path")
+        assert path and ":memory:" not in path, (
+            f"the SQLite catalog must be a file the test can open: {path!r}"
+        )
+        conn = sqlite3.connect(os.path.abspath(path), timeout=30, isolation_level=None)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def _placeholder(backend: str) -> str:
+    return "%s" if backend == "postgres" else "?"
+
+
+def _set_status(conn, backend: str, table_name: str, status: str) -> None:
+    """Set the table's catalog status: DELETING with a removal an hour away, or
+    back to ACTIVE with none scheduled."""
+    p = _placeholder(backend)
+    if status == "DELETING":
+        when = (
+            "NOW() + INTERVAL '1 hour'"
+            if backend == "postgres"
+            else "strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+1 hour')"
+        )
+    else:
+        when = "NULL"
+    cur = conn.cursor()
+    cur.execute(
+        f"UPDATE tables SET table_status = {p}, status_transition_at = {when} "
+        f"WHERE table_name = {p}",
+        (status, table_name),
+    )
+    assert cur.rowcount == 1, f"{table_name} has one catalog row"
+
+
+def _status_row(conn, backend: str, table_name: str):
+    cur = conn.cursor()
+    p = _placeholder(backend)
+    cur.execute(
+        f"SELECT table_status, CAST(status_transition_at AS TEXT) FROM tables "
+        f"WHERE table_name = {p}",
+        (table_name,),
+    )
+    return cur.fetchall()
+
 
 # ---------------------------------------------------------------------------
 # CreateTable validation additions (covers commits since 6b98234dcf)
@@ -290,6 +397,35 @@ class TestListTablesOrder:
         # Filter to just our test tables.
         our_tables = [t for t in collected if t.startswith(prefix)]
         assert our_tables == sorted(our_tables)
+
+    def test_list_tables_pages_in_byte_order_without_skipping(
+        self, create_and_cleanup_table, dynamodb_client
+    ):
+        """Names are ordered by UTF-8 byte value and every name lands on one page.
+
+        `a_z` sorts before `ab` in byte order (`_` is 0x5F, `b` is 0x62) but
+        after it under a locale collation such as en_US.utf8, which ignores
+        punctuation at the first level. A backend whose page filter and page
+        order use different collations skips `ab`. Measured against the
+        service 2026-09-16: order [a_z, ab], both returned, with Limit=1.
+        """
+        prefix = f"extenddb-order-{uuid.uuid4().hex[:4]}"
+        names = [f"{prefix}-a_z", f"{prefix}-ab"]
+        for name in names:
+            create_and_cleanup_table(name)
+
+        collected: list[str] = []
+        kwargs: dict = {"Limit": 1}
+        while True:
+            result = dynamodb_client.list_tables(**kwargs)
+            collected.extend(result["TableNames"])
+            if "LastEvaluatedTableName" not in result:
+                break
+            kwargs["ExclusiveStartTableName"] = result["LastEvaluatedTableName"]
+
+        our_tables = [t for t in collected if t.startswith(prefix)]
+        assert our_tables == names
+        assert collected == sorted(collected, key=lambda s: s.encode("utf-8"))
 
 
 # ---------------------------------------------------------------------------

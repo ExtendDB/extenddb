@@ -21,12 +21,10 @@ use extenddb_core::validation::{
 use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::storage_err_to_dynamo;
+use crate::request_limits;
 use crate::serialize_output;
 use crate::stream_capture;
 use crate::{DispatchMetrics, DispatchResult};
-
-/// Maximum number of write requests across all tables in a single `BatchWriteItem`.
-const MAX_BATCH_WRITE_ITEMS: usize = 25;
 
 /// Handle a `BatchWriteItem` request.
 ///
@@ -44,45 +42,15 @@ pub async fn handle_batch_write_item(
     let input: BatchWriteItemInput =
         serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
-    // Validate: RequestItems must not be empty
-    if input.request_items.is_empty() {
-        return Err(DynamoDbError::ValidationException(
-            "The requestItems parameter is required for BatchWriteItem".to_owned(),
-        ));
-    }
-
-    // Validate: per-table operations <= 25
-    for (table_name, reqs) in &input.request_items {
-        if reqs.len() > MAX_BATCH_WRITE_ITEMS {
-            let items_repr = reqs
-                .iter()
-                .map(|_| "WriteRequest")
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(DynamoDbError::ValidationException(format!(
-                "1 validation error detected: Value '{{{table_name}=[{items_repr}]}}' at 'requestItems' failed to satisfy constraint: \
-                 Map value must satisfy constraint: [Member must have length less than or equal to 25, \
-                 Member must have length greater than or equal to 1]"
-            )));
-        }
-    }
-
-    // Validate: total operations across all tables <= 25
-    let total_ops: usize = input.request_items.values().map(std::vec::Vec::len).sum();
-    if total_ops > MAX_BATCH_WRITE_ITEMS {
-        return Err(DynamoDbError::ValidationException(
-            "Too many items requested for the BatchWriteItem call".to_owned(),
-        ));
-    }
-
-    // Validate: each table must have at least one request
-    for (table_name, reqs) in &input.request_items {
-        if reqs.is_empty() {
-            return Err(DynamoDbError::ValidationException(format!(
-                "1 validation error detected: Value '[]' at 'requestItems.{table_name}.member' failed to satisfy constraint: Member must have length greater than or equal to 1"
-            )));
-        }
-    }
+    // Validate the table and request counts: RequestItems not empty, at most
+    // 25 tables, at most 25 requests per table and in total, at least one
+    // request per table. The server runs the same checks before authorization.
+    let counts: Vec<(&str, Option<usize>)> = input
+        .request_items
+        .iter()
+        .map(|(table_name, reqs)| (table_name.as_str(), Some(reqs.len())))
+        .collect();
+    request_limits::check_batch_counts("BatchWriteItem", &counts)?;
 
     // Validate: each WriteRequest has exactly one of PutRequest or DeleteRequest
     for reqs in input.request_items.values() {
@@ -103,11 +71,17 @@ pub async fn handle_batch_write_item(
         HashMap::new();
     let mut total_wcu: f64 = 0.0;
     let mut per_table_wcu: HashMap<String, f64> = HashMap::new();
+    // Per-table per-index write units, populated only when INDEXES is
+    // requested: attributing them needs each write's old image, which is
+    // an extra read the aggregate-only shapes never pay for.
+    let want_index_cc =
+        input.return_consumed_capacity == extenddb_core::types::ReturnConsumedCapacity::Indexes;
+    let mut per_table_gsi: HashMap<String, HashMap<String, f64>> = HashMap::new();
+    let mut per_table_lsi: HashMap<String, HashMap<String, f64>> = HashMap::new();
 
     for (table_name, reqs) in &input.request_items {
         let key_info = ctx
-            .storage
-            .table_key_info(&ctx.account_id, table_name)
+            .table_key_info_uncached(table_name)
             .await
             .map_err(storage_err_to_dynamo)?;
 
@@ -150,18 +124,34 @@ pub async fn handle_batch_write_item(
                 let item_wcu = capacity_helpers::write_capacity_units(item_size_bytes(&put.item));
                 total_wcu += item_wcu;
                 *per_table_wcu.entry(table_name.clone()).or_default() += item_wcu;
-                let _old_item = ctx
+                let old_item = ctx
                     .storage
                     .put_item(
                         &key_info,
                         put.item.clone(),
-                        need_old_for_stream,
+                        need_old_for_stream || want_index_cc,
                         None,
                         &empty_maps,
                         stream.as_ref(),
                     )
                     .await
                     .map_err(storage_err_to_dynamo)?;
+                if want_index_cc {
+                    let (gsi, lsi) = capacity_helpers::index_write_units(
+                        old_item.as_ref(),
+                        Some(&put.item),
+                        false,
+                        &key_info,
+                    );
+                    let g = per_table_gsi.entry(table_name.clone()).or_default();
+                    for (name, cu) in gsi {
+                        *g.entry(name).or_default() += cu;
+                    }
+                    let l = per_table_lsi.entry(table_name.clone()).or_default();
+                    for (name, cu) in lsi {
+                        *l.entry(name).or_default() += cu;
+                    }
+                }
             } else if let Some(del) = &wr.delete_request {
                 validate_batch_key_only(
                     &del.key,
@@ -188,29 +178,64 @@ pub async fn handle_batch_write_item(
                 let item_wcu = capacity_helpers::write_capacity_units(item_size_bytes(&del.key));
                 total_wcu += item_wcu;
                 *per_table_wcu.entry(table_name.clone()).or_default() += item_wcu;
-                let _old_item = ctx
+                let old_item = ctx
                     .storage
                     .delete_item(
                         &key_info,
                         &del.key,
-                        need_old_for_stream,
+                        need_old_for_stream || want_index_cc,
                         None,
                         &empty_maps,
                         stream.as_ref(),
                     )
                     .await
                     .map_err(storage_err_to_dynamo)?;
+                if want_index_cc {
+                    let (gsi, lsi) = capacity_helpers::index_write_units(
+                        old_item.as_ref(),
+                        None,
+                        false,
+                        &key_info,
+                    );
+                    let g = per_table_gsi.entry(table_name.clone()).or_default();
+                    for (name, cu) in gsi {
+                        *g.entry(name).or_default() += cu;
+                    }
+                    let l = per_table_lsi.entry(table_name.clone()).or_default();
+                    for (name, cu) in lsi {
+                        *l.entry(name).or_default() += cu;
+                    }
+                }
             }
         }
     }
 
-    // NOTE: per-index (INDEXES) breakdown for batch writes is deferred to the
-    // storage-layer capacity-reporting follow-up (Delete requests lack the old
-    // item needed to attribute per-index capacity). Base-table aggregate only.
-    let consumed_capacity = capacity_helpers::batch_write_capacity(
-        input.return_consumed_capacity,
-        per_table_wcu.iter().map(|(t, cu)| (t.as_str(), *cu)),
-    );
+    // With INDEXES, each per-table entry carries the arms the batch actually
+    // touched: base table plus every affected index, aggregate = their sum
+    // (pinned by the ground-truth runs of 2026-08-24: an indexed put and a
+    // sparse put in one batch answer total 3 = table 2 + gsi 1). TOTAL and
+    // NONE keep the aggregate-only shapes.
+    let consumed_capacity = if want_index_cc {
+        Some(
+            per_table_wcu
+                .iter()
+                .map(|(t, cu)| {
+                    extenddb_core::types::ConsumedCapacity::write_indexed(
+                        t,
+                        *cu,
+                        per_table_gsi.remove(t).unwrap_or_default(),
+                        per_table_lsi.remove(t).unwrap_or_default(),
+                        true,
+                    )
+                })
+                .collect(),
+        )
+    } else {
+        capacity_helpers::batch_write_capacity(
+            input.return_consumed_capacity,
+            per_table_wcu.iter().map(|(t, cu)| (t.as_str(), *cu)),
+        )
+    };
 
     // Per-item WCU already accumulated above (M-1: DynamoDB rounds per item, then sums).
     let wcu = total_wcu;

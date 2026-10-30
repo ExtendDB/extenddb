@@ -19,7 +19,7 @@ pub async fn handle_describe_table(
 
     validate_table_name(&input.table_name, &ctx.limits)?;
 
-    let table_desc = ctx
+    let mut table_desc = ctx
         .storage
         .describe_table(&ctx.account_id, input)
         .await
@@ -29,6 +29,8 @@ pub async fn handle_describe_table(
     // populated; the first search would silently undercount.
     table_desc.validate_vector_index_readiness()?;
 
+    // Includes the RestoreSummary lifetime (dropped once not CREATING).
+    table_desc.prepare_for_response();
     let output = DescribeTableOutput { table: table_desc };
     serialize_output(&output)
 }

@@ -17,6 +17,9 @@ This directory contains the authoritative design documents for ExtendDB (extendd
 | 09 | [Testing](09-testing.md) | Test strategy, reference suites, golden files, multi-language test suites, coverage tracking |
 | 10 | [Licenses](10-dependency-licenses.md) | Licensing summary for third-party dependencies |
 | 11 | [Scaling](11-high-availability.md) | DRAFT document on scaling ExtendDB |
+| 12 | [Auth / Authz Cache](12-auth-authz-cache.md) | In-process cache for IAM data (credentials, policies, tags, table key info); companion to 05 and 06 |
+| 13 | [MongoDB Storage](13-storage-mongodb.md) | MongoDB storage backend: engine and catalog traits over the official driver, replica-set transactions |
+| 15 | [Backup and Restore](15-backup-restore.md) | Overview of the off-host backup series: the invariants, the per-operation contracts and a short section per later PR; the format, store and snapshot documentation lives with their crates (`crates/core/src/backup_format`, `crates/backup-store`, `crates/storage/src/snapshot.rs`) |
 
 
 ## How to Use These Docs

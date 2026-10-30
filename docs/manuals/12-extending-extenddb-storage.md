@@ -93,6 +93,8 @@ Key design decisions:
 - **Condition expressions** are evaluated inside the storage transaction. The engine parses and compiles expressions; the storage layer receives an AST (`Expr`) and evaluates it against the existing item within the same transaction that performs the write. This is critical for correctness — condition checks and writes must be atomic.
 - **Stream capture** is passed as `Option<&StreamCapture>`. When present, the stream record must be written in the same transaction as the data write.
 - **Idempotency tokens** for `TransactWriteItems` must be checked and stored atomically with the writes, and must be scoped per account: a `ClientRequestToken` is unique per account in DynamoDB, not globally, so the store must key on `(account_id, token)`. Keying on the token alone lets the same token value from two accounts collide (one account's transaction wrongly replayed or rejected against another's).
+- **Lock order in `transact_write_items`**: a backend that takes blocking row locks must lock a transaction's items in one global order, so two write transactions cannot deadlock on each other. The PostgreSQL backend runs the ops sorted by table ID and key and keeps the results in request order. When the database still aborts a transaction to break a conflict (a deadlock or a serialization failure), return `StorageError::TransactionCanceled`, never an internal error. Put the `TransactionConflict` reason on the item whose statement hit the abort and `None` on the others. When the abort cannot be tied to one item (for example, it comes at commit), mark every item `TransactionConflict`.
+- **Missing items in `transact_write_items`**: a ConditionCheck or Delete that finds no item still depends on that item staying absent until commit. A lock on rows alone does not cover this, and two transactions that each check an item the other creates can then both commit (write skew). The PostgreSQL backend inserts the missing key and deletes it again in the same transaction, so any concurrent insert of the key waits for the transaction to end.
 - **Items** are `BTreeMap<String, AttributeValue>`. A new backend must handle the full `AttributeValue` type (S, N, B, SS, NS, BS, L, M, BOOL, NULL).
 - **Query** must support forward/reverse sort order, exclusive start key pagination, and routing to secondary index storage.
 - **Parallel scan** uses `segment` and `total_segments` to partition the keyspace.
@@ -395,7 +397,7 @@ The PostgreSQL implementation makes backend-specific choices. These are implemen
 
 1. **JSONB item storage** — items are stored as JSONB, enabling PostgreSQL-specific query optimizations. The traits pass `Item` = `BTreeMap<String, AttributeValue>` — your backend can use any serialization format.
 
-2. **Transaction isolation** — the PostgreSQL backend uses `BEGIN ISOLATION LEVEL SERIALIZABLE` for transactions. Your backend needs equivalent isolation guarantees.
+2. **Transaction isolation**: the PostgreSQL backend runs `transact_write_items` at `READ COMMITTED` and makes it serializable with locks held until commit: `SELECT ... FOR UPDATE` on every item that exists, and a reserved unique key on every item that a ConditionCheck or Delete finds missing. Your backend needs equivalent isolation guarantees.
 
 3. **Sequence generation** — stream sequence numbers use PostgreSQL sequences (`nextval`). Your backend needs a monotonic counter mechanism.
 

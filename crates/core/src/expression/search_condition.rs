@@ -76,7 +76,8 @@ pub fn validate_search_condition_expression(
     // Only equality is supported. Every other comparator contains one of these.
     if trimmed.contains(['<', '>', '!']) {
         return Err(invalid(
-            "Invalid comparator used in SearchConditionExpression",
+            "Invalid SearchConditionExpression: Invalid comparator used in \
+             SearchConditionExpression",
         ));
     }
 
@@ -430,7 +431,7 @@ mod tests {
                 Some(&n),
                 Some(&v)
             )),
-            "Invalid comparator used in SearchConditionExpression"
+            "Invalid SearchConditionExpression: Invalid comparator used in SearchConditionExpression"
         );
     }
 

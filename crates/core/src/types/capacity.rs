@@ -53,10 +53,16 @@ pub struct Capacity {
 /// Capacity consumed by a vector index.
 ///
 /// Vector indexes meter in their own units, separate from table read and write
-/// capacity: `VectorSearchRequestBytes` for `SearchVectors`, and
-/// `VectorWriteRequestBytes` for writes replicated into the index. Both are
-/// byte figures, not unit figures, and each is omitted rather than reported as
-/// zero when the operation does not consume it.
+/// capacity. A `SearchVectors` charge is reported twice, as
+/// `VectorSearchRequestBytes` and `VectorSearchUnits` with the same value; a
+/// write replicated into the index is reported as `VectorWriteRequestBytes`.
+/// Each member is omitted rather than reported as zero when the operation does
+/// not consume it.
+///
+/// The duplicated search member is measured, not a guess: probe P8 against real
+/// Amazon DynamoDB on 2026-08-19 captured both members on every search, always
+/// equal, under both `INDEXES` and `TOTAL`. The write side has no such capture,
+/// so it carries the bytes member alone until one exists.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct VectorCapacity {
     /// Bytes consumed by a `SearchVectors` operation.
@@ -65,12 +71,43 @@ pub struct VectorCapacity {
         skip_serializing_if = "Option::is_none"
     )]
     pub vector_search_request_bytes: Option<f64>,
+    /// The same figure as `VectorSearchRequestBytes`, under the name a client
+    /// reading units expects.
+    #[serde(rename = "VectorSearchUnits", skip_serializing_if = "Option::is_none")]
+    pub vector_search_units: Option<f64>,
     /// Bytes consumed replicating a write into the index.
     #[serde(
         rename = "VectorWriteRequestBytes",
         skip_serializing_if = "Option::is_none"
     )]
     pub vector_write_request_bytes: Option<f64>,
+}
+
+impl VectorCapacity {
+    /// A search charge, which the service reports under both search member names
+    /// with the same value.
+    ///
+    /// A constructor rather than a struct literal at the call site, so the two
+    /// members cannot drift apart: there is no way to set one and forget the
+    /// other.
+    #[must_use]
+    pub const fn search(bytes: f64) -> Self {
+        Self {
+            vector_search_request_bytes: Some(bytes),
+            vector_search_units: Some(bytes),
+            vector_write_request_bytes: None,
+        }
+    }
+
+    /// A write-replication charge.
+    #[must_use]
+    pub const fn write(bytes: f64) -> Self {
+        Self {
+            vector_search_request_bytes: None,
+            vector_search_units: None,
+            vector_write_request_bytes: Some(bytes),
+        }
+    }
 }
 
 /// Consumed capacity information returned when requested.
@@ -201,20 +238,50 @@ impl ConsumedCapacity {
         }
         let map: HashMap<String, VectorCapacity> = charges
             .into_iter()
-            .map(|(name, bytes)| {
-                (
-                    name,
-                    VectorCapacity {
-                        vector_search_request_bytes: None,
-                        vector_write_request_bytes: Some(bytes),
-                    },
-                )
-            })
+            .map(|(name, bytes)| (name, VectorCapacity::write(bytes)))
             .collect();
         if !map.is_empty() {
             self.vector_indexes = Some(map);
         }
         self
+    }
+
+    /// Build a `ConsumedCapacity` for a read served by a secondary index.
+    ///
+    /// The index carries the read and the table's share is zero, with the
+    /// aggregate being their sum; that is what makes the INDEXES breakdown a
+    /// breakdown rather than a copy of the total (pinned by the ground-truth
+    /// runs of 2026-08-24, us-east-1 and eu-west-2). `is_global` selects the
+    /// map the index entry lands in.
+    pub fn read_on_index(table_name: &str, index_name: &str, cu: f64, is_global: bool) -> Self {
+        let index_arm = std::iter::once((
+            index_name.to_owned(),
+            Capacity {
+                capacity_units: cu,
+                read_capacity_units: None,
+                write_capacity_units: None,
+            },
+        ))
+        .collect();
+        let (gsi, lsi) = if is_global {
+            (Some(index_arm), None)
+        } else {
+            (None, Some(index_arm))
+        };
+        Self {
+            table_name: table_name.to_owned(),
+            capacity_units: cu,
+            read_capacity_units: None,
+            write_capacity_units: None,
+            table: Some(Capacity {
+                capacity_units: 0.0,
+                read_capacity_units: None,
+                write_capacity_units: None,
+            }),
+            global_secondary_indexes: gsi,
+            local_secondary_indexes: lsi,
+            vector_indexes: None,
+        }
     }
 
     /// Build a `ConsumedCapacity` for a read operation with real capacity units.
@@ -270,6 +337,39 @@ impl ConsumedCapacity {
     /// and inside the nested `Table` breakdown at INDEXES granularity.
     #[must_use]
     pub fn transact_read(table_name: &str, cu: f64, indexes: bool) -> Self {
+        Self {
+            table_name: table_name.to_owned(),
+            capacity_units: cu,
+            read_capacity_units: Some(cu),
+            write_capacity_units: None,
+            table: if indexes {
+                Some(Capacity {
+                    capacity_units: cu,
+                    read_capacity_units: Some(cu),
+                    write_capacity_units: None,
+                })
+            } else {
+                None
+            },
+            global_secondary_indexes: None,
+            local_secondary_indexes: None,
+            vector_indexes: None,
+        }
+    }
+
+    /// Build the `ConsumedCapacity` for an idempotent-replay response: the
+    /// replay re-reads the stored result transactionally, so it reports READ
+    /// capacity recomputed against the item size, never the stored write
+    /// magnitude. Measured against the service (a ~1.5KB put: first call 4
+    /// WCU, same-token replay 2 RCU with no write arm).
+    ///
+    /// The magnitude is exact for Put operations, whose request carries the
+    /// full item. For Delete/Update/ConditionCheck the caller only holds the
+    /// key size, so the figure is a floor (the 1-RCU minimum in practice);
+    /// recomputing against the stored item would need a read the replay path
+    /// deliberately does not perform.
+    #[must_use]
+    pub fn transact_replay_read(table_name: &str, cu: f64, indexes: bool) -> Self {
         Self {
             table_name: table_name.to_owned(),
             capacity_units: cu,
@@ -418,5 +518,48 @@ mod tests {
                 .get("WriteCapacityUnits")
                 .is_none()
         );
+    }
+
+    /// A search charge serialises both measured members and nothing else.
+    ///
+    /// Probe P8 (2026-08-19, real Amazon DynamoDB) captured the whole
+    /// `SearchVectors` shape as
+    /// `{"VectorSearchRequestBytes": 1024.0, "VectorSearchUnits": 1024.0}` under
+    /// both `INDEXES` and `TOTAL`. A client reading the units member got `null`
+    /// from ExtendDB and a number from the service.
+    #[test]
+    fn a_search_charge_carries_both_measured_members() {
+        let capacity = VectorCapacity::search(2048.0);
+        let Ok(value) = serde_json::to_value(capacity) else {
+            panic!("vector capacity should serialize");
+        };
+        let members: Vec<&str> = value
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(members, ["VectorSearchRequestBytes", "VectorSearchUnits"]);
+        assert_eq!(value["VectorSearchRequestBytes"], 2048.0);
+        assert_eq!(value["VectorSearchUnits"], 2048.0);
+    }
+
+    /// The write charge is untouched by the search-side addition. The service's
+    /// write-side units member is NOT measured, so nothing may be invented for
+    /// it: a write charge still carries exactly one member.
+    #[test]
+    fn a_write_charge_carries_only_the_measured_bytes_member() {
+        let capacity = ConsumedCapacity::write("table", 1.0, true)
+            .with_vector_writes([("vidx".to_owned(), 512.0)], true);
+        let Ok(value) = serde_json::to_value(capacity) else {
+            panic!("indexed capacity should serialize");
+        };
+        let members: Vec<&str> = value["VectorIndexes"]["vidx"]
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(members, ["VectorWriteRequestBytes"]);
     }
 }

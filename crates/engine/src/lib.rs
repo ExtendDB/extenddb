@@ -28,6 +28,7 @@ mod list_tables;
 mod put_item;
 mod query;
 mod read_helpers;
+mod request_limits;
 mod scan;
 mod search_vectors;
 pub mod stream_capture;
@@ -44,6 +45,7 @@ mod vector_gate;
 pub use batch_get_item::handle_batch_get_item;
 pub use batch_write_item::handle_batch_write_item;
 pub use create_table::handle_create_table;
+pub use create_table::storage_err_to_dynamo;
 pub use delete_item::handle_delete_item;
 pub use delete_table::handle_delete_table;
 pub use describe_endpoints::handle_describe_endpoints;
@@ -54,8 +56,11 @@ pub use import_export::{handle_export_table, handle_import_table};
 pub use list_tables::handle_list_tables;
 pub use put_item::handle_put_item;
 pub use query::handle_query;
+pub use request_limits::check_request_item_counts;
 pub use scan::handle_scan;
 pub use search_vectors::handle_search_vectors;
+pub use streams::{SHARD_ITERATOR_EXPIRED_MESSAGE, ShardIteratorClass, classify_shard_iterator};
+pub use streams::{ShardIterator, decode_shard_iterator, encode_shard_iterator};
 pub use streams::{
     handle_describe_stream, handle_get_records, handle_get_shard_iterator, handle_list_streams,
 };
@@ -71,6 +76,7 @@ use std::sync::Arc;
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::limits::LimitsConfig;
+use extenddb_core::types::TableKeyInfo;
 
 /// Check whether an operation name is recognized by the dispatch table.
 ///
@@ -171,28 +177,67 @@ pub(crate) fn deserialize_error(e: serde_json::Error) -> DynamoDbError {
     }
 }
 
-/// Pre-validate enum fields in a JSON body and return a combined error if multiple are invalid.
-///
-/// `DynamoDB` reports all invalid enum fields together rather than stopping at the first.
-/// Each entry is `(json_field_name, api_field_name, valid_values)`.
+/// One enum field for [`validate_enum_fields`]: where to find it in the JSON
+/// body, what values are members, and how the service renders a violation.
+pub(crate) struct EnumField<'a> {
+    pub json_name: &'a str,
+    pub valid: &'a [&'a str],
+    pub clause: EnumClause<'a>,
+}
+
+/// How the service renders one enum violation inside the
+/// "N validation errors detected" envelope.
+pub(crate) enum EnumClause<'a> {
+    /// The common form: `Value 'X' at 'field' failed to satisfy constraint:
+    /// Member must satisfy enum value set: [...]`.
+    Named(&'a str),
+    /// A verbatim clause with no value or field prefix. `ReturnValues` is the
+    /// measured case: the service reports it as a bare
+    /// `Failed to satisfy constraint: Member must satisfy enum value set:
+    /// [ALL_OLD, UPDATED_OLD, ALL_NEW, UPDATE_NEW, NONE]` -- no field name,
+    /// and the displayed set carries the service's own `UPDATE_NEW` typo.
+    /// Measured 2026-08-24 (us-east-1) on PutItem, DeleteItem, and UpdateItem
+    /// alike, so the text is reproduced verbatim rather than derived.
+    Bare(&'a str),
+}
+
+/// The bare clause the service renders for a `ReturnValues` enum violation.
+/// See [`EnumClause::Bare`] for why the set below does not match the accepted
+/// member list.
+pub(crate) const RETURN_VALUES_BARE_CLAUSE: &str = "Failed to satisfy constraint: \
+     Member must satisfy enum value set: [ALL_OLD, UPDATED_OLD, ALL_NEW, UPDATE_NEW, NONE]";
+
+/// The `ReturnValues` members the service actually accepts (the displayed set
+/// in [`RETURN_VALUES_BARE_CLAUSE`] is NOT this list).
+pub(crate) const RETURN_VALUES_MEMBERS: &[&str] =
+    &["NONE", "ALL_OLD", "ALL_NEW", "UPDATED_OLD", "UPDATED_NEW"];
+
+/// Pre-validate enum fields in a JSON body and return a combined error if
+/// multiple are invalid, in the order listed. Whether an operation aggregates
+/// its enum violations or stops at the first is per operation on the service
+/// (PutItem/DeleteItem/Scan aggregate; UpdateItem and Query stop at the
+/// first), so callers choose by passing one list or several sequential calls.
 pub(crate) fn validate_enum_fields(
     body: &serde_json::Value,
-    fields: &[(&str, &str, &[&str])],
+    fields: &[EnumField<'_>],
 ) -> Result<(), DynamoDbError> {
     let Some(obj) = body.as_object() else {
         return Ok(());
     };
     let mut errors: Vec<String> = Vec::new();
-    for &(json_name, api_name, valid) in fields {
-        if let Some(val) = obj.get(json_name)
+    for field in fields {
+        if let Some(val) = obj.get(field.json_name)
             && let Some(s) = val.as_str()
-            && !valid.contains(&s)
+            && !field.valid.contains(&s)
         {
-            errors.push(format!(
-                "Value '{s}' at '{api_name}' failed to satisfy constraint: \
+            errors.push(match field.clause {
+                EnumClause::Named(api_name) => format!(
+                    "Value '{s}' at '{api_name}' failed to satisfy constraint: \
                          Member must satisfy enum value set: [{}]",
-                valid.join(", ")
-            ));
+                    field.valid.join(", ")
+                ),
+                EnumClause::Bare(clause) => clause.to_owned(),
+            });
         }
     }
     if errors.is_empty() {
@@ -276,17 +321,24 @@ impl DispatchResult {
     }
 }
 
+/// The `TableKeyInfo` the authorization layer read for a request, by table
+/// name. A `None` value records a table that authorization found missing.
+pub type AuthorizedKeyInfo = std::collections::HashMap<String, Option<TableKeyInfo>>;
+
 /// Context passed to every operation handler.
 /// Fix #9: region and `account_id` use Arc<str> to avoid per-request cloning.
 ///
 /// # Catalog Query Discipline (P118)
 ///
-/// For single-table item operations (`GetItem`, `PutItem`, `DeleteItem`,
-/// `UpdateItem`, `Query`, `Scan`), the auth layer pre-fetches `TableKeyInfo`
-/// and stores it in `pre_fetched_key_info`. Engine handlers MUST use this
-/// pre-fetched value instead of calling `storage.table_key_info()` directly.
-/// New per-request catalog roundtrips require justification in the discussion
-/// file and principal reviewer approval.
+/// The auth layer reads `TableKeyInfo` for every table whose partition key it
+/// evaluates (`dynamodb:LeadingKeys`) and stores what it read in
+/// `authorized_key_info`. Engine handlers MUST resolve those tables from this
+/// snapshot instead of reading the catalog again, through
+/// [`OperationContext::table_key_info`] or
+/// [`OperationContext::table_key_info_uncached`]. Authorization and the engine
+/// then act on the same key schema, and on the same answer to whether the
+/// table exists. New per-request catalog roundtrips require justification in
+/// the discussion file and principal reviewer approval.
 pub struct OperationContext {
     pub storage: Arc<dyn extenddb_storage::StorageEngine>,
     pub limits: Arc<LimitsConfig>,
@@ -298,37 +350,76 @@ pub struct OperationContext {
     /// Allowed directories for export file operations. Empty means exports
     /// are disabled (secure default).
     pub export_paths: Arc<[Arc<PathBuf>]>,
-    /// Pre-fetched `TableKeyInfo` from the auth layer (P118 optimization #2).
-    /// Populated for single-table item-level operations; `None` for table-level
-    /// and batch/transact operations.
-    pub pre_fetched_key_info: Option<extenddb_core::types::TableKeyInfo>,
+    /// The `TableKeyInfo` the auth layer read for this request (P118
+    /// optimization #2). Populated for single-table item operations, `Query`,
+    /// `Scan`, and the batch and transaction operations; empty for table-level
+    /// operations. In developer mode authorization is skipped after the
+    /// single-table read, so only a single-table operation has an entry.
+    pub authorized_key_info: AuthorizedKeyInfo,
     /// Auth/authz cache handles. Used by control-plane and tagging operations
     /// to issue write-through cache invalidations after the underlying state
     /// changes (e.g. `TagResource` invalidates the resource-tags cache).
     pub auth_cache: extenddb_auth::AuthCacheRegistry,
-    /// Optional cached `TableKeyInfo` lookup. When set, batch / transact /
-    /// multi-table engine handlers route through this instead of calling
-    /// `storage.table_key_info` directly. When unset (e.g. unit tests), the
-    /// engine falls back to direct storage lookups.
+    /// Optional cached `TableKeyInfo` lookup, used by
+    /// [`OperationContext::table_key_info`] for a table the auth layer did not
+    /// read. When unset (e.g. unit tests), the engine falls back to direct
+    /// storage lookups.
     pub table_key_info_lookup: Option<Arc<dyn extenddb_storage::TableKeyInfoLookup>>,
 }
 
 impl OperationContext {
-    /// Return pre-fetched `TableKeyInfo` if available and matching the requested
-    /// table, otherwise fetch from storage. This is the single entry point for
-    /// obtaining `TableKeyInfo` in engine handlers (P118 Catalog Query Discipline).
+    /// The auth layer's answer for `table_name`, if it read that table: the key
+    /// info it used, or `TableNotFound` when it found the table missing. A
+    /// missing table stays missing for the rest of the request even if it has
+    /// since become ACTIVE, because authorization left `dynamodb:LeadingKeys`
+    /// absent for it and an absent key satisfies a `ForAllValues` condition.
+    /// The snapshot is authoritative for every table it names: an entry for
+    /// another account is an internal error, never a reason to read the table
+    /// again.
+    fn authorized_table_key_info(
+        &self,
+        table_name: &str,
+    ) -> Option<Result<TableKeyInfo, extenddb_storage::error::StorageError>> {
+        use extenddb_storage::error::StorageError;
+        Some(match self.authorized_key_info.get(table_name)? {
+            Some(ki) if *ki.account_id == *self.account_id => Ok(ki.clone()),
+            Some(_) => Err(StorageError::Internal(format!(
+                "authorized key info for table {table_name} belongs to another account"
+            ))),
+            None => Err(StorageError::TableNotFound(table_name.to_owned())),
+        })
+    }
+
+    /// `TableKeyInfo` for a single-table operation: the auth layer's snapshot
+    /// when it read the table, otherwise the cached lookup, otherwise storage.
+    /// This is the entry point for single-table handlers (P118 Catalog Query
+    /// Discipline).
     pub(crate) async fn table_key_info(
         &self,
         table_name: &str,
-    ) -> Result<extenddb_core::types::TableKeyInfo, extenddb_storage::error::StorageError> {
-        if let Some(ref ki) = self.pre_fetched_key_info
-            && ki.table_name == table_name
-            && *ki.account_id == *self.account_id
-        {
-            return Ok(ki.clone());
+    ) -> Result<TableKeyInfo, extenddb_storage::error::StorageError> {
+        if let Some(result) = self.authorized_table_key_info(table_name) {
+            return result;
         }
         if let Some(ref lookup) = self.table_key_info_lookup {
             return lookup.lookup(&self.account_id, table_name).await;
+        }
+        self.storage
+            .table_key_info(&self.account_id, table_name)
+            .await
+    }
+
+    /// `TableKeyInfo` for a batch or transaction handler: the auth layer's
+    /// snapshot when it read the table, otherwise a direct storage read. The
+    /// fallback skips the cache, as these handlers always have, so a request
+    /// that authorization did not evaluate (developer mode) sees the catalog as
+    /// it is now rather than a cached or negative entry.
+    pub(crate) async fn table_key_info_uncached(
+        &self,
+        table_name: &str,
+    ) -> Result<TableKeyInfo, extenddb_storage::error::StorageError> {
+        if let Some(result) = self.authorized_table_key_info(table_name) {
+            return result;
         }
         self.storage
             .table_key_info(&self.account_id, table_name)

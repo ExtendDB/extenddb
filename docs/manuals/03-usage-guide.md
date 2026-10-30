@@ -399,6 +399,54 @@ aws dynamodbstreams get-records \
 
 Both DynamoDB and DynamoDB Streams endpoints use the same extenddb server URL. See `samples/stream_consumer.py` for a complete working example.
 
+## Vector Search
+
+Available on the PostgreSQL backend when the pgvector extension is present on the
+data database, and on the SQLite backend. A deployment without pgvector refuses
+every vector operation and is otherwise unaffected. The refusal comes in two
+strings, which matters if you grep logs for one of them. `CreateTable` and
+`UpdateTable` carrying `VectorIndexes` are refused with:
+
+`Vector indexes are not supported by this storage backend`
+
+and a search is refused with:
+
+`SearchVectors is not supported by this storage backend`
+
+See the admin guide for the detection and the restart requirement.
+
+A vector index is declared on a table that uses on-demand capacity, either at
+CreateTable or by UpdateTable on an existing table. The index names the attribute
+holding the vector, its dimension count, and one of three distance functions
+(`COSINE`, `EUCLIDEAN`, `DOT_PRODUCT`). Five vector indexes per table is the limit.
+
+Items are written normally: the vector attribute is a list of numbers with exactly
+the declared number of dimensions. An item that omits it is stored and simply does
+not appear in that index, the same way a GSI ignores an item missing its key.
+
+`SearchVectors` returns the nearest items with a `Score` per hit, ordered nearest
+first, and takes an optional `TopK` up to 100.
+
+Four things are worth knowing before building on it.
+
+**Amazon DynamoDB serves SearchVectors on a separate endpoint**,
+`search-dynamodb.<region>.amazonaws.com`, and rejects it on the standard endpoint.
+ExtendDB serves every operation on one endpoint, so an SDK that resolves a distinct
+search hostname from its endpoint ruleset needs its endpoint overridden.
+
+**A vector index is eventually consistent**, like a GSI: a search immediately after
+a write may not see the item. Adding an index to a table that already holds items
+starts a backfill, during which the index reports `CREATING`, the table stays
+writable, and searches against that index are refused until it is `ACTIVE`.
+
+**On-demand capacity is required.** A table holding a vector index cannot be
+switched to provisioned mode, and a vector index cannot be added to a provisioned
+table.
+
+**Scores and ranking differ from the service in documented ways** at extreme
+component magnitudes, and tie ordering is deterministic here where the service's is
+measured unstable. Both are in `docs/differences-from-dynamodb.md`.
+
 ## Other Operations
 
 ### DescribeEndpoints
@@ -509,6 +557,7 @@ extenddb reproduces DynamoDB error responses exactly. Common errors:
 | BatchWriteItem / BatchGetItem | ✓ |
 | TransactWriteItems / TransactGetItems | ✓ |
 | Global Secondary Indexes (GSI) | ✓ |
+| Vector indexes and SearchVectors | ✓ (PostgreSQL requires the pgvector extension) |
 | Local Secondary Indexes (LSI) | ✓ |
 | DynamoDB Streams | ✓ |
 | ConditionExpression / FilterExpression / UpdateExpression / ProjectionExpression | ✓ |

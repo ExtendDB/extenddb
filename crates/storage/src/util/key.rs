@@ -4,8 +4,6 @@
 //! Helper functions for transforming and parsing partition key (pk) and sort key (sk) values.
 
 use crate::error::StorageError;
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use extenddb_core::types::{
     AttributeDefinition, AttributeValue, Item, KeySchemaElement, KeyType, ScalarAttributeType,
 };
@@ -76,14 +74,10 @@ pub fn parse_sk(
 /// Per design doc §5.1: partition keys are always stored as TEXT.
 /// S → direct (borrowed), N → string representation (borrowed), B → base64 (owned).
 pub fn pk_to_text(value: &AttributeValue) -> Result<Cow<'_, str>, StorageError> {
-    match value {
-        AttributeValue::S(s) => Ok(Cow::Borrowed(s)),
-        AttributeValue::N(n) => Ok(Cow::Borrowed(n)),
-        AttributeValue::B(b) => Ok(Cow::Owned(BASE64.encode(b))),
-        _ => Err(StorageError::Internal(
-            "partition key must be S, N, or B".to_owned(),
-        )),
-    }
+    // One encoding for the row key: the backup format's key order binds the
+    // same function, so an ORDER BY pk and the manifest's key ranges agree.
+    extenddb_core::backup_format::hash_key_text(value)
+        .ok_or_else(|| StorageError::Internal("partition key must be S, N, or B".to_owned()))
 }
 
 /// Determine which sort key column to use based on the attribute type.
@@ -642,5 +636,37 @@ mod tests {
             .map(|a| a.attribute_name.as_str())
             .collect();
         assert_eq!(names, vec!["pk", "gh", "gr"]);
+    }
+}
+
+#[cfg(test)]
+mod row_key_contract_tests {
+    //! The on-disk row key. Every `B`-keyed row on every backend is addressed
+    //! by this text; the expected strings are literals on purpose so a change
+    //! to the function this delegates to (`backup_format::hash_key_text`)
+    //! fails here rather than silently re-keying the data. Standard base64,
+    //! not URL-safe.
+    use extenddb_core::types::AttributeValue;
+
+    use super::pk_to_text;
+
+    #[test]
+    fn pk_to_text_is_the_row_key_contract() {
+        assert_eq!(
+            pk_to_text(&AttributeValue::S("a b/c".into())).unwrap(),
+            "a b/c"
+        );
+        assert_eq!(pk_to_text(&AttributeValue::N("10".into())).unwrap(), "10");
+        // Standard base64 with padding, not URL-safe: `+` and `/` appear.
+        assert_eq!(
+            pk_to_text(&AttributeValue::B(vec![0xfb, 0xff, 0xbf])).unwrap(),
+            "+/+/"
+        );
+        assert_eq!(
+            pk_to_text(&AttributeValue::B(vec![0xde, 0xad])).unwrap(),
+            "3q0="
+        );
+        assert_eq!(pk_to_text(&AttributeValue::B(vec![])).unwrap(), "");
+        assert!(pk_to_text(&AttributeValue::Bool(true)).is_err());
     }
 }

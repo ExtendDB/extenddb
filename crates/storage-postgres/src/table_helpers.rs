@@ -4,12 +4,12 @@
 //! Helper types and methods for `TableEngine` operations.
 
 use extenddb_core::types::{
-    AttributeDefinition, BillingMode, BillingModeSummary, GsiDescription, KeySchemaElement,
-    LsiDescription, Projection, ProvisionedThroughputDescription, SseDescription, SseType,
-    TableDescription, TableStatus,
+    BillingMode, BillingModeSummary, GsiDescription, LsiDescription,
+    ProvisionedThroughputDescription, SseDescription, SseType, TableDescription, TableStatus,
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{index_arn, stream_arn};
+use extenddb_storage::vector_catalog::{VectorIndexCatalogRow, vector_index_descriptions};
 
 use crate::PostgresEngine;
 use crate::data;
@@ -48,116 +48,86 @@ pub(crate) struct IndexRow {
     pub provisioned_throughput: Option<serde_json::Value>,
 }
 
+/// A `vector_indexes` catalog row, in `FromRow` field order.
+///
+/// Separate from [`IndexRow`] because a vector index has no key schema and no
+/// throughput, and carries a dimension count, a distance function and a
+/// backfill state that no secondary index has. Decoding stops at this struct:
+/// the rules that turn it into a wire shape are shared with the other backends
+/// in `extenddb_storage::vector_catalog`.
+#[derive(sqlx::FromRow)]
+pub(crate) struct VectorIndexRow {
+    pub index_name: String,
+    pub dimensions: i32,
+    pub distance_function: String,
+    pub vector_attribute: serde_json::Value,
+    pub search_schema: Option<serde_json::Value>,
+    pub projection: serde_json::Value,
+    pub index_status: String,
+    pub backfilling: Option<bool>,
+}
+
+impl From<VectorIndexRow> for VectorIndexCatalogRow {
+    fn from(row: VectorIndexRow) -> Self {
+        Self {
+            index_name: row.index_name,
+            dimensions: i64::from(row.dimensions),
+            distance_function: row.distance_function,
+            vector_attribute: row.vector_attribute,
+            search_schema: row.search_schema,
+            projection: row.projection,
+            index_status: row.index_status,
+            backfilling: row.backfilling,
+        }
+    }
+}
+
+/// Columns of [`VectorIndexRow`], in its field order.
+///
+/// Named once so the reads that want a whole row select the same set. sqlx
+/// decodes a named-field struct by column name, so the order here is for reading
+/// rather than for correctness, and a column left out is a `ColumnNotFound`
+/// error rather than a silent mis-mapping.
+pub(crate) const VECTOR_INDEX_COLUMNS: &str = "index_name, dimensions, distance_function, vector_attribute, search_schema, \
+     projection, index_status, backfilling";
+
 impl PostgresEngine {
     /// SQL table name for a GSI data table (static version for use outside `data` module).
     pub(crate) fn index_table_name_static(index_id: &str) -> String {
         data::index_table_name(index_id)
     }
 
-    /// Backfill existing items from the base table into a newly created GSI.
-    ///
-    /// Uses batched reads with OFFSET/LIMIT to avoid loading all items into
-    /// memory at once (CB-19).
-    // S2: Parameters mirror the SQL schema dimensions (account, table, index,
-    // key schemas, attribute defs, projection). A wrapper struct would obscure
-    // the call site without adding clarity.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn backfill_gsi(
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        table_id: &str,
-        index_id: &str,
-        index_key_schema: &[KeySchemaElement],
-        attr_defs: &[AttributeDefinition],
-        base_key_schema: &[KeySchemaElement],
-        base_attr_defs: &[AttributeDefinition],
-        projection: &Projection,
-    ) -> Result<(), StorageError> {
-        const BATCH_SIZE: i64 = 500;
-
-        let base_table = data::data_table_name(table_id);
-        let idx_table = data::index_table_name(index_id);
-
-        let idx_sks = data::all_sort_key_info(index_key_schema, attr_defs);
-        let base_sks = data::all_sort_key_info(base_key_schema, base_attr_defs);
-
-        // Order by whatever key columns the base table actually has. A
-        // hash-only base table has no sort-key columns at all, so naming them
-        // unconditionally makes the backfill fail with "column sk_s does not
-        // exist" and the whole GSI add is rolled back.
-        let mut order_cols = vec!["pk".to_owned()];
-        for (i, _) in base_sks.iter().enumerate() {
-            if i == 0 {
-                order_cols.extend(["sk_s".to_owned(), "sk_n".to_owned(), "sk_b".to_owned()]);
-            } else {
-                let n = i + 1;
-                order_cols.extend([format!("sk{n}_s"), format!("sk{n}_n"), format!("sk{n}_b")]);
-            }
-        }
-        let sql = format!(
-            "SELECT item_data FROM {base_table} ORDER BY {} LIMIT $1 OFFSET $2",
-            order_cols.join(", ")
-        );
-        let mut offset: i64 = 0;
-        loop {
-            let rows: Vec<(serde_json::Value,)> = sqlx::query_as(&sql)
-                .bind(BATCH_SIZE)
-                .bind(offset)
-                .fetch_all(&mut **tx)
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            if rows.is_empty() {
-                break;
-            }
-
-            // BATCH_SIZE=500, always fits in i64.
-            let batch_len = i64::from(u16::try_from(rows.len()).unwrap_or(u16::MAX));
-
-            for (item_json,) in rows {
-                let item = data::json_to_item(item_json)?;
-
-                let has_all_keys = index_key_schema
-                    .iter()
-                    .all(|ks| item.contains_key(&ks.attribute_name));
-                if !has_all_keys {
-                    continue;
-                }
-
-                let projected = data::project_item_for_index(
-                    &item,
-                    index_key_schema,
-                    base_key_schema,
-                    projection,
-                );
-
-                data::insert_index_row_multi(
-                    tx,
-                    &idx_table,
-                    &item,
-                    &projected,
-                    index_key_schema,
-                    base_key_schema,
-                    &idx_sks,
-                    &base_sks,
-                )
-                .await?;
-            }
-
-            if batch_len < BATCH_SIZE {
-                break;
-            }
-            offset += batch_len;
-        }
-
-        Ok(())
-    }
-
-    // TODO(fidelity): These two queries are not in a transaction. Under concurrent
-    // UpdateTable (future phase), the table row and index rows could be read at
-    // different points in time, producing an inconsistent snapshot. Wrap in a
-    // transaction or use SELECT ... FOR SHARE when concurrent DDL is supported.
+    /// `DescribeTable`'s read of the definition, on a connection taken for the
+    /// four statements and nothing else: the table row and its index rows are
+    /// not read in one transaction, so a concurrent `UpdateTable` committing
+    /// between them can show a row with an index set from a moment later. That
+    /// is what the service's eventually consistent `DescribeTable` also allows.
+    /// The snapshot engine (`snapshot_engine.rs`) is the caller that needs one
+    /// instant and gets it: it calls [`Self::build_table_description_on`] on
+    /// the connection that holds the `tables` row `FOR SHARE` (separate data
+    /// database) or inside its `REPEATABLE READ` transaction (one shared
+    /// database). The end of `update_table` calls this one, after its own
+    /// transaction has committed.
     pub(crate) async fn build_table_description(
         &self,
+        account_id: &str,
+        table_name: &str,
+    ) -> Result<TableDescription, StorageError> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        self.build_table_description_on(&mut conn, account_id, table_name)
+            .await
+    }
+
+    /// Build the description through one catalog connection, so a caller
+    /// that already holds one (the snapshot engine, with the `tables` row
+    /// `FOR SHARE`) does not need a second from the pool while it waits.
+    pub(crate) async fn build_table_description_on(
+        &self,
+        conn: &mut sqlx::PgConnection,
         account_id: &str,
         table_name: &str,
     ) -> Result<TableDescription, StorageError> {
@@ -172,7 +142,7 @@ impl PostgresEngine {
         )
         .bind(account_id)
         .bind(table_name)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
@@ -184,11 +154,31 @@ impl PostgresEngine {
                FROM indexes WHERE table_id = $1",
         )
         .bind(&row.table_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *conn)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        self.build_table_description_from_row(account_id, row, index_rows)
+        let vector_rows: Vec<VectorIndexRow> = sqlx::query_as(&format!(
+            "SELECT {VECTOR_INDEX_COLUMNS} FROM vector_indexes WHERE table_id = $1 \
+             ORDER BY index_name"
+        ))
+        .bind(&row.table_id)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        let table_name_owned = row.table_name.clone();
+        let table_id = row.table_id.clone();
+        let mut desc = self.build_table_description_from_row(account_id, row, index_rows)?;
+        desc.restore_summary =
+            Self::restore_summary_on(conn, &table_id, &desc.table_status).await?;
+        desc.vector_indexes = vector_index_descriptions(
+            &self.region,
+            account_id,
+            &table_name_owned,
+            vector_rows.into_iter().map(Into::into).collect(),
+        )?;
+        Ok(desc)
     }
 
     pub(crate) fn build_table_description_from_row(
@@ -334,6 +324,7 @@ impl PostgresEngine {
                 last_decrease_date_time: None,
             },
             billing_mode_summary,
+            table_throughput_mode_summary: None,
             global_secondary_indexes: if gsis.is_empty() { None } else { Some(gsis) },
             local_secondary_indexes: if lsis.is_empty() { None } else { Some(lsis) },
             stream_specification: stream_spec,
@@ -365,10 +356,43 @@ impl PostgresEngine {
             on_demand_throughput: row
                 .on_demand_throughput
                 .and_then(|v| serde_json::from_value(v).ok()),
-            // Fields for features this backend does not implement, vector
-            // indexes today, take their defaults. Adding one to
-            // TableDescription then does not break this build.
+            // Vector indexes are read separately and applied by the caller: this
+            // builder takes `index_rows` only, and the two callers differ in
+            // whether they need them. `build_table_description` fills them in;
+            // the delete path leaves them absent, matching the response the
+            // service sends for a table that is going away.
             ..Default::default()
         })
+    }
+
+    /// The RestoreSummary of a table created by RestoreTableFromBackup, or
+    /// `None` for any other table. In progress until the table is ACTIVE; the
+    /// engine drops the summary from DescribeTable once the table is not
+    /// CREATING. Takes the connection so a caller holding the catalog barrier
+    /// reads it there.
+    pub(crate) async fn restore_summary_on(
+        conn: &mut sqlx::PgConnection,
+        table_id: &str,
+        status: &extenddb_core::types::TableStatus,
+    ) -> Result<Option<extenddb_core::types::RestoreSummary>, StorageError> {
+        // source_table_arn is NULL only on a row written by an earlier build
+        // of this release's 003 (see `migrations::CATALOG_SHAPE_STEPS`).
+        let row: Option<(String, Option<String>, f64)> = sqlx::query_as(
+            "SELECT source_backup_arn, source_table_arn, \
+             EXTRACT(EPOCH FROM restore_date_time)::FLOAT8 \
+             FROM table_restores WHERE table_id = $1",
+        )
+        .bind(table_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        Ok(row.map(
+            |(arn, source_table_arn, at)| extenddb_core::types::RestoreSummary {
+                source_backup_arn: Some(arn),
+                source_table_arn,
+                restore_date_time: at,
+                restore_in_progress: *status == extenddb_core::types::TableStatus::Creating,
+            },
+        ))
     }
 }

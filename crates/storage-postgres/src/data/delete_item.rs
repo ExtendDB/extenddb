@@ -9,7 +9,8 @@ use extenddb_storage::StreamCapture;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{SortKeyValue, parse_sk, pk_to_text, sk_column, sk_info};
 
-use super::index::{enqueue_async_indexes, fetch_indexes_for_table, sync_indexes};
+use super::gsi_build::fix_up_stale_write;
+use super::index::{enqueue_async_indexes, fetch_write_path_indexes, sync_indexes};
 use super::query::check_condition;
 use super::tx_helpers::write_stream_record_in_tx;
 use super::{data_table_name, json_to_item};
@@ -34,15 +35,46 @@ impl PostgresEngine {
             .ok_or_else(|| StorageError::Internal("missing partition key".to_owned()))?;
         let pk_text = pk_to_text(pk_value)?;
 
-        // Fetch indexes for GSI/LSI updates (D-4: sync + async split).
-        let indexes = fetch_indexes_for_table(&key_info.table_id, &self.pool).await?;
-        let sys_delay = if indexes.is_empty() {
+        // Both index families in one catalog visit (D-4: sync + async split for the
+        // secondary indexes).
+        //
+        // Vector indexes come from this fresh read rather than from the cached key
+        // info, and the answer decides two things: whether this write needs a
+        // transaction at all, and what maintenance runs inside it. A cached empty
+        // set would send a write down the no-maintenance fast path and silently
+        // leave an index missing a row.
+        //
+        // What this does and does not remove. The defect being designed out is the
+        // cached membership gate, and that is gone: an index takes effect the moment
+        // its catalog row commits. What remains is a window between this read and
+        // the data transaction's commit, in which an index created concurrently is
+        // missed. No transaction can close it, because the catalog and the data
+        // tables are different databases. For a GSI it is closed by time instead:
+        // the read's stamp lets a write that was slow to commit queue a repair
+        // for any GSI it did not see (`gsi_build::fix_up_stale_write`), and a fast
+        // write is one the backfill sees. Vector indexes still have the window.
+        let (indexes, vector_metas, stamp) =
+            fetch_write_path_indexes(&key_info.table_id, &self.pool).await?;
+        // Read whenever anything can propagate, secondary or vector. Gating this on
+        // the secondary set alone made a vector-only table ignore the configured
+        // delay and apply its vector index inline, while a TransactWriteItems on the
+        // same table read the delay unconditionally and enqueued: six write sites,
+        // two answers, on a setting the differences doc says covers both index kinds.
+        let sys_delay = if indexes.is_empty() && vector_metas.is_empty() {
             0
         } else {
             self.index_propagation_delay().await
         };
 
-        let needs_tx = condition.is_some() || return_old || !indexes.is_empty() || stream.is_some();
+        // A write that is already slow takes the transaction path even with no
+        // index to maintain, so that a repair for a GSI created meanwhile commits
+        // with the write (`gsi_build::fix_up_stale_write`) instead of after it.
+        let needs_tx = condition.is_some()
+            || return_old
+            || !indexes.is_empty()
+            || !vector_metas.is_empty()
+            || stream.is_some()
+            || stamp.elapsed() > super::gsi_build::GRACE_WRITE;
 
         if let Some((sk_name, sk_type)) =
             sk_info(&key_info.key_schema, &key_info.attribute_definitions)
@@ -128,7 +160,6 @@ impl PostgresEngine {
                     sync_indexes(
                         &mut tx,
                         &key_info.key_schema,
-                        &key_info.attribute_definitions,
                         &indexes,
                         oi.as_ref(),
                         None,
@@ -155,7 +186,7 @@ impl PostgresEngine {
                 }
                 // Persist async GSI work inside the same transaction — one row
                 // per async index, each honoring its own propagation delay.
-                let async_enqueued = enqueue_async_indexes(
+                let mut async_enqueued = enqueue_async_indexes(
                     &mut tx,
                     key_info,
                     &indexes,
@@ -164,6 +195,30 @@ impl PostgresEngine {
                     sys_delay,
                 )
                 .await?;
+
+                // The delete has no new image, so removing the indexed row is the
+                // whole of the vector work. Read fresh, never from the cache.
+                let old_for_vectors = match old_item_for_idx {
+                    Some(ref oi) => Some(oi.clone()),
+                    None => old
+                        .as_ref()
+                        .map(|(v,)| json_to_item(v.clone()))
+                        .transpose()?,
+                };
+                async_enqueued += crate::data::vector_index::maintain_vector_indexes(
+                    &mut tx,
+                    &vector_metas,
+                    &key_info.table_id,
+                    &key_info.key_schema,
+                    &key_info.attribute_definitions,
+                    old_for_vectors.as_ref(),
+                    None,
+                    sys_delay,
+                )
+                .await?;
+
+                async_enqueued +=
+                    fix_up_stale_write(&mut tx, &self.pool, stamp, key_info, &indexes, key).await?;
 
                 tx.commit()
                     .await
@@ -182,6 +237,7 @@ impl PostgresEngine {
                 }
             } else {
                 let delete_sql = format!("DELETE FROM {ddb_table} WHERE pk = $1 AND {sk_col} = $2");
+                super::gsi_build::pause_before_autocommit_statement().await;
                 match &sk {
                     SortKeyValue::S(s) => {
                         sqlx::query(&delete_sql)
@@ -206,6 +262,7 @@ impl PostgresEngine {
                     }
                 }
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
+                self.fix_up_autocommit(stamp, key_info, key).await;
                 Ok(None)
             }
         } else {
@@ -265,7 +322,6 @@ impl PostgresEngine {
                     sync_indexes(
                         &mut tx,
                         &key_info.key_schema,
-                        &key_info.attribute_definitions,
                         &indexes,
                         oi.as_ref(),
                         None,
@@ -292,7 +348,7 @@ impl PostgresEngine {
                 }
                 // Persist async GSI work inside the same transaction — one row
                 // per async index, each honoring its own propagation delay.
-                let async_enqueued = enqueue_async_indexes(
+                let mut async_enqueued = enqueue_async_indexes(
                     &mut tx,
                     key_info,
                     &indexes,
@@ -301,6 +357,30 @@ impl PostgresEngine {
                     sys_delay,
                 )
                 .await?;
+
+                // The delete has no new image, so removing the indexed row is the
+                // whole of the vector work. Read fresh, never from the cache.
+                let old_for_vectors = match old_item_for_idx {
+                    Some(ref oi) => Some(oi.clone()),
+                    None => old
+                        .as_ref()
+                        .map(|(v,)| json_to_item(v.clone()))
+                        .transpose()?,
+                };
+                async_enqueued += crate::data::vector_index::maintain_vector_indexes(
+                    &mut tx,
+                    &vector_metas,
+                    &key_info.table_id,
+                    &key_info.key_schema,
+                    &key_info.attribute_definitions,
+                    old_for_vectors.as_ref(),
+                    None,
+                    sys_delay,
+                )
+                .await?;
+
+                async_enqueued +=
+                    fix_up_stale_write(&mut tx, &self.pool, stamp, key_info, &indexes, key).await?;
 
                 tx.commit()
                     .await
@@ -319,11 +399,13 @@ impl PostgresEngine {
                 }
             } else {
                 let delete_sql = format!("DELETE FROM {ddb_table} WHERE pk = $1");
+                super::gsi_build::pause_before_autocommit_statement().await;
                 sqlx::query(&delete_sql)
                     .bind(pk_text.as_ref())
                     .execute(&self.data_pool)
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
+                self.fix_up_autocommit(stamp, key_info, key).await;
                 Ok(None)
             }
         }

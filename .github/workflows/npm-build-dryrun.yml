@@ -1,0 +1,74 @@
+# Pre-merge proof of the npm release build matrix.
+#
+# Every npm-publish failure to date surfaced only at release dispatch time,
+# after a human approval was already spent: the build matrix had never been
+# executed before a real release run. This workflow runs the exact matrix
+# (same reusable workflow, same runner labels, same build/smoke/launcher
+# steps, no publish) on every pull request that touches the release path OR
+# anything the release binary is built from, so a retired runner label, a
+# platform compile break (POSIX-only crates arrive through source and
+# Cargo.lock changes), or a launcher regression is caught while the change
+# is still reviewable.
+name: npm build dry run
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/npm-publish.yml'
+      - '.github/workflows/npm-build-matrix.yml'
+      - '.github/workflows/npm-build-dryrun.yml'
+      - 'packaging/npm/**'
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-build-dryrun-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  matrix:
+    uses: ./.github/workflows/npm-build-matrix.yml
+    with:
+      ref: ${{ github.event.pull_request.head.sha }}
+      # Every platform reports even when one fails: a pre-merge proof is
+      # worth more when it shows the full damage, not the first casualty.
+      fail-fast: false
+
+  # The publish job's side of the artifact contract, exercised pre-merge:
+  # resolve the platform list from optionalDependencies exactly as
+  # npm-publish.yml does, and require artifacts/bin-<pkg>/<bin> to exist for
+  # every entry. A drift between the matrix upload layout and the publish
+  # read path otherwise passes the dry run and fails only at release time.
+  artifact-contract:
+    needs: matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the pull request head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Download the built binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          path: artifacts/
+
+      - name: Every optionalDependencies platform must have its artifact
+        run: |
+          set -euo pipefail
+          # Same derivation as the publish job: the launcher's
+          # optionalDependencies is the single source of truth.
+          PLATFORMS=$(jq -r '.optionalDependencies | keys[] | ltrimstr("@extenddb/")' packaging/npm/package.json)
+          for pkg in $PLATFORMS; do
+            bin="extenddb"; [[ "$pkg" == win32-* ]] && bin="extenddb.exe"
+            [[ -f "artifacts/bin-${pkg}/${bin}" ]] || { echo "::error::publish expects artifacts/bin-${pkg}/${bin} and it is not there"; exit 1; }
+          done
+          # The one artifact this runner can execute must actually run.
+          chmod +x artifacts/bin-linux-x64/extenddb
+          artifacts/bin-linux-x64/extenddb --version

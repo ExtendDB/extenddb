@@ -120,7 +120,7 @@ After authentication, the authorization layer evaluates IAM policies using a 5-p
 4. **Identity Allow** — scan identity policies (user, group, role). Any matching Allow → access granted.
 5. **Implicit Deny** — no matching Allow → access denied.
 
-Policy conditions support all IAM condition operators: `StringEquals`, `StringNotEquals`, `StringEqualsIgnoreCase`, `StringLike`, `StringNotLike`, `NumericEquals`, `NumericNotEquals`, `NumericLessThan`, `NumericLessThanEquals`, `NumericGreaterThan`, `NumericGreaterThanEquals`, `DateEquals`, `DateNotEquals`, `DateLessThan`, `DateLessThanEquals`, `DateGreaterThan`, `DateGreaterThanEquals`, `Bool`, `Null`, `ArnEquals`, `ArnNotEquals`, `ArnLike`, `ArnNotLike`, plus `ForAllValues`, `ForAnyValue`, and `IfExists` modifiers. Supported condition keys include `aws:PrincipalTag/*`, `dynamodb:ResourceTag/*`, `dynamodb:LeadingKeys`, `dynamodb:Attributes`, `dynamodb:Select`, `dynamodb:ReturnValues`, `dynamodb:ReturnConsumedCapacity`, `dynamodb:FullTableScan`, and `dynamodb:EnclosingOperation`.
+Policy conditions support all IAM condition operators: `StringEquals`, `StringNotEquals`, `StringEqualsIgnoreCase`, `StringLike`, `StringNotLike`, `NumericEquals`, `NumericNotEquals`, `NumericLessThan`, `NumericLessThanEquals`, `NumericGreaterThan`, `NumericGreaterThanEquals`, `DateEquals`, `DateNotEquals`, `DateLessThan`, `DateLessThanEquals`, `DateGreaterThan`, `DateGreaterThanEquals`, `Bool`, `Null`, `ArnEquals`, `ArnNotEquals`, `ArnLike`, `ArnNotLike`, plus `ForAllValues`, `ForAnyValue`, and `IfExists` modifiers. Supported condition keys include `aws:PrincipalTag/*`, `aws:ResourceTag/*`, `dynamodb:LeadingKeys`, `dynamodb:Attributes`, `dynamodb:Select`, `dynamodb:ReturnValues`, `dynamodb:ReturnConsumedCapacity`, `dynamodb:FullTableScan`, and `dynamodb:EnclosingOperation`.
 
 ### Credential Storage
 
@@ -138,7 +138,7 @@ For UpdateItem, the `new_image` is not known until after `apply_update` runs ins
 
 ### Shard Model
 
-Each stream has a fixed set of shards (currently 4 shards per stream). Shard IDs are deterministic (`shardId-<table>-0000000000000000` through `shardId-<table>-0000000000000003`), zero-padded to 16 digits so every shard ID meets the AWS SDKs' 28-character minimum for `ShardId`, regardless of table name length. Sequence numbers are monotonically increasing integers.
+Each stream has a fixed set of shards (currently 4 shards per stream). On PostgreSQL and SQLite, shard IDs embed the table's id, a UUID assigned at creation (`shardId-<table_id>-0000000000000000` through `shardId-<table_id>-0000000000000003`), so a new shard ID is 61 characters, inside the AWS SDKs' 28-to-65-character bounds for `ShardId`. The table name is not used because it is reused by delete-and-recreate and by every account that picks it, while shard IDs must be unique across the data database. Shards created by earlier versions keep their `shardId-<table>-<n>` IDs. Sequence numbers are monotonically increasing integers. On PostgreSQL, DeleteTable leaves a table's shards and records in place; the hourly retention sweep trims records older than 24 hours and then removes the shards of a table that no longer exists once none of its records remain (SQLite removes both with the table). A stream ARN carries the table name and a millisecond label, and resolves to the table currently holding that name and label, so a table deleted and recreated within one millisecond would give the old ARN the new stream; that window is tracked, not closed.
 
 ### Iterator Types
 
@@ -198,7 +198,7 @@ Catalog state is never cached because correctness requires every request to see 
 
 - **Table metadata** (key schema, attribute definitions, status, billing mode): A stale cache could serve the wrong key schema after a table is deleted and recreated with the same name but different schema. The new table has a different `table_id`, different key schema, and different indexes — stale cache serves wrong schema, writes corrupt data, reads return garbage.
 - **IAM policies and credentials**: A revoked Deny policy still cached as absent creates a security gap. A deleted access key still cached as valid allows unauthorized access.
-- **Tags**: Tag-based authorization (`dynamodb:ResourceTag/*`) requires current tag values.
+- **Tags**: Tag-based authorization (`aws:ResourceTag/*`) requires current tag values.
 - **GSI definitions**: Stale GSI metadata could route writes to wrong index tables.
 
 ### The Table-Name-Reuse Problem
@@ -216,7 +216,7 @@ No safe TTL exists because delete-recreate can happen within milliseconds. Cross
 
 ### Multi-Instance Considerations
 
-extenddb does not enforce single-instance-per-catalog. Multiple extenddb instances may share the same PostgreSQL catalog. Any in-process cache of catalog state would be invisible to other instances. PostgreSQL's own buffer pool provides memory-resident access to hot rows, making application-level caching unnecessary for most workloads.
+On SQLite, `extenddb serve` enforces one instance per database file with an exclusive lock on `<database>.lock`. On PostgreSQL and MongoDB nothing enforces it, and running several instances against one catalog is not supported: the credential and policy caches are per instance with no cross-instance invalidation, and every instance runs every background worker (see the deployment guide). Any in-process cache of catalog state would likewise be invisible to other instances. PostgreSQL's own buffer pool provides memory-resident access to hot rows, making application-level caching unnecessary for most workloads.
 
 ### Future Considerations
 

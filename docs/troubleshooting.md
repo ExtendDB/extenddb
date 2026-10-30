@@ -93,6 +93,14 @@ ss -tlnp | grep :18443                    # find what's using the port
 extenddb serve --port 19443 --config extenddb.toml  # use a different port
 ```
 
+### `another extenddb process is already using <database> (lock held on <database>.lock)`
+
+**Cause:** A SQLite database file has one owner at a time. `extenddb serve` takes an exclusive lock on `<database>.lock` (next to the file SQLite opens, after resolving any `sqlite:` or `file:` form, relative path, or symlink) before it opens the database and holds it until it exits. `init` (through to the admin user being written), `migrate`, and `destroy` take the same lock for as long as they run, because they rewrite or remove the file. The backend serializes writers inside one process and recovers interrupted work at startup, so a second server, or a migration or destroy under a running server, would corrupt the first one's work. Read-only commands (`settings`, `manage`, `verify`, `status`) take no lock and run alongside a server.
+
+**Fix:** Stop the other process (`extenddb stop --config <config>` for a server), or point this command at a different database (`--sqlite-path` at `init` time). The lock is released by the operating system when the holder exits, including after a crash, so a leftover `<database>.lock` file is harmless and needs no cleanup.
+
+**Scope:** The lock is `flock(2)`, taken on Linux and macOS. It is advisory, and on network filesystems (NFS, SMB) its behavior depends on the server and mount options; keep SQLite databases on local disk. On other platforms no lock is taken and the server logs a warning at startup. The directory holding the database must be writable so the lock file can be created; a database in a read-only directory now fails to start with `cannot open lock file`. The lock file is created mode 0600 like the database itself; a world-readable lock file would let any local user hold the lock and keep the server from starting.
+
 ### `Failed to load TLS certificates: <error>`
 
 **Cause:** TLS is enabled (the default) but the server could not load the certificate or private key files. Possible causes:
@@ -349,14 +357,72 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 
 **Cause:** The background transition poller processes status changes when notified by CreateTable/DeleteTable, or on a 60-second defensive sweep. If the server was stopped while a table was in a transitional state, the transition completes on the next server startup.
 
+A second cause, on PostgreSQL only, is a session holding any lock on one of the table's relations (the base data table, a GSI or LSI data table, or a vector-index data table): a reader (a table snapshot, an in-catalog backup, a Scan or Query, `pg_dump`, any client transaction that read the table), an open write transaction, an index build, or `VACUUM`. DeleteTable then returns `DELETING` instead of dropping the tables in the request: at once for a reader, and after about a second for any other holder, which is how long its drops wait before they give up. The poller then checks the table for holders about once a second without waiting on them, and drops it at the first check that finds none, so the table disappears within about a second of the last holder's release however many tables are waiting this way, also when the server was restarted in between. A table snapshot or an in-catalog backup that ends also wakes the poller, which then checks at once. Until then a CreateTable of the same name is refused with `ResourceInUseException`, and a DeleteTable of the table returns its description with `TableStatus: DELETING`. A table that stays `DELETING` for longer has a long-running holder. To find it, list the table's relations on the catalog database:
+
+```sql
+SELECT '_ddb_' || t.table_id FROM tables t
+ WHERE t.account_id = '<account_id>' AND t.table_name = '<table_name>'
+UNION ALL
+SELECT '_ddb_' || i.index_id FROM indexes i JOIN tables t ON t.table_id = i.table_id
+ WHERE t.account_id = '<account_id>' AND t.table_name = '<table_name>'
+UNION ALL
+SELECT '_ddb_vec_' || v.index_id FROM vector_indexes v JOIN tables t ON t.table_id = v.table_id
+ WHERE t.account_id = '<account_id>' AND t.table_name = '<table_name>';
+```
+
+and the sessions holding a lock on any of them, on the data database (the same database when no separate data database is configured), with the names from the first query:
+
+```sql
+SELECT l.pid, l.mode, a.query_start, l.relation::regclass AS relation, a.query
+  FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+ WHERE l.locktype = 'relation' AND l.granted
+   AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+   AND l.relation IN (SELECT to_regclass(quote_ident(n))
+                        FROM unnest(ARRAY['_ddb_<table_id>', '_ddb_<index_id>']) AS n);
+```
+
 **Fix:** If a table appears stuck:
 1. Check that extenddb is running (`extenddb status`).
-2. Wait for the configured `control_plane_delay_seconds` (default: 5) — the poller is woken immediately when a table enters a transitional state.
-3. If the server was restarted, transitions are recovered automatically at startup.
+2. Wait for the configured `control_plane_delay_seconds` (default: 0.25) — the poller is woken immediately when a table enters a transitional state.
+3. On PostgreSQL, look for a session holding a lock on the table (above); the delete finishes within about a second of its end.
+4. If the server was restarted, transitions are recovered automatically at startup.
+
+### Data tables without a catalog row (PostgreSQL, separate data database)
+
+**Cause:** With a separate data database, a synchronous DeleteTable commits the catalog row removal first, then commits the drop of the table's data tables on the data database. If that data commit fails (the connection is terminated, a failover, a network fault), the server redoes the drop on a fresh connection for up to 60 seconds. Only a process that dies, or a data database unreachable for that whole window, between the catalog commit and the last retry leaves the table's data tables on the data database with no catalog row naming them. Nothing reclaims them afterwards: DescribeTable reports the table gone, a same-name CreateTable gets a new table id, and the control plane only enumerates relations that still have a catalog row. When the retries are exhausted the server logs, at error, the table id, the relation names, and the exact `DROP TABLE` to run. (On one shared database the row and the drops commit together, so this cannot happen there.)
+
+To find such relations, compare the `_ddb_%` tables on the data database with the table ids the catalog still knows. On the catalog database:
+
+```sql
+SELECT table_id FROM tables
+UNION ALL SELECT index_id FROM indexes
+UNION ALL SELECT index_id FROM vector_indexes;
+```
+
+On the data database, every data relation and whether the catalog still names it (replace the `VALUES` list with the ids from the first query):
+
+```sql
+SELECT d.tablename
+  FROM pg_tables d
+  LEFT JOIN (VALUES ('<table_id>'), ('<index_id>'), ('<vector_index_id>')) AS live(id)
+    ON d.tablename = '_ddb_' || live.id
+    OR d.tablename = '_ddb_vec_' || live.id
+ WHERE d.tablename LIKE '\_ddb\_%' AND live.id IS NULL;
+```
+
+Each row is a data relation with no catalog row. After confirming the table is gone from the catalog (`DescribeTable` returns `ResourceNotFoundException`), drop the listed relations on the data database:
+
+```sql
+DROP TABLE IF EXISTS "_ddb_<table_id>", "_ddb_<index_id>", "_ddb_vec_<vector_index_id>";
+```
+
+The error log line names the exact relations for one leaked table and gives this `DROP TABLE` verbatim.
+
+**Do not** use `extenddb catalog-check --fix` to clean these up: it expects a different relation-naming scheme and, against the current schema, reports every live data table as orphaned and would drop tables still in use.
 
 ### CreateTable returns CREATING instead of ACTIVE
 
-**Cause:** extenddb emulates real DynamoDB's async control plane behavior. Tables start in CREATING state and transition to ACTIVE after a configurable delay (default: 5 seconds).
+**Cause:** extenddb emulates real DynamoDB's async control plane behavior. Tables start in CREATING state and transition to ACTIVE after a configurable delay (`control_plane_delay_seconds`, default: 0.25 seconds).
 
 **Fix:** This is expected behavior matching real DynamoDB. Poll with DescribeTable until `TableStatus` is `ACTIVE` before performing operations on the table. All test code should use a `wait_for_active()` helper after CreateTable.
 
@@ -847,6 +913,46 @@ pool_size = 50  # default is 20
 If the problem persists, check for long-running queries or connection leaks with `SELECT * FROM pg_stat_activity WHERE datname = 'extenddb_data';`.
 
 **Known limitation:** The HTTP status code should be 503 with a `Retry-After` header. This is tracked as technical debt.
+
+---
+
+### `Vector indexes are not supported by this storage backend`
+
+**Error text:**
+```
+Vector indexes are not supported by this storage backend
+```
+
+Also `SearchVectors is not supported by this storage backend` for a search request.
+
+**Cause:** Vector indexes are stored in `vector(N)` columns, a type the
+[pgvector](https://github.com/pgvector/pgvector) extension provides, so support is a
+property of the PostgreSQL server rather than of the ExtendDB build. The server probes
+for the extension once at startup and refuses every vector operation for the rest of
+its life if it was absent. Other operations are unaffected.
+
+**Fix:** Confirm what the running server decided, by looking for one of these lines in
+its startup log:
+
+```
+pgvector 0.8.0 detected on the data database; vector index storage available
+pgvector not installed on the data database; vector indexes are not supported
+```
+
+If it is absent, install the extension for your server version (for example
+`postgresql-16-pgvector`), then create it on the **data** database, not the catalog:
+
+```sql
+CREATE EXTENSION vector;
+```
+
+`extenddb init` and `extenddb migrate` both attempt this and print a notice rather than
+failing when they cannot; a role without permission to create extensions needs a
+superuser or the database owner to run it once.
+
+**Then restart ExtendDB.** The probe result is cached at startup, so a server that
+started without the extension keeps refusing vector operations until it is restarted,
+even after the extension exists.
 
 ---
 

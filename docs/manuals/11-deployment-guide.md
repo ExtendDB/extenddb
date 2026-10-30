@@ -6,7 +6,7 @@ This guide covers deploying extenddb in various environments beyond local develo
 
 ## Architecture Overview
 
-extenddb is a single Rust binary that connects to PostgreSQL. All state lives in PostgreSQL — extenddb itself is stateless (no in-process caching). This means:
+extenddb is a single Rust binary that connects to PostgreSQL. All durable state lives in PostgreSQL; extenddb keeps only short-lived credential, policy, and table-metadata caches in process. This means:
 
 - Multiple extenddb instances can share a PostgreSQL catalog (with caveats — see Multi-Instance below)
 - Standard PostgreSQL HA, backup, and replication tools provide durability
@@ -223,12 +223,13 @@ sudo systemctl start extenddb
 
 ## Multi-Instance Considerations
 
-Multiple extenddb instances can connect to the same PostgreSQL catalog. However:
+Run one extenddb instance per catalog. Multiple instances behind a load balancer are not supported in this release:
 
-- extenddb does not cache database state in-process — every request reads directly from PostgreSQL
-- This means multiple instances see consistent data without cache invalidation
-- PostgreSQL's connection pool and row-level locking handle concurrent access
-- Ensure `pool_size × instance_count + 3 × instance_count ≤ PostgreSQL max_connections`
+- Credentials, policies, and table metadata are cached in each process (see the cache TTLs in the admin guide). Nothing invalidates a cache on another instance, so a key revoked or a policy changed through one instance stays in force on the others until the TTL expires.
+- Every instance runs every background worker (TTL expiry, GSI backfill, stream retention, control-plane transitions). The workers are safe to run twice, but the work is duplicated.
+- `/health` is a liveness check that does not query the database, so a load balancer cannot use it to take an instance with a broken database connection out of rotation.
+
+On SQLite this limit is enforced: `extenddb serve` holds an exclusive lock on `<database>.lock` and a second server on the same file refuses to start. On PostgreSQL and MongoDB it is not enforced; if you start a second instance anyway, size `pool_size × instance_count + 3 × instance_count ≤ PostgreSQL max_connections`.
 
 ## Performance Tuning
 
@@ -243,6 +244,8 @@ pool_size = 50  # Increase for higher concurrency
 
 Ensure PostgreSQL `max_connections` accommodates the total pool size plus overhead.
 
+Backup and restore work is admitted against the pool so it cannot take every connection from ordinary requests. On PostgreSQL and MongoDB one server runs at most 4 `RestoreTableFromBackup` copies per account and `min(16, pool/2)` in total (PostgreSQL: `pool_size`; MongoDB: the engine's driver pool, `maxPoolSize` in the connection string or `max_connections`, default 10, so 5 restores); a restore that waits more than 30 seconds for a slot is refused with `LimitExceededException` and creates nothing. On SQLite one server runs at most `pool_size / 2 - 1` `CreateBackup` copies at once (between 1 and 16; 4 for the default `pool_size` of 10), each holding its snapshot connection for its duration, and refuses a backup that waited 30 seconds with `LimitExceededException`. A MongoDB restore request that is not registered within 60 seconds answers an internal error while the restore goes on in the background; the MongoDB driver does not enforce `waitQueueTimeoutMS`, so the admission bound is what keeps a flood of restores from holding every pooled connection.
+
 ### PostgreSQL Tuning
 
 Key PostgreSQL settings for extenddb workloads:
@@ -250,7 +253,7 @@ Key PostgreSQL settings for extenddb workloads:
 - `shared_buffers`: 25% of available RAM
 - `effective_cache_size`: 75% of available RAM
 - `work_mem`: 64MB (for sort operations in Query/Scan)
-- `max_connections`: ≥ extenddb pool_size + 10
+- `max_connections`: ≥ `2 * pool_size + catalog_pool_size`, plus one per vector index build you expect to overlap and one during a schema migration. `pool_size` sizes both the catalog and the data pool, and `max_connections` is per cluster, so the default pool sizes need 60 of PostgreSQL's default 100
 
 ### Monitoring Queries
 

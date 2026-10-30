@@ -14,7 +14,7 @@ use extenddb_core::types::{
     StreamSummary, StreamViewType,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{parse_stream_arn, stream_arn};
+use extenddb_storage::util::{parse_stream_arn, shard_in_stream, stream_arn};
 use extenddb_storage::{StreamEngine, StreamListResult, StreamRecordsResult};
 use futures::future::BoxFuture;
 
@@ -33,21 +33,25 @@ impl SqliteEngine {
         table_name: &str,
         table_id: &str,
     ) -> Result<String, StorageError> {
-        let label: String = sqlx::query_scalar(
-            "UPDATE tables SET stream_label = strftime('%Y-%m-%dT%H:%M:%S','now') \
-             WHERE account_id = ? AND table_name = ? RETURNING stream_label",
-        )
-        .bind(account_id)
-        .bind(table_name)
-        .fetch_one(&mut **tx)
-        .await
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        // Formatted here, not in SQL, so every backend issues the same label
+        // shape from one function (`extenddb_storage::util::format_stream_label`).
+        let label = extenddb_storage::util::new_stream_label();
+        sqlx::query("UPDATE tables SET stream_label = ? WHERE account_id = ? AND table_name = ?")
+            .bind(&label)
+            .bind(account_id)
+            .bind(table_name)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         for i in 0..SHARDS_PER_STREAM {
-            // Zero-padded to 16 digits so the shard ID is always at
-            // least 28 characters (minimum length the AWS SDKs enforce for ShardId)
-            // even for the shortest legal table name.
-            let shard_id = format!("shardId-{table_name}-{i:016}");
+            // Derived from the table id, not its name. A name is shared by
+            // every account that picks it, while `stream_shards.shard_id` is
+            // unique across the database. A name of up to 255 bytes also
+            // overflowed the 65-character ShardId limit
+            // the AWS SDKs enforce. The table id is a UUID, giving a
+            // 61-character id.
+            let shard_id = format!("shardId-{table_id}-{i:016}");
             let start_seq = format!("{:021}", 0);
             sqlx::query(
                 "INSERT INTO stream_shards (shard_id, table_id, starting_sequence_number) \
@@ -108,62 +112,78 @@ impl StreamEngine for SqliteEngine {
     fn get_stream_records(
         &self,
         account_id: &str,
+        stream_arn: &str,
         shard_id: &str,
         after_sequence: Option<&str>,
         limit: i64,
     ) -> BoxFuture<'_, StreamRecordsResult> {
         let account_id = account_id.to_owned();
+        let stream_arn = stream_arn.to_owned();
         let shard_id = shard_id.to_owned();
         let after = after_sequence.map(str::to_owned);
         Box::pin(async move {
-            // Ownership guard: only return records if the shard's backing table
-            // belongs to the calling account. SQLite keeps shards and the table
-            // catalog in the same database, so ownership resolves in one join.
-            // A shard iterator resolves to a shard the caller does not own or
-            // one that does not exist. Real DynamoDB returns
-            // `ValidationException: Invalid ShardIterator` for a GetRecords
-            // iterator it did not issue, and does NOT distinguish "exists but
-            // not yours" from "does not exist" — so neither do we (both
-            // collapse here). Verified against DynamoDB Streams (us-east-1).
-            let owned: Option<(i32,)> = sqlx::query_as(
-                "SELECT 1 FROM stream_shards s \
-                 JOIN tables t ON t.table_id = s.table_id \
-                 WHERE s.shard_id = ? AND t.account_id = ?",
-            )
-            .bind(&shard_id)
-            .bind(&account_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-            if owned.is_none() {
-                return Err(StorageError::Validation("Invalid ShardIterator".to_owned()));
+            let (table_name, stream_label) = parse_stream_arn(&stream_arn)?;
+            // One query resolves the shard against the table the iterator's
+            // ARN names (scoped to the caller's account) and reads its
+            // records. The shard row is the driving row and the records are
+            // LEFT JOINed, so a shard of the named table with no records
+            // returns one row with a NULL record, and a shard that is not that
+            // table's (another table, or another account) returns no rows at
+            // all. The sequence bound sits in the join condition so the LEFT
+            // JOIN keeps its one row for an idle shard. Whether the shard
+            // belongs to the stream the ARN's label names is decided in Rust
+            // from the table's label and the shard id (`shard_in_stream`).
+            let rows: Vec<(String, Option<String>, String, Option<String>)> =
+                if let Some(after) = after {
+                    sqlx::query_as(
+                        "SELECT t.table_id, t.stream_label, s.shard_id, r.record_data \
+                         FROM stream_shards s \
+                         JOIN tables t ON t.table_id = s.table_id \
+                         LEFT JOIN stream_records r \
+                           ON r.shard_id = s.shard_id AND r.sequence_number > ? \
+                         WHERE s.shard_id = ? AND t.account_id = ? AND t.table_name = ? \
+                         ORDER BY r.sequence_number LIMIT ?",
+                    )
+                    .bind(&after)
+                    .bind(&shard_id)
+                    .bind(&account_id)
+                    .bind(&table_name)
+                    .bind(limit)
+                    .fetch_all(&self.pool)
+                    .await
+                } else {
+                    sqlx::query_as(
+                        "SELECT t.table_id, t.stream_label, s.shard_id, r.record_data \
+                         FROM stream_shards s \
+                         JOIN tables t ON t.table_id = s.table_id \
+                         LEFT JOIN stream_records r ON r.shard_id = s.shard_id \
+                         WHERE s.shard_id = ? AND t.account_id = ? AND t.table_name = ? \
+                         ORDER BY r.sequence_number LIMIT ?",
+                    )
+                    .bind(&shard_id)
+                    .bind(&account_id)
+                    .bind(&table_name)
+                    .bind(limit)
+                    .fetch_all(&self.pool)
+                    .await
+                }
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let Some((table_id, table_label, row_shard_id, _)) = rows.first() else {
+                return Err(extenddb_storage::util::stream_does_not_exist());
+            };
+            if !shard_in_stream(
+                table_id,
+                row_shard_id,
+                table_label.as_deref(),
+                &stream_label,
+            ) {
+                return Err(extenddb_storage::util::stream_does_not_exist());
             }
-
-            let rows: Vec<(String,)> = if let Some(after) = after {
-                sqlx::query_as(
-                    "SELECT record_data FROM stream_records \
-                     WHERE shard_id = ? AND sequence_number > ? ORDER BY sequence_number LIMIT ?",
-                )
-                .bind(&shard_id)
-                .bind(&after)
-                .bind(limit)
-                .fetch_all(&self.pool)
-                .await
-            } else {
-                sqlx::query_as(
-                    "SELECT record_data FROM stream_records \
-                     WHERE shard_id = ? ORDER BY sequence_number LIMIT ?",
-                )
-                .bind(&shard_id)
-                .bind(limit)
-                .fetch_all(&self.pool)
-                .await
-            }
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
 
             let records: Vec<StreamRecord> = rows
                 .into_iter()
-                .map(|(d,)| {
+                .filter_map(|(_, _, _, d)| d)
+                .map(|d| {
                     serde_json::from_str(&d).map_err(|e| StorageError::Internal(e.to_string()))
                 })
                 .collect::<Result<_, _>>()?;
@@ -194,11 +214,8 @@ impl StreamEngine for SqliteEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-            let (ks_json, stream_spec_json, table_status, table_id) = row.ok_or_else(|| {
-                StorageError::TableNotFound(format!(
-                    "Requested resource not found: Stream: {stream_arn} not found."
-                ))
-            })?;
+            let (ks_json, stream_spec_json, table_status, table_id) =
+                row.ok_or_else(|| extenddb_storage::util::stream_not_found(&stream_arn))?;
 
             let key_schema = serde_json::from_str(&ks_json)
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -361,6 +378,8 @@ impl StreamEngine for SqliteEngine {
         retention_hours: i64,
     ) -> BoxFuture<'_, Result<u64, StorageError>> {
         Box::pin(async move {
+            // D1: every writer holds the engine write lock.
+            let _writer = self.write_lock.lock().await;
             let cutoff = format_timestamp(
                 time::OffsetDateTime::now_utc() - time::Duration::hours(retention_hours),
             );
@@ -456,9 +475,7 @@ impl StreamEngine for SqliteEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
             let Some(table_id) = table_id else {
-                return Err(StorageError::TableNotFound(format!(
-                    "Requested resource not found: Stream: {stream_arn} not found."
-                )));
+                return Err(extenddb_storage::util::stream_does_not_exist());
             };
             let exists: Option<(i64,)> =
                 sqlx::query_as("SELECT 1 FROM stream_shards WHERE shard_id = ? AND table_id = ?")
@@ -468,9 +485,7 @@ impl StreamEngine for SqliteEngine {
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
             if exists.is_none() {
-                return Err(StorageError::TableNotFound(format!(
-                    "Requested resource not found: Stream: {stream_arn} not found."
-                )));
+                return Err(extenddb_storage::util::shard_not_in_stream(&stream_arn));
             }
             Ok(())
         })

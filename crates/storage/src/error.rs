@@ -10,10 +10,27 @@ pub enum StorageError {
     TableAlreadyExists(String),
     #[error("Table is not in ACTIVE state: {0}")]
     TableNotActive(String),
+    /// A table name taken by a `CREATING` restore target. Raised by
+    /// `RestoreTableFromBackup` into that name (the engine answers
+    /// `TableInUseException`), distinct from [`Self::TableAlreadyExists`].
+    #[error("Table: {table_name} is already being restored from backup: {backup_arn}")]
+    TableBeingRestored {
+        table_name: String,
+        backup_arn: String,
+    },
     #[error("Index not found: {0}")]
     IndexNotFound(String),
     #[error("Index already exists: {0}")]
     IndexAlreadyExists(String),
+    /// A change refused because an index on the resource is mid-transition.
+    /// Carries the whole client-facing message, because the state, and
+    /// therefore the wording, is known only to the backend that holds it: a
+    /// DeleteTable refused while indexes build carries the sentence AWS
+    /// documents for that case, and a vector index deleted while its creation
+    /// is still allocating resources carries the measured phase-dependent
+    /// refusal (2026-08-19). Maps to `ResourceInUseException` verbatim.
+    #[error("{0}")]
+    IndexesInUse(String),
     #[error("Deletion protection enabled: {0}")]
     DeletionProtected(String),
     #[error("Condition check failed")]
@@ -42,6 +59,10 @@ pub enum StorageError {
     /// measured 2026-08-13).
     #[error("{0}")]
     LimitExceeded(String),
+    /// A backup an in-progress restore is still reading. Maps to
+    /// `BackupInUseException`.
+    #[error("{0}")]
+    BackupInUse(String),
     /// A failure that is expected to succeed on retry: I/O errors, pool
     /// timeouts, SQLITE_BUSY / SQLITE_LOCKED. Exists so queue workers can tell
     /// "this row can never be applied" (drop it, or the whole queue stalls)
@@ -50,6 +71,12 @@ pub enum StorageError {
     /// and the worker dropped claimed rows on transient errors.
     #[error("{0}")]
     Transient(String),
+    /// The backend discarded a consistent snapshot before the reader drained
+    /// it (`MongoDB` `SnapshotTooOld`, a `PostgreSQL` snapshot conflict on a hot
+    /// standby). The operation that held it must restart from the beginning;
+    /// nothing read so far may be combined with a fresh snapshot.
+    #[error("snapshot expired: {0}")]
+    SnapshotExpired(String),
     #[error(
         "Catalog version mismatch: expected {expected}, found {found}. Run 'extenddb migrate' to update."
     )]

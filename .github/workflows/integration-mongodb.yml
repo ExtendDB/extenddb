@@ -18,9 +18,23 @@ permissions:
 # `run-tests --backend mongodb`, tearing everything down on exit. Both jobs
 # reuse it so CI runs the exact path developers run locally (no drift), while
 # splitting pytest and rust into parallel jobs the way integration.yml does.
+# Supersede an in-flight run of the SAME pull request when a new push arrives,
+# so repeated pushes do not stack up on a capped pool. Non-PR runs get a group
+# unique to the run (run_id): merge-group runs reuse a ref across re-queues,
+# and GitHub concurrency replaces a PENDING run in a group even with
+# cancel-in-progress false, so keying them by ref would let one merge-group
+# run cancel another and evict its queue entry.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   mongodb-pytest:
-    runs-on: ubuntu-latest
+    # Dedicated ExtendDB runner group (Ubuntu 24.04, 4 vCPU / 16 GB, capped at
+    # 20 concurrent). ubuntu-latest is an Amazon-wide shared pool where our jobs
+    # waited 10-90 minutes to start (2026-09-29/30); see integration.yml.
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -33,12 +47,62 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
       - name: Build release (mongodb backend)
-        run: cargo build --release --no-default-features --features mongodb
+        run: cargo build --release --no-default-features --features mongodb-test-hooks
       - name: Run MongoDB pytest suite
         run: devtools/run-mongodb-tests -- --pytest --comprehensive --parallel
 
+  # SnapshotEngine consistency check against a disposable replica set. The
+  # tests build their own per-test scratch databases (snap<uuid>_cat and
+  # _data) and drop them; they run in this job because it is the one that
+  # exports EXTENDDB_TEST_MONGODB_URI to cargo test.
+  mongodb-snapshot:
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Start replica set
+        # Same bootstrap developers run locally; --mongo-only skips the
+        # server and prints the URI. No pipe: a bootstrap failure must fail
+        # this step, not the next one's connection attempt.
+        run: devtools/run-mongodb-tests --mongo-only --mongo-port 27018
+      - name: Start standalone mongod
+        # No --replSet: a_standalone_server_is_unsupported checks that a
+        # server which cannot serve snapshot reads answers NotAReplicaSet and
+        # the open maps it to Unsupported. Published on 127.0.0.1 only.
+        run: |
+          docker run -d --name extenddb-snapshot-standalone-27019 \
+            -p 127.0.0.1:27019:27017 mongo:7
+          for _ in $(seq 1 60); do
+            if docker exec extenddb-snapshot-standalone-27019 \
+                mongosh --quiet --eval 'db.runCommand({ ping: 1 }).ok' 2>/dev/null \
+                | grep -qx 1; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "standalone mongod did not answer ping within 60 s" >&2
+          docker logs extenddb-snapshot-standalone-27019 >&2 || true
+          exit 1
+      - name: Run snapshot tests
+        # The tests serialise themselves on the snapshot hooks lock; the
+        # default parallel runner is what developers get locally and what
+        # this checks.
+        env:
+          EXTENDDB_TEST_MONGODB_URI: mongodb://127.0.0.1:27018/?directConnection=true
+          EXTENDDB_TEST_MONGODB_STANDALONE_URI: mongodb://127.0.0.1:27019/?directConnection=true
+          EXTENDDB_TEST_MONGODB_REQUIRED: "1"
+        run: cargo test -p extenddb-storage-mongodb snapshot_engine
+      - name: Stop MongoDB containers
+        if: always()
+        run: docker rm -f extenddb-runtests-mongo-27018 extenddb-snapshot-standalone-27019
+
   mongodb-rust:
-    runs-on: ubuntu-latest
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -51,17 +115,32 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
       - name: Build release (mongodb backend)
-        run: cargo build --release --no-default-features --features mongodb
+        run: cargo build --release --no-default-features --features mongodb-test-hooks
       - name: Run MongoDB rust integration suite
         run: devtools/run-mongodb-tests -- --rust --rust-integration
 
+  mongodb-production-build:
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Check production MongoDB feature graph
+        run: cargo check --release --no-default-features --features mongodb
+
   mongodb-integration:
-    runs-on: ubuntu-latest
-    needs: [mongodb-pytest, mongodb-rust]
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 40
+    needs: [mongodb-pytest, mongodb-rust, mongodb-production-build, mongodb-snapshot]
     if: always()
     steps:
       - run: |
           if [ "${{ needs.mongodb-pytest.result }}" != "success" ] || \
-             [ "${{ needs.mongodb-rust.result }}" != "success" ]; then
+             [ "${{ needs.mongodb-rust.result }}" != "success" ] || \
+             [ "${{ needs.mongodb-production-build.result }}" != "success" ] || \
+             [ "${{ needs.mongodb-snapshot.result }}" != "success" ]; then
             exit 1
           fi

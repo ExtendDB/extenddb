@@ -19,6 +19,7 @@ use std::path::PathBuf;
 
 use extenddb_config as config;
 use extenddb_storage::CancellationToken;
+#[cfg(unix)]
 use syslog_tracing::{Facility, Options, Syslog};
 use tracing_subscriber::{
     EnvFilter, Layer, fmt, fmt::writer::BoxMakeWriter, layer::SubscriberExt, reload,
@@ -34,10 +35,11 @@ use crate::workers;
 /// its package version, so the thin `main` passes them in. Surfaced by
 /// `extenddb version`, the startup banner, and the console version string.
 ///
-/// All fields are `&'static str` because every value originates from a compile
-/// time `env!` and is baked into the binary. Declaring the true lifetime up
-/// front means the values can later be stored beyond the call (in a struct, a
-/// metrics label, a spawned task) without a breaking signature change.
+/// String fields are `&'static str` because every value originates from a
+/// compile-time `env!` and is baked into the binary. Declaring the true
+/// lifetime up front means the values can later be stored beyond the call (in
+/// a struct, a metrics label, a spawned task) without a breaking signature
+/// change.
 #[derive(Debug, Clone, Copy)]
 pub struct BuildInfo {
     /// Package version of the deployed binary (e.g. `env!("CARGO_PKG_VERSION")`
@@ -47,6 +49,8 @@ pub struct BuildInfo {
     pub git_hash: &'static str,
     /// Build timestamp (e.g. `env!("EXTENDDB_BUILD_TIME")`).
     pub build_time: &'static str,
+    /// Whether deterministic MongoDB backfill test hooks are compiled in.
+    pub test_hooks_enabled: bool,
 }
 
 /// Where the server writes its log output.
@@ -187,7 +191,7 @@ pub async fn serve(params: ServeParams) -> anyhow::Result<()> {
 /// any error path.
 async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     let ServeParams {
-        app_config,
+        mut app_config,
         listener: std_listener,
         pid_file,
         log_target,
@@ -232,6 +236,7 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     // `.without_time()` only on the syslog path.
     let (writer, with_time): (BoxMakeWriter, bool) = match log_target {
         LogTarget::Stderr => (BoxMakeWriter::new(std::io::stderr), true),
+        #[cfg(unix)]
         LogTarget::Syslog => {
             let syslog = Syslog::new(
                 c"extenddb",
@@ -244,6 +249,16 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
                 )
             })?;
             (BoxMakeWriter::new(syslog), false)
+        }
+        // POSIX syslog does not exist on this platform; daemon mode (the only
+        // caller that selects Syslog) is unix-only, so this is unreachable in
+        // practice but must still be handled for the type to be total.
+        #[cfg(not(unix))]
+        LogTarget::Syslog => {
+            anyhow::bail!(
+                "syslog logging is not supported on this platform; \
+                 run `extenddb serve --foreground` (logs to stderr)"
+            )
         }
     };
 
@@ -264,11 +279,23 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         .try_init()
         .map_err(|e| anyhow::anyhow!("Failed to initialize tracing: {e}"))?;
 
+    for warning in app_config.storage.startup_warnings() {
+        tracing::warn!("{}", warning.log_message());
+    }
+
     // Create server components via factory pattern. Dev mode asks the backend
     // to bootstrap an uninitialized catalog at serve time (zero-config use).
     let mut component_options =
         extenddb_storage::server_components::ServerComponentsOptions::default();
+
     component_options.bootstrap_if_uninitialized = dev_mode;
+
+    // Wire the node's own bind address as the instance ID so each ExtendDB node
+    // has a distinct node ID (to support logical clocks for sequences, etc.).
+    app_config
+        .storage
+        .set_instance_id(&format!("{}:{}", app_config.server.bind_addr, port));
+
     let components = extenddb_storage::create_server_components(
         app_config.storage.as_trait(),
         &app_config.server.region,
@@ -281,17 +308,49 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     let cred_store = components.credential_store;
     let runtime_hooks = components.runtime_hooks;
 
-    // Dev mode: adopt the credential the SDK will sign with (from the standard
-    // AWS_* env) and verify against it. Seeded here so it works for both
-    // file-backed and bootstrap-on-serve (in-memory) deployments. SigV4
-    // verification is unchanged; only the IAM policy decision is opened.
+    // Resource-tag migration guard. ExtendDB evaluates resource tags only as
+    // aws:ResourceTag/* and leaves dynamodb:ResourceTag/* absent, so a catalog
+    // whose stored policies still name the dynamodb: form must be rewritten by
+    // `extenddb migrate --yes` before this binary serves it. `migrate`, `init`
+    // and every fresh-catalog bootstrap record a settings marker; refuse to
+    // start when it is missing. One settings-row read, no policy scan.
+    if catalog_store
+        .get_setting(extenddb_core::settings_keys::RESOURCE_TAG_MIGRATION)
+        .await
+        .map_err(|e| anyhow::anyhow!("reading the resource-tag migration marker: {e:?}"))?
+        .is_none()
+    {
+        anyhow::bail!(
+            "this catalog has not had the resource-tag condition-key migration applied. \
+             Run `extenddb migrate --yes` before starting the server. It rewrites stored \
+             policies from dynamodb:ResourceTag to aws:ResourceTag, which this build \
+             evaluates, and records a marker the server checks at startup."
+        );
+    }
+
+    // Dev mode: seed the credentials the SDK may sign with and verify against
+    // them (see `dev_credentials` for the vending contract). Seeded here so it
+    // works for both file-backed and bootstrap-on-serve (in-memory)
+    // deployments. SigV4 verification is unchanged; only the IAM policy
+    // decision is opened.
     if dev_mode {
-        let dev_access_key = seed_dev_credential(catalog_store.as_ref()).await?;
+        let dev_creds = crate::dev_credentials::resolve()?;
+        crate::dev_credentials::seed(catalog_store.as_ref(), cred_store.as_ref(), &dev_creds)
+            .await?;
         tracing::warn!(
             "DEVELOPER MODE active — plain HTTP, authorization open (SigV4 still \
-             enforced), loopback only. Storage: {}. Signing credential: {dev_access_key}",
+             enforced). Storage: {}. Signing credentials: {}",
             config::redact_password(app_config.storage.connection_config()),
+            crate::dev_credentials::describe(&dev_creds),
         );
+        if let Some(ignored) = crate::dev_credentials::ignored_aws_env_key(&dev_creds) {
+            tracing::warn!(
+                "AWS_ACCESS_KEY_ID is set in the environment but dev mode does not adopt \
+                 it; requests signed with '{ignored}' will get UnrecognizedClientException. \
+                 Set EXTENDDB_DEV_ACCESS_KEY_ID and EXTENDDB_DEV_SECRET_ACCESS_KEY to seed \
+                 an additional credential, or sign with the built-in example pair."
+            );
+        }
     }
 
     // Build SwrCacheConfig values from the [auth.cache] TOML section.
@@ -645,6 +704,7 @@ async fn drain_workers(shutdown: &CancellationToken, handles: Vec<tokio::task::J
 /// startup before syslog tracing is configured, and from the caller's panic
 /// hook after daemonizing (stderr is `/dev/null` there, so a panic would
 /// otherwise be invisible).
+#[cfg(unix)]
 pub fn log_to_syslog_raw(msg: &str) {
     // SAFETY: openlog/syslog are POSIX-standard C functions. The ident
     // string is a static C string literal with 'static lifetime.
@@ -660,76 +720,9 @@ pub fn log_to_syslog_raw(msg: &str) {
     }
 }
 
-/// Seed (or refresh) the developer-mode credential and return its access key id.
-///
-/// Dev mode verifies SigV4 exactly like production, so the server must know the
-/// credential the SDK signs with. To stay a drop-in for local development:
-///
-///  * If `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` are set in the server's
-///    environment, the server **adopts and verifies against them**. In the
-///    common CI case the SDK and the co-located server read the same env, so
-///    the user changes nothing but the endpoint URL.
-///  * Otherwise it seeds AWS's documented example credential as a well-known
-///    default the user can point any SDK at.
-///
-/// This mirrors the admin-credential pattern (env-or-default), differing only in
-/// that the default is well-known rather than randomly generated, because an SDK
-/// must know the credential up front (it cannot read a printed banner). Seeding
-/// goes through the generic management surface, so it is backend-agnostic.
-async fn seed_dev_credential(
-    catalog_store: &dyn extenddb_storage::CatalogStore,
-) -> anyhow::Result<String> {
-    use extenddb_storage::management_store::OpError;
-
-    // AWS's documented example credential (recognised everywhere and allowlisted
-    // by secret scanners): the zero-config default users point their SDK at.
-    const DEFAULT_ACCESS_KEY_ID: &str = "AKIAIOSFODNN7EXAMPLE";
-    const DEFAULT_SECRET: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
-
-    let access_key_id = std::env::var("AWS_ACCESS_KEY_ID")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_ACCESS_KEY_ID.to_owned());
-    let secret = std::env::var("AWS_SECRET_ACCESS_KEY")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_SECRET.to_owned());
-
-    // The access-key prefix is a credential-type discriminator across the auth
-    // layer: `AKIA*` = long-lived IAM user keys, `ASIA*` = temporary role
-    // session credentials (they carry `is_session`, are subject to
-    // ExpiredTokenException, and are invalidated with their role). The dev
-    // credential is a long-lived key on a *user*, so require the AKIA shape; an
-    // ASIA-shaped key here would be a user credential the rest of the system
-    // treats as a role session credential (e.g. user-delete invalidation
-    // matches `AKIA*`, not `ASIA*`).
-    if !access_key_id.starts_with("AKIA") {
-        anyhow::bail!(
-            "dev credential AWS_ACCESS_KEY_ID must be AKIA-shaped (got '{access_key_id}'); \
-             use e.g. AKIAIOSFODNN7EXAMPLE, or unset it to use the default."
-        );
-    }
-
-    // Attach the dev user to the deployment's recorded default account (set at
-    // bootstrap) rather than inferring it from account-list ordering.
-    let account_id = catalog_store
-        .default_account_id()
-        .await
-        .map_err(|e| anyhow::anyhow!("dev mode: failed to read default account: {e:?}"))?
-        .ok_or_else(|| {
-            anyhow::anyhow!("dev mode: no default account recorded (catalog not bootstrapped)")
-        })?;
-
-    match catalog_store.create_user(&account_id, "dev", None).await {
-        Ok(()) | Err(OpError::AlreadyExists(_)) => {}
-        Err(e) => anyhow::bail!("dev mode: failed to create dev user: {e:?}"),
-    }
-    match catalog_store
-        .import_access_key(&account_id, "dev", &access_key_id, &secret)
-        .await
-    {
-        Ok(()) | Err(OpError::AlreadyExists(_)) => {}
-        Err(e) => anyhow::bail!("dev mode: failed to import dev credential: {e:?}"),
-    }
-    Ok(access_key_id)
+/// Non-unix fallback: there is no POSIX syslog and no daemonized deployment
+/// (daemon mode is unix-only), so stderr is always attached — write there.
+#[cfg(not(unix))]
+pub fn log_to_syslog_raw(msg: &str) {
+    eprintln!("{msg}");
 }

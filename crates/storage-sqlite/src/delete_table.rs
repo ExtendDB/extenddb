@@ -22,9 +22,11 @@ impl SqliteEngine {
     ) -> Result<TableDescription, StorageError> {
         Self::validate_account_id(account_id)?;
 
+        // A DELETING row is fetched too: DeleteTable of a table that is
+        // already being deleted returns its description, as the service does.
         let row: Option<TableRow> = sqlx::query_as(&format!(
-            "SELECT {TABLE_COLUMNS} FROM tables \
-             WHERE account_id = ? AND table_name = ? AND table_status IN ('ACTIVE', 'CREATING')"
+            "SELECT {TABLE_COLUMNS} FROM tables WHERE account_id = ? AND table_name = ? \
+             AND table_status IN ('ACTIVE', 'CREATING', 'DELETING')"
         ))
         .bind(account_id)
         .bind(&input.table_name)
@@ -33,8 +35,47 @@ impl SqliteEngine {
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let row = row.ok_or_else(|| StorageError::TableNotFound(input.table_name.clone()))?;
+        if row.table_status == "DELETING" {
+            // Already scheduled for removal by the control-plane worker:
+            // nothing to change.
+            let index_rows: Vec<IndexRow> = sqlx::query_as(&format!(
+                "SELECT {INDEX_COLUMNS} FROM indexes WHERE table_id = ?"
+            ))
+            .bind(&row.table_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let desc = self.build_table_description_from_row(account_id, row, index_rows)?;
+            return Ok(TableDescription {
+                table_status: TableStatus::Deleting,
+                ..desc
+            });
+        }
         if row.deletion_protection_enabled {
             return Err(StorageError::DeletionProtected(row.table_arn.clone()));
+        }
+
+        // A restore target (CREATING with no scheduled transition) is being
+        // filled by RestoreTableFromBackup. The service refuses to delete a
+        // table it is still creating, and deleting this one would make the
+        // restore fail part-way; refuse until the restore finishes. An
+        // abandoned target is removed by the restore sweep, not here.
+        if row.table_status == "CREATING" {
+            let restoring: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM tables WHERE table_id = ? \
+                 AND table_status = 'CREATING' AND status_transition_at IS NULL)",
+            )
+            .bind(&row.table_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            if restoring {
+                return Err(StorageError::IndexesInUse(format!(
+                    "Attempt to change a resource which is still in use: Table is being \
+                     restored: {}",
+                    row.table_name
+                )));
+            }
         }
 
         let index_rows: Vec<IndexRow> = sqlx::query_as(&format!(
@@ -65,6 +106,15 @@ impl SqliteEngine {
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
+            // A vector index with `backfilling` set is an UpdateTable build in
+            // flight (the with-table path never sets the column), and the
+            // service refuses to delete the table underneath one; the refusal
+            // clears when the index flips ACTIVE or its create is cancelled.
+            // Checked INSIDE the immediate transaction rather than before it,
+            // so a build whose catalog row commits while this call is waiting
+            // on the write lock is still caught: the check and the cascade
+            // delete are atomic against a concurrent UpdateTable.
+            Self::refuse_if_index_build_in_flight(&mut tx, &row.table_id).await?;
             sqlx::query("DELETE FROM tags WHERE resource_arn = ?")
                 .bind(&table_arn)
                 .execute(&mut *tx)
@@ -95,6 +145,17 @@ impl SqliteEngine {
             let transition = format_timestamp(
                 time::OffsetDateTime::now_utc() + time::Duration::seconds_f64(delay_secs),
             );
+            let _writer = self.write_lock.lock().await;
+            let mut tx = self
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            // Same in-flight-build refusal as the immediate branch, and inside
+            // the transaction that flips the table to DELETING for the same
+            // reason: without it, a build committing between an earlier check
+            // and this flip would have its table deleted underneath it.
+            Self::refuse_if_index_build_in_flight(&mut tx, &row.table_id).await?;
             sqlx::query(
                 "UPDATE tables SET table_status = 'DELETING', status_transition_at = ? \
                  WHERE account_id = ? AND table_name = ?",
@@ -102,9 +163,12 @@ impl SqliteEngine {
             .bind(&transition)
             .bind(account_id)
             .bind(&input.table_name)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
+            tx.commit()
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
             self.control_plane_notify.notify_one();
         }
 
@@ -113,5 +177,35 @@ impl SqliteEngine {
             table_status: TableStatus::Deleting,
             ..desc
         })
+    }
+
+    /// Refuse the operation while any UpdateTable-created vector index build is
+    /// in flight on the table (`backfilling IS NOT NULL`; the with-table path
+    /// never sets the column). Must be called inside a `BEGIN IMMEDIATE`
+    /// transaction so the answer is atomic with the caller's own writes.
+    async fn refuse_if_index_build_in_flight(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        table_id: &str,
+    ) -> Result<(), StorageError> {
+        let in_flight: Option<(i64,)> = sqlx::query_as(
+            "SELECT 1 FROM vector_indexes WHERE table_id = ? AND backfilling IS NOT NULL LIMIT 1",
+        )
+        .bind(table_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        if in_flight.is_some() {
+            // The sentence AWS documents for this refusal, quoted in the vector
+            // search tutorial's readiness callout and pinned by the ground-truth
+            // runs of 2026-08-24 (us-east-1 and eu-west-2). Composed here rather
+            // than in the engine map because the variant carries the whole
+            // client-facing message: only the backend knows which in-use state
+            // it refused for.
+            return Err(StorageError::IndexesInUse(
+                "Cannot delete table while indexes are being created, updated, or deleted."
+                    .to_owned(),
+            ));
+        }
+        Ok(())
     }
 }

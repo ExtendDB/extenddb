@@ -16,13 +16,33 @@ use extenddb_storage::error::StorageError;
 /// Includes `account_id` for multi-account isolation (Phase 12a).
 /// Table names are validated at the engine layer (alphanumeric + `_.-`),
 /// so this is safe for identifier construction.
-pub(crate) fn data_table_name(table_id: &str) -> String {
+#[must_use]
+pub fn data_table_name(table_id: &str) -> String {
     format!("\"_ddb_{table_id}\"")
 }
 
 /// SQL table name for a GSI/LSI data table.
-pub(crate) fn index_table_name(index_id: &str) -> String {
+#[must_use]
+pub fn index_table_name(index_id: &str) -> String {
     format!("\"_ddb_{index_id}\"")
+}
+
+/// SQL table name for a vector index's data table.
+///
+/// Named from the index id alone, like a GSI's, and deliberately not from both
+/// ids. PostgreSQL truncates identifiers at 63 bytes, and two UUIDs plus a prefix
+/// is 82: the longer form was silently cut, which made two indexes on one table
+/// collide on 17 surviving characters of their ids.
+///
+/// The reason to want the table id in the name was to find these tables after
+/// DeleteTable cascades the catalog rows away. Both delete paths instead collect
+/// the ids before deleting the table row, which is what the GSI path already does
+/// for the same reason.
+///
+/// The id is a server-generated UUID, so no client input reaches this identifier.
+#[must_use]
+pub fn vector_table_name(index_id: &str) -> String {
+    format!("\"_ddb_vec_{index_id}\"")
 }
 
 /// Look up all RANGE key attribute definitions from the key schema (preserving order).
@@ -75,7 +95,7 @@ macro_rules! bind_sk_fetch_optional {
                     .await
             }
         }
-        .map_err(|e| extenddb_storage::error::StorageError::Internal(e.to_string()))
+        .map_err($crate::data::index::db_error)
     };
 }
 
@@ -107,7 +127,7 @@ macro_rules! bind_sk_execute {
                     .await
             }
         }
-        .map_err(|e| extenddb_storage::error::StorageError::Internal(e.to_string()))
+        .map_err($crate::data::index::db_error)
     };
 }
 
@@ -115,14 +135,18 @@ macro_rules! bind_sk_execute {
 mod data_engine;
 mod ddl;
 mod delete_item;
-mod index;
+pub(crate) mod gsi_build;
+pub(crate) mod index;
 mod put_item;
 mod query;
 mod query_scan;
 mod transactions;
 mod tx_helpers;
 mod update_item;
+pub mod vector_index;
 
-pub(crate) use index::{
-    delete_index_row_multi, insert_index_row_multi, item_has_index_keys, project_item_for_index,
+pub(crate) use ddl::{
+    LockHolders, delete_pending_queue_rows, drop_table_relations, lock_not_available,
+    lock_wait_failed, storage_in_use, table_storage_relations,
 };
+pub(crate) use index::{insert_index_rows_multi, item_has_index_keys, project_item_for_index};

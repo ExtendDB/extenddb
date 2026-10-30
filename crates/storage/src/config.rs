@@ -3,6 +3,26 @@
 
 //! Storage configuration trait and registry for storage backends.
 
+/// Operator-facing warning emitted during server startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupWarning {
+    /// Short warning headline shown prominently in the startup banner.
+    pub title: String,
+    /// Supporting lines describing the impact and remediation.
+    pub details: Vec<String>,
+}
+
+impl StartupWarning {
+    /// Render the warning as a single line suitable for structured logs.
+    #[must_use]
+    pub fn log_message(&self) -> String {
+        std::iter::once(self.title.as_str())
+            .chain(self.details.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
 /// Configuration interface for storage backends.
 ///
 /// Each backend implements this trait to expose connection parameters
@@ -20,6 +40,25 @@ pub trait StorageConfig: Send + Sync + std::fmt::Debug {
     /// Maximum concurrent connections for catalog/management operations.
     fn max_catalog_connections(&self) -> u32;
 
+    /// Explicit data-pool override, if the backend distinguishes an omitted
+    /// setting from its effective default.
+    fn max_connections_override(&self) -> Option<u32> {
+        Some(self.max_connections())
+    }
+
+    /// Explicit catalog-pool override, if the backend distinguishes an
+    /// omitted setting from its effective default.
+    fn max_catalog_connections_override(&self) -> Option<u32> {
+        Some(self.max_catalog_connections())
+    }
+
+    /// Operator-facing warnings for non-default or compatibility settings.
+    ///
+    /// The default keeps existing and third-party backends source-compatible.
+    fn startup_warnings(&self) -> Vec<StartupWarning> {
+        Vec::new()
+    }
+
     /// Clone this config into a boxed trait object.
     fn clone_box(&self) -> Box<dyn StorageConfig>;
 
@@ -29,11 +68,110 @@ pub trait StorageConfig: Send + Sync + std::fmt::Debug {
     fn as_any(&self) -> &dyn std::any::Any
     where
         Self: 'static;
+
+    /// Set a per-node instance identifier used to derive backend-specific
+    /// node identities (e.g. HLC node IDs for stream sequence numbers).
+    /// Backends that do not need a node identity may ignore this.
+    fn set_instance_id(&mut self, _instance_id: &str) {}
+
+    /// Return the instance identifier previously set via [`set_instance_id`],
+    /// if any.
+    fn instance_id(&self) -> Option<&str> {
+        None
+    }
 }
 
 impl Clone for Box<dyn StorageConfig> {
     fn clone(&self) -> Self {
         self.clone_box()
+    }
+}
+
+/// The warning for a `server.region` outside `[a-z0-9-]`, or `None` when the
+/// region is in that class.
+///
+/// The region is baked into every backup ARN the server issues
+/// (`arn:aws:dynamodb:<region>:<account>:table/<name>/backup/<id>`), and the
+/// `BackupArn` parser accepts a region in `[a-z0-9-]` only, as the service
+/// does. A deployment configured outside that class therefore issues ARNs
+/// it refuses on `DescribeBackup`, `DeleteBackup`, and
+/// `RestoreTableFromBackup` with `ValidationException` "Invalid Request:
+/// BackupArn is not valid". The server starts anyway (the setting is
+/// pre-existing and the data plane does not depend on it); the operator is
+/// told at startup.
+#[must_use]
+pub fn server_region_warning(region: &str) -> Option<StartupWarning> {
+    let well_formed = !region.is_empty()
+        && region
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if well_formed {
+        return None;
+    }
+    Some(StartupWarning {
+        title: format!(
+            "server.region {region:?} is outside [a-z0-9-]; the backup ARNs this server \
+             issues will not resolve."
+        ),
+        details: vec![
+            "Every backup ARN carries the configured region, and BackupArn is accepted \
+             only with a region in [a-z0-9-], so DescribeBackup, DeleteBackup, and \
+             RestoreTableFromBackup answer ValidationException \"Invalid Request: \
+             BackupArn is not valid\" for every backup this server creates, and \
+             ListBackups refuses the cursor it hands out, so a listing stops at its \
+             first page."
+                .to_owned(),
+            "Set server.region to a value in [a-z0-9-] (for example us-east-1). Backups \
+             already created keep the old region in their stored ARN; see the upgrade \
+             manual on changing server.region."
+                .to_owned(),
+        ],
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::server_region_warning;
+
+    #[test]
+    fn a_region_the_backup_arn_parser_accepts_draws_no_warning() {
+        for region in ["us-east-1", "local", "eu-west-2", "a", "0-9"] {
+            assert!(server_region_warning(region).is_none(), "{region}");
+        }
+    }
+
+    #[test]
+    fn a_region_the_backup_arn_parser_refuses_is_warned_about_with_the_consequence() {
+        for region in [
+            "LOCAL",
+            "us_east_1",
+            "dev.local",
+            "",
+            "us east",
+            "Us-East-1",
+            "ü",
+        ] {
+            let warning = server_region_warning(region).unwrap_or_else(|| panic!("{region:?}"));
+            assert!(warning.title.contains("server.region"), "{region:?}");
+            assert!(warning.title.contains(&format!("{region:?}")), "{region:?}");
+            let text = warning.log_message();
+            assert!(
+                text.contains("Invalid Request: BackupArn is not valid"),
+                "{region:?}: {text}"
+            );
+            assert!(text.contains("DescribeBackup"), "{region:?}: {text}");
+            // The warning agrees with the parser it speaks for.
+            let arn =
+                crate::util::backup_arn(region, "123456789012", "Music", "01489602797149-73d8d5bc");
+            assert!(crate::util::parse_backup_arn(&arn).is_none(), "{region:?}");
+        }
+        let arn = crate::util::backup_arn(
+            "us-east-1",
+            "123456789012",
+            "Music",
+            "01489602797149-73d8d5bc",
+        );
+        assert!(crate::util::parse_backup_arn(&arn).is_some());
     }
 }
 
@@ -99,6 +237,18 @@ pub mod string_coerce {
                 }),
             })
             .transpose()
+    }
+
+    /// Deserialize an optional positive `u32` from a number, its string form,
+    /// or absence. A present value must be at least one.
+    pub fn positive_opt_u32<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<u32>, D::Error> {
+        let value = opt_u32(deserializer)?;
+        if value == Some(0) {
+            return Err(D::Error::custom("value must be at least 1"));
+        }
+        Ok(value)
     }
 
     /// Deserialize a `bool` from either a boolean or its string form

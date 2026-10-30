@@ -64,10 +64,14 @@ def test_put_invalid_return_values_enum(dynamodb_client, table):
             TableName=table, Item={"pk": {"S": "k"}}, ReturnValues="GARBAGE"
         )
     msg = ei.value.response["Error"]["Message"]
+    # A ReturnValues violation carries a BARE clause: no value echo, no field
+    # name, and the displayed set is the service's own (note UPDATE_NEW, which
+    # is not an accepted member). Measured 2026-08-24 (us-east-1) on PutItem,
+    # DeleteItem, and UpdateItem, single-field and aggregated alike.
     assert msg == (
-        "1 validation error detected: Value 'GARBAGE' at 'returnValues' failed to "
-        "satisfy constraint: Member must satisfy enum value set: "
-        "[ALL_NEW, UPDATED_OLD, ALL_OLD, NONE, UPDATED_NEW]"
+        "1 validation error detected: Failed to satisfy constraint: "
+        "Member must satisfy enum value set: "
+        "[ALL_OLD, UPDATED_OLD, ALL_NEW, UPDATE_NEW, NONE]"
     )
 
 

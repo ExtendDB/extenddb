@@ -15,14 +15,21 @@ pub async fn handle_create_table(
 ) -> Result<Value, DynamoDbError> {
     crate::validate_enum_fields(
         &body,
-        &[(
-            "BillingMode",
-            "billingMode",
-            &["PROVISIONED", "PAY_PER_REQUEST"],
-        )],
+        &[
+            crate::EnumField {
+                json_name: "BillingMode",
+                valid: &["PROVISIONED", "PAY_PER_REQUEST"],
+                clause: crate::EnumClause::Named("billingMode"),
+            },
+            crate::EnumField {
+                json_name: "TableThroughputMode",
+                valid: &["PROVISIONED", "PAY_PER_REQUEST"],
+                clause: crate::EnumClause::Named("tableThroughputMode"),
+            },
+        ],
     )?;
 
-    let input: CreateTableInput = serde_json::from_value(body).map_err(|e| {
+    let mut input: CreateTableInput = serde_json::from_value(body).map_err(|e| {
         let msg = e.to_string();
         if msg.contains("validation error detected")
             || msg.contains("parameter values were invalid")
@@ -41,8 +48,17 @@ pub async fn handle_create_table(
             ))
         }
     })?;
+    input.resolve_table_throughput_mode();
 
     validate_create_table(&input, &ctx.limits)?;
+
+    // An empty SearchSchema means the same as an absent one, so it is collapsed
+    // here, once, rather than in each backend. Storing the empty list would make
+    // DescribeTable echo a state the service never reports, and would leave two
+    // backends free to disagree about it.
+    for spec in input.vector_indexes.iter_mut().flatten() {
+        spec.normalize_search_schema();
+    }
 
     crate::vector_gate::ensure_create_table_supported(
         input.vector_indexes.as_ref(),
@@ -53,7 +69,7 @@ pub async fn handle_create_table(
     // Kept for the post-condition check below, since `input` is moved into the
     // backend call.
     let requested_vector_indexes = input.vector_indexes.clone();
-    let table_desc = ctx
+    let mut table_desc = ctx
         .storage
         .create_table(&ctx.account_id, input)
         .await
@@ -87,13 +103,23 @@ pub async fn handle_create_table(
     );
     ctx.auth_cache.invalidate_resource_tags(&arn).await;
 
+    table_desc.prepare_for_response();
     let output = CreateTableOutput {
         table_description: table_desc,
     };
     serialize_output(&output)
 }
 
-pub(crate) fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> DynamoDbError {
+/// Map a storage-layer error to its `DynamoDB` wire error.
+///
+/// Exposed so the server's authorization path classifies a key-info lookup
+/// fault the same way the engine classifies the identical fault on the data
+/// path: a transient or connection error becomes `ServiceUnavailable`, the
+/// catalog and backend-internal errors become `InternalServerError`, and a
+/// not-active table becomes `ResourceInUseException`. Without a single mapper
+/// the same database hiccup returned different wire errors depending on which
+/// layer hit it first.
+pub fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> DynamoDbError {
     use extenddb_storage::error::StorageError;
     match e {
         StorageError::TableNotFound(name) => DynamoDbError::ResourceNotFoundException(
@@ -106,17 +132,41 @@ pub(crate) fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) ->
             ErrorMessageKey::TableInUse,
             &[&name],
         )),
+        // Only RestoreTableFromBackup raises this; its own mapping makes it
+        // TableInUseException. Elsewhere (a plain CreateTable into a name
+        // that is a CREATING restore target) the service's text is the one
+        // for a taken name, "Table already exists: <name>" (measured on
+        // DynamoDB), and the backup ARN is not disclosed to a caller
+        // authorized on the table alone.
+        StorageError::TableBeingRestored { table_name, .. } => {
+            DynamoDbError::ResourceInUseException(error_message(
+                ErrorMessageKey::TableAlreadyExists,
+                &[&table_name],
+            ))
+        }
         StorageError::IndexNotFound(name) => DynamoDbError::ValidationException(format!(
             "The table does not have the specified index: {name}"
         )),
         StorageError::IndexAlreadyExists(name) => DynamoDbError::ValidationException(format!(
             "One or more parameter values were invalid: Index already exists: {name}"
         )),
-        StorageError::LimitExceeded(msg) => DynamoDbError::LimitExceededException(msg),
-        // Retryable by definition, so it maps like Connection: a 503 the SDKs
+        // The resource exists and the request is well formed; its current state
+        // forbids the change. The backend owns the wording because it owns the
+        // state: the documented delete-table sentence and the measured
+        // phase-dependent vector refusal both arrive through this one arm.
+        StorageError::IndexesInUse(msg) => DynamoDbError::ResourceInUseException(msg),
+        StorageError::BackupInUse(msg) => DynamoDbError::BackupInUseException(msg),
+        StorageError::LimitExceeded(msg) => DynamoDbError::LimitExceededException(msg), // Retryable by definition, so it maps like Connection: a 503 the SDKs
         // retry, rather than a 500 they surface.
         StorageError::Transient(msg) => {
             tracing::warn!(transient_error = %msg, "transient storage error");
+            DynamoDbError::ServiceUnavailable("Service is temporarily unavailable".to_owned())
+        }
+        // Only backup and export jobs hold snapshots; a request that reaches
+        // this arm lost one mid-operation. The job owner restarts it; the
+        // client sees the same retryable 503 as a transient fault.
+        StorageError::SnapshotExpired(msg) => {
+            tracing::warn!(snapshot_error = %msg, "storage snapshot expired");
             DynamoDbError::ServiceUnavailable("Service is temporarily unavailable".to_owned())
         }
         StorageError::DeletionProtected(arn) => DynamoDbError::ValidationException(format!(
@@ -202,5 +252,23 @@ pub(crate) fn storage_err_to_dynamo_with_ccf(
             )
         }
         other => storage_err_to_dynamo(other),
+    }
+}
+
+#[cfg(test)]
+mod storage_error_mapping_tests {
+    use extenddb_core::error::DynamoDbError;
+    use extenddb_storage::error::StorageError;
+
+    use super::storage_err_to_dynamo;
+
+    /// A snapshot the backend discarded is retryable, like a transient error.
+    #[test]
+    fn snapshot_expired_is_service_unavailable() {
+        let err = storage_err_to_dynamo(StorageError::SnapshotExpired("gone".to_owned()));
+        assert!(
+            matches!(err, DynamoDbError::ServiceUnavailable(_)),
+            "{err:?}"
+        );
     }
 }

@@ -26,15 +26,79 @@
 
 use crate::test_base::*;
 use aws_sdk_dynamodb::types::{
-    AttributeDefinition, AttributeValue, BillingMode, KeySchemaElement, KeyType, PutRequest,
-    ScalarAttributeType, Select, WriteRequest,
+    AttributeDefinition, AttributeValue, BillingMode, GlobalSecondaryIndex,
+    KeySchemaElement, KeyType, Projection, ProjectionType, PutRequest, ScalarAttributeType,
+    Select, WriteRequest,
 };
+use std::time::Duration;
 
 const ITEMS: usize = 40000;
 
 /// Bound on the observer's wait for first ACTIVE, so a failed restore fails the
 /// test rather than hanging it. 10ms per attempt, so this is a 60s ceiling.
 const OBSERVER_MAX_ATTEMPTS: usize = 6000;
+const GSI_BACKFILL_TEST_GATE: &str = "gsi_backfill_test_gate";
+
+fn backfill_gate_key(table_name: &str) -> String {
+    format!("{GSI_BACKFILL_TEST_GATE}:{table_name}")
+}
+
+fn management_client() -> (reqwest::Client, String, String, String) {
+    let endpoint = std::env::var("EXTENDDB_TEST_ENDPOINT")
+        .expect("MongoDB restore race test requires EXTENDDB_TEST_ENDPOINT");
+    let user = std::env::var("EXTENDDB_ADMIN_USER").unwrap_or_else(|_| "admin".to_owned());
+    let password = std::env::var("EXTENDDB_ADMIN_PASSWORD")
+        .expect("MongoDB restore race test requires EXTENDDB_ADMIN_PASSWORD");
+    let http = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("management HTTP client build");
+    (
+        http,
+        format!("{}/management", endpoint.trim_end_matches('/')),
+        user,
+        password,
+    )
+}
+
+async fn set_backfill_gate(table_name: &str, value: &str) {
+    let (http, base, user, password) = management_client();
+    let response = http
+        .put(format!("{base}/settings/{}", backfill_gate_key(table_name)))
+        .basic_auth(user, Some(password))
+        .json(&serde_json::json!({ "value": value }))
+        .send()
+        .await
+        .expect("set restore backfill gate request");
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    assert!(
+        status.is_success(),
+        "setting restore backfill gate failed: {status}: {body}"
+    );
+}
+
+async fn wait_for_backfill_gate(table_name: &str, value: &str) -> bool {
+    let (http, base, user, password) = management_client();
+    for _ in 0..120 {
+        let response = http
+            .get(format!("{base}/settings/{}", backfill_gate_key(table_name)))
+            .basic_auth(&user, Some(&password))
+            .send()
+            .await;
+        if let Ok(response) = response {
+            if response.status().is_success() {
+                if let Ok(body) = response.json::<serde_json::Value>().await {
+                    if body.get("value").and_then(serde_json::Value::as_str) == Some(value) {
+                        return true;
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    false
+}
 
 #[tokio::test]
 async fn restored_table_has_all_items_when_first_active() {
@@ -202,4 +266,145 @@ async fn restored_table_has_all_items_when_first_active() {
         "restored table reported ACTIVE with {count}/{ITEMS} items present. \
          ACTIVE must imply the restore copy is complete"
     );
+}
+
+/// A restore index must not be completed by the worker while the base `$out`
+/// copy is still pending. The table-scoped test gate holds the restore after
+/// its CREATING index metadata exists, allowing a worker tick to occur before
+/// the copy starts. Without the restore-pending guard, the worker scans the
+/// empty target collection, marks the index ACTIVE, and the restored table
+/// becomes permanently missing that index's rows.
+#[tokio::test]
+async fn restore_worker_waits_for_base_copy_before_backfilling_indexes() {
+    if std::env::var("EXTENDDB_TEST_MONGODB_TEST_HOOKS").is_err() {
+        return;
+    }
+
+    let c = client();
+    let source = format!("RestoreWorkerSrc_{}", ts());
+    let restored = format!("RestoreWorkerDst_{}", ts());
+    let index_name = "restore_worker_gsi";
+
+    c.create_table()
+        .table_name(&source)
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("pk")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("gsi_pk")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("pk")
+                .key_type(KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .global_secondary_indexes(
+            GlobalSecondaryIndex::builder()
+                .index_name(index_name)
+                .key_schema(
+                    KeySchemaElement::builder()
+                        .attribute_name("gsi_pk")
+                        .key_type(KeyType::Hash)
+                        .build()
+                        .unwrap(),
+                )
+                .projection(
+                    Projection::builder()
+                        .projection_type(ProjectionType::All)
+                        .build(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .billing_mode(BillingMode::PayPerRequest)
+        .send()
+        .await
+        .unwrap();
+    wait_for_active(c, &source).await;
+
+    for i in 0..3 {
+        c.put_item()
+            .table_name(&source)
+            .item("pk", AttributeValue::S(format!("item-{i}")))
+            .item("gsi_pk", AttributeValue::S("partition-1".to_owned()))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let backup = c
+        .create_backup()
+        .table_name(&source)
+        .backup_name("restore-worker-race")
+        .send()
+        .await
+        .unwrap();
+    let backup_arn = backup.backup_details().unwrap().backup_arn().to_owned();
+    for _ in 0..240 {
+        let status = c
+            .describe_backup()
+            .backup_arn(&backup_arn)
+            .send()
+            .await
+            .unwrap()
+            .backup_description()
+            .and_then(|description| description.backup_details())
+            .map(|details| details.backup_status().as_str().to_owned());
+        if status.as_deref() == Some("AVAILABLE") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    set_backfill_gate(&restored, "armed").await;
+    let restore_client = c.clone();
+    let restore_target = restored.clone();
+    let restore_backup = backup_arn.clone();
+    let restore = tokio::spawn(async move {
+        restore_client
+            .restore_table_from_backup()
+            .target_table_name(&restore_target)
+            .backup_arn(&restore_backup)
+            .send()
+            .await
+    });
+
+    if !wait_for_backfill_gate(&restored, "paused").await {
+        set_backfill_gate(&restored, "release").await;
+        let _ = restore.await;
+        panic!("restore did not reach its deterministic pre-copy pause");
+    }
+
+    // The worker polls every five seconds. Holding the restore at this point
+    // guarantees that at least one worker tick sees CREATING restore metadata
+    // before the base copy can mark restore_backfill_pending.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    set_backfill_gate(&restored, "release").await;
+    restore.await.unwrap().unwrap();
+
+    wait_for_active(c, &restored).await;
+    let query = c
+        .query()
+        .table_name(&restored)
+        .index_name(index_name)
+        .key_condition_expression("gsi_pk = :value")
+        .expression_attribute_values(":value", AttributeValue::S("partition-1".to_owned()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(query.count(), 3);
+
+    c.delete_table().table_name(&restored).send().await.ok();
+    c.delete_table().table_name(&source).send().await.ok();
+    c.delete_backup().backup_arn(backup_arn).send().await.ok();
 }

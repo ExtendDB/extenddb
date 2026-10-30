@@ -10,17 +10,21 @@ use serde_json::Value;
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{ExpressionKind, ExpressionMaps, Projection};
 use extenddb_core::types::{
-    IndexType, ProjectionType, ScanInput, ScanOutput, Select, TableKeyInfo, extract_key,
-    item_size_bytes,
+    IndexType, ProjectionType, ScanInput, ScanOutput, Select, TableKeyInfo,
+    VECTOR_INDEX_BACKFILLING_SCAN_PREFIX, VECTOR_INDEX_SCAN_NOT_SUPPORTED,
 };
+use extenddb_storage::error::StorageError;
 
 use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::storage_err_to_dynamo;
 use crate::expression_helpers::{build_expression_maps, parse_optional_filter};
-use crate::index_helpers::{combined_lek_key_schema, validate_scan_exclusive_start_key};
+use crate::index_helpers::{
+    VectorIndexReadRefusal, classify_unresolved_index_read, combined_lek_key_schema,
+    validate_scan_exclusive_start_key,
+};
 use crate::legacy_filter::desugar_filter;
-use crate::read_helpers::apply_post_read;
+use crate::read_helpers::{PostRead, read_page};
 use crate::serialize_output;
 use crate::{DispatchMetrics, DispatchResult};
 
@@ -37,6 +41,31 @@ pub async fn handle_scan(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
+    // Pre-scanned before typed deserialization. Scan AGGREGATES its invalid
+    // enums with Select's clause ahead of ReturnConsumedCapacity's, the
+    // opposite of Query on both counts (Query stops at the first, RCC-first).
+    // Measured 2026-08-24 (us-east-1): both invalid answers "2 validation
+    // errors detected: ... 'select' ...; ... 'returnConsumedCapacity' ...".
+    crate::validate_enum_fields(
+        &body,
+        &[
+            crate::EnumField {
+                json_name: "Select",
+                valid: &[
+                    "SPECIFIC_ATTRIBUTES",
+                    "COUNT",
+                    "ALL_ATTRIBUTES",
+                    "ALL_PROJECTED_ATTRIBUTES",
+                ],
+                clause: crate::EnumClause::Named("select"),
+            },
+            crate::EnumField {
+                json_name: "ReturnConsumedCapacity",
+                valid: &["INDEXES", "TOTAL", "NONE"],
+                clause: crate::EnumClause::Named("returnConsumedCapacity"),
+            },
+        ],
+    )?;
     let input: ScanInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
     // Validate Filter/Projection expressions before the existence
@@ -206,25 +235,49 @@ pub async fn handle_scan(
 
     // GSI/LSI: resolve index metadata if scanning a secondary index.
     // Uses table_id from pre-fetched key_info to skip redundant table lookup (P118 #4).
-    let index_info = if let Some(ref idx_name) = input.index_name {
-        Some(
-            ctx.storage
+    // A vector index is not a row in the `indexes` catalog, so a not-found
+    // result is re-resolved against the vector index metadata before the
+    // name is treated as absent. A vector index is searched only via the
+    // vector search API, never scanned; the refusal fires here, before the
+    // ConsistentRead check (measured 2026-08-20; Query is the opposite order).
+    let index_info = match input.index_name {
+        Some(ref idx_name) => {
+            match ctx
+                .storage
                 .index_info_by_table_id(&key_info.table_id, idx_name)
                 .await
-                .map_err(storage_err_to_dynamo)?,
-        )
-    } else {
-        None
+            {
+                // Defense in depth: no in-tree backend stores a vector index in
+                // `indexes`, but if one ever surfaces here it must be refused,
+                // not sent down the GSI/LSI data path.
+                Ok(info) if info.index_type == IndexType::Vector => {
+                    return Err(DynamoDbError::ValidationException(
+                        VECTOR_INDEX_SCAN_NOT_SUPPORTED.to_owned(),
+                    ));
+                }
+                Ok(info) => Some(info),
+                Err(err @ StorageError::IndexNotFound(_)) => {
+                    return Err(
+                        match classify_unresolved_index_read(ctx, &key_info, idx_name).await? {
+                            VectorIndexReadRefusal::NotFound => storage_err_to_dynamo(err),
+                            VectorIndexReadRefusal::Backfilling => {
+                                DynamoDbError::ValidationException(format!(
+                                    "{VECTOR_INDEX_BACKFILLING_SCAN_PREFIX}{idx_name}"
+                                ))
+                            }
+                            VectorIndexReadRefusal::NotSupported => {
+                                DynamoDbError::ValidationException(
+                                    VECTOR_INDEX_SCAN_NOT_SUPPORTED.to_owned(),
+                                )
+                            }
+                        },
+                    );
+                }
+                Err(err) => return Err(storage_err_to_dynamo(err)),
+            }
+        }
+        None => None,
     };
-
-    // A vector index is searched only via the vector search API, never scanned.
-    if let Some(ref idx) = index_info
-        && idx.index_type == IndexType::Vector
-    {
-        return Err(DynamoDbError::ValidationException(
-            "Scan operation not supported on this index type".to_owned(),
-        ));
-    }
 
     // ConsistentRead is not supported on GSI scans (tenet 1: fidelity).
     if input.consistent_read == Some(true)
@@ -361,6 +414,34 @@ pub async fn handle_scan(
     // Validate ExclusiveStartKey matches the key schema
     if let Some(ref start_key) = input.exclusive_start_key {
         validate_scan_exclusive_start_key(start_key, &key_info, index_info.as_ref())?;
+
+        // Parallel scan: the ExclusiveStartKey must belong to the segment being
+        // scanned. Segment assignment is backend-private (each backend hashes or
+        // partitions differently), so the backend answers membership and the
+        // engine owns the refusal, uniformly across backends. Without this, a
+        // LastEvaluatedKey from one segment replayed against another returns a
+        // silently wrong page instead of an error. Message measured against the
+        // service (us-east-1).
+        if let (Some(seg), Some(total)) = (input.segment, input.total_segments) {
+            let in_segment = ctx
+                .storage
+                .scan_key_in_segment(
+                    &scan_key_info,
+                    start_key,
+                    seg,
+                    total,
+                    input.index_name.as_deref(),
+                )
+                .await
+                .map_err(storage_err_to_dynamo)?;
+            if !in_segment {
+                return Err(DynamoDbError::ValidationException(format!(
+                    "The provided starting key is invalid: Invalid ExclusiveStartKey. \
+                     Please use ExclusiveStartKey with correct Segment. \
+                     TotalSegments: {total} Segment: {seg}"
+                )));
+            }
+        }
     }
 
     // Validate begins_with operand types upfront (before any rows are scanned).
@@ -373,51 +454,44 @@ pub async fn handle_scan(
         )?;
     }
 
-    // Scan storage
-    let (raw_items, storage_last_key) = ctx
-        .storage
-        .scan(
-            &scan_key_info,
-            input.limit,
-            input.exclusive_start_key.as_ref(),
-            input.segment,
-            input.total_segments,
-            input.index_name.as_deref(),
-        )
-        .await
-        .map_err(storage_err_to_dynamo)?;
-
-    // Capacity metering: RCU based on total pre-projection size of all scanned items.
-    let pre_projection_bytes: usize = raw_items.iter().map(item_size_bytes).sum();
-    let strongly_consistent = input.consistent_read == Some(true);
-    let rcu = capacity_helpers::read_capacity_units(pre_projection_bytes, strongly_consistent);
-
     // Determine which key schema to use for LastEvaluatedKey extraction.
+    // For index scans the LEK carries the index key and the base table key,
+    // and the same shape addresses each chunk read from storage.
     let lek_key_schema = combined_lek_key_schema(&key_info.key_schema, index_info.as_ref());
 
-    // For index scans, the storage layer returns a LEK with only the index key
-    // attributes. Enrich it with the base table key attributes from the last
-    // raw item so the LEK matches DynamoDB's format (all combined keys).
-    let enriched_storage_last_key = if storage_last_key.is_some() && index_info.is_some() {
-        raw_items
-            .last()
-            .map(|item| extract_key(item, &lek_key_schema))
-    } else {
-        storage_last_key
-    };
-
-    // Apply FilterExpression, ProjectionExpression, and 1 MB limit
-    let result = apply_post_read(
-        &raw_items,
-        enriched_storage_last_key,
-        &filter,
-        compiled_projection.as_ref(),
-        &combined_maps,
-        &lek_key_schema,
-        input.select.as_ref(),
+    // Read the page from storage in chunks, applying FilterExpression,
+    // ProjectionExpression, and the page budget as items arrive.
+    let post = PostRead {
+        filter: filter.as_ref(),
+        projection: compiled_projection.as_ref(),
+        maps: &combined_maps,
+        lek_key_schema: &lek_key_schema,
+        select: input.select.as_ref(),
         index_proj,
-        &key_info.key_schema,
-    )?;
+        base_key_schema: &key_info.key_schema,
+    };
+    let page = read_page(
+        input.limit,
+        input.exclusive_start_key.as_ref(),
+        &post,
+        |cursor, count| {
+            ctx.storage.scan(
+                &scan_key_info,
+                Some(count),
+                cursor,
+                input.segment,
+                input.total_segments,
+                input.index_name.as_deref(),
+            )
+        },
+    )
+    .await?;
+    let result = page.post;
+
+    // Capacity metering: RCU based on the pre-projection size of the evaluated items.
+    let pre_projection_bytes = page.evaluated_bytes;
+    let strongly_consistent = input.consistent_read == Some(true);
+    let rcu = capacity_helpers::read_capacity_units(pre_projection_bytes, strongly_consistent);
 
     let output = ScanOutput {
         items: result.items,

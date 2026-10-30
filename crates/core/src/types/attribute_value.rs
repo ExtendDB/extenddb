@@ -68,6 +68,10 @@ impl<'de> Deserialize<'de> for AttributeValue {
 
 struct AttributeValueVisitor;
 
+const EMPTY_ATTRIBUTE_VALUE: &str =
+    "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes";
+const MULTI_ATTRIBUTE_VALUE: &str = "Supplied AttributeValue has more than one datatypes set, must contain exactly one of the supported datatypes";
+
 impl<'de> Visitor<'de> for AttributeValueVisitor {
     type Value = AttributeValue;
 
@@ -78,189 +82,210 @@ impl<'de> Visitor<'de> for AttributeValueVisitor {
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
         let (key, value): (String, serde_json::Value) = map
             .next_entry()?
-            .ok_or_else(|| {
-                de::Error::custom(
-                    "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes",
-                )
-            })?;
+            .ok_or_else(|| de::Error::custom(EMPTY_ATTRIBUTE_VALUE))?;
 
         // REQ-TYPE-001: reject if multiple keys
         if map.next_key::<String>()?.is_some() {
-            return Err(de::Error::custom(
-                "Supplied AttributeValue has more than one datatypes set, must contain exactly one of the supported datatypes",
-            ));
+            return Err(de::Error::custom(MULTI_ATTRIBUTE_VALUE));
         }
 
-        match key.as_str() {
-            "S" => {
-                let s = value
-                    .as_str()
-                    .ok_or_else(|| de::Error::custom("S value must be a string"))?;
-                Ok(AttributeValue::S(s.to_owned()))
-            }
-            "N" => {
-                let n = value
-                    .as_str()
-                    .ok_or_else(|| de::Error::custom("N value must be a string"))?;
-                // Normalize valid numbers; store raw string for invalid ones so the
-                // validation layer can reject them with ValidationException.
-                let stored = crate::validation::number::validate_and_normalize_number(n)
-                    .unwrap_or_else(|_| n.to_owned());
-                Ok(AttributeValue::N(stored))
-            }
-            "B" => {
-                let b64 = value
-                    .as_str()
-                    .ok_or_else(|| de::Error::custom("B value must be a base64 string"))?;
-                let bytes = BASE64
-                    .decode(b64)
-                    .map_err(|e| de::Error::custom(format!("invalid base64: {e}")))?;
-                Ok(AttributeValue::B(bytes))
-            }
-            "SS" => {
-                let arr = value
-                    .as_array()
-                    .ok_or_else(|| de::Error::custom("SS value must be an array"))?;
-                if arr.is_empty() {
-                    return Err(de::Error::custom(
-                        "One or more parameter values were invalid: An string set  may not be empty",
-                    ));
-                }
-                let set: BTreeSet<String> = arr
-                    .iter()
-                    .map(|v| {
-                        v.as_str()
-                            .map(std::borrow::ToOwned::to_owned)
-                            .ok_or_else(|| {
-                                de::Error::custom(
-                                    "One or more parameter values were invalid: An string set may not have a null string as a member",
-                                )
-                            })
-                    })
-                    .collect::<Result<_, _>>()?;
-                let values: Vec<String> = arr
-                    .iter()
-                    .filter_map(|v| v.as_str().map(std::borrow::ToOwned::to_owned))
-                    .collect();
-                if values.len() != set.len() {
-                    let repr = values.join(", ");
-                    return Err(de::Error::custom(format!(
-                        "One or more parameter values were invalid: Input collection [{repr}] contains duplicates."
-                    )));
-                }
-                Ok(AttributeValue::SS(set))
-            }
-            "NS" => {
-                let arr = value
-                    .as_array()
-                    .ok_or_else(|| de::Error::custom("NS value must be an array"))?;
-                if arr.is_empty() {
-                    return Err(de::Error::custom(
-                        "One or more parameter values were invalid: An number set  may not be empty",
-                    ));
-                }
-                let set: BTreeSet<String> = arr
-                    .iter()
-                    .map(|v| {
-                        let s = v
-                            .as_str()
-                            .ok_or_else(|| {
-                                de::Error::custom(
-                                    "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes",
-                                )
-                            })?;
-                        Ok(crate::validation::number::validate_and_normalize_number(s)
-                            .unwrap_or_else(|_| s.to_owned()))
-                    })
-                    .collect::<Result<_, _>>()?;
-                if set.len() != arr.len() {
-                    let values: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
-                    let repr = values.join(", ");
-                    return Err(de::Error::custom(format!(
-                        "One or more parameter values were invalid: Input collection [{repr}] contains duplicates."
-                    )));
-                }
-                Ok(AttributeValue::NS(set))
-            }
-            "BS" => {
-                let arr = value
-                    .as_array()
-                    .ok_or_else(|| de::Error::custom("BS value must be an array"))?;
-                if arr.is_empty() {
-                    return Err(de::Error::custom(
-                        "One or more parameter values were invalid: Binary sets should not be empty",
-                    ));
-                }
-                let set: BTreeSet<Vec<u8>> = arr
-                    .iter()
-                    .map(|v| {
-                        let b64 = v
-                            .as_str()
-                            .ok_or_else(|| {
-                                de::Error::custom(
-                                    "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes",
-                                )
-                            })?;
-                        BASE64
-                            .decode(b64)
-                            .map_err(|e| de::Error::custom(format!("invalid base64: {e}")))
-                    })
-                    .collect::<Result<_, _>>()?;
-                if set.len() != arr.len() {
-                    let values: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
-                    let repr = values.join(", ");
-                    return Err(de::Error::custom(format!(
-                        "One or more parameter values were invalid: Input collection [{repr}] contains duplicates."
-                    )));
-                }
-                Ok(AttributeValue::BS(set))
-            }
-            "BOOL" => {
-                let b = value
-                    .as_bool()
-                    .ok_or_else(|| de::Error::custom("BOOL value must be a boolean"))?;
-                Ok(AttributeValue::Bool(b))
-            }
-            "NULL" => {
-                let n = value
-                    .as_bool()
-                    .ok_or_else(|| de::Error::custom("NULL value must be a boolean"))?;
-                if !n {
-                    return Err(de::Error::custom(
-                        "One or more parameter values were invalid: Null attribute value types must have the value of true",
-                    ));
-                }
-                Ok(AttributeValue::Null)
-            }
-            "L" => {
-                let arr = value
-                    .as_array()
-                    .ok_or_else(|| de::Error::custom("L value must be an array"))?;
-                let list: Vec<AttributeValue> = arr
-                    .iter()
-                    .map(|v| serde_json::from_value(v.clone()).map_err(de::Error::custom))
-                    .collect::<Result<_, _>>()?;
-                Ok(AttributeValue::L(list))
-            }
-            "M" => {
-                let obj = value
-                    .as_object()
-                    .ok_or_else(|| de::Error::custom("M value must be an object"))?;
-                let map: BTreeMap<String, AttributeValue> = obj
-                    .iter()
-                    .map(|(k, v)| {
-                        let av: AttributeValue =
-                            serde_json::from_value(v.clone()).map_err(de::Error::custom)?;
-                        Ok((k.clone(), av))
-                    })
-                    .collect::<Result<_, A::Error>>()?;
-                Ok(AttributeValue::M(map))
-            }
-            other => Err(de::Error::custom(format!(
-                "unknown AttributeValue type descriptor: {other}"
-            ))),
-        }
+        from_descriptor(&key, value).map_err(de::Error::custom)
     }
+}
+
+/// An element of an `L` or a value of an `M`, converted from the
+/// `serde_json::Value` the enclosing level already owns.
+///
+/// The value is consumed, not cloned and re-deserialized: the earlier
+/// `serde_json::from_value(v.clone())` held one more copy of the subtree at
+/// every enclosing level, so a value nested 31 deep cost 31 copies of its
+/// leaves at once. The result and every error message are those of
+/// `serde_json::from_value::<AttributeValue>(value)`: a non-object goes
+/// through it unchanged (serde's "invalid type" text; nothing below it is
+/// visited), and an object takes the steps `visit_map` takes; the message is
+/// the one `visit_map` produces, rendered once per level as `from_value`
+/// rendered it: `serde_json::Error::custom` parses a trailing
+/// ` at line N column M` out of the message it is given and drops it when
+/// N is 0, so each nesting level strips one such suffix, and
+/// [`rendered_per_level`] repeats that here.
+fn from_nested(value: serde_json::Value) -> Result<AttributeValue, String> {
+    let serde_json::Value::Object(object) = value else {
+        return serde_json::from_value(value).map_err(|e| e.to_string());
+    };
+    let mut entries = object.into_iter();
+    match (entries.next(), entries.next()) {
+        (None, _) => Err(EMPTY_ATTRIBUTE_VALUE.to_owned()),
+        (Some(_), Some(_)) => Err(MULTI_ATTRIBUTE_VALUE.to_owned()),
+        (Some((key, value)), None) => from_descriptor(&key, value),
+    }
+    .map_err(rendered_per_level)
+}
+
+/// The text `serde_json::from_value` gave for a message its deserializer
+/// raised: the message through `serde_json::Error::custom`, displayed.
+fn rendered_per_level(message: String) -> String {
+    <serde_json::Error as de::Error>::custom(message).to_string()
+}
+
+/// The value of one type descriptor: `key` is the descriptor (`S`, `L`, ...)
+/// and `value` its payload. The error is the message; the caller turns it
+/// into its deserializer's error.
+fn from_descriptor(key: &str, value: serde_json::Value) -> Result<AttributeValue, String> {
+    use serde_json::Value;
+    match key {
+        "S" => match value {
+            Value::String(s) => Ok(AttributeValue::S(s)),
+            _ => Err("S value must be a string".to_owned()),
+        },
+        "N" => match value {
+            // Normalize valid numbers; store raw string for invalid ones so the
+            // validation layer can reject them with ValidationException.
+            Value::String(n) => Ok(AttributeValue::N(
+                crate::validation::number::validate_and_normalize_number(&n).unwrap_or(n),
+            )),
+            _ => Err("N value must be a string".to_owned()),
+        },
+        "B" => {
+            let b64 = value
+                .as_str()
+                .ok_or_else(|| "B value must be a base64 string".to_owned())?;
+            let bytes = BASE64
+                .decode(b64)
+                .map_err(|e| format!("invalid base64: {e}"))?;
+            Ok(AttributeValue::B(bytes))
+        }
+        "SS" => string_set(&value),
+        "NS" => number_set(&value),
+        "BS" => binary_set(&value),
+        "BOOL" => {
+            let b = value
+                .as_bool()
+                .ok_or_else(|| "BOOL value must be a boolean".to_owned())?;
+            Ok(AttributeValue::Bool(b))
+        }
+        "NULL" => {
+            let n = value
+                .as_bool()
+                .ok_or_else(|| "NULL value must be a boolean".to_owned())?;
+            if !n {
+                return Err(
+                    "One or more parameter values were invalid: Null attribute value types must have the value of true"
+                        .to_owned(),
+                );
+            }
+            Ok(AttributeValue::Null)
+        }
+        // `L` and `M` consume their payload (see `from_nested`).
+        "L" => match value {
+            Value::Array(arr) => Ok(AttributeValue::L(
+                arr.into_iter().map(from_nested).collect::<Result<_, _>>()?,
+            )),
+            _ => Err("L value must be an array".to_owned()),
+        },
+        "M" => match value {
+            Value::Object(obj) => Ok(AttributeValue::M(
+                obj.into_iter()
+                    .map(|(k, v)| from_nested(v).map(|av| (k, av)))
+                    .collect::<Result<_, _>>()?,
+            )),
+            _ => Err("M value must be an object".to_owned()),
+        },
+        other => Err(format!("unknown AttributeValue type descriptor: {other}")),
+    }
+}
+
+/// The payload of an `SS`.
+fn string_set(value: &serde_json::Value) -> Result<AttributeValue, String> {
+    let arr = value
+        .as_array()
+        .ok_or_else(|| "SS value must be an array".to_owned())?;
+    if arr.is_empty() {
+        return Err(
+            "One or more parameter values were invalid: An string set  may not be empty".to_owned(),
+        );
+    }
+    let set: BTreeSet<String> = arr
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .map(std::borrow::ToOwned::to_owned)
+                .ok_or_else(|| {
+                    "One or more parameter values were invalid: An string set may not have a null string as a member".to_owned()
+                })
+        })
+        .collect::<Result<_, _>>()?;
+    let values: Vec<String> = arr
+        .iter()
+        .filter_map(|v| v.as_str().map(std::borrow::ToOwned::to_owned))
+        .collect();
+    if values.len() != set.len() {
+        let repr = values.join(", ");
+        return Err(format!(
+            "One or more parameter values were invalid: Input collection [{repr}] contains duplicates."
+        ));
+    }
+    Ok(AttributeValue::SS(set))
+}
+
+/// The payload of an `NS`.
+fn number_set(value: &serde_json::Value) -> Result<AttributeValue, String> {
+    let arr = value
+        .as_array()
+        .ok_or_else(|| "NS value must be an array".to_owned())?;
+    if arr.is_empty() {
+        return Err(
+            "One or more parameter values were invalid: An number set  may not be empty".to_owned(),
+        );
+    }
+    let set: BTreeSet<String> = arr
+        .iter()
+        .map(|v| {
+            let s = v.as_str().ok_or_else(|| EMPTY_ATTRIBUTE_VALUE.to_owned())?;
+            Ok(crate::validation::number::validate_and_normalize_number(s)
+                .unwrap_or_else(|_| s.to_owned()))
+        })
+        .collect::<Result<_, String>>()?;
+    if set.len() != arr.len() {
+        let values: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+        let repr = values.join(", ");
+        return Err(format!(
+            "One or more parameter values were invalid: Input collection [{repr}] contains duplicates."
+        ));
+    }
+    Ok(AttributeValue::NS(set))
+}
+
+/// The payload of a `BS`.
+fn binary_set(value: &serde_json::Value) -> Result<AttributeValue, String> {
+    let arr = value
+        .as_array()
+        .ok_or_else(|| "BS value must be an array".to_owned())?;
+    if arr.is_empty() {
+        return Err(
+            "One or more parameter values were invalid: Binary sets should not be empty".to_owned(),
+        );
+    }
+    let set: BTreeSet<Vec<u8>> = arr
+        .iter()
+        .map(|v| {
+            let b64 = v.as_str().ok_or_else(|| EMPTY_ATTRIBUTE_VALUE.to_owned())?;
+            BASE64
+                .decode(b64)
+                .map_err(|e| format!("invalid base64: {e}"))
+        })
+        .collect::<Result<_, _>>()?;
+    if set.len() != arr.len() {
+        let values: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+        let repr = values.join(", ");
+        // The binary form names the set type, with the service's
+        // own missing space before 'of' ("...]of type BS...") --
+        // invariant across regions; the S and N set forms do not
+        // name a type.
+        return Err(format!(
+            "One or more parameter values were invalid: Input collection [{repr}]of type BS contains duplicates."
+        ));
+    }
+    Ok(AttributeValue::BS(set))
 }
 
 #[cfg(test)]
@@ -560,6 +585,116 @@ mod tests {
             msg.contains("Supplied AttributeValue is empty"),
             "expected DDB EMPTY_ATTRIBUTE_VALUE wording for empty inside L, got: {msg}"
         );
+    }
+
+    /// The text of an error inside an `L` or `M` is what
+    /// `serde_json::from_value` gave when each level re-deserialized a clone
+    /// of its subtree; the levels now consume the value instead, and these
+    /// strings (the API's error text) did not change. Checked from text and
+    /// from a `serde_json::Value`, the engine's path.
+    #[test]
+    fn nested_error_text_is_unchanged() {
+        const EXPECTING: &str =
+            "expected a DynamoDB AttributeValue map with exactly one type descriptor";
+        let cases = [
+            (
+                r#"{"L":["x"]}"#,
+                format!("invalid type: string \"x\", {EXPECTING}"),
+                " at line 1 column 11",
+            ),
+            (
+                r#"{"L":[{"L":[{"Q":1}]}]}"#,
+                "unknown AttributeValue type descriptor: Q".to_owned(),
+                " at line 1 column 23",
+            ),
+            (
+                r#"{"M":{"k":{"S":1}}}"#,
+                "S value must be a string".to_owned(),
+                " at line 1 column 19",
+            ),
+            (
+                r#"{"M":{"k":{"S":"a","N":"1"}}}"#,
+                MULTI_ATTRIBUTE_VALUE.to_owned(),
+                " at line 1 column 29",
+            ),
+            (
+                r#"{"L":[{"L":[{}]}]}"#,
+                EMPTY_ATTRIBUTE_VALUE.to_owned(),
+                " at line 1 column 18",
+            ),
+            (
+                r#"{"M":{"a":{"L":[null]}}}"#,
+                format!("invalid type: null, {EXPECTING}"),
+                " at line 1 column 24",
+            ),
+        ];
+        for (json, message, position) in cases {
+            let from_text = serde_json::from_str::<AttributeValue>(json).unwrap_err();
+            assert_eq!(
+                from_text.to_string(),
+                format!("{message}{position}"),
+                "{json}"
+            );
+            let value: serde_json::Value = serde_json::from_str(json).unwrap();
+            let from_value = serde_json::from_value::<AttributeValue>(value).unwrap_err();
+            assert_eq!(from_value.to_string(), message, "{json}");
+        }
+        // A message ending in ` at line 0 column 0` loses one such suffix
+        // per nesting level, as `serde_json::Error::custom` parses it out at
+        // each level; a nonzero position is kept. The texts are those the
+        // per-level `from_value` deserializer produced.
+        let at0 = " at line 0 column 0";
+        let unknown = "unknown AttributeValue type descriptor: X";
+        let cases = [
+            (
+                format!(r#"{{"M":{{"k":{{"X{at0}{at0}":1}}}}}}"#),
+                unknown.to_owned(),
+                " at line 1 column 57",
+            ),
+            (
+                format!(r#"{{"L":[{{"X{at0}{at0}":1}}]}}"#),
+                unknown.to_owned(),
+                " at line 1 column 53",
+            ),
+            (
+                format!(r#"{{"L":[{{"M":{{"k":{{"X{at0}{at0}{at0}":1}}}}}}]}}"#),
+                unknown.to_owned(),
+                " at line 1 column 84",
+            ),
+            (
+                format!(r#"{{"M":{{"k":{{"X{at0}":1}}}}}}"#),
+                unknown.to_owned(),
+                " at line 1 column 38",
+            ),
+            (
+                format!(r#"{{"X{at0}{at0}":1}}"#),
+                format!("{unknown}{at0}"),
+                " at line 1 column 45",
+            ),
+            // One suffix more than the levels strip: the nested level and
+            // the outer one take one each, and the third stays in the text.
+            (
+                format!(r#"{{"L":[{{"X{at0}{at0}{at0}":1}}]}}"#),
+                format!("{unknown}{at0}"),
+                " at line 1 column 72",
+            ),
+            (
+                r#"{"M":{"k":{"X at line 3 column 4":1}}}"#.to_owned(),
+                format!("{unknown} at line 3 column 4"),
+                "",
+            ),
+        ];
+        for (json, message, position) in cases {
+            let from_text = serde_json::from_str::<AttributeValue>(&json).unwrap_err();
+            assert_eq!(
+                from_text.to_string(),
+                format!("{message}{position}"),
+                "{json}"
+            );
+            let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            let from_value = serde_json::from_value::<AttributeValue>(value).unwrap_err();
+            assert_eq!(from_value.to_string(), message, "{json}");
+        }
     }
 
     #[test]

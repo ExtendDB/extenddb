@@ -17,6 +17,7 @@
 //!         version: env!("CARGO_PKG_VERSION"),
 //!         git_hash: env!("MY_GIT_HASH"),
 //!         build_time: env!("MY_BUILD_TIME"),
+//!         test_hooks_enabled: false,
 //!     })
 //! }
 //! ```
@@ -68,7 +69,7 @@ enum Command {
     Destroy(cmd_destroy::DestroyArgs),
     /// Validate a extenddb deployment
     Verify(cmd_verify::VerifyArgs),
-    /// Apply catalog schema migrations
+    /// Apply catalog schema migrations (exit 0 up to date or applied, 3 work pending without --yes)
     Migrate(cmd_migrate::MigrateArgs),
     /// Check if the extenddb server is running
     Status(cmd_status::StatusArgs),
@@ -113,7 +114,15 @@ pub fn run(build: BuildInfo) -> anyhow::Result<()> {
         }
         Command::Destroy(args) => run_interactive(cmd_destroy::run(args)),
         Command::Verify(args) => run_interactive(cmd_verify::run(args)),
-        Command::Migrate(args) => run_interactive(cmd_migrate::run(args)),
+        Command::Migrate(args) => {
+            // 0 up to date or applied; cmd_migrate::EXIT_PENDING for a preview
+            // that found work; errors exit 1 through main.
+            let code = run_interactive(cmd_migrate::run(args))?;
+            if code != 0 {
+                std::process::exit(i32::from(code));
+            }
+            Ok(())
+        }
         Command::Status(args) => {
             cmd_status::run(&args);
             Ok(())
@@ -155,6 +164,14 @@ fn print_version(build: BuildInfo) {
 
     println!("commit {}", build.git_hash);
     println!("built {}", build.build_time);
+    println!(
+        "test-hooks {}",
+        if build.test_hooks_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
 }
 
 /// Run an async subcommand with a single-threaded tokio runtime and stderr logging.
