@@ -53,7 +53,9 @@ mod tests {
 
     impl Umask {
         fn set(mask: libc::mode_t) -> Self {
-            let guard = UMASK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let guard = UMASK_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             // SAFETY: umask(2) has no preconditions and cannot fail; the lock
             // keeps the tests in this module from interleaving their changes.
             let previous = unsafe { libc::umask(mask) };
