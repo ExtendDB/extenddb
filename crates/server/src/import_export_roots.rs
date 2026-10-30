@@ -42,7 +42,11 @@ mod tests {
 
     use super::resolve_roots;
 
-    /// Serializes the tests that change the process-wide umask.
+    /// Serializes the tests that change the process-wide umask. While one of
+    /// them runs, every other test in this binary creates files under the umask
+    /// it set, so a test that checks the mode of a file it creates must hold
+    /// this lock and set its own umask. The lock and the `Umask` guard are
+    /// private to this module; make them `pub(crate)` to use them elsewhere.
     static UMASK_LOCK: Mutex<()> = Mutex::new(());
 
     /// Sets the process umask for the lifetime of the value, then restores it.
