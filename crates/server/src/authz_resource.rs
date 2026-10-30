@@ -63,6 +63,76 @@ const RESTORE_TARGET_ACTIONS: &[&str] = &[
     "BatchWriteItem",
 ];
 
+/// One (IAM action, resource) pair a request is authorized against.
+///
+/// `resource` is the canonical ARN for this deployment and is what the
+/// policies are matched against, so a Deny on the real resource matches
+/// however the caller spelled the partition, service, region or account.
+/// `supplied` is the resource as the caller wrote it, and is what a denial
+/// message names: the service echoes the caller's ARN with its partition,
+/// service and region intact (measured 2026-10-20 with TagResource on an
+/// `aws-cn` partition, an `s3` service and a `us-west-2` region). It equals
+/// `resource` when the request named the resource by a bare name or by its
+/// canonical ARN.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AuthzTarget {
+    /// The bare operation form; `check_authorization` prepends `dynamodb:`.
+    pub action: String,
+    pub resource: String,
+    pub supplied: String,
+}
+
+impl AuthzTarget {
+    /// A target named by a bare name or built by the server: the denial names
+    /// the canonical ARN.
+    pub(crate) fn new(action: &str, resource: String) -> Self {
+        Self {
+            action: action.to_owned(),
+            supplied: resource.clone(),
+            resource,
+        }
+    }
+
+    /// A target derived from request field `field`: when the field parses as
+    /// a `DynamoDB` resource ARN, the denial names it as written; otherwise
+    /// it names `resource`.
+    fn from_field(action: &str, resource: String, field: &str) -> Self {
+        let supplied = if extenddb_core::arn::parse(field).is_some() {
+            field.to_owned()
+        } else {
+            resource.clone()
+        };
+        Self {
+            action: action.to_owned(),
+            resource,
+            supplied,
+        }
+    }
+}
+
+/// Refuse a request whose resource ARN names another account.
+///
+/// Every `DynamoDB` resource ARN (`table/...`) whose account field differs
+/// from the caller's account is refused with `AccessDeniedException`
+/// "Access is denied" before the IAM decision, for every principal: the
+/// service answers an admin and a no-policy caller the same way (measured
+/// 2026-10-20, TagResource on `arn:aws:dynamodb:us-east-1:<other>:table/T`).
+/// The engine tag and backup handlers make the same check for the authorized
+/// caller; running it here first keeps a no-policy caller from receiving the
+/// long denial naming the other account's resource instead. A value that is
+/// not a `table/...` resource ARN (a bare name, a foreign-service ARN) passes
+/// to authorization unchanged.
+pub(crate) fn check_resource_account(arn: &str, account_id: &str) -> Result<(), DynamoDbError> {
+    if let Some(r) = extenddb_core::arn::parse(arn)
+        && r.account != account_id
+    {
+        return Err(DynamoDbError::AccessDeniedException(
+            "Access is denied".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// A `DynamoDB` resource identity: a table and an optional sub-resource.
 #[derive(Debug, PartialEq, Eq)]
 enum Sub {
@@ -384,6 +454,18 @@ pub(crate) fn table_resource_arn(value: &str, region: &str, account_id: &str) ->
     format!("arn:{PARTITION}:{SERVICE}:{region}:{account_id}:table/{value}")
 }
 
+/// The target for `action` on a table named by `value`, a bare name or a table
+/// ARN (a `RequestItems` key, a `TransactItems` table): the canonical table
+/// ARN for the policy match, the value as written for the denial.
+pub(crate) fn table_target(
+    action: &str,
+    value: &str,
+    region: &str,
+    account_id: &str,
+) -> AuthzTarget {
+    AuthzTarget::from_field(action, table_resource_arn(value, region, account_id), value)
+}
+
 /// Account-wide table wildcard, for operations with no specific resource.
 pub(crate) fn table_wildcard(region: &str, account_id: &str) -> String {
     format!("arn:{PARTITION}:{SERVICE}:{region}:{account_id}:table/*")
@@ -455,10 +537,9 @@ fn str_field(input: &Value, key: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-/// Derive the `(action, resource ARN)` pairs to authorize for a non-batch,
-/// non-transact `DynamoDB` operation. `action` is the bare operation form
-/// (`check_authorization` prepends `dynamodb:`). Most operations map to a
-/// single pair; multi-permission operations return more than one.
+/// Derive the [`AuthzTarget`]s to authorize for a non-batch, non-transact
+/// `DynamoDB` operation. Most operations map to a single target;
+/// multi-permission operations return more than one.
 ///
 /// This function never returns an empty list: the generic single-table path is
 /// the fallback for operations not named explicitly.
@@ -467,23 +548,28 @@ pub(crate) fn authz_targets(
     input: &Value,
     region: &str,
     account_id: &str,
-) -> Vec<(String, String)> {
-    let one = |resource: String| vec![(operation.to_owned(), resource)];
+) -> Vec<AuthzTarget> {
+    // A target built by the server (a wildcard, a table named by a bare name
+    // or a sub-resource of one): the denial names the canonical ARN.
+    let one = |resource: String| vec![AuthzTarget::new(operation, resource)];
+    // A target derived from a request field that may hold an ARN: the denial
+    // names the field as written.
+    let from =
+        |resource: String, field: &str| vec![AuthzTarget::from_field(operation, resource, field)];
+    let table_name = str_field(input, "TableName").unwrap_or_default();
 
     match operation {
         // Resource lives in ResourceArn (a table or stream ARN; a foreign ARN
         // passes the shape check and is denied by authorization).
-        "TagResource" | "UntagResource" | "ListTagsOfResource" => one(tag_resource_arn(
-            &str_field(input, "ResourceArn").unwrap_or_default(),
-            region,
-            account_id,
-        )),
+        "TagResource" | "UntagResource" | "ListTagsOfResource" => {
+            let arn = str_field(input, "ResourceArn").unwrap_or_default();
+            from(tag_resource_arn(&arn, region, account_id), &arn)
+        }
         // Resource lives in StreamArn, validated to a stream before authz.
-        "DescribeStream" | "GetShardIterator" => one(canonical_resource(
-            &str_field(input, "StreamArn").unwrap_or_default(),
-            region,
-            account_id,
-        )),
+        "DescribeStream" | "GetShardIterator" => {
+            let arn = str_field(input, "StreamArn").unwrap_or_default();
+            from(canonical_resource(&arn, region, account_id), &arn)
+        }
         // GetRecords carries only an opaque shard iterator, not the stream in a
         // body field, so it is handled in `authorize_request`: the iterator is
         // decoded for the stream ARN, and an iterator that names no stream gets
@@ -506,19 +592,15 @@ pub(crate) fn authz_targets(
             one(res)
         }
         // Resource lives in BackupArn, validated to a backup before authz.
-        "DescribeBackup" | "DeleteBackup" => one(canonical_resource(
-            &backup_arn_field(input),
-            region,
-            account_id,
-        )),
-        // Resource is the table named by TableName.
-        "CreateBackup" | "DescribeContinuousBackups" | "UpdateContinuousBackups" => {
-            one(table_resource_arn(
-                &str_field(input, "TableName").unwrap_or_default(),
-                region,
-                account_id,
-            ))
+        "DescribeBackup" | "DeleteBackup" => {
+            let arn = backup_arn_field(input);
+            from(canonical_resource(&arn, region, account_id), &arn)
         }
+        // Resource is the table named by TableName.
+        "CreateBackup" | "DescribeContinuousBackups" | "UpdateContinuousBackups" => from(
+            table_resource_arn(&table_name, region, account_id),
+            &table_name,
+        ),
         // ListBackups is scoped to a table's backups when TableName is given,
         // else to every table's backups. The service evaluates
         // table/<T>/backup/* and table/*/backup/* (measured live), the same
@@ -542,11 +624,10 @@ pub(crate) fn authz_targets(
         // does the same, measured live), and the export handler then refuses a
         // non-table ARN. Unparseable TableArns were already refused before
         // authorization by `validate_operation_arns`.
-        "ExportTableToPointInTime" => one(canonical_resource(
-            &str_field(input, "TableArn").unwrap_or_default(),
-            region,
-            account_id,
-        )),
+        "ExportTableToPointInTime" => {
+            let arn = str_field(input, "TableArn").unwrap_or_default();
+            from(canonical_resource(&arn, region, account_id), &arn)
+        }
         // Import creates a table; the resource is the new table.
         "ImportTable" => {
             let t = input
@@ -554,25 +635,16 @@ pub(crate) fn authz_targets(
                 .and_then(|p| p.get("TableName"))
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            one(table_resource_arn(t, region, account_id))
+            from(table_resource_arn(t, region, account_id), t)
         }
         // RestoreTableFromBackup requires dynamodb:RestoreTableFromBackup on the
         // source backup ARN and the item actions on the target table it writes
         // (measured live). A Deny on the backup ARN, or on any item action for
         // the target table, blocks the restore.
         "RestoreTableFromBackup" => {
-            let mut v = vec![(
-                operation.to_owned(),
-                canonical_resource(&backup_arn_field(input), region, account_id),
-            )];
-            let target = table_resource_arn(
-                &str_field(input, "TargetTableName").unwrap_or_default(),
-                region,
-                account_id,
-            );
-            for a in RESTORE_TARGET_ACTIONS {
-                v.push(((*a).to_owned(), target.clone()));
-            }
+            let arn = backup_arn_field(input);
+            let mut v = from(canonical_resource(&arn, region, account_id), &arn);
+            v.extend(restore_target_actions(input, region, account_id));
             v
         }
         // RestoreTableToPointInTime requires dynamodb:RestoreTableToPointInTime
@@ -582,30 +654,34 @@ pub(crate) fn authz_targets(
             let source = str_field(input, "SourceTableArn")
                 .or_else(|| str_field(input, "SourceTableName"))
                 .unwrap_or_default();
-            let mut v = vec![(
-                operation.to_owned(),
-                table_resource_arn(&source, region, account_id),
-            )];
-            let target = table_resource_arn(
-                &str_field(input, "TargetTableName").unwrap_or_default(),
-                region,
-                account_id,
-            );
-            for a in RESTORE_TARGET_ACTIONS {
-                v.push(((*a).to_owned(), target.clone()));
-            }
+            let mut v = from(table_resource_arn(&source, region, account_id), &source);
+            v.extend(restore_target_actions(input, region, account_id));
             v
         }
-        // Query and Scan on an index authorize the index ARN.
+        // Query and Scan on an index authorize the index ARN. With a table ARN
+        // in TableName the denial names that ARN with the index appended; any
+        // other ARN in TableName (an index ARN, a malformed resource) names
+        // the canonical index ARN, so the denial never names a resource the
+        // caller did not write.
         "Query" | "Scan" => {
-            let base = table_resource_arn(
-                &str_field(input, "TableName").unwrap_or_default(),
-                region,
-                account_id,
-            );
+            let base = table_resource_arn(&table_name, region, account_id);
             match str_field(input, "IndexName") {
-                Some(idx) if !idx.is_empty() => one(format!("{base}/index/{idx}")),
-                _ => one(base),
+                Some(idx) if !idx.is_empty() => {
+                    let resource = format!("{base}/index/{idx}");
+                    let names_a_table =
+                        extenddb_core::arn::parse(&table_name).is_some_and(|r| r.sub.is_none());
+                    let supplied = if names_a_table {
+                        format!("{table_name}/index/{idx}")
+                    } else {
+                        resource.clone()
+                    };
+                    vec![AuthzTarget {
+                        action: operation.to_owned(),
+                        resource,
+                        supplied,
+                    }]
+                }
+                _ => from(base, &table_name),
             }
         }
         // Account-level operations. ListTables is evaluated against the table
@@ -616,10 +692,25 @@ pub(crate) fn authz_targets(
         "DescribeLimits" | "DescribeEndpoints" => one("*".to_owned()),
         // Generic single-table operations keyed by TableName (name or ARN).
         _ => match str_field(input, "TableName") {
-            Some(t) => one(table_resource_arn(&t, region, account_id)),
+            Some(t) => from(table_resource_arn(&t, region, account_id), &t),
             None => one(table_wildcard(region, account_id)),
         },
     }
+}
+
+/// The item actions a restore requires on its `TargetTableName`, one target
+/// per action. The target is a new table named by a bare name, so each denial
+/// names the canonical ARN.
+fn restore_target_actions(input: &Value, region: &str, account_id: &str) -> Vec<AuthzTarget> {
+    let target = table_resource_arn(
+        &str_field(input, "TargetTableName").unwrap_or_default(),
+        region,
+        account_id,
+    );
+    RESTORE_TARGET_ACTIONS
+        .iter()
+        .map(|a| AuthzTarget::new(a, target.clone()))
+        .collect()
 }
 
 /// The bare table name from a value that may be a name or a table ARN.
@@ -664,8 +755,8 @@ mod tests {
     fn only(op: &str, input: Value) -> String {
         let t = authz_targets(op, &input, R, A);
         assert_eq!(t.len(), 1, "expected one target for {op}: {t:?}");
-        assert_eq!(t[0].0, op);
-        t[0].1.clone()
+        assert_eq!(t[0].action, op);
+        t[0].resource.clone()
     }
 
     /// The engine trims surrounding ASCII whitespace from a `BackupArn`
@@ -694,8 +785,8 @@ mod tests {
                 A,
             );
             assert_eq!(
-                restore[0],
-                ("RestoreTableFromBackup".to_owned(), arn.clone())
+                (restore[0].action.as_str(), restore[0].resource.as_str()),
+                ("RestoreTableFromBackup", arn.as_str())
             );
         }
     }
@@ -904,11 +995,14 @@ mod tests {
             R,
             A,
         );
-        assert!(rfb.contains(&("RestoreTableFromBackup".to_owned(), backup.to_owned())));
+        assert!(rfb.contains(&AuthzTarget::new(
+            "RestoreTableFromBackup",
+            backup.to_owned()
+        )));
         let target = "arn:aws:dynamodb:us-east-1:964157134968:table/restored".to_owned();
         for a in RESTORE_TARGET_ACTIONS {
             assert!(
-                rfb.contains(&((*a).to_owned(), target.clone())),
+                rfb.contains(&AuthzTarget::new(a, target.clone())),
                 "RestoreTableFromBackup missing {a} on target"
             );
         }
@@ -922,14 +1016,14 @@ mod tests {
             R,
             A,
         );
-        assert!(pitr.contains(&(
-            "RestoreTableToPointInTime".to_owned(),
+        assert!(pitr.contains(&AuthzTarget::new(
+            "RestoreTableToPointInTime",
             "arn:aws:dynamodb:us-east-1:964157134968:table/bb".to_owned()
         )));
         let ptarget = "arn:aws:dynamodb:us-east-1:964157134968:table/pitr".to_owned();
         for a in RESTORE_TARGET_ACTIONS {
             assert!(
-                pitr.contains(&((*a).to_owned(), ptarget.clone())),
+                pitr.contains(&AuthzTarget::new(a, ptarget.clone())),
                 "RestoreTableToPointInTime missing {a} on target"
             );
         }
@@ -1355,3 +1449,7 @@ mod key_lookup_name_tests {
         }
     }
 }
+
+/// The denial names the resource as the caller supplied it (issue #447).
+#[cfg(test)]
+mod supplied_resource_tests;

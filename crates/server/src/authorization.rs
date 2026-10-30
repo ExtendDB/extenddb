@@ -25,9 +25,14 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_storage::management_store::OpError;
 
 use crate::authz_cache::{CachedAuthzStore, PolicyList, TagMap};
+use crate::authz_resource::AuthzTarget;
 
 /// Evaluate whether the authenticated identity is authorized for the given
 /// `DynamoDB` operation on the given resource.
+///
+/// Policies are matched against `target.resource`, the canonical ARN for this
+/// deployment; a denial names `target.supplied`, the resource as the caller
+/// wrote it, as the service does.
 ///
 /// For `AuthIdentity::User` and `AuthIdentity::RoleSession`, the full IAM
 /// evaluation algorithm runs: explicit deny → permissions boundary → session
@@ -35,8 +40,7 @@ use crate::authz_cache::{CachedAuthzStore, PolicyList, TagMap};
 pub async fn check_authorization(
     cache: &CachedAuthzStore,
     identity: &AuthIdentity,
-    operation: &str,
-    resource_arn: &str,
+    target: &AuthzTarget,
     is_scan: bool,
     params: RequestParams,
 ) -> Result<(), DynamoDbError> {
@@ -44,18 +48,7 @@ pub async fn check_authorization(
         AuthIdentity::User {
             account_id,
             user_name,
-        } => {
-            check_user_authorization(
-                cache,
-                account_id,
-                user_name,
-                operation,
-                resource_arn,
-                is_scan,
-                params,
-            )
-            .await
-        }
+        } => check_user_authorization(cache, account_id, user_name, target, is_scan, params).await,
         AuthIdentity::RoleSession {
             account_id,
             role_name,
@@ -66,8 +59,7 @@ pub async fn check_authorization(
                 account_id,
                 role_name,
                 session_name,
-                operation,
-                resource_arn,
+                target,
                 is_scan,
                 params,
             )
@@ -80,12 +72,12 @@ async fn check_user_authorization(
     cache: &CachedAuthzStore,
     account_id: &str,
     user_name: &str,
-    operation: &str,
-    resource_arn: &str,
+    target: &AuthzTarget,
     is_scan: bool,
     params: RequestParams,
 ) -> Result<(), DynamoDbError> {
-    let action = format!("dynamodb:{operation}");
+    let action = format!("dynamodb:{}", target.action);
+    let resource_arn = target.resource.as_str();
 
     // Resource tags apply only to a table, and to an index through its base
     // table (indexes inherit the table's tags). A stream, backup or any other
@@ -170,24 +162,23 @@ async fn check_user_authorization(
         Err(DynamoDbError::AccessDeniedException(deny_message(
             &principal,
             &action,
-            resource_arn,
+            &target.supplied,
             explicit,
         )))
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn check_role_authorization(
     cache: &CachedAuthzStore,
     account_id: &str,
     role_name: &str,
     session_name: &str,
-    operation: &str,
-    resource_arn: &str,
+    target: &AuthzTarget,
     is_scan: bool,
     params: RequestParams,
 ) -> Result<(), DynamoDbError> {
-    let action = format!("dynamodb:{operation}");
+    let action = format!("dynamodb:{}", target.action);
+    let resource_arn = target.resource.as_str();
 
     // Resource tags for a table or index only (see the user path).
     let tag_arn = crate::authz_resource::resource_tag_lookup_arn(resource_arn);
@@ -268,7 +259,7 @@ async fn check_role_authorization(
         Err(DynamoDbError::AccessDeniedException(deny_message(
             &principal,
             &action,
-            resource_arn,
+            &target.supplied,
             explicit,
         )))
     }
@@ -280,7 +271,8 @@ async fn check_role_authorization(
 
 /// Build the AccessDeniedException message in the form the service uses, which
 /// depends on why the request was denied. `action` already carries the
-/// `dynamodb:` prefix. An explicit Deny statement yields "with an explicit deny
+/// `dynamodb:` prefix; `resource_arn` is the resource as the caller supplied
+/// it, partition, service and region included. An explicit Deny statement yields "with an explicit deny
 /// in an identity-based policy"; any other denial yields "because no
 /// identity-based policy allows the <action> action", measured against live
 /// DynamoDB.
@@ -473,6 +465,7 @@ mod resource_tag_tests {
     use super::{check_role_authorization, check_user_authorization, fetch_authz_resource_tags};
     use crate::authz_cache::CachedAuthzStore;
     use crate::authz_cache::tests::{CountingAuthzStore, fast_authz_cfg};
+    use crate::authz_resource::AuthzTarget;
     use extenddb_auth::policy::context::RequestParams;
     use extenddb_core::error::DynamoDbError;
     use std::sync::Arc;
@@ -516,12 +509,67 @@ mod resource_tag_tests {
             cache,
             ACCOUNT,
             "u",
-            op,
-            arn,
+            &AuthzTarget::new(op, arn.to_owned()),
             false,
             RequestParams::default(),
         )
         .await
+    }
+
+    /// The policy is matched against the canonical resource and the denial
+    /// names the resource as the caller supplied it (issue #447): a respelled
+    /// region is not allowed by the tag condition on the canonical table (the
+    /// stream carries no tags), and the message carries the respelled ARN.
+    #[tokio::test]
+    async fn denial_names_the_supplied_resource() {
+        let inner = store();
+        let cache = CachedAuthzStore::new(inner.clone(), fast_authz_cfg());
+        let supplied =
+            "arn:aws-cn:dynamodb:us-east-1:123456789012:table/t/stream/2026-10-20T16:17:40.188";
+        let target = AuthzTarget {
+            action: "DescribeStream".to_owned(),
+            resource: STREAM.to_owned(),
+            supplied: supplied.to_owned(),
+        };
+        let err = check_user_authorization(
+            &cache,
+            ACCOUNT,
+            "u",
+            &target,
+            false,
+            RequestParams::default(),
+        )
+        .await
+        .unwrap_err();
+        let DynamoDbError::AccessDeniedException(msg) = err else {
+            panic!("expected AccessDeniedException, got {err:?}");
+        };
+        assert_eq!(
+            msg,
+            format!(
+                "User: arn:aws:iam::{ACCOUNT}:user/u is not authorized to perform: \
+                 dynamodb:DescribeStream on resource: {supplied} because no \
+                 identity-based policy allows the dynamodb:DescribeStream action"
+            )
+        );
+        let err = check_role_authorization(
+            &cache,
+            ACCOUNT,
+            "r",
+            "s",
+            &target,
+            false,
+            RequestParams::default(),
+        )
+        .await
+        .unwrap_err();
+        let DynamoDbError::AccessDeniedException(msg) = err else {
+            panic!("expected AccessDeniedException, got {err:?}");
+        };
+        assert!(
+            msg.contains(&format!("on resource: {supplied} because")),
+            "{msg}"
+        );
     }
 
     #[tokio::test]
@@ -549,17 +597,17 @@ mod resource_tag_tests {
     async fn role_session_stream_and_backup_operations_read_no_resource_tags() {
         let inner = store();
         let cache = CachedAuthzStore::new(inner.clone(), fast_authz_cfg());
-        let role = |op: &'static str, arn: &'static str| {
+        let role = |op: &'static str, arn: &'static str| async {
             check_role_authorization(
                 &cache,
                 ACCOUNT,
                 "r",
                 "s",
-                op,
-                arn,
+                &AuthzTarget::new(op, arn.to_owned()),
                 false,
                 RequestParams::default(),
             )
+            .await
         };
         assert!(role("DescribeTable", TABLE).await.is_ok());
         let fetched = inner.resource_tags_calls.load(Ordering::SeqCst);
