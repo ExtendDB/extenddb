@@ -80,8 +80,8 @@ impl KeyCondition {
                 if let Some(ref_name) = name.strip_prefix('#') {
                     names.get(ref_name).map(String::as_str).ok_or_else(|| {
                         DynamoDbError::ValidationException(format!(
-                            "An expression attribute name used in the document path \
-                             is not defined; attribute name: #{ref_name}"
+                            "Invalid KeyConditionExpression: An expression attribute name used in \
+                             the document path is not defined; attribute name: #{ref_name}"
                         ))
                     })?
                 } else {
@@ -115,88 +115,258 @@ impl KeyCondition {
         Ok(())
     }
 
-    /// Reclassify conditions for multi-part key schemas.
+    /// Classify and validate the conditions of a multi-attribute key schema.
     ///
-    /// Given the full set of HASH attribute names, moves any equality conditions
-    /// on HASH attributes from `sk_condition` into `extra_pk_conditions`.
-    /// The remaining non-HASH equality or range condition stays as `sk_condition`.
+    /// A multi-attribute key schema has more than one HASH attribute, more
+    /// than one RANGE attribute, or both. `hash_attrs` and `range_attrs` are
+    /// the index's HASH and RANGE attribute names in key-schema order. The
+    /// parser cannot tell HASH from RANGE equalities, and clause order in the
+    /// expression is free, so every clause is assigned here by name.
     ///
-    /// Call this after `resolve_pk_sk()` for multi-part key queries.
+    /// The rules the service applies:
+    ///
+    /// - Each key attribute may carry one condition; a second one is refused
+    ///   as `KeyConditionExpressions must only contain one condition per key`.
+    /// - Every HASH attribute needs an equality condition. Every one without
+    ///   it is named, in key-schema order, in `HASH key attributes ... must
+    ///   have equality conditions specified in the query`.
+    /// - Conditions on RANGE attributes must cover a leading run of them in
+    ///   key-schema order. Every RANGE attribute before the last one that has
+    ///   a condition needs an equality; only that last one may use `<`, `<=`,
+    ///   `>`, `>=`, `BETWEEN` or `begins_with`. `h = :h AND b = :b` on a schema
+    ///   whose RANGE attributes are `a, b` is refused, and so is
+    ///   `h = :h AND a = :a AND b > :b AND c = :c`.
+    ///
+    /// On return the HASH conditions are in key-schema order (`pk_path` and
+    /// `extra_pk_conditions`, matching the composite partition key the write
+    /// path builds). When a RANGE attribute carries a non-equality condition,
+    /// that condition is `sk_condition` and the equalities before it are
+    /// `extra_sk_conditions`; otherwise `sk_condition` is the equality on the
+    /// first RANGE attribute and the rest follow in `extra_sk_conditions`.
+    /// Either way `extra_sk_conditions` is in key-schema order. A storage
+    /// backend maps each condition to its column by attribute name.
+    ///
+    /// Call this instead of [`KeyCondition::resolve_pk_sk`] when the key
+    /// schema is multi-attribute. A schema with one HASH and at most one
+    /// RANGE attribute is left unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ValidationException` when a `#name` reference cannot be
+    /// resolved, a HASH attribute has no equality condition, the RANGE
+    /// conditions skip an attribute or put a non-equality before the last
+    /// one, or a non-equality names a HASH attribute, or a non-key attribute
+    /// while a RANGE attribute also has a condition.
     pub fn resolve_multipart(
         &mut self,
         hash_attrs: &[&str],
+        range_attrs: &[&str],
         names: &std::collections::HashMap<String, String>,
     ) -> Result<(), DynamoDbError> {
-        if hash_attrs.len() <= 1 {
+        self.resolve_multipart_with(hash_attrs, range_attrs, names, |_, _| Ok(()))
+    }
+
+    /// [`Self::resolve_multipart`] with a check on every clause's value,
+    /// called with the clause's path and value after the structural rules
+    /// (one condition per key, condition count, HASH coverage, RANGE gap) and
+    /// before the non-key rule. That is where the service reports a value of
+    /// the wrong type (measured 2026-10-21: a wrong-typed value loses to a
+    /// duplicate, a count overflow, a missing HASH attribute and a RANGE gap,
+    /// and wins over a condition on a non-key attribute).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::resolve_multipart`], plus whatever `value_check` returns.
+    pub fn resolve_multipart_with<F>(
+        &mut self,
+        hash_attrs: &[&str],
+        range_attrs: &[&str],
+        names: &std::collections::HashMap<String, String>,
+        mut value_check: F,
+    ) -> Result<(), DynamoDbError>
+    where
+        F: FnMut(&[PathElement], &Expr) -> Result<(), DynamoDbError>,
+    {
+        if hash_attrs.len() <= 1 && range_attrs.len() <= 1 {
             return Ok(());
         }
 
-        // Collect all equality conditions (pk + extra_pk + sk if Eq)
+        // Every equality clause, whichever field the parser put it in.
         let mut all_eq: Vec<(Vec<PathElement>, Expr)> = Vec::new();
         all_eq.push((self.pk_path.clone(), self.pk_value.clone()));
         all_eq.append(&mut self.extra_pk_conditions);
+        all_eq.append(&mut self.extra_sk_conditions);
 
-        let mut sk_non_eq: Option<SortKeyCondition> = None;
-
+        // The parser allows at most one non-equality clause.
+        let mut non_eq: Option<SortKeyCondition> = None;
         if let Some(sk) = self.sk_condition.take() {
             match sk {
                 SortKeyCondition::Compare {
                     path,
                     op: CompareOp::Eq,
                     value,
-                } => {
-                    all_eq.push((path, value));
-                }
-                other => {
-                    sk_non_eq = Some(other);
-                }
+                } => all_eq.push((path, value)),
+                other => non_eq = Some(other),
             }
         }
 
-        // Classify each equality condition as HASH or RANGE.
-        // Index by position in hash_attrs so we can reorder to key schema order.
-        let mut pk_by_position: Vec<(usize, Vec<PathElement>, Expr)> = Vec::new();
-        let mut sk_eqs: Vec<(Vec<PathElement>, Expr)> = Vec::new();
-
+        let mut hash_eqs: Vec<(usize, Vec<PathElement>, Expr)> = Vec::new();
+        let mut range_eqs: Vec<(usize, Vec<PathElement>, Expr)> = Vec::new();
+        let mut other_eqs: Vec<(Vec<PathElement>, Expr)> = Vec::new();
         for (path, value) in all_eq {
             let attr_name = resolve_path_attr(&path, names)?;
-            if let Some(pos) = hash_attrs.iter().position(|a| *a == attr_name.as_str()) {
-                pk_by_position.push((pos, path, value));
+            if let Some(pos) = hash_attrs.iter().position(|a| *a == attr_name) {
+                hash_eqs.push((pos, path, value));
+            } else if let Some(pos) = range_attrs.iter().position(|a| *a == attr_name) {
+                range_eqs.push((pos, path, value));
             } else {
-                sk_eqs.push((path, value));
+                other_eqs.push((path, value));
             }
         }
 
-        // Sort PK conditions by key schema order to ensure composite PK
-        // concatenation matches the write path regardless of expression order.
-        pk_by_position.sort_by_key(|(pos, _, _)| *pos);
+        // The non-equality clause's attribute: its RANGE position when it
+        // names a RANGE attribute, its HASH position when it names a HASH
+        // attribute, neither when it names a non-key attribute.
+        let non_eq_attr = match &non_eq {
+            Some(cond) => Some(resolve_path_attr(cond.path(), names)?),
+            None => None,
+        };
+        let non_eq_pos = non_eq_attr
+            .as_deref()
+            .and_then(|a| range_attrs.iter().position(|r| *r == a));
+        let non_eq_hash_pos = non_eq_attr
+            .as_deref()
+            .and_then(|a| hash_attrs.iter().position(|h| *h == a));
 
-        // Assign first PK condition as primary, rest as extra
-        let mut pk_iter = pk_by_position
-            .into_iter()
-            .map(|(_, path, value)| (path, value));
-        if let Some((first_path, first_value)) = pk_iter.next() {
-            self.pk_path = first_path;
-            self.pk_value = first_value;
-            self.extra_pk_conditions = pk_iter.collect();
+        // One condition per key attribute. A second condition on one HASH or
+        // RANGE attribute, equality or not, is refused before any coverage
+        // check (measured on the service, 2026-10-21).
+        hash_eqs.sort_by_key(|(pos, _, _)| *pos);
+        range_eqs.sort_by_key(|(pos, _, _)| *pos);
+        let duplicated = hash_eqs.windows(2).any(|w| w[0].0 == w[1].0)
+            || range_eqs.windows(2).any(|w| w[0].0 == w[1].0)
+            || non_eq_pos.is_some_and(|p| range_eqs.iter().any(|(q, _, _)| *q == p))
+            || non_eq_hash_pos.is_some_and(|p| hash_eqs.iter().any(|(q, _, _)| *q == p));
+        if duplicated {
+            return Err(DynamoDbError::ValidationException(
+                "Invalid KeyConditionExpression: KeyConditionExpressions must only contain \
+                 one condition per key"
+                    .to_string(),
+            ));
         }
 
-        // Assign SK conditions: non-eq condition takes priority as primary SK,
-        // otherwise first equality RANGE condition is primary, rest are extra.
-        if let Some(non_eq) = sk_non_eq {
-            self.sk_condition = Some(non_eq);
-            self.extra_sk_conditions = sk_eqs;
-        } else if let Some((path, value)) = sk_eqs.first().cloned() {
+        // More conditions than key attributes (measured 2026-10-21: the count
+        // is reported ahead of which attribute is missing).
+        let condition_count =
+            hash_eqs.len() + range_eqs.len() + other_eqs.len() + usize::from(non_eq.is_some());
+        let key_attribute_count = hash_attrs.len() + range_attrs.len();
+        if condition_count > key_attribute_count {
+            return Err(DynamoDbError::ValidationException(format!(
+                "The number of query conditions ({condition_count}) exceeds the number of key \
+                 attributes defined in the schema ({key_attribute_count})"
+            )));
+        }
+
+        // Every HASH attribute needs an equality condition. On a
+        // multi-attribute key schema the service names every HASH attribute
+        // without one, in key-schema order (measured 2026-10-21); the
+        // single-attribute `Query condition missed key schema element`
+        // wording belongs to the single-attribute path in the engine.
+        let missing_hash: Vec<&str> = hash_attrs
+            .iter()
+            .enumerate()
+            .filter(|(pos, _)| !hash_eqs.iter().any(|(p, _, _)| p == pos))
+            .map(|(_, attr)| *attr)
+            .collect();
+        if !missing_hash.is_empty() {
+            return Err(DynamoDbError::ValidationException(format!(
+                "HASH key attributes {} must have equality conditions specified in the query",
+                missing_hash.join(", ")
+            )));
+        }
+
+        // RANGE conditions must cover a leading run of the RANGE attributes,
+        // with an equality on every one before the last.
+        let last_pos = range_eqs.iter().map(|(p, _, _)| *p).chain(non_eq_pos).max();
+        if let Some(last_pos) = last_pos {
+            let without_eq: Vec<&str> = range_attrs[..last_pos]
+                .iter()
+                .enumerate()
+                .filter(|(pos, _)| !range_eqs.iter().any(|(p, _, _)| p == pos))
+                .map(|(_, attr)| *attr)
+                .collect();
+            if !without_eq.is_empty() {
+                return Err(DynamoDbError::ValidationException(format!(
+                    "RANGE key attributes {} must have equality conditions specified in the \
+                     query because a condition is present on key attribute {}",
+                    without_eq.join(", "),
+                    range_attrs[last_pos]
+                )));
+            }
+        }
+
+        for (_, path, value) in hash_eqs.iter().chain(range_eqs.iter()) {
+            value_check(path, value)?;
+        }
+        for (path, value) in &other_eqs {
+            value_check(path, value)?;
+        }
+        match &non_eq {
+            Some(SortKeyCondition::Compare { path, value, .. }) => value_check(path, value)?,
+            Some(SortKeyCondition::Between { path, low, high }) => {
+                value_check(path, low)?;
+                value_check(path, high)?;
+            }
+            Some(SortKeyCondition::BeginsWith { path, prefix }) => value_check(path, prefix)?,
+            None => {}
+        }
+
+        // A condition on an attribute outside the index key schema. The
+        // service refuses it by naming the first RANGE attribute that has no
+        // condition (measured 2026-10-21: `h = :h AND z = :z` on RANGE
+        // `a, b, c, d` is `Query condition missed key schema element: a`;
+        // with `a` given, `b`). The count check above has already refused
+        // the case where every key attribute has a condition as well.
+        let non_key_non_eq = non_eq.is_some() && non_eq_pos.is_none() && non_eq_hash_pos.is_none();
+        if !other_eqs.is_empty() || non_key_non_eq {
+            let missing_range = range_attrs
+                .iter()
+                .enumerate()
+                .find(|(pos, _)| {
+                    !range_eqs.iter().any(|(p, _, _)| p == pos) && non_eq_pos != Some(*pos)
+                })
+                .map(|(_, attr)| *attr)
+                .unwrap_or(hash_attrs[0]);
+            return Err(DynamoDbError::ValidationException(format!(
+                "Query condition missed key schema element: {missing_range}"
+            )));
+        }
+
+        let mut hash_iter = hash_eqs.into_iter().map(|(_, path, value)| (path, value));
+        if let Some((first_path, first_value)) = hash_iter.next() {
+            self.pk_path = first_path;
+            self.pk_value = first_value;
+            self.extra_pk_conditions = hash_iter.collect();
+        }
+
+        let mut range_eqs: Vec<(Vec<PathElement>, Expr)> = range_eqs
+            .into_iter()
+            .map(|(_, path, value)| (path, value))
+            .collect();
+
+        if let Some(cond) = non_eq {
+            self.sk_condition = Some(cond);
+        } else if range_eqs.is_empty() {
+            self.sk_condition = None;
+        } else {
+            let (path, value) = range_eqs.remove(0);
             self.sk_condition = Some(SortKeyCondition::Compare {
                 path,
                 op: CompareOp::Eq,
                 value,
             });
-            self.extra_sk_conditions = sk_eqs.into_iter().skip(1).collect();
-        } else {
-            self.sk_condition = None;
-            self.extra_sk_conditions = Vec::new();
         }
+        self.extra_sk_conditions = range_eqs;
 
         Ok(())
     }
@@ -212,8 +382,8 @@ fn resolve_path_attr(
             if let Some(ref_name) = name.strip_prefix('#') {
                 names.get(ref_name).cloned().ok_or_else(|| {
                     DynamoDbError::ValidationException(format!(
-                        "An expression attribute name used in the document path \
-                         is not defined; attribute name: #{ref_name}"
+                        "Invalid KeyConditionExpression: An expression attribute name used in \
+                         the document path is not defined; attribute name: #{ref_name}"
                     ))
                 })
             } else {
@@ -246,6 +416,18 @@ pub enum SortKeyCondition {
         path: Vec<PathElement>,
         prefix: Expr,
     },
+}
+
+impl SortKeyCondition {
+    /// The attribute path the condition applies to.
+    #[must_use]
+    pub fn path(&self) -> &[PathElement] {
+        match self {
+            Self::Compare { path, .. }
+            | Self::Between { path, .. }
+            | Self::BeginsWith { path, .. } => path,
+        }
+    }
 }
 
 /// Parse a `KeyConditionExpression` token stream.
@@ -899,7 +1081,8 @@ mod tests {
         let tokens = tokenize("pk1 = :v1 AND pk2 = :v2 AND sk1 = :v3").unwrap();
         let mut kc = parse_key_condition(&tokens).unwrap();
         let names = HashMap::new();
-        kc.resolve_multipart(&["pk1", "pk2"], &names).unwrap();
+        kc.resolve_multipart(&["pk1", "pk2"], &["sk1"], &names)
+            .unwrap();
 
         // After resolve_multipart, pk_path + extra_pk should have pk1 and pk2
         let pk_count = 1 + kc.extra_pk_conditions.len();
@@ -913,7 +1096,8 @@ mod tests {
         let tokens = tokenize("pk1 = :v1 AND pk2 = :v2 AND sk1 > :v3").unwrap();
         let mut kc = parse_key_condition(&tokens).unwrap();
         let names = HashMap::new();
-        kc.resolve_multipart(&["pk1", "pk2"], &names).unwrap();
+        kc.resolve_multipart(&["pk1", "pk2"], &["sk1"], &names)
+            .unwrap();
 
         assert_eq!(1 + kc.extra_pk_conditions.len(), 2);
         match &kc.sk_condition {
@@ -930,7 +1114,8 @@ mod tests {
         let tokens = tokenize("pk2 = :v2 AND pk1 = :v1 AND sk = :v3").unwrap();
         let mut kc = parse_key_condition(&tokens).unwrap();
         let names = HashMap::new();
-        kc.resolve_multipart(&["pk1", "pk2"], &names).unwrap();
+        kc.resolve_multipart(&["pk1", "pk2"], &["sk"], &names)
+            .unwrap();
 
         // After resolve_multipart, pk_path should be pk1 (first in schema)
         assert_eq!(kc.pk_path, vec![PathElement::Attribute("pk1".to_owned())]);
@@ -948,7 +1133,8 @@ mod tests {
         let tokens = tokenize("pk1 = :v1 AND pk2 = :v2 AND sk1 = :v3 AND sk2 = :v4").unwrap();
         let mut kc = parse_key_condition(&tokens).unwrap();
         let names = HashMap::new();
-        kc.resolve_multipart(&["pk1", "pk2"], &names).unwrap();
+        kc.resolve_multipart(&["pk1", "pk2"], &["sk1", "sk2"], &names)
+            .unwrap();
 
         // 2 PK conditions
         assert_eq!(1 + kc.extra_pk_conditions.len(), 2);
@@ -1132,5 +1318,384 @@ mod tests {
                 "expr {expr} should be rejected"
             );
         }
+    }
+
+    /// The index key schema the single-HASH cases use: HASH `h`, then RANGE
+    /// `a`, `b`, `c`, `d`.
+    const ONE_HASH: [&str; 1] = ["h"];
+    const FOUR_RANGE: [&str; 4] = ["a", "b", "c", "d"];
+
+    /// Parse `expr` and classify it against `h` + `a, b, c, d`.
+    fn classify_one_hash(expr: &str) -> Result<KeyCondition, DynamoDbError> {
+        classify_with_names(expr, &HashMap::new())
+    }
+
+    fn classify_with_names(
+        expr: &str,
+        names: &HashMap<String, String>,
+    ) -> Result<KeyCondition, DynamoDbError> {
+        let tokens = tokenize(expr).unwrap();
+        let mut kc = parse_key_condition(&tokens).unwrap();
+        kc.resolve_multipart(&ONE_HASH, &FOUR_RANGE, names)?;
+        Ok(kc)
+    }
+
+    /// The attribute names of `extra_sk_conditions`, in order.
+    fn extra_sk_names(kc: &KeyCondition) -> Vec<String> {
+        kc.extra_sk_conditions
+            .iter()
+            .map(|(path, _)| match path.first() {
+                Some(PathElement::Attribute(name)) => name.clone(),
+                other => panic!("unexpected path {other:?}"),
+            })
+            .collect()
+    }
+
+    /// The sort-key condition's attribute and a label for its operator.
+    fn sk_shape(kc: &KeyCondition) -> Option<(String, &'static str)> {
+        let cond = kc.sk_condition.as_ref()?;
+        let name = match cond.path().first() {
+            Some(PathElement::Attribute(name)) => name.clone(),
+            other => panic!("unexpected path {other:?}"),
+        };
+        let op = match cond {
+            SortKeyCondition::Compare { op, .. } => match op {
+                CompareOp::Eq => "=",
+                CompareOp::Ne => "<>",
+                CompareOp::Lt => "<",
+                CompareOp::Le => "<=",
+                CompareOp::Gt => ">",
+                CompareOp::Ge => ">=",
+            },
+            SortKeyCondition::Between { .. } => "BETWEEN",
+            SortKeyCondition::BeginsWith { .. } => "begins_with",
+        };
+        Some((name, op))
+    }
+
+    fn assert_range_gap(expr: &str, without_eq: &str, present: &str) {
+        let err = classify_one_hash(expr).unwrap_err();
+        let want = format!(
+            "RANGE key attributes {without_eq} must have equality conditions specified in the \
+             query because a condition is present on key attribute {present}"
+        );
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg) if *msg == want),
+            "expr {expr}: got {err:?}, want {want}"
+        );
+    }
+
+    #[test]
+    fn one_hash_multi_range_hash_only_condition_is_accepted() {
+        let kc = classify_one_hash("h = :h").unwrap();
+        assert_eq!(kc.pk_path, vec![PathElement::Attribute("h".to_owned())]);
+        assert!(kc.extra_pk_conditions.is_empty());
+        assert!(kc.sk_condition.is_none());
+        assert!(kc.extra_sk_conditions.is_empty());
+    }
+
+    #[test]
+    fn one_hash_multi_range_equality_prefixes_are_accepted() {
+        // Equalities on a leading run of the RANGE attributes, up to all four.
+        for (expr, extra) in [
+            ("h = :h AND a = :a", vec![]),
+            ("h = :h AND a = :a AND b = :b", vec!["b"]),
+            ("h = :h AND a = :a AND b = :b AND c = :c", vec!["b", "c"]),
+            (
+                "h = :h AND a = :a AND b = :b AND c = :c AND d = :d",
+                vec!["b", "c", "d"],
+            ),
+        ] {
+            let kc = classify_one_hash(expr).unwrap_or_else(|e| panic!("{expr}: {e:?}"));
+            assert_eq!(
+                kc.pk_path,
+                vec![PathElement::Attribute("h".to_owned())],
+                "{expr}"
+            );
+            assert!(kc.extra_pk_conditions.is_empty(), "{expr}");
+            assert_eq!(sk_shape(&kc), Some(("a".to_owned(), "=")), "{expr}");
+            assert_eq!(extra_sk_names(&kc), extra, "{expr}");
+        }
+    }
+
+    #[test]
+    fn one_hash_multi_range_clause_order_is_free() {
+        // The defect: the first clause was taken as the partition key, so
+        // `b = :b AND h = :h AND a = :a` was refused as missing `h`.
+        for expr in [
+            "b = :b AND h = :h AND a = :a",
+            "a = :a AND b = :b AND h = :h",
+            "b = :b AND a = :a AND h = :h",
+        ] {
+            let kc = classify_one_hash(expr).unwrap_or_else(|e| panic!("{expr}: {e:?}"));
+            assert_eq!(
+                kc.pk_path,
+                vec![PathElement::Attribute("h".to_owned())],
+                "{expr}"
+            );
+            assert_eq!(sk_shape(&kc), Some(("a".to_owned(), "=")), "{expr}");
+            assert_eq!(extra_sk_names(&kc), vec!["b"], "{expr}");
+        }
+    }
+
+    #[test]
+    fn one_hash_multi_range_operator_on_the_last_given_attribute_is_accepted() {
+        for (expr, sk, extra) in [
+            ("h = :h AND a > :a", ("a", ">"), vec![]),
+            ("h = :h AND a = :a AND b < :b", ("b", "<"), vec!["a"]),
+            (
+                "h = :h AND a = :a AND b = :b AND c > :c",
+                ("c", ">"),
+                vec!["a", "b"],
+            ),
+            (
+                "h = :h AND a = :a AND begins_with(b, :b)",
+                ("b", "begins_with"),
+                vec!["a"],
+            ),
+            (
+                "h = :h AND a = :a AND b = :b AND c = :c AND begins_with(d, :d)",
+                ("d", "begins_with"),
+                vec!["a", "b", "c"],
+            ),
+            (
+                "h = :h AND a = :a AND b = :b AND c = :c AND d BETWEEN :x AND :y",
+                ("d", "BETWEEN"),
+                vec!["a", "b", "c"],
+            ),
+            (
+                "c > :c AND b = :b AND h = :h AND a = :a",
+                ("c", ">"),
+                vec!["a", "b"],
+            ),
+        ] {
+            let kc = classify_one_hash(expr).unwrap_or_else(|e| panic!("{expr}: {e:?}"));
+            assert_eq!(
+                kc.pk_path,
+                vec![PathElement::Attribute("h".to_owned())],
+                "{expr}"
+            );
+            assert_eq!(sk_shape(&kc), Some((sk.0.to_owned(), sk.1)), "{expr}");
+            assert_eq!(extra_sk_names(&kc), extra, "{expr}");
+        }
+    }
+
+    #[test]
+    fn one_hash_multi_range_gap_is_refused() {
+        // A condition on a RANGE attribute needs an equality on every RANGE
+        // attribute before it. The defect accepted `h = :h AND b = :b` and
+        // returned no items.
+        assert_range_gap("h = :h AND b = :b", "a", "b");
+        assert_range_gap("h = :h AND a = :a AND c = :c", "b", "c");
+        assert_range_gap("h = :h AND a = :a AND b = :b AND d > :d", "c", "d");
+    }
+
+    #[test]
+    fn one_hash_multi_range_operator_before_a_later_condition_is_refused() {
+        assert_range_gap("h = :h AND a = :a AND b > :b AND c = :c", "b", "c");
+        assert_range_gap("h = :h AND begins_with(a, :a) AND b = :b", "a", "b");
+    }
+
+    #[test]
+    fn one_hash_multi_range_missing_hash_is_refused() {
+        for expr in [
+            "a = :a AND b = :b AND c = :c",
+            "a = :a AND b = :b",
+            "a = :a",
+        ] {
+            let err = classify_one_hash(expr).unwrap_err();
+            assert!(
+                matches!(&err, DynamoDbError::ValidationException(msg)
+                    if msg == "HASH key attributes h must have equality conditions specified in the query"),
+                "expr {expr}: got {err:?}"
+            );
+        }
+    }
+
+    /// Classify against HASH `h1`, `h2` and RANGE `r`.
+    fn classify_two_hash(expr: &str) -> Result<KeyCondition, DynamoDbError> {
+        let tokens = tokenize(expr).unwrap();
+        let mut kc = parse_key_condition(&tokens).unwrap();
+        kc.resolve_multipart(&["h1", "h2"], &["r"], &HashMap::new())?;
+        Ok(kc)
+    }
+
+    #[test]
+    fn two_hash_missing_hash_names_every_missing_attribute() {
+        for (expr, missing) in [
+            ("h1 = :x", "h2"),
+            ("h2 = :x", "h1"),
+            ("h1 = :x AND r = :y", "h2"),
+            ("r = :y", "h1, h2"),
+            ("h1 = :x AND h2 > :y", "h2"),
+        ] {
+            let err = classify_two_hash(expr).unwrap_err();
+            let want = format!(
+                "HASH key attributes {missing} must have equality conditions specified in the query"
+            );
+            assert!(
+                matches!(&err, DynamoDbError::ValidationException(msg) if *msg == want),
+                "expr {expr}: got {err:?}"
+            );
+        }
+        assert!(classify_two_hash("h1 = :x AND h2 = :y").is_ok());
+        assert!(classify_two_hash("h1 = :x AND h2 = :y AND r > :z").is_ok());
+    }
+
+    #[test]
+    fn a_second_condition_on_one_key_attribute_is_refused() {
+        const WANT: &str = "Invalid KeyConditionExpression: KeyConditionExpressions must only \
+                            contain one condition per key";
+        for expr in [
+            "h = :x AND h = :y",
+            "h = :x AND h = :y AND a = :z",
+            "h = :x AND a = :y AND a = :z",
+            "h = :h AND a = :a AND a > :x",
+            "h = :h AND a > :x AND a = :a",
+            "h = :h AND a = :a AND b = :n AND b > :lo",
+            "h = :h AND h > :x",
+            "h = :h AND h = :y AND c = :c",
+            "a = :a AND a = :y",
+        ] {
+            let err = classify_one_hash(expr).unwrap_err();
+            assert!(
+                matches!(&err, DynamoDbError::ValidationException(msg) if msg == WANT),
+                "expr {expr}: got {err:?}"
+            );
+        }
+        for expr in [
+            "h1 = :x AND h1 = :y AND h2 = :z",
+            "h1 = :x AND h1 = :y",
+            "h1 = :x AND h2 = :n AND r = :r AND r > :y",
+            "h1 = :x AND r = :r AND r = :y",
+        ] {
+            let err = classify_two_hash(expr).unwrap_err();
+            assert!(
+                matches!(&err, DynamoDbError::ValidationException(msg) if msg == WANT),
+                "expr {expr}: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_condition_on_a_non_key_attribute_names_the_first_uncovered_range_attribute() {
+        for (expr, missing) in [
+            ("h = :h AND z = :z", "a"),
+            ("h = :h AND z = :z AND y = :y", "a"),
+            ("h = :h AND z > :z", "a"),
+            ("h = :h AND a = :a AND z = :z", "b"),
+            ("h = :h AND a = :a AND z > :z", "b"),
+            ("h = :h AND a > :a AND z = :z", "b"),
+            ("h = :h AND a = :a AND b = :b AND z > :z", "c"),
+            ("h = :h AND a = :a AND b = :b AND c = :c AND z = :z", "d"),
+        ] {
+            let err = classify_one_hash(expr).unwrap_err();
+            let want = format!("Query condition missed key schema element: {missing}");
+            assert!(
+                matches!(&err, DynamoDbError::ValidationException(msg) if *msg == want),
+                "expr {expr}: got {err:?}"
+            );
+        }
+        let err = classify_two_hash("h1 = :x AND h2 = :y AND z = :z").unwrap_err();
+        assert!(matches!(&err, DynamoDbError::ValidationException(msg)
+            if msg == "Query condition missed key schema element: r"));
+        // A gap is reported before the non-key attribute.
+        let err = classify_one_hash("h = :h AND b = :b AND z = :z").unwrap_err();
+        assert!(matches!(&err, DynamoDbError::ValidationException(msg)
+            if msg.starts_with("RANGE key attributes a must have equality conditions")));
+        // A missing HASH attribute is reported before the non-key attribute.
+        let err = classify_two_hash("h1 = :x AND z = :z").unwrap_err();
+        assert!(matches!(&err, DynamoDbError::ValidationException(msg)
+            if msg == "HASH key attributes h2 must have equality conditions specified in the query"));
+    }
+
+    #[test]
+    fn more_conditions_than_key_attributes_are_refused_by_count() {
+        for (expr, n) in [
+            (
+                "h = :h AND a = :a AND b = :b AND c = :c AND d = :d AND z = :z",
+                6,
+            ),
+            (
+                "h = :h AND a = :a AND b = :b AND c = :c AND d = :d AND z > :z",
+                6,
+            ),
+            (
+                "h = :h AND a = :a AND b = :b AND c = :c AND d = :d AND PK = :p",
+                6,
+            ),
+        ] {
+            let err = classify_one_hash(expr).unwrap_err();
+            let want = format!(
+                "The number of query conditions ({n}) exceeds the number of key attributes \
+                 defined in the schema (5)"
+            );
+            assert!(
+                matches!(&err, DynamoDbError::ValidationException(msg) if *msg == want),
+                "expr {expr}: got {err:?}"
+            );
+        }
+        let err = classify_two_hash("h1 = :x AND h2 = :y AND r = :r AND z = :z").unwrap_err();
+        assert!(matches!(&err, DynamoDbError::ValidationException(msg)
+            if msg == "The number of query conditions (4) exceeds the number of key attributes defined in the schema (3)"));
+    }
+
+    #[test]
+    fn one_hash_multi_range_resolves_name_references() {
+        let names: HashMap<String, String> = [("hh", "h"), ("aa", "a"), ("bb", "b")]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+        let kc = classify_with_names("#bb > :b AND #hh = :h AND #aa = :a", &names).unwrap();
+        assert_eq!(kc.pk_path, vec![PathElement::Attribute("#hh".to_owned())]);
+        assert_eq!(sk_shape(&kc), Some(("#bb".to_owned(), ">")));
+        assert_eq!(extra_sk_names(&kc), vec!["#aa"]);
+
+        let err = classify_with_names("#hh = :h AND #bb = :b", &names).unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg)
+                if msg.starts_with("RANGE key attributes a must have")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn one_hash_one_range_schema_is_left_unchanged() {
+        let tokens = tokenize("sk = :s AND pk = :p").unwrap();
+        let mut kc = parse_key_condition(&tokens).unwrap();
+        kc.resolve_multipart(&["pk"], &["sk"], &HashMap::new())
+            .unwrap();
+        // Still the parser's assignment; resolve_pk_sk handles this schema.
+        assert_eq!(kc.pk_path, vec![PathElement::Attribute("sk".to_owned())]);
+    }
+
+    #[test]
+    fn multi_hash_partition_key_need_not_come_first() {
+        // With two HASH attributes the first clause used to be checked as the
+        // first HASH attribute before reclassification, so this order was
+        // refused as missing `pk1`.
+        let tokens = tokenize("sk = :s AND pk1 = :a AND pk2 = :b").unwrap();
+        let mut kc = parse_key_condition(&tokens).unwrap();
+        kc.resolve_multipart(&["pk1", "pk2"], &["sk"], &HashMap::new())
+            .unwrap();
+        assert_eq!(kc.pk_path, vec![PathElement::Attribute("pk1".to_owned())]);
+        assert_eq!(
+            kc.extra_pk_conditions[0].0,
+            vec![PathElement::Attribute("pk2".to_owned())]
+        );
+        assert_eq!(sk_shape(&kc), Some(("sk".to_owned(), "=")));
+        assert!(kc.extra_sk_conditions.is_empty());
+    }
+
+    #[test]
+    fn multi_hash_multi_range_operator_after_equality_keeps_both() {
+        // The non-equality on the second RANGE attribute is the sort-key
+        // condition, and the equality on the first is carried with it.
+        let tokens = tokenize("pk1 = :a AND pk2 = :b AND s1 = :x AND s2 > :y").unwrap();
+        let mut kc = parse_key_condition(&tokens).unwrap();
+        kc.resolve_multipart(&["pk1", "pk2"], &["s1", "s2"], &HashMap::new())
+            .unwrap();
+        assert_eq!(sk_shape(&kc), Some(("s2".to_owned(), ">")));
+        assert_eq!(extra_sk_names(&kc), vec!["s1"]);
     }
 }
