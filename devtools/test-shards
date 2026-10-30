@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+"""Split the pytest suites into shards by test file, and check that the
+shards of one CI run together collected every test of the whole suite.
+
+  test-shards collect OUT -- PYTEST_ARGS...
+      Collect PYTEST_ARGS as `pytest --collect-only -q` does and write OUT
+      with one line per collected test: its file relative to the working
+      directory, a tab, and its id (that file, then the rest of the pytest
+      node id). The ids do not depend on which rootdir pytest picked, so a
+      shard's list and the whole suite's list compare line for line.
+
+  test-shards plan --shard K/N --out DIR [--backend NAME] [--config PATH]
+                   [--weights TSV] SUITE=COLLECTED...
+      Assign every file of the collected suites to one of N shards and write
+      DIR/files-SUITE.txt with the files of shard K, one per line, sorted.
+      Every shard computes the same assignment from the same collection, so
+      each file lands in exactly one shard. Files are spread by the seconds in
+      the weights file; a file missing from it counts its tests at the
+      suite's mean seconds per test. Weights only balance the shards: a wrong
+      weight makes one shard slower, it cannot drop or repeat a file.
+
+  test-shards check DIR...
+      Each DIR holds the lists written by the legs of one sharded job, one
+      subdirectory per leg (shard.txt, whole-SUITE.tsv, ran-SUITE.tsv), as
+      actions/download-artifact leaves them. Fails unless the legs are shards
+      1 to N of the same N, agree on the whole suite, and their ran lists
+      together hold every test of it exactly once.
+"""
+
+import argparse
+import contextlib
+import os
+import sys
+
+# The main suite runs under pytest-xdist; on the CI runners (4 vCPU) that is
+# two workers, so a main-suite file costs a shard about half its seconds. The
+# other suites run one file after another.
+PARALLEL_SUITES = {"main": 2}
+DEFAULT_WEIGHTS = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "test-shard-weights.tsv")
+
+
+def parse_shard(text):
+    try:
+        k, n = (int(part) for part in text.split("/"))
+    except ValueError:
+        raise SystemExit(f"test-shards: --shard must be K/N, got {text!r}")
+    if not 1 <= k <= n:
+        raise SystemExit(f"test-shards: --shard {text}: need 1 <= K <= N")
+    return k, n
+
+
+def read_tsv(path):
+    with open(path, encoding="utf-8") as f:
+        return [line.rstrip("\n").split("\t") for line in f if line.strip()]
+
+
+# --- collect ---------------------------------------------------------------
+
+def cmd_collect(out, pytest_args):
+    import pytest  # noqa: PLC0415 (only collect needs pytest)
+
+    # `python3 -m pytest` puts the working directory first on sys.path; do the
+    # same so the suites import exactly as they do when they run.
+    sys.path[0] = os.getcwd()
+    rows = []
+
+    class Recorder:
+        def pytest_collection_finish(self, session):
+            for item in session.items:
+                path = os.path.relpath(str(item.path))
+                rest = item.nodeid.partition("::")[2]
+                rows.append((path, f"{path}::{rest}" if rest else path))
+
+    # pytest prints the collected ids; keep stdout for callers that read it.
+    with contextlib.redirect_stdout(sys.stderr):
+        rc = pytest.main(["--collect-only", "-q", *pytest_args],
+                         plugins=[Recorder()])
+    # 5 is pytest's "no tests collected", which is a valid, empty selection.
+    if rc not in (0, 5):
+        print(f"test-shards: collection failed (pytest exit {int(rc)})",
+              file=sys.stderr)
+        return int(rc)
+    with open(out, "w", encoding="utf-8") as f:
+        for path, test_id in rows:
+            f.write(f"{path}\t{test_id}\n")
+    print(f"test-shards: {len(rows)} tests collected into {out}",
+          file=sys.stderr)
+    return 0
+
+
+# --- plan ------------------------------------------------------------------
+
+def load_weights(path):
+    """{(suite, file): {backend: seconds}} from the weights file."""
+    columns, weights = [], {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if line.startswith("# suite\t"):
+                columns = line[2:].split("\t")[2:]
+            if not line or line.startswith("#"):
+                continue
+            suite, unit, *secs = line.split("\t")
+            weights[(suite, unit)] = {
+                b: float(s) for b, s in zip(columns, secs) if s != "-"}
+    return columns, weights
+
+
+def config_backend(path):
+    """The [storage] backend a config file names, or None."""
+    try:
+        import tomllib  # noqa: PLC0415 (Python 3.11+)
+        with open(path, "rb") as f:
+            return tomllib.load(f).get("storage", {}).get("backend")
+    except (ImportError, OSError, ValueError):
+        return None
+
+
+def assign(units, n):
+    """Longest weight first, each to the least loaded shard; ties go to the
+    lower shard number, so every caller gets the same answer."""
+    loads = [0.0] * n
+    shards = [[] for _ in range(n)]
+    for unit in sorted(units, key=lambda u: (-u[2], u[0], u[1])):
+        i = loads.index(min(loads))
+        shards[i].append(unit)
+        loads[i] += unit[2]
+    return shards, loads
+
+
+def cmd_plan(args):
+    k, n = parse_shard(args.shard)
+    backend = (config_backend(args.config) if args.config else None) \
+        or args.backend
+    columns, weights = load_weights(args.weights)
+    column = backend if backend in columns else (columns[0] if columns else None)
+
+    suites = []
+    for spec in args.collected:
+        suite, sep, path = spec.partition("=")
+        if not sep:
+            raise SystemExit(f"test-shards: expected SUITE=FILE, got {spec!r}")
+        counts = {}
+        for row in read_tsv(path):
+            counts[row[0]] = counts.get(row[0], 0) + 1
+        suites.append((suite, counts))
+
+    units = []
+    for suite, counts in suites:
+        known = {f: weights[(suite, f)][column] for f in counts
+                 if column in weights.get((suite, f), {})}
+        known_tests = sum(counts[f] for f in known)
+        rate = sum(known.values()) / known_tests if known_tests else 1.0
+        divisor = PARALLEL_SUITES.get(suite, 1)
+        for f, count in counts.items():
+            secs = known.get(f, count * rate)
+            units.append((suite, f, secs / divisor))
+
+    shards, loads = assign(units, n)
+    os.makedirs(args.out, exist_ok=True)
+    for suite, _ in suites:
+        files = sorted(u[1] for u in shards[k - 1] if u[0] == suite)
+        with open(os.path.join(args.out, f"files-{suite}.txt"), "w",
+                  encoding="utf-8") as f:
+            f.writelines(f"{name}\n" for name in files)
+    print(f"test-shards: {len(units)} files, weights column {column}")
+    for i, (shard, load) in enumerate(zip(shards, loads), start=1):
+        per_suite = ", ".join(
+            f"{suite} {sum(1 for u in shard if u[0] == suite)}"
+            for suite, _ in suites)
+        mark = "  <- this shard" if i == k else ""
+        print(f"  shard {i}/{n}: {load / 60:5.1f} min modelled ({per_suite})"
+              f"{mark}")
+    return 0
+
+
+# --- check -----------------------------------------------------------------
+
+def read_ids(path):
+    return [row[1] if len(row) > 1 else row[0] for row in read_tsv(path)]
+
+
+def check_group(group):
+    """Problems found in one sharded job's lists; prints its summary."""
+    legs = sorted(root for root, _, files in os.walk(group)
+                  if "shard.txt" in files)
+    if not legs:
+        return [f"{group}: no shard lists found (did every leg upload?)"]
+    problems, shards = [], {}
+    for leg in legs:
+        with open(os.path.join(leg, "shard.txt"), encoding="utf-8") as f:
+            k, n = parse_shard(f.read().strip())
+        if k in shards:
+            problems.append(f"{group}: shard {k} appears twice "
+                            f"({shards[k][0]} and {leg})")
+        shards[k] = (leg, n)
+    totals = {n for _, n in shards.values()}
+    if len(totals) != 1:
+        return problems + [f"{group}: legs disagree on N: {sorted(totals)}"]
+    n = totals.pop()
+    missing = sorted(set(range(1, n + 1)) - set(shards))
+    if missing:
+        problems.append(f"{group}: no lists from shard(s) {missing} of {n}")
+
+    suites = sorted({name[len("whole-"):-len(".tsv")]
+                     for leg, _ in shards.values() for name in os.listdir(leg)
+                     if name.startswith("whole-") and name.endswith(".tsv")})
+    if not suites:
+        problems.append(f"{group}: no whole-suite lists found")
+    for suite in suites:
+        whole, ran = None, {}
+        for k, (leg, _) in sorted(shards.items()):
+            whole_path = os.path.join(leg, f"whole-{suite}.tsv")
+            ran_path = os.path.join(leg, f"ran-{suite}.tsv")
+            if not os.path.exists(whole_path) or not os.path.exists(ran_path):
+                problems.append(f"{group}: shard {k} has no {suite} lists")
+                continue
+            ids = sorted(read_ids(whole_path))
+            if whole is None:
+                whole = ids
+            elif ids != whole:
+                problems.append(f"{group}: shard {k} collected a different "
+                                f"whole {suite} suite ({len(ids)} tests, "
+                                f"others {len(whole)})")
+            ran[k] = read_ids(ran_path)
+        if whole is None:
+            continue
+        seen = {}
+        for k, ids in ran.items():
+            for test_id in ids:
+                seen.setdefault(test_id, []).append(k)
+        repeated = sorted(t for t, ks in seen.items() if len(ks) > 1)
+        absent = sorted(set(whole) - set(seen))
+        extra = sorted(set(seen) - set(whole))
+        counts = " + ".join(str(len(ran.get(k, []))) for k in range(1, n + 1))
+        total = sum(len(ids) for ids in ran.values())
+        ok = bool(whole) and not (repeated or absent or extra)
+        print(f"{group} {suite}: whole {len(whole)}, shards {counts} = "
+              f"{total} {'OK' if ok else 'MISMATCH'}")
+        if not whole:
+            problems.append(f"{group}: the whole {suite} suite is empty")
+        for label, ids in (("not run by any shard", absent),
+                           ("run by more than one shard", repeated),
+                           ("not in the whole suite", extra)):
+            if ids:
+                problems.append(f"{group} {suite}: {len(ids)} test(s) {label}"
+                                f", first: {ids[0]}")
+    return problems
+
+
+def cmd_check(groups):
+    problems = [p for group in groups for p in check_group(group)]
+    for problem in problems:
+        print(f"error: {problem}", file=sys.stderr)
+    return 1 if problems else 0
+
+
+def main(argv):
+    if len(argv) > 1 and argv[1] == "collect":
+        if len(argv) < 4 or argv[3] != "--":
+            raise SystemExit("usage: test-shards collect OUT -- PYTEST_ARGS...")
+        return cmd_collect(argv[2], argv[4:])
+    parser = argparse.ArgumentParser(prog="test-shards")
+    sub = parser.add_subparsers(dest="command", required=True)
+    plan = sub.add_parser("plan")
+    plan.add_argument("--shard", required=True)
+    plan.add_argument("--out", required=True)
+    plan.add_argument("--backend", default="postgres")
+    plan.add_argument("--config")
+    plan.add_argument("--weights", default=DEFAULT_WEIGHTS)
+    plan.add_argument("collected", nargs="+", metavar="SUITE=COLLECTED")
+    check = sub.add_parser("check")
+    check.add_argument("groups", nargs="+", metavar="DIR")
+    args = parser.parse_args(argv[1:])
+    if args.command == "plan":
+        return cmd_plan(args)
+    return cmd_check(args.groups)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
