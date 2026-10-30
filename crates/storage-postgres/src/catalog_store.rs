@@ -198,9 +198,10 @@ impl extenddb_storage::diagnostics::DiagnosticsStore for PostgresCatalogStore {
     fn check_storage_relations(&self) -> BoxFuture<'_, DiagResult<StorageRelationCheck>> {
         Box::pin(async move {
             let data = data_pool(&self.pool).await?;
-            crate::data::catalog_check::check(&self.pool, &data)
+            let budget = crate::data::catalog_check::INDEX_LOCK_BUDGET;
+            crate::data::catalog_check::check(&self.pool, &data, budget)
                 .await
-                .map_err(|e| DiagError::QueryFailed(e.to_string()))
+                .map_err(|e| catalog_check_error(&e, budget, "the check did not finish"))
         })
     }
 
@@ -210,41 +211,57 @@ impl extenddb_storage::diagnostics::DiagnosticsStore for PostgresCatalogStore {
     ) -> BoxFuture<'_, DiagResult<Vec<(String, OrphanDrop)>>> {
         Box::pin(async move {
             let data = data_pool(&self.pool).await?;
-            let budget = crate::data::catalog_check::FIX_LOCK_BUDGET;
+            let budget = crate::data::catalog_check::INDEX_LOCK_BUDGET;
             crate::data::catalog_check::drop_orphaned(&self.pool, &data, orphaned, budget)
                 .await
-                .map_err(|e| {
-                    if crate::data::lock_wait_failed(&e) {
-                        DiagError::QueryFailed(format!(
-                            "table or index changes in progress kept the catalog locked for \
-                             more than {} seconds, so nothing was dropped; run the command \
-                             again: {e}",
-                            budget.as_secs()
-                        ))
-                    } else {
-                        DiagError::QueryFailed(e.to_string())
-                    }
-                })
+                .map_err(|e| catalog_check_error(&e, budget, "nothing was dropped"))
         })
     }
 }
 
-/// The pool that holds the data relations, chosen the way the engine chooses
-/// it: the data database when the catalog names one, else the catalog itself.
+/// The error `catalog-check` reports when its catalog work fails. A lock wait
+/// that ran out its budget says so, with `outcome`, the effect on this run.
+fn catalog_check_error(e: &sqlx::Error, budget: std::time::Duration, outcome: &str) -> DiagError {
+    if crate::data::lock_wait_failed(e) {
+        DiagError::QueryFailed(format!(
+            "index changes in progress kept the index catalog locked for more than {} \
+             seconds, so {outcome}; run the command again: {e}",
+            budget.as_secs()
+        ))
+    } else {
+        DiagError::QueryFailed(e.to_string())
+    }
+}
+
+/// The pool that holds the data relations: the data database the catalog
+/// names, as `extenddb init` records it.
+///
+/// A catalog without the setting, or with an empty one, is refused: the data
+/// relations could then only be looked for in the catalog's own database, a
+/// layout `init` does not create, where another deployment's relations can
+/// sit unnamed by this catalog.
+///
+/// Statement logging is off, so a drop that waits out its lock timeout does
+/// not print a slow-statement line in the middle of the command's report.
 async fn data_pool(catalog: &PgPool) -> DiagResult<PgPool> {
     let conn: Option<(String,)> =
         sqlx::query_as("SELECT value FROM settings WHERE key = 'data_database_connection_string'")
             .fetch_optional(catalog)
             .await
             .map_err(|e| DiagError::QueryFailed(e.to_string()))?;
-    match conn {
-        Some((conn,)) if !conn.is_empty() => sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
-            .connect(&conn)
-            .await
-            .map_err(|e| DiagError::ConnectionFailed(e.to_string())),
-        _ => Ok(catalog.clone()),
-    }
+    let Some((conn,)) = conn.filter(|(conn,)| !conn.is_empty()) else {
+        return Err(DiagError::NotConfigured(
+            "No data database connection string in settings. Run `extenddb init`.".to_owned(),
+        ));
+    };
+    let options = conn
+        .parse::<sqlx::postgres::PgConnectOptions>()
+        .map_err(|e| DiagError::ConnectionFailed(e.to_string()))?;
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(sqlx::ConnectOptions::disable_statement_logging(options))
+        .await
+        .map_err(|e| DiagError::ConnectionFailed(e.to_string()))
 }
 
 // ── MetricsStore ───────────────────────────────────────────────────────

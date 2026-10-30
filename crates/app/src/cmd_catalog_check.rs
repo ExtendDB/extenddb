@@ -18,7 +18,7 @@ use clap::Args;
 use sqlx::postgres::PgPoolOptions;
 
 use extenddb_config as config;
-use extenddb_storage::diagnostics::OrphanDrop;
+use extenddb_storage::diagnostics::{DiagError, OrphanDrop};
 
 #[derive(Args)]
 pub struct CatalogCheckArgs {
@@ -71,8 +71,8 @@ pub async fn run(args: CatalogCheckArgs) -> anyhow::Result<()> {
     println!("Connected to catalog.");
 
     // The backend's own view of its data relations. It connects to the data
-    // database the catalog names, or to the catalog's database when the
-    // deployment keeps data and catalog together.
+    // database the catalog names, and refuses a catalog that names none, as
+    // this command always has.
     let diag_store = extenddb_storage::diagnostics_store::create_diagnostics_store(
         app_config.storage.connection_config(),
     )
@@ -81,7 +81,10 @@ pub async fn run(args: CatalogCheckArgs) -> anyhow::Result<()> {
     let relations = diag_store
         .check_storage_relations()
         .await
-        .map_err(|e| anyhow::anyhow!("Cannot compare data relations with the catalog: {e}"))?;
+        .map_err(|e| match e {
+            DiagError::NotConfigured(msg) => anyhow::anyhow!("{msg}"),
+            e => anyhow::anyhow!("Cannot compare data relations with the catalog: {e}"),
+        })?;
     println!("Compared data relations with the catalog.");
     println!();
 
@@ -98,8 +101,9 @@ pub async fn run(args: CatalogCheckArgs) -> anyhow::Result<()> {
 
         if args.fix {
             println!("  Cleaning up orphaned tables...");
-            // The backend checks each relation against the catalog again,
-            // with catalog changes held off, before it drops the relation.
+            // The backend waits for the index changes in flight, checks each
+            // relation against the catalog again, and drops each one that no
+            // row names with a short lock wait of its own.
             match diag_store
                 .drop_orphaned_relations(relations.orphaned.clone())
                 .await
@@ -108,6 +112,9 @@ pub async fn run(args: CatalogCheckArgs) -> anyhow::Result<()> {
                     for (name, outcome) in &outcomes {
                         match outcome {
                             OrphanDrop::Dropped => println!("    Dropped: {name}"),
+                            OrphanDrop::AlreadyGone => println!(
+                                "    Already gone: {name} (another session dropped it first)"
+                            ),
                             OrphanDrop::Kept(reason) => println!("    Kept: {name} ({reason})"),
                             OrphanDrop::Failed(e) => println!("    FAILED to drop {name}: {e}"),
                         }

@@ -44,6 +44,13 @@ pub use catalog_store::PostgresCatalogStore;
 pub use config::PostgresStorageConfig;
 pub use config::parse_connection_string;
 pub use credential_store::DbCredentialStore;
+/// Hold a `catalog-check` comparison between its first catalog read and its
+/// second listing of the data relations.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use data::catalog_check::test_pause::{
+    CatalogCheckPause, CatalogCheckPoint, arm_catalog_check_pause,
+};
 /// Finish GSI builds left `CREATING`, once. The server runs it from a background
 /// worker; exported for its test.
 pub use data::gsi_build::reconcile_creating_gsis;

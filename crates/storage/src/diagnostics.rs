@@ -15,6 +15,9 @@ pub enum DiagError {
     QueryFailed(String),
     /// The installed backend does not implement the operation.
     Unsupported(String),
+    /// The deployment lacks configuration the operation needs; the message
+    /// says what to run.
+    NotConfigured(String),
 }
 
 impl std::fmt::Display for DiagError {
@@ -23,6 +26,7 @@ impl std::fmt::Display for DiagError {
             Self::ConnectionFailed(msg) => write!(f, "Connection failed: {msg}"),
             Self::QueryFailed(msg) => write!(f, "Query failed: {msg}"),
             Self::Unsupported(msg) => write!(f, "Not supported: {msg}"),
+            Self::NotConfigured(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -52,11 +56,14 @@ pub struct StorageRelationCheck {
 /// What [`DiagnosticsStore::drop_orphaned_relations`] did with one relation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OrphanDrop {
-    /// The relation is gone: it was dropped here, or it had been dropped already.
+    /// The relation was dropped here.
     Dropped,
+    /// The relation no longer existed when the drop ran: another session, for
+    /// example a server's `DeleteTable`, had dropped it first.
+    AlreadyGone,
     /// The relation was kept, for the reason given.
     Kept(String),
-    /// The drop failed with the error given.
+    /// The drop failed with the error given, and the relation is still there.
     Failed(String),
 }
 
@@ -86,8 +93,8 @@ pub trait DiagnosticsStore: Send + Sync {
     ///
     /// A relation is orphaned when no catalog row names it, whatever the row's
     /// status. A relation is missing when a catalog row names it, neither the
-    /// row nor its table is being deleted, and the data database does not have
-    /// the relation.
+    /// row nor its table is being created or deleted, and the data database
+    /// does not have the relation.
     ///
     /// The default reports that the backend does not implement the check.
     fn check_storage_relations(&self) -> BoxFuture<'_, DiagResult<StorageRelationCheck>> {
@@ -97,10 +104,11 @@ pub trait DiagnosticsStore: Send + Sync {
     /// Drop relations that [`Self::check_storage_relations`] reported as
     /// orphaned, for `extenddb catalog-check --fix`.
     ///
-    /// The backend checks each relation against the catalog again before it
-    /// drops it, with catalog changes held off, and keeps any relation a
-    /// catalog row names by then. Returns one outcome per relation, in the
-    /// order given.
+    /// The backend waits for the catalog changes in flight that could name a
+    /// relation, checks each relation against the catalog again, and keeps
+    /// any relation a catalog row names by then. Each drop waits for its own
+    /// lock for a short time only and is reported failed when it cannot get
+    /// it. Returns one outcome per relation, in the order given.
     ///
     /// The default reports that the backend does not implement the drop.
     fn drop_orphaned_relations(
