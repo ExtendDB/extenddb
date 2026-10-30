@@ -146,46 +146,66 @@ impl SilencingProxy {
         self.silent.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// A session to the test node that sends every request through the
-    /// proxy. The driver reads the other nodes of a cluster from
-    /// `system.peers` and connects to them directly, so on two nodes the
-    /// second one would answer while the proxy is silent; this session
-    /// leaves every node but the proxy out of its query plans.
+    /// A session to the test node whose requests all go through the proxy.
+    /// On two nodes a session from `session()` would also send them straight
+    /// to the second node, which answers while the proxy is silent.
     pub async fn session(&self) -> Arc<CassandraSession> {
-        use cdrs_tokio::authenticators::StaticPasswordAuthenticatorProvider;
-        use cdrs_tokio::cluster::session::{SessionBuilder, TcpSessionBuilder};
-        use cdrs_tokio::cluster::topology::NodeDistance;
-        use cdrs_tokio::cluster::{NodeInfo, NodeTcpConfigBuilder};
-        use cdrs_tokio::load_balancing::RoundRobinLoadBalancingStrategy;
-        use cdrs_tokio::load_balancing::node_distance_evaluator::NodeDistanceEvaluator;
-
-        struct OnlyThrough(std::net::SocketAddr);
-
-        impl NodeDistanceEvaluator for OnlyThrough {
-            fn compute_distance(&self, node: &NodeInfo) -> Option<NodeDistance> {
-                (node.broadcast_rpc_address == self.0).then_some(NodeDistance::Local)
-            }
-        }
-
-        let config = helpers::test_config();
-        let proxy = self.address.parse().expect("the proxy's address");
-        let nodes = NodeTcpConfigBuilder::new()
-            .with_contact_point(self.address.clone().into())
-            .with_authenticator_provider(Arc::new(StaticPasswordAuthenticatorProvider::new(
-                config.username.unwrap_or_default(),
-                config.password.unwrap_or_default(),
-            )))
-            .build()
-            .await
-            .expect("the proxy's node config");
-        Arc::new(
-            TcpSessionBuilder::new(RoundRobinLoadBalancingStrategy::new(), nodes)
-                .with_node_distance_evaluator(Box::new(OnlyThrough(proxy)))
-                .build()
-                .await
-                .expect("connect through the proxy"),
-        )
+        pinned_session(&self.address).await
     }
+}
+
+/// A session whose requests all go to the node reached at `contact_point`.
+/// The driver reads the other nodes of a cluster from `system.peers_v2`
+/// (`system.peers` before Cassandra 4.0) and sends requests to every node in
+/// turn; this session leaves every node but that one out of its query plans.
+/// The schema agreement wait still asks every node for its version, on a
+/// connection to each. Like `CassandraEngine::create_session`, it logs in
+/// with the test credentials when both are set and gives up on the connect
+/// after 10 s.
+// tests/migrations_stopped.rs compiles this module too and uses no pinned
+// session.
+#[allow(dead_code)]
+pub async fn pinned_session(contact_point: &str) -> Arc<CassandraSession> {
+    use cdrs_tokio::authenticators::{
+        NoneAuthenticatorProvider, StaticPasswordAuthenticatorProvider,
+    };
+    use cdrs_tokio::cluster::session::{SessionBuilder, TcpSessionBuilder};
+    use cdrs_tokio::cluster::topology::NodeDistance;
+    use cdrs_tokio::cluster::{NodeInfo, NodeTcpConfigBuilder};
+    use cdrs_tokio::load_balancing::RoundRobinLoadBalancingStrategy;
+    use cdrs_tokio::load_balancing::node_distance_evaluator::NodeDistanceEvaluator;
+
+    struct OnlyThrough(std::net::SocketAddr);
+
+    impl NodeDistanceEvaluator for OnlyThrough {
+        fn compute_distance(&self, node: &NodeInfo) -> Option<NodeDistance> {
+            (node.broadcast_rpc_address == self.0).then_some(NodeDistance::Local)
+        }
+    }
+
+    let config = helpers::test_config();
+    let address = contact_point
+        .parse()
+        .unwrap_or_else(|e| panic!("contact point {contact_point}: {e}"));
+    let nodes = NodeTcpConfigBuilder::new().with_contact_point(contact_point.to_owned().into());
+    let nodes = if let (Some(username), Some(password)) = (&config.username, &config.password) {
+        nodes.with_authenticator_provider(Arc::new(StaticPasswordAuthenticatorProvider::new(
+            username, password,
+        )))
+    } else {
+        nodes.with_authenticator_provider(Arc::new(NoneAuthenticatorProvider))
+    };
+    let nodes = nodes.build().await.expect("the node config");
+    let session = tokio::time::timeout(
+        Duration::from_secs(10),
+        TcpSessionBuilder::new(RoundRobinLoadBalancingStrategy::new(), nodes)
+            .with_node_distance_evaluator(Box::new(OnlyThrough(address)))
+            .build(),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("no session to {contact_point} within 10 s"))
+    .unwrap_or_else(|e| panic!("connect to {contact_point}: {e}"));
+    Arc::new(session)
 }
 
 impl Drop for SilencingProxy {

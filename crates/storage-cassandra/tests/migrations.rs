@@ -27,12 +27,11 @@ use extenddb_storage::migrations::{
 };
 use extenddb_storage_cassandra::CassandraCatalogStore;
 use extenddb_storage_cassandra::cassandra_util::CassandraSession;
-use extenddb_storage_cassandra::engine::CassandraEngine;
 use extenddb_storage_cassandra::migrations::{
     CassandraCatalogMigrations, catalog_status, migrate_account, migrate_catalog_keyspace,
     postcheck, run_baseline_unrecorded,
 };
-use migrations_support::{TIMEOUT, cql, keyspace, new_prefix, session};
+use migrations_support::{TIMEOUT, cql, keyspace, new_prefix, pinned_session, session};
 
 /// A catalog keyspace at migration 4 and one account keyspace.
 async fn deployment(session: &Arc<CassandraSession>, prefix: &str) -> String {
@@ -66,20 +65,16 @@ fn target_of(prefix: &str) -> Target {
     ))
 }
 
-/// A session through the node `EXTENDDB_TEST_CASSANDRA_SECOND_CONTACT_POINT`
-/// names, the second node of a two-node cluster, so two migrators reach the
-/// catalog through different coordinators; through the test node when it is
-/// not set.
-async fn second_session() -> Arc<CassandraSession> {
-    let mut config = helpers::test_config();
-    if let Ok(second) = std::env::var("EXTENDDB_TEST_CASSANDRA_SECOND_CONTACT_POINT") {
-        config.contact_points = vec![second];
-    }
-    Arc::new(
-        CassandraEngine::create_session(&config)
-            .await
-            .expect("connect to the second node"),
-    )
+/// Two sessions for two migrators, each sending all its requests to one
+/// node: the test node, and the node `EXTENDDB_TEST_CASSANDRA_SECOND_CONTACT_POINT`
+/// names, the second node of a two-node cluster, so the two migrators reach
+/// the catalog through different coordinators. Both go to the test node
+/// when it is not set.
+async fn migrator_sessions() -> (Arc<CassandraSession>, Arc<CassandraSession>) {
+    let first = helpers::test_contact_point();
+    let second = std::env::var("EXTENDDB_TEST_CASSANDRA_SECOND_CONTACT_POINT")
+        .unwrap_or_else(|_| first.clone());
+    (pinned_session(&first).await, pinned_session(&second).await)
 }
 
 #[tokio::test]
@@ -88,7 +83,7 @@ async fn two_migrators_started_together_apply_a_legacy_catalog_once() {
         return;
     }
     let session = session().await;
-    let second = second_session().await;
+    let (first_node, second_node) = migrator_sessions().await;
     let (prefix, _drops) = new_prefix("race");
     let catalog = format!("{prefix}_catalog");
     keyspace(&session, &catalog).await;
@@ -101,8 +96,8 @@ async fn two_migrators_started_together_apply_a_legacy_catalog_once() {
     )
     .await;
     let (first, other) = tokio::join!(
-        migrate_catalog_keyspace(session.clone(), &prefix, "test", TIMEOUT),
-        migrate_catalog_keyspace(second.clone(), &prefix, "test", TIMEOUT),
+        migrate_catalog_keyspace(first_node.clone(), &prefix, "test", TIMEOUT),
+        migrate_catalog_keyspace(second_node.clone(), &prefix, "test", TIMEOUT),
     );
     let applied = [
         first.expect("the first migrator").applied.len(),
@@ -113,7 +108,7 @@ async fn two_migrators_started_together_apply_a_legacy_catalog_once() {
         "one migrator applies and the other finds nothing to do: {applied:?}"
     );
     assert_eq!(
-        catalog_status(second.clone(), &prefix)
+        catalog_status(second_node.clone(), &prefix)
             .await
             .expect("status"),
         CatalogStatus::Current { version: 4 }

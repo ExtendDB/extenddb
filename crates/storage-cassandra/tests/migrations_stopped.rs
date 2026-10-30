@@ -131,8 +131,9 @@ async fn add_tagged_users(store: &CassandraCatalogStore, prefix: &str, count: us
     use futures::StreamExt;
     let tagged: serde_json::Value = serde_json::from_str(TAGGED).expect("json");
     let insert = format!(
-        "INSERT INTO {prefix}_catalog.iam_users (account_id, user_name, user_arn, created_at) \
-         VALUES (?, ?, ?, toTimestamp(now()))"
+        "INSERT INTO {prefix}_catalog.iam_users \
+         (account_id, user_name, user_arn, password_hash, created_at) \
+         VALUES (?, ?, ?, ?, toTimestamp(now()))"
     );
     futures::stream::iter(0..count)
         .map(|i| {
@@ -145,7 +146,12 @@ async fn add_tagged_users(store: &CassandraCatalogStore, prefix: &str, count: us
                     .session()
                     .query_with_values(
                         insert,
-                        cdrs_tokio::query_values!(ACCOUNT, name.as_str(), arn.as_str()),
+                        cdrs_tokio::query_values!(
+                            ACCOUNT,
+                            name.as_str(),
+                            arn.as_str(),
+                            None::<&str>
+                        ),
                     )
                     .await
                     .unwrap_or_else(|e| panic!("user {name}: {e}"));
