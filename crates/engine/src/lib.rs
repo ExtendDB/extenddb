@@ -27,6 +27,8 @@ mod legacy_filter;
 mod list_tables;
 mod put_item;
 mod query;
+#[cfg(test)]
+mod query_key_size_tests;
 mod read_helpers;
 mod request_limits;
 mod scan;
