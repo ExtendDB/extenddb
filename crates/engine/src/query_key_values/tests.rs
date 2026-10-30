@@ -562,18 +562,28 @@ fn a_shape_fault_in_another_field_is_reported_ahead_of_the_checks() {
         Some(LIMIT_BELOW_ONE)
     );
 
-    // Neither does an unknown type descriptor, which the deserializer reports
-    // as a SerializationException: the service answers the Limit
-    // ValidationException (measured 2026-10-25), in its older
-    // `Value '0' at 'limit'` form; ExtendDB answers its usual Limit text.
-    let unknown_type = serde_json::json!({
-        "TableName": "t", "KeyConditionExpression": "pk = :p",
-        "Limit": 0, "ExpressionAttributeValues": {":p": {"S": "x"}, ":a": {"X": "1"}},
-    });
-    assert_eq!(
-        message(validate_query_request_body(&unknown_type)).as_deref(),
-        Some(LIMIT_BELOW_ONE)
-    );
+    // Neither does an entry the service cannot read as one AttributeValue (an
+    // unknown type descriptor, which the deserializer reports as a
+    // SerializationException, an empty one or one with two descriptors): the
+    // service answers the Limit ValidationException in its older form, with
+    // the value echoed (measured 2026-10-25 12:56 UTC).
+    for entry in [
+        serde_json::json!({"X": "1"}),
+        serde_json::json!({}),
+        serde_json::json!({"S": "x", "N": "1"}),
+    ] {
+        let unreadable = serde_json::json!({
+            "TableName": "t", "KeyConditionExpression": "pk = :p",
+            "Limit": 0, "ExpressionAttributeValues": {":p": {"S": "x"}, ":a": entry},
+        });
+        assert_eq!(
+            message(validate_query_request_body(&unreadable)).as_deref(),
+            Some(
+                "1 validation error detected: Value '0' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"
+            ),
+            "{unreadable}"
+        );
+    }
 
     // A body that passes every check is left to the handler's deserializer.
     let shape_fault_only = serde_json::json!({

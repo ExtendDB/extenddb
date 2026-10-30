@@ -119,6 +119,16 @@ fn query_request_checks(body: &Value) -> Result<(), DynamoDbError> {
     if let Some(limit) = body.get("Limit").and_then(Value::as_i64)
         && limit < 1
     {
+        // Beside an ExpressionAttributeValues entry that is not one
+        // AttributeValue the service answers its older form, with the value
+        // echoed (measured 2026-10-25 12:56 UTC on Query and Scan).
+        if has_unreadable_attribute_value(body) {
+            return Err(DynamoDbError::ValidationException(format!(
+                "1 validation error detected: Value '{}' at 'limit' failed to satisfy constraint: \
+                 Member must have value greater than or equal to 1",
+                limit.clamp(i64::from(i32::MIN), i64::from(i32::MAX))
+            )));
+        }
         return Err(DynamoDbError::ValidationException(
             LIMIT_BELOW_ONE.to_owned(),
         ));
@@ -192,6 +202,31 @@ pub(crate) fn non_empty(body: &Value, field: &str) -> bool {
         Some(Value::Array(items)) => !items.is_empty(),
         _ => false,
     }
+}
+
+/// The type descriptors an AttributeValue may carry.
+const TYPE_DESCRIPTORS: &[&str] = &["S", "N", "B", "SS", "NS", "BS", "M", "L", "NULL", "BOOL"];
+
+/// Whether an `ExpressionAttributeValues` entry is an object that is not one
+/// AttributeValue: empty, with a type descriptor the service does not have, or
+/// with more than one. Beside such an entry the service reports a range fault
+/// in its older form (measured 2026-10-25 12:56 UTC: `Limit: 0` beside `{}`,
+/// `{"X": "1"}` or `{"S": "x", "N": "1"}` answers `Value '0' at 'limit'` on
+/// Query and Scan, and beside an empty or duplicate `NS` the newer form). An
+/// entry that is not an object is a shape fault, reported ahead of the checks.
+pub(crate) fn has_unreadable_attribute_value(body: &Value) -> bool {
+    body.get("ExpressionAttributeValues")
+        .and_then(Value::as_object)
+        .is_some_and(|values| {
+            values.values().any(|entry| {
+                entry.as_object().is_some_and(|descriptors| {
+                    descriptors.len() != 1
+                        || descriptors
+                            .keys()
+                            .any(|key| !TYPE_DESCRIPTORS.contains(&key.as_str()))
+                })
+            })
+        })
 }
 
 /// Refuse the first `N` value in `ExpressionAttributeValues` (including `NS`
