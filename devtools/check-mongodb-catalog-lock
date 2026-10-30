@@ -19,6 +19,11 @@ extenddb-check-lock-<mongo port>, published on 127.0.0.1 only:
   migrate --yes exits 6, and the preview still runs;
 - a server refuses a catalog behind this binary with 3, and the command it
   prints, run exactly as printed, applies what is missing;
+- the startup policy on a catalog behind this binary: serve names
+  --migrate, and in daemon mode the invoking process exits 3 with the
+  message on its stderr; while another migration holds the lock, serve
+  --migrate waits for catalog_upgrade_lock_timeout and exits 6; serve
+  --migrate applies the migration and serves;
 - a server killed with SIGKILL keeps migrate --yes waiting until its
   registration expires, at most 45 s after its last renewal;
 - a server whose database stops answering answers 503 within 40 s, before
@@ -136,6 +141,33 @@ def main(binary: str, mongo_port: int, api_port: int) -> int:
         if report(bool(words) and words[0] == "extenddb", f"serve prints the command to run: {advised!r}", output):
             expect_exit(0, "the printed command, run as printed", [binary, *words[1:]], env)
         expect_exit(0, "verify after the printed command", verify, env)
+
+        # The startup policy on a catalog behind this binary.
+        mongosh(container, mongo_port, "db.getSiblingDB('extenddb_catalog').extenddb_migrations.deleteOne({_id: 4})")
+        expect_exit(3, "serve on a catalog behind this binary", serve, env, timeout=60,
+                    contains="or start this server with --migrate")
+        # The parent reads the status before it forks, so the code and the
+        # message reach the invoking shell.
+        daemon = [binary, "serve", "--config", "extenddb.toml", "--port", str(api_port)]
+        done = subprocess.run(daemon, env=env, capture_output=True, text=True, timeout=120, check=False)
+        report(done.returncode == 3 and "or start this server with --migrate" in done.stderr,
+               f"exit {done.returncode}: serve in daemon mode on a catalog behind this binary, "
+               "the message on stderr", done.stdout + done.stderr)
+        mongosh(container, mongo_port, "db.getSiblingDB('extenddb_catalog').settings.insertOne("
+                "{_id: 'migration_lock', owner: 'check', expires_at: new Date(Date.now() + 120000)})")
+        started = time.monotonic()
+        expect_exit(6, "serve --migrate while another migration holds the lock", serve + ["--migrate"],
+                    dict(env, EXTENDDB__SERVER__CATALOG_UPGRADE_LOCK_TIMEOUT="3"), timeout=60)
+        waited = time.monotonic() - started
+        report(waited >= 3, f"serve --migrate waited {waited:.1f} s for the lock, its 3 s timeout")
+        mongosh(container, mongo_port, "db.getSiblingDB('extenddb_catalog').settings.deleteOne({_id: 'migration_lock'})")
+        server = start(serve + ["--migrate"], env, "serve-migrate.log")
+        servers.append(server)
+        up = healthy(url, server, 60)
+        stop(server)
+        with open("serve-migrate.log", encoding="utf-8") as f:
+            report(up, "serve --migrate applies the pending migration and serves", f.read())
+        expect_exit(0, "verify after serve --migrate", verify, env, contains="OK: Current")
 
         # A server killed without deleting its registration blocks
         # migrate --yes until the registration expires, 45 s after its last
