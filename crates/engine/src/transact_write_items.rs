@@ -46,11 +46,20 @@ pub async fn handle_transact_write_items(
         serde_json::from_value(body.clone()).map_err(crate::deserialize_error)?;
 
     // Compute fingerprint keyed by the client request token for collision
-    // resistance. Must happen after parsing so the token is available.
+    // resistance. Must happen after parsing so the token is available. The
+    // two Return fields are part of the fingerprint: the service refuses a
+    // replay that changes either of them.
     let fingerprint = input
         .client_request_token
         .as_deref()
-        .map(|t| compute_fingerprint(&body, t))
+        .map(|t| {
+            compute_fingerprint(
+                &body,
+                t,
+                input.return_consumed_capacity,
+                input.return_item_collection_metrics,
+            )
+        })
         .unwrap_or_default();
 
     // At least one and at most 100 items. The server runs the same check
@@ -201,8 +210,8 @@ pub async fn handle_transact_write_items(
         }
         Err(extenddb_storage::error::StorageError::IdempotentMismatch) => {
             return Err(DynamoDbError::IdempotentParameterMismatchException(
-                "The request uses the same client token as a previous, \
-                 but different, request."
+                "Specified idempotent token was used with different request parameters \
+                 within the idempotency window"
                     .to_owned(),
             ));
         }
