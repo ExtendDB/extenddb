@@ -246,6 +246,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A configured `sqlite:` URL names the same files as the path in it.
+    #[test]
+    fn prepare_and_restrict_accept_a_sqlite_url() {
+        let dir = temp_dir();
+        let db = dir.join("db.sqlite");
+        let location = format!("sqlite://{}?mode=rwc", db.display());
+        prepare(&location).expect("prepare");
+        assert_eq!(mode(&db), 0o600);
+        let wal = sidecar(&db, "-wal");
+        std::fs::write(&wal, b"").expect("create");
+        set_mode(&db, 0o644);
+        set_mode(&wal, 0o644);
+        restrict(&location).expect("restrict");
+        assert_eq!(mode(&db), 0o600);
+        assert_eq!(mode(&wal), 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn prepare_and_restrict_set_an_existing_database_and_its_sidecars_to_0600() {
         let dir = temp_dir();
