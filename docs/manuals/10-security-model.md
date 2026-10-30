@@ -222,6 +222,7 @@ Import/export file paths are validated:
 - DynamoDB-fidelity error messages reproduce real DynamoDB exactly (no additional information)
 - Internal errors (database connection failures, SQL errors, I/O errors) are logged server-side but return generic messages to clients
 - Stack traces, file paths, and SQL text are never exposed to clients
+- One path carries backend-chosen text to a client: a backend may return `StorageError::Service(DynamoDbError)` when it has classified its own failure into a service error class, and the engine returns that error with its message unchanged. The message inside is client-facing text the backend author owns; it must not contain driver output, SQL text, paths or connection details, and it is reviewed as client-visible wording under the same rule as the engine's own messages
 
 ## Operational Security
 

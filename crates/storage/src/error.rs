@@ -92,4 +92,24 @@ pub enum StorageError {
     Unsupported(String),
     #[error("Internal error: {0}")]
     Internal(String),
+    /// A client error the backend has already classified. The engine passes it
+    /// to the client with its variant and message unchanged and does not log it
+    /// as a storage fault. One exception: a `ConditionalCheckFailedException`
+    /// carries its item to the client only when the request set
+    /// `ReturnValuesOnConditionCheckFailure` to `ALL_OLD`, the rule the engine
+    /// applies to its own `ConditionFailed`. Use this
+    /// when the backend can map its own failure onto a specific service error
+    /// with its own message, for example a hosted database reporting a
+    /// documented unavailability or capacity condition.
+    ///
+    /// The message inside crosses the wire verbatim; the engine does not
+    /// inspect or redact it. It must be the text the service documents for that
+    /// error class, or text of the same shape, and must not contain driver
+    /// output, host names, connection strings or credentials. A failure the
+    /// backend cannot classify stays [`Self::Internal`], which the engine
+    /// redacts behind a fixed string. Distinct from [`Self::Transient`], which
+    /// the engine also redacts and which the queue workers read as the retry
+    /// signal; `Service` is for request paths only.
+    #[error(transparent)]
+    Service(extenddb_core::error::DynamoDbError),
 }
