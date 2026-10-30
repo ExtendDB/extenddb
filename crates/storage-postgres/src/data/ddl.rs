@@ -729,7 +729,7 @@ pub(crate) async fn drop_table_relations(
 /// Set `conn`'s transaction-local `lock_timeout` to the time left until
 /// `deadline`, and to 1 ms once it has passed (`0` would disable the
 /// timeout).
-async fn set_lock_timeout_until(
+pub(super) async fn set_lock_timeout_until(
     conn: &mut sqlx::PgConnection,
     deadline: std::time::Instant,
 ) -> Result<(), sqlx::Error> {

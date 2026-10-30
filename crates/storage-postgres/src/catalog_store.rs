@@ -11,6 +11,7 @@
 
 use std::sync::Arc;
 
+use extenddb_storage::diagnostics::{DiagError, DiagResult, OrphanDrop, StorageRelationCheck};
 use extenddb_storage::management_store::{MetricsRow, OpError, OpResult};
 use futures::future::BoxFuture;
 use sqlx::PgPool;
@@ -192,6 +193,57 @@ impl extenddb_storage::diagnostics::DiagnosticsStore for PostgresCatalogStore {
                 )),
             }
         })
+    }
+
+    fn check_storage_relations(&self) -> BoxFuture<'_, DiagResult<StorageRelationCheck>> {
+        Box::pin(async move {
+            let data = data_pool(&self.pool).await?;
+            crate::data::catalog_check::check(&self.pool, &data)
+                .await
+                .map_err(|e| DiagError::QueryFailed(e.to_string()))
+        })
+    }
+
+    fn drop_orphaned_relations(
+        &self,
+        orphaned: Vec<String>,
+    ) -> BoxFuture<'_, DiagResult<Vec<(String, OrphanDrop)>>> {
+        Box::pin(async move {
+            let data = data_pool(&self.pool).await?;
+            let budget = crate::data::catalog_check::FIX_LOCK_BUDGET;
+            crate::data::catalog_check::drop_orphaned(&self.pool, &data, orphaned, budget)
+                .await
+                .map_err(|e| {
+                    if crate::data::lock_wait_failed(&e) {
+                        DiagError::QueryFailed(format!(
+                            "table or index changes in progress kept the catalog locked for \
+                             more than {} seconds, so nothing was dropped; run the command \
+                             again: {e}",
+                            budget.as_secs()
+                        ))
+                    } else {
+                        DiagError::QueryFailed(e.to_string())
+                    }
+                })
+        })
+    }
+}
+
+/// The pool that holds the data relations, chosen the way the engine chooses
+/// it: the data database when the catalog names one, else the catalog itself.
+async fn data_pool(catalog: &PgPool) -> DiagResult<PgPool> {
+    let conn: Option<(String,)> =
+        sqlx::query_as("SELECT value FROM settings WHERE key = 'data_database_connection_string'")
+            .fetch_optional(catalog)
+            .await
+            .map_err(|e| DiagError::QueryFailed(e.to_string()))?;
+    match conn {
+        Some((conn,)) if !conn.is_empty() => sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&conn)
+            .await
+            .map_err(|e| DiagError::ConnectionFailed(e.to_string())),
+        _ => Ok(catalog.clone()),
     }
 }
 
