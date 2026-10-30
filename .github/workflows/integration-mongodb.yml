@@ -61,6 +61,8 @@ jobs:
       fail-fast: false
       matrix:
         shard: [1, 2, 3]
+    env:
+      EXTENDDB_TEST_SHARD: ${{ matrix.shard }}/3
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v5
@@ -75,7 +77,9 @@ jobs:
       # Artifacts do not keep file modes.
       - run: chmod +x target/release/extenddb
       - name: Run MongoDB pytest suite
-        run: devtools/run-mongodb-tests -- --pytest --comprehensive --parallel --shard ${{ matrix.shard }}/3
+        run: devtools/run-mongodb-tests -- --pytest --comprehensive --parallel
+
+      # mongodb-integration checks these lists.
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         if: always()
         with:

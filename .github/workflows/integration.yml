@@ -83,6 +83,8 @@ jobs:
       fail-fast: false
       matrix:
         shard: [1, 2, 3]
+    env:
+      EXTENDDB_TEST_SHARD: ${{ matrix.shard }}/3
     services:
       postgres:
         # pgvector's own image, which is postgres:16 plus the extension. The
@@ -148,15 +150,7 @@ jobs:
           EXTENDDB_ADMIN_USER: admin
           EXTENDDB_ADMIN_PASSWORD: ${{ steps.init.outputs.admin_password }}
           EXTENDDB_TEST_PG_ADMIN_CONNECTION_STRING: postgresql://postgres:devpass@127.0.0.1:5432
-        run: devtools/run-tests --extenddb --pytest --comprehensive --parallel --filter "not import_export" --shard ${{ matrix.shard }}/3
-
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
-        if: always()
-        with:
-          name: shards-run-integration-${{ matrix.shard }}
-          path: discussions/shards/
-          if-no-files-found: warn
-          retention-days: 1
+        run: devtools/run-tests --extenddb --pytest --comprehensive --parallel --filter "not import_export"
 
       # run-tests restarts the server daemonized to apply the import/export
       # config, and a daemonized server logs to syslog, not the job log. Without
@@ -166,6 +160,15 @@ jobs:
         if: failure()
         run: sudo journalctl -t extenddb --no-pager -n 500 || true
 
+      # The integration job checks these lists.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        if: always()
+        with:
+          name: shards-run-integration-${{ matrix.shard }}
+          path: discussions/shards/
+          if-no-files-found: warn
+          retention-days: 1
+
   run-integration-sqlite:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 40
@@ -174,6 +177,8 @@ jobs:
       fail-fast: false
       matrix:
         shard: [1, 2, 3]
+    env:
+      EXTENDDB_TEST_SHARD: ${{ matrix.shard }}/3
     steps:
       - uses: actions/checkout@v6
 
@@ -220,8 +225,15 @@ jobs:
           EXTENDDB_TEST_ENDPOINT: https://127.0.0.1:18443
           EXTENDDB_ADMIN_USER: admin
           EXTENDDB_ADMIN_PASSWORD: ${{ steps.init.outputs.admin_password }}
-        run: devtools/run-tests --extenddb --pytest --comprehensive --parallel --filter "not import_export" --shard ${{ matrix.shard }}/3
+        run: devtools/run-tests --extenddb --pytest --comprehensive --parallel --filter "not import_export"
 
+      # Same rationale as the postgres job: the daemonized server logs to
+      # syslog, so this dump is the only server-side evidence on failure.
+      - name: Dump server syslog on failure
+        if: failure()
+        run: sudo journalctl -t extenddb --no-pager -n 500 || true
+
+      # The integration job checks these lists.
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         if: always()
         with:
@@ -229,12 +241,6 @@ jobs:
           path: discussions/shards/
           if-no-files-found: warn
           retention-days: 1
-
-      # Same rationale as the postgres job: the daemonized server logs to
-      # syslog, so this dump is the only server-side evidence on failure.
-      - name: Dump server syslog on failure
-        if: failure()
-        run: sudo journalctl -t extenddb --no-pager -n 500 || true
 
   run-integration-dev-mode:
     # dev-mode was shipped with no CI coverage at all, which is how the batch and
