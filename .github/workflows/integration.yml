@@ -34,6 +34,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          # Only pushes to main save, so other runs restore main's cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build release
         run: cargo build --release
@@ -58,6 +60,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          # Only pushes to main save, so other runs restore main's cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build release (SQLite backend)
         run: cargo build --release -p extenddb --no-default-features --features sqlite
@@ -426,6 +430,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          # Only pushes to main save, so other runs restore main's cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # The control plane for vector indexes is not reachable over the wire while
       # this backend declares no vector search capability, so its tests drive the
