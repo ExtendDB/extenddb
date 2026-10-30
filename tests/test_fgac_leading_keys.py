@@ -348,6 +348,43 @@ class TestLeadingKeys:
             c.scan(TableName=table)
         assert _denied(e)
 
+    # -- An equality on the partition key decides the key ------------------
+
+    def test_unreadable_partition_equality_does_not_bind_another_clause(self, table):
+        # An equality on the partition key decides the key. When its value
+        # cannot be read (`:u = {"N": "bob"}`), a second clause naming the
+        # fenced value must not be bound in its place.
+        for form in ("ForAnyValue", "ForAllValues+Null"):
+            if form == "ForAnyValue":
+                policy = self._leading_keys_policy("ForAnyValue", [OWN], table)
+            else:
+                policy = self._leading_keys_policy("ForAllValues", [OWN], table)
+                stmt = policy["Statement"][0]
+                stmt["Condition"]["Null"] = {"dynamodb:LeadingKeys": "false"}
+            c = self._user_client([("lk", policy)])
+            for kce in ("pk = :u AND pk > :v", "pk > :v AND pk = :u"):
+                try:
+                    got = c.query(
+                        TableName=table, KeyConditionExpression=kce,
+                        ExpressionAttributeValues={":u": {"N": OTHER}, ":v": {"S": OWN}})
+                except ClientError:
+                    continue
+                parts = {it["pk"]["S"] for it in got["Items"]}
+                assert OTHER not in parts, (form, kce, parts)
+
+    def test_non_equality_partition_with_sort_clause_is_refused(self, table):
+        # The fix binds the partition operand of these shapes; the engine still
+        # refuses them, so no partition is read whatever authorization binds.
+        owner = self._user_client([("all", {
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow", "Action": "dynamodb:*", "Resource": "*"}],
+        })])
+        for kce in ("pk > :v AND sk = :s", "pk > :v AND sk < :s"):
+            with pytest.raises(ClientError) as e:
+                owner.query(TableName=table, KeyConditionExpression=kce,
+                            ExpressionAttributeValues={":v": {"S": OWN}, ":s": {"S": "x"}})
+            assert e.value.response["Error"]["Code"] == "ValidationException", kce
+
     # -- BatchGetItem / BatchWriteItem: per-table key set ------------------
 
     def test_batch_get_fenced_to_own_partition(self, table):
@@ -781,9 +818,9 @@ class TestLeadingKeys:
     # other principal. Every rejected shape returned ValidationException to the
     # owner and to the fenced principal. To the other principal the service
     # returned ValidationException, except where QUERY_REJECTED_OTHER_CODE
-    # names a different code. For the shapes in that map ExtendDB returns the
-    # other of the two codes, so the test asserts only that no data is
-    # returned.
+    # names a different code. For the shapes in QUERY_REJECTED_CODE_DIVERGES
+    # ExtendDB still answers the other code, so the test asserts only that no
+    # data is returned.
 
     QUERY_ACCEPTED = [
         ("pk eq placeholder", "main", {"KeyConditionExpression": "pk = :v",
@@ -879,13 +916,22 @@ class TestLeadingKeys:
                                              "ExpressionAttributeValues": {":a": {"S": "alice"}}}),
     ]
 
-    # Rejected shapes where the service and ExtendDB return different error
-    # codes to the principal fenced away from the value. The value is the code
-    # the service returned.
+    # Rejected shapes where the service returns a code other than
+    # ValidationException to the principal fenced away from the value. The value
+    # is the code the service returned on 2026-10-21. For these shapes the
+    # partition key's condition names one value, which the service binds to
+    # dynamodb:LeadingKeys and evaluates before it rejects the shape.
     QUERY_REJECTED_OTHER_CODE = {
         "non-eq pk": "AccessDeniedException",
         "legacy non-eq pk": "AccessDeniedException",
         "legacy begins_with pk": "AccessDeniedException",
+    }
+
+    # Rejected shapes where ExtendDB still answers a different code than the
+    # service to the principal fenced away from the value. The service returned
+    # ValidationException to all three principals for the GSI shape below, while
+    # ExtendDB binds g1's value and denies. Tracked separately from issue #448.
+    QUERY_REJECTED_CODE_DIVERGES = {
         "multi hash gsi missing g2": "ValidationException",
     }
 
@@ -954,12 +1000,13 @@ class TestLeadingKeys:
                 if err != "ValidationException":
                     failures.append(f"{label}: {who} got {err or 'rows'}, expected ValidationException")
             _, err_o = call(other, table_key, kwargs)
-            if label in self.QUERY_REJECTED_OTHER_CODE:
-                if err_o not in ("AccessDeniedException", "ValidationException"):
-                    failures.append(f"{label}: other principal got {err_o or 'rows'}")
-            elif err_o != "ValidationException":
+            want = self.QUERY_REJECTED_OTHER_CODE.get(label, "ValidationException")
+            if label in self.QUERY_REJECTED_CODE_DIVERGES:
+                if err_o is None:
+                    failures.append(f"{label}: other principal got rows")
+            elif err_o != want:
                 failures.append(f"{label}: other principal got {err_o or 'rows'}, "
-                                "expected ValidationException")
+                                f"expected {want}")
 
         assert not failures, "\n".join(failures)
 
