@@ -313,6 +313,33 @@ FROM pg_stat_statements WHERE usename = 'extenddb'
 ORDER BY mean_exec_time DESC LIMIT 10;
 ```
 
+### Process Memory
+
+The server's resident memory does not grow with the number of requests
+served. Counter metrics are held for at most two minutes before they are
+flushed to the catalog, so the memory they occupy scales with the request
+rate (for example six 40-byte points per GetItem, held for 60 to 120 seconds)
+and not with uptime, and per-operation latency segments are summed into fixed
+time buckets, at most about 110 KB per operation.
+
+Releases through 0.1.13 kept one latency segment record per data-plane
+request in memory for 24 hours, about 190 bytes per request. On those
+releases resident memory grows for the first 24 hours and then holds at the
+level set by the busiest 24-hour window the process has seen; it does not
+come down short of a restart. To run one of those releases until you upgrade,
+size the memory limit as
+
+```
+limit >= baseline + 190 bytes * requests_per_24h * 1.3
+```
+
+where 1.3 is a modelled allowance for allocator overhead, not a measured
+figure (274 requests per second is 23.7 million requests per day and about
+5.5 GiB plus baseline), or restart the process before the limit is reached.
+Stop with SIGTERM or `extenddb stop` so the last partial minute of counter
+metrics is flushed. Only the in-memory latency segments are lost on restart;
+counter metrics are in the catalog.
+
 ---
 
 ## License
