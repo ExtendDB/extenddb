@@ -221,10 +221,14 @@ async fn a_held_orphan_fails_within_its_lock_timeout_and_catalog_writes_go_on() 
     let started = Instant::now();
     let ((outcomes, dropped_at), ()) = tokio::join!(
         async {
-            let outcomes = d
-                .diagnostics
-                .drop_orphaned_relations(vec![orphan.clone()])
-                .await;
+            // The holder is released only after the drop returns, so a drop
+            // without a lock timeout of its own would wait here for good.
+            let outcomes = tokio::time::timeout(
+                Duration::from_secs(10),
+                d.diagnostics.drop_orphaned_relations(vec![orphan.clone()]),
+            )
+            .await
+            .expect("the drop gave up on the held orphan within 10 s");
             (outcomes, started.elapsed())
         },
         async {
