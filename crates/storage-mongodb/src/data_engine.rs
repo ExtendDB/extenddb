@@ -953,11 +953,12 @@ impl MongoEngine {
                 )
                 .map_err(|e| TxErr::Fatal(StorageError::Validation(e.to_string())))?;
 
-                // Reject wrong-type or empty index-key attributes on
-                // the resulting item — D-M10, RFC-0003 §2.3. Same
-                // shape as put_item's up-front check, but the
-                // post-update item is what actually gets written.
-                self.validate_index_keys_for_item(key_info, &new_item)
+                // Secondary-index keys on the written item. Literal operands
+                // were checked by the engine ahead of the condition; a value
+                // computed from the existing item is only known now and
+                // carries the service's computed-value wording, and a key the
+                // statement leaves empty carries the update-expression wording.
+                self.validate_index_keys_after_update(key_info, &new_item)
                     .await
                     .map_err(TxErr::Fatal)?;
 
@@ -1857,6 +1858,40 @@ impl MongoEngine {
             .map_err(|e| StorageError::Validation(e.to_string()))
     }
 
+    /// Secondary-index key checks on the item an UpdateExpression produced:
+    /// a computed value of the wrong type, reported with the service's
+    /// post-apply wording, and a key left empty, reported with the
+    /// update-expression wording.
+    async fn validate_index_keys_after_update(
+        &self,
+        key_info: &TableKeyInfo,
+        item: &Item,
+    ) -> Result<(), StorageError> {
+        let idx_pairs = self.fetch_index_key_schemas(&key_info.table_id).await?;
+        if idx_pairs.is_empty() {
+            return Ok(());
+        }
+        let refs: Vec<extenddb_core::validation::IndexKeyRef<'_>> = idx_pairs
+            .iter()
+            .map(|(name, ks)| extenddb_core::validation::IndexKeyRef {
+                index_name: name.as_str(),
+                key_schema: ks.as_slice(),
+            })
+            .collect();
+        extenddb_core::validation::validate_index_key_types_after_update(
+            item,
+            &refs,
+            &key_info.attribute_definitions,
+        )
+        .map_err(|e| StorageError::Validation(e.to_string()))?;
+        extenddb_core::validation::validate_index_key_not_empty(
+            item,
+            &refs,
+            extenddb_core::validation::SecondaryIndexEmptyContext::UpdateExpression,
+        )
+        .map_err(|e| StorageError::Validation(e.to_string()))
+    }
+
     async fn sync_indexes_in_session(
         &self,
         key_info: &TableKeyInfo,
@@ -2354,7 +2389,14 @@ impl MongoEngine {
                 }
                 Ok(AttemptOutcome::CanceledReasons(reasons)) => {
                     let _ = session.abort_transaction().await;
-                    return Err(StorageError::TransactionCanceled(reasons));
+                    // Key faults left the members as internal reasons; the
+                    // shared resolver applies the service's cross-member
+                    // precedence and decides between a cancellation and a
+                    // top-level ValidationException.
+                    return Err(match CancellationReason::resolve_key_faults(reasons) {
+                        Ok(reasons) => StorageError::TransactionCanceled(reasons),
+                        Err(message) => StorageError::Validation(message),
+                    });
                 }
                 Ok(AttemptOutcome::Retry) => {
                     let _ = session.abort_transaction().await;
@@ -2409,12 +2451,13 @@ impl MongoEngine {
                     &key_info.attribute_definitions,
                 )
                 .map_err(|e| {
-                    TransactOpError::Cancel(CancellationReason::validation_error(e.to_string()))
+                    TransactOpError::Cancel(CancellationReason::key_type_mismatch(e.to_string()))
                 })?;
 
-                // Index-key type/empty faults inside a transaction
-                // surface as per-item cancellation reasons (matches
-                // postgres data/transactions.rs). D-M10.
+                // Secondary-index key faults, both ahead of the condition on a
+                // Put member. They leave as internal reasons; the caller applies
+                // the service's cross-member precedence and decides between a
+                // cancellation and a top-level ValidationException.
                 let idx_pairs = self
                     .fetch_index_key_schemas(&key_info.table_id)
                     .await
@@ -2427,13 +2470,25 @@ impl MongoEngine {
                             key_schema: ks.as_slice(),
                         })
                         .collect();
-                    extenddb_core::validation::validate_index_keys(
+                    extenddb_core::validation::validate_index_key_types(
                         item,
                         &idx_refs,
                         &key_info.attribute_definitions,
                     )
                     .map_err(|e| {
-                        TransactOpError::Cancel(CancellationReason::validation_error(e.to_string()))
+                        TransactOpError::Cancel(CancellationReason::key_type_mismatch(
+                            e.to_string(),
+                        ))
+                    })?;
+                    extenddb_core::validation::validate_index_key_not_empty(
+                        item,
+                        &idx_refs,
+                        extenddb_core::validation::SecondaryIndexEmptyContext::Item,
+                    )
+                    .map_err(|e| {
+                        TransactOpError::Cancel(CancellationReason::index_key_empty_abort(
+                            e.to_string(),
+                        ))
                     })?;
                 }
 
@@ -2533,7 +2588,7 @@ impl MongoEngine {
                     &key_info.attribute_definitions,
                 )
                 .map_err(|e| {
-                    TransactOpError::Cancel(CancellationReason::validation_error(e.to_string()))
+                    TransactOpError::Cancel(CancellationReason::key_type_mismatch(e.to_string()))
                 })?;
 
                 let coll_name = data_collection_name(&key_info.table_id);
@@ -2625,7 +2680,31 @@ impl MongoEngine {
                     &key_info.attribute_definitions,
                 )
                 .map_err(|e| {
-                    TransactOpError::Cancel(CancellationReason::validation_error(e.to_string()))
+                    TransactOpError::Cancel(CancellationReason::key_type_mismatch(e.to_string()))
+                })?;
+
+                // A literal operand of the wrong type on a secondary-index key
+                // is reported on the statement, ahead of the condition and
+                // ahead of applying any action.
+                let idx_pairs = self
+                    .fetch_index_key_schemas(&key_info.table_id)
+                    .await
+                    .map_err(TransactOpError::Storage)?;
+                let idx_refs: Vec<extenddb_core::validation::IndexKeyRef<'_>> = idx_pairs
+                    .iter()
+                    .map(|(n, ks)| extenddb_core::validation::IndexKeyRef {
+                        index_name: n.as_str(),
+                        key_schema: ks.as_slice(),
+                    })
+                    .collect();
+                extenddb_core::validation::validate_index_key_literal_operands(
+                    actions,
+                    &idx_refs,
+                    &key_info.attribute_definitions,
+                    maps,
+                )
+                .map_err(|e| {
+                    TransactOpError::Cancel(CancellationReason::key_type_mismatch(e.to_string()))
                 })?;
 
                 let coll_name = data_collection_name(&key_info.table_id);
@@ -2683,28 +2762,30 @@ impl MongoEngine {
                     TransactOpError::Cancel(CancellationReason::validation_error(e.to_string()))
                 })?;
 
-                // Validate index-key types/emptiness on the post-update
-                // item; a violation here surfaces as a per-item
-                // cancellation reason. D-M10, RFC-0003 §2.3.
-                let idx_pairs = self
-                    .fetch_index_key_schemas(&key_info.table_id)
-                    .await
-                    .map_err(TransactOpError::Storage)?;
-                if !idx_pairs.is_empty() {
-                    let idx_refs: Vec<extenddb_core::validation::IndexKeyRef<'_>> = idx_pairs
-                        .iter()
-                        .map(|(n, ks)| extenddb_core::validation::IndexKeyRef {
-                            index_name: n.as_str(),
-                            key_schema: ks.as_slice(),
-                        })
-                        .collect();
-                    extenddb_core::validation::validate_index_keys(
+                // Secondary-index keys on the written item: a value computed
+                // from the existing item (an attribute reference, the fallback
+                // of if_not_exists) of the wrong type, reported with the
+                // service's computed-value wording, and a key left empty.
+                if !idx_refs.is_empty() {
+                    extenddb_core::validation::validate_index_key_types_after_update(
                         &item,
                         &idx_refs,
                         &key_info.attribute_definitions,
                     )
                     .map_err(|e| {
-                        TransactOpError::Cancel(CancellationReason::validation_error(e.to_string()))
+                        TransactOpError::Cancel(CancellationReason::key_type_mismatch(
+                            e.to_string(),
+                        ))
+                    })?;
+                    extenddb_core::validation::validate_index_key_not_empty(
+                        &item,
+                        &idx_refs,
+                        extenddb_core::validation::SecondaryIndexEmptyContext::UpdateExpression,
+                    )
+                    .map_err(|e| {
+                        TransactOpError::Cancel(CancellationReason::index_key_empty_abort(
+                            e.to_string(),
+                        ))
                     })?;
                 }
 
@@ -2767,7 +2848,7 @@ impl MongoEngine {
                     &key_info.attribute_definitions,
                 )
                 .map_err(|e| {
-                    TransactOpError::Cancel(CancellationReason::validation_error(e.to_string()))
+                    TransactOpError::Cancel(CancellationReason::key_type_mismatch(e.to_string()))
                 })?;
 
                 let coll_name = data_collection_name(&key_info.table_id);

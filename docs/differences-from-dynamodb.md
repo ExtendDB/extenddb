@@ -94,6 +94,7 @@ adaptation when switching between ExtendDB and the real service.
 | Multi-part base table keys | Not supported | Preview extension (opt-in via `enable_multipart_keys` setting). Standard single/composite keys work identically. |
 | GSI throughput on a `PROVISIONED` table | Every GSI needs `ProvisionedThroughput` of at least 1 read and 1 write unit | A GSI `ProvisionedThroughput` below 1 (including 0/0) is `ValidationException` on `CreateTable` of a `PROVISIONED` table and on `UpdateTable`'s GSI `Create` ("ReadCapacityUnits and WriteCapacityUnits must both be greater than or equal to 1 for index: <name>"; the service's text was not captured). A GSI with no `ProvisionedThroughput` is still accepted on a `PROVISIONED` table, and `UpdateTable` to `PROVISIONED` leaves an on-demand table's GSIs without one; see the `BillingModeOverride` row under Backup and Restore for how a backup of such a table restores |
 | Projected attributes across all indexes | At most 100 | Enforced on `CreateTable` (and so on `RestoreTableFromBackup`, which validates its target the same way) and on `UpdateTable`'s GSI `Create`: every `NonKeyAttributes` entry of every GSI and LSI is counted, so an attribute projected into two indexes counts twice. Over 100 is `ValidationException` ("Number of projected attributes in all indexes exceeds limit of 100, projected: <n>"; the service's text was not captured) |
+| Index key validation on `UpdateItem` and transaction writes | A secondary-index key attribute must carry its declared scalar type and may not be empty. On `UpdateItem` a literal operand of the wrong type (`SET k = :v`, `ADD`, `DELETE`, `list_append` of literals) is refused on the statement, ahead of the `ConditionExpression`, naming the attribute and the index; a value computed from the item (an attribute reference, the fallback of `if_not_exists`) is refused after the condition passes with the message "The update expression attempted to update the secondary index key to unsupported type"; a key left empty is refused after the condition passes with the update-expression wording. In `TransactWriteItems` a wrong-typed key (table or index) on any member cancels the transaction with the first such member's `ValidationError` in position and `None` elsewhere; otherwise an empty index key on any member is a top-level `ValidationException`; otherwise members report their own conditions. On a `Put` member both checks come ahead of the member's condition. (Measured on the service.) | Matches on every backend. Two known shared differences: an empty index key supplied through the legacy `AttributeUpdates` parameter is reported with the update-expression wording where the service uses the `PutItem` wording naming the index; and a request whose own value exceeds 400 KB is refused for size by the service before any index-key check, where ExtendDB reports the index-key fault first. |
 
 ## Backup and Restore
 
@@ -140,6 +141,37 @@ The same on all four backends.
 | `LocalSecondaryIndexOverride` | As `GlobalSecondaryIndexOverride`, with `IndexName`, `KeySchema`, and `Projection` only: an empty list restores no LSI, a subset restores those, an unknown or changed index is refused |
 | `OnDemandThroughputOverride` | Applied on an on-demand restore, as on the service (measured on DynamoDB): equal to the backup's, changed, with one member, or on a `PROVISIONED` backup restored with `BillingModeOverride` `PAY_PER_REQUEST`. It replaces the backup's on-demand throughput as a whole: a member left out means no maximum, as on `CreateTable`, so `{}` restores a table with no maxima. On a `PROVISIONED` restore (from a `PROVISIONED` backup or by override) it is refused with `ValidationException`, as is a member other than `MaxReadRequestUnits` and `MaxWriteRequestUnits`. Measured on SQLite |
 | `VectorIndexOverride` | Refused with `ValidationException` |
+
+## Item Size
+
+ExtendDB enforces the 400 KB (409,600-byte) item-size limit. This section is the
+single reference for how an item and an update are sized; `docs/dynamodb-limits.md`
+records the limit and points here. Every figure was measured against the service
+in us-east-1 on 2026-10-19.
+
+How an item is sized: its attribute names plus its values. A string or binary
+value costs its byte length. A number costs `1 + ceil(integer significant digits
+/ 2) + ceil(fraction significant digits / 2)`, plus one for a sign, the two
+halves rounded up separately, so `1.5` is 3 bytes and `3.14159` is 5. A list
+costs 3 bytes plus one per element; a map costs 3 bytes plus, per entry, the
+entry name, its value, and one more.
+
+How a standalone `UpdateItem` is sized: by the statement, not the finished item.
+A base of 3; 18 per `SET` or `ADD` clause; a skeleton of the written paths (each
+map level 3 bytes plus one per named entry, each list level 3 bytes plus one per
+element, untouched siblings left out) whose `SET` or `ADD` leaves carry their
+value-placeholder bytes; one more per clause written through a list index; 26
+plus the name length per function call; 34 per `+` and 37 per `-`; and 15 plus
+the name per document path operand (14 for a nested attribute, 15 for an index).
+`REMOVE` and `DELETE` cost their path skeleton only. The legacy `AttributeUpdates`
+form costs 3 plus the name and finished value of each attribute it names that
+remains. The key and untouched attributes are left out. Both the statement figure
+and the finished item are checked against the limit, and a breach refuses with
+`Item size to update has exceeded the maximum allowed size`.
+
+| Area | DynamoDB | ExtendDB |
+|------|----------|------|
+| `UpdateItem` item-size accounting | In 31 of 33 commercial regions a standalone `UpdateItem` is sized by the statement (the rule above). At a one-byte key the largest finished item it can produce is 409,581 bytes. Two regions (`eu-south-2`, `me-central-1`) size an `UpdateItem` on the finished item, like a `PutItem`. | PostgreSQL and SQLite follow the 31-region statement rule. A transacted `Update` is sized on the finished item on both, as on the service. Cassandra sizes every update on the finished item against a fixed 409,600 bytes; MongoDB applies no item-size limit on updates. |
 
 ## Capacity and Throttling
 

@@ -315,7 +315,87 @@ impl CancellationReason {
             item: None,
         }
     }
+
+    /// Internal reason for a wrong-typed key found while preparing a
+    /// transaction member: a table key element that does not match the
+    /// schema, or a secondary-index key (on a written item or as a literal
+    /// operand) that does not match its attribute definition. Never reaches a
+    /// client: [`Self::resolve_key_faults`] rewrites it to `ValidationError`.
+    #[must_use]
+    pub fn key_type_mismatch(msg: impl Into<String>) -> Self {
+        Self {
+            code: KEY_TYPE_MISMATCH_CODE.to_owned(),
+            message: Some(msg.into()),
+            item: None,
+        }
+    }
+
+    /// Internal reason for a secondary-index key left empty by a transaction
+    /// member. Never reaches a client: [`Self::resolve_key_faults`] turns it
+    /// into a top-level `ValidationException` message.
+    #[must_use]
+    pub fn index_key_empty_abort(msg: impl Into<String>) -> Self {
+        Self {
+            code: INDEX_KEY_EMPTY_ABORT_CODE.to_owned(),
+            message: Some(msg.into()),
+            item: None,
+        }
+    }
+
+    /// Whether this reason is one of the internal key faults that
+    /// [`Self::resolve_key_faults`] gives precedence to. A backend that runs
+    /// members out of request order can stop once the earliest such member
+    /// in request order is known: a wrong-typed key there outranks every later
+    /// member, and an empty index key there outranks every later member that
+    /// is not itself a wrong-typed key.
+    #[must_use]
+    pub fn is_key_fault(&self) -> bool {
+        self.code == KEY_TYPE_MISMATCH_CODE || self.code == INDEX_KEY_EMPTY_ABORT_CODE
+    }
+
+    /// Apply the precedence `DynamoDB` gives key faults across the members of
+    /// a `TransactWriteItems` request, measured on the service. A wrong-typed
+    /// key (table or secondary index) on any member cancels the transaction
+    /// with the first such member's `ValidationError` in position and `None`
+    /// in every other position, whatever those members' own faults were.
+    /// Otherwise an empty secondary-index key on any member aborts the whole
+    /// request with a top-level `ValidationException`, outranking failed
+    /// conditions and unapplicable statements on the other members. Otherwise
+    /// the reasons are returned as they are.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(message)` when the request must be answered with a
+    /// top-level `ValidationException` carrying `message`.
+    pub fn resolve_key_faults(reasons: Vec<Self>) -> Result<Vec<Self>, String> {
+        let first_type_mismatch = reasons
+            .iter()
+            .position(|r| r.code == KEY_TYPE_MISMATCH_CODE);
+        let mut reasons = reasons;
+        for (i, reason) in reasons.iter_mut().enumerate() {
+            match first_type_mismatch {
+                Some(first) if i == first => reason.code = "ValidationError".to_owned(),
+                Some(_) => *reason = Self::none(),
+                None if reason.code == INDEX_KEY_EMPTY_ABORT_CODE => {
+                    if let Some(message) = reason.message.take() {
+                        return Err(message);
+                    }
+                    *reason = Self::none();
+                }
+                None => {}
+            }
+        }
+        Ok(reasons)
+    }
 }
+
+/// Internal cancellation code for a wrong-typed key. See
+/// [`CancellationReason::key_type_mismatch`].
+const KEY_TYPE_MISMATCH_CODE: &str = "ExtendDbKeyTypeMismatch";
+
+/// Internal cancellation code for an empty secondary-index key. See
+/// [`CancellationReason::index_key_empty_abort`].
+const INDEX_KEY_EMPTY_ABORT_CODE: &str = "ExtendDbIndexKeyEmptyAbort";
 
 #[cfg(test)]
 mod tests {
@@ -336,5 +416,61 @@ mod tests {
         let resp = ItemResponse { item: Some(item) };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["Item"]["pk"]["S"], "val");
+    }
+
+    fn codes(reasons: &[CancellationReason]) -> Vec<&str> {
+        reasons.iter().map(|r| r.code.as_str()).collect()
+    }
+
+    #[test]
+    fn no_key_fault_leaves_the_reasons_untouched() {
+        let reasons = vec![
+            CancellationReason::condition_check_failed_with_item(None),
+            CancellationReason::validation_error("cannot apply"),
+            CancellationReason::none(),
+        ];
+        let out = CancellationReason::resolve_key_faults(reasons).unwrap();
+        assert_eq!(
+            codes(&out),
+            ["ConditionalCheckFailed", "ValidationError", "None"]
+        );
+    }
+
+    #[test]
+    fn an_empty_index_key_becomes_a_top_level_message_over_other_member_faults() {
+        let reasons = vec![
+            CancellationReason::condition_check_failed_with_item(None),
+            CancellationReason::index_key_empty_abort("empty key"),
+            CancellationReason::validation_error("cannot apply"),
+        ];
+        assert_eq!(
+            CancellationReason::resolve_key_faults(reasons).unwrap_err(),
+            "empty key"
+        );
+    }
+
+    #[test]
+    fn a_type_mismatch_masks_every_other_member_including_an_empty_key() {
+        let reasons = vec![
+            CancellationReason::condition_check_failed_with_item(None),
+            CancellationReason::index_key_empty_abort("empty key"),
+            CancellationReason::key_type_mismatch("type"),
+            CancellationReason::validation_error("cannot apply"),
+        ];
+        let out = CancellationReason::resolve_key_faults(reasons).unwrap();
+        assert_eq!(codes(&out), ["None", "None", "ValidationError", "None"]);
+        assert_eq!(out[2].message.as_deref(), Some("type"));
+    }
+
+    #[test]
+    fn only_the_first_type_mismatch_by_position_is_reported() {
+        let reasons = vec![
+            CancellationReason::none(),
+            CancellationReason::key_type_mismatch("second"),
+            CancellationReason::key_type_mismatch("third"),
+        ];
+        let out = CancellationReason::resolve_key_faults(reasons).unwrap();
+        assert_eq!(codes(&out), ["None", "ValidationError", "None"]);
+        assert_eq!(out[1].message.as_deref(), Some("second"));
     }
 }
