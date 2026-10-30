@@ -286,6 +286,18 @@ mod tests {
             read_only.display()
         ))
         .expect("prepare");
+        // A `file:` URI with its own query (here `?mode=ro`, percent-encoded
+        // for sqlx), and a VFS outside the unix family, are left to SQLite.
+        prepare(&format!(
+            "sqlite:file:{}%3Fmode=ro?mode=rwc",
+            dir.join("uri.sqlite").display()
+        ))
+        .expect("prepare");
+        prepare(&format!(
+            "sqlite://{}?mode=rwc&vfs=memdb",
+            dir.join("vfs.sqlite").display()
+        ))
+        .expect("prepare");
         prepare(":memory:").expect("prepare");
         prepare("sqlite::memory:").expect("prepare");
         restrict(&plain.to_string_lossy()).expect("restrict");
@@ -296,8 +308,12 @@ mod tests {
     /// Open a pool through `connect` that switches to WAL and writes in its
     /// connection setup, and return it with the modes of the database file
     /// and its `-wal` and `-shm` files as that setup saw them, which is before
-    /// `connect` calls `restrict`.
-    async fn connect_and_record(db: &Path) -> (sqlx::SqlitePool, Vec<(&'static str, u32)>) {
+    /// `connect` calls `restrict`. With `set_in_setup`, the setup then sets
+    /// those files to that mode.
+    async fn connect_and_record(
+        db: &Path,
+        set_in_setup: Option<u32>,
+    ) -> (sqlx::SqlitePool, Vec<(&'static str, u32)>) {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let options = {
             let (seen, db) = (Arc::clone(&seen), db.to_path_buf());
@@ -310,9 +326,15 @@ mod tests {
                         conn.execute("PRAGMA journal_mode = WAL").await?;
                         conn.execute("CREATE TABLE IF NOT EXISTS t (k INTEGER PRIMARY KEY)")
                             .await?;
-                        let modes = ["", "-wal", "-shm"]
-                            .map(|suffix| (suffix, mode(&sidecar(&db, suffix))));
+                        let files =
+                            ["", "-wal", "-shm"].map(|suffix| (suffix, sidecar(&db, suffix)));
+                        let modes = files.clone().map(|(suffix, file)| (suffix, mode(&file)));
                         seen.lock().expect("lock").extend(modes);
+                        if let Some(setup_mode) = set_in_setup {
+                            for (_, file) in &files {
+                                set_mode(file, setup_mode);
+                            }
+                        }
                         Ok(())
                     })
                 })
@@ -330,7 +352,7 @@ mod tests {
     async fn connect_creates_a_missing_database_and_its_sidecars_at_0600() {
         let dir = temp_dir();
         let db = dir.join("db.sqlite");
-        let (pool, seen) = connect_and_record(&db).await;
+        let (pool, seen) = connect_and_record(&db, None).await;
         assert_eq!(seen, [("", 0o600), ("-wal", 0o600), ("-shm", 0o600)]);
         pool.close().await;
         let _ = std::fs::remove_dir_all(&dir);
@@ -349,8 +371,23 @@ mod tests {
             let _ = std::fs::remove_file(sidecar(&db, suffix));
         }
         set_mode(&db, 0o644);
-        let (pool, seen) = connect_and_record(&db).await;
+        let (pool, seen) = connect_and_record(&db, None).await;
         assert_eq!(seen, [("", 0o600), ("-wal", 0o600), ("-shm", 0o600)]);
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Whatever the connection leaves behind is set to 0600 once the pool
+    /// has connected. Here the connection setup itself sets the database file
+    /// and its sidecars to 0644.
+    #[tokio::test]
+    async fn connect_restricts_the_files_after_the_pool_connects() {
+        let dir = temp_dir();
+        let db = dir.join("db.sqlite");
+        let (pool, _) = connect_and_record(&db, Some(0o644)).await;
+        for suffix in ["", "-wal", "-shm"] {
+            assert_eq!(mode(&sidecar(&db, suffix)), 0o600, "{suffix}");
+        }
         pool.close().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
