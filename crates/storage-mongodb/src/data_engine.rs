@@ -2038,6 +2038,9 @@ impl MongoEngine {
             .next_sequence_number_in_session(&shard_id, &mut *session)
             .await?;
 
+        // One wall-clock read feeds both the record's ApproximateCreationDateTime
+        // and the created_at field, so the two never disagree.
+        let created_at = mongodb::bson::DateTime::now();
         let record = StreamRecord {
             event_id: uuid::Uuid::new_v4().to_string(),
             event_name: event,
@@ -2045,13 +2048,7 @@ impl MongoEngine {
             event_source: "aws:dynamodb".to_owned(),
             aws_region: capture.region.to_string(),
             dynamodb: StreamRecordData {
-                approximate_creation_date_time: i64::try_from(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
-                )
-                .unwrap_or(i64::MAX),
+                approximate_creation_date_time: created_at.timestamp_millis().div_euclid(1_000),
                 keys,
                 new_image,
                 old_image,
@@ -2081,7 +2078,7 @@ impl MongoEngine {
                 "table_id": table_id,
                 "event_name": crate::stream_engine::event_name_ddb_str(record.event_name),
                 "record_data": record_bson,
-                "created_at": mongodb::bson::DateTime::now(),
+                "created_at": created_at,
             })
             .session(&mut *session)
             .await

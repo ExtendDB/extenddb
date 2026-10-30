@@ -299,7 +299,8 @@ jobs:
       # this backend declares no vector search capability, so its tests drive the
       # storage layer directly against this job's PostgreSQL. The PutItem create
       # race tests hold a create open in an outside transaction, the
-      # write-transaction conflict tests force a deadlock, and the backup restore
+      # write-transaction conflict tests force a deadlock, the stream clock test
+      # holds a row lock open while a write waits on it, and the backup restore
       # cases need catalog rows the current binary would not write; all need
       # direct access. The online GSI build tests reorder queue rows by hand and
       # pause writers with a test hook. They build their own throwaway databases;
@@ -316,7 +317,7 @@ jobs:
           cargo test --release -p extenddb-storage-postgres
           --test vector_control_plane --test put_create_race --test twi_conflict
           --test stream_shard_retention --test stream_shard_ownership --test stream_records_page_order --test backup_restore
-          --test gsi_online_build --test gsi_stale_writer --test table_snapshot
+          --test gsi_online_build --test gsi_stale_writer --test table_snapshot --test stream_record_clock
 
       # The daemonized server logs to syslog; dump it so server-side failures
       # are diagnosable from the job log.

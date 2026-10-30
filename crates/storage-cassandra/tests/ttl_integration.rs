@@ -593,7 +593,8 @@ async fn test_ttl_sweep_emits_service_remove_stream_record() {
         &key_info.table_id,
     );
     let query = format!(
-        "SELECT event_name, record_data FROM {account_keyspace}.stream_records WHERE shard_id = ?"
+        "SELECT event_name, sequence_number, created_at, record_data \
+         FROM {account_keyspace}.stream_records WHERE shard_id = ?"
     );
     let rows = engine
         .session_arc()
@@ -604,20 +605,38 @@ async fn test_ttl_sweep_emits_service_remove_stream_record() {
         .expect("parse TTL stream response")
         .into_rows()
         .unwrap_or_default();
-    let remove_records: Vec<String> = rows
+    let remove_records: Vec<(String, i64, String)> = rows
         .into_iter()
         .filter_map(|row| {
             let event: String = row.get_r_by_name("event_name").ok()?;
             if event == "Remove" {
-                row.get_r_by_name("record_data").ok()
+                Some((
+                    row.get_r_by_name("sequence_number")
+                        .expect("sequence_number"),
+                    row.get_r_by_name("created_at").expect("created_at"),
+                    row.get_r_by_name("record_data").expect("record_data"),
+                ))
             } else {
                 None
             }
         })
         .collect();
     assert_eq!(remove_records.len(), 1);
+    let (seq, created_at_ms, data) = &remove_records[0];
     let record: serde_json::Value =
-        serde_json::from_str(&remove_records[0]).expect("parse TTL stream record JSON");
+        serde_json::from_str(data).expect("parse TTL stream record JSON");
+    // The TTL plan takes its sequence number and created_at from one clock
+    // call, so the pair the worker persisted keeps the stream invariants.
+    let hlc_ms: i64 = seq[..13].parse().expect("sequence number prefix");
+    assert!(
+        *created_at_ms <= hlc_ms,
+        "TTL record created_at_ms {created_at_ms} exceeds sequence prefix {hlc_ms} in {seq}"
+    );
+    assert_eq!(
+        record["dynamodb"]["ApproximateCreationDateTime"].as_i64(),
+        Some(created_at_ms / 1_000),
+        "TTL record timestamp must be created_at_ms / 1000"
+    );
     assert_eq!(record["userIdentity"]["Type"], "Service");
     assert_eq!(
         record["userIdentity"]["PrincipalId"],
