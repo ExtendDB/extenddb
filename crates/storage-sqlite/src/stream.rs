@@ -6,8 +6,8 @@
 //! Shards, records, and the sequence counter all live in the one SQLite file,
 //! so `init_stream_shards` runs in the caller's catalog transaction.
 //! Monotonic sequence numbers come from the `seq_counters` table (there is no
-//! PostgreSQL sequence). Retention cleanup compares an RFC 3339 cutoff computed
-//! in Rust.
+//! PostgreSQL sequence). Retention cleanup compares a text cutoff computed in
+//! Rust in the millisecond shape of the `created_at` column.
 
 use extenddb_core::types::{
     DescribeStreamInput, SequenceNumberRange, Shard, StreamDescription, StreamRecord, StreamStatus,
@@ -18,13 +18,58 @@ use extenddb_storage::util::{parse_stream_arn, shard_in_stream, stream_arn};
 use extenddb_storage::{StreamEngine, StreamListResult, StreamRecordsResult};
 use futures::future::BoxFuture;
 
-use crate::sqlite_util::format_timestamp;
+use crate::sqlite_util::format_epoch_millis;
 use crate::store::SqliteEngine;
 
 /// Fixed shards per stream (hash-based partition-key assignment).
 const SHARDS_PER_STREAM: u32 = 4;
 
+/// Retention cutoff for `stream_records.created_at`: `now` minus
+/// `retention_hours`, rendered in the column's own millisecond shape
+/// (`2026-10-23T14:19:07.000Z`). The sweep compares text, so the cutoff has to
+/// carry the same three fraction digits as the rows. An RFC 3339 cutoff drops
+/// the fraction on a whole second (`...07Z`), and `Z` sorts after `.`, which
+/// put every row of that second (`...07.000Z` to `...07.999Z`) before the
+/// cutoff and deleted them up to 999 ms early.
+fn retention_cutoff(now: time::OffsetDateTime, retention_hours: i64) -> String {
+    let cutoff = now - time::Duration::hours(retention_hours);
+    let cutoff_ms = cutoff
+        .unix_timestamp()
+        .saturating_mul(1_000)
+        .saturating_add(i64::from(cutoff.millisecond()));
+    format_epoch_millis(cutoff_ms)
+}
+
+/// Delete every stream record whose `created_at` sorts before `cutoff`; both
+/// sides are text in the column's shape. Returns the number of rows deleted.
+async fn delete_stream_records_before(
+    pool: &sqlx::SqlitePool,
+    cutoff: &str,
+) -> Result<u64, StorageError> {
+    let result = sqlx::query("DELETE FROM stream_records WHERE created_at < ?")
+        .bind(cutoff)
+        .execute(pool)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+    Ok(result.rows_affected())
+}
+
 impl SqliteEngine {
+    /// The retention sweep with the clock passed in: takes the engine write
+    /// lock, renders the cutoff from `now`, deletes the rows before it and
+    /// returns the count. The trait method calls this with the wall clock;
+    /// tests call it with a fixed `now` so the production path is what runs.
+    pub(crate) async fn cleanup_expired_stream_records_at(
+        &self,
+        now: time::OffsetDateTime,
+        retention_hours: i64,
+    ) -> Result<u64, StorageError> {
+        // D1: every writer holds the engine write lock.
+        let _writer = self.write_lock.lock().await;
+        let cutoff = retention_cutoff(now, retention_hours);
+        delete_stream_records_before(&self.pool, &cutoff).await
+    }
+
     /// Initialize stream shards and set `stream_label`, within the caller's
     /// transaction. Returns the assigned stream label.
     pub(crate) async fn init_stream_shards(
@@ -378,17 +423,8 @@ impl StreamEngine for SqliteEngine {
         retention_hours: i64,
     ) -> BoxFuture<'_, Result<u64, StorageError>> {
         Box::pin(async move {
-            // D1: every writer holds the engine write lock.
-            let _writer = self.write_lock.lock().await;
-            let cutoff = format_timestamp(
-                time::OffsetDateTime::now_utc() - time::Duration::hours(retention_hours),
-            );
-            let result = sqlx::query("DELETE FROM stream_records WHERE created_at < ?")
-                .bind(&cutoff)
-                .execute(&self.pool)
+            self.cleanup_expired_stream_records_at(time::OffsetDateTime::now_utc(), retention_hours)
                 .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            Ok(result.rows_affected())
         })
     }
 
@@ -509,3 +545,6 @@ impl StreamEngine for SqliteEngine {
         })
     }
 }
+
+#[cfg(test)]
+mod retention_cutoff_tests;
