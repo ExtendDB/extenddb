@@ -302,8 +302,10 @@ jobs:
       # write-transaction conflict tests force a deadlock, and the backup restore
       # cases need catalog rows the current binary would not write; all need
       # direct access. The online GSI build tests reorder queue rows by hand and
-      # pause writers with a test hook. They build their own throwaway databases;
-      # the connection string is the server, not a database.
+      # pause writers with a test hook. The LSI query plan test reads the
+      # statement the engine sent from pg_stat_activity and explains it, which
+      # the wire cannot show. They build their own throwaway databases; the
+      # connection string is the server, not a database.
       - name: Run PostgreSQL storage-level tests
         # table_snapshot: the SnapshotEngine consistency check; it needs the
         # shared page-size hook, compiled only into the crate's own test
@@ -316,7 +318,7 @@ jobs:
           cargo test --release -p extenddb-storage-postgres
           --test vector_control_plane --test put_create_race --test twi_conflict
           --test stream_shard_retention --test stream_shard_ownership --test stream_records_page_order --test backup_restore
-          --test gsi_online_build --test gsi_stale_writer --test table_snapshot
+          --test gsi_online_build --test gsi_stale_writer --test table_snapshot --test lsi_query_plan
 
       # The daemonized server logs to syslog; dump it so server-side failures
       # are diagnosable from the job log.
