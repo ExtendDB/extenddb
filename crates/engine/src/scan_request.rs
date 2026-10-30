@@ -18,14 +18,37 @@
 //!    switches the message to the older form, `Value '-2147483648' at 'limit'
 //!    ...`, with the value saturated or truncated, in the order
 //!    `totalSegments`, `segment`, `limit`; see `validate_ranges`;
-//! 2. the expression and non-expression parameter mix;
-//! 3. the `ReturnConsumedCapacity` enum;
-//! 4. every number in `ExpressionAttributeValues`, `NS` members and values
+//! 2. the length constraint on `AttributesToGet`: an empty list answers `1
+//!    validation error detected: Value at 'AttributesToGet' failed to satisfy
+//!    constraint: Member must have length greater than or equal to 1`, alone,
+//!    with a `FilterExpression`, and with a `FilterExpression` and a number
+//!    fault, so it comes ahead of the number check;
+//! 3. the expression and non-expression parameter mix, in which a `ScanFilter`
+//!    object counts as present whether or not it is empty (`ScanFilter: {}`
+//!    with a `FilterExpression` answers the mix, `ScanFilter: {}` alone is
+//!    accepted);
+//! 4. the `ReturnConsumedCapacity` enum;
+//! 5. every number in `ExpressionAttributeValues`, `NS` members and values
 //!    nested in `L` and `M` included, whether a `FilterExpression` reads the
 //!    value, nothing reads it, or the request carries no expression at all; a
-//!    Unicode decimal digit counts as the digit it stands for;
-//! 5. the `Select` enum. Both enums invalid answers the `ReturnConsumedCapacity`
+//!    Unicode decimal digit counts as the digit it stands for; then every
+//!    number in the `ExclusiveStartKey` values, which answers the same text as
+//!    a malformed number in a value;
+//! 6. the nesting depth of `ExpressionAttributeValues`: a value nested 32
+//!    levels deep in `L` answers `Nesting Levels have exceeded supported
+//!    limits: Attributes in the item have nested levels beyond supported
+//!    limit`, 31 levels pass, and a malformed number anywhere is reported
+//!    first. The check counts `M` levels the same way as `L` levels; only `L`
+//!    was measured with a valid number at the bottom;
+//! 7. the `Select` enum. Both enums invalid answers the `ReturnConsumedCapacity`
 //!    error alone, so the two are not aggregated.
+//!
+//! Not measured, and checked in the order listed above: the `AttributesToGet`
+//! length against the range constraints and against the enums, the
+//! `ExclusiveStartKey` number check against the `ExpressionAttributeValues`
+//! one, and the nesting check against the `Select` enum. A body nested deeper
+//! than the JSON parser accepts is a `SerializationException` from the parser,
+//! ahead of every check here.
 //!
 //! Each of these is reported ahead of the next one, ahead of the table lookup,
 //! and ahead of the checks the handler makes after deserializing the body
@@ -47,9 +70,11 @@ use crate::query_key_values::{
 };
 
 /// The `Scan` checks that run on the raw request body, in the service's order:
-/// the `Limit`, `Segment` and `TotalSegments` ranges, the expression and
-/// non-expression parameter mix, the `ReturnConsumedCapacity` enum, every
-/// number in `ExpressionAttributeValues`, then the `Select` enum.
+/// the `Limit`, `Segment` and `TotalSegments` ranges, the `AttributesToGet`
+/// length, the expression and non-expression parameter mix, the
+/// `ReturnConsumedCapacity` enum, every number in `ExpressionAttributeValues`
+/// and `ExclusiveStartKey`, the nesting depth of `ExpressionAttributeValues`,
+/// then the `Select` enum.
 ///
 /// The checks read the raw body, so a field that does not deserialize (an
 /// invalid `Select`, for one) does not stop the ones before it. When a check
@@ -71,11 +96,14 @@ pub fn validate_scan_request_body(body: &Value) -> Result<(), DynamoDbError> {
 /// [`validate_scan_request_body`].
 fn scan_request_checks(body: &Value) -> Result<(), DynamoDbError> {
     validate_ranges(body)?;
+    validate_attributes_to_get_length(body)?;
 
     extenddb_core::validation::validate_no_expression_param_mixing(
         &[
             ("AttributesToGet", non_empty(body, "AttributesToGet")),
-            ("ScanFilter", non_empty(body, "ScanFilter")),
+            // An empty ScanFilter object counts as present, as a typed field
+            // that deserialized to an empty map is.
+            ("ScanFilter", present(body, "ScanFilter")),
             ("ConditionalOperator", present(body, "ConditionalOperator")),
         ],
         &[
@@ -96,10 +124,16 @@ fn scan_request_checks(body: &Value) -> Result<(), DynamoDbError> {
         }],
     )?;
 
-    if let Some(raw) = body.get("ExpressionAttributeValues")
-        && let Ok(values) = serde_json::from_value::<HashMap<String, AttributeValue>>(raw.clone())
-    {
-        validate_expression_attribute_value_numbers(&values)?;
+    let values = attribute_value_map(body, "ExpressionAttributeValues");
+    if let Some(values) = &values {
+        validate_expression_attribute_value_numbers(values)?;
+    }
+    // The key's values are numbers checked with the same rules and text.
+    if let Some(key) = attribute_value_map(body, "ExclusiveStartKey") {
+        validate_expression_attribute_value_numbers(&key)?;
+    }
+    if let Some(values) = &values {
+        extenddb_core::validation::validate_attribute_values_nesting_depth(values.values())?;
     }
 
     crate::validate_enum_fields(
@@ -115,6 +149,29 @@ fn scan_request_checks(body: &Value) -> Result<(), DynamoDbError> {
             clause: crate::EnumClause::Named("select"),
         }],
     )
+}
+
+/// The length constraint on `AttributesToGet`: an empty list is refused in the
+/// newer form of the constraint text, with no value echoed (measured
+/// 2026-10-25 10:38 and 10:55 UTC: alone, with a `FilterExpression`, and with
+/// a `FilterExpression` and a malformed number).
+fn validate_attributes_to_get_length(body: &Value) -> Result<(), DynamoDbError> {
+    if body
+        .get("AttributesToGet")
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty)
+    {
+        return Err(DynamoDbError::ValidationException(
+            "1 validation error detected: Value at 'AttributesToGet' failed to satisfy constraint: Member must have length greater than or equal to 1".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// `field` of the body read as a map of attribute values, or `None` when the
+/// field is absent or is not one; [`shape_fault_first`] reports the shape.
+fn attribute_value_map(body: &Value, field: &str) -> Option<HashMap<String, AttributeValue>> {
+    serde_json::from_value(body.get(field)?.clone()).ok()
 }
 
 /// The range constraints on `Limit`, `Segment` and `TotalSegments`, every
@@ -232,5 +289,7 @@ const RANGE_FIELDS: [RangeField; 3] = [
 
 #[cfg(test)]
 mod range_tests;
+#[cfg(test)]
+mod request_tests;
 #[cfg(test)]
 mod tests;
