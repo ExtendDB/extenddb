@@ -7,10 +7,12 @@
 //! Amazon DynamoDB answers a second `DeleteTable` and an `UpdateTable` in that
 //! window with `ResourceInUseException` and the sentence `Attempt to change a
 //! resource which is still in use: Table is being deleted: <name>` (measured
-//! 2026-10-24). On this backend `DeleteTable` drops the data and the catalog
-//! row in one call and never sets `DELETING` itself; the abandoned-restore
-//! sweep does. The window is produced here by setting the row's status
-//! directly.
+//! 2026-10-24). On this backend `DeleteTable` claims the row as `DELETING`
+//! with a lightweight transaction and then drops the data and the catalog row
+//! inside the same call, so the window lasts as long as the drops. The tests
+//! here need it held open for longer than that, and set the row's status
+//! directly; `concurrent_delete_table.rs` runs against the window the request
+//! itself opens.
 //!
 //! The catalog keyspace is shared by every test in this binary, and the
 //! control-plane sweep (`process_control_plane_transitions`) removes any

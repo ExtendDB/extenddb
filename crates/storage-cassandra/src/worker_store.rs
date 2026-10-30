@@ -26,8 +26,10 @@ impl CassandraEngine {
     /// Process pending control plane transitions (H-5).
     ///
     /// Tables in CREATING state whose `status_transition_at` has passed are
-    /// moved to ACTIVE. Tables in DELETING state whose transition time has
-    /// passed are removed (along with their indexes and tags).
+    /// moved to ACTIVE. A DELETING table whose deadline has passed is taken
+    /// with a compare-and-set on that deadline and removed by the same steps
+    /// `DeleteTable` runs (see `remove_claimed_table`); a row the swap does
+    /// not take is left to the actor that holds it.
     ///
     /// Called by the background poller in `cmd_serve`. Also called at startup
     /// to recover in-flight operations from a previous server instance.
@@ -37,7 +39,9 @@ impl CassandraEngine {
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError`] if the database is unreachable or a query fails.
+    /// Returns [`StorageError`] if the catalog cannot be read or a row cannot
+    /// be parsed; a failure to remove one `DELETING` table is logged and the
+    /// table is left for a later pass.
     pub async fn process_control_plane_transitions(
         &self,
     ) -> Result<Vec<(String, &'static str)>, StorageError> {
@@ -88,9 +92,14 @@ impl CassandraEngine {
             transitions.push((table_name, "CREATING → active"));
         }
 
-        // DELETING → remove row (with tags and data table cleanup)
+        // DELETING → removed. Only a DeleteTable claim and the renewals of it
+        // give a DELETING row a deadline, so a row here is a claim whose call
+        // stopped, a call still running past its lease, or a removal by an
+        // earlier pass that stopped part way.
         let query = format!(
-            "SELECT account_id, table_name, table_arn, table_id FROM {catalog_keyspace}.tables \
+            "SELECT account_id, table_name, table_arn, table_id, \
+             toUnixTimestamp(status_transition_at) AS deadline_ms \
+             FROM {catalog_keyspace}.tables \
              WHERE table_status = 'DELETING' AND status_transition_at <= toTimestamp(now()) \
              ALLOW FILTERING"
         );
@@ -119,57 +128,44 @@ impl CassandraEngine {
             let table_id: String = row
                 .get_r_by_name("table_id")
                 .map_err(|e| StorageError::Internal(format!("Failed to parse table_id: {e}")))?;
+            let deadline_ms: i64 = row
+                .get_r_by_name("deadline_ms")
+                .map_err(|e| StorageError::Internal(format!("Failed to parse deadline: {e}")))?;
 
-            // Delete tags
-            let tag_delete = format!("DELETE FROM {catalog_keyspace}.tags WHERE resource_arn = ?");
-            self.session
-                .query_with_values(&tag_delete, cdrs_tokio::query_values!(table_arn.as_str()))
-                .await
-                .map_err(|e| StorageError::Internal(format!("Failed to delete tags: {e}")))?;
-
-            // Delete indexes (catalog + data tables)
-            let account_keyspace = self.account_keyspace(&account_id);
-            self.clear_ttl_entries_for_table_id(&account_id, &table_id)
-                .await?;
-            crate::data::index::delete_indexes_for_table(
-                &self.session_arc(),
-                &catalog_keyspace,
-                &account_keyspace,
-                &table_id,
-                self,
-            )
-            .await?;
-
-            let continuous_backup_delete = format!(
-                "DELETE FROM {catalog_keyspace}.continuous_backups WHERE account_id = ? AND table_name = ?"
-            );
-            self.session
-                .query_with_values(
-                    &continuous_backup_delete,
-                    cdrs_tokio::query_values!(account_id.as_str(), table_name.as_str()),
+            // Take the row from the deadline this pass read. The swap applies
+            // for one actor; a row that another sweeper took, that its call
+            // renewed, or that was removed or created again under the name
+            // since the select is left alone.
+            let removal = async {
+                let Some(lease) = self
+                    .renew_delete_lease(&account_id, &table_name, &table_id, deadline_ms)
+                    .await?
+                else {
+                    return Ok(false);
+                };
+                // The call's removal, under this pass's lease. It returns false,
+                // having deleted nothing keyed on the name, when the lease is
+                // taken from this pass before the name-keyed deletes.
+                self.remove_claimed_table(
+                    &account_id,
+                    &table_name,
+                    &table_id,
+                    &table_arn,
+                    Some(lease),
                 )
                 .await
-                .map_err(|e| {
-                    StorageError::Internal(format!("Failed to delete continuous backup state: {e}"))
-                })?;
-
-            // Delete table row — LWT to avoid mixing plain/LWT writes on a row
-            // created with IF NOT EXISTS. See ADR-0021.
-            let table_delete = format!(
-                "DELETE FROM {catalog_keyspace}.tables WHERE account_id = ? AND table_name = ? IF EXISTS"
-            );
-            crate::cassandra_util::query_lwt(
-                &self.session,
-                &table_delete,
-                cdrs_tokio::query_values!(account_id.as_str(), table_name.as_str()),
-            )
-            .await
-            .map_err(|e| StorageError::Internal(format!("Failed to delete table: {e}")))?;
-
-            // Drop base table in account keyspace
-            self.drop_data_table(&account_keyspace, &table_id).await?;
-
-            transitions.push((table_name, "DELETING → deleted"));
+            };
+            match removal.await {
+                Ok(true) => transitions.push((table_name, "DELETING → deleted")),
+                Ok(false) => {}
+                // Logged and left, as the abandoned-restore sweep does, so one
+                // row that cannot be removed does not stop the rows after it. A
+                // later pass takes it again once this pass's lease has passed.
+                Err(error) => tracing::warn!(
+                    "Control-plane sweep: removing table {table_name} (account {account_id}): \
+                     {error}; retrying on a later pass"
+                ),
+            }
         }
 
         Ok(transitions)

@@ -27,8 +27,14 @@ mod backup_engine;
 mod cassandra_engine;
 #[path = "direct/concurrent_account_creation.rs"]
 mod concurrent_account_creation;
+#[path = "direct/concurrent_delete_table.rs"]
+mod concurrent_delete_table;
 #[path = "direct/delete_item.rs"]
 mod delete_item;
+#[path = "direct/delete_table_lease.rs"]
+mod delete_table_lease;
+#[path = "direct/delete_table_support.rs"]
+mod delete_table_support;
 #[path = "direct/deleting_window.rs"]
 mod deleting_window;
 #[path = "direct/groups.rs"]
