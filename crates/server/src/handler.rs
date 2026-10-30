@@ -10,7 +10,7 @@ use std::sync::Arc;
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, State};
 use axum::http::HeaderMap;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use extenddb_core::error::DynamoDbError;
 use extenddb_engine::OperationContext;
 use serde_json::Value;
@@ -48,14 +48,31 @@ pub(crate) async fn handle_request(
     }
     let request_id = uuid::Uuid::new_v4().to_string();
 
-    // SP-WIRE-007: body limit exceeded → 413
-    let Ok(body) = body else {
-        return error_response(
-            &DynamoDbError::RequestEntityTooLargeException(
-                "Request size has exceeded the maximum allowed size".to_owned(),
-            ),
-            &request_id,
-        );
+    // A repeated `host` or `authorization` header was refused before routing
+    // (see `repeated_headers`), so each is read as one value from here on.
+
+    // SP-WIRE-007: body limit exceeded → 413. Any other failure to read the
+    // body is the body timeout (the client stopped sending) → 408.
+    let body = match body {
+        Ok(body) => body,
+        Err(axum::extract::rejection::BytesRejection::FailedToBufferBody(
+            axum::extract::rejection::FailedToBufferBody::LengthLimitError(_),
+        )) => {
+            return error_response(
+                &DynamoDbError::RequestEntityTooLargeException(
+                    "Request size has exceeded the maximum allowed size".to_owned(),
+                ),
+                &request_id,
+            );
+        }
+        Err(_) => {
+            return (
+                axum::http::StatusCode::REQUEST_TIMEOUT,
+                [(axum::http::header::CONNECTION, "close")],
+                "request body was not received within the server's request timeout",
+            )
+                .into_response();
+        }
     };
 
     // Extract operation from X-Amz-Target
