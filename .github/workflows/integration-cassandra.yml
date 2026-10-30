@@ -117,6 +117,8 @@ jobs:
           path: target/release/extenddb
           if-no-files-found: error
           retention-days: 1
+          # A re-run of a failed job uploads the same name again.
+          overwrite: true
 
   cassandra-pytest:
     runs-on: extenddb_ubuntu-2404_4-core
