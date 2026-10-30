@@ -303,6 +303,10 @@ export EXTENDDB_TEST_MONGODB_CONTAINER="$CONTAINER_NAME"
 # physical index lifecycle after exercising the DynamoDB API.
 export EXTENDDB_TEST_MONGODB_CONTAINER="$CONTAINER_NAME"
 
+# Storage crate tests that need a live replica set connect here. Each test
+# uses its own databases and drops them when it finishes.
+export EXTENDDB_TEST_MONGODB_URI="mongodb://localhost:$MONGO_PORT/?replicaSet=rs0&directConnection=true"
+
 # Some tests read EXTENDDB_CONFIG to invoke `extenddb settings` against
 # the running instance. Without this, they fall back to `./extenddb.toml`
 # in the repo root, which is a stale dev config that points at a
