@@ -198,30 +198,20 @@ async fn a_server_and_a_migration_refuse_each_other() {
 /// timeout, through the store the body is handed, rather than when the lease
 /// cuts the body 35 to 65 s later (SPEC.md A6: every request under the lock
 /// is bounded by 10 s). The node is the test node behind a proxy that stops
-/// passing bytes once the session is up.
+/// passing bytes once the session is up, and the session sends every
+/// request through the proxy, on one node or two.
 #[tokio::test]
 async fn a_bodys_request_to_a_node_that_stops_answering_fails_at_the_request_timeout() {
     use extenddb_storage::migrations::{HasManagementStore, MigrationBackend};
-    use extenddb_storage_cassandra::migrations::{CassandraMigrations, Deployment};
+    use extenddb_storage_cassandra::migrations::CassandraMigrations;
 
     if helpers::skip_without_cassandra() {
         return;
     }
     let proxy =
         migrations_support::SilencingProxy::in_front_of(helpers::test_contact_point()).await;
-    let config = helpers::test_config();
-    let deployment = Deployment {
-        contact_points: vec![proxy.address.clone()],
-        keyspace_prefix: "p2m_silent".to_owned(),
-        username: config.username.clone(),
-        password: config.password.clone(),
-        app_role: config.username.clone(),
-    };
-    let session = deployment
-        .connect()
-        .await
-        .expect("connect through the proxy");
-    let migrations = CassandraMigrations::for_status(session, &deployment.keyspace_prefix);
+    let session = proxy.session().await;
+    let migrations = CassandraMigrations::for_status(session, "p2m_silent");
     let store = migrations.stores().management_store();
     // Through the proxy, a request is answered: the keyspace does not exist.
     let answered = store.list_policies("000000000000", "user", "alice").await;

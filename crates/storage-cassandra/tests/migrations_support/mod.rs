@@ -145,6 +145,47 @@ impl SilencingProxy {
     pub fn go_silent(&self) {
         self.silent.store(true, std::sync::atomic::Ordering::SeqCst);
     }
+
+    /// A session to the test node that sends every request through the
+    /// proxy. The driver reads the other nodes of a cluster from
+    /// `system.peers` and connects to them directly, so on two nodes the
+    /// second one would answer while the proxy is silent; this session
+    /// leaves every node but the proxy out of its query plans.
+    pub async fn session(&self) -> Arc<CassandraSession> {
+        use cdrs_tokio::authenticators::StaticPasswordAuthenticatorProvider;
+        use cdrs_tokio::cluster::session::{SessionBuilder, TcpSessionBuilder};
+        use cdrs_tokio::cluster::topology::NodeDistance;
+        use cdrs_tokio::cluster::{NodeInfo, NodeTcpConfigBuilder};
+        use cdrs_tokio::load_balancing::RoundRobinLoadBalancingStrategy;
+        use cdrs_tokio::load_balancing::node_distance_evaluator::NodeDistanceEvaluator;
+
+        struct OnlyThrough(std::net::SocketAddr);
+
+        impl NodeDistanceEvaluator for OnlyThrough {
+            fn compute_distance(&self, node: &NodeInfo) -> Option<NodeDistance> {
+                (node.broadcast_rpc_address == self.0).then_some(NodeDistance::Local)
+            }
+        }
+
+        let config = helpers::test_config();
+        let proxy = self.address.parse().expect("the proxy's address");
+        let nodes = NodeTcpConfigBuilder::new()
+            .with_contact_point(self.address.clone().into())
+            .with_authenticator_provider(Arc::new(StaticPasswordAuthenticatorProvider::new(
+                config.username.unwrap_or_default(),
+                config.password.unwrap_or_default(),
+            )))
+            .build()
+            .await
+            .expect("the proxy's node config");
+        Arc::new(
+            TcpSessionBuilder::new(RoundRobinLoadBalancingStrategy::new(), nodes)
+                .with_node_distance_evaluator(Box::new(OnlyThrough(proxy)))
+                .build()
+                .await
+                .expect("connect through the proxy"),
+        )
+    }
 }
 
 impl Drop for SilencingProxy {

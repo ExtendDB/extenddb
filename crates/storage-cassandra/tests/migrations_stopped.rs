@@ -121,17 +121,51 @@ async fn released_catalog(session: &Arc<CassandraSession>, prefix: &str) {
         .expect("session");
 }
 
-/// Add `count` IAM users to [`ACCOUNT`], each with one inline policy holding
-/// a `dynamodb:ResourceTag` key, 32 users at a time.
-async fn add_tagged_users(store: &CassandraCatalogStore, count: usize) {
+/// Add `count` IAM users to [`ACCOUNT`] of the catalog of `prefix`, 32 at a
+/// time, each with the self-service policy `create_user` gives a user and
+/// one inline policy holding a `dynamodb:ResourceTag` key. The user row is a
+/// plain insert of the columns `create_user` writes: `create_user` inserts it
+/// with a lightweight transaction, and 32 of those at once on the account's
+/// partition contend with each other, so on a loaded node some of them fail.
+async fn add_tagged_users(store: &CassandraCatalogStore, prefix: &str, count: usize) {
     use futures::StreamExt;
     let tagged: serde_json::Value = serde_json::from_str(TAGGED).expect("json");
+    let insert = format!(
+        "INSERT INTO {prefix}_catalog.iam_users (account_id, user_name, user_arn, created_at) \
+         VALUES (?, ?, ?, toTimestamp(now()))"
+    );
     futures::stream::iter(0..count)
         .map(|i| {
             let tagged = &tagged;
+            let insert = &insert;
             async move {
                 let name = format!("u{i:05}");
-                store.create_user(ACCOUNT, &name, None).await.expect("user");
+                let arn = format!("arn:aws:iam::{ACCOUNT}:user/{name}");
+                store
+                    .session()
+                    .query_with_values(
+                        insert,
+                        cdrs_tokio::query_values!(ACCOUNT, name.as_str(), arn.as_str()),
+                    )
+                    .await
+                    .unwrap_or_else(|e| panic!("user {name}: {e}"));
+                let self_service = serde_json::json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Action": [
+                            "iam:CreateAccessKey",
+                            "iam:DeleteAccessKey",
+                            "iam:ListAccessKeys",
+                            "iam:ChangePassword"
+                        ],
+                        "Resource": arn
+                    }]
+                });
+                store
+                    .put_policy(ACCOUNT, "user", &name, "SelfServicePolicy", &self_service)
+                    .await
+                    .expect("self-service policy");
                 store
                     .put_policy(ACCOUNT, "user", &name, "tagged", tagged)
                     .await
@@ -430,7 +464,7 @@ async fn migration_2_records_its_row_when_it_rewrote_many_policies() {
     let (prefix, _drops) = new_prefix("m2many");
     released_catalog(&session, &prefix).await;
     let store = CassandraCatalogStore::catalog_only(session.clone(), prefix.clone());
-    add_tagged_users(&store, USERS).await;
+    add_tagged_users(&store, &prefix, USERS).await;
     let (done, _) =
         run_stopped_after(&session, &prefix, usize::MAX, false, MigrationId::LATEST).await;
     done.expect("migrate records migration 2 over many policies");
@@ -480,7 +514,7 @@ async fn the_status_read_under_the_lock_keeps_it_through_a_long_scan() {
     let (prefix, _drops) = new_prefix("m2status");
     released_catalog(&session, &prefix).await;
     let store = CassandraCatalogStore::catalog_only(session.clone(), prefix.clone());
-    add_tagged_users(&store, USERS).await;
+    add_tagged_users(&store, &prefix, USERS).await;
     let times = LeaseTimes {
         ttl: Duration::from_secs(6),
         renew_every: Duration::from_millis(300),
