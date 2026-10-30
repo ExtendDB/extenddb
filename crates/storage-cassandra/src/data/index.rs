@@ -147,7 +147,7 @@ pub async fn fetch_index_by_name(
     let row = rows
         .into_iter()
         .next()
-        .ok_or_else(|| StorageError::IndexNotFound(format!("Index {index_name} not found")))?;
+        .ok_or_else(|| StorageError::IndexNotFound(index_name.to_owned()))?;
 
     let index_id: String = get_column(&row, "index_id", "fetch_index_by_name")?;
     let index_type: String = get_column(&row, "index_type", "fetch_index_by_name")?;

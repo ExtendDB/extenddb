@@ -43,32 +43,13 @@ pub async fn handle_query(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
-    // Pre-scanned before typed deserialization, sequentially: Query stops at
-    // the FIRST invalid enum, checking ReturnConsumedCapacity ahead of Select.
-    // Measured 2026-08-24 (us-east-1): both invalid answers "1 validation
-    // error detected" naming returnConsumedCapacity alone. (Scan is the
-    // opposite on both counts: it aggregates, select-first; see handle_scan.)
-    crate::validate_enum_fields(
-        &body,
-        &[crate::EnumField {
-            json_name: "ReturnConsumedCapacity",
-            valid: &["INDEXES", "TOTAL", "NONE"],
-            clause: crate::EnumClause::Named("returnConsumedCapacity"),
-        }],
-    )?;
-    crate::validate_enum_fields(
-        &body,
-        &[crate::EnumField {
-            json_name: "Select",
-            valid: &[
-                "SPECIFIC_ATTRIBUTES",
-                "COUNT",
-                "ALL_ATTRIBUTES",
-                "ALL_PROJECTED_ATTRIBUTES",
-            ],
-            clause: crate::EnumClause::Named("select"),
-        }],
-    )?;
+    // Request-time checks on the raw body, in the service's order: Limit, the
+    // expression and non-expression parameter mix, the ReturnConsumedCapacity
+    // enum, every number in ExpressionAttributeValues, the Select enum. They
+    // run before typed deserialization so a field that does not deserialize
+    // does not stop the ones before it. The server runs the same function
+    // ahead of the IAM decision; see `query_key_values`.
+    crate::query_key_values::validate_query_request_body(&body)?;
     let input: QueryInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
     // P118: Fetch key_info first so we can use table_id for index lookup.
@@ -137,14 +118,7 @@ pub async fn handle_query(
         )?;
     }
 
-    // Validate Limit >= 1 (REQ-QUERY-001)
-    if let Some(limit) = input.limit
-        && limit < 1
-    {
-        return Err(DynamoDbError::ValidationException(
-                "1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1".to_owned(),
-            ));
-    }
+    // Limit >= 1 is checked at request time in validate_query_request_body.
 
     // For index queries, build a key_info that reflects the index's key schema
     // so the storage layer uses the correct SK column for the index table.
@@ -166,34 +140,9 @@ pub async fn handle_query(
         key_info.clone()
     };
 
-    // --- Legacy vs expression mutual exclusivity checks ---
-    let kce_present = input.key_condition_expression.is_some();
-    let has_kc = input.key_conditions.as_ref().is_some_and(|m| !m.is_empty());
-    let has_fe = input.filter_expression.is_some();
-    let has_qf = input.query_filter.as_ref().is_some_and(|m| !m.is_empty());
-    let has_pe = input.projection_expression.is_some();
-    let has_atg = input
-        .attributes_to_get
-        .as_ref()
-        .is_some_and(|a| !a.is_empty());
+    // The legacy versus expression mutual exclusivity check runs at request
+    // time in validate_query_request_body.
     let has_cond_op = input.conditional_operator.is_some();
-
-    // KeyConditions legitimately combines with FilterExpression and
-    // ProjectionExpression, so it joins the mixing check only when
-    // KeyConditionExpression is also present.
-    extenddb_core::validation::validate_no_expression_param_mixing(
-        &[
-            ("AttributesToGet", has_atg),
-            ("QueryFilter", has_qf),
-            ("ConditionalOperator", has_cond_op),
-            ("KeyConditions", has_kc && kce_present),
-        ],
-        &[
-            ("ProjectionExpression", has_pe),
-            ("FilterExpression", has_fe),
-            ("KeyConditionExpression", kce_present),
-        ],
-    )?;
 
     // An explicitly empty KeyConditionExpression is rejected up front, before
     // the expression-parameter-usage checks (matching real DynamoDB).
@@ -468,6 +417,19 @@ pub async fn handle_query(
         )?;
         extenddb_core::expression::validate_ordering_operand_types(f, &combined_maps).map_err(
             |e| crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Filter),
+        )?;
+    }
+
+    // A key condition value whose type is not the key attribute's type is
+    // refused after the key schema, filter, projection, unused value and
+    // Select checks and before the ExclusiveStartKey check (measured
+    // 2026-10-24). The legacy KeyConditions path makes its own checks when it
+    // desugars.
+    if legacy_kc_maps.is_none() {
+        crate::query_key_values::validate_key_condition_types(
+            &key_condition,
+            effective_maps,
+            &query_key_info.attribute_definitions,
         )?;
     }
 
