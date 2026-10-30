@@ -62,6 +62,19 @@ pub async fn handle_update_item(
 
     extenddb_core::validation::validate_table_name(&input.table_name, &ctx.limits)?;
 
+    // An attribute name over the size limit is input validation: it is
+    // reported ahead of the table lookup, the expressions, the condition and
+    // the index-key checks, whichever map the name arrives through.
+    extenddb_core::validation::validate_expression_attribute_name_sizes(
+        input.expression_attribute_names.as_ref(),
+        input.expression_attribute_values.as_ref(),
+        &ctx.limits,
+        extenddb_core::validation::AttributeNameRequestForm::SingleItem,
+    )?;
+    if let Some(updates) = &input.attribute_updates {
+        extenddb_core::validation::validate_attribute_updates_name_sizes(updates, &ctx.limits)?;
+    }
+
     // Validate Update/Condition expressions (and AttributeUpdates
     // desugaring) before the existence check; key, item-content nesting, and
     // the no-key-update checks stay after (post-existence on Amazon DynamoDB).
