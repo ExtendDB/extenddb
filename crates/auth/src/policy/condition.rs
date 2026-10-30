@@ -452,11 +452,12 @@ fn compare_single(op: &ConditionOperator, context_value: &str, policy_value: &st
         }
         ConditionOperator::Bool => context_value.eq_ignore_ascii_case(policy_value),
         // IAM evaluates ArnEquals exactly as ArnLike and ArnNotEquals exactly
-        // as ArnNotLike: `*` and `?` match in every ARN field, matching is
-        // case sensitive, and both sides need the same number of fields,
-        // except that a bare `*` pattern matches any six-field value
-        // (`arn_match` returns before it compares fields; derived, since the
-        // simulator refuses `*` against an ARN).
+        // as ArnNotLike, with the matcher in `arn_value::arn_condition_match`:
+        // `*` and `?` match in every field, matching is case sensitive, a
+        // pattern of two to five fields starting `arn` compares only the
+        // fields it has, and a one-field pattern (bare `*` included) matches
+        // nothing, so the negative operators hold for it. Measured on a live
+        // role session on 2026-10-30 (issue #665).
         // A context value that is not an ARN (fewer than six fields) matches
         // neither the positive nor the negative operator, so a Deny on
         // ArnNotEquals does not apply to a malformed value; under
@@ -467,11 +468,11 @@ fn compare_single(op: &ConditionOperator, context_value: &str, policy_value: &st
         // the values `notanarn` and `arn:aws:dynamodb`.
         ConditionOperator::ArnEquals | ConditionOperator::ArnLike => {
             super::matcher::is_arn(context_value)
-                && super::matcher::arn_match(policy_value, context_value)
+                && super::arn_value::arn_condition_match(policy_value, context_value)
         }
         ConditionOperator::ArnNotEquals | ConditionOperator::ArnNotLike => {
             super::matcher::is_arn(context_value)
-                && !super::matcher::arn_match(policy_value, context_value)
+                && !super::arn_value::arn_condition_match(policy_value, context_value)
         }
         // IpAddress matches only when the caller address and the policy range
         // are the same family and the address is in the range. NotIpAddress
