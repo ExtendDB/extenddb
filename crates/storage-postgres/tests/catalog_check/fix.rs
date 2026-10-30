@@ -7,9 +7,39 @@ use std::time::{Duration, Instant};
 
 use extenddb_storage::diagnostics::{DiagnosticsStore, OrphanDrop};
 use extenddb_storage_postgres::PostgresCatalogStore;
-use sqlx::Connection;
+use sqlx::{Connection, PgPool};
 
 use crate::support::{ACCOUNT, Deployment, TABLE, base_conn, hold_relation, skip};
+
+/// Wait until a session of the catalog database waits for `SHARE` on
+/// `indexes`, and return the catalog tables among `tables` and
+/// `vector_indexes` that this session holds a lock on while it waits. One
+/// read of `pg_locks` gives both, and `SHARE` is never a fast-path lock, so
+/// the two come from the same state of the lock table.
+async fn other_tables_locked_by_the_index_lock_waiter(catalog: &PgPool) -> Vec<String> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let waiters: Vec<(Option<Vec<String>>,)> = sqlx::query_as(
+            "SELECT array_agg(c.relname::text ORDER BY c.relname) \
+                    FILTER (WHERE l.granted AND c.relname IN ('tables', 'vector_indexes')) \
+               FROM pg_locks l JOIN pg_class c ON c.oid = l.relation \
+              WHERE l.database = (SELECT oid FROM pg_database WHERE datname = current_database()) \
+              GROUP BY l.pid \
+             HAVING bool_or(c.relname = 'indexes' AND l.mode = 'ShareLock' AND NOT l.granted)",
+        )
+        .fetch_all(catalog)
+        .await
+        .expect("read pg_locks");
+        if let Some((held,)) = waiters.into_iter().next() {
+            return held.unwrap_or_default();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no session waited for ShareLock on indexes within 10 s"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
 
 /// `--fix` drops the relation no catalog row names and nothing else: not the
 /// live table's relations, not a table created after the check, not a table
@@ -94,11 +124,12 @@ async fn fix_drops_only_the_relation_no_catalog_row_names() {
 
 /// An `UpdateTable` adding a GSI has inserted the index row and committed
 /// the index's relation, and its catalog transaction is still open when the
-/// drop is asked to drop that relation. The drop waits for the add; the add's
-/// next write, to the table row, does not wait on the drop (the drop locks
-/// only `indexes`); another write to `indexes` queues behind the drop's
-/// request for one attempt at most; and once the add commits, its relation is
-/// kept. Run at both the default isolation and REPEATABLE READ.
+/// drop is asked to drop that relation. The drop waits for the add, holding
+/// no lock on `tables` or `vector_indexes`; the add's next write, to the
+/// table row, does not wait on the drop; another write to `indexes` queues
+/// behind the drop's request for one attempt at most; and once the add
+/// commits, its relation is kept. Run at both the default isolation and
+/// REPEATABLE READ.
 async fn an_index_added_during_the_drop_keeps_its_relation(
     store: &PostgresCatalogStore,
     d: &Deployment,
@@ -107,10 +138,10 @@ async fn an_index_added_during_the_drop_keeps_its_relation(
     let mut add = d.begin_index_add("gsi9").await;
     let relation = add.relation.clone();
     let five = Duration::from_secs(5);
-    let (outcomes, (table_write, other_write)) = tokio::join!(
+    let (outcomes, (held_while_waiting, table_write, other_write)) = tokio::join!(
         store.drop_orphaned_relations(vec![relation.clone()]),
         async move {
-            Deployment::wait_for_lock_request(&d.catalog, "indexes", "ShareLock").await;
+            let held = other_tables_locked_by_the_index_lock_waiter(&d.catalog).await;
             let table_write = tokio::time::timeout(five, add.write_table_row()).await;
             let started = Instant::now();
             let other_write = tokio::time::timeout(
@@ -125,10 +156,14 @@ async fn an_index_added_during_the_drop_keeps_its_relation(
             // Open past several attempts, so the drop has to try again.
             tokio::time::sleep(Duration::from_millis(600)).await;
             add.commit().await;
-            (table_write, other_write)
+            (held, table_write, other_write)
         }
     );
 
+    assert!(
+        held_while_waiting.is_empty(),
+        "the drop held locks on {held_while_waiting:?} while it waited for indexes"
+    );
     let table_write = table_write
         .expect("the add's table write did not wait out 5 s")
         .expect("the add's table write succeeded");
