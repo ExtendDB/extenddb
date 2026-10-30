@@ -119,6 +119,14 @@ pub struct StreamDescription {
     pub stream_arn: String,
     #[serde(rename = "StreamLabel")]
     pub stream_label: String,
+    /// When the stream was requested, epoch seconds. The service returns it
+    /// on every stream, enabled or disabled. Backends leave it `None`; the
+    /// engine derives it from `stream_label` at the response boundary.
+    #[serde(
+        rename = "CreationRequestDateTime",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub creation_request_date_time: Option<f64>,
     #[serde(rename = "StreamStatus")]
     pub stream_status: StreamStatus,
     #[serde(rename = "StreamViewType")]
