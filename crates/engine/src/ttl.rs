@@ -226,6 +226,15 @@ fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
         StorageError::TableNotActive(name) => {
             DynamoDbError::ResourceInUseException(format!("Table {name} is not in ACTIVE state"))
         }
+        // No TTL path raises this today (the TTL metadata paths answer
+        // TableNotActive for every non-ACTIVE status), but the variant exists
+        // and a backend that raises it here must not become a 500.
+        StorageError::TableBeingDeleted(name) => {
+            DynamoDbError::ResourceInUseException(extenddb_core::error::error_message(
+                extenddb_core::error::ErrorMessageKey::TableBeingDeleted,
+                &[&name],
+            ))
+        }
         other => {
             tracing::error!(internal_error = %other, "storage internal error");
             DynamoDbError::InternalServerError("Internal server error".to_owned())
@@ -236,6 +245,25 @@ fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The TTL mapper renders a DELETING table with the service's sentence and
+    /// keeps the other non-ACTIVE statuses on theirs.
+    #[test]
+    fn a_deleting_table_has_its_own_sentence() {
+        match storage_to_dynamo(StorageError::TableBeingDeleted("t".to_owned())) {
+            DynamoDbError::ResourceInUseException(msg) => assert_eq!(
+                msg,
+                "Attempt to change a resource which is still in use: Table is being deleted: t"
+            ),
+            other => panic!("expected ResourceInUseException, got {other:?}"),
+        }
+        match storage_to_dynamo(StorageError::TableNotActive("t".to_owned())) {
+            DynamoDbError::ResourceInUseException(msg) => {
+                assert_eq!(msg, "Table t is not in ACTIVE state");
+            }
+            other => panic!("expected ResourceInUseException, got {other:?}"),
+        }
+    }
 
     #[test]
     fn valid_ttl_attribute_names() {

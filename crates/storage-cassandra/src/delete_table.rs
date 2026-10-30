@@ -79,6 +79,17 @@ impl CassandraEngine {
 
         match caller {
             DeleteTableCaller::Client => {
+                // A DELETING row belongs to the deletion already under way
+                // (the abandoned-restore sweep sets it on this backend). The
+                // service refuses a second DeleteTable in that window as a
+                // table still in use (measured 2026-10-24); checked before
+                // deletion protection, as the SQL backends order it.
+                let status: String =
+                    crate::cassandra_util::get_column(table_row, "table_status", "delete_table")?;
+                if status == "DELETING" {
+                    return Err(StorageError::TableBeingDeleted(input.table_name.clone()));
+                }
+
                 // Check deletion protection
                 let deletion_protection: bool = table_row
                     .get_r_by_name("deletion_protection_enabled")
@@ -94,12 +105,11 @@ impl CassandraEngine {
                 // A restore target is owned by its copy until the copy
                 // activates it (or the sweep removes it). Deleting it mid-copy
                 // would race the copy's writes into dropped tables.
-                let status: Option<String> = table_row.get_by_name("table_status").ok().flatten();
                 let restoring_from: Option<String> = table_row
                     .get_by_name("restore_source_backup_arn")
                     .ok()
                     .flatten();
-                if status.as_deref() == Some("CREATING") && restoring_from.is_some() {
+                if status == "CREATING" && restoring_from.is_some() {
                     return Err(table_being_restored(&input.table_name));
                 }
             }

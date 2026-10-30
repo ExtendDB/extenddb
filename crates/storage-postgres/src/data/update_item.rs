@@ -11,7 +11,7 @@ use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{parse_sk, pk_to_text, sk_column, sk_info};
 
 use super::gsi_build::fix_up_stale_write;
-use super::index::{enqueue_async_indexes, fetch_write_path_indexes, sync_indexes};
+use super::index::{db_error, enqueue_async_indexes, fetch_write_path_indexes, sync_indexes};
 use super::query::check_condition;
 use super::tx_helpers::write_stream_record_in_tx;
 use super::{data_table_name, json_to_item};
@@ -40,11 +40,7 @@ impl PostgresEngine {
         let pk_text = pk_to_text(pk_value)?;
 
         // UpdateItem always needs a transaction (read-modify-write)
-        let mut tx = self
-            .data_pool
-            .begin()
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let mut tx = self.data_pool.begin().await.map_err(db_error)?;
 
         // Both index families in one catalog visit (D-4: sync + async split for the
         // secondary indexes).
@@ -133,7 +129,7 @@ impl PostgresEngine {
                         .bind(pk_text.as_ref())
                         .fetch_optional(&mut *tx)
                         .await
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
+                        .map_err(db_error)?;
                     row.map(|(v,)| v)
                 }
             };
@@ -233,7 +229,7 @@ impl PostgresEngine {
                             .bind(&item_json)
                             .execute(&mut *tx)
                             .await
-                            .map_err(|e| StorageError::Internal(e.to_string()))?;
+                            .map_err(db_error)?;
                     }
                 }
                 break (old_item, new_item, item, pre_mutation_item);
@@ -260,7 +256,7 @@ impl PostgresEngine {
                         .bind(&item_json)
                         .execute(&mut *tx)
                         .await
-                        .map_err(|e| StorageError::Internal(e.to_string()))?
+                        .map_err(db_error)?
                         .rows_affected()
                         == 1
                 }
@@ -333,9 +329,7 @@ impl PostgresEngine {
         async_enqueued +=
             fix_up_stale_write(&mut tx, &self.pool, stamp, key_info, &indexes, key).await?;
 
-        tx.commit()
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        tx.commit().await.map_err(db_error)?;
 
         if async_enqueued > 0
             && let Some(ref q) = self.gsi_queue

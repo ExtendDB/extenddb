@@ -30,6 +30,8 @@ mod create_table;
 mod credential_store;
 mod data;
 mod delete_table;
+#[cfg(test)]
+mod deleting_window_data_tests;
 mod hooks;
 mod management_store;
 mod metadata;

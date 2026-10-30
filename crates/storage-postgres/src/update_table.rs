@@ -131,6 +131,11 @@ impl PostgresEngine {
 
         let (status, table_id, ks_json, ad_json, stored_billing_mode) =
             row.ok_or_else(|| StorageError::TableNotFound(input.table_name.clone()))?;
+        // A DELETING table has its own sentence on the service (measured
+        // 2026-10-24); every other non-ACTIVE status keeps the existing one.
+        if status == "DELETING" {
+            return Err(StorageError::TableBeingDeleted(input.table_name.clone()));
+        }
         if status != "ACTIVE" {
             return Err(StorageError::TableNotActive(input.table_name.clone()));
         }

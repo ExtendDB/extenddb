@@ -14,6 +14,8 @@ use extenddb_storage::error::StorageError;
 use extenddb_storage::util::SortKeyValue;
 use extenddb_storage::util::{parse_sk, pk_to_text, sk_info};
 
+use super::index::db_error;
+
 /// Extra pagination bind values for index queries.
 ///
 /// Built in `query_scan.rs` in the same branch that generates the SQL placeholders,
@@ -203,10 +205,7 @@ pub(crate) async fn execute_query_sql(
         }
     }
 
-    let rows: Vec<(serde_json::Value,)> = query
-        .fetch_all(pool)
-        .await
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
+    let rows: Vec<(serde_json::Value,)> = query.fetch_all(pool).await.map_err(db_error)?;
 
     Ok(rows.into_iter().map(|(v,)| v).collect())
 }
@@ -343,10 +342,7 @@ pub(crate) async fn execute_scan_sql(
         }
     }
 
-    let rows: Vec<(serde_json::Value,)> = query
-        .fetch_all(pool)
-        .await
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
+    let rows: Vec<(serde_json::Value,)> = query.fetch_all(pool).await.map_err(db_error)?;
 
     Ok(rows.into_iter().map(|(v,)| v).collect())
 }

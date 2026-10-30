@@ -22,34 +22,35 @@ impl SqliteEngine {
     ) -> Result<TableDescription, StorageError> {
         Self::validate_account_id(account_id)?;
 
-        // A DELETING row is fetched too: DeleteTable of a table that is
-        // already being deleted returns its description, as the service does.
+        // The status lookup runs inside the write transaction, so two
+        // DeleteTable calls on one table are serialized: the second reads the
+        // row the first committed (DELETING, or gone) rather than the ACTIVE
+        // row both would otherwise read before either wrote. A DELETING row is
+        // fetched too, so that a DeleteTable of a table already being deleted
+        // can be answered the way the service answers it.
+        let _writer = self.write_lock.lock().await;
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+
         let row: Option<TableRow> = sqlx::query_as(&format!(
             "SELECT {TABLE_COLUMNS} FROM tables WHERE account_id = ? AND table_name = ? \
              AND table_status IN ('ACTIVE', 'CREATING', 'DELETING')"
         ))
         .bind(account_id)
         .bind(&input.table_name)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let row = row.ok_or_else(|| StorageError::TableNotFound(input.table_name.clone()))?;
         if row.table_status == "DELETING" {
-            // Already scheduled for removal by the control-plane worker:
-            // nothing to change.
-            let index_rows: Vec<IndexRow> = sqlx::query_as(&format!(
-                "SELECT {INDEX_COLUMNS} FROM indexes WHERE table_id = ?"
-            ))
-            .bind(&row.table_id)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-            let desc = self.build_table_description_from_row(account_id, row, index_rows)?;
-            return Ok(TableDescription {
-                table_status: TableStatus::Deleting,
-                ..desc
-            });
+            // The service answers a DeleteTable of a table that is already
+            // being deleted as a table still in use (measured 2026-10-25 and
+            // 2026-10-30), not with the table's description.
+            return Err(StorageError::TableBeingDeleted(input.table_name.clone()));
         }
         if row.deletion_protection_enabled {
             return Err(StorageError::DeletionProtected(row.table_arn.clone()));
@@ -66,7 +67,7 @@ impl SqliteEngine {
                  AND table_status = 'CREATING' AND status_transition_at IS NULL)",
             )
             .bind(&row.table_id)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
             if restoring {
@@ -82,14 +83,14 @@ impl SqliteEngine {
             "SELECT {INDEX_COLUMNS} FROM indexes WHERE table_id = ?"
         ))
         .bind(&row.table_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let delay_secs: f64 = sqlx::query_scalar::<_, String>(
             "SELECT value FROM settings WHERE key = 'control_plane_delay_seconds'",
         )
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?
         .and_then(|v| v.parse::<f64>().ok())
@@ -100,12 +101,6 @@ impl SqliteEngine {
         let table_arn = row.table_arn.clone();
 
         if delay_secs < 1.0 {
-            let _writer = self.write_lock.lock().await;
-            let mut tx = self
-                .pool
-                .begin_with("BEGIN IMMEDIATE")
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
             // A vector index with `backfilling` set is an UpdateTable build in
             // flight (the with-table path never sets the column), and the
             // service refuses to delete the table underneath one; the refusal
@@ -145,27 +140,28 @@ impl SqliteEngine {
             let transition = format_timestamp(
                 time::OffsetDateTime::now_utc() + time::Duration::seconds_f64(delay_secs),
             );
-            let _writer = self.write_lock.lock().await;
-            let mut tx = self
-                .pool
-                .begin_with("BEGIN IMMEDIATE")
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
             // Same in-flight-build refusal as the immediate branch, and inside
             // the transaction that flips the table to DELETING for the same
             // reason: without it, a build committing between an earlier check
             // and this flip would have its table deleted underneath it.
             Self::refuse_if_index_build_in_flight(&mut tx, &row.table_id).await?;
-            sqlx::query(
+            // Fenced on the table id read above, so the mark can only land on
+            // the table this call described, never on a table created into the
+            // same name afterwards.
+            let marked = sqlx::query(
                 "UPDATE tables SET table_status = 'DELETING', status_transition_at = ? \
-                 WHERE account_id = ? AND table_name = ?",
+                 WHERE account_id = ? AND table_name = ? AND table_id = ?",
             )
             .bind(&transition)
             .bind(account_id)
             .bind(&input.table_name)
+            .bind(&table_id)
             .execute(&mut *tx)
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
+            if marked.rows_affected() == 0 {
+                return Err(StorageError::TableNotFound(input.table_name.clone()));
+            }
             tx.commit()
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -207,5 +203,120 @@ impl SqliteEngine {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod deleting_window_tests {
+    use crate::SqliteEngine;
+    use extenddb_core::types::{DeleteTableInput, UpdateTableInput};
+    use extenddb_storage::TableEngine;
+    use extenddb_storage::error::StorageError;
+    use serde_json::json;
+
+    const ACCOUNT: &str = "000000000000";
+
+    /// An engine with one ACTIVE table `t`, whose catalog row is then set to
+    /// DELETING directly: the window a slow data drop would hold open.
+    async fn engine_with_deleting_table() -> SqliteEngine {
+        let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
+            .await
+            .expect("engine");
+        crate::schema::apply(&engine.pool).await.expect("schema");
+        sqlx::query("UPDATE settings SET value = '0' WHERE key = 'control_plane_delay_seconds'")
+            .execute(&engine.pool)
+            .await
+            .expect("delay");
+        sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
+            .bind(ACCOUNT)
+            .execute(&engine.pool)
+            .await
+            .expect("account");
+        let input: extenddb_core::types::CreateTableInput = serde_json::from_value(json!({
+            "TableName": "t",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST"
+        }))
+        .expect("input");
+        engine
+            .create_table_impl(ACCOUNT, input, false)
+            .await
+            .expect("create table");
+        sqlx::query("UPDATE tables SET table_status = 'DELETING' WHERE table_name = 't'")
+            .execute(&engine.pool)
+            .await
+            .expect("mark DELETING");
+        engine
+    }
+
+    /// A second DeleteTable during the window reports the table as being
+    /// deleted, not as absent, and leaves the row in place.
+    #[tokio::test]
+    async fn a_second_delete_table_during_the_window_is_table_being_deleted() {
+        let engine = engine_with_deleting_table().await;
+        let err = engine
+            .delete_table(
+                ACCOUNT,
+                DeleteTableInput {
+                    table_name: "t".to_owned(),
+                },
+            )
+            .await
+            .expect_err("DeleteTable on a DELETING table");
+        assert!(
+            matches!(&err, StorageError::TableBeingDeleted(name) if name == "t"),
+            "expected TableBeingDeleted(\"t\"), got {err:?}"
+        );
+        let status: String =
+            sqlx::query_scalar("SELECT table_status FROM tables WHERE table_name = 't'")
+                .fetch_one(&engine.pool)
+                .await
+                .expect("row still present");
+        assert_eq!(status, "DELETING");
+    }
+
+    /// UpdateTable during the window reports the table as being deleted,
+    /// not with the sentence for the other non-ACTIVE statuses.
+    #[tokio::test]
+    async fn update_table_during_the_window_is_table_being_deleted() {
+        let engine = engine_with_deleting_table().await;
+        let update: UpdateTableInput = serde_json::from_value(json!({
+            "TableName": "t",
+            "DeletionProtectionEnabled": true
+        }))
+        .expect("update");
+        let err = engine
+            .update_table(ACCOUNT, update)
+            .await
+            .expect_err("UpdateTable on a DELETING table");
+        assert!(
+            matches!(&err, StorageError::TableBeingDeleted(name) if name == "t"),
+            "expected TableBeingDeleted(\"t\"), got {err:?}"
+        );
+    }
+
+    /// A CREATING table keeps the existing answer: the new sentence is for
+    /// DELETING only.
+    #[tokio::test]
+    async fn update_table_on_a_creating_table_keeps_table_not_active() {
+        let engine = engine_with_deleting_table().await;
+        sqlx::query("UPDATE tables SET table_status = 'CREATING' WHERE table_name = 't'")
+            .execute(&engine.pool)
+            .await
+            .expect("mark CREATING");
+        let update: UpdateTableInput = serde_json::from_value(json!({
+            "TableName": "t",
+            "DeletionProtectionEnabled": true
+        }))
+        .expect("update");
+        let err = engine
+            .update_table(ACCOUNT, update)
+            .await
+            .expect_err("UpdateTable on a CREATING table");
+        assert!(
+            matches!(&err, StorageError::TableNotActive(name) if name == "t"),
+            "expected TableNotActive(\"t\"), got {err:?}"
+        );
     }
 }

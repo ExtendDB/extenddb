@@ -1146,8 +1146,9 @@ on_both_layouts!(concurrent_delete_tables_do_not_exhaust_the_pool);
 /// deletes wait on the row the open holds `FOR SHARE` with catalog
 /// connections while the open needs only a data connection, and the open
 /// then streams every item; the first delete finds the table in use and
-/// leaves it `DELETING`, and the other eight find it `DELETING` and return
-/// its description. On the shared layout the open holds no row lock and, at
+/// leaves it `DELETING`, and the other eight find it `DELETING` and are
+/// refused as `TableBeingDeleted`, as the service refuses a second
+/// `DeleteTable`. On the shared layout the open holds no row lock and, at
 /// this pause, no lock on the data table yet, so the first delete drops the
 /// table at once, the other eight find it gone, and the open reports
 /// `TableNotFound`.
@@ -1180,7 +1181,7 @@ async fn an_open_held_with_deletes_queued_completes(shared: bool) {
     .await
     .expect("the open and the deletes finish well inside the 30 s acquire timeout");
     eprintln!("open and nine deletes took {:?}", started.elapsed());
-    let mut returned = 0;
+    let (mut returned, mut being_deleted) = (0, 0);
     for result in deletes {
         match result {
             Ok(d) => {
@@ -1188,17 +1189,19 @@ async fn an_open_held_with_deletes_queued_completes(shared: bool) {
                 returned += 1;
             }
             Err(extenddb_storage::error::StorageError::TableNotFound(_)) => {}
+            Err(extenddb_storage::error::StorageError::TableBeingDeleted(_)) => being_deleted += 1,
             Err(e) => panic!("a queued DeleteTable failed: {e}"),
         }
     }
-    let (want, status) = if shared {
-        (1, None)
+    let (want, want_being_deleted, status) = if shared {
+        (1, 0, None)
     } else {
-        (9, Some("DELETING"))
+        (1, 8, Some("DELETING"))
     };
     assert_eq!(
-        returned, want,
-        "DeleteTables that returned the table's description"
+        (returned, being_deleted),
+        (want, want_being_deleted),
+        "DeleteTables that returned the table's description, and that were refused as being deleted"
     );
     assert_eq!(catalog_status(&s, "queued").await.as_deref(), status);
     if shared {
@@ -2978,10 +2981,10 @@ async fn create_table_is_not_held_up_by_deferred_drops(shared: bool) {
 on_both_layouts!(create_table_is_not_held_up_by_deferred_drops);
 
 /// `DeleteTable` of a table that is already `DELETING` (a retried or
-/// duplicated request while a reader holds it) returns the table's
-/// description with `TableStatus: DELETING`, as the service does, and
-/// changes nothing: the row and its scheduled removal stay as they were.
-async fn delete_table_of_a_deleting_table_returns_its_description(shared: bool) {
+/// duplicated request while a reader holds it) is refused as a table still
+/// in use, as the service refuses it (measured 2026-10-25 and 2026-10-30),
+/// and changes nothing: the row and its scheduled removal stay as they were.
+async fn delete_table_of_a_deleting_table_is_refused_as_being_deleted(shared: bool) {
     let s = scratch_with(shared).await;
     create_active(&s, snapshot_conformance::table_input("twice")).await;
     let relations = base_and_gsi_relations(&s, "twice").await;
@@ -3003,25 +3006,10 @@ async fn delete_table_of_a_deleting_table_returns_its_description(shared: bool) 
     let before = scheduled().await;
     assert!(before.starts_with("DELETING "), "precondition: {before}");
 
-    let second = delete_within_5s(&s, "twice")
-        .await
-        .expect("DeleteTable of a DELETING table returns its description");
-    assert_eq!(
-        second.table_status,
-        extenddb_core::types::TableStatus::Deleting
-    );
-    assert_eq!(second.table_arn, first.table_arn);
-    assert_eq!(second.table_id, first.table_id);
-    assert_eq!(second.key_schema, first.key_schema);
-    assert_eq!(
-        second
-            .global_secondary_indexes
-            .iter()
-            .flatten()
-            .map(|g| g.index_name.clone())
-            .collect::<Vec<_>>(),
-        ["gi"],
-        "the description lists the indexes"
+    let second = delete_within_5s(&s, "twice").await;
+    assert!(
+        matches!(&second, Err(extenddb_storage::error::StorageError::TableBeingDeleted(name)) if name == "twice"),
+        "DeleteTable of a DELETING table: {second:?}"
     );
     assert_eq!(
         scheduled().await,
@@ -3031,7 +3019,7 @@ async fn delete_table_of_a_deleting_table_returns_its_description(shared: bool) 
     release_relation(holder).await;
     pump_until_removed(&s, "twice", &relations).await;
 }
-on_both_layouts!(delete_table_of_a_deleting_table_returns_its_description);
+on_both_layouts!(delete_table_of_a_deleting_table_is_refused_as_being_deleted);
 
 /// A drop deferred by a reader is due at once, whatever
 /// `control_plane_delay_seconds` is (below 1, so `DeleteTable` tried to drop

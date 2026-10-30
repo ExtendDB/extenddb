@@ -39,8 +39,8 @@ impl PostgresEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         // Lock and fetch the row atomically with SELECT ... FOR UPDATE. A
-        // DELETING row is fetched too: DeleteTable of a table that is already
-        // being deleted returns its description, as the service does.
+        // DELETING row is fetched too, so that a DeleteTable of a table already
+        // being deleted can be answered the way the service answers it.
         let row: Option<TableRow> = sqlx::query_as(
             r"SELECT table_name, key_schema, attribute_definitions, billing_mode,
                       provisioned_throughput, stream_specification, table_status,
@@ -59,6 +59,16 @@ impl PostgresEngine {
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let row = row.ok_or_else(|| StorageError::TableNotFound(input.table_name.clone()))?;
+        if row.table_status == "DELETING" {
+            // The service answers a DeleteTable of a table that is already
+            // being deleted as a table still in use (measured 2026-10-25 and
+            // 2026-10-30), not with the table's description. The rollback
+            // releases the row lock.
+            tx.rollback()
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            return Err(StorageError::TableBeingDeleted(input.table_name.clone()));
+        }
 
         // Fetch indexes for the response description.
         let index_rows: Vec<IndexRow> = sqlx::query_as(
@@ -70,20 +80,6 @@ impl PostgresEngine {
         .fetch_all(&mut *tx)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-        if row.table_status == "DELETING" {
-            // Already being removed (a deferred drop the control plane
-            // retries, or a delay of a second or more): nothing to change.
-            // The rollback releases the row lock.
-            tx.rollback()
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            let desc = self.build_table_description_from_row(account_id, row, index_rows)?;
-            return Ok(TableDescription {
-                table_status: TableStatus::Deleting,
-                ..desc
-            });
-        }
 
         // REQ: DeletionProtectionEnabled check — real DynamoDB returns ValidationException
         if row.deletion_protection_enabled {
