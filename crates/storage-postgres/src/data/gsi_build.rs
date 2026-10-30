@@ -66,6 +66,7 @@ use super::index::{
     project_item_for_index,
 };
 use super::{all_sort_key_info, data_table_name, index_table_name, json_to_item};
+use crate::catalog_json::from_catalog_json;
 use crate::gsi_queue::{GsiApplyContext, GsiIndexDef, PendingApplyContext, enqueue_gsi_pending};
 
 /// How long a write may take, from just before its catalog read to just before
@@ -1235,12 +1236,12 @@ async fn reconcile_pass(
                 continue;
             }
         }
-        let parse = || -> Result<_, serde_json::Error> {
+        let parse = || -> Result<_, StorageError> {
             Ok((
-                serde_json::from_value::<Vec<KeySchemaElement>>(idx_ks.clone())?,
-                serde_json::from_value::<extenddb_core::types::Projection>(idx_proj.clone())?,
-                serde_json::from_value::<Vec<KeySchemaElement>>(base_ks.clone())?,
-                serde_json::from_value::<Vec<AttributeDefinition>>(attr_defs.clone())?,
+                from_catalog_json::<Vec<KeySchemaElement>>(idx_ks.clone())?,
+                from_catalog_json::<extenddb_core::types::Projection>(idx_proj.clone())?,
+                from_catalog_json::<Vec<KeySchemaElement>>(base_ks.clone())?,
+                from_catalog_json::<Vec<AttributeDefinition>>(attr_defs.clone())?,
             ))
         };
         let (key_schema, projection, base_ks, attr_defs) = match parse() {

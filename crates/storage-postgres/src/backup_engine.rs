@@ -25,6 +25,7 @@ use futures::future::BoxFuture;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::PostgresEngine;
+use crate::catalog_json::{escape_json, from_catalog_json, to_catalog_json, unescape_json};
 use crate::create_table::RestoreRegistration;
 use crate::data::{
     all_sort_key_info, data_table_name, index_table_name, insert_index_rows_multi,
@@ -396,9 +397,9 @@ impl PostgresEngine {
         let mut lsis = Vec::new();
         let mut gsi_ids = Vec::new();
         for (index_name, index_id, index_type, ks, proj, ipt) in rows {
-            let key_schema: Vec<KeySchemaElement> = serde_json::from_value(ks)
+            let key_schema: Vec<KeySchemaElement> = from_catalog_json(ks)
                 .map_err(|e| StorageError::Internal(format!("index key schema: {e}")))?;
-            let projection: Projection = serde_json::from_value(proj)
+            let projection: Projection = from_catalog_json(proj)
                 .map_err(|e| StorageError::Internal(format!("index projection: {e}")))?;
             if index_type == "LSI" {
                 lsis.push(LsiInput {
@@ -490,9 +491,9 @@ impl PostgresEngine {
         for (index_id, ks, proj) in index_rows {
             indexes.push(RestoreIndex {
                 table: index_table_name(&index_id),
-                key_schema: serde_json::from_value(ks)
+                key_schema: from_catalog_json(ks)
                     .map_err(|e| StorageError::Internal(format!("index key schema: {e}")))?,
-                projection: serde_json::from_value(proj)
+                projection: from_catalog_json(proj)
                     .map_err(|e| StorageError::Internal(format!("index projection: {e}")))?,
             });
         }
@@ -1140,7 +1141,7 @@ impl BackupEngine for PostgresEngine {
             // uses, which CreateTable would refuse on the service; drop those.
             if omitted {
                 let mut used: std::collections::HashSet<String> =
-                    serde_json::from_value::<Vec<KeySchemaElement>>(key_schema.clone())
+                    from_catalog_json::<Vec<KeySchemaElement>>(key_schema.clone())
                         .map_err(|e| StorageError::Internal(format!("key schema: {e}")))?
                         .into_iter()
                         .map(|k| k.attribute_name)
@@ -1158,15 +1159,17 @@ impl BackupEngine for PostgresEngine {
                 {
                     used.insert(k.attribute_name.clone());
                 }
-                if let Some(defs) = attr_defs.as_array_mut() {
-                    defs.retain(|d| {
-                        d.get("AttributeName")
-                            .and_then(serde_json::Value::as_str)
-                            .is_some_and(|n| used.contains(n))
-                    });
-                }
+                // Compare decoded names: the stored column is in escaped form.
+                let mut defs: Vec<extenddb_core::types::AttributeDefinition> =
+                    from_catalog_json(attr_defs).map_err(|e| {
+                        StorageError::Internal(format!("attribute definitions: {e}"))
+                    })?;
+                defs.retain(|d| used.contains(&d.attribute_name));
+                attr_defs = to_catalog_json(&defs)?;
             }
-            let definition = definition.to_json()?;
+            // The definition carries attribute names, so it is stored in the
+            // same form as the catalog's key_schema and projection columns.
+            let definition = escape_json(definition.to_json()?);
 
             // All catalog-side writes are one transaction, so a crash cannot
             // leave a backup AVAILABLE with partial items. The items are read
@@ -1321,7 +1324,7 @@ impl BackupEngine for PostgresEngine {
             ) = row;
 
             let key_schema: Vec<extenddb_core::types::KeySchemaElement> =
-                serde_json::from_value(ks_json)
+                from_catalog_json(ks_json)
                     .map_err(|e| StorageError::Internal(format!("Parse key schema: {e}")))?;
 
             Ok(BackupDescription {
@@ -1573,7 +1576,7 @@ impl BackupEngine for PostgresEngine {
             };
 
             let definition = definition
-                .map(|d| BackupTableDefinition::from_json(d, &backup_arn))
+                .map(|d| BackupTableDefinition::from_json(unescape_json(d), &backup_arn))
                 .transpose()?;
             // A backup taken before catalog 0.0.4 has no definition; its
             // vector indexes are known only from the `backups.vector_indexes`
@@ -1609,9 +1612,9 @@ impl BackupEngine for PostgresEngine {
                 source_table_name,
                 source_table_arn,
                 source_table_id,
-                key_schema: serde_json::from_value(ks_json)
+                key_schema: from_catalog_json(ks_json)
                     .map_err(|e| StorageError::Internal(format!("Parse key schema: {e}")))?,
-                attribute_definitions: serde_json::from_value(ad_json)
+                attribute_definitions: from_catalog_json(ad_json)
                     .map_err(|e| StorageError::Internal(format!("Parse attr defs: {e}")))?,
                 billing_mode,
                 provisioned_throughput,

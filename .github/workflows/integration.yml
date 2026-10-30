@@ -325,6 +325,7 @@ jobs:
           --test vector_control_plane --test put_create_race --test twi_conflict
           --test stream_shard_retention --test stream_shard_ownership --test stream_records_page_order --test backup_restore
           --test gsi_online_build --test gsi_stale_writer --test table_snapshot
+          --test catalog_nul_names --test catalog_escape_migration
 
       # The daemonized server logs to syslog; dump it so server-side failures
       # are diagnosable from the job log.

@@ -20,8 +20,9 @@ use extenddb_storage_postgres::{
     PostgresConfig, PostgresEngine, apply_all_migrations, data_table_name, index_table_name,
     vector_table_name,
 };
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{Connection, PgConnection, PgPool};
+use std::str::FromStr;
 
 const ACCOUNT: &str = "123456789012";
 /// SQL backend: ordered keys, numbers to the service's 38 digits. With a
@@ -194,7 +195,7 @@ async fn scratch_opts(shared: bool, pgvector: bool) -> Option<Scratch> {
     };
     let catalog = PgPoolOptions::new()
         .max_connections(2)
-        .connect(&catalog_url)
+        .connect_with(migrate_options(&catalog_url))
         .await
         .expect("catalog pool");
     migrate(&catalog, &data_url, pgvector).await;
@@ -257,6 +258,17 @@ async fn create_databases(base: &str, names: &[String; 2], pgvector: bool) -> bo
     true
 }
 
+/// Connection options for the pools that apply migrations. `extenddb migrate`
+/// names its sessions `extenddb-migrate`, and catalog migration 004 refuses to
+/// rewrite rows while any session without that name is connected to the
+/// catalog database, so a harness that applies the migrations the same way
+/// connects the same way.
+fn migrate_options(url: &str) -> PgConnectOptions {
+    PgConnectOptions::from_str(url)
+        .expect("connection url")
+        .application_name("extenddb-migrate")
+}
+
 /// Apply every catalog and data migration the crate ships, as `extenddb
 /// migrate --yes` does (the data ones on `data_url`, which is the catalog
 /// database on the shared layout), and pgvector if asked. The lists live in
@@ -265,7 +277,7 @@ async fn create_databases(base: &str, names: &[String; 2], pgvector: bool) -> bo
 async fn migrate(catalog: &PgPool, data_url: &str, pgvector: bool) {
     let data = PgPoolOptions::new()
         .max_connections(2)
-        .connect(data_url)
+        .connect_with(migrate_options(data_url))
         .await
         .expect("data pool");
     apply_all_migrations(catalog, &data)

@@ -135,6 +135,17 @@ pub trait Bootstrapper: Send + Sync {
     /// decide whether confirmation is required — without running anything.
     async fn pending_data_migrations(&self) -> OpResult<Vec<String>>;
 
+    /// Refuse when a pending migration needs the databases to itself and
+    /// another session holds one of them.
+    ///
+    /// `migrate` calls this after confirmation and before its first write, so
+    /// a refusal leaves the deployment exactly as it found it (the catalog
+    /// version in particular). Defaults to a no-op; a backend whose pending
+    /// migrations never rewrite rows in place has nothing to check.
+    async fn check_exclusive_access_for_pending_migrations(&self) -> OpResult<()> {
+        Ok(())
+    }
+
     /// Record the data database connection string in the catalog.
     async fn record_data_connection(&self) -> OpResult<()>;
 

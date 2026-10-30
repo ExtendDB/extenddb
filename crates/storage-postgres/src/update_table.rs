@@ -10,6 +10,7 @@ use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{building_refuses, effective_attribute_definitions};
 
 use crate::PostgresEngine;
+use crate::catalog_json::{from_catalog_json, to_catalog_json};
 use crate::data::gsi_build::{
     GsiBuild, build_gsis, drop_gsi_tables, is_transient, remove_failed_build,
 };
@@ -454,10 +455,8 @@ impl PostgresEngine {
                     // `ensure_index_name_free`.
                     ensure_index_name_free(&mut tx, &table_id, &create.index_name).await?;
 
-                    let gsi_ks = serde_json::to_value(&create.key_schema)
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
-                    let gsi_proj = serde_json::to_value(&create.projection)
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    let gsi_ks = to_catalog_json(&create.key_schema)?;
+                    let gsi_proj = to_catalog_json(&create.projection)?;
                     let gsi_pt = create
                         .provisioned_throughput
                         .as_ref()
@@ -528,12 +527,8 @@ impl PostgresEngine {
             // transaction, so `indexes` already holds exactly the surviving set;
             // the stored definitions were read under the FOR UPDATE lock, so the
             // read-modify-write is atomic against a concurrent UpdateTable.
-            let stored_attr_defs: Vec<AttributeDefinition> =
-                serde_json::from_value(ad_json.clone())
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-            let table_key_schema: Vec<KeySchemaElement> =
-                serde_json::from_value(ks_json.clone())
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let stored_attr_defs: Vec<AttributeDefinition> = from_catalog_json(ad_json.clone())?;
+            let table_key_schema: Vec<KeySchemaElement> = from_catalog_json(ks_json.clone())?;
 
             let surviving_rows: Vec<(serde_json::Value,)> =
                 sqlx::query_as("SELECT key_schema FROM indexes WHERE table_id = $1")
@@ -544,10 +539,7 @@ impl PostgresEngine {
             let mut surviving_index_key_schemas: Vec<Vec<KeySchemaElement>> =
                 Vec::with_capacity(surviving_rows.len());
             for (ks_value,) in surviving_rows {
-                surviving_index_key_schemas.push(
-                    serde_json::from_value(ks_value)
-                        .map_err(|e| StorageError::Internal(e.to_string()))?,
-                );
+                surviving_index_key_schemas.push(from_catalog_json(ks_value)?);
             }
 
             let effective = effective_attribute_definitions(
@@ -558,8 +550,7 @@ impl PostgresEngine {
             );
 
             if effective != stored_attr_defs {
-                let effective_json = serde_json::to_value(&effective)
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                let effective_json = to_catalog_json(&effective)?;
                 sqlx::query(
                     "UPDATE tables SET attribute_definitions = $1 \
                      WHERE account_id = $2 AND table_name = $3",
@@ -645,11 +636,9 @@ impl PostgresEngine {
                         // naming both shapes, with the vector as type L and its
                         // dimension count.
                         let base_key_schema: Vec<KeySchemaElement> =
-                            serde_json::from_value(ks_json.clone())
-                                .map_err(|e| StorageError::Internal(e.to_string()))?;
+                            from_catalog_json(ks_json.clone())?;
                         let stored_attr_defs: Vec<AttributeDefinition> =
-                            serde_json::from_value(ad_json.clone())
-                                .map_err(|e| StorageError::Internal(e.to_string()))?;
+                            from_catalog_json(ad_json.clone())?;
                         let vec_attr_name = &create.vector_attribute.attribute_name;
                         if let Some(ks) = base_key_schema
                             .iter()
@@ -792,10 +781,8 @@ impl PostgresEngine {
         // recovery sweep never sees a CREATING row with nobody holding it. It is an
         // efficiency measure only: a second, concurrent build is correct, because a
         // full backfill pass is enough on its own to publish the index.
-        let base_key_schema: Vec<KeySchemaElement> = serde_json::from_value(ks_json.clone())
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-        let base_attr_defs: Vec<AttributeDefinition> = serde_json::from_value(ad_json.clone())
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let base_key_schema: Vec<KeySchemaElement> = from_catalog_json(ks_json.clone())?;
+        let base_attr_defs: Vec<AttributeDefinition> = from_catalog_json(ad_json.clone())?;
         // Built from the merged and pruned set rather than the request's subset: a
         // new index may key on an attribute the base table already defined, and on
         // a conflicting redeclaration the stored type is the one that counts.
@@ -926,10 +913,8 @@ impl PostgresEngine {
         // leaves a CREATING row for the reconciler rather than an ACTIVE index over
         // a table that was never populated.
         for (index_id, create) in &created_vector_indexes {
-            let base_key_schema: Vec<KeySchemaElement> = serde_json::from_value(ks_json.clone())
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            let base_attr_defs: Vec<AttributeDefinition> = serde_json::from_value(ad_json.clone())
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let base_key_schema: Vec<KeySchemaElement> = from_catalog_json(ks_json.clone())?;
+            let base_attr_defs: Vec<AttributeDefinition> = from_catalog_json(ad_json.clone())?;
 
             let started = self
                 .start_vector_index_build(

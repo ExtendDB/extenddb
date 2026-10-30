@@ -25,6 +25,7 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tokio::sync::{Mutex, OnceCell};
 
 use crate::CATALOG_VERSION;
+use crate::catalog_json::{from_catalog_json, to_catalog_json};
 use crate::migrations;
 
 /// ExtendDB's advisory-lock namespace. PostgreSQL's two-argument form,
@@ -110,6 +111,9 @@ impl PostgresBootstrapper {
             .username(&self.config.app_user)
             .password(&self.config.app_password)
             .database(database)
+            // Lets a migration tell its own connections apart from a server's
+            // in pg_stat_activity (see `catalog_escape::MIGRATE_APPLICATION_NAME`).
+            .application_name(crate::catalog_escape::MIGRATE_APPLICATION_NAME)
     }
 
     /// Build the connection URL for the application user and a named database.
@@ -446,6 +450,18 @@ impl Bootstrapper for PostgresBootstrapper {
         Ok(pending)
     }
 
+    /// `004_escape_catalog_control_chars.sql` rewrites rows in the catalog, so
+    /// while it is pending the migrate command must be the only client of the
+    /// catalog. The same check runs again inside the migration; this one runs
+    /// before anything is written, so a refusal changes nothing.
+    async fn check_exclusive_access_for_pending_migrations(&self) -> OpResult<()> {
+        let catalog_pool = self.app_pool(&self.config.catalog_db).await?;
+        if !crate::catalog_escape::needs_exclusive_access(&catalog_pool).await? {
+            return Ok(());
+        }
+        crate::catalog_escape::refuse_if_other_clients_connected(&catalog_pool, "catalog").await
+    }
+
     async fn record_data_connection(&self) -> OpResult<()> {
         let pool = self.app_pool(&self.config.catalog_db).await?;
         let data_conn = self.app_connection_url(&self.config.data_db);
@@ -627,7 +643,7 @@ impl Bootstrapper for PostgresBootstrapper {
             .map_err(|e| OpError::Internal(format!("Cannot read tables: {e}")))?;
 
         for (account_id, table_name, table_id, ks_json, ad_json) in rows {
-            let key_schema: Vec<KeySchemaElement> = match serde_json::from_value(ks_json) {
+            let key_schema: Vec<KeySchemaElement> = match from_catalog_json(ks_json) {
                 Ok(v) => v,
                 Err(e) => {
                     report
@@ -637,7 +653,7 @@ impl Bootstrapper for PostgresBootstrapper {
                 }
             };
             let attr_defs: Vec<AttributeDefinition> =
-                serde_json::from_value(ad_json).unwrap_or_default();
+                from_catalog_json(ad_json).unwrap_or_default();
 
             // Nothing to do unless a sort key has lost its definition.
             // Reported for every table on every run, not only when a sort key is
@@ -716,7 +732,7 @@ impl Bootstrapper for PostgresBootstrapper {
 
             let mut merged = attr_defs;
             merged.extend(recovered.iter().cloned());
-            let merged_json = serde_json::to_value(&merged)
+            let merged_json = to_catalog_json(&merged)
                 .map_err(|e| OpError::Internal(format!("Cannot serialize definitions: {e}")))?;
             if apply {
                 sqlx::query(

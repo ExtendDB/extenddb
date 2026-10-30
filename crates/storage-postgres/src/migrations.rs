@@ -20,6 +20,10 @@ pub(crate) const CATALOG_MIGRATIONS: &[(&str, &str)] = &[
         "003_backup_definitions.sql",
         include_str!("../../storage-postgres/migrations/003_backup_definitions.sql"),
     ),
+    (
+        crate::catalog_escape::ESCAPE_CATALOG_MIGRATION,
+        include_str!("../../storage-postgres/migrations/004_escape_catalog_control_chars.sql"),
+    ),
 ];
 
 /// The runner's convergence write, executed after the walk over
@@ -37,6 +41,12 @@ pub(crate) async fn run_catalog_migrations(pool: &PgPool) -> OpResult<()> {
             continue;
         }
         println!("    Applying {filename}...");
+        // 004 moves the version for a change of stored form; the rows are
+        // re-encoded first, each table in its own committed transaction with a
+        // progress marker, so a crash before the version write resumes here.
+        if *filename == crate::catalog_escape::ESCAPE_CATALOG_MIGRATION {
+            crate::catalog_escape::escape_legacy_catalog_control_chars(pool).await?;
+        }
         sqlx::raw_sql(sql)
             .execute(pool)
             .await
@@ -399,6 +409,7 @@ pub async fn apply_all_migrations(catalog: &PgPool, data: &PgPool) -> Result<(),
 /// created before the index existed. `CREATE INDEX CONCURRENTLY IF NOT EXISTS`
 /// is idempotent and does not block concurrent writes.
 async fn ensure_gsi_base_key_indexes(catalog_pool: &PgPool, data_pool: &PgPool) -> OpResult<()> {
+    use crate::catalog_json::from_catalog_json;
     use extenddb_core::types::{AttributeDefinition, KeySchemaElement};
     use extenddb_storage::util::{sk_column, sk_column_n};
 
@@ -414,9 +425,9 @@ async fn ensure_gsi_base_key_indexes(catalog_pool: &PgPool, data_pool: &PgPool) 
 
     for (index_id, ks_json, ad_json) in rows {
         let base_ks: Vec<KeySchemaElement> =
-            serde_json::from_value(ks_json).map_err(|e| OpError::Internal(e.to_string()))?;
+            from_catalog_json(ks_json).map_err(|e| OpError::Internal(e.to_string()))?;
         let attr_defs: Vec<AttributeDefinition> =
-            serde_json::from_value(ad_json).map_err(|e| OpError::Internal(e.to_string()))?;
+            from_catalog_json(ad_json).map_err(|e| OpError::Internal(e.to_string()))?;
 
         let base_sks = crate::data::all_sort_key_info(&base_ks, &attr_defs);
         let idx_table = crate::data::index_table_name(&index_id);
@@ -494,7 +505,7 @@ pub(crate) async fn pending_data_migrations(pool: &PgPool) -> OpResult<Vec<Strin
 }
 
 /// Check if a migration has already been applied.
-async fn is_migration_applied(pool: &PgPool, filename: &str) -> OpResult<bool> {
+pub(crate) async fn is_migration_applied(pool: &PgPool, filename: &str) -> OpResult<bool> {
     if table_exists(pool, "schema_history").await? {
         let applied: (bool,) =
             sqlx::query_as("SELECT EXISTS(SELECT 1 FROM schema_history WHERE filename = $1)")
@@ -539,10 +550,10 @@ mod tests {
     fn the_migration_count_and_the_catalog_version_agree() {
         assert_eq!(
             CATALOG_MIGRATIONS.len(),
-            3,
+            4,
             "a catalog migration was added or removed; update CATALOG_VERSION and this count"
         );
-        assert_eq!(CATALOG_VERSION.to_string(), "0.0.4");
+        assert_eq!(CATALOG_VERSION.to_string(), "0.0.5");
     }
 
     /// The version the binary expects must be the version the schema writes.

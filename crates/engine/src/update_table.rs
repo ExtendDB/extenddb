@@ -10,6 +10,30 @@ use serde_json::Value;
 use crate::OperationContext;
 use crate::serialize_output;
 
+/// `validate_index_name` with the pattern clause located at the update's
+/// member path, as the service reports it. The length clauses keep the
+/// bare `indexName` location, which is not measured for UpdateTable.
+fn validate_update_index_name(
+    name: &str,
+    position: usize,
+    action: &str,
+) -> Result<(), DynamoDbError> {
+    match extenddb_core::validation::validate_index_name(name) {
+        Err(DynamoDbError::ValidationException(m))
+            if m.contains("' at 'indexName' ") && m.contains("regular expression pattern") =>
+        {
+            Err(DynamoDbError::ValidationException(m.replace(
+                "' at 'indexName' ",
+                &format!(
+                    "' at 'globalSecondaryIndexUpdates.{}.member.{action}.indexName' ",
+                    position + 1
+                ),
+            )))
+        }
+        other => other,
+    }
+}
+
 /// Handle `UpdateTable` — modify billing mode, throughput, deletion protection,
 /// or GSI configuration.
 ///
@@ -209,7 +233,7 @@ pub async fn handle_update_table(
 /// (when given) a throughput of at least 1 unit each.
 fn validate_gsi_updates(input: &UpdateTableInput) -> Result<(), DynamoDbError> {
     if let Some(updates) = &input.global_secondary_index_updates {
-        for update in updates {
+        for (position, update) in updates.iter().enumerate() {
             if update.create.is_some() && update.delete.is_some() {
                 return Err(DynamoDbError::ValidationException(
                     "One or more parameter values were invalid: Only one of Create or Delete can be specified per GlobalSecondaryIndexUpdate".to_owned(),
@@ -227,9 +251,11 @@ fn validate_gsi_updates(input: &UpdateTableInput) -> Result<(), DynamoDbError> {
                     "One or more parameter values were invalid: GlobalSecondaryIndexUpdate must contain Create, Update, or Delete".to_owned(),
                 ));
             }
-            // M3: Validate index names the same way CreateTable does.
+            // Index names are validated the way CreateTable does, except that the
+            // pattern clause carries the member's path (measured 2026-10-24:
+            // `globalSecondaryIndexUpdates.<n>.member.create.indexName`, 1-based).
             if let Some(create) = &update.create {
-                extenddb_core::validation::validate_index_name(&create.index_name)?;
+                validate_update_index_name(&create.index_name, position, "create")?;
                 extenddb_core::validation::validate_index_throughput_minimum(
                     &create.index_name,
                     create.provisioned_throughput.as_ref(),
@@ -260,7 +286,7 @@ fn validate_gsi_updates(input: &UpdateTableInput) -> Result<(), DynamoDbError> {
                 }
             }
             if let Some(delete) = &update.delete {
-                extenddb_core::validation::validate_index_name(&delete.index_name)?;
+                validate_update_index_name(&delete.index_name, position, "delete")?;
             }
         }
     }

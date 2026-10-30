@@ -11,6 +11,7 @@ use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{index_arn, stream_arn, table_arn};
 
 use crate::PostgresEngine;
+use crate::catalog_json::to_catalog_json;
 
 /// What a restore target records about where it came from, written in the
 /// same catalog transaction that creates it.
@@ -110,10 +111,8 @@ impl PostgresEngine {
         let table_id = uuid::Uuid::new_v4().to_string();
         let table_arn = table_arn(&self.region, account_id, &input.table_name);
         let billing_mode = input.billing_mode.unwrap_or(BillingMode::Provisioned);
-        let key_schema_json = serde_json::to_value(&input.key_schema)
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-        let attr_defs_json = serde_json::to_value(&input.attribute_definitions)
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let key_schema_json = to_catalog_json(&input.key_schema)?;
+        let attr_defs_json = to_catalog_json(&input.attribute_definitions)?;
         let billing_str = match billing_mode {
             BillingMode::Provisioned => "PROVISIONED",
             BillingMode::PayPerRequest => "PAY_PER_REQUEST",
@@ -262,10 +261,8 @@ impl PostgresEngine {
         let mut gsi_index_ids: Vec<String> = Vec::new();
         if let Some(gsis) = &input.global_secondary_indexes {
             for gsi in gsis {
-                let gsi_ks = serde_json::to_value(&gsi.key_schema)
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-                let gsi_proj = serde_json::to_value(&gsi.projection)
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                let gsi_ks = to_catalog_json(&gsi.key_schema)?;
+                let gsi_proj = to_catalog_json(&gsi.projection)?;
                 let gsi_pt = gsi
                     .provisioned_throughput
                     .as_ref()
@@ -305,10 +302,8 @@ impl PostgresEngine {
         let mut lsi_index_ids: Vec<String> = Vec::new();
         if let Some(lsis) = &input.local_secondary_indexes {
             for lsi in lsis {
-                let lsi_ks = serde_json::to_value(&lsi.key_schema)
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-                let lsi_proj = serde_json::to_value(&lsi.projection)
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                let lsi_ks = to_catalog_json(&lsi.key_schema)?;
+                let lsi_proj = to_catalog_json(&lsi.projection)?;
 
                 let index_id = uuid::Uuid::new_v4().to_string();
                 sqlx::query(
