@@ -83,8 +83,9 @@ pub use data::vector_index::reconcile_incomplete_vector_indexes;
 #[doc(hidden)]
 pub use data::{data_table_name, index_table_name, vector_table_name};
 /// Hold a `DeleteTable` between its in-use probe and its drops, or (separate
-/// data database) between its catalog commit and its data commit; and shorten
-/// the bound on the drop retried after a failed data commit.
+/// data database) between its catalog commit and its data commit, or after
+/// its data commit; and shorten the bound on the drop retried after a failed
+/// data commit.
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub use delete_table::test_pause::{
