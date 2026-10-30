@@ -22,7 +22,7 @@ mod tokenizer;
 mod update_evaluator;
 mod update_parser;
 
-pub use ast::{ArithOp, CompareOp, Expr, PathElement, UpdateAction};
+pub use ast::{ArithOp, CompareOp, Expr, PathElement, UpdateAction, removes_only};
 pub use evaluator::evaluate_condition;
 pub use key_condition::{KeyCondition, SortKeyCondition, parse_key_condition};
 pub use kind::ExpressionKind;
