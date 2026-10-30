@@ -34,7 +34,12 @@ use serde::Deserialize;
 pub struct SqliteConfig {
     #[serde(default = "default_path")]
     pub path: String,
-    #[serde(default = "default_pool_size")]
+    // Environment overrides (EXTENDDB__STORAGE__SQLITE__POOL_SIZE=4) reach
+    // this deserializer as strings; accept both forms (issue #539).
+    #[serde(
+        default = "default_pool_size",
+        deserialize_with = "extenddb_storage::config::string_coerce::u32"
+    )]
     pub pool_size: u32,
 }
 
@@ -156,5 +161,27 @@ mod tests {
         let mut t = toml::Table::new();
         t.insert("bogus".into(), toml::Value::Integer(1));
         assert!(deserialize_config(&t).is_err());
+    }
+
+    /// Issue #539: `EXTENDDB__STORAGE__SQLITE__POOL_SIZE=4` arrives in the
+    /// `[storage.sqlite]` table as the string "4".
+    #[test]
+    fn deserialize_accepts_pool_size_in_string_form() {
+        let mut t = toml::Table::new();
+        t.insert("path".into(), toml::Value::String(":memory:".into()));
+        t.insert("pool_size".into(), toml::Value::String("4".into()));
+        let boxed = deserialize_config(&t).expect("string-valued pool_size must parse");
+        assert_eq!(boxed.max_connections(), 4);
+    }
+
+    #[test]
+    fn deserialize_rejects_a_pool_size_that_is_not_a_number() {
+        let mut t = toml::Table::new();
+        t.insert("pool_size".into(), toml::Value::String("four".into()));
+        let err = deserialize_config(&t).expect_err("non-numeric pool_size must be rejected");
+        assert!(
+            err.contains("four"),
+            "error should quote the value, got: {err}"
+        );
     }
 }

@@ -6,9 +6,17 @@
 use serde::Deserialize;
 
 /// Cassandra storage backend configuration.
+///
+/// Unknown keys are refused like every other section (issue #540), so a
+/// misspelled key fails at startup instead of silently taking the default.
+/// Environment overrides (`EXTENDDB__STORAGE__CASSANDRA__<KEY>`) reach this
+/// deserializer as strings, so the numeric fields accept their string form and
+/// `contact_points` accepts one comma-delimited string (issue #539).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CassandraStorageConfig {
     /// Cassandra contact points (host:port)
+    #[serde(deserialize_with = "extenddb_storage::config::string_coerce::string_list")]
     pub contact_points: Vec<String>,
 
     /// Username for authentication
@@ -22,7 +30,10 @@ pub struct CassandraStorageConfig {
     pub keyspace_prefix: String,
 
     /// Replication factor for keyspaces (default: 3)
-    #[serde(default = "default_replication_factor")]
+    #[serde(
+        default = "default_replication_factor",
+        deserialize_with = "extenddb_storage::config::string_coerce::u32"
+    )]
     pub replication_factor: u32,
 
     /// Datacenter name for `NetworkTopologyStrategy` (default: "datacenter1")
@@ -30,7 +41,10 @@ pub struct CassandraStorageConfig {
     pub datacenter: String,
 
     /// Maximum connections per host (default: 10)
-    #[serde(default = "default_max_connections")]
+    #[serde(
+        default = "default_max_connections",
+        deserialize_with = "extenddb_storage::config::string_coerce::u32"
+    )]
     pub max_connections: u32,
 
     /// Cached connection string (JDBC-style: `host1,host2/keyspace_prefix`)
@@ -150,6 +164,26 @@ impl extenddb_storage::config::StorageConfig for CassandraStorageConfig {
     }
 }
 
+/// Deserialize a `[storage.cassandra]` TOML table into a boxed `StorageConfig`.
+///
+/// This is the entry point the installed backend hands to `extenddb-config`,
+/// so what it accepts is what `extenddb serve` accepts.
+///
+/// # Errors
+///
+/// Returns the deserialization error as text: an unknown key, a value of the
+/// wrong type, or a missing `contact_points`.
+pub fn deserialize_config(
+    table: &toml::Table,
+) -> Result<Box<dyn extenddb_storage::config::StorageConfig>, String> {
+    let mut config: CassandraStorageConfig = table
+        .clone()
+        .try_into()
+        .map_err(|e: toml::de::Error| format!("Failed to parse cassandra config: {e}"))?;
+    config.ensure_cached_connection_string();
+    Ok(Box::new(config))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,6 +255,118 @@ mod tests {
         assert_eq!(config.max_connections, 10);
         assert_eq!(config.username, None);
         assert_eq!(config.password, None);
+    }
+
+    fn table(toml_str: &str) -> toml::Table {
+        toml::from_str(toml_str).expect("test TOML parses")
+    }
+
+    /// Issue #540: a misspelled key fails at startup with the key named,
+    /// instead of silently leaving the default in force.
+    #[test]
+    fn deserialize_rejects_unknown_field() {
+        let err = deserialize_config(&table(
+            r#"
+            contact_points = ["localhost:9042"]
+            replication_factr = 3
+        "#,
+        ))
+        .expect_err("unknown key must be rejected");
+        assert!(err.contains("unknown field"), "got: {err}");
+        assert!(err.contains("replication_factr"), "got: {err}");
+    }
+
+    /// A key that belongs to another backend's section is unknown here.
+    #[test]
+    fn deserialize_rejects_another_backends_key() {
+        let err = deserialize_config(&table(
+            r#"
+            contact_points = ["localhost:9042"]
+            pool_size = 10
+        "#,
+        ))
+        .expect_err("pool_size is a postgres key");
+        assert!(err.contains("pool_size"), "got: {err}");
+    }
+
+    /// Issue #539: `EXTENDDB__STORAGE__CASSANDRA__REPLICATION_FACTOR=5` and
+    /// `..__MAX_CONNECTIONS=20` arrive in the table as strings.
+    #[test]
+    fn deserialize_accepts_numeric_fields_in_string_form() {
+        let boxed = deserialize_config(&table(
+            r#"
+            contact_points = ["localhost:9042"]
+            replication_factor = "5"
+            max_connections = "20"
+        "#,
+        ))
+        .expect("string-valued numeric fields must parse");
+        assert_eq!(boxed.max_connections(), 20);
+        let config = boxed
+            .as_any()
+            .downcast_ref::<CassandraStorageConfig>()
+            .expect("cassandra config");
+        assert_eq!(config.replication_factor, 5);
+    }
+
+    /// Issue #539: `EXTENDDB__STORAGE__CASSANDRA__CONTACT_POINTS=a:9042,b:9042`
+    /// arrives as one string; it splits into the list the array form gives.
+    #[test]
+    fn deserialize_accepts_contact_points_as_a_comma_delimited_string() {
+        let boxed = deserialize_config(&table(
+            r#"
+            contact_points = "host1:9042, host2:9042"
+        "#,
+        ))
+        .expect("string-valued contact_points must parse");
+        assert_eq!(boxed.connection_config(), "host1:9042,host2:9042/extenddb");
+        let config = boxed
+            .as_any()
+            .downcast_ref::<CassandraStorageConfig>()
+            .expect("cassandra config");
+        assert_eq!(config.contact_points, vec!["host1:9042", "host2:9042"]);
+    }
+
+    /// String fields are never reinterpreted: a numeric-looking password
+    /// stays a string, and a numeric password is still a type error.
+    #[test]
+    fn deserialize_leaves_string_fields_alone() {
+        let boxed = deserialize_config(&table(
+            r#"
+            contact_points = ["localhost:9042"]
+            password = "12345"
+        "#,
+        ))
+        .expect("string password must parse");
+        let config = boxed
+            .as_any()
+            .downcast_ref::<CassandraStorageConfig>()
+            .expect("cassandra config");
+        assert_eq!(config.password.as_deref(), Some("12345"));
+        assert!(
+            deserialize_config(&table(
+                r#"
+            contact_points = ["localhost:9042"]
+            password = 12345
+        "#
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn deserialize_rejects_a_replication_factor_that_is_not_a_number() {
+        let err = deserialize_config(&table(
+            r#"
+            contact_points = ["localhost:9042"]
+            replication_factor = "three"
+        "#,
+        ))
+        .expect_err("non-numeric replication_factor must be rejected");
+        assert!(
+            err.contains("three"),
+            "error should quote the value, got: {err}"
+        );
     }
 
     #[test]

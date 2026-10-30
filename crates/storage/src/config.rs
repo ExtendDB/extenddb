@@ -183,32 +183,112 @@ mod tests {
 /// a raw `toml::Table`, which is strict about types (issue #222). These helpers
 /// accept either the native type or its string form, so
 /// `EXTENDDB__STORAGE__POSTGRES__POOL_SIZE=10` deserializes like
-/// `pool_size = 10`. String fields are untouched — coercion applies only where
-/// a backend explicitly opts a numeric or boolean field in with
+/// `pool_size = 10`, and a list key accepts one comma-delimited string, so
+/// `EXTENDDB__STORAGE__CASSANDRA__CONTACT_POINTS=a:9042,b:9042` deserializes
+/// like `contact_points = ["a:9042", "b:9042"]`. String fields are untouched:
+/// coercion applies only where a field explicitly opts in with
 /// `#[serde(deserialize_with = ...)]`, so a password of `"12345"` is never
 /// reinterpreted.
 pub mod string_coerce {
-    use serde::{Deserialize, Deserializer, de::Error};
+    use std::marker::PhantomData;
 
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum MaybeString<T> {
-        Native(T),
-        Text(String),
+    use serde::{Deserialize, Deserializer, de::Error, de::Unexpected, de::Visitor};
+
+    /// Parses one scalar from its string form; the error quotes the value and
+    /// names the type, and serde appends the key.
+    fn parse<T, E>(s: &str, what: &str) -> Result<T, E>
+    where
+        T: std::str::FromStr,
+        <T as std::str::FromStr>::Err: std::fmt::Display,
+        E: Error,
+    {
+        s.trim()
+            .parse()
+            .map_err(|e| E::custom(format!("invalid {what} value \"{s}\": {e}")))
     }
 
-    fn coerce<'de, T, D>(deserializer: D, what: &str) -> Result<T, D::Error>
+    /// Accepts a scalar as its native type (integer or boolean) or as a string
+    /// that parses to it. Every native value goes through `FromStr` as well, so
+    /// an out-of-range or negative integer fails with the same message shape
+    /// as a bad string (`invalid u32 value "-1": ...`). A float, array or
+    /// table is a type error naming what was found and what is accepted.
+    struct Scalar<T> {
+        what: &'static str,
+        _target: PhantomData<T>,
+    }
+
+    impl<'de, T> Visitor<'de> for Scalar<T>
     where
-        T: Deserialize<'de> + std::str::FromStr,
+        T: std::str::FromStr,
+        <T as std::str::FromStr>::Err: std::fmt::Display,
+    {
+        type Value = T;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "a {} or its string form", self.what)
+        }
+
+        fn visit_str<E: Error>(self, s: &str) -> Result<T, E> {
+            parse(s, self.what)
+        }
+
+        fn visit_u64<E: Error>(self, v: u64) -> Result<T, E> {
+            parse(&v.to_string(), self.what)
+        }
+
+        fn visit_i64<E: Error>(self, v: i64) -> Result<T, E> {
+            parse(&v.to_string(), self.what)
+        }
+
+        fn visit_bool<E: Error>(self, v: bool) -> Result<T, E> {
+            parse(&v.to_string(), self.what)
+        }
+
+        fn visit_f64<E: Error>(self, v: f64) -> Result<T, E> {
+            Err(E::invalid_type(Unexpected::Float(v), &self))
+        }
+    }
+
+    fn coerce<'de, T, D>(deserializer: D, what: &'static str) -> Result<T, D::Error>
+    where
+        T: std::str::FromStr,
         <T as std::str::FromStr>::Err: std::fmt::Display,
         D: Deserializer<'de>,
     {
-        match MaybeString::<T>::deserialize(deserializer)? {
-            MaybeString::Native(v) => Ok(v),
-            MaybeString::Text(s) => s
-                .trim()
-                .parse()
-                .map_err(|e| D::Error::custom(format!("invalid {what} value \"{s}\": {e}"))),
+        deserializer.deserialize_any(Scalar {
+            what,
+            _target: PhantomData,
+        })
+    }
+
+    /// `Option` over [`Scalar`]: absent or null is `None`, anything present
+    /// is coerced.
+    struct OptScalar<T> {
+        what: &'static str,
+        _target: PhantomData<T>,
+    }
+
+    impl<'de, T> Visitor<'de> for OptScalar<T>
+    where
+        T: std::str::FromStr,
+        <T as std::str::FromStr>::Err: std::fmt::Display,
+    {
+        type Value = Option<T>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "a {} or its string form, or nothing", self.what)
+        }
+
+        fn visit_none<E: Error>(self) -> Result<Option<T>, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: Error>(self) -> Result<Option<T>, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Option<T>, D::Error> {
+            coerce(d, self.what).map(Some)
         }
     }
 
@@ -229,14 +309,10 @@ pub mod string_coerce {
     /// Returns an error when a present value is neither a `u32` nor a string
     /// that parses as one.
     pub fn opt_u32<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<u32>, D::Error> {
-        Option::<MaybeString<u32>>::deserialize(deserializer)?
-            .map(|v| match v {
-                MaybeString::Native(n) => Ok(n),
-                MaybeString::Text(s) => s.trim().parse().map_err(|e| {
-                    serde::de::Error::custom(format!("invalid u32 value \"{s}\": {e}"))
-                }),
-            })
-            .transpose()
+        deserializer.deserialize_option(OptScalar {
+            what: "u32",
+            _target: PhantomData,
+        })
     }
 
     /// Deserialize an optional positive `u32` from a number, its string form,
@@ -270,6 +346,50 @@ pub mod string_coerce {
     /// parses as one.
     pub fn u16<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u16, D::Error> {
         coerce(deserializer, "u16")
+    }
+
+    /// Deserialize a `Vec<String>` from an array or from one comma-delimited
+    /// string, the only shape an environment variable can carry
+    /// (`EXTENDDB__IMPORT__PATHS="/data/in,/data/shared"`). Items in the
+    /// string form are trimmed and empty items are dropped, so an empty
+    /// variable is an empty list. An array is taken as written. The string
+    /// form has no escape, so an item that itself contains a comma can only
+    /// be written as an array in the file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming both accepted shapes when the value is neither
+    /// an array nor a string; an array element that is not a string fails
+    /// with serde's own type error.
+    pub fn string_list<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<String>, D::Error> {
+        struct ListVisitor;
+
+        impl<'de> Visitor<'de> for ListVisitor {
+            type Value = Vec<String>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an array of strings or one comma-delimited string")
+            }
+
+            fn visit_str<E: Error>(self, s: &str) -> Result<Self::Value, E> {
+                Ok(s.split(',')
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(str::to_owned)
+                    .collect())
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                Vec::<String>::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
+            }
+        }
+
+        deserializer.deserialize_any(ListVisitor)
     }
 }
 
@@ -390,5 +510,81 @@ password = "x""#
             )
             .is_err()
         );
+    }
+
+    /// A native value of the wrong type or range is refused with the value,
+    /// the accepted type and the key in the message, so `pool_size = -1` in a
+    /// file reads the same as it did before the string form was accepted.
+    #[test]
+    fn native_wrong_type_errors_name_the_value_type_and_key() {
+        let cases: [(&str, &[&str]); 5] = [
+            ("count = -1", &["-1", "u32", "count"]),
+            ("count = 4294967296", &["4294967296", "u32", "count"]),
+            ("count = 4.0", &["floating point", "u32", "count"]),
+            ("count = true", &["true", "u32", "count"]),
+            ("count = [4]", &["sequence", "u32", "count"]),
+        ];
+        for (line, expected) in cases {
+            let doc = format!("{line}\nflag = false\nport = 1\npassword = \"x\"");
+            let err = toml::from_str::<Sample>(&doc).expect_err(line);
+            let text = err.to_string();
+            for needle in expected {
+                assert!(
+                    text.contains(needle),
+                    "{line}: missing {needle:?} in: {text}"
+                );
+            }
+        }
+    }
+
+    /// Native integers are accepted as before: a float that happens to be
+    /// whole is not.
+    #[test]
+    fn native_integers_are_accepted_and_whole_floats_are_not() {
+        let s: Sample =
+            toml::from_str("count = 7\nflag = false\nport = 1\npassword = \"x\"").expect("int");
+        assert_eq!(s.count, 7);
+        assert!(
+            toml::from_str::<Sample>("count = 7.0\nflag = false\nport = 1\npassword = \"x\"")
+                .is_err()
+        );
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ListSample {
+        #[serde(default, deserialize_with = "super::string_coerce::string_list")]
+        items: Vec<String>,
+    }
+
+    #[test]
+    fn a_list_key_takes_an_array_as_written() {
+        let s: ListSample = toml::from_str(r#"items = ["a:9042", " b:9042 ", ""]"#).expect("array");
+        assert_eq!(s.items, vec!["a:9042", " b:9042 ", ""]);
+    }
+
+    /// The environment form: one string, split on commas, each item trimmed,
+    /// empty items dropped.
+    #[test]
+    fn a_list_key_takes_one_comma_delimited_string() {
+        let s: ListSample = toml::from_str(r#"items = "a:9042, b:9042,,c:9042 ""#).expect("string");
+        assert_eq!(s.items, vec!["a:9042", "b:9042", "c:9042"]);
+        let one: ListSample = toml::from_str(r#"items = "/data/in""#).expect("single item");
+        assert_eq!(one.items, vec!["/data/in"]);
+        let none: ListSample = toml::from_str(r#"items = """#).expect("empty string");
+        assert!(none.items.is_empty());
+    }
+
+    /// A wrong type is refused with both accepted shapes named, so a startup
+    /// error tells the operator what the key takes.
+    #[test]
+    fn a_list_key_rejects_other_types() {
+        let err = toml::from_str::<ListSample>("items = 7").expect_err("integer");
+        assert!(
+            err.to_string()
+                .contains("an array of strings or one comma-delimited string"),
+            "got: {err}"
+        );
+        assert!(toml::from_str::<ListSample>("items = [1, 2]").is_err());
+        assert!(toml::from_str::<ListSample>("items = true").is_err());
     }
 }

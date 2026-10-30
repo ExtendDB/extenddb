@@ -206,14 +206,7 @@ pub fn backend() -> extenddb_storage::Backend {
             })
         },
         operations: &operations::CassandraOperationsEngine,
-        storage_config: |table| {
-            let mut config: CassandraStorageConfig = table
-                .clone()
-                .try_into()
-                .map_err(|e: toml::de::Error| format!("Failed to parse cassandra config: {e}"))?;
-            config.ensure_cached_connection_string();
-            Ok(Box::new(config) as Box<dyn extenddb_storage::config::StorageConfig>)
-        },
+        storage_config: config::deserialize_config,
         settings_store: |connection_string| {
             let connection_string = connection_string.to_string();
             Box::pin(async move {

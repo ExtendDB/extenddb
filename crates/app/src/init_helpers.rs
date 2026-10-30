@@ -242,6 +242,8 @@ backend = "{backend}"
 # Environment variable overrides use the EXTENDDB__ prefix with __ as separator:
 #   EXTENDDB__SERVER__PORT=9000
 #   EXTENDDB__STORAGE__POSTGRES__CONNECTION_STRING="postgresql://..."
+#   EXTENDDB__IMPORT__PATHS="/data/in,/data/shared"   (a list key takes one
+#   comma-delimited string)
 
 {docs_line}
 [server]
