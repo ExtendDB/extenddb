@@ -43,6 +43,8 @@ mod policies;
 mod put_get_item;
 #[path = "direct/query.rs"]
 mod query;
+#[path = "direct/query_rows_without_item.rs"]
+mod query_rows_without_item;
 #[path = "direct/roles.rs"]
 mod roles;
 #[path = "direct/scan.rs"]
