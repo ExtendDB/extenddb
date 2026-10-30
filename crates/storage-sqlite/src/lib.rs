@@ -35,6 +35,7 @@ mod management_store;
 mod metadata;
 mod number_key;
 mod operations;
+mod password_hash_store;
 mod schema;
 mod serve_lock;
 mod snapshot_engine;
