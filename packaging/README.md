@@ -93,36 +93,54 @@ cargo build --release --locked --no-default-features --features sqlite,dev-mode 
 ```
 
 Flow (mirrors the container release: candidate first, promotion is a
-deliberate second step):
+deliberate second step, each a separately approved workflow run):
 
 1. Land the release state on `main` with the workspace version bumped and
    `npm/package.json` bumped to match, then tag that commit `vX.Y.Z` and push
    the tag. This is the same tag the container release consumes; the two
    publish workflows are dispatched independently against it.
-2. Dispatch the `npm-publish` workflow from `main` with the tag as input.
-   The gate validates shape, existence, ancestry against `main`, and the
-   version match. Five native runners build, smoke test, and run the full
-   launcher suite against their own binary. Only after all five pass does the
-   reviewer-gated `npm` environment release the token, and everything is
-   published with `--provenance` under the `candidate` dist-tag. Nothing
-   reaches `latest`.
-3. Verify the candidate from a clean machine:
-   `npm install @extenddb/dev@candidate` and run a smoke script in both storage
-   modes.
-4. Promote, one dist-tag move per package:
+2. Dispatch the `npm-publish` workflow from `main` with the tag and
+   `action: candidate`. The gate validates shape, existence, ancestry against
+   `main`, and the version match. Five native runners build, smoke test, and
+   run the full launcher suite against their own binary. Only after all five
+   pass does the reviewer-gated `npm` environment release the OIDC credential,
+   and everything is published with provenance under the `candidate`
+   dist-tag. Nothing reaches `latest`. The run then installs the candidate
+   back from the public registry on all five platforms and requires both
+   packages at `X.Y.Z`, verified registry signatures and provenance
+   attestations on both, the binary reporting `X.Y.Z`, the launcher
+   resolving its platform package on its own, and the launcher suite passing
+   in both storage modes (`.github/workflows/npm-verify-matrix.yml`).
+3. Dispatch `npm-publish` again with the same tag and `action: promote`. The
+   gate additionally requires every package of the release to be on the
+   registry at `X.Y.Z` with a provenance attestation whose signed statement
+   names this repository and `npm-publish.yml`, and refuses to move `latest`
+   backwards; the five verify legs run again; then, after a second reviewer
+   approval, the run re-reads every `latest`, adds and removes a transient
+   tag on every package (a write, which proves the OIDC credential and the
+   dist-tag permission on each entry before `latest` moves), moves `latest`
+   to `X.Y.Z` on each platform package and the launcher with `npm dist-tag
+   add` over the same OIDC credential, and reads every tag back from the
+   registry. No maintainer login or token is involved. Re-running `promote`
+   for the version `latest` already holds exercises the whole path and
+   leaves every durable tag as it was.
 
-   ```
-   npm dist-tag add @extenddb/dev@X.Y.Z latest
-   npm dist-tag add @extenddb/linux-x64@X.Y.Z latest        # and the other four
-   ```
+Anyone with dispatch rights dispatches either step; a reviewer of the `npm`
+environment other than the dispatcher approves each run. The release does
+not depend on one maintainer's npm account.
 
 One-time registry and repo setup, in order: create the npm org `extenddb`.
 The launcher ships as the scoped `@extenddb/dev` rather than an unscoped
 `extenddb`, because npm's package-name similarity filter refuses the latter
-against the long-established `extend` package. Then create a granular
-automation token scoped to the `@extenddb` scope with publish permission only,
-and create the GitHub environment `npm` with deployment branch rule `main`,
-required reviewers, and the token as `NPM_TOKEN`.
+against the long-established `extend` package. Publish each of the six
+packages once as a `0.0.0` placeholder under the `placeholder` dist-tag from a
+maintainer machine (npm needs the package to exist before a trusted publisher
+can be configured). Create the GitHub environment `npm` with deployment branch
+rule `main` and required reviewers; it holds no secrets. Then on npmjs.com,
+for each of the six packages, add a trusted publisher for GitHub Actions
+(organization `ExtendDB`, repository `extenddb`, workflow `npm-publish.yml`,
+environment `npm`) with `npm publish` and "Allow npm dist-tag" both allowed;
+the promote step fails naming that setting if it is off.
 
 ## Known limits
 
