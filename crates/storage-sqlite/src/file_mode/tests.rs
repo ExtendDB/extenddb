@@ -399,3 +399,60 @@ fn owner_only_files_are_left_alone() {
     assert_eq!(mode(&sidecar(&db, "-shm")), 0o400);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Whether a write lock on `len` bytes at `start` of `file` would conflict
+/// with a lock already held there. The question is asked with an open file
+/// description lock, which conflicts with this process's own POSIX locks as
+/// well as other processes'. Closing the descriptor afterwards releases this
+/// process's POSIX locks on the file, so ask once per file, last.
+#[cfg(target_os = "linux")]
+fn write_lock_conflicts(file: &Path, start: i64, len: i64) -> bool {
+    use std::os::fd::AsRawFd;
+    let probe = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(file)
+        .expect("open");
+    // SAFETY: `flock` is plain data, for which all zero bytes is a value.
+    let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+    lock.l_type = libc::F_WRLCK as libc::c_short;
+    lock.l_whence = libc::SEEK_SET as libc::c_short;
+    lock.l_start = start;
+    lock.l_len = len;
+    // SAFETY: F_OFD_GETLK reads and writes the `flock` that `lock` owns; the
+    // descriptor belongs to `probe`, which lives until the call returns.
+    let rc = unsafe { libc::fcntl(probe.as_raw_fd(), libc::F_OFD_GETLK, &mut lock) };
+    assert_eq!(rc, 0, "F_OFD_GETLK: {}", std::io::Error::last_os_error());
+    lock.l_type != libc::F_UNLCK as libc::c_short
+}
+
+/// Narrowing the files of a database this process has open keeps the
+/// connection's POSIX locks: the read lock a WAL connection holds on the
+/// database file's shared range and the one on the `-shm` file's DMS byte.
+/// A closed read descriptor on either file would release them, and another
+/// process could then reset the `-shm` file or delete the WAL under the open
+/// connection.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn narrowing_keeps_the_locks_of_an_open_connection() {
+    let dir = temp_dir();
+    let db = dir.join("db.sqlite");
+    let pool = raw_wal_pool(&db).await;
+    for suffix in ["", "-wal", "-shm"] {
+        set_mode(&sidecar(&db, suffix), 0o644);
+    }
+    restrict(&db.to_string_lossy()).expect("restrict");
+    for suffix in ["", "-wal", "-shm"] {
+        assert_eq!(mode(&sidecar(&db, suffix)), 0o600, "{suffix}");
+    }
+    assert!(
+        write_lock_conflicts(&db, 0x4000_0002, 510),
+        "the connection's lock on the database file was released"
+    );
+    assert!(
+        write_lock_conflicts(&sidecar(&db, "-shm"), 128, 1),
+        "the connection's lock on the -shm file was released"
+    );
+    pool.close().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
