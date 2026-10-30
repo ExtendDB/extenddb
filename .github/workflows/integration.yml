@@ -20,6 +20,53 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # One release build per feature set. The jobs below download the binary
+  # instead of each compiling the same one, so the cargo flags and features of
+  # a test job live in the build job it needs.
+  build-postgres:
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Build release
+        run: cargo build --release
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: extenddb-postgres
+          path: target/release/extenddb
+          if-no-files-found: error
+          retention-days: 1
+
+  build-sqlite:
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Build release (SQLite backend)
+        run: cargo build --release -p extenddb --no-default-features --features sqlite
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: extenddb-sqlite
+          path: target/release/extenddb
+          if-no-files-found: error
+          retention-days: 1
+
   run-integration:
     # Dedicated ExtendDB runner group (4 vCPU / 16 GB, capped at 20 concurrent),
     # pinned to Ubuntu 24.04. ubuntu-latest is an Amazon-wide pool of 1,000
@@ -29,6 +76,7 @@ jobs:
     # 2026 and this compiles Rust; move to 26 deliberately.
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 40
+    needs: build-postgres
     services:
       postgres:
         # pgvector's own image, which is postgres:16 plus the extension. The
@@ -49,16 +97,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
-          cache-on-failure: true
-          # Only pushes to main save, so other runs restore main's cache.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          name: extenddb-postgres
+          path: target/release
 
-      - name: Build release
-        run: cargo build --release
+      # Artifacts do not keep file modes.
+      - run: chmod +x target/release/extenddb
 
       - name: Initialize ExtendDB
         id: init
@@ -110,19 +155,17 @@ jobs:
   run-integration-sqlite:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 40
+    needs: build-sqlite
     steps:
       - uses: actions/checkout@v6
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
-          cache-on-failure: true
-          # Only pushes to main save, so other runs restore main's cache.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          name: extenddb-sqlite
+          path: target/release
 
-      - name: Build release (SQLite backend)
-        run: cargo build --release -p extenddb --no-default-features --features sqlite
+      # Artifacts do not keep file modes.
+      - run: chmod +x target/release/extenddb
 
       - name: Initialize ExtendDB
         id: init
@@ -225,6 +268,7 @@ jobs:
   run-rust-integration:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 40
+    needs: build-postgres
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -249,8 +293,14 @@ jobs:
           # Only pushes to main save, so other runs restore main's cache.
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Build release
-        run: cargo build --release
+      # After the cache restore, so a cached target/ cannot replace it.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: extenddb-postgres
+          path: target/release
+
+      # Artifacts do not keep file modes.
+      - run: chmod +x target/release/extenddb
 
       - name: Initialize ExtendDB
         id: init
@@ -341,6 +391,7 @@ jobs:
   run-rust-integration-postgres-novector:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 40
+    needs: build-postgres
     services:
       postgres:
         image: postgres:16
@@ -365,8 +416,14 @@ jobs:
           # Only pushes to main save, so other runs restore main's cache.
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Build release
-        run: cargo build --release
+      # After the cache restore, so a cached target/ cannot replace it.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: extenddb-postgres
+          path: target/release
+
+      # Artifacts do not keep file modes.
+      - run: chmod +x target/release/extenddb
 
       - name: Initialize ExtendDB
         id: init
@@ -416,6 +473,7 @@ jobs:
   run-rust-integration-sqlite:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 40
+    needs: build-sqlite
 
     steps:
       - uses: actions/checkout@v6
@@ -428,8 +486,14 @@ jobs:
           # Only pushes to main save, so other runs restore main's cache.
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Build release (SQLite backend)
-        run: cargo build --release -p extenddb --no-default-features --features sqlite
+      # After the cache restore, so a cached target/ cannot replace it.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: extenddb-sqlite
+          path: target/release
+
+      # Artifacts do not keep file modes.
+      - run: chmod +x target/release/extenddb
 
       - name: Initialize ExtendDB
         id: init

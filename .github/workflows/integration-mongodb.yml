@@ -29,10 +29,8 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  mongodb-pytest:
-    # Dedicated ExtendDB runner group (Ubuntu 24.04, 4 vCPU / 16 GB, capped at
-    # 20 concurrent). ubuntu-latest is an Amazon-wide shared pool where our jobs
-    # waited 10-90 minutes to start (2026-09-29/30); see integration.yml.
+  # One release build shared by the pytest and rust jobs; see integration.yml.
+  build-mongodb:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 40
     steps:
@@ -41,15 +39,35 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-          # Only pushes to main save, so other runs restore main's cache.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build release (mongodb backend)
+        run: cargo build --release --no-default-features --features mongodb-test-hooks
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: extenddb-mongodb
+          path: target/release/extenddb
+          if-no-files-found: error
+          retention-days: 1
+
+  mongodb-pytest:
+    # Dedicated ExtendDB runner group (Ubuntu 24.04, 4 vCPU / 16 GB, capped at
+    # 20 concurrent). ubuntu-latest is an Amazon-wide shared pool where our jobs
+    # waited 10-90 minutes to start (2026-09-29/30); see integration.yml.
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 40
+    needs: build-mongodb
+    steps:
+      - uses: actions/checkout@v6
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - name: Install Python dependencies
         run: pip install -r requirements.txt
-      - name: Build release (mongodb backend)
-        run: cargo build --release --no-default-features --features mongodb-test-hooks
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: extenddb-mongodb
+          path: target/release
+      # Artifacts do not keep file modes.
+      - run: chmod +x target/release/extenddb
       - name: Run MongoDB pytest suite
         run: devtools/run-mongodb-tests -- --pytest --comprehensive --parallel
 
@@ -107,6 +125,7 @@ jobs:
   mongodb-rust:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 40
+    needs: build-mongodb
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -120,8 +139,13 @@ jobs:
           python-version: "3.11"
       - name: Install Python dependencies
         run: pip install -r requirements.txt
-      - name: Build release (mongodb backend)
-        run: cargo build --release --no-default-features --features mongodb-test-hooks
+      # After the cache restore, so a cached target/ cannot replace it.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: extenddb-mongodb
+          path: target/release
+      # Artifacts do not keep file modes.
+      - run: chmod +x target/release/extenddb
       - name: Run MongoDB rust integration suite
         run: devtools/run-mongodb-tests -- --rust --rust-integration
 

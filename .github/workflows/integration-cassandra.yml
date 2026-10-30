@@ -99,9 +99,29 @@ jobs:
         env:
           EXTENDDB_TEST_CASSANDRA: required
 
+  # One release build shared by the pytest and rust jobs; see integration.yml.
+  build-cassandra:
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Build release (cassandra backend)
+        run: cargo build --release --no-default-features --features cassandra
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: extenddb-cassandra
+          path: target/release/extenddb
+          if-no-files-found: error
+          retention-days: 1
+
   cassandra-pytest:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 45
+    needs: build-cassandra
     services:
       cassandra:
         image: cassandra:4.1
@@ -119,12 +139,6 @@ jobs:
           --health-start-period 60s
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-          # Only pushes to main save, so other runs restore main's cache.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Configure Cassandra authentication
         run: |
           docker exec ${{ job.services.cassandra.id }} sed -i \
@@ -147,14 +161,19 @@ jobs:
           python-version: "3.11"
       - name: Install Python dependencies
         run: pip install -r requirements.txt
-      - name: Build release (cassandra backend)
-        run: cargo build --release --no-default-features --features cassandra
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: extenddb-cassandra
+          path: target/release
+      # Artifacts do not keep file modes.
+      - run: chmod +x target/release/extenddb
       - name: Run Cassandra pytest suite
         run: devtools/run-cassandra-tests -- --pytest --comprehensive --parallel
 
   cassandra-rust:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 45
+    needs: build-cassandra
     services:
       cassandra:
         image: cassandra:4.1
@@ -200,8 +219,13 @@ jobs:
           python-version: "3.11"
       - name: Install Python dependencies
         run: pip install -r requirements.txt
-      - name: Build release (cassandra backend)
-        run: cargo build --release --no-default-features --features cassandra
+      # After the cache restore, so a cached target/ cannot replace it.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: extenddb-cassandra
+          path: target/release
+      # Artifacts do not keep file modes.
+      - run: chmod +x target/release/extenddb
       - name: Run Cassandra rust integration suite
         run: devtools/run-cassandra-tests -- --rust-integration
 
