@@ -1,0 +1,417 @@
+// Copyright 2026 ExtendDB contributors
+// SPDX-License-Identifier: Apache-2.0
+
+//! Update expression parser.
+//!
+//! Parses `UpdateExpression` strings into a list of `UpdateAction`s.
+//! Phase 3 supports SET and REMOVE actions.
+//!
+//! Grammar:
+//! ```text
+//! update_expr → action_clause ( action_clause )*
+//! action_clause → SET set_action ( ',' set_action )*
+//!               | REMOVE remove_action ( ',' remove_action )*
+//! set_action → path '=' value_expr
+//! value_expr → operand ( ('+' | '-') operand )?
+//! remove_action → path
+//! ```
+
+use super::ast::{ArithOp, Expr, UpdateAction};
+use super::parser_common;
+use super::tokenizer::Token;
+use crate::error::DynamoDbError;
+
+/// One `SET`, `REMOVE`, `ADD`, or `DELETE` section of a parsed update
+/// expression: its keyword and the range of actions it holds, in expression
+/// order. A keyword may appear more than once in the parse; the semantic pass
+/// reports the repetition after it has checked the section's own actions, as
+/// Amazon DynamoDB does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateSection {
+    pub keyword: &'static str,
+    pub actions: std::ops::Range<usize>,
+}
+
+/// The grammar-level result of parsing an `UpdateExpression`: the actions in
+/// expression order and the sections that group them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedUpdate {
+    pub actions: Vec<UpdateAction>,
+    pub sections: Vec<UpdateSection>,
+}
+
+/// Parse an update expression token stream into a list of actions, with the
+/// grammar-only checks plus the repeated-section rule.
+///
+/// Callers that go on to run [`validate_update_semantics`](super::semantics::validate_update_semantics) should use
+/// [`parse_update_sections`] instead; this entry point serves the storage
+/// crates' tests and other callers that need only a parsed action list.
+///
+/// # Errors
+///
+/// Returns `ValidationException` for syntax errors.
+pub fn parse_update(tokens: &[Token]) -> Result<Vec<UpdateAction>, DynamoDbError> {
+    let parsed = parse_update_sections(tokens, None)?;
+    check_sections_unique(&parsed.sections)?;
+    Ok(parsed.actions)
+}
+
+/// Parse an update expression with DynamoDB-compatible syntax error messages,
+/// including the repeated-section rule.
+///
+/// # Errors
+///
+/// Returns `ValidationException` for syntax errors.
+pub fn parse_update_from(
+    tokens: &[Token],
+    source: &str,
+) -> Result<Vec<UpdateAction>, DynamoDbError> {
+    let parsed = parse_update_sections(tokens, Some(source))?;
+    check_sections_unique(&parsed.sections)?;
+    Ok(parsed.actions)
+}
+
+/// Grammar pass over an `UpdateExpression`.
+///
+/// Only syntax is checked here: the section keywords, the shape of each
+/// action, and balanced parentheses. Any identifier followed by `(` parses
+/// as a function call with its name kept as written, operand counts are not
+/// checked, and a section keyword may repeat. Amazon DynamoDB reports every
+/// syntax error ahead of every semantic one, so the semantic rules (function
+/// names, operand counts and types, undefined references, repeated sections,
+/// overlapping paths) run afterwards in [`validate_update_semantics`](super::semantics::validate_update_semantics) over
+/// the returned tree.
+///
+/// `source`, when given, enables the service's `Syntax error; token: ...,
+/// near: ...` wording for an unexpected token at section level.
+///
+/// # Errors
+///
+/// Returns `ValidationException` for syntax errors.
+pub fn parse_update_sections(
+    tokens: &[Token],
+    source: Option<&str>,
+) -> Result<ParsedUpdate, DynamoDbError> {
+    parser_common::check_redundant_parens(tokens).map_err(|msg| {
+        DynamoDbError::ValidationException(format!("Invalid UpdateExpression: {msg}"))
+    })?;
+
+    let mut pos = 0;
+    let mut actions = Vec::new();
+    let mut sections: Vec<UpdateSection> = Vec::new();
+
+    while pos < tokens.len() {
+        let start = actions.len();
+        let keyword = match &tokens[pos] {
+            Token::Set => {
+                pos += 1;
+                parse_set_actions(tokens, &mut pos, &mut actions)?;
+                "SET"
+            }
+            Token::Remove => {
+                pos += 1;
+                parse_remove_actions(tokens, &mut pos, &mut actions)?;
+                "REMOVE"
+            }
+            Token::Add => {
+                pos += 1;
+                parse_add_actions(tokens, &mut pos, &mut actions)?;
+                "ADD"
+            }
+            Token::Delete => {
+                pos += 1;
+                parse_delete_actions(tokens, &mut pos, &mut actions)?;
+                "DELETE"
+            }
+            token => {
+                return Err(match source {
+                    Some(source) => {
+                        let token_text = token_display_text(token);
+                        let near = build_near_context(source, &token_text);
+                        validation_err(&format!(
+                            "Invalid UpdateExpression: Syntax error; token: \"{token_text}\", near: \"{near}\""
+                        ))
+                    }
+                    None => validation_err(
+                        "Invalid UpdateExpression: expected SET, REMOVE, ADD, or DELETE",
+                    ),
+                });
+            }
+        };
+        sections.push(UpdateSection {
+            keyword,
+            actions: start..actions.len(),
+        });
+    }
+
+    if actions.is_empty() {
+        return Err(validation_err(
+            "Invalid UpdateExpression: expression must contain at least one action",
+        ));
+    }
+
+    Ok(ParsedUpdate { actions, sections })
+}
+
+/// Each of SET, REMOVE, ADD, and DELETE may open one section. The first
+/// repeated section in order of appearance is named.
+pub(crate) fn check_sections_unique(sections: &[UpdateSection]) -> Result<(), DynamoDbError> {
+    for (i, section) in sections.iter().enumerate() {
+        if sections[..i].iter().any(|s| s.keyword == section.keyword) {
+            return Err(repeated_section_err(section.keyword));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn repeated_section_err(keyword: &str) -> DynamoDbError {
+    validation_err(&format!(
+        "Invalid UpdateExpression: The \"{keyword}\" section can only be used once in an update expression;"
+    ))
+}
+
+fn token_display_text(token: &Token) -> String {
+    match token {
+        Token::Ident(s) => s.clone(),
+        Token::NameRef(s) => format!("#{s}"),
+        Token::Placeholder(s) => format!(":{s}"),
+        Token::Eq => "=".to_owned(),
+        Token::Ne => "<>".to_owned(),
+        Token::Lt => "<".to_owned(),
+        Token::Le => "<=".to_owned(),
+        Token::Gt => ">".to_owned(),
+        Token::Ge => ">=".to_owned(),
+        Token::Plus => "+".to_owned(),
+        Token::Minus => "-".to_owned(),
+        Token::Comma => ",".to_owned(),
+        Token::Dot => ".".to_owned(),
+        Token::LBracket => "[".to_owned(),
+        Token::RBracket => "]".to_owned(),
+        Token::LParen => "(".to_owned(),
+        Token::RParen => ")".to_owned(),
+        Token::And => "AND".to_owned(),
+        Token::Or => "OR".to_owned(),
+        Token::Not => "NOT".to_owned(),
+        Token::Between => "BETWEEN".to_owned(),
+        Token::In => "IN".to_owned(),
+        Token::Set => "SET".to_owned(),
+        Token::Remove => "REMOVE".to_owned(),
+        Token::Add => "ADD".to_owned(),
+        Token::Delete => "DELETE".to_owned(),
+    }
+}
+
+fn build_near_context(source: &str, token_text: &str) -> String {
+    if source.is_empty() {
+        return token_text.to_owned();
+    }
+    if let Some(start) = source.find(token_text) {
+        let end = std::cmp::min(start + token_text.len() + 7, source.len());
+        source[start..end].trim_end().to_owned()
+    } else {
+        token_text.to_owned()
+    }
+}
+
+fn parse_set_actions(
+    tokens: &[Token],
+    pos: &mut usize,
+    actions: &mut Vec<UpdateAction>,
+) -> Result<(), DynamoDbError> {
+    loop {
+        let path = parser_common::parse_path(tokens, pos)?;
+        parser_common::expect_token(tokens, pos, &Token::Eq, "=", "UpdateExpression")?;
+        let value = parse_value_expr(tokens, pos)?;
+        actions.push(UpdateAction::Set { path, value });
+
+        if *pos < tokens.len() && tokens[*pos] == Token::Comma {
+            *pos += 1;
+        } else {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn parse_remove_actions(
+    tokens: &[Token],
+    pos: &mut usize,
+    actions: &mut Vec<UpdateAction>,
+) -> Result<(), DynamoDbError> {
+    loop {
+        let path = parser_common::parse_path(tokens, pos)?;
+        actions.push(UpdateAction::Remove { path });
+
+        if *pos < tokens.len() && tokens[*pos] == Token::Comma {
+            *pos += 1;
+        } else {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Parse a SET value expression: `operand` or `operand +/- operand`.
+fn parse_value_expr(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbError> {
+    let left = parse_set_operand(tokens, pos)?;
+
+    if *pos < tokens.len() {
+        let arith_op = match &tokens[*pos] {
+            Token::Plus => Some(ArithOp::Add),
+            Token::Minus => Some(ArithOp::Sub),
+            _ => None,
+        };
+        if let Some(op) = arith_op {
+            *pos += 1;
+            let right = parse_set_operand(tokens, pos)?;
+            return Ok(Expr::Arithmetic {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            });
+        }
+    }
+
+    Ok(left)
+}
+
+/// Parse a SET operand: path, placeholder, or function call.
+///
+/// Any identifier followed by `(` is a function call, with the name kept as
+/// written. This pass checks grammar only: whether the name exists, its case,
+/// and its operand count are checked afterwards by
+/// `validate_update_semantics`, over the whole parsed expression. Amazon
+/// DynamoDB reports every syntax error before any semantic error (measured
+/// 2026-10-14: `SET x = foo(x), b = ` reports the syntax error at the end,
+/// not the unknown function name), and deferring the semantic checks gives
+/// the same precedence.
+fn parse_set_operand(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbError> {
+    if *pos >= tokens.len() {
+        return Err(validation_err("Invalid UpdateExpression: expected operand"));
+    }
+
+    match &tokens[*pos] {
+        Token::Placeholder(name) => {
+            let expr = Expr::Placeholder(name.clone());
+            *pos += 1;
+            Ok(expr)
+        }
+        Token::Ident(_) => {
+            if *pos + 1 < tokens.len() && tokens[*pos + 1] == Token::LParen {
+                parse_set_function_call(tokens, pos)
+            } else {
+                parser_common::parse_path(tokens, pos).map(Expr::Path)
+            }
+        }
+        Token::NameRef(_) => parser_common::parse_path(tokens, pos).map(Expr::Path),
+        Token::LParen => {
+            *pos += 1; // consume '('
+            let expr = parse_value_expr(tokens, pos)?;
+            if *pos >= tokens.len() || tokens[*pos] != Token::RParen {
+                return Err(validation_err(
+                    "Invalid UpdateExpression: expected closing ')'",
+                ));
+            }
+            *pos += 1; // consume ')'
+            Ok(expr)
+        }
+        _ => Err(validation_err(
+            "Invalid UpdateExpression: expected path, placeholder, or function",
+        )),
+    }
+}
+
+fn parse_set_function_call(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbError> {
+    let name = match &tokens[*pos] {
+        Token::Ident(n) => n.clone(),
+        _ => {
+            return Err(validation_err(
+                "Invalid UpdateExpression: expected function name",
+            ));
+        }
+    };
+    *pos += 1;
+    parser_common::expect_token(tokens, pos, &Token::LParen, "(", "UpdateExpression")?;
+
+    // The grammar requires at least one operand between the parentheses. A
+    // call with an empty operand list, `foo()`, is a grammar error on the
+    // service, reported at the `)` with the text below, before the function
+    // name is looked at (measured 2026-10-14).
+    if *pos < tokens.len() && tokens[*pos] == Token::RParen {
+        return Err(validation_err(
+            "Invalid UpdateExpression: Syntax error; token: \")\", near: \"()\"",
+        ));
+    }
+    let mut args = vec![parse_set_operand(tokens, pos)?];
+    while *pos < tokens.len() && tokens[*pos] == Token::Comma {
+        *pos += 1;
+        args.push(parse_set_operand(tokens, pos)?);
+    }
+
+    parser_common::expect_token(tokens, pos, &Token::RParen, ")", "UpdateExpression")?;
+    Ok(Expr::Function { name, args })
+}
+
+/// Parse ADD actions: `ADD path value (, path value)*`
+fn parse_add_actions(
+    tokens: &[Token],
+    pos: &mut usize,
+    actions: &mut Vec<UpdateAction>,
+) -> Result<(), DynamoDbError> {
+    loop {
+        let path = parser_common::parse_path(tokens, pos)?;
+        let value = parse_add_delete_value(tokens, pos)?;
+        actions.push(UpdateAction::Add { path, value });
+        if *pos < tokens.len() && tokens[*pos] == Token::Comma {
+            *pos += 1;
+        } else {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Parse DELETE actions: `DELETE path value (, path value)*`
+fn parse_delete_actions(
+    tokens: &[Token],
+    pos: &mut usize,
+    actions: &mut Vec<UpdateAction>,
+) -> Result<(), DynamoDbError> {
+    loop {
+        let path = parser_common::parse_path(tokens, pos)?;
+        let value = parse_add_delete_value(tokens, pos)?;
+        actions.push(UpdateAction::Delete { path, value });
+        if *pos < tokens.len() && tokens[*pos] == Token::Comma {
+            *pos += 1;
+        } else {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Parse a value for ADD/DELETE. Only placeholders are valid.
+fn parse_add_delete_value(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbError> {
+    if *pos >= tokens.len() {
+        return Err(validation_err(
+            "Invalid UpdateExpression: expected value for ADD/DELETE action",
+        ));
+    }
+    match &tokens[*pos] {
+        Token::Placeholder(name) => {
+            let expr = Expr::Placeholder(name.clone());
+            *pos += 1;
+            Ok(expr)
+        }
+        _ => Err(validation_err(
+            "Invalid UpdateExpression: ADD/DELETE value must be a placeholder",
+        )),
+    }
+}
+
+fn validation_err(msg: &str) -> DynamoDbError {
+    DynamoDbError::ValidationException(msg.to_owned())
+}
+
+#[cfg(test)]
+mod tests;

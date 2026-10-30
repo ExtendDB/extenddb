@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::expression::{ExpressionKind, ExpressionMaps, PathElement, UpdateAction};
+use extenddb_core::expression::{ExpressionMaps, PathElement, UpdateAction};
 use extenddb_core::types::{
     AttributeValue, Item, ReturnValues, TableKeyInfo, UpdateItemInput, UpdateItemOutput,
     item_size_bytes,
@@ -20,7 +20,7 @@ use extenddb_core::types::{
 use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::{storage_err_to_dynamo, storage_err_to_dynamo_with_ccf};
-use crate::expression_helpers::resolve_condition;
+use crate::expression_helpers::{resolve_condition, single_item_write_prefix};
 use crate::serialize_output;
 use crate::stream_capture;
 use crate::{DispatchMetrics, DispatchResult};
@@ -92,6 +92,7 @@ pub async fn handle_update_item(
     // Desugar legacy AttributeUpdates into UpdateExpression if present.
     let (effective_update_expr, extra_expr_values, extra_expr_names) =
         if let Some(attr_updates) = &input.attribute_updates {
+            crate::attribute_updates::validate_action_value_types(attr_updates)?;
             desugar_attribute_updates(attr_updates)?
         } else {
             (
@@ -123,13 +124,16 @@ pub async fn handle_update_item(
     };
 
     let has_expr = has_update_expr || has_condition;
+    // The single-item write APIs name no expression in the values message and
+    // wrap every expression-stage error in `1 validation error detected: `.
     extenddb_core::expression::validate_expression_param_usage(
         input.expression_attribute_names.as_ref(),
         has_expr,
         input.expression_attribute_values.as_ref(),
         has_expr,
-        &[ExpressionKind::Update, ExpressionKind::Condition],
-    )?;
+        &[],
+    )
+    .map_err(single_item_write_prefix)?;
 
     // ConditionalOperator requires an Expected with two or more conditions.
     extenddb_core::validation::validate_conditional_operator_usage(
@@ -137,6 +141,10 @@ pub async fn handle_update_item(
         input.expected.as_ref().map_or(0, HashMap::len),
     )?;
 
+    // Amazon DynamoDB checks the whole ConditionExpression (syntax, then
+    // references, functions, and operand types) before it looks at the
+    // UpdateExpression: a request with a defect in each reports the
+    // condition's (measured 2026-10-14). `resolve_condition` runs that pass.
     let (condition, maps) = resolve_condition(
         input.condition_expression.as_deref(),
         effective_expr_names.as_ref(),
@@ -144,33 +152,22 @@ pub async fn handle_update_item(
         input.expected.as_ref(),
         input.conditional_operator,
         &ctx.limits,
-    )?;
+    )
+    .map_err(single_item_write_prefix)?;
 
     // No UpdateExpression and no AttributeUpdates: no-op upsert.
-    // Some("") still errors via parse_update_expr.
+    // Some("") still errors via parse_update_expr_checked. The checked parse
+    // runs the service's ordered walk over the parsed actions (function
+    // names, operand counts and types, undefined references, repeated
+    // sections) and then the overlapping-path rule, all ahead of the table
+    // lookup.
     let actions = if let Some(update_expr) = effective_update_expr.as_deref() {
-        crate::expression_helpers::parse_update_expr(update_expr, &ctx.limits)?
+        crate::expression_helpers::parse_update_expr_checked(update_expr, &maps, &ctx.limits)
+            .map_err(single_item_write_prefix)?
     } else {
         Vec::new()
     };
-
-    // Reject an undefined #name before the existence check
-    // (otherwise it is only raised later, during execution).
-    for action in &actions {
-        let path = match action {
-            UpdateAction::Set { path, .. }
-            | UpdateAction::Remove { path }
-            | UpdateAction::Add { path, .. }
-            | UpdateAction::Delete { path, .. } => path,
-        };
-        for el in path {
-            if let PathElement::Attribute(name) = el
-                && let Some(ref_name) = name.strip_prefix('#')
-            {
-                maps.resolve_name(ref_name)?;
-            }
-        }
-    }
+    let action_refs: Vec<&UpdateAction> = actions.iter().collect();
 
     if input.expected.is_none()
         || input
@@ -183,10 +180,11 @@ pub async fn handle_update_item(
             &maps.names,
             &maps.values,
             &exprs,
-            &actions.iter().collect::<Vec<_>>(),
+            &action_refs,
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
-        )?;
+        )
+        .map_err(single_item_write_prefix)?;
     }
 
     let key_info = ctx

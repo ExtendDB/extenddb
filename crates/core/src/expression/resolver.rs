@@ -273,31 +273,77 @@ pub fn validate_unused_attributes(
         collect_action_refs(action, &mut used_names, &mut used_values);
     }
 
-    for key in names.keys() {
-        if !used_names.contains(key.strip_prefix('#').unwrap_or(key)) {
-            let display_key = if key.starts_with('#') {
+    // The service lists every unused key in one set (`keys: {:x, :y, :z}`).
+    // Its order is a hash artifact no client can depend on; the keys are
+    // sorted here so the message is the same on every backend and process.
+    let mut unused_names: Vec<String> = names
+        .keys()
+        .filter(|key| !used_names.contains(key.strip_prefix('#').unwrap_or(key)))
+        .map(|key| {
+            if key.starts_with('#') {
                 key.clone()
             } else {
                 format!("#{key}")
-            };
-            return Err(DynamoDbError::ValidationException(format!(
-                "Value provided in ExpressionAttributeNames unused in expressions: keys: {{{display_key}}}"
-            )));
-        }
+            }
+        })
+        .collect();
+    if !unused_names.is_empty() {
+        unused_names.sort();
+        return Err(DynamoDbError::ValidationException(format!(
+            "Value provided in ExpressionAttributeNames unused in expressions: keys: {{{}}}",
+            unused_names.join(", ")
+        )));
     }
-    for key in values.keys() {
-        if !used_values.contains(key.strip_prefix(':').unwrap_or(key)) {
-            let display_key = if key.starts_with(':') {
+    let mut unused_values: Vec<String> = values
+        .keys()
+        .filter(|key| !used_values.contains(key.strip_prefix(':').unwrap_or(key)))
+        .map(|key| {
+            if key.starts_with(':') {
                 key.clone()
             } else {
                 format!(":{key}")
-            };
-            return Err(DynamoDbError::ValidationException(format!(
-                "Value provided in ExpressionAttributeValues unused in expressions: keys: {{{display_key}}}"
-            )));
-        }
+            }
+        })
+        .collect();
+    if !unused_values.is_empty() {
+        unused_values.sort();
+        return Err(DynamoDbError::ValidationException(format!(
+            "Value provided in ExpressionAttributeValues unused in expressions: keys: {{{}}}",
+            unused_values.join(", ")
+        )));
     }
     Ok(())
+}
+
+/// Reject an update expression whose actions name overlapping document paths.
+///
+/// Amazon DynamoDB refuses two actions whose paths are equal or where one is a
+/// prefix of the other, across all four sections, after `#name` resolution:
+/// `SET a = :v, a = :w`, `SET m = :v, m.x = :w`, `SET a.b = :v REMOVE a`, and
+/// `SET #l[1] = :v, #l[1].x = :w` with `#l` bound to `lst` all fail. Siblings
+/// (`m.x` and `m.y`) are fine. The first offending pair in expression order is
+/// named, rendered as the service renders it: `[lst, [1]]`.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` with the `Invalid
+/// UpdateExpression:` prefix.
+pub fn validate_update_paths_disjoint(
+    actions: &[super::ast::UpdateAction],
+    maps: &ExpressionMaps,
+) -> Result<(), DynamoDbError> {
+    use super::ast::UpdateAction;
+    let paths: Vec<Vec<PathElement>> = actions
+        .iter()
+        .map(|action| match action {
+            UpdateAction::Set { path, .. }
+            | UpdateAction::Remove { path }
+            | UpdateAction::Add { path, .. }
+            | UpdateAction::Delete { path, .. } => path.clone(),
+        })
+        .collect();
+    let resolved = super::projection::resolve_paths(&paths, maps)?;
+    super::projection::check_overlap_for(&resolved, super::ExpressionKind::Update)
 }
 
 fn collect_expr_refs(
@@ -490,7 +536,7 @@ pub fn validate_begins_with_operands(
 
 /// Return the DynamoDB type code for an AttributeValue (S, N, B, BOOL, NULL,
 /// L, M, SS, NS, BS). Used in operand-type validation messages.
-pub(crate) fn attribute_type_code(val: &AttributeValue) -> &'static str {
+pub fn attribute_type_code(val: &AttributeValue) -> &'static str {
     match val {
         AttributeValue::S(_) => "S",
         AttributeValue::N(_) => "N",
@@ -847,5 +893,39 @@ mod tests {
         let mut out = Vec::new();
         collect_value_placeholders(&expr, &mut out);
         assert!(out.is_empty());
+    }
+
+    // The service lists every unused key in one set, in an order that is a hash
+    // artifact. ExtendDB sorts the keys so the message is the same on every
+    // backend and process; this is ExtendDB's own choice, not a measurement.
+    // Each round builds fresh maps, which iterate in a fresh random order, so a
+    // missing sort cannot pass by luck.
+    #[test]
+    fn unused_keys_are_listed_sorted() {
+        let none = std::collections::HashSet::new();
+        let unused = |names: &HashMap<String, String>, values: &HashMap<String, AttributeValue>| {
+            match validate_unused_attributes(names, values, &[], &[], &none, &none) {
+                Err(DynamoDbError::ValidationException(msg)) => msg,
+                other => panic!("unexpected {other:?}"),
+            }
+        };
+        for _ in 0..20 {
+            let names: HashMap<String, String> = ["#z", "#a", "#m"]
+                .iter()
+                .map(|k| ((*k).to_owned(), "x".to_owned()))
+                .collect();
+            let values: HashMap<String, AttributeValue> = [":z", ":a", ":m"]
+                .iter()
+                .map(|k| ((*k).to_owned(), AttributeValue::N("1".to_owned())))
+                .collect();
+            assert_eq!(
+                unused(&HashMap::new(), &values),
+                "Value provided in ExpressionAttributeValues unused in expressions: keys: {:a, :m, :z}"
+            );
+            assert_eq!(
+                unused(&names, &HashMap::new()),
+                "Value provided in ExpressionAttributeNames unused in expressions: keys: {#a, #m, #z}"
+            );
+        }
     }
 }

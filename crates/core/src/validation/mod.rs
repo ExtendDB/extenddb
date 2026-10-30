@@ -1293,6 +1293,14 @@ pub fn validate_item_keys(
 
 /// Validate that a key map contains exactly the key attributes and nothing else.
 ///
+/// A key with an attribute missing, an attribute of the wrong type, or an
+/// extra attribute is refused with `The provided key element does not match
+/// the schema` on every key-shaped API (GetItem, DeleteItem, UpdateItem, the
+/// batch and transaction key paths; measured against Amazon DynamoDB
+/// 2026-10-14). Only `PutItem`, whose key arrives inside the item, names the
+/// attribute (see [`validate_item_keys`]). An empty key value keeps its own
+/// message.
+///
 /// # Errors
 ///
 /// Returns `DynamoDbError::ValidationException` if the key has extra/missing attributes or wrong types.
@@ -1301,31 +1309,53 @@ pub fn validate_key_only(
     key_schema: &[KeySchemaElement],
     attr_defs: &[AttributeDefinition],
 ) -> Result<(), DynamoDbError> {
+    validate_key_shape(key, key_schema, attr_defs, true)
+}
+
+/// [`validate_key_only`] without the empty-value rule: the count, the missing
+/// attribute and the type of every key attribute, and nothing else. The
+/// transaction key pass uses it because the service reports an empty key value
+/// only after every shape error of the same item, even one on a later key
+/// attribute (measured 2026-10-27).
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` if the key has extra/missing attributes or wrong types.
+pub fn validate_key_shape_only(
+    key: &Item,
+    key_schema: &[KeySchemaElement],
+    attr_defs: &[AttributeDefinition],
+) -> Result<(), DynamoDbError> {
+    validate_key_shape(key, key_schema, attr_defs, false)
+}
+
+fn validate_key_shape(
+    key: &Item,
+    key_schema: &[KeySchemaElement],
+    attr_defs: &[AttributeDefinition],
+    reject_empty: bool,
+) -> Result<(), DynamoDbError> {
     // Must contain exactly the key attributes
     let expected_count = key_schema.len();
     if key.len() != expected_count {
-        return Err(DynamoDbError::ValidationException(
-            "The provided key element does not match the schema".to_owned(),
-        ));
+        return Err(key_schema_mismatch());
     }
 
     for ks in key_schema {
-        let value = key.get(&ks.attribute_name).ok_or_else(|| {
-            DynamoDbError::ValidationException(format!(
-                "One or more parameter values were invalid: Missing the key {} in the item",
-                ks.attribute_name
-            ))
-        })?;
-        validate_key_attribute_type(&ks.attribute_name, value, attr_defs)?;
-        validate_no_empty_key_value(&ks.attribute_name, value)?;
+        let value = key
+            .get(&ks.attribute_name)
+            .ok_or_else(key_schema_mismatch)?;
+        validate_key_attribute_type(&ks.attribute_name, value, attr_defs)
+            .map_err(remap_key_shape_errors)?;
+        if reject_empty {
+            validate_no_empty_key_value(&ks.attribute_name, value)?;
+        }
     }
     Ok(())
 }
 
-/// Batch-specific key validation: uses `DynamoDB`'s batch error message for type mismatches.
-///
-/// Real `DynamoDB` returns "The provided key element does not match the schema" for
-/// batch operations, not the single-item "Type mismatch" message.
+/// Key validation for the batch and transaction key paths. Same rules and
+/// message as [`validate_key_only`]; kept as a separate name for the callers.
 ///
 /// # Errors
 ///
@@ -1335,10 +1365,12 @@ pub fn validate_batch_key_only(
     key_schema: &[KeySchemaElement],
     attr_defs: &[AttributeDefinition],
 ) -> Result<(), DynamoDbError> {
-    validate_key_only(key, key_schema, attr_defs).map_err(remap_key_type_mismatch)
+    validate_key_only(key, key_schema, attr_defs)
 }
 
-/// Batch-specific item key validation: uses `DynamoDB`'s batch error message for type mismatches.
+/// `BatchWriteItem` Put key validation: a missing or mistyped key attribute
+/// inside the item is `The provided key element does not match the schema`,
+/// where `PutItem` names the attribute (measured 2026-10-14).
 ///
 /// # Errors
 ///
@@ -1348,20 +1380,24 @@ pub fn validate_batch_item_keys(
     key_schema: &[KeySchemaElement],
     attr_defs: &[AttributeDefinition],
 ) -> Result<(), DynamoDbError> {
-    validate_item_keys(item, key_schema, attr_defs).map_err(remap_key_type_mismatch)
+    validate_item_keys(item, key_schema, attr_defs).map_err(remap_key_shape_errors)
 }
 
-/// Remap key type-mismatch errors to the batch/transaction-specific message.
-///
-/// Real `DynamoDB` uses "The provided key element does not match the schema"
-/// for batch and transaction operations, not the single-item "Type mismatch"
-/// message.
-fn remap_key_type_mismatch(err: DynamoDbError) -> DynamoDbError {
+fn key_schema_mismatch() -> DynamoDbError {
+    DynamoDbError::ValidationException(
+        "The provided key element does not match the schema".to_owned(),
+    )
+}
+
+/// Remap the item-shaped key messages (`Missing the key`, `Type mismatch for
+/// key`) to the key-shaped `The provided key element does not match the
+/// schema`.
+fn remap_key_shape_errors(err: DynamoDbError) -> DynamoDbError {
     match &err {
-        DynamoDbError::ValidationException(msg) if msg.contains("Type mismatch for key ") => {
-            DynamoDbError::ValidationException(
-                "The provided key element does not match the schema".to_owned(),
-            )
+        DynamoDbError::ValidationException(msg)
+            if msg.contains("Type mismatch for key ") || msg.contains("Missing the key ") =>
+        {
+            key_schema_mismatch()
         }
         _ => err,
     }
@@ -1947,6 +1983,26 @@ where
         check_attribute_value_depth(v, 0)?;
     }
     Ok(())
+}
+
+/// Validate the nesting of one `ExpressionAttributeValues` value of a
+/// transaction item. The service accepts a value with as many wrappers as an
+/// item may hold plus one, and refuses one more (measured 2026-10-27: a
+/// `ConditionCheck` value 32 `M` wrappers deep is accepted, 33 is refused,
+/// while a `Put` item attribute 32 deep is refused). A value that is stored
+/// then meets the item limit, which is checked separately.
+pub fn validate_expression_value_nesting_depth(
+    value: &AttributeValue,
+) -> Result<(), DynamoDbError> {
+    match value {
+        AttributeValue::M(map) => map
+            .values()
+            .try_for_each(|v| check_attribute_value_depth(v, 0)),
+        AttributeValue::L(list) => list
+            .iter()
+            .try_for_each(|v| check_attribute_value_depth(v, 0)),
+        _ => Ok(()),
+    }
 }
 
 fn check_attribute_value_depth(

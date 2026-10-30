@@ -479,12 +479,19 @@ fn parse_key_clause_inner(tokens: &[Token], pos: &mut usize) -> Result<RawClause
         ));
     }
 
-    // begins_with(path, :val)
+    // begins_with(path, :val). The name is matched as written. Any other
+    // identifier followed by `(` is refused with the text the service gives
+    // it, which depends on the name (see `key_condition_function_refusal`).
     if let Token::Ident(name) = &tokens[*pos]
-        && name.eq_ignore_ascii_case("begins_with")
         && *pos + 1 < tokens.len()
         && tokens[*pos + 1] == Token::LParen
     {
+        if name != "begins_with" {
+            return Err(validation_err(&format!(
+                "Invalid KeyConditionExpression: {}",
+                super::semantics::key_condition_function_refusal(name)
+            )));
+        }
         *pos += 1; // skip function name
         parser_common::expect_token(tokens, pos, &Token::LParen, "(", "KeyConditionExpression")?;
         let path = parse_key_operand_path(tokens, pos)?;
