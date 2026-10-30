@@ -30,6 +30,8 @@ mod create_table;
 mod credential_store;
 mod data;
 mod delete_table;
+#[cfg(test)]
+mod gsi_backfilling_tests;
 mod hooks;
 mod management_store;
 mod metadata;

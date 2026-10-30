@@ -18,7 +18,9 @@ use extenddb_storage::management_store::SettingsStore;
 use extenddb_config::{self as config, MASK};
 
 // Re-use validation constants from the ops layer.
-use extenddb_server::management::ops_settings::{KNOWN_KEYS, READONLY_KEYS};
+use extenddb_server::management::ops_settings::{
+    KNOWN_KEYS, READONLY_KEYS, writable_key_validator,
+};
 
 #[derive(Args)]
 pub struct SettingsArgs {
@@ -118,26 +120,7 @@ async fn get(store: &dyn SettingsStore, key: &str, show_secret: bool) -> anyhow:
 }
 
 async fn set(store: &dyn SettingsStore, key: &str, value: &str) -> anyhow::Result<()> {
-    if READONLY_KEYS.contains(&key) {
-        anyhow::bail!("Setting '{key}' is read-only and cannot be changed via this command.");
-    }
-
-    // Validate against known keys.
-    let known = KNOWN_KEYS.iter().find(|(k, _)| *k == key);
-    if let Some((_, validator)) = known {
-        validator(value)
-            .map_err(|reason| anyhow::anyhow!("Invalid value for '{key}': {reason}"))?;
-    } else {
-        // Unknown key — reject.
-        anyhow::bail!(
-            "Unknown setting '{key}'. Known writable keys: {}",
-            KNOWN_KEYS
-                .iter()
-                .map(|(k, _)| *k)
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
+    validate(key, value)?;
 
     // Write under the canonical name so the deprecated alias updates the row the read
     // path consults, rather than adding a second one that is silently ignored.
@@ -152,6 +135,30 @@ async fn set(store: &dyn SettingsStore, key: &str, value: &str) -> anyhow::Resul
         "settings-set: key={key}, value={value}",
     );
     println!("{key} = {value}");
+    Ok(())
+}
+
+/// Refuse a read-only or unknown key, or a value its validator rejects, with
+/// the same lookup the management API uses.
+fn validate(key: &str, value: &str) -> anyhow::Result<()> {
+    if READONLY_KEYS.contains(&key) {
+        anyhow::bail!("Setting '{key}' is read-only and cannot be changed via this command.");
+    }
+
+    if let Some(validator) = writable_key_validator(key) {
+        validator(value)
+            .map_err(|reason| anyhow::anyhow!("Invalid value for '{key}': {reason}"))?;
+    } else {
+        // Unknown key — reject.
+        anyhow::bail!(
+            "Unknown setting '{key}'. Known writable keys: {}",
+            KNOWN_KEYS
+                .iter()
+                .map(|(k, _)| *k)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     Ok(())
 }
 
@@ -235,5 +242,24 @@ mod tests {
                 "writable key {key} matches a redaction pattern"
             );
         }
+    }
+
+    #[test]
+    fn a_table_gsi_phase_hold_is_writable_from_the_cli() {
+        // The admin guide lists `gsi_creating_phase_delay_ms:<table>` among the
+        // settings managed with `extenddb settings set`.
+        validate("gsi_creating_phase_delay_ms:orders", "1000").expect("a valid hold");
+        validate("gsi_creating_phase_delay_ms:orders", "0").expect("zero clears it");
+        let err =
+            validate("gsi_creating_phase_delay_ms:orders", "60001").expect_err("above the bound");
+        assert!(
+            err.to_string()
+                .starts_with("Invalid value for 'gsi_creating_phase_delay_ms:orders'"),
+            "{err}"
+        );
+        let err = validate("gsi_creating_phase_delay_ms:ab", "1000")
+            .expect_err("a table name the service would refuse");
+        assert!(err.to_string().starts_with("Unknown setting"), "{err}");
+        assert!(!config::should_redact("gsi_creating_phase_delay_ms:orders"));
     }
 }

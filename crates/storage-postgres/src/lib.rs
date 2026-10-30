@@ -304,6 +304,10 @@ pub struct PostgresEngine {
     /// tests that count them. Shared by clones.
     #[cfg(feature = "test-hooks")]
     pub(crate) drop_attempts: Arc<std::sync::atomic::AtomicU64>,
+    /// GSI builds in this process whose backfill has started, which is what
+    /// DescribeTable reports as `Backfilling` and what decides a Query or Scan
+    /// refusal for a `CREATING` GSI; see `extenddb_storage::gsi_backfill`.
+    pub(crate) gsi_backfills: extenddb_storage::gsi_backfill::GsiBackfills,
 }
 
 /// Table snapshots one engine may hold open at once: half the pool (at least
@@ -430,6 +434,7 @@ impl PostgresEngine {
             shared_data_pool,
             #[cfg(feature = "test-hooks")]
             drop_attempts: Arc::default(),
+            gsi_backfills: extenddb_storage::gsi_backfill::GsiBackfills::default(),
         })
     }
 
@@ -741,6 +746,22 @@ impl PostgresEngine {
                 0
             }
         }
+    }
+
+    /// The `gsi_creating_phase_delay_ms` test hold for one table; zero when unset.
+    pub(crate) async fn gsi_creating_phase_delay(&self, table_name: &str) -> std::time::Duration {
+        let live: Result<Option<(String,)>, _> =
+            sqlx::query_as("SELECT value FROM settings WHERE key = $1")
+                .bind(extenddb_core::settings_keys::gsi_creating_phase_delay_key(
+                    table_name,
+                ))
+                .fetch_optional(&self.pool)
+                .await;
+        let value = live.unwrap_or_else(|e| {
+            tracing::debug!("gsi_creating_phase_delay: live read failed, using 0: {e:?}");
+            None
+        });
+        extenddb_storage::gsi_backfill::phase_delay(value.as_ref().map(|(v,)| v.as_str()))
     }
 
     /// Whether the data database has pgvector, as probed at construction.

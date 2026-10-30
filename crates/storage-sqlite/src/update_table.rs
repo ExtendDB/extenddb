@@ -715,6 +715,20 @@ impl SqliteEngine {
                 if let Some(create) = &update.create {
                     let idx_id = created[ci].clone();
                     ci += 1;
+                    // The row committed above as CREATING reports `Backfilling:
+                    // false` until the record below is taken, and `true` from then
+                    // until the flip to ACTIVE. The test hold lengthens each phase;
+                    // it runs under the engine write lock, so it also delays every
+                    // other write in this process while it lasts.
+                    let hold = self.gsi_creating_phase_delay(&input.table_name).await;
+                    if !hold.is_zero() {
+                        tokio::time::sleep(hold).await;
+                    }
+                    // The record ends with this block. A build that fails below
+                    // deletes its row. If that DELETE fails, or the flip to ACTIVE
+                    // fails, the row stays CREATING with no record and reports the
+                    // first phase until the startup reconciler rebuilds it.
+                    let _backfilling = self.gsi_backfills.start_scoped(&idx_id);
                     let result = async {
                         let mut data_tx = self
                             .pool
@@ -762,6 +776,12 @@ impl SqliteEngine {
                         .execute(&self.pool)
                         .await;
                         return Err(e);
+                    }
+                    // The second hold sits between the build's commit and the flip,
+                    // as on PostgreSQL, so a record that ended before the flip would
+                    // show as the first phase while it lasts.
+                    if !hold.is_zero() {
+                        tokio::time::sleep(hold).await;
                     }
                     // Backfill succeeded and the data table is populated, so the
                     // index is now queryable: flip CREATING -> ACTIVE. DescribeTable

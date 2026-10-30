@@ -79,6 +79,10 @@ pub struct SqliteEngine {
     /// no entry, because nothing else ever will until a restart, and until then
     /// the per-table queue hold blocks every write's index maintenance.
     pub(crate) vector_builds_running: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// GSI builds whose backfill has started, which is what DescribeTable
+    /// reports as `Backfilling` and what decides a Query or Scan refusal for a
+    /// `CREATING` GSI; see `extenddb_storage::gsi_backfill`.
+    pub(crate) gsi_backfills: extenddb_storage::gsi_backfill::GsiBackfills,
     /// The `extenddb serve` lock on the database file, held for as long as any
     /// clone of the engine lives. `None` outside `serve` and for in-memory
     /// databases.
@@ -181,6 +185,7 @@ impl SqliteEngine {
             vector_builds_running: Arc::new(
                 std::sync::Mutex::new(std::collections::HashSet::new()),
             ),
+            gsi_backfills: extenddb_storage::gsi_backfill::GsiBackfills::default(),
             serve_lock: None,
             backup_server_slot_count,
             backup_server_slots: Arc::new(tokio::sync::Semaphore::new(backup_server_slot_count)),
@@ -386,6 +391,22 @@ impl SqliteEngine {
                 0
             }
         }
+    }
+
+    /// The `gsi_creating_phase_delay_ms` test hold for one table; zero when unset.
+    pub(crate) async fn gsi_creating_phase_delay(&self, table_name: &str) -> std::time::Duration {
+        let live: Result<Option<(String,)>, _> =
+            sqlx::query_as("SELECT value FROM settings WHERE key = ?")
+                .bind(extenddb_core::settings_keys::gsi_creating_phase_delay_key(
+                    table_name,
+                ))
+                .fetch_optional(&self.pool)
+                .await;
+        let value = live.unwrap_or_else(|e| {
+            tracing::debug!("gsi_creating_phase_delay: live read failed, using 0: {e:?}");
+            None
+        });
+        extenddb_storage::gsi_backfill::phase_delay(value.as_ref().map(|(v,)| v.as_str()))
     }
 
     /// Handle to the GSI propagation notifier, woken after an enqueue.

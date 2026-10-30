@@ -60,7 +60,9 @@ impl PostgresEngine {
 
         let row = row.ok_or_else(|| StorageError::TableNotFound(input.table_name.clone()))?;
 
-        // Fetch indexes for the response description.
+        // Fetch indexes for the response description, after the backfill set;
+        // see `GsiBackfills::snapshot`.
+        let started = self.gsi_backfills.snapshot();
         let index_rows: Vec<IndexRow> = sqlx::query_as(
             r"SELECT index_name, index_id, index_type, key_schema, projection,
                       index_status, provisioned_throughput
@@ -78,7 +80,8 @@ impl PostgresEngine {
             tx.rollback()
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
-            let desc = self.build_table_description_from_row(account_id, row, index_rows)?;
+            let desc =
+                self.build_table_description_from_row(account_id, row, index_rows, &started)?;
             return Ok(TableDescription {
                 table_status: TableStatus::Deleting,
                 ..desc
@@ -328,7 +331,7 @@ impl PostgresEngine {
         }
 
         // Build description from the fetched row data
-        let desc = self.build_table_description_from_row(account_id, row, index_rows)?;
+        let desc = self.build_table_description_from_row(account_id, row, index_rows, &started)?;
 
         Ok(TableDescription {
             table_status: TableStatus::Deleting,

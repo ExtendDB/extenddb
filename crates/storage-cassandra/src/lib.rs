@@ -21,6 +21,7 @@ mod credential_store;
 pub mod data;
 mod delete_table;
 pub mod engine;
+mod gsi_backfill_phase;
 pub mod gsi_queue;
 mod management_store;
 mod metadata_engine;

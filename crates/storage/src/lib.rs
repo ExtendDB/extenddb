@@ -15,6 +15,7 @@ pub mod config;
 pub mod diagnostics;
 pub mod diagnostics_store;
 pub mod error;
+pub mod gsi_backfill;
 pub mod hooks;
 pub mod management_store;
 pub mod management_store_factory;

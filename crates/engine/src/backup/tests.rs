@@ -205,6 +205,7 @@ fn described(request: &RestoreRequest) -> TableDescription {
                     key_schema: g.key_schema.clone(),
                     projection: g.projection.clone(),
                     index_status: "ACTIVE".to_owned(),
+                    backfilling: None,
                     provisioned_throughput: Some(ProvisionedThroughputDescription {
                         read_capacity_units: 9,
                         write_capacity_units: 9,

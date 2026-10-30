@@ -470,17 +470,34 @@ pub(crate) async fn poll_gsi_backfill_recovery(
         };
 
         for account_ks in &keyspaces {
-            if let Err(e) = recover_stale_backfills(&engine, account_ks, stale_threshold).await {
+            if let Err(e) =
+                recover_stale_backfills(&engine, account_ks, stale_threshold, None).await
+            {
                 tracing::warn!("gsi_recovery: {account_ks}: {e}");
             }
         }
     }
 }
 
+/// One scan of the recovery worker, limited to the `CREATING` indexes of one
+/// table. Hidden because no deployment path calls it: a direct test drives the
+/// worker's claim with it, and the table filter keeps the scan off the indexes
+/// the tests running beside it stage.
+#[doc(hidden)]
+pub async fn recover_stale_gsi_backfills_of_table(
+    engine: &Arc<CassandraEngine>,
+    account_ks: &str,
+    table_id: &str,
+    stale_threshold: Duration,
+) -> Result<(), extenddb_storage::error::StorageError> {
+    recover_stale_backfills(engine, account_ks, stale_threshold, Some(table_id)).await
+}
+
 async fn recover_stale_backfills(
     engine: &Arc<CassandraEngine>,
     account_ks: &str,
     stale_threshold: Duration,
+    only_table: Option<&str>,
 ) -> Result<(), extenddb_storage::error::StorageError> {
     use cdrs_tokio::types::IntoRustByName as _;
 
@@ -513,6 +530,9 @@ async fn recover_stale_backfills(
         }
 
         let table_id: String = crate::cassandra_util::get_column(&row, "table_id", "gsi_recovery")?;
+        if only_table.is_some_and(|t| t != table_id) {
+            continue;
+        }
         let index_name: String =
             crate::cassandra_util::get_column(&row, "index_name", "gsi_recovery")?;
         let index_id: String = crate::cassandra_util::get_column(&row, "index_id", "gsi_recovery")?;
@@ -537,12 +557,12 @@ async fn recover_stale_backfills(
             }
         };
 
-        // Fetch base table key_schema + attribute_definitions.
+        // Fetch the base table's account, key_schema and attribute_definitions.
         let base_row =
             match crate::cassandra_util::query_optional::<extenddb_storage::error::StorageError>(
                 &engine.session,
                 &format!(
-                    "SELECT key_schema, attribute_definitions \
+                    "SELECT account_id, key_schema, attribute_definitions, table_name \
                  FROM {catalog_ks}.tables WHERE table_id = ? ALLOW FILTERING"
                 ),
                 cdrs_tokio::query_values!(table_id.as_str()),
@@ -562,6 +582,17 @@ async fn recover_stale_backfills(
                     continue;
                 }
             };
+
+        // The catalog scan returns the CREATING indexes of every account, and
+        // the worker runs it once per account keyspace. Only the scan of the
+        // keyspace that holds the base table can build the index, so the
+        // others leave the row alone: a claim written by one of them would
+        // make the scan that can build the index find it taken and skip it.
+        let owner: String =
+            crate::cassandra_util::get_column(&base_row, "account_id", "gsi_recovery_base")?;
+        if engine.account_keyspace(&owner) != account_ks {
+            continue;
+        }
 
         let base_ks_json: String =
             crate::cassandra_util::get_column(&base_row, "key_schema", "gsi_recovery_base")?;
@@ -591,6 +622,14 @@ async fn recover_stale_backfills(
             "gsi_recovery: recovering stale backfill for index '{index_name}' \
              (table_id={table_id}, index_id={index_id})"
         );
+        let base_table_name: String =
+            crate::cassandra_util::get_column(&base_row, "table_name", "gsi_recovery_base")?;
+        let Some(hold) =
+            crate::gsi_backfill_phase::claim(engine, &table_id, &index_name, &base_table_name)
+                .await
+        else {
+            continue;
+        };
 
         // Drop and recreate the data table so we start from a clean slate.
         if let Err(e) = engine.drop_index_data_table(account_ks, &index_id).await {
@@ -635,6 +674,7 @@ async fn recover_stale_backfills(
         let index_id_owned = index_id.clone();
         let index_name_owned = index_name.clone();
         tokio::spawn(async move {
+            tokio::time::sleep(hold).await;
             let result = crate::data::ddl::backfill_gsi(
                 &session,
                 &account_ks_owned,

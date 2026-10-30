@@ -37,7 +37,9 @@ impl SqliteEngine {
         let row = row.ok_or_else(|| StorageError::TableNotFound(input.table_name.clone()))?;
         if row.table_status == "DELETING" {
             // Already scheduled for removal by the control-plane worker:
-            // nothing to change.
+            // nothing to change. After the backfill set; see
+            // `GsiBackfills::snapshot`.
+            let started = self.gsi_backfills.snapshot();
             let index_rows: Vec<IndexRow> = sqlx::query_as(&format!(
                 "SELECT {INDEX_COLUMNS} FROM indexes WHERE table_id = ?"
             ))
@@ -45,7 +47,8 @@ impl SqliteEngine {
             .fetch_all(&self.pool)
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
-            let desc = self.build_table_description_from_row(account_id, row, index_rows)?;
+            let desc =
+                self.build_table_description_from_row(account_id, row, index_rows, &started)?;
             return Ok(TableDescription {
                 table_status: TableStatus::Deleting,
                 ..desc
@@ -78,6 +81,8 @@ impl SqliteEngine {
             }
         }
 
+        // After the backfill set; see `GsiBackfills::snapshot`.
+        let started = self.gsi_backfills.snapshot();
         let index_rows: Vec<IndexRow> = sqlx::query_as(&format!(
             "SELECT {INDEX_COLUMNS} FROM indexes WHERE table_id = ?"
         ))
@@ -172,7 +177,7 @@ impl SqliteEngine {
             self.control_plane_notify.notify_one();
         }
 
-        let desc = self.build_table_description_from_row(account_id, row, index_rows)?;
+        let desc = self.build_table_description_from_row(account_id, row, index_rows, &started)?;
         Ok(TableDescription {
             table_status: TableStatus::Deleting,
             ..desc

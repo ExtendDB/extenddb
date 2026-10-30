@@ -178,6 +178,15 @@ async fn run_gsi_backfill_job(storage: &MongoEngine, job: &Document) -> Result<(
     if mode == GsiBackfillMode::Restore && !restore_backfill_is_ready(storage, &table_id).await? {
         return Ok(());
     }
+    let indexes_coll = storage.catalog_db.collection::<Document>("indexes");
+    if mode == GsiBackfillMode::Live
+        && !crate::gsi_backfill_phase::started(job)
+        && !crate::gsi_backfill_phase::mark_started(storage, &index_id, &key_info.table_name)
+            .await?
+    {
+        return drop_index_collection_if_catalog_entry_missing(storage, &indexes_coll, &index_id)
+            .await;
+    }
 
     let context = GsiBackfillContext {
         key_info: &key_info,
@@ -187,7 +196,6 @@ async fn run_gsi_backfill_job(storage: &MongoEngine, job: &Document) -> Result<(
         mode,
     };
     let mut cursor = job.get("backfill_cursor").cloned();
-    let indexes_coll = storage.catalog_db.collection::<Document>("indexes");
 
     loop {
         let progress = storage
@@ -201,7 +209,7 @@ async fn run_gsi_backfill_job(storage: &MongoEngine, job: &Document) -> Result<(
                     doc! { "index_id": &index_id, "index_status": "CREATING" },
                     doc! {
                         "$set": { "index_status": "ACTIVE" },
-                        "$unset": { "backfill_cursor": "" },
+                        "$unset": { "backfill_cursor": "", "backfilling": "" },
                     },
                 )
                 .await

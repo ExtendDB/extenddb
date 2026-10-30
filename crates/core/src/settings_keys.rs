@@ -101,6 +101,28 @@ pub const VECTOR_INDEX_MIN_CREATING_MS: &str = "vector_index_min_creating_ms";
 /// Unset, nothing waits and no branch is taken.
 pub const VECTOR_ALLOCATION_PHASE_DELAY_MS: &str = "vector_allocation_phase_delay_ms";
 
+/// Test-only hold on the two `CREATING` phases of a GSI that `UpdateTable` adds.
+///
+/// Keys take the form `gsi_creating_phase_delay_ms:<table-name>` (see
+/// [`gsi_creating_phase_delay_key`]) and the value is milliseconds. While it is
+/// set for a table, a GSI added to that table waits that long after its catalog
+/// row commits and before its backfill starts (`Backfilling: false`), then that
+/// long again after the backfill has started (`Backfilling: true`). The phases
+/// come from the build itself; the hold only lengthens them. On a test-sized
+/// table both phases otherwise last milliseconds, so a client polling
+/// DescribeTable could not observe them, and the measured Query and Scan refusals
+/// for each phase could not be tested at the wire.
+///
+/// Scoped to one table so a test that sets it does not slow the GSI builds of the
+/// tests running beside it. Unset or zero, nothing waits.
+pub const GSI_CREATING_PHASE_DELAY_MS: &str = "gsi_creating_phase_delay_ms";
+
+/// The settings key holding [`GSI_CREATING_PHASE_DELAY_MS`] for one table.
+#[must_use]
+pub fn gsi_creating_phase_delay_key(table_name: &str) -> String {
+    format!("{GSI_CREATING_PHASE_DELAY_MS}:{table_name}")
+}
+
 /// Marker recording that the resource-tag condition-key migration has run on
 /// this catalog, or that the catalog was created after the migration existed
 /// and so has nothing to rewrite.
