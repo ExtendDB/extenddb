@@ -925,7 +925,7 @@ Check that PostgreSQL is running and the connection string in `extenddb.toml` is
 
 **The catalog has pending migrations, or is ahead of the binary:**
 
-On PostgreSQL and SQLite, `serve` reads the catalog's migration status before it opens the engine and refuses a catalog it cannot serve, printing the status and the command that resolves it. A catalog with pending migrations exits 3, for example `the catalog is at migration 3, and ExtendDB <release> needs migration 4`, followed by the pending migrations and `extenddb migrate --config extenddb.toml --yes`. A catalog that a newer release migrated with a breaking migration exits 4 and names that release's migrations; upgrade the binary rather than the catalog. The [Upgrade Manual](07-upgrade-manual.md#the-catalog-status) lists every status with its exit code and the stop / migrate / start sequence. On Cassandra and MongoDB the catalog checks are those of the 0.1.x releases; their sections of the Upgrade Manual describe them.
+On PostgreSQL, SQLite, Cassandra and MongoDB, `serve` reads the catalog's migration status before it opens the engine and refuses a catalog it cannot serve, printing the status and the command that resolves it. A catalog with pending migrations exits 3, for example `the catalog is at migration 3, and ExtendDB <release> needs migration 4`, followed by the pending migrations and `extenddb migrate --config extenddb.toml --yes`. A catalog that a newer release migrated with a breaking migration exits 4 and names that release's migrations; upgrade the binary rather than the catalog. The [Upgrade Manual](07-upgrade-manual.md#the-catalog-status) lists every status with its exit code and the stop / migrate / start sequence.
 
 ### Authentication Errors
 

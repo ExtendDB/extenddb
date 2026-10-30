@@ -405,7 +405,7 @@ The PostgreSQL implementation makes backend-specific choices. These are implemen
 
 5. **Dual-database architecture** — catalog and data are separate PostgreSQL databases. Your backend might use a single database with keyspace separation, or a different topology entirely.
 
-6. **SQL migrations** — migration files are raw SQL. Your backend needs its own schema initialization mechanism, exposed through `Bootstrapper`.
+6. **SQL migrations**: migration files are raw SQL. Your backend applies the numbered catalog migrations through the shared runner: it implements `CatalogMigrations` (`crates/storage/src/migrations/catalog.rs`), installs it in its `Backend`, and declares a body or a reason for every id. Its `Bootstrapper` keeps database creation and the rows `init` writes after the migrations. [ADR-0023](../adr/0023-catalog-migrations.md) records the design and the [catalog migration section](../../CONTRIBUTING.md#adding-a-catalog-migration) of `CONTRIBUTING.md` the procedure.
 
 ## Summary of Traits and Implementations
 

@@ -133,7 +133,7 @@ def get_extenddb_version() -> str:
 def get_catalog_version() -> str:
     """The catalog the manuals describe: `migration <n>`, the last id of the
     `migration_ids!` list in crates/storage/src/migrations/registry.rs, as
-    `extenddb version` prints it on PostgreSQL and SQLite."""
+    `extenddb version` prints it."""
     registry = ROOT / "crates" / "storage" / "src" / "migrations" / "registry.rs"
     text = registry.read_text()
     ids = [int(n) for n in re.findall(r"^\s*[A-Z][A-Za-z0-9]* = (\d+), \"", text, re.MULTILINE)]

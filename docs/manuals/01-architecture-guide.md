@@ -205,9 +205,8 @@ extenddb uses a dual-database architecture:
 - **Catalog database** (e.g., `extenddb_catalog`): Stores table metadata, account/user/group/role/policy definitions, access keys, settings, stream metadata, and metrics. Shared across all accounts.
 - **Data database** (e.g., `extenddb_catalog_data`): Stores user items, GSI/LSI data, and stream records. Each table gets its own PostgreSQL table.
 
-On PostgreSQL and SQLite the catalog is versioned by its migration ledger, the `extenddb_migrations` table: the catalog version is the highest migration recorded in every store, migration 4 for this release, and `serve` reads the catalog's status at startup and refuses a catalog that is behind it or carries a breaking migration it does not know. The Cassandra catalog version is 0.0.4, stored in the `settings` table under the key `catalog_version`; Cassandra has no startup check (see the Upgrade Manual).
-The MongoDB backend tracks its own catalog version, 0.0.2. <!-- version-literal-ok: MongoDB's backend has its own catalog version, deliberately not the compiled-in constant the documentation guard checks -->
-A mismatch between the compiled-in version and the stored one prevents a PostgreSQL or SQLite server from starting; run `extenddb migrate` to upgrade.
+On PostgreSQL, SQLite, Cassandra and MongoDB the catalog is versioned by its migration ledger, the `extenddb_migrations` table (on MongoDB a collection, in the catalog database and in the data database): the catalog version is the highest migration recorded in every store, migration 4 for this release, and `serve` reads the catalog's status at startup and refuses a catalog that is behind it or carries a breaking migration it does not know. On Cassandra every account keyspace has a ledger beside the catalog keyspace's.
+A mismatch between the binary's migrations and the catalog's ledger prevents a server from starting; run `extenddb migrate` to upgrade.
 
 ## Pluggable Architecture
 

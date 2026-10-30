@@ -110,21 +110,29 @@ The node must run `PasswordAuthenticator` (step 3). `init` always creates its
 application role with a password, so it fails against an unauthenticated
 (`AllowAllAuthenticator`) node — there is no credential-free path.
 
-> **Authorizer.** Run the node with `AllowAllAuthorizer` (the default). `init`
-> creates the application role but grants it no permissions, so under
-> `CassandraAuthorizer` the server later fails to start with
-> `User extenddb has no SELECT permission ...`. Until `init` issues the grants,
-> only `AllowAllAuthorizer` works.
+> **Authorizer.** The node may run `AllowAllAuthorizer` (the default) or
+> `CassandraAuthorizer`. `init` reads the node's authorizer from
+> `system_views.settings`; under any authorizer other than
+> `AllowAllAuthorizer` it grants the application role SELECT, MODIFY, CREATE
+> and ALTER on the catalog keyspace, CREATE ON ALL KEYSPACES (for
+> CreateAccount), and SELECT, MODIFY, CREATE, ALTER and DROP on the default
+> account's keyspace (DeleteTable drops the account's tables and DeleteAccount
+> drops the keyspace). A keyspace that CreateAccount creates as the application
+> role needs no grant: a role holds every permission on a keyspace it created.
+> Under `AllowAllAuthorizer`, which grants everything and supports no GRANT,
+> `init` grants nothing.
 
 init creates:
 - The catalog keyspace (`extenddb_catalog` by default)
+- The default account's keyspace (`extenddb_account_<account id>` by default)
 - The application role ExtendDB uses at serve time (named `extenddb` by
-  default; override with `--extenddb-user` / `--extenddb-pass`)
+  default; override with `--extenddb-user` / `--extenddb-pass`), with the
+  grants above when the node's authorizer is not `AllowAllAuthorizer`
 - Admin user credentials (printed to stdout once — save them)
 - A self-signed TLS certificate at `~/.extenddb/tls/cert.pem`
 - The config file `extenddb.toml`
 
-Per-account keyspaces are created later, when accounts are added.
+Further account keyspaces are created when accounts are added.
 
 > **Save the admin credentials.** They are printed once and cannot be retrieved
 > later.
@@ -157,8 +165,10 @@ Fields:
   `extenddb`).
 - `replication_factor` — keyspace replication factor. `init` always writes `1`,
   regardless of the cluster. For a multi-node cluster, edit this to 3 or more
-  **after** `init`; keyspaces created later (per account) use the config value.
-  Existing keyspaces are not altered retroactively.
+  **after** `init`; keyspaces created later (per account) use the config value,
+  except an account keyspace that `migrate --yes` creates for an account whose
+  CreateAccount stopped before its keyspace: that one takes the catalog
+  keyspace's replication. Existing keyspaces are not altered retroactively.
 - `datacenter` — the local datacenter name for `NetworkTopologyStrategy`. Currently,
   `init` always writes `datacenter1` and has no flag to change it, and the keyspaces
   it creates reference `datacenter1`, so the cluster's local datacenter must be
@@ -231,7 +241,10 @@ section covers only what is specific to Cassandra.
 
 Set `replication_factor` to 3 or more for a multi-node cluster. `init` always
 writes `1`, so edit the config after `init`; keyspaces created afterward (per
-account) use the value in the config. The `datacenter` must be `datacenter1`:
+account) use the value in the config, except an account keyspace that
+`migrate --yes` creates for an account whose CreateAccount stopped before its
+keyspace, which takes the catalog keyspace's replication. The `datacenter` must
+be `datacenter1`:
 `init` hardcodes that name into the keyspace definitions and provides no flag to
 change it, so your cluster's local datacenter has to be named `datacenter1`
 until that is configurable. ExtendDB creates its keyspaces with
@@ -256,10 +269,12 @@ a password. Give ExtendDB a dedicated application role rather than the
 `cassandra` superuser, and supply its credentials through `username` and
 `password`; both are required.
 
-Use `AllowAllAuthorizer` for now. `init` creates the application role but grants
-it no permissions, so `CassandraAuthorizer` makes `serve` fail with
-`User <role> has no SELECT permission ...`. Until `init` issues the grants a
-role needs, authorization must be left open at the Cassandra layer.
+`CassandraAuthorizer` works: when the node's authorizer is not
+`AllowAllAuthorizer`, `init` grants the application role SELECT, MODIFY, CREATE
+and ALTER on the catalog keyspace, CREATE ON ALL KEYSPACES, and those four and
+DROP on the default account's keyspace; a keyspace the role creates itself
+(CreateAccount) needs no grant. Under `AllowAllAuthorizer` `init` grants
+nothing, since that authorizer grants everything.
 
 ### Connection encryption
 

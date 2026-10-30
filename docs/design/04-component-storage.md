@@ -567,13 +567,17 @@ The ops run in table and key order. A ConditionCheck or Delete that finds no row
 
 ### 5.6 Migrations
 
-Migrations are embedded in the binary at compile time via `include_str!` and applied in order by the
-`catalog::run_migrations` helper. Each migration is tracked in the `schema_history` table.
+The catalog migrations are the numbered list every backend shares
+([ADR-0023](../adr/0023-catalog-migrations.md)). PostgreSQL's bodies are SQL files embedded in the
+binary at compile time via `include_str!`. The shared runner applies them in id order and records
+each body in the `extenddb_migrations` ledger of the database it changed, and every id in the
+catalog's ledger. The
+`schema_history` table of a 0.1.x catalog stays in place and is not read.
 
-Migration files are numbered sequentially:
+Migration files are named by id:
 ```
 migrations/
-└── 001_initial_schema.sql
+└── 0001_baseline.sql
 ```
 
 ## 6. GSI Consistency Model

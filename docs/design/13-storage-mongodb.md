@@ -46,7 +46,8 @@ creation.
 
 ## 3. Catalog Database Collections
 
-Collections created by `run_catalog_migrations` in `bootstrapper.rs`. Two
+Collections created by migration 1's catalog body,
+`crates/storage-mongodb/src/migrations/m0001_baseline.rs`. Two
 additional collections (`iam_group_members`, `backup_items` — the latter is
 no longer used) are auto-created on first insert and not in the migration list.
 
@@ -108,8 +109,10 @@ field is unset when the index flips to `ACTIVE`.
 ```json
 { "_id": "<key>", "value": "..." }
 ```
-Bootstrapped keys include `catalog_version`, `encryption_key` (base64-encoded
-256-bit AES-GCM key), `data_database_name`, and `data_connection_string`.
+Keys include `catalog_version` (the catalog's migration id, which the
+migration runner writes with each catalog ledger row), `encryption_key`
+(base64-encoded 256-bit AES-GCM key), `data_database_name`, and
+`data_connection_string`.
 
 ### 3.6 `admin_users`
 ```json
@@ -832,12 +835,14 @@ in `lib.rs`). Reject `$` (operator injection), `.` (field-path
 traversal), null bytes, and non-ASCII. Runs before any query
 construction.
 
-### 5.10 Catalog version check
+### 5.10 Catalog status check
 
-`read_catalog_version` returns the `settings.catalog_version` value;
-`expected_catalog_version` returns the compiled-in `0.0.2`. The bin
-layer compares them on `extenddb serve` startup — same pattern as the
-PostgreSQL backend.
+The catalog and the data database each hold a migration ledger, the
+`extenddb_migrations` collection. `extenddb serve` reads the catalog's
+status from both ledgers through the shared migration runner before it
+opens the engine, and refuses a catalog with pending migrations or with a
+breaking migration this binary does not know, as on every backend.
+[ADR-0023](../adr/0023-catalog-migrations.md) records the design.
 
 ## 6. Crate Structure
 
@@ -941,27 +946,16 @@ layer redacts the password from it for display via the
 
 ## 9. Bootstrapper Flow
 
-**`extenddb init`:**
-
-1. Materialize both databases with sentinel collections (MongoDB creates
-   databases lazily on first write, so we explicitly create
-   `schema_history` in the catalog db and `idempotency_tokens` in the
-   data db).
-2. `run_catalog_migrations` — create the 17 catalog collections and
-   their indexes; seed `settings.catalog_version = 0.0.2`; record
-   the migration in `schema_history`.
-3. `create_data_db` — create `idempotency_tokens` (TTL + unique index),
-   `stream_shards` (unique on shard_id), `stream_records` (TTL + compound
-   query index).
-4. `bootstrap_encryption_key` — generate a random 256-bit key,
-   base64-encode, insert into `settings` (idempotent — E11000 races are
-   silently ignored).
-5. `bootstrap_default_account` — insert `default` account if none
-   exists.
-6. `bootstrap_admin_user` — bcrypt-hash the password, insert into
-   `admin_users`.
-7. `record_data_connection` — record `data_database_name` and
-   `data_connection_string` in `settings`.
+**`extenddb init`:** takes the migration lock, whose claim creates the
+catalog database, and checks under it that the catalog is not
+initialized. It applies every migration through the shared runner:
+migration 1 creates the catalog and data collections and their indexes,
+and the runner records each body in its database's ledger once the body
+completes. Still under the lock, it writes
+the encryption key, the default account, the admin user and the data
+connection rows, checking the lock's lease before each request as the
+runner does, and then releases the lock.
+[ADR-0023](../adr/0023-catalog-migrations.md) records the design.
 
 **`extenddb destroy`:** drop both databases.
 

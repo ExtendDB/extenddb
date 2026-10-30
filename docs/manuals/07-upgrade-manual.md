@@ -4,7 +4,7 @@
 
 ## Current Status
 
-This release versions the PostgreSQL and SQLite catalogs by a migration ledger and carries catalog migrations 1 to 4, which `extenddb migrate --list` prints. **Every PostgreSQL and SQLite deployment created by a 0.1.x release runs `extenddb migrate --yes` once** before a server of this release starts on it: the server refuses a catalog with pending migrations. Migration 1 brings the catalog of every 0.1.x release to the v1.0 schema. Cassandra stays at catalog 0.0.4 and MongoDB at 0.0.2, and their sections below apply unchanged. <!-- version-literal-ok: names the Cassandra and MongoDB catalog versions -->
+This release versions the PostgreSQL, SQLite, Cassandra and MongoDB catalogs by a migration ledger and carries catalog migrations 1 to 4, which `extenddb migrate --list` prints. **Every deployment created by a 0.1.x release runs `extenddb migrate --yes` once** before a server of this release starts on it: the server refuses a catalog with pending migrations. Migration 1 brings the catalog of every 0.1.x release to the v1.0 schema.
 
 A backup that a 0.1.x release took can restore without its global and local secondary indexes: a SQLite backup taken by 0.1.14 records only the table's key schema and attribute definitions, and its restore creates the table with its items and no index. Take a new backup of each table after upgrading to v1.0, and keep the 0.1.x backups for their items only.
 
@@ -14,9 +14,9 @@ The [general upgrade procedure](#general-upgrade-procedure) gives the sequence. 
 
 ### The Migration System
 
-Every backend shares one numbered list of catalog migrations, in `crates/storage/src/migrations/registry.rs`. For each id a backend declares the body it runs in each of its stores, a SQL file under `crates/storage-<backend>/migrations/` or code, or why the id does not apply to it. `extenddb migrate --yes` applies the pending bodies in id order, catalog store first, and commits each body with a row in that store's ledger, the `extenddb_migrations` table: the id, name, kind, checksum, notes, time, and the release that applied it. On PostgreSQL the catalog database and the data database each have a ledger; on SQLite the database file has one.
+Every backend shares one numbered list of catalog migrations, in `crates/storage/src/migrations/registry.rs`. For each id a backend declares the body it runs in each of its stores, a SQL file under `crates/storage-<backend>/migrations/` or code, or why the id does not apply to it. `extenddb migrate --yes` applies the pending bodies in id order, catalog store first, and commits each body with a row in that store's ledger, the `extenddb_migrations` table: the id, name, kind, checksum, notes, time, and the release that applied it. On PostgreSQL the catalog database and the data database each have a ledger; on SQLite the database file has one. On MongoDB the bodies are code, and the catalog database and the data database each have a ledger collection: there a body's requests are each safe to send again, and its ledger row and, in the catalog, the `catalog_version` row commit in one transaction after the body, so a migrator stopped part way runs the body again. On Cassandra the bodies are CQL files and code, and the catalog keyspace and each account keyspace have a ledger table. Cassandra has no transactions: every statement of a body is safe to send again and a body's ledger row is written after it, so a run that stopped or failed part way, for example with `no answer within 20 s` from a loaded node, finishes when `migrate --yes` runs again.
 
-The catalog's version is the highest id such that it and every lower id are recorded in every store its bodies touch. The `catalog_version` row in `settings` holds the same integer, written with each catalog row, for tools that read it. The `schema_history` tables of 0.1.x PostgreSQL catalogs stay in place and are not read.
+The catalog's version is the highest id such that it and every lower id are recorded in every store its bodies touch. The `catalog_version` row in `settings` holds the same integer, written with each catalog row, for tools that read it; on Cassandra a stopped run can leave it one ahead of the ledger, or one behind after migration 1's last account keyspace, until `migrate --yes` runs again. The `schema_history` tables of 0.1.x PostgreSQL catalogs stay in place and are not read.
 
 Running `extenddb migrate --yes` on an up-to-date catalog changes nothing.
 
@@ -41,7 +41,7 @@ A migration is additive when the previous release serves the catalog correctly w
 
 ## Writing a New Migration
 
-Writing a catalog migration is contributor work. The procedure, with a worked example and the tests to run on each backend, is in the [catalog migration section](../../CONTRIBUTING.md#adding-a-catalog-migration) of `CONTRIBUTING.md` in the repository root. `extenddb migrate --list` prints the migrations a PostgreSQL or SQLite binary carries, with each one's kind on its backend; a Cassandra or MongoDB binary refuses `--list`, because those backends still migrate through their bootstrappers.
+Writing a catalog migration is contributor work. The procedure, with a worked example and the tests to run on each backend, is in the [catalog migration section](../../CONTRIBUTING.md#adding-a-catalog-migration) of `CONTRIBUTING.md` in the repository root. `extenddb migrate --list` prints the migrations the binary carries, with each one's kind on its backend.
 
 ## General Upgrade Procedure
 
@@ -53,7 +53,7 @@ For releases that include catalog changes. The names below in angle brackets are
 extenddb stop --config extenddb.toml
 ```
 
-2. **Back up the databases** (PostgreSQL; for SQLite see [SQLite](#sqlite) below)
+2. **Back up the databases** (PostgreSQL; for SQLite see [SQLite](#sqlite) below, for Cassandra see the [rollback procedure](#rollback-procedure))
 
 ```bash
 pg_dump -h <host> -U <admin> <catalog-db> > catalog_backup_$(date +%Y%m%d).sql
@@ -87,7 +87,39 @@ The PostgreSQL commands and `serve` work through PgBouncer in transaction mode a
 - Behind PgBouncer, the TCP keepalives the serving session sets (30 s) run on the database's connection to PgBouncer, which stays up when a serving host dies. The database keeps that host's key until PgBouncer closes the dead host's connection, which PgBouncer's own keepalive settings decide: by default the operating system's, two hours idle on Linux. Until then `migrate --yes` exits 6 naming the dead server. Set `tcp_keepalive = 1`, `tcp_keepidle = 10`, `tcp_keepintvl = 5` and `tcp_keepcnt = 4` in PgBouncer's `[pgbouncer]` section for the same 30 s, or end the session with `SELECT pg_terminate_backend(<pid>)` on the pid `migrate` names.
 - After a failover of the catalog's server, the new primary holds no server's key, while a server that served through the old primary goes on serving through connections that reconnect to the new primary, until it counts its key as lost: at most 30 s after its last renewal. A `migrate --yes` in those 30 s does not see that server. Wait 30 s after a failover before you run `migrate --yes`, or stop the servers first.
 
-Without `--yes`, `migrate` reads the [catalog status](#the-catalog-status), prints each pending migration, and changes nothing; it takes no lock, so it runs beside a server. With `--yes` it takes the migration lock, waiting up to `--lock-timeout` seconds (60 by default) for running servers and other migrations, reads the status again under the lock, and applies what is pending. It refuses a store that is not a catalog with exit status 1 and the advice to run `extenddb init`. The exit statuses are those in the status table; a script under `set -e` can run the preview as `extenddb migrate ... || [ $? -eq 3 ]`.
+On MongoDB, `migrate` connects with the connection string in the config file, which the server uses too. A user with the `readWrite` role on `extenddb_catalog` and on `extenddb_data` and no other role can run `init`, `migrate --yes`, `verify` and `serve`. `migrate --yes` takes the migration lock, a document in the catalog's `settings` collection, and then waits for the registration every running server keeps in the catalog's `extenddb_servers` collection, and after `--lock-timeout` exits 6 naming each server's host and pid. A server deletes its registration when it stops; a server that was killed leaves it until it expires, at most 45 s after its last renewal. A server that cannot renew its registration for 30 s, for example because the database stopped answering, exits 1 and removes its PID file. The lock and the registrations expire by the clock of the replica set's primary, so keep the clocks of its members in sync with NTP.
+
+On Cassandra, `migrate` connects as the role the config file names, which the server connects as too. `--cassandra-user <role>` connects as another role, with its password in `EXTENDDB_CASSANDRA_PASSWORD` or `--cassandra-pass`; a wrong password is reported as a connection timeout. Migration 1 adopts a 0.1.x catalog: it keeps every setting except the `resource_tag_migration` row, which it deletes, and records itself in a ledger in the catalog keyspace and in every account keyspace. On a cluster that runs `CassandraAuthorizer`, `init` grants the application role SELECT, MODIFY, CREATE and ALTER on the catalog keyspace, those four and DROP on the default account's keyspace, and CREATE ON ALL KEYSPACES, which CreateAccount needs to create a keyspace per account and which also lets the role create tables in every keyspace on the cluster; a run of `migrate --yes --cassandra-user <role>` that creates a missing account keyspace grants the application role the five permissions on it. A 0.1.x `init` granted the application role nothing, so a deployment created before 1.0 on such a cluster needs the statements below before `migrate`. `migrate --yes` takes the migration lock, a row in the catalog's `settings` table written by lightweight transactions, and then waits for the registration every running server of this release keeps in the catalog's `extenddb_servers` table, and after `--lock-timeout` exits 6 naming each server. A server deletes its registration when it stops; a server that was killed leaves it until it expires, at most 45 s after its last renewal. A server that cannot renew its registration for 30 s exits 1. A migration needs every replica of the catalog keyspace reachable: the lock is written at `SERIAL`, the registrations are read at `ALL`, and after each schema statement the runner waits until every live node reports the same schema version. `serve` refuses a catalog with pending migrations, exiting 3 under `--foreground` with the pending migrations and the `extenddb migrate --config <config> --yes` command to run. A 0.1.x server refuses a migrated catalog.
+
+On a deployment created before 1.0 on a cluster that runs `CassandraAuthorizer`, this release's `migrate`, `verify` and `serve`, connected as the application role, fail with `Unauthorized ... has no SELECT permission on <table <prefix>_catalog.accounts>` until the role holds its permissions. With every server stopped, run the statements below in `cqlsh` as a superuser; the application role cannot grant them to itself. `<role>` and `<prefix>` are `username` and `keyspace_prefix` under `[storage.cassandra]` in the config file. Each account has its own keyspace, so list the accounts first:
+
+```
+SELECT account_id FROM <prefix>_catalog.accounts;
+```
+
+Grant on the catalog keyspace and on all keyspaces:
+
+```
+GRANT SELECT ON KEYSPACE <prefix>_catalog TO '<role>';
+GRANT MODIFY ON KEYSPACE <prefix>_catalog TO '<role>';
+GRANT CREATE ON KEYSPACE <prefix>_catalog TO '<role>';
+GRANT ALTER ON KEYSPACE <prefix>_catalog TO '<role>';
+GRANT CREATE ON ALL KEYSPACES TO '<role>';
+```
+
+Then, for each account id whose keyspace `<prefix>_account_<account id>` exists:
+
+```
+GRANT SELECT ON KEYSPACE <prefix>_account_<account id> TO '<role>';
+GRANT MODIFY ON KEYSPACE <prefix>_account_<account id> TO '<role>';
+GRANT CREATE ON KEYSPACE <prefix>_account_<account id> TO '<role>';
+GRANT ALTER ON KEYSPACE <prefix>_account_<account id> TO '<role>';
+GRANT DROP ON KEYSPACE <prefix>_account_<account id> TO '<role>';
+```
+
+A GRANT on an account keyspace that does not exist fails with `Resource ... doesn't exist`; skip that account, and `migrate --yes` creates its keyspace. A statement for a permission the role already holds prints `Role '<role>' was already granted ...` and changes nothing, so a role granted some of these by hand runs the whole list.
+
+Without `--yes`, `migrate` reads the [catalog status](#the-catalog-status), prints each pending migration, and changes nothing; it takes no lock, so it runs beside a server. With `--yes` it takes the migration lock, waiting up to `--lock-timeout` seconds (60 by default) for running servers and other migrations, reads the status again under the lock, and applies what is pending. It refuses a store that is not a catalog with exit status 1 and the advice to run `extenddb init`; on Cassandra it refuses a keyspace that holds another program's tables with a message that names them. The exit statuses are those in the status table; a script under `set -e` can run the preview as `extenddb migrate ... || [ $? -eq 3 ]`.
 
 On PostgreSQL `migrate --yes` can also print:
 
@@ -123,6 +155,8 @@ psql -h <host> -U <admin> -d <catalog-db> -f catalog_backup_YYYYMMDD.sql
 To discard data written after the upgrade as well, restore `<data-db>` from its dump the same way.
 
 3. Rebuild the previous version and start it
+
+This manual has no tested rollback for Cassandra. Before migrating, with every server stopped, take a snapshot of the catalog keyspace and every account keyspace on every node with your usual Cassandra tooling; a rollback restores those snapshots, again with every server stopped, before the previous binary starts.
 
 ## Version History
 
