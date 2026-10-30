@@ -36,6 +36,7 @@ mod legacy_filter;
 mod list_tables;
 #[cfg(feature = "partiql")]
 mod partiql;
+pub mod private_fs;
 mod put_item;
 mod query;
 mod read_helpers;
