@@ -16,7 +16,7 @@ use extenddb_storage::bootstrapper::{
     },
 };
 use extenddb_storage::management_store::{OpError, OpResult};
-use extenddb_storage::migrations::{AdminRole, MigrationId, Target};
+use extenddb_storage::migrations::{AdminRole, Target};
 use sqlx::PgPool;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tokio::sync::OnceCell;
@@ -120,16 +120,6 @@ impl PostgresBootstrapper {
     }
 }
 
-/// The error of a bootstrapper method the commands do not call on this
-/// backend: its catalog migrates through
-/// [`crate::migrations::PostgresCatalogMigrations`] and the shared runner.
-fn through_the_runner(method: &str) -> OpError {
-    OpError::Internal(format!(
-        "postgres migrates through its CatalogMigrations; the bootstrapper method {method} is \
-         not used"
-    ))
-}
-
 #[async_trait]
 impl Bootstrapper for PostgresBootstrapper {
     async fn ensure_app_user(&self) -> OpResult<()> {
@@ -205,18 +195,6 @@ impl Bootstrapper for PostgresBootstrapper {
             &self.config.app_user,
         )
         .await
-    }
-
-    async fn run_catalog_migrations(&self) -> OpResult<()> {
-        Err(through_the_runner("run_catalog_migrations"))
-    }
-
-    async fn run_data_migrations(&self) -> OpResult<()> {
-        Err(through_the_runner("run_data_migrations"))
-    }
-
-    async fn pending_data_migrations(&self) -> OpResult<Vec<String>> {
-        Err(through_the_runner("pending_data_migrations"))
     }
 
     async fn record_data_connection(&self) -> OpResult<()> {
@@ -369,10 +347,6 @@ impl Bootstrapper for PostgresBootstrapper {
         })
     }
 
-    async fn is_catalog_initialized(&self) -> OpResult<bool> {
-        Err(through_the_runner("is_catalog_initialized"))
-    }
-
     async fn list_table_names(&self) -> OpResult<Vec<String>> {
         let Ok(pool) = self.app_pool(&self.config.catalog_db).await else {
             return Ok(Vec::new());
@@ -418,14 +392,6 @@ impl Bootstrapper for PostgresBootstrapper {
             .map_err(|e| OpError::Internal(format!("Drop catalog database: {e}")))?;
 
         Ok(())
-    }
-
-    async fn read_catalog_version(&self) -> OpResult<Option<String>> {
-        Err(through_the_runner("read_catalog_version"))
-    }
-
-    fn expected_catalog_version(&self) -> String {
-        MigrationId::LATEST.number().to_string()
     }
 
     fn catalog_database_name(&self) -> String {

@@ -4,11 +4,8 @@
 //! The installed backend's catalog migrations, as `init`, `migrate`,
 //! `verify` and `serve` use them.
 //!
-//! The app crate does not name a backend crate, so a backend that migrates
-//! through the shared runner installs a [`CatalogMigrations`] in its
-//! [`Backend`](crate::Backend). A backend without one still migrates through
-//! its [`Bootstrapper`](crate::bootstrapper::Bootstrapper), and the commands
-//! take that path for it.
+//! The app crate does not name a backend crate, so every backend installs
+//! its [`CatalogMigrations`] in its [`Backend`](crate::Backend).
 
 use std::any::Any;
 use std::time::Duration;
@@ -180,6 +177,19 @@ pub trait CatalogMigrations: Send + Sync {
     /// beside a server.
     async fn status(&self, target: &Target) -> Result<CatalogStatus, MigrationError>;
 
+    /// The catalog status, read under a lock this backend took, which
+    /// [`run_locked`] and [`forget_locked`] read before they act. The
+    /// status as [`CatalogMigrations::status`] reads it by default; a
+    /// backend whose lock ends when its holder stops making progress reads
+    /// it as the holder, so a long status read keeps the lock.
+    async fn status_under_lock(
+        &self,
+        _lock: &HeldLock,
+        target: &Target,
+    ) -> Result<CatalogStatus, MigrationError> {
+        self.status(target).await
+    }
+
     /// The catalog store's ledger rows, in id order, for `verify` to print
     /// their notes. Read-only; empty for a store with no ledger.
     async fn catalog_ledger(&self, target: &Target) -> Result<Vec<LedgerRow>, MigrationError>;
@@ -200,6 +210,14 @@ pub trait CatalogMigrations: Send + Sync {
     /// Delete the ledger rows of an unreleased id under a lock this backend
     /// took ([`Runner::forget`](super::Runner::forget)).
     async fn forget(&self, lock: &HeldLock, id: u32) -> Result<(), MigrationError>;
+
+    /// Release a lock this backend took. The default drops it, which frees
+    /// a lock its connection or file holds; a backend whose lock is a row
+    /// (Cassandra) deletes the row here, so the next migration or server
+    /// need not wait for its TTL.
+    async fn release(&self, lock: HeldLock) {
+        drop(lock);
+    }
 
     /// Notes about the deployment that its status does not show, for the
     /// preview and `verify` to print and `migrate --yes` to check before it
@@ -287,7 +305,7 @@ pub async fn run_locked(
     release: &str,
     kind: RunKind,
 ) -> Result<RunReport, MigrationError> {
-    let status = migrations.status(target).await?;
+    let status = migrations.status_under_lock(lock, target).await?;
     if let Some(refusal) = refusal(&status, kind) {
         return Err(refusal);
     }
@@ -308,7 +326,7 @@ pub async fn forget_locked(
     lock: &HeldLock,
     id: u32,
 ) -> Result<(), MigrationError> {
-    let status = migrations.status(target).await?;
+    let status = migrations.status_under_lock(lock, target).await?;
     if status == CatalogStatus::Uninitialized {
         return Err(MigrationError::Status(status));
     }
@@ -339,21 +357,17 @@ fn refusal(status: &CatalogStatus, kind: RunKind) -> Option<MigrationError> {
 }
 
 /// The installed backend's catalog migrations, or `None` when no backend is
-/// installed or the installed one still migrates through its bootstrapper.
+/// installed.
 #[must_use]
 pub fn installed() -> Option<&'static dyn CatalogMigrations> {
-    crate::backend::try_backend().and_then(|backend| backend.catalog_migrations)
+    crate::backend::try_backend().map(|backend| backend.catalog_migrations)
 }
 
 /// What `extenddb version`, `verify` and the `serve` banner call the catalog
-/// this binary needs: `migration <n>`, the highest id it carries, on a
-/// backend on the runner; else the backend's catalog version string.
+/// this binary needs: `migration <n>`, the highest id it carries.
 #[must_use]
 pub fn binary_catalog_label() -> String {
-    if installed().is_some() {
-        return format!("migration {}", MigrationId::LATEST.number());
-    }
-    crate::operations::catalog_version().unwrap_or_else(|_| "unknown".to_owned())
+    format!("migration {}", MigrationId::LATEST.number())
 }
 
 #[cfg(test)]

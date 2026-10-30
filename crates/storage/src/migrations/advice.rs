@@ -8,7 +8,6 @@
 use super::catalog::{CatalogMigrations, Target};
 use super::registry::{MigrationId, RELEASED_THROUGH};
 use super::status::{CatalogStatus, MigrationError, Pending};
-use super::table::Kind;
 
 /// What a message needs beyond the status.
 #[derive(Debug, Clone, Copy)]
@@ -203,26 +202,36 @@ fn capitalized(text: &str) -> String {
 /// `Pending (all breaking): 2 name (catalog), ...`, or each kind beside its
 /// migration when the kinds differ.
 fn pending_line(pending: &[Pending]) -> String {
-    let kinds: Vec<Kind> = pending.iter().map(|p| p.kind).collect();
-    let same = kinds.windows(2).all(|w| w[0] == w[1]);
-    let items: Vec<String> = pending
+    // One item per id and kind of store: a body that runs in several stores
+    // of one kind (Cassandra's account keyspaces) is named once, with the
+    // number of stores.
+    let mut groups: Vec<(&Pending, usize)> = Vec::new();
+    for p in pending {
+        match groups
+            .iter_mut()
+            .find(|(g, _)| g.id == p.id && g.store == p.store && g.kind == p.kind)
+        {
+            Some((_, stores)) => *stores += 1,
+            None => groups.push((p, 1)),
+        }
+    }
+    let same = groups.windows(2).all(|w| w[0].0.kind == w[1].0.kind);
+    let items: Vec<String> = groups
         .iter()
-        .map(|p| {
+        .map(|(p, stores)| {
+            let store = match stores {
+                1 => p.store.as_str().to_owned(),
+                n => format!("{} in {n} stores", p.store.as_str()),
+            };
             if same {
-                format!("{} {} ({})", p.id, p.name, p.store.as_str())
+                format!("{} {} ({store})", p.id, p.name)
             } else {
-                format!(
-                    "{} {} ({}, {})",
-                    p.id,
-                    p.name,
-                    p.store.as_str(),
-                    p.kind.as_str()
-                )
+                format!("{} {} ({store}, {})", p.id, p.name, p.kind.as_str())
             }
         })
         .collect();
-    match kinds.first() {
-        Some(kind) if same => format!("Pending (all {}): {}.", kind.as_str(), items.join(", ")),
+    match groups.first() {
+        Some((p, _)) if same => format!("Pending (all {}): {}.", p.kind.as_str(), items.join(", ")),
         _ => format!("Pending: {}.", items.join(", ")),
     }
 }
@@ -297,6 +306,55 @@ mod tests {
         );
         assert!(message.starts_with("the catalog has no migration ledger"));
         assert!(message.contains("Stop every server that uses this catalog"));
+    }
+
+    /// A body that runs in every account keyspace is named once per id with
+    /// the number of keyspaces, not once per keyspace.
+    #[test]
+    fn a_body_in_many_stores_of_one_kind_is_named_once() {
+        let baseline = MigrationId::ALL[0];
+        let entry = |store, store_name: &str, kind| Pending {
+            id: baseline.number(),
+            name: baseline.name(),
+            store,
+            store_name: store_name.to_owned(),
+            kind,
+        };
+        let mut list = vec![entry(
+            StoreKind::Catalog,
+            "extenddb_catalog",
+            Kind::Breaking,
+        )];
+        for keyspace in ["acct_a", "acct_b", "acct_c"] {
+            list.push(entry(StoreKind::Account, keyspace, Kind::Breaking));
+        }
+        let message = status_message(
+            &CatalogStatus::Behind {
+                version: None,
+                pending: list.clone(),
+            },
+            &ADVICE,
+        );
+        let line = format!(
+            "Pending (all breaking): {id} {name} (catalog), {id} {name} (account in 3 stores).",
+            id = baseline.number(),
+            name = baseline.name()
+        );
+        assert!(message.contains(&line), "{message}");
+
+        list[1].kind = Kind::Additive;
+        let message = status_message(
+            &CatalogStatus::Behind {
+                version: None,
+                pending: list,
+            },
+            &ADVICE,
+        );
+        assert!(message.contains("(account, additive), "), "{message}");
+        assert!(
+            message.contains("(account in 2 stores, breaking)."),
+            "{message}"
+        );
     }
 
     #[test]

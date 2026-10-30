@@ -356,6 +356,7 @@ impl extenddb_storage::management_store::ManagementStore for CassandraCatalogSto
         let policy_name = policy_name.to_string();
         let document = document.clone();
         Box::pin(async move {
+            self.test_stop()?;
             self.put_policy_impl(
                 &account_id,
                 &principal_type,
@@ -411,6 +412,7 @@ impl extenddb_storage::management_store::ManagementStore for CassandraCatalogSto
         let user_name = user_name.to_string();
         let document = document.clone();
         Box::pin(async move {
+            self.test_stop()?;
             self.set_boundary_impl(&account_id, "user", &user_name, &document)
                 .await
         })
@@ -452,6 +454,7 @@ impl extenddb_storage::management_store::ManagementStore for CassandraCatalogSto
         let role_name = role_name.to_string();
         let document = document.clone();
         Box::pin(async move {
+            self.test_stop()?;
             self.set_boundary_impl(&account_id, "role", &role_name, &document)
                 .await
         })
@@ -592,6 +595,7 @@ impl extenddb_storage::management_store::ManagementStore for CassandraCatalogSto
         let session_token = session_token.to_string();
         let document = document.clone();
         Box::pin(async move {
+            self.test_stop()?;
             self.update_session_policy_impl(&session_token, &document)
                 .await
         })

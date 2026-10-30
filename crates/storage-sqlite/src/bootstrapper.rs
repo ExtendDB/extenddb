@@ -179,18 +179,6 @@ impl Bootstrapper for SqliteBootstrapper {
         Ok(()) // Catalog and data share one file.
     }
 
-    async fn run_catalog_migrations(&self) -> OpResult<()> {
-        Err(through_the_runner("run_catalog_migrations"))
-    }
-
-    async fn run_data_migrations(&self) -> OpResult<()> {
-        Err(through_the_runner("run_data_migrations"))
-    }
-
-    async fn pending_data_migrations(&self) -> OpResult<Vec<String>> {
-        Err(through_the_runner("pending_data_migrations"))
-    }
-
     async fn record_data_connection(&self) -> OpResult<()> {
         let pool = self.pool().await?;
         sqlx::query(
@@ -306,10 +294,6 @@ impl Bootstrapper for SqliteBootstrapper {
         })
     }
 
-    async fn is_catalog_initialized(&self) -> OpResult<bool> {
-        Err(through_the_runner("is_catalog_initialized"))
-    }
-
     async fn list_table_names(&self) -> OpResult<Vec<String>> {
         let Ok(pool) = self.pool().await else {
             return Ok(Vec::new());
@@ -353,16 +337,6 @@ impl Bootstrapper for SqliteBootstrapper {
         Ok(())
     }
 
-    async fn read_catalog_version(&self) -> OpResult<Option<String>> {
-        Err(through_the_runner("read_catalog_version"))
-    }
-
-    fn expected_catalog_version(&self) -> String {
-        extenddb_storage::migrations::MigrationId::LATEST
-            .number()
-            .to_string()
-    }
-
     fn catalog_database_name(&self) -> String {
         self.path.clone()
     }
@@ -383,16 +357,6 @@ impl Bootstrapper for SqliteBootstrapper {
             self.path
         )
     }
-}
-
-/// The error of a bootstrapper method the commands do not call on this
-/// backend: its catalog migrates through
-/// [`crate::migrations::SqliteCatalogMigrations`] and the shared runner.
-fn through_the_runner(method: &str) -> OpError {
-    OpError::Internal(format!(
-        "sqlite migrates through its CatalogMigrations; the bootstrapper method {method} is \
-         not used"
-    ))
 }
 
 #[cfg(all(test, unix))]

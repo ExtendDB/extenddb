@@ -1,0 +1,108 @@
+{
+  "idempotency_tokens": {
+    "type": "collection",
+    "options": {},
+    "indexes": {
+      "_id_": {
+        "key": [
+          [
+            "_id",
+            1
+          ]
+        ],
+        "options": {}
+      },
+      "account_id_1_token_1": {
+        "key": [
+          [
+            "account_id",
+            1
+          ],
+          [
+            "token",
+            1
+          ]
+        ],
+        "options": {
+          "unique": true
+        }
+      },
+      "created_at_1": {
+        "key": [
+          [
+            "created_at",
+            1
+          ]
+        ],
+        "options": {
+          "expireAfterSeconds": 540
+        }
+      }
+    }
+  },
+  "stream_records": {
+    "type": "collection",
+    "options": {},
+    "indexes": {
+      "_id_": {
+        "key": [
+          [
+            "_id",
+            1
+          ]
+        ],
+        "options": {}
+      },
+      "created_at_1": {
+        "key": [
+          [
+            "created_at",
+            1
+          ]
+        ],
+        "options": {
+          "expireAfterSeconds": 86400
+        }
+      },
+      "shard_id_1_sequence_number_1": {
+        "key": [
+          [
+            "shard_id",
+            1
+          ],
+          [
+            "sequence_number",
+            1
+          ]
+        ],
+        "options": {}
+      }
+    }
+  },
+  "stream_shards": {
+    "type": "collection",
+    "options": {},
+    "indexes": {
+      "_id_": {
+        "key": [
+          [
+            "_id",
+            1
+          ]
+        ],
+        "options": {}
+      },
+      "shard_id_1": {
+        "key": [
+          [
+            "shard_id",
+            1
+          ]
+        ],
+        "options": {
+          "unique": true
+        }
+      }
+    }
+  }
+}

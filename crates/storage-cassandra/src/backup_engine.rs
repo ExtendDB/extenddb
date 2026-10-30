@@ -140,15 +140,6 @@ fn registration_exhausted(
     }
 }
 
-/// See [`CassandraEngine::require_migrated_catalog`].
-fn unmigrated_catalog_refusal(pending: &[&str]) -> StorageError {
-    StorageError::Unsupported(format!(
-        "Backups are unavailable until the ExtendDB catalog is migrated: it does not record \
-         catalog migration {}. Run `extenddb migrate --yes` with the admin credentials.",
-        pending.join(", ")
-    ))
-}
-
 #[derive(Debug)]
 struct StoredBackup {
     backup_arn: String,
@@ -181,7 +172,8 @@ impl StoredBackup {
                 .as_rust::<HashMap<String, String>>()
                 .map_err(|e| StorageError::Internal(format!("Parse active_restores: {e}")))?
                 .unwrap_or_default(),
-            // Absent before V005 has been applied, and null when empty.
+            // Null when empty. Every catalog this release serves has the
+            // column (catalog migration 1 creates it).
             Ok(None) | Err(_) => HashMap::new(),
         };
         Ok(Self {
@@ -399,29 +391,6 @@ struct HeartbeatTarget {
 }
 
 impl CassandraEngine {
-    /// Refuse a backup operation on a catalog that has not run every catalog
-    /// migration this binary carries. Catalog migration V005 adds the columns
-    /// CreateBackup, DeleteBackup and RestoreTableFromBackup write; without
-    /// it they failed with an internal error (`Undefined column name ...`),
-    /// which SDKs retry. `Unsupported` reaches the client as
-    /// `ValidationException` with this message. Table, item, ListBackups and
-    /// DescribeBackup operations do not call this: they work on such a
-    /// catalog.
-    pub(crate) async fn require_migrated_catalog(&self) -> Result<(), StorageError> {
-        use std::sync::atomic::Ordering;
-        if self.catalog_migrated.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        let pending =
-            crate::migrations::pending_catalog_migrations(&self.session, &self.catalog_keyspace())
-                .await?;
-        if pending.is_empty() {
-            self.catalog_migrated.store(true, Ordering::Release);
-            return Ok(());
-        }
-        Err(unmigrated_catalog_refusal(&pending))
-    }
-
     async fn load_backup(
         &self,
         account_id: &str,
@@ -1426,7 +1395,6 @@ impl BackupEngine for CassandraEngine {
         let backup_name = backup_name.to_owned();
         Box::pin(async move {
             Self::validate_account_id(&account_id)?;
-            self.require_migrated_catalog().await?;
 
             // fetch_table_key_info enforces the DynamoDB requirement that only
             // ACTIVE tables can be backed up.
@@ -1739,7 +1707,6 @@ impl BackupEngine for CassandraEngine {
             /// the registration check and the DELETING claim.
             const CLAIM_ATTEMPTS: usize = 3;
 
-            self.require_migrated_catalog().await?;
             let mut backup = self.load_backup(&account_id, &backup_arn).await?;
             if backup.backup_status != "AVAILABLE" && backup.backup_status != "DELETING" {
                 return Err(backup_not_found(&backup_arn));
@@ -1888,10 +1855,6 @@ impl BackupEngine for CassandraEngine {
             tokio::spawn(async move {
                 // Inside the task, like the registration, so the first poll
                 // still spawns before any await.
-                if let Err(error) = engine.require_migrated_catalog().await {
-                    let _ = registered_tx.send(Err(error));
-                    return;
-                }
                 match engine.register_restore_target(&account_id, request).await {
                     Ok((description, job, heartbeat)) => {
                         // The receiver is gone if the request was dropped;

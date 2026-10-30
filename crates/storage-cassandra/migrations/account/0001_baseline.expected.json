@@ -1,0 +1,400 @@
+{
+  "columns": {
+    "backup_items.backup_arn": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backup_items.bucket": {
+      "kind": "partition_key",
+      "position": 1,
+      "clustering_order": "none",
+      "type": "int"
+    },
+    "backup_items.item_data": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backup_items.item_index": {
+      "kind": "clustering",
+      "position": 0,
+      "clustering_order": "asc",
+      "type": "bigint"
+    },
+    "gsi_pending.id": {
+      "kind": "clustering",
+      "position": 1,
+      "clustering_order": "asc",
+      "type": "timeuuid"
+    },
+    "gsi_pending.index_context": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "gsi_pending.last_ready_at": {
+      "kind": "static",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "timestamp"
+    },
+    "gsi_pending.new_item": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "gsi_pending.old_item": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "gsi_pending.ready_at": {
+      "kind": "clustering",
+      "position": 0,
+      "clustering_order": "asc",
+      "type": "timestamp"
+    },
+    "gsi_pending.table_id": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "gsi_pending.worker_partition": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "int"
+    },
+    "index_propagation_holds.index_id": {
+      "kind": "clustering",
+      "position": 0,
+      "clustering_order": "asc",
+      "type": "text"
+    },
+    "index_propagation_holds.table_id": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "schema_history.applied_at": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "timestamp"
+    },
+    "schema_history.description": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "schema_history.version": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "int"
+    },
+    "stream_records.created_at": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "timestamp"
+    },
+    "stream_records.event_name": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "stream_records.record_data": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "stream_records.sequence_number": {
+      "kind": "clustering",
+      "position": 0,
+      "clustering_order": "asc",
+      "type": "text"
+    },
+    "stream_records.shard_id": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "stream_records.table_id": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "stream_shards.created_at": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "timestamp"
+    },
+    "stream_shards.ending_sequence_number": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "stream_shards.parent_shard_id": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "stream_shards.shard_id": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "stream_shards.starting_sequence_number": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "stream_shards.table_id": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "transaction_ledger.client_token": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "transaction_ledger.items_blob": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "transaction_ledger.request_fingerprint": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "transaction_ledger.started_at": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "bigint"
+    },
+    "transaction_ledger.state": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "transaction_ledger.txn_id": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "uuid"
+    },
+    "ttl_expiration_buckets.bucket": {
+      "kind": "clustering",
+      "position": 1,
+      "clustering_order": "asc",
+      "type": "bigint"
+    },
+    "ttl_expiration_buckets.generation": {
+      "kind": "clustering",
+      "position": 0,
+      "clustering_order": "asc",
+      "type": "uuid"
+    },
+    "ttl_expiration_buckets.shard": {
+      "kind": "clustering",
+      "position": 2,
+      "clustering_order": "asc",
+      "type": "int"
+    },
+    "ttl_expiration_buckets.table_id": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "ttl_expirations.bucket": {
+      "kind": "partition_key",
+      "position": 2,
+      "clustering_order": "none",
+      "type": "bigint"
+    },
+    "ttl_expirations.expires_at": {
+      "kind": "clustering",
+      "position": 0,
+      "clustering_order": "asc",
+      "type": "bigint"
+    },
+    "ttl_expirations.generation": {
+      "kind": "partition_key",
+      "position": 1,
+      "clustering_order": "none",
+      "type": "uuid"
+    },
+    "ttl_expirations.key_data": {
+      "kind": "clustering",
+      "position": 2,
+      "clustering_order": "asc",
+      "type": "text"
+    },
+    "ttl_expirations.key_hash": {
+      "kind": "clustering",
+      "position": 1,
+      "clustering_order": "asc",
+      "type": "text"
+    },
+    "ttl_expirations.shard": {
+      "kind": "partition_key",
+      "position": 3,
+      "clustering_order": "none",
+      "type": "int"
+    },
+    "ttl_expirations.state": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "ttl_expirations.table_id": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "ttl_expirations.work_data": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "ttl_expirations.work_id": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "uuid"
+    },
+    "ttl_reconcile_pending.account_id": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "ttl_reconcile_pending.id": {
+      "kind": "clustering",
+      "position": 0,
+      "clustering_order": "asc",
+      "type": "timeuuid"
+    },
+    "ttl_reconcile_pending.key_data": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "ttl_reconcile_pending.table_id": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "ttl_reconcile_pending.table_name": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "ttl_reconcile_pending.worker_partition": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "int"
+    },
+    "ttl_repair_inflight.account_id": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "ttl_repair_inflight.created_at": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "timestamp"
+    },
+    "ttl_repair_inflight.generation": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "uuid"
+    },
+    "ttl_repair_inflight.key_data": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "ttl_repair_inflight.repair_id": {
+      "kind": "clustering",
+      "position": 0,
+      "clustering_order": "asc",
+      "type": "uuid"
+    },
+    "ttl_repair_inflight.table_id": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "ttl_repair_inflight.table_name": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "ttl_repair_inflight.worker_partition": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "int"
+    },
+    "ttl_repair_inflight_partitions.worker_partition": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "int"
+    }
+  },
+  "indexes": {
+    "idx_txn_started_at": {
+      "table": "transaction_ledger",
+      "kind": "COMPOSITES",
+      "target": "started_at"
+    },
+    "stream_shards_table_id_idx": {
+      "table": "stream_shards",
+      "kind": "COMPOSITES",
+      "target": "table_id"
+    }
+  }
+}

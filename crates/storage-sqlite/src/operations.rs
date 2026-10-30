@@ -50,14 +50,6 @@ impl OperationsEngine for SqliteOperationsEngine {
         Ok(())
     }
 
-    /// The highest migration this binary carries: the catalog is versioned
-    /// by its ledger, and its `catalog_version` row holds the same integer.
-    fn catalog_version(&self) -> String {
-        extenddb_storage::migrations::MigrationId::LATEST
-            .number()
-            .to_string()
-    }
-
     fn setting_default(&self, key: &str) -> Option<String> {
         use extenddb_core::settings_keys::INDEX_PROPAGATION_DELAY_MS;
         match key {

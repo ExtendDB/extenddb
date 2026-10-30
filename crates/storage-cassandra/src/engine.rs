@@ -101,14 +101,6 @@ pub struct CassandraEngine {
     /// runs (`tables.restore_owner`). Random per process start, so a restore
     /// left behind by a crashed process is never mistaken for a live one.
     pub(crate) restore_owner: uuid::Uuid,
-
-    /// Set once `schema_history` was seen to record every catalog migration
-    /// this binary carries; until then each CreateBackup, DeleteBackup and
-    /// RestoreTableFromBackup re-reads it (see `require_migrated_catalog`), so
-    /// a `migrate --yes` run while the server is up takes effect without a
-    /// restart. Never cleared: migrations are not undone under a running
-    /// server.
-    pub(crate) catalog_migrated: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Cap on concurrently in-flight detached TTL claim releases.
@@ -151,7 +143,6 @@ impl CassandraEngine {
                 std::collections::HashMap::new(),
             )),
             restore_owner: uuid::Uuid::new_v4(),
-            catalog_migrated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 

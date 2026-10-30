@@ -24,6 +24,12 @@ type CassandraSession = Session<
     RoundRobinLoadBalancingStrategy<TransportTcp, TcpConnectionManager>,
 >;
 
+/// The replication map of a keyspace with `NetworkTopologyStrategy` and
+/// `replication_factor` replicas in `datacenter`.
+pub(crate) fn network_topology(datacenter: &str, replication_factor: u32) -> String {
+    format!("{{'class': 'NetworkTopologyStrategy', '{datacenter}': {replication_factor}}}")
+}
+
 /// Cassandra-backed catalog store for settings, metrics, and rate limiting.
 ///
 /// Holds a session to the catalog keyspace. Created once at startup
@@ -31,14 +37,22 @@ type CassandraSession = Session<
 pub struct CassandraCatalogStore {
     session: Arc<CassandraSession>,
     keyspace_prefix: String,
-    datacenter: String,
-    replication_factor: u32,
+    /// The replication CreateAccount gives a new account keyspace, as a CQL
+    /// map literal; `None` for a store opened from a connection string,
+    /// which knows no replication and refuses to create a keyspace.
+    replication: Option<String>,
+    /// The release recorded in the ledger rows of a new account keyspace.
+    release: String,
     /// Cached encryption key (immutable after bootstrap). Avoids
     /// per-request DB query on access key and assume-role operations.
     encryption_key: Option<Arc<str>>,
     /// TTL in seconds applied to every metrics row on insert.
     /// Cassandra expires rows natively; `prune_metrics` is a no-op.
     metrics_ttl_seconds: i32,
+    /// The crash-and-rerun tests' request budget, shared with the migration
+    /// backend, which fails a policy write once it is spent.
+    #[cfg(any(test, feature = "test-util"))]
+    stop_after: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl CassandraCatalogStore {
@@ -53,11 +67,58 @@ impl CassandraCatalogStore {
         Self {
             session,
             keyspace_prefix,
-            datacenter,
-            replication_factor,
+            replication: Some(network_topology(&datacenter, replication_factor)),
+            release: env!("CARGO_PKG_VERSION").to_owned(),
             encryption_key: None,
             metrics_ttl_seconds: 86400,
+            #[cfg(any(test, feature = "test-util"))]
+            stop_after: None,
         }
+    }
+
+    /// A store for the catalog's rows alone, opened from a connection string
+    /// (`settings`, `verify`, the diagnostics, a migration's code body). It
+    /// knows no replication, so CreateAccount on it fails instead of
+    /// creating a keyspace with a guessed one.
+    #[must_use]
+    pub fn catalog_only(session: Arc<CassandraSession>, keyspace_prefix: String) -> Self {
+        Self {
+            session,
+            keyspace_prefix,
+            replication: None,
+            release: env!("CARGO_PKG_VERSION").to_owned(),
+            encryption_key: None,
+            metrics_ttl_seconds: 86400,
+            #[cfg(any(test, feature = "test-util"))]
+            stop_after: None,
+        }
+    }
+
+    /// Share the crash-and-rerun tests' request budget: each policy write
+    /// takes one request, and fails once the budget is spent.
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) fn stop_after(&mut self, left: Arc<std::sync::atomic::AtomicUsize>) {
+        self.stop_after = Some(left);
+    }
+
+    /// Fail a policy write once the crash-and-rerun tests' budget is spent,
+    /// as a migrator killed before the write stops.
+    pub(crate) fn test_stop(&self) -> OpResult<()> {
+        #[cfg(any(test, feature = "test-util"))]
+        if crate::migrations::stopped(self.stop_after.as_deref()) {
+            return Err(OpError::Internal(
+                "stopped by the test hook before a policy write".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Record `release` in the ledger rows of the account keyspaces this
+    /// store creates: the server's own release.
+    #[must_use]
+    pub fn recording_release(mut self, release: &str) -> Self {
+        release.clone_into(&mut self.release);
+        self
     }
 
     /// Create a new catalog store with a pre-loaded encryption key.
@@ -72,10 +133,12 @@ impl CassandraCatalogStore {
         Self {
             session,
             keyspace_prefix,
-            datacenter,
-            replication_factor,
+            replication: Some(network_topology(&datacenter, replication_factor)),
+            release: env!("CARGO_PKG_VERSION").to_owned(),
             encryption_key: Some(Arc::from(encryption_key.as_str())),
             metrics_ttl_seconds: 86400,
+            #[cfg(any(test, feature = "test-util"))]
+            stop_after: None,
         }
     }
 
@@ -101,60 +164,35 @@ impl CassandraCatalogStore {
         format!("{}_account_{}", self.keyspace_prefix, account_id)
     }
 
-    /// Ensure an account keyspace exists (idempotent).
-    /// Creates the keyspace with `NetworkTopologyStrategy` if it doesn't exist.
+    /// Ensure an account keyspace exists with every account migration
+    /// (idempotent): create it when missing, then run the account
+    /// migrations on it through the migration runner, which waits for
+    /// schema agreement after each statement and records each one in the
+    /// keyspace's ledger. A retried CreateAccount whose earlier call stopped
+    /// after the `accounts` row repairs the keyspace the same way.
     pub(crate) async fn ensure_account_keyspace(&self, account_id: &str) -> OpResult<()> {
         let keyspace_name = self.account_keyspace(account_id);
-
-        // Check if keyspace already exists to avoid re-running migrations on every call.
-        let exists_result = self
-            .session
-            .query_with_values(
-                "SELECT keyspace_name FROM system_schema.keyspaces WHERE keyspace_name = ?",
-                cdrs_tokio::query_values!(keyspace_name.as_str()),
-            )
-            .await
-            .ok()
-            .and_then(|r| r.response_body().ok())
-            .is_some_and(|b| !b.into_rows().unwrap_or_default().is_empty());
-
-        if exists_result {
-            // Keyspace exists but may have been created by a concurrent caller that
-            // hasn't finished running migrations yet. Always run migrations — they are
-            // idempotent (CREATE TABLE IF NOT EXISTS) so re-running is safe.
-            return crate::migrations::run_data_migrations(&self.session, &keyspace_name)
-                .await
-                .map_err(|e| {
-                    tracing::error!(
-                        "Failed to run data migrations for {}: {:?}",
-                        keyspace_name,
-                        e
-                    );
-                    OpError::Internal("Failed to initialize account storage".to_owned())
-                });
-        }
-
-        let cql = format!(
-            "CREATE KEYSPACE IF NOT EXISTS {} WITH replication = {{'class': 'NetworkTopologyStrategy', '{}': {}}}",
-            keyspace_name, self.datacenter, self.replication_factor
-        );
-
-        self.session.query(cql).await.map_err(|e| {
-            tracing::error!("Failed to create account keyspace {}: {}", keyspace_name, e);
+        let failed = |e: &dyn std::fmt::Display| {
+            tracing::error!("Failed to initialize account keyspace {keyspace_name}: {e}");
             OpError::Internal("Failed to initialize account storage".to_owned())
-        })?;
-
-        crate::migrations::run_data_migrations(&self.session, &keyspace_name)
-            .await
-            .map_err(|e| {
-                tracing::error!(
-                    "Failed to run data migrations for {}: {:?}",
-                    keyspace_name,
-                    e
-                );
-                OpError::Internal("Failed to initialize account storage".to_owned())
-            })?;
-
+        };
+        let Some(replication) = &self.replication else {
+            return Err(failed(
+                &"this store was opened without the deployment's replication",
+            ));
+        };
+        let cql = format!(
+            "CREATE KEYSPACE IF NOT EXISTS {keyspace_name} WITH replication = {replication}"
+        );
+        self.session.query(cql).await.map_err(|e| failed(&e))?;
+        crate::migrations::migrate_account(
+            self.session.clone(),
+            &self.keyspace_prefix,
+            &keyspace_name,
+            &self.release,
+        )
+        .await
+        .map_err(|e| failed(&e))?;
         Ok(())
     }
 

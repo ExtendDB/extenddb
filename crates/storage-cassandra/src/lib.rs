@@ -7,8 +7,6 @@
 //! as the underlying database. It provides a DynamoDB-compatible API backed
 //! by Cassandra's distributed architecture.
 
-pub const CATALOG_VERSION: &str = "0.0.4";
-
 /// Default control-plane delay (seconds) when the `control_plane_delay_seconds`
 /// setting is absent or unparseable: CreateTable, the control-plane worker
 /// and the console's default all read this one value.
@@ -49,10 +47,6 @@ pub use config::CassandraStorageConfig;
 pub use engine::{CassandraEngine, CassandraSession};
 pub use metadata_engine::TtlBackfillCursor;
 
-use cdrs_tokio::authenticators::StaticPasswordAuthenticatorProvider;
-use cdrs_tokio::cluster::NodeTcpConfigBuilder;
-use cdrs_tokio::cluster::session::{SessionBuilder, TcpSessionBuilder};
-use cdrs_tokio::load_balancing::RoundRobinLoadBalancingStrategy;
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_storage::hooks::{ServerRuntimeHooks, WorkerContext};
 use extenddb_storage::server_components::{BackendError, ServerComponents};
@@ -67,6 +61,8 @@ struct CassandraRuntimeHooks {
     engine: Arc<CassandraEngine>,
     control_plane_notify: Arc<tokio::sync::Notify>,
     gsi_worker_guard: std::sync::OnceLock<workers::GsiWorkerGuard>,
+    /// The registration this server holds while it serves.
+    registration: Arc<migrations::ServingRegistration>,
 }
 
 #[async_trait::async_trait]
@@ -172,6 +168,11 @@ impl ServerRuntimeHooks for CassandraRuntimeHooks {
                 .await;
         });
 
+        let registration = tokio::spawn(hold_registration(
+            self.registration.clone(),
+            ctx.shutdown.clone(),
+        ));
+
         vec![
             control_plane,
             transaction_recovery,
@@ -181,11 +182,47 @@ impl ServerRuntimeHooks for CassandraRuntimeHooks {
             ttl_repair,
             ttl_audit,
             restore_sweep,
+            registration,
         ]
     }
 
     fn backend_info(&self) -> Option<String> {
         Some(format!("keyspace_prefix={}", self.engine.keyspace_prefix))
+    }
+}
+
+/// Hold the serving registration for the server's life: release it when
+/// the server shuts down, so a migration need not wait for its TTL, and end
+/// the process with exit status 1 once it could not be renewed for 30 s,
+/// before its row expires and a migration could start under this server.
+/// The exit runs the `atexit` handler that removes the PID file.
+async fn hold_registration(
+    registration: Arc<migrations::ServingRegistration>,
+    shutdown: extenddb_storage::hooks::CancellationToken,
+) {
+    let mut lost = registration.lost();
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => {
+                registration.release().await;
+                return;
+            }
+            changed = lost.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                let reason = lost.borrow().clone();
+                if let Some(reason) = reason {
+                    let message = format!(
+                        "extenddb fatal: {reason}; the server stops, because a migration can \
+                         start on the catalog once the serving registration is gone"
+                    );
+                    tracing::error!("{message}");
+                    eprintln!("{message}");
+                    std::process::exit(1);
+                }
+            }
+        }
     }
 }
 
@@ -258,57 +295,37 @@ pub fn backend() -> extenddb_storage::Backend {
             })
         },
         server_components: server_components_factory,
-        // Migrates through its bootstrapper until it moves onto the runner.
-        catalog_migrations: None,
+        catalog_migrations: &migrations::CassandraCatalogMigrations,
     }
 }
 
 /// Build a `CassandraCatalogStore` from a bare connection string.
 ///
-/// Used by the `settings_store` and `diagnostics_store` factories, which
-/// receive only a connection string (no full config object).
+/// Used by the `settings_store`, `management_store` and `diagnostics_store`
+/// factories, which receive only a connection string (no full config
+/// object): `extenddb settings`, `verify` and the diagnostics. The string
+/// carries the role the config file names, so they connect as the server
+/// does, with its 10 s bound on the connect.
 async fn make_catalog_store_from_connection_string(
     connection_string: &str,
 ) -> Result<CassandraCatalogStore, String> {
-    let (contact_points, keyspace_prefix) =
-        CassandraStorageConfig::parse_connection_string(connection_string);
-
-    if contact_points.is_empty() {
-        return Err("No contact points provided".to_string());
-    }
-
-    let mut node_builder = NodeTcpConfigBuilder::new();
-    for contact_point in &contact_points {
-        node_builder = node_builder.with_contact_point(contact_point.clone().into());
-    }
-    let auth_provider = Arc::new(StaticPasswordAuthenticatorProvider::new(
-        "cassandra",
-        "cassandra",
-    ));
-    node_builder = node_builder.with_authenticator_provider(auth_provider);
-
-    let cluster_config = node_builder
-        .build()
-        .await
-        .map_err(|e| format!("Failed to build cluster config: {e}"))?;
-
-    let session = TcpSessionBuilder::new(RoundRobinLoadBalancingStrategy::new(), cluster_config)
-        .build()
-        .await
-        .map_err(|e| format!("Failed to create session: {e}"))?;
-
-    Ok(CassandraCatalogStore::new(
-        Arc::new(session),
-        keyspace_prefix,
-        "datacenter1".to_string(),
-        1,
+    let deployment = migrations::Deployment::from_target(
+        &extenddb_storage::migrations::Target::at(connection_string),
+    )
+    .map_err(|e| e.to_string())?;
+    let session = deployment.connect().await.map_err(|e| e.to_string())?;
+    Ok(CassandraCatalogStore::catalog_only(
+        session,
+        deployment.keyspace_prefix,
     ))
 }
 
 fn server_components_factory(
     config: &dyn extenddb_storage::config::StorageConfig,
     region: &str,
-    _options: extenddb_storage::server_components::ServerComponentsOptions,
+    // `bootstrap_if_uninitialized` is not honored: an uninitialized catalog
+    // fails with the explicit-`init` guidance, as on PostgreSQL.
+    options: extenddb_storage::server_components::ServerComponentsOptions,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<ServerComponents, BackendError>> + Send>,
 > {
@@ -323,12 +340,42 @@ fn server_components_factory(
                 BackendError::InitializationFailed("Expected CassandraStorageConfig".to_string())
             })?;
 
-        let engine = CassandraEngine::new(cassandra_config, &region)
-            .await
-            .map_err(|e| BackendError::ConnectionFailed {
-                backend: "cassandra".to_string(),
-                details: e.to_string(),
-            })?;
+        // Register and read the catalog's status before the engine starts:
+        // creating it runs the control-plane recovery, which writes to the
+        // catalog. The status session uses the engine's role and settings.
+        let deployment = migrations::Deployment::from_config(cassandra_config);
+        let status_session =
+            deployment
+                .connect()
+                .await
+                .map_err(|e| BackendError::ConnectionFailed {
+                    backend: "cassandra".to_string(),
+                    details: e.to_string(),
+                })?;
+        let host = cassandra_config
+            .instance_id
+            .clone()
+            .unwrap_or_else(|| "unknown".to_owned());
+        let registration = migrations::register_server(
+            status_session,
+            &cassandra_config.keyspace_prefix,
+            &host,
+            options.release,
+        )
+        .await
+        .map_err(BackendError::Catalog)?;
+        let registration = Arc::new(registration);
+
+        let engine = match CassandraEngine::new(cassandra_config, &region).await {
+            Ok(engine) => engine,
+            Err(e) => {
+                registration.release().await;
+                return Err(BackendError::ConnectionFailed {
+                    backend: "cassandra".to_string(),
+                    details: e.to_string(),
+                });
+            }
+        };
 
         let control_plane_notify = engine.control_plane_notify.clone();
         let engine = Arc::new(engine);
@@ -366,13 +413,16 @@ fn server_components_factory(
             BackendError::InitializationFailed(format!("Failed to parse encryption key: {e}"))
         })?;
 
-        let catalog_store = Arc::new(CassandraCatalogStore::with_encryption_key(
-            engine.session.clone(),
-            cassandra_config.keyspace_prefix.clone(),
-            cassandra_config.datacenter.clone(),
-            cassandra_config.replication_factor,
-            enc_key.clone(),
-        ));
+        let catalog_store = Arc::new(
+            CassandraCatalogStore::with_encryption_key(
+                engine.session.clone(),
+                cassandra_config.keyspace_prefix.clone(),
+                cassandra_config.datacenter.clone(),
+                cassandra_config.replication_factor,
+                enc_key.clone(),
+            )
+            .recording_release(options.release),
+        );
 
         let credential_store: Arc<dyn extenddb_auth::CredentialStore> =
             Arc::new(credential_store::CassandraCredentialStore::new(
@@ -385,6 +435,7 @@ fn server_components_factory(
             engine: engine.clone(),
             control_plane_notify,
             gsi_worker_guard: std::sync::OnceLock::new(),
+            registration,
         });
 
         Ok(ServerComponents {

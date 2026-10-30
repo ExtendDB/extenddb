@@ -1,8 +1,8 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! The migration runners create their tables, indexes and added columns in
-//! the keyspace they are given, whatever keyspace the session has selected
+//! The migration runner creates its tables, indexes and added columns in
+//! the keyspace it is given, whatever keyspace the session has selected
 //! (#632).
 //!
 //! cdrs-tokio runs a `USE` on one connection and copies it to the session's
@@ -14,6 +14,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use cdrs_tokio::authenticators::StaticPasswordAuthenticatorProvider;
 use cdrs_tokio::cluster::NodeTcpConfigBuilder;
@@ -23,7 +24,7 @@ use cdrs_tokio::load_balancing::RoundRobinLoadBalancingStrategy;
 use extenddb_storage::error::StorageError;
 use extenddb_storage_cassandra::CassandraSession;
 use extenddb_storage_cassandra::cassandra_util::{get_column, query_rows};
-use extenddb_storage_cassandra::migrations::{run_catalog_migrations, run_data_migrations};
+use extenddb_storage_cassandra::migrations::{migrate_account, migrate_catalog_keyspace};
 
 /// Connections per node, the `max_connections` default.
 const POOL_SIZE: usize = 10;
@@ -31,7 +32,10 @@ const POOL_SIZE: usize = 10;
 /// Catalog keyspaces, and account keyspaces, the alternating `USE` test migrates.
 const ROUNDS: usize = 5;
 
-/// What one runner leaves in the keyspace it migrates.
+/// How long a catalog run waits for the migration lock.
+const LOCK_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// What migration 1 leaves in a keyspace of one store kind.
 struct Schema {
     tables: &'static [&'static str],
     indexes: &'static [&'static str],
@@ -39,7 +43,9 @@ struct Schema {
     added_columns: &'static [(&'static str, &'static str)],
 }
 
-/// Catalog migrations V001 to V005.
+/// Migration 1's catalog body: the tables, index and columns of the 0.1.x
+/// catalog migrations V001 to V005. The runner's ledger and the serving
+/// registrations are in neither list.
 const CATALOG: Schema = Schema {
     tables: &[
         "access_keys",
@@ -80,8 +86,9 @@ const CATALOG: Schema = Schema {
     ],
 };
 
-/// Data migrations V001 and V002.
-const DATA: Schema = Schema {
+/// Migration 1's account body: the tables and indexes of the 0.1.x data
+/// migrations V001 and V002.
+const ACCOUNT: Schema = Schema {
     tables: &[
         "backup_items",
         "gsi_pending",
@@ -142,7 +149,7 @@ async fn create_keyspaces(session: &Arc<CassandraSession>, keyspaces: &[String])
     }
 }
 
-/// Drops `keyspaces` now. Each migrated keyspace holds 12 to 24 tables, so
+/// Drops `keyspaces` now. Each migrated keyspace holds 13 to 26 tables, so
 /// leaving them for the harness's queued drops would grow the node's schema
 /// by hundreds of tables per run.
 async fn drop_keyspaces(session: &Arc<CassandraSession>, keyspaces: &[String]) {
@@ -188,7 +195,8 @@ async fn tables_in(session: &Arc<CassandraSession>, keyspace: &str) -> BTreeSet<
 }
 
 /// One line for each table, index or added column of `schema` that `keyspace`
-/// lacks, and for each table of `other` (the other runner's schema) it holds.
+/// lacks, and for each table of `other` (the other store kind's schema) it
+/// holds.
 async fn problems_in(
     session: &Arc<CassandraSession>,
     keyspace: &str,
@@ -223,7 +231,7 @@ async fn problems_in(
     for table in other.tables.iter().filter(|t| !schema.tables.contains(t)) {
         if tables.contains(*table) {
             problems.push(format!(
-                "{keyspace}: holds {table}, which the other runner creates"
+                "{keyspace}: holds {table}, which the other store kind's body creates"
             ));
         }
     }
@@ -231,52 +239,55 @@ async fn problems_in(
 }
 
 /// Before every migration run the session selects another keyspace with
-/// `USE`, as an earlier runner on the same session did before #632:
-/// `extenddb init` and `extenddb migrate` run the catalog migrations and then
-/// each account's data migrations on the engine's one session, and each
-/// runner began with `USE` for its own keyspace. Each keyspace must end up
-/// with its own schema and the other keyspace with none. Against runners
-/// that rely on `USE`, some runs execute their statements in the other
-/// keyspace, so the outcome varies from run to run, and `ROUNDS` runs of
-/// each runner give it many chances to show.
+/// `USE`, as the 0.1.x runners on the same session did before #632:
+/// `extenddb init` and `extenddb migrate` migrate the catalog keyspace and
+/// then each account keyspace on one session, and CreateAccount migrates
+/// its keyspace on the engine's session, which every other caller shares.
+/// Each keyspace must end up with its own schema and the other keyspace
+/// with none. Against a runner that relies on `USE`, some runs execute
+/// their statements in the other keyspace, so the outcome varies from run
+/// to run, and `ROUNDS` runs of each store kind give it many chances to
+/// show. Each round is a deployment of its own prefix, since
+/// [`migrate_catalog_keyspace`] migrates `<prefix>_catalog`.
 #[tokio::test]
 async fn migrations_ignore_the_keyspace_another_caller_selected() {
     if crate::helpers::skip_without_cassandra() {
         return;
     }
     let session = pooled_session().await;
-    let prefix = format!("m632_{}", &crate::helpers::unique_test_id()[..8]);
-    let decoy = format!("{prefix}_decoy");
-    let rounds: Vec<[String; 2]> = (0..ROUNDS)
+    let base = format!("m632_{}", &crate::helpers::unique_test_id()[..8]);
+    let decoy = format!("{base}_decoy");
+    let rounds: Vec<(String, [String; 2])> = (0..ROUNDS)
         .map(|i| {
-            [
-                format!("{prefix}_catalog_{i}"),
-                format!("{prefix}_account_{i}"),
-            ]
+            let prefix = format!("{base}_{i}");
+            let keyspaces = [format!("{prefix}_catalog"), format!("{prefix}_account")];
+            (prefix, keyspaces)
         })
         .collect();
     let _drop = crate::helpers::DropKeyspacesOnDrop(
         std::iter::once(decoy.clone())
-            .chain(rounds.iter().flatten().cloned())
+            .chain(rounds.iter().flat_map(|(_, keyspaces)| keyspaces.clone()))
             .collect(),
     );
     create_keyspaces(&session, std::slice::from_ref(&decoy)).await;
 
     let use_decoy = format!("USE {decoy}");
     let mut problems = Vec::new();
-    for round in &rounds {
+    for (prefix, round) in &rounds {
         let [catalog, account] = round;
         create_keyspaces(&session, round).await;
         session.query(&use_decoy).await.expect("USE decoy");
-        if let Err(e) = run_catalog_migrations(&session, catalog).await {
-            problems.push(format!("{catalog}: run_catalog_migrations: {e:?}"));
+        if let Err(e) =
+            migrate_catalog_keyspace(session.clone(), prefix, "test", LOCK_TIMEOUT).await
+        {
+            problems.push(format!("{catalog}: migrate_catalog_keyspace: {e:?}"));
         }
         session.query(&use_decoy).await.expect("USE decoy");
-        if let Err(e) = run_data_migrations(&session, account).await {
-            problems.push(format!("{account}: run_data_migrations: {e:?}"));
+        if let Err(e) = migrate_account(session.clone(), prefix, account, "test").await {
+            problems.push(format!("{account}: migrate_account: {e:?}"));
         }
-        problems.extend(problems_in(&session, catalog, &CATALOG, &DATA).await);
-        problems.extend(problems_in(&session, account, &DATA, &CATALOG).await);
+        problems.extend(problems_in(&session, catalog, &CATALOG, &ACCOUNT).await);
+        problems.extend(problems_in(&session, account, &ACCOUNT, &CATALOG).await);
         drop_keyspaces(&session, round).await;
     }
     for table in tables_in(&session, &decoy).await {
@@ -300,8 +311,8 @@ async fn migrations_ignore_the_keyspace_another_caller_selected() {
 
 /// On a session that never selected a keyspace, any migration statement that
 /// leaves its keyspace to the session fails ("No keyspace has been
-/// specified"). The runners must also leave the session's keyspace unset, so
-/// they move no other caller's statements.
+/// specified"). The runner must also leave the session's keyspace unset, so
+/// it moves no other caller's statements.
 #[tokio::test]
 async fn migrations_run_on_a_session_with_no_keyspace_and_leave_none_selected() {
     if crate::helpers::skip_without_cassandra() {
@@ -320,18 +331,19 @@ async fn migrations_run_on_a_session_with_no_keyspace_and_leave_none_selected() 
     let _drop = crate::helpers::DropKeyspacesOnDrop(keyspaces.clone());
     create_keyspaces(&session, &keyspaces).await;
 
-    let catalog_result = run_catalog_migrations(&session, &catalog).await;
-    let data_result = run_data_migrations(&session, &account).await;
-    let mut problems = problems_in(&session, &catalog, &CATALOG, &DATA).await;
-    problems.extend(problems_in(&session, &account, &DATA, &CATALOG).await);
+    let catalog_result =
+        migrate_catalog_keyspace(session.clone(), &prefix, "test", LOCK_TIMEOUT).await;
+    let account_result = migrate_account(session.clone(), &prefix, &account, "test").await;
+    let mut problems = problems_in(&session, &catalog, &CATALOG, &ACCOUNT).await;
+    problems.extend(problems_in(&session, &account, &ACCOUNT, &CATALOG).await);
     let selected = session.current_keyspace();
     drop_keyspaces(&session, &keyspaces).await;
 
     catalog_result.expect("catalog migrations on a session with no keyspace");
-    data_result.expect("data migrations on a session with no keyspace");
+    account_result.expect("account migrations on a session with no keyspace");
     assert!(problems.is_empty(), "{}", problems.join("\n"));
     assert_eq!(
         selected, None,
-        "the migration runners selected a keyspace on the session"
+        "the migration runner selected a keyspace on the session"
     );
 }
