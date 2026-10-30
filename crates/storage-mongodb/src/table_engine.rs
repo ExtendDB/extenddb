@@ -1144,7 +1144,7 @@ impl MongoEngine {
         let table_doc = tables_coll
             .find_one(filter.clone())
             .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?
+            .map_err(|e| crate::error_class::catalog_read_err(&e))?
             .ok_or_else(|| StorageError::TableNotFound(table_name.to_owned()))?;
         if table_doc.get_str("table_status").unwrap_or("ACTIVE") != "ACTIVE" {
             return Err(StorageError::TableNotActive(table_name.to_owned()));
@@ -1163,7 +1163,7 @@ impl MongoEngine {
         let table_doc = tables_coll
             .find_one(doc! { "_id": { "account_id": account_id, "table_name": table_name } })
             .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?
+            .map_err(|e| crate::error_class::catalog_read_err(&e))?
             .ok_or_else(|| StorageError::TableNotFound(table_name.to_string()))?;
 
         self.table_key_info_from_doc(&table_doc, true).await
@@ -1184,7 +1184,7 @@ impl MongoEngine {
         let table_doc = tables_coll
             .find_one(doc! { "table_id": table_id })
             .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?
+            .map_err(|e| crate::error_class::catalog_read_err(&e))?
             .ok_or_else(|| StorageError::TableNotFound(table_id.to_string()))?;
 
         self.table_key_info_from_doc(&table_doc, false).await
@@ -1252,12 +1252,12 @@ impl MongoEngine {
         let mut idx_cursor = indexes_coll
             .find(doc! { "_id.table_id": &table_id })
             .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            .map_err(|e| crate::error_class::catalog_read_err(&e))?;
         let mut infos = Vec::new();
         while let Some(idx_doc) = idx_cursor
             .try_next()
             .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?
+            .map_err(|e| crate::error_class::catalog_read_err(&e))?
         {
             infos.push(index_info_from_doc(&idx_doc)?);
         }
@@ -1315,7 +1315,7 @@ impl MongoEngine {
         let index_doc = indexes_coll
             .find_one(doc! { "_id": { "table_id": table_id, "index_name": index_name } })
             .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?
+            .map_err(|e| crate::error_class::catalog_read_err(&e))?
             .ok_or_else(|| StorageError::IndexNotFound(index_name.to_string()))?;
 
         let index_id = index_doc
