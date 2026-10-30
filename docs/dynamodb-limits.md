@@ -1,6 +1,6 @@
 # DynamoDB Limits Enforcement Status
 
-Last updated: 2026-04-23 (P42)
+Last updated: 2026-10-19
 
 Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/ServiceQuotas.html)
 
@@ -38,7 +38,7 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 
 | Limit | DynamoDB Value | Status | Notes                                                                         |
 |-------|---------------|--------|-------------------------------------------------------------------------------|
-| Maximum item size | 400 KB (409,600 bytes) | Enforced | `LimitsConfig::max_item_size_bytes`, validated on PutItem and post-UpdateItem |
+| Maximum item size | 400 KB (409,600 bytes) | Enforced | `LimitsConfig::max_item_size_bytes`. The engine enforces it on PutItem, BatchWriteItem, the transaction Put path and ImportTable; the PostgreSQL and SQLite storage layers enforce it on UpdateItem and the transaction Update path. Cassandra applies a fixed 409,600 to the finished item of an update with the put wording; MongoDB applies no limit on updates. The sizing calculation (item bytes, number cost, and the statement-based UpdateItem rule) lives in [differences-from-dynamodb.md](differences-from-dynamodb.md#item-size). |
 | Partition key size | 1–2,048 bytes | Enforced | `validate_key_sizes`, `LimitsConfig::max_partition_key_size_bytes`            |
 | Sort key size | 1–1,024 bytes | Enforced | `validate_key_sizes`, `LimitsConfig::max_sort_key_size_bytes`                 |
 | Attribute name size | 1–64 KB (65,535 bytes) | Partial | `validate_attribute_name_sizes`, `LimitsConfig::max_attribute_name_bytes`; top-level names and nested map keys at every depth, on PutItem, BatchWriteItem.PutRequest, TransactWriteItems.Put, and ImportTable. Not enforced on UpdateItem or TransactWriteItems.Update at any level. |

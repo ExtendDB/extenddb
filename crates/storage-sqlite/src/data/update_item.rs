@@ -72,7 +72,9 @@ impl SqliteEngine {
             &key_info.attribute_definitions,
         )
         .map_err(|e| StorageError::Validation(e.to_string()))?;
-        validation::validate_item_size(&item, self.max_item_size_bytes)
+        // Size the update the way the service does: what the statement writes
+        // plus a fixed cost per clause, against the item limit.
+        validation::validate_update_item_size(&item, actions, maps, self.max_item_size_bytes)
             .map_err(|e| StorageError::Validation(e.to_string()))?;
         // Secondary-index key validation on the post-update item, matching the
         // TransactWriteItems update path: a wrong-typed index key attribute or

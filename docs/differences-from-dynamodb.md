@@ -141,6 +141,37 @@ The same on all four backends.
 | `OnDemandThroughputOverride` | Applied on an on-demand restore, as on the service (measured on DynamoDB): equal to the backup's, changed, with one member, or on a `PROVISIONED` backup restored with `BillingModeOverride` `PAY_PER_REQUEST`. It replaces the backup's on-demand throughput as a whole: a member left out means no maximum, as on `CreateTable`, so `{}` restores a table with no maxima. On a `PROVISIONED` restore (from a `PROVISIONED` backup or by override) it is refused with `ValidationException`, as is a member other than `MaxReadRequestUnits` and `MaxWriteRequestUnits`. Measured on SQLite |
 | `VectorIndexOverride` | Refused with `ValidationException` |
 
+## Item Size
+
+ExtendDB enforces the 400 KB (409,600-byte) item-size limit. This section is the
+single reference for how an item and an update are sized; `docs/dynamodb-limits.md`
+records the limit and points here. Every figure was measured against the service
+in us-east-1 on 2026-10-19.
+
+How an item is sized: its attribute names plus its values. A string or binary
+value costs its byte length. A number costs `1 + ceil(integer significant digits
+/ 2) + ceil(fraction significant digits / 2)`, plus one for a sign, the two
+halves rounded up separately, so `1.5` is 3 bytes and `3.14159` is 5. A list
+costs 3 bytes plus one per element; a map costs 3 bytes plus, per entry, the
+entry name, its value, and one more.
+
+How a standalone `UpdateItem` is sized: by the statement, not the finished item.
+A base of 3; 18 per `SET` or `ADD` clause; a skeleton of the written paths (each
+map level 3 bytes plus one per named entry, each list level 3 bytes plus one per
+element, untouched siblings left out) whose `SET` or `ADD` leaves carry their
+value-placeholder bytes; one more per clause written through a list index; 26
+plus the name length per function call; 34 per `+` and 37 per `-`; and 15 plus
+the name per document path operand (14 for a nested attribute, 15 for an index).
+`REMOVE` and `DELETE` cost their path skeleton only. The legacy `AttributeUpdates`
+form costs 3 plus the name and finished value of each attribute it names that
+remains. The key and untouched attributes are left out. Both the statement figure
+and the finished item are checked against the limit, and a breach refuses with
+`Item size to update has exceeded the maximum allowed size`.
+
+| Area | DynamoDB | ExtendDB |
+|------|----------|------|
+| `UpdateItem` item-size accounting | In 31 of 33 commercial regions a standalone `UpdateItem` is sized by the statement (the rule above). At a one-byte key the largest finished item it can produce is 409,581 bytes. Two regions (`eu-south-2`, `me-central-1`) size an `UpdateItem` on the finished item, like a `PutItem`. | PostgreSQL and SQLite follow the 31-region statement rule. A transacted `Update` is sized on the finished item on both, as on the service. Cassandra sizes every update on the finished item against a fixed 409,600 bytes; MongoDB applies no item-size limit on updates. |
+
 ## Capacity and Throttling
 
 | Area | DynamoDB | ExtendDB |
