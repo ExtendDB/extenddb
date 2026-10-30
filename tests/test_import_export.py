@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import tempfile
 import time
 import uuid
@@ -176,6 +177,11 @@ class TestExportTable:
             assert export_desc["ExportStatus"] == "COMPLETED"
             assert export_desc["ItemCount"] == 5
             assert export_desc["ExportFormat"] == "DYNAMODB_JSON"
+
+            # The file holds the table's items, so only the server's user may
+            # read it, whatever the server's umask.
+            if os.name == "posix":
+                assert stat.S_IMODE(os.stat(export_path).st_mode) == 0o600
 
             # Verify file contents.
             with open(export_path) as f:
