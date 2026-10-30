@@ -186,6 +186,7 @@ async fn scratch_with_pool(pool_size: u32) -> Scratch {
             include_str!("../data_migrations/002_gsi_pending.sql"),
             include_str!("../data_migrations/003_idempotency_account_scope.sql"),
             include_str!("../data_migrations/004_vector_index_state.sql"),
+            include_str!("../data_migrations/005_gsi_pending_table_claim.sql"),
         ],
     )
     .await;
