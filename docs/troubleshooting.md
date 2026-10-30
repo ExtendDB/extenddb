@@ -391,7 +391,11 @@ SELECT l.pid, l.mode, a.query_start, l.relation::regclass AS relation, a.query
 
 **Cause:** With a separate data database, a synchronous DeleteTable commits the catalog row removal first, then commits the drop of the table's data tables on the data database. If that data commit fails (the connection is terminated, a failover, a network fault), the server redoes the drop on a fresh connection for up to 60 seconds. Only a process that dies, or a data database unreachable for that whole window, between the catalog commit and the last retry leaves the table's data tables on the data database with no catalog row naming them. Nothing reclaims them afterwards: DescribeTable reports the table gone, a same-name CreateTable gets a new table id, and the control plane only enumerates relations that still have a catalog row. When the retries are exhausted the server logs, at error, the table id, the relation names, and the exact `DROP TABLE` to run. (On one shared database the row and the drops commit together, so this cannot happen there.)
 
-To find such relations, compare the `_ddb_%` tables on the data database with the table ids the catalog still knows. On the catalog database:
+To find such relations, stop the server and run `extenddb catalog-check` with the deployment's config file. The check lists the `_ddb_` relations on the data database (or on the shared database when the deployment keeps catalog and data together) and compares them with the relations the catalog's table, index and vector index rows name, through the same naming the server uses, for rows in every status. A relation no row names is reported under "orphaned data tables". A relation a row names that the data database lacks is reported under "missing data tables" with the table or index that owns it; a table or index in DELETING is not reported missing, since its relations are being removed.
+
+`extenddb catalog-check --fix` drops the orphaned relations. Before it drops anything it locks the catalog's `tables`, `indexes` and `vector_indexes` against new rows, waits for a table or index change still in flight to commit, reads the ids again, and keeps every relation a row names by then, so a CreateTable or UpdateTable that lands between the report and the drop loses nothing. The command prints what it did with each relation: `Dropped`, `Kept` with the reason, or `FAILED` with the error. If it cannot take the locks within 30 seconds it reports that, drops nothing, and can be run again. Relations without the `_ddb_` prefix are never touched.
+
+To do the comparison by hand, compare the `_ddb_%` tables on the data database with the table ids the catalog still knows. On the catalog database:
 
 ```sql
 SELECT table_id FROM tables
@@ -417,8 +421,6 @@ DROP TABLE IF EXISTS "_ddb_<table_id>", "_ddb_<index_id>", "_ddb_vec_<vector_ind
 ```
 
 The error log line names the exact relations for one leaked table and gives this `DROP TABLE` verbatim.
-
-**Do not** use `extenddb catalog-check --fix` to clean these up: it expects a different relation-naming scheme and, against the current schema, reports every live data table as orphaned and would drop tables still in use.
 
 ### CreateTable returns CREATING instead of ACTIVE
 
