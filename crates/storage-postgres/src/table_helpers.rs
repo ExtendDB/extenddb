@@ -97,12 +97,37 @@ impl PostgresEngine {
         data::index_table_name(index_id)
     }
 
-    // TODO(fidelity): These two queries are not in a transaction. Under concurrent
-    // UpdateTable (future phase), the table row and index rows could be read at
-    // different points in time, producing an inconsistent snapshot. Wrap in a
-    // transaction or use SELECT ... FOR SHARE when concurrent DDL is supported.
+    /// `DescribeTable`'s read of the definition, on a connection taken for the
+    /// four statements and nothing else: the table row and its index rows are
+    /// not read in one transaction, so a concurrent `UpdateTable` committing
+    /// between them can show a row with an index set from a moment later. That
+    /// is what the service's eventually consistent `DescribeTable` also allows.
+    /// The snapshot engine (`snapshot_engine.rs`) is the caller that needs one
+    /// instant and gets it: it calls [`Self::build_table_description_on`] on
+    /// the connection that holds the `tables` row `FOR SHARE` (separate data
+    /// database) or inside its `REPEATABLE READ` transaction (one shared
+    /// database). The end of `update_table` calls this one, after its own
+    /// transaction has committed.
     pub(crate) async fn build_table_description(
         &self,
+        account_id: &str,
+        table_name: &str,
+    ) -> Result<TableDescription, StorageError> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        self.build_table_description_on(&mut conn, account_id, table_name)
+            .await
+    }
+
+    /// Build the description through one catalog connection, so a caller
+    /// that already holds one (the snapshot engine, with the `tables` row
+    /// `FOR SHARE`) does not need a second from the pool while it waits.
+    pub(crate) async fn build_table_description_on(
+        &self,
+        conn: &mut sqlx::PgConnection,
         account_id: &str,
         table_name: &str,
     ) -> Result<TableDescription, StorageError> {
@@ -117,7 +142,7 @@ impl PostgresEngine {
         )
         .bind(account_id)
         .bind(table_name)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
@@ -129,7 +154,7 @@ impl PostgresEngine {
                FROM indexes WHERE table_id = $1",
         )
         .bind(&row.table_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *conn)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
@@ -138,14 +163,15 @@ impl PostgresEngine {
              ORDER BY index_name"
         ))
         .bind(&row.table_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *conn)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let table_name_owned = row.table_name.clone();
         let table_id = row.table_id.clone();
         let mut desc = self.build_table_description_from_row(account_id, row, index_rows)?;
-        desc.restore_summary = self.restore_summary(&table_id, &desc.table_status).await?;
+        desc.restore_summary =
+            Self::restore_summary_on(conn, &table_id, &desc.table_status).await?;
         desc.vector_indexes = vector_index_descriptions(
             &self.region,
             account_id,
@@ -342,9 +368,10 @@ impl PostgresEngine {
     /// The RestoreSummary of a table created by RestoreTableFromBackup, or
     /// `None` for any other table. In progress until the table is ACTIVE; the
     /// engine drops the summary from DescribeTable once the table is not
-    /// CREATING.
-    pub(crate) async fn restore_summary(
-        &self,
+    /// CREATING. Takes the connection so a caller holding the catalog barrier
+    /// reads it there.
+    pub(crate) async fn restore_summary_on(
+        conn: &mut sqlx::PgConnection,
         table_id: &str,
         status: &extenddb_core::types::TableStatus,
     ) -> Result<Option<extenddb_core::types::RestoreSummary>, StorageError> {
@@ -356,7 +383,7 @@ impl PostgresEngine {
              FROM table_restores WHERE table_id = $1",
         )
         .bind(table_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
         Ok(row.map(

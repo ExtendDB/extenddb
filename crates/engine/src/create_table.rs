@@ -162,6 +162,13 @@ pub fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> Dynamo
             tracing::warn!(transient_error = %msg, "transient storage error");
             DynamoDbError::ServiceUnavailable("Service is temporarily unavailable".to_owned())
         }
+        // Only backup and export jobs hold snapshots; a request that reaches
+        // this arm lost one mid-operation. The job owner restarts it; the
+        // client sees the same retryable 503 as a transient fault.
+        StorageError::SnapshotExpired(msg) => {
+            tracing::warn!(snapshot_error = %msg, "storage snapshot expired");
+            DynamoDbError::ServiceUnavailable("Service is temporarily unavailable".to_owned())
+        }
         StorageError::DeletionProtected(arn) => DynamoDbError::ValidationException(format!(
             "Resource '{arn}' cannot be deleted as it is currently protected against deletion. Disable deletion protection first then try again."
         )),
@@ -245,5 +252,23 @@ pub(crate) fn storage_err_to_dynamo_with_ccf(
             )
         }
         other => storage_err_to_dynamo(other),
+    }
+}
+
+#[cfg(test)]
+mod storage_error_mapping_tests {
+    use extenddb_core::error::DynamoDbError;
+    use extenddb_storage::error::StorageError;
+
+    use super::storage_err_to_dynamo;
+
+    /// A snapshot the backend discarded is retryable, like a transient error.
+    #[test]
+    fn snapshot_expired_is_service_unavailable() {
+        let err = storage_err_to_dynamo(StorageError::SnapshotExpired("gone".to_owned()));
+        assert!(
+            matches!(err, DynamoDbError::ServiceUnavailable(_)),
+            "{err:?}"
+        );
     }
 }

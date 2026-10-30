@@ -305,13 +305,18 @@ jobs:
       # pause writers with a test hook. They build their own throwaway databases;
       # the connection string is the server, not a database.
       - name: Run PostgreSQL storage-level tests
+        # table_snapshot: the SnapshotEngine consistency check; it needs the
+        # shared page-size hook, compiled only into the crate's own test
+        # build, and scratch databases it creates and drops itself.
         env:
           EXTENDDB_TEST_PG_CONNECTION_STRING: postgresql://postgres:devpass@127.0.0.1:5432
+          # table_snapshot fails rather than skips without the string above.
+          EXTENDDB_TEST_PG_REQUIRED: "1"
         run: >-
           cargo test --release -p extenddb-storage-postgres
           --test vector_control_plane --test put_create_race --test twi_conflict
           --test stream_shard_retention --test stream_shard_ownership --test stream_records_page_order --test backup_restore
-          --test gsi_online_build --test gsi_stale_writer
+          --test gsi_online_build --test gsi_stale_writer --test table_snapshot
 
       # The daemonized server logs to syslog; dump it so server-side failures
       # are diagnosable from the job log.
