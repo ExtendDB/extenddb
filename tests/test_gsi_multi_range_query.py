@@ -22,7 +22,7 @@ from __future__ import annotations
 import pytest
 from botocore.exceptions import ClientError
 
-from conftest import scoped_table, wait_for_gsi_items
+from conftest import configured_backend, _is_real_dynamodb, scoped_table, wait_for_gsi_items
 
 INDEX = "gsi"
 TWO_HASH_INDEX = "two-hash"
@@ -92,16 +92,24 @@ def multi_range_table(dynamodb_client):
 
 
 FIRST_RANGE_ONLY_MARK = "applies a key condition to the first RANGE attribute"
+FIRST_RANGE_ONLY_BACKENDS = ("mongodb", "cassandra")
 
 
 @pytest.fixture(scope="module")
 def first_range_only(dynamodb_client, multi_range_table) -> bool:
-    """True when the server refuses a key condition on a later RANGE attribute.
+    """True when the backend under test refuses a key condition on a later
+    RANGE attribute.
 
     The MongoDB and Cassandra backends store and filter the first RANGE
     attribute of a multi-attribute index only and refuse the rest; the
-    service, SQLite and PostgreSQL serve them.
+    service, SQLite and PostgreSQL serve them. The backend comes from
+    `EXTENDDB_TEST_BACKEND` or the server's config file, as tests/test_ttl.py
+    reads it, and the server's reply must match it: a backend that serves
+    these conditions and starts refusing them fails here instead of skipping
+    the served-result tests.
     """
+    backend = None if _is_real_dynamodb() else configured_backend()
+    expected = backend in FIRST_RANGE_ONLY_BACKENDS
     try:
         dynamodb_client.query(
             TableName=multi_range_table,
@@ -109,11 +117,14 @@ def first_range_only(dynamodb_client, multi_range_table) -> bool:
             KeyConditionExpression="h = :h AND a = :a AND b = :b",
             ExpressionAttributeValues=_values({":h": "o1", ":a": "T", ":b": "live"}),
         )
+        refused = None
     except ClientError as exc:
-        if FIRST_RANGE_ONLY_MARK in exc.response["Error"]["Message"]:
-            return True
-        raise
-    return False
+        refused = exc.response["Error"]
+    if expected and (refused is None or FIRST_RANGE_ONLY_MARK not in refused["Message"]):
+        pytest.fail(f"backend {backend} should refuse a condition on b, got {refused or 'items'}")
+    if not expected and refused is not None:
+        pytest.fail(f"backend {backend or 'unknown'} should serve a condition on b, got {refused}")
+    return expected
 
 
 @pytest.fixture
