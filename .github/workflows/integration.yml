@@ -77,6 +77,12 @@ jobs:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 40
     needs: build-postgres
+    # Three shards by test file (devtools/test-shards); the integration job
+    # checks that together they collected every test of the whole suite.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     services:
       postgres:
         # pgvector's own image, which is postgres:16 plus the extension. The
@@ -142,7 +148,15 @@ jobs:
           EXTENDDB_ADMIN_USER: admin
           EXTENDDB_ADMIN_PASSWORD: ${{ steps.init.outputs.admin_password }}
           EXTENDDB_TEST_PG_ADMIN_CONNECTION_STRING: postgresql://postgres:devpass@127.0.0.1:5432
-        run: devtools/run-tests --extenddb --pytest --comprehensive --parallel --filter "not import_export"
+        run: devtools/run-tests --extenddb --pytest --comprehensive --parallel --filter "not import_export" --shard ${{ matrix.shard }}/3
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        if: always()
+        with:
+          name: shards-run-integration-${{ matrix.shard }}
+          path: discussions/shards/
+          if-no-files-found: warn
+          retention-days: 1
 
       # run-tests restarts the server daemonized to apply the import/export
       # config, and a daemonized server logs to syslog, not the job log. Without
@@ -156,6 +170,10 @@ jobs:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 40
     needs: build-sqlite
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@v6
 
@@ -202,7 +220,15 @@ jobs:
           EXTENDDB_TEST_ENDPOINT: https://127.0.0.1:18443
           EXTENDDB_ADMIN_USER: admin
           EXTENDDB_ADMIN_PASSWORD: ${{ steps.init.outputs.admin_password }}
-        run: devtools/run-tests --extenddb --pytest --comprehensive --parallel --filter "not import_export"
+        run: devtools/run-tests --extenddb --pytest --comprehensive --parallel --filter "not import_export" --shard ${{ matrix.shard }}/3
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        if: always()
+        with:
+          name: shards-run-integration-sqlite-${{ matrix.shard }}
+          path: discussions/shards/
+          if-no-files-found: warn
+          retention-days: 1
 
       # Same rationale as the postgres job: the daemonized server logs to
       # syslog, so this dump is the only server-side evidence on failure.
@@ -569,3 +595,17 @@ jobs:
              [ "${{ needs.run-rust-integration-sqlite.result }}" != "success" ]; then
             exit 1
           fi
+
+      # Fails unless the shards of each sharded job together collected every
+      # test of the whole suite exactly once, so a bad split cannot pass.
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          pattern: shards-run-integration-[0-9]*
+          path: shards/run-integration
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          pattern: shards-run-integration-sqlite-*
+          path: shards/run-integration-sqlite
+      - name: Check the shards ran every test
+        run: python3 devtools/test-shards check shards/run-integration shards/run-integration-sqlite
