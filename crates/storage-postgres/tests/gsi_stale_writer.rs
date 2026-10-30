@@ -186,7 +186,13 @@ async fn create_table(s: &Scratch) -> TableKeyInfo {
         .expect("read the key info")
 }
 
-/// Add GSI `gidx` keyed on `g` (S) and, when `range`, `r` (N).
+/// Add GSI `gidx` keyed on `g` (S) and, when `range`, `r` (N), and wait for the
+/// backfill to finish.
+///
+/// Since issue #654 `UpdateTable` returns while the index is still `CREATING`
+/// and the backfill runs in a detached task. This helper waits for `ACTIVE`,
+/// which is where the old in-request build left the index before `UpdateTable`
+/// returned, so the join points in these tests keep their original timing.
 async fn add_gsi(s: &Scratch, range: bool) {
     let mut defs = vec![serde_json::json!({"AttributeName": "g", "AttributeType": "S"})];
     let mut schema = vec![serde_json::json!({"AttributeName": "g", "KeyType": "HASH"})];
@@ -208,6 +214,13 @@ async fn add_gsi(s: &Scratch, range: bool) {
         .update_table(ACCOUNT, input)
         .await
         .expect("add the GSI");
+    for _ in 0..200 {
+        if ids(&s.db).await.2 == "ACTIVE" {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the detached GSI backfill did not reach ACTIVE");
 }
 
 fn item(n: u32, g: Option<&str>, r: Option<u32>) -> Item {

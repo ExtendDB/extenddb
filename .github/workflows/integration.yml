@@ -323,8 +323,8 @@ jobs:
         run: >-
           cargo test --release -p extenddb-storage-postgres
           --test vector_control_plane --test put_create_race --test twi_conflict
-          --test stream_shard_retention --test stream_shard_ownership --test stream_records_page_order --test backup_restore
-          --test gsi_online_build --test gsi_stale_writer --test table_snapshot
+          --test stream_shard_retention --test stream_shard_ownership --test stream_records_page_order --test backup_restore --test gsi_async_build
+          --test gsi_build_task --test gsi_build_slots --test gsi_online_build --test gsi_stale_writer --test table_snapshot
 
       # The daemonized server logs to syslog; dump it so server-side failures
       # are diagnosable from the job log.

@@ -6,13 +6,19 @@
 //! Three pieces, and the order they run in is the design:
 //!
 //! 1. `UpdateTable` creates the index data table, then commits the catalog row as
-//!    `CREATING`. From that commit on, every write that reads the catalog maintains
-//!    the index the way it maintains an `ACTIVE` one, inline or through the queue.
-//! 2. It waits [`GRACE_PUBLISH`], takes a [`write_barrier`], and runs
-//!    [`backfill`], which writes the current state of every base item into the
-//!    index under that item's row lock.
-//! 3. It flips the row to `ACTIVE`. A build that fails or is cut short leaves the
-//!    index `CREATING`, and [`recovery_worker`] finishes it.
+//!    `CREATING`, starts the build in a task of its own and returns. From that
+//!    commit on, every write that reads the catalog maintains the index the way it
+//!    maintains an `ACTIVE` one, inline or through the queue.
+//! 2. The build task, once it holds one of the engine's [`GSI_BUILD_SLOTS`], waits
+//!    [`GRACE_PUBLISH`], takes a [`write_barrier`], and runs [`backfill`], which
+//!    writes the current state of every base item into the index under that
+//!    item's row lock.
+//! 3. The task flips the row to `ACTIVE`. A build that fails for a reason
+//!    [`is_transient`] accepts (a conflict, a timeout, a lost or refused
+//!    connection, a shutdown, a server-side I/O or internal error, an exhausted
+//!    connection pool), or that a restart cuts short, leaves the index `CREATING`,
+//!    and [`recovery_worker`] finishes it. Any other failure would recur on every
+//!    attempt: it is logged and the index removed ([`remove_failed_build`]).
 //!
 //! Every write to the index, from the backfill, the queue or a write's own inline
 //! maintenance, leaves the rows for one base key equal to that item's state at the
@@ -27,11 +33,12 @@
 //!
 //! - A write whose base table statements had all returned within [`GRACE_WRITE`]
 //!   of its catalog read holds the table's `ROW EXCLUSIVE` lock from the first of
-//!   them until it commits. The barrier comes [`GRACE_PUBLISH`] (longer) after the
-//!   catalog commit, so it finds that lock held, waits for the commit, and the
-//!   backfill, which starts after it, sees the write. (A `SELECT ... FOR UPDATE`
-//!   alone takes only `ROW SHARE`, which the barrier does not wait for; the check
-//!   runs after the write's `INSERT`, `UPDATE` or `DELETE`, which is what counts.)
+//!   them until it commits. The barrier comes at least [`GRACE_PUBLISH`] (longer)
+//!   after the catalog commit, so it either finds that lock held and waits for the
+//!   commit or comes after the commit, and the backfill, which starts after it,
+//!   sees the write. (A `SELECT ... FOR UPDATE` alone takes only `ROW SHARE`,
+//!   which the barrier does not wait for; the check runs after the write's
+//!   `INSERT`, `UPDATE` or `DELETE`, which is what counts.)
 //! - A slower write re-reads the catalog before it commits and queues a repair for
 //!   any index it did not know about. If the re-read does not show the index, the
 //!   catalog commit came after it, so that write's lock was again taken before the
@@ -39,8 +46,8 @@
 //!
 //! Measurement error only ever makes a write look slower or the wait longer, which
 //! is the safe direction: the clock is one that keeps counting while the host is
-//! suspended, the writer measures to a point after its write, and `UpdateTable`
-//! measures from after its commit returned.
+//! suspended, the writer measures to a point after its write, and the build task,
+//! which `UpdateTable` starts after its commit returned, measures from its start.
 //!
 //! One gap is left. A write that needs no transaction (a plain put or delete on
 //! a table it believed had no index) commits with its one statement, so if it
@@ -72,9 +79,11 @@ use crate::gsi_queue::{GsiApplyContext, GsiIndexDef, PendingApplyContext, enqueu
 /// its commit, and still rely on the backfill to have seen it.
 pub(crate) const GRACE_WRITE: Duration = Duration::from_millis(500);
 
-/// How long `UpdateTable` waits after committing a `CREATING` index before the
-/// barrier and backfill. Must exceed [`GRACE_WRITE`]; the margin covers the two
-/// clocks (a writer's and this call's) disagreeing on how long half a second is,
+/// How long a GSI build waits before its barrier and backfill. The build task
+/// starts the wait after `UpdateTable` has committed the `CREATING` index row and
+/// the task holds its build slot, so the barrier comes at least this long after
+/// the commit. Must exceed [`GRACE_WRITE`]; the margin covers the two clocks (a
+/// writer's and the build task's) disagreeing on how long half a second is,
 /// which is the one error the monotonic clock does not remove.
 pub(crate) const GRACE_PUBLISH: Duration = Duration::from_millis(1_000);
 
@@ -84,6 +93,18 @@ pub(crate) const GRACE_PUBLISH: Duration = Duration::from_millis(1_000);
 /// that stall. Small next to the vector backfill's batch because the lock is the
 /// point here.
 const BACKFILL_BATCH: i64 = 256;
+
+/// GSI builds one engine (one server process) runs at once: the builds
+/// `UpdateTable` starts and the recovery sweep's together.
+///
+/// A running build holds a PostgreSQL session of its own for its ownership lock
+/// (`vector_index::build_ownership`), and one data pool connection at a time for
+/// its barrier and page transactions. `UpdateTable` returns before its build
+/// starts, so without a bound a client that adds an index to one table after
+/// another starts all the builds at once, each with its own session. A build
+/// that finds every slot taken waits for one in its task with no connection
+/// open, still `CREATING`; slots go to builds in the order they asked.
+pub const GSI_BUILD_SLOTS: usize = 4;
 
 /// A point in time on a clock that keeps counting while the host is suspended.
 ///
@@ -186,6 +207,54 @@ pub(crate) async fn pause_after_index_read() {
 pub(crate) async fn pause_before_autocommit_statement() {
     pause(&PAUSE_BEFORE_AUTOCOMMIT_MS).await;
 }
+
+/// Test hook: the tables whose GSI builds are held, each with the number of
+/// backfill pages a build writes before it stops (0: before the scan starts).
+#[cfg(feature = "test-hooks")]
+static BACKFILL_HOLDS: std::sync::Mutex<Vec<(String, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// Hold the GSI builds of table `table_id` once they have written `after_pages`
+/// backfill pages (`Some(0)`: before the scan starts), or release them (`None`).
+///
+/// Lets a test see `UpdateTable` return while the backfill is stuck, write to the
+/// table during the build, or stop a build partway and restart the server under
+/// it. Keyed by table so the tests of one binary, which run in parallel, do not
+/// hold each other's builds. A hold lasts at most a minute, so a test that fails
+/// before releasing it cannot wedge a build for good.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub fn hold_gsi_backfill_for_tests(table_id: &str, after_pages: Option<usize>) {
+    let mut holds = BACKFILL_HOLDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    holds.retain(|(t, _)| t != table_id);
+    if let Some(pages) = after_pages {
+        holds.push((table_id.to_owned(), pages));
+    }
+}
+
+/// Where a build waits while [`hold_gsi_backfill_for_tests`] holds it: at the
+/// build's entry with `pages` 0, and after each backfill page with the count of
+/// pages written so far.
+#[cfg(feature = "test-hooks")]
+async fn backfill_hold_point(table_id: &str, pages: usize) {
+    let held = || {
+        BACKFILL_HOLDS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|(t, n)| t == table_id && *n == pages)
+    };
+    let step = Duration::from_millis(20);
+    let mut waited = Duration::ZERO;
+    while held() && waited < Duration::from_secs(60) {
+        tokio::time::sleep(step).await;
+        waited += step;
+    }
+}
+
+#[cfg(not(feature = "test-hooks"))]
+async fn backfill_hold_point(_table_id: &str, _pages: usize) {}
 
 /// One typed key value, as stored in a base or index table's key column.
 #[derive(Debug, Clone)]
@@ -573,6 +642,7 @@ pub(crate) async fn backfill(
         .transpose()?;
 
     let mut cursor: Option<BaseKey> = None;
+    let mut pages = 0usize;
     while let Some(end) = &last {
         // 1. The page's keys.
         let mut conds = Vec::new();
@@ -642,6 +712,8 @@ pub(crate) async fn backfill(
             .await?;
         }
 
+        pages += 1;
+        backfill_hold_point(table_id, pages).await;
         if same_key(&upper, end) {
             break;
         }
@@ -926,6 +998,8 @@ pub(crate) struct GsiBuild {
     pub(crate) index_name: String,
     pub(crate) def: GsiIndexDef,
     /// Held for the whole build so a peer's sweep leaves it alone; released on drop.
+    /// An `UpdateTable` build that had to wait for its build slot takes it in its
+    /// task when the slot comes.
     pub(crate) _owner: Option<crate::data::vector_index::BuildOwner>,
 }
 
@@ -1009,6 +1083,26 @@ async fn index_row_exists(
     Ok(found.is_some())
 }
 
+/// Whether this index is still a `CREATING` GSI on an `ACTIVE` table. Read under
+/// the index's ownership by a build that has waited for a build slot (an
+/// `UpdateTable` build or the recovery sweep): while it waited, another build
+/// may have published the index, or the index or its table may have been
+/// deleted.
+pub(crate) async fn index_still_building(
+    catalog: &sqlx::PgPool,
+    index_id: &str,
+) -> Result<bool, StorageError> {
+    let found: Option<(i32,)> = sqlx::query_as(
+        "SELECT 1 FROM indexes i JOIN tables t ON t.table_id = i.table_id \
+         WHERE i.index_id = $1 AND i.index_status = 'CREATING' AND t.table_status = 'ACTIVE'",
+    )
+    .bind(index_id)
+    .fetch_optional(catalog)
+    .await
+    .map_err(db_error)?;
+    Ok(found.is_some())
+}
+
 /// Wait, barrier, backfill and publish each build, in order.
 ///
 /// Returns how many this call published, or the position of the first build
@@ -1026,6 +1120,7 @@ pub(crate) async fn build_gsis(
     if builds.is_empty() {
         return Ok(0);
     }
+    backfill_hold_point(table_id, 0).await;
     let mut published_here = 0usize;
     tokio::time::sleep(GRACE_PUBLISH).await;
     if let Err(e) = write_barrier(data, table_id).await {
@@ -1218,18 +1313,21 @@ async fn reconcile_pass(
         else {
             continue;
         };
+        // A build slot ([`GSI_BUILD_SLOTS`]), the same ones UpdateTable's builds
+        // take. After ownership, so the sweep waits only for an index it is going
+        // to build, holding that one ownership session while it waits; before the
+        // re-read, so the re-read sees the index as it is when the wait ends.
+        let Ok(_slot) = std::sync::Arc::clone(&engine.gsi_build_slots)
+            .acquire_owned()
+            .await
+        else {
+            continue;
+        };
         // Re-read under ownership: the list above is a snapshot, and the build
         // that held this index a moment ago may have published or abandoned it.
-        let still_building: Result<Option<(i32,)>, _> = sqlx::query_as(
-            "SELECT 1 FROM indexes i JOIN tables t ON t.table_id = i.table_id \
-             WHERE i.index_id = $1 AND i.index_status = 'CREATING' AND t.table_status = 'ACTIVE'",
-        )
-        .bind(&index_id)
-        .fetch_optional(&engine.pool)
-        .await;
-        match still_building {
-            Ok(Some(_)) => {}
-            Ok(None) => continue,
+        match index_still_building(&engine.pool, &index_id).await {
+            Ok(true) => {}
+            Ok(false) => continue,
             Err(e) => {
                 tracing::warn!(index_id = %index_id, "could not re-check a CREATING GSI: {e}");
                 continue;
