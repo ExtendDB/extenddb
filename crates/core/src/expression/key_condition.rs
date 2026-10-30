@@ -18,6 +18,9 @@ use super::parser_common;
 use super::tokenizer::Token;
 use crate::error::DynamoDbError;
 
+mod no_hash_equality;
+mod references;
+
 /// Parsed key condition: partition key value expression(s) and optional sort key condition.
 ///
 /// For standard (single-attribute) keys, `pk_path`/`pk_value` hold the single PK condition
@@ -27,7 +30,10 @@ use crate::error::DynamoDbError;
 /// `extra_pk_conditions` holds additional PK equality conditions.
 #[derive(Debug, Clone)]
 pub struct KeyCondition {
-    /// First partition key attribute path (resolved name).
+    /// First partition key attribute path (resolved name). Empty when the
+    /// expression held one or two clauses and none is an equality; they are
+    /// then `sk_condition` and `extra_sk_conditions`, and
+    /// [`KeyCondition::refuse_without_hash_equality`] refuses them.
     pub pk_path: Vec<PathElement>,
     /// First partition key value expression (placeholder or literal).
     pub pk_value: Expr,
@@ -409,9 +415,9 @@ fn classify_single(clause: RawClause) -> Result<KeyCondition, DynamoDbError> {
             sk_condition: None,
             extra_sk_conditions: Vec::new(),
         }),
-        _ => Err(validation_err(
-            "Invalid KeyConditionExpression: partition key condition must use equality (=)",
-        )),
+        // The wording of the refusal depends on the key schema, which is not
+        // known here. See `KeyCondition::refuse_without_hash_equality`.
+        other => Ok(KeyCondition::without_equality(raw_to_sk(other), None)),
     }
 }
 
@@ -419,7 +425,7 @@ fn classify_pair(a: RawClause, b: RawClause) -> Result<KeyCondition, DynamoDbErr
     // When both clauses are Eq, we assign the first as PK and second as SK.
     // The caller must call `resolve_pk_sk()` after parsing to correct the
     // assignment using the table's key schema (REQ-QUERY-002).
-    // One must be EQ (the PK), the other is the SK condition
+    // One is EQ (the PK) and the other is the SK condition
     match (a, b) {
         (RawClause::Eq(pk_path, pk_value), sk) | (sk, RawClause::Eq(pk_path, pk_value)) => {
             Ok(KeyCondition {
@@ -430,8 +436,11 @@ fn classify_pair(a: RawClause, b: RawClause) -> Result<KeyCondition, DynamoDbErr
                 extra_sk_conditions: Vec::new(),
             })
         }
-        _ => Err(validation_err(
-            "Invalid KeyConditionExpression: one condition must be an equality on the partition key",
+        // Neither clause is an equality. As for a single clause, the key
+        // schema decides the wording. See `KeyCondition::refuse_without_hash_equality`.
+        (a, b) => Ok(KeyCondition::without_equality(
+            raw_to_sk(a),
+            Some(raw_to_sk(b)),
         )),
     }
 }
