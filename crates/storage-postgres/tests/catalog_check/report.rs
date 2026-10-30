@@ -9,6 +9,7 @@ use extenddb_core::types::DeleteTableInput;
 use extenddb_storage::TableEngine;
 use extenddb_storage::diagnostics::{CatalogRelation, DiagError, DiagnosticsStore};
 use extenddb_storage_postgres::{CatalogCheckPoint, arm_catalog_check_pause};
+use sqlx::Connection;
 
 use crate::support::{ACCOUNT, Deployment, TABLE, base_conn, skip};
 
@@ -207,6 +208,46 @@ async fn rows_being_created_or_deleted_are_not_reported_missing() {
         .expect("check");
     let missing: BTreeSet<String> = check.missing.into_iter().map(|m| m.relation).collect();
     assert_eq!(missing, all);
+}
+
+/// A check that finds every listed relation named takes no lock: a write to
+/// `indexes` left open (a slow GSI add, a status change) does not hold it up.
+#[tokio::test]
+async fn a_check_that_finds_every_relation_named_does_not_wait_for_index_writers() {
+    let test = "a_check_that_finds_every_relation_named_does_not_wait_for_index_writers";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let d = Deployment::new().await;
+    d.create_table_with_indexes(TABLE).await;
+    let mut writer = sqlx::PgConnection::connect(&d.catalog_url())
+        .await
+        .expect("a catalog session for the writer");
+    sqlx::query("BEGIN")
+        .execute(&mut writer)
+        .await
+        .expect("begin");
+    sqlx::query("UPDATE indexes SET index_status = index_status WHERE index_name = 'gsi1'")
+        .execute(&mut writer)
+        .await
+        .expect("an open write to indexes");
+
+    let started = std::time::Instant::now();
+    let check = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        d.diagnostics.check_storage_relations(),
+    )
+    .await
+    .expect("the check did not wait out 5 s")
+    .expect("check");
+    let took = started.elapsed();
+    assert!(check.orphaned.is_empty(), "orphaned: {:?}", check.orphaned);
+    assert!(check.missing.is_empty(), "missing: {:?}", check.missing);
+    assert!(
+        took < std::time::Duration::from_secs(2),
+        "the check took {took:?} with an index write open"
+    );
+    writer.close().await.expect("end the writer");
 }
 
 /// A catalog with no data database setting, or an empty one, is refused

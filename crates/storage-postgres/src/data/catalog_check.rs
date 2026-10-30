@@ -31,9 +31,11 @@
 //!
 //! # The reads, and what they leave out while a server is running
 //!
-//! [`check`] lists the relations, waits for the `indexes` writers in flight
-//! and reads the catalog ([`read_after_index_writers`]), lists the relations
-//! again and reads the catalog again.
+//! [`check`] lists the relations and reads the catalog. When a listed
+//! relation is unnamed, it waits for the `indexes` writers in flight and
+//! reads the catalog again ([`read_after_index_writers`]); a check that
+//! finds every relation named takes no lock. Then it lists the relations
+//! again and reads the catalog a last time.
 //!
 //! - Orphaned: in the first listing, unnamed by the read after the wait, and
 //!   still in the second listing. A relation whose catalog row a server has
@@ -87,10 +89,11 @@ pub(crate) const INDEX_LOCK_BUDGET: Duration = Duration::from_secs(30);
 /// While the request waits, every new write to `indexes` (a `CreateTable`
 /// with indexes, a GSI add, a status change, the cascade of a
 /// `DeleteTable`) queues behind it, so this is the longest a server write
-/// waits on the command. A fifth of PostgreSQL's default `deadlock_timeout`
-/// (1 s); the command holds no other lock while it waits, so it cannot be
-/// part of a deadlock.
-const INDEX_LOCK_ATTEMPT: Duration = Duration::from_millis(200);
+/// waits on the command. A tenth of PostgreSQL's default `deadlock_timeout`
+/// (1 s), and well under the default `control_plane_delay_seconds` (0.25 s)
+/// that a `CreateTable` held this long eats into. The command holds no other
+/// lock while it waits, so it cannot be part of a deadlock.
+const INDEX_LOCK_ATTEMPT: Duration = Duration::from_millis(100);
 
 /// The pause between two attempts, in which the writers that queued behind
 /// the last one run.
@@ -314,7 +317,13 @@ pub(crate) async fn check(
 ) -> Result<StorageRelationCheck, sqlx::Error> {
     let deadline = Instant::now() + budget;
     let listed = storage_relations(data).await?;
-    let named = read_after_index_writers(catalog, deadline).await?;
+    let mut named = read_catalog(catalog, deadline).await?;
+    // A listed relation no row names may be a GSI add's whose row has not
+    // committed. Only then is the lock taken, so a check that finds every
+    // relation named holds up no write to `indexes`.
+    if listed.iter().any(|relation| !named.contains_key(relation)) {
+        named = read_after_index_writers(catalog, deadline).await?;
+    }
     #[cfg(feature = "test-hooks")]
     test_pause::reached(test_pause::CatalogCheckPoint::AfterCatalogRead).await;
     let listed_again = storage_relations(data).await?;

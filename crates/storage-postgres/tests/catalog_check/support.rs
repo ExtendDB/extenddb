@@ -202,7 +202,7 @@ impl Deployment {
         }
     }
 
-    fn catalog_url(&self) -> String {
+    pub(crate) fn catalog_url(&self) -> String {
         format!("{}/{}", self.base, self.catalog_db)
     }
 
