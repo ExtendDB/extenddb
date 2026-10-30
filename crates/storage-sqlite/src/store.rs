@@ -127,6 +127,10 @@ impl SqliteEngine {
         if in_memory {
             opts = opts.idle_timeout(None).max_lifetime(None);
         }
+        // The database file stores the AES encryption key alongside the data it
+        // protects (encrypted access-key secrets, password hashes), so the file
+        // and its sidecars are kept to owner read/write; see `file_mode`.
+        crate::file_mode::prepare(path_or_url).map_err(StorageError::Connection)?;
         let pool = opts
             .after_connect(|conn, _| {
                 Box::pin(async move {
@@ -142,22 +146,7 @@ impl SqliteEngine {
             .connect(&url)
             .await
             .map_err(|e| StorageError::Connection(e.to_string()))?;
-
-        // The database file stores the AES encryption key alongside the data it
-        // protects (encrypted access-key secrets, password hashes). Restrict the
-        // file and its WAL/SHM sidecars to owner read/write so other local users
-        // or processes cannot read it and decrypt secrets. In-memory databases
-        // have no file to protect.
-        #[cfg(unix)]
-        if !in_memory {
-            use std::os::unix::fs::PermissionsExt;
-            for suffix in ["", "-wal", "-shm"] {
-                let f = format!("{path_or_url}{suffix}");
-                if std::path::Path::new(&f).exists() {
-                    let _ = std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600));
-                }
-            }
-        }
+        crate::file_mode::restrict(path_or_url).map_err(StorageError::Connection)?;
 
         let initial_index_delay: u64 =
             sqlx::query_as::<_, (String,)>(INDEX_PROPAGATION_DELAY_QUERY)

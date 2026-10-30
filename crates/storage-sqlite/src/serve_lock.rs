@@ -203,7 +203,7 @@ impl ServeLock {
 /// Follow symlinks along `path` as far as they go, by hand. `canonicalize`
 /// refuses a path whose final target does not exist; this returns that
 /// target instead, so a dangling link still names the file it will become.
-fn resolve_dangling_symlinks(path: &Path) -> PathBuf {
+pub(crate) fn resolve_dangling_symlinks(path: &Path) -> PathBuf {
     let mut current = path.to_path_buf();
     // Bounded like the kernel's own symlink-loop limit.
     for _ in 0..40 {

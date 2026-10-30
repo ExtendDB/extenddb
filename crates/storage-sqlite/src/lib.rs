@@ -30,6 +30,7 @@ mod create_table;
 mod credential_store;
 mod data;
 mod delete_table;
+mod file_mode;
 mod hooks;
 mod management_store;
 mod metadata;
@@ -106,9 +107,10 @@ use extenddb_storage::settings_store::SettingsStoreError;
 use crate::sqlite_util::sqlite_url;
 
 /// Open a small catalog-only pool for the settings/diagnostics factories,
-/// applying the same PRAGMAs as the engine.
-async fn catalog_pool(connection_string: &str) -> Result<sqlx::SqlitePool, sqlx::Error> {
-    sqlx::sqlite::SqlitePoolOptions::new()
+/// applying the same PRAGMAs and file modes as the engine.
+async fn catalog_pool(connection_string: &str) -> Result<sqlx::SqlitePool, String> {
+    file_mode::prepare(connection_string)?;
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(4)
         .after_connect(|conn, _| {
             Box::pin(async move {
@@ -121,6 +123,9 @@ async fn catalog_pool(connection_string: &str) -> Result<sqlx::SqlitePool, sqlx:
         })
         .connect(&sqlite_url(connection_string))
         .await
+        .map_err(|e| e.to_string())?;
+    file_mode::restrict(connection_string)?;
+    Ok(pool)
 }
 
 // ── Bootstrapper ───────────────────────────────────────────────────────
