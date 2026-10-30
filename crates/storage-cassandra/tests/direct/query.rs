@@ -6,6 +6,7 @@
 use extenddb_core::expression::{CompareOp, Expr, ExpressionMaps, KeyCondition};
 use extenddb_core::types::AttributeValue;
 use extenddb_storage::DataEngine;
+use extenddb_storage::ReadOptions;
 use std::collections::BTreeMap;
 
 use crate::helpers::{TestTable, setup_engine};
@@ -57,6 +58,7 @@ async fn test_query_pk_only() {
             None,
             None,
             None,
+            ReadOptions::default(),
         )
         .await
         .expect("query should succeed");
@@ -145,6 +147,7 @@ async fn test_query_with_sk_equals() {
             None,
             None,
             None,
+            ReadOptions::default(),
         )
         .await
         .expect("query should succeed");
@@ -226,6 +229,7 @@ async fn test_query_with_sk_comparison() {
             None,
             None,
             None,
+            ReadOptions::default(),
         )
         .await
         .expect("query should succeed");
@@ -328,6 +332,7 @@ async fn test_query_with_numeric_sk() {
             None,
             None,
             None,
+            ReadOptions::default(),
         )
         .await
         .expect("query should succeed");
@@ -429,6 +434,7 @@ async fn test_query_with_decimal_sk_range_and_order() {
             None,
             None,
             None,
+            ReadOptions::default(),
         )
         .await
         .expect("decimal range query should succeed");
@@ -512,6 +518,7 @@ async fn test_query_ordering() {
             None,
             None,
             None,
+            ReadOptions::default(),
         )
         .await
         .expect("forward query should succeed");
@@ -544,6 +551,7 @@ async fn test_query_ordering() {
             None,
             None,
             None,
+            ReadOptions::default(),
         )
         .await
         .expect("reverse query should succeed");
@@ -625,6 +633,7 @@ async fn test_query_limit() {
             Some(3),
             None,
             None,
+            ReadOptions::default(),
         )
         .await
         .expect("query should succeed");
@@ -708,6 +717,7 @@ async fn test_query_pagination() {
             Some(3),
             None,
             None,
+            ReadOptions::default(),
         )
         .await
         .expect("first query should succeed");
@@ -729,6 +739,7 @@ async fn test_query_pagination() {
             Some(3),
             last_key1.as_ref(),
             None,
+            ReadOptions::default(),
         )
         .await
         .expect("second query should succeed");
@@ -750,6 +761,7 @@ async fn test_query_pagination() {
             Some(3),
             last_key2.as_ref(),
             None,
+            ReadOptions::default(),
         )
         .await
         .expect("third query should succeed");
@@ -771,6 +783,7 @@ async fn test_query_pagination() {
             Some(3),
             last_key3.as_ref(),
             None,
+            ReadOptions::default(),
         )
         .await
         .expect("fourth query should succeed");
@@ -875,6 +888,7 @@ async fn test_query_between() {
             None,
             None,
             None,
+            ReadOptions::default(),
         )
         .await
         .expect("query should succeed");
@@ -970,6 +984,7 @@ async fn test_query_begins_with() {
             None,
             None,
             None,
+            ReadOptions::default(),
         )
         .await
         .expect("query should succeed");
@@ -1077,6 +1092,7 @@ async fn test_query_gsi() {
             None,
             None,
             Some("StatusIndex"),
+            ReadOptions::default(),
         )
         .await
         .expect("query GSI should succeed");
@@ -1173,6 +1189,7 @@ async fn test_query_gsi_pagination() {
             Some(3),
             None,
             Some("StatusIndex"),
+            ReadOptions::default(),
         )
         .await
         .expect("first GSI query should succeed");
@@ -1191,6 +1208,7 @@ async fn test_query_gsi_pagination() {
             Some(3),
             last_key1.as_ref(),
             Some("StatusIndex"),
+            ReadOptions::default(),
         )
         .await
         .expect("second GSI query should succeed");
@@ -1209,6 +1227,7 @@ async fn test_query_gsi_pagination() {
             Some(3),
             last_key2.as_ref(),
             Some("StatusIndex"),
+            ReadOptions::default(),
         )
         .await
         .expect("third GSI query should succeed");
@@ -1227,6 +1246,7 @@ async fn test_query_gsi_pagination() {
             Some(3),
             last_key3.as_ref(),
             Some("StatusIndex"),
+            ReadOptions::default(),
         )
         .await
         .expect("fourth GSI query should succeed");
@@ -1319,6 +1339,7 @@ async fn test_query_lsi() {
             None,
             None,
             Some("LsiPriority"),
+            ReadOptions::default(),
         )
         .await
         .expect("query LSI should succeed");
@@ -1434,6 +1455,7 @@ async fn test_query_gsi_with_sort_key() {
             None,
             None,
             Some("CategoryTimeIndex"),
+            ReadOptions::default(),
         )
         .await
         .expect("simple GSI query should succeed");
@@ -1481,6 +1503,7 @@ async fn test_query_gsi_with_sort_key() {
             None,
             None,
             Some("CategoryTimeIndex"),
+            ReadOptions::default(),
         )
         .await
         .expect("query GSI with SK condition should succeed");

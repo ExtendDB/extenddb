@@ -275,6 +275,9 @@ pub async fn handle_export_table(
     let max_export_items = ctx.limits.max_export_item_count;
     let mut exclusive_start_key: Option<Item> = None;
     loop {
+        // An export reflects every write acknowledged before the export time,
+        // so its pages are read consistent; a backend that serves eventually
+        // consistent reads from a replica must not serve these from it.
         let (items, last_key) = ctx
             .storage
             .scan(
@@ -284,6 +287,7 @@ pub async fn handle_export_table(
                 None,
                 None,
                 None,
+                extenddb_storage::ReadOptions::new(true),
             )
             .await
             .map_err(storage_err_to_dynamo)?;

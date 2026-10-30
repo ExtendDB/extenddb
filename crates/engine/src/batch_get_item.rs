@@ -11,6 +11,7 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::Projection;
 use extenddb_core::types::{BatchGetItemInput, BatchGetItemOutput, Item, item_size_bytes};
 use extenddb_core::validation::{validate_batch_key_only, validate_key_sizes};
+use extenddb_storage::ReadOptions;
 
 use crate::OperationContext;
 use crate::capacity_helpers;
@@ -163,6 +164,10 @@ pub async fn handle_batch_get_item(
             .map_err(storage_err_to_dynamo)?;
 
         let projection = table_projections.get(table_name).and_then(Option::as_ref);
+        // Each table carries its own ConsistentRead; one derivation serves both
+        // the read that reaches storage and the capacity it is charged.
+        let strongly_consistent = ka.consistent_read == Some(true);
+        let read_opts = ReadOptions::new(strongly_consistent);
 
         let mut table_items: Vec<Item> = Vec::new();
         for key in &ka.keys {
@@ -171,12 +176,11 @@ pub async fn handle_batch_get_item(
 
             if let Some(item) = ctx
                 .storage
-                .get_item(&key_info, key)
+                .get_item(&key_info, key, read_opts)
                 .await
                 .map_err(storage_err_to_dynamo)?
             {
                 let size = item_size_bytes(&item);
-                let strongly_consistent = ka.consistent_read == Some(true);
                 let item_rcu = capacity_helpers::read_capacity_units(size, strongly_consistent);
                 total_rcu += item_rcu;
                 *per_table_rcu.entry(table_name.clone()).or_default() += item_rcu;

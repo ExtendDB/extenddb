@@ -19,7 +19,7 @@
 mod helpers;
 
 use extenddb_core::types::{AttributeValue, Item};
-use extenddb_storage::{DataEngine, MetadataEngine};
+use extenddb_storage::{DataEngine, MetadataEngine, ReadOptions};
 
 use crate::helpers::setup_engine;
 
@@ -176,7 +176,12 @@ async fn bench_expiration_drain_throughput() {
         for index in 0..EXPIRED_ITEMS {
             let mut key = Item::new();
             key.insert("id".to_owned(), AttributeValue::S(format!("drain-{index}")));
-            if engine.get_item(key_info, &key).await.unwrap().is_some() {
+            if engine
+                .get_item(key_info, &key, ReadOptions::default())
+                .await
+                .unwrap()
+                .is_some()
+            {
                 left += 1;
             }
         }

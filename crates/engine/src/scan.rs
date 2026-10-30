@@ -13,6 +13,7 @@ use extenddb_core::types::{
     IndexType, ProjectionType, ScanInput, ScanOutput, Select, TableKeyInfo,
     VECTOR_INDEX_BACKFILLING_SCAN_PREFIX, VECTOR_INDEX_SCAN_NOT_SUPPORTED,
 };
+use extenddb_storage::ReadOptions;
 use extenddb_storage::error::StorageError;
 
 use crate::OperationContext;
@@ -470,6 +471,8 @@ pub async fn handle_scan(
         index_proj,
         base_key_schema: &key_info.key_schema,
     };
+    let strongly_consistent = input.consistent_read == Some(true);
+    let read_opts = ReadOptions::new(strongly_consistent);
     let page = read_page(
         input.limit,
         input.exclusive_start_key.as_ref(),
@@ -482,6 +485,7 @@ pub async fn handle_scan(
                 input.segment,
                 input.total_segments,
                 input.index_name.as_deref(),
+                read_opts,
             )
         },
     )
@@ -490,7 +494,6 @@ pub async fn handle_scan(
 
     // Capacity metering: RCU based on the pre-projection size of the evaluated items.
     let pre_projection_bytes = page.evaluated_bytes;
-    let strongly_consistent = input.consistent_read == Some(true);
     let rcu = capacity_helpers::read_capacity_units(pre_projection_bytes, strongly_consistent);
 
     let output = ScanOutput {

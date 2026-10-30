@@ -28,7 +28,7 @@ use extenddb_core::types::{
     AttributeDefinition, AttributeValue, BillingMode, CreateTableInput, Item, KeySchemaElement,
     KeyType, ScalarAttributeType, TableKeyInfo, UpdateTableInput,
 };
-use extenddb_storage::{DataEngine, TableEngine};
+use extenddb_storage::{DataEngine, ReadOptions, TableEngine};
 use extenddb_storage_postgres::{PostgresConfig, PostgresEngine};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
@@ -1055,7 +1055,10 @@ async fn a_write_to_a_dropped_data_table_is_table_not_found() {
             .map(|_| "ok")
             .unwrap_or("an error other than TableNotFound")
     );
-    let get = s.engine.get_item(&key_info, &item(1, None, None)).await;
+    let get = s
+        .engine
+        .get_item(&key_info, &item(1, None, None), ReadOptions::default())
+        .await;
     assert!(
         matches!(
             get,

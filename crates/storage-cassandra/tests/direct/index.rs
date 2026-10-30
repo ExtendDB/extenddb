@@ -10,6 +10,7 @@ use extenddb_core::types::{
 use extenddb_storage_cassandra::CassandraEngine;
 
 use crate::helpers::{ensure_test_account, test_config, unique_test_account, unique_test_id};
+use extenddb_storage::ReadOptions;
 
 #[tokio::test]
 async fn test_create_and_drop_index_table() {
@@ -646,6 +647,7 @@ async fn gsi_query_count(
             None,
             None,
             Some(gsi_name),
+            ReadOptions::default(),
         )
         .await
         .map(|(items, _)| items.len())
