@@ -214,10 +214,13 @@ pub fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> Dynamo
             DynamoDbError::InternalServerError("Internal server error".to_owned())
         }
         StorageError::TransactionConflict(msg) => {
-            // Single-item write raced an in-flight TransactWriteItems on
-            // the same item and the backend couldn't serialize them
-            // through internal retries. RFC-0003 §4.3 requires
-            // TransactionConflictException here — never InternalServerError.
+            // A single-item write met an in-flight TransactWriteItems on the
+            // same item and the backend did not wait it out. The service
+            // answers TransactionConflictException to a single-item write only
+            // while a TransactWriteItems holds the item. The MongoDB backend
+            // reports a write that lost to other single-item writers as
+            // Transient (503); Cassandra reports it as TransactionConflict.
+            // Never InternalServerError.
             DynamoDbError::TransactionConflictException(msg)
         }
         StorageError::Internal(msg) => {

@@ -26,6 +26,7 @@ mod stream_engine;
 mod table_engine;
 mod ttl_worker;
 mod worker_store;
+mod write_conflict;
 
 pub use bootstrapper::MongoBootstrapper;
 pub use catalog_store::MongoCatalogStore;
