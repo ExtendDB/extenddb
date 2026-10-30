@@ -211,8 +211,10 @@ Login rate limiting and account lockout:
 - `count_principal_failures`, `count_ip_failures`, `record_failed_login`,
   `cleanup_old_attempts`
 
-Tracks failed login attempts by principal and source IP to mitigate clients
-sending excessive traffic.
+Records failed login attempts with the principal and the source address, and
+counts them per (principal, source address) pair and per source address, so
+the server can refuse an address that has failed too often for one principal
+or overall without locking the principal out of other addresses.
 
 ### AuthorizationStore
 

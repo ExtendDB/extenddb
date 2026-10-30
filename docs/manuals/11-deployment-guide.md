@@ -206,7 +206,7 @@ extenddb init \
 
 - [ ] Set `bind_addr` to the appropriate interface (not `0.0.0.0` unless behind a load balancer)
 - [ ] Firewall: allow only necessary ports (extenddb port, storage backend port)
-- [ ] Consider a reverse proxy (nginx, HAProxy) for TLS termination, rate limiting, and access logging
+- [ ] Consider a reverse proxy (nginx, HAProxy) for TLS termination, rate limiting, and access logging. Login limits count the proxy's address as the source for every caller behind it (see the security model manual).
 
 ### Database (PostgreSQL)
 
