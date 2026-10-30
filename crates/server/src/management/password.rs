@@ -39,6 +39,19 @@ pub async fn hash_password(password: String) -> Result<String, bcrypt::BcryptErr
         })
 }
 
-// Password verification (verify_password) has been migrated to the
-// AdminStore and ManagementStore trait implementations in storage-postgres.
-// The server crate only needs hash_password for creating/updating passwords.
+/// Verify a password against a stored bcrypt hash on a blocking thread.
+///
+/// The console login uses this so that it verifies the same hash it binds the
+/// new session to. The management API's Basic auth verifies through the
+/// `AdminStore` and `ManagementStore` implementations instead.
+///
+/// Returns `false` when the password does not match, when `hash` is not a
+/// valid bcrypt hash, or when the blocking task fails.
+pub async fn verify_password(password: String, hash: String) -> bool {
+    tokio::task::spawn_blocking(move || bcrypt::verify(password, &hash).unwrap_or(false))
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("bcrypt blocking task failed: {e}");
+            false
+        })
+}

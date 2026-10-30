@@ -4,7 +4,8 @@
 //! Console page handlers.
 //!
 //! Each handler queries the catalog DB directly and renders server-side HTML.
-//! Authentication is via session cookies validated against the in-memory store.
+//! Authentication is via session cookies validated against the in-memory store
+//! and, on every request, against the principal's password hash in the catalog.
 //! All state-changing POST forms include a CSRF token validated on submission.
 
 mod access_key_pages;
@@ -41,10 +42,11 @@ pub use user_pages::{create_user, delete_user, new_user_form, user_detail};
 
 use std::sync::Arc;
 
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 
 use crate::console::ConsoleState;
+use crate::console::session::SessionCheck;
 use crate::management::CallerIdentity;
 
 /// Session data returned by `require_session`: identity + CSRF token.
@@ -53,24 +55,32 @@ pub struct SessionData {
     pub csrf_token: String,
 }
 
-/// Extract session identity and CSRF token from the cookie header. Returns
-/// the session data or a redirect to the login page.
+/// Extract the session from the cookie header and check it against the
+/// catalog. Returns the session data; a redirect to the login page when there
+/// is no session, it expired, or its principal was deleted or had its
+/// password changed; or 503 when the catalog cannot be read.
 #[allow(clippy::result_large_err)]
 async fn require_session(
     headers: &HeaderMap,
     state: &Arc<ConsoleState>,
 ) -> Result<SessionData, Response> {
-    let token = extract_session_token(headers);
-    let result = match token {
-        Some(t) => state.sessions.get(&t).await,
-        None => None,
+    let Some(token) = extract_session_token(headers) else {
+        return Err(Redirect::to("/console/login").into_response());
     };
-    match result {
-        Some((identity, csrf_token)) => Ok(SessionData {
+    match state.sessions.validate(&token, &*state.catalog_store).await {
+        SessionCheck::Valid {
+            identity,
+            csrf_token,
+        } => Ok(SessionData {
             identity,
             csrf_token,
         }),
-        None => Err(Redirect::to("/console/login").into_response()),
+        SessionCheck::Invalid => Err(Redirect::to("/console/login").into_response()),
+        SessionCheck::Unavailable => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The catalog is unavailable. Try again.",
+        )
+            .into_response()),
     }
 }
 

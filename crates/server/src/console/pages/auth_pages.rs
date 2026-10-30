@@ -9,11 +9,14 @@ use axum::Form;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
+use extenddb_storage::management_store::PasswordHashStore;
 use serde::Deserialize;
 
 use crate::console::ConsoleState;
 use crate::console::html;
+use crate::console::session::CredentialStamp;
 use crate::management::CallerIdentity;
+use crate::management::password::verify_password;
 use crate::rate_limit;
 
 use super::extract_session_token;
@@ -50,17 +53,16 @@ pub async fn login_submit(
     }
 
     // Try admin auth first.
-    let identity =
-        match try_admin_login(&form.username, &form.password, &*state.catalog_store).await {
-            AdminLoginResult::Authenticated(id) => Some(id),
-            AdminLoginResult::WrongPassword => None, // Admin exists, wrong password — do NOT fall through.
-            AdminLoginResult::NotFound => {
-                // Admin not found — try IAM user auth.
-                try_iam_login(&form.username, &form.password, &*state.catalog_store).await
-            }
-        };
+    let login = match try_admin_login(&form.username, &form.password, &*state.catalog_store).await {
+        AdminLoginResult::Authenticated(id, stamp) => Some((id, stamp)),
+        AdminLoginResult::WrongPassword => None, // Admin exists, wrong password: do NOT fall through.
+        AdminLoginResult::NotFound => {
+            // Admin not found: try IAM user auth.
+            try_iam_login(&form.username, &form.password, &*state.catalog_store).await
+        }
+    };
 
-    let Some(identity) = identity else {
+    let Some((identity, stamp)) = login else {
         rate_limit::record_failed_login(&*state.catalog_store, &form.username, Some(&source_ip))
             .await;
         return (
@@ -70,7 +72,7 @@ pub async fn login_submit(
             .into_response();
     };
 
-    let (token, _csrf) = state.sessions.create(identity).await;
+    let (token, _csrf) = state.sessions.create(identity, stamp).await;
     let cookie = format!(
         "extenddb_session={token}; Path=/console; HttpOnly; SameSite=Strict; Max-Age=28800"
     );
@@ -134,7 +136,7 @@ IAM users: enter <code>account_id/user_name</code>.
 /// Result of an admin login attempt — three-state to distinguish "not found"
 /// (fall through to IAM) from "wrong password" (reject immediately).
 enum AdminLoginResult {
-    Authenticated(CallerIdentity),
+    Authenticated(CallerIdentity, CredentialStamp),
     WrongPassword,
     NotFound,
 }
@@ -142,34 +144,45 @@ enum AdminLoginResult {
 async fn try_admin_login(
     username: &str,
     password: &str,
-    store: &dyn extenddb_storage::management_store::AdminStore,
+    store: &dyn PasswordHashStore,
 ) -> AdminLoginResult {
-    let Ok(result) = store.verify_admin_password(username, password).await else {
+    let Ok(Some(hash)) = store.get_admin_password_hash(username).await else {
         return AdminLoginResult::NotFound;
     };
-    match result {
-        Some(true) => AdminLoginResult::Authenticated(CallerIdentity::Admin(username.to_owned())),
-        Some(false) => AdminLoginResult::WrongPassword,
-        None => AdminLoginResult::NotFound,
+    match verify_login(password, hash).await {
+        Some(stamp) => {
+            AdminLoginResult::Authenticated(CallerIdentity::Admin(username.to_owned()), stamp)
+        }
+        None => AdminLoginResult::WrongPassword,
     }
 }
 
 async fn try_iam_login(
     username: &str,
     password: &str,
-    store: &dyn extenddb_storage::management_store::ManagementStore,
-) -> Option<CallerIdentity> {
+    store: &dyn PasswordHashStore,
+) -> Option<(CallerIdentity, CredentialStamp)> {
     let (acct_id, uname) = username.split_once('/')?;
-    let ok = store
-        .verify_iam_user_password(acct_id, uname, password)
+    // `None` when the user does not exist or has no console password.
+    let hash = store.get_user_password_hash(acct_id, uname).await.ok()??;
+    let stamp = verify_login(password, hash).await?;
+    let identity = CallerIdentity::IamUser {
+        account_id: acct_id.to_owned(),
+        user_name: uname.to_owned(),
+    };
+    Some((identity, stamp))
+}
+
+/// Verify a login password against the hash read from the catalog. On a
+/// match, returns the stamp of that same hash, which the new session is bound
+/// to. The hash is read once and used for both, so a password change that
+/// lands during the login either fails the login or ends the new session at
+/// its first request.
+///
+/// All console login verification goes through this function.
+async fn verify_login(password: &str, hash: String) -> Option<CredentialStamp> {
+    let stamp = CredentialStamp::of(&hash);
+    verify_password(password.to_owned(), hash)
         .await
-        .ok()?;
-    if ok {
-        Some(CallerIdentity::IamUser {
-            account_id: acct_id.to_owned(),
-            user_name: uname.to_owned(),
-        })
-    } else {
-        None
-    }
+        .then_some(stamp)
 }
