@@ -4,51 +4,67 @@
 //! The `Scan` checks that run on the request body alone, before the body is
 //! deserialized and before the table is looked up, in the service's order.
 //!
-//! Measured 2026-10-25 and 2026-10-30 (us-east-1, each request twice):
+//! Measured 2026-10-25, 2026-10-30 and 2026-10-31 (us-east-1, each request
+//! twice):
 //!
-//! 1. the range constraints on `Limit` (at least 1), `Segment` (0 to 999999)
-//!    and `TotalSegments` (1 to 1000000), each checked when present, whether or
-//!    not the other segment field is, every fault in one message: `1
-//!    validation error detected: Value at 'Limit' failed to satisfy
-//!    constraint: Member must have value greater than or equal to 1`, or `2
-//!    validation errors detected: ...; ...` in the order `Limit`, `Segment`,
-//!    `TotalSegments`. A float or a value outside int32 in any of the three,
-//!    or a value that is not one AttributeValue in `ExpressionAttributeValues`,
-//!    in `ExclusiveStartKey` or in a `ScanFilter` `AttributeValueList`,
+//! 1. the constraints the service aggregates into one message: the length of
+//!    `AttributesToGet` (at least 1) and the ranges of `Limit` (at least 1),
+//!    `Segment` (0 to 999999) and `TotalSegments` (1 to 1000000), each checked
+//!    when present, whether or not the other segment field is, every fault in
+//!    one message: `1 validation error detected: Value at 'Limit' failed to
+//!    satisfy constraint: Member must have value greater than or equal to 1`,
+//!    or `2 validation errors detected: ...; ...` in the order
+//!    `AttributesToGet`, `Limit`, `Segment`, `TotalSegments`. `Limit: 0` with
+//!    `AttributesToGet: []` answers the length clause and then the `Limit`
+//!    clause; the empty list alone, with a `FilterExpression`, and with a
+//!    `FilterExpression` and a number fault answers the length clause alone,
+//!    so the length comes ahead of the number check. A float or a value
+//!    outside int32 in any of the three number fields, or a value that is not
+//!    one AttributeValue in `ExpressionAttributeValues`, in
+//!    `ExclusiveStartKey` or in a `ScanFilter` `AttributeValueList`,
 //!    switches the message to the older form, `Value '-2147483648' at 'limit'
 //!    ...`, with the value saturated or truncated, in the order
-//!    `totalSegments`, `segment`, `limit`; see `validate_ranges`;
-//! 2. the length constraint on `AttributesToGet`: an empty list answers `1
-//!    validation error detected: Value at 'AttributesToGet' failed to satisfy
-//!    constraint: Member must have length greater than or equal to 1`, alone,
-//!    with a `FilterExpression`, and with a `FilterExpression` and a number
-//!    fault, so it comes ahead of the number check;
-//! 3. the expression and non-expression parameter mix, in which a `ScanFilter`
+//!    `totalSegments`, `segment`, `limit`; see `validate_constraints`;
+//! 2. the expression and non-expression parameter mix, in which a `ScanFilter`
 //!    object counts as present whether or not it is empty (`ScanFilter: {}`
 //!    with a `FilterExpression` answers the mix, `ScanFilter: {}` alone is
-//!    accepted);
-//! 4. the `ReturnConsumedCapacity` enum;
-//! 5. every number in `ExpressionAttributeValues`, `NS` members and values
+//!    accepted); `AttributesToGet: []` with `ScanFilter: {}` and a
+//!    `FilterExpression` answers the length clause, so the constraints come
+//!    ahead of the mix;
+//! 3. the `ReturnConsumedCapacity` enum;
+//! 4. every number in `ExpressionAttributeValues`, `NS` members and values
 //!    nested in `L` and `M` included, whether a `FilterExpression` reads the
 //!    value, nothing reads it, or the request carries no expression at all; a
 //!    Unicode decimal digit counts as the digit it stands for; then every
 //!    number in the `ExclusiveStartKey` values, which answers the same text as
-//!    a malformed number in a value;
-//! 6. the nesting depth of `ExpressionAttributeValues`: a value nested 32
+//!    a malformed number in a value, with no filter and on an index scan too,
+//!    and after the `ReturnConsumedCapacity` enum;
+//! 5. the nesting depth of `ExpressionAttributeValues`: a value nested 32
 //!    levels deep in `L` answers `Nesting Levels have exceeded supported
 //!    limits: Attributes in the item have nested levels beyond supported
 //!    limit`, 31 levels pass, and a malformed number anywhere is reported
 //!    first. The check counts `M` levels the same way as `L` levels; only `L`
 //!    was measured with a valid number at the bottom;
-//! 7. the `Select` enum. Both enums invalid answers the `ReturnConsumedCapacity`
-//!    error alone, so the two are not aggregated.
+//! 6. the `Select` enum, after the nesting check (32 levels with `Select:
+//!    "BAD"` answers the nesting text). Both enums invalid answers the
+//!    `ReturnConsumedCapacity` error alone, so the two are not aggregated.
 //!
 //! Not measured, and checked in the order listed above: the `AttributesToGet`
-//! length against the range constraints and against the enums, the
-//! `ExclusiveStartKey` number check against the `ExpressionAttributeValues`
-//! one, and the nesting check against the `Select` enum. A body nested deeper
-//! than the JSON parser accepts is a `SerializationException` from the parser,
-//! ahead of every check here.
+//! length clause beside a `Segment` or `TotalSegments` fault without a `Limit`
+//! fault (listed first, as beside `Limit`), the older form of the length
+//! clause (the empty list echoed, `Value '[]' at 'attributesToGet' ...`, and
+//! listed last, as the older form reverses the newer one), the length clause
+//! against the enums, the `ExclusiveStartKey` number check against the
+//! `ExpressionAttributeValues` one, `M` levels in the nesting count, and the
+//! nesting of a value an expression reads or of a request with no expression.
+//!
+//! The JSON parser accepts 128 levels of nesting, which is 62 `L` levels; a
+//! body nested deeper is a `SerializationException` from the parser, ahead of
+//! every check here. The service answers the nesting text from 32 to 62 levels
+//! and, from 63 to 100 levels, `ExpressionAttributeValues contains invalid
+//! value: Nesting Levels have exceeded supported limits: Attributes in the
+//! item have nested levels beyond supported limit for key :d` (measured
+//! 2026-10-30), which this module does not reach.
 //!
 //! Each of these is reported ahead of the next one, ahead of the table lookup,
 //! and ahead of the checks the handler makes after deserializing the body
@@ -70,8 +86,8 @@ use crate::query_key_values::{
 };
 
 /// The `Scan` checks that run on the raw request body, in the service's order:
-/// the `Limit`, `Segment` and `TotalSegments` ranges, the `AttributesToGet`
-/// length, the expression and non-expression parameter mix, the
+/// the `AttributesToGet` length and the `Limit`, `Segment` and `TotalSegments`
+/// ranges in one message, the expression and non-expression parameter mix, the
 /// `ReturnConsumedCapacity` enum, every number in `ExpressionAttributeValues`
 /// and `ExclusiveStartKey`, the nesting depth of `ExpressionAttributeValues`,
 /// then the `Select` enum.
@@ -95,8 +111,7 @@ pub fn validate_scan_request_body(body: &Value) -> Result<(), DynamoDbError> {
 /// The `Scan` checks in the service's order; see
 /// [`validate_scan_request_body`].
 fn scan_request_checks(body: &Value) -> Result<(), DynamoDbError> {
-    validate_ranges(body)?;
-    validate_attributes_to_get_length(body)?;
+    validate_constraints(body)?;
 
     extenddb_core::validation::validate_no_expression_param_mixing(
         &[
@@ -151,46 +166,35 @@ fn scan_request_checks(body: &Value) -> Result<(), DynamoDbError> {
     )
 }
 
-/// The length constraint on `AttributesToGet`: an empty list is refused in the
-/// newer form of the constraint text, with no value echoed (measured
-/// 2026-10-25 10:38 and 10:55 UTC: alone, with a `FilterExpression`, and with
-/// a `FilterExpression` and a malformed number).
-fn validate_attributes_to_get_length(body: &Value) -> Result<(), DynamoDbError> {
-    if body
-        .get("AttributesToGet")
-        .and_then(Value::as_array)
-        .is_some_and(Vec::is_empty)
-    {
-        return Err(DynamoDbError::ValidationException(
-            "1 validation error detected: Value at 'AttributesToGet' failed to satisfy constraint: Member must have length greater than or equal to 1".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
 /// `field` of the body read as a map of attribute values, or `None` when the
 /// field is absent or is not one; [`shape_fault_first`] reports the shape.
 fn attribute_value_map(body: &Value, field: &str) -> Option<HashMap<String, AttributeValue>> {
     serde_json::from_value(body.get(field)?.clone()).ok()
 }
 
-/// The range constraints on `Limit`, `Segment` and `TotalSegments`, every
-/// fault in one message, in one of the service's two forms (measured
-/// 2026-10-25, us-east-1).
+/// The constraints the service aggregates into one message: the length of
+/// `AttributesToGet` and the ranges of `Limit`, `Segment` and `TotalSegments`,
+/// every fault in one message, in one of the service's two forms (measured
+/// 2026-10-25 and 2026-10-30, us-east-1).
 ///
-/// When each field present is an integer inside the int32 range, the newer
-/// form: `Value at '<Field>' failed to satisfy constraint: ...` with the field
-/// capitalised and no value echoed, in the order `Limit`, `Segment`,
-/// `TotalSegments`. When any of the three is a float or outside int32, or a
-/// value in `ExpressionAttributeValues`, `ExclusiveStartKey` or a `ScanFilter`
-/// `AttributeValueList` is not one AttributeValue (see
+/// When each number field present is an integer inside the int32 range, the
+/// newer form: `Value at '<Field>' failed to satisfy constraint: ...` with the
+/// field capitalised and no value echoed, in the order `AttributesToGet`,
+/// `Limit`, `Segment`, `TotalSegments` (`Limit: 0` with `AttributesToGet: []`
+/// answers the length clause, then the `Limit` clause, measured 2026-10-30
+/// 12:40 UTC; the length clause beside a `Segment` or `TotalSegments` fault
+/// alone is not measured). When any of the three is a float or outside int32,
+/// or a value in `ExpressionAttributeValues`, `ExclusiveStartKey` or a
+/// `ScanFilter` `AttributeValueList` is not one AttributeValue (see
 /// [`has_unreadable_attribute_value`]), the older form: `Value '<n>' at
 /// '<field>' ...` with the value as [`saturated_int32`] reads it and the field
 /// in lower camel case, in the reverse of the newer form's order:
 /// `totalSegments`, `segment`, `limit` (measured 2026-10-30 12:40 UTC with a
 /// fault in each of the three, and on 2026-10-25 with `segment` then `limit`
-/// and `totalSegments` then `limit`).
-fn validate_ranges(body: &Value) -> Result<(), DynamoDbError> {
+/// and `totalSegments` then `limit`). The older form of the length clause is
+/// not measured: the code echoes the empty list, `Value '[]' at
+/// 'attributesToGet' ...`, and lists it last.
+fn validate_constraints(body: &Value) -> Result<(), DynamoDbError> {
     let numbers: Vec<(&RangeField, &serde_json::Number)> = RANGE_FIELDS
         .iter()
         .filter_map(|range| {
@@ -205,48 +209,50 @@ fn validate_ranges(body: &Value) -> Result<(), DynamoDbError> {
                 .as_i64()
                 .is_none_or(|value| i32::try_from(value).is_err())
         });
-    let faults: Vec<(&RangeField, i32, String)> = numbers
-        .into_iter()
-        .filter_map(|(range, number)| {
-            let value = saturated_int32(number);
-            if value < range.min {
-                Some((
-                    range,
-                    value,
-                    format!("greater than or equal to {}", range.min),
-                ))
-            } else {
-                range
-                    .max
-                    .filter(|max| value > *max)
-                    .map(|max| (range, value, format!("less than or equal to {max}")))
-            }
-        })
-        .collect();
+    // Each fault as its newer-form and its older-form clause, in the newer
+    // form's order.
+    let mut faults: Vec<(String, String)> = Vec::new();
+    if body
+        .get("AttributesToGet")
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty)
+    {
+        faults.push((
+            "Value at 'AttributesToGet' failed to satisfy constraint: Member must have length greater than or equal to 1".to_owned(),
+            "Value '[]' at 'attributesToGet' failed to satisfy constraint: Member must have length greater than or equal to 1".to_owned(),
+        ));
+    }
+    for (range, number) in numbers {
+        let value = saturated_int32(number);
+        let constraint = if value < range.min {
+            format!("greater than or equal to {}", range.min)
+        } else if let Some(max) = range.max.filter(|max| value > *max) {
+            format!("less than or equal to {max}")
+        } else {
+            continue;
+        };
+        faults.push((
+            format!(
+                "Value at '{}' failed to satisfy constraint: Member must have value {constraint}",
+                range.field
+            ),
+            format!(
+                "Value '{value}' at '{}' failed to satisfy constraint: Member must have value {constraint}",
+                range.older_field
+            ),
+        ));
+    }
     if faults.is_empty() {
         return Ok(());
     }
-    let clauses: Vec<String> = if older_form {
+    let clauses: Vec<&str> = if older_form {
         faults
             .iter()
             .rev()
-            .map(|(range, value, constraint)| {
-                format!(
-                    "Value '{value}' at '{}' failed to satisfy constraint: Member must have value {constraint}",
-                    range.older_field
-                )
-            })
+            .map(|(_, older)| older.as_str())
             .collect()
     } else {
-        faults
-            .iter()
-            .map(|(range, _, constraint)| {
-                format!(
-                    "Value at '{}' failed to satisfy constraint: Member must have value {constraint}",
-                    range.field
-                )
-            })
-            .collect()
+        faults.iter().map(|(newer, _)| newer.as_str()).collect()
     };
     let count = clauses.len();
     Err(DynamoDbError::ValidationException(format!(

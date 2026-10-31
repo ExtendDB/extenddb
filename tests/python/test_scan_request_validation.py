@@ -6,10 +6,11 @@ empty ``AttributesToGet``, a malformed number in ``ExclusiveStartKey`` and the
 nesting depth of ``ExpressionAttributeValues``.
 
 Every request below is sent as raw signed JSON. Each is a row of the table
-measured against DynamoDB (us-east-1) on 2026-10-25 at 10:38 and 10:55 UTC,
-each sent twice, on a Scan of an existing table of 29 items, and each expected
-answer is the service's. The table here holds 12 items, so the count the
-accepted request returns is 12.
+measured against DynamoDB (us-east-1) on 2026-10-25 at 10:38 and 10:55 UTC on
+a Scan of an existing table of 29 items, or of the one measured on 2026-10-30
+at 12:40 UTC where a row says so, each sent twice, and each expected answer is
+the service's. The table here holds 12 items, so the count the accepted
+request returns is 12.
 
 Depth is the number of ``L`` wrappers around the leaf: 32 or more answers the
 nesting text, 31 reaches the unused-value check. A malformed number at the
@@ -36,7 +37,17 @@ LENGTH = (
     "1 validation error detected: Value at 'AttributesToGet' failed to "
     "satisfy constraint: Member must have length greater than or equal to 1"
 )
+LENGTH_AND_LIMIT = (
+    "2 validation errors detected: Value at 'AttributesToGet' failed to "
+    "satisfy constraint: Member must have length greater than or equal to 1; "
+    "Value at 'Limit' failed to satisfy constraint: Member must have value "
+    "greater than or equal to 1"
+)
 NUMERIC_BOB = "The parameter cannot be converted to a numeric value: bob"
+RCC_ENUM = (
+    "1 validation error detected: Value 'BAD' at 'returnConsumedCapacity' failed "
+    "to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"
+)
 NESTING = (
     "Nesting Levels have exceeded supported limits: "
     "Attributes in the item have nested levels beyond supported limit"
@@ -61,6 +72,19 @@ REFUSED = [
     ("ExclusiveStartKey-bob-on-an-S-key",
      '"ExclusiveStartKey": {"pk": {"N": "bob"}, "sk": {"S": "x"}}, ' + VALID_FILTER,
      NUMERIC_BOB),
+    # Measured 2026-10-30 12:40 UTC.
+    ("AttributesToGet-empty-with-Limit-0", '"AttributesToGet": [], "Limit": 0',
+     LENGTH_AND_LIMIT),
+    ("AttributesToGet-empty-with-ScanFilter-empty-and-FilterExpression",
+     '"AttributesToGet": [], "ScanFilter": {}, ' + VALID_FILTER, LENGTH),
+    ("ExclusiveStartKey-bob-with-no-filter",
+     '"ExclusiveStartKey": {"pk": {"N": "bob"}, "sk": {"S": "x"}}', NUMERIC_BOB),
+    ("ExclusiveStartKey-bob-in-the-index-key-of-a-GSI-scan",
+     '"IndexName": "gsi", "ExclusiveStartKey": {"gpk": {"N": "bob"}, "pk": {"S": "p"}, '
+     '"sk": {"S": "x"}}', NUMERIC_BOB),
+    ("ExclusiveStartKey-bob-with-ReturnConsumedCapacity-BAD",
+     '"ExclusiveStartKey": {"pk": {"N": "bob"}, "sk": {"S": "x"}}, '
+     '"ReturnConsumedCapacity": "BAD"', RCC_ENUM),
 ]
 
 
@@ -100,18 +124,24 @@ def _validation_message(status: int, payload: dict) -> str:
 
 @pytest.fixture(scope="module")
 def table(dynamodb_client):
-    """pk S, sk S, with ITEMS items."""
+    """pk S, sk S, a GSI ``gsi`` on gpk S, with ITEMS items."""
     name = unique_name("scanreq")
     dynamodb_client.create_table(
         TableName=name,
         AttributeDefinitions=[
             {"AttributeName": "pk", "AttributeType": "S"},
             {"AttributeName": "sk", "AttributeType": "S"},
+            {"AttributeName": "gpk", "AttributeType": "S"},
         ],
         KeySchema=[
             {"AttributeName": "pk", "KeyType": "HASH"},
             {"AttributeName": "sk", "KeyType": "RANGE"},
         ],
+        GlobalSecondaryIndexes=[{
+            "IndexName": "gsi",
+            "KeySchema": [{"AttributeName": "gpk", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "ALL"},
+        }],
         BillingMode="PAY_PER_REQUEST",
     )
     wait_for_active(dynamodb_client, name)
@@ -150,6 +180,11 @@ class TestNestingDepth:
     def test_31_levels_reach_the_unused_value_check(self, dynamodb_client, table):
         fields = unused_value(nest(ONE, 31))
         assert _validation_message(*_scan(dynamodb_client, table, fields)) == UNUSED
+
+    def test_32_levels_are_refused_ahead_of_the_select_enum(self, dynamodb_client, table):
+        # Measured 2026-10-30 12:40 UTC.
+        fields = unused_value(nest(ONE, 32)) + ', "Select": "BAD"'
+        assert _validation_message(*_scan(dynamodb_client, table, fields)) == NESTING
 
     @pytest.mark.parametrize("levels", [31, 32, 33, 40, 60])
     def test_a_malformed_number_at_the_bottom_is_reported_first(

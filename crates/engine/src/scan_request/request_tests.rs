@@ -5,10 +5,11 @@
 //! numbers in `ExclusiveStartKey` and the nesting depth of
 //! `ExpressionAttributeValues`.
 //!
-//! The rows in every test but the last are requests sent to the service on
-//! 2026-10-25 (us-east-1, 10:38 and 10:55 UTC, each request twice, a Scan of
-//! an existing table of 29 items) with the answers it gave. The last test
-//! applies the same rules to requests that were not sent.
+//! The rows in every test but the last are requests sent to the service
+//! (us-east-1, each request twice, a Scan of an existing table) with the
+//! answers it gave: on 2026-10-25 at 10:38 and 10:55 UTC, and on 2026-10-30 at
+//! 12:40 UTC where a test says so. The last test applies the same rules to
+//! requests that were not sent.
 
 use extenddb_core::error::DynamoDbError;
 use serde_json::{Value, json};
@@ -85,11 +86,26 @@ fn an_empty_attributes_to_get_is_a_length_fault_ahead_of_the_number_check() {
     for body in [
         scan(empty.clone()),
         with(scan(filter("1")), empty.clone()),
-        with(scan(filter("bob")), empty),
+        with(scan(filter("bob")), empty.clone()),
+        // Measured 2026-10-30 12:40 UTC: ahead of the parameter mix too.
+        with(scan(filter("1")), with(empty, json!({"ScanFilter": {}}))),
     ] {
         assert_eq!(check(&body).as_deref(), Some(LENGTH), "{body}");
     }
     assert_eq!(check(&scan(json!({"AttributesToGet": ["a"]}))), None);
+}
+
+/// Measured 2026-10-30 12:40 UTC: the length constraint is aggregated with the
+/// range constraints, ahead of `Limit`.
+#[test]
+fn an_empty_attributes_to_get_joins_the_range_faults() {
+    let body = scan(json!({"AttributesToGet": [], "Limit": 0}));
+    assert_eq!(
+        check(&body).as_deref(),
+        Some(
+            "2 validation errors detected: Value at 'AttributesToGet' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1"
+        )
+    );
 }
 
 #[test]
@@ -98,6 +114,16 @@ fn a_malformed_number_in_the_exclusive_start_key_is_reported_with_the_number_tex
     let bad = with(scan(filter("1")), key("bob"));
     assert_eq!(check(&bad).as_deref(), Some(NUMERIC_BOB));
     assert_eq!(check(&with(scan(filter("1")), key("1"))), None);
+    // Measured 2026-10-30 12:40 UTC: with no filter, the same text; the
+    // ReturnConsumedCapacity enum is checked first.
+    assert_eq!(check(&scan(key("bob"))).as_deref(), Some(NUMERIC_BOB));
+    let enum_first = with(scan(key("bob")), json!({"ReturnConsumedCapacity": "BAD"}));
+    assert_eq!(
+        check(&enum_first).as_deref(),
+        Some(
+            "1 validation error detected: Value 'BAD' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"
+        )
+    );
 }
 
 #[test]
@@ -109,6 +135,12 @@ fn a_value_nested_32_levels_deep_is_refused_and_31_levels_pass() {
     }
     // 31 levels reach the checks the handler makes after deserializing.
     assert_eq!(check(&with_unused_value(nested(&one, 31))), None);
+    // Measured 2026-10-30 12:40 UTC: ahead of the Select enum.
+    let select = with(
+        with_unused_value(nested(&one, 32)),
+        json!({"Select": "BAD"}),
+    );
+    assert_eq!(check(&select).as_deref(), Some(NESTING));
 }
 
 #[test]
@@ -145,12 +177,22 @@ fn combinations_the_service_was_not_sent_follow_the_order_of_the_checks() {
     // The length constraint applies beside a ProjectionExpression too.
     let beside_projection = scan(json!({"AttributesToGet": [], "ProjectionExpression": "a"}));
     assert_eq!(check(&beside_projection).as_deref(), Some(LENGTH));
-    // A range fault is reported alone, ahead of the length constraint.
-    let range = scan(json!({"AttributesToGet": [], "Limit": 0}));
+    // The length clause keeps its place ahead of the range clauses beside a
+    // Segment fault, as measured beside a Limit fault.
+    let segment = scan(json!({"AttributesToGet": [], "Segment": -1, "TotalSegments": 2}));
     assert_eq!(
-        check(&range).as_deref(),
+        check(&segment).as_deref(),
         Some(
-            "1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1"
+            "2 validation errors detected: Value at 'AttributesToGet' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'Segment' failed to satisfy constraint: Member must have value greater than or equal to 0"
+        )
+    );
+    // In the older form the clauses are reversed and the values echoed, so
+    // the empty list comes last.
+    let older = scan(json!({"AttributesToGet": [], "Limit": 0.0}));
+    assert_eq!(
+        check(&older).as_deref(),
+        Some(
+            "2 validation errors detected: Value '0' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1; Value '[]' at 'attributesToGet' failed to satisfy constraint: Member must have length greater than or equal to 1"
         )
     );
     // The values are checked ahead of the key.
