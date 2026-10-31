@@ -151,18 +151,15 @@ pub(crate) fn sanitize_storage_error(e: extenddb_storage::error::StorageError) -
     DynamoDbError::InternalServerError("Internal server error".to_owned())
 }
 
-/// Map a serde deserialization error to the appropriate `DynamoDB` error type.
-///
-/// Enum validation errors (produced by custom Deserialize impls) contain
-/// "validation error detected" and should be returned as `ValidationException`.
-/// All other deserialization failures are `SerializationException`.
-/// A `StreamSpecification` member without `StreamEnabled`, on `CreateTable`
-/// and `UpdateTable` alike (measured 2026-10-24). Checked before the body is
-/// deserialised, where the missing field would otherwise surface as a
-/// serialization error; its order against the other request checks is not
-/// measured.
+/// The null-member sentence for a `StreamSpecification` object without
+/// `StreamEnabled`, on `CreateTable` and `UpdateTable` alike (measured
+/// 2026-10-24). Checked before the body is deserialised, where the missing
+/// field would otherwise surface as a serialization error; its order against
+/// the other request checks is not measured. A `StreamSpecification` that is
+/// not an object is left to deserialisation, which refuses it as a
+/// `SerializationException`.
 pub(crate) fn require_stream_enabled_member(body: &serde_json::Value) -> Result<(), DynamoDbError> {
-    if let Some(spec) = body.get("StreamSpecification").filter(|v| !v.is_null())
+    if let Some(spec) = body.get("StreamSpecification").filter(|v| v.is_object())
         && spec
             .get("StreamEnabled")
             .is_none_or(serde_json::Value::is_null)
@@ -174,6 +171,11 @@ pub(crate) fn require_stream_enabled_member(body: &serde_json::Value) -> Result<
     Ok(())
 }
 
+/// Map a serde deserialization error to the appropriate `DynamoDB` error type.
+///
+/// Enum validation errors (produced by custom Deserialize impls) contain
+/// "validation error detected" and should be returned as `ValidationException`.
+/// All other deserialization failures are `SerializationException`.
 pub(crate) fn deserialize_error(e: serde_json::Error) -> DynamoDbError {
     let msg = e.to_string();
     if msg.contains("validation error detected")

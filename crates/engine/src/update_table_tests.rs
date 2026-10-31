@@ -213,3 +213,41 @@ fn an_internal_failure_is_still_an_internal_server_error() {
     let err = update_table_err_to_dynamo(StorageError::Internal("disk on fire".to_owned()), "t");
     assert!(matches!(err, DynamoDbError::InternalServerError(_)));
 }
+
+/// Measured 2026-10-24: a `StreamSpecification` object without `StreamEnabled`
+/// gets the null-member sentence. A member that is not an object (a string, a
+/// number, an array) is not that case: it is left to deserialisation, which
+/// refuses it as a `SerializationException`, as before the member check.
+#[test]
+fn a_stream_specification_that_is_not_an_object_is_a_serialization_error() {
+    let null_member = "1 validation error detected: Value null at 'streamSpecification.streamEnabled' failed to satisfy constraint: Member must not be null";
+    for spec in [
+        serde_json::json!({}),
+        serde_json::json!({"StreamViewType": "KEYS_ONLY"}),
+        serde_json::json!({"StreamEnabled": null}),
+    ] {
+        let body = serde_json::json!({"TableName": "t", "StreamSpecification": spec});
+        match crate::require_stream_enabled_member(&body) {
+            Err(DynamoDbError::ValidationException(m)) => assert_eq!(m, null_member),
+            other => panic!("{other:?}"),
+        }
+    }
+    for spec in [
+        serde_json::json!("x"),
+        serde_json::json!(1),
+        serde_json::json!([]),
+        serde_json::json!(true),
+    ] {
+        let body = serde_json::json!({"TableName": "t", "StreamSpecification": spec});
+        crate::require_stream_enabled_member(&body).expect("not the member check's case");
+        let err = serde_json::from_value::<UpdateTableInput>(body)
+            .map_err(crate::deserialize_error)
+            .expect_err("a non-object specification does not deserialise");
+        assert!(
+            matches!(err, DynamoDbError::SerializationException(_)),
+            "{err:?}"
+        );
+    }
+    let body = serde_json::json!({"TableName": "t", "StreamSpecification": null});
+    crate::require_stream_enabled_member(&body).expect("an absent member");
+}
