@@ -12,8 +12,8 @@
 use extenddb_core::types::{StreamSpecification, StreamViewType};
 use extenddb_storage::error::StorageError;
 use extenddb_storage::stream_lineage::{
-    SHARDS_PER_STREAM, ShardRow, StreamChange, TableStreamRow, next_stream_label, shard_id,
-    stored_specification, stream_change,
+    SHARDS_PER_STREAM, ShardRow, StreamChange, TableStreamRow, disabled_stream_to_close,
+    next_stream_label, shard_id, stored_specification, stream_change,
 };
 
 use crate::store::SqliteEngine;
@@ -105,33 +105,51 @@ impl SqliteEngine {
     /// Apply an `UpdateTable` `StreamSpecification` within the caller's
     /// transaction.
     ///
-    /// Disabling clears the stored specification, so DescribeTable omits
-    /// `StreamSpecification`, keeps `stream_label` (`LatestStreamArn` keeps
-    /// naming the disabled stream) and closes the stream's shards. Enabling
-    /// closes any shard still open (a stream disabled before shards were
-    /// closed on disable) and creates a new stream.
+    /// Disabling stores `{StreamEnabled: false}` with the stream's view type,
+    /// which DescribeTable omits, keeps `stream_label` (`LatestStreamArn`
+    /// keeps naming the disabled stream) and closes the stream's shards.
+    /// Enabling closes any shard still open (a stream disabled before shards
+    /// were closed on disable) and creates a new stream.
+    ///
+    /// `Ok(Some(refusal))` is a disable refused because the stored
+    /// specification is already disabled, whose open shards (left by a release
+    /// that did not close them, or by a close that failed after its catalog
+    /// write) this call closed in the transaction: the caller commits it and
+    /// answers the refusal. Any other refusal is `Err`, with nothing to commit.
     pub(crate) async fn apply_stream_specification(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         account_id: &str,
         table_name: &str,
         table_id: &str,
         requested: &StreamSpecification,
-    ) -> Result<(), StorageError> {
-        let current: Option<String> = sqlx::query_scalar(
-            "SELECT stream_specification FROM tables WHERE account_id = ? AND table_name = ?",
+    ) -> Result<Option<StorageError>, StorageError> {
+        let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT stream_specification, stream_label FROM tables \
+             WHERE account_id = ? AND table_name = ?",
         )
         .bind(account_id)
         .bind(table_name)
         .fetch_optional(&mut **tx)
         .await
-        .map_err(internal)?
-        .flatten();
+        .map_err(internal)?;
+        let (current, current_label) = row.unwrap_or_default();
         let current: Option<StreamSpecification> = current
             .as_deref()
             .map(serde_json::from_str)
             .transpose()
             .map_err(internal)?;
-        let change = stream_change(table_name, current.as_ref(), requested)?;
+        let change = match stream_change(table_name, current.as_ref(), requested) {
+            Ok(change) => change,
+            Err(refusal) => {
+                if disabled_stream_to_close(current.as_ref(), current_label.as_deref(), requested)
+                    .is_some()
+                {
+                    Self::close_stream_shards(tx, table_id).await?;
+                    return Ok(Some(refusal));
+                }
+                return Err(refusal);
+            }
+        };
         let stored =
             serde_json::to_string(&stored_specification(change, current.as_ref(), requested))
                 .map_err(internal)?;
@@ -148,7 +166,7 @@ impl SqliteEngine {
         if let StreamChange::Enable(view_type) = change {
             Self::init_stream_shards(tx, account_id, table_name, table_id, view_type).await?;
         }
-        Ok(())
+        Ok(None)
     }
 
     /// The table's stream columns and its key schema JSON, by name.

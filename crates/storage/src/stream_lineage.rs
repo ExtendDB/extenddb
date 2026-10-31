@@ -104,6 +104,30 @@ pub fn stream_change(
     }
 }
 
+/// The stream a refused disable closes before it is answered: the table's
+/// current label, when `requested` disables a table whose stored specification
+/// is already disabled.
+///
+/// A release before shards were closed on disable left a disabled stream's
+/// four shards open, and a close that fails after its catalog write leaves the
+/// same state until the request is retried; either way `DescribeStream`
+/// reports `DISABLED` while writes keep recording into the open shards. The
+/// retry is refused with [`stream_change`]'s sentence, as on the service, and
+/// the backend closes the current label's open shards first, which is what the
+/// first disable would have done. `None` when the request enables, when the
+/// table never had a stream (no stored specification), or when it has no
+/// label.
+#[must_use]
+pub fn disabled_stream_to_close<'a>(
+    current: Option<&StreamSpecification>,
+    current_label: Option<&'a str>,
+    requested: &StreamSpecification,
+) -> Option<&'a str> {
+    (!requested.stream_enabled && current.is_some_and(|c| !c.stream_enabled))
+        .then_some(current_label)
+        .flatten()
+}
+
 /// The specification to store once a stream change is decided: the request's
 /// own on an enable, and on a disable `{StreamEnabled: false}` carrying the
 /// closed stream's view type, so a legacy stream (whose view type lives only

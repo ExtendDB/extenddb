@@ -20,8 +20,9 @@ use mongodb::options::FindOptions;
 use extenddb_core::types::{StreamSpecification, StreamViewType};
 use extenddb_storage::error::StorageError;
 use extenddb_storage::stream_lineage::{
-    SHARDS_PER_STREAM, ShardRow, StreamChange, TableStreamRow, enable_still_current,
-    next_stream_label, open_shard_ids_of, shard_id, stored_specification, stream_change,
+    SHARDS_PER_STREAM, ShardRow, StreamChange, TableStreamRow, disabled_stream_to_close,
+    enable_still_current, next_stream_label, open_shard_ids_of, shard_id, stored_specification,
+    stream_change,
 };
 
 use crate::MongoEngine;
@@ -229,6 +230,34 @@ impl MongoEngine {
             close: table.stream_label,
             open,
         })
+    }
+
+    /// [`Self::prepare_stream_update`], and for a disable refused because the
+    /// stored specification is already disabled, the close of the current
+    /// label's open shards first (left by a release that did not close them,
+    /// or by a close that failed after the catalog write); the refusal is
+    /// still the answer.
+    pub(crate) async fn prepare_stream_update_or_close(
+        &self,
+        update_doc: &mut Document,
+        table_doc: &Document,
+        table_name: &str,
+        requested: &StreamSpecification,
+    ) -> Result<PendingStream, StorageError> {
+        match Self::prepare_stream_update(update_doc, table_doc, table_name, requested) {
+            Ok(pending) => Ok(pending),
+            Err(refusal) => {
+                let table = table_row(table_name, table_doc);
+                if let Some(label) = disabled_stream_to_close(
+                    table.stream_specification.as_ref(),
+                    table.stream_label.as_deref(),
+                    requested,
+                ) {
+                    self.close_stream_shards(&table.table_id, label).await?;
+                }
+                Err(refusal)
+            }
+        }
     }
 
     /// The table's stream fields and its document, by name.

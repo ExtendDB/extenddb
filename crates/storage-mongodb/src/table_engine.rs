@@ -839,12 +839,15 @@ impl MongoEngine {
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?
                 .ok_or_else(|| StorageError::TableNotFound(input.table_name.clone()))?;
-            pending_stream = Some(Self::prepare_stream_update(
-                &mut update_doc,
-                &table_doc,
-                &input.table_name,
-                ss,
-            )?);
+            pending_stream = Some(
+                self.prepare_stream_update_or_close(
+                    &mut update_doc,
+                    &table_doc,
+                    &input.table_name,
+                    ss,
+                )
+                .await?,
+            );
             for field in ["stream_specification", "stream_label"] {
                 stream_guard.insert(
                     field,

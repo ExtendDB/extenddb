@@ -80,6 +80,44 @@ fn the_two_refusals_are_the_measured_sentences() {
 }
 
 #[test]
+fn a_refused_disable_of_a_disabled_stream_closes_the_current_label_first() {
+    let label = "2026-10-20T10:00:00.000";
+    let disabled = spec(false, Some(StreamViewType::NewImage));
+    let disable = spec(false, None);
+    let enable = spec(true, Some(StreamViewType::KeysOnly));
+    // The stored specification says disabled: the first disable (an earlier
+    // release's, or one whose close failed) may have left the shards open.
+    assert_eq!(
+        disabled_stream_to_close(Some(&disabled), Some(label), &disable),
+        Some(label)
+    );
+    assert_eq!(
+        disabled_stream_to_close(Some(&spec(false, None)), Some(label), &disable),
+        Some(label)
+    );
+    // A table that never had a stream, or has no label, has nothing to close;
+    // an enabled stream is closed by the disable itself; an enable closes
+    // through its own change.
+    assert_eq!(disabled_stream_to_close(None, Some(label), &disable), None);
+    assert_eq!(
+        disabled_stream_to_close(Some(&disabled), None, &disable),
+        None
+    );
+    assert_eq!(
+        disabled_stream_to_close(
+            Some(&spec(true, Some(StreamViewType::KeysOnly))),
+            Some(label),
+            &disable
+        ),
+        None
+    );
+    assert_eq!(
+        disabled_stream_to_close(Some(&disabled), Some(label), &enable),
+        None
+    );
+}
+
+#[test]
 fn labels_round_trip_through_shard_ids() {
     assert_eq!(label_millis("1970-01-01T00:00:00.001"), Some(1));
     assert_eq!(label_millis("2026-10-24T08:54:14.03"), None);

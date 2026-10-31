@@ -337,6 +337,7 @@ impl PostgresEngine {
             Some(spec) => Some(
                 Self::apply_stream_specification(
                     &mut tx,
+                    &self.data_pool,
                     account_id,
                     &input.table_name,
                     &table_id,

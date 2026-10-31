@@ -16,8 +16,9 @@
 use extenddb_core::types::{StreamSpecification, StreamViewType};
 use extenddb_storage::error::StorageError;
 use extenddb_storage::stream_lineage::{
-    SHARDS_PER_STREAM, ShardRow, StreamChange, TableStreamRow, enable_still_current,
-    next_stream_label, open_shard_ids_of, shard_id, stored_specification, stream_change,
+    SHARDS_PER_STREAM, ShardRow, StreamChange, TableStreamRow, disabled_stream_to_close,
+    enable_still_current, next_stream_label, open_shard_ids_of, shard_id, stored_specification,
+    stream_change,
 };
 use sqlx::PgPool;
 
@@ -223,8 +224,15 @@ impl PostgresEngine {
     /// with [`PendingStream::apply`] once the catalog has committed: a request
     /// refused after this point (an invalid index update in the same call)
     /// then leaves no shards behind.
+    ///
+    /// A disable refused because the stored specification is already disabled
+    /// first closes the current label's open shards in the data database
+    /// (left by a release that did not close them, or by a close that failed
+    /// after its catalog write), then returns the refusal; the catalog
+    /// transaction has nothing to commit.
     pub(crate) async fn apply_stream_specification(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        data_pool: &PgPool,
         account_id: &str,
         table_name: &str,
         table_id: &str,
@@ -249,7 +257,17 @@ impl PostgresEngine {
         .await
         .map_err(internal)?
         .flatten();
-        let change = stream_change(table_name, current.as_ref(), requested)?;
+        let change = match stream_change(table_name, current.as_ref(), requested) {
+            Ok(change) => change,
+            Err(refusal) => {
+                if let Some(label) =
+                    disabled_stream_to_close(current.as_ref(), current_label.as_deref(), requested)
+                {
+                    Self::close_stream_shards(data_pool, table_id, label).await?;
+                }
+                return Err(refusal);
+            }
+        };
         let stored =
             serde_json::to_value(stored_specification(change, current.as_ref(), requested))
                 .map_err(internal)?;

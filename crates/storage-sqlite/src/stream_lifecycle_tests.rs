@@ -355,3 +355,128 @@ async fn a_stream_from_before_labelled_shard_ids_closes_and_is_replaced() {
     assert_eq!(new.shards.len(), 4);
     engine.pool.close().await;
 }
+
+/// A stream disabled by a release that stored `{StreamEnabled: false}` and
+/// left its four shards open (the same state a close that failed after its
+/// catalog write leaves): writes still record into it. A disable is refused,
+/// as on the service, and closes the open shards first, so the next write
+/// records nothing; an enable on that state closes them too.
+#[tokio::test]
+async fn a_disable_refused_on_a_disabled_stream_closes_the_shards_it_left_open() {
+    let engine = engine().await;
+    create(&engine, "base", true).await;
+    let arn = describe_table(&engine, "base")
+        .await
+        .latest_stream_arn
+        .unwrap();
+    // The shards in the shape the earlier release created them, and what its
+    // disable wrote: the specification alone.
+    sqlx::query(
+        "UPDATE stream_shards SET shard_id = 'shardId-' || table_id || '-' || \
+         printf('%016d', CAST(substr(shard_id, -2) AS INTEGER)) \
+         WHERE table_id = (SELECT table_id FROM tables WHERE table_name = 'base')",
+    )
+    .execute(&engine.pool)
+    .await
+    .unwrap();
+    put(&engine, "base", "before", StreamViewType::NewAndOldImages).await;
+    sqlx::query(
+        "UPDATE tables SET stream_specification = '{\"StreamEnabled\":false}' \
+         WHERE table_name = 'base'",
+    )
+    .execute(&engine.pool)
+    .await
+    .unwrap();
+    let open_shards = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM stream_shards WHERE ending_sequence_number IS NULL",
+        )
+        .fetch_one(&engine.pool)
+        .await
+        .unwrap()
+    };
+    assert_eq!(open_shards().await, 4);
+    let described = describe_stream(&engine, &arn).await;
+    assert!(matches!(described.stream_status, StreamStatus::Disabled));
+    put(&engine, "base", "dark", StreamViewType::NewAndOldImages).await;
+    let recorded = || async {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM stream_records")
+            .fetch_one(&engine.pool)
+            .await
+            .unwrap()
+    };
+    assert_eq!(recorded().await, 2, "the open shards still record");
+
+    match set_stream(&engine, "base", serde_json::json!({"StreamEnabled": false})).await {
+        Err(StorageError::Validation(m)) => {
+            assert_eq!(m, "Table has no stream to disable: TableName: base");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        open_shards().await,
+        0,
+        "the refused disable closed the shards"
+    );
+    let closed = describe_stream(&engine, &arn).await;
+    assert!(matches!(closed.stream_status, StreamStatus::Disabled));
+    assert_eq!(closed.stream_view_type, StreamViewType::KeysOnly);
+    for shard in &closed.shards {
+        let last = records_in(&engine, &shard.shard_id).await.pop();
+        let expected =
+            last.unwrap_or_else(|| shard.sequence_number_range.starting_sequence_number.clone());
+        assert_eq!(
+            shard
+                .sequence_number_range
+                .ending_sequence_number
+                .as_deref(),
+            Some(expected.as_str())
+        );
+    }
+    put(&engine, "base", "after", StreamViewType::NewAndOldImages).await;
+    assert_eq!(
+        recorded().await,
+        2,
+        "a write after the close records nothing"
+    );
+    // A second refusal has nothing left to close and changes nothing.
+    match set_stream(&engine, "base", serde_json::json!({"StreamEnabled": false})).await {
+        Err(StorageError::Validation(m)) => {
+            assert_eq!(m, "Table has no stream to disable: TableName: base");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(open_shards().await, 0);
+
+    // The same state, met by an enable: the enable closes the open shards.
+    create(&engine, "base2", true).await;
+    sqlx::query(
+        "UPDATE tables SET stream_specification = '{\"StreamEnabled\":false}' \
+         WHERE table_name = 'base2'",
+    )
+    .execute(&engine.pool)
+    .await
+    .unwrap();
+    assert_eq!(open_shards().await, 4);
+    set_stream(
+        &engine,
+        "base2",
+        serde_json::json!({"StreamEnabled": true, "StreamViewType": "KEYS_ONLY"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        open_shards().await,
+        4,
+        "only the new stream's shards are open"
+    );
+    let closed_by_enable: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM stream_shards s JOIN tables t ON t.table_id = s.table_id \
+         WHERE t.table_name = 'base2' AND s.ending_sequence_number IS NOT NULL",
+    )
+    .fetch_one(&engine.pool)
+    .await
+    .unwrap();
+    assert_eq!(closed_by_enable, 4);
+    engine.pool.close().await;
+}

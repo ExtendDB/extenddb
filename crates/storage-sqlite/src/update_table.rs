@@ -311,15 +311,23 @@ impl SqliteEngine {
             )
             .await?;
         }
-        if let Some(spec) = &input.stream_specification {
-            Self::apply_stream_specification(
+        if let Some(spec) = &input.stream_specification
+            && let Some(refusal) = Self::apply_stream_specification(
                 &mut tx,
                 account_id,
                 &input.table_name,
                 &table_id,
                 spec,
             )
-            .await?;
+            .await?
+        {
+            // A disable of an already disabled stream: the request is refused,
+            // and the transaction holds only the close of the shards the first
+            // disable left open (a stream change travels alone in the request).
+            tx.commit()
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            return Err(refusal);
         }
 
         // GSI create/delete.

@@ -156,8 +156,15 @@ impl CassandraEngine {
         // in a different keyspace.
         let mut pending_stream = None;
         if let Some(spec) = &input.stream_specification {
-            let (cols, pending) =
-                crate::stream_lifecycle::PendingStream::decide(&row, &input.table_name, spec)?;
+            let (cols, pending) = self
+                .decide_stream_change_or_close(
+                    &row,
+                    &self.account_keyspace(account_id),
+                    &table_id,
+                    &input.table_name,
+                    spec,
+                )
+                .await?;
             for (col, val) in cols {
                 table_cols.push((col, Value::from(val.as_str())));
             }

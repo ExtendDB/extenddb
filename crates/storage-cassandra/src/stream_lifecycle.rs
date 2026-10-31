@@ -21,9 +21,9 @@ use cdrs_tokio::types::IntoRustByName;
 use extenddb_core::types::{StreamSpecification, StreamViewType};
 use extenddb_storage::error::StorageError;
 use extenddb_storage::stream_lineage::{
-    SHARDS_PER_STREAM, ShardRow, StreamChange, TableStreamRow, enable_still_current,
-    next_stream_label, open_shard_ids_of, parse_shard_id, shard_id, stored_specification,
-    stream_change,
+    SHARDS_PER_STREAM, ShardRow, StreamChange, TableStreamRow, disabled_stream_to_close,
+    enable_still_current, next_stream_label, open_shard_ids_of, parse_shard_id, shard_id,
+    stored_specification, stream_change,
 };
 
 use crate::CassandraEngine;
@@ -187,6 +187,40 @@ impl PendingStream {
 }
 
 impl CassandraEngine {
+    /// [`PendingStream::decide`], and for a disable refused because the stored
+    /// specification is already disabled, the close of the current label's
+    /// open shards first (left by a release that did not close them, or by a
+    /// close that failed after the catalog write); the refusal is still the
+    /// answer.
+    pub(crate) async fn decide_stream_change_or_close(
+        &self,
+        row: &cdrs_tokio::types::rows::Row,
+        account_ks: &str,
+        table_id: &str,
+        table_name: &str,
+        requested: &StreamSpecification,
+    ) -> Result<(StreamColumns, PendingStream), StorageError> {
+        match PendingStream::decide(row, table_name, requested) {
+            Ok(decided) => Ok(decided),
+            Err(refusal) => {
+                let stored: Option<String> = row.get_by_name("stream_specification").ok().flatten();
+                let current: Option<StreamSpecification> = stored
+                    .as_deref()
+                    .map(serde_json::from_str)
+                    .transpose()
+                    .map_err(internal)?;
+                let label: Option<String> = row.get_by_name("stream_label").ok().flatten();
+                if let Some(label) =
+                    disabled_stream_to_close(current.as_ref(), label.as_deref(), requested)
+                {
+                    self.close_stream_shards(account_ks, table_id, label)
+                        .await?;
+                }
+                Err(refusal)
+            }
+        }
+    }
+
     /// The refusal for a stream change whose conditional catalog write found
     /// the stream fields changed: re-read the row and decide the request
     /// against it, which refuses the loser of two overlapping changes with the
