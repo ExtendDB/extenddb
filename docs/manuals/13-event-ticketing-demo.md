@@ -5,7 +5,7 @@ description: "A worked application on ExtendDB: accounts and IAM users, tables, 
 # Event ticketing demo
 
 This guide walks you through building a complete event ticketing system on
-ExtendDB (extenddb). You will create tables, load data, purchase tickets
+ExtendDB. You will create tables, load data, purchase tickets
 with transactions, observe TTL-based reservation expiry, consume change events
 via DynamoDB Streams, enforce IAM policies, and verify operational metrics.
 

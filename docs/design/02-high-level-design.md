@@ -403,7 +403,7 @@ There is no in-memory locking (no `Mutex`, `RwLock`, or similar) on the data pat
 - **Contention on the same item serializes at the database.** 50 threads incrementing the same counter will queue on the row lock; each update succeeds, but throughput for that single item is bounded by PostgreSQL's single-row transaction rate.
 - **Different items have no contention.** Parallel inserts to different keys proceed fully concurrently up to the pool size.
 
-## 7. High-Level Design Choices: Deferred Components
+## 7. Design Choices Recorded for Streams and Global Tables
 
 This section records the design space as it stood when the document was written (April 2026). DynamoDB Streams has since been implemented; see the [DynamoDB Streams component design](07-component-streams.md). Global Tables remain not implemented.
 

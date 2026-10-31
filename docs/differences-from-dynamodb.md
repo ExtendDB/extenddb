@@ -21,7 +21,7 @@ give the behavioral detail for each area.
 | BatchWriteItem / BatchGetItem | ✓ |
 | TransactWriteItems / TransactGetItems | ✓ |
 | Global Secondary Indexes (GSI) | ✓ |
-| Vector indexes and SearchVectors | ✓ (PostgreSQL requires the pgvector extension) |
+| Vector indexes and SearchVectors | ✓ (PostgreSQL needs pgvector) |
 | Local Secondary Indexes (LSI) | ✓ |
 | DynamoDB Streams | ✓ |
 | ConditionExpression / FilterExpression / UpdateExpression / ProjectionExpression | ✓ |
@@ -32,11 +32,11 @@ give the behavioral detail for each area.
 | SigV4 Authentication | ✓ |
 | IAM Policy Evaluation | ✓ |
 | Legacy API (Expected, AttributeUpdates, AttributesToGet) | ✓ |
-| PartiQL (ExecuteStatement, BatchExecuteStatement, ExecuteTransaction) | ✗ Not implemented (UnknownOperationException) |
+| PartiQL (ExecuteStatement, BatchExecuteStatement, ExecuteTransaction) | ✗ Not implemented (see Operations Not Implemented) |
 | DAX | ✗ (not applicable) |
-| Global Tables | ✗ Not implemented (UnknownOperationException) |
+| Global Tables | ✗ Not implemented (see Operations Not Implemented) |
 | On-demand backups (CreateBackup, RestoreTableFromBackup, DescribeBackup, ListBackups, DeleteBackup) | ✓ (see Backup and Restore below) |
-| Point-in-time recovery | ✗ RestoreTableToPointInTime is refused (ValidationException) |
+| Point-in-time recovery | ✗ Not supported (see Backup and Restore) |
 | Import/Export (local filesystem) | ✓ (FileSource instead of S3) |
 
 ## Storage and Infrastructure

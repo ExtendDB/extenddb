@@ -554,8 +554,8 @@ ExtendDB returns the DynamoDB error types and, where measured against the servic
 ## Supported features
 
 The status of every feature area (implemented, not implemented, or implemented with a difference) is
-recorded in one place: the [Feature status](../differences-from-dynamodb.md#feature-status) table on
-the Differences from DynamoDB page. That page also lists every measured behavioural difference by area.
+recorded in one place: the [Feature Status](../differences-from-dynamodb.md#feature-status) table on
+the Differences from DynamoDB page. That page also lists every measured behavioral difference by area.
 
 ---
 

@@ -9,7 +9,7 @@ status: "Draft"
 
 ## 1. Overview
 
-ExtendDB is a standalone, stateless Rust application that provides a DynamoDB-compatible API backed by pluggable storage engines (the [Feature status](../differences-from-dynamodb.md#feature-status) table on the Differences from DynamoDB page records what is implemented). Any AWS SDK client (Java, Python, Go, Node.js, Rust, .NET, etc.) connects directly with zero code changes. The system runs as its own process, completely independent of any specific database, and supports pluggable authentication providers and pluggable storage backends.
+ExtendDB is a standalone, stateless Rust application that provides a DynamoDB-compatible API backed by pluggable storage engines (the [Feature Status](../differences-from-dynamodb.md#feature-status) table on the Differences from DynamoDB page records what is implemented). Any AWS SDK client (Java, Python, Go, Node.js, Rust, .NET, etc.) connects directly with zero code changes. The system runs as its own process, completely independent of any specific database, and supports pluggable authentication providers and pluggable storage backends.
 
 ### 1.1 Goals
 
@@ -22,7 +22,7 @@ ExtendDB is a standalone, stateless Rust application that provides a DynamoDB-co
 ### 1.2 Non-Goals / Out of Scope
 
 This table records the scope decided when the document was written (April 2026). Where the
-implementation has since moved, the [Feature status](../differences-from-dynamodb.md#feature-status)
+implementation has since moved, the [Feature Status](../differences-from-dynamodb.md#feature-status)
 table on the Differences from DynamoDB page is the current record.
 
 | Feature | Reason |
