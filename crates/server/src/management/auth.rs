@@ -241,9 +241,41 @@ async fn try_iam_user_auth(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use extenddb_storage::management_store::{AdminEntry, AdminStore, OpError, OpResult};
+    use futures::future::BoxFuture;
+
     use super::*;
     use crate::rate_limit::PRINCIPAL_LIMITED;
+
+    /// An admin store whose password check fails with `OpError::Internal`
+    /// carrying `message`. Logins call nothing else on it.
+    pub(crate) struct FailingAdmins {
+        pub(crate) message: &'static str,
+    }
+
+    impl AdminStore for FailingAdmins {
+        fn create_admin(&self, _: &str, _: &str) -> BoxFuture<'_, OpResult<()>> {
+            unreachable!("a login does not create admins")
+        }
+
+        fn list_admins(&self) -> BoxFuture<'_, OpResult<Vec<AdminEntry>>> {
+            unreachable!("a login does not list admins")
+        }
+
+        fn delete_admin(&self, _: &str) -> BoxFuture<'_, OpResult<()>> {
+            unreachable!("a login does not delete admins")
+        }
+
+        fn change_admin_password(&self, _: &str, _: &str) -> BoxFuture<'_, OpResult<()>> {
+            unreachable!("a login does not change passwords")
+        }
+
+        fn verify_admin_password(&self, _: &str, _: &str) -> BoxFuture<'_, OpResult<Option<bool>>> {
+            let error = OpError::Internal(self.message.to_owned());
+            Box::pin(async move { Err(error) })
+        }
+    }
 
     #[test]
     fn a_refused_attempt_is_answered_by_its_reason() {

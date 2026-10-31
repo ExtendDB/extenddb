@@ -9,12 +9,13 @@ use axum::Form;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
+use extenddb_storage::management_store::RateLimitStore;
 use serde::Deserialize;
 
 use crate::console::ConsoleState;
 use crate::console::html;
 use crate::management::CallerIdentity;
-use crate::rate_limit::{self, LoginRefusal};
+use crate::rate_limit::{self, LoginAttempt, LoginRefusal};
 
 use super::extract_session_token;
 
@@ -43,27 +44,15 @@ pub async fn login_submit(
         Err(refusal) => return refusal_page(refusal, &state.listen_url),
     };
 
-    // Try admin auth first. A storage error (including a timed-out wait for
-    // a bcrypt slot) is answered 500 and recorded as nothing: no password
-    // was checked.
+    // Try admin auth first, then IAM user auth. A storage error (including a
+    // timed-out wait for a bcrypt slot) is answered 500 and recorded as
+    // nothing: no password was checked.
+    let checked = check_credentials(&form.username, &form.password, &*state.catalog_store).await;
     let identity =
-        match try_admin_login(&form.username, &form.password, &*state.catalog_store).await {
-            Err(()) => return internal_error(&state.listen_url),
-            Ok(AdminLoginResult::Authenticated(id)) => Some(id),
-            Ok(AdminLoginResult::WrongPassword) => None, // Admin exists, wrong password: do NOT fall through.
-            Ok(AdminLoginResult::NotFound) => {
-                // Admin not found: try IAM user auth.
-                match try_iam_login(&form.username, &form.password, &*state.catalog_store).await {
-                    Err(()) => return internal_error(&state.listen_url),
-                    Ok(identity) => identity,
-                }
-            }
+        match settle_attempt(attempt, checked, &*state.catalog_store, &state.listen_url).await {
+            Ok(identity) => identity,
+            Err(page) => return page,
         };
-
-    let Some(identity) = identity else {
-        attempt.record_failure(&*state.catalog_store).await;
-        return invalid_credentials(&state.listen_url);
-    };
 
     let (token, _csrf) = state.sessions.create(identity).await;
     let cookie = format!(
@@ -169,6 +158,43 @@ fn refusal_page(refusal: LoginRefusal, listen_url: &str) -> Response {
     }
 }
 
+/// Check the form's credentials, admin first and then IAM user. `Ok(None)`
+/// is a wrong password or an unknown principal; `Err(())` is a storage
+/// error, including a timed-out wait for a bcrypt slot.
+async fn check_credentials(
+    username: &str,
+    password: &str,
+    store: &dyn extenddb_storage::CatalogStore,
+) -> Result<Option<CallerIdentity>, ()> {
+    match try_admin_login(username, password, store).await? {
+        AdminLoginResult::Authenticated(id) => Ok(Some(id)),
+        // Admin exists, wrong password: do NOT fall through.
+        AdminLoginResult::WrongPassword => Ok(None),
+        // Admin not found: try IAM user auth.
+        AdminLoginResult::NotFound => try_iam_login(username, password, store).await,
+    }
+}
+
+/// Settle an admitted attempt with the result of its password check. A
+/// wrong password is recorded as a failure and answered with the form's
+/// error. A storage error is answered 500 and recorded as nothing; dropping
+/// the attempt releases its reservation.
+async fn settle_attempt(
+    attempt: LoginAttempt,
+    checked: Result<Option<CallerIdentity>, ()>,
+    rate_limiter: &dyn RateLimitStore,
+    listen_url: &str,
+) -> Result<CallerIdentity, Response> {
+    match checked {
+        Ok(Some(identity)) => Ok(identity),
+        Ok(None) => {
+            attempt.record_failure(rate_limiter).await;
+            Err(invalid_credentials(listen_url))
+        }
+        Err(()) => Err(internal_error(listen_url)),
+    }
+}
+
 /// `Err(())` is a storage error; the caller answers 500 and records nothing.
 async fn try_admin_login(
     username: &str,
@@ -209,7 +235,9 @@ async fn try_iam_login(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::management::auth::tests::FailingAdmins;
     use crate::rate_limit::PRINCIPAL_LIMITED;
+    use crate::rate_limit::tests::{MemoryStore, peer};
 
     const LISTEN_URL: &str = "https://127.0.0.1:8443";
 
@@ -234,5 +262,43 @@ mod tests {
         let too_long = refusal_page(LoginRefusal::InvalidCredentials, LISTEN_URL);
         assert_eq!(too_long.status(), StatusCode::OK);
         assert!(body_text(too_long).await.contains("Invalid credentials"));
+    }
+
+    #[tokio::test]
+    async fn a_store_error_in_the_admin_check_is_an_error_not_an_unknown_admin() {
+        let admins = FailingAdmins {
+            message: "store is down",
+        };
+        assert!(try_admin_login("admin", "pw", &admins).await.is_err());
+    }
+
+    // Each test uses its own source address: the in-flight registry is
+    // process-wide.
+
+    #[tokio::test]
+    async fn a_store_error_during_the_password_check_answers_500_and_records_nothing() {
+        let attempts = MemoryStore::default();
+        let attempt = rate_limit::begin_login(&attempts, "admin", peer("198.51.100.90"))
+            .await
+            .unwrap();
+        let page = settle_attempt(attempt, Err(()), &attempts, LISTEN_URL)
+            .await
+            .unwrap_err();
+        assert_eq!(page.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(attempts.row_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_wrong_password_answers_the_form_error_and_records_one_failure() {
+        let attempts = MemoryStore::default();
+        let attempt = rate_limit::begin_login(&attempts, "admin", peer("198.51.100.91"))
+            .await
+            .unwrap();
+        let page = settle_attempt(attempt, Ok(None), &attempts, LISTEN_URL)
+            .await
+            .unwrap_err();
+        assert_eq!(page.status(), StatusCode::OK);
+        assert!(body_text(page).await.contains("Invalid credentials"));
+        assert_eq!(attempts.rows_for("admin", "198.51.100.91"), 1);
     }
 }

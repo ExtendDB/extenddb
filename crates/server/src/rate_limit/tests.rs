@@ -19,7 +19,7 @@ use super::*;
 /// write announces itself on `write_started` and then waits for a permit
 /// before the row lands.
 #[derive(Default)]
-struct MemoryStore {
+pub(crate) struct MemoryStore {
     rows: Mutex<Vec<(String, Option<String>)>>,
     delay: Option<Duration>,
     broken: AtomicBool,
@@ -28,7 +28,7 @@ struct MemoryStore {
 }
 
 impl MemoryStore {
-    fn rows_for(&self, principal: &str, source_ip: &str) -> i64 {
+    pub(crate) fn rows_for(&self, principal: &str, source_ip: &str) -> i64 {
         self.rows
             .lock()
             .unwrap()
@@ -37,7 +37,7 @@ impl MemoryStore {
             .count() as i64
     }
 
-    fn row_count(&self) -> usize {
+    pub(crate) fn row_count(&self) -> usize {
         self.rows.lock().unwrap().len()
     }
 
@@ -101,7 +101,7 @@ impl RateLimitStore for MemoryStore {
     }
 }
 
-fn peer(ip: &str) -> SocketAddr {
+pub(crate) fn peer(ip: &str) -> SocketAddr {
     format!("{ip}:40000").parse().unwrap()
 }
 
