@@ -2253,11 +2253,48 @@ impl MongoEngine {
         // Outcome of one attempt at running the whole idempotency check
         // + op fan-out + commit. `Retry` means MongoDB aborted the txn
         // as a transient conflict; the caller should re-run from the top.
+        // `KeyFaults` means the key-check pass below decided the request.
         enum AttemptOutcome {
             Committed,
             CanceledReasons(Vec<CancellationReason>),
+            KeyFaults,
             Retry,
         }
+
+        // Key checks first, for every member in request order, before the
+        // session transaction starts. They need only the request and the
+        // table's indexes, and a fault among them decides the request under
+        // the service's precedence (the first such fault in request order)
+        // before any member is applied, as on the other backends. The
+        // decision is answered inside the attempt once the idempotency token
+        // is checked, so a reused token is answered first, and the abort
+        // discards the token insert.
+        let mut index_schemas: std::collections::HashMap<
+            &str,
+            Vec<(String, Vec<KeySchemaElement>)>,
+        > = std::collections::HashMap::new();
+        for op in ops {
+            let table_id = op.table_id();
+            if !index_schemas.contains_key(table_id) {
+                let schemas = self.fetch_index_key_schemas(table_id).await?;
+                index_schemas.insert(table_id, schemas);
+            }
+        }
+        let key_check = extenddb_storage::transact_key_check_pass(ops.iter().map(|op| {
+            let idx_refs: Vec<extenddb_core::validation::IndexKeyRef<'_>> = index_schemas
+                [op.table_id()]
+            .iter()
+            .map(|(n, ks)| extenddb_core::validation::IndexKeyRef {
+                index_name: n.as_str(),
+                key_schema: ks.as_slice(),
+            })
+            .collect();
+            extenddb_storage::transact_op_key_checks(
+                &op.as_op(),
+                &idx_refs,
+                &op.key_info().attribute_definitions,
+            )
+        }));
 
         // Rehydrate the `IdempotencyKey` per attempt from owned strings.
         // The input struct holds `&str`s, so it cannot be moved across
@@ -2393,6 +2430,10 @@ impl MongoEngine {
                     }
                 }
 
+                if key_check.is_err() {
+                    return Ok(AttemptOutcome::KeyFaults);
+                }
+
                 let mut reasons: Vec<CancellationReason> = Vec::with_capacity(ops.len());
                 let mut any_failed = false;
 
@@ -2440,6 +2481,10 @@ impl MongoEngine {
                         Ok(reasons) => StorageError::TransactionCanceled(reasons),
                         Err(message) => StorageError::Validation(message),
                     });
+                }
+                Ok(AttemptOutcome::KeyFaults) => {
+                    let _ = session.abort_transaction().await;
+                    return key_check;
                 }
                 Ok(AttemptOutcome::Retry) => {
                     let _ = session.abort_transaction().await;
@@ -2805,14 +2850,16 @@ impl MongoEngine {
                     TransactOpError::Cancel(CancellationReason::validation_error(e.to_string()))
                 })?;
 
-                // Secondary-index keys on the written item: a value computed
-                // from the existing item (an attribute reference, the fallback
-                // of if_not_exists) of the wrong type, reported with the
-                // service's computed-value wording, and a key left empty. The
-                // computed value is a plain positional reason: the service
-                // leaves the other members' outcomes in place beside it, where
-                // a wrong type supplied in the request (the literal check
-                // above, a Put item's keys) masks them.
+                // Secondary-index keys on the written item: a wrong-typed value
+                // the statement wrote from an attribute reference or from
+                // if_not_exists, reported with the service's computed-value
+                // wording, and a key left empty. With the path absent the
+                // if_not_exists fallback is a literal from the request, which
+                // the service ranks with the values taken from the item. The
+                // type fault is a plain positional reason: the service leaves
+                // the other members' outcomes in place beside it, where a
+                // wrong type supplied in the request (the key-check pass of
+                // transact_write_items_impl) masks them.
                 if !idx_refs.is_empty() {
                     extenddb_core::validation::validate_index_key_types_after_update(
                         &item,
@@ -3877,11 +3924,81 @@ enum OwnedTransactWriteOp {
 
 impl OwnedTransactWriteOp {
     fn table_id(&self) -> &str {
+        &self.key_info().table_id
+    }
+
+    fn key_info(&self) -> &TableKeyInfo {
         match self {
             Self::Put { key_info, .. }
             | Self::Delete { key_info, .. }
             | Self::Update { key_info, .. }
-            | Self::ConditionCheck { key_info, .. } => &key_info.table_id,
+            | Self::ConditionCheck { key_info, .. } => key_info,
+        }
+    }
+
+    /// The borrowed form the shared transaction helpers take.
+    fn as_op(&self) -> TransactWriteOp<'_> {
+        match self {
+            Self::Put {
+                key_info,
+                item,
+                condition,
+                maps,
+                return_values_on_ccf,
+                stream,
+            } => TransactWriteOp::Put {
+                key_info,
+                item,
+                condition: condition.as_ref(),
+                maps,
+                return_values_on_ccf: *return_values_on_ccf,
+                stream: stream.clone(),
+            },
+            Self::Delete {
+                key_info,
+                key,
+                condition,
+                maps,
+                return_values_on_ccf,
+                stream,
+            } => TransactWriteOp::Delete {
+                key_info,
+                key,
+                condition: condition.as_ref(),
+                maps,
+                return_values_on_ccf: *return_values_on_ccf,
+                stream: stream.clone(),
+            },
+            Self::Update {
+                key_info,
+                key,
+                actions,
+                condition,
+                maps,
+                return_values_on_ccf,
+                stream,
+            } => TransactWriteOp::Update {
+                key_info,
+                key,
+                actions,
+                condition: condition.as_ref(),
+                maps,
+                return_values_on_ccf: *return_values_on_ccf,
+                stream: stream.clone(),
+            },
+            Self::ConditionCheck {
+                key_info,
+                key,
+                condition,
+                maps,
+                return_values_on_ccf,
+            } => TransactWriteOp::ConditionCheck {
+                key_info,
+                key,
+                condition,
+                maps,
+                return_values_on_ccf: *return_values_on_ccf,
+            },
         }
     }
 }

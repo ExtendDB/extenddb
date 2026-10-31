@@ -40,7 +40,9 @@ pub use backend::{Backend, BackendAlreadySet, backend_name, set_backend, try_bac
 pub use backup_definition::{BackupRestoreSource, RestoreRequest, RestoreTableOverrides};
 pub use snapshot::{SnapshotEngine, SnapshotInfo, TableSnapshot};
 
-pub use transact::{IdempotencyKey, TransactGetOp, TransactWriteOp};
+pub use transact::{
+    IdempotencyKey, TransactGetOp, TransactWriteOp, transact_key_check_pass, transact_op_key_checks,
+};
 
 pub use server_components::{
     BackendError, ServerComponents, ServerComponentsFactory, create_server_components,

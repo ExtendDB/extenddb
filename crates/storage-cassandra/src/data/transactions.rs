@@ -204,9 +204,12 @@ impl CassandraEngine {
             .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
         let idx_refs = Self::transact_index_key_refs(key_info);
         if !idx_refs.is_empty() {
-            // A value computed from the existing item (an attribute reference,
-            // the fallback of if_not_exists) is only known now, and the service
-            // reports it with its own wording as a cancellation reason.
+            // A value written from an attribute reference or from
+            // if_not_exists is only known now, and the service reports a wrong
+            // type with its own wording as a cancellation reason. With the
+            // path absent the if_not_exists fallback is a literal from the
+            // request, which the service ranks with the values taken from the
+            // item.
             validation::validate_index_key_types_after_update(
                 &item,
                 &idx_refs,
@@ -435,6 +438,29 @@ impl CassandraEngine {
                 fingerprint,
             )
             .await?;
+        }
+
+        // Key checks first, for every member in request order, before the
+        // ledger entry and PREPARE. They need only the request and the table
+        // metadata, and a fault among them decides the request under the
+        // service's precedence (the first such fault in request order) before
+        // any item is read or any marker is written, as on the other
+        // backends. The token reserved above is released on this path, as on
+        // the PREPARE cancellation path below, so a retry can proceed.
+        let key_check = extenddb_storage::transact_key_check_pass(ops.iter().map(|op| {
+            let key_info = transact_write_op_key_info(op);
+            extenddb_storage::transact_op_key_checks(
+                op,
+                &Self::transact_index_key_refs(key_info),
+                &key_info.attribute_definitions,
+            )
+        }));
+        if let Err(answer) = key_check {
+            if let Some((idempotency_account, token, _)) = idempotency {
+                self.delete_idempotency_token(&self.catalog_keyspace(), idempotency_account, token)
+                    .await;
+            }
+            return Err(answer);
         }
 
         // Generate unique transaction ID
@@ -1146,11 +1172,16 @@ fn eval_condition(
 
 /// Extract `account_id` from a `TransactWriteOp`.
 fn transact_write_op_account_id<'a>(op: &'a TransactWriteOp<'_>) -> &'a str {
+    &transact_write_op_key_info(op).account_id
+}
+
+/// The table metadata of a `TransactWriteOp`.
+fn transact_write_op_key_info<'a>(op: &'a TransactWriteOp<'_>) -> &'a TableKeyInfo {
     match op {
         TransactWriteOp::Put { key_info, .. }
         | TransactWriteOp::Delete { key_info, .. }
         | TransactWriteOp::Update { key_info, .. }
-        | TransactWriteOp::ConditionCheck { key_info, .. } => &key_info.account_id,
+        | TransactWriteOp::ConditionCheck { key_info, .. } => key_info,
     }
 }
 

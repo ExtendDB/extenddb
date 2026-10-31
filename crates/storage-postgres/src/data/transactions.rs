@@ -13,10 +13,13 @@ use extenddb_core::types::{
 use extenddb_core::validation;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::pk_to_text;
-use extenddb_storage::{IdempotencyKey, TransactGetOp, TransactWriteOp};
+use extenddb_storage::{
+    IdempotencyKey, TransactGetOp, TransactWriteOp, transact_key_check_pass, transact_op_key_checks,
+};
 
 use super::index::{
-    IndexMeta, db_error, enqueue_async_indexes, fetch_write_path_indexes, sync_indexes,
+    IndexMeta, db_error, enqueue_async_indexes, fetch_write_path_indexes, fresh_attr_defs,
+    sync_indexes,
 };
 use super::tx_helpers::{
     check_idempotency_token_in_tx, delete_item_in_tx, fetch_item_for_update, fetch_item_in_tx,
@@ -154,28 +157,18 @@ impl PostgresEngine {
 
         // Key checks first, for every member, before any row is locked. They
         // need only the request and the table metadata, and a fault among them
-        // decides the request under the service's precedence (a wrong-typed
-        // key on any member, else an empty index key on any member), so a
-        // request that is already decided never waits on a row another
-        // transaction holds.
-        {
-            let mut key_reasons: Vec<CancellationReason> =
-                vec![CancellationReason::none(); ops.len()];
-            let mut any_key_fault = false;
-            for (i, op) in ops.iter().enumerate() {
-                let indexes = &table_indexes[transact_op_table_name(op)];
-                if let Err(r) = transact_op_key_checks(op, indexes) {
-                    any_key_fault = true;
-                    key_reasons[i] = r;
-                }
-            }
-            if any_key_fault {
-                return Err(match CancellationReason::resolve_key_faults(key_reasons) {
-                    Ok(reasons) => StorageError::TransactionCanceled(reasons),
-                    Err(message) => StorageError::Validation(message),
-                });
-            }
-        }
+        // decides the request under the service's precedence (the first such
+        // fault in request order), so a request that is already decided never
+        // waits on a row another transaction holds. Returning drops `tx`,
+        // which rolls back the idempotency token checked above.
+        transact_key_check_pass(ops.iter().map(|op| {
+            let indexes = &table_indexes[transact_op_table_name(op)];
+            transact_op_key_checks(
+                op,
+                &index_key_refs(indexes),
+                fresh_attr_defs(indexes, &transact_op_key_info(op).attribute_definitions),
+            )
+        }))?;
 
         // Run the ops in key order, not request order, so every transaction
         // locks its items in one global order and two cannot deadlock on each
@@ -210,8 +203,15 @@ impl PostgresEngine {
             if is_conflict_abort(&e) {
                 // PostgreSQL broke a lock conflict by aborting this transaction.
                 // Cancel it with the contended item named, as the service does.
+                // A member that ran earlier in execution order may have left an
+                // internal key fault (an Update's empty index key); the shared
+                // resolver ranks it as it does without the conflict, so no
+                // internal code reaches the client.
                 reasons[i] = CancellationReason::transaction_conflict();
-                return Err(StorageError::TransactionCanceled(reasons));
+                return Err(match CancellationReason::resolve_key_faults(reasons) {
+                    Ok(reasons) => StorageError::TransactionCanceled(reasons),
+                    Err(message) => StorageError::Validation(message),
+                });
             }
             // Infrastructure error: abort without leaking internal details
             // into cancellation reasons.
@@ -399,6 +399,16 @@ fn lock_key<'a>(op: &'a TransactWriteOp<'_>) -> (&'a str, Vec<Cow<'a, str>>) {
     (&key_info.table_id, values)
 }
 
+/// The table metadata of a transactional write operation.
+fn transact_op_key_info<'a>(op: &'a TransactWriteOp<'_>) -> &'a TableKeyInfo {
+    match op {
+        TransactWriteOp::Put { key_info, .. }
+        | TransactWriteOp::Delete { key_info, .. }
+        | TransactWriteOp::Update { key_info, .. }
+        | TransactWriteOp::ConditionCheck { key_info, .. } => key_info,
+    }
+}
+
 /// Extract the table name from a transactional write operation.
 fn transact_op_table_name<'a>(op: &'a TransactWriteOp<'_>) -> &'a str {
     match op {
@@ -435,71 +445,6 @@ pub(super) fn index_key_refs(indexes: &[IndexMeta]) -> Vec<validation::IndexKeyR
             key_schema: &idx.key_schema,
         })
         .collect()
-}
-
-/// The key checks a transaction member can fail before any row is read or
-/// locked: the table key's shape and types, and the secondary-index keys the
-/// member supplies in the request itself (a Put item's attributes, an Update
-/// statement's literal operands). Faults carry the internal reasons that
-/// `CancellationReason::resolve_key_faults` ranks. Values computed from the
-/// existing item are checked later, once the row is read.
-fn transact_op_key_checks(
-    op: &TransactWriteOp<'_>,
-    indexes: &[IndexMeta],
-) -> Result<(), CancellationReason> {
-    match op {
-        TransactWriteOp::Put { key_info, item, .. } => {
-            validation::validate_item_keys(
-                item,
-                &key_info.key_schema,
-                &key_info.attribute_definitions,
-            )
-            .map_err(|e| CancellationReason::key_type_mismatch(e.to_string()))?;
-            let idx_refs = index_key_refs(indexes);
-            validation::validate_index_key_types(
-                item,
-                &idx_refs,
-                super::index::fresh_attr_defs(indexes, &key_info.attribute_definitions),
-            )
-            .map_err(|e| CancellationReason::key_type_mismatch(e.to_string()))?;
-            validation::validate_index_key_not_empty(
-                item,
-                &idx_refs,
-                validation::SecondaryIndexEmptyContext::Item,
-            )
-            .map_err(|e| CancellationReason::index_key_empty_abort(e.to_string()))
-        }
-        TransactWriteOp::Update {
-            key_info,
-            key,
-            actions,
-            maps,
-            ..
-        } => {
-            validation::validate_batch_key_only(
-                key,
-                &key_info.key_schema,
-                &key_info.attribute_definitions,
-            )
-            .map_err(|e| CancellationReason::key_type_mismatch(e.to_string()))?;
-            validation::validate_index_key_literal_operands(
-                actions,
-                &index_key_refs(indexes),
-                super::index::fresh_attr_defs(indexes, &key_info.attribute_definitions),
-                maps,
-            )
-            .map_err(|e| CancellationReason::key_type_mismatch(e.to_string()))
-        }
-        TransactWriteOp::Delete { key_info, key, .. }
-        | TransactWriteOp::ConditionCheck { key_info, key, .. } => {
-            validation::validate_batch_key_only(
-                key,
-                &key_info.key_schema,
-                &key_info.attribute_definitions,
-            )
-            .map_err(|e| CancellationReason::key_type_mismatch(e.to_string()))
-        }
-    }
 }
 
 enum TxnOpError {
@@ -542,7 +487,12 @@ async fn execute_transact_write_op(
             // reasons, matching real DynamoDB behavior.
             // Key checks ran in the pre-pass; repeated so the arm stays
             // correct if called on its own.
-            transact_op_key_checks(op, indexes).map_err(TxnOpError::Cancel)?;
+            transact_op_key_checks(
+                op,
+                &index_key_refs(indexes),
+                fresh_attr_defs(indexes, &key_info.attribute_definitions),
+            )
+            .map_err(TxnOpError::Cancel)?;
             let mut existing = fetch_item_for_update(tx, key_info, item)
                 .await
                 .map_err(TxnOpError::Storage)?;
@@ -687,8 +637,9 @@ async fn execute_transact_write_op(
             return_values_on_ccf,
             ..
         } => {
-            transact_op_key_checks(op, indexes).map_err(TxnOpError::Cancel)?;
             let idx_refs = index_key_refs(indexes);
+            let attr_defs = fresh_attr_defs(indexes, &key_info.attribute_definitions);
+            transact_op_key_checks(op, &idx_refs, attr_defs).map_err(TxnOpError::Cancel)?;
             let mut existing = fetch_item_for_update(tx, key_info, key)
                 .await
                 .map_err(TxnOpError::Storage)?;
@@ -724,21 +675,19 @@ async fn execute_transact_write_op(
                     .map_err(|e| {
                         TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))
                     })?;
-                // Secondary-index keys on the written item: a value computed from
-                // the existing item (an attribute reference, the fallback of
-                // if_not_exists) of the wrong type, reported with the service's
-                // computed-value wording, and a key left empty. The computed
-                // value is a plain positional reason: the service leaves the
-                // other members' outcomes in place beside it, where a wrong
-                // type supplied in the request (the pre-pass) masks them.
-                validation::validate_index_key_types_after_update(
-                    &item,
-                    &idx_refs,
-                    super::index::fresh_attr_defs(indexes, &key_info.attribute_definitions),
-                )
-                .map_err(|e| {
-                    TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))
-                })?;
+                // Secondary-index keys on the written item: a wrong-typed value
+                // the statement wrote from an attribute reference or from
+                // if_not_exists, reported with the service's computed-value
+                // wording, and a key left empty. With the path absent the
+                // if_not_exists fallback is a literal from the request, which
+                // the service ranks with the values taken from the item. The
+                // type fault is a plain positional reason: the service leaves
+                // the other members' outcomes in place beside it, where a
+                // wrong type supplied in the request (the pre-pass) masks them.
+                validation::validate_index_key_types_after_update(&item, &idx_refs, attr_defs)
+                    .map_err(|e| {
+                        TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))
+                    })?;
                 validation::validate_index_key_not_empty(
                     &item,
                     &idx_refs,
