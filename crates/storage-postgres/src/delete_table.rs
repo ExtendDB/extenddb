@@ -4,14 +4,16 @@
 //! `delete_table` implementation for `PostgresEngine`.
 //!
 //! The synchronous path (`control_plane_delay_seconds` below 1 and no reader
-//! on the table's relations) removes the catalog row and drops the data
-//! relations in the request. On one shared database both go in one commit.
-//! With a separate data database the drops are run first and held
-//! uncommitted, the catalog removal commits, and the data transaction
-//! commits after it ([`drop_on_data_database`]); a data commit that fails
-//! then has the drop retried on fresh connections for
-//! [`DATA_DROP_RETRY_BOUND`] before the request gives up. What is left
-//! behind when it does, and how to remove it, is stated at
+//! on the table's relations) removes the table's catalog row and drops its
+//! data relations in the request. On one shared database both go in one
+//! commit. With a separate data database the drops are run first and held
+//! uncommitted ([`drop_on_data_database`]); the row is committed `DELETING`,
+//! the data transaction commits, and only then is the row removed
+//! ([`remove_deleting_row`]). A data commit that fails has the drop retried
+//! on fresh connections for [`DATA_DROP_RETRY_BOUND`]; a process that dies,
+//! or a data database unreachable for that whole window, leaves the row
+//! `DELETING` for the control-plane poller to finish, not data relations
+//! without a row. What that costs, and the recovery, is stated at
 //! [`DATA_DROP_RETRY_BOUND`].
 
 use std::time::{Duration, Instant};
@@ -233,19 +235,25 @@ impl PostgresEngine {
             .await?
             {
                 // Separate data database: no transaction covers both. The
-                // drops hold their locks, uncommitted, in `data_tx`; the
-                // catalog removal is made here and the two commits follow,
-                // catalog first, below.
-                sqlx::query("DELETE FROM tags WHERE resource_arn = $1")
-                    .bind(&row.table_arn)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-                sqlx::query("DELETE FROM tables WHERE table_id = $1")
-                    .bind(&row.table_id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                // drops hold their locks, uncommitted, in `data_tx`. The row
+                // is marked DELETING here, not removed, and the catalog
+                // commit and the data commit follow, catalog first, below;
+                // the row is removed only once the data commit has landed
+                // (`remove_deleting_row`). A process that dies, or a data
+                // database unreachable past `DATA_DROP_RETRY_BOUND`, between
+                // the two leaves a DELETING row the control-plane poller
+                // finishes, not data tables that no catalog row names. The
+                // transition is due at once (`NOW()`), so the poller takes it
+                // the moment this request's own task does not.
+                sqlx::query(
+                    r"UPDATE tables SET table_status = 'DELETING',
+                        status_transition_at = NOW()
+                       WHERE table_id = $1",
+                )
+                .bind(&row.table_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
                 data_commit = Some(data_tx);
                 true
             } else {
@@ -257,42 +265,75 @@ impl PostgresEngine {
 
         if removed {
             if let Some(data_tx) = data_commit {
-                // Both commits, and the retries a failed data commit needs,
-                // run in a task of their own, which the request awaits: a
-                // caller cancelled from here on cannot stop between the
-                // commits and leave the row gone with the data tables kept,
-                // and cannot stop the retries either (dropping the request
-                // detaches the task; it does not cancel it). The drops
-                // already hold their locks, so the data commit does not
-                // wait. Once the catalog commit is in, the row is gone
-                // whatever happens next: a data commit that fails (the
-                // connection terminated, a failover, a network fault) has
-                // the drop redone on a fresh connection by
-                // `drop_after_catalog_commit`, and only a process that dies,
-                // or a data database unreachable for longer than
-                // `DATA_DROP_RETRY_BOUND`, between the catalog commit and
-                // the last retry leaves the data tables without a row.
-                let data_pool = self.data_pool.clone();
+                // The catalog commit, the data commit, the retries a failed
+                // data commit needs, and the row removal that a landed data
+                // commit allows run in a task of their own, which the request
+                // awaits. The row is DELETING across the whole window, so a
+                // caller cancelled from here on (dropping the request only
+                // detaches the task; it does not cancel it) and a process
+                // that dies both leave the row DELETING, never gone with the
+                // data tables kept. The drops already hold their locks, so
+                // the data commit does not wait. A data commit that fails
+                // (the connection terminated, a failover, a network fault)
+                // has the drop redone on a fresh connection by
+                // `drop_after_catalog_commit`; the row is removed only once
+                // the data relations are gone. A process that dies, or a data
+                // database unreachable for longer than
+                // `DATA_DROP_RETRY_BOUND`, between the catalog commit and the
+                // last retry leaves the row DELETING for the control-plane
+                // poller to finish, so the drop is retried rather than the
+                // data tables leaked.
+                let engine = self.clone();
+                let table_arn = row.table_arn.clone();
                 let table_id = row.table_id.clone();
+                let task_index_ids = index_ids.clone();
+                let task_vector_index_ids = vector_index_ids.clone();
                 tokio::spawn(async move {
                     tx.commit()
                         .await
                         .map_err(|e| StorageError::Internal(e.to_string()))?;
                     #[cfg(feature = "test-hooks")]
                     test_pause::reached(test_pause::DeleteTablePoint::BetweenCommits).await;
-                    match data_tx.commit().await {
+                    // Commit the data drop; a failed commit (a lost
+                    // connection, a failover, a network fault) has the drop
+                    // redone on a fresh connection, bounded by
+                    // `DATA_DROP_RETRY_BOUND`.
+                    let data_dropped = match data_tx.commit().await {
                         Ok(()) => Ok(()),
                         Err(e) => {
                             drop_after_catalog_commit(
-                                &data_pool,
+                                &engine.data_pool,
                                 &table_id,
-                                &index_ids,
-                                &vector_index_ids,
+                                &task_index_ids,
+                                &task_vector_index_ids,
                                 &e,
                             )
                             .await
                         }
+                    };
+                    if let Err(drop_err) = data_dropped {
+                        // The data relations could not be dropped within the
+                        // retry bound, and the row stays DELETING. The wake
+                        // starts a control-plane pass now. When the bound ran
+                        // out on lock waits, that pass defers the drop while
+                        // the holder remains, and the poller retries it every
+                        // second until the holder ends. When the data database
+                        // is unreachable, that pass fails and the poller goes
+                        // idle; its idle pass, every 60 s, finishes the drop
+                        // once the data database answers.
+                        engine.control_plane_notify.notify_one();
+                        return Err(drop_err);
                     }
+                    #[cfg(feature = "test-hooks")]
+                    test_pause::reached(test_pause::DeleteTablePoint::AfterDataCommit).await;
+                    // The data relations are gone; remove the catalog row.
+                    // When another session holds it, a pass removes it: the
+                    // pass that holds it, or the next one, which the wake
+                    // starts, once the holder is done.
+                    if !remove_deleting_row(&engine.pool, &table_arn, &table_id).await? {
+                        engine.control_plane_notify.notify_one();
+                    }
+                    Ok(())
                 })
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))??;
@@ -374,17 +415,19 @@ pub(crate) const SYNC_DROP_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
 /// names, and the `DROP TABLE` to run) is what they need to finish the
 /// delete by hand.
 ///
-/// What is left behind when the retries are exhausted, or when the process
-/// dies between the catalog commit and the last retry: the table's data
-/// relations (`_ddb_<table_id>`, one `_ddb_<index_id>` per GSI or LSI, one
-/// `_ddb_vec_<index_id>` per vector index) on the data database with no
-/// catalog row naming them, and possibly a `vector_index_holds` row for the
-/// table id, which the hold sweep clears by age. Nothing in the server drops
-/// such relations later: `DescribeTable` reports the table gone, a
-/// `CreateTable` of the same name gets a new table id, and the control
-/// plane enumerates relations from catalog rows only. They stay until an
-/// operator drops them (`docs/troubleshooting.md`, "Data tables without a
-/// catalog row"). On one shared database the row and the drops are one
+/// When the retries are exhausted, or when the process dies between the
+/// catalog commit and the last retry, the table's catalog row stays
+/// `DELETING` with its transition due, and the control-plane poller (the
+/// startup pass, or a later pass) drops the data relations and removes the
+/// row once the data database is reachable again (`worker_store.rs`). The
+/// data relations (`_ddb_<table_id>`, one `_ddb_<index_id>` per GSI or LSI,
+/// one `_ddb_vec_<index_id>` per vector index) are therefore not left on the
+/// data database without a catalog row naming them: the `DELETING` row names
+/// them until the poller drops them. The error the exhausted request returns
+/// and the error log it writes (the table id, the relation names, the `DROP
+/// TABLE` to run) are for the operator watching the outage, who can finish
+/// the drop by hand; the poller finishes it without them once the data
+/// database answers. On one shared database the row and the drops are one
 /// commit, and none of this applies.
 pub(crate) const DATA_DROP_RETRY_BOUND: Duration = Duration::from_secs(60);
 
@@ -398,8 +441,8 @@ fn data_drop_retry_bound() -> Duration {
     DATA_DROP_RETRY_BOUND
 }
 
-/// Separate data database: the catalog commit is in and the data commit
-/// failed with `commit_error`, so the table's row is gone while its data
+/// Separate data database: the catalog commit is in (the row is `DELETING`)
+/// and the data commit failed with `commit_error`, so the table's data
 /// relations may still exist (a commit whose reply was lost may also have
 /// gone through; nothing here can tell). Redo the drop on fresh connections
 /// from `data` until it succeeds or [`DATA_DROP_RETRY_BOUND`] has passed.
@@ -413,11 +456,11 @@ fn data_drop_retry_bound() -> Duration {
 /// backoff from 100 ms doubling to 5 s: a lock wait that fails
 /// (`lock_wait_failed`) because a session took a lock after the first drop's
 /// locks were released with its connection, a connection the pool cannot
-/// open, a statement the server did not answer. On success the delete is
-/// complete and the caller returns the description as usual. When the bound
-/// is exhausted the relation names and the table id are logged at error with
-/// the `DROP TABLE` that removes them, and the request fails with
-/// `Internal`; the row is gone either way.
+/// open, a statement the server did not answer. On success the data
+/// relations are gone and the caller removes the `DELETING` row. When the
+/// bound is exhausted the relation names and the table id are logged at
+/// error with the `DROP TABLE` that removes them, and `Err` is returned; the
+/// row stays `DELETING` and the control-plane poller finishes the drop.
 async fn drop_after_catalog_commit(
     data: &sqlx::PgPool,
     table_id: &str,
@@ -431,7 +474,7 @@ async fn drop_after_catalog_commit(
     tracing::warn!(
         table_id,
         ?relations,
-        "DeleteTable: the catalog row is removed but the data commit failed ({commit_error}); \
+        "DeleteTable: the catalog row is DELETING but the data commit failed ({commit_error}); \
          retrying the drop of the data relations for up to {bound:?}"
     );
     let mut backoff = Duration::from_millis(100);
@@ -470,13 +513,13 @@ async fn drop_after_catalog_commit(
     tracing::error!(
         table_id,
         ?relations,
-        "DeleteTable: the catalog row of table {table_id} is removed but its data relations \
-         could not be dropped in {attempts} attempt(s) over {:?} ({last_error}); they stay on \
-         the data database until dropped by hand: {drop_statement}",
+        "DeleteTable: table {table_id} is DELETING but its data relations could not be \
+         dropped in {attempts} attempt(s) over {:?} ({last_error}); the control plane finishes \
+         the drop once the data database is reachable, or run it by hand: {drop_statement}",
         started.elapsed()
     );
     Err(StorageError::Internal(format!(
-        "DeleteTable: table {table_id} is removed from the catalog but its data relations \
+        "DeleteTable: table {table_id} is DELETING but its data relations \
          {relations:?} could not be dropped ({last_error})"
     )))
 }
@@ -489,11 +532,11 @@ async fn drop_after_catalog_commit(
 /// is returned, and the data transaction rolls back when it is dropped.
 ///
 /// Nothing commits here, so a failure up to and including the catalog commit
-/// leaves the table as it was. After the catalog commit the row is gone, and
-/// a data commit that fails for any reason (not only a process death) is
-/// followed by [`drop_after_catalog_commit`]'s retries; what a process death
-/// or an outage longer than [`DATA_DROP_RETRY_BOUND`] leaves behind is
-/// stated there.
+/// leaves the table as it was. After the catalog commit the row is
+/// `DELETING`, and a data commit that fails for any reason (not only a
+/// process death) is followed by [`drop_after_catalog_commit`]'s retries;
+/// what a process death or an outage longer than [`DATA_DROP_RETRY_BOUND`]
+/// leaves behind is stated there.
 ///
 /// The order is `remove_table_and_storage`'s: the pending queue rows first,
 /// with no timeout (a claim in flight is short and the drop waits for it, as
@@ -548,6 +591,52 @@ async fn drop_on_data_database(
         }
         Err(e) => Err(StorageError::Internal(e.to_string())),
     }
+}
+
+/// Separate data database: the data relations are gone, so remove the
+/// table's tags and catalog row, in a catalog transaction of its own after
+/// the row was committed `DELETING` and the data drop has landed.
+///
+/// The row is locked first, without waiting (`FOR UPDATE SKIP LOCKED`), and
+/// the tags are deleted after it. That is a control-plane pass's order: it
+/// locks the row, deletes the tags, then deletes the row. Deleting the tags
+/// first and then waiting for a row a pass holds deadlocks with that pass
+/// when the table has tags. `Ok(false)`: the row is already removed, or
+/// another session holds it (a control-plane pass, or a request that returns
+/// at once on a `DELETING` row). Nothing is changed then, and the caller
+/// wakes the poller: the pass that holds the row removes it, or the next
+/// pass does once the holder is done.
+async fn remove_deleting_row(
+    catalog: &sqlx::PgPool,
+    table_arn: &str,
+    table_id: &str,
+) -> Result<bool, StorageError> {
+    let internal = |e: sqlx::Error| StorageError::Internal(e.to_string());
+    let mut tx = catalog.begin().await.map_err(internal)?;
+    let locked: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM tables WHERE table_id = $1 AND table_status = 'DELETING' \
+         FOR UPDATE SKIP LOCKED",
+    )
+    .bind(table_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(internal)?;
+    if locked.is_none() {
+        tx.rollback().await.map_err(internal)?;
+        return Ok(false);
+    }
+    sqlx::query("DELETE FROM tags WHERE resource_arn = $1")
+        .bind(table_arn)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
+    sqlx::query("DELETE FROM tables WHERE table_id = $1 AND table_status = 'DELETING'")
+        .bind(table_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
+    tx.commit().await.map_err(internal)?;
+    Ok(true)
 }
 
 /// One shared database: drop the table's storage and remove its tags and
@@ -643,9 +732,15 @@ pub(crate) mod test_pause {
         /// on the table in the window a reader the probe missed has.
         BeforeDrops,
         /// Separate data database only: between the catalog commit and the
-        /// data commit of the synchronous path, so a test can make the data
-        /// commit fail with the row already gone.
+        /// data commit of the synchronous path, with the row `DELETING` and
+        /// the drops held uncommitted, so a test can make the data commit
+        /// fail or kill the request there.
         BetweenCommits,
+        /// Separate data database only: after the data drop has committed
+        /// (or been redone after a failed commit) and before the `DELETING`
+        /// row is removed, so a test can stop the request with the data
+        /// relations gone and the row still there.
+        AfterDataCommit,
     }
 
     static PAUSE: PausePoint<DeleteTablePoint> = PausePoint::new();

@@ -2571,12 +2571,10 @@ async fn make_data_unreachable(s: &Scratch) {
 }
 
 /// Separate data database: when the data commit fails after the catalog
-/// commit, the spawned task retries the drop on a fresh connection, so the
-/// delete still succeeds and no data table is left without its row. This is
-/// the window the PR used to describe as "a process that dies between the
-/// two commits"; any failure of the data commit reaches it, with the process
-/// up, and the retry closes it. Mutant: return the commit error instead of
-/// retrying, and the relations stay.
+/// commit, the row is DELETING from the catalog commit on, and the spawned
+/// task redoes the drop on a fresh connection, so `DeleteTable` still
+/// returns `Ok` and no data table is left without its row. Mutant: return
+/// the commit error instead of redoing the drop, and the relations stay.
 #[tokio::test]
 async fn a_failed_data_commit_after_the_catalog_commit_is_retried() {
     if base_conn().is_none() {
@@ -2602,8 +2600,8 @@ async fn a_failed_data_commit_after_the_catalog_commit_is_retried() {
     }
     assert_eq!(
         catalog_status(&s, "recommit").await.as_deref(),
-        None,
-        "the catalog commit is in by the pause"
+        Some("DELETING"),
+        "the row is DELETING by the pause, not removed"
     );
     terminate_held_data_backend(&s).await;
     pause.resume();
@@ -2630,15 +2628,18 @@ async fn a_failed_data_commit_after_the_catalog_commit_is_retried() {
 }
 
 /// Separate data database: when the data database stays unreachable past the
-/// retry bound, the delete gives up, names the leaked relations in its error
-/// (and logs them with the `DROP TABLE` to run), and the catalog row is gone
-/// regardless. A test-shortened bound keeps it quick.
+/// retry bound, the delete gives up and names the relations it could not drop
+/// in its error (and logs them with the `DROP TABLE` to run), but the catalog
+/// row stays DELETING, not removed. Once the data database is reachable again
+/// the control-plane poller finishes the drop and removes the row, so the
+/// relations are never left without one. A test-shortened bound keeps it
+/// quick.
 #[tokio::test]
-async fn an_unreachable_data_database_past_the_bound_reports_the_leaked_relations() {
+async fn an_unreachable_data_database_past_the_bound_leaves_the_row_deleting_for_the_poller() {
     if base_conn().is_none() {
         eprintln!(
-            "SKIP an_unreachable_data_database_past_the_bound_reports_the_leaked_relations: no \
-             PostgreSQL"
+            "SKIP an_unreachable_data_database_past_the_bound_leaves_the_row_deleting_for_the_poller: \
+             no PostgreSQL"
         );
         return;
     }
@@ -2676,12 +2677,15 @@ async fn an_unreachable_data_database_past_the_bound_reports_the_leaked_relation
     }
     assert_eq!(
         catalog_status(&s, "stranded").await.as_deref(),
-        None,
-        "the catalog row is removed even though the data drop could not be redone"
+        Some("DELETING"),
+        "the row stays DELETING when the data drop could not be redone, not removed"
     );
-    // Let the engine reach the data database again so the Drop cleanup can
-    // force-drop it.
+
+    // The data database is reachable again; the control-plane poller finishes
+    // the drop and removes the row, leaving nothing without a catalog row.
     set_data_allow_connections(&s, true).await;
+    assert_no_orphan(&s, "stranded", &relations, "after the bound was exhausted").await;
+    pump_until_removed(&s, "stranded", &relations).await;
 }
 
 /// Separate data database: a caller that gives up after the catalog commit
@@ -2727,6 +2731,410 @@ async fn a_caller_cancelled_between_the_commits_does_not_strand_the_data() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     panic!("the detached task did not finish the drop after the caller was cancelled");
+}
+
+/// Run a `DeleteTable` of `table` the way another server process would, on
+/// its own runtime with its own engine, until it signals `reached` (a pause
+/// the caller armed), then drop that runtime, the way a kill does: the task
+/// running the request is dropped where it waits, with whatever transactions
+/// it holds. Returns once no session holds a lock on `relations`, so the
+/// server has rolled back what the dead process left open.
+async fn kill_delete_table_at_the_pause(
+    s: &Scratch,
+    table: &str,
+    relations: &[String],
+    reached: tokio::sync::oneshot::Receiver<()>,
+) {
+    let catalog_url = format!("{}/{}", s.base, s.names[0]);
+    let table_name = table.to_owned();
+    let (kill_tx, kill_rx) = std::sync::mpsc::channel::<()>();
+    let dying = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build the dying process's runtime");
+        let engine = rt.block_on(async {
+            PostgresEngine::new(
+                &PostgresConfig {
+                    connection_string: catalog_url,
+                    pool_size: 8,
+                    max_item_size_bytes: 400_000,
+                },
+                REGION,
+            )
+            .await
+            .expect("open the dying process's engine")
+        });
+        rt.spawn(async move {
+            let _ = engine
+                .delete_table(ACCOUNT, delete_input(&table_name))
+                .await;
+        });
+        // Block the thread until the test has seen the pause reached, then
+        // "die": dropping the runtime drops the task mid-request.
+        let _ = kill_rx.recv();
+        drop(rt);
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(30), reached)
+        .await
+        .expect("the dying DeleteTable reached the pause in time")
+        .expect("the pause was reached");
+    kill_tx
+        .send(())
+        .expect("signal the dying process to drop its runtime");
+    dying.join().expect("the dying process's thread ends");
+
+    // Wait for the server to notice the dropped connections and roll back
+    // what they held, releasing the locks.
+    let data = s.data_pool().await;
+    for _ in 0..200 {
+        let held: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'relation' AND granted \
+             AND pid <> pg_backend_pid() \
+             AND database = (SELECT oid FROM pg_database WHERE datname = current_database()) \
+             AND relation = ANY (SELECT to_regclass(n)::oid FROM unnest($1::text[]) AS n))",
+        )
+        .bind(relations)
+        .fetch_one(&data)
+        .await
+        .expect("probe the data relations' locks");
+        if !held {
+            data.close().await;
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("a session still holds the data relations 5 s after the kill");
+}
+
+/// Separate data database: a process that dies between the catalog commit and
+/// the data commit leaves the row DELETING, so the next process's startup
+/// pass finishes the drop. The request runs on its own runtime with its own
+/// engine; dropping that runtime drops the task holding the uncommitted data
+/// drops, the way a kill does, so the data drops roll back and both data
+/// tables remain. The DELETING row still names them, and the startup pass
+/// drops the tables and removes the row.
+#[tokio::test]
+async fn process_death_between_the_commits_is_finished_by_the_startup_pass() {
+    if base_conn().is_none() {
+        eprintln!(
+            "SKIP process_death_between_the_commits_is_finished_by_the_startup_pass: no PostgreSQL"
+        );
+        return;
+    }
+    let s = scratch_with(false).await;
+    create_active(&s, snapshot_conformance::table_input("killed")).await;
+    snapshot_conformance::populate(&s.engine, ACCOUNT, "killed", 5).await;
+    let relations = base_and_gsi_relations(&s, "killed").await;
+
+    // The dying process reaches the between-commits pause after the catalog
+    // commit, with the data drops held uncommitted, and is killed there.
+    let mut pause = extenddb_storage_postgres::arm_delete_table_pause_at(
+        extenddb_storage_postgres::DeleteTablePoint::BetweenCommits,
+    );
+    let reached = pause.take_reached();
+    kill_delete_table_at_the_pause(&s, "killed", &relations, reached).await;
+
+    // The row is DELETING and names the data tables the rolled-back drops
+    // left behind.
+    assert_eq!(
+        catalog_status(&s, "killed").await.as_deref(),
+        Some("DELETING"),
+        "the row is left DELETING, not removed, after the process died between the commits"
+    );
+    assert_eq!(
+        present_relations(&s, &relations).await,
+        relations,
+        "the interrupted data drop rolled back, so both data tables remain"
+    );
+    assert_no_orphan(&s, "killed", &relations, "after the process died").await;
+
+    // The next process's startup pass finishes the delete: drops the data
+    // tables, then removes the row.
+    s.engine.recover_control_plane_at_startup_for_tests().await;
+    assert_eq!(
+        catalog_status(&s, "killed").await,
+        None,
+        "the startup pass removed the row"
+    );
+    assert!(
+        present_relations(&s, &relations).await.is_empty(),
+        "the startup pass dropped every data relation"
+    );
+    drop(pause);
+}
+
+/// Separate data database: a process that dies after the data commit and
+/// before the row removal leaves the row DELETING with no data relations,
+/// and the next process's startup pass removes the row.
+#[tokio::test]
+async fn process_death_after_the_data_commit_is_finished_by_the_startup_pass() {
+    if base_conn().is_none() {
+        eprintln!(
+            "SKIP process_death_after_the_data_commit_is_finished_by_the_startup_pass: \
+             no PostgreSQL"
+        );
+        return;
+    }
+    let s = scratch_with(false).await;
+    create_active(&s, snapshot_conformance::table_input("dropped")).await;
+    snapshot_conformance::populate(&s.engine, ACCOUNT, "dropped", 5).await;
+    let relations = base_and_gsi_relations(&s, "dropped").await;
+
+    let mut pause = extenddb_storage_postgres::arm_delete_table_pause_at(
+        extenddb_storage_postgres::DeleteTablePoint::AfterDataCommit,
+    );
+    let reached = pause.take_reached();
+    kill_delete_table_at_the_pause(&s, "dropped", &relations, reached).await;
+
+    assert_eq!(
+        catalog_status(&s, "dropped").await.as_deref(),
+        Some("DELETING"),
+        "the row is DELETING after the process died past the data commit"
+    );
+    assert!(
+        present_relations(&s, &relations).await.is_empty(),
+        "the data commit dropped every data relation before the process died"
+    );
+
+    s.engine.recover_control_plane_at_startup_for_tests().await;
+    assert_eq!(
+        catalog_status(&s, "dropped").await,
+        None,
+        "the startup pass removed the row"
+    );
+    drop(pause);
+}
+
+/// Separate data database: past the data commit the request removes the row
+/// itself; no control-plane pass runs here. Mutant: skip the call to
+/// `remove_deleting_row`, and the row is still DELETING after `DeleteTable`
+/// returns.
+#[tokio::test]
+async fn delete_table_removes_the_row_after_the_data_commit() {
+    if base_conn().is_none() {
+        eprintln!("SKIP delete_table_removes_the_row_after_the_data_commit: no PostgreSQL");
+        return;
+    }
+    let s = scratch_with(false).await;
+    create_active(&s, snapshot_conformance::table_input("removed")).await;
+    snapshot_conformance::populate(&s.engine, ACCOUNT, "removed", 5).await;
+    let relations = base_and_gsi_relations(&s, "removed").await;
+
+    let mut pause = extenddb_storage_postgres::arm_delete_table_pause_at(
+        extenddb_storage_postgres::DeleteTablePoint::AfterDataCommit,
+    );
+    let reached = pause.take_reached();
+    let mut delete = Box::pin(tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        s.engine.delete_table(ACCOUNT, delete_input("removed")),
+    ));
+    tokio::select! {
+        r = &mut delete => panic!("DeleteTable finished before the after-data-commit pause: {r:?}"),
+        r = reached => r.expect("DeleteTable reached the after-data-commit pause"),
+    }
+    assert_eq!(
+        catalog_status(&s, "removed").await.as_deref(),
+        Some("DELETING"),
+        "the row is DELETING at the pause"
+    );
+    assert!(
+        present_relations(&s, &relations).await.is_empty(),
+        "the data commit dropped every data relation by the pause"
+    );
+
+    pause.resume();
+    let deleted = delete
+        .await
+        .expect("DeleteTable returns within 30 s")
+        .expect("DeleteTable returns Ok");
+    assert_eq!(
+        deleted.table_status,
+        extenddb_core::types::TableStatus::Deleting
+    );
+    assert_eq!(
+        catalog_status(&s, "removed").await,
+        None,
+        "the request removed the row"
+    );
+}
+
+/// Whether a session on the catalog database waits for a lock it has not
+/// been granted.
+async fn catalog_lock_waiter(s: &Scratch) -> bool {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid \
+         WHERE NOT l.granted AND a.datname = $1)",
+    )
+    .bind(&s.names[0])
+    .fetch_one(&s.catalog)
+    .await
+    .expect("catalog lock waiters")
+}
+
+/// Separate data database: a control-plane pass holds the DELETING row when
+/// the request comes to remove it. A pass locks the row (`FOR UPDATE SKIP
+/// LOCKED`), then deletes the table's tags, then the row, and commits at the
+/// end of the pass. An outside catalog transaction runs those statements in
+/// that order here, since no hook holds a pass between its select and its
+/// tag delete. The request takes the row first too, without waiting for it,
+/// so it leaves the tags and the row to the pass and returns `Ok`. Mutant:
+/// delete the tags, then the row, with no lock taken on the row first, and
+/// on a tagged table the request waits for the row while the pass waits for
+/// the tags, until the server's deadlock check fails one of them. Mutant:
+/// take the row with a `FOR UPDATE` that waits, and the request waits for
+/// the pass.
+async fn a_pass_holding_the_deleting_row_does_not_fail_delete_table(tagged: bool) {
+    let s = scratch_with(false).await;
+    let table = if tagged { "tagged" } else { "untagged" };
+    create_active(&s, snapshot_conformance::table_input(table)).await;
+    snapshot_conformance::populate(&s.engine, ACCOUNT, table, 5).await;
+    let relations = base_and_gsi_relations(&s, table).await;
+    let (arn, table_id): (String, String) =
+        sqlx::query_as("SELECT table_arn, table_id FROM tables WHERE table_name = $1")
+            .bind(table)
+            .fetch_one(&s.catalog)
+            .await
+            .expect("the table's arn and id");
+    if tagged {
+        sqlx::query("INSERT INTO tags (resource_arn, tag_key, tag_value) VALUES ($1, 'k', 'v')")
+            .bind(&arn)
+            .execute(&s.catalog)
+            .await
+            .expect("tag the table");
+    }
+
+    let mut pause = extenddb_storage_postgres::arm_delete_table_pause_at(
+        extenddb_storage_postgres::DeleteTablePoint::BetweenCommits,
+    );
+    let reached = pause.take_reached();
+    let mut delete = Box::pin(tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        s.engine.delete_table(ACCOUNT, delete_input(table)),
+    ));
+    tokio::select! {
+        r = &mut delete => panic!("DeleteTable finished before the between-commits pause: {r:?}"),
+        r = reached => r.expect("DeleteTable reached the between-commits pause"),
+    }
+
+    // The pass takes the DELETING row, which is due at once.
+    let mut pass_conn = PgConnection::connect(&format!("{}/{}", s.base, s.names[0]))
+        .await
+        .expect("the pass's connection");
+    let mut pass = pass_conn.begin().await.expect("begin the pass");
+    let candidates: Vec<String> = sqlx::query_scalar(
+        "SELECT table_id FROM tables \
+         WHERE table_status = 'DELETING' AND status_transition_at <= NOW() \
+         FOR UPDATE SKIP LOCKED",
+    )
+    .fetch_all(&mut *pass)
+    .await
+    .expect("the pass's select");
+    assert_eq!(candidates, vec![table_id.clone()], "the pass holds the row");
+
+    // The request commits its data drop and comes to remove the row. Wait
+    // until it has returned or waits on a lock.
+    pause.resume();
+    let mut returned = None;
+    let mut waiting = false;
+    for _ in 0..200 {
+        tokio::select! {
+            r = &mut delete => {
+                returned = Some(r);
+                break;
+            }
+            () = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
+        }
+        if catalog_lock_waiter(&s).await {
+            waiting = true;
+            break;
+        }
+    }
+    assert!(
+        returned.is_some() || waiting,
+        "DeleteTable neither returned nor waited on a lock within 5 s"
+    );
+
+    // The pass's next statements for this row: its tags, then the row.
+    let tags_deleted = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        sqlx::query("DELETE FROM tags WHERE resource_arn = $1")
+            .bind(&arn)
+            .execute(&mut *pass),
+    )
+    .await
+    .expect("the pass's tag delete returns within 10 s");
+    let pass_committed = match tags_deleted {
+        Ok(_) => {
+            sqlx::query("DELETE FROM tables WHERE table_id = $1")
+                .bind(&table_id)
+                .execute(&mut *pass)
+                .await
+                .expect("the pass deletes the row");
+            pass.commit().await.map_err(|e| e.to_string())
+        }
+        Err(e) => {
+            drop(pass);
+            Err(e.to_string())
+        }
+    };
+    let deleted = match returned {
+        Some(r) => r,
+        None => delete.await,
+    }
+    .expect("DeleteTable returns within 30 s")
+    .unwrap_or_else(|e| panic!("DeleteTable failed while a pass held the row: {e}"));
+    assert!(
+        pass_committed.is_ok(),
+        "the pass committed: {pass_committed:?}"
+    );
+    assert!(!waiting, "DeleteTable waited for the row the pass holds");
+    assert_eq!(
+        deleted.table_status,
+        extenddb_core::types::TableStatus::Deleting
+    );
+    assert_eq!(
+        catalog_status(&s, table).await,
+        None,
+        "the pass removed the row"
+    );
+    let tags: i64 = sqlx::query_scalar("SELECT count(*) FROM tags WHERE resource_arn = $1")
+        .bind(&arn)
+        .fetch_one(&s.catalog)
+        .await
+        .expect("count the tags");
+    assert_eq!(tags, 0, "the pass removed the tags");
+    assert!(
+        present_relations(&s, &relations).await.is_empty(),
+        "the request dropped every data relation"
+    );
+    pass_conn
+        .close()
+        .await
+        .expect("close the pass's connection");
+    drop(pause);
+}
+
+mod a_pass_holding_the_deleting_row_does_not_fail_delete_table {
+    #[tokio::test]
+    async fn tagged() {
+        if super::base_conn().is_none() {
+            eprintln!("SKIP {}: no PostgreSQL", module_path!());
+            return;
+        }
+        super::a_pass_holding_the_deleting_row_does_not_fail_delete_table(true).await;
+    }
+
+    #[tokio::test]
+    async fn untagged() {
+        if super::base_conn().is_none() {
+            eprintln!("SKIP {}: no PostgreSQL", module_path!());
+            return;
+        }
+        super::a_pass_holding_the_deleting_row_does_not_fail_delete_table(false).await;
+    }
 }
 
 /// A hash-only table with three GSIs, for the drop-deadline test.
