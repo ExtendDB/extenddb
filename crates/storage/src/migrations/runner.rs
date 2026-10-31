@@ -143,19 +143,20 @@ impl<'a, B: MigrationBackend> Runner<'a, B> {
     ///
     /// # Errors
     ///
-    /// `id` is at or below the released bound, this binary does not carry
-    /// it, no store has a row for it, or a store failed.
+    /// This binary does not carry `id` (0 is no migration id), `id` is at or
+    /// below the released bound, no store has a row for it, or a store
+    /// failed.
     pub async fn forget(&self, id: u32) -> Result<(), MigrationError> {
-        if id <= self.released_through {
-            return Err(MigrationError::Refused(format!(
-                "migration {id} has been released; only migrations above {} can be forgotten",
-                self.released_through
-            )));
-        }
         if MigrationId::from_number(id).is_none() {
             return Err(MigrationError::Refused(format!(
                 "this binary carries no migration {id}; it carries migrations 1 to {}",
                 MigrationId::LATEST.number()
+            )));
+        }
+        if id <= self.released_through {
+            return Err(MigrationError::Refused(format!(
+                "migration {id} has been released; only migrations above {} can be forgotten",
+                self.released_through
             )));
         }
         let mut snap = self.read().await?;

@@ -46,6 +46,16 @@ async fn forget_refuses_an_id_it_cannot_forget() {
     let err = runner(&fake).forget(LATEST).await.unwrap_err();
     assert_eq!(err.exit_code(), exit::ERROR);
     assert!(err.to_string().contains("nothing to forget"), "{err}");
+    // 0 is no migration id, whatever the released bound.
+    for released in [0, 2] {
+        let err = runner(&fake)
+            .with_released_through(released)
+            .forget(0)
+            .await
+            .unwrap_err();
+        assert_eq!(err.exit_code(), exit::ERROR);
+        assert!(err.to_string().contains("carries no migration 0"), "{err}");
+    }
     assert_eq!(fake.rows("cat"), before);
 }
 
