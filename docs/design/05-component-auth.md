@@ -504,14 +504,14 @@ pub enum ConditionOperator {
 }
 ```
 
-> **Deferred: Policy Variables.** AWS IAM supports variable substitution in `Resource` ARNs and `Condition` values — e.g., `"Resource": "arn:aws:dynamodb:*:*:table/${aws:PrincipalTag/Team}-*"` grants access to tables matching the caller's own team tag. extenddb v1 does not support policy variables; all Resource and Condition values are treated as literal strings (with wildcard matching where applicable). This means ABAC policies that use variables to generalize across principals must be written as separate per-principal policies. Policy variable support is tracked as REQ-ABAC-006.
+> **Deferred: Policy Variables.** AWS IAM supports variable substitution in `Resource` ARNs and `Condition` values, e.g., `"Resource": "arn:aws:dynamodb:*:*:table/${aws:PrincipalTag/Team}-*"` grants access to tables matching the caller's own team tag. extenddb v1 does not support policy variables; all Resource and Condition values are treated as literal strings (with wildcard matching where applicable). This means ABAC policies that use variables to generalize across principals must be written as separate per-principal policies. Policy variable support is tracked as REQ-ABAC-006.
 
 **JSON deserialization:**
 
 IAM policy documents are JSON. Both Mode 2 (management API) and Mode 3 (IAM retrieval) receive policies as JSON strings. Deserialization uses `serde_json` with the following rules:
 
 - `Effect`: case-insensitive match to `"Allow"` or `"Deny"`. Any other value is a parse error.
-- `Action` / `NotAction`: a single string or array of strings. Mutually exclusive — a statement with both is a parse error. Mapped to `ActionMatch::Actions` or `ActionMatch::NotActions`.
+- `Action` / `NotAction`: a single string or array of strings. Mutually exclusive: a statement with both is a parse error. Mapped to `ActionMatch::Actions` or `ActionMatch::NotActions`.
 - `Resource` / `NotResource`: same pattern as Action. Mapped to `ResourceMatch`.
 - `Principal` / `NotPrincipal`: same pattern. Only present in trust policies; absent in identity-based policies. Mapped to `Option<PrincipalMatch>`.
 - `Condition`: a nested object `{ "OperatorName": { "key": "value" | ["values"] } }`. The operator name is parsed by splitting on `:` to detect `ForAllValues:` / `ForAnyValue:` prefixes and `IfExists` suffix, then matching the base operator name (e.g., `StringEquals`, `ArnLike`). Unknown operator names are a parse error.
@@ -558,7 +558,7 @@ authorization reference. For DynamoDB, `dynamodb:Attributes`,
 extenddb resolves (`dynamodb:Select`, `dynamodb:ReturnValues`,
 `aws:RequestTag/<key>`, etc.) is single-valued.
 A **bare** operator (one without a `ForAllValues:`/`ForAnyValue:` qualifier)
-applied to a multivalued key **never matches** — verified against real AWS IAM
+applied to a multivalued key **never matches**, verified against real AWS IAM
 (BR-7085), and independent of how many values are present. Only the set-operator
 qualifiers evaluate multivalued keys. This is fail-safe: a bare `Deny` on such a
 key is a no-op (the author must use `ForAnyValue:` to build a denylist), and a
@@ -867,7 +867,7 @@ pub fn arn_match(pattern: &str, value: &str) -> bool;
 
 ## 7. Role Assumption (AssumeRole)
 
-extenddb provides a local AssumeRole mechanism for testing role-based access patterns. This is not exposed as an STS API — it's a extenddb management API.
+extenddb provides a local AssumeRole mechanism for testing role-based access patterns. This is not exposed as an STS API; it's a extenddb management API.
 
 ### 7.1 AssumeRole Flow
 
@@ -987,10 +987,10 @@ impl ConditionContext for AssumeRoleContext {
 
 ## 8. Auth Providers
 
-### 8.1 No-Auth Provider (Mode 1) — REMOVED
+### 8.1 No-Auth Provider (Mode 1): REMOVED
 
 > **Historical note (P63b):** The `NoopAuthProvider` and `AuthIdentity::Anonymous`
-> variant were removed in v0.0.67. Authentication is now mandatory — the server
+> variant were removed in v0.0.67. Authentication is now mandatory; the server
 > refuses to start with `auth.provider = "none"`. The code below is preserved
 > for historical reference only.
 
@@ -1123,7 +1123,7 @@ Client (with extenddb wrapper)
 
 This is the same pattern used by EKS (`aws-iam-authenticator`) and Vault's AWS auth method. The client generates a pre-signed STS `GetCallerIdentity` request using its own credentials (signed for the `sts` service), and extenddb calls STS with that pre-signed request to validate the caller's identity.
 
-> **Why pre-signed tokens instead of header forwarding?** SigV4 signatures are bound to the service name, host, and request body they were generated for. A request signed for `dynamodb` / `localhost:18443` cannot be replayed against `sts` / `sts.amazonaws.com` — STS will reject the signature because the credential scope, signed host, and body hash all mismatch. Pre-signed URLs solve this: the client signs a separate request specifically for STS, and extenddb uses that to authenticate.
+> **Why pre-signed tokens instead of header forwarding?** SigV4 signatures are bound to the service name, host, and request body they were generated for. A request signed for `dynamodb` / `localhost:18443` cannot be replayed against `sts` / `sts.amazonaws.com`: STS will reject the signature because the credential scope, signed host, and body hash all mismatch. Pre-signed URLs solve this: the client signs a separate request specifically for STS, and extenddb uses that to authenticate.
 
 #### 8.3.2 Authentication: Pre-Signed STS GetCallerIdentity
 
@@ -1346,7 +1346,7 @@ The EC2 instance (or IAM role) running extenddb in Mode 3 needs the following pe
 }
 ```
 
-> `sts:GetCallerIdentity` requires no permissions — any valid AWS credential can call it.
+> `sts:GetCallerIdentity` requires no permissions: any valid AWS credential can call it.
 
 #### 8.3.5 Known Limitations (Mode 3)
 
@@ -1360,11 +1360,11 @@ The EC2 instance (or IAM role) running extenddb in Mode 3 needs the following pe
 
 5. **Cross-account access is not evaluated.** extenddb assumes all callers are in the same account. Cross-account role assumption and resource policies are not supported.
 
-6. **Latency on cache miss.** Policy retrieval for a user with multiple groups and managed policies can require 10+ IAM API calls. With caching (default 300s TTL), this only happens once per principal per TTL window. First-request latency for a new principal may be 500ms–2s.
+6. **Latency on cache miss.** Policy retrieval for a user with multiple groups and managed policies can require 10+ IAM API calls. With caching (default 300s TTL), this only happens once per principal per TTL window. First-request latency for a new principal may be 500ms-2s.
 
 7. **Identity cache eventual consistency.** If a user rotates their access key, the old key's identity remains cached for up to one `identity_cache_ttl_seconds` window. During this window, a pre-signed token generated with the old key (before deletion) that hasn't expired could still produce a cache hit. In practice, the short token expiry (60s) and short default identity cache TTL (60s) limit this window. For security-sensitive deployments, lower the identity cache TTL.
 
-8. **Policy cache eventual consistency.** If an admin detaches or modifies a policy in IAM, extenddb continues using the cached (now-stale) policies for up to `policy_cache_ttl_seconds`. This is analogous to real DynamoDB's IAM propagation delay (typically seconds). This is a conscious design choice — the TTL trades freshness for reduced IAM API call volume.
+8. **Policy cache eventual consistency.** If an admin detaches or modifies a policy in IAM, extenddb continues using the cached (now-stale) policies for up to `policy_cache_ttl_seconds`. This is analogous to real DynamoDB's IAM propagation delay (typically seconds). This is a conscious design choice: the TTL trades freshness for reduced IAM API call volume.
 
 9. **Client wrapper required.** Unlike Modes 1 and 2, Mode 3 requires a thin client-side wrapper to generate the pre-signed STS token. The wrapper is provided for Python, Rust, and Java. Applications that cannot use the wrapper cannot use Mode 3.
 
@@ -1526,7 +1526,7 @@ impl AuthProvider for AwsIamProvider {
 }
 ```
 
-### 8.4 Azure AD Provider (Sketch — Deferred)
+### 8.4 Azure AD Provider (Sketch, Deferred)
 
 ```rust
 pub struct AzureAdProvider {

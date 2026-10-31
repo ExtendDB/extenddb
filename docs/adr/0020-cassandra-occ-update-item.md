@@ -6,7 +6,7 @@
 
 ## Context
 
-`update_item_impl` and the conditional path of `put_item_impl` use a read-check-write pattern: read `item_data`, mutate in Rust, write back. This is not atomic. Under concurrent writes to the same item, the last writer wins and intermediate updates are silently lost. This affects all `UpdateItem` calls — not just conditional ones. The root cause is the non-atomic read-modify-write cycle itself.
+`update_item_impl` and the conditional path of `put_item_impl` use a read-check-write pattern: read `item_data`, mutate in Rust, write back. This is not atomic. Under concurrent writes to the same item, the last writer wins and intermediate updates are silently lost. This affects all `UpdateItem` calls, not just conditional ones. The root cause is the non-atomic read-modify-write cycle itself.
 
 ## Options Considered
 
@@ -32,9 +32,9 @@ Version-based OCC via LWT (option 1).
 
 - **Max retries:** 20
 - **Base delay:** 2 ms
-- **Backoff:** full jitter — `sleep = random(0, base * 2^min(attempt, 3))`, capped at a 16 ms window to bound tail latency
+- **Backoff:** full jitter (`sleep = random(0, base * 2^min(attempt, 3))`), capped at a 16 ms window to bound tail latency
 - **Retry on:** `[applied] = false` (clean lost race) only
-- **Do not retry on:** Cassandra errors (timeout, unavailable) — propagate immediately
+- **Do not retry on:** Cassandra errors (timeout, unavailable); propagate immediately
 
 ## Consequences
 

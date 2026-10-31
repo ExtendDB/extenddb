@@ -40,9 +40,9 @@ crates/server/src/
 
 `AppState<S>` carries a generic `S: StorageEngine` while `AuthProvider` is erased behind `Arc<dyn>`. This asymmetry is intentional:
 
-- **Storage uses static dispatch (generic `S`).** The storage engine is on the hot path — every request makes 1-3 storage calls. RPITIT on the storage traits avoids a `Box<dyn Future>` heap allocation per call. In absolute terms this saves ~50ns per call against a PostgreSQL round-trip of 0.5-5ms, so it's not measurable today. But this is a database compatibility layer where we control the full stack — there's no reason to leave performance on the table, and the ergonomic cost is small (the generic appears on ~6 function signatures, all in `server` and `engine`; it never leaks into `core`, `auth`, or middleware).
+- **Storage uses static dispatch (generic `S`).** The storage engine is on the hot path: every request makes 1-3 storage calls. RPITIT on the storage traits avoids a `Box<dyn Future>` heap allocation per call. In absolute terms this saves ~50ns per call against a PostgreSQL round-trip of 0.5-5ms, so it's not measurable today. But this is a database compatibility layer where we control the full stack; there's no reason to leave performance on the table, and the ergonomic cost is small (the generic appears on ~6 function signatures, all in `server` and `engine`; it never leaks into `core`, `auth`, or middleware).
 - **Auth uses dynamic dispatch (`Arc<dyn>`).** Auth is called once per request, involves HMAC-SHA256 crypto that dwarfs any vtable cost, and benefits from runtime pluggability (swap providers via config without recompilation).
-- **The generic does NOT propagate into middleware.** `RequestIdLayer`, `LoggingLayer`, `MetricsLayer`, `RequestSizeLayer`, `CompressionLayer` — none of these touch storage. Only the main request handler and `OperationContext` carry the generic.
+- **The generic does NOT propagate into middleware.** `RequestIdLayer`, `LoggingLayer`, `MetricsLayer`, `RequestSizeLayer`, `CompressionLayer`: none of these touch storage. Only the main request handler and `OperationContext` carry the generic.
 - **Testing:** Test code needs a concrete `S` type. Use a `MockStorage` struct that implements all storage sub-traits. This is more verbose than `Arc<dyn>` mocks but straightforward with hand-written mocks or `mockall`.
 - **If this decision is revisited:** The simplest migration path is to add `#[async_trait]` to the storage traits and replace `Arc<S>` with `Arc<dyn StorageEngine>`. This removes all generics from the server/engine crates at the cost of one heap allocation per storage call. The change is mechanical and confined to trait definitions + `AppState`.
 
@@ -269,7 +269,7 @@ impl<S> Layer<S> for CompressionLayer {
 }
 ```
 
-The CRC32 header is computed on the uncompressed body (matching DynamoDB behavior — SDKs validate CRC32 after decompression).
+The CRC32 header is computed on the uncompressed body (matching DynamoDB behavior; SDKs validate CRC32 after decompression).
 
 ## 6. Middleware Pipeline
 
@@ -375,7 +375,7 @@ convert from this JSON externally.
 
 ## 8. Management API
 
-The management API provides identity and credential management for extenddb's built-in auth provider. These endpoints are the only way to create users, roles, groups, credentials, and policies — the DynamoDB API surface is not used for identity management.
+The management API provides identity and credential management for extenddb's built-in auth provider. These endpoints are the only way to create users, roles, groups, credentials, and policies; the DynamoDB API surface is not used for identity management.
 
 ### 8.1 Authentication Model
 
@@ -401,7 +401,7 @@ All management routes use `POST /management/<action>` with JSON request/response
 | `POST /management/set-principal-tags` | Set tags on a user or role | `IdentityEngine::set_user_tags` or `set_role_tags` | `invalidate_user` or `invalidate_role` |
 | `POST /management/store-credential` | Create an access key for a user | `CredentialEngine::store_credential` | none |
 | `POST /management/deactivate-credential` | Deactivate an access key | `CredentialEngine::deactivate_credential` | `invalidate_credential` |
-| `POST /management/assume-role` | Assume a role, get temporary credentials | Load role via `IdentityEngine::get_role` → evaluate trust policy via `evaluate_trust_policy` with `AssumeRoleContext` → `SessionEngine::create_session` + `CredentialEngine::store_credential` | — (creates new entries; no stale cache possible) |
+| `POST /management/assume-role` | Assume a role, get temporary credentials | Load role via `IdentityEngine::get_role` → evaluate trust policy via `evaluate_trust_policy` with `AssumeRoleContext` → `SessionEngine::create_session` + `CredentialEngine::store_credential` | (creates new entries; no stale cache possible) |
 | `POST /management/revoke-session` | Revoke a role session | `SessionEngine::revoke_session` | `invalidate_session`, `invalidate_credential` |
 
 ### 8.3 Request/Response Formats
@@ -486,7 +486,7 @@ All management routes use `POST /management/<action>` with JSON request/response
 }
 ```
 
-`CallerArn` is required — it identifies the principal assuming the role. It must match the format `arn:aws:iam::{account_id}:user/{user_name}`. If the format is invalid, the handler returns 400 with `{"Error": "ValidationError", "Message": "CallerArn must be a valid IAM user ARN"}`. Role-chaining (a role assuming another role) is deferred to a future version; in v1, `CallerArn` must reference a user. The handler loads the caller's tags via `IdentityEngine`, builds an `AssumeRoleContext` from the caller's tags + `SessionTags` + `ExternalId`, loads the role's trust policy, and evaluates it using `evaluate_trust_policy`. If the trust policy denies the assumption, the handler returns 403 with `{"Error": "AccessDenied", "Message": "Trust policy does not allow this principal to assume the role"}`. This ensures developers can test trust policy conditions (e.g., `sts:ExternalId`, `aws:PrincipalTag/*` restrictions) through the management API.
+`CallerArn` is required; it identifies the principal assuming the role. It must match the format `arn:aws:iam::{account_id}:user/{user_name}`. If the format is invalid, the handler returns 400 with `{"Error": "ValidationError", "Message": "CallerArn must be a valid IAM user ARN"}`. Role-chaining (a role assuming another role) is deferred to a future version; in v1, `CallerArn` must reference a user. The handler loads the caller's tags via `IdentityEngine`, builds an `AssumeRoleContext` from the caller's tags + `SessionTags` + `ExternalId`, loads the role's trust policy, and evaluates it using `evaluate_trust_policy`. If the trust policy denies the assumption, the handler returns 403 with `{"Error": "AccessDenied", "Message": "Trust policy does not allow this principal to assume the role"}`. This ensures developers can test trust policy conditions (e.g., `sts:ExternalId`, `aws:PrincipalTag/*` restrictions) through the management API.
 
 ### 8.4 Error Responses
 
@@ -590,7 +590,7 @@ impl RateLimiter {
 
 ## 11. Throughput Tracking
 
-Throughput tracking enforces DynamoDB's per-partition and per-table capacity limits (REQ-CAP-004, REQ-CAP-005). This is a runtime stateful component — it lives in the server crate, not in `core` (which only contains the pure-math RCU/WCU calculator).
+Throughput tracking enforces DynamoDB's per-partition and per-table capacity limits (REQ-CAP-004, REQ-CAP-005). This is a runtime stateful component; it lives in the server crate, not in `core` (which only contains the pure-math RCU/WCU calculator).
 
 ```rust
 use std::sync::Mutex;

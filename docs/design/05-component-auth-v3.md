@@ -29,7 +29,7 @@ The crate depends on `extenddb-core` (for types and errors) and `async_trait` (f
 
 5. **Multi-account support.** The catalog schema is scoped by `account_id`. Different accounts can have tables with the same name. The `account_id` is resolved from the authenticated identity, not from config.
 
-6. **Auth provider is config-only.** Set in `extenddb.toml` as `auth.provider = "builtin"`. The `"none"` value is no longer accepted — the server refuses to start with it. Cannot be changed at runtime via settings.
+6. **Auth provider is config-only.** Set in `extenddb.toml` as `auth.provider = "builtin"`. The `"none"` value is no longer accepted; the server refuses to start with it. Cannot be changed at runtime via settings.
 
 7. **No catalog migration.** `extenddb init` is required. The schema includes auth tables from the start.
 
@@ -57,7 +57,7 @@ JWT-based auth with Azure AD group-to-role mapping. Design unchanged from v2.0 �
 
 ## 4. Admin User Model
 
-Admin users are organizational administrators who manage accounts, IAM users, roles, groups, and policies. They are separate from IAM users — they do not make DynamoDB requests.
+Admin users are organizational administrators who manage accounts, IAM users, roles, groups, and policies. They are separate from IAM users; they do not make DynamoDB requests.
 
 ### 4.1 Bootstrap
 
@@ -304,9 +304,9 @@ Per-table Postgres tables change from `_ddb_{table_name}` to `_ddb_{account_id}_
 
 ### 6.3 Indexes, Streams, Tags
 
-- `indexes` FK is on `table_id` (UUID) — no change needed, already account-independent.
-- `stream_shards` and `stream_records` reference `table_name` — must add `account_id` or switch to `table_id` FK.
-- `tags` keyed by `resource_arn` — ARNs embed account_id, so no change needed.
+- `indexes` FK is on `table_id` (UUID): no change needed, already account-independent.
+- `stream_shards` and `stream_records` reference `table_name`: must add `account_id` or switch to `table_id` FK.
+- `tags` keyed by `resource_arn`: ARNs embed account_id, so no change needed.
 
 ### 6.4 Account ID Flow
 
@@ -373,7 +373,7 @@ Full set from v2.0 §6.5: StringEquals, StringLike, NumericEquals, DateEquals, B
 
 ### 8.4 Management API Policy Evaluation
 
-Management API calls are treated as IAM actions (`iam:CreateUser`, `iam:PutUserPolicy`, etc.) and evaluated against the caller's policies using the same engine. This is how admin vs IAM user permissions are enforced — via default policies, not hard-coded logic.
+Management API calls are treated as IAM actions (`iam:CreateUser`, `iam:PutUserPolicy`, etc.) and evaluated against the caller's policies using the same engine. This is how admin vs IAM user permissions are enforced: via default policies, not hard-coded logic.
 
 The only exception is the bootstrap admin created by `extenddb init`: if no policies exist for this principal, the system allows the operation. Once the seed policy is in place, normal evaluation takes over.
 

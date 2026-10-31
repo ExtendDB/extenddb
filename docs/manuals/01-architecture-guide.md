@@ -189,7 +189,7 @@ expect.
 3. Fork to background via `daemonize`, writing a PID file to `run_dir`
    (skipped entirely in `--foreground` mode, so no run directory is needed and
    the root filesystem can be read-only)
-4. Initialize logging — syslog when daemonized, stderr in `--foreground`
+4. Initialize logging: syslog when daemonized, stderr in `--foreground`
 5. Connect to the storage backend
 6. Verify catalog version matches binary expectation
 7. Start axum server on the pre-bound socket
@@ -241,7 +241,7 @@ The IAM policy engine evaluates:
 - Permissions boundaries
 - Explicit Deny takes precedence over Allow
 
-Unparseable policies fail closed — a corrupted Deny policy results in access denied, not silent skip.
+Unparseable policies fail closed: a corrupted Deny policy results in access denied, not silent skip.
 
 ### Transport
 
@@ -260,7 +260,7 @@ All user-supplied strings are validated at the engine layer before reaching stor
 
 ## Web Console
 
-The management web console is a server-rendered HTML interface mounted at `/console/*`. It runs inside the `server` crate — no separate process, no external dependencies. All HTML is generated with Rust string formatting.
+The management web console is a server-rendered HTML interface mounted at `/console/*`. It runs inside the `server` crate: no separate process, no external dependencies. All HTML is generated with Rust string formatting.
 
 ### Features
 
@@ -278,7 +278,7 @@ The management web console is a server-rendered HTML interface mounted at `/cons
 
 ### Architecture
 
-The console uses the `ManagementStore` trait for all data access — it never queries the database directly. Write operations route through shared functions in `management::ops`, ensuring validation and business logic are defined once. This means every action available in the console is also available through the management REST API.
+The console uses the `ManagementStore` trait for all data access; it never queries the database directly. Write operations route through shared functions in `management::ops`, ensuring validation and business logic are defined once. This means every action available in the console is also available through the management REST API.
 
 ### Authentication Model
 

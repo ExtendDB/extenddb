@@ -17,16 +17,16 @@ The index table stores:
 
 DynamoDB semantics require that:
 1. Queries against an index use the index keys (not base table keys)
-2. Index keys are not unique — multiple base items can have the same index keys
+2. Index keys are not unique: multiple base items can have the same index keys
 3. Each base item appears at most once in the index
 
 ## Options Considered
 
-1. **PostgreSQL-style ordering: `PRIMARY KEY (pk, base_pk, base_sk_*)`** — Partition by index PK, cluster by base keys only, with index sort keys as regular columns.
+1. **PostgreSQL-style ordering: `PRIMARY KEY (pk, base_pk, base_sk_*)`**: Partition by index PK, cluster by base keys only, with index sort keys as regular columns.
 
-2. **Cassandra-optimized ordering: `PRIMARY KEY ((pk), sk_*, base_pk, base_sk_*)`** — Partition by index PK, cluster first by index sort keys, then by base keys.
+2. **Cassandra-optimized ordering: `PRIMARY KEY ((pk), sk_*, base_pk, base_sk_*)`**: Partition by index PK, cluster first by index sort keys, then by base keys.
 
-3. **Composite partition key: `PRIMARY KEY ((pk, base_pk), sk_*, base_sk_*)`** — Include base PK in partition key for uniqueness.
+3. **Composite partition key: `PRIMARY KEY ((pk, base_pk), sk_*, base_sk_*)`**: Include base PK in partition key for uniqueness.
 
 ## Decision
 

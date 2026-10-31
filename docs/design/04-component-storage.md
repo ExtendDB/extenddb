@@ -136,7 +136,7 @@ written atomically with data writes when `stream` is `Some`.
 - `describe_ttl`, `update_ttl`
 - `tag_resource`, `untag_resource`, `list_tags`
 - `refresh_table_size`: updates cached table size and item count
-- `create_ttl_index`, `find_expired_items_indexed` — TTL cleanup support
+- `create_ttl_index`, `find_expired_items_indexed`: TTL cleanup support
 
 **StreamEngine** (DynamoDB Streams):
 - `write_stream_record`: writes stream record atomically with data write
@@ -351,13 +351,13 @@ The PostgreSQL backend uses two categories of tables:
 - `indexes`: GSI/LSI metadata (key schema, projection, status, index_id)
 - `tags`: resource tags
 - `_dynamodb_credentials`: access keys and session tokens
-- `_dynamodb_users`, `_dynamodb_roles`, `_dynamodb_groups` — IAM-type entities
+- `_dynamodb_users`, `_dynamodb_roles`, `_dynamodb_groups`: IAM-type entities
 - `_dynamodb_group_members`: group membership
 - `_dynamodb_principal_tags`: user/role tags
 - `_dynamodb_policies`: IAM-type policy documents
 - `_dynamodb_sessions`: temporary role session credentials
 - `_dynamodb_stream_records`: DynamoDB Streams records
-- `_dynamodb_import_jobs`, `_dynamodb_export_jobs` — import/export tracking
+- `_dynamodb_import_jobs`, `_dynamodb_export_jobs`: import/export tracking
 - `_dynamodb_idempotency_tokens`: TransactWriteItems idempotency
 
 **Data tables** (created dynamically per DynamoDB table):
@@ -411,7 +411,7 @@ The PostgreSQL backend uses two categories of tables:
 
 - **GSI tables**: GSI tables include base table primary key columns (`base_pk`,
   `base_sk_*`) as actual SQL columns (not just inside `item_data` JSONB). This
-  is required because: (1) GSI keys are not unique — two base table items can
+  is required because: (1) GSI keys are not unique: two base table items can
   project to the same GSI key, so the base table PK is needed for uniqueness;
   (2) pagination requires a tiebreaker when GSI keys collide; (3) the base
   table PK is needed to look up the full item for projections.
@@ -482,7 +482,7 @@ parameter is accepted and correctly reflected in capacity calculations (eventual
 **Read replica mode (`read_replica_url` configured):** Eventually consistent reads (`consistent_read=false`) are routed
 to a PostgreSQL streaming replica that is naturally a few milliseconds behind the primary. Strongly consistent reads
 (`consistent_read=true`) always read from the primary. This mirrors how DynamoDB achieves eventual consistency
-— via storage node replicas — and surfaces the exact class of bugs that applications may encounter in production
+(via storage node replicas) and surfaces the exact class of bugs that applications may encounter in production
 DynamoDB (e.g., read-after-write without `ConsistentRead=true` returning stale data).
 
 **Which operations are affected:**
@@ -490,7 +490,7 @@ DynamoDB (e.g., read-after-write without `ConsistentRead=true` returning stale d
 - `Query`: uses `consistent_read` field (default `false` in DynamoDB)
 - `Scan`: uses `consistent_read` field (default `false` in DynamoDB)
 - `BatchGetItem`: uses per-table `consistent_read` field
-- `TransactGetItems`: always strongly consistent (DynamoDB spec — serializable isolation)
+- `TransactGetItems`: always strongly consistent (DynamoDB spec: serializable isolation)
 - All write operations: always use the primary pool
 
 The `read_pool()` helper method on `PostgresEngine` encapsulates this routing. All read implementations call
@@ -612,7 +612,7 @@ All data plane operations (PutItem, GetItem, Query, etc.) must check `table_stat
 not `ACTIVE`, return `StorageError::TableNotActive` (mapped to `ResourceInUseException`). Control plane operations that
 modify the table (`UpdateTable`, `DeleteTable`) must:
 
-1. Atomically set `table_status` to `UPDATING` or `DELETING` (using `UPDATE ... WHERE table_status = 'ACTIVE'` — if
+1. Atomically set `table_status` to `UPDATING` or `DELETING` (using `UPDATE ... WHERE table_status = 'ACTIVE'`; if
  zero rows affected, the table is already being modified, return `ResourceInUseException`)
 2. Perform the operation
 3. Set `table_status` back to `ACTIVE` (or remove the row for `DeleteTable`)
@@ -621,7 +621,7 @@ This prevents concurrent DDL operations on the same table.
 
 ### 6.1.1 Async Control Plane Transitions (Phase 1c)
 
-Real DynamoDB control plane operations are not instantaneous — `CreateTable` returns `CREATING` status and the table
+Real DynamoDB control plane operations are not instantaneous: `CreateTable` returns `CREATING` status and the table
 transitions to `ACTIVE` asynchronously. extenddb emulates this behavior.
 
 **Implementation:**
@@ -653,7 +653,7 @@ on the `indexes` table when GSI operations are implemented.
   DynamoDB emulation (Phase 2).
 - Startup recovery will reset stuck `CREATING` tables to
   `NOW() + random[5, 20]` instead of instant activation (Phase 2).
-- `control_plane_delay_seconds` is a runtime setting (0–300 range), managed
+- `control_plane_delay_seconds` is a runtime setting (0-300 range), managed
   via `extenddb settings set`. It is not a `.toml` config key.
 
 **Crash recovery and in-flight operation tracking:**

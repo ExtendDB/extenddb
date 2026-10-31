@@ -6,8 +6,8 @@
 
 ## Context
 
-Cassandra's LWT (Lightweight Transaction) mechanism — `INSERT ... IF NOT EXISTS`,
-`UPDATE ... IF ...`, `DELETE ... IF EXISTS` — uses Paxos under the hood. A
+Cassandra's LWT (Lightweight Transaction) mechanism (`INSERT ... IF NOT EXISTS`,
+`UPDATE ... IF ...`, `DELETE ... IF EXISTS`) uses Paxos under the hood. A
 fundamental Cassandra constraint is that **LWT statements cannot appear inside a
 logged batch**. Attempting to do so is rejected by the coordinator at runtime.
 
@@ -84,9 +84,9 @@ backend **must** either:
 - Implement the worker/saga pattern described above.
 
 Adding a plain multi-row delete against LWT-managed rows is not an acceptable
-shortcut — it causes `system.paxos` corruption that accumulates across
+shortcut; it causes `system.paxos` corruption that accumulates across
 operations and eventually stalls the entire node (observed: 29-minute test
-hangs, GC pauses of 4–11 seconds, `system.paxos` growing without bound).
+hangs, GC pauses of 4-11 seconds, `system.paxos` growing without bound).
 
 ## Consequences
 

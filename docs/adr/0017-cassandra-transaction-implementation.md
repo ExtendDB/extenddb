@@ -110,7 +110,7 @@ CREATE INDEX ON transaction_ledger (started_at);
      ```cql
      SELECT partition_max_delete_timestamp FROM items WHERE pk = ? LIMIT 1;
      ```
-     If `partition_max_delete_timestamp` exists and `txn_timestamp <= partition_max_delete_timestamp`, reject transaction (would violate timestamp ordering—item was deleted at a later timestamp)
+     If `partition_max_delete_timestamp` exists and `txn_timestamp <= partition_max_delete_timestamp`, reject transaction (would violate timestamp ordering: item was deleted at a later timestamp)
 6. If all conditions pass, **execute PREPARE for each item**:
    - If item exists: `UPDATE items SET prepared_txn_id = ?, prepared_txn_timestamp = ? WHERE pk = ? AND sk = ? IF prepared_txn_id IS NULL`
    - If item doesn't exist (for Put): `INSERT INTO items (pk, sk, prepared_txn_id, prepared_txn_timestamp, created_to_prepare) VALUES (?, ?, ?, ?, true) IF NOT EXISTS`
@@ -427,7 +427,7 @@ Implement transaction coordination logic (two-phase commit, ledger, recovery) in
 
 **Rejected**: While appealing for code reuse, this approach has fundamental problems:
 
-1. **Different databases need different mechanisms**: PostgreSQL uses native ACID transactions with `SELECT ... FOR UPDATE` (no ledger, no two-phase commit, no recovery needed). Forcing it to use a ledger would be strictly worse—fighting the database instead of leveraging its strengths.
+1. **Different databases need different mechanisms**: PostgreSQL uses native ACID transactions with `SELECT ... FOR UPDATE` (no ledger, no two-phase commit, no recovery needed). Forcing it to use a ledger would be strictly worse, fighting the database instead of leveraging its strengths.
 
 2. **Primitives don't compose uniformly**: The Cassandra implementation uses LWT for conflict detection and STATIC columns for partition-level metadata. Many databases lack these features. Abstracting over such differences creates a lowest-common-denominator that makes all backends worse.
 

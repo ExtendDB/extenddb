@@ -5,7 +5,7 @@ description: "The in-process cache of IAM data (credentials, policies, tags, tab
 # Component design: Authorization cache
 
 > Status: implemented (single-instance). Multi-instance fanout in
-> Appendix B is designed but deferred — implementation is gated on a
+> Appendix B is designed but deferred; implementation is gated on a
 > separate review.
 > Author: assisted, reviewed by repository owner
 > Companion document to: [05-component-auth.md](05-component-auth.md), [06-component-server.md](06-component-server.md)
@@ -29,7 +29,7 @@ Each DynamoDB request issues 6+ catalog queries before dispatch can begin:
 | 6 | Resource tags | `fetch_resource_tags` |
 | 7 | TableKeyInfo (item-level ops only) | `request_helpers.rs::authorize_request` (serial, outside the `try_join!`) |
 
-Queries 2–6 fan out concurrently via `tokio::try_join!` (`crates/server/src/authorization.rs:82`), but they still each consume a connection from the catalog pool. With a 1024-connection catalog pool (post-PR #46), the pool itself is no longer the limit — but the **per-request DB roundtrips and JSON-parse cost** are now the dominant overhead before dispatch.
+Queries 2-6 fan out concurrently via `tokio::try_join!` (`crates/server/src/authorization.rs:82`), but they still each consume a connection from the catalog pool. With a 1024-connection catalog pool (post-PR #46), the pool itself is no longer the limit, but the **per-request DB roundtrips and JSON-parse cost** are now the dominant overhead before dispatch.
 
 In addition, every call to `fetch_policies` reparses policy JSON via `PolicyDocument::from_json` (`crates/server/src/authorization.rs:189`). Caching parsed `PolicyDocument` values eliminates that cost, not just the DB roundtrip.
 
@@ -81,7 +81,7 @@ Considered: fetch a cheap `updated_at` first, only refetch full data if changed.
 
 ## 5. Negative caching
 
-Negative results (`Ok(None)` — key not found) are cached for a **short** TTL (default: 5 seconds). Reasons:
+Negative results (`Ok(None)`, key not found) are cached for a **short** TTL (default: 5 seconds). Reasons:
 
 - Stops attackers from hammering the catalog with random `AKIA...` access keys.
 - 5s ensures newly-created keys become usable quickly without manual cache flush.
@@ -120,11 +120,11 @@ A cross-process invalidation channel is **not** added in this iteration. Multi-n
 
 Write-through hooks (§6) cover every IAM mutation we own. They do **not** cover off-instance changes on multi-node deployments before TTL kicks in, bugs in the write-through plumbing, or test scenarios that need a deterministic flush. For those cases, an admin-authenticated **manual invalidation API** complements the automatic hooks.
 
-Both the management API and the web console expose this surface; the CLI (`extenddb manage cache invalidate ...`) is a thin client over the management API. The console route and the management API route call the same handler logic, so behavior is identical regardless of how it's invoked. All three paths use the existing admin authentication mechanism (Basic auth for the API, session-based auth for the console — neither introduces a new auth path).
+Both the management API and the web console expose this surface; the CLI (`extenddb manage cache invalidate ...`) is a thin client over the management API. The console route and the management API route call the same handler logic, so behavior is identical regardless of how it's invoked. All three paths use the existing admin authentication mechanism (Basic auth for the API, session-based auth for the console; neither introduces a new auth path).
 
 ### HTTP endpoint
 
-`POST /management/cache/invalidate` — admin-only, JSON body, returns 200 with an audit-friendly response or 400 on malformed scope.
+`POST /management/cache/invalidate`: admin-only, JSON body, returns 200 with an audit-friendly response or 400 on malformed scope.
 
 ```json
 { "scope": "<scope-tag>", "selectors": { ... } }
@@ -143,7 +143,7 @@ Both the management API and the web console expose this surface; the CLI (`exten
 
 Composite scopes (`user`, `role`) match what an operator most often actually wants when they reach for this tool ("forget everything about user X"). The narrow scopes are still exposed for surgical use. `all` is the broadest hammer and requires `--yes` from the CLI / a confirmation token from the console.
 
-`account` sweeps the authz and credential caches but not `table_key_info` (the `TableKeyInfo` cache is keyed by `(account, table)` and the registry's `invalidate_account` does not currently fan out across it). To clear cached table-key-info for an account, either call `scope: table_key_info` per table or use `scope: all`. This is a deliberate scoping choice — the table-key-info cache rarely diverges per account in practice, so the narrower `invalidate_account` semantics keep the most common path cheap.
+`account` sweeps the authz and credential caches but not `table_key_info` (the `TableKeyInfo` cache is keyed by `(account, table)` and the registry's `invalidate_account` does not currently fan out across it). To clear cached table-key-info for an account, either call `scope: table_key_info` per table or use `scope: all`. This is a deliberate scoping choice: the table-key-info cache rarely diverges per account in practice, so the narrower `invalidate_account` semantics keep the most common path cheap.
 
 ### Response shape
 
@@ -151,7 +151,7 @@ Composite scopes (`user`, `role`) match what an operator most often actually wan
 { "scope": "user", "invalidated": ["user_policies", "user_group_policies", "user_boundary", "user_tags", "principal_credentials"] }
 ```
 
-The `invalidated` array tells operators which subcaches were touched — useful for confirming that composite scopes did what was expected, and for the console UI's success banner.
+The `invalidated` array tells operators which subcaches were touched, useful for confirming that composite scopes did what was expected, and for the console UI's success banner.
 
 ### Audit trail
 
@@ -165,7 +165,7 @@ Cache invalidation counters on each subcache (exposed via `/management/auth-cach
 
 ### Behavior when caches are disabled
 
-When `auth.cache.enabled = false`, the cache layer is in pass-through mode and there is nothing to invalidate. The endpoint still returns 200 — the `AuthCacheRegistry` invalidate methods are no-ops in this state, and the operator's contract ("cache-driven staleness for X is now cleared") is trivially satisfied.
+When `auth.cache.enabled = false`, the cache layer is in pass-through mode and there is nothing to invalidate. The endpoint still returns 200: the `AuthCacheRegistry` invalidate methods are no-ops in this state, and the operator's contract ("cache-driven staleness for X is now cleared") is trivially satisfied.
 
 ### CLI
 
@@ -201,13 +201,13 @@ max_entries        = 10000 # per-cache LRU size limit
 
 Default rationale:
 
-- **60 s hard TTL** mirrors AWS IAM's "policy propagation" expectation (~30 s–2 min). Long enough to absorb the perf bottleneck (60 s of caching → 99.99%+ hit rate per hot key under any meaningful load), short enough to bound the blast radius of off-instance credential revocation.
+- **60 s hard TTL** mirrors AWS IAM's "policy propagation" expectation (~30 s-2 min). Long enough to absorb the perf bottleneck (60 s of caching → 99.99%+ hit rate per hot key under any meaningful load), short enough to bound the blast radius of off-instance credential revocation.
 - **30 s soft TTL** = TTL / 2 keeps refreshes from clustering at the boundary.
 - **5 s negative TTL** is short enough that newly-issued keys work quickly, long enough to absorb a dictionary attack against `lookup_credential`.
 - **10 000 entries per cache** is a generous default for typical deployments; under memory pressure the LRU evicts cold entries.
 - **`enabled = false`** is a kill switch for incident response.
 
-The cache is configured statically (`extenddb.toml`). Runtime tunability is not added — cache TTL changes are rare and a server restart is acceptable. Adding it to the existing `settings` poller table is an option for a follow-up if operationally needed.
+The cache is configured statically (`extenddb.toml`). Runtime tunability is not added: cache TTL changes are rare and a server restart is acceptable. Adding it to the existing `settings` poller table is an option for a follow-up if operationally needed.
 
 ## 8. Architecture: decorator pattern, one cache per data shape
 
@@ -268,7 +268,7 @@ Caching is layered as **wrapper types** over the existing trait implementations,
                               └────────────────────────────────────┘
 ```
 
-The auth cache stores **parsed `PolicyDocument`s** wrapped in `Arc<PolicyDocument>` — multiple cache entries (e.g. a shared inline policy attached to several users) share the parsed document via `Arc::clone`. The `check_authorization` path is updated to call a new method on the cached wrapper that returns parsed documents, eliminating the `from_json` step from the request hot path.
+The auth cache stores **parsed `PolicyDocument`s** wrapped in `Arc<PolicyDocument>`; multiple cache entries (e.g. a shared inline policy attached to several users) share the parsed document via `Arc::clone`. The `check_authorization` path is updated to call a new method on the cached wrapper that returns parsed documents, eliminating the `from_json` step from the request hot path.
 
 ## 9. Library choice: `moka`
 
@@ -277,12 +277,12 @@ The implementation uses the `moka` crate (`features = ["future"]`):
 - Async-aware (`moka::future::Cache`) integrates cleanly with `tokio`.
 - Built-in time-based expiration with O(1) eviction.
 - Bounded with LRU/W-TinyLFU eviction policy under memory pressure.
-- **Single-flight** via `entry().or_insert_with(future)` — concurrent misses for the same key share one load future. This is critical: prevents thundering herd at cache cold-start.
-- Internal sharding — no global lock contention.
+- **Single-flight** via `entry().or_insert_with(future)`: concurrent misses for the same key share one load future. This is critical: prevents thundering herd at cache cold-start.
+- Internal sharding: no global lock contention.
 
 The SWR layer is a thin (~80 line) wrapper on top of `moka` that adds the soft-TTL / spawn-refresh logic. We do **not** hand-roll the cache itself; that would be 200+ lines of subtle concurrency code with the same external behavior.
 
-The `moka` `future` feature uses `tokio` internals consistent with the rest of the codebase. License is MIT/Apache-2.0 — compatible with our Apache-2.0 license.
+The `moka` `future` feature uses `tokio` internals consistent with the rest of the codebase. License is MIT/Apache-2.0, compatible with our Apache-2.0 license.
 
 ## 10. Cache key shapes and value types
 
@@ -355,7 +355,7 @@ auth, admin user). The response shape is:
 | Field | Description |
 |-------|-------------|
 | `hits` | Fresh cache hits (younger than `soft_ttl`). |
-| `stale_hits` | Hits between `soft_ttl` and `ttl` — served immediately, refresh spawned. |
+| `stale_hits` | Hits between `soft_ttl` and `ttl`: served immediately, refresh spawned. |
 | `misses` | Hard misses (caller waited for the loader). |
 | `negative_hits` | Cached `None` returned (negative cache). |
 | `refresh_success` | Background refresh wrote a fresh entry. |
@@ -372,7 +372,7 @@ gauges/counters under `/metrics`; until then, scrape the JSON endpoint.
 ## 12. Error semantics
 
 - DB errors during a **request-blocking load** propagate to the caller as today (`InternalServerError`).
-- DB errors during a **background refresh** are logged and counted in `auth_cache_refresh_failure`. The stale entry is **not** evicted — the next request continues serving it (until the hard TTL passes, at which point it transitions back to a request-blocking load).
+- DB errors during a **background refresh** are logged and counted in `auth_cache_refresh_failure`. The stale entry is **not** evicted; the next request continues serving it (until the hard TTL passes, at which point it transitions back to a request-blocking load).
 - Decrypt failures during a credential load return `InternalServerError` and are not cached.
 
 ## 13. Test strategy
@@ -405,9 +405,9 @@ gauges/counters under `/metrics`; until then, scrape the JSON endpoint.
 
 | Phase | Scope | Risk |
 |-------|-------|------|
-| 1 | `SwrCache<K, V>` primitive + `moka` dep | low — pure library code, no behavior change |
-| 2 | `CachedCredentialStore` + invalidation hooks for access-key mutations | medium — touches auth path |
-| 3 | `CachedAuthorizationStore` (with parsed `PolicyDocument` cache) + invalidation hooks for IAM mutations | medium — touches authorization path |
+| 1 | `SwrCache<K, V>` primitive + `moka` dep | low: pure library code, no behavior change |
+| 2 | `CachedCredentialStore` + invalidation hooks for access-key mutations | medium: touches auth path |
+| 3 | `CachedAuthorizationStore` (with parsed `PolicyDocument` cache) + invalidation hooks for IAM mutations | medium: touches authorization path |
 | 4 | `CachedTableKeyInfoStore` + invalidation hooks on `CreateTable`/`UpdateTable`/`DeleteTable` | low |
 | 5 | Documentation, config sample, `init` template, admin guide, metrics console row | trivial |
 
@@ -420,7 +420,7 @@ Each phase is a separate PR. After each phase the test suite runs green and the 
 > **Propagation timing for invalidations**:
 >
 > - **Single-key invalidations** (e.g. `DeleteAccessKey`, `PutUserPolicy`) bump an internal epoch counter and drop the moka entry immediately. The next request blocks on a fresh load.
-> - **Fanout invalidations** (e.g. `DeleteAccount`, `DeleteRole`'s session sweep, `DeleteGroup`'s member fanout) use moka's `invalidate_entries_if`, which is **asynchronous** — predicate evaluation runs on moka's internal worker after the management call returns. There is a small window (~ms) between the API responding 200/204 and the matching entries actually being evicted from the underlying store. The accompanying epoch bump ensures any in-flight refresh on those keys is dropped on completion, but a request that reads the slot during this window can still see the pre-invalidation value. Operators should treat fanout invalidation as "eventually consistent within a few ms"; for hard cutover (e.g. revoking a compromised key), prefer the single-key invalidations (`DeleteAccessKey`) over the cascade ones.
+> - **Fanout invalidations** (e.g. `DeleteAccount`, `DeleteRole`'s session sweep, `DeleteGroup`'s member fanout) use moka's `invalidate_entries_if`, which is **asynchronous**: predicate evaluation runs on moka's internal worker after the management call returns. There is a small window (~ms) between the API responding 200/204 and the matching entries actually being evicted from the underlying store. The accompanying epoch bump ensures any in-flight refresh on those keys is dropped on completion, but a request that reads the slot during this window can still see the pre-invalidation value. Operators should treat fanout invalidation as "eventually consistent within a few ms"; for hard cutover (e.g. revoking a compromised key), prefer the single-key invalidations (`DeleteAccessKey`) over the cascade ones.
 > - **Off-instance changes** (a separate process modifying the catalog directly, or a different instance in a multi-node deployment) take up to `auth.cache.ttl_seconds` to propagate. The cross-process invalidation channel described in Appendix B is not yet implemented.
 >
 > Self-induced single-key changes via the admin API or the web console propagate instantly on the local instance via write-through invalidation; both paths share the same `AuthCacheRegistry`.
@@ -429,7 +429,7 @@ Each phase is a separate PR. After each phase the test suite runs green and the 
 
 ---
 
-## Appendix A — alternatives considered
+## Appendix A: alternatives considered
 
 - **No cache, just larger pool.** Insufficient. The catalog roundtrip itself is ~1 ms on a co-located DB; per-request 6× roundtrips × 1 ms = 6 ms of pre-dispatch latency that is impossible to remove without caching. No pool size fixes this.
 - **Verdict cache (cache `Allow`/`Deny` for `(principal, action, resource)`).** Considered. Rejected: condition expressions can depend on per-request context (`aws:CurrentTime`, request IP, leading keys, attribute names) that varies per call. Caching the verdict requires either invalidating on every condition-relevant input change (impractical) or only caching for a subset of verdicts (complexity not worth it). Caching the inputs and re-evaluating in CPU per request gives the same throughput at lower complexity and zero correctness risk.
@@ -440,7 +440,7 @@ Each phase is a separate PR. After each phase the test suite runs green and the 
 
 ---
 
-## Appendix B — Multi-instance cache invalidation (deferred)
+## Appendix B: Multi-instance cache invalidation (deferred)
 
 > **Status:** designed, **not implemented**. Single-instance correctness is the focus of the initial cache PR; multi-instance fanout requires additional engineering review (failure modes, schema, ordering guarantees) before implementation.
 >
@@ -448,7 +448,7 @@ Each phase is a separate PR. After each phase the test suite runs green and the 
 
 ### B.1 Why the current state is not enough for multi-instance deployments
 
-In a multi-instance deployment (multiple extenddb processes sharing a catalog DB), each instance's in-memory cache is local. Self-induced changes propagate instantly **on the local instance** via the existing write-through hooks. Off-instance changes — an admin-API mutation on instance A, where instance B is serving the same principal — only become visible on instance B when its cache entry expires (`auth.cache.ttl_seconds`, default 60 s).
+In a multi-instance deployment (multiple extenddb processes sharing a catalog DB), each instance's in-memory cache is local. Self-induced changes propagate instantly **on the local instance** via the existing write-through hooks. Off-instance changes (an admin-API mutation on instance A, where instance B is serving the same principal) only become visible on instance B when its cache entry expires (`auth.cache.ttl_seconds`, default 60 s).
 
 For an auth/authz cache, "60 seconds of stale policy" can mean a deleted access key still authenticates, or a Deny statement still being shadowed by a stale Allow. That window is acceptable for soft state but not for IAM revocation.
 
@@ -532,7 +532,7 @@ If the catch-up scan exceeds the cleanup window (B.4), assume too much state has
 | Scenario | Behavior |
 |----------|----------|
 | Listener connection drops, reconnects within the cleanup window | Catch-up via table scan. No data loss. |
-| Listener can't drain fast enough → NOTIFY queue overflow | Same — catch-up via table scan on next iteration. |
+| Listener can't drain fast enough → NOTIFY queue overflow | Same: catch-up via table scan on next iteration. |
 | Network partition between instance and DB | NOTIFY paused; catch-up on heal. |
 | Instance offline > cleanup window | `invalidate_all` on every cache. Equivalent to a fresh start; correct but cold. |
 | Total LISTEN channel failure | Falls back gracefully to TTL-bounded propagation. No worse than today. |
@@ -564,7 +564,7 @@ enabled = false
 
 ### B.7 Implementation cost estimate
 
-- ~400–500 LOC, self-contained, in `crates/storage-postgres/src/cache_fanout.rs`.
+- ~400-500 LOC, self-contained, in `crates/storage-postgres/src/cache_fanout.rs`.
 - One new migration.
 - ~10 lines per IAM mutation handler to insert the row and trigger NOTIFY.
 - Behind the `auth.cache.fanout.enabled` flag (default off) so single-instance deployments are unaffected.

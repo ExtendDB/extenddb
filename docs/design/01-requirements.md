@@ -23,16 +23,16 @@ extenddb (ExtendDB) is a standalone, stateless Rust application that provides a 
 
 | Feature | Reason |
 |---------|--------|
-| PartiQL (ExecuteStatement, BatchExecuteStatement, ExecuteTransaction) | Deferred — focus on JSON wire protocol first |
-| Backup/Restore (CreateBackup, DeleteBackup, DescribeBackup, ListBackups, RestoreTableFromBackup, DescribeContinuousBackups, UpdateContinuousBackups, RestoreTableToPointInTime) | Excluded — backup is a storage-layer concern, not an API concern |
-| Auto-scaling APIs (DescribeTableReplicaAutoScaling, UpdateTableReplicaAutoScaling) | Excluded — auto-scaling is an infrastructure concern |
-| Contributor Insights (DescribeContributorInsights, ListContributorInsights, UpdateContributorInsights) | Excluded — analytics feature, not core API |
-| Kinesis Streaming Destination (DescribeKinesisStreamingDestination, EnableKinesisStreamingDestination, DisableKinesisStreamingDestination, UpdateKinesisStreamingDestination) | Excluded — AWS-specific integration |
-| Resource Policies (GetResourcePolicy, PutResourcePolicy, DeleteResourcePolicy) | Deferred — resource-based policies are a future enhancement |
-| IAM Policy Variables (`${aws:PrincipalTag/key}`, `${aws:username}`, etc.) | Deferred — variable substitution in Resource ARNs and Condition values is a future enhancement (see REQ-ABAC-006) |
-| Federated Role Assumption (AssumeRoleWithSAML, AssumeRoleWithWebIdentity) | Deferred — v1 supports basic AssumeRole only (see REQ-IDENT-008) |
-| Role Chaining (role assumes role) | Deferred — v1 requires CallerArn to be a user; SourceIdentity and TransitiveTagKeys are deferred alongside (see REQ-IDENT-009) |
-| Role MaxSessionDuration | Deferred — v1 accepts any DurationSeconds with no per-role cap (see REQ-IDENT-010) |
+| PartiQL (ExecuteStatement, BatchExecuteStatement, ExecuteTransaction) | Deferred: focus on JSON wire protocol first |
+| Backup/Restore (CreateBackup, DeleteBackup, DescribeBackup, ListBackups, RestoreTableFromBackup, DescribeContinuousBackups, UpdateContinuousBackups, RestoreTableToPointInTime) | Excluded: backup is a storage-layer concern, not an API concern |
+| Auto-scaling APIs (DescribeTableReplicaAutoScaling, UpdateTableReplicaAutoScaling) | Excluded: auto-scaling is an infrastructure concern |
+| Contributor Insights (DescribeContributorInsights, ListContributorInsights, UpdateContributorInsights) | Excluded: analytics feature, not core API |
+| Kinesis Streaming Destination (DescribeKinesisStreamingDestination, EnableKinesisStreamingDestination, DisableKinesisStreamingDestination, UpdateKinesisStreamingDestination) | Excluded: AWS-specific integration |
+| Resource Policies (GetResourcePolicy, PutResourcePolicy, DeleteResourcePolicy) | Deferred: resource-based policies are a future enhancement |
+| IAM Policy Variables (`${aws:PrincipalTag/key}`, `${aws:username}`, etc.) | Deferred: variable substitution in Resource ARNs and Condition values is a future enhancement (see REQ-ABAC-006) |
+| Federated Role Assumption (AssumeRoleWithSAML, AssumeRoleWithWebIdentity) | Deferred: v1 supports basic AssumeRole only (see REQ-IDENT-008) |
+| Role Chaining (role assumes role) | Deferred: v1 requires CallerArn to be a user; SourceIdentity and TransitiveTagKeys are deferred alongside (see REQ-IDENT-009) |
+| Role MaxSessionDuration | Deferred: v1 accepts any DurationSeconds with no per-role cap (see REQ-IDENT-010) |
 
 ## 2. Wire Protocol Compatibility
 
@@ -133,7 +133,7 @@ Error responses must be byte-for-byte compatible with DynamoDB:
 | `UnrecognizedClientException` | 403 | Invalid access key or signature mismatch |
 | `ValidationException` | 400 | Input validation failure (bad table name, missing required field, etc.) |
 
-## 3. Functional Requirements — Operations
+## 3. Functional Requirements: Operations
 
 ### 3.1 Data Plane Operations (In Scope)
 
@@ -163,8 +163,8 @@ These are the core CRUD operations. All must be fully implemented.
 - REQ-DATA-008: Scan response size must not exceed 1 MB; return `LastEvaluatedKey` for pagination
 - REQ-DATA-009: BatchGetItem must support up to 100 items, 16 MB total response; return `UnprocessedKeys` for partial failures
 - REQ-DATA-010: BatchWriteItem must support up to 25 items (put or delete); return `UnprocessedItems` for partial failures
-- REQ-DATA-011: TransactWriteItems must be atomic — all succeed or all fail; support `ClientRequestToken` for idempotency
-- REQ-DATA-012: TransactGetItems must be atomic — consistent snapshot of up to 100 items
+- REQ-DATA-011: TransactWriteItems must be atomic: all succeed or all fail; support `ClientRequestToken` for idempotency
+- REQ-DATA-012: TransactGetItems must be atomic: consistent snapshot of up to 100 items
 - REQ-DATA-013: All data operations must support legacy `Expected` and `ConditionalOperator` parameters (converted internally to expressions)
 - REQ-DATA-014: All write operations must trigger stream event capture when streams are enabled on the table
 - REQ-DATA-015: `ConsistentRead` parameter must be accepted on GetItem, Query, Scan, and BatchGetItem. When a read replica is configured, `ConsistentRead=false` reads must route to the replica; `ConsistentRead=true` reads must route to the primary. When no replica is configured, all reads are strongly consistent. Capacity calculations must reflect the consistency mode regardless of replica configuration (0.5 RCU for eventually consistent, 1.0 RCU for strongly consistent).
@@ -211,7 +211,7 @@ These are the core CRUD operations. All must be fully implemented.
 - REQ-IMPEXP-003: Import/export must work with local filesystem paths (S3 support is a future enhancement)
 - REQ-IMPEXP-004: Import/export jobs must be tracked with status (IN_PROGRESS, COMPLETED, FAILED, CANCELLED)
 
-### 3.4 DynamoDB Streams Operations (In Scope — Deferred Detail)
+### 3.4 DynamoDB Streams Operations (In Scope: Deferred Detail)
 
 | # | Operation | Description |
 |---|-----------|-------------|
@@ -227,7 +227,7 @@ These are the core CRUD operations. All must be fully implemented.
 - REQ-STREAM-004: Stream records must be ordered by sequence number within a shard
 - REQ-STREAM-005: Detailed shard management and retention design is deferred
 
-### 3.5 Global Tables Operations (In Scope — Deferred Detail)
+### 3.5 Global Tables Operations (In Scope: Deferred Detail)
 
 | # | Operation | Description |
 |---|-----------|-------------|
@@ -261,7 +261,7 @@ These are the core CRUD operations. All must be fully implemented.
 
 extenddb supports three authentication modes, selectable by configuration. The mode determines how credentials are validated and how authorization decisions are made.
 
-**Mode 1: No auth** (removed — `auth.provider = "none"` is no longer accepted)
+**Mode 1: No auth** (removed: `auth.provider = "none"` is no longer accepted)
 Previously accepted any request regardless of the Authorization header. This mode has been removed. The server refuses to start with `provider = "none"`.
 
 **Mode 2: Local credential store** (`auth.provider = "builtin"`)
@@ -276,7 +276,7 @@ When extenddb has network connectivity to AWS (e.g., running on EC2), it delegat
 - REQ-AUTH-011: **Graceful degradation.** If STS or IAM is unreachable (network partition, transient failure), extenddb must return a clear error (`ServiceUnavailable` with a message indicating the auth backend is unreachable) rather than silently allowing or denying requests. Cached identities and policies remain valid for their TTL during outages.
 - REQ-AUTH-012: **IAM permissions required.** The EC2 instance (or IAM principal) running extenddb must have permissions to call `sts:GetCallerIdentity` (always allowed, no policy needed) and the `iam:Get*`/`iam:List*` actions above. The required IAM policy for the extenddb host is documented in the deployment guide.
 
-> **Design note:** Mode 3 enables a powerful workflow: develop locally with Mode 2 (local credentials + policies), then deploy to EC2 with Mode 3 (real IAM) using the same application code and SDK configuration (only `endpoint_url` changes, plus adding the extenddb client wrapper). The same policy documents work in both modes because the policy engine is shared. The pre-signed token approach is a proven pattern used by EKS and Vault — it works because the token is signed for the `sts` service by the client's own credentials, avoiding the SigV4 service-binding problem.
+> **Design note:** Mode 3 enables a powerful workflow: develop locally with Mode 2 (local credentials + policies), then deploy to EC2 with Mode 3 (real IAM) using the same application code and SDK configuration (only `endpoint_url` changes, plus adding the extenddb client wrapper). The same policy documents work in both modes because the policy engine is shared. The pre-signed token approach is a proven pattern used by EKS and Vault. It works because the token is signed for the `sts` service by the client's own credentials, avoiding the SigV4 service-binding problem.
 
 ### 4.2 Identity Model
 
@@ -287,19 +287,19 @@ extenddb implements a local IAM identity model that mirrors the structure of AWS
 - REQ-IDENT-003: Each principal (user, role) has an ARN: `arn:aws:iam::{account_id}:user/{name}`, `arn:aws:iam::{account_id}:role/{name}`. Groups: `arn:aws:iam::{account_id}:group/{name}`.
 - REQ-IDENT-004: Support **principal tags** (key-value pairs attached to users and roles). Principal tags are available as `aws:PrincipalTag/{key}` in policy condition evaluation.
 - REQ-IDENT-005: Support **session tags** passed during role assumption. Session tags override principal tags for the duration of the session and are available as `aws:PrincipalTag/{key}`.
-- REQ-IDENT-006: Support **AssumeRole** — a user assumes a role to obtain temporary session credentials (access key, secret key, session token). The session has an expiration time. The role's trust policy controls who can assume it.
+- REQ-IDENT-006: Support **AssumeRole**: a user assumes a role to obtain temporary session credentials (access key, secret key, session token). The session has an expiration time. The role's trust policy controls who can assume it.
 - REQ-IDENT-007: Session credentials include an `aws:PrincipalTag/*` namespace populated from the role's tags, the user's tags, and any session tags passed at assumption time (session tags take precedence).
 - REQ-IDENT-008 (Deferred): **Federated role assumption** (`AssumeRoleWithSAML`, `AssumeRoleWithWebIdentity`) is not supported in v1. Applications that use web identity federation (e.g., Lambda functions, EKS pods) to access DynamoDB cannot replicate that auth path against extenddb. Workaround: use basic AssumeRole with equivalent policies.
 - REQ-IDENT-009 (Deferred): **Role chaining** (a role assuming another role) is not supported in v1. `CallerArn` in AssumeRole must reference a user. `SourceIdentity` (tracks the original caller through a chain) and `TransitiveTagKeys` (session tags that persist through chains) are deferred alongside role chaining since they only apply in chained scenarios.
 - REQ-IDENT-010 (Deferred): **MaxSessionDuration** per role is not enforced in v1. AWS IAM roles have a configurable maximum session duration (default 1 hour, up to 12 hours) that caps the `DurationSeconds` parameter in AssumeRole. extenddb v1 accepts any `DurationSeconds` value with no per-role validation.
 
-### 4.3 Authorization — Identity-Based Policies
+### 4.3 Authorization: Identity-Based Policies
 
 - REQ-AUTHZ-001: Authorization must evaluate IAM-style policy documents
 - REQ-AUTHZ-002: Support `Allow` and `Deny` effects with explicit Deny precedence
 - REQ-AUTHZ-003: Support action matching with wildcards (`dynamodb:*`, `dynamodb:Get*`)
 - REQ-AUTHZ-004: Support resource matching with wildcards (`arn:aws:dynamodb:*:*:table/Prefix*`)
-- REQ-AUTHZ-005: Authorization must be decoupled from authentication — any auth provider can feed into the same policy engine
+- REQ-AUTHZ-005: Authorization must be decoupled from authentication: any auth provider can feed into the same policy engine
 - REQ-AUTHZ-006: Support **identity-based policies** attached to users, groups, and roles. When a request is made:
   - Collect all policies attached directly to the user
   - Collect all policies from groups the user belongs to
@@ -308,7 +308,7 @@ extenddb implements a local IAM identity model that mirrors the structure of AWS
 - REQ-AUTHZ-007: Support **permissions boundaries** on users and roles. A permissions boundary is a managed policy that sets the maximum permissions. The effective permissions are the intersection of identity-based policies and the permissions boundary.
 - REQ-AUTHZ-008: Policy evaluation order follows AWS IAM semantics: (1) explicit Deny in any policy → Deny; (2) if permissions boundary exists, action must be allowed by both the boundary and an identity policy; (3) explicit Allow in any identity policy → Allow; (4) implicit Deny.
 
-### 4.4 Authorization — Tag-Based Access Control (ABAC)
+### 4.4 Authorization: Tag-Based Access Control (ABAC)
 
 - REQ-ABAC-001: Support **resource tag conditions** in policies via `aws:ResourceTag/{key}`. The policy engine resolves resource tags by querying the tag store for the target table's ARN.
 - REQ-ABAC-002: Support **principal tag conditions** via `aws:PrincipalTag/{key}`. Principal tags come from the authenticated identity (user tags, role tags, or session tags).
@@ -329,9 +329,9 @@ extenddb implements a local IAM identity model that mirrors the structure of AWS
   - `dynamodb:FullTableScan`: restricts whether Scan operations are allowed (`Bool` condition).
   - `dynamodb:EnclosingOperation`: identifies the parent operation for batch/transact sub-operations.
 - REQ-ABAC-005: The policy engine must build a **request context** for each operation containing all applicable context keys. The request context is populated by the server middleware before policy evaluation.
-- REQ-ABAC-006 (Deferred): **Policy variables** (`${aws:PrincipalTag/key}`, `${aws:username}`, etc.) in Resource ARNs and Condition values are not supported in v1. In AWS IAM, policy variables enable a single policy to grant access to resources that match the caller's own tags — e.g., `"Resource": "arn:aws:dynamodb:*:*:table/${aws:PrincipalTag/Team}-*"`. Without policy variables, each team or department requires a separate policy with hardcoded resource ARNs, which reduces the ABAC testing value. This is a high-priority enhancement for a future version.
+- REQ-ABAC-006 (Deferred): **Policy variables** (`${aws:PrincipalTag/key}`, `${aws:username}`, etc.) in Resource ARNs and Condition values are not supported in v1. In AWS IAM, policy variables enable a single policy to grant access to resources that match the caller's own tags, e.g., `"Resource": "arn:aws:dynamodb:*:*:table/${aws:PrincipalTag/Team}-*"`. Without policy variables, each team or department requires a separate policy with hardcoded resource ARNs, which reduces the ABAC testing value. This is a high-priority enhancement for a future version.
 
-### 4.5 Authorization — Caching
+### 4.5 Authorization: Caching
 
 - REQ-CACHE-001: Policy evaluation results must be cached with configurable TTL to avoid repeated database lookups on every request
 - REQ-CACHE-002: Identity resolution (user → groups → policies, role → policies) must be cached with configurable TTL
@@ -361,7 +361,7 @@ All limits must be enforced by default with DynamoDB-compatible values. All limi
 
 | Limit | DynamoDB Default | Configurable | Requirement ID |
 |-------|-----------------|--------------|----------------|
-| Table name length | 3–255 characters | Yes | REQ-LIM-020 |
+| Table name length | 3-255 characters | Yes | REQ-LIM-020 |
 | Table name characters | `[a-zA-Z0-9_.-]` | No | REQ-LIM-021 |
 | Tables per account | 2,500 | Yes | REQ-LIM-022 |
 | GSIs per table | 20 | Yes | REQ-LIM-023 |
@@ -385,13 +385,13 @@ All limits must be enforced by default with DynamoDB-compatible values. All limi
 
 | Limit | DynamoDB Default | Configurable | Requirement ID |
 |-------|-----------------|--------------|----------------|
-| BatchGetItem — max items | 100 | Yes | REQ-LIM-040 |
-| BatchGetItem — max response size | 16 MB | Yes | REQ-LIM-041 |
-| BatchWriteItem — max items | 25 | Yes | REQ-LIM-042 |
-| TransactGetItems — max items | 100 | Yes | REQ-LIM-043 |
-| TransactWriteItems — max items | 100 | Yes | REQ-LIM-044 |
-| Query/Scan — max response size | 1 MB | Yes | REQ-LIM-045 |
-| ListTables — max per page | 100 | Yes | REQ-LIM-046 |
+| BatchGetItem: max items | 100 | Yes | REQ-LIM-040 |
+| BatchGetItem: max response size | 16 MB | Yes | REQ-LIM-041 |
+| BatchWriteItem: max items | 25 | Yes | REQ-LIM-042 |
+| TransactGetItems: max items | 100 | Yes | REQ-LIM-043 |
+| TransactWriteItems: max items | 100 | Yes | REQ-LIM-044 |
+| Query/Scan: max response size | 1 MB | Yes | REQ-LIM-045 |
+| ListTables: max per page | 100 | Yes | REQ-LIM-046 |
 | Max request body size | 16 MB | Yes | REQ-LIM-047 |
 
 ## 6. Capacity & Throughput Emulation
@@ -404,7 +404,7 @@ All limits must be enforced by default with DynamoDB-compatible values. All limi
 - REQ-CAP-006: Return `ConsumedCapacity` in responses when `ReturnConsumedCapacity` is TOTAL or INDEXES
 - REQ-CAP-007: Return per-table and per-index capacity breakdown when `ReturnConsumedCapacity` is INDEXES
 - REQ-CAP-008: Return `ProvisionedThroughputExceededException` when throughput limits are exceeded
-- REQ-CAP-009: Throughput tracking must be per-instance (stateless — no cross-instance coordination required)
+- REQ-CAP-009: Throughput tracking must be per-instance (stateless: no cross-instance coordination required)
 
 ## 7. Catalog & Data Separation Requirements
 
@@ -415,12 +415,12 @@ The catalog database stores extenddb metadata: table definitions, indexes, tags,
 - REQ-CAT-001: extenddb metadata (table definitions, indexes, tags) must reside in a catalog database, separate from user item data
 - REQ-CAT-002: User item data must reside in a data database whose connection info is recorded in the catalog
 - REQ-CAT-003: The `extenddb.toml` connection string points to the catalog database; the catalog stores the data database location
-- REQ-CAT-004: The catalog database name is user-chosen via the connection string — never hardcoded. Multiple independent catalogs can coexist on one PostgreSQL instance
+- REQ-CAT-004: The catalog database name is user-chosen via the connection string, never hardcoded. Multiple independent catalogs can coexist on one PostgreSQL instance
 
 ### 7.2 Catalog Versioning
 
 - REQ-CAT-005: The catalog carries a semver version (`major.minor.patch`). Major = breaking schema changes, minor = additive, patch = non-structural
-- REQ-CAT-006: The expected catalog version is a build-time constant compiled into the binary — not configurable at runtime
+- REQ-CAT-006: The expected catalog version is a build-time constant compiled into the binary, not configurable at runtime
 - REQ-CAT-007: On startup, the server validates the catalog version matches the version compiled into the binary. Mismatch → refuse to start with a clear error directing the user to run `extenddb migrate`
 - REQ-CAT-008: `extenddb --version` prints both binary version and expected catalog version: `extenddb 0.1.0 (catalog 1.0.0)`. Binary version and catalog version are independent
 - REQ-CAT-009: Any PR that modifies catalog schema or migration files must bump the catalog version. This is a hard review gate for developer, reviewer, and principal reviewer
@@ -428,10 +428,10 @@ The catalog database stores extenddb metadata: table definitions, indexes, tags,
 ### 7.3 Lifecycle Tools
 
 - REQ-CAT-010: The server does not run migrations on startup. Migrations are an explicit step via `extenddb init` or `extenddb migrate`. Server startup is read-only against the catalog schema
-- REQ-CAT-011: `extenddb init` — subcommand that initializes a new deployment: creates (or connects to) the catalog database, runs initial migrations, creates (or connects to) the data database, records the data database connection in the catalog, generates `extenddb.toml` if needed. Documented in `docs/`
-- REQ-CAT-012: `extenddb destroy` — subcommand that tears down a deployment: reads config, connects to catalog, enumerates all user tables, prints what will be destroyed, requires `--yes` to confirm, drops data database, drops catalog database. Documented in `docs/`
-- REQ-CAT-013: `extenddb verify` — subcommand that validates a deployment: connects to catalog, checks version, enumerates all tables and indexes in catalog, connects to data database, verifies corresponding storage structures exist. Reports healthy/missing/inconsistent. Documented in `docs/`
-- REQ-CAT-014: `extenddb migrate` — subcommand that applies schema migrations to an existing catalog: reads current version, determines required migrations, shows plan, requires `--yes` to confirm, runs migrations, updates catalog version. Documented in `docs/`
+- REQ-CAT-011: `extenddb init`: subcommand that initializes a new deployment: creates (or connects to) the catalog database, runs initial migrations, creates (or connects to) the data database, records the data database connection in the catalog, generates `extenddb.toml` if needed. Documented in `docs/`
+- REQ-CAT-012: `extenddb destroy`: subcommand that tears down a deployment: reads config, connects to catalog, enumerates all user tables, prints what will be destroyed, requires `--yes` to confirm, drops data database, drops catalog database. Documented in `docs/`
+- REQ-CAT-013: `extenddb verify`: subcommand that validates a deployment: connects to catalog, checks version, enumerates all tables and indexes in catalog, connects to data database, verifies corresponding storage structures exist. Reports healthy/missing/inconsistent. Documented in `docs/`
+- REQ-CAT-014: `extenddb migrate`: subcommand that applies schema migrations to an existing catalog: reads current version, determines required migrations, shows plan, requires `--yes` to confirm, runs migrations, updates catalog version. Documented in `docs/`
 
 ## 8. Storage Backend Requirements
 
@@ -440,7 +440,7 @@ The catalog database stores extenddb metadata: table definitions, indexes, tags,
 - REQ-STOR-001: All data access must go through a `StorageEngine` trait (async, `Send + Sync`)
 - REQ-STOR-002: The trait must cover: table CRUD, item CRUD, query/scan, batch operations, transaction operations, metadata, stream events, import/export job tracking
 - REQ-STOR-003: The trait must support transactions with serializable isolation for TransactWriteItems/TransactGetItems
-- REQ-STOR-004: The trait must not leak backend-specific types — all inputs and outputs use core DynamoDB types
+- REQ-STOR-004: The trait must not leak backend-specific types: all inputs and outputs use core DynamoDB types
 - REQ-STOR-005: Adding a new backend must not require changes to any existing crate
 
 ### 8.2 PostgreSQL Backend (First Implementation)
@@ -544,7 +544,7 @@ The system must support all 10 DynamoDB attribute value types:
 
 ## 12. SDK Client Configuration Requirements
 
-An unmodified application that works against AWS DynamoDB must work against extenddb by changing only endpoint configuration — no code changes, no SDK patches, no custom plugins.
+An unmodified application that works against AWS DynamoDB must work against extenddb by changing only endpoint configuration: no code changes, no SDK patches, no custom plugins.
 
 ### 12.1 Endpoint Override Mechanism
 
@@ -565,7 +565,7 @@ The service-specific environment variables for DynamoDB and DynamoDB Streams are
 Both must point to the same extenddb address (extenddb serves both services on a single port).
 
 **Requirements:**
-- REQ-SDK-001: extenddb serves both DynamoDB and DynamoDB Streams on a single `host:port`. No separate Streams port or path prefix is needed — the `X-Amz-Target` prefix distinguishes the two services.
+- REQ-SDK-001: extenddb serves both DynamoDB and DynamoDB Streams on a single `host:port`. No separate Streams port or path prefix is needed; the `X-Amz-Target` prefix distinguishes the two services.
 - REQ-SDK-002: `DescribeEndpoints` must return the server's own `host:port` as the `Address` with a `CachePeriodInMinutes` of 10. This is a no-op for SDK clients that set `endpoint_url` (endpoint discovery is disabled when a custom endpoint is set), but must return a valid response if called directly.
 - REQ-SDK-003: SigV4 signing name is `dynamodb` for both DynamoDB and DynamoDB Streams requests. The auth layer does not need to distinguish between the two services.
 
@@ -573,7 +573,7 @@ Both must point to the same extenddb address (extenddb serves both services on a
 
 extenddb requires credentials for SigV4 authentication. The standard `~/.aws/credentials` and `~/.aws/config` files are used by the SDK client, not by extenddb itself. extenddb has its own credential store (see §4). The credentials configured in `~/.aws/credentials` must match a credential pair registered in extenddb's credential store.
 
-**Minimal setup — environment variables only (simplest):**
+**Minimal setup: environment variables only (simplest):**
 
 ```bash
 # Point both services at extenddb
@@ -586,9 +586,9 @@ export AWS_SECRET_ACCESS_KEY=local-dev-secret
 export AWS_DEFAULT_REGION=us-east-1
 ```
 
-With this setup, any application using `boto3.client('dynamodb')` or `boto3.client('dynamodbstreams')` — or the equivalent in any other SDK — automatically talks to extenddb with zero code changes.
+With this setup, any application using `boto3.client('dynamodb')` or `boto3.client('dynamodbstreams')`, or the equivalent in any other SDK, automatically talks to extenddb with zero code changes.
 
-**Alternative — `~/.aws/config` with services section:**
+**Alternative: `~/.aws/config` with services section:**
 
 ```ini
 [profile extenddb]
@@ -609,9 +609,9 @@ aws_access_key_id = local-dev-key
 aws_secret_access_key = local-dev-secret
 ```
 
-Usage: `export AWS_PROFILE=extenddb` — then all SDK clients in the process use extenddb.
+Usage: `export AWS_PROFILE=extenddb`; then all SDK clients in the process use extenddb.
 
-**Alternative — global endpoint override (all AWS services go to one place):**
+**Alternative: global endpoint override (all AWS services go to one place):**
 
 ```bash
 export AWS_ENDPOINT_URL=https://127.0.0.1:18443
@@ -634,9 +634,9 @@ DynamoDB SDKs support optional endpoint discovery via the `DescribeEndpoints` op
 
 - REQ-TEST-001: A minimal test suite must exist for every phase, covering all implemented operations. No phase exits without a passing test suite
 - REQ-TEST-002: Tests are written in Python (boto3) and AWS CLI, covering all Phase 1 operations: CreateTable, DescribeTable, ListTables, DeleteTable, and key error paths
-- REQ-TEST-003: Tests must be dual-target — run against both real DynamoDB and extenddb with identical assertions, controlled by an endpoint parameter. No target-specific branching
+- REQ-TEST-003: Tests must be dual-target: run against both real DynamoDB and extenddb with identical assertions, controlled by an endpoint parameter. No target-specific branching
 - REQ-TEST-004: If behavior differs between real DynamoDB and extenddb, that is a bug in extenddb
-- REQ-TEST-005: Tests must clean up after themselves — all created resources are deleted on exit, even on failure
+- REQ-TEST-005: Tests must clean up after themselves: all created resources are deleted on exit, even on failure
 
 ## 14. Documentation Requirements
 

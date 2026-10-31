@@ -14,7 +14,7 @@ ExtendDB manages two kinds of stored state in every storage backend. The
 examples below name the PostgreSQL databases; other backends map the same two
 roles onto their own structures (see backend-specific documentation).
 
-- **Catalog** (e.g., the `extenddb_catalog` PostgreSQL database): All metadata — table definitions, indexes, accounts, IAM entities, settings, stream metadata, and schema history.
+- **Catalog** (e.g., the `extenddb_catalog` PostgreSQL database): All metadata: table definitions, indexes, accounts, IAM entities, settings, stream metadata, and schema history.
 - **Data** (e.g., the `extenddb_catalog_data` PostgreSQL database): User item data. Each DynamoDB table maps to a PostgreSQL table. GSI and LSI data are stored in separate PostgreSQL tables.
 
 On PostgreSQL, the data database connection string is stored in the catalog's `settings` table under the key `data_database_url`. This allows the catalog and data databases to live on different PostgreSQL instances.
@@ -80,7 +80,7 @@ Condition evaluation happens inside the storage transaction (after `SELECT FOR U
 
 ### FilterExpression
 
-Applied after reads (Query/Scan) to exclude non-matching items. Same syntax as ConditionExpression. Filter expressions do not reduce consumed capacity — all scanned items count toward RCU.
+Applied after reads (Query/Scan) to exclude non-matching items. Same syntax as ConditionExpression. Filter expressions do not reduce consumed capacity; all scanned items count toward RCU.
 
 ### UpdateExpression
 
@@ -132,7 +132,7 @@ Policy conditions support all IAM condition operators: `StringEquals`, `StringNo
 
 Access key secrets are encrypted at rest using AES-256-GCM. The encryption key is generated during `extenddb init` and stored in the `encryption_keys` table. Each access key record stores the encrypted secret and a unique nonce.
 
-Credential lookups (access key → encrypted secret) read directly from the database on every request — there is no in-process cache for credentials. The encryption key used to decrypt secrets is cached at startup because it is immutable after `extenddb init` (see Caching Design below).
+Credential lookups (access key → encrypted secret) read directly from the database on every request; there is no in-process cache for credentials. The encryption key used to decrypt secrets is cached at startup because it is immutable after `extenddb init` (see Caching Design below).
 
 ## DynamoDB Streams Internals
 
@@ -202,7 +202,7 @@ All cached values are operational tuning knobs where a briefly-stale value does 
 
 Catalog state is never cached because correctness requires every request to see the current state:
 
-- **Table metadata** (key schema, attribute definitions, status, billing mode): A stale cache could serve the wrong key schema after a table is deleted and recreated with the same name but different schema. The new table has a different `table_id`, different key schema, and different indexes — stale cache serves wrong schema, writes corrupt data, reads return garbage.
+- **Table metadata** (key schema, attribute definitions, status, billing mode): A stale cache could serve the wrong key schema after a table is deleted and recreated with the same name but different schema. The new table has a different `table_id`, different key schema, and different indexes: stale cache serves wrong schema, writes corrupt data, reads return garbage.
 - **IAM policies and credentials**: A revoked Deny policy still cached as absent creates a security gap. A deleted access key still cached as valid allows unauthorized access.
 - **Tags**: Tag-based authorization (`aws:ResourceTag/*`) requires current tag values.
 - **GSI definitions**: Stale GSI metadata could route writes to wrong index tables.

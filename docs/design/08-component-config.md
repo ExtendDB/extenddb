@@ -513,7 +513,7 @@ extenddb serves both DynamoDB and DynamoDB Streams on a single port. An unmodifi
 
 ### 10.1 Recommended Setup: Environment Variables
 
-The simplest approach — set two service-specific endpoint variables and credentials:
+The simplest approach: set two service-specific endpoint variables and credentials:
 
 ```bash
 # Endpoint overrides (both point to the same extenddb instance)
@@ -526,9 +526,9 @@ export AWS_SECRET_ACCESS_KEY=local-dev-secret
 export AWS_DEFAULT_REGION=us-east-1
 ```
 
-This works with every AWS SDK (Python/boto3, Java v2, Rust, Go v2, .NET, Node.js) — all support the `AWS_ENDPOINT_URL_<SERVICE>` convention since late 2023.
+This works with every AWS SDK (Python/boto3, Java v2, Rust, Go v2, .NET, Node.js); all support the `AWS_ENDPOINT_URL_<SERVICE>` convention since late 2023.
 
-**Alternative — single global override** (when the application only uses DynamoDB):
+**Alternative: single global override** (when the application only uses DynamoDB):
 
 ```bash
 export AWS_ENDPOINT_URL=https://127.0.0.1:18443

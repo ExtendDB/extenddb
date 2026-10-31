@@ -24,7 +24,7 @@ This document defines extenddb's test strategy: how tests are organized, what re
 
 ### 3.1 Reference Strategy
 
-extenddb uses test suites as a coverage map — a source of *what to test*, not *how to implement*. The test suites are not included here.
+extenddb uses test suites as a coverage map: a source of *what to test*, not *how to implement*. The test suites are not included here.
 
 ### 3.2 Arm's-Length Boundary (MF-1)
 
@@ -67,13 +67,13 @@ When new tests appear upstream, a developer reviews them for new scenarios to ad
 
 The coverage map (`tests/reference/coverage-map.md`) tracks which reference suite scenarios have corresponding extenddb tests. Every test method maps to an extenddb test scenario at per-method granularity.
 
-The coverage map is a living document, not a prerequisite — it is updated alongside development and does not block Phase 1 implementation.
+The coverage map is a living document, not a prerequisite; it is updated alongside development and does not block Phase 1 implementation.
 
 ## 4. Multi-Language Test Suites
 
 ### 4.1 Why Multiple Languages
 
-Different SDKs serialize requests differently (field ordering, default values, header formatting), handle error responses differently (some parse `__type`, some parse `Code`), and implement SigV4 with subtle variations. If extenddb only passes Python tests, it may fail with the Java SDK. Real DynamoDB users use all four SDKs — extenddb must work with all of them.
+Different SDKs serialize requests differently (field ordering, default values, header formatting), handle error responses differently (some parse `__type`, some parse `Code`), and implement SigV4 with subtle variations. If extenddb only passes Python tests, it may fail with the Java SDK. Real DynamoDB users use all four SDKs; extenddb must work with all of them.
 
 ### 4.2 Language Roles (SF-1)
 
@@ -82,7 +82,7 @@ Different SDKs serialize requests differently (field ordering, default values, h
 | Python | boto3 | Primary test suite. Full fidelity: golden files, error message matching, edge cases. Every phase starts here. | Phase 1+ |
 | Java | aws-sdk-java-v2 | Elevated integration. Covers more scenarios than Rust/C++ because the PostgreSQL extension suite (our primary reference) is Java. Tests scenarios that have a direct PostgreSQL extension suite counterpart. | Phase 2+ |
 | Rust | aws-sdk-rust | SDK integration validation. Core smoke tests proving the Rust SDK works against extenddb. | Phase 2+ |
-| C/C++ | aws-sdk-cpp | SDK integration validation. Exercises a fundamentally different SDK architecture. | Phase 7+ (Query/Scan gives a broad enough API surface — CRUD alone is too narrow to exercise C++'s distinct serialization and memory patterns meaningfully) |
+| C/C++ | aws-sdk-cpp | SDK integration validation. Exercises a fundamentally different SDK architecture. | Phase 7+ (Query/Scan gives a broad enough API surface; CRUD alone is too narrow to exercise C++'s distinct serialization and memory patterns meaningfully) |
 
 **Phase exit criteria:**
 - Python tests: mandatory
@@ -168,7 +168,7 @@ Each golden file contains:
 }
 ```
 
-The `request` is included so the test harness can replay it. The `response` is the expected result. Each language's test harness deserializes the golden file and compares against its SDK's parsed response. Note: headers like `x-amzn-RequestId` are captured for completeness but are not meaningful for exact comparison — they are validated by format only (see §5.3).
+The `request` is included so the test harness can replay it. The `response` is the expected result. Each language's test harness deserializes the golden file and compares against its SDK's parsed response. Note: headers like `x-amzn-RequestId` are captured for completeness but are not meaningful for exact comparison; they are validated by format only (see §5.3).
 
 ### 5.2 Capturing Golden Files (N-2)
 
@@ -184,7 +184,7 @@ To capture a new golden file:
    - Replace stripped values with `"REDACTED"`
 4. Save to `tests/golden/<operation>/<scenario>.json`
 5. Verify the captured response is deterministic (run twice, diff)
-6. Commit the golden file — it must never contain real credentials
+6. Commit the golden file; it must never contain real credentials
 
 The `tests/README.md` documents this workflow.
 
@@ -236,8 +236,8 @@ Each language's test harness:
 
 - Reads endpoint configuration from environment variables (`AWS_ENDPOINT_URL_DYNAMODB`, `AWS_REGION`, etc.)
 - Runs against both real DynamoDB and extenddb with zero code changes
-- Handles table creation wait times — both real DynamoDB and extenddb use async control plane transitions. The harness polls `DescribeTable` until `ACTIVE`
-- Cleans up test tables using the `EXTENDDB_TABLE_PREFIX` convention — deletes all matching tables at the start of each run (idempotent cleanup)
+- Handles table creation wait times: both real DynamoDB and extenddb use async control plane transitions. The harness polls `DescribeTable` until `ACTIVE`
+- Cleans up test tables using the `EXTENDDB_TABLE_PREFIX` convention: deletes all matching tables at the start of each run (idempotent cleanup)
 - Reports results in JUnit XML format for CI integration
 
 ### 6.1 Test Infrastructure Pattern (Q-7)
@@ -247,7 +247,7 @@ All language suites adopt the same architectural pattern independently (not copi
 - A base class/fixture with table setup and teardown
 - Assertion helpers for item comparison and attribute value comparison
 - Endpoint configuration from environment variables
-- Table name prefix (`EXTENDDB_TABLE_PREFIX`, defaults to `extenddb_test_`) for cleanup isolation — configurable to support parallel test runs
+- Table name prefix (`EXTENDDB_TABLE_PREFIX`, defaults to `extenddb_test_`) for cleanup isolation; configurable to support parallel test runs
 
 This pattern is standard for DynamoDB test suites and proven by the PostgreSQL extension suite's architecture.
 
@@ -255,7 +255,7 @@ This pattern is standard for DynamoDB test suites and proven by the PostgreSQL e
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
-| `AWS_ENDPOINT_URL_DYNAMODB` | extenddb endpoint override | (none — uses real DynamoDB) |
+| `AWS_ENDPOINT_URL_DYNAMODB` | extenddb endpoint override | (none: uses real DynamoDB) |
 | `AWS_REGION` | Region for requests | `us-east-1` |
 | `AWS_ACCESS_KEY_ID` | Credentials | (from AWS config) |
 | `AWS_SECRET_ACCESS_KEY` | Credentials | (from AWS config) |

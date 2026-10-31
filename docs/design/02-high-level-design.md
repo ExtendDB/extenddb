@@ -165,7 +165,7 @@ graph TD
     STORAGE --> CORE
 ```
 
-**Key principle:** `core` depends on nothing in the workspace and has no async runtime — it is pure sync Rust (types, expressions, validation, capacity, errors). `storage` depends only on `core`. `engine` depends on `core` + `storage` and contains the async operation handlers. Backend crates depend on `storage` + `core`. `auth` depends on `core`. `server` depends on `core` + `storage` + `auth` + `engine`. `bin` wires everything together.
+**Key principle:** `core` depends on nothing in the workspace and has no async runtime; it is pure sync Rust (types, expressions, validation, capacity, errors). `storage` depends only on `core`. `engine` depends on `core` + `storage` and contains the async operation handlers. Backend crates depend on `storage` + `core`. `auth` depends on `core`. `server` depends on `core` + `storage` + `auth` + `engine`. `bin` wires everything together.
 
 ## 3. Request Lifecycle
 
@@ -206,13 +206,13 @@ sequenceDiagram
 **Decision:** Structure as a Cargo workspace with 7 crates.
 
 **Rationale:**
-- Compile-time enforcement of dependency boundaries — the storage trait crate physically cannot depend on PostgreSQL
-- `core` is pure sync Rust with no async runtime — types, expressions, validation, capacity, errors
+- Compile-time enforcement of dependency boundaries: the storage trait crate physically cannot depend on PostgreSQL
+- `core` is pure sync Rust with no async runtime: types, expressions, validation, capacity, errors
 - `engine` contains async operation handlers that depend on `core` + `storage`, keeping the async boundary explicit
-- Independent testing — `cargo test -p dynamodb-core` needs no database and no async runtime
-- Faster incremental builds — changing the Postgres backend doesn't recompile the expression parser
-- Clean extension points — adding a SQLite backend is a new crate, zero changes to existing code
-- Lean dependency trees — core has no async runtime, no database drivers, no HTTP framework
+- Independent testing: `cargo test -p dynamodb-core` needs no database and no async runtime
+- Faster incremental builds: changing the Postgres backend doesn't recompile the expression parser
+- Clean extension points: adding a SQLite backend is a new crate, zero changes to existing code
+- Lean dependency trees: core has no async runtime, no database drivers, no HTTP framework
 
 ### 4.2 axum + tower for HTTP
 
@@ -221,7 +221,7 @@ sequenceDiagram
 **Rationale:**
 - axum is the de facto standard for async Rust HTTP servers, built on top of hyper and tower
 - tower's `Layer` and `Service` traits provide composable middleware that maps directly to the DynamoDB middleware pipeline (auth, capacity, metrics, logging)
-- Native async/await with tokio — no blocking threads, efficient connection handling
+- Native async/await with tokio: no blocking threads, efficient connection handling
 - Mature ecosystem with TLS (rustls), compression, and graceful shutdown support
 - axum's extractor pattern cleanly maps to parsing DynamoDB request headers and bodies
 
@@ -230,22 +230,22 @@ sequenceDiagram
 **Decision:** Define `StorageEngine` sub-traits as async traits using RPITIT (Return Position Impl Trait In Trait, stable since Rust 1.75), selected at startup via enum dispatch. Define `AuthProvider` and `CredentialStore` using `#[async_trait]` for object-safe dynamic dispatch.
 
 **Rationale:**
-- **Storage (RPITIT + enum dispatch):** RPITIT avoids the `Box<dyn Future>` heap allocation per call that `async_trait` introduces — at high throughput on the data path this matters. Since RPITIT traits are not object-safe, the backend is selected at startup via an enum dispatch wrapper in the `bin` crate (e.g., `enum Storage { Postgres(PostgresEngine) }`) rather than `Arc<dyn StorageEngine>`. The enum dispatch approach has zero overhead (static dispatch) and the match arms are generated once at startup.
-- **Auth (`#[async_trait]` + `Arc<dyn>`):** Both `AuthProvider` and `CredentialStore` use `#[async_trait]` for object safety. Auth is called once per request and involves crypto operations (SigV4 HMAC-SHA256, policy evaluation) that dwarf the cost of a single `Box<dyn Future>` allocation. Using `#[async_trait]` makes `AuthProvider` object-safe, allowing `Arc<dyn AuthProvider>` in the server crate without enum wrappers. `CredentialStore` uses `#[async_trait]` for the same reason — it allows `Arc<dyn CredentialStore>` inside `BuiltinAuthProvider`, avoiding a generic parameter that would propagate up through the auth provider. Note: `CredentialStore` (in the `auth` crate) is a separate trait from `CredentialEngine` (in the `storage` crate, which uses RPITIT). The `bin` crate bridges them with a thin adapter.
+- **Storage (RPITIT + enum dispatch):** RPITIT avoids the `Box<dyn Future>` heap allocation per call that `async_trait` introduces; at high throughput on the data path this matters. Since RPITIT traits are not object-safe, the backend is selected at startup via an enum dispatch wrapper in the `bin` crate (e.g., `enum Storage { Postgres(PostgresEngine) }`) rather than `Arc<dyn StorageEngine>`. The enum dispatch approach has zero overhead (static dispatch) and the match arms are generated once at startup.
+- **Auth (`#[async_trait]` + `Arc<dyn>`):** Both `AuthProvider` and `CredentialStore` use `#[async_trait]` for object safety. Auth is called once per request and involves crypto operations (SigV4 HMAC-SHA256, policy evaluation) that dwarf the cost of a single `Box<dyn Future>` allocation. Using `#[async_trait]` makes `AuthProvider` object-safe, allowing `Arc<dyn AuthProvider>` in the server crate without enum wrappers. `CredentialStore` uses `#[async_trait]` for the same reason: it allows `Arc<dyn CredentialStore>` inside `BuiltinAuthProvider`, avoiding a generic parameter that would propagate up through the auth provider. Note: `CredentialStore` (in the `auth` crate) is a separate trait from `CredentialEngine` (in the `storage` crate, which uses RPITIT). The `bin` crate bridges them with a thin adapter.
 - Avoids monomorphization bloat from generic parameters threaded through the entire codebase
-- Clean testing — mock implementations for unit tests, real backends for integration tests
+- Clean testing: mock implementations for unit tests, real backends for integration tests
 
 ### 4.4 Expression Engine in Core (No Database Dependency)
 
 **Decision:** The expression parser and evaluator live in the `core` crate and operate on in-memory `AttributeValue` types.
 
 **Rationale:**
-- Expressions are DynamoDB-specific logic, not storage-specific — `FilterExpression` is evaluated after items are fetched, `ConditionExpression` is evaluated against the current item before a write
+- Expressions are DynamoDB-specific logic, not storage-specific: `FilterExpression` is evaluated after items are fetched, `ConditionExpression` is evaluated against the current item before a write
 - Keeping expressions in core means every storage backend gets the same expression behavior for free
 - The storage backend only needs to handle `KeyConditionExpression` translation to its native query language (e.g., SQL WHERE clauses for partition key equality + sort key range)
 - This matches how DynamoDB actually works: filter expressions are applied after the read, not pushed down to the storage layer
 
-**Important:** While the expression evaluator lives in `core`, `ConditionExpression` evaluation for writes is called by the storage backend inside its transaction (after `SELECT FOR UPDATE`). The storage backend imports `core::expression::evaluate_condition` and calls it within the transaction to prevent TOCTOU races. `FilterExpression` evaluation happens in the core handler after items are returned — this is safe because filters are read-only post-processing.
+**Important:** While the expression evaluator lives in `core`, `ConditionExpression` evaluation for writes is called by the storage backend inside its transaction (after `SELECT FOR UPDATE`). The storage backend imports `core::expression::evaluate_condition` and calls it within the transaction to prevent TOCTOU races. `FilterExpression` evaluation happens in the core handler after items are returned; this is safe because filters are read-only post-processing.
 
 ### 4.5 Configuration: TOML + Env Vars + CLI
 
@@ -273,13 +273,13 @@ sequenceDiagram
 **Decision:** All reads are strongly consistent by default. Eventually consistent reads (`ConsistentRead=false`) are supported by routing to an optional PostgreSQL streaming replica.
 
 **Rationale:**
-- DynamoDB's eventual consistency is a consequence of reading from storage replicas that haven't received the latest write yet — it's not artificial delays or queues
-- Strongly consistent is strictly stronger than eventually consistent — any application that works against eventually consistent DynamoDB also works against a strongly consistent backend
+- DynamoDB's eventual consistency is a consequence of reading from storage replicas that haven't received the latest write yet; it's not artificial delays or queues
+- Strongly consistent is strictly stronger than eventually consistent: any application that works against eventually consistent DynamoDB also works against a strongly consistent backend
 - For migration testing (relational → DynamoDB), teams need to surface bugs where application code assumes strong consistency on default reads. A real read replica provides genuine staleness without synthetic delays
-- The read replica is opt-in via `storage.postgres.read_replica_url`. When unset, all reads hit the primary — simple, correct, and matching what DynamoDB Local and other emulators do
+- The read replica is opt-in via `storage.postgres.read_replica_url`. When unset, all reads hit the primary: simple, correct, and matching what DynamoDB Local and other emulators do
 - Writes always go to the primary. `ConsistentRead=true` always reads from the primary. Only `ConsistentRead=false` reads route to the replica
 - Capacity calculations always reflect the consistency mode (0.5 RCU for eventually consistent, 1.0 RCU for strongly consistent) regardless of whether a replica is configured
-- This requires zero changes to the storage trait, engine, or server — it's entirely contained in the PostgreSQL backend's pool selection logic
+- This requires zero changes to the storage trait, engine, or server; it's entirely contained in the PostgreSQL backend's pool selection logic
 
 ## 5. Data Flow
 
@@ -310,7 +310,7 @@ sequenceDiagram
 
 > **Key invariant:** Condition evaluation, data write, GSI updates, and stream record capture all happen within a single PostgreSQL transaction. This prevents TOCTOU races (another request modifying the item between condition check and write) and ensures atomicity of stream capture.
 
-### 5.1b Write Path (UpdateItem — Additional Detail)
+### 5.1b Write Path (UpdateItem: Additional Detail)
 
 UpdateItem is more complex than PutItem because the storage backend must also apply the update expression inside the transaction:
 
@@ -362,7 +362,7 @@ extenddb handles concurrent requests through three cooperating layers:
 
 ### 6.1 Async Runtime (tokio)
 
-The server runs on a tokio multi-thread runtime. Each incoming HTTP request is handled by an independent async task — there is no shared in-memory state on the hot path. Tasks are scheduled cooperatively across OS threads by the tokio work-stealing scheduler.
+The server runs on a tokio multi-thread runtime. Each incoming HTTP request is handled by an independent async task; there is no shared in-memory state on the hot path. Tasks are scheduled cooperatively across OS threads by the tokio work-stealing scheduler.
 
 ### 6.2 PostgreSQL Connection Pool (sqlx)
 
@@ -400,10 +400,10 @@ There is no in-memory locking (no `Mutex`, `RwLock`, or similar) on the data pat
 ### 6.4 Implications
 
 - **Throughput scales with pool_size.** More connections allow more concurrent transactions. The limit is PostgreSQL's `max_connections` and available CPU/IO.
-- **Contention on the same item serializes at the database.** 50 threads incrementing the same counter will queue on the row lock — each update succeeds, but throughput for that single item is bounded by PostgreSQL's single-row transaction rate.
+- **Contention on the same item serializes at the database.** 50 threads incrementing the same counter will queue on the row lock; each update succeeds, but throughput for that single item is bounded by PostgreSQL's single-row transaction rate.
 - **Different items have no contention.** Parallel inserts to different keys proceed fully concurrently up to the pool size.
 
-## 7. High-Level Design Choices — Deferred Components
+## 7. High-Level Design Choices: Deferred Components
 
 ### 7.1 DynamoDB Streams
 
