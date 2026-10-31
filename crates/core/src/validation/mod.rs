@@ -4998,13 +4998,14 @@ mod index_key_literal_tests {
     #[test]
     fn an_empty_literal_on_an_index_key_is_refused_with_its_kind() {
         let empty_s = ("e", AttributeValue::S(String::new()));
-        let empty_b = ("eb", AttributeValue::B(Vec::new().into()));
-        let string = empty_check("SET sidx = :e", &[empty_s.clone()]).unwrap_err();
+        let empty_b = ("eb", AttributeValue::B(Vec::new()));
+        let string = empty_check("SET sidx = :e", std::slice::from_ref(&empty_s)).unwrap_err();
         assert!(
             string.ends_with("cannot contain an empty string value."),
             "{string}"
         );
-        let binary = empty_check("SET sidx = n, bidx = :eb", &[empty_b.clone()]).unwrap_err();
+        let binary =
+            empty_check("SET sidx = n, bidx = :eb", std::slice::from_ref(&empty_b)).unwrap_err();
         assert!(
             binary.ends_with("cannot contain an empty binary value."),
             "{binary}"
@@ -5027,7 +5028,11 @@ mod index_key_literal_tests {
             "SET m.sidx = :e",
             "REMOVE sidx",
         ] {
-            assert_eq!(empty_check(expr, &[empty_s.clone()]), Ok(()), "{expr}");
+            assert_eq!(
+                empty_check(expr, std::slice::from_ref(&empty_s)),
+                Ok(()),
+                "{expr}"
+            );
         }
     }
 }

@@ -310,11 +310,12 @@ async fn a_deadlock_cancels_with_transaction_conflict_on_the_waiting_item() {
 
 #[tokio::test]
 async fn a_deadlock_after_an_empty_index_key_answers_the_empty_key() {
-    // An Update member that sets an index key to the empty string records
-    // that fault once its statement is applied, and the member after it in
-    // execution order then deadlocks. The request answers the empty key's
-    // ValidationException, as it does without the conflict, and no internal
-    // cancellation code reaches the caller.
+    // An Update member that writes an empty value to an index key from the
+    // stored item records that fault once its statement is applied (an empty
+    // literal would be found before any row is locked), and the member after
+    // it in execution order then deadlocks. The request answers the empty
+    // key's ValidationException, as it does without the conflict, and no
+    // internal cancellation code reaches the caller.
     let test = "a_deadlock_after_an_empty_index_key_answers_the_empty_key";
     if base_conn().is_none() {
         return skip(test);
@@ -322,16 +323,18 @@ async fn a_deadlock_after_an_empty_index_key_answers_the_empty_key() {
     let s = scratch().await;
     let key_info = gsi_table(&s).await;
     let plain = ExpressionMaps::default();
-    for pk in ["a", "b"] {
+    let mut seed_a = item("a", "seed");
+    seed_a.insert("e".to_owned(), AttributeValue::S(String::new()));
+    for seed in [seed_a, item("b", "seed")] {
         s.engine
-            .put_item(&key_info, item(pk, "seed"), false, None, &plain, None)
+            .put_item(&key_info, seed, false, None, &plain, None)
             .await
             .expect("seed an item");
     }
     let table = data_table(&s.db).await;
 
     // An outside transaction holds `b`. The ops run in key order, so the
-    // Update of `a` runs first: it locks `a`, applies `SET a1 = :e` and
+    // Update of `a` runs first: it locks `a`, applies `SET a1 = e` and
     // records the empty key. The Put of `b` then waits on `b`, and the
     // outside transaction asks for `a`, which closes the cycle. The write
     // transaction waited first, so PostgreSQL aborts it.
@@ -345,11 +348,7 @@ async fn a_deadlock_after_an_empty_index_key_answers_the_empty_key() {
         .await
         .expect("lock b");
 
-    let empty = ExpressionMaps::new(
-        std::collections::HashMap::new(),
-        std::collections::HashMap::from([("e".to_owned(), AttributeValue::S(String::new()))]),
-    );
-    let tokens = expression::tokenize("SET a1 = :e").expect("tokenize");
+    let tokens = expression::tokenize("SET a1 = e").expect("tokenize");
     let actions = expression::parse_update(&tokens).expect("parse");
     let (key_a, new_b) = (key("a"), item("b", "twi"));
     // Request order is b, a; the empty key decides wherever it is.
@@ -360,7 +359,7 @@ async fn a_deadlock_after_an_empty_index_key_answers_the_empty_key() {
             key: &key_a,
             actions: &actions,
             condition: None,
-            maps: &empty,
+            maps: &plain,
             return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
             stream: None,
         },

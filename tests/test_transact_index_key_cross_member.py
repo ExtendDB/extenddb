@@ -37,6 +37,16 @@ against each other:
   member: the wrong type (J1 to J3); an empty value the statement writes
   from the stored item against a failed condition: the empty key (J4).
 
+The same measurement typed list_append by its result: SET sidx =
+list_append(l, :l), which reads the item, is a wrong type supplied in the
+request beside every partner (L rows) and ahead of the condition on
+UpdateItem (la1, la2). A third measurement on 2026-10-31 (15 requests, each
+sent twice) found an Update's empty index-key literal reported on the
+statement, ahead of the member's own failing condition and of a wrong type
+computed from the item in the same statement, on UpdateItem (s1 to s9) and
+in TransactWriteItems (t1 to t6); between two such members the first in
+request order decides (K1, K1r).
+
 Run with EXTENDDB_TEST_ENDPOINT unset to assert the same against the service.
 """
 
@@ -71,6 +81,11 @@ TYPE_WORDING_SS = (
     "Expected: S Actual: SS IndexName: gsi_s"
 )
 KEY_SCHEMA_WORDING = "The provided key element does not match the schema"
+EMPTY_UPDATE_WORDING_B = (
+    "One or more parameter values are not valid. The update expression attempted to "
+    "update a secondary index key to a value that is not supported. The AttributeValue "
+    "for a key attribute cannot contain an empty binary value."
+)
 CANCELLED = "Transaction cancelled, please refer cancellation reasons for specific reasons"
 CCF_WORDING = "The conditional request failed"
 
@@ -188,12 +203,62 @@ def members(table: str) -> dict:
         "set_sidx_fallback_empty": _update(
             table, "r", "SET #s = if_not_exists(#x, :e)", {"#s": "sidx", "#x": "nope"}, {":e": {"S": ""}}
         ),
+        # Update r SET sidx = list_append(l, :l): a list built from the stored l.
+        "set_sidx_list_ref": _update(
+            table, "r", "SET #s = list_append(#l, :l)", {"#s": "sidx", "#l": "l"}, {":l": {"L": [{"S": "y"}]}}
+        ),
+        # Update b0 SET v = v + :one: arithmetic on an attribute b0 lacks.
+        "cannot_apply": _update(table, "b0", "SET #v = #v + :one", {"#v": "v"}, {":one": {"N": "1"}}),
+        # ConditionCheck bp with attribute_not_exists(pk): the condition fails.
+        "check_present": {
+            "ConditionCheck": {
+                "TableName": table,
+                "Key": {"pk": {"S": "bp"}},
+                "ConditionExpression": "attribute_not_exists(#p)",
+                "ExpressionAttributeNames": {"#p": "pk"},
+            }
+        },
+        # Delete bp with attribute_not_exists(pk): the condition fails.
+        "delete_present": {
+            "Delete": {
+                "TableName": table,
+                "Key": {"pk": {"S": "bp"}},
+                "ConditionExpression": "attribute_not_exists(#p)",
+                "ExpressionAttributeNames": {"#p": "pk"},
+            }
+        },
+        # Update r SET sidx = n, bidx = :eb: a computed wrong type and an empty
+        # binary literal in one statement.
+        "set_sidx_n_bidx_empty": _update(
+            table, "r", "SET #s = #n, #b = :eb", {"#s": "sidx", "#n": "n", "#b": "bidx"}, {":eb": {"B": b""}}
+        ),
+        # The 2026-10-31 statement rows on r, each with the failing condition
+        # attribute_not_exists(pk) where named so, and a plain Update of a.
+        "r_sidx_empty_failing": _update(
+            table, "r", "SET #s = :e", {"#s": "sidx", "#p": "pk"}, {":e": {"S": ""}}, "attribute_not_exists(#p)"
+        ),
+        "r_bidx_empty_failing": _update(
+            table, "r", "SET #b = :eb", {"#b": "bidx", "#p": "pk"}, {":eb": {"B": b""}}, "attribute_not_exists(#p)"
+        ),
+        "r_sidx_n_bidx_empty_failing": _update(
+            table,
+            "r",
+            "SET #s = #n, #b = :eb",
+            {"#s": "sidx", "#n": "n", "#b": "bidx", "#p": "pk"},
+            {":eb": {"B": b""}},
+            "attribute_not_exists(#p)",
+        ),
+        "r_sidx_empty_bidx_pk": _update(
+            table, "r", "SET #s = :e, #b = #p", {"#s": "sidx", "#b": "bidx", "#p": "pk"}, {":e": {"S": ""}}
+        ),
+        "plain_a": _update(table, "a", "SET #v = :v", {"#v": "v"}, {":v": {"S": "x"}}),
     }
 
 
 # Cancellation reasons by position, as (Code, Message).
 VE_COMPUTED = ("ValidationError", COMPUTED_WORDING)
 VE_TYPE = ("ValidationError", TYPE_WORDING)
+VE_TYPE_L = ("ValidationError", TYPE_WORDING_L)
 CCF = ("ConditionalCheckFailed", CCF_WORDING)
 NONE = ("None", None)
 
@@ -243,6 +308,37 @@ ROWS = [
     ("J2", ["set_sidx_empty", "add_sidx_one"], (NONE, VE_TYPE)),
     ("J3", ["set_sidx_empty", "delete_sidx_ss"], (NONE, ("ValidationError", TYPE_WORDING_SS))),
     ("J4", ["set_sidx_stored_empty", "cond_present"], EMPTY_UPDATE_WORDING),
+    # list_append that reads the item is typed by its result, a list, and
+    # ranks as a wrong type supplied in the request beside every partner.
+    ("L1", ["set_sidx_list_ref"], (VE_TYPE_L,)),
+    ("L2", ["set_sidx_list_ref", "cond_present"], (VE_TYPE_L, NONE)),
+    ("L2r", ["cond_present", "set_sidx_list_ref"], (NONE, VE_TYPE_L)),
+    ("L3", ["set_sidx_list_ref", "set_sidx_empty"], (VE_TYPE_L, NONE)),
+    ("L3r", ["set_sidx_empty", "set_sidx_list_ref"], (NONE, VE_TYPE_L)),
+    ("L4", ["set_sidx_list_ref", "set_d0_lit_n"], (VE_TYPE_L, NONE)),
+    ("L5", ["set_sidx_list_ref", "set_sidx_n"], (VE_TYPE_L, NONE)),
+    ("L5r", ["set_sidx_n", "set_sidx_list_ref"], (NONE, VE_TYPE_L)),
+    ("L6", ["set_sidx_list_ref", "cannot_apply"], (VE_TYPE_L, NONE)),
+    ("L6r", ["cannot_apply", "set_sidx_list_ref"], (NONE, VE_TYPE_L)),
+    ("L7", ["set_sidx_list_ref", "check_present"], (VE_TYPE_L, NONE)),
+    ("L7r", ["check_present", "set_sidx_list_ref"], (NONE, VE_TYPE_L)),
+    ("L8", ["set_sidx_list_ref", "delete_present"], (VE_TYPE_L, NONE)),
+    ("L8r", ["delete_present", "set_sidx_list_ref"], (NONE, VE_TYPE_L)),
+    ("L9", ["set_sidx_list_ref", "put_empty"], (VE_TYPE_L, NONE)),
+    ("L10", ["set_sidx_list_ref", "put_wrong"], (VE_TYPE_L, NONE)),
+    # An Update member's empty literal is checked before any member runs,
+    # below the faults above: ahead of the member's own failing condition
+    # (t1, t2, t5, t6) and of a wrong type computed from the item in the same
+    # statement (t3, t4), and the first such member in request order decides
+    # (K1, K1r).
+    ("t1", ["r_sidx_empty_failing", "plain_a"], EMPTY_UPDATE_WORDING),
+    ("t2", ["r_bidx_empty_failing", "plain_a"], EMPTY_UPDATE_WORDING_B),
+    ("t3", ["r_sidx_n_bidx_empty_failing"], EMPTY_UPDATE_WORDING_B),
+    ("t4", ["r_sidx_empty_bidx_pk"], EMPTY_UPDATE_WORDING),
+    ("t5", ["r_sidx_empty_failing"], EMPTY_UPDATE_WORDING),
+    ("t6", ["r_bidx_empty_failing"], EMPTY_UPDATE_WORDING_B),
+    ("K1", ["set_sidx_n_bidx_empty", "set_sidx_empty"], EMPTY_UPDATE_WORDING_B),
+    ("K1r", ["set_sidx_empty", "set_sidx_n_bidx_empty"], EMPTY_UPDATE_WORDING),
 ]
 
 
@@ -292,6 +388,50 @@ def test_single_request_controls(dynamodb_client, table, row_id, kind, name, mes
             dynamodb_client.update_item(**shape["Update"])
         else:
             dynamodb_client.put_item(**shape["Put"])
+    err = exc_info.value.response["Error"]
+    assert err["Code"] == "ValidationException", err
+    assert err["Message"] == message
+    assert _items(dynamodb_client, table) == SEEDED
+
+
+# UpdateItem on r, measured on 2026-10-31: an empty index-key literal is
+# reported on the statement, after the literal type check and ahead of the
+# condition and of a wrong type computed from the item (s1 to s9), and
+# list_append that reads the item is a wrong type supplied in the request,
+# ahead of the condition (la1, la2). Each row: id, UpdateExpression, names,
+# values, whether the failing condition attribute_not_exists(pk) is attached,
+# and the ValidationException message.
+STATEMENT_ROWS = [
+    ("s1", "SET #s = :e", {"#s": "sidx"}, {":e": {"S": ""}}, True, EMPTY_UPDATE_WORDING),
+    ("s2", "SET #b = :eb", {"#b": "bidx"}, {":eb": {"B": b""}}, True, EMPTY_UPDATE_WORDING_B),
+    ("s3", "SET #s = #n, #b = :eb", {"#s": "sidx", "#n": "n", "#b": "bidx"}, {":eb": {"B": b""}}, True, EMPTY_UPDATE_WORDING_B),
+    ("s4", "SET #b = :eb, #s = #n", {"#s": "sidx", "#n": "n", "#b": "bidx"}, {":eb": {"B": b""}}, True, EMPTY_UPDATE_WORDING_B),
+    ("s5", "SET #s = :e, #b = #k", {"#s": "sidx", "#b": "bidx", "#k": "pk"}, {":e": {"S": ""}}, True, EMPTY_UPDATE_WORDING),
+    ("s6", "SET #s = #n, #b = :eb", {"#s": "sidx", "#n": "n", "#b": "bidx"}, {":eb": {"B": b""}}, False, EMPTY_UPDATE_WORDING_B),
+    ("s7", "SET #s = :e, #b = #k", {"#s": "sidx", "#b": "bidx", "#k": "pk"}, {":e": {"S": ""}}, False, EMPTY_UPDATE_WORDING),
+    ("s8", "SET #s = :e", {"#s": "sidx"}, {":e": {"S": ""}}, False, EMPTY_UPDATE_WORDING),
+    ("s9", "SET #b = :eb", {"#b": "bidx"}, {":eb": {"B": b""}}, False, EMPTY_UPDATE_WORDING_B),
+    ("la1", "SET #s = list_append(#l, :l)", {"#s": "sidx", "#l": "l"}, {":l": {"L": [{"S": "y"}]}}, False, TYPE_WORDING_L),
+    ("la2", "SET #s = list_append(#l, :l)", {"#s": "sidx", "#l": "l"}, {":l": {"L": [{"S": "y"}]}}, True, TYPE_WORDING_L),
+]
+
+
+@pytest.mark.parametrize(
+    "row_id, expr, names, values, failing, message", STATEMENT_ROWS, ids=[r[0] for r in STATEMENT_ROWS]
+)
+def test_update_item_answers_as_the_service_does(dynamodb_client, table, row_id, expr, names, values, failing, message):
+    request = {
+        "TableName": table,
+        "Key": {"pk": {"S": "r"}},
+        "UpdateExpression": expr,
+        "ExpressionAttributeNames": dict(names),
+        "ExpressionAttributeValues": values,
+    }
+    if failing:
+        request["ExpressionAttributeNames"]["#p"] = "pk"
+        request["ConditionExpression"] = "attribute_not_exists(#p)"
+    with pytest.raises(ClientError) as exc_info:
+        dynamodb_client.update_item(**request)
     err = exc_info.value.response["Error"]
     assert err["Code"] == "ValidationException", err
     assert err["Message"] == message
