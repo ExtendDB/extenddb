@@ -315,56 +315,6 @@ pub fn validate_unused_attributes(
     Ok(())
 }
 
-/// Validate that every `#name` and `:value` reference in the expressions is
-/// defined in the supplied maps.
-///
-/// The single-item APIs discover an undefined reference while evaluating the
-/// expression against the item. Transactions validate every item's expressions
-/// before any table is looked up, so this runs the same check on the parsed
-/// expression ahead of time. Messages match the resolver's, without the
-/// `Invalid <Kind>:` prefix, which the caller adds for the expression at hand.
-///
-/// # Errors
-///
-/// Returns `DynamoDbError::ValidationException` naming the first undefined
-/// reference, names before values, in the order the expressions are given.
-pub fn validate_refs_defined(
-    names: &HashMap<String, String>,
-    values: &HashMap<String, AttributeValue>,
-    exprs: &[&super::ast::Expr],
-    update_actions: &[&super::ast::UpdateAction],
-) -> Result<(), DynamoDbError> {
-    let mut used_names = std::collections::HashSet::new();
-    let mut used_values = std::collections::HashSet::new();
-    for expr in exprs {
-        collect_expr_refs(expr, &mut used_names, &mut used_values);
-    }
-    for action in update_actions {
-        collect_action_refs(action, &mut used_names, &mut used_values);
-    }
-    let mut missing_names: Vec<&String> = used_names
-        .iter()
-        .filter(|n| !names.contains_key(*n))
-        .collect();
-    missing_names.sort();
-    if let Some(name) = missing_names.first() {
-        return Err(DynamoDbError::ValidationException(format!(
-            "An expression attribute name used in the document path is not defined; attribute name: #{name}"
-        )));
-    }
-    let mut missing_values: Vec<&String> = used_values
-        .iter()
-        .filter(|v| !values.contains_key(*v))
-        .collect();
-    missing_values.sort();
-    if let Some(value) = missing_values.first() {
-        return Err(DynamoDbError::ValidationException(format!(
-            "An expression attribute value used in expression is not defined; attribute value: :{value}"
-        )));
-    }
-    Ok(())
-}
-
 /// Reject an update expression whose actions name overlapping document paths.
 ///
 /// Amazon DynamoDB refuses two actions whose paths are equal or where one is a

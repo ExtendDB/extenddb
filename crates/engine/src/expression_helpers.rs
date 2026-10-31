@@ -313,20 +313,29 @@ pub fn parse_projection_expr(
     result.map_err(|e| prefix_expression_error(e, ExpressionKind::Projection))
 }
 
-/// Size-check, tokenize, reserved-word check, and parse a `KeyConditionExpression`.
+/// Size-check, tokenize, reserved-word check, and parse a
+/// `KeyConditionExpression`, then reject a `#name` or `:value` the request
+/// does not define.
 ///
-/// Errors carry the `KeyConditionExpression` prefix, matching Amazon `DynamoDB`.
+/// Errors carry the `KeyConditionExpression` prefix, matching Amazon
+/// `DynamoDB`. The references are checked once the whole expression parses,
+/// in the order they stand in the text, names and values alike (measured
+/// 2026-10-27: `pk = :q AND #n = :v` names `:q`, `#b = :p AND #a > :q` names
+/// `#b`). The check runs before the key schema is consulted, so an undefined
+/// `#n` is reported as such rather than as a key schema mismatch (measured
+/// 2026-10-14).
 ///
 /// # Errors
 ///
-/// Returns `DynamoDbError::ValidationException` for over-size, syntax, or
-/// reserved-word errors.
+/// Returns `DynamoDbError::ValidationException` for over-size, syntax,
+/// reserved-word, or undefined-reference errors.
 pub fn parse_key_condition_expr(
     expr: &str,
+    maps: &ExpressionMaps,
     limits: &LimitsConfig,
 ) -> Result<KeyCondition, DynamoDbError> {
     check_expression_size(expr, ExpressionKind::KeyCondition, limits)?;
-    tokenize_for(
+    let (tokens, parsed) = tokenize_for(
         expr,
         limits.max_expression_tokens,
         ExpressionKind::KeyCondition,
@@ -335,45 +344,31 @@ pub fn parse_key_condition_expr(
         if limits.enforce_reserved_keywords {
             validate_no_reserved_words(&tokens)?;
         }
-        parse_key_condition(&tokens)
+        let parsed = parse_key_condition(&tokens)?;
+        Ok((tokens, parsed))
     })
-    .map_err(|e| prefix_expression_error(e, ExpressionKind::KeyCondition))
+    .map_err(|e| prefix_expression_error(e, ExpressionKind::KeyCondition))?;
+    check_key_condition_refs(&tokens, maps)?;
+    Ok(parsed)
 }
 
-/// Reject a parsed `KeyConditionExpression` that references a `#name` or
-/// `:value` absent from the request maps, with the `Invalid
-/// KeyConditionExpression:` prefix the service uses. Runs before the key
-/// schema is consulted, so an undefined `#n` is reported as such rather than
-/// as a key schema mismatch (measured 2026-10-14).
-///
-/// # Errors
-///
-/// Returns `DynamoDbError::ValidationException` naming the first undefined
-/// reference, names before values.
-pub fn check_key_condition_refs(
-    kc: &KeyCondition,
-    maps: &ExpressionMaps,
-) -> Result<(), DynamoDbError> {
-    let (names, values) = extenddb_core::expression::collect_key_condition_refs(kc);
-    let mut missing: Vec<&String> = names
-        .iter()
-        .filter(|n| !maps.names.contains_key(*n))
-        .collect();
-    missing.sort();
-    if let Some(name) = missing.first() {
-        return Err(DynamoDbError::ValidationException(format!(
-            "Invalid KeyConditionExpression: An expression attribute name used in the document path is not defined; attribute name: #{name}"
-        )));
-    }
-    let mut missing: Vec<&String> = values
-        .iter()
-        .filter(|v| !maps.values.contains_key(*v))
-        .collect();
-    missing.sort();
-    if let Some(value) = missing.first() {
-        return Err(DynamoDbError::ValidationException(format!(
-            "Invalid KeyConditionExpression: An expression attribute value used in expression is not defined; attribute value: :{value}"
-        )));
+/// The first `#name` or `:value` token, in text order, that `maps` does not
+/// define.
+fn check_key_condition_refs(tokens: &[Token], maps: &ExpressionMaps) -> Result<(), DynamoDbError> {
+    for token in tokens {
+        match token {
+            Token::NameRef(name) if !maps.names.contains_key(name) => {
+                return Err(DynamoDbError::ValidationException(format!(
+                    "Invalid KeyConditionExpression: An expression attribute name used in the document path is not defined; attribute name: #{name}"
+                )));
+            }
+            Token::Placeholder(value) if !maps.values.contains_key(value) => {
+                return Err(DynamoDbError::ValidationException(format!(
+                    "Invalid KeyConditionExpression: An expression attribute value used in expression is not defined; attribute value: :{value}"
+                )));
+            }
+            _ => {}
+        }
     }
     Ok(())
 }

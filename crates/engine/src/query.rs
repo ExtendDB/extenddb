@@ -184,11 +184,11 @@ pub async fn handle_query(
     }
 
     let parsed_key_condition = match input.key_condition_expression.as_deref() {
-        Some(kce_str) => {
-            let parsed = crate::expression_helpers::parse_key_condition_expr(kce_str, &ctx.limits)?;
-            crate::expression_helpers::check_key_condition_refs(&parsed, &maps)?;
-            Some(parsed)
-        }
+        Some(kce_str) => Some(crate::expression_helpers::parse_key_condition_expr(
+            kce_str,
+            &maps,
+            &ctx.limits,
+        )?),
         None => None,
     };
 
