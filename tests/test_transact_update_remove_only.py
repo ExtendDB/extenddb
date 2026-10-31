@@ -569,33 +569,6 @@ def _records_for(streams_client, arn, pks: set[str]) -> list[dict]:
     return found
 
 
-def _configured_backend():
-    """The backend under test: `EXTENDDB_TEST_BACKEND` (exported by
-    devtools/run-tests), else the `[storage] backend` of the server's config
-    file, else None (real DynamoDB, or a server started elsewhere)."""
-    explicit = os.environ.get("EXTENDDB_TEST_BACKEND", "").strip()
-    if explicit:
-        return explicit
-    path = os.environ.get("EXTENDDB_CONFIG", "extenddb.toml")
-    try:
-        with open(path) as f:
-            text = f.read()
-    except OSError:
-        return None
-    section = None
-    for line in text.splitlines():
-        line = line.split("#", 1)[0].strip()
-        if line.startswith("["):
-            section = line.strip("[]").strip()
-        elif section == "storage" and line.split("=", 1)[0].strip() == "backend":
-            return line.split("=", 1)[1].strip().strip('"').strip("'")
-    return None
-
-
-@pytest.mark.skipif(
-    _configured_backend() == "cassandra",
-    reason="the Cassandra transaction path writes no stream record for any operation",
-)
 def test_no_stream_record_for_a_removal_only_update(
     dynamodb_client, streams_client, stream_table
 ):
