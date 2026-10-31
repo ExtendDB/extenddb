@@ -68,9 +68,9 @@ pub async fn handle_scan(
     )?;
     let input: ScanInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
-    // Limit and Segment, then the Filter and Projection expressions, are
-    // checked before the existence check; index resolution, Select and the
-    // key checks stay after it.
+    // Limit and the Segment range checks come first, then the Filter and
+    // Projection expressions and the Segment pairing checks, all before the
+    // existence check; index resolution, Select and the key checks stay after it.
 
     // --- Legacy vs expression mutual exclusivity checks ---
     let has_fe = input.filter_expression.is_some();
@@ -82,53 +82,32 @@ pub async fn handle_scan(
         .is_some_and(|a| !a.is_empty());
     let has_cond_op = input.conditional_operator.is_some();
 
-    // Limit and Segment/TotalSegments are parameter-level checks the service
-    // runs ahead of every expression check (measured 2026-10-14: a Scan with
-    // an undefined filter value and Limit 0 reports the limit; with Segment
-    // and no TotalSegments it reports TotalSegments).
-    // Validate Segment/TotalSegments. DynamoDB returns a different message per direction
-    match (input.segment, input.total_segments) {
-        (Some(_), None) => {
+    // The range checks on Limit, Segment and TotalSegments are parameter-level
+    // checks the service runs ahead of every expression check (measured
+    // 2026-10-14: a Scan with an undefined filter value and Limit 0 reports the
+    // limit). That Segment and TotalSegments go together, and Segment is below
+    // TotalSegments, is checked after the expressions (see below).
+    if let (Some(seg), Some(total)) = (input.segment, input.total_segments) {
+        if total < 1 {
             return Err(DynamoDbError::ValidationException(
-                "The TotalSegments parameter is required but was not present in the request when Segment parameter is present"
-                    .to_owned(),
+                "The parameter TotalSegments should be greater than or equal to 1".to_owned(),
             ));
         }
-        (None, Some(_)) => {
-            return Err(DynamoDbError::ValidationException(
-                "The Segment parameter is required but was not present in the request when parameter TotalSegments is present"
-                    .to_owned(),
-            ));
+        if total > 1_000_000 {
+            return Err(DynamoDbError::ValidationException(format!(
+                "1 validation error detected: Value '{total}' at 'totalSegments' failed to satisfy constraint: Member must have value less than or equal to 1000000"
+            )));
         }
-        (Some(seg), Some(total)) => {
-            if total < 1 {
-                return Err(DynamoDbError::ValidationException(
-                    "The parameter TotalSegments should be greater than or equal to 1".to_owned(),
-                ));
-            }
-            if total > 1_000_000 {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "1 validation error detected: Value '{total}' at 'totalSegments' failed to satisfy constraint: Member must have value less than or equal to 1000000"
-                )));
-            }
-            if seg < 0 {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "1 validation error detected: Value '{seg}' at 'segment' failed to satisfy constraint: Member must have value greater than or equal to 0"
-                )));
-            }
-            if seg > 999_999 {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "1 validation error detected: Value '{seg}' at 'segment' failed to satisfy constraint: Member must have value less than or equal to 999999"
-                )));
-            }
-            if seg >= total {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "The Segment parameter is zero-based and must be less than parameter TotalSegments: \
-                     Segment: {seg} is not less than TotalSegments: {total}"
-                )));
-            }
+        if seg < 0 {
+            return Err(DynamoDbError::ValidationException(format!(
+                "1 validation error detected: Value '{seg}' at 'segment' failed to satisfy constraint: Member must have value greater than or equal to 0"
+            )));
         }
-        (None, None) => {}
+        if seg > 999_999 {
+            return Err(DynamoDbError::ValidationException(format!(
+                "1 validation error detected: Value '{seg}' at 'segment' failed to satisfy constraint: Member must have value less than or equal to 999999"
+            )));
+        }
     }
 
     // Validate Limit >= 1. The service's text carries neither the value nor a
@@ -295,6 +274,34 @@ pub async fn handle_scan(
             &extra_names,
             &std::collections::HashSet::new(),
         )?;
+    }
+
+    // Segment and TotalSegments go together, and Segment is below
+    // TotalSegments. The service checks this after the expressions and the
+    // unused names and values, and before the table lookup (measured
+    // 2026-10-27: an undefined filter value is reported ahead of a Segment
+    // with no TotalSegments, which is reported ahead of a missing table).
+    // DynamoDB returns a different message per direction.
+    match (input.segment, input.total_segments) {
+        (Some(_), None) => {
+            return Err(DynamoDbError::ValidationException(
+                "The TotalSegments parameter is required but was not present in the request when Segment parameter is present"
+                    .to_owned(),
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(DynamoDbError::ValidationException(
+                "The Segment parameter is required but was not present in the request when parameter TotalSegments is present"
+                    .to_owned(),
+            ));
+        }
+        (Some(seg), Some(total)) if seg >= total => {
+            return Err(DynamoDbError::ValidationException(format!(
+                "The Segment parameter is zero-based and must be less than parameter TotalSegments: \
+                 Segment: {seg} is not less than TotalSegments: {total}"
+            )));
+        }
+        _ => {}
     }
 
     // P118: Fetch key_info first so we can use table_id for index lookup.
