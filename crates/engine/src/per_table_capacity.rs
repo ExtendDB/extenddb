@@ -9,8 +9,8 @@ use extenddb_core::types::TableKeyInfo;
 /// Per-table capacity totals, listed oldest table first.
 ///
 /// Amazon DynamoDB documents no order for the `ConsumedCapacity` entries of a
-/// transaction. Measured on 2026-10-23 with three single-hash-key tables
-/// created on 2026-10-22, 2026-10-23 11:01 and 2026-10-23 14:45 UTC, where the
+/// transaction. Measured on 2026-10-23 with three tables created on
+/// 2026-10-22, 2026-10-23 11:01 and 2026-10-23 14:45 UTC, where the
 /// newest table's name sorts first and the oldest table's name sorts last:
 /// `TransactGetItems` and `TransactWriteItems` listed the tables oldest first
 /// for the request orders [newest, middle, oldest], [middle, newest, oldest]
@@ -21,10 +21,13 @@ use extenddb_core::types::TableKeyInfo;
 ///
 /// ExtendDB orders the entries the same way, by the `creation_date_time` the
 /// catalog carries on [`TableKeyInfo`], oldest first; two tables with the same
-/// creation time are listed in name order so the array is deterministic on
-/// every backend. Before this change the handlers aggregated into a `HashMap`,
-/// so the order changed from one process to the next and differed between
-/// backends (docs/differences-from-dynamodb.md, Capacity and Throttling).
+/// stored creation time are listed in name order so the array is deterministic
+/// on every backend. The precision of the stored value sets how close two
+/// creates have to be to tie: nanoseconds on SQLite, microseconds on
+/// PostgreSQL, milliseconds on MongoDB and Cassandra. Before this change the
+/// handlers aggregated into a `HashMap`, so the order changed from one process
+/// to the next and differed between backends
+/// (docs/differences-from-dynamodb.md, Capacity and Throttling).
 #[derive(Default)]
 pub struct PerTableCapacity(Vec<Entry>);
 

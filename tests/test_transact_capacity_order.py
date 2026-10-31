@@ -5,7 +5,7 @@
 
 Amazon DynamoDB documents no order for the ``ConsumedCapacity`` array of
 ``TransactGetItems`` and ``TransactWriteItems``. Measured on 2026-10-23 with
-three single-hash-key tables whose names sort opposite to their creation order:
+three tables whose names sort opposite to their creation order:
 both operations listed the tables oldest first, for every request order tried
 ([newest, middle, oldest], [middle, newest, oldest], [oldest, newest, middle]).
 The order follows neither the request nor the names.

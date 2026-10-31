@@ -242,8 +242,9 @@ fn parse_function_call(tokens: &[Token], pos: &mut usize) -> Result<Expr, Dynamo
     // call with an empty operand list, `foo()` or `attribute_exists()`, is a
     // grammar error on the service, reported at the `)` with the text below,
     // before the function name or its operand count is looked at (measured
-    // 2026-10-14; `begins_with(pk)` with one operand is instead the semantic
-    // operand-count error from `validate_condition_semantics`).
+    // 2026-10-14 and again 2026-10-23, where `attribute_exists()` and `foo()`
+    // both answered this text; `begins_with(pk)` with one operand is instead
+    // the semantic operand-count error from `validate_condition_semantics`).
     if *pos < tokens.len() && tokens[*pos] == Token::RParen {
         return Err(validation_err(
             "Invalid ConditionExpression: Syntax error; token: \")\", near: \"()\"",
