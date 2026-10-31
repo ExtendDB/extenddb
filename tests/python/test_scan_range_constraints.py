@@ -6,19 +6,23 @@
 Every request below is sent as raw signed JSON, so a number keeps the form
 written here (``0.0``, ``1e2``, ``9223372036854775808``). Each request is a
 row of the table measured against DynamoDB (us-east-1) on 2026-10-25 at 09:23,
-09:25, 09:28, 10:38, 10:55 and 12:56 UTC, each sent twice, and each expected
-answer is the service's. Where that table records only that the service
-accepted a request, the test asserts what a Scan with that limit returns on
-this table of 12 items.
+09:25, 09:28, 10:38, 10:55 and 12:56 UTC, or of the ones measured on
+2026-10-30 at 12:40 UTC and 2026-10-31 at 12:36 UTC where a row says so, each
+sent twice, and each expected answer is the service's. Where a table records
+only that the service accepted a request, the test asserts what a Scan with
+that limit returns on this table of 12 items. ``Segment: 0, TotalSegments: 1``
+with ``ConsistentRead: true`` returned the whole table in one page on
+2026-10-31, and the test asserts the same here.
 
 When each field present is an integer inside the int32 range, a fault reads
 ``Value at '<Field>' failed to satisfy constraint: ...`` with the field
 capitalised and no value echoed, and several faults are reported in one
 message in the order Limit, Segment, TotalSegments. When a field is a float
 or outside int32, or an ``ExpressionAttributeValues`` entry is not one
-AttributeValue, the service saturates or truncates the value and uses the
-older form, ``Value '<n>' at '<field>' ...``, with ``limit`` last. A float or
-an out-of-range integer that satisfies the constraint is accepted.
+AttributeValue (an ``L`` or ``M`` member included), the service saturates or
+truncates the value and uses the older form, ``Value '<n>' at '<field>' ...``,
+in the order totalSegments, segment, limit. A float or an out-of-range integer
+that satisfies the constraint is accepted.
 """
 
 from __future__ import annotations
@@ -101,12 +105,31 @@ OLDER_FORM = [
     ("TotalSegments-1000001-Limit-0.0", '"TotalSegments": 1000001, "Limit": 0.0',
      "2 validation errors detected: "
      f"{older('1000001', 'totalSegments', 'less than or equal to 1000000')}; {OLDER_LIMIT_0}"),
+    # Measured 2026-10-30 12:40 UTC.
+    ("three-faults-Limit-0.0", '"Limit": 0.0, "Segment": -1, "TotalSegments": 1000001',
+     "3 validation errors detected: "
+     f"{older('1000001', 'totalSegments', 'less than or equal to 1000000')}; "
+     f"{older('-1', 'segment', 'greater than or equal to 0')}; {OLDER_LIMIT_0}"),
+    ("three-faults-TotalSegments-1000001.0",
+     '"Limit": 0, "Segment": -1, "TotalSegments": 1000001.0',
+     "3 validation errors detected: "
+     f"{older('1000001', 'totalSegments', 'less than or equal to 1000000')}; "
+     f"{older('-1', 'segment', 'greater than or equal to 0')}; {OLDER_LIMIT_0}"),
+    ("Limit-minus-1.5", '"Limit": -1.5',
+     one(older("-1", "limit", "greater than or equal to 1"))),
+    ("Limit-minus-0.5", '"Limit": -0.5', one(OLDER_LIMIT_0)),
+    ("Limit-minus-0", '"Limit": -0', one(OLDER_LIMIT_0)),
 ]
 
 # ExpressionAttributeValues entries the service does not read as one
 # AttributeValue (older form beside Limit 0), and two it does (newer form).
 UNREADABLE = [("empty", {}), ("unknown-type", {"X": "1"}), ("two-types", {"S": "x", "N": "1"})]
 READABLE = [("empty-NS", {"NS": []}), ("duplicate-NS", {"NS": ["1", "1"]})]
+# Measured 2026-10-30 12:40 UTC on Scan, each under :d beside a filter that
+# reads :p: older form.
+UNREADABLE_MEMBERS = [("L-empty-member", {"L": [{}]}),
+                      ("M-member-type-X", {"M": {"k": {"X": "1"}}}),
+                      ("lower-case-s", {"s": "x"})]
 
 
 def _raw(client, operation: str, body_text: str):
@@ -206,6 +229,12 @@ class TestFloatsAndValuesOutsideInt32AreAccepted:
         assert keys(whole), "segment 1 of 2 holds at least one item"
         assert keys(half) == keys(whole)
 
+    def test_segment_0_of_1_returns_every_item(self, dynamodb_client, table):
+        status, payload = _scan(dynamodb_client, table,
+                                '"Segment": 0, "TotalSegments": 1, "ConsistentRead": true')
+        assert status == 200, payload
+        assert (payload["Count"], payload["ScannedCount"]) == (ITEMS, ITEMS)
+
 
 class TestBesideAnExpressionAttributeValuesEntry:
     """Limit 0 beside an entry that is not one AttributeValue answers the older
@@ -232,3 +261,30 @@ class TestBesideAnExpressionAttributeValuesEntry:
             "ExpressionAttributeValues": {":p": {"S": "p0"}, ":a": entry},
         })
         assert _validation_message(*_raw(dynamodb_client, "Query", body)) == expected
+
+    def test_query_limit_below_int32_beside_an_empty_entry(self, dynamodb_client, table):
+        # Measured 2026-10-31 12:36 UTC: the echoed value is saturated to
+        # int32, as the Scan row Limit -2147483649 is.
+        body = json.dumps({
+            "TableName": table, "KeyConditionExpression": "pk = :p", "Limit": -2147483649,
+            "ExpressionAttributeValues": {":p": {"S": "p0"}, ":a": {}},
+        })
+        assert _validation_message(*_raw(dynamodb_client, "Query", body)) == one(OLDER_LIMIT_MIN)
+
+    @pytest.mark.parametrize("entry", [e for _, e in UNREADABLE_MEMBERS],
+                             ids=[i for i, _ in UNREADABLE_MEMBERS])
+    def test_scan_unreadable_member(self, dynamodb_client, table, entry):
+        fields = ('"Limit": 0, "FilterExpression": "a = :p", "ExpressionAttributeValues": '
+                  + json.dumps({":p": {"S": "x"}, ":d": entry}))
+        assert _validation_message(*_scan(dynamodb_client, table, fields)) == one(OLDER_LIMIT_0)
+
+    @pytest.mark.parametrize("entry", [e for _, e in UNREADABLE_MEMBERS],
+                             ids=[i for i, _ in UNREADABLE_MEMBERS])
+    def test_query_unreadable_member(self, dynamodb_client, table, entry):
+        # Measured on Query 2026-10-31 12:36 UTC, each entry under :d beside
+        # the key condition's :p.
+        body = json.dumps({
+            "TableName": table, "KeyConditionExpression": "pk = :p", "Limit": 0,
+            "ExpressionAttributeValues": {":p": {"S": "p0"}, ":d": entry},
+        })
+        assert _validation_message(*_raw(dynamodb_client, "Query", body)) == one(OLDER_LIMIT_0)

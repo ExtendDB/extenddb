@@ -4,7 +4,7 @@
 //! The `Scan` checks that run on the request body alone, before the body is
 //! deserialized and before the table is looked up, in the service's order.
 //!
-//! Measured 2026-10-25 (us-east-1, each request twice):
+//! Measured 2026-10-25 and 2026-10-30 (us-east-1, each request twice):
 //!
 //! 1. the range constraints on `Limit` (at least 1), `Segment` (0 to 999999)
 //!    and `TotalSegments` (1 to 1000000), each checked when present, whether or
@@ -15,8 +15,8 @@
 //!    `TotalSegments`. A float or a value outside int32 in any of the three,
 //!    or an `ExpressionAttributeValues` entry that is not one AttributeValue,
 //!    switches the message to the older form, `Value '-2147483648' at 'limit'
-//!    ...`, with the value saturated or truncated and `limit` last; see
-//!    `validate_ranges`;
+//!    ...`, with the value saturated or truncated, in the order
+//!    `totalSegments`, `segment`, `limit`; see `validate_ranges`;
 //! 2. the expression and non-expression parameter mix;
 //! 3. the `ReturnConsumedCapacity` enum;
 //! 4. every number in `ExpressionAttributeValues`, `NS` members and values
@@ -127,9 +127,10 @@ fn scan_request_checks(body: &Value) -> Result<(), DynamoDbError> {
 /// `ExpressionAttributeValues` entry is not one AttributeValue (see
 /// [`has_unreadable_attribute_value`]), the older form: `Value '<n>' at
 /// '<field>' ...` with the value as [`saturated_int32`] reads it and the field
-/// in lower camel case, with `limit` last. The service's order of `segment`
-/// and `totalSegments` in the older form is not measured; they keep the order
-/// of the newer form.
+/// in lower camel case, in the reverse of the newer form's order:
+/// `totalSegments`, `segment`, `limit` (measured 2026-10-30 12:40 UTC with a
+/// fault in each of the three, and on 2026-10-25 with `segment` then `limit`
+/// and `totalSegments` then `limit`).
 fn validate_ranges(body: &Value) -> Result<(), DynamoDbError> {
     let numbers: Vec<(&RangeField, &serde_json::Number)> = RANGE_FIELDS
         .iter()
@@ -145,7 +146,7 @@ fn validate_ranges(body: &Value) -> Result<(), DynamoDbError> {
                 .as_i64()
                 .is_none_or(|value| i32::try_from(value).is_err())
         });
-    let mut faults: Vec<(&RangeField, i32, String)> = numbers
+    let faults: Vec<(&RangeField, i32, String)> = numbers
         .into_iter()
         .filter_map(|(range, number)| {
             let value = saturated_int32(number);
@@ -167,10 +168,9 @@ fn validate_ranges(body: &Value) -> Result<(), DynamoDbError> {
         return Ok(());
     }
     let clauses: Vec<String> = if older_form {
-        // `limit` last; the stable sort keeps `segment` ahead of `totalSegments`.
-        faults.sort_by_key(|(range, ..)| range.field == "Limit");
         faults
             .iter()
+            .rev()
             .map(|(range, value, constraint)| {
                 format!(
                     "Value '{value}' at '{}' failed to satisfy constraint: Member must have value {constraint}",

@@ -208,25 +208,42 @@ pub(crate) fn non_empty(body: &Value, field: &str) -> bool {
 const TYPE_DESCRIPTORS: &[&str] = &["S", "N", "B", "SS", "NS", "BS", "M", "L", "NULL", "BOOL"];
 
 /// Whether an `ExpressionAttributeValues` entry is an object that is not one
-/// AttributeValue: empty, with a type descriptor the service does not have, or
-/// with more than one. Beside such an entry the service reports a range fault
-/// in its older form (measured 2026-10-25 12:56 UTC: `Limit: 0` beside `{}`,
-/// `{"X": "1"}` or `{"S": "x", "N": "1"}` answers `Value '0' at 'limit'` on
-/// Query and Scan, and beside an empty or duplicate `NS` the newer form). An
-/// entry that is not an object is a shape fault, reported ahead of the checks.
+/// AttributeValue: empty, with a type descriptor the service does not have
+/// (a lower-case `s` included), or with more than one, at the top or as a
+/// member of an `L` or `M` at any depth. Beside such an entry the service
+/// reports a range fault in its older form (measured 2026-10-25 12:56 UTC:
+/// `Limit: 0` beside `{}`, `{"X": "1"}` or `{"S": "x", "N": "1"}` answers
+/// `Value '0' at 'limit'` on Query and Scan, and beside an empty or duplicate
+/// `NS` the newer form; measured 2026-10-30 12:40 UTC on Scan and 2026-10-31
+/// 12:36 UTC on Query: beside `{"L": [{}]}`, `{"M": {"k": {"X": "1"}}}` or
+/// `{"s": "x"}`, the older form).
+/// An entry that is not an object is a shape fault, reported ahead of the
+/// checks.
 pub(crate) fn has_unreadable_attribute_value(body: &Value) -> bool {
     body.get("ExpressionAttributeValues")
         .and_then(Value::as_object)
-        .is_some_and(|values| {
-            values.values().any(|entry| {
-                entry.as_object().is_some_and(|descriptors| {
-                    descriptors.len() != 1
-                        || descriptors
-                            .keys()
-                            .any(|key| !TYPE_DESCRIPTORS.contains(&key.as_str()))
-                })
-            })
-        })
+        .is_some_and(|values| values.values().any(is_unreadable_attribute_value))
+}
+
+/// Whether `entry` is an object that is not one AttributeValue, or an `L` or
+/// `M` with such a member; see [`has_unreadable_attribute_value`].
+fn is_unreadable_attribute_value(entry: &Value) -> bool {
+    let Some(descriptors) = entry.as_object() else {
+        return false;
+    };
+    let mut fields = descriptors.iter();
+    match (fields.next(), fields.next()) {
+        (Some((descriptor, value)), None) => match descriptor.as_str() {
+            "L" => value
+                .as_array()
+                .is_some_and(|members| members.iter().any(is_unreadable_attribute_value)),
+            "M" => value
+                .as_object()
+                .is_some_and(|members| members.values().any(is_unreadable_attribute_value)),
+            descriptor => !TYPE_DESCRIPTORS.contains(&descriptor),
+        },
+        _ => true,
+    }
 }
 
 /// Refuse the first `N` value in `ExpressionAttributeValues` (including `NS`

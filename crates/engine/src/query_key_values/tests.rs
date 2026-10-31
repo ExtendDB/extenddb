@@ -566,11 +566,16 @@ fn a_shape_fault_in_another_field_is_reported_ahead_of_the_checks() {
     // unknown type descriptor, which the deserializer reports as a
     // SerializationException, an empty one or one with two descriptors): the
     // service answers the Limit ValidationException in its older form, with
-    // the value echoed (measured 2026-10-25 12:56 UTC).
+    // the value echoed (measured 2026-10-25 12:56 UTC). An unreadable member
+    // of an L or M and a lower-case descriptor do the same (measured on Scan
+    // 2026-10-30 12:40 UTC and on Query 2026-10-31 12:36 UTC).
     for entry in [
         serde_json::json!({"X": "1"}),
         serde_json::json!({}),
         serde_json::json!({"S": "x", "N": "1"}),
+        serde_json::json!({"L": [{}]}),
+        serde_json::json!({"M": {"k": {"X": "1"}}}),
+        serde_json::json!({"s": "x"}),
     ] {
         let unreadable = serde_json::json!({
             "TableName": "t", "KeyConditionExpression": "pk = :p",

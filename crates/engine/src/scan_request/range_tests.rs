@@ -3,10 +3,10 @@
 
 //! The range constraints on `Limit`, `Segment` and `TotalSegments`.
 //!
-//! The rows in every test but the last are requests sent to the service on
-//! 2026-10-25 (us-east-1, 09:23 to 12:56 UTC, each request twice, a Scan of an
-//! existing table) with the answers it gave. The last test applies the same
-//! rules to requests that were not sent.
+//! Every row is a request sent to the service (us-east-1, each request twice,
+//! a Scan of an existing table) with the answer it gave: on 2026-10-25 between
+//! 09:23 and 12:56 UTC, and on 2026-10-30 at 12:40 UTC or 2026-10-31 at 12:36
+//! UTC where a test says so.
 
 use extenddb_core::error::DynamoDbError;
 use serde_json::Value;
@@ -151,11 +151,96 @@ fn an_entry_that_is_not_one_attribute_value_switches_to_the_older_form() {
     }
 }
 
-/// Requests the service was not sent. The answers follow from the measured
-/// ones: every fault in one message, in the order Limit, Segment,
-/// TotalSegments, and nothing reported for a field inside its bounds.
+/// Measured 2026-10-30 12:40 UTC: a fault in each of the three fields in the
+/// older form is reported `totalSegments`, `segment`, `limit`, whichever field
+/// is the float.
 #[test]
-fn combinations_the_service_was_not_sent_follow_the_measured_rules() {
+fn three_older_form_faults_are_reported_total_segments_segment_limit() {
+    let expected = format!(
+        "3 validation errors detected: {}; {}; {}",
+        older("1000001", "totalSegments", "less than or equal to 1000000"),
+        older("-1", "segment", "greater than or equal to 0"),
+        older("0", "limit", "greater than or equal to 1")
+    );
+    for fields in [
+        r#""Limit": 0.0, "Segment": -1, "TotalSegments": 1000001"#,
+        r#""Limit": 0, "Segment": -1, "TotalSegments": 1000001.0"#,
+    ] {
+        assert_eq!(
+            check(&scan(fields)).as_deref(),
+            Some(expected.as_str()),
+            "{fields}"
+        );
+    }
+}
+
+/// Measured 2026-10-30 12:40 UTC: a negative fraction is truncated toward
+/// zero, and `-0` is read as 0.
+#[test]
+fn a_negative_fraction_is_truncated_toward_zero() {
+    for (fields, value) in [
+        (r#""Limit": -1.5"#, "-1"),
+        (r#""Limit": -0.5"#, "0"),
+        (r#""Limit": -0"#, "0"),
+    ] {
+        assert_eq!(
+            check(&scan(fields)),
+            Some(one(&older(value, "limit", "greater than or equal to 1"))),
+            "{fields}"
+        );
+    }
+}
+
+/// Measured 2026-10-30 12:40 UTC: an unreadable member of an `L` or an `M`
+/// entry, and a lower-case type descriptor, switch to the older form. Each
+/// entry sits under `:d` beside a filter that reads `:p`, as sent.
+#[test]
+fn an_unreadable_member_of_a_list_or_map_entry_switches_to_the_older_form() {
+    let older_limit = one(&older("0", "limit", "greater than or equal to 1"));
+    for entry in [
+        r#"{"L": [{}]}"#,
+        r#"{"M": {"k": {"X": "1"}}}"#,
+        r#"{"s": "x"}"#,
+    ] {
+        let fields = format!(
+            r#""Limit": 0, "FilterExpression": "a = :p", "ExpressionAttributeValues": {{":p": {{"S": "x"}}, ":d": {entry}}}"#
+        );
+        assert_eq!(
+            check(&scan(&fields)).as_deref(),
+            Some(older_limit.as_str()),
+            "{entry}"
+        );
+    }
+}
+
+/// Measured 2026-10-31 12:36 UTC: `Limit: 0` beside a readable entry of each
+/// type, and beside an `L` and an `M` whose members are readable, keeps the
+/// newer form, as the empty and duplicate `NS` measured on 2026-10-25 do.
+#[test]
+fn a_readable_entry_of_any_type_keeps_the_newer_form() {
+    for entry in [
+        r#"{"S": "x"}"#,
+        r#"{"N": "1"}"#,
+        r#"{"B": "AA=="}"#,
+        r#"{"SS": ["x"]}"#,
+        r#"{"NS": ["1"]}"#,
+        r#"{"BS": ["AA=="]}"#,
+        r#"{"M": {"k": {"S": "x"}}}"#,
+        r#"{"L": [{"N": "1"}, {"L": []}]}"#,
+        r#"{"NULL": true}"#,
+        r#"{"BOOL": false}"#,
+    ] {
+        let fields = format!(r#""Limit": 0, "ExpressionAttributeValues": {{":a": {entry}}}"#);
+        assert_eq!(check(&scan(&fields)), Some(one(LIMIT)), "{entry}");
+    }
+}
+
+/// Measured 2026-10-31 12:36 UTC: every fault in one message, in the order
+/// Limit, Segment, TotalSegments, and nothing reported for a field inside its
+/// bounds. `Segment: 0, TotalSegments: 1` was sent with `ConsistentRead: true`
+/// and returned the whole table in one page.
+#[test]
+fn every_fault_is_reported_in_one_message_and_a_field_inside_its_bounds_is_not() {
     let cases = [
         (r#""Limit": -1"#, one(LIMIT)),
         (r#""Segment": 0, "TotalSegments": 1000001"#, one(TOTAL_HIGH)),
@@ -188,6 +273,7 @@ fn combinations_the_service_was_not_sent_follow_the_measured_rules() {
     for fields in [
         r#""Limit": 2147483647"#,
         r#""Limit": null"#,
+        r#""Segment": 0, "TotalSegments": 1"#,
         r#""Segment": 999999, "TotalSegments": 1000000"#,
     ] {
         assert_eq!(check(&scan(fields)), None, "{fields}");

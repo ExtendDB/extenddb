@@ -191,7 +191,9 @@ pub struct ScanInput {
 /// item, `Limit: 1e2`, `Limit: 2147483648` and `Limit: 9223372036854775808`
 /// are accepted, `Segment: 1.5` of `TotalSegments: 2` returns the items of
 /// segment 1, `Limit: 0.0` is reported as `0`, `Limit: -2147483649` as
-/// `-2147483648` and `TotalSegments: 2147483648` as `2147483647`.
+/// `-2147483648` and `TotalSegments: 2147483648` as `2147483647`. Measured
+/// 2026-10-30 12:40 UTC: `Limit: -1.5` is reported as `-1`, and `Limit: -0.5`
+/// and `Limit: -0` as `0`.
 #[must_use]
 pub fn saturated_int32(number: &serde_json::Number) -> i32 {
     if let Some(value) = number.as_i64() {
@@ -255,6 +257,9 @@ mod tests {
             ("1.5", 1),
             ("1.0", 1),
             ("0.0", 0),
+            ("-1.5", -1),
+            ("-0.5", 0),
+            ("-0", 0),
             ("1e2", 100),
             ("1e40", i32::MAX),
             ("-1e40", i32::MIN),
