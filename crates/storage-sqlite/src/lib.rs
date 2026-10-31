@@ -100,7 +100,7 @@ pub fn backend() -> extenddb_storage::Backend {
         management_store: sqlite_management_store_factory,
         diagnostics_store: sqlite_diagnostics_store_factory,
         server_components: sqlite_server_components_factory,
-        catalog_migrations: Some(&migrations::SqliteCatalogMigrations),
+        catalog_migrations: &migrations::SqliteCatalogMigrations,
     }
 }
 

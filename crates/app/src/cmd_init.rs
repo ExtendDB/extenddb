@@ -252,32 +252,9 @@ pub async fn run(args: InitArgs, release: &str) -> anyhow::Result<u8> {
         .await
         .map_err(crate::cmd_migrate::op_err)?;
 
-    let admin_result = if let Some(migrations) = extenddb_storage::migrations::installed() {
-        init_on_runner(bootstrapper.as_ref(), migrations, release).await?
-    } else {
-        // Take the same lock `migrate` uses around the schema work below, so an
-        // init cannot race a migrate running on another replica and fail on a
-        // duplicate pg_type entry from concurrent `CREATE TABLE IF NOT EXISTS`.
-        // Two concurrent inits cannot get this far: the second aborts earlier, at
-        // `create_catalog_db`, because the database already exists. The catalog
-        // database does exist by this point, so the lock connection can be opened.
-        //
-        // The lock is held through the bootstrap rows as well, not just the
-        // schema: a server that starts after the schema exists but before the
-        // encryption key is written fails with MissingEncryptionKey.
-        bootstrapper
-            .acquire_migration_lock()
-            .await
-            .map_err(crate::cmd_migrate::op_err)?;
-        let bootstrap_result = run_init_bootstrap(bootstrapper.as_ref()).await;
-        if let Err(e) = bootstrapper.release_migration_lock().await {
-            tracing::warn!(
-                "Failed to release migration lock: {}",
-                crate::cmd_migrate::op_err(e)
-            );
-        }
-        bootstrap_result?
-    };
+    let migrations = extenddb_storage::migrations::installed()
+        .ok_or_else(|| anyhow::anyhow!("no storage backend is installed"))?;
+    let admin_result = init_on_runner(bootstrapper.as_ref(), migrations, release).await?;
 
     if admin_result.already_existed {
         // Already printed by the bootstrap store.
@@ -351,33 +328,26 @@ async fn init_on_runner(
         .lock(&target, INIT_LOCK_TIMEOUT)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    println!("--- Creating the catalog through its migrations...");
-    let report = run_locked(migrations, &target, &lock, release, RunKind::Create)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    for note in &report.notes {
-        println!("    {note}");
+    let result = async {
+        println!("--- Creating the catalog through its migrations...");
+        let report = run_locked(migrations, &target, &lock, release, RunKind::Create)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        for note in &report.notes {
+            println!("    {note}");
+        }
+        crate::util::print_applied(&report, "    ", "Applied migration");
+        bootstrapper.hold(&lock);
+        let admin = write_bootstrap_rows(bootstrapper).await?;
+        bootstrapper
+            .record_data_connection()
+            .await
+            .map_err(crate::cmd_migrate::op_err)?;
+        Ok(admin)
     }
-    crate::util::print_applied(&report, "    ", "Applied migration");
-    let admin = write_bootstrap_rows(bootstrapper).await?;
-    bootstrapper
-        .record_data_connection()
-        .await
-        .map_err(crate::cmd_migrate::op_err)?;
-    drop(lock);
-    Ok(admin)
-}
-
-/// Apply the catalog and data schema while the migration lock is held. Split out
-/// of `run` so that the lock is released on every path, including errors.
-/// Everything `init` does under the migration lock: the schema, then the
-/// rows a server needs before it can start (encryption key, default account,
-/// admin user).
-async fn run_init_bootstrap(
-    bootstrapper: &dyn extenddb_storage::bootstrapper::Bootstrapper,
-) -> anyhow::Result<extenddb_storage::bootstrapper::AdminBootstrapResult> {
-    run_init_migrations(bootstrapper).await?;
-    write_bootstrap_rows(bootstrapper).await
+    .await;
+    migrations.release(lock).await;
+    result
 }
 
 /// The rows a server needs before it can start: encryption key, default
@@ -402,39 +372,6 @@ async fn write_bootstrap_rows(
         .bootstrap_admin_user(env_user.as_deref(), env_pass.as_deref())
         .await
         .map_err(crate::cmd_migrate::op_err)
-}
-
-async fn run_init_migrations(
-    bootstrapper: &dyn extenddb_storage::bootstrapper::Bootstrapper,
-) -> anyhow::Result<()> {
-    // Check if catalog is already initialized.
-    let initialized = bootstrapper
-        .is_catalog_initialized()
-        .await
-        .map_err(crate::cmd_migrate::op_err)?;
-
-    if initialized {
-        println!("--- Catalog already initialized. Use 'extenddb migrate' for pending migrations.");
-    } else {
-        bootstrapper
-            .run_catalog_migrations()
-            .await
-            .map_err(crate::cmd_migrate::op_err)?;
-    }
-
-    // Record data database connection in catalog.
-    bootstrapper
-        .record_data_connection()
-        .await
-        .map_err(crate::cmd_migrate::op_err)?;
-
-    // Initialize data database schema.
-    bootstrapper
-        .run_data_migrations()
-        .await
-        .map_err(crate::cmd_migrate::op_err)?;
-
-    Ok(())
 }
 
 #[cfg(test)]

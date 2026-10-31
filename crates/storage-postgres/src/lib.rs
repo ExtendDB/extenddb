@@ -168,7 +168,7 @@ pub fn backend() -> extenddb_storage::Backend {
             })
         },
         server_components: server_components_factory,
-        catalog_migrations: Some(&migrations::PostgresCatalogMigrations),
+        catalog_migrations: &migrations::PostgresCatalogMigrations,
     }
 }
 

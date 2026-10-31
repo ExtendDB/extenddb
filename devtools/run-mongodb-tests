@@ -287,6 +287,16 @@ if [[ " ${RUN_TESTS_ARGS[*]} " == *" --rust"* ]]; then
     EXTENDDB_TEST_MONGODB_URI="mongodb://localhost:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
         cargo test -p extenddb-storage-mongodb --lib -- --ignored records_live
     echo ""
+    # The catalog migration tests: each runs in databases of its own on this
+    # server, and EXTENDDB_TEST_MONGODB_REQUIRED turns a skip for a missing
+    # server into a failure.
+    echo "=== Running MongoDB catalog migration tests (migrations_*) ==="
+    echo ""
+    EXTENDDB_TEST_MONGODB_URI="mongodb://localhost:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
+    EXTENDDB_TEST_MONGODB_REQUIRED=1 \
+        cargo test -p extenddb-storage-mongodb --test migrations_fresh --test migrations_guards \
+            --test migrations_holders --test migrations_locks --test migrations_released
+    echo ""
 fi
 echo "=== Running test suite via devtools/run-tests --backend mongodb ==="
 echo "  passthrough args: ${RUN_TESTS_ARGS[*]}"

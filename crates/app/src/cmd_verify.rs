@@ -31,8 +31,6 @@ pub struct VerifyArgs {
 /// Run `extenddb verify`; returns the process exit status.
 pub async fn run(args: VerifyArgs, release: &str) -> anyhow::Result<u8> {
     let (app_config, config_file) = crate::util::command_config(args.config.as_deref())?;
-    let expected_version =
-        extenddb_storage::operations::catalog_version().unwrap_or_else(|_| "unknown".to_string());
 
     // Parse connection string to get database name for display
     let parts = extenddb_storage::operations::parse_connection_string(
@@ -54,58 +52,26 @@ pub async fn run(args: VerifyArgs, release: &str) -> anyhow::Result<u8> {
 
     // Read first, before anything opens the catalog: a store that does not
     // exist is reported, not created.
-    let status_code = match extenddb_storage::migrations::installed() {
-        Some(migrations) => {
-            let code =
-                check_migrations(migrations, config_file.as_deref(), &app_config, release).await;
-            if code == extenddb_storage::migrations::exit::ERROR {
-                println!();
-                println!("=== UNHEALTHY: see the catalog check above ===");
-                return Ok(code);
-            }
-            Some(code)
-        }
-        None => None,
-    };
+    let migrations = extenddb_storage::migrations::installed()
+        .ok_or_else(|| anyhow::anyhow!("no storage backend is installed"))?;
+    let status_code =
+        check_migrations(migrations, config_file.as_deref(), &app_config, release).await;
+    if status_code == extenddb_storage::migrations::exit::ERROR {
+        println!();
+        println!("=== UNHEALTHY: see the catalog check above ===");
+        return Ok(status_code);
+    }
 
-    // Create settings and diagnostics store
     println!("--- Checking catalog connection...");
-    let store = match extenddb_storage::settings_store::create_settings_store(
+    match extenddb_storage::settings_store::create_settings_store(
         app_config.storage.connection_config(),
     )
     .await
     {
-        Ok(store) => {
-            println!("  OK: Connected to catalog.");
-            store
-        }
+        Ok(_) => println!("  OK: Connected to catalog."),
         Err(e) => {
             println!("  FAIL: Cannot connect to catalog database: {e}");
             anyhow::bail!("Cannot proceed without catalog connection");
-        }
-    };
-
-    // Check 2: Catalog version (D-10: strict parsing), on a backend that
-    // still records one; the runner's status replaced it above.
-    if status_code.is_none() {
-        println!("--- Checking catalog version...");
-        match store.get_setting("catalog_version").await {
-            Ok(Some(v)) => {
-                if v == expected_version {
-                    println!("  OK: Catalog version {v}");
-                } else {
-                    println!("  WARN: Catalog version {v} (binary expects {expected_version})");
-                    errors += 1;
-                }
-            }
-            Ok(None) => {
-                println!("  FAIL: No catalog version found. Run 'extenddb init'.");
-                errors += 1;
-            }
-            Err(e) => {
-                println!("  FAIL: Failed to read catalog version: {e:?}");
-                errors += 1;
-            }
         }
     }
 
@@ -137,7 +103,6 @@ pub async fn run(args: VerifyArgs, release: &str) -> anyhow::Result<u8> {
     println!("  Indexes: {index_count}");
 
     println!();
-    let status_code = status_code.unwrap_or(0);
     if errors == 0 && status_code == 0 {
         println!("=== HEALTHY: All checks passed ===");
         return Ok(0);

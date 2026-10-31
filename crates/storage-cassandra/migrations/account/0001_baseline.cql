@@ -1,8 +1,21 @@
 -- Copyright 2026 ExtendDB contributors
 -- SPDX-License-Identifier: Apache-2.0
--- Data schema for user-facing DynamoDB resources
+--
+-- Migration 1, baseline, Cassandra account keyspace.
+--
+-- Creates the v1.0 schema in an empty account keyspace and brings an account
+-- keyspace created by any released version to the same schema. It is the
+-- statements of the legacy data files V001 and V002 in order, with every
+-- CREATE using IF NOT EXISTS. Tables are named without a keyspace: the runner
+-- writes the account keyspace in front of each one, and waits for every live
+-- node to agree on the schema after each CREATE. CreateAccount runs this file
+-- through the same runner on a new account's keyspace.
+--
+-- The runner splits this file on the semicolon character, so no comment holds
+-- one.
 
--- Migration tracking table (must be first)
+-- The ledger of releases before 1.0, kept so their migrate finds every file
+-- it knows recorded and runs none of them.
 CREATE TABLE IF NOT EXISTS schema_history (
     version int PRIMARY KEY,
     description text,
@@ -131,3 +144,20 @@ CREATE TABLE IF NOT EXISTS ttl_repair_inflight (
     created_at timestamp,
     PRIMARY KEY ((worker_partition), repair_id)
 );
+
+-- Legacy V002: logical backup payloads. Each backup is split into bounded
+-- partitions so a large DynamoDB table does not become one unbounded
+-- Cassandra partition.
+
+CREATE TABLE IF NOT EXISTS backup_items (
+    backup_arn text,
+    bucket int,
+    item_index bigint,
+    item_data text,
+    PRIMARY KEY ((backup_arn, bucket), item_index)
+) WITH CLUSTERING ORDER BY (item_index ASC);
+
+-- Every legacy data file, recorded in the legacy ledger. The insert names no
+-- applied_at, so a row a release wrote keeps its time.
+INSERT INTO schema_history (version, description) VALUES (1, 'initial_data_schema');
+INSERT INTO schema_history (version, description) VALUES (2, 'backup_items');

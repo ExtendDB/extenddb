@@ -46,10 +46,17 @@ pub async fn flush_pending_drops(session: &Arc<CassandraSession>) {
         let _ = session.query(format!("DROP KEYSPACE IF EXISTS {ks}")).await;
     }
 }
+/// The node the tests use: `EXTENDDB_TEST_CASSANDRA_CONTACT_POINT`, else
+/// 127.0.0.1:9042, the port CI's service container publishes.
+pub fn test_contact_point() -> String {
+    std::env::var("EXTENDDB_TEST_CASSANDRA_CONTACT_POINT")
+        .unwrap_or_else(|_| "127.0.0.1:9042".to_string())
+}
+
 /// Returns a standard test configuration for Cassandra.
 pub fn test_config() -> CassandraStorageConfig {
     let mut config = CassandraStorageConfig {
-        contact_points: vec!["127.0.0.1:9042".to_string()],
+        contact_points: vec![test_contact_point()],
         username: Some("cassandra".to_string()),
         password: Some("cassandra".to_string()),
         keyspace_prefix: "extenddb_ttl_test".to_string(),
@@ -86,13 +93,15 @@ pub async fn ensure_test_account(
         engine.create_keyspace(catalog_keyspace).await?;
     }
     ensure_keyspace_rf(engine, catalog_keyspace).await?;
-    // Always run migrations — idempotent, guards against concurrent creation races.
-    extenddb_storage_cassandra::migrations::run_catalog_migrations(
-        &engine.session_arc(),
-        catalog_keyspace,
+    // Always run the migrations: the runner applies only what is missing.
+    extenddb_storage_cassandra::migrations::migrate_catalog_keyspace(
+        engine.session_arc(),
+        "extenddb_ttl_test",
+        "test",
+        std::time::Duration::from_secs(120),
     )
     .await
-    .map_err(|e| format!("Failed to run catalog migrations: {:?}", e))?;
+    .map_err(|e| format!("Failed to run catalog migrations: {e}"))?;
 
     if !engine.keyspace_exists(&account_keyspace).await? {
         engine.create_keyspace(&account_keyspace).await?;
@@ -100,13 +109,15 @@ pub async fn ensure_test_account(
     } else {
         ensure_keyspace_rf(engine, &account_keyspace).await?;
     }
-    // Always run migrations — idempotent, guards against concurrent creation races.
-    extenddb_storage_cassandra::migrations::run_data_migrations(
-        &engine.session_arc(),
+    // Always run the migrations: the runner applies only what is missing.
+    extenddb_storage_cassandra::migrations::migrate_account(
+        engine.session_arc(),
+        "extenddb_ttl_test",
         &account_keyspace,
+        "test",
     )
     .await
-    .map_err(|e| format!("Failed to run migrations: {:?}", e))?;
+    .map_err(|e| format!("Failed to run migrations: {e}"))?;
 
     let query = format!(
         "INSERT INTO {}.accounts (account_id, account_name, created_at) VALUES (?, ?, toTimestamp(now())) IF NOT EXISTS",
@@ -612,10 +623,12 @@ pub async fn setup_engine() -> CassandraEngine {
     ensure_keyspace_rf(&engine, &catalog_keyspace)
         .await
         .unwrap();
-    // Always run migrations — idempotent, guards against concurrent creation races.
-    extenddb_storage_cassandra::migrations::run_catalog_migrations(
-        &engine.session_arc(),
-        &catalog_keyspace,
+    // Always run the migrations: the runner applies only what is missing.
+    extenddb_storage_cassandra::migrations::migrate_catalog_keyspace(
+        engine.session_arc(),
+        &config.keyspace_prefix,
+        "test",
+        std::time::Duration::from_secs(120),
     )
     .await
     .unwrap();
@@ -725,14 +738,16 @@ pub fn skip_without_cassandra() -> bool {
     if std::env::var("EXTENDDB_TEST_CASSANDRA").as_deref() == Ok("required") {
         return false;
     }
-    let reachable = std::net::TcpStream::connect_timeout(
-        &std::net::SocketAddr::from(([127, 0, 0, 1], 9042)),
-        std::time::Duration::from_secs(2),
-    )
-    .is_ok();
+    let contact_point = test_contact_point();
+    let reachable = contact_point
+        .parse::<std::net::SocketAddr>()
+        .is_ok_and(|address| {
+            std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_secs(2))
+                .is_ok()
+        });
     if !reachable {
         eprintln!(
-            "skipping: no Cassandra at 127.0.0.1:9042 (set EXTENDDB_TEST_CASSANDRA=required to fail instead)"
+            "skipping: no Cassandra at {contact_point} (set EXTENDDB_TEST_CASSANDRA=required to fail instead)"
         );
     }
     !reachable

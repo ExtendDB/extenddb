@@ -1,0 +1,446 @@
+#!/usr/bin/env python3
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+"""A Cassandra catalog the last 0.1.x release created, upgraded by this
+binary, and that release run against v1.0 catalogs:
+
+    devtools/check-cassandra-older-binary <extenddb binary> <0.1.14 binary> \\
+        <container> <contact point> [port]
+
+<0.1.14 binary> is `extenddb` built from the v0.1.14 tag with
+`--no-default-features --features cassandra` (there is no released Cassandra
+image). <container> and <contact point> are as in
+devtools/check-cassandra-catalog-lock; the node uses PasswordAuthenticator
+with the admin role $CASSANDRA_ADMIN_USER and $CASSANDRA_ADMIN_PASSWORD
+(default cassandra and cassandra).
+
+- Released catalog: the 0.1.14 binary's `init` creates a deployment, and its
+  server is seeded with a table that has a sort key, a GSI, an LSI and a
+  stream, a table with TTL, items and a backup. This binary's preview exits 3
+  and `migrate --yes` applies every migration. A fresh deployment from this
+  binary's `init`, seeded the same way through this binary's server, is then
+  compared with it: the columns of every table of the catalog keyspace and of
+  each account keyspace (per-table tables named by their table and index),
+  the settings keys and the ledgers. The only accepted difference is the
+  control_plane_delay_seconds row the 0.1.14 baseline seeded.
+- Two migrators: on another 0.1.14 catalog, two `migrate --yes` started
+  together both exit 0, one applies the migrations and the other waits for
+  the lock and finds nothing to do.
+- Older binary: on the fresh and the upgraded v1.0 catalog the 0.1.14 binary
+  runs `verify`, `migrate --yes` and `serve`. The script prints what each run
+  changed and checks what this binary then reports: after a run that wrote
+  the catalog, `migrate` and `verify` exit 5 naming WrittenByOlderRelease and
+  `migrate --yes --reconverge` restores Current with the schema the catalog
+  had before; the 0.1.14 `serve` refuses a v1.0 catalog.
+
+Everything the script creates (roles, keyspaces, the temporary directory) is
+removed at the end. The servers bind 127.0.0.1 only.
+"""
+import csv
+import io
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+from catalog_checks import expect_exit, finish, healthy, report, run, start, stop
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+ADMIN_USER = os.environ.get("CASSANDRA_ADMIN_USER", "cassandra")
+ADMIN_PASSWORD = os.environ.get("CASSANDRA_ADMIN_PASSWORD", "cassandra")
+ADMIN_LOGIN_PASSWORD = "AdminPassw0rd!x"
+
+# What a 0.1.14 catalog upgraded by this binary may hold that a fresh one
+# does not: the row the 0.1.14 baseline seeded, whose value cannot be told
+# from one an operator set (SPEC A3).
+ACCEPTED = {"+ setting control_plane_delay_seconds"}
+
+
+def cqlsh(container: str, statements: str) -> tuple[int, str]:
+    done = subprocess.run(
+        ["docker", "exec", "-i", container, "cqlsh", "-u", ADMIN_USER, "-p", ADMIN_PASSWORD],
+        input=statements,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=180,
+    )
+    return done.returncode, done.stdout + done.stderr
+
+
+def copy(container: str, table: str, columns: str) -> list[list[str]]:
+    """Every row of `table`, as `cqlsh COPY ... TO STDOUT` prints them."""
+    code, output = cqlsh(container, f"COPY {table} ({columns}) TO STDOUT;\n")
+    if code != 0:
+        raise RuntimeError(f"COPY {table}: {output}")
+    width = len(columns.split(","))
+    rows = []
+    for row in csv.reader(io.StringIO(output)):
+        if len(row) == width and not row[0].startswith("Using "):
+            rows.append(row)
+    return rows
+
+
+class Deployment:
+    def __init__(self, stem: str, binary: str, work: str, contact_point: str, old: bool) -> None:
+        self.stem = stem
+        self.binary = binary
+        self.old = old
+        self.config = os.path.join(work, f"{stem}.toml")
+        self.app_password = f"App{secrets.token_hex(8)}"
+        self.contact_point = contact_point
+        self.env = dict(os.environ, HOME=os.path.join(work, "home"))
+
+    def init(self) -> tuple[int, str]:
+        # v0.1.14 reads the admin password from --cassandra-pass only.
+        password = ["--cassandra-pass", ADMIN_PASSWORD] if self.old else []
+        code, output = run(
+            [
+                self.binary, "init", "--config", self.config,
+                "--cassandra-contact-points", self.contact_point,
+                "--cassandra-user", ADMIN_USER, *password,
+                "--keyspace-prefix", self.stem, "--extenddb-user", self.stem,
+                "--bind-addr", "127.0.0.1",
+            ],
+            dict(
+                self.env,
+                EXTENDDB_CASSANDRA_PASSWORD=ADMIN_PASSWORD,
+                EXTENDDB_APP_PASSWORD=self.app_password,
+                EXTENDDB_ADMIN_USER="admin",
+                EXTENDDB_ADMIN_PASSWORD=ADMIN_LOGIN_PASSWORD,
+            ),
+            timeout=240,
+        )
+        if code == 0 and self.old:
+            # v0.1.14 writes the role and password lines commented out; with
+            # PasswordAuthenticator the operator sets them to the role init
+            # created.
+            with open(self.config, encoding="utf-8") as f:
+                lines = f.read().splitlines()
+            with open(self.config, "w", encoding="utf-8") as f:
+                for line in lines:
+                    if line.startswith("# username = "):
+                        line = f'username = "{self.stem}"'
+                    elif line.startswith("# password = "):
+                        line = f'password = "{self.app_password}"'
+                    f.write(line + "\n")
+        return code, output
+
+    def snapshot(self, container: str) -> list[str]:
+        """The deployment's columns, settings keys and ledger rows, with the
+        keyspace prefix, account ids and table ids replaced by names."""
+        prefix = f"{self.stem}_"
+        accounts = {
+            row[0]: row[1]
+            for row in copy(container, f"{self.stem}_catalog.accounts", "account_id, account_name")
+        }
+        names = {}
+        for account_id, table_name, table_id in copy(
+            container, f"{self.stem}_catalog.tables", "account_id, table_name, table_id"
+        ):
+            names[f"items_{table_id.replace('-', '_')}"] = f"items_<{table_name}>"
+            for row in copy(container, f"{self.stem}_catalog.indexes", "table_id, index_name, index_id"):
+                if row[0] == table_id:
+                    names[f"index_{row[2].replace('-', '_')}"] = f"index_<{table_name}/{row[1]}>"
+        def keyspace(name: str) -> str:
+            rest = name[len(prefix):]
+            if rest == "catalog":
+                return "catalog"
+            account_id = rest.removeprefix("account_")
+            return f"account<{accounts.get(account_id, account_id)}>"
+        lines = []
+        for ks, table, column, kind, position, order, kind_type in copy(
+            container,
+            "system_schema.columns",
+            "keyspace_name, table_name, column_name, kind, position, clustering_order, type",
+        ):
+            if ks.startswith(prefix):
+                lines.append(
+                    f"column {keyspace(ks)}.{names.get(table, table)}.{column} {kind} {position} "
+                    f"{order} {kind_type}"
+                )
+        for (key,) in copy(container, f"{self.stem}_catalog.settings", "key"):
+            if key != "migration_lock":
+                lines.append(f"setting {key}")
+        for ks in sorted({line.split()[1].split(".")[0] for line in lines if line.startswith("column ")}):
+            physical = (
+                f"{self.stem}_catalog"
+                if ks == "catalog"
+                else f"{self.stem}_account_"
+                + next((i for i, n in accounts.items() if f"account<{n}>" == ks), ks)
+            )
+            # system_schema gives a partition key column position 0.
+            if any(line.startswith(f"column {ks}.extenddb_migrations.id ") for line in lines):
+                for row in copy(container, f"{physical}.extenddb_migrations", "id, name, outcome"):
+                    lines.append(f"ledger {ks} {' '.join(row)}")
+            for row in copy(container, f"{physical}.schema_history", "version, description"):
+                lines.append(f"legacy {ks} {' '.join(row)}")
+        return sorted(lines)
+
+    def schema(self, container: str) -> list[str]:
+        return [line for line in self.snapshot(container) if line.startswith("column ")]
+
+
+def diff(before: list[str], after: list[str]) -> list[str]:
+    return [f"- {line}" for line in before if line not in after] + [
+        f"+ {line}" for line in after if line not in before
+    ]
+
+
+def seed(binary: str, deployment: Deployment, port: int, work: str) -> bool:
+    """Start `binary`'s server on the deployment and create the seeded
+    objects through it."""
+    log = os.path.join(work, f"seed-{deployment.stem}.log")
+    server = start(
+        [binary, "serve", "--config", deployment.config, "--foreground", "--port", str(port)],
+        deployment.env,
+        log,
+    )
+    try:
+        if not healthy(f"https://127.0.0.1:{port}/health", server, 90):
+            with open(log, encoding="utf-8") as f:
+                report(False, f"{deployment.stem}: the server became healthy", f.read()[-3000:])
+            return False
+        code, output = run(
+            [sys.executable, os.path.join(HERE, "provision-test-credentials")],
+            dict(
+                deployment.env,
+                EXTENDDB_TEST_ENDPOINT=f"https://127.0.0.1:{port}",
+                EXTENDDB_ADMIN_USER="admin",
+                EXTENDDB_ADMIN_PASSWORD=ADMIN_LOGIN_PASSWORD,
+            ),
+        )
+        keys = dict(re.findall(r"export (AWS_[A-Z_]+)=(\S+)", output))
+        if not report(code == 0 and "AWS_ACCESS_KEY_ID" in keys, f"{deployment.stem}: credentials", output):
+            return False
+        import boto3
+        import urllib3
+
+        urllib3.disable_warnings()
+        client = boto3.client(
+            "dynamodb",
+            endpoint_url=f"https://127.0.0.1:{port}",
+            region_name="us-east-1",
+            aws_access_key_id=keys["AWS_ACCESS_KEY_ID"],
+            aws_secret_access_key=keys["AWS_SECRET_ACCESS_KEY"],
+            verify=False,
+        )
+        client.create_table(
+            TableName="seeded",
+            AttributeDefinitions=[
+                {"AttributeName": n, "AttributeType": "S"} for n in ("pk", "sk", "g", "l")
+            ],
+            KeySchema=[
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"},
+            ],
+            GlobalSecondaryIndexes=[
+                {
+                    "IndexName": "gsi1",
+                    "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"},
+                }
+            ],
+            LocalSecondaryIndexes=[
+                {
+                    "IndexName": "lsi1",
+                    "KeySchema": [
+                        {"AttributeName": "pk", "KeyType": "HASH"},
+                        {"AttributeName": "l", "KeyType": "RANGE"},
+                    ],
+                    "Projection": {"ProjectionType": "ALL"},
+                }
+            ],
+            BillingMode="PAY_PER_REQUEST",
+            StreamSpecification={"StreamEnabled": True, "StreamViewType": "NEW_AND_OLD_IMAGES"},
+        )
+        client.create_table(
+            TableName="expiring",
+            AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        for table in ("seeded", "expiring"):
+            for _ in range(120):
+                if client.describe_table(TableName=table)["Table"]["TableStatus"] == "ACTIVE":
+                    break
+                time.sleep(0.5)
+        client.update_time_to_live(
+            TableName="expiring",
+            TimeToLiveSpecification={"Enabled": True, "AttributeName": "expires"},
+        )
+        for i in range(5):
+            client.put_item(
+                TableName="seeded",
+                Item={"pk": {"S": f"p{i}"}, "sk": {"S": "s"}, "g": {"S": "g"}, "l": {"S": f"l{i}"}},
+            )
+        client.create_backup(TableName="seeded", BackupName="seeded-backup")
+        who = "the 0.1.14 binary" if deployment.old else "this binary"
+        print(f"ok   {deployment.stem}: seeded through {who}'s server")
+        return True
+    except Exception as e:  # noqa: BLE001 - reported as a failed check
+        report(False, f"{deployment.stem}: seeding", repr(e))
+        return False
+    finally:
+        stop(server)
+
+
+def older_binary_runs(label: str, d: Deployment, binary: str, old: str, container: str, port: int) -> None:
+    """The 0.1.14 binary's verify, migrate --yes and serve on a v1.0 catalog,
+    and what this binary then reports."""
+    migrate = [binary, "migrate", "--config", d.config]
+    for command in (["verify"], ["migrate", "--yes"], ["serve", "--foreground", "--port", str(port)]):
+        what = " ".join(command[:2])
+        before = d.snapshot(container)
+        code, output = run(
+            [old, command[0], "--config", d.config, *command[1:]],
+            dict(d.env, EXTENDDB_CASSANDRA_PASSWORD=ADMIN_PASSWORD),
+            timeout=60,
+        )
+        after = d.snapshot(container)
+        changes = diff(before, after)
+        print(f"     {label}: the 0.1.14 {what}: exit {code}; {len(changes)} change(s)")
+        for line in changes:
+            print(f"     |   {line}")
+        for line in output.strip().splitlines()[-3:]:
+            print(f"     | > {line}")
+        if command[0] == "serve":
+            report(code not in (0, -1), f"exit {code}: {label}: the 0.1.14 serve refuses a v1.0 catalog", output)
+        if not changes:
+            expect_exit(0, f"{label}: after the 0.1.14 {what}, the catalog is Current", migrate, d.env)
+            continue
+        expect_exit(
+            5,
+            f"{label}: after the 0.1.14 {what}, migrate reports WrittenByOlderRelease",
+            migrate,
+            d.env,
+            contains="a release before 1.0 wrote to this catalog",
+        )
+        expect_exit(5, f"{label}: after the 0.1.14 {what}, verify exits 5", [binary, "verify", "--config", d.config], d.env)
+        expect_exit(0, f"{label}: migrate --yes --reconverge", migrate + ["--yes", "--reconverge"], d.env)
+        expect_exit(0, f"{label}: verify reports Current", [binary, "verify", "--config", d.config], d.env, contains="OK: Current")
+        report(
+            d.schema(container) == [line for line in before if line.startswith("column ")],
+            f"{label}: the schema is the one it had before the 0.1.14 {what}",
+        )
+
+
+def marker_written_by_older_migrate(label: str, d: Deployment, binary: str, container: str) -> None:
+    """The row a 0.1.14 `migrate --yes` writes on a catalog whose legacy
+    files are all recorded (its resource-tag step, read in its
+    crates/app/src/cmd_migrate.rs). That migrate has no Cassandra password
+    option, so on a node with PasswordAuthenticator, the only kind its `init`
+    can use, it cannot log in; the script writes the row as it would."""
+    before = d.schema(container)
+    code, output = cqlsh(
+        container,
+        f"INSERT INTO {d.stem}_catalog.settings (key, value) VALUES "
+        "('resource_tag_migration', 'applied');\n",
+    )
+    if not report(code == 0, f"{label}: write the row a 0.1.14 migrate --yes writes", output):
+        return
+    migrate = [binary, "migrate", "--config", d.config]
+    expect_exit(
+        5,
+        f"{label}: with the 0.1.14 marker row, migrate reports WrittenByOlderRelease",
+        migrate,
+        d.env,
+        contains="a release before 1.0 wrote to this catalog",
+    )
+    expect_exit(5, f"{label}: with the 0.1.14 marker row, migrate --yes refuses", migrate + ["--yes"], d.env)
+    expect_exit(0, f"{label}: migrate --yes --reconverge removes the row", migrate + ["--yes", "--reconverge"], d.env)
+    expect_exit(0, f"{label}: verify reports Current", [binary, "verify", "--config", d.config], d.env, contains="OK: Current")
+    report(d.schema(container) == before, f"{label}: the schema is the one it had before the row")
+
+
+def main(binary: str, old: str, container: str, contact_point: str, port: int) -> int:
+    binary = os.path.realpath(binary)
+    old = os.path.realpath(old)
+    work = tempfile.mkdtemp(prefix="eddb-cass-older.")
+    tag = secrets.token_hex(3)
+    upgraded = Deployment(f"eddb_up_{tag}", old, work, contact_point, True)
+    fresh = Deployment(f"eddb_fr_{tag}", binary, work, contact_point, False)
+    raced = Deployment(f"eddb_rc_{tag}", old, work, contact_point, True)
+    try:
+        for d, who in ((upgraded, "0.1.14"), (fresh, "this binary's"), (raced, "0.1.14")):
+            code, output = d.init()
+            report(code == 0, f"exit {code}: {who} init of {d.stem}", output)
+        seeded = seed(old, upgraded, port, work) and seed(binary, fresh, port, work)
+
+        migrate = [binary, "migrate", "--config", upgraded.config]
+        expect_exit(3, "the preview on the 0.1.14 catalog lists every migration", migrate, upgraded.env, contains="1 baseline")
+        expect_exit(0, "migrate --yes on the 0.1.14 catalog", migrate + ["--yes"], upgraded.env, contains="Applied 1 baseline")
+        expect_exit(0, "a second migrate --yes finds nothing to do", migrate + ["--yes"], upgraded.env, contains="Up to date")
+        if seeded:
+            fresh_lines = fresh.snapshot(container)
+            upgraded_lines = upgraded.snapshot(container)
+            missing = [
+                f"{label}: {needle}"
+                for label, lines in (("fresh", fresh_lines), ("upgraded", upgraded_lines))
+                for needle in ("items_<seeded>", "index_<seeded/gsi1>", "index_<seeded/lsi1>", "ledger account<")
+                if not any(needle in line for line in lines)
+            ]
+            report(
+                not missing,
+                "the comparison covers the seeded table's per-table tables and every ledger",
+                "\n".join(missing),
+            )
+            differences = diff(fresh_lines, upgraded_lines)
+            unexpected = [line for line in differences if line not in ACCEPTED]
+            report(
+                not unexpected,
+                f"the upgraded 0.1.14 catalog equals a fresh one seeded the same way "
+                f"({len(differences)} accepted difference(s))",
+                "\n".join(unexpected),
+            )
+
+        # Two migrators started together on a 0.1.14 catalog.
+        cmd = [binary, "migrate", "--config", raced.config, "--yes"]
+        logs = [os.path.join(work, f"race-{i}.log") for i in (1, 2)]
+        procs = [start(cmd, raced.env, log) for log in logs]
+        codes = [p.wait(timeout=180) for p in procs]
+        outputs = []
+        for log in logs:
+            with open(log, encoding="utf-8") as f:
+                outputs.append(f.read())
+        applied = sum("Applied 1 baseline" in o for o in outputs)
+        waited = sum("Up to date" in o for o in outputs)
+        report(
+            codes == [0, 0] and applied == 1 and waited == 1,
+            f"two migrate --yes started together: exits {codes}, {applied} applied, {waited} found "
+            "nothing to do",
+            "\n----\n".join(outputs),
+        )
+
+        for label, d in (("fresh", fresh), ("upgraded", upgraded)):
+            older_binary_runs(label, d, binary, old, container, port)
+            marker_written_by_older_migrate(label, d, binary, container)
+    finally:
+        for d in (upgraded, fresh, raced):
+            code, output = cqlsh(container, "SELECT keyspace_name FROM system_schema.keyspaces;\n")
+            statements = "".join(
+                f"DROP KEYSPACE IF EXISTS {word};\n"
+                for word in output.split()
+                if word.startswith(f"{d.stem}_")
+            )
+            cqlsh(container, statements + f"DROP ROLE IF EXISTS '{d.stem}';\n")
+        shutil.rmtree(work, ignore_errors=True)
+    return finish()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) not in (5, 6):
+        sys.exit(__doc__)
+    sys.exit(
+        main(
+            sys.argv[1],
+            sys.argv[2],
+            sys.argv[3],
+            sys.argv[4],
+            int(sys.argv[5]) if len(sys.argv) == 6 else 18455,
+        )
+    )

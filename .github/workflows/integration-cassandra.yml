@@ -26,16 +26,19 @@ concurrency:
 # talk to a live node at 127.0.0.1:9042 with default cassandra/cassandra
 # credentials. This workflow enables them to run in CI.
 #
-# A single-node Cassandra installation is enough. the tests create their own
+# A single-node Cassandra installation is enough for every job except
+# cassandra-two-nodes, which starts two nodes. The tests create their own
 # keyspaces with replication factor (RF) of 1 (one).
 #
 # The cassandra:4.1 image does not recognize CASSANDRA_AUTHENTICATOR as an
-# environment variable for configuring authentication, so each job patches
-# cassandra.yaml inside the running container to enable password auth, and
-# restarts it before running any tests. The health-check on the service container
-# uses the default AllowAllAuthenticator auth (no auth challenge) before the
-# patch step runs. After the restart a second wait loop confirms the node is
-# back up with PasswordAuthenticator active.
+# environment variable for configuring authentication, so each job on a
+# service container patches cassandra.yaml inside the running container to
+# enable password auth (cassandra-authorizer also enables
+# CassandraAuthorizer), and restarts it before running any tests. The
+# health-check on the service container uses the default AllowAllAuthenticator
+# auth (no auth challenge) before the patch step runs. After the restart a
+# second wait loop confirms the node is back up with PasswordAuthenticator
+# active. cassandra-two-nodes keeps the default AllowAllAuthenticator.
 
 jobs:
   cassandra-storage:
@@ -84,6 +87,20 @@ jobs:
           echo "Cassandra did not become ready" >&2; exit 1
       - name: Unit tests
         run: cargo test -p extenddb-storage-cassandra --lib
+      - name: Catalog migration integration tests
+        # Migration 1's definitions, the status of keyspaces that are not
+        # catalogs, the lock's lease, the serving registration and
+        # CreateAccount's account migrations (tests/migrations.rs).
+        run: cargo test -p extenddb-storage-cassandra --test migrations
+        env:
+          EXTENDDB_TEST_CASSANDRA: required
+      - name: Catalog migration crash and load tests
+        # Runs stopped before a write and run again, migration 2's rewrite
+        # of a released catalog's policies, and its status read and ledger
+        # row on catalogs with many policies (tests/migrations_stopped.rs).
+        run: cargo test -p extenddb-storage-cassandra --test migrations_stopped
+        env:
+          EXTENDDB_TEST_CASSANDRA: required
       - name: TTL integration tests
         continue-on-error: true  # TTL integration tests are known-flaky under CI load; tracked in #338
         run: cargo test -p extenddb-storage-cassandra --test ttl_integration -- --test-threads=1
@@ -211,16 +228,235 @@ jobs:
       - name: Check production Cassandra feature graph
         run: cargo check --release --no-default-features --features cassandra
 
+  # The current schema, serve and migrate on one catalog, and the v0.1.14
+  # release against catalogs this binary created and migrated.
+  cassandra-catalog-checks:
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 60
+    services:
+      cassandra:
+        image: cassandra:4.1
+        ports:
+          - 127.0.0.1:9042:9042
+        env:
+          CASSANDRA_CLUSTER_NAME: extenddb-ci
+          HEAP_NEWSIZE: 128M
+          MAX_HEAP_SIZE: 1024M
+        options: >-
+          --health-cmd "cqlsh -e 'SELECT release_version FROM system.local'"
+          --health-interval 15s
+          --health-timeout 10s
+          --health-retries 20
+          --health-start-period 60s
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Configure Cassandra authentication
+        run: |
+          docker exec ${{ job.services.cassandra.id }} sed -i \
+            's/^authenticator: .*/authenticator: PasswordAuthenticator/' \
+            /etc/cassandra/cassandra.yaml
+          docker restart ${{ job.services.cassandra.id }}
+          for i in $(seq 1 90); do
+            if docker exec ${{ job.services.cassandra.id }} \
+                cqlsh -u cassandra -p cassandra \
+                -e 'SELECT release_version FROM system.local' \
+                >/dev/null 2>&1; then
+              echo "Cassandra ready with PasswordAuthenticator after ${i}s"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Cassandra did not become ready" >&2; exit 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+      - name: Build release (cassandra backend)
+        run: cargo build --release --no-default-features --features cassandra
+
+      # A fresh install's schema against the committed file. On a difference
+      # the job fails with the diff and uploads the regenerated file to commit.
+      - name: Check the current schema
+        env:
+          EXTENDDB_CASSANDRA_PASSWORD: cassandra
+        run: |
+          ./target/release/extenddb init --config schema-check.toml \
+            --cassandra-contact-points 127.0.0.1:9042 --cassandra-user cassandra \
+            --keyspace-prefix schema_check --extenddb-user schema_check_app \
+            --bind-addr 127.0.0.1
+          devtools/schema-dump cassandra ${{ job.services.cassandra.id }} schema_check \
+            > schema-cassandra.txt
+          if ! diff -u docs/schema/cassandra.txt schema-cassandra.txt; then
+            echo "docs/schema/cassandra.txt differs from a fresh install: commit the schema-cassandra artifact as docs/schema/cassandra.txt"
+            exit 1
+          fi
+
+      - name: Upload the regenerated schema
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: schema-cassandra
+          path: schema-cassandra.txt
+          if-no-files-found: ignore
+
+      - name: Check serve and migrate on one catalog
+        run: >-
+          devtools/check-cassandra-catalog-lock ./target/release/extenddb
+          ${{ job.services.cassandra.id }} 127.0.0.1:9042 18454
+
+      # No released image carries the Cassandra backend, so the job builds
+      # the last 0.1.x release from its tag.
+      - name: Build the v0.1.14 release (cassandra backend)
+        run: |
+          git fetch --depth 1 origin tag v0.1.14
+          git worktree add "$RUNNER_TEMP/extenddb-v0.1.14" v0.1.14
+          cargo build --release --no-default-features --features cassandra \
+            --manifest-path "$RUNNER_TEMP/extenddb-v0.1.14/Cargo.toml" \
+            --target-dir "$RUNNER_TEMP/target-v0.1.14"
+
+      - name: Check the last 0.1.x release against migrated catalogs
+        run: >-
+          devtools/check-cassandra-older-binary ./target/release/extenddb
+          ${{ runner.temp }}/target-v0.1.14/release/extenddb
+          ${{ job.services.cassandra.id }} 127.0.0.1:9042 18455
+
+  # Two nodes, so a statement that follows a CREATE or ALTER can reach the
+  # node that did not coordinate it (#637), and two migrators reach the
+  # catalog through different coordinators.
+  cassandra-two-nodes:
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Start a two-node cluster
+        run: |
+          docker network create cassandra-two-nodes
+          for node in 1 2; do
+            seeds=()
+            if [ "$node" = 2 ]; then
+              seeds=(-e CASSANDRA_SEEDS=cassandra-1)
+            fi
+            docker run -d --name "cassandra-$node" --network cassandra-two-nodes \
+              -p "127.0.0.1:$((9041 + node)):9042" "${seeds[@]}" \
+              -e CASSANDRA_CLUSTER_NAME=extenddb-ci \
+              -e HEAP_NEWSIZE=128M -e MAX_HEAP_SIZE=1024M cassandra:4.1
+            for i in $(seq 1 120); do
+              if docker exec "cassandra-$node" \
+                  cqlsh -e 'SELECT release_version FROM system.local' >/dev/null 2>&1; then
+                echo "cassandra-$node ready after ${i} tries"
+                break
+              fi
+              sleep 2
+            done
+          done
+          for i in $(seq 1 60); do
+            if [ "$(docker exec cassandra-1 nodetool status | grep -c '^UN')" = 2 ]; then
+              docker exec cassandra-1 nodetool status
+              exit 0
+            fi
+            sleep 2
+          done
+          docker exec cassandra-1 nodetool status
+          echo "the second node did not join" >&2; exit 1
+      - name: Catalog migration integration tests on two nodes
+        run: cargo test -p extenddb-storage-cassandra --test migrations
+        env:
+          EXTENDDB_TEST_CASSANDRA: required
+          EXTENDDB_TEST_CASSANDRA_CONTACT_POINT: 127.0.0.1:9042
+          EXTENDDB_TEST_CASSANDRA_SECOND_CONTACT_POINT: 127.0.0.1:9043
+      # The containers carry fixed names and publish 9042 and 9043, so a
+      # runner that is not ephemeral needs them gone before its next run.
+      - name: Remove the two nodes
+        if: always()
+        run: |
+          docker rm -f -v cassandra-1 cassandra-2 || true
+          docker network rm cassandra-two-nodes || true
+
+  # init, migrate, serve and CreateAccount with the application role init
+  # creates, on a node that enforces permissions.
+  cassandra-authorizer:
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 45
+    services:
+      cassandra:
+        image: cassandra:4.1
+        ports:
+          - 127.0.0.1:9042:9042
+        env:
+          CASSANDRA_CLUSTER_NAME: extenddb-ci
+          HEAP_NEWSIZE: 128M
+          MAX_HEAP_SIZE: 1024M
+        options: >-
+          --health-cmd "cqlsh -e 'SELECT release_version FROM system.local'"
+          --health-interval 15s
+          --health-timeout 10s
+          --health-retries 20
+          --health-start-period 60s
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Configure Cassandra authentication and CassandraAuthorizer
+        run: |
+          docker exec ${{ job.services.cassandra.id }} sed -i \
+            -e 's/^authenticator: .*/authenticator: PasswordAuthenticator/' \
+            -e 's/^authorizer: .*/authorizer: CassandraAuthorizer/' \
+            /etc/cassandra/cassandra.yaml
+          docker restart ${{ job.services.cassandra.id }}
+          for i in $(seq 1 90); do
+            if docker exec ${{ job.services.cassandra.id }} \
+                cqlsh -u cassandra -p cassandra \
+                -e 'SELECT release_version FROM system.local' \
+                >/dev/null 2>&1; then
+              echo "Cassandra ready with CassandraAuthorizer after ${i}s"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Cassandra did not become ready" >&2; exit 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+      - name: Build release (cassandra backend)
+        run: cargo build --release --no-default-features --features cassandra
+      - name: Check init, migrate, serve and CreateAccount under CassandraAuthorizer
+        run: >-
+          devtools/check-cassandra-authorizer ./target/release/extenddb
+          ${{ job.services.cassandra.id }} 127.0.0.1:9042 18456
+
   cassandra-integration:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 75
-    needs: [cassandra-storage, cassandra-pytest, cassandra-rust, cassandra-production-build]
+    needs:
+      - cassandra-storage
+      - cassandra-pytest
+      - cassandra-rust
+      - cassandra-production-build
+      - cassandra-catalog-checks
+      - cassandra-two-nodes
+      - cassandra-authorizer
     if: always()
     steps:
       - run: |
           if [ "${{ needs.cassandra-storage.result }}" != "success" ] || \
              [ "${{ needs.cassandra-pytest.result }}" != "success" ] || \
              [ "${{ needs.cassandra-rust.result }}" != "success" ] || \
-             [ "${{ needs.cassandra-production-build.result }}" != "success" ]; then
+             [ "${{ needs.cassandra-production-build.result }}" != "success" ] || \
+             [ "${{ needs.cassandra-catalog-checks.result }}" != "success" ] || \
+             [ "${{ needs.cassandra-two-nodes.result }}" != "success" ] || \
+             [ "${{ needs.cassandra-authorizer.result }}" != "success" ]; then
             exit 1
           fi

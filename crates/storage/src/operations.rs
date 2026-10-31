@@ -28,9 +28,6 @@ pub trait OperationsEngine: Send + Sync {
     /// parameterized queries are not possible (e.g., CREATE DATABASE, DROP DATABASE).
     fn validate_identifier(&self, name: &str, label: &str) -> Result<(), StorageError>;
 
-    /// Get the catalog schema version for this backend.
-    fn catalog_version(&self) -> String;
-
     /// Check if a configuration key contains sensitive data that should be redacted.
     fn is_sensitive_key(&self, key: &str) -> bool;
 
@@ -67,11 +64,6 @@ pub fn get_operations_engine() -> Result<&'static dyn OperationsEngine, StorageE
 }
 
 // Convenience functions that delegate to the operations engine
-
-/// Get the catalog version for a backend.
-pub fn catalog_version() -> Result<String, StorageError> {
-    get_operations_engine().map(OperationsEngine::catalog_version)
-}
 
 /// The installed backend's default for the runtime setting `key`
 /// ([`OperationsEngine::setting_default`]); `None` when no backend is

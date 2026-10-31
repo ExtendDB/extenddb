@@ -1,0 +1,65 @@
+collection extenddb_catalog.access_keys type collection options {}
+index extenddb_catalog.access_keys _id_ key {"_id":1} options {}
+index extenddb_catalog.access_keys account_id_1_user_name_1 key {"account_id":1,"user_name":1} options {}
+collection extenddb_catalog.accounts type collection options {}
+index extenddb_catalog.accounts _id_ key {"_id":1} options {}
+index extenddb_catalog.accounts account_name_1 key {"account_name":1} options {"unique":true}
+collection extenddb_catalog.admin_users type collection options {}
+index extenddb_catalog.admin_users _id_ key {"_id":1} options {}
+collection extenddb_catalog.backups type collection options {}
+index extenddb_catalog.backups _id_ key {"_id":1} options {}
+index extenddb_catalog.backups account_id_1_table_name_1 key {"account_id":1,"table_name":1} options {}
+collection extenddb_catalog.continuous_backups type collection options {}
+index extenddb_catalog.continuous_backups _id_ key {"_id":1} options {}
+collection extenddb_catalog.extenddb_migrations type collection options {}
+index extenddb_catalog.extenddb_migrations _id_ key {"_id":1} options {}
+collection extenddb_catalog.extenddb_servers type collection options {}
+index extenddb_catalog.extenddb_servers _id_ key {"_id":1} options {}
+index extenddb_catalog.extenddb_servers expires_at_1 key {"expires_at":1} options {"expireAfterSeconds":0}
+collection extenddb_catalog.iam_groups type collection options {}
+index extenddb_catalog.iam_groups _id_ key {"_id":1} options {}
+index extenddb_catalog.iam_groups group_arn_1 key {"group_arn":1} options {"unique":true}
+collection extenddb_catalog.iam_permissions_boundaries type collection options {}
+index extenddb_catalog.iam_permissions_boundaries _id_ key {"_id":1} options {}
+collection extenddb_catalog.iam_policies type collection options {}
+index extenddb_catalog.iam_policies _id_ key {"_id":1} options {}
+collection extenddb_catalog.iam_roles type collection options {}
+index extenddb_catalog.iam_roles _id_ key {"_id":1} options {}
+index extenddb_catalog.iam_roles role_arn_1 key {"role_arn":1} options {"unique":true}
+collection extenddb_catalog.iam_sessions type collection options {}
+index extenddb_catalog.iam_sessions _id_ key {"_id":1} options {}
+index extenddb_catalog.iam_sessions access_key_id_1 key {"access_key_id":1} options {"unique":true}
+index extenddb_catalog.iam_sessions expires_at_1 key {"expires_at":1} options {"expireAfterSeconds":0}
+collection extenddb_catalog.iam_users type collection options {}
+index extenddb_catalog.iam_users _id_ key {"_id":1} options {}
+index extenddb_catalog.iam_users user_arn_1 key {"user_arn":1} options {"unique":true}
+collection extenddb_catalog.indexes type collection options {}
+index extenddb_catalog.indexes _id_ key {"_id":1} options {}
+collection extenddb_catalog.login_attempts type collection options {}
+index extenddb_catalog.login_attempts _id_ key {"_id":1} options {}
+index extenddb_catalog.login_attempts principal_1_attempted_at_1 key {"principal":1,"attempted_at":1} options {}
+collection extenddb_catalog.metrics type collection options {}
+index extenddb_catalog.metrics _id.bucket_1 key {"_id.bucket":1} options {}
+index extenddb_catalog.metrics _id_ key {"_id":1} options {}
+collection extenddb_catalog.schema_history type collection options {}
+index extenddb_catalog.schema_history _id_ key {"_id":1} options {}
+collection extenddb_catalog.settings type collection options {}
+index extenddb_catalog.settings _id_ key {"_id":1} options {}
+collection extenddb_catalog.tables type collection options {}
+index extenddb_catalog.tables _id_ key {"_id":1} options {}
+index extenddb_catalog.tables table_id_1 key {"table_id":1} options {"unique":true}
+collection extenddb_catalog.tags type collection options {}
+index extenddb_catalog.tags _id_ key {"_id":1} options {}
+collection extenddb_data.extenddb_migrations type collection options {}
+index extenddb_data.extenddb_migrations _id_ key {"_id":1} options {}
+collection extenddb_data.idempotency_tokens type collection options {}
+index extenddb_data.idempotency_tokens _id_ key {"_id":1} options {}
+index extenddb_data.idempotency_tokens account_id_1_token_1 key {"account_id":1,"token":1} options {"unique":true}
+index extenddb_data.idempotency_tokens created_at_1 key {"created_at":1} options {"expireAfterSeconds":540}
+collection extenddb_data.stream_records type collection options {}
+index extenddb_data.stream_records _id_ key {"_id":1} options {}
+index extenddb_data.stream_records created_at_1 key {"created_at":1} options {"expireAfterSeconds":86400}
+index extenddb_data.stream_records shard_id_1_sequence_number_1 key {"shard_id":1,"sequence_number":1} options {}
+collection extenddb_data.stream_shards type collection options {}
+index extenddb_data.stream_shards _id_ key {"_id":1} options {}
+index extenddb_data.stream_shards shard_id_1 key {"shard_id":1} options {"unique":true}

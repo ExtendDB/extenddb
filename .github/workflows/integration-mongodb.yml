@@ -119,6 +119,47 @@ jobs:
       - name: Run MongoDB rust integration suite
         run: devtools/run-mongodb-tests -- --rust --rust-integration
 
+  # The catalog migrations against released catalogs and released binaries,
+  # each check on a mongo:7 replica set of its own that the script starts
+  # with its ports on 127.0.0.1 and removes. The schema check uploads the
+  # regenerated file to commit when it differs.
+  mongodb-catalog:
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+      - name: Build release (mongodb backend)
+        run: cargo build --release --no-default-features --features mongodb-test-hooks
+      - name: Check the current schema
+        run: devtools/check-mongodb-schema ./target/release/extenddb schema-mongodb.txt 27071
+      - name: Upload the regenerated schema
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: schema-mongodb
+          path: schema-mongodb.txt
+          if-no-files-found: ignore
+      - name: Check serve and migrate on one catalog
+        run: devtools/check-mongodb-catalog-lock ./target/release/extenddb 27041 18460
+      - name: Check the commands and the server as a readWrite user
+        run: devtools/check-mongodb-auth ./target/release/extenddb 27081 18490
+      - name: Check the released catalogs against a fresh install
+        run: devtools/check-mongodb-released ./target/release/extenddb 27061 18480
+      - name: Check the last 0.1.x release against migrated catalogs
+        run: |
+          docker pull extenddb/extenddb-mongodb:0.1.14
+          devtools/check-mongodb-older-binary ./target/release/extenddb \
+            extenddb/extenddb-mongodb:0.1.14 27051 18470
+
   mongodb-production-build:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 40
@@ -134,12 +175,13 @@ jobs:
   mongodb-integration:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 40
-    needs: [mongodb-pytest, mongodb-rust, mongodb-production-build, mongodb-snapshot]
+    needs: [mongodb-pytest, mongodb-rust, mongodb-catalog, mongodb-production-build, mongodb-snapshot]
     if: always()
     steps:
       - run: |
           if [ "${{ needs.mongodb-pytest.result }}" != "success" ] || \
              [ "${{ needs.mongodb-rust.result }}" != "success" ] || \
+             [ "${{ needs.mongodb-catalog.result }}" != "success" ] || \
              [ "${{ needs.mongodb-production-build.result }}" != "success" ] || \
              [ "${{ needs.mongodb-snapshot.result }}" != "success" ]; then
             exit 1

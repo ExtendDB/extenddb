@@ -1,0 +1,14 @@
+group	devs	tagged-group	{"Statement":[{"Action":"dynamodb:*","Condition":{"StringEquals":{"aws:ResourceTag/env":"prod"}},"Effect":"Deny","Resource":"*"}],"Version":"2012-10-17"}
+role	app	tagged-role	{"Statement":[{"Action":"dynamodb:*","Condition":{"StringEquals":{"aws:ResourceTag/env":"prod"}},"Effect":"Deny","Resource":"*"}],"Version":"2012-10-17"}
+user	dev	SelfServicePolicy	{"Statement":[{"Action":["iam:CreateAccessKey","iam:DeleteAccessKey","iam:ListAccessKeys","iam:ChangePassword"],"Effect":"Allow","Resource":"arn:aws:iam::111111111111:user/dev"}],"Version":"2012-10-17"}
+user	dev	tagged-user	{"Statement":[{"Action":"dynamodb:*","Condition":{"StringEquals":{"aws:ResourceTag/env":"prod"}},"Effect":"Deny","Resource":"*"}],"Version":"2012-10-17"}
+role	boundary	{"Statement":[{"Action":"dynamodb:*","Condition":{"StringEquals":{"aws:ResourceTag/env":"prod"}},"Effect":"Deny","Resource":"*"}],"Version":"2012-10-17"}
+user	boundary	{"Statement":[{"Action":"dynamodb:*","Condition":{"StringEquals":{"aws:ResourceTag/env":"prod"}},"Effect":"Deny","Resource":"*"}],"Version":"2012-10-17"}
+session	token-1	app	{"Statement":[{"Action":"dynamodb:*","Condition":{"StringEquals":{"aws:ResourceTag/env":"prod"}},"Effect":"Deny","Resource":"*"}],"Version":"2012-10-17"}
+-- notes
+rewrote account 111111111111 user/dev policy tagged-user (1 key(s))
+rewrote account 111111111111 user/dev policy <permissions-boundary> (1 key(s))
+rewrote account 111111111111 group/devs policy tagged-group (1 key(s))
+rewrote account 111111111111 role/app policy tagged-role (1 key(s))
+rewrote account 111111111111 role/app policy <permissions-boundary> (1 key(s))
+rewrote account 111111111111 assumed-role/app/session policy <session-policy> (1 key(s))

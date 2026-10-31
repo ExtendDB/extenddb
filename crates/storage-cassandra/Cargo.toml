@@ -29,3 +29,11 @@ crc32fast = { workspace = true }
 zeroize = { workspace = true }
 cdrs-tokio = { workspace = true }
 chrono = { workspace = true }
+
+[features]
+# Entry points the integration tests build catalogs with.
+test-util = ["extenddb-storage/test-util"]
+
+[dev-dependencies]
+extenddb-storage = { workspace = true, features = ["test-util"] }
+extenddb-storage-cassandra = { path = ".", features = ["test-util"] }

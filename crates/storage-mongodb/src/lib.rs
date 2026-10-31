@@ -19,6 +19,7 @@ mod data;
 mod data_engine;
 mod management_store;
 mod metadata_engine;
+pub mod migrations;
 mod operations;
 pub mod pushdown;
 mod snapshot_engine;
@@ -46,11 +47,28 @@ use extenddb_storage::server_components::{BackendError, ServerComponents};
 /// Backend-specific runtime hooks for `MongoDB`.
 struct MongoRuntimeHooks {
     engine: Arc<MongoEngine>,
+    /// The serving registration, released when the server shuts down.
+    registration: Arc<std::sync::Mutex<Option<migrations::ServingRegistration>>>,
 }
 
 #[async_trait::async_trait]
 impl ServerRuntimeHooks for MongoRuntimeHooks {
     async fn spawn_workers(&self, ctx: &WorkerContext) -> Vec<tokio::task::JoinHandle<()>> {
+        let registration = self
+            .registration
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let token = ctx.shutdown.clone();
+        // The drain after the listener closes waits for this task, so the
+        // registration is deleted before the process ends and a migration
+        // can start at once.
+        let release_registration = tokio::spawn(async move {
+            token.cancelled().await;
+            if let Some(registration) = registration {
+                registration.release().await;
+            }
+        });
         let storage_for_ttl = self.engine.clone();
         let metrics = ctx.metrics.clone();
         let ttl = tokio::spawn(async move {
@@ -71,11 +89,30 @@ impl ServerRuntimeHooks for MongoRuntimeHooks {
         tracing::info!(
             "MongoDB backend: TTL, stream cleanup, GSI backfill, and control-plane workers spawned"
         );
-        vec![ttl, stream, backfill, control_plane]
+        vec![ttl, stream, backfill, control_plane, release_registration]
     }
 
     fn backend_info(&self) -> Option<String> {
         Some("mongodb".to_string())
+    }
+}
+
+/// End the process with exit status 1 once the serving registration is
+/// lost: it has not been renewed for 30 s, so `migrate --yes` may no longer
+/// see this server. The PID file is removed at exit. A registration released
+/// at shutdown ends this task without exiting.
+async fn stop_when_registration_lost(mut lost: tokio::sync::watch::Receiver<Option<String>>) {
+    while lost.changed().await.is_ok() {
+        let reason = lost.borrow().clone();
+        if let Some(reason) = reason {
+            let message = format!(
+                "extenddb fatal: {reason}; the server stops, because a migration can start on \
+                 the catalog once the serving registration is gone"
+            );
+            tracing::error!("{message}");
+            eprintln!("{message}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -86,7 +123,7 @@ fn server_components_factory(
     // MongoDB bootstrap needs operator input (databases, admin credentials), so
     // `bootstrap_if_uninitialized` is not honored here: an uninitialized catalog
     // fails with the explicit-`init` guidance, matching the PostgreSQL backend.
-    _options: extenddb_storage::server_components::ServerComponentsOptions,
+    options: extenddb_storage::server_components::ServerComponentsOptions,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<ServerComponents, BackendError>> + Send>,
 > {
@@ -113,79 +150,118 @@ fn server_components_factory(
         let tx_read_concern = config::parse_transaction_read_concern(&raw_read_concern)
             .map_err(BackendError::InitializationFailed)?;
 
-        // Create MongoEngine
-        let engine = MongoEngine::new(
+        // Register as the catalog's server, then read the migration lock and
+        // the catalog's status, before the engine writes anything: a server
+        // that refuses has deleted its registration and written nothing else.
+        let registration = migrations::register_and_check(
+            &migrations::MongoTarget::new(&connection_string),
+            options.release,
+            migrations::Timing::PRODUCTION,
+        )
+        .await
+        .map_err(BackendError::Catalog)?;
+        tokio::spawn(stop_when_registration_lost(registration.lost()));
+        let registration = Arc::new(std::sync::Mutex::new(Some(registration)));
+        let built = build_components(
             &connection_string,
             &region,
             max_connections,
+            max_catalog_connections,
             tx_read_concern,
+            Arc::clone(&registration),
         )
+        .await;
+        if built.is_err() {
+            let taken = registration
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some(registration) = taken {
+                registration.release().await;
+            }
+        }
+        built
+    })
+}
+
+/// The engine and stores `serve` runs on, built once the server holds its
+/// registration.
+async fn build_components(
+    connection_string: &str,
+    region: &str,
+    max_connections: Option<u32>,
+    max_catalog_connections: Option<u32>,
+    tx_read_concern: mongodb::options::ReadConcern,
+    registration: Arc<std::sync::Mutex<Option<migrations::ServingRegistration>>>,
+) -> Result<ServerComponents, BackendError> {
+    // Create MongoEngine
+    let engine = MongoEngine::new(connection_string, region, max_connections, tx_read_concern)
         .await
         .map_err(|e| BackendError::ConnectionFailed {
             backend: "mongodb".to_string(),
             details: e.to_string(),
         })?;
 
-        // A crash can leave a backup's metadata claimed by a restore or a
-        // delete that will never finish, or a restore target nothing will
-        // finish. The sweep removes only state whose heartbeat has stopped, so
-        // it is safe while another process shares this catalog; the GSI
-        // backfill worker repeats it periodically.
-        match engine.sweep_stale_backup_claims().await {
-            Ok(sweep) if sweep.is_empty() => {}
-            Ok(sweep) => tracing::warn!("startup backup sweep: {sweep}"),
-            Err(e) => tracing::error!("Failed to sweep stale backup claims: {e}"),
-        }
+    // A crash can leave a backup's metadata claimed by a restore or a
+    // delete that will never finish, or a restore target nothing will
+    // finish. The sweep removes only state whose heartbeat has stopped, so
+    // it is safe while another process shares this catalog; the GSI
+    // backfill worker repeats it periodically.
+    match engine.sweep_stale_backup_claims().await {
+        Ok(sweep) if sweep.is_empty() => {}
+        Ok(sweep) => tracing::warn!("startup backup sweep: {sweep}"),
+        Err(e) => tracing::error!("Failed to sweep stale backup claims: {e}"),
+    }
 
-        let engine = Arc::new(engine);
+    let engine = Arc::new(engine);
 
-        // Create one shared catalog/management client. MongoDB Client clones
-        // share the underlying pool, so max_catalog_connections limits the
-        // combined catalog and auth traffic rather than creating two
-        // independent pools with twice the configured ceiling.
-        let catalog_client = connect_guarded(&connection_string, max_catalog_connections, false)
-            .await
-            .map_err(|e| BackendError::ConnectionFailed {
-                backend: "mongodb".to_string(),
-                details: format!("Failed to create catalog client: {e}"),
-            })?;
+    // Create one shared catalog/management client. MongoDB Client clones
+    // share the underlying pool, so max_catalog_connections limits the
+    // combined catalog and auth traffic rather than creating two
+    // independent pools with twice the configured ceiling.
+    let catalog_client = connect_guarded(connection_string, max_catalog_connections, false)
+        .await
+        .map_err(|e| BackendError::ConnectionFailed {
+            backend: "mongodb".to_string(),
+            details: format!("Failed to create catalog client: {e}"),
+        })?;
 
-        // Load encryption key from settings collection. A missing key must be
-        // a hard failure: an empty key would base64-decode to zero bytes and
-        // panic in aes_gcm (`Key::from_slice` requires 32 bytes). Refuse to
-        // start instead, matching the postgres backend.
-        let catalog_db = catalog_client.database("extenddb_catalog");
-        let settings_coll = catalog_db.collection::<mongodb::bson::Document>("settings");
-        let enc_key = settings_coll
-            .find_one(mongodb::bson::doc! { "_id": "encryption_key" })
-            .await
-            .map_err(|e| BackendError::InitializationFailed(format!("Load encryption key: {e}")))?
-            .and_then(|d| d.get_str("value").ok().map(std::borrow::ToOwned::to_owned))
-            .ok_or(BackendError::MissingEncryptionKey)?;
+    // Load encryption key from settings collection. A missing key must be
+    // a hard failure: an empty key would base64-decode to zero bytes and
+    // panic in aes_gcm (`Key::from_slice` requires 32 bytes). Refuse to
+    // start instead, matching the postgres backend.
+    let catalog_db = catalog_client.database("extenddb_catalog");
+    let settings_coll = catalog_db.collection::<mongodb::bson::Document>("settings");
+    let enc_key = settings_coll
+        .find_one(mongodb::bson::doc! { "_id": "encryption_key" })
+        .await
+        .map_err(|e| BackendError::InitializationFailed(format!("Load encryption key: {e}")))?
+        .and_then(|d| d.get_str("value").ok().map(std::borrow::ToOwned::to_owned))
+        .ok_or(BackendError::MissingEncryptionKey)?;
 
-        let auth_client = catalog_client.clone();
-        let catalog_store = Arc::new(MongoCatalogStore::with_encryption_key(
-            catalog_client,
-            enc_key.clone(),
-        )) as Arc<dyn extenddb_storage::CatalogStore>;
+    let auth_client = catalog_client.clone();
+    let catalog_store = Arc::new(MongoCatalogStore::with_encryption_key(
+        catalog_client,
+        enc_key.clone(),
+    )) as Arc<dyn extenddb_storage::CatalogStore>;
 
-        // Create credential store. The bin layer wraps this in
-        // CachedCredentialStore using the operator-configured TTL
-        // before constructing the auth provider.
-        let cred_store: Arc<dyn extenddb_auth::CredentialStore> =
-            Arc::new(MongoCredentialStore::new(auth_client, enc_key));
+    // Create credential store. The bin layer wraps this in
+    // CachedCredentialStore using the operator-configured TTL
+    // before constructing the auth provider.
+    let cred_store: Arc<dyn extenddb_auth::CredentialStore> =
+        Arc::new(MongoCredentialStore::new(auth_client, enc_key));
 
-        // Create runtime hooks
-        let runtime_hooks = Box::new(MongoRuntimeHooks {
-            engine: engine.clone(),
-        });
+    // Create runtime hooks
+    let runtime_hooks = Box::new(MongoRuntimeHooks {
+        engine: engine.clone(),
+        registration,
+    });
 
-        Ok(ServerComponents {
-            engine,
-            catalog_store,
-            credential_store: cred_store,
-            runtime_hooks: Some(runtime_hooks),
-        })
+    Ok(ServerComponents {
+        engine,
+        catalog_store,
+        credential_store: cred_store,
+        runtime_hooks: Some(runtime_hooks),
     })
 }
 
@@ -255,8 +331,7 @@ pub fn backend() -> extenddb_storage::Backend {
             })
         },
         server_components: server_components_factory,
-        // Migrates through its bootstrapper until it moves onto the runner.
-        catalog_migrations: None,
+        catalog_migrations: &migrations::MongoCatalogMigrations,
     }
 }
 
@@ -398,7 +473,7 @@ pub(crate) async fn connect_guarded(
 /// The checked [`mongodb::options::ClientOptions`] behind [`connect_guarded`],
 /// for a caller that needs to read an effective option (the pool size) before
 /// building the client.
-async fn guarded_client_options(
+pub(crate) async fn guarded_client_options(
     connection_string: &str,
     max_pool_size: Option<u32>,
     warn_on_no_tls: bool,
@@ -539,11 +614,12 @@ pub(crate) fn majority_write_concern(
 /// concern other than `majority` in the connection string; this does not rely
 /// on it.
 fn catalog_database(client: &mongodb::Client) -> mongodb::Database {
-    catalog_database_named(client, "extenddb_catalog")
+    catalog_database_named(client, migrations::CATALOG_DATABASE)
 }
 
-/// [`catalog_database`] under another name, for test fixtures that must run
-/// the production option set on a scratch database.
+/// [`catalog_database`] for the database `name`: the migration runner uses
+/// the same options on both databases, and the migration and snapshot test
+/// fixtures run the production option set on databases of other names.
 pub(crate) fn catalog_database_named(client: &mongodb::Client, name: &str) -> mongodb::Database {
     use mongodb::options::{DatabaseOptions, ReadConcern, ReadPreference, SelectionCriteria};
     client.database_with_options(

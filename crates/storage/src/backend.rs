@@ -58,10 +58,8 @@ pub struct Backend {
     /// Creates the assembled server components for `serve`.
     pub server_components: ServerComponentsFactory,
     /// The backend's catalog migrations on the shared runner, which `init`,
-    /// `migrate`, `verify` and `serve` use; `None` for a backend that still
-    /// migrates through its bootstrapper and checks its catalog in its own
-    /// server factory.
-    pub catalog_migrations: Option<&'static dyn crate::migrations::CatalogMigrations>,
+    /// `migrate`, `verify` and `serve` use.
+    pub catalog_migrations: &'static dyn crate::migrations::CatalogMigrations,
 }
 
 static BACKEND: OnceLock<Backend> = OnceLock::new();

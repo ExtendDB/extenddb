@@ -15,11 +15,13 @@ use extenddb_storage::bootstrapper::{
 };
 use extenddb_storage::management_store::{OpError, OpResult};
 
+use extenddb_storage::migrations::{AdminRole, HeldLock, Target};
+
 use crate::config::CassandraStorageConfig;
 use crate::engine::CassandraEngine;
-use crate::migrations;
 
-use crate::CATALOG_VERSION;
+mod guards;
+use guards::{HeldLease, check_name};
 
 // Helper structs for parsing Cassandra rows
 #[derive(Debug, Clone, TryFromRow)]
@@ -32,16 +34,17 @@ struct KeyspaceNameRow {
     keyspace_name: String,
 }
 
-#[derive(Debug, Clone, TryFromRow)]
-struct SettingRow {
-    value: String,
-}
-
 /// Cassandra bootstrapper for init/destroy/migrate operations.
 pub struct CassandraBootstrapper {
     engine: CassandraEngine,
     config: BootstrapConfig,
     keyspace_prefix: String,
+    /// The connection string of the admin session, without credentials;
+    /// [`Bootstrapper::init_target`] adds the admin role.
+    engine_connection_string: String,
+    /// The lease of the migration lock `init` holds while the bootstrap rows
+    /// are written, set by [`Bootstrapper::hold`].
+    held: HeldLease,
 }
 
 impl CassandraBootstrapper {
@@ -58,7 +61,41 @@ impl CassandraBootstrapper {
             engine,
             config: bootstrap_config,
             keyspace_prefix: cassandra_config.keyspace_prefix.clone(),
+            engine_connection_string: format!(
+                "{}/{}",
+                cassandra_config.contact_points.join(","),
+                cassandra_config.keyspace_prefix
+            ),
+            held: HeldLease::default(),
         })
+    }
+
+    /// Grant the application role what `migrate`, `serve` and CreateAccount
+    /// need under `CassandraAuthorizer` on `keyspace`, which `init` creates as
+    /// the admin role, so the application role holds no permission on it
+    /// yet: see [`crate::migrations::grants`]. A role that creates a keyspace
+    /// holds every permission on it, so the keyspaces CreateAccount creates
+    /// need no grant. Under `AllowAllAuthorizer` nothing is granted.
+    async fn grant_app_role(&self, keyspace: &str, account: bool) -> OpResult<()> {
+        let session = self.engine.session_arc();
+        let role = &self.config.app_user;
+        // Checked against the held lease before each request, so a holder
+        // whose lease has lapsed sends no further GRANT.
+        let what = format!("Grant on {keyspace}");
+        let granted = crate::migrations::grant_role(
+            &session,
+            keyspace,
+            role,
+            account,
+            || self.held.check_run(&what),
+            || self.held.progress(),
+        )
+        .await
+        .map_err(|e| OpError::Internal(e.to_string()))?;
+        if let Some(authorizer) = granted {
+            println!("    Granted '{role}' its permissions on {keyspace} ({authorizer}).");
+        }
+        Ok(())
     }
 
     /// Create a bootstrapper from config file and CLI args. Parses
@@ -194,6 +231,11 @@ impl CassandraBootstrapper {
             replication_factor.map_or(rf_from_config, |rf| rf.parse::<u32>().unwrap_or(1));
         let resolved_app_user = extenddb_user.unwrap_or(user);
         let resolved_app_password = extenddb_pass.unwrap_or(password);
+        check_name("the application role (--extenddb-user)", &resolved_app_user)?;
+        check_name(
+            "the keyspace prefix (--keyspace-prefix)",
+            &resolved_keyspace_prefix,
+        )?;
 
         // Extract host and port from first contact point
         let (host, port) = resolved_contact_points
@@ -346,26 +388,42 @@ impl Bootstrapper for CassandraBootstrapper {
         Ok(())
     }
 
+    /// Create the catalog keyspace and its `settings` table with
+    /// `IF NOT EXISTS`, wait for schema agreement, and grant the application
+    /// role what it needs. The migration lock is a row of `settings`, so
+    /// `init` creates the table before it takes the lock; the catalog is
+    /// created under the lock, which refuses one that is already
+    /// initialized. Two `init`s that start together can both send these two
+    /// statements before either holds the lock; that window is accepted. A
+    /// keyspace of the catalog's name that holds tables and is not a catalog
+    /// is refused before anything is written to it.
     async fn create_catalog_db(&self) -> OpResult<()> {
         let keyspace = self.engine.catalog_keyspace();
         println!("--- Creating catalog keyspace '{keyspace}'...");
-
-        if self
-            .engine
-            .keyspace_exists(&keyspace)
+        let session = self.engine.session_arc();
+        let status = crate::migrations::catalog_status(session.clone(), &self.keyspace_prefix)
             .await
-            .map_err(|e| OpError::Internal(e.to_string()))?
-        {
-            return Err(OpError::AlreadyExists(format!(
-                "Catalog keyspace '{keyspace}' already exists. Run 'destroy' first, then re-run 'init'."
-            )));
+            .map_err(|e| OpError::Internal(e.to_string()))?;
+        if status == extenddb_storage::migrations::CatalogStatus::Uninitialized {
+            let foreign = crate::migrations::foreign_contents(&session, &keyspace)
+                .await
+                .map_err(|e| OpError::Internal(e.to_string()))?;
+            if !foreign.is_empty() {
+                return Err(OpError::AlreadyExists(format!(
+                    "Keyspace '{keyspace}' exists and is not an ExtendDB catalog: it holds {}. \
+                     Choose another --keyspace-prefix.",
+                    foreign.join(", ")
+                )));
+            }
         }
-
         self.engine
             .create_keyspace(&keyspace)
             .await
             .map_err(|e| OpError::Internal(format!("Create catalog keyspace: {e}")))?;
-
+        crate::migrations::create_lock_table(&session, &keyspace)
+            .await
+            .map_err(|e| OpError::Internal(e.to_string()))?;
+        self.grant_app_role(&keyspace, false).await?;
         println!("    Created.");
         Ok(())
     }
@@ -376,92 +434,48 @@ impl Bootstrapper for CassandraBootstrapper {
         Ok(())
     }
 
-    async fn run_catalog_migrations(&self) -> OpResult<()> {
-        let keyspace = self.engine.catalog_keyspace();
-        migrations::run_catalog_migrations(&self.engine.session_arc(), &keyspace).await
-    }
-
-    async fn run_data_migrations(&self) -> OpResult<()> {
-        // Data schema is isolated per account, so upgrades must visit every
-        // existing account keyspace. New accounts receive the same migration
-        // list from ensure_account_keyspace/bootstrap_default_account.
-        let query = format!(
-            "SELECT account_id FROM {}.accounts",
-            self.engine.catalog_keyspace()
-        );
-        let rows = self
-            .engine
-            .session()
-            .query(query)
-            .await
-            .map_err(|e| OpError::Internal(format!("List accounts for migration: {e}")))?
-            .response_body()
-            .map_err(|e| OpError::Internal(format!("Parse accounts for migration: {e}")))?
-            .into_rows()
-            .unwrap_or_default();
-
-        for row in rows {
-            let account_id: String = crate::cassandra_util::get_column::<String, OpError>(
-                &row,
-                "account_id",
-                "run_data_migrations",
-            )?;
-            let keyspace = self.engine.account_keyspace(&account_id);
-            migrations::run_data_migrations(&self.engine.session_arc(), &keyspace).await?;
-        }
-        Ok(())
-    }
-
-    async fn pending_data_migrations(&self) -> OpResult<Vec<String>> {
-        migrations::pending_data_migrations(
-            &self.engine.session_arc(),
-            &self.engine.catalog_keyspace(),
-            |account_id| self.engine.account_keyspace(account_id),
-        )
-        .await
-    }
-
     async fn record_data_connection(&self) -> OpResult<()> {
         // Not applicable for Cassandra (no separate data connection)
         Ok(())
     }
 
+    /// Keep the lease of the lock `init` holds, checked before each
+    /// bootstrap row; a lock another backend took carries none.
+    fn hold(&self, lock: &HeldLock) {
+        if let Some(lease) = crate::migrations::lease_of(lock) {
+            self.held.hold(lease);
+        }
+    }
+
+    /// Store a new encryption key unless the catalog has one, with
+    /// `INSERT ... IF NOT EXISTS`, so a key a concurrent `init` stored first
+    /// is never replaced: credentials a server encrypted with it stay
+    /// readable. Nothing else writes that row.
     async fn bootstrap_encryption_key(&self) -> OpResult<()> {
         let keyspace = self.engine.catalog_keyspace();
         println!("--- Generating AES-256-GCM encryption key...");
-
-        // Check if key already exists
-        let check_cql =
-            format!("SELECT value FROM {keyspace}.settings WHERE key = 'encryption_key'");
-        let exists = self
-            .engine
-            .session()
-            .query(check_cql)
-            .await
-            .ok()
-            .and_then(|frame| frame.response_body().ok())
-            .and_then(cdrs_tokio::frame::message_response::ResponseBody::into_rows)
-            .is_some_and(|rows| !rows.is_empty());
-
-        if exists {
-            println!("--- Encryption key already exists, skipping.");
-            return Ok(());
-        }
-
         let key_b64 = generate_encryption_key();
-
-        // Store key
-        let insert_cql = format!("INSERT INTO {keyspace}.settings (key, value) VALUES (?, ?)");
-        self.engine
-            .session()
-            .query_with_values(
-                insert_cql,
-                cdrs_tokio::query_values!("encryption_key", key_b64),
+        let insert_cql = format!(
+            "INSERT INTO {keyspace}.settings (key, value) VALUES ('encryption_key', ?) IF NOT \
+             EXISTS"
+        );
+        let applied = self
+            .held
+            .request(
+                "Store encryption key",
+                crate::cassandra_util::apply_lwt::<extenddb_storage::error::StorageError>(
+                    &self.engine.session_arc(),
+                    &insert_cql,
+                    cdrs_tokio::query_values!(key_b64),
+                    "bootstrap_encryption_key",
+                ),
             )
-            .await
-            .map_err(|e| OpError::Internal(format!("Store encryption key: {e}")))?;
-
-        println!("    Encryption key stored.");
+            .await?;
+        if applied {
+            println!("    Encryption key stored.");
+        } else {
+            println!("--- Encryption key already exists, skipping.");
+        }
         Ok(())
     }
 
@@ -476,16 +490,18 @@ impl Bootstrapper for CassandraBootstrapper {
              VALUES (?, ?, toTimestamp(now())) IF NOT EXISTS"
         );
 
-        let applied = crate::cassandra_util::apply_lwt(
-            &self.engine.session_arc(),
-            &insert_cql,
-            cdrs_tokio::query_values!(account_id.as_str(), account_name),
-            "bootstrap_default_account",
-        )
-        .await
-        .map_err(|e: extenddb_storage::error::StorageError| {
-            OpError::Internal(format!("Create account: {e}"))
-        })?;
+        let applied = self
+            .held
+            .request(
+                "Create account",
+                crate::cassandra_util::apply_lwt::<extenddb_storage::error::StorageError>(
+                    &self.engine.session_arc(),
+                    &insert_cql,
+                    cdrs_tokio::query_values!(account_id.as_str(), account_name),
+                    "bootstrap_default_account",
+                ),
+            )
+            .await?;
 
         if !applied {
             println!("--- Default account already exists, skipping.");
@@ -494,17 +510,49 @@ impl Bootstrapper for CassandraBootstrapper {
 
         println!("--- Default account created");
 
-        // Create account-specific keyspace
+        // The keyspace, then every account migration through the runner,
+        // as CreateAccount does, all under the lease of the lock `init`
+        // holds: the CREATE KEYSPACE through the held lease with the bound of
+        // a schema statement under the lock, and the account run checking
+        // the lease before each write and recording progress on it.
         let account_keyspace = self.engine.account_keyspace(&account_id);
         println!("--- Creating account keyspace...");
-        self.engine
-            .create_keyspace(&account_keyspace)
-            .await
-            .map_err(|e| OpError::Internal(format!("Create account keyspace: {e}")))?;
-
-        // Run data migrations in account keyspace
-        println!("--- Running data migrations for default account...");
-        migrations::run_data_migrations(&self.engine.session_arc(), &account_keyspace).await?;
+        self.held
+            .request_within(
+                "Create account keyspace",
+                crate::migrations::LOCKED_DDL_TIMEOUT,
+                self.engine.create_keyspace(&account_keyspace),
+            )
+            .await?;
+        println!("--- Running the account migrations for the default account...");
+        self.held.check("Migrate the default account's keyspace")?;
+        let session = self.engine.session_arc();
+        let release = env!("CARGO_PKG_VERSION");
+        let run = match self.held.handle() {
+            Some(lease) => {
+                crate::migrations::migrate_account_under(
+                    session,
+                    &self.keyspace_prefix,
+                    &account_keyspace,
+                    release,
+                    lease,
+                )
+                .await
+            }
+            None => {
+                crate::migrations::migrate_account(
+                    session,
+                    &self.keyspace_prefix,
+                    &account_keyspace,
+                    release,
+                )
+                .await
+            }
+        };
+        run.map_err(|e| OpError::Internal(format!("Migrate the default account's keyspace: {e}")))?;
+        // `init` created this keyspace as the admin role, so the application
+        // role holds no permission on it yet.
+        self.grant_app_role(&account_keyspace, true).await?;
 
         Ok(())
     }
@@ -536,16 +584,18 @@ impl Bootstrapper for CassandraBootstrapper {
             "INSERT INTO {keyspace}.admin_users (admin_name, password_hash) VALUES (?, ?) IF NOT EXISTS"
         );
 
-        let applied = crate::cassandra_util::apply_lwt(
-            &self.engine.session_arc(),
-            &insert_cql,
-            cdrs_tokio::query_values!(username, password_hash),
-            "bootstrap_admin_user",
-        )
-        .await
-        .map_err(|e: extenddb_storage::error::StorageError| {
-            OpError::Internal(format!("Create admin user: {e}"))
-        })?;
+        let applied = self
+            .held
+            .request(
+                "Create admin user",
+                crate::cassandra_util::apply_lwt::<extenddb_storage::error::StorageError>(
+                    &self.engine.session_arc(),
+                    &insert_cql,
+                    cdrs_tokio::query_values!(username, password_hash),
+                    "bootstrap_admin_user",
+                ),
+            )
+            .await?;
 
         if !applied {
             println!("--- Admin user already exists, skipping.");
@@ -565,11 +615,6 @@ impl Bootstrapper for CassandraBootstrapper {
             already_existed: false,
             from_env,
         })
-    }
-
-    async fn is_catalog_initialized(&self) -> OpResult<bool> {
-        let keyspace = self.engine.catalog_keyspace();
-        migrations::table_exists(&self.engine.session_arc(), &keyspace, "settings").await
     }
 
     async fn list_table_names(&self) -> OpResult<Vec<String>> {
@@ -645,31 +690,18 @@ impl Bootstrapper for CassandraBootstrapper {
         Ok(())
     }
 
-    async fn read_catalog_version(&self) -> OpResult<Option<String>> {
-        let keyspace = self.engine.catalog_keyspace();
-
-        if !migrations::table_exists(&self.engine.session_arc(), &keyspace, "settings").await? {
-            return Ok(None);
+    /// The deployment `init` creates, reached as the admin role `init`
+    /// connects with.
+    fn init_target(&self) -> Target {
+        Target {
+            location: self.engine_connection_string.clone(),
+            data_store: None,
+            admin: Some(AdminRole {
+                user: self.config.admin_user.clone(),
+                password: self.config.admin_password.clone(),
+            }),
+            data_connection: None,
         }
-
-        let query = format!("SELECT value FROM {keyspace}.settings WHERE key = 'catalog_version'");
-        let version = self
-            .engine
-            .session()
-            .query(query)
-            .await
-            .ok()
-            .and_then(|frame| frame.response_body().ok())
-            .and_then(cdrs_tokio::frame::message_response::ResponseBody::into_rows)
-            .and_then(|mut rows| rows.pop())
-            .and_then(|row| TryFromRowTrait::try_from_row(row).ok())
-            .map(|r: SettingRow| r.value);
-
-        Ok(version)
-    }
-
-    fn expected_catalog_version(&self) -> String {
-        CATALOG_VERSION.to_string()
     }
 
     fn catalog_database_name(&self) -> String {

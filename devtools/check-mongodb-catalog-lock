@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+"""Serve and migrate on one MongoDB catalog, with a release binary:
+
+    devtools/check-mongodb-catalog-lock <extenddb binary> [mongo port] [api port]
+
+On a mongo:7 replica set this script starts in the container
+extenddb-check-lock-<mongo port>, published on 127.0.0.1 only:
+
+- before init, migrate --yes and verify exit 1 naming extenddb init and
+  create no database;
+- a second init exits 1 saying the catalog is already initialized;
+- the migrate preview and verify run beside a server and exit 0, and
+  migrate --yes exits 6 naming the server's host and pid;
+- a server stopped with SIGTERM deletes its registration, so migrate --yes
+  then runs at once;
+- while a migration holds the lock, a server exits 6 and a second
+  migrate --yes exits 6, and the preview still runs;
+- a server refuses a catalog behind this binary with 3, and the command it
+  prints, run exactly as printed, applies what is missing;
+- a server killed with SIGKILL keeps migrate --yes waiting until its
+  registration expires, at most 45 s after its last renewal;
+- a server whose database stops answering exits 1 within 30 s, because its
+  registration counts as lost 30 s after its last renewal, which it sent
+  before the database stopped answering, and removes its PID file.
+
+Everything runs in a new temporary directory, with HOME pointed into it so
+init's TLS certificate is not written to the caller's home. The server
+binds 127.0.0.1 only. The container is removed at the end.
+"""
+import os
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+
+from catalog_checks import docker, expect_exit, finish, healthy, mongosh, report, start, start_mongo, stop
+
+
+def live_servers(container: str, port: int) -> int:
+    """The registrations whose expiry has not passed."""
+    _, out = mongosh(
+        container, port,
+        "db.getSiblingDB('extenddb_catalog').extenddb_servers"
+        ".countDocuments({$expr: {$gt: ['$expires_at', '$$NOW']}})",
+    )
+    return int(out.strip().splitlines()[-1])
+
+
+def main(binary: str, mongo_port: int, api_port: int) -> int:
+    binary = os.path.realpath(binary)
+    container = f"extenddb-check-lock-{mongo_port}"
+    work = tempfile.mkdtemp()
+    servers = []
+    try:
+        if not start_mongo(container, mongo_port):
+            return finish()
+        os.chdir(work)
+        env = dict(
+            os.environ,
+            HOME=os.path.join(work, "home"),
+            EXTENDDB__SERVER__RUN_DIR=os.path.join(work, "run"),
+            EXTENDDB_ADMIN_PASSWORD="CheckAdminPassw0rd1",
+        )
+        uri = f"mongodb://127.0.0.1:{mongo_port}/?replicaSet=rs0&directConnection=true"
+        with open("extenddb.toml", "w", encoding="utf-8") as f:
+            f.write(f'[storage]\nbackend = "mongodb"\n\n[storage.mongodb]\nconnection_string = "{uri}"\n')
+        migrate = [binary, "migrate", "--config", "extenddb.toml"]
+        verify = [binary, "verify", "--config", "extenddb.toml"]
+        serve = [binary, "serve", "--config", "extenddb.toml", "--foreground", "--port", str(api_port)]
+        url = f"https://127.0.0.1:{api_port}/health"
+
+        output = expect_exit(1, "migrate --yes before init", migrate + ["--yes", "--lock-timeout", "1"], env)
+        report("extenddb init" in output, "the refusal names extenddb init", output)
+        expect_exit(1, "verify before init", verify, env, contains="extenddb init")
+        _, names = mongosh(container, mongo_port, "db.getMongo().getDBNames().join(',')")
+        report("extenddb" not in names, "nothing was created before init", names)
+
+        expect_exit(0, "init", [binary, "init", "--backend", "mongodb", "--config", "extenddb.toml",
+                                "--overwrite"], env, timeout=120)
+        expect_exit(1, "a second init", [binary, "init", "--backend", "mongodb", "--config",
+                                         "extenddb.toml", "--overwrite"], env, contains="already initialized")
+
+        server = start(serve, env, "serve.log")
+        servers.append(server)
+        if not healthy(url, server, 60):
+            stop(server)
+            with open("serve.log", encoding="utf-8") as f:
+                report(False, "the server did not become healthy", f.read())
+            return finish()
+        report(live_servers(container, mongo_port) == 1, "the server registered")
+        expect_exit(0, "migrate preview beside a server", migrate, env)
+        expect_exit(0, "verify beside a server", verify, env)
+        expect_exit(6, "migrate --yes while a server runs", migrate + ["--yes", "--lock-timeout", "2"], env,
+                    contains=f"pid {server.pid} on {socket.gethostname()}")
+        stop(server)
+        report(server.returncode == 0, f"the server stopped on SIGTERM with exit {server.returncode}")
+        report(live_servers(container, mongo_port) == 0, "the stopped server deleted its registration")
+        expect_exit(0, "migrate --yes once the server stopped", migrate + ["--yes", "--lock-timeout", "2"], env)
+
+        # Another migration's lock, as its claim writes it.
+        mongosh(container, mongo_port, "db.getSiblingDB('extenddb_catalog').settings.insertOne("
+                "{_id: 'migration_lock', owner: 'check', expires_at: new Date(Date.now() + 120000)})")
+        expect_exit(6, "serve while a migration holds the lock", serve, env, timeout=60)
+        expect_exit(6, "a second migrate --yes while a migration holds the lock",
+                    migrate + ["--yes", "--lock-timeout", "1"], env)
+        expect_exit(0, "migrate preview while a migration holds the lock", migrate, env)
+        report(live_servers(container, mongo_port) == 0, "the refused server deleted its registration")
+        mongosh(container, mongo_port, "db.getSiblingDB('extenddb_catalog').settings.deleteOne({_id: 'migration_lock'})")
+
+        # A catalog behind this binary: the server refuses with 3 and prints
+        # the command that applies what is missing.
+        mongosh(container, mongo_port, "db.getSiblingDB('extenddb_catalog').extenddb_migrations.deleteOne({_id: 4})")
+        expect_exit(3, "verify on a catalog behind this binary", verify, env)
+        output = expect_exit(3, "serve on a catalog behind this binary", serve, env, timeout=60)
+        advised = next((line for line in output.splitlines()
+                        if line.startswith("  ") and " migrate " in f" {line} "), "")
+        words = shlex.split(advised)
+        if report(bool(words) and words[0] == "extenddb", f"serve prints the command to run: {advised!r}", output):
+            expect_exit(0, "the printed command, run as printed", [binary, *words[1:]], env)
+        expect_exit(0, "verify after the printed command", verify, env)
+
+        # A server killed without deleting its registration blocks
+        # migrate --yes until the registration expires, 45 s after its last
+        # renewal.
+        server = start(serve, env, "serve-killed.log")
+        servers.append(server)
+        if healthy(url, server, 60):
+            server.kill()
+            server.wait()
+            killed = time.monotonic()
+            expect_exit(0, "migrate --yes after a killed server's registration expires",
+                        migrate + ["--yes", "--lock-timeout", "70"], env, timeout=90)
+            waited = time.monotonic() - killed
+            report(waited <= 50, f"migrate --yes ran {waited:.0f} s after the server was killed")
+        else:
+            report(False, "the server did not start for the kill check")
+
+        # A server whose database stops answering exits 1 and removes its
+        # PID file.
+        server = start(serve + ["--write-pid-file"], env, "serve-paused.log")
+        servers.append(server)
+        pid_file = os.path.join(work, "run", f"extenddb-{api_port}.pid")
+        if healthy(url, server, 60) and report(os.path.exists(pid_file), "the server wrote its PID file"):
+            docker("pause", container)
+            paused = time.monotonic()
+            try:
+                server.wait(timeout=90)
+            except subprocess.TimeoutExpired:
+                pass
+            took = time.monotonic() - paused
+            docker("unpause", container)
+            with open("serve-paused.log", encoding="utf-8") as f:
+                log = f.read()
+            report(server.returncode == 1 and took <= 31,
+                   f"the server exited {server.returncode} {took:.0f} s after its database stopped answering", log)
+            report("registration" in log, "its last line names the lost registration", log)
+            report(not os.path.exists(pid_file), "the server removed its PID file")
+        else:
+            report(False, "the server did not start for the pause check")
+    finally:
+        for server in servers:
+            if server.poll() is None:
+                server.send_signal(signal.SIGTERM)
+                stop(server)
+        docker("unpause", container)
+        docker("rm", "-f", "-v", container)
+        os.chdir("/")
+        shutil.rmtree(work, ignore_errors=True)
+    return finish()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) not in (2, 3, 4):
+        sys.exit(__doc__)
+    sys.exit(main(
+        sys.argv[1],
+        int(sys.argv[2]) if len(sys.argv) > 2 else 27041,
+        int(sys.argv[3]) if len(sys.argv) > 3 else 18460,
+    ))

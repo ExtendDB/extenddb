@@ -41,19 +41,6 @@ pub struct AdminBootstrapResult {
     pub from_env: bool,
 }
 
-/// Outcome of [`Bootstrapper::repair_lost_sort_key_definitions`].
-#[derive(Debug, Default, Clone)]
-pub struct KeyDefinitionRepair {
-    /// Tables whose sort key definitions were restored, as
-    /// `table_name: attribute (TYPE)` lines. When the caller passed `apply =
-    /// false` these are the repairs that WOULD be made.
-    pub repaired: Vec<String>,
-    /// Tables that are damaged but could not be repaired automatically, because
-    /// no physical sort key column was found to read the type back from. These
-    /// need a human: guessing a type would resolve the key to the wrong column.
-    pub needs_attention: Vec<String>,
-}
-
 /// High-level bootstrap operations for storage backends.
 ///
 /// Covers the init, destroy, and migrate command paths. Implementations
@@ -73,68 +60,6 @@ pub trait Bootstrapper: Send + Sync {
     /// Create the data database. Returns error if it already exists.
     async fn create_data_db(&self) -> OpResult<()>;
 
-    /// Run catalog schema migrations (creates tables, indexes, etc.).
-    async fn run_catalog_migrations(&self) -> OpResult<()>;
-
-    /// Run data schema migrations (stream tables, sequences, etc.).
-    async fn run_data_migrations(&self) -> OpResult<()>;
-
-    /// Restore sort key attribute definitions that issue #259 deleted from table
-    /// metadata, reading each type back from the physical sort key column.
-    ///
-    /// Before the fix, `UpdateTable` replaced a table's stored attribute
-    /// definitions with the request's subset, so adding a GSI dropped the base
-    /// table's own key definitions and keyed reads silently returned another item
-    /// in the same partition. The write path no longer does that, but a table
-    /// damaged by an older build stays damaged, and it now fails its reads loudly
-    /// instead (see `TableKeyInfo::validate_sort_key_definitions`). This repairs
-    /// such tables so they serve correct reads again.
-    ///
-    /// With `apply` false this only detects and reports, writing nothing, so a
-    /// `migrate` run that has not been confirmed with `--yes` never mutates the
-    /// catalog. With `apply` true the repair is written.
-    ///
-    /// Idempotent: a table whose definitions are intact is left untouched, so
-    /// running it on a healthy deployment reports nothing and changes nothing.
-    ///
-    /// The default implementation repairs nothing, which is correct for a backend
-    /// that never wrote the definitions in the first place.
-    async fn repair_lost_sort_key_definitions(&self, apply: bool) -> OpResult<KeyDefinitionRepair> {
-        let _ = apply;
-        Ok(KeyDefinitionRepair::default())
-    }
-
-    /// Acquire a cross-process lock so that concurrent `migrate` runs, such as
-    /// several replicas starting at once, don't race each other applying schema
-    /// changes. Blocks until the lock is available.
-    ///
-    /// The default is a no-op, which means a backend that does not override this
-    /// gets no serialization at all. Implement it if concurrent bootstrap is a
-    /// supported deployment for your backend.
-    ///
-    /// Implementations need not be re-entrant, and callers must not acquire
-    /// twice without releasing. Every acquire must be paired with
-    /// [`Bootstrapper::release_migration_lock`], and the backend must also
-    /// release the lock if the process dies without doing so.
-    async fn acquire_migration_lock(&self) -> OpResult<()> {
-        Ok(())
-    }
-
-    /// Release the lock taken by [`Bootstrapper::acquire_migration_lock`], and
-    /// do nothing if no lock is held. Defaults to a no-op.
-    async fn release_migration_lock(&self) -> OpResult<()> {
-        Ok(())
-    }
-
-    /// Filenames of data-database migrations that have not yet been applied.
-    ///
-    /// Excludes a pre-tracking baseline migration that already exists and will
-    /// be adopted (recorded without re-running) rather than applied. Data
-    /// migrations are tracked in the data database's own ledger, independent of
-    /// the catalog version, so `migrate` uses this to report accurately and to
-    /// decide whether confirmation is required — without running anything.
-    async fn pending_data_migrations(&self) -> OpResult<Vec<String>>;
-
     /// Record the data database connection string in the catalog.
     async fn record_data_connection(&self) -> OpResult<()>;
 
@@ -152,9 +77,6 @@ pub trait Bootstrapper: Send + Sync {
         env_password: Option<&str>,
     ) -> OpResult<AdminBootstrapResult>;
 
-    /// Check if the catalog is already initialized (has schema).
-    async fn is_catalog_initialized(&self) -> OpResult<bool>;
-
     /// List table names in the catalog (for destroy confirmation display).
     async fn list_table_names(&self) -> OpResult<Vec<String>>;
 
@@ -163,12 +85,6 @@ pub trait Bootstrapper: Send + Sync {
 
     /// Drop both catalog and data databases. Destructive and irreversible.
     async fn drop_databases(&self, data_db: &str) -> OpResult<()>;
-
-    /// Read the current catalog schema version.
-    async fn read_catalog_version(&self) -> OpResult<Option<String>>;
-
-    /// Get the expected catalog version for this binary.
-    fn expected_catalog_version(&self) -> String;
 
     /// Return the catalog database name for display.
     fn catalog_database_name(&self) -> String;
@@ -186,6 +102,13 @@ pub trait Bootstrapper: Send + Sync {
     fn init_target(&self) -> crate::migrations::Target {
         crate::migrations::Target::at(self.catalog_connection_url())
     }
+
+    /// The migration lock `init` holds while it writes the encryption key,
+    /// the default account, the admin user and the data connection. A
+    /// backend whose lock has a lease checks it before each of those writes,
+    /// as its runner does before each migration request; the default keeps
+    /// nothing.
+    fn hold(&self, _lock: &crate::migrations::HeldLock) {}
 
     /// Generate the backend-specific configuration subsection for extenddb.toml.
     /// Returns only the [`storage.backend_name`] section content, not the [storage] header.
@@ -609,7 +532,7 @@ pub mod helpers {
 /// new required method is added, or a defaulted one loses its default, this
 /// stops compiling, which is the same breakage an out-of-tree backend crate
 /// would hit. It also pins object safety by boxing as `dyn Bootstrapper`, and
-/// checks that the defaulted migration-lock methods are usable no-ops.
+/// checks that the defaulted `hold` is a usable no-op.
 #[cfg(test)]
 mod out_of_tree_compat_tests {
     use super::*;
@@ -630,15 +553,6 @@ mod out_of_tree_compat_tests {
         }
         async fn create_data_db(&self) -> OpResult<()> {
             Ok(())
-        }
-        async fn run_catalog_migrations(&self) -> OpResult<()> {
-            Ok(())
-        }
-        async fn run_data_migrations(&self) -> OpResult<()> {
-            Ok(())
-        }
-        async fn pending_data_migrations(&self) -> OpResult<Vec<String>> {
-            Ok(Vec::new())
         }
         async fn record_data_connection(&self) -> OpResult<()> {
             Ok(())
@@ -661,9 +575,6 @@ mod out_of_tree_compat_tests {
                 from_env: false,
             })
         }
-        async fn is_catalog_initialized(&self) -> OpResult<bool> {
-            Ok(true)
-        }
         async fn list_table_names(&self) -> OpResult<Vec<String>> {
             Ok(Vec::new())
         }
@@ -672,12 +583,6 @@ mod out_of_tree_compat_tests {
         }
         async fn drop_databases(&self, _data_db: &str) -> OpResult<()> {
             Ok(())
-        }
-        async fn read_catalog_version(&self) -> OpResult<Option<String>> {
-            Ok(None)
-        }
-        fn expected_catalog_version(&self) -> String {
-            "0.0.0".to_owned()
         }
         fn catalog_database_name(&self) -> String {
             "minimal".to_owned()
@@ -693,14 +598,14 @@ mod out_of_tree_compat_tests {
         }
     }
 
-    /// A backend that does not implement the migration lock still works, and
-    /// the defaults are no-ops rather than errors.
-    #[tokio::test]
-    async fn migration_lock_defaults_to_a_usable_no_op() {
+    /// A backend that keeps no lease takes the default `hold`, which keeps
+    /// nothing and needs no lock of its own kind.
+    #[test]
+    fn hold_defaults_to_a_no_op() {
         let bootstrapper: Box<dyn Bootstrapper> = Box::new(MinimalBootstrapper);
-        assert!(bootstrapper.acquire_migration_lock().await.is_ok());
-        assert!(bootstrapper.release_migration_lock().await.is_ok());
-        // Releasing without acquiring must also be harmless.
-        assert!(bootstrapper.release_migration_lock().await.is_ok());
+        bootstrapper.hold(&crate::migrations::HeldLock::new(
+            "minimal://".to_owned(),
+            (),
+        ));
     }
 }

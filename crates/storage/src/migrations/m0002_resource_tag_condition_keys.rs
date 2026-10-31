@@ -277,8 +277,10 @@ impl<H: HasManagementStore + Send + Sync + 'static> CodeBody<H> for ResourceTagC
 }
 
 /// A pass that could not read or write a policy must not be recorded: the
-/// next run finishes it. The error carries the first failure's database
-/// error code, so the runner runs the body again after a lock timeout.
+/// next run finishes it. The error carries the first failure's text, such
+/// as a lapsed migration lock or a node that did not answer, and its
+/// database error code when it has one, so the runner runs the body again
+/// after a lock timeout.
 fn refuse_lookup_errors(report: &MigrationReport) -> Result<(), MigrationError> {
     if report.errors == 0 {
         return Ok(());
@@ -292,7 +294,14 @@ fn refuse_lookup_errors(report: &MigrationReport) -> Result<(), MigrationError> 
             message: format!("{failed}, the first with {message}"),
             sqlstate: sqlstate.clone(),
         },
-        _ => MigrationError::Store(failed),
+        Some(
+            OpError::Validation(message)
+            | OpError::AlreadyExists(message)
+            | OpError::NotFound(message)
+            | OpError::HasDependents(message)
+            | OpError::Internal(message),
+        ) => MigrationError::Store(format!("{failed}, the first with {message}")),
+        None => MigrationError::Store(failed),
     })
 }
 
@@ -303,4 +312,33 @@ fn collision_line(n: &NeedsAttention) -> String {
          two forms",
         n.account_id, n.principal, n.policy_name
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MigrationError, MigrationReport, OpError, refuse_lookup_errors};
+
+    /// The first failure's own text reaches the operator whatever its kind:
+    /// a store under a lease that lapsed, or a request a node did not
+    /// answer, returns an internal error, and its text says which.
+    #[test]
+    fn a_failed_pass_names_its_first_error() {
+        let report = MigrationReport {
+            errors: 2,
+            first_error: Some(OpError::Internal(
+                "the migration lock in ks_catalog.settings was not renewed in time".to_owned(),
+            )),
+            ..MigrationReport::default()
+        };
+        let refused = refuse_lookup_errors(&report);
+        let Err(MigrationError::Store(message)) = refused else {
+            panic!("{refused:?}");
+        };
+        assert_eq!(
+            message,
+            "resource-tag rewrite: 2 policy lookup(s) or write(s) failed, the first with the \
+             migration lock in ks_catalog.settings was not renewed in time"
+        );
+        assert!(refuse_lookup_errors(&MigrationReport::default()).is_ok());
+    }
 }

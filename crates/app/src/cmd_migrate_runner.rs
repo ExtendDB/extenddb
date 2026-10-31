@@ -49,10 +49,11 @@ pub(crate) async fn run(
     let target = Target {
         location,
         data_store: args.data_db.clone(),
-        admin: admin_role(
-            args.pg_user.as_deref(),
-            args.pg_pass.as_deref(),
+        admin: admin_role_for(
+            extenddb_storage::backend_name(),
+            args,
             std::env::var_os("EXTENDDB_PG_PASSWORD"),
+            std::env::var_os("EXTENDDB_CASSANDRA_PASSWORD"),
         )?,
         data_connection: None,
     };
@@ -100,12 +101,41 @@ pub(crate) async fn run(
     }))
 }
 
-/// The admin role `--pg-user` names, with `--pg-pass` or else the
-/// `EXTENDDB_PG_PASSWORD` variable; `None` without `--pg-user`.
+/// The admin role of the backend this binary serves: on Cassandra the role
+/// the runner connects as instead of the config file's (`--cassandra-user`,
+/// `--cassandra-pass` or `EXTENDDB_CASSANDRA_PASSWORD`); on every other
+/// backend the PostgreSQL role of the pgvector attempt (`--pg-user`,
+/// `--pg-pass` or `EXTENDDB_PG_PASSWORD`), which only PostgreSQL reads. The
+/// other backend's flags are ignored, as they were before Cassandra moved
+/// onto the runner.
+fn admin_role_for(
+    backend: Option<&str>,
+    args: &MigrateArgs,
+    pg_password_env: Option<std::ffi::OsString>,
+    cassandra_password_env: Option<std::ffi::OsString>,
+) -> anyhow::Result<Option<AdminRole>> {
+    if backend == Some("cassandra") {
+        admin_role(
+            args.cassandra_user.as_deref(),
+            args.cassandra_pass.as_deref(),
+            ("EXTENDDB_CASSANDRA_PASSWORD", cassandra_password_env),
+        )
+    } else {
+        admin_role(
+            args.pg_user.as_deref(),
+            args.pg_pass.as_deref(),
+            ("EXTENDDB_PG_PASSWORD", pg_password_env),
+        )
+    }
+}
+
+/// The admin role a user flag names (`--pg-user` or `--cassandra-user`),
+/// with its password flag or else the password variable `env_name` names;
+/// `None` without the user flag.
 fn admin_role(
     user: Option<&str>,
     password: Option<&str>,
-    password_env: Option<std::ffi::OsString>,
+    (env_name, password_env): (&str, Option<std::ffi::OsString>),
 ) -> anyhow::Result<Option<AdminRole>> {
     let Some(user) = user else {
         return Ok(None);
@@ -114,7 +144,7 @@ fn admin_role(
         (Some(password), _) => Some(password.to_owned()),
         (None, Some(env)) => Some(
             env.into_string()
-                .map_err(|_| anyhow::anyhow!("EXTENDDB_PG_PASSWORD must contain valid UTF-8"))?,
+                .map_err(|_| anyhow::anyhow!("{env_name} must contain valid UTF-8"))?,
         ),
         (None, None) => None,
     };
@@ -243,8 +273,9 @@ async fn apply(
         lock_timeout.as_secs()
     );
     let lock = migrations.lock(target, lock_timeout).await?;
-    let report = run_locked(migrations, target, &lock, release, kind).await?;
-    drop(lock);
+    let report = run_locked(migrations, target, &lock, release, kind).await;
+    migrations.release(lock).await;
+    let report = report?;
     print_report(&report, kind);
     if report.applied.is_empty() && kind == RunKind::Migrate {
         // A catalog ahead by additive migrations has nothing to apply and
@@ -289,7 +320,9 @@ async fn forget(
     lock_timeout: Duration,
 ) -> Result<u8, MigrationError> {
     let lock = migrations.lock(target, lock_timeout).await?;
-    forget_locked(migrations, target, &lock, id).await?;
+    let forgotten = forget_locked(migrations, target, &lock, id).await;
+    migrations.release(lock).await;
+    forgotten?;
     println!(
         "Forgot migration {id}: its ledger rows are deleted, and the next \
          `extenddb migrate --yes` runs it again."

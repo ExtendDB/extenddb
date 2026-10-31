@@ -106,10 +106,7 @@ records the migrations it applied in a ledger table, `extenddb_migrations`,
 and `extenddb migrate --yes` applies the missing ones in order.
 [ADR-0023](docs/adr/0023-catalog-migrations.md) records the design.
 
-SQLite and PostgreSQL migrate through this framework. Cassandra and MongoDB
-still migrate through their bootstrappers: a Cassandra change is a numbered
-CQL file listed in `crates/storage-cassandra/src/migrations.rs`, and a MongoDB
-change is code in `crates/storage-mongodb/src/bootstrapper.rs`.
+SQLite, PostgreSQL, Cassandra and MongoDB migrate through this framework.
 
 ### Procedure
 
@@ -121,14 +118,17 @@ change is code in `crates/storage-mongodb/src/bootstrapper.rs`.
    is never reused, reordered or removed.
 
 2. Add an arm for the id to each backend's table, `migration()` in
-   `crates/storage-sqlite/src/migrations/mod.rs` and in
-   `crates/storage-postgres/src/migrations/mod.rs`. Both are exhaustive
+   `crates/storage-sqlite/src/migrations/mod.rs`,
+   `crates/storage-postgres/src/migrations/mod.rs`,
+   `crates/storage-cassandra/src/migrations/mod.rs` and
+   `crates/storage-mongodb/src/migrations/mod.rs`. All four are exhaustive
    `match`es with no wildcard arm, so the workspace does not compile until
    every table has the arm. The arm is one of:
 
    - `Migration::Applies { kind, convergent, bodies }`, with one body for each
-     kind of store the migration changes: `StoreKind::Catalog`, and on
-     PostgreSQL also `StoreKind::Data`. The runner applies the catalog body
+     kind of store the migration changes: `StoreKind::Catalog`, on
+     PostgreSQL and MongoDB also `StoreKind::Data`, and on Cassandra also
+     `StoreKind::Account` (one body for every account keyspace). The runner applies the catalog body
      first, and it writes a catalog ledger row for every id, including an id
      whose only body runs in the data database.
    - `Migration::NotApplicable("reason")`, when the change has no effect on
@@ -196,6 +196,40 @@ change is code in `crates/storage-mongodb/src/bootstrapper.rs`.
    `EXTENDDB_BLESS_EXPECTED=1` the test writes the golden file instead of
    comparing; read the file before you commit it.
 
+   On MongoDB every body is code; the backend has no file bodies. A body
+   sends every request through `MongoStores::request`
+   (`crates/storage-mongodb/src/migrations/backend.rs`), which checks first
+   that this process still holds the migration lock and waits at most 10 s
+   for the answer, and every request must be safe to send again: the body
+   is not in a transaction, and a migrator stopped part way runs it again.
+   The runner writes the ledger row, and in the catalog the
+   `catalog_version` row, in one transaction after the body. Accept an
+   object that already exists only by the server's error code, such as
+   NamespaceExists (48) from `create`, never by discarding a result. A body
+   that reaches the catalog through `ManagementStore` gets one that checks
+   the lock before each call. MongoDB's golden tests are in
+   `crates/storage-mongodb/tests/migrations_released.rs`; they need a
+   replica set, named by `EXTENDDB_TEST_MONGODB_URI`.
+
+   On Cassandra a file body is CQL, `NNNN_<name>.cql` in
+   `crates/storage-cassandra/migrations/catalog/` for the catalog keyspace or
+   `crates/storage-cassandra/migrations/account/` for the account keyspaces,
+   embedded with `file_body!` like the others. Cassandra has no transactions:
+   the runner sends the statements one by one, checks before each that this
+   process still holds the migration lock, and writes the ledger row at
+   `QUORUM` after the body, so every statement must be safe to run again
+   (`CREATE ... IF NOT EXISTS`, `ALTER TABLE ... ADD IF NOT EXISTS ...`). A
+   statement is `CREATE TABLE`, `CREATE INDEX`, `ALTER TABLE`, `INSERT INTO`
+   or `DELETE FROM`, naming its table without a keyspace: the runner writes
+   the keyspace in front of the table (`crates/storage-cassandra/src/migrations/cql.rs`)
+   and refuses a file with any other statement before it runs anything. After
+   each `CREATE` and `ALTER` the runner waits until every live node reports the
+   same schema version. The file is split on the semicolon character, so no
+   comment may hold one. The golden tests are in
+   `crates/storage-cassandra/src/migrations/tests.rs`; the
+   `0001_baseline.expected.json` beside each body holds the definitions the
+   runner compares the keyspace with the first time migration 1 is applied.
+
    On PostgreSQL, a body that runs `CREATE INDEX CONCURRENTLY` builds every
    index through `IndexHelper` in
    `crates/storage-postgres/src/migrations/index_helper.rs`. `ensure` drops
@@ -225,7 +259,10 @@ change is code in `crates/storage-mongodb/src/bootstrapper.rs`.
    the new binary. The job does not exist yet; the first PR that declares an
    additive migration adds it, and deletes the tests that refuse
    `Kind::Additive` until then (`no_migration_is_additive_before_the_old_binary_job`
-   in the SQLite crate, and its PostgreSQL counterpart in `crates/bin`).
+   in the SQLite crate and in `crates/storage-cassandra/src/migrations/tests.rs`,
+   its PostgreSQL counterpart in `crates/bin`, and
+   `no_migration_is_declared_additive_before_the_old_binary_job_exists` in
+   the MongoDB crate).
 
    Set `convergent: true` when every body is safe to run again on a store at
    any later migration. `extenddb migrate --yes --reconverge`, which repairs a
@@ -234,17 +271,21 @@ change is code in `crates/storage-mongodb/src/bootstrapper.rs`.
 
 5. Handle per-table objects. CreateTable and CreateAccount create objects at
    request time with the binary's own DDL: the `_ddb_<id>` tables and their
-   indexes on PostgreSQL, the index tables on SQLite, and on Cassandra the
+   indexes on PostgreSQL, the index tables on SQLite, the `_ddb_<id>`
+   collections and their indexes on MongoDB, and on Cassandra the
    `items_<table>` tables and each account's keyspace. Their shape depends on
    the release that created them. A migration that changes them is breaking.
    It lists the objects from the catalog rows, never by name in the data
-   store, where PostgreSQL's vector tables share the `_ddb_` prefix. It skips
+   store, where PostgreSQL's vector tables and MongoDB's index collections
+   share the `_ddb_` prefix. It skips
    a catalog row whose table is `DELETING` or whose physical table is
    missing, and adds a note for it. The same PR changes the DDL that creates
-   new objects, in `crates/storage-sqlite/src/data/ddl.rs` and
-   `crates/storage-postgres/src/data/ddl.rs`. Migration 4,
-   `m0004_index_table_base_key.rs` in each backend's `src/migrations/`, does
-   this.
+   new objects, in `crates/storage-sqlite/src/data/ddl.rs`,
+   `crates/storage-postgres/src/data/ddl.rs`,
+   `crates/storage-cassandra/src/data/ddl.rs` and
+   `crates/storage-mongodb/src/table_engine.rs`. Migration 4,
+   `m0004_index_table_base_key.rs` in the SQLite and PostgreSQL crates'
+   `src/migrations/`, does this.
 
 6. Commit the current schema. Each backend's integration job regenerates
    `docs/schema/<backend>.txt` from a fresh install. When the result differs
@@ -256,6 +297,9 @@ change is code in `crates/storage-mongodb/src/bootstrapper.rs`.
    <catalog db> <data db>` for a deployment `init` created on that server.
    The dump lists the kinds of object `devtools/schema-dump`'s docstring
    names; a migration that creates another kind adds a query for it there.
+   On MongoDB, `devtools/check-mongodb-schema <extenddb binary> <output file>`
+   runs `init` on a replica set of its own, writes the schema to the output
+   file and compares it with `docs/schema/mongodb.txt`.
 
 7. Leave the checksum literals to the release. Each backend's `RELEASED`
    table pins the checksum, kind and convergent flag of every released body,
@@ -272,6 +316,7 @@ change is code in `crates/storage-mongodb/src/bootstrapper.rs`.
    ```bash
    cargo test -p extenddb-storage-sqlite --lib the_released_bodies -- --nocapture
    cargo test -p extenddb-storage-postgres --lib the_released_bodies -- --nocapture
+   cargo test -p extenddb-storage-mongodb --lib the_released_bodies -- --nocapture
    ```
 
    A released body does not change. If one has to, for example because a

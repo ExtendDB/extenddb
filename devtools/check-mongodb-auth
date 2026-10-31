@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+"""The commands and the server as a MongoDB user with readWrite only:
+
+    devtools/check-mongodb-auth <extenddb binary> [mongo port] [api port]
+
+Starts mongo:7 as a one-node replica set with access control (a key file)
+in the container extenddb-check-auth-<mongo port>, published on 127.0.0.1
+only, and creates the user `extenddb` with the roles readWrite on
+extenddb_catalog and readWrite on extenddb_data and nothing else. As that
+user: `init`, the migrate preview and `verify` exit 0, the server starts,
+an account, IAM user and access key are created through `extenddb manage`,
+the table seed.py describes is created and written through the DynamoDB
+API, and on a catalog behind the binary `migrate --yes` applies what is
+missing. The container is removed at the end with the temporary
+directory.
+"""
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+from catalog_checks import docker, expect_exit, finish, healthy, report, run, start, stop
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+SEED = os.path.join(HERE, "..", "crates", "storage-mongodb", "tests", "fixtures", "released", "seed.py")
+ROOT_PASSWORD = "CheckRootPassw0rd1"
+APP_PASSWORD = "CheckAppPassw0rd1"
+
+
+def shell(container: str, port: int, script: str, root: bool = True) -> tuple[int, str]:
+    login = ["-u", "root", "-p", ROOT_PASSWORD, "--authenticationDatabase", "admin"] if root else []
+    done = docker("exec", container, "mongosh", "--quiet", "--port", str(port), *login, "--eval", script)
+    return done.returncode, done.stdout + done.stderr
+
+
+def start_with_auth(container: str, port: int) -> bool:
+    docker("rm", "-f", container)
+    keyfile = "head -c 756 /dev/urandom | base64 -w0 > /tmp/key && chmod 400 /tmp/key && chown mongodb /tmp/key"
+    started = docker(
+        "run", "-d", "--name", container, "-p", f"127.0.0.1:{port}:{port}", "--entrypoint", "bash", "mongo:7",
+        "-c", f"{keyfile} && exec docker-entrypoint.sh mongod --replSet rs0 --bind_ip_all --port {port} "
+              "--keyFile /tmp/key",
+    )
+    if not report(started.returncode == 0, f"start {container} with access control", started.stderr):
+        return False
+    for _ in range(60):
+        if shell(container, port, "db.runCommand({ping: 1}).ok", root=False)[1].strip().endswith("1"):
+            break
+        time.sleep(1)
+    # The localhost exception allows the first user and the initiation.
+    shell(container, port, f"rs.initiate({{_id: 'rs0', members: [{{_id: 0, host: 'localhost:{port}'}}]}})",
+          root=False)
+    for _ in range(60):
+        if shell(container, port, "db.hello().isWritablePrimary", root=False)[1].strip().endswith("true"):
+            break
+        time.sleep(1)
+    code, out = shell(container, port, f"db.getSiblingDB('admin').createUser({{user: 'root', pwd: "
+                                       f"'{ROOT_PASSWORD}', roles: ['root']}})", root=False)
+    if not report(code == 0, "create the administrator", out):
+        return False
+    code, out = shell(container, port, f"db.getSiblingDB('admin').createUser({{user: 'extenddb', pwd: "
+                                       f"'{APP_PASSWORD}', roles: [{{role: 'readWrite', db: 'extenddb_catalog'}}, "
+                                       f"{{role: 'readWrite', db: 'extenddb_data'}}]}})")
+    return report(code == 0, "create the application user with readWrite on both databases", out)
+
+
+def main(binary: str, port: int, api: int) -> int:
+    binary = os.path.realpath(binary)
+    container = f"extenddb-check-auth-{port}"
+    work = tempfile.mkdtemp()
+    server = None
+    try:
+        if not start_with_auth(container, port):
+            return finish()
+        os.chdir(work)
+        env = dict(os.environ, HOME=os.path.join(work, "home"), EXTENDDB__SERVER__RUN_DIR=os.path.join(work, "run"),
+                   EXTENDDB_ADMIN_USER="admin", EXTENDDB_ADMIN_PASSWORD="CheckAdminPassw0rd1")
+        uri = (f"mongodb://extenddb:{APP_PASSWORD}@127.0.0.1:{port}/?replicaSet=rs0&directConnection=true"
+               "&authSource=admin")
+        with open("extenddb.toml", "w", encoding="utf-8") as f:
+            f.write(f'[storage]\nbackend = "mongodb"\n\n[storage.mongodb]\nconnection_string = "{uri}"\n')
+        config = os.path.join(work, "extenddb.toml")
+        expect_exit(0, "init as the application user",
+                    [binary, "init", "--backend", "mongodb", "--config", config, "--overwrite"], env, timeout=120)
+        expect_exit(0, "migrate preview as the application user", [binary, "migrate", "--config", config], env)
+        expect_exit(0, "verify as the application user", [binary, "verify", "--config", config], env)
+        server = start([binary, "serve", "--config", config, "--foreground", "--port", str(api)], env, "serve.log")
+        if not healthy(f"https://127.0.0.1:{api}/health", server, 60):
+            with open("serve.log", encoding="utf-8") as f:
+                report(False, "the server starts as the application user", f.read())
+            return finish()
+        report(True, "the server starts as the application user")
+        manage_env = dict(env, EXTENDDB_PASSWORD="CheckAdminPassw0rd1", EXTENDDB__SERVER__PORT=str(api))
+        manage = [binary, "manage", "--user", "admin", "--config", config]
+        for step in (["create-account", "--account-id", "123456789012", "--account-name", "auth"],
+                     ["create-user", "--account-id", "123456789012", "--user-name", "tester"],
+                     ["put-user-policy", "--account-id", "123456789012", "--user-name", "tester", "--policy-name",
+                      "all", "--policy-document",
+                      '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"dynamodb:*","Resource":"*"}]}']):
+            expect_exit(0, f"manage {step[0]}", manage + step, manage_env)
+        code, out = run(manage + ["create-access-key", "--account-id", "123456789012", "--user-name", "tester"],
+                        manage_env)
+        if report(code == 0, "manage create-access-key", out):
+            import json
+            created = json.loads(out[out.index("{"):])
+            seed_env = {k: v for k, v in os.environ.items() if k != "REQUESTS_CA_BUNDLE"}
+            done = subprocess.run([sys.executable, SEED, f"https://127.0.0.1:{api}", created["access_key_id"],
+                                   created["secret_access_key"]], capture_output=True, text=True, env=seed_env,
+                                  check=False, timeout=180)
+            report(done.returncode == 0, "CreateTable with a GSI, an LSI, a stream and TTL, and ten PutItems",
+                   done.stdout + done.stderr)
+        stop(server)
+        server = None
+        code, out = shell(container, port, "db.getSiblingDB('extenddb_catalog').extenddb_migrations.deleteOne({_id: 2})")
+        report(code == 0, "remove migration 2's catalog row as the administrator", out)
+        expect_exit(3, "migrate preview on a catalog behind the binary", [binary, "migrate", "--config", config], env)
+        expect_exit(0, "migrate --yes as the application user", [binary, "migrate", "--config", config, "--yes"], env)
+        expect_exit(0, "verify after migrate --yes", [binary, "verify", "--config", config], env)
+    finally:
+        if server is not None:
+            stop(server)
+        docker("rm", "-f", "-v", container)
+        os.chdir("/")
+        shutil.rmtree(work, ignore_errors=True)
+    return finish()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) not in (2, 3, 4):
+        sys.exit(__doc__)
+    sys.exit(main(
+        sys.argv[1],
+        int(sys.argv[2]) if len(sys.argv) > 2 else 27081,
+        int(sys.argv[3]) if len(sys.argv) > 3 else 18490,
+    ))

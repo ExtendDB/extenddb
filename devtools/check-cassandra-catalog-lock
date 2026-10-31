@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+"""Serve and migrate on one Cassandra catalog, with a release binary:
+
+    devtools/check-cassandra-catalog-lock <extenddb binary> <container> \\
+        <contact point> [port]
+
+<container> is the Cassandra node's Docker container, which the script reads
+and writes with `docker exec ... cqlsh` as the admin role
+($CASSANDRA_ADMIN_USER and $CASSANDRA_ADMIN_PASSWORD, default cassandra and
+cassandra). <contact point> is the node's host:port as the binary reaches it,
+for example 127.0.0.1:9042. The script creates its own role and keyspaces
+with `init` and removes them at the end.
+
+- a store that is not a catalog: for a keyspace prefix with no keyspace, a
+  keyspace whose settings table holds only the lock row, and another
+  program's keyspace, migrate --yes exits 1 naming `extenddb init`; for
+  another program's keyspace whose settings table has the catalog's key and
+  value columns and a row of its own, it exits 1 saying the keyspace is not
+  an ExtendDB catalog; each keyspace's tables and settings rows are left as
+  they were;
+- verify, the migrate preview and migrate --list exit 0 on the fresh catalog;
+- the preview and verify run beside a server and exit 0;
+- migrate --yes waits for the server's registration and exits 6, naming
+  "extenddb serve", when it outlasts --lock-timeout;
+- a stopped server removes its registration, so migrate --yes runs at once;
+- while another session holds the migration lock (the lock row, written by
+  the script with a lightweight transaction as a migration would), serve and
+  a second migrate --yes exit 6, and the preview exits 0;
+- once the lock is free, migrate --yes --reconverge, migrate --forget 3 and
+  the migrate --yes that applies 3 again run, and serve runs;
+- a server that cannot renew its registration for 30 s, with the node
+  paused, stops with exit 1 and removes its PID file.
+
+init's HOME points into a temporary directory, so its TLS certificate is not
+written to the caller's home. The server binds 127.0.0.1 only.
+"""
+import os
+import secrets
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+
+from catalog_checks import expect_exit, finish, healthy, report, run, start, stop
+
+ADMIN_USER = os.environ.get("CASSANDRA_ADMIN_USER", "cassandra")
+ADMIN_PASSWORD = os.environ.get("CASSANDRA_ADMIN_PASSWORD", "cassandra")
+
+
+def cqlsh(container: str, statements: str) -> tuple[int, str]:
+    """Run CQL statements in the node's cqlsh as the admin role."""
+    done = subprocess.run(
+        ["docker", "exec", "-i", container, "cqlsh", "-u", ADMIN_USER, "-p", ADMIN_PASSWORD],
+        input=statements,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    return done.returncode, done.stdout + done.stderr
+
+
+def config_with_prefix(source: str, target: str, prefix: str) -> None:
+    """A copy of the config `init` wrote, with another keyspace prefix."""
+    with open(source, encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    with open(target, "w", encoding="utf-8") as f:
+        for line in lines:
+            if line.strip().startswith("keyspace_prefix"):
+                line = f'keyspace_prefix = "{prefix}"'
+            f.write(line + "\n")
+    os.chmod(target, 0o600)
+
+
+def tables(container: str, keyspace: str) -> str:
+    code, output = cqlsh(
+        container,
+        f"SELECT table_name FROM system_schema.tables WHERE keyspace_name = '{keyspace}';\n",
+    )
+    return output if code == 0 else f"cqlsh failed: {output}"
+
+
+def settings_keys(container: str, keyspace: str) -> str:
+    """The keys of the keyspace's settings table, or "" without one."""
+    if "settings" not in tables(container, keyspace).split():
+        return ""
+    code, output = cqlsh(container, f"SELECT key FROM {keyspace}.settings;\n")
+    return output if code == 0 else f"cqlsh failed: {output}"
+
+
+def not_a_catalog(binary: str, env: dict, container: str, config: str, stem: str, work: str) -> None:
+    """migrate --yes refuses every store that is not a catalog with exit 1:
+    naming `extenddb init` for one init would create or adopt, and saying it
+    is not a catalog, and what it holds, for another program's keyspace,
+    which init refuses too."""
+    cases = {
+        "a prefix with no keyspace": ("", "extenddb init"),
+        # Under its own lock, migrate --yes finds this keyspace holding only
+        # the lock row it wrote.
+        "a keyspace whose settings table holds only the lock row": (
+            "CREATE KEYSPACE {ks} WITH replication = {{'class': 'SimpleStrategy', "
+            "'replication_factor': 1}};\n"
+            "CREATE TABLE {ks}.settings (key text PRIMARY KEY, value text);\n",
+            "extenddb init",
+        ),
+        "another program's keyspace": (
+            "CREATE KEYSPACE {ks} WITH replication = {{'class': 'SimpleStrategy', "
+            "'replication_factor': 1}};\n"
+            "CREATE TABLE {ks}.settings (name text PRIMARY KEY, val int);\n"
+            "CREATE TABLE {ks}.orders (id int PRIMARY KEY);\n",
+            "is not an ExtendDB catalog",
+        ),
+        "another program's keyspace with a settings table of the catalog's columns": (
+            "CREATE KEYSPACE {ks} WITH replication = {{'class': 'SimpleStrategy', "
+            "'replication_factor': 1}};\n"
+            "CREATE TABLE {ks}.settings (key text PRIMARY KEY, value text);\n"
+            "INSERT INTO {ks}.settings (key, value) VALUES ('theme', 'dark');\n",
+            "is not an ExtendDB catalog",
+        ),
+    }
+    for i, (label, (setup, named)) in enumerate(cases.items()):
+        prefix = f"{stem}_x{i}"
+        keyspace = f"{prefix}_catalog"
+        if setup:
+            code, output = cqlsh(container, setup.format(ks=keyspace))
+            if not report(code == 0, f"set up {label}", output):
+                continue
+        other = os.path.join(work, f"x{i}.toml")
+        config_with_prefix(config, other, prefix)
+        before = tables(container, keyspace) + settings_keys(container, keyspace)
+        expect_exit(
+            1,
+            f"migrate --yes on {label}",
+            [binary, "migrate", "--config", other, "--yes", "--lock-timeout", "5"],
+            env,
+            contains=named,
+        )
+        expect_exit(1, f"the migrate preview on {label}", [binary, "migrate", "--config", other], env, contains=named)
+        after = tables(container, keyspace) + settings_keys(container, keyspace)
+        report(after == before, f"{label} is left as it was")
+    # Another process's lock row in a keyspace that is not a catalog yet: the
+    # preview, which takes no lock, reports it uninitialized.
+    keyspace = f"{stem}_x1_catalog"
+    code, output = cqlsh(
+        container,
+        "CONSISTENCY QUORUM;\nSERIAL CONSISTENCY SERIAL;\n"
+        f"INSERT INTO {keyspace}.settings (key, value) VALUES ('migration_lock', 'another') "
+        "IF NOT EXISTS USING TTL 300;\n",
+    )
+    if report(code == 0 and "True" in output, "another process holds the lock row", output):
+        expect_exit(
+            1,
+            "the migrate preview on a keyspace holding only another process's lock row",
+            [binary, "migrate", "--config", os.path.join(work, "x1.toml")],
+            env,
+            contains="extenddb init",
+        )
+
+
+def main(binary: str, container: str, contact_point: str, port: int) -> int:
+    binary = os.path.realpath(binary)
+    stem = f"eddb_lock_{secrets.token_hex(4)}"
+    app_password = f"App{secrets.token_hex(8)}"
+    work = tempfile.mkdtemp(prefix=f"{stem}.")
+    env = dict(os.environ, HOME=os.path.join(work, "home"))
+    config = os.path.join(work, "extenddb.toml")
+    serve = [binary, "serve", "--config", config, "--foreground", "--write-pid-file", "--port", str(port)]
+    servers: list[subprocess.Popen] = []
+    paused = False
+    try:
+        code, output = run(
+            [
+                binary, "init", "--config", config,
+                "--cassandra-contact-points", contact_point,
+                "--cassandra-user", ADMIN_USER,
+                "--keyspace-prefix", stem, "--extenddb-user", stem,
+                "--bind-addr", "127.0.0.1",
+            ],
+            dict(env, EXTENDDB_CASSANDRA_PASSWORD=ADMIN_PASSWORD, EXTENDDB_APP_PASSWORD=app_password),
+            timeout=180,
+        )
+        if not report(code == 0, f"exit {code}: init", output):
+            return finish()
+        with open(config, "rb") as f:
+            run_dir = os.path.expanduser(
+                tomllib.load(f).get("server", {}).get("run_dir", "~/.extenddb/run").replace(
+                    "~", env["HOME"], 1
+                )
+            )
+        pid_file = os.path.join(run_dir, f"extenddb-{port}.pid")
+        migrate = [binary, "migrate", "--config", config]
+        expect_exit(0, "verify on the fresh catalog", [binary, "verify", "--config", config], env, contains="OK: Current")
+        expect_exit(0, "the migrate preview on the fresh catalog", migrate, env, contains="Up to date")
+        expect_exit(0, "migrate --list", migrate + ["--list"], env, contains="not applicable")
+        not_a_catalog(binary, env, container, config, stem, work)
+
+        log = os.path.join(work, "serve.log")
+        server = start(serve, env, log)
+        servers.append(server)
+        if not healthy(f"https://127.0.0.1:{port}/health", server):
+            stop(server)
+            with open(log, encoding="utf-8") as f:
+                report(False, "the server became healthy", f.read())
+            return finish()
+        print("ok   the server is healthy")
+        expect_exit(0, "migrate preview beside a server", migrate, env)
+        expect_exit(0, "verify beside a server", [binary, "verify", "--config", config], env)
+        expect_exit(
+            6,
+            "migrate --yes while a server runs",
+            migrate + ["--yes", "--lock-timeout", "3"],
+            env,
+            contains="extenddb serve",
+        )
+        stop(server)
+        started = time.monotonic()
+        expect_exit(
+            0,
+            "migrate --yes once the server stopped, without waiting for its registration's TTL",
+            migrate + ["--yes", "--lock-timeout", "5"],
+            env,
+        )
+        report(time.monotonic() - started < 30, "the stopped server's registration was removed")
+
+        keyspace = f"{stem}_catalog"
+        code, output = cqlsh(
+            container,
+            "CONSISTENCY QUORUM;\nSERIAL CONSISTENCY SERIAL;\n"
+            f"INSERT INTO {keyspace}.settings (key, value) VALUES ('migration_lock', "
+            "'held-by-check') IF NOT EXISTS USING TTL 300;\n",
+        )
+        report(code == 0 and "True" in output, "the script holds the migration lock", output)
+        expect_exit(6, "serve while a migration holds the lock", serve, env, contains="migration lock")
+        expect_exit(
+            6,
+            "a second migrate --yes while a migration holds the lock",
+            migrate + ["--yes", "--lock-timeout", "2"],
+            env,
+        )
+        expect_exit(0, "migrate preview while a migration holds the lock", migrate, env)
+        code, output = cqlsh(
+            container,
+            "CONSISTENCY QUORUM;\nSERIAL CONSISTENCY SERIAL;\n"
+            f"DELETE FROM {keyspace}.settings WHERE key = 'migration_lock' IF value = "
+            "'held-by-check';\n",
+        )
+        report(code == 0 and "True" in output, "the script releases the lock", output)
+
+        expect_exit(
+            0,
+            "migrate --yes --reconverge once the lock is free, every body run again",
+            migrate + ["--yes", "--reconverge", "--lock-timeout", "5"],
+            env,
+            contains="Ran again 1 baseline",
+        )
+        expect_exit(0, "migrate --forget 3", migrate + ["--forget", "3"], env)
+        expect_exit(3, "the preview lists migration 3 as pending", migrate, env, contains="3 sort_key_definitions")
+        expect_exit(
+            0,
+            "migrate --yes applies migration 3 again",
+            migrate + ["--yes", "--lock-timeout", "5"],
+            env,
+            contains="Applied 3 sort_key_definitions",
+        )
+
+        server = start(serve, env, log)
+        servers.append(server)
+        if not report(healthy(f"https://127.0.0.1:{port}/health", server), "serve once the lock is free"):
+            return finish()
+        report(os.path.exists(pid_file), f"the server wrote its PID file {pid_file}")
+        # The node stops answering: the server cannot renew its registration
+        # and must stop before the row's 45 s TTL ends.
+        subprocess.run(["docker", "pause", container], check=True, capture_output=True)
+        paused = True
+        started = time.monotonic()
+        try:
+            code = server.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            code = None
+        waited = time.monotonic() - started
+        subprocess.run(["docker", "unpause", container], check=True, capture_output=True)
+        paused = False
+        with open(log, encoding="utf-8") as f:
+            report(
+                code == 1 and waited < 45,
+                f"a server that cannot renew its registration stops with exit {code} after "
+                f"{waited:.0f} s",
+                f.read()[-3000:],
+            )
+        report(not os.path.exists(pid_file), "the stopped server removed its PID file")
+    finally:
+        if paused:
+            subprocess.run(["docker", "unpause", container], check=False)
+        for server in servers:
+            stop(server)
+        cleanup(container, stem)
+        shutil.rmtree(work, ignore_errors=True)
+    return finish()
+
+
+def cleanup(container: str, stem: str) -> None:
+    """Drop every keyspace with the script's prefix, and its role."""
+    for _ in range(30):
+        code, _ = cqlsh(container, "SELECT now() FROM system.local;\n")
+        if code == 0:
+            break
+        time.sleep(2)
+    code, output = cqlsh(container, "SELECT keyspace_name FROM system_schema.keyspaces;\n")
+    keyspaces = [
+        word.strip()
+        for word in output.split()
+        if word.strip().startswith(f"{stem}_")
+    ]
+    statements = "".join(f"DROP KEYSPACE IF EXISTS {ks};\n" for ks in keyspaces)
+    statements += f"DROP ROLE IF EXISTS '{stem}';\n"
+    cqlsh(container, statements)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) not in (4, 5):
+        sys.exit(__doc__)
+    sys.exit(main(sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]) if len(sys.argv) == 5 else 18454))

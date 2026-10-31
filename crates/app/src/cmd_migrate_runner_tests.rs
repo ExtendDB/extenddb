@@ -375,3 +375,110 @@ async fn the_preview_refuses_a_lock_timeout() {
     );
     assert!(fake.calls().is_empty());
 }
+
+fn role(user: &str, password: Option<&str>) -> Option<extenddb_storage::migrations::AdminRole> {
+    Some(extenddb_storage::migrations::AdminRole {
+        user: user.to_owned(),
+        password: password.map(str::to_owned),
+    })
+}
+
+/// The admin role is the backend's own: a Cassandra binary reads
+/// `--cassandra-user` with `--cassandra-pass` or
+/// `EXTENDDB_CASSANDRA_PASSWORD` and ignores `--pg-user`; every other
+/// binary reads `--pg-user` with `--pg-pass` or `EXTENDDB_PG_PASSWORD` and
+/// ignores `--cassandra-user`.
+#[test]
+fn the_admin_role_is_chosen_by_the_backend() {
+    let both = parse(&[
+        "--yes",
+        "--pg-user",
+        "pg_admin",
+        "--pg-pass",
+        "pg_secret",
+        "--cassandra-user",
+        "cass_admin",
+        "--cassandra-pass",
+        "cass_secret",
+    ])
+    .expect("parse");
+    let pick = |backend: Option<&str>, args| {
+        super::admin_role_for(backend, args, None, None).expect("admin role")
+    };
+    assert_eq!(
+        pick(Some("cassandra"), &both),
+        role("cass_admin", Some("cass_secret"))
+    );
+    assert_eq!(
+        pick(Some("postgres"), &both),
+        role("pg_admin", Some("pg_secret"))
+    );
+    assert_eq!(
+        pick(Some("sqlite"), &both),
+        role("pg_admin", Some("pg_secret"))
+    );
+    assert_eq!(
+        pick(Some("mongodb"), &both),
+        role("pg_admin", Some("pg_secret"))
+    );
+    assert_eq!(pick(None, &both), role("pg_admin", Some("pg_secret")));
+
+    let cassandra_only = parse(&["--yes", "--cassandra-user", "cass_admin"]).expect("parse");
+    assert_eq!(pick(Some("postgres"), &cassandra_only), None);
+    assert_eq!(
+        pick(Some("cassandra"), &cassandra_only),
+        role("cass_admin", None)
+    );
+
+    let pg_only = parse(&["--yes", "--pg-user", "pg_admin"]).expect("parse");
+    assert_eq!(pick(Some("cassandra"), &pg_only), None);
+    assert_eq!(pick(Some("postgres"), &pg_only), role("pg_admin", None));
+}
+
+/// Each backend's password variable fills in for its password flag, and the
+/// flag wins over the variable; the other backend's variable is ignored.
+#[test]
+fn the_password_variable_is_the_backends_own() {
+    let env = |value: &str| Some(std::ffi::OsString::from(value));
+    let cassandra = parse(&["--yes", "--cassandra-user", "cass_admin"]).expect("parse");
+    assert_eq!(
+        super::admin_role_for(
+            Some("cassandra"),
+            &cassandra,
+            env("pg_env"),
+            env("cass_env")
+        )
+        .expect("admin role"),
+        role("cass_admin", Some("cass_env"))
+    );
+    assert_eq!(
+        super::admin_role_for(Some("cassandra"), &cassandra, env("pg_env"), None)
+            .expect("admin role"),
+        role("cass_admin", None)
+    );
+    let with_flag = parse(&[
+        "--yes",
+        "--cassandra-user",
+        "cass_admin",
+        "--cassandra-pass",
+        "flag",
+    ])
+    .expect("parse");
+    assert_eq!(
+        super::admin_role_for(Some("cassandra"), &with_flag, None, env("cass_env"))
+            .expect("admin role"),
+        role("cass_admin", Some("flag"))
+    );
+
+    let postgres = parse(&["--yes", "--pg-user", "pg_admin"]).expect("parse");
+    assert_eq!(
+        super::admin_role_for(Some("postgres"), &postgres, env("pg_env"), env("cass_env"))
+            .expect("admin role"),
+        role("pg_admin", Some("pg_env"))
+    );
+    assert_eq!(
+        super::admin_role_for(Some("postgres"), &postgres, None, env("cass_env"))
+            .expect("admin role"),
+        role("pg_admin", None)
+    );
+}

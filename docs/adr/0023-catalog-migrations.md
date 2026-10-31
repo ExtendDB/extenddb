@@ -213,8 +213,11 @@ that each backend implements, as follows.
    | Cassandra | A row in the catalog's `settings` table, written only by lightweight transactions at `SERIAL`, with a 60 s TTL renewed every 15 s | A row per server in `extenddb_servers`, renewed every 15 s with a 45 s TTL |
    | MongoDB | A document in the `settings` collection, claimed by a conditional update with majority write concern and renewed by its owner | A document per server in `extenddb_servers` that expires 45 s after its last renewal |
 
-   The Cassandra and MongoDB rows are the design those backends implement
-   when they move onto the runner; their intervals and TTLs may change then.
+   The Cassandra row's values are in
+   `crates/storage-cassandra/src/migrations/locks.rs` (the lock) and
+   `crates/storage-cassandra/src/migrations/registrations.rs` (the
+   registration); the MongoDB row's are in
+   `crates/storage-mongodb/src/migrations/locks.rs`.
 
    On PostgreSQL there are two layouts in which the serving key does not
    match the servers that run, and the upgrade manual's step that stops
@@ -385,12 +388,14 @@ that each backend implements, as follows.
   fails the test.
 - On Cassandra a migration needs every replica of the catalog keyspace
   reachable, because the lock is taken at `SERIAL` and running servers are
-  read at `ALL`. When Cassandra moves onto the runner,
-  the runner is to wait for schema agreement after every DDL statement, reading `schema_version` from `system.local` on each node.
-- SQLite and PostgreSQL run on the runner first. Cassandra and MongoDB keep
-  their bootstrapper migrations and the marker check in `serve.rs` until they
-  move onto it, and each backend's previous mechanism is deleted when it
-  moves.
+  read at `ALL`. The runner waits for schema agreement after every DDL
+  statement, before every ledger row and before it releases the lock, reading
+  `schema_version` from `system.local` on each live node
+  (`crates/storage-cassandra/src/migrations/agreement.rs`).
+- Every backend runs on the runner. Each backend's previous mechanism was
+  deleted when it moved: the PostgreSQL and SQLite migration helpers first,
+  then the Cassandra and MongoDB bootstrapper migrations, with the marker
+  check in `serve.rs`.
 - The shared numbering and the ledger in every store are read by every later
   release, so reversing this decision means migrating every deployment's
   ledgers. A released body changes only through a `rebless` entry.

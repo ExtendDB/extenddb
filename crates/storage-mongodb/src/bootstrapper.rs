@@ -3,19 +3,26 @@
 
 //! Bootstrapper implementation for `MongoDB`.
 
+use std::sync::{Arc, OnceLock};
+
 use async_trait::async_trait;
 use bson::{Document, doc};
-use mongodb::IndexModel;
-use mongodb::options::IndexOptions;
 
 use extenddb_storage::bootstrapper::{AdminBootstrapResult, Bootstrapper};
 use extenddb_storage::error::StorageError;
 use extenddb_storage::management_store::{OpError, OpResult};
+use extenddb_storage::migrations::HeldLock;
+
+use crate::migrations::{Lease, REQUEST_TIMEOUT};
 
 /// `MongoDB` bootstrapper for init/destroy/migrate operations.
 pub struct MongoBootstrapper {
     client: mongodb::Client,
     connection_string: String,
+    /// The lease of the migration lock `init` holds while it writes the
+    /// bootstrap rows, set by [`Bootstrapper::hold`]; every row's requests
+    /// check it first.
+    lease: OnceLock<Arc<Lease>>,
 }
 
 impl MongoBootstrapper {
@@ -40,18 +47,51 @@ impl MongoBootstrapper {
             .unwrap_or("mongodb://localhost:27017")
             .to_string();
 
-        // Route through the shared guard so init/destroy/migrate also reject
-        // non-primary read preferences and warn on missing TLS.
-        let client = crate::connect_guarded(&connection_string, None, false).await?;
+        // The runner's client: the shared guard's checks (primary reads, a
+        // write concern no weaker than majority) and its 10 s timeouts to
+        // connect and to select a server, so `init` and `destroy` give up on
+        // an unreachable database as `migrate` and `verify` do.
+        let client = crate::migrations::connect(&connection_string)
+            .await
+            .map_err(|e| StorageError::Connection(e.to_string()))?;
 
         Ok(Self {
             client,
             connection_string,
+            lease: OnceLock::new(),
         })
     }
 
     fn catalog_db(&self) -> mongodb::Database {
         self.client.database("extenddb_catalog")
+    }
+
+    /// Send one of `init`'s bootstrap requests as the runner sends a
+    /// migration request: the lock's lease is checked first and nothing is
+    /// sent once it is past its margin, the answer is waited for at most
+    /// [`REQUEST_TIMEOUT`], and a completed request counts as progress.
+    async fn request<T>(
+        &self,
+        what: &str,
+        request: impl std::future::IntoFuture<Output = mongodb::error::Result<T>>,
+    ) -> OpResult<T> {
+        if let Some(lease) = self.lease.get() {
+            lease
+                .check()
+                .map_err(|e| OpError::Internal(format!("{what}: {e}")))?;
+        }
+        let answer = tokio::time::timeout(REQUEST_TIMEOUT, request.into_future()).await;
+        if let Some(lease) = self.lease.get() {
+            lease.progressed();
+        }
+        match answer {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(e)) => Err(OpError::Internal(format!("{what}: {e}"))),
+            Err(_) => Err(OpError::Internal(format!(
+                "{what}: no answer within {} s",
+                REQUEST_TIMEOUT.as_secs()
+            ))),
+        }
     }
 
     fn data_db(&self) -> mongodb::Database {
@@ -71,322 +111,25 @@ impl Bootstrapper for MongoBootstrapper {
         Ok(())
     }
 
+    /// Nothing: `init` takes the migration lock before its first write, and
+    /// the lock's claim creates the catalog database. A second `init` is
+    /// refused under the lock, because the catalog is initialized.
     async fn create_catalog_db(&self) -> OpResult<()> {
-        // MongoDB creates databases implicitly on first write.
-        // We'll create a sentinel collection to materialize the database.
-        let db = self.catalog_db();
-        db.create_collection("schema_history")
-            .await
-            .map_err(|e| OpError::Internal(format!("Failed to create catalog db: {e}")))?;
         Ok(())
     }
 
+    /// Nothing: migration 1's data body creates the data database's
+    /// collections under the lock.
     async fn create_data_db(&self) -> OpResult<()> {
-        // MongoDB creates databases implicitly on first write.
-        let db = self.data_db();
-        db.create_collection("idempotency_tokens")
-            .await
-            .map_err(|e| OpError::Internal(format!("Failed to create data db: {e}")))?;
-
-        let coll = db.collection::<Document>("idempotency_tokens");
-
-        // DDB spec: `ClientRequestToken` dedups retries within a 10-minute
-        // window. MongoDB's TTL monitor runs on a ~60s cadence, so an
-        // `expireAfterSeconds = 600` index deletes rows anywhere from
-        // 10:00 to ~11:00 minutes after `created_at` — retention drifts
-        // above the spec. Shrink to 540s (9 min) so worst-case retention
-        // is ≤10 min. The data-plane read path also filters on `created_at`
-        // to enforce the boundary strictly, independent of TTL monitor
-        // cadence (see `transact_write_items_impl`).
-        let ttl_index = IndexModel::builder()
-            .keys(doc! { "created_at": 1 })
-            .options(
-                IndexOptions::builder()
-                    .expire_after(std::time::Duration::from_secs(540))
-                    .build(),
-            )
-            .build();
-        coll.create_index(ttl_index)
-            .await
-            .map_err(|e| OpError::Internal(format!("Failed to create TTL index: {e}")))?;
-
-        // Unique compound index on (account_id, token). Without this,
-        // two concurrent TransactWriteItems calls with the same token
-        // both do a snapshot read that misses the other's uncommitted
-        // insert, and both commit — the operation executes twice.
-        // With the unique index in place, the second inserter fails
-        // E11000 and the write path converts that into a retryable
-        // error, giving the client the read-check path on retry.
-        coll.create_index(
-            IndexModel::builder()
-                .keys(doc! { "account_id": 1, "token": 1 })
-                .options(IndexOptions::builder().unique(true).build())
-                .build(),
-        )
-        .await
-        .map_err(|e| OpError::Internal(format!("idempotency_tokens unique index: {e}")))?;
-
-        // stream_shards: unique index on shard_id so a subsequent init/
-        // recreate can never insert a duplicate shard document under the
-        // same shard_id. Combined with `table_id`-derived shard_ids
-        // (see stream_engine::build_shard_id) this rules out cross-tenant
-        // shard collisions structurally.
-        db.create_collection("stream_shards")
-            .await
-            .map_err(|e| OpError::Internal(format!("Failed to create stream_shards: {e}")))?;
-        db.collection::<Document>("stream_shards")
-            .create_index(
-                IndexModel::builder()
-                    .keys(doc! { "shard_id": 1 })
-                    .options(IndexOptions::builder().unique(true).build())
-                    .build(),
-            )
-            .await
-            .map_err(|e| OpError::Internal(format!("stream_shards shard_id index: {e}")))?;
-
-        // stream_records: TTL index enforcing DDB's 24-hour retention.
-        // The `expireAfterSeconds` is the delta from the field value,
-        // not a hard cutoff, so a MongoDB background thread will
-        // delete records ~1 minute after created_at + 24h. The
-        // TTL cleanup worker in `ttl_worker.rs` provides a defense-
-        // in-depth deletion path but the primary enforcement is here.
-        db.create_collection("stream_records")
-            .await
-            .map_err(|e| OpError::Internal(format!("Failed to create stream_records: {e}")))?;
-        let stream_records = db.collection::<Document>("stream_records");
-        stream_records
-            .create_index(
-                IndexModel::builder()
-                    .keys(doc! { "created_at": 1 })
-                    .options(
-                        IndexOptions::builder()
-                            .expire_after(std::time::Duration::from_secs(24 * 3600))
-                            .build(),
-                    )
-                    .build(),
-            )
-            .await
-            .map_err(|e| OpError::Internal(format!("stream_records TTL index: {e}")))?;
-
-        // Query-side index on (shard_id, sequence_number). GetRecords
-        // filters by shard_id and paginates by sequence_number > cursor
-        // with an ascending sort — the only way this can be efficient
-        // is if the index prefix matches. Without it, GetRecords does a
-        // full collection scan every time consumer polls, and cost
-        // grows linearly in the retained record count. D-m6.
-        stream_records
-            .create_index(
-                IndexModel::builder()
-                    .keys(doc! { "shard_id": 1, "sequence_number": 1 })
-                    .build(),
-            )
-            .await
-            .map_err(|e| OpError::Internal(format!("stream_records shard index: {e}")))?;
-
         Ok(())
     }
 
-    async fn run_catalog_migrations(&self) -> OpResult<()> {
-        let db = self.catalog_db();
-
-        // Create all catalog collections
-        let collections = [
-            "accounts",
-            "tables",
-            "indexes",
-            "tags",
-            "settings",
-            "admin_users",
-            "iam_users",
-            "access_keys",
-            "iam_groups",
-            "iam_roles",
-            "iam_sessions",
-            "iam_policies",
-            "iam_permissions_boundaries",
-            "metrics",
-            "login_attempts",
-            "backups",
-            "continuous_backups",
-        ];
-
-        for coll_name in collections {
-            // create_collection is idempotent in recent MongoDB versions
-            let _ = db.create_collection(coll_name).await;
+    /// Hold the lease of the lock `init` took, so each bootstrap row's
+    /// requests check it; another backend's lock holds nothing.
+    fn hold(&self, lock: &HeldLock) {
+        if let Some(lease) = crate::migrations::lease_of(lock) {
+            let _ = self.lease.set(lease);
         }
-
-        // Create indexes for catalog collections
-
-        // accounts: unique index on account_name
-        let accounts = db.collection::<Document>("accounts");
-        accounts
-            .create_index(
-                IndexModel::builder()
-                    .keys(doc! { "account_name": 1 })
-                    .options(IndexOptions::builder().unique(true).build())
-                    .build(),
-            )
-            .await
-            .map_err(|e| OpError::Internal(format!("accounts index: {e}")))?;
-
-        // tables: unique index on table_id
-        let tables = db.collection::<Document>("tables");
-        tables
-            .create_index(
-                IndexModel::builder()
-                    .keys(doc! { "table_id": 1 })
-                    .options(IndexOptions::builder().unique(true).build())
-                    .build(),
-            )
-            .await
-            .map_err(|e| OpError::Internal(format!("tables table_id index: {e}")))?;
-
-        // iam_users: unique index on user_arn
-        let iam_users = db.collection::<Document>("iam_users");
-        iam_users
-            .create_index(
-                IndexModel::builder()
-                    .keys(doc! { "user_arn": 1 })
-                    .options(IndexOptions::builder().unique(true).build())
-                    .build(),
-            )
-            .await
-            .map_err(|e| OpError::Internal(format!("iam_users user_arn index: {e}")))?;
-
-        // access_keys: index on (account_id, user_name)
-        let access_keys = db.collection::<Document>("access_keys");
-        access_keys
-            .create_index(
-                IndexModel::builder()
-                    .keys(doc! { "account_id": 1, "user_name": 1 })
-                    .build(),
-            )
-            .await
-            .map_err(|e| OpError::Internal(format!("access_keys index: {e}")))?;
-
-        // iam_groups: unique index on group_arn
-        let iam_groups = db.collection::<Document>("iam_groups");
-        iam_groups
-            .create_index(
-                IndexModel::builder()
-                    .keys(doc! { "group_arn": 1 })
-                    .options(IndexOptions::builder().unique(true).build())
-                    .build(),
-            )
-            .await
-            .map_err(|e| OpError::Internal(format!("iam_groups index: {e}")))?;
-
-        // iam_roles: unique index on role_arn
-        let iam_roles = db.collection::<Document>("iam_roles");
-        iam_roles
-            .create_index(
-                IndexModel::builder()
-                    .keys(doc! { "role_arn": 1 })
-                    .options(IndexOptions::builder().unique(true).build())
-                    .build(),
-            )
-            .await
-            .map_err(|e| OpError::Internal(format!("iam_roles index: {e}")))?;
-
-        // iam_sessions: unique index on access_key_id, TTL on expires_at
-        let iam_sessions = db.collection::<Document>("iam_sessions");
-        iam_sessions
-            .create_index(
-                IndexModel::builder()
-                    .keys(doc! { "access_key_id": 1 })
-                    .options(IndexOptions::builder().unique(true).build())
-                    .build(),
-            )
-            .await
-            .map_err(|e| OpError::Internal(format!("iam_sessions access_key index: {e}")))?;
-        iam_sessions
-            .create_index(
-                IndexModel::builder()
-                    .keys(doc! { "expires_at": 1 })
-                    .options(
-                        IndexOptions::builder()
-                            .expire_after(std::time::Duration::from_secs(0))
-                            .build(),
-                    )
-                    .build(),
-            )
-            .await
-            .map_err(|e| OpError::Internal(format!("iam_sessions TTL index: {e}")))?;
-
-        // metrics: index on bucket
-        let metrics = db.collection::<Document>("metrics");
-        metrics
-            .create_index(IndexModel::builder().keys(doc! { "_id.bucket": 1 }).build())
-            .await
-            .map_err(|e| OpError::Internal(format!("metrics bucket index: {e}")))?;
-
-        // login_attempts: compound index
-        let login_attempts = db.collection::<Document>("login_attempts");
-        login_attempts
-            .create_index(
-                IndexModel::builder()
-                    .keys(doc! { "principal": 1, "attempted_at": 1 })
-                    .build(),
-            )
-            .await
-            .map_err(|e| OpError::Internal(format!("login_attempts index: {e}")))?;
-
-        // backups: index on (account_id, table_name)
-        let backups = db.collection::<Document>("backups");
-        backups
-            .create_index(
-                IndexModel::builder()
-                    .keys(doc! { "account_id": 1, "table_name": 1 })
-                    .build(),
-            )
-            .await
-            .map_err(|e| OpError::Internal(format!("backups index: {e}")))?;
-
-        // Seed catalog_version in settings
-        let settings = db.collection::<Document>("settings");
-        let _ = settings
-            .update_one(
-                doc! { "_id": "catalog_version" },
-                doc! { "$setOnInsert": { "value": "0.0.2" } },
-            )
-            .upsert(true)
-            .await;
-
-        // Seed the resource-tag migration marker on this fresh catalog so the
-        // server's startup guard passes. An existing catalog created before
-        // this change has no such row, so serve refuses it until
-        // `extenddb migrate --yes` records it.
-        let _ = settings
-            .update_one(
-                doc! { "_id": "resource_tag_migration" },
-                doc! { "$setOnInsert": { "value": "applied" } },
-            )
-            .upsert(true)
-            .await;
-
-        // Record migration
-        let schema_history = db.collection::<Document>("schema_history");
-        let _ = schema_history
-            .insert_one(doc! {
-                "_id": "001_initial",
-                "applied_at": bson::DateTime::now(),
-            })
-            .await; // Ignore E11000 (already applied)
-
-        Ok(())
-    }
-
-    async fn run_data_migrations(&self) -> OpResult<()> {
-        // Data database schema is minimal for MongoDB (just idempotency_tokens)
-        // Table collections are created on-demand
-        Ok(())
-    }
-
-    async fn pending_data_migrations(&self) -> OpResult<Vec<String>> {
-        // MongoDB has no versioned data-database migrations — table
-        // collections are created on-demand, and the idempotency_tokens
-        // collection is created in create_data_db. Nothing to apply.
-        Ok(Vec::new())
     }
 
     async fn record_data_connection(&self) -> OpResult<()> {
@@ -394,24 +137,28 @@ impl Bootstrapper for MongoBootstrapper {
         let settings = db.collection::<Document>("settings");
 
         let data_db_name = "extenddb_data".to_string();
-        settings
-            .update_one(
-                doc! { "_id": "data_database_name" },
-                doc! { "$set": { "value": &data_db_name } },
-            )
-            .upsert(true)
-            .await
-            .map_err(|e| OpError::Internal(format!("record_data_connection: {e}")))?;
+        self.request(
+            "record_data_connection",
+            settings
+                .update_one(
+                    doc! { "_id": "data_database_name" },
+                    doc! { "$set": { "value": &data_db_name } },
+                )
+                .upsert(true),
+        )
+        .await?;
 
         let redacted = redact_connection_string(&self.connection_string);
-        settings
-            .update_one(
-                doc! { "_id": "data_connection_string" },
-                doc! { "$set": { "value": &redacted } },
-            )
-            .upsert(true)
-            .await
-            .map_err(|e| OpError::Internal(format!("record data_connection_string: {e}")))?;
+        self.request(
+            "record data_connection_string",
+            settings
+                .update_one(
+                    doc! { "_id": "data_connection_string" },
+                    doc! { "$set": { "value": &redacted } },
+                )
+                .upsert(true),
+        )
+        .await?;
 
         Ok(())
     }
@@ -424,10 +171,12 @@ impl Bootstrapper for MongoBootstrapper {
         let settings = db.collection::<Document>("settings");
 
         // Check if already exists
-        let existing = settings
-            .find_one(doc! { "_id": "encryption_key" })
-            .await
-            .map_err(|e| OpError::Internal(format!("check encryption key: {e}")))?;
+        let existing = self
+            .request(
+                "check encryption key",
+                settings.find_one(doc! { "_id": "encryption_key" }),
+            )
+            .await?;
 
         if existing.is_some() {
             return Ok(());
@@ -438,15 +187,22 @@ impl Bootstrapper for MongoBootstrapper {
         rand::rng().fill_bytes(&mut key_bytes);
         let key_b64 = base64::engine::general_purpose::STANDARD.encode(key_bytes);
 
-        // Ignore E11000 (race: someone else created it first)
-        let _ = settings
-            .insert_one(doc! {
-                "_id": "encryption_key",
-                "value": &key_b64,
-            })
-            .await;
-
-        Ok(())
+        // A duplicate `_id` (code 11000) means another process wrote the key
+        // first, which keeps one key; every other error stops `init`.
+        self.request("write the encryption key", async {
+            match settings
+                .insert_one(doc! {
+                    "_id": "encryption_key",
+                    "value": &key_b64,
+                })
+                .await
+            {
+                Ok(_) => Ok(()),
+                Err(e) if crate::migrations::is_duplicate_key(&e) => Ok(()),
+                Err(e) => Err(e),
+            }
+        })
+        .await
     }
 
     async fn bootstrap_default_account(&self) -> OpResult<()> {
@@ -454,24 +210,24 @@ impl Bootstrapper for MongoBootstrapper {
         let accounts = db.collection::<Document>("accounts");
 
         // Check if any account exists
-        let count = accounts
-            .count_documents(doc! {})
-            .await
-            .map_err(|e| OpError::Internal(format!("count accounts: {e}")))?;
+        let count = self
+            .request("count accounts", accounts.count_documents(doc! {}))
+            .await?;
 
         if count > 0 {
             return Ok(());
         }
 
         let account_id = uuid::Uuid::new_v4().to_string();
-        accounts
-            .insert_one(doc! {
+        self.request(
+            "create default account",
+            accounts.insert_one(doc! {
                 "_id": &account_id,
                 "account_name": "default",
                 "created_at": bson::DateTime::now(),
-            })
-            .await
-            .map_err(|e| OpError::Internal(format!("create default account: {e}")))?;
+            }),
+        )
+        .await?;
 
         Ok(())
     }
@@ -487,10 +243,12 @@ impl Bootstrapper for MongoBootstrapper {
         let admin_users = db.collection::<Document>("admin_users");
 
         // Check if admin already exists
-        let existing = admin_users
-            .find_one(doc! { "_id": &username })
-            .await
-            .map_err(|e| OpError::Internal(format!("check admin: {e}")))?;
+        let existing = self
+            .request(
+                "check admin",
+                admin_users.find_one(doc! { "_id": &username }),
+            )
+            .await?;
 
         if existing.is_some() {
             return Ok(AdminBootstrapResult {
@@ -517,14 +275,15 @@ impl Bootstrapper for MongoBootstrapper {
         let password_hash = bcrypt::hash(&password, bcrypt::DEFAULT_COST)
             .map_err(|e| OpError::Internal(format!("bcrypt hash: {e}")))?;
 
-        admin_users
-            .insert_one(doc! {
+        self.request(
+            "create admin",
+            admin_users.insert_one(doc! {
                 "_id": &username,
                 "password_hash": &password_hash,
                 "created_at": bson::DateTime::now(),
-            })
-            .await
-            .map_err(|e| OpError::Internal(format!("create admin: {e}")))?;
+            }),
+        )
+        .await?;
 
         Ok(AdminBootstrapResult {
             username,
@@ -532,15 +291,6 @@ impl Bootstrapper for MongoBootstrapper {
             already_existed: false,
             from_env,
         })
-    }
-
-    async fn is_catalog_initialized(&self) -> OpResult<bool> {
-        let db = self.catalog_db();
-        let collections = db
-            .list_collection_names()
-            .await
-            .map_err(|e| OpError::Internal(format!("list collections: {e}")))?;
-        Ok(collections.contains(&"settings".to_string()))
     }
 
     async fn list_table_names(&self) -> OpResult<Vec<String>> {
@@ -599,24 +349,6 @@ impl Bootstrapper for MongoBootstrapper {
         Ok(())
     }
 
-    async fn read_catalog_version(&self) -> OpResult<Option<String>> {
-        let db = self.catalog_db();
-        let settings = db.collection::<Document>("settings");
-        let doc = settings
-            .find_one(doc! { "_id": "catalog_version" })
-            .await
-            .map_err(|e| OpError::Internal(format!("read catalog_version: {e}")))?;
-        Ok(doc.and_then(|d| {
-            d.get_str("value")
-                .ok()
-                .map(std::string::ToString::to_string)
-        }))
-    }
-
-    fn expected_catalog_version(&self) -> String {
-        "0.0.2".to_string()
-    }
-
     fn catalog_database_name(&self) -> String {
         "extenddb_catalog".to_string()
     }
@@ -627,6 +359,16 @@ impl Bootstrapper for MongoBootstrapper {
 
     fn catalog_connection_url(&self) -> String {
         format!("{}/extenddb_catalog", self.connection_string)
+    }
+
+    /// The connection string the config file names, which the server uses
+    /// too, and the redacted one `record_data_connection` records, so
+    /// taking the lock knows it runs for `init` and may create the catalog.
+    fn init_target(&self) -> extenddb_storage::migrations::Target {
+        extenddb_storage::migrations::Target {
+            data_connection: Some(redact_connection_string(&self.connection_string)),
+            ..extenddb_storage::migrations::Target::at(self.connection_string.clone())
+        }
     }
 
     fn generate_backend_config_section(&self) -> String {
@@ -669,6 +411,124 @@ fn redact_connection_string(uri: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::redact_connection_string;
+
+    /// `init` and `destroy` reach the database through this client. Against
+    /// a port nothing listens on, a request fails after the runner's 10 s
+    /// server selection timeout, not the driver's 30 s default; the outer
+    /// timeout turns a hang into a failure instead of a blocked test run.
+    #[tokio::test]
+    async fn a_request_to_an_unreachable_database_fails_within_the_runner_timeout() {
+        use extenddb_storage::bootstrapper::Bootstrapper;
+        use std::time::{Duration, Instant};
+
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .expect("a free port")
+            .port();
+        let config = std::env::temp_dir().join(format!(
+            "extenddb-unreachable-{}-{port}.toml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &config,
+            format!(
+                "[storage]\nbackend = \"mongodb\"\n\n[storage.mongodb]\nconnection_string = \
+                 \"mongodb://127.0.0.1:{port}/?directConnection=true\"\n"
+            ),
+        )
+        .expect("write the config");
+        let bootstrapper =
+            super::MongoBootstrapper::from_config(config.to_str().expect("a UTF-8 path"), &[])
+                .await
+                .expect("the client is built without connecting");
+        let started = Instant::now();
+        let answer = tokio::time::timeout(Duration::from_secs(40), bootstrapper.get_data_db_name())
+            .await
+            .expect("the request ended instead of waiting");
+        let took = started.elapsed();
+        let _ = std::fs::remove_file(&config);
+        assert!(answer.is_err(), "{answer:?}");
+        assert!(
+            took < Duration::from_secs(15),
+            "the request failed {took:?} after it was sent"
+        );
+    }
+
+    /// `init` writes the bootstrap rows under the migration lock, and each
+    /// row's requests check the lock's lease first, as the runner does before
+    /// a migration request. Past the lease's margin nothing is sent: the
+    /// write to a port nothing listens on fails at once with the lease's
+    /// reason, not after the 10 s server selection timeout.
+    #[tokio::test]
+    async fn a_bootstrap_row_is_refused_once_the_held_lease_lapses() {
+        use crate::migrations::{Lease, Timing};
+        use extenddb_storage::bootstrapper::Bootstrapper;
+        use std::time::{Duration, Instant};
+
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .expect("a free port")
+            .port();
+        let config = std::env::temp_dir().join(format!(
+            "extenddb-lapsed-{}-{port}.toml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &config,
+            format!(
+                "[storage]\nbackend = \"mongodb\"\n\n[storage.mongodb]\nconnection_string = \
+                 \"mongodb://127.0.0.1:{port}/?directConnection=true\"\n"
+            ),
+        )
+        .expect("write the config");
+        let bootstrapper =
+            super::MongoBootstrapper::from_config(config.to_str().expect("a UTF-8 path"), &[])
+                .await
+                .expect("the client is built without connecting");
+        let _ = std::fs::remove_file(&config);
+        // A lease last renewed a full lease ago, with no renewal task.
+        let renewed = Instant::now()
+            .checked_sub(Timing::PRODUCTION.lease)
+            .expect("the clock has run for a lease");
+        bootstrapper
+            .lease
+            .set(Lease::new(renewed, Timing::PRODUCTION))
+            .ok()
+            .expect("no lease was held yet");
+
+        for (what, write) in [
+            ("encryption key", bootstrapper.bootstrap_encryption_key()),
+            ("default account", bootstrapper.bootstrap_default_account()),
+            ("data connection", bootstrapper.record_data_connection()),
+        ] {
+            let started = Instant::now();
+            let error = tokio::time::timeout(Duration::from_secs(5), write)
+                .await
+                .unwrap_or_else(|_| panic!("the {what} write waited for an answer"))
+                .expect_err("refused");
+            assert!(
+                format!("{error:?}").contains("the migration lock was last renewed"),
+                "{what}: {error:?}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "the {what} write was sent"
+            );
+        }
+        let admin = tokio::time::timeout(
+            Duration::from_secs(5),
+            bootstrapper.bootstrap_admin_user(None, None),
+        )
+        .await
+        .expect("the admin write waited for an answer");
+        match admin {
+            Err(error) => assert!(
+                format!("{error:?}").contains("the migration lock was last renewed"),
+                "admin: {error:?}"
+            ),
+            Ok(result) => panic!("the admin row was written: {}", result.username),
+        }
+    }
 
     #[test]
     fn redact_userinfo_with_password() {
