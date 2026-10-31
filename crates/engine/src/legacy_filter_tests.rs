@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Tests for the legacy condition validator; every expected message was
-//! measured against Amazon DynamoDB on 2026-10-23.
+//! measured against Amazon DynamoDB on 2026-10-23 and 2026-10-24.
 
 use std::collections::BTreeMap;
 
@@ -191,55 +191,401 @@ fn desugar_filter_refuses_before_desugaring() {
     );
 }
 
+fn cond(op: &str, values: Vec<AttributeValue>) -> Condition {
+    Condition {
+        comparison_operator: op.to_owned(),
+        attribute_value_list: values,
+    }
+}
+
+fn s(v: &str) -> AttributeValue {
+    AttributeValue::S(v.to_owned())
+}
+
+fn n(v: &str) -> AttributeValue {
+    AttributeValue::N(v.to_owned())
+}
+
+fn kc(entries: Vec<(&str, Condition)>) -> HashMap<String, Condition> {
+    entries
+        .into_iter()
+        .map(|(name, c)| (name.to_owned(), c))
+        .collect()
+}
+
+fn schema(
+    keys: &[(&str, KeyType, ScalarAttributeType)],
+) -> (Vec<KeySchemaElement>, Vec<AttributeDefinition>) {
+    (
+        keys.iter()
+            .map(|(name, key_type, _)| KeySchemaElement {
+                attribute_name: (*name).to_owned(),
+                key_type: *key_type,
+            })
+            .collect(),
+        keys.iter()
+            .map(|(name, _, ty)| AttributeDefinition {
+                attribute_name: (*name).to_owned(),
+                attribute_type: *ty,
+            })
+            .collect(),
+    )
+}
+
+fn ss_schema() -> (Vec<KeySchemaElement>, Vec<AttributeDefinition>) {
+    schema(&[
+        ("pk", KeyType::Hash, ScalarAttributeType::S),
+        ("sk", KeyType::Range, ScalarAttributeType::S),
+    ])
+}
+
+fn key_error(
+    conditions: &HashMap<String, Condition>,
+    (ks, defs): &(Vec<KeySchemaElement>, Vec<AttributeDefinition>),
+) -> Option<String> {
+    match desugar_key_conditions(conditions, ks, defs) {
+        Ok(_) => None,
+        Err(DynamoDbError::ValidationException(m)) => Some(m),
+        Err(other) => panic!("unexpected error {other:?}"),
+    }
+}
+
+const SCHEMA_TYPE: &str = "Condition parameter type does not match schema type";
+const NOT_INDEXABLE: &str = "Attempted conditional constraint is not an indexable operation";
+
+fn empty_key(name: &str) -> Option<String> {
+    Some(format!(
+        "One or more parameter values are not valid. The AttributeValue for a key attribute cannot contain an empty string value. Key: {name}"
+    ))
+}
+
+/// A number that does not parse is reported before the operator name, the
+/// count, the operator type, the same-type check and the range, inside sets,
+/// lists and maps too (measured 2026-10-24).
 #[test]
-fn key_conditions_refuse_non_indexable_operators_after_the_value_checks() {
-    let schema = vec![("pk".to_owned(), true), ("sk".to_owned(), false)];
-    let eq = |v: AttributeValue| Condition {
-        comparison_operator: "EQ".to_owned(),
-        attribute_value_list: vec![v],
+fn numbers_are_checked_before_the_operator_checks() {
+    let bad = |raw: &str| {
+        Some(format!(
+            "The parameter cannot be converted to a numeric value: {raw}"
+        ))
     };
+    assert_eq!(msg("EQ", &[n("abc")]), bad("abc"));
+    assert_eq!(msg("EQ", &[n("12e")]), bad("12e"));
+    assert_eq!(msg("BEGINS_WITH", &[n("abc")]), bad("abc"));
+    assert_eq!(msg("FOO", &[n("abc")]), bad("abc"));
+    assert_eq!(msg("EQ", &[n("abc"), s("x")]), bad("abc"));
+    assert_eq!(msg("EQ", &[s("x"), n("abc")]), bad("abc"));
+    assert_eq!(msg("IN", &[s("x"), n("abc")]), bad("abc"));
+    assert_eq!(msg("NULL", &[n("abc")]), bad("abc"));
+    assert_eq!(msg("BETWEEN", &[n("2"), n("abc")]), bad("abc"));
+    assert_eq!(msg("BETWEEN", &[n("abc"), n("2")]), bad("abc"));
+    assert_eq!(
+        msg(
+            "EQ",
+            &[AttributeValue::NS(
+                ["1".to_owned(), "abc".to_owned()].into()
+            )]
+        ),
+        bad("abc")
+    );
+    assert_eq!(msg("EQ", &[AttributeValue::L(vec![n("abc")])]), bad("abc"));
+    assert_eq!(
+        msg(
+            "EQ",
+            &[AttributeValue::M([("k".to_owned(), n("abc"))].into())]
+        ),
+        bad("abc")
+    );
+    assert_eq!(msg("LT", &[AttributeValue::L(vec![n("abc")])]), bad("abc"));
+    assert_eq!(
+        msg("EQ", &[n("1e400")]),
+        Some(
+            "Number overflow. Attempting to store a number with magnitude larger than supported range"
+                .to_owned()
+        )
+    );
+    assert_eq!(msg("EQ", &[n("1")]), None);
+    assert_eq!(msg("EQ", &[n("-1.5e3")]), None);
+}
+
+#[test]
+fn key_conditions_refuse_non_indexable_operators_on_any_key_at_request_time() {
     for (op, values) in [
-        ("NE", vec![AttributeValue::S("a".to_owned())]),
+        ("NE", vec![s("a")]),
         ("NULL", Vec::new()),
         ("NOT_NULL", Vec::new()),
-        ("CONTAINS", vec![AttributeValue::S("a".to_owned())]),
-        ("NOT_CONTAINS", vec![AttributeValue::N("1".to_owned())]),
-        (
-            "IN",
-            vec![
-                AttributeValue::S("a".to_owned()),
-                AttributeValue::S("b".to_owned()),
-            ],
-        ),
+        ("CONTAINS", vec![s("a")]),
+        ("NOT_CONTAINS", vec![n("1")]),
+        ("IN", vec![s("a"), s("b")]),
     ] {
-        let mut kc = HashMap::new();
-        kc.insert("pk".to_owned(), eq(AttributeValue::S("p".to_owned())));
-        kc.insert(
-            "sk".to_owned(),
-            Condition {
-                comparison_operator: op.to_owned(),
-                attribute_value_list: values,
-            },
-        );
-        let err = desugar_key_conditions(&kc, &schema).unwrap_err();
-        assert!(
-            matches!(&err, DynamoDbError::ValidationException(m) if Some(m.clone()) == refusal("Attempted conditional constraint is not an indexable operation")),
-            "{op}: {err:?}"
-        );
+        let on_sk = kc(vec![
+            ("pk", cond("EQ", vec![s("p")])),
+            ("sk", cond(op, values.clone())),
+        ]);
+        let on_pk = kc(vec![("pk", cond(op, values))]);
+        for conditions in [&on_sk, &on_pk] {
+            let err = validate_key_conditions(conditions).unwrap_err();
+            assert!(
+                matches!(&err, DynamoDbError::ValidationException(m) if Some(m.clone()) == refusal(NOT_INDEXABLE)),
+                "{op}: {err:?}"
+            );
+        }
     }
     // A value the operator does not take is reported first, as is a count.
-    let mut kc = HashMap::new();
-    kc.insert("pk".to_owned(), eq(AttributeValue::S("p".to_owned())));
-    kc.insert(
-        "sk".to_owned(),
-        Condition {
-            comparison_operator: "CONTAINS".to_owned(),
-            attribute_value_list: vec![AttributeValue::L(Vec::new())],
-        },
-    );
-    let err = desugar_key_conditions(&kc, &schema).unwrap_err();
+    let typed = kc(vec![
+        ("pk", cond("EQ", vec![s("p")])),
+        ("sk", cond("CONTAINS", vec![AttributeValue::L(Vec::new())])),
+    ]);
+    let err = validate_key_conditions(&typed).unwrap_err();
     assert!(
         matches!(&err, DynamoDbError::ValidationException(m) if Some(m.clone()) == type_refusal("CONTAINS", "L")),
         "{err:?}"
+    );
+    // Non-indexable is reported ahead of a schema type mismatch on the other key.
+    assert_eq!(
+        key_error(
+            &kc(vec![
+                ("pk", cond("EQ", vec![n("1")])),
+                ("sk", cond("NE", vec![s("a")]))
+            ]),
+            &ss_schema()
+        ),
+        refusal(NOT_INDEXABLE)
+    );
+    assert!(validate_key_conditions(&kc(vec![("pk", cond("EQ", vec![s("p")]))])).is_ok());
+}
+
+#[test]
+fn key_conditions_refuse_a_value_of_the_wrong_schema_type() {
+    let ss = ss_schema();
+    let sn = schema(&[
+        ("pk", KeyType::Hash, ScalarAttributeType::S),
+        ("sk", KeyType::Range, ScalarAttributeType::N),
+    ]);
+    let pk_s = || ("pk", cond("EQ", vec![s("p")]));
+    for hash in [
+        n("1"),
+        AttributeValue::B(vec![1]),
+        AttributeValue::Bool(true),
+    ] {
+        assert_eq!(
+            key_error(&kc(vec![("pk", cond("EQ", vec![hash]))]), &ss),
+            refusal(SCHEMA_TYPE)
+        );
+    }
+    for range in [
+        cond("EQ", vec![n("1")]),
+        cond("LE", vec![AttributeValue::B(vec![1])]),
+        cond("BETWEEN", vec![n("1"), n("2")]),
+        cond("BEGINS_WITH", vec![AttributeValue::B(vec![1])]),
+    ] {
+        assert_eq!(
+            key_error(&kc(vec![pk_s(), ("sk", range)]), &ss),
+            refusal(SCHEMA_TYPE)
+        );
+    }
+    for range in [
+        cond("EQ", vec![s("abc")]),
+        cond("BEGINS_WITH", vec![s("1")]),
+        cond("BETWEEN", vec![s("a"), s("b")]),
+        cond("LT", vec![s("5")]),
+    ] {
+        assert_eq!(
+            key_error(&kc(vec![pk_s(), ("sk", range)]), &sn),
+            refusal(SCHEMA_TYPE)
+        );
+    }
+    // Both keys wrong: one message, no attribute named.
+    assert_eq!(
+        key_error(
+            &kc(vec![
+                ("pk", cond("EQ", vec![n("1")])),
+                ("sk", cond("EQ", vec![n("1")]))
+            ]),
+            &ss
+        ),
+        refusal(SCHEMA_TYPE)
+    );
+    // The hash key's type is checked before its operator; a well-typed hash key
+    // with a non-EQ operator is refused before the range key's type.
+    assert_eq!(
+        key_error(&kc(vec![("pk", cond("LT", vec![n("1")]))]), &ss),
+        refusal(SCHEMA_TYPE)
+    );
+    assert_eq!(
+        key_error(
+            &kc(vec![
+                ("pk", cond("LT", vec![s("p")])),
+                ("sk", cond("EQ", vec![n("1")]))
+            ]),
+            &ss
+        ),
+        Some("Query key condition not supported".to_owned())
+    );
+    // Type before a condition on a non-key attribute; an absent hash key first.
+    assert_eq!(
+        key_error(
+            &kc(vec![
+                ("pk", cond("EQ", vec![n("1")])),
+                ("foo", cond("EQ", vec![s("x")]))
+            ]),
+            &ss
+        ),
+        refusal(SCHEMA_TYPE)
+    );
+    assert_eq!(
+        key_error(&kc(vec![("sk", cond("EQ", vec![n("1")]))]), &ss),
+        Some("Query condition missed key schema element: pk".to_owned())
+    );
+    // Well-typed conditions pass.
+    assert!(key_error(&kc(vec![pk_s(), ("sk", cond("EQ", vec![n("1")]))]), &sn).is_none());
+    assert!(
+        key_error(
+            &kc(vec![pk_s(), ("sk", cond("BETWEEN", vec![s("a"), s("b")]))]),
+            &ss
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn key_conditions_refuse_an_empty_string_after_the_schema_checks() {
+    let ss = ss_schema();
+    let pk_s = || ("pk", cond("EQ", vec![s("p")]));
+    assert_eq!(
+        key_error(&kc(vec![("pk", cond("EQ", vec![s("")]))]), &ss),
+        empty_key("pk")
+    );
+    for op in ["EQ", "LE", "LT", "GE", "GT", "BEGINS_WITH"] {
+        assert_eq!(
+            key_error(&kc(vec![pk_s(), ("sk", cond(op, vec![s("")]))]), &ss),
+            empty_key("sk"),
+            "{op}"
+        );
+    }
+    assert_eq!(
+        key_error(
+            &kc(vec![pk_s(), ("sk", cond("BETWEEN", vec![s(""), s("a")]))]),
+            &ss
+        ),
+        empty_key("sk")
+    );
+    assert_eq!(
+        key_error(
+            &kc(vec![pk_s(), ("sk", cond("BETWEEN", vec![s(""), s("")]))]),
+            &ss
+        ),
+        empty_key("sk")
+    );
+    // Hash key named first; schema type, operator and non-key checks come first.
+    assert_eq!(
+        key_error(
+            &kc(vec![
+                ("pk", cond("EQ", vec![s("")])),
+                ("sk", cond("EQ", vec![s("")]))
+            ]),
+            &ss
+        ),
+        empty_key("pk")
+    );
+    assert_eq!(
+        key_error(
+            &kc(vec![
+                ("pk", cond("EQ", vec![s("")])),
+                ("sk", cond("EQ", vec![n("1")]))
+            ]),
+            &ss
+        ),
+        refusal(SCHEMA_TYPE)
+    );
+    assert_eq!(
+        key_error(
+            &kc(vec![
+                ("pk", cond("EQ", vec![n("1")])),
+                ("sk", cond("EQ", vec![s("")]))
+            ]),
+            &ss
+        ),
+        refusal(SCHEMA_TYPE)
+    );
+    assert_eq!(
+        key_error(&kc(vec![("pk", cond("LT", vec![s("")]))]), &ss),
+        Some("Query key condition not supported".to_owned())
+    );
+    assert_eq!(
+        key_error(
+            &kc(vec![
+                ("pk", cond("EQ", vec![s("")])),
+                ("foo", cond("EQ", vec![s("x")]))
+            ]),
+            &ss
+        ),
+        Some("Query condition missed key schema element: pk".to_owned())
+    );
+    // An inverted range is a request-time error and wins over the empty bound.
+    assert_eq!(
+        key_error(
+            &kc(vec![pk_s(), ("sk", cond("BETWEEN", vec![s("a"), s("")]))]),
+            &ss
+        ),
+        refusal(
+            "The BETWEEN condition was provided a range where the lower bound is greater than the upper bound"
+        )
+    );
+    // An empty B on an S key is a schema type mismatch.
+    assert_eq!(
+        key_error(
+            &kc(vec![(
+                "pk",
+                cond("EQ", vec![AttributeValue::B(Vec::new())])
+            )]),
+            &ss
+        ),
+        refusal(SCHEMA_TYPE)
+    );
+}
+
+#[test]
+fn query_filter_may_not_name_a_key_of_the_queried_schema() {
+    let (ks, _) = ss_schema();
+    let on_key = |name: &str| {
+        Some(format!(
+            "QueryFilter can only contain non-primary key attributes: Primary key attribute: {name}"
+        ))
+    };
+    let err = |filter: &HashMap<String, Condition>| match reject_query_filter_on_key(filter, &ks) {
+        Ok(()) => None,
+        Err(DynamoDbError::ValidationException(m)) => Some(m),
+        Err(other) => panic!("unexpected error {other:?}"),
+    };
+    assert_eq!(
+        err(&kc(vec![("pk", cond("EQ", vec![s("x")]))])),
+        on_key("pk")
+    );
+    assert_eq!(
+        err(&kc(vec![("sk", cond("EQ", vec![s("x")]))])),
+        on_key("sk")
+    );
+    assert_eq!(
+        err(&kc(vec![("pk", cond("NOT_NULL", vec![]))])),
+        on_key("pk")
+    );
+    // Hash key named first whatever the map order.
+    assert_eq!(
+        err(&kc(vec![
+            ("sk", cond("EQ", vec![s("x")])),
+            ("pk", cond("EQ", vec![s("x")]))
+        ])),
+        on_key("pk")
+    );
+    assert_eq!(err(&kc(vec![("zz", cond("EQ", vec![s("x")]))])), None);
+    // Only the queried schema's keys count: a GSI schema frees the table keys.
+    let (gsi, _) = schema(&[
+        ("gpk", KeyType::Hash, ScalarAttributeType::S),
+        ("gsk", KeyType::Range, ScalarAttributeType::S),
+    ]);
+    assert!(reject_query_filter_on_key(&kc(vec![("pk", cond("EQ", vec![s("x")]))]), &gsi).is_ok());
+    assert!(
+        reject_query_filter_on_key(&kc(vec![("gsk", cond("EQ", vec![s("x")]))]), &gsi).is_err()
     );
 }
