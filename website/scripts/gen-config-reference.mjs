@@ -165,8 +165,17 @@ function render(sections) {
     out.push('| Key | Default | Description |');
     out.push('|-----|---------|-------------|');
     for (const key of section.keys) {
-      const def = key.hasDefault ? `\`${key.value}\`` : 'none';
-      out.push(`| \`${key.name}\` | ${def} | ${cell(key.description)} |`);
+      // A long default (the PostgreSQL connection string) would set the column
+      // width for the whole table; it moves into the description instead.
+      let def = 'none';
+      let desc = key.description;
+      if (key.hasDefault && key.value.length > 40) {
+        def = 'see description';
+        desc += ` Default: \`${key.name} = ${key.value}\``;
+      } else if (key.hasDefault) {
+        def = `\`${key.value}\``;
+      }
+      out.push(`| \`${key.name}\` | ${def} | ${cell(desc)} |`);
     }
   }
   out.push('');

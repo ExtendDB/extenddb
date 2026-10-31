@@ -59,7 +59,7 @@ Connection budget: `pool_size` sizes two pools, one against the catalog database
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `connection_string` | `"postgresql://extenddb:extenddb-local-dev@localhost:5432/extenddb_catalog"` | Connection string for the catalog database. For production add `?sslmode=require` and a password of your own. |
+| `connection_string` | see description | Connection string for the catalog database. For production add `?sslmode=require` and a password of your own. Default: `connection_string = "postgresql://extenddb:extenddb-local-dev@localhost:5432/extenddb_catalog"` |
 | `pool_size` | `20` | Maximum concurrent connections in each of the two data-operation pools. Minimum 10: smaller values are raised to 10 with a startup warning. Increase for higher concurrency and raise PostgreSQL's max_connections to at least 2 \* `pool_size` + `catalog_pool_size` + the number of vector index builds and restores you expect to overlap. |
 | `catalog_pool_size` | none | Maximum connections for the management and catalog pool (authorization, Identity and Access Management (IAM), console). Minimum 10, raised with a startup warning. With auth enabled each DynamoDB request makes concurrent authorization queries, so size this to match the expected request concurrency. Falls back to `pool_size` when absent. Example: `catalog_pool_size = 20` |
 

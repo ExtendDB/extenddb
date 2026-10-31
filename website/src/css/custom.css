@@ -297,10 +297,18 @@ html {
     min-width: 0;
     overflow-wrap: break-word;
   }
-  /* Key names, quoted defaults and example assignments are single
-     unbreakable words; let code spans break anywhere so a reference table
-     fits a phone-width column. */
-  article table td code {
+  /* Key names and defaults stay whole: a key split into syllables or a number
+     split across lines is harder to read than a sideways scroll. The
+     description column keeps a floor so it stays readable while the table
+     scrolls inside its own box. */
+  article table td:nth-child(1) code,
+  article table td:nth-child(2) code {
+    white-space: nowrap;
+  }
+  article table td:nth-child(3) {
+    min-width: 14rem;
+  }
+  article table td:nth-child(3) code {
     overflow-wrap: anywhere;
   }
 }
