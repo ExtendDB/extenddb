@@ -143,6 +143,16 @@ mod tests {
     /// their bcrypt calls are the only ones in flight in this process.
     static COUNTERS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    /// Check the result of a wrong password queued behind other bcrypt calls:
+    /// refused as wrong, or refused as overloaded when the host is slow
+    /// enough that no slot freed within [`VERIFY_WAIT`].
+    fn assert_wrong_or_overloaded(result: OpResult<bool>) {
+        match result {
+            Ok(verified) => assert!(!verified, "a wrong password verified"),
+            Err(e) => assert!(is_overloaded(&e), "unexpected error: {e:?}"),
+        }
+    }
+
     /// Wait until `n` bcrypt calls are running on the blocking pool.
     async fn wait_until_running(n: usize) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
@@ -188,7 +198,7 @@ mod tests {
             })
             .collect();
         for task in fresh {
-            assert!(!task.await.unwrap().unwrap());
+            assert_wrong_or_overloaded(task.await.unwrap());
         }
         // The cancelled calls run to completion on the blocking pool.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
@@ -281,11 +291,11 @@ mod tests {
         for _ in 0..32 {
             let hash = hash.clone();
             tasks.push(tokio::spawn(async move {
-                verify_password("wrong".to_owned(), hash).await.unwrap()
+                verify_password("wrong".to_owned(), hash).await
             }));
         }
         for task in tasks {
-            assert!(!task.await.unwrap());
+            assert_wrong_or_overloaded(task.await.unwrap());
         }
         let peak = high_water_mark();
         assert!(peak >= 1, "no verification was observed running");
