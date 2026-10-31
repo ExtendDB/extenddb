@@ -8,6 +8,37 @@ This document lists all known behavioral differences between ExtendDB and the
 Amazon DynamoDB service. Use it to understand what works identically and what requires
 adaptation when switching between ExtendDB and the service.
 
+## Feature status
+
+This table is the one record of which DynamoDB features ExtendDB implements. The sections that follow
+give the behavioural detail for each area.
+
+| Feature | Status |
+|---------|--------|
+| CreateTable / DeleteTable / DescribeTable / ListTables / UpdateTable | ✓ |
+| PutItem / GetItem / UpdateItem / DeleteItem | ✓ |
+| Query / Scan (with filter, projection, pagination) | ✓ |
+| BatchWriteItem / BatchGetItem | ✓ |
+| TransactWriteItems / TransactGetItems | ✓ |
+| Global Secondary Indexes (GSI) | ✓ |
+| Vector indexes and SearchVectors | ✓ (PostgreSQL requires the pgvector extension) |
+| Local Secondary Indexes (LSI) | ✓ |
+| DynamoDB Streams | ✓ |
+| ConditionExpression / FilterExpression / UpdateExpression / ProjectionExpression | ✓ |
+| KeyConditionExpression | ✓ |
+| ReturnValues / ReturnConsumedCapacity | ✓ |
+| TTL (DescribeTimeToLive / UpdateTimeToLive) | ✓ |
+| Tagging (TagResource / UntagResource / ListTagsOfResource) | ✓ |
+| SigV4 Authentication | ✓ |
+| IAM Policy Evaluation | ✓ |
+| Legacy API (Expected, AttributeUpdates, AttributesToGet) | ✓ |
+| PartiQL (ExecuteStatement, BatchExecuteStatement, ExecuteTransaction) | ✗ (not implemented; returns UnknownOperationException) |
+| DAX | ✗ (not applicable) |
+| Global Tables | ✗ (not implemented; returns UnknownOperationException) |
+| On-demand backups (CreateBackup, RestoreTableFromBackup, DescribeBackup, ListBackups, DeleteBackup) | ✓ (see Backup and Restore below) |
+| Point-in-time recovery | ✗ (RestoreTableToPointInTime is refused with ValidationException) |
+| Import/Export (local filesystem) | ✓ (FileSource instead of S3) |
+
 ## Storage and Infrastructure
 
 | Area | DynamoDB | ExtendDB |

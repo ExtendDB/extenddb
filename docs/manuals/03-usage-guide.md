@@ -551,33 +551,11 @@ ExtendDB returns the DynamoDB error types and, where measured against the servic
 | `UnrecognizedClientException` | 403 | Invalid access key |
 | `InternalServerError` | 500 | Unexpected server error |
 
-## Supported Features Summary
+## Supported features
 
-| Feature | Status |
-|---------|--------|
-| CreateTable / DeleteTable / DescribeTable / ListTables / UpdateTable | ✓ |
-| PutItem / GetItem / UpdateItem / DeleteItem | ✓ |
-| Query / Scan (with filter, projection, pagination) | ✓ |
-| BatchWriteItem / BatchGetItem | ✓ |
-| TransactWriteItems / TransactGetItems | ✓ |
-| Global Secondary Indexes (GSI) | ✓ |
-| Vector indexes and SearchVectors | ✓ (PostgreSQL requires the pgvector extension) |
-| Local Secondary Indexes (LSI) | ✓ |
-| DynamoDB Streams | ✓ |
-| ConditionExpression / FilterExpression / UpdateExpression / ProjectionExpression | ✓ |
-| KeyConditionExpression | ✓ |
-| ReturnValues / ReturnConsumedCapacity | ✓ |
-| TTL (DescribeTimeToLive / UpdateTimeToLive) | ✓ |
-| Tagging (TagResource / UntagResource / ListTagsOfResource) | ✓ |
-| SigV4 Authentication | ✓ |
-| IAM Policy Evaluation | ✓ |
-| Legacy API (Expected, AttributeUpdates, AttributesToGet) | ✓ |
-| PartiQL (ExecuteStatement, BatchExecuteStatement, ExecuteTransaction) | ✗ (not implemented; returns UnknownOperationException) |
-| DAX | ✗ (not applicable) |
-| Global Tables | ✗ (not implemented; returns UnknownOperationException) |
-| On-demand backups (CreateBackup, RestoreTableFromBackup, DescribeBackup, ListBackups, DeleteBackup) | ✓ (see the backup rows on the differences page) |
-| Point-in-time recovery | ✗ (RestoreTableToPointInTime is refused with ValidationException) |
-| Import/Export (local filesystem) | ✓ (FileSource instead of S3) |
+The status of every feature area (implemented, not implemented, or implemented with a difference) is
+recorded in one place: the [Feature status](../differences-from-dynamodb.md#feature-status) table on
+the Differences from DynamoDB page. That page also lists every measured behavioural difference by area.
 
 ---
 
