@@ -9,7 +9,9 @@
 use std::collections::BTreeMap;
 
 use super::ast::PathElement;
+use super::kind::ExpressionKind;
 use super::resolver::{ExpressionMaps, resolve_name_ref};
+use super::syntax_error::{is_operator_or_keyword, syntax_error};
 use super::tokenizer::Token;
 use crate::error::DynamoDbError;
 use crate::types::{AttributeValue, Item};
@@ -22,11 +24,25 @@ use crate::types::{AttributeValue, Item};
 ///
 /// Returns `ValidationException` for syntax errors.
 pub fn parse_projection(tokens: &[Token]) -> Result<Vec<Vec<PathElement>>, DynamoDbError> {
+    parse_projection_from(tokens, "")
+}
+
+/// Parse a `ProjectionExpression` whose tokens came from `source`, so a syntax
+/// error can quote the source window around the offending token as Amazon
+/// `DynamoDB` does. An empty `source` joins the token texts instead.
+///
+/// # Errors
+///
+/// Returns `ValidationException` for syntax errors.
+pub fn parse_projection_from(
+    tokens: &[Token],
+    source: &str,
+) -> Result<Vec<Vec<PathElement>>, DynamoDbError> {
     if tokens.is_empty() {
         return Ok(Vec::new());
     }
     let mut pos = 0;
-    let mut paths = vec![super::parser_common::parse_path(tokens, &mut pos)?];
+    let mut paths = vec![parse_projection_path(tokens, source, &mut pos)?];
     while pos < tokens.len() {
         if tokens[pos] != Token::Comma {
             return Err(DynamoDbError::ValidationException(format!(
@@ -34,9 +50,27 @@ pub fn parse_projection(tokens: &[Token]) -> Result<Vec<Vec<PathElement>>, Dynam
             )));
         }
         pos += 1;
-        paths.push(super::parser_common::parse_path(tokens, &mut pos)?);
+        paths.push(parse_projection_path(tokens, source, &mut pos)?);
     }
     Ok(paths)
+}
+
+/// Parse one projected path. Input that ends where a path is required (`#v,`)
+/// and a comma, operator or keyword there (`#v, , #v`) answer the service's
+/// syntax error (measured 2026-10-25: token ",", near ", , #v"; token "<EOF>",
+/// near ","). Any other token keeps the previous text.
+fn parse_projection_path(
+    tokens: &[Token],
+    source: &str,
+    pos: &mut usize,
+) -> Result<Vec<PathElement>, DynamoDbError> {
+    match tokens.get(*pos) {
+        None | Some(Token::Comma) => Err(syntax_error(ExpressionKind::Projection, source, tokens, *pos)),
+        Some(token) if is_operator_or_keyword(token) => {
+            Err(syntax_error(ExpressionKind::Projection, source, tokens, *pos))
+        }
+        Some(_) => super::parser_common::parse_path(tokens, pos),
+    }
 }
 
 /// A node in the projection trie.
@@ -680,5 +714,41 @@ mod tests {
             }
             other => panic!("Expected L, got {other:?}"),
         }
+    }
+
+    // Syntax error wording measured 2026-10-25 (us-east-1) on GetItem.
+
+    fn proj_msg(src: &str) -> String {
+        match parse_projection_from(&tokenize(src).unwrap(), src) {
+            Err(DynamoDbError::ValidationException(m)) => m,
+            other => panic!("expected ValidationException, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn doubled_comma_quotes_the_source_window() {
+        // [d27] `#v, , #v`
+        assert_eq!(
+            proj_msg("#v, , #v"),
+            "Invalid ProjectionExpression: Syntax error; token: \",\", near: \", , #v\""
+        );
+    }
+
+    #[test]
+    fn trailing_comma_is_eof_with_the_comma_as_window() {
+        // [d28] `#v,`
+        assert_eq!(
+            proj_msg("#v,"),
+            "Invalid ProjectionExpression: Syntax error; token: \"<EOF>\", near: \",\""
+        );
+    }
+
+    #[test]
+    fn other_projection_texts_are_unchanged() {
+        assert_eq!(
+            proj_msg("#v #w"),
+            "Invalid ProjectionExpression: unexpected token at position 1"
+        );
+        assert_eq!(proj_msg("#v, )"), "Invalid expression: expected attribute name");
     }
 }

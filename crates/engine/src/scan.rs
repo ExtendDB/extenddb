@@ -139,6 +139,13 @@ pub async fn handle_scan(
         )
     };
 
+    // The operator cap runs before the unused placeholder check and the table
+    // lookup (measured 2026-10-25: the count beats an unused value, a missing
+    // table and an unknown IndexName).
+    if let Some(ref f) = filter {
+        crate::expression_helpers::check_operator_count(f, ExpressionKind::Filter)?;
+    }
+
     // Parse ProjectionExpression or desugar legacy AttributesToGet
     let (effective_projection_str, extra_proj_names) = if input.projection_expression.is_some() {
         (input.projection_expression.clone(), HashMap::new())

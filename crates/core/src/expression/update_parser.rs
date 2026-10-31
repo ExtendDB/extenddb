@@ -17,9 +17,13 @@
 //! ```
 
 use super::ast::{ArithOp, Expr, UpdateAction};
+use super::kind::ExpressionKind;
 use super::parser_common;
+use super::syntax_error::{is_operator_or_keyword, syntax_error};
 use super::tokenizer::Token;
 use crate::error::DynamoDbError;
+
+const KIND: ExpressionKind = ExpressionKind::Update;
 
 /// Parse an update expression token stream into a list of actions.
 ///
@@ -27,49 +31,16 @@ use crate::error::DynamoDbError;
 ///
 /// Returns `ValidationException` for syntax errors.
 pub fn parse_update(tokens: &[Token]) -> Result<Vec<UpdateAction>, DynamoDbError> {
-    parser_common::check_redundant_parens(tokens).map_err(|msg| {
-        DynamoDbError::ValidationException(format!("Invalid UpdateExpression: {msg}"))
-    })?;
-
-    let mut pos = 0;
-    let mut actions = Vec::new();
-
-    while pos < tokens.len() {
-        match &tokens[pos] {
-            Token::Set => {
-                pos += 1;
-                parse_set_actions(tokens, &mut pos, &mut actions)?;
-            }
-            Token::Remove => {
-                pos += 1;
-                parse_remove_actions(tokens, &mut pos, &mut actions)?;
-            }
-            Token::Add => {
-                pos += 1;
-                parse_add_actions(tokens, &mut pos, &mut actions)?;
-            }
-            Token::Delete => {
-                pos += 1;
-                parse_delete_actions(tokens, &mut pos, &mut actions)?;
-            }
-            _ => {
-                return Err(validation_err(
-                    "Invalid UpdateExpression: expected SET, REMOVE, ADD, or DELETE",
-                ));
-            }
-        }
-    }
-
-    if actions.is_empty() {
-        return Err(validation_err(
-            "Invalid UpdateExpression: expression must contain at least one action",
-        ));
-    }
-
-    Ok(actions)
+    parse_update_from(tokens, "")
 }
 
-/// Parse an update expression with DynamoDB-compatible syntax error messages.
+/// Parse an update expression whose tokens came from `source`, so a syntax
+/// error can quote the source window around the offending token as Amazon
+/// `DynamoDB` does. An empty `source` joins the token texts instead.
+///
+/// # Errors
+///
+/// Returns `ValidationException` for syntax errors.
 pub fn parse_update_from(
     tokens: &[Token],
     source: &str,
@@ -85,27 +56,24 @@ pub fn parse_update_from(
         match &tokens[pos] {
             Token::Set => {
                 pos += 1;
-                parse_set_actions(tokens, &mut pos, &mut actions)?;
+                parse_set_actions(tokens, source, &mut pos, &mut actions)?;
             }
             Token::Remove => {
                 pos += 1;
-                parse_remove_actions(tokens, &mut pos, &mut actions)?;
+                parse_remove_actions(tokens, source, &mut pos, &mut actions)?;
             }
             Token::Add => {
                 pos += 1;
-                parse_add_actions(tokens, &mut pos, &mut actions)?;
+                parse_add_actions(tokens, source, &mut pos, &mut actions)?;
             }
             Token::Delete => {
                 pos += 1;
-                parse_delete_actions(tokens, &mut pos, &mut actions)?;
+                parse_delete_actions(tokens, source, &mut pos, &mut actions)?;
             }
-            token => {
-                let token_text = token_display_text(token);
-                let near = build_near_context(source, &token_text);
-                return Err(validation_err(&format!(
-                    "Invalid UpdateExpression: Syntax error; token: \"{token_text}\", near: \"{near}\""
-                )));
-            }
+            // A token where a section keyword is required, such as the second
+            // `+` of `SET #v = :v + :v + :v`, which answers token "+", near
+            // ":v + :v" (measured 2026-10-25).
+            _ => return Err(syntax_error(KIND, source, tokens, pos)),
         }
     }
 
@@ -118,58 +86,48 @@ pub fn parse_update_from(
     Ok(actions)
 }
 
-fn token_display_text(token: &Token) -> String {
-    match token {
-        Token::Ident(s) => s.clone(),
-        Token::NameRef(s) => format!("#{s}"),
-        Token::Placeholder(s) => format!(":{s}"),
-        Token::Eq => "=".to_owned(),
-        Token::Ne => "<>".to_owned(),
-        Token::Lt => "<".to_owned(),
-        Token::Le => "<=".to_owned(),
-        Token::Gt => ">".to_owned(),
-        Token::Ge => ">=".to_owned(),
-        Token::Plus => "+".to_owned(),
-        Token::Minus => "-".to_owned(),
-        Token::Comma => ",".to_owned(),
-        Token::Dot => ".".to_owned(),
-        Token::LBracket => "[".to_owned(),
-        Token::RBracket => "]".to_owned(),
-        Token::LParen => "(".to_owned(),
-        Token::RParen => ")".to_owned(),
-        Token::And => "AND".to_owned(),
-        Token::Or => "OR".to_owned(),
-        Token::Not => "NOT".to_owned(),
-        Token::Between => "BETWEEN".to_owned(),
-        Token::In => "IN".to_owned(),
-        Token::Set => "SET".to_owned(),
-        Token::Remove => "REMOVE".to_owned(),
-        Token::Add => "ADD".to_owned(),
-        Token::Delete => "DELETE".to_owned(),
-    }
-}
-
-fn build_near_context(source: &str, token_text: &str) -> String {
-    if source.is_empty() {
-        return token_text.to_owned();
-    }
-    if let Some(start) = source.find(token_text) {
-        let end = std::cmp::min(start + token_text.len() + 7, source.len());
-        source[start..end].trim_end().to_owned()
-    } else {
-        token_text.to_owned()
+/// Parse the path that starts an action. Input that ends here (`REMOVE`,
+/// `SET #v = :v,`) or an operator here (`SET = :v`) is a syntax error in the
+/// service's wording (measured 2026-10-25).
+fn parse_action_path(
+    tokens: &[Token],
+    src: &str,
+    pos: &mut usize,
+) -> Result<Vec<super::ast::PathElement>, DynamoDbError> {
+    match tokens.get(*pos) {
+        None => Err(syntax_error(KIND, src, tokens, *pos)),
+        Some(token) if is_operator_or_keyword(token) => {
+            Err(syntax_error(KIND, src, tokens, *pos))
+        }
+        _ => parser_common::parse_path(tokens, pos),
     }
 }
 
 fn parse_set_actions(
     tokens: &[Token],
+    src: &str,
     pos: &mut usize,
     actions: &mut Vec<UpdateAction>,
 ) -> Result<(), DynamoDbError> {
     loop {
-        let path = parser_common::parse_path(tokens, pos)?;
-        parser_common::expect_token(tokens, pos, &Token::Eq, "=", "UpdateExpression")?;
-        let value = parse_value_expr(tokens, pos)?;
+        let path = parse_action_path(tokens, src, pos)?;
+        // `SET #v :v` answers token ":v", near "#v :v" (measured 2026-10-25);
+        // end of input and an operator or keyword here follow the same rule.
+        // Any other token keeps the previous text.
+        match tokens.get(*pos) {
+            Some(Token::Eq) => {}
+            None | Some(Token::Placeholder(_)) => {
+                return Err(syntax_error(KIND, src, tokens, *pos));
+            }
+            Some(token) if is_operator_or_keyword(token) => {
+                return Err(syntax_error(KIND, src, tokens, *pos));
+            }
+            Some(_) => {
+                parser_common::expect_token(tokens, pos, &Token::Eq, "=", "UpdateExpression")?;
+            }
+        }
+        *pos += 1;
+        let value = parse_value_expr(tokens, src, pos)?;
         actions.push(UpdateAction::Set { path, value });
 
         if *pos < tokens.len() && tokens[*pos] == Token::Comma {
@@ -183,11 +141,12 @@ fn parse_set_actions(
 
 fn parse_remove_actions(
     tokens: &[Token],
+    src: &str,
     pos: &mut usize,
     actions: &mut Vec<UpdateAction>,
 ) -> Result<(), DynamoDbError> {
     loop {
-        let path = parser_common::parse_path(tokens, pos)?;
+        let path = parse_action_path(tokens, src, pos)?;
         actions.push(UpdateAction::Remove { path });
 
         if *pos < tokens.len() && tokens[*pos] == Token::Comma {
@@ -200,8 +159,8 @@ fn parse_remove_actions(
 }
 
 /// Parse a SET value expression: `operand` or `operand +/- operand`.
-fn parse_value_expr(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbError> {
-    let left = parse_set_operand(tokens, pos)?;
+fn parse_value_expr(tokens: &[Token], src: &str, pos: &mut usize) -> Result<Expr, DynamoDbError> {
+    let left = parse_set_operand(tokens, src, pos)?;
 
     if *pos < tokens.len() {
         let arith_op = match &tokens[*pos] {
@@ -211,7 +170,7 @@ fn parse_value_expr(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbE
         };
         if let Some(op) = arith_op {
             *pos += 1;
-            let right = parse_set_operand(tokens, pos)?;
+            let right = parse_set_operand(tokens, src, pos)?;
             return Ok(Expr::Arithmetic {
                 left: Box::new(left),
                 op,
@@ -224,9 +183,10 @@ fn parse_value_expr(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbE
 }
 
 /// Parse a SET operand: path, placeholder, or function call (`if_not_exists`, `list_append`).
-fn parse_set_operand(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbError> {
+fn parse_set_operand(tokens: &[Token], src: &str, pos: &mut usize) -> Result<Expr, DynamoDbError> {
     if *pos >= tokens.len() {
-        return Err(validation_err("Invalid UpdateExpression: expected operand"));
+        // `SET #v = :v +` answers token "<EOF>", near "+" (measured 2026-10-25).
+        return Err(syntax_error(KIND, src, tokens, *pos));
     }
 
     match &tokens[*pos] {
@@ -241,7 +201,7 @@ fn parse_set_operand(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDb
                 && *pos + 1 < tokens.len()
                 && tokens[*pos + 1] == Token::LParen
             {
-                parse_set_function_call(tokens, pos)
+                parse_set_function_call(tokens, src, pos)
             } else {
                 parser_common::parse_path(tokens, pos).map(Expr::Path)
             }
@@ -249,7 +209,7 @@ fn parse_set_operand(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDb
         Token::NameRef(_) => parser_common::parse_path(tokens, pos).map(Expr::Path),
         Token::LParen => {
             *pos += 1; // consume '('
-            let expr = parse_value_expr(tokens, pos)?;
+            let expr = parse_value_expr(tokens, src, pos)?;
             if *pos >= tokens.len() || tokens[*pos] != Token::RParen {
                 return Err(validation_err(
                     "Invalid UpdateExpression: expected closing ')'",
@@ -258,13 +218,21 @@ fn parse_set_operand(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDb
             *pos += 1; // consume ')'
             Ok(expr)
         }
+        // An operator where an operand is required: `SET #v = = :v` answers
+        // token "=", near "= = :v"; `SET #v = :v + + :v` answers token "+",
+        // near "+ + :v" (measured 2026-10-25).
+        token if is_operator_or_keyword(token) => Err(syntax_error(KIND, src, tokens, *pos)),
         _ => Err(validation_err(
             "Invalid UpdateExpression: expected path, placeholder, or function",
         )),
     }
 }
 
-fn parse_set_function_call(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbError> {
+fn parse_set_function_call(
+    tokens: &[Token],
+    src: &str,
+    pos: &mut usize,
+) -> Result<Expr, DynamoDbError> {
     let name = match &tokens[*pos] {
         Token::Ident(n) => n.to_ascii_lowercase(),
         _ => {
@@ -278,10 +246,10 @@ fn parse_set_function_call(tokens: &[Token], pos: &mut usize) -> Result<Expr, Dy
 
     let mut args = Vec::new();
     if *pos < tokens.len() && tokens[*pos] != Token::RParen {
-        args.push(parse_set_operand(tokens, pos)?);
+        args.push(parse_set_operand(tokens, src, pos)?);
         while *pos < tokens.len() && tokens[*pos] == Token::Comma {
             *pos += 1;
-            args.push(parse_set_operand(tokens, pos)?);
+            args.push(parse_set_operand(tokens, src, pos)?);
         }
     }
 
@@ -296,11 +264,12 @@ fn is_set_function(name: &str) -> bool {
 /// Parse ADD actions: `ADD path value (, path value)*`
 fn parse_add_actions(
     tokens: &[Token],
+    src: &str,
     pos: &mut usize,
     actions: &mut Vec<UpdateAction>,
 ) -> Result<(), DynamoDbError> {
     loop {
-        let path = parser_common::parse_path(tokens, pos)?;
+        let path = parse_action_path(tokens, src, pos)?;
         let value = parse_add_delete_value(tokens, pos)?;
         actions.push(UpdateAction::Add { path, value });
         if *pos < tokens.len() && tokens[*pos] == Token::Comma {
@@ -315,11 +284,12 @@ fn parse_add_actions(
 /// Parse DELETE actions: `DELETE path value (, path value)*`
 fn parse_delete_actions(
     tokens: &[Token],
+    src: &str,
     pos: &mut usize,
     actions: &mut Vec<UpdateAction>,
 ) -> Result<(), DynamoDbError> {
     loop {
-        let path = parser_common::parse_path(tokens, pos)?;
+        let path = parse_action_path(tokens, src, pos)?;
         let value = parse_add_delete_value(tokens, pos)?;
         actions.push(UpdateAction::Delete { path, value });
         if *pos < tokens.len() && tokens[*pos] == Token::Comma {
@@ -517,10 +487,11 @@ mod tests {
 
     #[test]
     fn parse_invalid_action_keyword_rejected() {
+        // A token where a section keyword is required is the service's syntax
+        // error; without a source the window joins the token texts.
         let err = parse("price = :v").unwrap_err();
-        assert!(
-            matches!(err, DynamoDbError::ValidationException(msg) if msg.contains("expected SET"))
-        );
+        assert!(matches!(err, DynamoDbError::ValidationException(msg)
+            if msg == "Invalid UpdateExpression: Syntax error; token: \"price\", near: \"price =\""));
     }
 
     #[test]
@@ -566,6 +537,43 @@ mod tests {
         assert!(
             matches!(&err, DynamoDbError::ValidationException(_)),
             "Expected validation error for stray ')', got: {err:?}"
+        );
+    }
+
+    // Syntax error wording measured 2026-10-25 (us-east-1) on UpdateItem.
+
+    fn upd_msg(src: &str) -> String {
+        match parse_update_from(&tokenize(src).unwrap(), src) {
+            Err(DynamoDbError::ValidationException(m)) => m,
+            other => panic!("expected ValidationException, got {other:?}"),
+        }
+    }
+
+    fn syntax(token: &str, near: &str) -> String {
+        format!("Invalid UpdateExpression: Syntax error; token: \"{token}\", near: \"{near}\"")
+    }
+
+    #[test]
+    fn measured_update_syntax_errors() {
+        assert_eq!(upd_msg("SET #v = = :v"), syntax("=", "= = :v")); // [d24]
+        assert_eq!(upd_msg("SET #v = :v + + :v"), syntax("+", "+ + :v")); // [d25]
+        assert_eq!(upd_msg("SET #v = :v,"), syntax("<EOF>", ",")); // [d26]
+        assert_eq!(upd_msg("SET #v = :v + :v + :v"), syntax("+", ":v + :v")); // [b07]
+        assert_eq!(upd_msg("SET #v = :v +"), syntax("<EOF>", "+")); // [u08]
+        assert_eq!(upd_msg("SET #v = :v REMOVE"), syntax("<EOF>", "REMOVE")); // [u10]
+        assert_eq!(upd_msg("SET = :v"), syntax("=", "SET = :v")); // [u11]
+        assert_eq!(upd_msg("SET #v :v"), syntax(":v", "#v :v")); // [u12]
+    }
+
+    #[test]
+    fn other_update_texts_are_unchanged() {
+        assert_eq!(
+            upd_msg("SET #v #w = :v"),
+            "Invalid UpdateExpression: expected '='"
+        );
+        assert_eq!(
+            upd_msg("SET #v = (:v"),
+            "Invalid UpdateExpression: expected closing ')'"
         );
     }
 }

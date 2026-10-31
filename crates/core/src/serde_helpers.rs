@@ -26,24 +26,16 @@ fn is_placeholder_ident(rest: &str) -> bool {
 
 /// Validate one placeholder key. Length is checked before syntax.
 ///
-/// `include_size_in_too_long`: the Names too-long message appends
-/// `; size of key: N`, the Values one does not (Amazon `DynamoDB` quirk).
-fn validate_placeholder_key(
-    key: &str,
-    prefix: char,
-    field_name: &str,
-    include_size_in_too_long: bool,
-) -> Result<(), String> {
+/// The too-long message carries `; size of key: N` for both maps: measured
+/// 2026-10-25 (us-east-1) on PutItem, Scan and Query for
+/// `ExpressionAttributeValues` as well as `ExpressionAttributeNames`.
+fn validate_placeholder_key(key: &str, prefix: char, field_name: &str) -> Result<(), String> {
     if key.len() > MAX_PLACEHOLDER_KEY_BYTES {
-        let mut msg = format!(
+        return Err(format!(
             "{field_name} contains invalid key: The expression attribute map \
-             contains a key that is too long;"
-        );
-        if include_size_in_too_long {
-            use std::fmt::Write as _;
-            let _ = write!(msg, " size of key: {}", key.len());
-        }
-        return Err(msg);
+             contains a key that is too long; size of key: {}",
+            key.len()
+        ));
     }
     if !key.strip_prefix(prefix).is_some_and(is_placeholder_ident) {
         return Err(format!(
@@ -61,7 +53,6 @@ fn deserialize_placeholder_map<'de, D, T>(
     deserializer: D,
     prefix: char,
     field_name: &str,
-    include_size_in_too_long: bool,
     check_value: impl Fn(&str, &Value) -> Result<(), String>,
     convert: impl Fn(Value) -> Result<T, serde_json::Error>,
 ) -> Result<Option<HashMap<String, T>>, D::Error>
@@ -76,8 +67,7 @@ where
     }
     let mut out = HashMap::with_capacity(raw.len());
     for (key, value) in raw {
-        validate_placeholder_key(&key, prefix, field_name, include_size_in_too_long)
-            .map_err(de::Error::custom)?;
+        validate_placeholder_key(&key, prefix, field_name).map_err(de::Error::custom)?;
         check_value(&key, &value).map_err(de::Error::custom)?;
         let converted = convert(value).map_err(de::Error::custom)?;
         out.insert(key, converted);
@@ -101,7 +91,6 @@ where
         deserializer,
         '#',
         "ExpressionAttributeNames",
-        true,
         |key, value| {
             // Only a genuine empty *string* is rejected. A non-string falls
             // through to `convert` -> type error -> SerializationException,
@@ -134,7 +123,6 @@ where
         deserializer,
         ':',
         "ExpressionAttributeValues",
-        false,
         |key, value| {
             // Empty AttributeValue (no datatype). Caught here so the error names
             // its key. Mirrors the empty-object check in `types::attribute_value`;
@@ -265,13 +253,19 @@ mod tests {
     }
 
     #[test]
-    fn values_key_too_long_omits_size() {
+    fn values_key_too_long_reports_size() {
+        // Measured 2026-10-25 (us-east-1), PutItem, Scan and Query: the Values
+        // message carries the size suffix like the Names one.
         let key = format!(":{}", "a".repeat(255)); // 256 bytes including ':'
         let json = format!(r#"{{"values":{{"{key}":{{"S":"x"}}}}}}"#);
         let msg = values_err(&json);
-        assert!(msg.contains("contains a key that is too long;"), "{msg}");
-        // Quirk: the values variant omits "; size of key: N".
-        assert!(!msg.contains("size of key"), "{msg}");
+        assert!(
+            msg.contains(
+                "ExpressionAttributeValues contains invalid key: The expression \
+                 attribute map contains a key that is too long; size of key: 256"
+            ),
+            "{msg}"
+        );
     }
 
     #[test]
