@@ -12,11 +12,12 @@ use crate::sample_toml_support as support;
 fn storage_postgres_section_matches_the_struct() {
     let root = support::sample();
     // `catalog_pool_size` is `Option<u32>` that falls back to `pool_size`; the
-    // sample shows the fallback as the example.
+    // sample shows the fallback as the example, written as an integer.
     support::pin(
         &root,
         "storage.postgres",
         &["catalog_pool_size"],
         &PostgresStorageConfig::default(),
     );
+    support::assert_integers(&root, "storage.postgres", &["catalog_pool_size"]);
 }

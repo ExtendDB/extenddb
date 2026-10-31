@@ -11,14 +11,22 @@ use crate::sample_toml_support as support;
 #[test]
 fn storage_cassandra_section_matches_the_struct() {
     let root = support::sample();
-    // The struct has no `Default`: `contact_points` is required, so the
-    // expected value is `new` with the sample's example contact point.
-    // `username` and `password` are `Option<String>` shown as examples.
-    let expected = CassandraStorageConfig::new(vec!["localhost:9042".to_owned()]);
+    // The struct has no `Default`: `contact_points` is required and the
+    // sample shows an example, so its value is not compared. `username` and
+    // `password` are `Option<String>` shown as examples.
+    let expected = CassandraStorageConfig::new(vec!["example.invalid:9042".to_owned()]);
     support::pin(
         &root,
         "storage.cassandra",
-        &["username", "password"],
+        &["contact_points", "username", "password"],
         &expected,
+    );
+    // The struct does not deny unknown fields, so a stray sub-table would
+    // pass deserialization; the section must have none.
+    let section = support::table_at(&root, "storage.cassandra");
+    assert!(
+        support::table_keys(section).is_empty(),
+        "[storage.cassandra] has sub-tables the struct does not: {:?}",
+        support::table_keys(section)
     );
 }

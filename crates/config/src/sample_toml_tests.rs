@@ -22,6 +22,47 @@ fn top_level_keys_are_the_optional_app_config_fields() {
     );
 }
 
+/// The sections of the sample are the struct-valued fields of `AppConfig`
+/// (`import` and `export` are the serde names of `import_config` and
+/// `export_config`).
+#[test]
+fn root_sections_are_the_app_config_tables() {
+    let root = support::sample();
+    assert_eq!(
+        support::table_keys(&root),
+        [
+            "auth", "export", "import", "limits", "logging", "server", "storage"
+        ]
+    );
+}
+
+/// Keys whose description carries the "no default" marker (the generator
+/// shows them as none with an example) are exactly the keys the pin tests
+/// exclude from value comparison plus the keys with no struct default at all:
+/// `backend` (read by the custom `StorageConfig` deserializer), the three
+/// optional top-level keys, and the two required backend keys.
+#[test]
+fn no_default_marker_matches_the_example_keys() {
+    let mut expected: Vec<&str> = vec![
+        // Excluded from value comparison in the pin tests.
+        "server.throttling_enabled",
+        "storage.postgres.catalog_pool_size",
+        "storage.mongodb.max_connections",
+        "storage.mongodb.max_catalog_connections",
+        "storage.cassandra.username",
+        "storage.cassandra.password",
+        // No struct default.
+        "storage.backend",
+        "docs_dir",
+        "import_export_root",
+        "max_import_bytes",
+        "storage.mongodb.connection_string",
+        "storage.cassandra.contact_points",
+    ];
+    expected.sort_unstable();
+    assert_eq!(support::no_default_keys(), expected);
+}
+
 #[test]
 fn storage_section_names_only_the_backend() {
     let root = support::sample();
@@ -40,7 +81,7 @@ fn storage_section_names_only_the_backend() {
 fn server_section_matches_server_config() {
     let root = support::sample();
     // `throttling_enabled` is `Option<bool>` with no default; the sample shows
-    // `false` as the example.
+    // `false` as the example and its value is not compared.
     support::pin(
         &root,
         "server",
