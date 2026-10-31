@@ -319,6 +319,38 @@ Catalog upgrades change the schema; behavior changes alter how the running serve
 interprets existing data or configuration. Review these before upgrading a live
 deployment, even when no catalog migration is required.
 
+### PostgreSQL: the GSI propagation queue serves tables in turn
+
+**What changed.** A queue worker claimed the lowest `id` across its whole
+partition, and partitions are shared by every table, so a table's index rows
+waited behind every row another table had enqueued earlier: a bulk write to one
+table with an asynchronous GSI delayed a second table's propagation by the time
+the backlog took to drain. Each batch now lists the tables with a ready row in the
+partition and claims each table's oldest row in turn, so a table's latency depends
+on its own backlog. Within a table the order is unchanged. A table is listed once
+its oldest queued row is ready; a per-index `propagation_delay_ms` set above the
+default (the column is not written by any command today) widens the window in
+which a table's later row waits for its earlier one, by the difference between
+the two delays.
+
+**Operator step.** Data migration `005_gsi_pending_table_claim.sql` adds the
+index `idx_gsi_pending_table_claim` on `gsi_pending (worker_partition, table_id,
+id)`. Apply it with the usual sequence: stop the servers, `extenddb migrate
+--config extenddb.toml --pg-user <admin> --yes`, start the servers. The catalog
+version does not change; the preview lists the file under `data migrations`.
+`migrate` builds the index with the servers stopped; at about 1.7 s per million
+queued rows on a development host the build is a pause of that length inside the
+maintenance window, and `CREATE INDEX IF NOT EXISTS` makes a repeated run harmless.
+
+**If the migrate step is skipped.** A server started without the index serves
+every operation and propagates every row, and logs one warning at startup:
+`gsi_pending has no idx_gsi_pending_table_claim index, so the upgrade's migrate
+step was skipped ...`. That warning means exactly that: run the migrate step.
+Until then two statements run slower under a backlog: each claim for a table
+behind another table's backlog reads past that backlog (3.6 ms at 40,000 queued
+rows), and the per-batch table listing scans the queue table (33 ms at 40,000
+rows, once per 100 claims), so the drain rate falls while the queue is large.
+
 ### v0.1.14 LeadingKeys now enforced on Query, batch and transaction operations
 
 **What changed.** `dynamodb:LeadingKeys` is now evaluated on `Query`,

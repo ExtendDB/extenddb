@@ -308,7 +308,9 @@ jobs:
       # storage layer directly against this job's PostgreSQL. The PutItem create
       # race tests hold a create open in an outside transaction, the
       # write-transaction conflict tests force a deadlock, and the backup restore
-      # cases need catalog rows the current binary would not write; all need
+      # cases need catalog rows the current binary would not write, the GSI
+      # queue tests seed the queue table and start the workers directly, and the
+      # data migration test builds a database one migration behind; all need
       # direct access. The online GSI build tests reorder queue rows by hand and
       # pause writers with a test hook. They build their own throwaway databases;
       # the connection string is the server, not a database.
@@ -325,6 +327,7 @@ jobs:
           --test vector_control_plane --test put_create_race --test twi_conflict
           --test stream_shard_retention --test stream_shard_ownership --test stream_records_page_order --test backup_restore
           --test gsi_online_build --test gsi_stale_writer --test table_snapshot
+          --test gsi_queue_fairness --test gsi_queue_many_tables --test data_migrations
 
       # The daemonized server logs to syslog; dump it so server-side failures
       # are diagnosable from the job log.

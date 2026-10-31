@@ -269,6 +269,10 @@ pub(crate) const DATA_MIGRATIONS: &[(&str, &str)] = &[
         "004_vector_index_state.sql",
         include_str!("../../storage-postgres/data_migrations/004_vector_index_state.sql"),
     ),
+    (
+        "005_gsi_pending_table_claim.sql",
+        include_str!("../../storage-postgres/data_migrations/005_gsi_pending_table_claim.sql"),
+    ),
 ];
 
 /// Run data database migrations, skipping already-applied ones.
@@ -524,7 +528,7 @@ async fn record_migration(pool: &PgPool, filename: &str) -> OpResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::CATALOG_MIGRATIONS;
+    use super::{CATALOG_MIGRATIONS, DATA_MIGRATIONS};
     use crate::CATALOG_VERSION;
 
     /// The catalog version and the migration list must move together.
@@ -570,21 +574,24 @@ mod tests {
     /// would be applied again on every run.
     #[test]
     fn every_migration_is_registered_under_a_sql_filename_with_its_own_contents() {
-        for (filename, sql) in CATALOG_MIGRATIONS {
-            assert!(filename.ends_with(".sql"), "{filename}");
-            assert!(!sql.trim().is_empty(), "{filename} is empty");
-        }
-        // The failure this guards is a copy-pasted `include_str!` that points one
-        // entry at another file's bytes: the ledger would then record one name
-        // while the SQL of another ran, and the missed migration would be applied
-        // again on every upgrade. Two entries sharing contents is what that looks
-        // like, so distinctness is the assertion that delivers the rationale.
-        for (i, (left_name, left_sql)) in CATALOG_MIGRATIONS.iter().enumerate() {
-            for (right_name, right_sql) in &CATALOG_MIGRATIONS[i + 1..] {
-                assert_ne!(
-                    left_sql, right_sql,
-                    "{left_name} and {right_name} embed identical SQL; check their include_str! paths"
-                );
+        for list in [CATALOG_MIGRATIONS, DATA_MIGRATIONS] {
+            for (filename, sql) in list {
+                assert!(filename.ends_with(".sql"), "{filename}");
+                assert!(!sql.trim().is_empty(), "{filename} is empty");
+            }
+            // The failure this guards is a copy-pasted `include_str!` that points
+            // one entry at another file's bytes: the ledger would then record one
+            // name while the SQL of another ran, and the missed migration would be
+            // applied again on every upgrade. Two entries sharing contents is what
+            // that looks like, so distinctness is the assertion that delivers the
+            // rationale. The data list has its own ledger and the same exposure.
+            for (i, (left_name, left_sql)) in list.iter().enumerate() {
+                for (right_name, right_sql) in &list[i + 1..] {
+                    assert_ne!(
+                        left_sql, right_sql,
+                        "{left_name} and {right_name} embed identical SQL; check their include_str! paths"
+                    );
+                }
             }
         }
     }

@@ -190,6 +190,10 @@ impl Scratch {
                 "004_vector_index_state.sql",
                 include_str!("../data_migrations/004_vector_index_state.sql"),
             ),
+            (
+                "005_gsi_pending_table_claim.sql",
+                include_str!("../data_migrations/005_gsi_pending_table_claim.sql"),
+            ),
             ("003_gsi_base_key_index", ""),
         ] {
             if !sql.is_empty() {

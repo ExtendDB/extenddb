@@ -342,12 +342,22 @@ async fn queue_rows_applied_out_of_order_converge_to_the_item() {
     assert_eq!(pending.len(), 2, "both writes queued");
 
     // The newer row first, as a peer process's worker that skipped the locked
-    // older row would apply it.
-    sqlx::query("UPDATE gsi_pending SET ready_at = NOW() WHERE id = $1")
-        .bind(pending[1])
+    // older row would apply it. An outside transaction holds the older row, so
+    // the claim (`FOR UPDATE SKIP LOCKED`) passes over it once both are due.
+    // `FOR KEY SHARE` conflicts with the claim's lock but not with the `ready_at`
+    // update, so the older row can be held before it is made due. A worker lists
+    // a table only when the table's lowest-`id` row is due, so making only the
+    // newer row due would leave both rows queued.
+    let mut peer = s.db.begin().await.expect("begin the peer transaction");
+    sqlx::query("SELECT id FROM gsi_pending WHERE id = $1 FOR KEY SHARE")
+        .bind(pending[0])
+        .fetch_one(&mut *peer)
+        .await
+        .expect("hold the older row");
+    sqlx::query("UPDATE gsi_pending SET ready_at = NOW()")
         .execute(&s.db)
         .await
-        .expect("release the newer row");
+        .expect("release both rows");
     let mut left = 2;
     for _ in 0..500 {
         left = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM gsi_pending")
@@ -360,10 +370,7 @@ async fn queue_rows_applied_out_of_order_converge_to_the_item() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(left, 1, "the newer row applied on its own first");
-    sqlx::query("UPDATE gsi_pending SET ready_at = NOW()")
-        .execute(&s.db)
-        .await
-        .expect("release the older row");
+    peer.rollback().await.expect("let the older row go");
     wait_queue_empty(&s.db).await;
 
     assert_eq!(
