@@ -238,7 +238,91 @@ async fn execute_migration(
             .await
             .map_err(|e| OpError::Internal(format!("Migration failed: {e}")))?;
     }
-    Ok(())
+
+    // A migration is DDL (CREATE KEYSPACE/TABLE, etc.). The driver runs queries
+    // over a pool of connections and selects one per query, so the statement
+    // that records or checks a migration can land on a different connection —
+    // and a different coordinator view — from the one that just ran the DDL.
+    // cdrs-tokio 9.0.2 exposes no schema-agreement wait, and learns of schema
+    // changes asynchronously via SCHEMA_CHANGE events, so a read issued right
+    // after a CREATE can hit a coordinator that has not yet applied it and fail
+    // with "table ... does not exist". With a single connection the statements
+    // serialized on one coordinator and the race was effectively impossible;
+    // the multi-connection pool (issue #403) exposes it. Wait for the cluster
+    // schema to agree before the next statement so the new object is visible
+    // everywhere. This is startup/DDL-only, so the poll cost is irrelevant.
+    wait_for_schema_agreement(session).await
+}
+
+/// Poll until the cluster agrees on a single schema version.
+///
+/// Reads `schema_version` from `system.local` (this node) and `system.peers`
+/// (every other node); when they are all equal the schema change has
+/// propagated and newly created objects are visible through any connection in
+/// the pool. On a single-node cluster `system.peers` is empty, so this returns
+/// as soon as the local version is readable — which still gives the driver's
+/// event loop a beat to apply the change before the next query.
+async fn wait_for_schema_agreement(session: &Arc<CassandraSession>) -> OpResult<()> {
+    use std::time::{Duration, Instant};
+
+    const TIMEOUT: Duration = Duration::from_secs(30);
+    const INTERVAL: Duration = Duration::from_millis(200);
+
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        if schema_versions_agree(session).await? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(OpError::Internal(
+                "Timed out waiting for Cassandra schema agreement after a migration".to_owned(),
+            ));
+        }
+        tokio::time::sleep(INTERVAL).await;
+    }
+}
+
+/// Return true when `system.local` and every `system.peers` row report the same
+/// `schema_version`.
+async fn schema_versions_agree(session: &Arc<CassandraSession>) -> OpResult<bool> {
+    use cdrs_tokio::types::IntoRustByName as _;
+
+    let local = session
+        .query("SELECT schema_version FROM system.local")
+        .await
+        .map_err(|e| OpError::Internal(format!("schema agreement (local): {e}")))?
+        .response_body()
+        .map_err(|e| OpError::Internal(format!("schema agreement (local): {e}")))?
+        .into_rows()
+        .unwrap_or_default();
+
+    let Some(local_version) = local.first().and_then(|r| {
+        let v: Option<uuid::Uuid> = r.get_r_by_name("schema_version").ok();
+        v
+    }) else {
+        // No readable local version yet; treat as not-yet-agreed and retry.
+        return Ok(false);
+    };
+
+    let peers = session
+        .query("SELECT schema_version FROM system.peers")
+        .await
+        .map_err(|e| OpError::Internal(format!("schema agreement (peers): {e}")))?
+        .response_body()
+        .map_err(|e| OpError::Internal(format!("schema agreement (peers): {e}")))?
+        .into_rows()
+        .unwrap_or_default();
+
+    for peer in &peers {
+        let peer_version: Option<uuid::Uuid> = peer.get_r_by_name("schema_version").ok();
+        match peer_version {
+            Some(v) if v == local_version => {}
+            // A peer that disagrees, or whose version is not yet readable, means
+            // the change has not propagated. Retry.
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
 }
 
 /// The statements of migration file `filename`, split on semicolons, each

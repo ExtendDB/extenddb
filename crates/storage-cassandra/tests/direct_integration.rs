@@ -37,6 +37,8 @@ mod index;
 mod keyspace_migrations;
 #[path = "direct/metadata_engine.rs"]
 mod metadata_engine;
+#[path = "direct/migration_schema_agreement.rs"]
+mod migration_schema_agreement;
 #[path = "direct/policies.rs"]
 mod policies;
 #[path = "direct/put_get_item.rs"]
