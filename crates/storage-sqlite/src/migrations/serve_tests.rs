@@ -11,11 +11,13 @@
 //! apart are tested here too.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use extenddb_storage::migrations::{
-    CatalogMigrations, CatalogStatus, MigrationError, MigrationId, Prepared, Startup, Target, exit,
-    prepare_to_serve,
+    CatalogMigrations, CatalogStatus, HeldLock, LedgerRow, Listed, MigrationError, MigrationId,
+    Prepared, RunKind, RunReport, Startup, Target, exit, prepare_to_serve,
 };
 use extenddb_storage::server_components::{
     BackendError, ServerComponents, ServerComponentsOptions,
@@ -272,27 +274,173 @@ async fn apply_waits_for_a_held_lock_and_exits_6() {
     drop(holder);
 }
 
-/// Two servers started together under `apply` on a released catalog: one
-/// migrates it, and the other waits for the lock and finds nothing to do.
+/// Two `prepare_to_serve` runs under `apply` on a released catalog, both
+/// waiting for a lock another process holds, as the checks of two servers
+/// started together do after their first status read: once it is free, one
+/// migrates the catalog, and the other takes the lock after it and applies
+/// nothing. The servers are not started here; one of two servers started
+/// together can exit 6 when it registers while the other holds the lock.
+#[cfg(unix)]
 #[tokio::test]
-async fn two_servers_started_together_with_apply_migrate_once() {
+async fn two_prepare_to_serve_runs_under_apply_migrate_once() {
     let db = temp_db("startup-two");
     load_dump(&db, DEV_0_1_14).await;
-    let apply = startup(true, Duration::from_secs(30));
-    let (a, b) = tokio::join!(prepare(&db, &apply), prepare(&db, &apply));
-    let applied: Vec<usize> = [a.expect("first"), b.expect("second")]
+    let holder = crate::serve_lock::ServeLock::acquire(&db).expect("another process's lock");
+    let waiting = AtomicUsize::new(0);
+    let progress = |line: &str| {
+        if line.starts_with("taking the migration lock") {
+            waiting.fetch_add(1, Ordering::SeqCst);
+        }
+    };
+    let target = Target::at(db.to_string_lossy());
+    let apply = startup(true, Duration::from_secs(60));
+    let free = async {
+        while waiting.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        drop(holder);
+    };
+    let (a, b, ()) = tokio::join!(
+        prepare_to_serve(&SqliteCatalogMigrations, &target, &apply, &progress),
+        prepare_to_serve(&SqliteCatalogMigrations, &target, &apply, &progress),
+        free,
+    );
+    let mut applied: Vec<usize> = [a.expect("first"), b.expect("second")]
         .iter()
-        .map(|p| p.run.as_ref().map_or(0, |r| r.applied.len()))
+        .map(|p| p.run.as_ref().expect("each took the lock").applied.len())
         .collect();
-    assert!(
-        applied.contains(&0) && applied.contains(&MigrationId::ALL.len()),
-        "one migrates and the other finds nothing to do: {applied:?}"
+    applied.sort_unstable();
+    assert_eq!(
+        applied,
+        [0, MigrationId::ALL.len()],
+        "one migrates, and the other takes the lock after it and applies nothing"
     );
     assert_eq!(copies(&db).len(), 1);
     assert_eq!(
         status(&db).await,
         CatalogStatus::Current { version: LATEST }
     );
+}
+
+/// The SQLite backend, counting the runs it is asked to make.
+#[derive(Default)]
+struct CountingRuns {
+    runs: AtomicUsize,
+}
+
+#[async_trait]
+impl CatalogMigrations for CountingRuns {
+    fn listed(&self, id: MigrationId) -> Listed {
+        SqliteCatalogMigrations.listed(id)
+    }
+    fn backup_advice(&self, target: &Target) -> String {
+        SqliteCatalogMigrations.backup_advice(target)
+    }
+    fn in_process(&self, target: &Target) -> bool {
+        SqliteCatalogMigrations.in_process(target)
+    }
+    async fn server_creates_catalog(&self, target: &Target) -> Result<bool, MigrationError> {
+        SqliteCatalogMigrations.server_creates_catalog(target).await
+    }
+    async fn status(&self, target: &Target) -> Result<CatalogStatus, MigrationError> {
+        SqliteCatalogMigrations.status(target).await
+    }
+    async fn catalog_ledger(&self, target: &Target) -> Result<Vec<LedgerRow>, MigrationError> {
+        SqliteCatalogMigrations.catalog_ledger(target).await
+    }
+    async fn lock(&self, target: &Target, timeout: Duration) -> Result<HeldLock, MigrationError> {
+        SqliteCatalogMigrations.lock(target, timeout).await
+    }
+    async fn run(
+        &self,
+        lock: &HeldLock,
+        release: &str,
+        kind: RunKind,
+    ) -> Result<RunReport, MigrationError> {
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        SqliteCatalogMigrations.run(lock, release, kind).await
+    }
+    async fn forget(&self, lock: &HeldLock, id: u32) -> Result<(), MigrationError> {
+        SqliteCatalogMigrations.forget(lock, id).await
+    }
+}
+
+/// Another process migrates the catalog while this one waits for the lock:
+/// under the lock this one finds it current, and releases the lock and
+/// serves it without the backend's run, so it writes nothing to the
+/// database and takes no copy.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_catalog_migrated_during_the_wait_is_served_with_nothing_written() {
+    let db = temp_db("startup-migrated-meanwhile");
+    load_dump(&db, DEV_0_1_14).await;
+    let location = db.to_string_lossy().into_owned();
+    let other = crate::serve_lock::ServeLock::acquire(&db).expect("another process's lock");
+    let backend = CountingRuns::default();
+    let waiting = AtomicUsize::new(0);
+    let progress = |line: &str| {
+        if line.starts_with("taking the migration lock") {
+            waiting.fetch_add(1, Ordering::SeqCst);
+        }
+    };
+    let target = Target::at(location.as_str());
+    let apply = startup(true, Duration::from_secs(60));
+    let other_process = async {
+        while waiting.load(Ordering::SeqCst) < 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        super::migrate_holding(&location, RELEASE, &other)
+            .await
+            .expect("the other process migrates");
+        let written = (bytes(&db), copies(&db));
+        drop(other);
+        written
+    };
+    let (prepared, (after_other, copies_after_other)) = tokio::join!(
+        prepare_to_serve(&backend, &target, &apply, &progress),
+        other_process,
+    );
+    let report = prepared.expect("served").run.expect("a run under the lock");
+    assert!(report.applied.is_empty(), "{report:?}");
+    assert_eq!(report.to, Some(LATEST));
+    assert_eq!(backend.runs.load(Ordering::SeqCst), 0, "the backend ran");
+    assert_eq!(bytes(&db), after_other, "the waiting process wrote");
+    assert_eq!(copies(&db), copies_after_other);
+    assert_eq!(copies(&db).len(), 1, "only the other process's copy");
+    assert_eq!(
+        status(&db).await,
+        CatalogStatus::Current { version: LATEST }
+    );
+}
+
+/// A dev build's policy refuses, before the server starts, a file that
+/// holds another program's tables, with the refusal the server's factory
+/// gives it, and writes nothing; an empty file is left to the server, which
+/// creates the catalog in it.
+#[tokio::test]
+async fn a_dev_policy_refuses_a_file_that_holds_another_programs_tables() {
+    let db = temp_db("startup-dev-foreign");
+    exec(
+        &db,
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)",
+    )
+    .await;
+    let before = bytes(&db);
+    let dev = Startup {
+        creates_uninitialized: true,
+        ..startup(true, Duration::from_secs(5))
+    };
+    let err = prepare(&db, &dev).await.expect_err("refused");
+    assert_eq!(err, MigrationError::Status(CatalogStatus::Uninitialized));
+    assert_eq!(err.exit_code(), exit::ERROR);
+    assert_eq!(err, refusal(start(&db.to_string_lossy(), true).await));
+    assert_eq!(bytes(&db), before, "the policy wrote to the file");
+    assert!(copies(&db).is_empty());
+
+    let empty = temp_db("startup-dev-empty");
+    std::fs::write(&empty, b"").expect("an empty file");
+    let prepared = prepare(&empty, &dev).await.expect("left to the server");
+    assert_eq!(prepared, Prepared::default());
 }
 
 /// An in-memory database belongs to the server that opens it: the policy

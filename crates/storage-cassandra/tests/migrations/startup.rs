@@ -6,10 +6,12 @@
 //! legacy catalog is migrated through the lock `migrate --yes` takes, a
 //! current one is served with nothing written, one that needs a person
 //! exits 5 with nothing written, a held lock makes the server wait and then
-//! exit 6, and two servers started together, whose connection strings name
-//! the two nodes of a two-node cluster when the job has one, migrate once.
+//! exit 6, and two `prepare_to_serve` runs that wait for the lock together,
+//! whose connection strings name the two nodes of a two-node cluster when
+//! the job has one, migrate once.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use extenddb_storage::management_store::{ManagementStore, SettingsStore};
@@ -231,30 +233,61 @@ async fn apply_waits_for_a_held_migration_lock_and_exits_6() {
     holder.release().await;
 }
 
-/// Two servers started together under `apply` on a legacy catalog, their
-/// connection strings naming different nodes when the job has two: one
-/// migrates it, and the other waits for the lock and finds nothing to do.
-/// Each server's session reaches the cluster at the node its connection
-/// string names and then sends requests to both nodes in turn, as a
-/// server's session does.
+/// Two `prepare_to_serve` runs under `apply` on a legacy catalog, their
+/// connection strings naming different nodes when the job has two, both
+/// waiting for the lock another process holds, as the checks of two servers
+/// started together do after their first status read: once it is free, one
+/// migrates the catalog, and the other takes the lock after it and applies
+/// nothing. Each run's session reaches the cluster at the node its
+/// connection string names and then sends requests to both nodes in turn,
+/// as a server's session does. The servers are not started here; one of two
+/// servers started together can exit 6 when it registers while the other
+/// holds the lock.
 #[tokio::test]
-async fn two_servers_started_together_with_apply_migrate_a_legacy_catalog_once() {
+async fn two_prepare_to_serve_runs_under_apply_migrate_a_legacy_catalog_once() {
     if helpers::skip_without_cassandra() {
         return;
     }
     let session = session().await;
     let (prefix, _drops) = new_prefix("start_two");
     legacy_catalog(&session, &prefix).await;
-    let apply = startup(true, TIMEOUT);
+    let holder = MigrationLock::acquire(
+        session.clone(),
+        &format!("{prefix}_catalog"),
+        LeaseTimes::DEFAULT,
+        TIMEOUT,
+    )
+    .await
+    .expect("another process's lock");
+    let waiting = AtomicUsize::new(0);
+    let progress = |line: &str| {
+        if line.starts_with("taking the migration lock") {
+            waiting.fetch_add(1, Ordering::SeqCst);
+        }
+    };
+    // Each run waits for the holder, and the second also for the first
+    // one's migration.
+    let apply = startup(true, TIMEOUT * 2);
     let (first, second) = (target_of(&prefix), second_target_of(&prefix));
-    let (a, b) = tokio::join!(prepare(&first, &apply), prepare(&second, &apply));
-    let applied: Vec<usize> = [a.expect("first"), b.expect("second")]
+    let free = async {
+        while waiting.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        holder.release().await;
+    };
+    let (a, b, ()) = tokio::join!(
+        prepare_to_serve(&CassandraCatalogMigrations, &first, &apply, &progress),
+        prepare_to_serve(&CassandraCatalogMigrations, &second, &apply, &progress),
+        free,
+    );
+    let mut applied: Vec<usize> = [a.expect("first"), b.expect("second")]
         .iter()
-        .map(|p| p.run.as_ref().map_or(0, |r| r.applied.len()))
+        .map(|p| p.run.as_ref().expect("each took the lock").applied.len())
         .collect();
+    applied.sort_unstable();
     assert!(
-        applied.contains(&0) && applied.iter().any(|n| *n > 0),
-        "one migrates and the other finds nothing to do: {applied:?}"
+        applied[0] == 0 && applied[1] > 0,
+        "one migrates, and the other takes the lock after it and applies nothing: {applied:?}"
     );
     assert_eq!(
         catalog_status(pinned_session(&second_contact_point()).await, &prefix)

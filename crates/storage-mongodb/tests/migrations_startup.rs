@@ -5,11 +5,12 @@
 //! catalogs: under `apply` a catalog behind the binary is migrated through
 //! the lock `migrate --yes` takes, a current one is served with nothing
 //! written, one that needs a person exits 5 with nothing written, a held
-//! migration lock makes the server wait and then exit 6, and two servers
-//! started together migrate once.
+//! migration lock makes the server wait and then exit 6, and two
+//! `prepare_to_serve` runs that wait for the lock together migrate once.
 
 mod migrations_support;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bson::{Document, doc};
@@ -172,17 +173,7 @@ async fn apply_waits_for_a_held_migration_lock_and_exits_6() {
     let Some(uri) = server() else { return };
     let d = Deployment::new(&uri, "start_locked").await;
     fixture::load(&d, &fixture::read("0.1.14")).await;
-    d.catalog()
-        .collection::<Document>("settings")
-        .insert_one(doc! {
-            "_id": "migration_lock",
-            "owner": "another",
-            "expires_at": bson::DateTime::from_millis(
-                bson::DateTime::now().timestamp_millis() + 120_000
-            ),
-        })
-        .await
-        .expect("another migration's lock");
+    another_migrations_lock(&d).await;
     let before = state(&d).await;
     let started = Instant::now();
     let err = prepare(&d, &startup(true, Duration::from_secs(2)))
@@ -202,24 +193,68 @@ async fn apply_waits_for_a_held_migration_lock_and_exits_6() {
     d.drop_databases().await;
 }
 
-/// Two servers started together under `apply` on a released catalog: one
-/// migrates it, and the other waits for the lock and finds nothing to do.
+/// Another migration's lock document, as its claim writes it, for two
+/// minutes.
+async fn another_migrations_lock(d: &Deployment) {
+    d.catalog()
+        .collection::<Document>("settings")
+        .insert_one(doc! {
+            "_id": "migration_lock",
+            "owner": "another",
+            "expires_at": bson::DateTime::from_millis(
+                bson::DateTime::now().timestamp_millis() + 120_000
+            ),
+        })
+        .await
+        .expect("another migration's lock");
+}
+
+/// Two `prepare_to_serve` runs under `apply` on a released catalog, both
+/// waiting for the lock another migration holds, as the checks of two
+/// servers started together do after their first status read: once it is
+/// free, one migrates the catalog, and the other takes the lock after it
+/// and applies nothing. The servers are not started here; one of two
+/// servers started together can exit 6 when it registers while the other
+/// holds the lock.
 #[tokio::test(flavor = "multi_thread")]
-async fn two_servers_started_together_with_apply_migrate_once() {
+async fn two_prepare_to_serve_runs_under_apply_migrate_once() {
     let Some(uri) = server() else { return };
     let d = Deployment::new(&uri, "start_two").await;
     fixture::load(&d, &fixture::read("0.1.12")).await;
+    another_migrations_lock(&d).await;
+    let migrations = MongoCatalogMigrations::with_databases(&d.target.catalog, &d.target.data);
+    let target = Target::at(&d.target.connection_string);
+    let waiting = AtomicUsize::new(0);
+    let progress = |line: &str| {
+        if line.starts_with("taking the migration lock") {
+            waiting.fetch_add(1, Ordering::SeqCst);
+        }
+    };
     let apply = startup(true, Duration::from_secs(60));
-    let (a, b) = tokio::join!(prepare(&d, &apply), prepare(&d, &apply));
+    let free = async {
+        while waiting.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        d.catalog()
+            .collection::<Document>("settings")
+            .delete_one(doc! { "_id": "migration_lock", "owner": "another" })
+            .await
+            .expect("the other migration releases its lock");
+    };
+    let (a, b, ()) = tokio::join!(
+        prepare_to_serve(&migrations, &target, &apply, &progress),
+        prepare_to_serve(&migrations, &target, &apply, &progress),
+        free,
+    );
     let mut applied: Vec<usize> = [a.expect("first"), b.expect("second")]
         .iter()
-        .map(|p| p.run.as_ref().map_or(0, |r| r.applied.len()))
+        .map(|p| p.run.as_ref().expect("each took the lock").applied.len())
         .collect();
     applied.sort_unstable();
     assert_eq!(
         applied,
         [0, 5],
-        "one migrates and the other finds nothing to do"
+        "one migrates, and the other takes the lock after it and applies nothing"
     );
     assert_eq!(d.status().await, CatalogStatus::Current { version: 4 });
     d.drop_databases().await;

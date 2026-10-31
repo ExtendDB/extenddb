@@ -4,26 +4,31 @@
 //! catalogs: under `apply` a catalog behind the binary is migrated through
 //! the lock `migrate --yes` takes, a current one is served with nothing
 //! written, one that needs a person exits 5 with nothing written, a held
-//! migration lock makes the server wait and then exit 6, and two servers
-//! started together migrate once. See `migrations_support` for the
-//! database these tests need.
+//! migration lock makes the server wait and then exit 6, a zero lock
+//! timeout tries each key once, the waits of a run share one timeout, and
+//! two `prepare_to_serve` runs that wait for the lock together migrate
+//! once. See `migrations_support` for the database these tests need.
 
 mod migrations_support;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use extenddb_storage::migrations::{
-    CatalogStatus, MigrationError, Prepared, Startup, Target, exit, prepare_to_serve,
+    CatalogStatus, MigrationError, Prepared, RunKind, Startup, Target, WhenCurrent, exit,
+    prepare_to_serve, run_with_lock,
 };
 use extenddb_storage_postgres::migrations::{Definitions, PostgresCatalogMigrations};
 use migrations_support::{
     LATEST, Scratch, base_conn, describe_pool, ledger, settings, skip, step_count,
 };
 
-/// The advisory key of the migration lock, `NAMESPACE` and `MIGRATION_KEY`
-/// in `src/migrations/locks.rs`.
+/// The advisory keys of the migration lock and the serving registration,
+/// `NAMESPACE`, `MIGRATION_KEY` and `SERVING_KEY` in
+/// `src/migrations/locks.rs`.
 const NAMESPACE: i32 = 0x0045_4442;
 const MIGRATION_KEY: i32 = 1;
+const SERVING_KEY: i32 = 2;
 
 fn startup(apply: bool, lock_timeout: Duration) -> Startup<'static> {
     Startup {
@@ -182,24 +187,52 @@ async fn apply_waits_for_a_held_migration_lock_and_exits_6() {
     );
 }
 
-/// Two servers started together under `apply` on a released catalog: one
-/// migrates it, and the other waits for the lock and finds nothing to do.
+/// Two `prepare_to_serve` runs under `apply` on a released catalog, both
+/// waiting for the migration lock another session holds, as the checks of
+/// two servers started together do after their first status read: once it
+/// is free, one migrates the catalog, and the other takes the lock after it
+/// and applies nothing. The servers are not started here; one of two
+/// servers started together can exit 6 when it registers while the other
+/// holds the lock.
 #[tokio::test]
-async fn two_servers_started_together_with_apply_migrate_once() {
+async fn two_prepare_to_serve_runs_under_apply_migrate_once() {
     let Some(base) = base_conn() else {
         return skip("startup two");
     };
     let s = Scratch::new(&base, "pgs_two").await;
     s.load("0.1.14").await;
+    let holder = s.catalog().await;
+    let mut tx = holder.begin().await.unwrap();
+    hold(&mut tx, "pg_advisory_xact_lock", MIGRATION_KEY).await;
+    let waiting = AtomicUsize::new(0);
+    let progress = |line: &str| {
+        if line.starts_with("taking the migration lock") {
+            waiting.fetch_add(1, Ordering::SeqCst);
+        }
+    };
+    let target = Target::at(s.catalog_url());
     let apply = startup(true, Duration::from_secs(60));
-    let (a, b) = tokio::join!(prepare(&s, &apply), prepare(&s, &apply));
-    let applied: Vec<usize> = [a.expect("first"), b.expect("second")]
+    let free = async {
+        while waiting.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tx.rollback().await.unwrap();
+    };
+    let (a, b, ()) = tokio::join!(
+        prepare_to_serve(&PostgresCatalogMigrations, &target, &apply, &progress),
+        prepare_to_serve(&PostgresCatalogMigrations, &target, &apply, &progress),
+        free,
+    );
+    holder.close().await;
+    let mut applied: Vec<usize> = [a.expect("first"), b.expect("second")]
         .iter()
-        .map(|p| p.run.as_ref().map_or(0, |r| r.applied.len()))
+        .map(|p| p.run.as_ref().expect("each took the lock").applied.len())
         .collect();
-    assert!(
-        applied.contains(&0) && applied.contains(&step_count()),
-        "one migrates and the other finds nothing to do: {applied:?}"
+    applied.sort_unstable();
+    assert_eq!(
+        applied,
+        [0, step_count()],
+        "one migrates, and the other takes the lock after it and applies nothing"
     );
     let catalog = s.catalog().await;
     assert_eq!(
@@ -208,4 +241,116 @@ async fn two_servers_started_together_with_apply_migrate_once() {
     );
     catalog.close().await;
     assert_eq!(s.status().await, CatalogStatus::Current { version: LATEST });
+}
+
+/// Hold an advisory key of the catalog in `tx`, as another migrator
+/// (`pg_advisory_xact_lock` on the migration key) or a running server
+/// (`pg_advisory_xact_lock_shared` on the serving key) does.
+async fn hold(tx: &mut sqlx::Transaction<'static, sqlx::Postgres>, function: &str, key: i32) {
+    sqlx::query(&format!("SELECT {function}($1, $2)"))
+        .bind(NAMESPACE)
+        .bind(key)
+        .execute(&mut **tx)
+        .await
+        .unwrap();
+}
+
+/// A zero lock timeout tries each key once. While another migrator holds
+/// the migration key, or a server the serving key, the server's run and the
+/// run `migrate --yes` makes exit 6 at once, with the catalog unchanged.
+/// PostgreSQL reads a `lock_timeout` of 0 as no limit, so a wait would last
+/// as long as the holder keeps its key.
+#[tokio::test]
+async fn a_zero_lock_timeout_tries_each_key_once() {
+    let Some(base) = base_conn() else {
+        return skip("startup zero timeout");
+    };
+    let s = Scratch::new(&base, "pgs_zero").await;
+    s.load("0.1.14").await;
+    let before = state(&s).await;
+    let target = Target::at(s.catalog_url());
+    for (function, key) in [
+        ("pg_advisory_xact_lock", MIGRATION_KEY),
+        ("pg_advisory_xact_lock_shared", SERVING_KEY),
+    ] {
+        let holder = s.catalog().await;
+        let mut tx = holder.begin().await.unwrap();
+        hold(&mut tx, function, key).await;
+        let started = Instant::now();
+        let served = tokio::time::timeout(
+            Duration::from_secs(20),
+            prepare(&s, &startup(true, Duration::ZERO)),
+        )
+        .await
+        .expect("the server's run waited for the key");
+        let err = served.expect_err("locked");
+        assert_eq!(err.exit_code(), exit::LOCKED, "{function}: {err:?}");
+        let migrated = tokio::time::timeout(
+            Duration::from_secs(20),
+            run_with_lock(
+                &PostgresCatalogMigrations,
+                &target,
+                "1.0.0-test",
+                RunKind::Migrate,
+                Duration::ZERO,
+                WhenCurrent::Run,
+            ),
+        )
+        .await
+        .expect("migrate --yes waited for the key");
+        let err = migrated.expect_err("locked");
+        assert_eq!(err.exit_code(), exit::LOCKED, "{function}: {err:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{function}: {:?}",
+            started.elapsed()
+        );
+        tx.rollback().await.unwrap();
+        holder.close().await;
+    }
+    assert!(state(&s).await == before, "a run at a zero timeout wrote");
+}
+
+/// The waits of one run share its lock timeout: a server's run that waits
+/// for another migrator's key, and then for a running server's key, exits 6
+/// once the timeout has passed in all, not after a timeout for each wait.
+#[tokio::test]
+async fn the_waits_of_a_run_share_one_lock_timeout() {
+    let Some(base) = base_conn() else {
+        return skip("startup one bound");
+    };
+    let s = Scratch::new(&base, "pgs_bound").await;
+    s.load("0.1.14").await;
+    // A server serves the catalog for the whole test, and another migrator
+    // holds the migration key for 6 s of the run's 8 s.
+    let server = s.catalog().await;
+    let mut serving = server.begin().await.unwrap();
+    hold(&mut serving, "pg_advisory_xact_lock_shared", SERVING_KEY).await;
+    let migrator = s.catalog().await;
+    let mut migrating = migrator.begin().await.unwrap();
+    hold(&mut migrating, "pg_advisory_xact_lock", MIGRATION_KEY).await;
+    let apply = startup(true, Duration::from_secs(8));
+    let started = Instant::now();
+    let other_finishes = async {
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        migrating.rollback().await.unwrap();
+    };
+    let (locked, ()) = tokio::join!(prepare(&s, &apply), other_finishes);
+    let waited = started.elapsed();
+    let err = locked.expect_err("locked");
+    assert_eq!(err.exit_code(), exit::LOCKED, "{err:?}");
+    assert!(
+        err.to_string()
+            .starts_with("servers are serving this catalog"),
+        "{err}"
+    );
+    // 8 s in all, plus the status reads; 8 s for each key would end after
+    // 14 s.
+    assert!(
+        waited >= Duration::from_millis(7500) && waited < Duration::from_secs(13),
+        "it waited {waited:?}"
+    );
+    serving.rollback().await.unwrap();
+    server.close().await;
+    migrator.close().await;
 }
