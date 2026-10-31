@@ -49,8 +49,9 @@ pub async fn handle_transact_get_items(
     // every item before the next phase starts: projection grammar and alias
     // resolution (top-level ValidationException), then table lookup
     // (ResourceNotFoundException), then key schema and key size
-    // (TransactionCanceledException with a ValidationError reason per
-    // offending item), then duplicate keys (top-level ValidationException).
+    // (TransactionCanceledException with a ValidationError reason on the
+    // first offending item and None on every other), then duplicate keys
+    // (top-level ValidationException).
     // Measured against DynamoDB for #108.
     let mut projections: Vec<Option<Projection>> = Vec::with_capacity(input.transact_items.len());
     for tgi in &input.transact_items {

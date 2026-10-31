@@ -23,8 +23,9 @@ use extenddb_core::types::TableKeyInfo;
 /// catalog carries on [`TableKeyInfo`], oldest first; two tables with the same
 /// stored creation time are listed in name order so the array is deterministic
 /// on every backend. The precision of the stored value sets how close two
-/// creates have to be to tie: nanoseconds on SQLite, microseconds on
-/// PostgreSQL, milliseconds on MongoDB and Cassandra. Before this change the
+/// creates have to be to tie: about 0.24 microseconds on SQLite (the value
+/// is an `f64` of epoch seconds), microseconds on PostgreSQL, milliseconds on
+/// MongoDB and Cassandra. Before this change the
 /// handlers aggregated into a `HashMap`, so the order changed from one process
 /// to the next and differed between backends
 /// (docs/differences-from-dynamodb.md, Capacity and Throttling).

@@ -894,4 +894,38 @@ mod tests {
         collect_value_placeholders(&expr, &mut out);
         assert!(out.is_empty());
     }
+
+    // The service lists every unused key in one set, in an order that is a hash
+    // artifact. ExtendDB sorts the keys so the message is the same on every
+    // backend and process; this is ExtendDB's own choice, not a measurement.
+    // Each round builds fresh maps, which iterate in a fresh random order, so a
+    // missing sort cannot pass by luck.
+    #[test]
+    fn unused_keys_are_listed_sorted() {
+        let none = std::collections::HashSet::new();
+        let unused = |names: &HashMap<String, String>, values: &HashMap<String, AttributeValue>| {
+            match validate_unused_attributes(names, values, &[], &[], &none, &none) {
+                Err(DynamoDbError::ValidationException(msg)) => msg,
+                other => panic!("unexpected {other:?}"),
+            }
+        };
+        for _ in 0..20 {
+            let names: HashMap<String, String> = ["#z", "#a", "#m"]
+                .iter()
+                .map(|k| ((*k).to_owned(), "x".to_owned()))
+                .collect();
+            let values: HashMap<String, AttributeValue> = [":z", ":a", ":m"]
+                .iter()
+                .map(|k| ((*k).to_owned(), AttributeValue::N("1".to_owned())))
+                .collect();
+            assert_eq!(
+                unused(&HashMap::new(), &values),
+                "Value provided in ExpressionAttributeValues unused in expressions: keys: {:a, :m, :z}"
+            );
+            assert_eq!(
+                unused(&names, &HashMap::new()),
+                "Value provided in ExpressionAttributeNames unused in expressions: keys: {#a, #m, #z}"
+            );
+        }
+    }
 }

@@ -388,8 +388,10 @@ impl SqliteEngine {
         // decide whether any maintenance is needed without a query, and so the
         // engine can validate vector attributes on writes.
         let vector_indexes = self.fetch_vector_index_key_info(&table_id).await?;
-        // The column is RFC 3339 with milliseconds (schema.rs); keep them, the
-        // transaction handlers order tables by this value.
+        // CreateTable writes the column as RFC 3339 with up to nanosecond
+        // digits (the schema default, milliseconds, only fills a row written
+        // without one). The transaction handlers order tables by this value as
+        // epoch seconds in an f64, which resolves about 0.24 microseconds.
         let creation_date_time = crate::sqlite_util::parse_timestamp(&created_str)
             .map(|dt| dt.unix_timestamp_nanos() as f64 / 1e9)
             .unwrap_or(0.0);
