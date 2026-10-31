@@ -18,10 +18,11 @@
 //! The source address is the peer address of the TCP connection; behind a
 //! reverse proxy that is the proxy's address for every caller, and `ExtendDB`
 //! does not read `X-Forwarded-For`, so all callers behind one proxy share
-//! one set of limits.
+//! one set of limits. An IPv6 peer is counted by its /64 prefix (see
+//! `limiter_source`).
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 
 use extenddb_storage::management_store::RateLimitStore;
@@ -68,7 +69,8 @@ pub struct LoginAttempt {
 }
 
 impl LoginAttempt {
-    /// The source address the attempt is counted under.
+    /// The source key the attempt is counted under: an IPv4 address, or an
+    /// IPv6 /64 prefix.
     #[must_use]
     pub fn source_ip(&self) -> &str {
         &self.source_ip
@@ -113,12 +115,27 @@ pub async fn begin_login(
     principal: &str,
     peer: SocketAddr,
 ) -> Result<LoginAttempt, LoginRefusal> {
-    begin_login_from(
-        store,
-        principal,
-        crate::authorization::condition_source_ip(&peer),
-    )
-    .await
+    begin_login_from(store, principal, limiter_source(&peer)).await
+}
+
+/// The source key a peer's login attempts are counted under.
+///
+/// An IPv4 peer, and an IPv6 peer carrying an IPv4-mapped address, count
+/// under the IPv4 address. Any other IPv6 peer counts under its /64 prefix
+/// (`2001:db8:1:2::/64`): a /64 is the block usually assigned to one host or
+/// site, and a client can send from any address in it, so keying on the full
+/// address would give it a fresh set of limits for every address it picks.
+///
+/// This applies to the limiter only. `aws:SourceIp` still sees the full
+/// address through [`crate::authorization::condition_source_ip`].
+fn limiter_source(peer: &SocketAddr) -> String {
+    match peer.ip().to_canonical() {
+        IpAddr::V6(v6) => {
+            let prefix = Ipv6Addr::from(u128::from(v6) & !(u128::from(u64::MAX)));
+            format!("{prefix}/64")
+        }
+        v4 @ IpAddr::V4(_) => v4.to_string(),
+    }
 }
 
 async fn begin_login_from(
@@ -458,6 +475,67 @@ mod tests {
             Some(LoginRefusal::Internal)
         );
         assert!(!registry().tracks("198.51.100.50"));
+    }
+
+    #[test]
+    fn an_ipv6_peer_is_keyed_by_its_64_and_ipv4_by_its_address() {
+        assert_eq!(
+            limiter_source(&peer("[2001:db8:1:2:aaaa:bbbb:cccc:dddd]")),
+            "2001:db8:1:2::/64"
+        );
+        assert_eq!(
+            limiter_source(&peer("[::ffff:198.51.100.7]")),
+            "198.51.100.7"
+        );
+        assert_eq!(limiter_source(&peer("198.51.100.7")), "198.51.100.7");
+    }
+
+    #[tokio::test]
+    async fn addresses_in_one_ipv6_64_share_the_pair_limit_and_another_64_does_not() {
+        let store = MemoryStore::default();
+        for n in 1..=MAX_FAILURES_PER_PRINCIPAL {
+            let attempt = begin_login(&store, "admin", peer(&format!("[2001:db8:64:1::{n:x}]")))
+                .await
+                .unwrap();
+            attempt.record_failure(&store).await;
+        }
+        assert_eq!(store.rows_for("admin", "2001:db8:64:1::/64"), 5);
+
+        // A sixth address in the same /64 is refused for the principal.
+        assert_eq!(
+            begin_login(&store, "admin", peer("[2001:db8:64:1:ffff::99]"))
+                .await
+                .err(),
+            Some(LoginRefusal::TooManyAttempts(PRINCIPAL_LIMITED))
+        );
+        // The neighbouring /64 is a different source.
+        let _other = begin_login(&store, "admin", peer("[2001:db8:64:2::1]"))
+            .await
+            .expect("another /64 is not affected");
+    }
+
+    #[tokio::test]
+    async fn addresses_in_one_ipv6_64_share_the_source_limit_and_another_64_does_not() {
+        let store = MemoryStore::default();
+        for n in 1..=MAX_FAILURES_PER_IP {
+            let attempt = begin_login(
+                &store,
+                &format!("user{n}"),
+                peer(&format!("[2001:db8:64:3::{n:x}]")),
+            )
+            .await
+            .unwrap();
+            attempt.record_failure(&store).await;
+        }
+        assert_eq!(
+            begin_login(&store, "user-new", peer("[2001:db8:64:3::abcd]"))
+                .await
+                .err(),
+            Some(LoginRefusal::TooManyAttempts(SOURCE_LIMITED))
+        );
+        let _other = begin_login(&store, "user-new", peer("[2001:db8:64:4::abcd]"))
+            .await
+            .expect("another /64 is not affected");
     }
 
     #[tokio::test]
