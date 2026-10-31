@@ -251,46 +251,17 @@ fn validate_gsi_updates(input: &UpdateTableInput) -> Result<(), DynamoDbError> {
                 }
                 // Every key attribute must be in AttributeDefinitions. The
                 // service's sentence depends on the member's shape (measured
-                // 2026-10-25): absent names the index; present but lacking
-                // the key lists the keys and the definitions (the CreateTable
-                // sentence, whose CreateTable copy lives in core's validation
-                // and is not shared with this path); an empty list has its
-                // own sentence.
-                let missing: Vec<&str> = match &input.attribute_definitions {
-                    None => {
-                        return Err(DynamoDbError::ValidationException(format!(
-                            "One or more parameter values were invalid: AttributeDefinitions is not specified for index: {}",
-                            create.index_name
-                        )));
-                    }
-                    Some(defs) if defs.is_empty() => {
-                        return Err(DynamoDbError::ValidationException(
-                            "Invalid KeySchema: Some index key attribute have no definition"
-                                .to_owned(),
-                        ));
-                    }
-                    Some(defs) => create
-                        .key_schema
-                        .iter()
-                        .filter(|ks| !defs.iter().any(|ad| ad.attribute_name == ks.attribute_name))
-                        .map(|ks| ks.attribute_name.as_str())
-                        .collect(),
-                };
-                if let Some(first_missing) = missing.first() {
-                    let defined: Vec<&str> = input
-                        .attribute_definitions
-                        .as_deref()
-                        .unwrap_or(&[])
-                        .iter()
-                        .map(|ad| ad.attribute_name.as_str())
-                        .collect();
+                // 2026-10-25 and 2026-10-26): absent names the index; a name
+                // defined twice is refused first; then the CreateTable rules
+                // for the index's key schema (core's key_definitions.rs).
+                let Some(defs) = &input.attribute_definitions else {
                     return Err(DynamoDbError::ValidationException(format!(
-                        "One or more parameter values were invalid: Some index key attributes are not defined in AttributeDefinitions. \
-                         Keys: [{}], AttributeDefinitions: [{}]",
-                        first_missing,
-                        defined.join(", ")
+                        "One or more parameter values were invalid: AttributeDefinitions is not specified for index: {}",
+                        create.index_name
                     )));
-                }
+                };
+                extenddb_core::validation::validate_unique_attribute_definitions(defs)?;
+                extenddb_core::validation::validate_key_schema_defined(&create.key_schema, defs)?;
             }
             if let Some(delete) = &update.delete {
                 extenddb_core::validation::validate_index_name(&delete.index_name)?;
