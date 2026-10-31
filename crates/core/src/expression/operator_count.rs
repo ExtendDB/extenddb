@@ -79,7 +79,13 @@ mod tests {
         assert_eq!(count(&chain("#v = :v", 300, " OR ")), 599); // [a02]
         assert_eq!(count(&chain("#v <> :v", 300, " OR ")), 599); // [a05]
         assert_eq!(count(&chain("#v >= :v", 300, " AND ")), 599); // [a09, a03]
-        assert_eq!(count(&format!("attribute_not_exists(pk) OR {}", chain("#v = :v", 300, " OR "))), 601); // [a01]
+        assert_eq!(
+            count(&format!(
+                "attribute_not_exists(pk) OR {}",
+                chain("#v = :v", 300, " OR ")
+            )),
+            601
+        ); // [a01]
     }
 
     #[test]
@@ -92,31 +98,57 @@ mod tests {
         assert_eq!(count(&chain("attribute_exists(#v)", 170, " OR ")), 339); // [a43]
         assert_eq!(count(&chain("contains(#v, :v)", 200, " OR ")), 399); // [a45]
         assert_eq!(count(&chain("size(#v) = :v", 230, " OR ")), 689); // [a47]
-        assert_eq!(count(&chain("size(#v) BETWEEN :v AND :v", 130, " OR ")), 389); // [a53]
+        assert_eq!(
+            count(&chain("size(#v) BETWEEN :v AND :v", 130, " OR ")),
+            389
+        ); // [a53]
     }
 
     #[test]
     fn parentheses_count_zero() {
         assert_eq!(count(&chain("(#v = :v)", 300, " OR ")), 599); // [a19]
         assert_eq!(count(&chain("((#v = :v) OR (#v = :v))", 140, " OR ")), 559); // [a51]
-        assert_eq!(count(&format!("attribute_exists(pk) AND ({})", chain("#v = :v", 300, " OR "))), 601); // [a04]
-        assert_eq!(count(&format!("attribute_exists(pk) AND NOT ({})", chain("#v = :v", 150, " OR "))), 302); // [a52]
+        assert_eq!(
+            count(&format!(
+                "attribute_exists(pk) AND ({})",
+                chain("#v = :v", 300, " OR ")
+            )),
+            601
+        ); // [a04]
+        assert_eq!(
+            count(&format!(
+                "attribute_exists(pk) AND NOT ({})",
+                chain("#v = :v", 150, " OR ")
+            )),
+            302
+        ); // [a52]
     }
 
     #[test]
     fn cap_is_exclusive_at_300() {
         let kind = ExpressionKind::Condition;
-        let at_cap = format!("NOT attribute_not_exists(pk) OR {}", chain("#v = :v", 149, " OR ")); // [a49]
+        let at_cap = format!(
+            "NOT attribute_not_exists(pk) OR {}",
+            chain("#v = :v", 149, " OR ")
+        ); // [a49]
         assert_eq!(count(&at_cap), 300);
-        assert!(validate_operator_count(&parse_condition(&tokenize(&at_cap).unwrap()).unwrap(), kind).is_ok());
+        assert!(
+            validate_operator_count(&parse_condition(&tokenize(&at_cap).unwrap()).unwrap(), kind)
+                .is_ok()
+        );
 
         let over = chain("#v = :v", 151, " OR "); // [a30]
-        let err = validate_operator_count(&parse_condition(&tokenize(&over).unwrap()).unwrap(), kind).unwrap_err();
+        let err =
+            validate_operator_count(&parse_condition(&tokenize(&over).unwrap()).unwrap(), kind)
+                .unwrap_err();
         assert!(matches!(err, DynamoDbError::ValidationException(m)
             if m == "Invalid ConditionExpression: The expression contains too many operators; operator count: 301"));
 
         let under = chain("#v = :v", 150, " OR "); // [a30]
-        assert!(validate_operator_count(&parse_condition(&tokenize(&under).unwrap()).unwrap(), kind).is_ok());
+        assert!(
+            validate_operator_count(&parse_condition(&tokenize(&under).unwrap()).unwrap(), kind)
+                .is_ok()
+        );
     }
 
     #[test]

@@ -448,9 +448,13 @@ mod tests {
     fn count_over_the_cap_is_refused_with_the_full_count() {
         let limits = LimitsConfig::default();
         // 151 comparisons and 150 ORs: 301 [a30].
-        let err = resolve_condition(Some(&chain(151)), None, None, None, None, &limits).unwrap_err();
-        assert!(matches!(&err, DynamoDbError::ValidationException(msg)
-            if msg == "Invalid ConditionExpression: The expression contains too many operators; operator count: 301"), "got {err:?}");
+        let err =
+            resolve_condition(Some(&chain(151)), None, None, None, None, &limits).unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg)
+            if msg == "Invalid ConditionExpression: The expression contains too many operators; operator count: 301"),
+            "got {err:?}"
+        );
         // 150 comparisons and 149 ORs: 299, accepted [a30].
         assert!(resolve_condition(Some(&chain(150)), None, None, None, None, &limits).is_ok());
     }
@@ -463,9 +467,13 @@ mod tests {
         let mut values = HashMap::new();
         values.insert(":v".to_owned(), AttributeValue::S("x".to_owned()));
         values.insert(":b".to_owned(), AttributeValue::Bool(true));
-        let err = resolve_condition(Some(&expr), None, Some(&values), None, None, &limits).unwrap_err();
-        assert!(matches!(&err, DynamoDbError::ValidationException(msg)
-            if msg.contains("Incorrect operand type for operator or function; operator or function: <, operand type: BOOL")), "got {err:?}");
+        let err =
+            resolve_condition(Some(&expr), None, Some(&values), None, None, &limits).unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg)
+            if msg.contains("Incorrect operand type for operator or function; operator or function: <, operand type: BOOL")),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -474,8 +482,11 @@ mod tests {
         let limits = LimitsConfig::default();
         let expr = format!("{} = =", chain(300));
         let err = resolve_condition(Some(&expr), None, None, None, None, &limits).unwrap_err();
-        assert!(matches!(&err, DynamoDbError::ValidationException(msg)
-            if msg == "Invalid ConditionExpression: Syntax error; token: \"=\", near: \":v = =\""), "got {err:?}");
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg)
+            if msg == "Invalid ConditionExpression: Syntax error; token: \"=\", near: \":v = =\""),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -484,16 +495,25 @@ mod tests {
         // [a62] `pk = :v OR` + 150 terms: 301, the count, not the OR refusal.
         let expr = format!("pk = :v OR {}", vec!["#v = :v"; 150].join(" AND "));
         let err = parse_key_condition_expr(&expr, &limits).unwrap_err();
-        assert!(matches!(&err, DynamoDbError::ValidationException(msg)
-            if msg == "Invalid KeyConditionExpression: The expression contains too many operators; operator count: 301"), "got {err:?}");
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg)
+            if msg == "Invalid KeyConditionExpression: The expression contains too many operators; operator count: 301"),
+            "got {err:?}"
+        );
         // [a63] two conditions joined by OR under the cap: the key grammar answers.
         let err = parse_key_condition_expr("pk = :v OR sk = :s", &limits).unwrap_err();
-        assert!(matches!(&err, DynamoDbError::ValidationException(msg)
-            if msg == "Invalid KeyConditionExpression: only AND is supported between key conditions"), "got {err:?}");
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg)
+            if msg == "Invalid KeyConditionExpression: only AND is supported between key conditions"),
+            "got {err:?}"
+        );
         // [d23] a syntax error is reported by the key grammar in the service's words.
         let err = parse_key_condition_expr("pk = :v AND", &limits).unwrap_err();
-        assert!(matches!(&err, DynamoDbError::ValidationException(msg)
-            if msg == "Invalid KeyConditionExpression: Syntax error; token: \"<EOF>\", near: \"AND\""), "got {err:?}");
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg)
+            if msg == "Invalid KeyConditionExpression: Syntax error; token: \"<EOF>\", near: \"AND\""),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -501,7 +521,10 @@ mod tests {
         // [d27]
         let limits = LimitsConfig::default();
         let err = parse_projection_expr("#v, , #v", &limits).unwrap_err();
-        assert!(matches!(&err, DynamoDbError::ValidationException(msg)
-            if msg == "Invalid ProjectionExpression: Syntax error; token: \",\", near: \", , #v\""), "got {err:?}");
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg)
+            if msg == "Invalid ProjectionExpression: Syntax error; token: \",\", near: \", , #v\""),
+            "got {err:?}"
+        );
     }
 }

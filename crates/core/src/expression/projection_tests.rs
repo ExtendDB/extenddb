@@ -456,5 +456,8 @@ fn other_projection_texts_are_unchanged() {
         proj_msg("#v #w"),
         "Invalid ProjectionExpression: unexpected token at position 1"
     );
-    assert_eq!(proj_msg("#v, )"), "Invalid expression: expected attribute name");
+    assert_eq!(
+        proj_msg("#v, )"),
+        "Invalid expression: expected attribute name"
+    );
 }
