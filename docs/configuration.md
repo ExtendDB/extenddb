@@ -6,7 +6,7 @@ description: "Every key of extenddb.toml, its default and what it controls, gene
 
 This page is generated from [`extenddb.sample.toml`](https://github.com/ExtendDB/extenddb/blob/main/extenddb.sample.toml) by `npm run gen:config` in `website/`; edit the sample, not this file. Tests in the `extenddb-config` crate and in each storage backend crate compare the sample with the configuration structs, so a key listed here exists in the code with the default shown.
 
-The server reads `extenddb.toml` (or the file named by `--config`) at startup. Every key can also be set through an environment variable: the name is `EXTENDDB__` followed by the key path in upper case with `__` between levels, for example `EXTENDDB__SERVER__PORT=9000` or `EXTENDDB__STORAGE__POSTGRES__CONNECTION_STRING="postgresql://..."`. Precedence, highest first: command-line flags, environment variables, the configuration file, built-in defaults.
+The server reads `extenddb.toml` (or the file named by `--config`) at startup. Every key can also be set through an environment variable: the name is `EXTENDDB__` followed by the key path in upper case with `__` between levels, for example `EXTENDDB__SERVER__PORT=9000` or `EXTENDDB__STORAGE__POSTGRES__CONNECTION_STRING="postgresql://..."`. Precedence, highest first: environment variables, the configuration file, built-in defaults; `extenddb serve --port` overrides `server.port` on top of all three.
 
 The keys below are static: a change takes effect at the next server start. Settings that change on a running server (log level, control plane delay, throttling at runtime) are set with `extenddb settings set` and are listed under [Runtime Settings](./manuals/05-admin-guide.md#runtime-settings) in the administration guide.
 

@@ -18,8 +18,8 @@
 # separator between levels:
 #   EXTENDDB__SERVER__PORT=9000
 #   EXTENDDB__STORAGE__POSTGRES__CONNECTION_STRING="postgresql://..."
-# Precedence: CLI flags, then environment variables, then this file, then the
-# built-in defaults.
+# Precedence: environment variables, then this file, then the built-in
+# defaults. `extenddb serve --port` overrides server.port on top of all three.
 #
 # Runtime settings (log level, control plane delay, throttling at runtime) are
 # changed with `extenddb settings set <key> <value>`, not in this file. The
