@@ -135,10 +135,13 @@ fn parse_primary(
 
     // Operand (a path, a placeholder, or a function call), then a comparator,
     // BETWEEN, or IN. A function call with nothing after it is the condition
-    // itself; whether that function may stand alone, whether its name exists,
-    // and how many operands it takes are semantic questions answered after
-    // the grammar pass (see `validate_condition_semantics`), so a syntax error
-    // further along still wins, as on Amazon DynamoDB.
+    // itself. This pass checks grammar only: whether that function may stand
+    // alone, whether its name exists, and how many operands it takes are
+    // checked afterwards by `validate_condition_semantics`, over the whole
+    // parsed tree. Amazon DynamoDB reports every syntax error before any
+    // semantic error, so `foo(pk) AND` is reported as the syntax error at the
+    // end, not as the unknown function name that comes first in the text.
+    // Deferring the semantic checks here gives the same precedence.
     let left = parse_operand(tokens, pos)?;
 
     if *pos < tokens.len() {
@@ -235,7 +238,12 @@ fn parse_function_call(tokens: &[Token], pos: &mut usize) -> Result<Expr, Dynamo
 
     parser_common::expect_token(tokens, pos, &Token::LParen, "(", "ConditionExpression")?;
 
-    // `f()` is a syntax error on the service, reported at the `)`.
+    // The grammar requires at least one operand between the parentheses. A
+    // call with an empty operand list, `foo()` or `attribute_exists()`, is a
+    // grammar error on the service, reported at the `)` with the text below,
+    // before the function name or its operand count is looked at (measured
+    // 2026-10-14; `begins_with(pk)` with one operand is instead the semantic
+    // operand-count error from `validate_condition_semantics`).
     if *pos < tokens.len() && tokens[*pos] == Token::RParen {
         return Err(validation_err(
             "Invalid ConditionExpression: Syntax error; token: \")\", near: \"()\"",

@@ -278,9 +278,13 @@ fn parse_value_expr(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbE
 /// Parse a SET operand: path, placeholder, or function call.
 ///
 /// Any identifier followed by `(` is a function call, with the name kept as
-/// written; whether the name exists, its case, and its operand count are
-/// semantic questions answered later so that a syntax error further along
-/// still wins, as on Amazon DynamoDB.
+/// written. This pass checks grammar only: whether the name exists, its case,
+/// and its operand count are checked afterwards by
+/// `validate_update_semantics`, over the whole parsed expression. Amazon
+/// DynamoDB reports every syntax error before any semantic error (measured
+/// 2026-10-14: `SET x = foo(x), b = ` reports the syntax error at the end,
+/// not the unknown function name), and deferring the semantic checks gives
+/// the same precedence.
 fn parse_set_operand(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbError> {
     if *pos >= tokens.len() {
         return Err(validation_err("Invalid UpdateExpression: expected operand"));
@@ -329,7 +333,10 @@ fn parse_set_function_call(tokens: &[Token], pos: &mut usize) -> Result<Expr, Dy
     *pos += 1;
     parser_common::expect_token(tokens, pos, &Token::LParen, "(", "UpdateExpression")?;
 
-    // `foo()` is a syntax error on the service, reported at the `)`.
+    // The grammar requires at least one operand between the parentheses. A
+    // call with an empty operand list, `foo()`, is a grammar error on the
+    // service, reported at the `)` with the text below, before the function
+    // name is looked at (measured 2026-10-14).
     if *pos < tokens.len() && tokens[*pos] == Token::RParen {
         return Err(validation_err(
             "Invalid UpdateExpression: Syntax error; token: \")\", near: \"()\"",

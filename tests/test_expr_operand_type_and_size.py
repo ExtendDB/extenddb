@@ -350,3 +350,59 @@ class TestConditionApiSurface:
         err = _err(ei)
         assert err["Code"] == "ValidationException"
         assert "Invalid FilterExpression: Incorrect operand type" in err["Message"]
+
+
+@pytest.fixture(scope="class")
+def empty_table(dynamodb_client):
+    name = f"expr_legacy_{uuid.uuid4().hex[:8]}"
+    dynamodb_client.create_table(
+        TableName=name,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    from conftest import wait_for_active
+
+    wait_for_active(dynamodb_client, name)
+    yield name
+    dynamodb_client.delete_table(TableName=name)
+
+
+class TestLegacyFilterOperandType:
+    """The legacy QueryFilter and ScanFilter parameters are checked at request
+    time too: on an empty table, where no row is evaluated, BEGINS_WITH with a
+    number and an ordering comparison with a boolean are refused. Only the
+    error code is asserted here; the service's message text for the legacy
+    parameters has not been captured."""
+
+    def test_scan_filter_begins_with_number_rejected_on_empty_table(self, dynamodb_client, empty_table):
+        with pytest.raises(ClientError) as ei:
+            dynamodb_client.scan(
+                TableName=empty_table,
+                ScanFilter={"pk": {"ComparisonOperator": "BEGINS_WITH", "AttributeValueList": [{"N": "1"}]}},
+            )
+        assert _err(ei)["Code"] == "ValidationException"
+
+    def test_scan_filter_ordering_boolean_rejected_on_empty_table(self, dynamodb_client, empty_table):
+        with pytest.raises(ClientError) as ei:
+            dynamodb_client.scan(
+                TableName=empty_table,
+                ScanFilter={"n": {"ComparisonOperator": "LT", "AttributeValueList": [{"BOOL": True}]}},
+            )
+        assert _err(ei)["Code"] == "ValidationException"
+
+    def test_query_filter_begins_with_number_rejected_on_empty_table(self, dynamodb_client, empty_table):
+        with pytest.raises(ClientError) as ei:
+            dynamodb_client.query(
+                TableName=empty_table,
+                KeyConditions={"pk": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "absent"}]}},
+                QueryFilter={"s": {"ComparisonOperator": "BEGINS_WITH", "AttributeValueList": [{"N": "1"}]}},
+            )
+        assert _err(ei)["Code"] == "ValidationException"
+
+    def test_scan_filter_begins_with_string_accepted(self, dynamodb_client, empty_table):
+        resp = dynamodb_client.scan(
+            TableName=empty_table,
+            ScanFilter={"pk": {"ComparisonOperator": "BEGINS_WITH", "AttributeValueList": [{"S": "p"}]}},
+        )
+        assert resp["Count"] == 0

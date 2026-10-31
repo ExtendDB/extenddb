@@ -383,12 +383,16 @@ pub fn batch_write_capacity<'a>(
 /// Per-table capacity totals in the order the tables first appear in the
 /// request.
 ///
-/// Amazon DynamoDB's own order of the `ConsumedCapacity` entries of a
-/// transaction follows no documented rule (measured 2026-10-14: hash order of
-/// the table names, which differs between name sets), so no client can depend
-/// on it. A `HashMap` here made ExtendDB's order change from one process to
-/// the next; first appearance is stable and is what a reader of the request
-/// expects.
+/// This is a firmer guarantee than Amazon DynamoDB gives, not a copy of its
+/// order. The service documents no order for the `ConsumedCapacity` entries
+/// of a transaction, and the measured order (2026-10-14) is neither first
+/// appearance nor alphabetical: a TransactGetItems naming table b, then a,
+/// then b again returned a before b; a TransactWriteItems naming b, a2, b
+/// returned b before a2. A client cannot depend on the service's order, so
+/// any deterministic order is compatible with it. Before this change ExtendDB
+/// aggregated into a `HashMap`, so the order changed from one process to the
+/// next and differed between backends; first appearance is stable, matches
+/// the request as the caller wrote it, and lets the tests assert the array.
 #[derive(Default)]
 pub struct PerTableCapacity(Vec<(String, f64)>);
 
