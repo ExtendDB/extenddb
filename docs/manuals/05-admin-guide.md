@@ -1,6 +1,12 @@
-# Admin Guide
+---
+description: "Running an ExtendDB server: lifecycle, the configuration file, IAM administration, the web console, monitoring and troubleshooting."
+---
 
-> See [NOTICE](../NOTICE.md) for important disclaimers.
+# Administration
+
+> See [NOTICE](https://github.com/ExtendDB/extenddb/blob/main/docs/NOTICE.md) for important disclaimers.
+
+This guide covers running an ExtendDB server day to day: starting and stopping it, the configuration file, IAM administration (accounts, users, access keys, groups, roles, policies), the web console, monitoring and troubleshooting.
 
 ## Server Lifecycle
 
@@ -10,7 +16,7 @@
 ./target/release/extenddb serve --config extenddb.toml
 ```
 
-extenddb always runs as a daemon. On startup it:
+ExtendDB always runs as a daemon. On startup it:
 
 1. Reads `extenddb.toml` configuration
 2. Binds the TCP socket (port conflicts are reported before forking)
@@ -40,7 +46,7 @@ Or manually:
 kill <pid>
 ```
 
-extenddb handles SIGTERM and SIGINT gracefully — it drains active connections for up to 5 seconds before exiting.
+ExtendDB handles SIGTERM and SIGINT gracefully; it drains active connections for up to 5 seconds before exiting.
 
 Note that `extenddb stop` reads the PID file, which a server started with
 `serve --foreground` does not write by default. Stop a foreground server through
@@ -56,7 +62,7 @@ curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/health
 # {"status":"healthy"}
 ```
 
-Or without `curl` — useful inside a minimal container image, and what a Docker
+Or without `curl`, useful inside a minimal container image, and what a Docker
 `HEALTHCHECK` should call:
 
 ```bash
@@ -80,7 +86,7 @@ only, and rely on client retries for backend failures.
 
 ## Configuration Reference
 
-### extenddb.toml — Static Configuration
+### extenddb.toml: Static Configuration
 
 These settings require a server restart to take effect.
 
@@ -96,7 +102,7 @@ These settings require a server restart to take effect.
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `backend` | `postgres` | Storage backend (only `postgres` supported) |
+| `backend` | `postgres` | Storage backend: `postgres`, `mongodb`, `sqlite` or `cassandra`. Must match the feature the binary was built with; see [Storage backends](../storage-backends.md) |
 
 #### [storage.postgres]
 
@@ -130,7 +136,7 @@ In-memory stale-while-revalidate caches eliminate the per-request catalog roundt
 | Key | Default | Description |
 |-----|---------|-------------|
 | `enabled` | `true` | Master kill switch. When `false`, all caches operate in pass-through mode. |
-| `ttl_seconds` | `60` | Hard TTL — entries older than this trigger a fresh, request-blocking load. |
+| `ttl_seconds` | `60` | Hard TTL: entries older than this trigger a fresh, request-blocking load. |
 | `soft_ttl_seconds` | `30` | Stale-but-usable threshold; older entries still serve immediately while a background task refreshes them. |
 | `negative_ttl_seconds` | `5` | Negative-cache TTL for "not found" results. |
 | `max_entries` | `10000` | Per-cache LRU cap. |
@@ -140,7 +146,7 @@ Statistics are exposed at `/management/auth-cache-metrics` (JSON, admin-authenti
 **Invalidation timing**:
 
 - **Single-key invalidations** (e.g. `DeleteAccessKey`, `PutUserPolicy`) drop the cached entry immediately; the next request sees the post-mutation state.
-- **Fanout invalidations** (e.g. `DeleteAccount`, `DeleteRole` session sweep, `DeleteGroup` member fanout) are **asynchronous** — there is a small window (~ms) between the API returning success and the matching entries being evicted. For hard cutover (e.g. revoking a compromised key), prefer the single-key path (`DeleteAccessKey`) over the cascade.
+- **Fanout invalidations** (e.g. `DeleteAccount`, `DeleteRole` session sweep, `DeleteGroup` member fanout) are **asynchronous**: there is a small window (~ms) between the API returning success and the matching entries being evicted. For hard cutover (e.g. revoking a compromised key), prefer the single-key path (`DeleteAccessKey`) over the cascade.
 - **Off-instance changes** (multi-node deployments, or direct catalog writes) wait up to `ttl_seconds` to be observed locally.
 
 #### [server.tls]
@@ -155,7 +161,7 @@ Statistics are exposed at `/management/auth-cache-metrics` (JSON, admin-authenti
 
 #### [limits]
 
-All defaults match real DynamoDB limits. Override only for testing edge cases.
+All defaults match the DynamoDB service limits. Override only for testing edge cases.
 
 #### [logging]
 
@@ -867,7 +873,7 @@ Targets: `extenddb::audit::manage` (management ops), `extenddb::audit::settings`
 curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/metrics
 ```
 
-JSON metrics endpoint with DynamoDB CloudWatch-style metric names and dimensions. The response shape is `{ metrics, buckets, segments, source }`. See `docs/design/06-component-server.md` §7.2 for the full schema and metric list.
+JSON metrics endpoint with DynamoDB CloudWatch-style metric names and dimensions. The response shape is `{ metrics, buckets, segments, source }`. See the [server component design](../design/06-component-server.md) section 7.2 for the full schema and metric list.
 
 ### Health Check
 
@@ -958,7 +964,7 @@ Increase `pool_size` in `extenddb.toml` or check for connection leaks.
 
 ### Data Recovery
 
-extenddb stores all data in PostgreSQL. Use standard PostgreSQL backup and recovery tools:
+ExtendDB stores all data in PostgreSQL. Use standard PostgreSQL backup and recovery tools:
 
 ```bash
 # Backup
@@ -975,7 +981,7 @@ psql -f data_backup.sql extenddb_catalog_data
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
-See [LICENSE](../../LICENSE) for the full text.
+See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
 This software is provided "as is" without warranty of any kind. ExtendDB is not
 affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark

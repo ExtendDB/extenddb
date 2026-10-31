@@ -1,4 +1,8 @@
-# Design: MongoDB Storage Backend
+---
+description: "How the MongoDB backend implements the storage traits: collections, documents, indexes and transactions."
+---
+
+# Component design: MongoDB storage backend
 
 ## 1. Overview
 

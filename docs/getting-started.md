@@ -1,17 +1,21 @@
-# Getting Started with extenddb
+---
+description: "Build ExtendDB from source, initialize a deployment, start the server and run DynamoDB commands against it, with every CLI option explained."
+---
 
-> See [NOTICE](NOTICE.md) for important disclaimers.
+# Full walkthrough from source
 
-This guide walks you through initializing a extenddb deployment, starting the server, and running your first DynamoDB commands against it.
+> See [NOTICE](https://github.com/ExtendDB/extenddb/blob/main/docs/NOTICE.md) for important disclaimers.
 
-### Platform-specific installation guides
+This guide builds ExtendDB from source, initializes a deployment, starts the server, and runs DynamoDB commands against it. It is the long route; for a server in one command see [Getting started](start.md), and for the two container images see [Install](/start/install/).
 
-- [macOS (Homebrew)](manuals/09-install-macos.md) — covers Homebrew PostgreSQL, macOS syslog, and `--pg-user $(whoami)`
-- [Linux (Ubuntu/Debian, Amazon Linux, Fedora/RHEL)](manuals/08-install-linux.md) — covers system PostgreSQL, `journalctl`, and `--pg-user postgres`
+## Platform-specific installation guides
 
-### Installer scripts
+- [macOS (Homebrew)](manuals/09-install-macos.md): covers Homebrew PostgreSQL, macOS syslog, and `--pg-user $(whoami)`
+- [Linux (Ubuntu/Debian, Amazon Linux, Fedora/RHEL)](manuals/08-install-linux.md): covers system PostgreSQL, `journalctl`, and `--pg-user postgres`
 
-The fastest way to build extenddb from source is the platform installer script.
+## Installer scripts
+
+The fastest way to build ExtendDB from source is the platform installer script.
 It checks dependencies, builds the binary, sets up a Python venv, and
 generates PDF documentation:
 
@@ -23,29 +27,30 @@ scripts/install-linux.sh
 scripts/install-macos.sh
 ```
 
-The scripts report missing dependencies and exit — they never install
+The scripts report missing dependencies and exit; they never install
 software on your behalf. After the script completes, continue from
 [Step 2: Initialize the deployment](#2-initialize-the-deployment) below.
 
 ## Quick start with Docker Compose
 
-If you have Docker, the fastest way to get a local ExtendDB stack running is with
-the included `docker-compose.yml`. It wires the official image to a PostgreSQL
-container and handles initialization automatically — no build or manual init required.
-See [Local Development with Docker Compose](local-dev-docker-compose.md).
+If you have Docker, the repository's `docker-compose.yml` starts the published
+PostgreSQL image together with a PostgreSQL container and runs the initialization
+for you, with no build step. See [Docker Compose with PostgreSQL](local-dev-docker-compose.md),
+then apply the Docker Compose row of the table in [section 5](#5-configure-aws-cli)
+and continue at [section 6](#6-try-it-out).
 
 ## Prerequisites
 
 - **Storage backend** (one of):
-  - PostgreSQL 14+ running locally (see `docs/local-postgres-setup.md`)
+  - PostgreSQL 14+ running locally (see [Local PostgreSQL setup](local-postgres-setup.md))
   - SQLite (embedded; nothing to install)
-  - MongoDB 7.0+ with replica set (see `docs/local-mongodb-setup.md`)
-  - Cassandra 4.1+ running locally (see `docs/cassandra-setup.md`)
+  - MongoDB 7.0+ with replica set (see [Local MongoDB setup](local-mongodb-setup.md))
+  - Apache Cassandra 4.1+ running locally (CI runs the `cassandra:4.1` image; see [Cassandra setup](cassandra-setup.md) and [Storage backends](storage-backends.md))
 - Rust toolchain (1.88+)
 - AWS CLI v2 (for testing)
-- Python 3.10+ with virtual environment (see [Python Environment Setup](../README.md#python-environment-setup) in the README)
+- Python 3.10+ with virtual environment (see [Python Environment Setup](https://github.com/ExtendDB/extenddb/blob/main/README.md#python-environment-setup) in the README)
 
-## 1. Build extenddb
+## 1. Build ExtendDB
 
 ```bash
 # PostgreSQL backend (default)
@@ -63,8 +68,8 @@ cargo build --release --no-default-features --features sqlite
 ```
 
 Each build produces a single-backend binary. The `postgres`, `mongodb`,
-`sqlite`, and `cassandra` features are mutually exclusive — a build enabling
-more than one is rejected at compile time — so to run two backends, build one
+`cassandra` and `sqlite` features are mutually exclusive; a build enabling
+more than one is rejected at compile time. To run two backends, build one
 binary per backend.
 
 The binary is at `target/release/extenddb`.
@@ -138,10 +143,10 @@ This generates a certificate with SANs: `localhost`, `127.0.0.1`, and `10.0.1.5`
 
 ### SQLite backend (developer mode)
 
-For local development and CI, extenddb can run against a SQLite backend instead
+For local development and CI, ExtendDB can run against a SQLite backend instead
 of PostgreSQL. It requires its own build (the `postgres`, `mongodb`, and
 `sqlite` backends are mutually exclusive, each compiled into a single-backend
-binary — see [Build extenddb](#1-build-extenddb) above):
+binary, see [Build ExtendDB](#1-build-extenddb) above):
 
 ```bash
 cargo build --release --no-default-features --features sqlite
@@ -193,7 +198,7 @@ limitations and the full walkthrough. Select it at init time with
 
 The node must run `PasswordAuthenticator`. `init` always creates its
 application role with a password, so it fails against a stock node using the
-default `AllowAllAuthenticator` — there is no credential-free path. Pass the
+default `AllowAllAuthenticator`; there is no credential-free path. Pass the
 Cassandra admin credentials with `--cassandra-user` / `--cassandra-pass`; `init`
 uses them to create the keyspaces and the application role. `init` writes a
 `[storage.cassandra]` section to the config, with the application credentials.
@@ -211,20 +216,20 @@ max_connections = 10
 
 To override a default, pass the matching flag at init time:
 
-- `--cassandra-contact-points host1:9042,host2:9042` — one or more contact
+- `--cassandra-contact-points host1:9042,host2:9042`: one or more contact
   points for a remote or multi-node cluster.
-- `--cassandra-user` and `--cassandra-pass` — the admin credentials `init` uses
+- `--cassandra-user` and `--cassandra-pass`: the admin credentials `init` uses
   to create the keyspaces and the application role (required).
-- `--extenddb-user` and `--extenddb-pass` — override the application role's name
+- `--extenddb-user` and `--extenddb-pass`: override the application role's name
   and password (default `extenddb` / `extenddb-local-dev`).
-- `--keyspace-prefix myapp` — a different keyspace prefix, so one cluster can
+- `--keyspace-prefix myapp`: a different keyspace prefix, so one cluster can
   host more than one deployment.
 
 For a higher replication factor, edit `replication_factor` in the config after
 `init` (there is no init flag for it today). The datacenter must be
 `datacenter1`. For replication strategy, datacenter topology, authentication,
 authorization, and the fact that connections are unencrypted, see
-`docs/cassandra-setup.md`.
+[Cassandra setup](cassandra-setup.md).
 
 ### Generating a self-signed certificate manually
 
@@ -248,7 +253,7 @@ chmod 600 ~/.extenddb/tls/key.pem
 
 Adjust the `-addext` SANs to match the hostnames and IP addresses clients will use to connect. Every address that appears in `endpoint_url` must be listed as a SAN, or TLS verification will fail.
 
-If the certificate already exists when `extenddb init` runs, it is preserved — init only generates a certificate when `~/.extenddb/tls/cert.pem` and `~/.extenddb/tls/key.pem` are both absent. To regenerate, delete the existing files first:
+If the certificate already exists when `extenddb init` runs, it is preserved; init only generates a certificate when `~/.extenddb/tls/cert.pem` and `~/.extenddb/tls/key.pem` are both absent. To regenerate, delete the existing files first:
 
 ```bash
 rm ~/.extenddb/tls/cert.pem ~/.extenddb/tls/key.pem
@@ -280,7 +285,7 @@ You should see all checks pass:
 
 ## 4. Start the server
 
-extenddb runs as a daemon (background process) and logs to syslog. On startup it prints a two-line banner to stdout, the version, catalog version and bind address followed by the storage backend and its redacted connection string, then forks to background. It says "starting", not "listening": the socket is not accepting connections yet at that point.
+ExtendDB runs as a daemon (background process) and logs to syslog. On startup it prints a two-line banner to stdout, the version, catalog version and bind address followed by the storage backend and its redacted connection string, then forks to background. It says "starting", not "listening": the socket is not accepting connections yet at that point.
 
 ```bash
 ./target/release/extenddb serve --config extenddb.toml
@@ -338,7 +343,7 @@ journalctl -t extenddb | grep sqlx
 
 ### Control Plane Delay
 
-By default, control plane operations (CreateTable, DeleteTable) emulate real DynamoDB's async behavior — tables transition through CREATING → ACTIVE and DELETING → removed states over a configurable delay (default: 5 seconds). Adjust with:
+By default, control plane operations (CreateTable, DeleteTable) emulate the service's asynchronous behavior: tables transition through CREATING → ACTIVE and DELETING → removed states over a configurable delay (default: 5 seconds). Adjust with:
 
 ```bash
 # Set to 0 for instant transitions (useful for fast test cycles)
@@ -366,7 +371,7 @@ Controls whether `extenddb manage import-access-key` is allowed (default: `true`
 
 ### GSI Propagation Delay
 
-GSI updates are applied asynchronously with a configurable delay, simulating real DynamoDB's eventually consistent GSI behavior. The system-wide default is 10ms. Each GSI can override this with a per-index `propagation_delay_ms` stored in the catalog.
+GSI updates are applied asynchronously with a configurable delay, simulating the DynamoDB service's eventually consistent GSI behavior. The system-wide default is 10ms. Each GSI can override this with a per-index `propagation_delay_ms` stored in the catalog.
 
 ```bash
 # Set system-wide default to 0 for synchronous GSI updates (fast tests)
@@ -380,7 +385,7 @@ GSI updates are applied asynchronously with a configurable delay, simulating rea
 
 ### Throttling
 
-extenddb enforces provisioned throughput limits using a token bucket per table and partition, matching DynamoDB's burst and refill behavior. Throttling is enabled by default.
+ExtendDB enforces provisioned throughput limits using a token bucket per table and partition, matching DynamoDB's burst and refill behavior. Throttling is enabled by default.
 
 ```bash
 # Disable throttling (useful for bulk loading)
@@ -414,7 +419,7 @@ Stop the server:
 
 If `extenddb stop` is unavailable (e.g., older binary), fall back to manual process management:
 
-1. Find the process listening on the extenddb port (default 18443):
+1. Find the process listening on the ExtendDB port (default 18443):
    ```bash
    ss -tlnp | grep :18443
    ```
@@ -425,7 +430,15 @@ If `extenddb stop` is unavailable (e.g., older binary), fall back to manual proc
 
 ## 5. Configure AWS CLI
 
-extenddb uses TLS with a self-signed certificate. To make AWS CLI and SDKs trust it, set `AWS_CA_BUNDLE` to the generated certificate:
+Where the server came from decides three settings. Apply the endpoint with `--endpoint-url <endpoint>` on each command, or once with `export AWS_ENDPOINT_URL_DYNAMODB=<endpoint>`; the commands in section 6 assume the variable is set.
+
+| Server started with | Endpoint | Certificate | Credentials |
+|---|---|---|---|
+| The [development image](dev-image.md) | `http://127.0.0.1:18080` | none (plain HTTP) | `AKIAIOSFODNN7EXAMPLE` / `wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY` |
+| [Docker Compose](local-dev-docker-compose.md) | `https://127.0.0.1:18443` | the file extracted on that page (`/tmp/extenddb-cert.pem`) | the access key created with `docker compose exec extenddb extenddb manage ...` on that page |
+| A build from source (this guide) | `https://127.0.0.1:18443` | `~/.extenddb/tls/cert.pem` | the access key created in [Post-init workflow](#post-init-workflow) |
+
+The rest of this section describes the build-from-source case. ExtendDB uses TLS with a self-signed certificate. To make AWS CLI and SDKs trust it, set `AWS_CA_BUNDLE` to the generated certificate:
 
 ```bash
 export AWS_CA_BUNDLE=~/.extenddb/tls/cert.pem
@@ -519,6 +532,12 @@ aws dynamodb create-table \
     --billing-mode PAY_PER_REQUEST
 ```
 
+The table is created in the `CREATING` state and becomes `ACTIVE` a few seconds later, as on the service. Wait for it before writing:
+
+```bash
+aws dynamodb wait table-exists --table-name MyTable
+```
+
 ### List tables
 
 ```bash
@@ -529,12 +548,6 @@ aws dynamodb list-tables
 
 ```bash
 aws dynamodb describe-table --table-name MyTable
-```
-
-### Delete a table
-
-```bash
-aws dynamodb delete-table --table-name MyTable
 ```
 
 ### Put an item
@@ -675,7 +688,7 @@ aws dynamodb transact-get-items \
 
 ### DynamoDB Streams
 
-extenddb supports DynamoDB Streams for change data capture. Enable streams when creating a table:
+ExtendDB supports DynamoDB Streams for change data capture. Enable streams when creating a table:
 
 ```bash
 aws dynamodb create-table \
@@ -686,7 +699,7 @@ aws dynamodb create-table \
     --stream-specification StreamEnabled=true,StreamViewType=NEW_AND_OLD_IMAGES
 ```
 
-**Important: SDK users need a separate `dynamodbstreams` client.** In every AWS SDK, DynamoDB and DynamoDB Streams are separate services. Both clients must point at the same extenddb endpoint URL:
+**Important: SDK users need a separate `dynamodbstreams` client.** In every AWS SDK, DynamoDB and DynamoDB Streams are separate services. Both clients must point at the same ExtendDB endpoint URL:
 
 ```python
 import boto3
@@ -787,9 +800,17 @@ curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/health
 # {"status":"healthy"}
 ```
 
+### Delete the table
+
+When you are done with `MyTable`:
+
+```bash
+aws dynamodb delete-table --table-name MyTable
+```
+
 ## 7. Manage admin users and accounts
 
-The management API is available at `/management/*` on the running extenddb server. The `extenddb manage` CLI subcommand is a thin client that calls these endpoints.
+The management API is available at `/management/*` on the running ExtendDB server. The `extenddb manage` CLI subcommand is a thin client that calls these endpoints.
 
 Admin commands require admin credentials (the username and password printed during `extenddb init`). IAM user self-service commands accept `account_id/user_name` as the `--user` value.
 
@@ -878,7 +899,7 @@ Deleting a user also removes their access keys, group memberships, tags, and pol
 
 IAM users create their own access keys by authenticating with `account_id/user_name:password`. When authenticating as an IAM user, `--account-id` and `--user-name` are inferred automatically. The secret key is shown once and cannot be retrieved later.
 
-Generated access keys are branded with extenddb-specific prefixes to distinguish them from real AWS credentials:
+Generated access keys carry ExtendDB-specific prefixes that distinguish them from AWS credentials:
 - Long-lived keys: `AKIAEXTENDDB` + 8 random chars (20 total)
 - Temporary credentials (AssumeRole): `ASIAEXTENDDB` + 8 random chars (20 total)
 - Secret keys: `extenddb` + 32 random chars (40 total)
@@ -913,7 +934,7 @@ Admins can also create access keys on behalf of any user:
 
 ### Import an existing access key
 
-Import real AWS credentials (or any AKIA* key) into extenddb. This enables the "just change the endpoint URL" workflow — use the same credentials against both extenddb and real DynamoDB.
+Import AWS credentials (or any AKIA* key) into ExtendDB. This enables the "change only the endpoint URL" workflow: the same credentials work against ExtendDB and the DynamoDB service.
 
 Both `--secret-access-key` and `--yes` are required:
 
@@ -934,7 +955,7 @@ Credential import is gated by the `allow_credential_import` runtime setting (def
     allow_credential_import false
 ```
 
-Every import is logged to syslog (access key ID, account, user — never the secret).
+Every import is logged to syslog (access key ID, account and user; never the secret).
 
 ### Change IAM user password
 
@@ -1254,7 +1275,7 @@ By default, `extenddb manage` reads the server address from `extenddb.toml`. To 
 
 ## 8. Management web console
 
-extenddb includes a built-in web console for managing accounts, users, groups, roles, and policies through a browser. The console is served at `/console/` on the same port as the DynamoDB API.
+ExtendDB includes a built-in web console for managing accounts, users, groups, roles, and policies through a browser. The console is served at `/console/` on the same port as the DynamoDB API.
 
 ### Accessing the console
 
@@ -1283,8 +1304,8 @@ Sessions expire after 8 hours of inactivity. Click "Logout" to end a session imm
 
 All management and settings operations are logged to syslog at WARN level with structured targets for filtering:
 
-- **Management operations:** `extenddb::audit::manage` — covers admin CRUD, account CRUD, IAM user/group/role/policy CRUD, access key lifecycle, permissions boundaries, assume-role, and credential import.
-- **Settings operations:** `extenddb::audit::settings` — covers `extenddb settings set` changes.
+- **Management operations:** `extenddb::audit::manage`: covers admin CRUD, account CRUD, IAM user/group/role/policy CRUD, access key lifecycle, permissions boundaries, assume-role, and credential import.
+- **Settings operations:** `extenddb::audit::settings`: covers `extenddb settings set` changes.
 
 Secrets (passwords, secret keys) are never included in audit log entries.
 
@@ -1296,7 +1317,7 @@ journalctl -t extenddb | grep 'extenddb::audit'
 
 ## 10. External test suites
 
-extenddb supports running external test suites (e.g., Java/JUnit, Python/pytest) against a running instance. Suites are registered in `external-suites.toml` at the project root and referenced by path — never copied into the repo.
+ExtendDB supports running external test suites (e.g., Java/JUnit, Python/pytest) against a running instance. Suites are registered in `external-suites.toml` at the project root and referenced by path, never copied into the repo.
 
 ### Running external suites
 
@@ -1305,8 +1326,8 @@ extenddb supports running external test suites (e.g., Java/JUnit, Python/pytest)
 ./target/release/extenddb serve --config extenddb.toml
 
 # Set GSI propagation delay to 0 for external tests.
-# External suites expect synchronous GSI behavior (matching real DynamoDB's
-# typical sub-millisecond propagation). The async GSI path is tested
+# External suites expect synchronous GSI behavior (the service's propagation
+# is usually under a millisecond). The async GSI path is tested
 # separately by the extenddb-specific test_gsi_async.py suite.
 ./target/release/extenddb settings --config extenddb.toml set index_propagation_delay_ms 0
 
@@ -1318,7 +1339,7 @@ python3 devtools/run-external-tests --dry-run
 
 # Run a specific suite by name
 python3 devtools/run-external-tests \
-    --suite "DynamoDB PostgreSQL Extension Functional Tests"
+    --suite "My Test Suite"      # the name field of a [[suite]] entry
 
 # Override the endpoint
 python3 devtools/run-external-tests --endpoint http://localhost:9000
@@ -1390,7 +1411,7 @@ The `--yes` flag is required to confirm destruction. Without it, the command exi
 
 The `storage.postgres.pool_size` setting (default: 20, minimum: 10) sizes the connections used for DynamoDB data operations. It sizes **two** pools, not one: a deployment created by `extenddb init` keeps its catalog and its data in separate databases, and the engine opens a pool of `pool_size` against each. Both count against the same server-wide `max_connections`, because that limit is per cluster rather than per database. Each in-flight request that touches the database holds one connection for the duration of its transaction. Values below 10 are clamped at startup with a warning.
 
-The `storage.postgres.catalog_pool_size` setting controls the maximum number of concurrent connections for the management/catalog pool (authorization queries, IAM operations, console). Defaults to `pool_size` if not set, minimum: 10. With auth enabled (`provider = "builtin"`), each DynamoDB request makes concurrent authorization queries against this pool — size it to match expected concurrency. Values below 10 are clamped at startup with a warning.
+The `storage.postgres.catalog_pool_size` setting controls the maximum number of concurrent connections for the management/catalog pool (authorization queries, IAM operations, console). Defaults to `pool_size` if not set, minimum: 10. With auth enabled (`provider = "builtin"`), each DynamoDB request makes concurrent authorization queries against this pool, size it to match expected concurrency. Values below 10 are clamped at startup with a warning.
 
 **When to increase:** If you see elevated latency under concurrent load, the pool may be saturated. Requests queue at the pool level when all connections are in use. Increase `pool_size` (and `catalog_pool_size` if auth is enabled) to allow more concurrent transactions.
 
@@ -1436,21 +1457,21 @@ Cache statistics are exposed at `/management/auth-cache-metrics` (JSON, admin-au
 
 ## Troubleshooting
 
-See `docs/troubleshooting.md` for common errors and fixes.
+See [Troubleshooting](troubleshooting.md) for common errors and fixes.
 
 ## Sample Application
 
-A complete Python sample application is included at `samples/sample_app.py`. It demonstrates the full extenddb lifecycle:
+A complete Python sample application is included at `samples/sample_app.py`. It demonstrates the full ExtendDB lifecycle:
 
-1. **Create tables** — simple PK, PK+SK with GSI, and multi-part GSI keys (tournament pattern)
-2. **Poll for ACTIVE** — wait for all tables to reach ACTIVE status
-3. **Load data** — PutItem and BatchWriteItem
-4. **Query** — Query on base tables and GSIs (including multi-part GSI keys), Scan
-5. **Update** — UpdateItem with update expressions and conditions
-6. **Batch read** — BatchGetItem across multiple keys
-7. **Transactions** — TransactWriteItems and TransactGetItems across tables
-8. **Delete** — DeleteItem to remove individual items
-9. **Drop tables** — DeleteTable to tear down all tables
+1. **Create tables**: simple PK, PK+SK with GSI, and multi-part GSI keys (tournament pattern)
+2. **Poll for ACTIVE**: wait for all tables to reach ACTIVE status
+3. **Load data**: PutItem and BatchWriteItem
+4. **Query**: Query on base tables and GSIs (including multi-part GSI keys), Scan
+5. **Update**: UpdateItem with update expressions and conditions
+6. **Batch read**: BatchGetItem across multiple keys
+7. **Transactions**: TransactWriteItems and TransactGetItems across tables
+8. **Delete**: DeleteItem to remove individual items
+9. **Drop tables**: DeleteTable to tear down all tables
 
 ### Running the sample application
 
@@ -1487,7 +1508,7 @@ The sample creates three tables (`SampleUsers`, `SampleOrders`, `SampleTournamen
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
-See [LICENSE](../LICENSE) for the full text.
+See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
 This software is provided "as is" without warranty of any kind. ExtendDB is not
 affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark

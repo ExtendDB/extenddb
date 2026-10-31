@@ -6,7 +6,7 @@
 
 ## Context
 
-The Cassandra backend uses a keyspace-per-account isolation model ([cassandra-key-decisions.md](../../notes/cassandra-key-decisions.md)). Each ExtendDB account gets its own Cassandra keyspace (e.g., `extenddb_account_123456789012`) to provide operational benefits: storage isolation, noisy neighbor protection, per-account monitoring, independent backups, and configurable replication strategies.
+The Cassandra backend uses a keyspace-per-account isolation model. Each ExtendDB account gets its own Cassandra keyspace (e.g., `extenddb_account_123456789012`) to provide operational benefits: storage isolation, noisy neighbor protection, per-account monitoring, independent backups, and configurable replication strategies.
 
 The PostgreSQL backend uses a single database with all accounts sharing the same schema. Account creation in PostgreSQL is a simple catalog INSERT with no storage initialization. This raises the question: when should Cassandra create the account-specific keyspace?
 
@@ -63,7 +63,7 @@ Create account keyspace during account creation (`ManagementStore::create_accoun
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
-See [LICENSE](../../LICENSE) for the full text.
+See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
 This software is provided "as is" without warranty of any kind. ExtendDB is not
 affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is
