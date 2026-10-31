@@ -321,14 +321,18 @@ pub(super) async fn write_stream_record_in_tx(
     // disabled stream's shards are closed and take no new records, so a write
     // that read the table's key info before a disable records nothing.
     //
-    // FOR SHARE: a disable locks the same rows FOR UPDATE before it takes the
-    // ending numbers, so this write either commits before the ending number
-    // is taken or, waiting here, re-evaluates `ending_sequence_number IS NULL`
-    // on the closed rows and records nothing (`close_stream_shards`).
+    // The open set is read without a lock, and only the shard this record
+    // goes to is locked, FOR KEY SHARE, re-checking that it is still open: a
+    // disable locks the open rows FOR UPDATE before it takes the ending
+    // numbers (`close_stream_shards`), which conflicts with this lock, so the
+    // write either commits before the ending number is taken or, waiting
+    // here, finds the row closed and records nothing. Locking every open row
+    // FOR SHARE made concurrent writers to one table extend the same
+    // MultiXacts on all four rows for a record that goes into one.
     let shards: Vec<(String,)> = sqlx::query_as(
         "SELECT shard_id FROM stream_shards \
          WHERE table_id = $1 AND ending_sequence_number IS NULL \
-         ORDER BY shard_id FOR SHARE",
+         ORDER BY shard_id",
     )
     .bind(&key_info.table_id)
     .fetch_all(&mut **tx)
@@ -344,6 +348,18 @@ pub(super) async fn write_stream_record_in_tx(
     #[allow(clippy::cast_possible_truncation)]
     let idx = (hash as usize) % shards.len();
     let shard_id = &shards[idx].0;
+    let still_open: Option<(String,)> = sqlx::query_as(
+        "SELECT shard_id FROM stream_shards \
+         WHERE shard_id = $1 AND ending_sequence_number IS NULL FOR KEY SHARE",
+    )
+    .bind(shard_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(db_error)?;
+    if still_open.is_none() {
+        // Closed between the read and the lock: the stream is disabled.
+        return Ok(());
+    }
 
     // Generate monotonic sequence number within the transaction (CB-21).
     let (seq_val,): (i64,) = sqlx::query_as("SELECT nextval('stream_seq')")
