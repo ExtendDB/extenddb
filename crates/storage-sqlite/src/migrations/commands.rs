@@ -8,8 +8,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use extenddb_storage::migrations::{
-    CatalogMigrations, CatalogStatus, HeldLock, LedgerRow, Listed, MigrationError, MigrationId,
-    RunKind, RunReport, Runner, Target,
+    CatalogMigrations, CatalogStatus, HasManagementStore, HeldLock, LedgerRow, Listed,
+    MigrationBackend, MigrationError, MigrationId, RunKind, RunReport, Runner, Target,
+    policy_rewrite_lines, policy_rewrite_pending,
 };
 
 use super::{
@@ -52,6 +53,25 @@ impl CatalogMigrations for SqliteCatalogMigrations {
 
     async fn status(&self, target: &Target) -> Result<CatalogStatus, MigrationError> {
         catalog_status(&target.location).await
+    }
+
+    /// Reads the policies on a read-only connection, as the status does.
+    /// The installed backend's management store opens the database for
+    /// writing: it sets WAL mode on a rollback-journal database, and its
+    /// connection, when it is the last one to close, checkpoints the WAL
+    /// into the database file.
+    async fn pending_changes(
+        &self,
+        target: &Target,
+        status: &CatalogStatus,
+    ) -> Result<Vec<String>, MigrationError> {
+        if !policy_rewrite_pending(status) {
+            return Ok(Vec::new());
+        }
+        let migrations = SqliteMigrations::open_for_status(&target.location).await?;
+        let lines = policy_rewrite_lines(migrations.stores().management_store()).await;
+        migrations.close().await;
+        lines
     }
 
     async fn catalog_ledger(&self, target: &Target) -> Result<Vec<LedgerRow>, MigrationError> {

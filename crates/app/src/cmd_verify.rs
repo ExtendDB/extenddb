@@ -150,8 +150,8 @@ pub async fn run(args: VerifyArgs, release: &str) -> anyhow::Result<u8> {
     Ok(if status_code == 0 { 1 } else { status_code })
 }
 
-/// Print the catalog status and the notes the ledger records, and return
-/// the status's exit code.
+/// Print the catalog status, what its pending migrations change, and the
+/// notes the ledger records, and return the status's exit code.
 async fn check_migrations(
     migrations: &dyn extenddb_storage::migrations::CatalogMigrations,
     config_file: Option<&str>,
@@ -186,6 +186,16 @@ async fn check_migrations(
             for (i, line) in advice::status_message(&status, &advice).lines().enumerate() {
                 println!("  {}{line}", if i == 0 { "FAIL: " } else { "" });
             }
+        }
+    }
+    if matches!(status, CatalogStatus::Behind { .. }) {
+        match migrations.pending_changes(&target, &status).await {
+            Ok(lines) => {
+                for line in lines {
+                    println!("  {line}");
+                }
+            }
+            Err(e) => println!("  WARN: {}", advice::error_message(&e, &advice)),
         }
     }
     match migrations.status_notes(&target).await {

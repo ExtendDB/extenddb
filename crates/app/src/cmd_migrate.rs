@@ -254,7 +254,8 @@ async fn apply_migrations(
     // schema connection.
     println!("--- Checking resource-tag condition keys...");
     let (rtag_detect, marker_present) = rtag.detect().await?;
-    if rtag_detect.rewritten.is_empty() && rtag_detect.needs_attention.is_empty() {
+    let rtag_attention = rtag_detect.needs_attention.len() + rtag_detect.unreadable.len();
+    if rtag_detect.rewritten.is_empty() && rtag_attention == 0 {
         println!("  No dynamodb:ResourceTag condition keys found.");
     } else {
         for r in &rtag_detect.rewritten {
@@ -270,6 +271,7 @@ async fn apply_migrations(
                 n.account_id, n.principal, n.policy_name
             );
         }
+        print_unreadable(&rtag_detect);
     }
     if rtag_detect.errors > 0 {
         println!(
@@ -289,7 +291,7 @@ async fn apply_migrations(
         && !marker_pending
     {
         println!();
-        if detected.needs_attention.is_empty() && rtag_detect.needs_attention.is_empty() {
+        if detected.needs_attention.is_empty() && rtag_attention == 0 {
             println!(
                 "Everything is up to date (catalog version {expected}). No migrations needed."
             );
@@ -300,7 +302,7 @@ async fn apply_migrations(
             println!(
                 "No migrations needed (catalog version {expected}), but {} item(s) above \
                  need manual attention.",
-                detected.needs_attention.len() + rtag_detect.needs_attention.len()
+                detected.needs_attention.len() + rtag_attention
             );
         }
         return Ok(0);
@@ -335,11 +337,10 @@ async fn apply_migrations(
                 rtag_detect.errors
             ));
         }
-        if !rtag_detect.needs_attention.is_empty() {
+        if rtag_attention > 0 {
             what.push(format!(
-                "{} policy(ies) listed as NEEDS ATTENTION, which must be fixed by hand before \
-                 the migration can complete",
-                rtag_detect.needs_attention.len()
+                "{rtag_attention} policy(ies) listed as NEEDS ATTENTION, which must be fixed by \
+                 hand before the migration can complete"
             ));
         }
         // A preview, not a failure: report and exit EXIT_PENDING so a script
@@ -392,6 +393,7 @@ async fn apply_migrations(
             n.account_id, n.principal, n.policy_name
         );
     }
+    print_unreadable(&rtag_applied);
     if rtag_applied.errors > 0 {
         anyhow::bail!(
             "resource-tag migration incomplete: {} policy lookup(s) failed. \
@@ -413,6 +415,16 @@ async fn apply_migrations(
             rtag_applied.needs_attention.len()
         );
     }
+    // A policy whose document cannot be decoded may name the dynamodb: form
+    // too, so the marker is withheld for it as for a collision.
+    if !rtag_applied.unreadable.is_empty() {
+        anyhow::bail!(
+            "resource-tag migration incomplete: {} policy(ies) above have a stored document \
+             that cannot be decoded and were left unchanged. Replace or delete each, then \
+             re-run `extenddb migrate --yes`; the migration marker was not recorded.",
+            rtag_applied.unreadable.len()
+        );
+    }
     // Record the completion marker only after a clean rewrite. serve reads this
     // row and refuses to start without it.
     rtag.record_marker().await?;
@@ -426,6 +438,18 @@ async fn apply_migrations(
     println!("Catalog version: {current_display} -> {new_display}");
 
     Ok(0)
+}
+
+/// One `NEEDS ATTENTION` line per policy of `report` whose stored document
+/// cannot be decoded, with the decode error.
+fn print_unreadable(report: &extenddb_storage::policy_migration::MigrationReport) {
+    for u in &report.unreadable {
+        println!(
+            "  NEEDS ATTENTION: account {} {} policy {} left unchanged (its stored document \
+             cannot be decoded: {})",
+            u.account_id, u.principal, u.policy_name, u.error
+        );
+    }
 }
 
 /// Boxed future returned by [`ResourceTagStep`].

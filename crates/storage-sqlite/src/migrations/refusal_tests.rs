@@ -250,6 +250,71 @@ async fn the_status_writes_nothing() {
     );
 }
 
+/// The list of policies a pending migration 2 rewrites, which the preview
+/// and `verify` print, is read on a read-only connection as the status is:
+/// a rollback-journal database keeps its journal mode and its bytes. A
+/// connection that opens the database for writing sets WAL mode, and when
+/// it is the last one to close it checkpoints the WAL into the file.
+#[tokio::test]
+async fn listing_the_policies_migration_2_rewrites_writes_nothing() {
+    use extenddb_storage::migrations::{CatalogMigrations, Target};
+
+    use super::SqliteCatalogMigrations;
+
+    let db = temp_db("pending-read-only");
+    load_dump(&db, DEV_0_1_14).await;
+    let pool = plain_pool(&db).await;
+    let (account, user): (String, String) =
+        sqlx::query_as("SELECT account_id, user_name FROM iam_users LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .expect("an IAM user");
+    sqlx::query(
+        "INSERT INTO iam_policies (account_id, principal_type, principal_name, policy_name, \
+         policy_document) VALUES (?, 'user', ?, 'tagged', ?)",
+    )
+    .bind(&account)
+    .bind(&user)
+    .bind(
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"dynamodb:*","Resource":"*","Condition":{"StringEquals":{"dynamodb:ResourceTag/env":"prod"}}}]}"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("policy");
+    pool.close().await;
+    exec(&db, "PRAGMA journal_mode = DELETE").await;
+    let bytes = std::fs::read(&*db).expect("database");
+    // As in the binary: the trait's default would open the installed
+    // backend's management store.
+    let _ = extenddb_storage::set_backend(crate::backend());
+
+    let target = Target::at(db.to_string_lossy());
+    let status = SqliteCatalogMigrations
+        .status(&target)
+        .await
+        .expect("status");
+    let lines = SqliteCatalogMigrations
+        .pending_changes(&target, &status)
+        .await
+        .expect("the policies migration 2 rewrites");
+    assert_eq!(
+        lines[0],
+        "Migration 2 rewrites 1 stored policy from dynamodb:ResourceTag to aws:ResourceTag:"
+    );
+    assert!(
+        lines[1].contains(&format!("account {account} ")) && lines[1].contains("policy tagged"),
+        "{lines:?}"
+    );
+    assert!(
+        std::fs::read(&*db).expect("database") == bytes,
+        "listing the policies changed the database file"
+    );
+    assert_eq!(
+        scalar(&db, "PRAGMA journal_mode").await.as_deref(),
+        Some("delete")
+    );
+}
+
 /// A file at the copy's name, whatever it holds, is never kept as the copy
 /// or replaced: the run stops, and the file and the database are untouched.
 #[tokio::test]

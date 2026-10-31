@@ -38,6 +38,19 @@ impl OpError {
             | Self::Internal(_) => None,
         }
     }
+
+    /// The error's text, without the variant name that `{:?}` prints.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Validation(m)
+            | Self::AlreadyExists(m)
+            | Self::NotFound(m)
+            | Self::HasDependents(m)
+            | Self::Internal(m)
+            | Self::Database { message: m, .. } => m,
+        }
+    }
 }
 
 /// Result alias for management operations.

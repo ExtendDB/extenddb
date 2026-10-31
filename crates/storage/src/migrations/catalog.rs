@@ -214,6 +214,64 @@ pub trait CatalogMigrations: Send + Sync {
         let _ = target;
         Ok(Vec::new())
     }
+
+    /// Lines saying what the pending migrations of a `Behind` `status`
+    /// change, for the preview and `verify` to print: while migration 2 is
+    /// pending in the catalog store, the stored policies it rewrites
+    /// ([`pending_rewrite_lines`](crate::policy_migration::pending_rewrite_lines)).
+    /// Read-only. Empty for any other status. The default reads the
+    /// policies through the installed backend's management store; a backend
+    /// whose management store writes when it opens reads them another way.
+    async fn pending_changes(
+        &self,
+        target: &Target,
+        status: &CatalogStatus,
+    ) -> Result<Vec<String>, MigrationError> {
+        if !policy_rewrite_pending(status) {
+            return Ok(Vec::new());
+        }
+        let store = crate::management_store_factory::create_management_store(&target.location)
+            .await
+            .map_err(|e| {
+                MigrationError::store(
+                    "open the catalog to list the policies migration 2 rewrites",
+                    e,
+                )
+            })?;
+        policy_rewrite_lines(store.as_ref()).await
+    }
+}
+
+/// Whether migration 2 is pending in the catalog store of a `Behind`
+/// `status`: when [`CatalogMigrations::pending_changes`] lists the policies
+/// it rewrites.
+#[must_use]
+pub fn policy_rewrite_pending(status: &CatalogStatus) -> bool {
+    let CatalogStatus::Behind { pending, .. } = status else {
+        return false;
+    };
+    let rewrite = MigrationId::ResourceTagConditionKeys.number();
+    pending
+        .iter()
+        .any(|p| p.id == rewrite && p.store == StoreKind::Catalog)
+}
+
+/// [`CatalogMigrations::pending_changes`]'s lines for a pending migration
+/// 2, from a pass over the policies stored in `store` that writes nothing.
+///
+/// # Errors
+///
+/// A stored policy could not be read.
+pub async fn policy_rewrite_lines(
+    store: &dyn crate::management_store::ManagementStore,
+) -> Result<Vec<String>, MigrationError> {
+    let report = crate::policy_migration::migrate_resource_tag_condition_keys(store, false).await;
+    if report.errors > 0 {
+        return Err(MigrationError::Store(
+            crate::policy_migration::failure_message(&report),
+        ));
+    }
+    Ok(crate::policy_migration::pending_rewrite_lines(&report))
 }
 
 /// A note from [`CatalogMigrations::status_notes`].

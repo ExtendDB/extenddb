@@ -212,6 +212,14 @@ async fn preview(
                     p.kind.as_str()
                 );
             }
+            match migrations.pending_changes(target, &status).await {
+                Ok(lines) => {
+                    for line in lines {
+                        println!("{line}");
+                    }
+                }
+                Err(e) => println!("WARNING: {}", advice::error_message(&e, advice)),
+            }
             println!();
             println!(
                 "Nothing was changed; {}, then run again with --yes to apply (exit status {}: \
