@@ -157,6 +157,15 @@ impl CatalogMigrations for MongoCatalogMigrations {
         migrations.close().await;
         result
     }
+
+    /// Delete the lock document with the lock's own client, on this
+    /// runtime, so the next migration or server need not wait for its
+    /// lease. Dropping the lock afterwards does nothing.
+    async fn release(&self, lock: HeldLock) {
+        if let Ok(held) = held(&lock) {
+            held.lock.release_held().await;
+        }
+    }
 }
 
 /// Take the migration lock on `target`, waiting up to `timeout` for another
