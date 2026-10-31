@@ -28,7 +28,7 @@ If `extenddb status` reports a deployment, `extenddb init` will abort with:
 Database '<name>' already exists. Run 'extenddb destroy --config <config>' first, then re-run 'extenddb init'.
 ```
 
-This abort is driven by the PostgreSQL databases, not by `extenddb.toml`. The docs are explicit: "`extenddb init` will abort if either the catalog or data database already exists" (`docs/getting-started.md`), and "`extenddb init` detected that the catalog or data database already exists in PostgreSQL" (`docs/troubleshooting.md`).
+This abort is driven by the PostgreSQL databases, not by `extenddb.toml`. The docs are explicit: "`init` refuses to run when the catalog or data database already exists" (`docs/install-from-source.md`), and "`extenddb init` detected that the catalog or data database already exists in PostgreSQL" (`docs/troubleshooting.md`).
 
 To clear the blocker, drop both databases:
 

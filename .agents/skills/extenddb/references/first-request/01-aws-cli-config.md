@@ -8,7 +8,7 @@ The default port is 18443 (configured via `port` in `[server]` section of `exten
 
 ## 2. Option 1: Environment variables (simplest)
 
-Copied verbatim from `docs/getting-started.md`, "Option A: Environment variables (simplest)":
+Copied verbatim from `docs/first-requests.md` (the environment variable form):
 
 ```bash
 export AWS_CA_BUNDLE=~/.extenddb/tls/cert.pem
@@ -25,7 +25,7 @@ Notes:
 
 ## 3. Option 2: AWS config profile (persistent)
 
-Copied verbatim from `docs/getting-started.md`, "Option B: AWS config profile".
+Copied verbatim from `docs/first-requests.md` (the AWS config profile form).
 
 Add to `~/.aws/config`:
 
