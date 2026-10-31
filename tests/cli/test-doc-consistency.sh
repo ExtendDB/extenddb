@@ -100,7 +100,7 @@ if [ -f extenddb.sample.toml ]; then
     for key in $SAMPLE_KEYS; do
         # Skip very generic keys
         if [ ${#key} -lt 3 ]; then continue; fi
-        grep -rq "$key" docs/manuals/ docs/install-from-source.md 2>/dev/null; RC=$?
+        grep -rq "$key" docs/manuals/ docs/install-from-source.md docs/configuration.md 2>/dev/null; RC=$?
         assert_ok $RC "config key '$key' documented"
     done
 else

@@ -128,18 +128,7 @@
 # migration lock is transaction scoped and needs a pinned connection, because
 # its explicit transaction must keep one PostgreSQL backend until COMMIT, and
 # a transaction-pooling proxy could otherwise move the lock between backends.
-#
-# Restores are bounded per server process: at most 4 per account and at most
-# half of pool_size in total (after the minimum of 10 is applied, capped at
-# 16; 10 with the default pool_size of 20). A restore that cannot get both
-# within 30 seconds is refused with LimitExceededException. Each running
-# restore holds one pooled connection for its whole copy plus one dedicated
-# connection outside the pool for its lock. RestoreTableFromBackup holds a
-# session-level advisory lock for the whole copy, so ExtendDB must reach the
-# catalog database directly or through a session-mode pooler; behind a
-# transaction-mode pooler (for example PgBouncer with pool_mode set to
-# transaction) restore locks are not released and the abandoned-restore sweep
-# can remove a restore that is still running.
+# The administration guide describes how restores draw on this pool.
 
 # Connection string for the catalog database. For production add
 # `?sslmode=require` and a password of your own.
@@ -249,9 +238,8 @@
 # is close to none. Changes made through this server's admin API propagate
 # at once by write-through invalidation. Changes made elsewhere (other nodes
 # of a multi-node deployment, or direct database writes) take up to
-# ttl_seconds to become visible. Statistics are exposed at
-# /management/auth-cache-metrics (JSON, admin authenticated); the per-cache
-# pass_through flag separates "cache disabled" from "cache cold".
+# ttl_seconds to become visible. The administration guide covers the cache
+# statistics endpoint and invalidation timing.
 
 # Kill switch. When false, the cache wrappers skip lookup, insert and
 # eviction and forward every request to the catalog. Use it during incident
