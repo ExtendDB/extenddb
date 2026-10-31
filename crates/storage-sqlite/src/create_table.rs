@@ -68,6 +68,7 @@ impl SqliteEngine {
         restore: Option<&RestoreRegistration<'_>>,
     ) -> Result<TableDescription, StorageError> {
         Self::validate_account_id(account_id)?;
+        let input = extenddb_storage::stream_lineage::without_disabled_specification(input);
         // D1: every writer holds the engine write lock. This method runs two
         // write transactions (catalog rows, then data-table DDL); without the
         // lock they contend with data-plane writers at the SQLite level, and a
@@ -419,14 +420,23 @@ impl SqliteEngine {
         }
 
         // Stream shards (same transaction — single file).
-        let stream_label = if input
+        let stream_label = match input
             .stream_specification
             .as_ref()
-            .is_some_and(|s| s.stream_enabled)
+            .filter(|s| s.stream_enabled)
+            .and_then(|s| s.stream_view_type)
         {
-            Some(Self::init_stream_shards(&mut tx, account_id, &input.table_name, &table_id).await?)
-        } else {
-            None
+            Some(view_type) => Some(
+                Self::init_stream_shards(
+                    &mut tx,
+                    account_id,
+                    &input.table_name,
+                    &table_id,
+                    view_type,
+                )
+                .await?,
+            ),
+            None => None,
         };
 
         tx.commit()

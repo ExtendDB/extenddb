@@ -28,6 +28,7 @@ mod snapshot_engine;
 #[doc(hidden)]
 pub use snapshot_engine::map_fetch_error;
 mod stream_engine;
+mod stream_lifecycle;
 #[doc(hidden)]
 pub mod stream_records_sql;
 mod table_engine;

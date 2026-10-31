@@ -34,6 +34,14 @@ fn uri() -> String {
     )
 }
 
+/// A shard id in the shape releases before stream labels were part of the id
+/// wrote: shard `index` of table `table_id`. Such an id belongs to the
+/// table's current stream, so these fixtures read as a table whose stream was
+/// enabled by an earlier release.
+fn legacy_shard_id(table_id: &str, index: u32) -> String {
+    format!("shardId-{table_id}-{index:012}")
+}
+
 struct Fixture {
     engine: MongoEngine,
 }
@@ -77,7 +85,7 @@ impl Fixture {
                 .data_db
                 .collection::<Document>("stream_shards")
                 .insert_one(doc! {
-                    "shard_id": super::build_shard_id(&table_id, i),
+                    "shard_id": legacy_shard_id(&table_id, i),
                     "table_id": &table_id,
                     "starting_sequence_number": format!("{:021}", 0),
                 })
@@ -164,7 +172,7 @@ async fn records_live_a_page_over_16_mb_is_read_in_full() {
     let f = Fixture::new().await;
     let table_id = f.stream_table(ACCOUNT, "big", LABEL).await;
     let arn = stream_arn(REGION, ACCOUNT, "big", LABEL);
-    let shard_id = super::build_shard_id(&table_id, 0);
+    let shard_id = legacy_shard_id(&table_id, 0);
     // Inserted in descending order so the read's sort, not insertion order,
     // produces the sequence order the page is asserted in.
     let seqs: Vec<u64> = (1..=40).rev().collect();
@@ -209,7 +217,7 @@ async fn records_live_a_page_over_16_mb_is_read_in_full() {
 async fn records_live_an_earlier_label_on_the_same_shards_is_not_found() {
     let f = Fixture::new().await;
     let table_id = f.stream_table(ACCOUNT, "t", LABEL).await;
-    let shard_id = super::build_shard_id(&table_id, 0);
+    let shard_id = legacy_shard_id(&table_id, 0);
     f.write_records(&shard_id, &table_id, &[1], 10).await;
     let old_arn = stream_arn(REGION, ACCOUNT, "t", LABEL);
     f.engine
@@ -243,8 +251,8 @@ async fn records_live_another_accounts_same_named_stream_is_not_found() {
     let f = Fixture::new().await;
     let own_id = f.stream_table(ACCOUNT, "t", LABEL).await;
     let other_id = f.stream_table(OTHER_ACCOUNT, "t", LABEL).await;
-    let own_shard = super::build_shard_id(&own_id, 0);
-    let other_shard = super::build_shard_id(&other_id, 0);
+    let own_shard = legacy_shard_id(&own_id, 0);
+    let other_shard = legacy_shard_id(&other_id, 0);
     f.write_records(&own_shard, &own_id, &[1], 10).await;
     f.write_records(&other_shard, &other_id, &[1], 10).await;
 
@@ -285,9 +293,9 @@ async fn records_live_another_tables_shard_with_the_same_label_is_not_found() {
     let f = Fixture::new().await;
     let a_id = f.stream_table(ACCOUNT, "a", LABEL).await;
     let b_id = f.stream_table(ACCOUNT, "b", LABEL).await;
-    f.write_records(&super::build_shard_id(&a_id, 0), &a_id, &[1], 10)
+    f.write_records(&legacy_shard_id(&a_id, 0), &a_id, &[1], 10)
         .await;
-    f.write_records(&super::build_shard_id(&b_id, 0), &b_id, &[1, 2], 10)
+    f.write_records(&legacy_shard_id(&b_id, 0), &b_id, &[1, 2], 10)
         .await;
     let arn_a = stream_arn(REGION, ACCOUNT, "a", LABEL);
     let arn_b = stream_arn(REGION, ACCOUNT, "b", LABEL);
@@ -296,12 +304,12 @@ async fn records_live_another_tables_shard_with_the_same_label_is_not_found() {
     // pick, one of them reads a shard that is not its own.
     assert_stream_not_found(
         f.engine
-            .get_stream_records(ACCOUNT, &arn_a, &super::build_shard_id(&b_id, 0), None, 10)
+            .get_stream_records(ACCOUNT, &arn_a, &legacy_shard_id(&b_id, 0), None, 10)
             .await,
     );
     assert_stream_not_found(
         f.engine
-            .get_stream_records(ACCOUNT, &arn_b, &super::build_shard_id(&a_id, 0), None, 10)
+            .get_stream_records(ACCOUNT, &arn_b, &legacy_shard_id(&a_id, 0), None, 10)
             .await,
     );
     assert_stream_not_found(
@@ -311,7 +319,7 @@ async fn records_live_another_tables_shard_with_the_same_label_is_not_found() {
     );
     let (records, _) = f
         .engine
-        .get_stream_records(ACCOUNT, &arn_a, &super::build_shard_id(&a_id, 0), None, 10)
+        .get_stream_records(ACCOUNT, &arn_a, &legacy_shard_id(&a_id, 0), None, 10)
         .await
         .expect("own shard reads");
     assert_eq!(records.len(), 1);
@@ -327,7 +335,7 @@ async fn records_live_a_record_document_without_record_data_is_an_internal_error
     let f = Fixture::new().await;
     let table_id = f.stream_table(ACCOUNT, "t", LABEL).await;
     let arn = stream_arn(REGION, ACCOUNT, "t", LABEL);
-    let shard_id = super::build_shard_id(&table_id, 0);
+    let shard_id = legacy_shard_id(&table_id, 0);
     f.write_records(&shard_id, &table_id, &[1], 10).await;
     f.engine
         .data_db
@@ -369,8 +377,8 @@ async fn records_live_an_idle_shard_reads_an_empty_page() {
     let f = Fixture::new().await;
     let table_id = f.stream_table(ACCOUNT, "t", LABEL).await;
     let arn = stream_arn(REGION, ACCOUNT, "t", LABEL);
-    let written = super::build_shard_id(&table_id, 0);
-    let idle = super::build_shard_id(&table_id, 1);
+    let written = legacy_shard_id(&table_id, 0);
+    let idle = legacy_shard_id(&table_id, 1);
     f.write_records(&written, &table_id, &[1, 2], 10).await;
 
     let last_written = format!("{:021}", 2);

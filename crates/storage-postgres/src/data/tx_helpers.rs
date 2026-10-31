@@ -317,10 +317,18 @@ pub(super) async fn write_stream_record_in_tx(
         })
         .unwrap_or_default();
 
+    // Only the open shards: they belong to the table's enabled stream. A
+    // disabled stream's shards are closed and take no new records, so a write
+    // that read the table's key info before a disable records nothing.
+    //
+    // FOR SHARE: a disable locks the same rows FOR UPDATE before it takes the
+    // ending numbers, so this write either commits before the ending number
+    // is taken or, waiting here, re-evaluates `ending_sequence_number IS NULL`
+    // on the closed rows and records nothing (`close_stream_shards`).
     let shards: Vec<(String,)> = sqlx::query_as(
         "SELECT shard_id FROM stream_shards \
-         WHERE table_id = $1 \
-         ORDER BY shard_id",
+         WHERE table_id = $1 AND ending_sequence_number IS NULL \
+         ORDER BY shard_id FOR SHARE",
     )
     .bind(&key_info.table_id)
     .fetch_all(&mut **tx)

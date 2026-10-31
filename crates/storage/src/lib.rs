@@ -26,6 +26,7 @@ pub mod snapshot;
 #[doc(hidden)]
 #[cfg(feature = "test-hooks")]
 pub mod snapshot_conformance;
+pub mod stream_lineage;
 #[doc(hidden)]
 #[cfg(feature = "test-hooks")]
 pub mod test_pause;

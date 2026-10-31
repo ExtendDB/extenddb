@@ -51,6 +51,8 @@ mod scan;
 mod settings_store;
 #[path = "direct/snapshot_engine.rs"]
 mod snapshot_engine;
+#[path = "direct/stream_disable.rs"]
+mod stream_disable;
 #[path = "direct/stream_ownership.rs"]
 mod stream_ownership;
 #[path = "direct/streams.rs"]

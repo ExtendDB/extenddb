@@ -107,6 +107,7 @@ impl PostgresEngine {
         restore: Option<&RestoreRegistration<'_>>,
     ) -> Result<TableDescription, StorageError> {
         Self::validate_account_id(account_id)?;
+        let input = extenddb_storage::stream_lineage::without_disabled_specification(input);
         let table_id = uuid::Uuid::new_v4().to_string();
         let table_arn = table_arn(&self.region, account_id, &input.table_name);
         let billing_mode = input.billing_mode.unwrap_or(BillingMode::Provisioned);
@@ -437,22 +438,24 @@ impl PostgresEngine {
         // If data DDL fails, the catalog entry is cleaned up (see below).
 
         // Initialize stream shards and label if streams are enabled on this table.
-        let stream_label = if input
+        let stream_label = match input
             .stream_specification
             .as_ref()
-            .is_some_and(|s| s.stream_enabled)
+            .filter(|s| s.stream_enabled)
+            .and_then(|s| s.stream_view_type)
         {
-            let label = Self::init_stream_shards(
-                &mut tx,
-                &self.data_pool,
-                account_id,
-                &input.table_name,
-                &table_id,
-            )
-            .await?;
-            Some(label)
-        } else {
-            None
+            Some(view_type) => Some(
+                Self::init_stream_shards(
+                    &mut tx,
+                    &self.data_pool,
+                    account_id,
+                    &input.table_name,
+                    &table_id,
+                    view_type,
+                )
+                .await?,
+            ),
+            None => None,
         };
 
         tx.commit()

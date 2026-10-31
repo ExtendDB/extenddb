@@ -29,6 +29,7 @@ pub mod operations;
 pub(crate) mod propagation_hold;
 mod snapshot_engine;
 mod stream_engine;
+mod stream_lifecycle;
 pub mod stream_util;
 pub mod table_engine;
 mod table_helpers;
