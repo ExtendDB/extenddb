@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
+use extenddb_storage::management_store::{AdminStore, OpError};
 
 use crate::rate_limit::LoginRefusal;
 
@@ -29,6 +30,16 @@ fn invalid_credentials() -> Response {
         "Invalid credentials",
     )
         .into_response()
+}
+
+/// Log an error from a password check under `context`. A verification that
+/// found no free bcrypt slot in time is an overload, not a storage error:
+/// [`extenddb_storage::password::verify_password`] has already logged it at
+/// WARN under its own message, so it is not logged again here.
+pub(crate) fn log_password_check_error(context: &str, error: &OpError) {
+    if !extenddb_storage::password::is_overloaded(error) {
+        tracing::error!("{context}: {error:?}");
+    }
 }
 
 /// The answer to a login attempt the rate limiter did not admit.
@@ -191,13 +202,13 @@ enum AdminAuth {
 async fn try_admin_auth(
     username: &str,
     password: &str,
-    store: &dyn extenddb_storage::CatalogStore,
+    store: &dyn AdminStore,
 ) -> Result<AdminAuth, Response> {
     let result = store
         .verify_admin_password(username, password)
         .await
         .map_err(|e| {
-            tracing::error!("Management API: DB error during auth: {e:?}");
+            log_password_check_error("Management API: DB error during auth", &e);
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         })?;
 
@@ -226,7 +237,7 @@ async fn try_iam_user_auth(
         .verify_iam_user_password(acct_id, uname, password)
         .await
         .map_err(|e| {
-            tracing::error!("Management API: DB error during IAM user auth: {e:?}");
+            log_password_check_error("Management API: DB error during IAM user auth", &e);
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         })?;
 
@@ -242,11 +253,13 @@ async fn try_iam_user_auth(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use extenddb_storage::management_store::{AdminEntry, AdminStore, OpError, OpResult};
+    use extenddb_storage::management_store::{AdminEntry, OpResult};
+    use extenddb_storage::password::VERIFY_OVERLOADED;
     use futures::future::BoxFuture;
 
     use super::*;
     use crate::rate_limit::PRINCIPAL_LIMITED;
+    use crate::rate_limit::tests::capture_logs;
 
     /// An admin store whose password check fails with `OpError::Internal`
     /// carrying `message`. Logins call nothing else on it.
@@ -293,5 +306,36 @@ pub(crate) mod tests {
             too_long.headers()[axum::http::header::WWW_AUTHENTICATE],
             WWW_AUTHENTICATE_BASIC
         );
+    }
+
+    #[tokio::test]
+    async fn a_store_error_in_the_admin_check_answers_500_and_is_logged_as_one() {
+        let admins = FailingAdmins {
+            message: "store is down",
+        };
+        let (logs, _guard) = capture_logs();
+        let Err(response) = try_admin_auth("admin", "pw", &admins).await else {
+            panic!("a store error is not a login outcome");
+        };
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let text = logs.text();
+        assert!(
+            text.contains("ERROR") && text.contains("Management API: DB error during auth"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bcrypt_slot_timeout_answers_500_and_is_not_logged_as_a_store_error() {
+        let admins = FailingAdmins {
+            message: VERIFY_OVERLOADED,
+        };
+        let (logs, _guard) = capture_logs();
+        let Err(response) = try_admin_auth("admin", "pw", &admins).await else {
+            panic!("an overload is not a login outcome");
+        };
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let text = logs.text();
+        assert!(!text.contains("DB error"), "{text}");
     }
 }

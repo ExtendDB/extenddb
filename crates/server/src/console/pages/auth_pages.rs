@@ -15,6 +15,7 @@ use serde::Deserialize;
 use crate::console::ConsoleState;
 use crate::console::html;
 use crate::management::CallerIdentity;
+use crate::management::auth::log_password_check_error;
 use crate::rate_limit::{self, LoginAttempt, LoginRefusal};
 
 use super::extract_session_token;
@@ -204,7 +205,7 @@ async fn try_admin_login(
     let result = store
         .verify_admin_password(username, password)
         .await
-        .map_err(|e| tracing::error!("Console login: DB error during admin auth: {e:?}"))?;
+        .map_err(|e| log_password_check_error("Console login: DB error during admin auth", &e))?;
     Ok(match result {
         Some(true) => AdminLoginResult::Authenticated(CallerIdentity::Admin(username.to_owned())),
         Some(false) => AdminLoginResult::WrongPassword,
@@ -225,7 +226,9 @@ async fn try_iam_login(
     let ok = store
         .verify_iam_user_password(acct_id, uname, password)
         .await
-        .map_err(|e| tracing::error!("Console login: DB error during IAM user auth: {e:?}"))?;
+        .map_err(|e| {
+            log_password_check_error("Console login: DB error during IAM user auth", &e)
+        })?;
     Ok(ok.then(|| CallerIdentity::IamUser {
         account_id: acct_id.to_owned(),
         user_name: uname.to_owned(),
@@ -234,10 +237,12 @@ async fn try_iam_login(
 
 #[cfg(test)]
 mod tests {
+    use extenddb_storage::password::VERIFY_OVERLOADED;
+
     use super::*;
     use crate::management::auth::tests::FailingAdmins;
     use crate::rate_limit::PRINCIPAL_LIMITED;
-    use crate::rate_limit::tests::{MemoryStore, peer};
+    use crate::rate_limit::tests::{MemoryStore, capture_logs, peer};
 
     const LISTEN_URL: &str = "https://127.0.0.1:8443";
 
@@ -269,7 +274,24 @@ mod tests {
         let admins = FailingAdmins {
             message: "store is down",
         };
+        let (logs, _guard) = capture_logs();
         assert!(try_admin_login("admin", "pw", &admins).await.is_err());
+        let text = logs.text();
+        assert!(
+            text.contains("ERROR") && text.contains("Console login: DB error during admin auth"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bcrypt_slot_timeout_is_an_error_and_is_not_logged_as_a_store_error() {
+        let admins = FailingAdmins {
+            message: VERIFY_OVERLOADED,
+        };
+        let (logs, _guard) = capture_logs();
+        assert!(try_admin_login("admin", "pw", &admins).await.is_err());
+        let text = logs.text();
+        assert!(!text.contains("DB error"), "{text}");
     }
 
     // Each test uses its own source address: the in-flight registry is
