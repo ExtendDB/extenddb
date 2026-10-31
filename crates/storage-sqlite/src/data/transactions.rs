@@ -489,15 +489,16 @@ async fn execute_transact_write_op(
             // Secondary-index keys on the written item: a value computed from
             // the existing item (an attribute reference, the fallback of
             // if_not_exists) of the wrong type, reported with the service's
-            // computed-value wording, and a key left empty.
+            // computed-value wording, and a key left empty. The computed
+            // value is a plain positional reason: the service leaves the
+            // other members' outcomes in place beside it, where a wrong type
+            // supplied in the request (the pre-pass) masks them.
             validation::validate_index_key_types_after_update(
                 &item,
                 &idx_refs,
                 super::index::fresh_attr_defs(indexes, &key_info.attribute_definitions),
             )
-            .map_err(|e| {
-                TxnOpError::Cancel(CancellationReason::key_type_mismatch(e.to_string()))
-            })?;
+            .map_err(|e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())))?;
             validation::validate_index_key_not_empty(
                 &item,
                 &idx_refs,

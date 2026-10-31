@@ -15,10 +15,14 @@ rules:
   member both are reported ahead of the member's condition; on an Update
   member the type case is reported ahead of the condition and the empty case
   after it.
-- Across members: a wrong-typed index key on any member wins (the transaction
-  is cancelled, None in the other positions); otherwise an empty index key on
-  any member wins over failed conditions and unapplicable statements on the
-  others.
+- Across members: a wrong-typed index key supplied in the request (a Put
+  item's attribute, an Update's literal operand) on any member wins (the
+  transaction is cancelled, None in the other positions); otherwise an empty
+  index key on any member wins over failed conditions, unapplicable statements
+  and computed wrong types on the others; otherwise each member reports its
+  own outcome, and a wrong type an Update computes from the stored item is a
+  ValidationError at that member beside them. The member orders of each case
+  are in tests/test_transact_index_key_cross_member.py.
 - if_not_exists(k, :empty) is judged on what the statement writes: accepted
   when k is present, refused when k is absent.
 - Nothing is written in any refused case.

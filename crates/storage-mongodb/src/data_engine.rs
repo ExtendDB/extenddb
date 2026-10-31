@@ -2808,7 +2808,11 @@ impl MongoEngine {
                 // Secondary-index keys on the written item: a value computed
                 // from the existing item (an attribute reference, the fallback
                 // of if_not_exists) of the wrong type, reported with the
-                // service's computed-value wording, and a key left empty.
+                // service's computed-value wording, and a key left empty. The
+                // computed value is a plain positional reason: the service
+                // leaves the other members' outcomes in place beside it, where
+                // a wrong type supplied in the request (the literal check
+                // above, a Put item's keys) masks them.
                 if !idx_refs.is_empty() {
                     extenddb_core::validation::validate_index_key_types_after_update(
                         &item,
@@ -2816,9 +2820,7 @@ impl MongoEngine {
                         &key_info.attribute_definitions,
                     )
                     .map_err(|e| {
-                        TransactOpError::Cancel(CancellationReason::key_type_mismatch(
-                            e.to_string(),
-                        ))
+                        TransactOpError::Cancel(CancellationReason::validation_error(e.to_string()))
                     })?;
                     extenddb_core::validation::validate_index_key_not_empty(
                         &item,

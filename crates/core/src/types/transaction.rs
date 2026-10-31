@@ -316,11 +316,18 @@ impl CancellationReason {
         }
     }
 
-    /// Internal reason for a wrong-typed key found while preparing a
+    /// Internal reason for a wrong-typed key supplied in the request of a
     /// transaction member: a table key element that does not match the
-    /// schema, or a secondary-index key (on a written item or as a literal
-    /// operand) that does not match its attribute definition. Never reaches a
-    /// client: [`Self::resolve_key_faults`] rewrites it to `ValidationError`.
+    /// schema, or a secondary-index key (on a Put item or as an Update's
+    /// literal operand) that does not match its attribute definition. Never
+    /// reaches a client: [`Self::resolve_key_faults`] rewrites it to
+    /// `ValidationError`.
+    ///
+    /// A wrong type an Update computes from the stored item (an attribute
+    /// reference, the fallback of `if_not_exists`) is not this reason: the
+    /// service reports it as a plain positional `ValidationError` and leaves
+    /// the other members' outcomes in place, so the storage layers carry it as
+    /// [`Self::validation_error`].
     #[must_use]
     pub fn key_type_mismatch(msg: impl Into<String>) -> Self {
         Self {
@@ -355,13 +362,17 @@ impl CancellationReason {
 
     /// Apply the precedence `DynamoDB` gives key faults across the members of
     /// a `TransactWriteItems` request, measured on the service. A wrong-typed
-    /// key (table or secondary index) on any member cancels the transaction
-    /// with the first such member's `ValidationError` in position and `None`
-    /// in every other position, whatever those members' own faults were.
+    /// key supplied in the request (a table key, a Put item's index key, an
+    /// Update's literal operand) on any member cancels the transaction with
+    /// the first such member's `ValidationError` in position and `None` in
+    /// every other position, whatever those members' own faults were.
     /// Otherwise an empty secondary-index key on any member aborts the whole
     /// request with a top-level `ValidationException`, outranking failed
-    /// conditions and unapplicable statements on the other members. Otherwise
-    /// the reasons are returned as they are.
+    /// conditions, unapplicable statements and computed wrong types on the
+    /// other members. Otherwise the reasons are returned as they are: a wrong
+    /// type an Update computes from the stored item arrives here as a plain
+    /// `ValidationError` and the other members keep their own outcomes beside
+    /// it (measured: `[ValidationError, ConditionalCheckFailed]`).
     ///
     /// # Errors
     ///
@@ -472,5 +483,75 @@ mod tests {
         let out = CancellationReason::resolve_key_faults(reasons).unwrap();
         assert_eq!(codes(&out), ["None", "ValidationError", "None"]);
         assert_eq!(out[1].message.as_deref(), Some("second"));
+    }
+
+    // The three kinds of index-key fault a transaction can carry, resolved
+    // against each other the way the service answers them (rows A2, B1, C1,
+    // F1 and F2 of the 2026-10-30 measurement, in both member orders). A wrong
+    // type an Update computes from the stored item travels as a plain
+    // `ValidationError`.
+    const COMPUTED: &str =
+        "The update expression attempted to update the secondary index key to unsupported type";
+
+    #[test]
+    fn a_computed_wrong_type_leaves_the_other_members_own_outcomes_in_place() {
+        for computed_first in [true, false] {
+            let computed = CancellationReason::validation_error(COMPUTED);
+            let failed = CancellationReason::condition_check_failed_with_item(None);
+            let reasons = if computed_first {
+                vec![computed, failed]
+            } else {
+                vec![failed, computed]
+            };
+            let out = CancellationReason::resolve_key_faults(reasons).unwrap();
+            let expected = if computed_first {
+                ["ValidationError", "ConditionalCheckFailed"]
+            } else {
+                ["ConditionalCheckFailed", "ValidationError"]
+            };
+            assert_eq!(codes(&out), expected);
+            let computed_at = usize::from(!computed_first);
+            assert_eq!(out[computed_at].message.as_deref(), Some(COMPUTED));
+        }
+    }
+
+    #[test]
+    fn an_empty_key_in_the_request_outranks_a_computed_wrong_type_elsewhere() {
+        for empty_first in [true, false] {
+            let empty = CancellationReason::index_key_empty_abort("empty key");
+            let computed = CancellationReason::validation_error(COMPUTED);
+            let reasons = if empty_first {
+                vec![empty, computed]
+            } else {
+                vec![computed, empty]
+            };
+            assert_eq!(
+                CancellationReason::resolve_key_faults(reasons).unwrap_err(),
+                "empty key"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wrong_type_in_the_request_outranks_a_computed_wrong_type_elsewhere() {
+        for request_first in [true, false] {
+            let request = CancellationReason::key_type_mismatch("literal");
+            let computed = CancellationReason::validation_error(COMPUTED);
+            let reasons = if request_first {
+                vec![request, computed]
+            } else {
+                vec![computed, request]
+            };
+            let out = CancellationReason::resolve_key_faults(reasons).unwrap();
+            let expected = if request_first {
+                ["ValidationError", "None"]
+            } else {
+                ["None", "ValidationError"]
+            };
+            assert_eq!(codes(&out), expected);
+            let request_at = usize::from(!request_first);
+            assert_eq!(out[request_at].message.as_deref(), Some("literal"));
+            assert_eq!(out[1 - request_at].message, None);
+        }
     }
 }
