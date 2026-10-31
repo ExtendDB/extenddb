@@ -748,6 +748,18 @@ pub trait BackupCatalog: Send + Sync {
         key: &'a BackupKey,
     ) -> BoxFuture<'a, Result<bool, StorageError>>;
 
+    /// Remove a CREATING row whose owner is dead: `heartbeat_at` older than
+    /// `stale_after` on the catalog's clock. `false` when the row is not
+    /// CREATING, is gone, or has a live owner. The maintenance command's
+    /// write for a CREATING row its wait saw no live owner for, after it has
+    /// deleted the row's prefix; the row's own job, were it alive, would
+    /// find its claim lost at its next heartbeat.
+    fn remove_dead_creating_backup_row<'a>(
+        &'a self,
+        key: &'a BackupKey,
+        stale_after: Duration,
+    ) -> BoxFuture<'a, Result<bool, StorageError>>;
+
     /// The name of a CREATING restore target registered from the backup, if
     /// any: the rule under which DeleteBackup and a second restore of the
     /// backup are refused with `BackupInUseException`. Reads the target's
@@ -798,10 +810,64 @@ pub trait BackupCatalog: Send + Sync {
         reason: &'a str,
     ) -> BoxFuture<'a, Result<bool, StorageError>>;
 
-    /// Whether the catalog-level maintenance claim is held. Jobs check it
-    /// after their own claim and row exist and refuse while it is held; the
-    /// reconciler runs only the duties the holder waits on.
-    fn check_maintenance_claim(&self) -> BoxFuture<'_, Result<bool, StorageError>>;
+    /// The distinct `store_id`s the catalog's rows record for a root, of
+    /// every status: the store identity check reads them before it knows an
+    /// id. Empty when no row names the root.
+    fn read_store_ids<'a>(
+        &'a self,
+        store_kind: StoreKind,
+        store_root: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<String>, StorageError>>;
+
+    /// Take the catalog-level maintenance claim for `holder` (a label naming
+    /// the command and the host it runs on, for the operator who finds it
+    /// held). The claim is one record, `backup_maintenance`, born owned
+    /// with a fresh generation and heartbeated through the handle; a holder
+    /// whose heartbeat is older than `stale_after` on the catalog's clock is
+    /// dead and its claim is taken over. PostgreSQL is the exception to the
+    /// liveness rule on the holder's side: there the holder's session holds
+    /// an advisory lock, a holder whose session ended is dead whatever its
+    /// heartbeat says, and `stale_after` is read by [`check_maintenance_claim`]
+    /// alone; on SQLite a server's startup under the serve lock removes the
+    /// record outright, since no holder can be alive there.
+    ///
+    /// [`check_maintenance_claim`]: BackupCatalog::check_maintenance_claim
+    ///
+    /// # Errors
+    ///
+    /// `AlreadyExists` naming the holder when a live one holds the claim: a
+    /// second maintenance command fails at once.
+    fn maintenance_claim<'a>(
+        &'a self,
+        holder: &'a str,
+        stale_after: Duration,
+    ) -> BoxFuture<'a, Result<Box<dyn MaintenanceClaim>, StorageError>>;
+
+    /// Whether the catalog-level maintenance claim is held by a live holder:
+    /// a record whose heartbeat is younger than `stale_after` on the
+    /// catalog's clock. Jobs check it after their own claim and row exist and
+    /// refuse while it is held; the reconciler runs only the duties the
+    /// holder waits on.
+    fn check_maintenance_claim(
+        &self,
+        stale_after: Duration,
+    ) -> BoxFuture<'_, Result<bool, StorageError>>;
+}
+
+/// The holder's handle on the catalog-level maintenance claim: the
+/// heartbeat that keeps it, and the release that ends it. Dropping the handle
+/// without `release` leaves the record for the stale rule to expire.
+pub trait MaintenanceClaim: Send + Sync {
+    /// The fencing token the claim was taken with.
+    fn generation(&self) -> u64;
+
+    /// Refresh `heartbeat_at` on the catalog's clock and confirm the claim is
+    /// still this holder's. The caller treats an `Err` as [`Heartbeat::Lost`].
+    fn heartbeat(&self) -> BoxFuture<'_, Result<Heartbeat, StorageError>>;
+
+    /// Remove the record, conditioned on the generation; a record another
+    /// holder took over is left to it. Idempotent.
+    fn release(&self) -> BoxFuture<'_, Result<(), StorageError>>;
 }
 
 /// A job's handle on its row: the claim that excludes a second owner and

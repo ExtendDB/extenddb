@@ -214,18 +214,39 @@ fn sqlite_server_components_factory(
         // One server per database file, taken before the database is opened:
         // startup recovery below assumes no other server is using it, and a
         // migration holds the same lock. A file database only; an in-memory
-        // one belongs to this process alone.
-        let serve_lock = serve_lock::ServeLock::try_acquire_for_location(&db_path)
-            .map_err(|failure| {
-                BackendError::Catalog(match failure {
-                    serve_lock::LockFailure::Held(m) => MigrationError::Locked(m),
-                    serve_lock::LockFailure::Failed(m) => MigrationError::Store(m),
+        // one belongs to this process alone. A command reading beside a
+        // server (`options.beside_server`) takes no lock and runs none of
+        // the recovery: the file is a served database and the server owns
+        // both.
+        let serve_lock = if options.beside_server {
+            // The catalog's status is still read, on a read-only
+            // connection: a catalog this binary cannot serve (behind, or
+            // ahead with a migration that is not additive) is reported as
+            // the server would report it, not as a missing table.
+            match migrations::catalog_status(&db_path)
+                .await
+                .map_err(BackendError::Catalog)?
+            {
+                extenddb_storage::migrations::CatalogStatus::Current { .. }
+                | extenddb_storage::migrations::CatalogStatus::AheadCompatible { .. } => {}
+                status => {
+                    return Err(BackendError::Catalog(MigrationError::Status(status)));
+                }
+            }
+            None
+        } else {
+            serve_lock::ServeLock::try_acquire_for_location(&db_path)
+                .map_err(|failure| {
+                    BackendError::Catalog(match failure {
+                        serve_lock::LockFailure::Held(m) => MigrationError::Locked(m),
+                        serve_lock::LockFailure::Failed(m) => MigrationError::Store(m),
+                    })
+                })?
+                .map(|lock| {
+                    tracing::debug!("holding serve lock {}", lock.path().display());
+                    std::sync::Arc::new(lock)
                 })
-            })?
-            .map(|lock| {
-                tracing::debug!("holding serve lock {}", lock.path().display());
-                std::sync::Arc::new(lock)
-            });
+        };
         // The catalog's status is read before the engine opens the file, so
         // a server that refuses has written nothing. A dev build migrates
         // instead, as `migrate --yes` would, copy included.
@@ -241,6 +262,9 @@ fn sqlite_server_components_factory(
                 backend: "sqlite".to_owned(),
                 details: e.to_string(),
             })?;
+        if options.beside_server {
+            return components_of(engine, &db_path).await;
+        }
 
         // An in-memory database exists only on the engine's single
         // connection, so its catalog is created there, by the runner, every
@@ -307,6 +331,19 @@ fn sqlite_server_components_factory(
             Err(e) => tracing::error!("Failed to mark interrupted restores: {e}"),
         }
 
+        // A maintenance claim (`backup purge`) the previous holder left: one
+        // process has this file, so the holder is dead whatever the row's
+        // heartbeat says, and the row would otherwise make the jobs refuse
+        // for the whole stale window.
+        match engine.clear_maintenance_claim().await {
+            Ok(Some(holder)) => tracing::warn!(
+                "the maintenance claim held by {holder} was left behind; cleared (one process \
+                 serves this file, so its holder is gone)"
+            ),
+            Ok(None) => {}
+            Err(e) => tracing::error!("Failed to clear a left-behind maintenance claim: {e}"),
+        }
+
         // Rebuild any GSI left mid-backfill (status CREATING) by a prior crash.
         match engine.reconcile_incomplete_gsis().await {
             Ok(n) if n > 0 => tracing::info!("Reconciled {n} incomplete GSI(s) at startup"),
@@ -326,59 +363,72 @@ fn sqlite_server_components_factory(
         }
 
         engine.serve_lock = serve_lock;
-        let control_plane_notify = engine.control_plane_notify();
-        let engine = Arc::new(engine);
+        components_of(engine, &db_path).await
+    })
+}
 
-        // Catalog + auth queries: a file-backed database opens a dedicated
-        // catalog pool over the same file; an in-memory database must reuse the
-        // engine's single shared connection (its data lives only there).
-        let catalog_pool = if in_memory {
-            engine.pool.clone()
-        } else {
-            catalog_pool(&db_path)
-                .await
-                .map_err(|e| BackendError::ConnectionFailed {
-                    backend: "sqlite".to_owned(),
-                    details: format!("catalog pool: {e}"),
-                })?
-        };
+/// The server components around an opened engine: the catalog and
+/// credential stores over a second pool on the same file (the engine's own
+/// connection for an in-memory database, whose data lives only there) and
+/// the runtime hooks.
+async fn components_of(
+    engine: SqliteEngine,
+    db_path: &str,
+) -> Result<ServerComponents, BackendError> {
+    let in_memory = engine.in_memory;
+    let control_plane_notify = engine.control_plane_notify();
+    let engine = Arc::new(engine);
 
-        let enc_key: Option<String> =
-            sqlx::query_scalar("SELECT value FROM settings WHERE key = 'encryption_key'")
-                .fetch_optional(&catalog_pool)
-                .await
-                .map_err(|e| {
-                    BackendError::InitializationFailed(format!("fetch encryption key: {e}"))
-                })?;
-        let enc_key = enc_key.ok_or(BackendError::MissingEncryptionKey)?;
+    // Catalog + auth queries: a file-backed database opens a dedicated
+    // catalog pool over the same file; an in-memory database must reuse the
+    // engine's single shared connection (its data lives only there).
 
-        // The catalog store writes through the second pool over the same
-        // file, so its writers must hold the SAME lock instance as the
-        // engine's (design decision D1); an unshared lock would leave the two
-        // pools contending at the SQLite level, where a slow commit exhausts
-        // a concurrent writer's busy_timeout ("database is locked" -> 500).
-        // For an in-memory database the pools are one and the sharing is
-        // harmless. The credential store only reads and needs no lock.
-        let catalog_store: Arc<dyn extenddb_storage::CatalogStore> =
-            Arc::new(SqliteCatalogStore::with_encryption_key(
-                catalog_pool.clone(),
-                enc_key.clone(),
-                Arc::clone(&engine.write_lock),
-            ));
-        let credential_store: Arc<dyn CredentialStore> =
-            Arc::new(SqliteCredentialStore::new(catalog_pool, enc_key));
+    let catalog_pool = if in_memory {
+        engine.pool.clone()
+    } else {
+        catalog_pool(db_path)
+            .await
+            .map_err(|e| BackendError::ConnectionFailed {
+                backend: "sqlite".to_owned(),
+                details: format!("catalog pool: {e}"),
+            })?
+    };
 
-        let runtime_hooks = Box::new(SqliteRuntimeHooks {
-            engine: engine.clone(),
-            control_plane_notify,
-        });
+    let enc_key: Option<String> =
+        sqlx::query_scalar("SELECT value FROM settings WHERE key = 'encryption_key'")
+            .fetch_optional(&catalog_pool)
+            .await
+            .map_err(|e| {
+                BackendError::InitializationFailed(format!("fetch encryption key: {e}"))
+            })?;
+    let enc_key = enc_key.ok_or(BackendError::MissingEncryptionKey)?;
 
-        Ok(ServerComponents {
-            engine,
-            catalog_store,
-            credential_store,
-            runtime_hooks: Some(runtime_hooks),
-        })
+    // The catalog store writes through the second pool over the same
+    // file, so its writers must hold the SAME lock instance as the
+    // engine's (design decision D1); an unshared lock would leave the two
+    // pools contending at the SQLite level, where a slow commit exhausts
+    // a concurrent writer's busy_timeout ("database is locked" -> 500).
+    // For an in-memory database the pools are one and the sharing is
+    // harmless. The credential store only reads and needs no lock.
+    let catalog_store: Arc<dyn extenddb_storage::CatalogStore> =
+        Arc::new(SqliteCatalogStore::with_encryption_key(
+            catalog_pool.clone(),
+            enc_key.clone(),
+            Arc::clone(&engine.write_lock),
+        ));
+    let credential_store: Arc<dyn CredentialStore> =
+        Arc::new(SqliteCredentialStore::new(catalog_pool, enc_key));
+
+    let runtime_hooks = Box::new(SqliteRuntimeHooks {
+        engine: engine.clone(),
+        control_plane_notify,
+    });
+
+    Ok(ServerComponents {
+        engine,
+        catalog_store,
+        credential_store,
+        runtime_hooks: Some(runtime_hooks),
     })
 }
 
@@ -415,6 +465,65 @@ mod serve_lock_tests {
             .await
             .expect("starts once the first is gone");
         drop(again);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A maintenance claim a killed `backup purge` left (its row's heartbeat
+    /// young) is cleared when a server starts on the file: under the serve
+    /// lock no holder can be alive, so the jobs' check answers free at once
+    /// rather than after the stale window.
+    #[tokio::test]
+    async fn a_server_start_clears_a_left_behind_maintenance_claim() {
+        let dir = std::env::temp_dir().join(format!(
+            "extenddb-serve-clears-claim-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let config = crate::config::SqliteConfig {
+            path: dir.join("db.sqlite").to_string_lossy().into_owned(),
+            pool_size: 2,
+        };
+        let mut options = extenddb_storage::server_components::ServerComponentsOptions::default();
+        options.bootstrap_if_uninitialized = true;
+        let stale = std::time::Duration::from_secs(300);
+        let first = super::sqlite_server_components_factory(&config, "us-east-1", options)
+            .await
+            .expect("first server");
+        let claim = first
+            .engine
+            .maintenance_claim("purge on this host (pid 1)", stale)
+            .await
+            .expect("claim");
+        assert!(
+            first
+                .engine
+                .check_maintenance_claim(stale)
+                .await
+                .expect("check")
+        );
+        // The holder dies without releasing: the row stays, heartbeat young.
+        drop(claim);
+        drop(first);
+
+        let second = super::sqlite_server_components_factory(&config, "us-east-1", options)
+            .await
+            .expect("starts once the first is gone");
+        assert!(
+            !second
+                .engine
+                .check_maintenance_claim(stale)
+                .await
+                .expect("check"),
+            "the claim a dead holder left is cleared at startup, not honoured for the window"
+        );
+        // The claim is free to a new holder at once.
+        let taken = second
+            .engine
+            .maintenance_claim("purge on this host (pid 2)", stale)
+            .await
+            .expect("a new holder takes the cleared claim");
+        taken.release().await.expect("release");
+        drop(second);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

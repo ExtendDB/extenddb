@@ -33,8 +33,11 @@ mod s3;
 
 pub use config::{BackupStoreConfig, BackupStoreKind, FilesystemStoreConfig, S3StoreConfig};
 pub use error::StoreError;
-pub use fs::FilesystemStore;
-pub use s3::{MAX_PART_SIZE_BYTES, MAX_STORE_PREFIX_LEN, MIN_PART_SIZE_BYTES, S3Store};
+pub use fs::{FilesystemStore, check_private_directory};
+pub use s3::{
+    ATTEMPT_TIMEOUT as S3_ATTEMPT_TIMEOUT, MAX_PART_SIZE_BYTES, MAX_STORE_PREFIX_LEN,
+    MIN_PART_SIZE_BYTES, S3Store,
+};
 
 /// Byte stream flowing into and out of a store.
 ///
@@ -105,6 +108,31 @@ pub trait BackupStore: Send + Sync {
         key: &'a str,
         body: ByteStream,
     ) -> BoxFuture<'a, Result<ObjectMeta, StoreError>>;
+
+    /// Store `body` under `key` only if no object is there, and return the
+    /// stored object's metadata; return `None`, leaving the existing object
+    /// untouched and reading none of `body` the store did not already read,
+    /// if one is. Of two concurrent calls on one key exactly one stores its
+    /// body. The object appears under its key complete or not at all, as
+    /// with [`BackupStore::put`], and a call that is dropped or fails before
+    /// the object is in place leaves nothing (the same guards as `put`); a
+    /// filesystem call whose `link` succeeded and whose parent-directory
+    /// sync then fails returns `Err` with the object in place, as `put`
+    /// does after its `rename`. Written for the store identity file; the
+    /// mechanics are the stores': S3 sends `PutObject` (or, for a body over
+    /// one part, `CompleteMultipartUpload`) with `If-None-Match: *`, where a
+    /// 412 means the key is present and a 409 `ConditionalRequestConflict`
+    /// from a concurrent conditional write is retried; the filesystem store
+    /// writes and syncs its temporary as `put` does, created
+    /// `O_CREAT | O_EXCL`, then `link`s it to the key, which fails if the
+    /// key exists. An S3-compatible server that ignores `If-None-Match` on
+    /// `PutObject` makes this a plain put, last writer wins; the README
+    /// names it, and the caller's re-read is what catches it.
+    fn put_if_absent<'a>(
+        &'a self,
+        key: &'a str,
+        body: ByteStream,
+    ) -> BoxFuture<'a, Result<Option<ObjectMeta>, StoreError>>;
 
     /// Stream the object stored under `key`.
     ///
@@ -183,13 +211,37 @@ pub trait BackupStore: Send + Sync {
 ///
 /// # Errors
 ///
-/// Returns an error when the section matching the selected store kind is
+/// Returns an error when `kind` is `disabled` (no store to open; the caller
+/// checks the kind first), when the section matching the selected store kind
+/// is
 /// absent, a value fails validation (an empty bucket, an S3 Express bucket
 /// name, a part size outside 5 MiB to 5 GiB, zero concurrency, a malformed
 /// prefix, an endpoint setting that breaks the rules in the `config` module
 /// doc, the SDK's own and its credential providers' and IMDS client's
 /// included), or the filesystem root is unusable.
 pub async fn open(config: &BackupStoreConfig) -> Result<Arc<dyn BackupStore>, StoreError> {
+    open_described(config).await.map(|opened| opened.store)
+}
+
+/// A store [`open_described`] built, with the two facts a catalog row records
+/// about it.
+pub struct OpenedStore {
+    /// The store.
+    pub store: Arc<dyn BackupStore>,
+    /// Which kind it is (never [`BackupStoreKind::Disabled`]).
+    pub kind: BackupStoreKind,
+    /// The root label: the canonical directory of a filesystem store
+    /// ([`FilesystemStore::store_root`]), `s3://<bucket>/<prefix>` with an
+    /// optional `?endpoint=<url>` for an S3 store ([`S3Store::store_root`]).
+    pub root: String,
+}
+
+/// [`open`], also returning the store's kind and root label.
+///
+/// # Errors
+///
+/// As [`open`].
+pub async fn open_described(config: &BackupStoreConfig) -> Result<OpenedStore, StoreError> {
     match config.kind {
         BackupStoreKind::Filesystem => {
             let fs_config = config.filesystem.as_ref().ok_or_else(|| {
@@ -198,7 +250,13 @@ pub async fn open(config: &BackupStoreConfig) -> Result<Arc<dyn BackupStore>, St
                         .to_owned(),
                 )
             })?;
-            Ok(Arc::new(FilesystemStore::open(&fs_config.path).await?))
+            let store = FilesystemStore::open(&fs_config.path).await?;
+            let root = store.store_root();
+            Ok(OpenedStore {
+                store: Arc::new(store),
+                kind: BackupStoreKind::Filesystem,
+                root,
+            })
         }
         BackupStoreKind::S3 => {
             let s3_config = config.s3.as_ref().ok_or_else(|| {
@@ -206,7 +264,16 @@ pub async fn open(config: &BackupStoreConfig) -> Result<Arc<dyn BackupStore>, St
                     "[backup.store.s3] with a bucket is required when kind = \"s3\"".to_owned(),
                 )
             })?;
-            Ok(Arc::new(S3Store::open(s3_config).await?))
+            let store = S3Store::open(s3_config).await?;
+            let root = store.store_root().to_owned();
+            Ok(OpenedStore {
+                store: Arc::new(store),
+                kind: BackupStoreKind::S3,
+                root,
+            })
         }
+        BackupStoreKind::Disabled => Err(StoreError::Other(
+            "[backup.store] kind = \"disabled\" configures no store; nothing to open".to_owned(),
+        )),
     }
 }

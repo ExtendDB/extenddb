@@ -628,9 +628,21 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         initial_throttling,
     ));
 
-    let backup_runtime = Arc::new(extenddb_engine::BackupRuntime::new(
-        app_config.backup.max_concurrent_jobs,
-    ));
+    // The backup store: resolved per backend, opened, validated, its identity
+    // checked. A configuration error stops startup here; a transport or
+    // identity failure starts the server with the store unhealthy
+    // (`backup_store` module doc). The spool lock lives until shutdown.
+    let backend_name = app_config.storage.backend.clone();
+    let (backup_runtime, _spool_lock) = crate::backup_store::configure(
+        &app_config.backup,
+        app_config.storage.database_file().as_deref(),
+        &backend_name,
+        &storage,
+        crate::backup_store::Caller::Server,
+    )
+    .await?;
+    let backup_runtime = Arc::new(backup_runtime);
+    let backup_runtime_for_reconciler = Arc::clone(&backup_runtime);
     let state = AppState {
         storage: storage.clone(),
         backup_runtime,
@@ -714,10 +726,12 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     // backends' workers rather than in each backend's `spawn_workers`.
     worker_handles.push(tokio::spawn(extenddb_engine::reconciler::run(
         storage.clone(),
+        Arc::clone(&backup_runtime_for_reconciler),
         extenddb_engine::reconciler::ReconcilerSettings {
             interval: std::time::Duration::from_secs(app_config.backup.reconcile_interval_secs),
             stale_job_after: std::time::Duration::from_secs(app_config.backup.stale_job_after_secs),
         },
+        backend_name,
         metrics.clone(),
         shutdown.clone(),
     )));

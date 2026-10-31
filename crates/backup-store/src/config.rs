@@ -11,7 +11,9 @@
 //!
 //! ```toml
 //! [backup.store]
-//! kind = "filesystem"                   # "filesystem" | "s3"; filesystem when absent
+//! kind = "filesystem"                   # "filesystem" | "s3" | "disabled"; filesystem when absent
+//!                                       # ("disabled" configures no store on purpose; the server
+//!                                       # then creates in-catalog backups and logs that)
 //!
 //! [backup.store.filesystem]
 //! path = "<data_dir>/backups"           # required when kind = "filesystem"; the server defaults it
@@ -167,6 +169,21 @@ pub enum BackupStoreKind {
     Filesystem,
     /// S3 bucket store.
     S3,
+    /// No store, on purpose: the opt-out of the server's per-backend default
+    /// root. [`crate::open`] refuses it; a caller checks the kind first.
+    Disabled,
+}
+
+impl BackupStoreKind {
+    /// The value `kind` takes in the configuration.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Filesystem => "filesystem",
+            Self::S3 => "s3",
+            Self::Disabled => "disabled",
+        }
+    }
 }
 
 /// The `[backup.store]` table.
@@ -175,7 +192,7 @@ pub enum BackupStoreKind {
 /// survive `serde(flatten)`, so the server nests this struct under its own
 /// key (`store`) in its `[backup]` model rather than flattening it; that
 /// keeps one definition of these fields and unknown-field rejection on both.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackupStoreConfig {
     /// Selected store kind; `filesystem` when absent.
@@ -190,7 +207,7 @@ pub struct BackupStoreConfig {
 }
 
 /// `[backup.store.filesystem]` settings.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FilesystemStoreConfig {
     /// Root directory for backup objects. Must exist at startup.
@@ -201,7 +218,7 @@ pub struct FilesystemStoreConfig {
 /// from the standard AWS SDK chain. `Debug` prints the endpoint without its
 /// user information, which `open` refuses but a log of the configuration
 /// written before `open` would otherwise carry.
-#[derive(Clone, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct S3StoreConfig {
     /// Destination bucket.
@@ -373,6 +390,15 @@ mod tests {
     #[test]
     fn unknown_store_kind_is_rejected() {
         assert!(toml::from_str::<BackupStoreConfig>("kind = \"gcs\"").is_err());
+    }
+
+    #[tokio::test]
+    async fn disabled_parses_and_does_not_open() {
+        let config: BackupStoreConfig = toml::from_str("kind = \"disabled\"").unwrap();
+        assert_eq!(config.kind, BackupStoreKind::Disabled);
+        assert_eq!(BackupStoreKind::Disabled.as_str(), "disabled");
+        let err = open_err(&config).await;
+        assert!(err.to_string().contains("disabled"), "{err}");
     }
 
     #[tokio::test]

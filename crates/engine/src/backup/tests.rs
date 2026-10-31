@@ -5,7 +5,7 @@
 //! reader that records what the engine asked of it.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use extenddb_core::backup_format::BackupArn;
@@ -30,6 +30,7 @@ use extenddb_storage::{
     BackupCatalog, BackupRestoreSource, BoxedFuture, JobPermit, LegacyBackupReader, RestoreRequest,
     TableEngine,
 };
+use futures::TryStreamExt;
 use futures::stream::BoxStream;
 use serde_json::{Value, json};
 
@@ -87,9 +88,9 @@ struct Fake {
     abandoned_backups: Mutex<Vec<AbandonedLegacyBackup>>,
     deleted: Mutex<Vec<String>>,
     maintenance_held: Mutex<bool>,
-    /// How many times `check_maintenance_claim` ran: one per reconciler
-    /// cycle, so a test can see that a cycle ran.
-    maintenance_checks: Mutex<usize>,
+    /// The windows `check_maintenance_claim` was called with: one entry per
+    /// reconciler cycle, so a test can see that a cycle ran.
+    maintenance_checks: Mutex<Vec<Duration>>,
     /// When set, `check_maintenance_claim` fails with it (every call).
     maintenance_error: Mutex<Option<String>>,
     /// The `TimeBounds` `list_account_backup_rows` received.
@@ -99,6 +100,16 @@ struct Fake {
     tables: Mutex<HashMap<String, TableDescription>>,
     /// The names `describe_table` was asked for.
     table_reads: Mutex<Vec<String>>,
+    /// What `catalog_id` answers; `catalog-1` unless a test changes it.
+    catalog_id: Mutex<Option<String>>,
+    /// When set, `catalog_id` fails as a catalog that cannot be read.
+    catalog_id_error: Mutex<bool>,
+    /// Rows `set_backup_deleted` moved to DELETED, by ARN.
+    set_deleted: Mutex<Vec<String>>,
+    /// Rows `remove_backup_row` removed, by ARN.
+    removed_rows: Mutex<Vec<String>>,
+    /// When set, `list_backup_rows` fails with it.
+    list_error: Mutex<Option<String>>,
 }
 
 impl Fake {
@@ -135,6 +146,299 @@ fn store() -> StoreIdentity {
     }
 }
 
+/// An in-memory `BackupStore` for the engine's tests: objects by key, a
+/// switch that makes every call fail as a transport error, a switch that
+/// makes every call wait forever (a store that has stopped answering), and
+/// the keys each operation was called with.
+#[derive(Default)]
+struct MemStore {
+    objects: Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
+    /// When set, every operation fails with this text as the cause under a
+    /// "dispatch failure" link, the shape the SDK's transport errors have.
+    down: Mutex<Option<String>>,
+    /// When set, every operation's future never completes; `stalls` counts
+    /// the calls that entered the stall. A stalled call returns once the
+    /// store is un-stalled, as a parked filesystem call returns when its
+    /// mount answers.
+    stalled: std::sync::atomic::AtomicBool,
+    stalls: std::sync::atomic::AtomicUsize,
+    deletes: Mutex<Vec<String>>,
+    puts: Mutex<Vec<String>>,
+    /// When set, the bytes `put_if_absent` leaves under the key right after
+    /// it stored its own: a server that ignores `If-None-Match` and a second
+    /// writer that won the plain-put race.
+    overwrite_after_conditional_put: Mutex<Option<Vec<u8>>>,
+    /// When set, `put_if_absent` finds the key taken (`None`) while `get`
+    /// and `head` find no object: something that is not an object (a FIFO,
+    /// a socket) sits at the path.
+    key_taken_by_a_non_object: std::sync::atomic::AtomicBool,
+}
+
+/// A transport error with the SDK's shape: a top link naming only the class
+/// and the cause one link below it.
+#[derive(Debug)]
+struct DispatchFailure(ConnectError);
+
+#[derive(Debug)]
+struct ConnectError(String);
+
+impl std::fmt::Display for DispatchFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("dispatch failure")
+    }
+}
+
+impl std::error::Error for DispatchFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ConnectError {}
+
+impl MemStore {
+    /// A store that is down fails every call as the S3 store fails one it
+    /// cannot send: a transport error whose cause is a link below the top.
+    fn check(&self) -> Result<(), extenddb_backup_store::StoreError> {
+        match self.down.lock().unwrap().as_ref() {
+            Some(text) => Err(extenddb_backup_store::StoreError::Transport {
+                source: Box::new(DispatchFailure(ConnectError(text.clone()))),
+            }),
+            None => Ok(()),
+        }
+    }
+    /// Wait while the store is stalled; otherwise return at once.
+    async fn stall(&self) {
+        if self.stalled.load(std::sync::atomic::Ordering::Acquire) {
+            self.stalls
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            while self.stalled.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+    fn set_down(&self, down: bool) {
+        *self.down.lock().unwrap() = down.then(|| "connection refused".to_owned());
+    }
+    fn set_stalled(&self, stalled: bool) {
+        self.stalled
+            .store(stalled, std::sync::atomic::Ordering::Release);
+    }
+    fn insert(&self, key: &str, body: &[u8]) {
+        self.objects
+            .lock()
+            .unwrap()
+            .insert(key.to_owned(), body.to_vec());
+    }
+    fn keys(&self) -> Vec<String> {
+        self.objects.lock().unwrap().keys().cloned().collect()
+    }
+    fn matches(key: &str, prefix: &str) -> bool {
+        let prefix = prefix.trim_end_matches('/');
+        prefix.is_empty() || key == prefix || key.starts_with(&format!("{prefix}/"))
+    }
+}
+
+async fn collect_body(
+    body: extenddb_backup_store::ByteStream,
+) -> Result<Vec<u8>, extenddb_backup_store::StoreError> {
+    body.try_fold(Vec::new(), |mut acc, chunk| async move {
+        acc.extend_from_slice(&chunk);
+        Ok(acc)
+    })
+    .await
+}
+
+impl extenddb_backup_store::BackupStore for MemStore {
+    fn put<'a>(
+        &'a self,
+        key: &'a str,
+        body: extenddb_backup_store::ByteStream,
+    ) -> BoxedFuture<'a, Result<extenddb_backup_store::ObjectMeta, extenddb_backup_store::StoreError>>
+    {
+        Box::pin(async move {
+            self.stall().await;
+            self.check()?;
+            let bytes = collect_body(body).await?;
+            self.puts.lock().unwrap().push(key.to_owned());
+            let size = bytes.len() as u64;
+            self.insert(key, &bytes);
+            Ok(extenddb_backup_store::ObjectMeta {
+                key: key.to_owned(),
+                size,
+                last_modified: None,
+                etag: None,
+            })
+        })
+    }
+
+    fn put_if_absent<'a>(
+        &'a self,
+        key: &'a str,
+        body: extenddb_backup_store::ByteStream,
+    ) -> BoxedFuture<
+        'a,
+        Result<Option<extenddb_backup_store::ObjectMeta>, extenddb_backup_store::StoreError>,
+    > {
+        Box::pin(async move {
+            self.stall().await;
+            self.check()?;
+            let bytes = collect_body(body).await?;
+            if self
+                .key_taken_by_a_non_object
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Ok(None);
+            }
+            let mut objects = self.objects.lock().unwrap();
+            if objects.contains_key(key) {
+                return Ok(None);
+            }
+            self.puts.lock().unwrap().push(key.to_owned());
+            let size = bytes.len() as u64;
+            objects.insert(key.to_owned(), bytes);
+            if let Some(other) = self.overwrite_after_conditional_put.lock().unwrap().clone() {
+                objects.insert(key.to_owned(), other);
+            }
+            Ok(Some(extenddb_backup_store::ObjectMeta {
+                key: key.to_owned(),
+                size,
+                last_modified: None,
+                etag: None,
+            }))
+        })
+    }
+
+    fn get<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> BoxedFuture<'a, Result<extenddb_backup_store::ByteStream, extenddb_backup_store::StoreError>>
+    {
+        Box::pin(async move {
+            self.stall().await;
+            self.check()?;
+            let bytes = self
+                .objects
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .ok_or(extenddb_backup_store::StoreError::NotFound)?;
+            Ok(extenddb_backup_store::byte_stream_from(bytes))
+        })
+    }
+
+    fn head<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> BoxedFuture<
+        'a,
+        Result<Option<extenddb_backup_store::ObjectMeta>, extenddb_backup_store::StoreError>,
+    > {
+        Box::pin(async move {
+            self.stall().await;
+            self.check()?;
+            Ok(self.objects.lock().unwrap().get(key).map(|bytes| {
+                extenddb_backup_store::ObjectMeta {
+                    key: key.to_owned(),
+                    size: bytes.len() as u64,
+                    last_modified: None,
+                    etag: None,
+                }
+            }))
+        })
+    }
+
+    fn list<'a>(
+        &'a self,
+        prefix: &'a str,
+    ) -> BoxStream<'a, Result<extenddb_backup_store::ObjectMeta, extenddb_backup_store::StoreError>>
+    {
+        if let Err(e) = self.check() {
+            return Box::pin(futures::stream::once(async move { Err(e) }));
+        }
+        let metas: Vec<_> = self
+            .objects
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(k, _)| Self::matches(k, prefix))
+            .map(|(k, v)| {
+                Ok(extenddb_backup_store::ObjectMeta {
+                    key: k.clone(),
+                    size: v.len() as u64,
+                    last_modified: None,
+                    etag: None,
+                })
+            })
+            .collect();
+        Box::pin(futures::stream::iter(metas))
+    }
+
+    fn delete_prefix<'a>(
+        &'a self,
+        prefix: &'a str,
+    ) -> BoxedFuture<'a, Result<u64, extenddb_backup_store::StoreError>> {
+        Box::pin(async move {
+            self.stall().await;
+            self.check()?;
+            self.deletes.lock().unwrap().push(prefix.to_owned());
+            let mut objects = self.objects.lock().unwrap();
+            let before = objects.len();
+            objects.retain(|k, _| !Self::matches(k, prefix));
+            Ok((before - objects.len()) as u64)
+        })
+    }
+
+    fn validate(&self) -> BoxedFuture<'_, Result<(), extenddb_backup_store::StoreError>> {
+        Box::pin(async move {
+            self.stall().await;
+            self.check()
+        })
+    }
+}
+
+/// A runtime with `store` configured as `identity`, healthy.
+fn runtime_on(mem: &Arc<MemStore>, identity: StoreIdentity) -> BackupRuntime {
+    runtime().with_store(ConfiguredStore::new(
+        identity.store_kind,
+        identity.store_root.clone(),
+        Arc::clone(mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+        None,
+        Ok(identity),
+    ))
+}
+
+/// A runtime whose configured store (`store()`'s kind and root) failed its
+/// startup check with `problem`: the id is unknown.
+fn runtime_unhealthy(mem: &Arc<MemStore>, problem: StoreProblem) -> BackupRuntime {
+    runtime().with_store(ConfiguredStore::new(
+        store().store_kind,
+        store().store_root,
+        Arc::clone(mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+        None,
+        Err(problem),
+    ))
+}
+
+/// The identity file of `store()` for catalog `catalog_id`, as bytes.
+fn identity_file(store_id: &str, catalog_id: &str) -> Vec<u8> {
+    StoreIdentityFile {
+        format_version: 1,
+        store_id: store_id.to_owned(),
+        catalog_id: catalog_id.to_owned(),
+        backend: "test".to_owned(),
+        created_at_ms: 0,
+    }
+    .to_bytes()
+}
+
 /// A catalog row for `arn`, with the manifest fixture's source table (the
 /// `Music` table of account 123456789012).
 fn row(arn: &str, status: BackupStatus) -> BackupRow {
@@ -164,7 +468,16 @@ fn row(arn: &str, status: BackupStatus) -> BackupRow {
 
 impl BackupCatalog for Fake {
     fn catalog_id(&self) -> BoxedFuture<'_, Result<String, StorageError>> {
-        Box::pin(async { Ok("catalog-1".to_owned()) })
+        if *self.catalog_id_error.lock().unwrap() {
+            return Box::pin(async { Err(StorageError::Internal("pool exhausted".to_owned())) });
+        }
+        let id = self
+            .catalog_id
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| "catalog-1".to_owned());
+        Box::pin(async move { Ok(id) })
     }
 
     fn claim_backup<'a>(
@@ -174,12 +487,33 @@ impl BackupCatalog for Fake {
         unused()
     }
 
+    /// The backend's listing: rows of the store (kind, root and id), of the
+    /// status when given, in (`created_at`, `backup_arn`) order.
     fn list_backup_rows<'a>(
         &'a self,
-        _status: Option<BackupStatus>,
-        _store: &'a StoreIdentity,
+        status: Option<BackupStatus>,
+        store: &'a StoreIdentity,
     ) -> BoxStream<'a, Result<BackupRow, StorageError>> {
-        Box::pin(futures::stream::empty())
+        if let Some(e) = self.list_error.lock().unwrap().clone() {
+            return Box::pin(futures::stream::once(async move {
+                Err(StorageError::Internal(e))
+            }));
+        }
+        let mut rows: Vec<BackupRow> = self
+            .rows
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|r| r.store == *store)
+            .filter(|r| status.is_none_or(|s| r.status == s))
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            a.created_at
+                .total_cmp(&b.created_at)
+                .then_with(|| a.backup_arn.cmp(&b.backup_arn))
+        });
+        Box::pin(futures::stream::iter(rows.into_iter().map(Ok)))
     }
 
     fn list_account_backup_rows<'a>(
@@ -231,12 +565,17 @@ impl BackupCatalog for Fake {
             .unwrap()
             .get(&key.backup_arn)
             .cloned();
-        let status = self
-            .rows
-            .lock()
-            .unwrap()
-            .get(&key.backup_arn)
-            .map(|r| r.status);
+        let mut rows = self.rows.lock().unwrap();
+        let status = rows.get(&key.backup_arn).map(|r| r.status);
+        // The natural answer moves an AVAILABLE row to DELETING, as the
+        // backends do; a preset answer leaves the row as the test set it.
+        if answer.is_none()
+            && status == Some(BackupStatus::Available)
+            && let Some(row) = rows.get_mut(&key.backup_arn)
+        {
+            row.status = BackupStatus::Deleting;
+        }
+        drop(rows);
         Box::pin(async move {
             match (answer, status) {
                 (Some(answer), _) => Ok(answer),
@@ -247,18 +586,72 @@ impl BackupCatalog for Fake {
         })
     }
 
+    /// DELETING to DELETED, conditional, as the backends do.
     fn set_backup_deleted<'a>(
         &'a self,
-        _key: &'a BackupKey,
+        key: &'a BackupKey,
     ) -> BoxedFuture<'a, Result<bool, StorageError>> {
-        unused()
+        let moved = match self.rows.lock().unwrap().get_mut(&key.backup_arn) {
+            Some(row) if row.status == BackupStatus::Deleting => {
+                row.status = BackupStatus::Deleted;
+                true
+            }
+            _ => false,
+        };
+        if moved {
+            self.set_deleted
+                .lock()
+                .unwrap()
+                .push(key.backup_arn.clone());
+        }
+        Box::pin(async move { Ok(moved) })
     }
 
+    /// Remove a DELETED or FAILED tombstone, as the backends do.
     fn remove_backup_row<'a>(
         &'a self,
-        _key: &'a BackupKey,
+        key: &'a BackupKey,
     ) -> BoxedFuture<'a, Result<bool, StorageError>> {
-        unused()
+        let mut rows = self.rows.lock().unwrap();
+        let removed = match rows.get(&key.backup_arn) {
+            Some(row) if matches!(row.status, BackupStatus::Deleted | BackupStatus::Failed) => {
+                rows.remove(&key.backup_arn);
+                true
+            }
+            _ => false,
+        };
+        if removed {
+            self.removed_rows
+                .lock()
+                .unwrap()
+                .push(key.backup_arn.clone());
+        }
+        Box::pin(async move { Ok(removed) })
+    }
+
+    /// Remove a CREATING row whose heartbeat is older than `stale_after`
+    /// (on this process's clock, which stands for the catalog's here).
+    fn remove_dead_creating_backup_row<'a>(
+        &'a self,
+        key: &'a BackupKey,
+        stale_after: Duration,
+    ) -> BoxedFuture<'a, Result<bool, StorageError>> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        let mut rows = self.rows.lock().unwrap();
+        let removed = match rows.get(&key.backup_arn) {
+            Some(row)
+                if row.status == BackupStatus::Creating
+                    && row.heartbeat_at < now - stale_after.as_secs_f64() =>
+            {
+                rows.remove(&key.backup_arn);
+                true
+            }
+            _ => false,
+        };
+        Box::pin(async move { Ok(removed) })
     }
 
     fn backup_in_use<'a>(
@@ -299,8 +692,37 @@ impl BackupCatalog for Fake {
         Box::pin(async move { Ok(answer) })
     }
 
-    fn check_maintenance_claim(&self) -> BoxedFuture<'_, Result<bool, StorageError>> {
-        *self.maintenance_checks.lock().unwrap() += 1;
+    fn read_store_ids<'a>(
+        &'a self,
+        store_kind: StoreKind,
+        store_root: &'a str,
+    ) -> BoxedFuture<'a, Result<Vec<String>, StorageError>> {
+        let mut ids: Vec<String> = self
+            .rows
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|row| row.store.store_kind == store_kind && row.store.store_root == store_root)
+            .map(|row| row.store.store_id.clone())
+            .collect();
+        ids.sort();
+        ids.dedup();
+        Box::pin(async move { Ok(ids) })
+    }
+
+    fn maintenance_claim<'a>(
+        &'a self,
+        _holder: &'a str,
+        _stale_after: Duration,
+    ) -> BoxedFuture<'a, Result<Box<dyn extenddb_storage::MaintenanceClaim>, StorageError>> {
+        unused()
+    }
+
+    fn check_maintenance_claim(
+        &self,
+        stale_after: Duration,
+    ) -> BoxedFuture<'_, Result<bool, StorageError>> {
+        self.maintenance_checks.lock().unwrap().push(stale_after);
         let held = *self.maintenance_held.lock().unwrap();
         let error = self.maintenance_error.lock().unwrap().clone();
         Box::pin(async move {
@@ -666,13 +1088,22 @@ fn restore_body(extra: Value) -> Value {
 }
 
 async fn restore(fake: &Fake, body: Value) -> Result<Value, DynamoDbError> {
+    restore_on(fake, &runtime(), &body).await
+}
+
+/// `restore` on `runtime` rather than the tests' default one.
+async fn restore_on(
+    fake: &Fake,
+    runtime: &BackupRuntime,
+    body: &Value,
+) -> Result<Value, DynamoDbError> {
     restore_table_from_backup(
         fake,
-        &runtime(),
+        runtime,
         ACCOUNT,
         REGION,
         &LimitsConfig::default(),
-        &body,
+        body,
     )
     .await
     .map(|(_, v)| v)
@@ -3670,7 +4101,7 @@ fn fake_with_row(status: BackupStatus) -> Fake {
 }
 
 fn runtime_with_store() -> BackupRuntime {
-    runtime().with_store(store())
+    runtime_on(&Arc::new(MemStore::default()), store())
 }
 
 /// DescribeBackup answers from the catalog row when one exists, derived from
@@ -4255,7 +4686,13 @@ async fn restore_over_a_row_refuses_before_the_permit() {
         assert!(fake.restores().is_empty());
         err
     }
-    let configured = BackupRuntime::new(1).with_store(store());
+    let configured = BackupRuntime::new(1).with_store(ConfiguredStore::new(
+        store().store_kind,
+        store().store_root,
+        Arc::new(MemStore::default()) as Arc<dyn extenddb_backup_store::BackupStore>,
+        None,
+        Ok(store()),
+    ));
     let _held_configured = JobPermit::try_acquire(configured.slots()).unwrap();
     let none = BackupRuntime::new(1);
     let _held_none = JobPermit::try_acquire(none.slots()).unwrap();
@@ -4304,10 +4741,16 @@ async fn restore_over_a_row_refuses_before_the_permit() {
     assert!(msg.contains("store other than"), "{msg}");
     // A configured store that is not the row's: the row is of another store,
     // not of "the" store because one is configured.
-    let other = BackupRuntime::new(1).with_store(StoreIdentity {
-        store_id: "store-2".to_owned(),
-        ..store()
-    });
+    let other = BackupRuntime::new(1).with_store(ConfiguredStore::new(
+        store().store_kind,
+        store().store_root,
+        Arc::new(MemStore::default()) as Arc<dyn extenddb_backup_store::BackupStore>,
+        None,
+        Ok(StoreIdentity {
+            store_id: "store-2".to_owned(),
+            ..store()
+        }),
+    ));
     let _held_other = JobPermit::try_acquire(other.slots()).unwrap();
     let msg = validation_message(check(fake_with_row(BackupStatus::Available), &other).await);
     assert!(
@@ -4735,6 +5178,465 @@ async fn create_backup_under_a_region_outside_the_arn_alphabet_names_the_setting
     assert_eq!(fake.row_reads.lock().unwrap().len(), 1, "no further read");
 }
 
+/// While a maintenance command holds the catalog's claim, CreateBackup and
+/// RestoreTableFromBackup are refused with LimitExceeded naming the command,
+/// after every other check (a missing table is still TableNotFound) and
+/// before the permit (no slot is taken, and the backend is not asked); once
+/// the claim is gone both run.
+#[tokio::test]
+async fn jobs_are_refused_while_a_maintenance_claim_is_held() {
+    let fake = Fake::with_source(source(Some(definition("PROVISIONED"))));
+    *fake.maintenance_held.lock().unwrap() = true;
+    let runtime = BackupRuntime::new(1).with_stale_job_after(Duration::from_secs(7));
+    let err = create_backup(
+        &fake,
+        &runtime,
+        ACCOUNT,
+        REGION,
+        "Music",
+        "nightly",
+        Ok(active_table("Music")),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&err, DynamoDbError::LimitExceededException(m) if m.contains("backup purge")),
+        "{err:?}"
+    );
+    assert!(fake.creates.lock().unwrap().is_empty());
+    assert_eq!(runtime.free_slots(), 1, "no slot was taken");
+    let err = create_backup(
+        &fake,
+        &runtime,
+        ACCOUNT,
+        REGION,
+        "Music",
+        "nightly",
+        Err(StorageError::TableNotFound("Music".to_owned())),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::TableNotFoundException(_)),
+        "the table check comes first: {err:?}"
+    );
+
+    let err = restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, DynamoDbError::LimitExceededException(m) if m.contains("backup purge")),
+        "{err:?}"
+    );
+    assert!(fake.restores().is_empty(), "the backend was not asked");
+    assert_eq!(runtime.free_slots(), 1);
+    assert_eq!(
+        *fake.maintenance_checks.lock().unwrap(),
+        vec![Duration::from_secs(7); 2],
+        "the claim is read with stale_job_after_secs"
+    );
+
+    *fake.maintenance_held.lock().unwrap() = false;
+    create_backup(
+        &fake,
+        &runtime,
+        ACCOUNT,
+        REGION,
+        "Music",
+        "nightly",
+        Ok(active_table("Music")),
+    )
+    .await
+    .unwrap();
+    fake.permits.lock().unwrap().clear();
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    assert_eq!(fake.creates.lock().unwrap().len(), 1);
+    assert_eq!(fake.restores().len(), 1);
+
+    // Before the permit: with every slot held and the claim held, the
+    // refusal names the command, not the slot limit, so the check cannot
+    // have run after `take_permit`.
+    *fake.maintenance_held.lock().unwrap() = true;
+    let full = BackupRuntime::new(1).with_stale_job_after(Duration::from_secs(7));
+    let held_slot = full.take_permit().unwrap();
+    assert_eq!(full.free_slots(), 0, "every slot is held");
+    let err = create_backup(
+        &fake,
+        &full,
+        ACCOUNT,
+        REGION,
+        "Music",
+        "nightly",
+        Ok(active_table("Music")),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&err, DynamoDbError::LimitExceededException(m) if m.contains("backup purge")),
+        "the claim is checked before the permit: {err:?}"
+    );
+    let err = restore_on(&fake, &full, &restore_body(json!({})))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, DynamoDbError::LimitExceededException(m) if m.contains("backup purge")),
+        "the claim is checked before the permit: {err:?}"
+    );
+    drop(held_slot);
+}
+
+// --- purge: the wait and the row deletion (`maintenance`) ----------------------
+
+/// A maintenance claim handle for `HeldClaim`: heartbeats confirm until
+/// `lost` is set.
+#[derive(Default)]
+struct FakeHolder {
+    lost: Mutex<bool>,
+    released: Mutex<bool>,
+}
+
+impl extenddb_storage::MaintenanceClaim for FakeHolder {
+    fn generation(&self) -> u64 {
+        11
+    }
+    fn heartbeat(
+        &self,
+    ) -> BoxedFuture<'_, Result<extenddb_storage::backup_catalog::Heartbeat, StorageError>> {
+        let lost = *self.lost.lock().unwrap();
+        Box::pin(async move {
+            Ok(if lost {
+                extenddb_storage::backup_catalog::Heartbeat::Lost
+            } else {
+                extenddb_storage::backup_catalog::Heartbeat::Confirmed
+            })
+        })
+    }
+    fn release(&self) -> BoxedFuture<'_, Result<(), StorageError>> {
+        *self.released.lock().unwrap() = true;
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// A forwarding handle, so the test keeps its own reference to the holder.
+struct Forward(Arc<FakeHolder>);
+
+impl extenddb_storage::MaintenanceClaim for Forward {
+    fn generation(&self) -> u64 {
+        self.0.generation()
+    }
+    fn heartbeat(
+        &self,
+    ) -> BoxedFuture<'_, Result<extenddb_storage::backup_catalog::Heartbeat, StorageError>> {
+        self.0.heartbeat()
+    }
+    fn release(&self) -> BoxedFuture<'_, Result<(), StorageError>> {
+        self.0.release()
+    }
+}
+
+fn held(holder: &Arc<FakeHolder>) -> maintenance::HeldClaim {
+    maintenance::HeldClaim::start(
+        Box::new(Forward(Arc::clone(holder))),
+        Duration::from_secs(1),
+    )
+}
+
+fn seconds_since_epoch() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
+}
+
+/// A row of `store()` under ARN `arn` in `status`, with a manifest and a
+/// data file under its prefix in `mem`.
+fn seed(fake: &Fake, mem: &MemStore, arn: &str, status: BackupStatus) {
+    let prefix = BackupArn::parse(arn).unwrap().store_prefix();
+    mem.insert(&format!("{prefix}extenddb-manifest.json"), b"{}");
+    mem.insert(&format!("{prefix}data/00001.json.gz"), b"x");
+    fake.rows
+        .lock()
+        .unwrap()
+        .insert(arn.to_owned(), row(arn, status));
+}
+
+fn arn_n(n: u32) -> String {
+    format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/Music/backup/0179197643143{n}-0000000{n}")
+}
+
+/// The states a row can be in when purge reaches it after reading it
+/// AVAILABLE, a DeleteBackup having run meanwhile: still AVAILABLE; moved to
+/// DELETING (the other deleter mid-way); moved to DELETED (the other
+/// finished); gone (finished and its tombstone removed). Each ends with no
+/// row and no object, counted as deleted; a status that cannot follow
+/// AVAILABLE (FAILED) is the one case left for a look. A tombstone read
+/// and removed meanwhile (a second purge) counts as deleted too.
+#[tokio::test]
+async fn purge_finishes_a_row_another_deleter_moved_or_removed_meanwhile() {
+    let fake = Fake::default();
+    let mem = MemStore::default();
+    let arns: Vec<String> = (1..=6).map(arn_n).collect();
+    for arn in &arns[..5] {
+        seed(&fake, &mem, arn, BackupStatus::Available);
+    }
+    // A DELETED tombstone the command read, whose prefix is already empty.
+    fake.rows
+        .lock()
+        .unwrap()
+        .insert(arns[5].clone(), row(&arns[5], BackupStatus::Deleted));
+    // The command's read under the claim.
+    let read: Vec<BackupRow> = fake
+        .list_backup_rows(None, &store())
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(read.len(), 6);
+    // Between the read and the rows' turns, DeleteBackup moves rows 2 and 3
+    // and finishes 4 (its tombstone removed too); a writer moves 5 to
+    // FAILED, which no DeleteBackup does; the tombstone 6 is removed by a
+    // second purge.
+    {
+        let mut rows = fake.rows.lock().unwrap();
+        rows.get_mut(&arns[1]).unwrap().status = BackupStatus::Deleting;
+        rows.get_mut(&arns[2]).unwrap().status = BackupStatus::Deleted;
+        rows.remove(&arns[3]);
+        rows.get_mut(&arns[4]).unwrap().status = BackupStatus::Failed;
+        rows.remove(&arns[5]);
+    }
+    // The deleter that finished rows 3 and 4 deleted their objects.
+    for arn in [&arns[2], &arns[3]] {
+        let prefix = BackupArn::parse(arn).unwrap().store_prefix();
+        extenddb_backup_store::BackupStore::delete_prefix(&mem, &prefix)
+            .await
+            .unwrap();
+    }
+
+    let mut outcomes = Vec::new();
+    for row in &read {
+        outcomes.push(maintenance::purge_row(&fake, &mem, row, Duration::from_secs(300)).await);
+    }
+    assert_eq!(
+        outcomes[0],
+        Ok(()),
+        "still AVAILABLE: moved and deleted here"
+    );
+    assert_eq!(
+        outcomes[1],
+        Ok(()),
+        "moved to DELETING by another deleter: finished here"
+    );
+    assert_eq!(
+        outcomes[2],
+        Ok(()),
+        "moved to DELETED by another deleter: the tombstone removed here, counted as deleted"
+    );
+    assert_eq!(outcomes[3], Ok(()), "gone: counted as deleted");
+    assert_eq!(
+        outcomes[4],
+        Err("its status changed to FAILED".to_owned()),
+        "a status that cannot follow AVAILABLE is left"
+    );
+    assert_eq!(
+        outcomes[5],
+        Ok(()),
+        "a tombstone removed meanwhile: counted as deleted"
+    );
+    let left: Vec<String> = fake.rows.lock().unwrap().keys().cloned().collect();
+    assert_eq!(left, vec![arns[4].clone()], "no row of the five remains");
+    let failed_prefix = BackupArn::parse(&arns[4]).unwrap().store_prefix();
+    assert_eq!(
+        mem.keys(),
+        vec![
+            format!("{failed_prefix}data/00001.json.gz"),
+            format!("{failed_prefix}extenddb-manifest.json"),
+        ],
+        "only the left row's objects remain"
+    );
+    // The row moved to DELETED was never moved by purge (DELETING to
+    // DELETED is the other deleter's write); the one left DELETING and the
+    // one still AVAILABLE were finished by purge; the three tombstones were
+    // removed here.
+    assert_eq!(
+        *fake.set_deleted.lock().unwrap(),
+        vec![arns[0].clone(), arns[1].clone()]
+    );
+    assert_eq!(
+        *fake.removed_rows.lock().unwrap(),
+        vec![arns[0].clone(), arns[1].clone(), arns[2].clone()]
+    );
+}
+
+/// A CREATING row with a dead owner goes through the dead-owner removal and
+/// then its prefix; one whose heartbeat is young is left with its objects
+/// under the live window, and removed under the zero window SQLite uses.
+#[tokio::test]
+async fn purge_removes_a_dead_creating_row_and_leaves_a_live_one() {
+    let fake = Fake::default();
+    let mem = MemStore::default();
+    let dead = arn_n(1);
+    let live = arn_n(2);
+    seed(&fake, &mem, &dead, BackupStatus::Creating);
+    seed(&fake, &mem, &live, BackupStatus::Creating);
+    fake.rows
+        .lock()
+        .unwrap()
+        .get_mut(&live)
+        .unwrap()
+        .heartbeat_at = seconds_since_epoch();
+    let window = Duration::from_secs(300);
+    let dead_row = fake.rows.lock().unwrap()[&dead].clone();
+    let live_row = fake.rows.lock().unwrap()[&live].clone();
+    assert_eq!(
+        maintenance::purge_row(&fake, &mem, &dead_row, window).await,
+        Ok(())
+    );
+    let err = maintenance::purge_row(&fake, &mem, &live_row, window)
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("the CREATING row could not be removed"),
+        "{err}"
+    );
+    let left: Vec<String> = fake.rows.lock().unwrap().keys().cloned().collect();
+    assert_eq!(left, vec![live.clone()]);
+    assert_eq!(mem.keys().len(), 2, "the live row's objects stay");
+    // A heartbeat written a moment ago is older than a zero window once a
+    // moment has passed.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(
+        maintenance::purge_row(&fake, &mem, &live_row, Duration::ZERO).await,
+        Ok(())
+    );
+    assert!(fake.rows.lock().unwrap().is_empty());
+    assert!(mem.keys().is_empty());
+}
+
+/// The wait's five outcomes are told apart: quiet, also with a FAILED
+/// restore record whose target is still CREATING (the reconciler's duty,
+/// not a running job) and a FAILED backup row whose owner is dead; busy at
+/// the limit, with the jobs named (a CREATING row and a FAILED row with a
+/// live heartbeat, a RUNNING restore) and announced once; a signal, during
+/// a sleep and before the first read; the catalog unreadable; the claim
+/// lost.
+#[tokio::test(start_paused = true)]
+async fn the_wait_reports_each_outcome_as_itself() {
+    use extenddb_storage::backup_catalog::{JobStatus, RestoreKind};
+    use maintenance::{Interrupt, Wait, WaitOutcome, wait_for_quiet};
+    let fake = Fake::default();
+    let holder = Arc::new(FakeHolder::default());
+    let claim = held(&holder);
+    let limit = Duration::from_secs(20);
+    let wait = Wait {
+        owner_window: Duration::from_secs(10),
+        limit,
+        poll: Duration::from_secs(2),
+    };
+    let announced: Mutex<Vec<Vec<String>>> = Mutex::new(Vec::new());
+    let announce = |jobs: &[String]| announced.lock().unwrap().push(jobs.to_vec());
+
+    let (_tx, mut quiet) = Interrupt::new();
+    assert_eq!(
+        wait_for_quiet(&fake, &store(), &claim, wait, &mut quiet, announce).await,
+        WaitOutcome::Quiet
+    );
+    // A FAILED record whose target is still CREATING is listed by the
+    // zero-window dead-job listing with the RUNNING ones; it is the
+    // reconciler's to finish and no job runs under it. A FAILED backup row
+    // whose heartbeat is older than the window has a dead owner.
+    let mut failed_record = dead_job(RestoreKind::Legacy, "FailedTarget");
+    failed_record.status = JobStatus::Failed;
+    fake.dead_jobs.lock().unwrap().push(failed_record);
+    fake.rows
+        .lock()
+        .unwrap()
+        .insert(arn_n(3), row(&arn_n(3), BackupStatus::Failed));
+    let started = tokio::time::Instant::now();
+    assert_eq!(
+        wait_for_quiet(&fake, &store(), &claim, wait, &mut quiet, announce).await,
+        WaitOutcome::Quiet,
+        "a FAILED restore record and a FAILED row with a dead owner are not waited on"
+    );
+    assert_eq!(started.elapsed(), Duration::ZERO, "quiet at the first read");
+    assert!(announced.lock().unwrap().is_empty());
+
+    // Busy: a CREATING row and a FAILED row whose heartbeats are young, and
+    // a RUNNING restore.
+    for (n, status) in [(1, BackupStatus::Creating), (2, BackupStatus::Failed)] {
+        fake.rows.lock().unwrap().insert(arn_n(n), {
+            let mut r = row(&arn_n(n), status);
+            r.heartbeat_at = seconds_since_epoch();
+            r
+        });
+    }
+    fake.dead_jobs
+        .lock()
+        .unwrap()
+        .push(dead_job(RestoreKind::Legacy, "Target"));
+    let started = tokio::time::Instant::now();
+    let busy = wait_for_quiet(&fake, &store(), &claim, wait, &mut quiet, announce).await;
+    let expected = vec![
+        format!(
+            "CreateBackup {} has a live owner (heartbeat within stale_job_after_secs)",
+            arn_n(1)
+        ),
+        format!(
+            "the FAILED backup {} has a live owner (heartbeat within stale_job_after_secs)",
+            arn_n(2)
+        ),
+        format!("a restore into Target (account {ACCOUNT}) is RUNNING"),
+    ];
+    assert_eq!(busy, WaitOutcome::Busy(expected.clone()));
+    assert!(started.elapsed() >= limit, "{:?}", started.elapsed());
+    assert_eq!(*announced.lock().unwrap(), vec![expected]);
+
+    // A signal during a sleep ends the wait before the limit.
+    let (tx, mut interrupted) = Interrupt::new();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let _ = tx.send(Some("SIGTERM"));
+    });
+    let started = tokio::time::Instant::now();
+    assert_eq!(
+        wait_for_quiet(&fake, &store(), &claim, wait, &mut interrupted, announce).await,
+        WaitOutcome::Interrupted("SIGTERM")
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(3_500),
+        "the signal ends the sleep, not the next poll: {:?}",
+        started.elapsed()
+    );
+    // One already received ends it before the first read.
+    assert_eq!(interrupted.signalled(), Some("SIGTERM"));
+    assert_eq!(
+        wait_for_quiet(&fake, &store(), &claim, wait, &mut interrupted, announce).await,
+        WaitOutcome::Interrupted("SIGTERM")
+    );
+
+    // The catalog unreadable.
+    *fake.list_error.lock().unwrap() = Some("pool exhausted".to_owned());
+    assert_eq!(
+        wait_for_quiet(&fake, &store(), &claim, wait, &mut quiet, announce).await,
+        WaitOutcome::CatalogError(
+            "cannot list the catalog's backup rows: Internal error: pool exhausted".to_owned()
+        )
+    );
+    *fake.list_error.lock().unwrap() = None;
+
+    // The claim lost: the next heartbeat records it, and the wait stops.
+    *holder.lost.lock().unwrap() = true;
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert_eq!(
+        wait_for_quiet(&fake, &store(), &claim, wait, &mut quiet, announce).await,
+        WaitOutcome::Lost(
+            "the maintenance claim was lost (another holder took it over)".to_owned()
+        )
+    );
+    claim.release().await.unwrap();
+    assert!(*holder.released.lock().unwrap());
+}
+
 // --- the reconciler -------------------------------------------------------------
 
 fn dead_job(kind: extenddb_storage::backup_catalog::RestoreKind, name: &str) -> RestoreJobRow {
@@ -4779,7 +5681,9 @@ async fn the_reconciler_fails_dead_legacy_restores_and_removes_abandoned_backups
 
     let report = reconciler::cycle(
         &fake,
+        &runtime(),
         Duration::from_secs(300),
+        "test",
         &mut reconciler::ReconcilerState::default(),
     )
     .await
@@ -4816,7 +5720,9 @@ async fn the_reconciler_leaves_a_target_whose_record_moved() {
         .push(dead_job(RestoreKind::Legacy, "LegacyTarget"));
     let report = reconciler::cycle(
         &fake,
+        &runtime(),
         Duration::from_secs(300),
+        "test",
         &mut reconciler::ReconcilerState::default(),
     )
     .await
@@ -4848,7 +5754,9 @@ async fn the_reconciler_leaves_a_target_that_is_no_longer_creating_after_the_fai
         .extend([dead.clone(), failed.clone()]);
     let report = reconciler::cycle(
         &fake,
+        &runtime(),
         Duration::from_secs(300),
+        "test",
         &mut reconciler::ReconcilerState::default(),
     )
     .await
@@ -4873,11 +5781,16 @@ async fn the_reconciler_leaves_a_target_that_is_no_longer_creating_after_the_fai
 }
 
 /// The maintenance claim is checked first and reported; the duties that
-/// resolve dead owners still run while it is held.
+/// resolve dead owners and the DELETING rows of the configured store still
+/// run while it is held (the command waits on the first and finishes the
+/// second itself, so neither races it).
 #[tokio::test]
 async fn the_reconciler_reports_a_held_maintenance_claim_and_still_resolves_dead_owners() {
     use extenddb_storage::backup_catalog::RestoreKind;
-    let fake = Fake::default();
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    mem.insert(&manifest_key(&arn(ACCOUNT)), b"{}");
+    let fake = fake_with_rows(&[(arn(ACCOUNT), BackupStatus::Deleting)]);
     *fake.maintenance_held.lock().unwrap() = true;
     *fake.target_still_creating.lock().unwrap() = true;
     *fake.record_still_running.lock().unwrap() = true;
@@ -4887,13 +5800,25 @@ async fn the_reconciler_reports_a_held_maintenance_claim_and_still_resolves_dead
         .push(dead_job(RestoreKind::Legacy, "LegacyTarget"));
     let report = reconciler::cycle(
         &fake,
+        &runtime_on(&mem, store()),
         Duration::from_secs(300),
+        "test",
         &mut reconciler::ReconcilerState::default(),
     )
     .await
     .unwrap();
     assert!(report.maintenance_held);
     assert_eq!(report.legacy_restores_removed, ["LegacyTarget"]);
+    assert_eq!(
+        report.deletions_finished,
+        [arn(ACCOUNT)],
+        "a DELETING row is finished while the claim is held"
+    );
+    assert_eq!(
+        fake.rows.lock().unwrap()[&arn(ACCOUNT)].status,
+        BackupStatus::Deleted
+    );
+    assert_eq!(mem.keys(), [STORE_IDENTITY_KEY]);
 }
 
 /// The worker runs a cycle at once (observed through the maintenance check,
@@ -4908,15 +5833,17 @@ async fn the_reconciler_worker_runs_at_startup_and_stops_on_shutdown() {
     let shutdown = extenddb_storage::CancellationToken::new();
     let worker = tokio::spawn(reconciler::run(
         Arc::clone(&fake),
+        Arc::new(runtime()),
         reconciler::ReconcilerSettings {
             interval: Duration::from_secs(3600),
             stale_job_after: Duration::from_secs(300),
         },
+        "test".to_owned(),
         Arc::clone(&metrics),
         shutdown.clone(),
     ));
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while *fake.maintenance_checks.lock().unwrap() == 0 {
+    while fake.maintenance_checks.lock().unwrap().is_empty() {
         assert!(
             tokio::time::Instant::now() < deadline,
             "the first cycle did not run"
@@ -4924,7 +5851,7 @@ async fn the_reconciler_worker_runs_at_startup_and_stops_on_shutdown() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     assert_eq!(
-        *fake.maintenance_checks.lock().unwrap(),
+        fake.maintenance_checks.lock().unwrap().len(),
         1,
         "one cycle before the first interval"
     );
@@ -4933,7 +5860,7 @@ async fn the_reconciler_worker_runs_at_startup_and_stops_on_shutdown() {
         .await
         .expect("the worker stops at shutdown")
         .unwrap();
-    assert_eq!(*fake.maintenance_checks.lock().unwrap(), 1);
+    assert_eq!(fake.maintenance_checks.lock().unwrap().len(), 1);
     let recorded: Vec<MetricName> = metrics
         .drain(Duration::ZERO)
         .into_iter()
@@ -4959,15 +5886,17 @@ async fn a_failed_reconciler_cycle_records_a_worker_error() {
     let shutdown = extenddb_storage::CancellationToken::new();
     let worker = tokio::spawn(reconciler::run(
         Arc::clone(&fake),
+        Arc::new(runtime()),
         reconciler::ReconcilerSettings {
             interval: Duration::from_millis(5),
             stale_job_after: Duration::from_secs(300),
         },
+        "test".to_owned(),
         Arc::clone(&metrics),
         shutdown.clone(),
     ));
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while *fake.maintenance_checks.lock().unwrap() < 2 {
+    while fake.maintenance_checks.lock().unwrap().len() < 2 {
         assert!(
             tokio::time::Instant::now() < deadline,
             "the worker did not go on after a failed cycle"
@@ -5008,7 +5937,9 @@ async fn the_reconciler_removes_the_target_of_a_failed_record_without_writing_fa
         .extend([failed.clone(), failed_manifest.clone()]);
     let report = reconciler::cycle(
         &fake,
+        &runtime(),
         Duration::from_secs(300),
+        "test",
         &mut reconciler::ReconcilerState::default(),
     )
     .await
@@ -5040,14 +5971,26 @@ async fn a_dead_manifest_record_is_logged_once_per_record() {
         .unwrap()
         .push(dead_job(RestoreKind::Manifest, "ManifestTarget"));
     let mut state = reconciler::ReconcilerState::default();
-    let first = reconciler::cycle(&fake, Duration::from_secs(300), &mut state)
-        .await
-        .unwrap();
+    let first = reconciler::cycle(
+        &fake,
+        &runtime(),
+        Duration::from_secs(300),
+        "test",
+        &mut state,
+    )
+    .await
+    .unwrap();
     assert_eq!(first.manifest_restores_seen, ["ManifestTarget"]);
     assert_eq!(first.manifest_restores_logged, ["ManifestTarget"]);
-    let second = reconciler::cycle(&fake, Duration::from_secs(300), &mut state)
-        .await
-        .unwrap();
+    let second = reconciler::cycle(
+        &fake,
+        &runtime(),
+        Duration::from_secs(300),
+        "test",
+        &mut state,
+    )
+    .await
+    .unwrap();
     assert_eq!(second.manifest_restores_seen, ["ManifestTarget"]);
     assert!(
         second.manifest_restores_logged.is_empty(),
@@ -5057,13 +6000,1282 @@ async fn a_dead_manifest_record_is_logged_once_per_record() {
         .lock()
         .unwrap()
         .push(dead_job(RestoreKind::Manifest, "Another"));
-    let third = reconciler::cycle(&fake, Duration::from_secs(300), &mut state)
-        .await
-        .unwrap();
+    let third = reconciler::cycle(
+        &fake,
+        &runtime(),
+        Duration::from_secs(300),
+        "test",
+        &mut state,
+    )
+    .await
+    .unwrap();
     assert_eq!(third.manifest_restores_logged, ["Another"]);
     assert!(
         fake.failed_jobs.lock().unwrap().is_empty()
             && fake.removed_targets.lock().unwrap().is_empty(),
         "a manifest record is never acted on by this release"
+    );
+}
+
+// --- the store identity file and the store's health ---------------------------
+
+const MANIFEST_KEY_SUFFIX: &str = "extenddb-manifest.json";
+
+/// The manifest key of `arn`'s prefix.
+fn manifest_key(arn: &str) -> String {
+    format!(
+        "{}{MANIFEST_KEY_SUFFIX}",
+        BackupArn::parse(arn).unwrap().store_prefix()
+    )
+}
+
+/// An ACTIVE table description, the probe CreateBackup's handler ran.
+fn active_table(name: &str) -> TableDescription {
+    TableDescription {
+        table_name: name.to_owned(),
+        table_status: TableStatus::Active,
+        ..Default::default()
+    }
+}
+
+/// A second, newer backup of the `Music` table.
+fn newer_arn(account: &str) -> String {
+    format!("arn:aws:dynamodb:{REGION}:{account}:table/Music/backup/01791976999999-0badf00d")
+}
+
+fn fake_with_rows(rows: &[(String, BackupStatus)]) -> Fake {
+    let fake = Fake::default();
+    for (arn, status) in rows {
+        fake.rows
+            .lock()
+            .unwrap()
+            .insert(arn.clone(), row(arn, *status));
+    }
+    fake
+}
+
+/// An empty root and a catalog with no rows for it: startup creates the file
+/// with this catalog's id and a fresh store id, re-reads it and uses that id.
+#[tokio::test]
+async fn establish_creates_the_identity_file_on_an_empty_root() {
+    let mem = MemStore::default();
+    let fake = Fake::default();
+    let identity = store_identity::establish(&mem, StoreKind::Filesystem, "/r", &fake, "test")
+        .await
+        .unwrap();
+    assert_eq!(identity.store_kind, StoreKind::Filesystem);
+    assert_eq!(identity.store_root, "/r");
+    assert_eq!(mem.keys(), [STORE_IDENTITY_KEY]);
+    let file = StoreIdentityFile::parse(&mem.objects.lock().unwrap()[STORE_IDENTITY_KEY]).unwrap();
+    assert_eq!(file.store_id, identity.store_id);
+    assert_eq!(file.catalog_id, "catalog-1");
+    assert_eq!(file.backend, "test");
+    assert_eq!(mem.puts.lock().unwrap().as_slice(), [STORE_IDENTITY_KEY]);
+    // A second startup against the same root reads the file and uses its id.
+    let again = store_identity::establish(&mem, StoreKind::Filesystem, "/r", &fake, "test")
+        .await
+        .unwrap();
+    assert_eq!(again, identity);
+    assert_eq!(
+        mem.puts.lock().unwrap().len(),
+        1,
+        "the file is not rewritten"
+    );
+}
+
+/// Two instances of one catalog starting against one empty root: one creates
+/// the file, the other finds it present, and both use the winner's id.
+#[tokio::test]
+async fn two_instances_on_one_empty_root_end_with_one_id() {
+    let mem = Arc::new(MemStore::default());
+    let fakes = [Fake::default(), Fake::default()];
+    let (a, b) = tokio::join!(
+        store_identity::establish(&*mem, StoreKind::S3, "s3://b/", &fakes[0], "test"),
+        store_identity::establish(&*mem, StoreKind::S3, "s3://b/", &fakes[1], "test"),
+    );
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert_eq!(a, b);
+    assert_eq!(mem.keys(), [STORE_IDENTITY_KEY]);
+    assert_eq!(
+        mem.puts.lock().unwrap().len(),
+        1,
+        "one create stored its file"
+    );
+}
+
+/// A root whose file names another catalog is unhealthy, and stays so until
+/// the file is restored; the problem names both catalogs and no root.
+#[tokio::test]
+async fn a_file_naming_another_catalog_is_unhealthy_until_restored() {
+    let mem = MemStore::default();
+    mem.insert(
+        STORE_IDENTITY_KEY,
+        &identity_file("store-1", "another-catalog"),
+    );
+    let fake = fake_with_row(BackupStatus::Available);
+    let err = store_identity::establish(&mem, StoreKind::Filesystem, "/r", &fake, "test")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        StoreProblem::ForeignCatalog {
+            file_catalog_id: "another-catalog".to_owned(),
+            catalog_id: "catalog-1".to_owned(),
+        }
+    );
+    assert_eq!(err.category(), "owned by another catalog");
+    assert!(!err.public_reason().contains("/r"));
+    // Restored: the check passes.
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    mem.insert(&manifest_key(&arn(ACCOUNT)), b"{}");
+    let identity = store_identity::recheck(&mem, &store(), &fake, "test").await;
+    assert_eq!(identity, Ok(()));
+}
+
+/// Something that is not an object at the identity file's key (a FIFO, a
+/// socket): the create finds the key taken and the read finds no object, so
+/// nothing was created and nothing can be read, and the problem says so
+/// rather than claiming a file was created.
+#[tokio::test]
+async fn a_non_object_at_the_identity_key_is_neither_readable_nor_creatable() {
+    let mem = MemStore::default();
+    mem.key_taken_by_a_non_object
+        .store(true, std::sync::atomic::Ordering::Release);
+    let fake = Fake::default();
+    let err = store_identity::establish(&mem, StoreKind::Filesystem, "/r", &fake, "test")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        StoreProblem::Transport("extenddb-store.json is neither readable nor creatable".to_owned())
+    );
+    assert!(mem.keys().is_empty(), "nothing was created");
+}
+
+/// The rows for the root carry an id the file does not, or more than one id,
+/// or the root has no file while rows exist: each is unhealthy.
+#[tokio::test]
+async fn ids_that_disagree_or_a_missing_file_with_rows_are_unhealthy() {
+    // The file holds another id than the rows.
+    let mem = MemStore::default();
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-2", "catalog-1"));
+    let fake = fake_with_row(BackupStatus::Available);
+    let err = store_identity::establish(
+        &mem,
+        StoreKind::Filesystem,
+        store().store_root.as_str(),
+        &fake,
+        "test",
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err,
+        StoreProblem::IdMismatch {
+            file_id: "store-2".to_owned(),
+            row_ids: vec!["store-1".to_owned()],
+        }
+    );
+    assert_eq!(err.category(), "identity mismatch");
+
+    // No file, rows exist.
+    let mem = MemStore::default();
+    let err = store_identity::establish(
+        &mem,
+        StoreKind::Filesystem,
+        store().store_root.as_str(),
+        &fake,
+        "test",
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err,
+        StoreProblem::FileMissingWithRows(vec!["store-1".to_owned()])
+    );
+    assert!(mem.keys().is_empty(), "nothing is created over rows");
+    // The file put back: healthy.
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    mem.insert(&manifest_key(&arn(ACCOUNT)), b"{}");
+    store_identity::establish(
+        &mem,
+        StoreKind::Filesystem,
+        store().store_root.as_str(),
+        &fake,
+        "test",
+    )
+    .await
+    .unwrap();
+
+    // Rows carrying two ids.
+    let fake = fake_with_row(BackupStatus::Available);
+    let mut other = row(&newer_arn(ACCOUNT), BackupStatus::Available);
+    other.store.store_id = "store-9".to_owned();
+    fake.rows.lock().unwrap().insert(newer_arn(ACCOUNT), other);
+    let err = store_identity::establish(
+        &mem,
+        StoreKind::Filesystem,
+        store().store_root.as_str(),
+        &fake,
+        "test",
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err,
+        StoreProblem::MultipleRowIds(vec!["store-1".to_owned(), "store-9".to_owned()])
+    );
+}
+
+/// The manifest probe: the newest AVAILABLE row's manifest must be under the
+/// root. A second instance with a host-local root at the same path and the
+/// first's file copied to it has the file and none of the objects, which is
+/// what the probe catches; a root with no AVAILABLE row is not probed.
+#[tokio::test]
+async fn the_manifest_probe_reads_the_newest_available_rows_manifest() {
+    let mem = MemStore::default();
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = fake_with_rows(&[
+        (arn(ACCOUNT), BackupStatus::Available),
+        (newer_arn(ACCOUNT), BackupStatus::Available),
+        (
+            music_arn(ACCOUNT, "01791976999999-0bad0bad"),
+            BackupStatus::Creating,
+        ),
+    ]);
+    // Only the older manifest is there: the newest is probed and missing.
+    mem.insert(&manifest_key(&arn(ACCOUNT)), b"{}");
+    let err = store_identity::establish(
+        &mem,
+        StoreKind::Filesystem,
+        &store().store_root,
+        &fake,
+        "test",
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err,
+        StoreProblem::ManifestMissing {
+            backup_arn: newer_arn(ACCOUNT),
+        }
+    );
+    assert_eq!(err.category(), "manifest probe failed");
+    mem.insert(&manifest_key(&newer_arn(ACCOUNT)), b"{}");
+    store_identity::establish(
+        &mem,
+        StoreKind::Filesystem,
+        &store().store_root,
+        &fake,
+        "test",
+    )
+    .await
+    .unwrap();
+    // The CREATING row's manifest is not probed: it has none yet.
+    // A root with rows but none AVAILABLE is not probed either.
+    let fake = fake_with_rows(&[(arn(ACCOUNT), BackupStatus::Creating)]);
+    let empty = MemStore::default();
+    empty.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    store_identity::establish(
+        &empty,
+        StoreKind::Filesystem,
+        &store().store_root,
+        &fake,
+        "test",
+    )
+    .await
+    .unwrap();
+}
+
+/// A store that ignores the conditional put makes the create a plain put: a
+/// race lost before the re-read leaves another id in the file, which the
+/// re-read catches, naming both ids.
+#[tokio::test]
+async fn a_create_race_lost_on_a_store_ignoring_the_condition_is_caught_by_the_re_read() {
+    let mem = MemStore::default();
+    *mem.overwrite_after_conditional_put.lock().unwrap() =
+        Some(identity_file("the-other-instance", "catalog-1"));
+    let fake = Fake::default();
+    let err = store_identity::establish(&mem, StoreKind::S3, "s3://b/", &fake, "test")
+        .await
+        .unwrap_err();
+    match err {
+        StoreProblem::CreateRaceLost { ours, file } => {
+            assert_eq!(file, "the-other-instance");
+            assert_ne!(ours, file);
+            let reason = StoreProblem::CreateRaceLost {
+                ours: ours.clone(),
+                file: file.clone(),
+            }
+            .public_reason();
+            assert!(reason.contains(&ours) && reason.contains(&file), "{reason}");
+        }
+        other => panic!("expected CreateRaceLost, got {other:?}"),
+    }
+}
+
+/// An unreachable store is unhealthy with the store's error in the log line
+/// and not in the `/health` text; the check that runs again (the
+/// reconciler's) recovers it once the store answers.
+#[tokio::test]
+async fn an_unreachable_store_is_unhealthy_and_recovers_on_recheck() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    mem.set_down(true);
+    let fake = Fake::default();
+    let err = store_identity::establish(
+        &*mem,
+        StoreKind::Filesystem,
+        &store().store_root,
+        &fake,
+        "test",
+    )
+    .await
+    .unwrap_err();
+    // The operator's line carries the whole cause chain: the top link names
+    // the class ("dispatch failure"), the cause is the link below it.
+    assert!(
+        matches!(&err, StoreProblem::Transport(m)
+            if m.contains("dispatch failure") && m.contains("connection refused")),
+        "{err:?}"
+    );
+    assert_eq!(err.public_reason(), "the store could not be reached");
+    assert!(err.to_string().contains("connection refused"));
+
+    let runtime = runtime_unhealthy(&mem, err);
+    assert_eq!(
+        runtime.configured_store().unwrap().identity(),
+        None,
+        "the id is unknown until a check passes"
+    );
+    let report = runtime.store_health().unwrap();
+    assert_eq!(report.kind, "filesystem");
+    assert_eq!(report.status, "unhealthy");
+    assert_eq!(report.reason, Some("unreachable"));
+
+    // Still down: the cycle leaves it unhealthy.
+    let report = reconciler::cycle(
+        &fake,
+        &runtime,
+        Duration::from_secs(300),
+        "test",
+        &mut reconciler::ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.store_healthy, Some(false));
+    // Up again: the cycle's recheck passes and the component recovers.
+    mem.set_down(false);
+    let report = reconciler::cycle(
+        &fake,
+        &runtime,
+        Duration::from_secs(300),
+        "test",
+        &mut reconciler::ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.store_healthy, Some(true));
+    assert_eq!(runtime.store_health().unwrap().status, "healthy");
+    assert_eq!(runtime.store_health().unwrap().reason, None);
+    assert_eq!(
+        runtime.configured_store().unwrap().identity(),
+        Some(store()),
+        "the check that passed settled the id from the file"
+    );
+    // And back to unhealthy when it goes away again.
+    mem.set_down(true);
+    let report = reconciler::cycle(
+        &fake,
+        &runtime,
+        Duration::from_secs(300),
+        "test",
+        &mut reconciler::ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.store_healthy, Some(false));
+}
+
+/// A store that has stopped answering costs a cycle its check bound and
+/// nothing more: the dead-owner duties ran before the check, the check is
+/// abandoned at `check_timeout` (5 s for a filesystem root) and recorded as
+/// a transport failure naming the bound, the cycle returns, and the next
+/// cycle on a store that answers again recovers it.
+#[tokio::test(start_paused = true)]
+async fn a_stalled_store_check_is_abandoned_at_its_bound() {
+    use extenddb_storage::backup_catalog::RestoreKind;
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    mem.set_stalled(true);
+    let runtime = runtime_on(&mem, store());
+    let configured = runtime.configured_store().unwrap();
+    assert_eq!(configured.check_timeout(), LOCAL_CHECK_TIMEOUT);
+    let fake = Fake::default();
+    *fake.record_still_running.lock().unwrap() = true;
+    *fake.target_still_creating.lock().unwrap() = true;
+    fake.dead_jobs
+        .lock()
+        .unwrap()
+        .push(dead_job(RestoreKind::Legacy, "LegacyTarget"));
+
+    let started = tokio::time::Instant::now();
+    // The test's own bound, far past the check's: a cycle that waits on the
+    // store for longer than it fails here instead of hanging.
+    let report = tokio::time::timeout(
+        Duration::from_secs(120),
+        reconciler::cycle(
+            &fake,
+            &runtime,
+            Duration::from_secs(300),
+            "test",
+            &mut reconciler::ReconcilerState::default(),
+        ),
+    )
+    .await
+    .expect("the cycle returns within the check's bound")
+    .unwrap();
+    assert_eq!(
+        started.elapsed(),
+        LOCAL_CHECK_TIMEOUT,
+        "the check's bound is the whole cost"
+    );
+    assert_eq!(
+        report.legacy_restores_removed,
+        ["LegacyTarget"],
+        "the duties ran"
+    );
+    assert_eq!(report.store_healthy, Some(false));
+    assert_eq!(
+        configured.health(),
+        StoreHealth::Unhealthy(StoreProblem::Transport(
+            "the check did not finish within 5 s".to_owned()
+        ))
+    );
+    assert_eq!(runtime.store_health().unwrap().reason, Some("unreachable"));
+    assert_eq!(mem.stalls.load(std::sync::atomic::Ordering::Acquire), 1);
+    // The abandoned check's call is still in the store (on a filesystem
+    // root, a thread parked on the mount). A cycle during the stall starts
+    // no second check: it returns at once, the store stays `unreachable`
+    // with the reason, and the store sees no second call.
+    assert!(configured.check_call_in_flight());
+    let started = tokio::time::Instant::now();
+    let report = reconciler::cycle(
+        &fake,
+        &runtime,
+        Duration::from_secs(300),
+        "test",
+        &mut reconciler::ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        started.elapsed(),
+        Duration::ZERO,
+        "a cycle that starts no check waits no bound"
+    );
+    assert_eq!(report.store_healthy, Some(false));
+    assert_eq!(
+        configured.health(),
+        StoreHealth::Unhealthy(StoreProblem::Transport(
+            "a call of an earlier check has not returned".to_owned()
+        ))
+    );
+    assert_eq!(
+        mem.stalls.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "no second call reached the store while the first was in flight"
+    );
+    // Checking stores wait the same bound: an S3 store's is 30 s, under the
+    // SDK's attempt timeout so no retry outlives the check.
+    let s3 = ConfiguredStore::checking(
+        StoreKind::S3,
+        "s3://b/".to_owned(),
+        Arc::clone(&mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+        None,
+    );
+    assert_eq!(s3.check_timeout(), S3_CHECK_TIMEOUT);
+    assert_eq!(S3_CHECK_TIMEOUT, Duration::from_secs(30));
+    assert!(S3_CHECK_TIMEOUT < extenddb_backup_store::S3_ATTEMPT_TIMEOUT);
+    // An S3 store's abandoned request is dropped with the check (the SDK
+    // would otherwise retry it past the bound), so nothing is in flight
+    // afterwards and the next cycle sends a fresh request.
+    let s3_runtime = BackupRuntime::new(4).with_store(s3);
+    let s3 = s3_runtime.configured_store().unwrap();
+    let calls_before = mem.stalls.load(std::sync::atomic::Ordering::Acquire);
+    for _ in 0..2 {
+        let started = tokio::time::Instant::now();
+        reconciler::cycle(
+            &fake,
+            &s3_runtime,
+            Duration::from_secs(300),
+            "test",
+            &mut reconciler::ReconcilerState::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(started.elapsed(), S3_CHECK_TIMEOUT);
+        assert!(
+            !s3.check_call_in_flight(),
+            "an S3 request ends with the check"
+        );
+    }
+    assert_eq!(
+        mem.stalls.load(std::sync::atomic::Ordering::Acquire),
+        calls_before + 2,
+        "each cycle's check reached the endpoint"
+    );
+
+    // The store answers again: the parked call returns (its task clears the
+    // in-flight mark), and the next cycle's check passes.
+    mem.set_stalled(false);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        !configured.check_call_in_flight(),
+        "the parked call returned once the store answered"
+    );
+    let report = reconciler::cycle(
+        &fake,
+        &runtime,
+        Duration::from_secs(300),
+        "test",
+        &mut reconciler::ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.store_healthy, Some(true));
+    assert!(configured.is_healthy());
+}
+
+/// A shutdown that fires while a cycle waits on the store's check ends the
+/// cycle at once (the health is left as it was), so the worker drains
+/// without waiting the check's bound.
+#[tokio::test(start_paused = true)]
+async fn a_shutdown_during_the_store_check_ends_the_cycle() {
+    use extenddb_core::metrics::MetricsCollector;
+    let mem = Arc::new(MemStore::default());
+    mem.set_stalled(true);
+    // An S3 store, whose bound (30 s) is the longer one.
+    let runtime = Arc::new(runtime().with_store(ConfiguredStore::checking(
+        StoreKind::S3,
+        "s3://b/".to_owned(),
+        Arc::clone(&mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+        None,
+    )));
+    let fake = Arc::new(Fake::default());
+    let shutdown = extenddb_storage::CancellationToken::new();
+    let worker = tokio::spawn(reconciler::run(
+        Arc::clone(&fake),
+        Arc::clone(&runtime),
+        reconciler::ReconcilerSettings {
+            interval: Duration::from_secs(3600),
+            stale_job_after: Duration::from_secs(300),
+        },
+        "test".to_owned(),
+        Arc::new(MetricsCollector::new()),
+        shutdown.clone(),
+    ));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while mem.stalls.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the first cycle's check reached the store"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let cancelled = tokio::time::Instant::now();
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .expect("the worker stops at shutdown without waiting the check's bound")
+        .unwrap();
+    assert!(
+        cancelled.elapsed() < Duration::from_secs(1),
+        "the drain took {:?}",
+        cancelled.elapsed()
+    );
+    assert_eq!(
+        runtime.configured_store().unwrap().health(),
+        StoreHealth::Checking,
+        "a check shutdown ended records nothing"
+    );
+}
+
+/// A command's identity read (`backup list`, the purge's dry run) runs under
+/// the store's check bound as the server's check does: a store that does not
+/// answer costs the command the bound (5 s for a filesystem root) and
+/// reports it, where the unbounded read would wait out the store's retries
+/// or, on a stalled mount, never return; a store that answers is read.
+#[tokio::test(start_paused = true)]
+async fn a_commands_identity_read_is_bounded_as_the_check_is() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Fake::default();
+    let configured = ConfiguredStore::checking(
+        StoreKind::Filesystem,
+        store().store_root,
+        Arc::clone(&mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+        None,
+    );
+    let read = runtime::read_identity_bounded(&configured, &fake)
+        .await
+        .unwrap();
+    assert_eq!(read.map(|i| i.store_id), Some("store-1".to_owned()));
+
+    mem.set_stalled(true);
+    let started = tokio::time::Instant::now();
+    // The test's own bound, far past the read's: an unbounded read fails
+    // here instead of hanging.
+    let problem = tokio::time::timeout(
+        Duration::from_secs(120),
+        runtime::read_identity_bounded(&configured, &fake),
+    )
+    .await
+    .expect("the read returns at its bound")
+    .unwrap_err();
+    assert_eq!(started.elapsed(), LOCAL_CHECK_TIMEOUT);
+    assert_eq!(
+        problem,
+        StoreProblem::Transport("the identity read did not finish within 5 s".to_owned())
+    );
+    assert_eq!(problem.category(), "unreachable");
+    assert_eq!(mem.stalls.load(std::sync::atomic::Ordering::Acquire), 1);
+    mem.set_stalled(false);
+}
+
+/// `record_check` logs a transition once per category: it reports a change
+/// of category, and not a new text within the same one, so a store that
+/// stays down with a varying error costs one line.
+#[test]
+fn record_check_reports_a_transition_only_across_categories() {
+    let mem = Arc::new(MemStore::default());
+    let runtime = runtime_on(&mem, store());
+    let store = runtime.configured_store().unwrap();
+    assert!(store.record_check(Err(StoreProblem::Transport("refused".to_owned()))));
+    assert!(
+        !store.record_check(Err(StoreProblem::Transport("timed out".to_owned()))),
+        "a new text in the same category is not a transition"
+    );
+    assert_eq!(
+        store.health(),
+        StoreHealth::Unhealthy(StoreProblem::Transport("timed out".to_owned())),
+        "the latest text is kept"
+    );
+    assert!(store.record_check(Err(StoreProblem::Validate("no bucket".to_owned()))));
+    assert!(store.record_check(Ok(self::store())));
+    assert!(!store.record_check(Ok(self::store())));
+    assert!(
+        !store.record_check(Err(StoreProblem::Catalog("pool exhausted".to_owned()))),
+        "a catalog read failure changes nothing"
+    );
+}
+
+/// A recheck of a root that lost its file while the catalog has no rows for
+/// it writes the file back with the same id.
+#[tokio::test]
+async fn a_recheck_rewrites_a_lost_file_when_no_rows_exist() {
+    let mem = MemStore::default();
+    let fake = Fake::default();
+    store_identity::recheck(&mem, &store(), &fake, "test")
+        .await
+        .unwrap();
+    let file = StoreIdentityFile::parse(&mem.objects.lock().unwrap()[STORE_IDENTITY_KEY]).unwrap();
+    assert_eq!(file.store_id, "store-1");
+    assert_eq!(file.catalog_id, "catalog-1");
+    // A file that changed under the running server (the root replaced) is
+    // an id mismatch.
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-2", "catalog-1"));
+    let err = store_identity::recheck(&mem, &store(), &fake, "test")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        StoreProblem::IdMismatch {
+            file_id: "store-2".to_owned(),
+            row_ids: vec!["store-1".to_owned()],
+        }
+    );
+}
+
+/// No store configured: `/health` has no component and no operation is
+/// refused for the store.
+#[test]
+fn no_configured_store_reports_no_component() {
+    assert_eq!(runtime().store_health(), None);
+    assert_eq!(
+        runtime_with_store().store_health().unwrap().status,
+        "healthy"
+    );
+}
+
+/// The `/health` reason is the problem's category and nothing else: the
+/// endpoint is unauthenticated, and the ARN (account, table and backup id)
+/// a manifest probe names, and the catalog and store ids the identity
+/// problems name, go to the operator's log line only.
+#[test]
+fn the_health_reason_is_the_category_only() {
+    let mem = Arc::new(MemStore::default());
+    for (problem, category) in [
+        (
+            StoreProblem::ManifestMissing {
+                backup_arn: arn("999988887777"),
+            },
+            "manifest probe failed",
+        ),
+        (
+            StoreProblem::ForeignCatalog {
+                file_catalog_id: "cat-other".to_owned(),
+                catalog_id: "cat-mine".to_owned(),
+            },
+            "owned by another catalog",
+        ),
+        (
+            StoreProblem::IdMismatch {
+                file_id: "store-9".to_owned(),
+                row_ids: vec!["store-1".to_owned()],
+            },
+            "identity mismatch",
+        ),
+        (
+            StoreProblem::FileMissingWithRows(vec!["store-1".to_owned()]),
+            "identity file missing",
+        ),
+        (
+            StoreProblem::Transport("connect /var/lib/extenddb: refused".to_owned()),
+            "unreachable",
+        ),
+    ] {
+        let report = runtime_unhealthy(&mem, problem.clone())
+            .store_health()
+            .unwrap();
+        assert_eq!(report.status, "unhealthy");
+        assert_eq!(report.reason, Some(category), "{problem:?}");
+        for secret in ["999988887777", "cat-", "store-", "/var/lib", "arn:"] {
+            assert!(
+                !report.reason.unwrap().contains(secret),
+                "{problem:?}: the reason carries {secret:?}"
+            );
+        }
+    }
+}
+
+/// An identity file over the read bound is reported unreadable without
+/// being read in full; one under it parses.
+#[tokio::test]
+async fn an_oversized_identity_file_is_unreadable() {
+    let mem = MemStore::default();
+    let fake = Fake::default();
+    let mut big = identity_file("store-1", "catalog-1");
+    big.resize(store_identity::STORE_IDENTITY_MAX_BYTES + 1, b' ');
+    mem.insert(STORE_IDENTITY_KEY, &big);
+    let err = store_identity::establish(&mem, StoreKind::Filesystem, "/r", &fake, "test")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, StoreProblem::FileUnreadable(m) if m.contains("larger than 65536 bytes")),
+        "{err:?}"
+    );
+    assert_eq!(err.category(), "identity file unreadable");
+    // Trailing blanks up to the bound are JSON whitespace: the file parses.
+    let mut padded = identity_file("store-1", "catalog-1");
+    padded.resize(store_identity::STORE_IDENTITY_MAX_BYTES, b' ');
+    mem.insert(STORE_IDENTITY_KEY, &padded);
+    let identity = store_identity::establish(&mem, StoreKind::Filesystem, "/r", &fake, "test")
+        .await
+        .unwrap();
+    assert_eq!(identity.store_id, "store-1");
+}
+
+/// A check that could not read the catalog leaves the store's health as the
+/// last check left it, healthy or unhealthy, and keeps its id.
+#[tokio::test]
+async fn a_catalog_read_failure_leaves_the_health_unchanged() {
+    let mem = Arc::new(MemStore::default());
+    let healthy = runtime_on(&mem, store());
+    let store = healthy.configured_store().unwrap();
+    store.record_check(Err(StoreProblem::Catalog("pool exhausted".to_owned())));
+    assert_eq!(store.health(), StoreHealth::Healthy);
+    assert_eq!(store.identity(), Some(self::store()));
+    let unhealthy = runtime_unhealthy(&mem, StoreProblem::Transport("refused".to_owned()));
+    let store = unhealthy.configured_store().unwrap();
+    store.record_check(Err(StoreProblem::Catalog("pool exhausted".to_owned())));
+    assert_eq!(
+        store.health(),
+        StoreHealth::Unhealthy(StoreProblem::Transport("refused".to_owned()))
+    );
+    // And through a cycle: a catalog that fails `catalog_id` leaves a
+    // healthy store healthy.
+    let fake = Fake::default();
+    *fake.catalog_id_error.lock().unwrap() = true;
+    let report = reconciler::cycle(
+        &fake,
+        &healthy,
+        Duration::from_secs(300),
+        "test",
+        &mut reconciler::ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.store_healthy, Some(true));
+    // A problem of another category replaces the last one; one of the same
+    // category is kept as the latest text.
+    let store = healthy.configured_store().unwrap();
+    store.record_check(Err(StoreProblem::Transport("refused".to_owned())));
+    store.record_check(Err(StoreProblem::Transport("timed out".to_owned())));
+    assert_eq!(
+        store.health(),
+        StoreHealth::Unhealthy(StoreProblem::Transport("timed out".to_owned()))
+    );
+}
+
+/// A store whose checks run after the listener is up is `checking` until
+/// the first check records: `/health` says so with no reason, the
+/// operations that touch the store refuse naming the pending check, and
+/// the check runs `validate` first (a store that cannot be reached fails
+/// there, with its id still unknown), then the identity check, which
+/// settles the id.
+#[tokio::test]
+async fn a_store_checked_after_startup_is_checking_until_the_first_check() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    mem.set_down(true);
+    let runtime = runtime().with_store(ConfiguredStore::checking(
+        store().store_kind,
+        store().store_root,
+        Arc::clone(&mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+        None,
+    ));
+    let configured = runtime.configured_store().unwrap();
+    assert_eq!(configured.health(), StoreHealth::Checking);
+    assert!(!configured.is_validated());
+    let report = runtime.store_health().unwrap();
+    assert_eq!((report.status, report.reason), ("checking", None));
+    let err = runtime.require_healthy_store().err().unwrap();
+    assert!(
+        matches!(&err, DynamoDbError::ValidationException(m) if m.contains("first check is pending")),
+        "{err:?}"
+    );
+    // The restore check of a row of the store refuses the same way, before
+    // the permit: with no slot free, the refusal is still the store's.
+    let fake = fake_with_row(BackupStatus::Available);
+    let full = BackupRuntime::new(0).with_store(ConfiguredStore::checking(
+        store().store_kind,
+        store().store_root,
+        Arc::clone(&mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+        None,
+    ));
+    let err = restore_on(&fake, &full, &restore_body(json!({})))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, DynamoDbError::ValidationException(m) if m.contains("first check is pending")),
+        "{err:?}"
+    );
+
+    // The first check: `validate` fails on the unreachable store.
+    let fake = Fake::default();
+    let report = reconciler::cycle(
+        &fake,
+        &runtime,
+        Duration::from_secs(300),
+        "test",
+        &mut reconciler::ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.store_healthy, Some(false));
+    assert!(!configured.is_validated());
+    assert_eq!(runtime.store_health().unwrap().reason, Some("unreachable"));
+    assert_eq!(configured.identity(), None);
+    // Reachable: `validate` passes once and is not run again, the identity
+    // check settles the id, and the store is healthy.
+    mem.set_down(false);
+    let report = reconciler::cycle(
+        &fake,
+        &runtime,
+        Duration::from_secs(300),
+        "test",
+        &mut reconciler::ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.store_healthy, Some(true));
+    assert!(configured.is_validated());
+    assert_eq!(configured.identity(), Some(store()));
+    assert_eq!(runtime.store_health().unwrap().status, "healthy");
+}
+
+/// The refusals while the configured store is unhealthy: DeleteBackup of a
+/// row of the store, and the restore of such a row, each a
+/// ValidationException naming the store's kind and the problem's category
+/// and never the root; the legacy reader is not reached, and the restore's
+/// refusal comes before the permit (with no slot free it is still the
+/// store's, not LimitExceeded). CreateBackup is not refused: the in-catalog
+/// create, the one this release runs, touches no store, so it runs with an
+/// unhealthy store as it does with none (a server that never configured
+/// backups keeps CreateBackup through a failed check of the default root),
+/// and on a backend bound to the in-catalog create.
+#[tokio::test]
+async fn an_unhealthy_store_refuses_delete_and_restore_but_not_the_in_catalog_create() {
+    let mem = Arc::new(MemStore::default());
+    let unhealthy = || {
+        runtime_unhealthy(
+            &mem,
+            StoreProblem::Transport("connect /var/lib/extenddb/backups: refused".to_owned()),
+        )
+    };
+    let check = |e: DynamoDbError| {
+        let DynamoDbError::ValidationException(m) = e else {
+            panic!("expected ValidationException, got {e:?}");
+        };
+        assert!(m.contains("filesystem backup store"), "{m}");
+        assert!(m.contains("unreachable"), "{m}");
+        assert!(!m.contains("/var/lib"), "{m}");
+        assert!(!m.contains("connect"), "{m}");
+    };
+
+    // CreateBackup runs the in-catalog create, taking its slot.
+    let fake = Fake::default();
+    for runtime in [unhealthy(), unhealthy().with_legacy_create_only(true)] {
+        let before = fake.creates.lock().unwrap().len();
+        create_backup(
+            &fake,
+            &runtime,
+            ACCOUNT,
+            REGION,
+            "Music",
+            "nightly",
+            Ok(active_table("Music")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fake.creates.lock().unwrap().len(), before + 1);
+        assert_eq!(runtime.free_slots(), 3, "the create holds its slot");
+        fake.permits.lock().unwrap().clear();
+    }
+    // With no slot free the create is LimitExceeded, the store's health
+    // notwithstanding.
+    let full = BackupRuntime::new(0).with_store(ConfiguredStore::new(
+        store().store_kind,
+        store().store_root,
+        Arc::clone(&mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+        None,
+        Err(StoreProblem::Transport("refused".to_owned())),
+    ));
+    let err = create_backup(
+        &fake,
+        &full,
+        ACCOUNT,
+        REGION,
+        "Music",
+        "nightly",
+        Ok(active_table("Music")),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::LimitExceededException(_)),
+        "{err:?}"
+    );
+
+    // DeleteBackup of a row of the store.
+    let fake = fake_with_row(BackupStatus::Available);
+    let err = delete_backup(&fake, &unhealthy(), ACCOUNT, REGION, &own(&arn(ACCOUNT)))
+        .await
+        .unwrap_err();
+    check(err);
+    assert!(
+        fake.delete_starts_seen.lock().unwrap().is_empty(),
+        "no DELETING write"
+    );
+
+    // The restore of a row of the store, with no slot free: the refusal is
+    // the store's, so it came before the permit.
+    let full = BackupRuntime::new(0).with_store(ConfiguredStore::new(
+        store().store_kind,
+        store().store_root,
+        Arc::clone(&mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+        None,
+        Err(StoreProblem::Transport(
+            "connect /var/lib/extenddb/backups: refused".to_owned(),
+        )),
+    ));
+    let err = restore_on(&fake, &full, &restore_body(json!({})))
+        .await
+        .unwrap_err();
+    check(err);
+    assert!(fake.restores().is_empty(), "the backend was not asked");
+
+    // A row of another store is the other-store refusal, whatever the health
+    // of the configured one.
+    let mut other = row(&arn(ACCOUNT), BackupStatus::Available);
+    other.store.store_root = "/elsewhere".to_owned();
+    let fake = Fake::default();
+    fake.rows.lock().unwrap().insert(arn(ACCOUNT), other);
+    let err = delete_backup(&fake, &unhealthy(), ACCOUNT, REGION, &own(&arn(ACCOUNT)))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, DynamoDbError::ValidationException(m) if m.contains("other than")),
+        "{err:?}"
+    );
+}
+
+/// With a healthy store configured, CreateBackup takes the in-catalog path
+/// (this release has no store-backed create) and logs that the store is
+/// configured; the slot is taken and the reader's create runs.
+#[tokio::test]
+async fn a_healthy_store_leaves_create_backup_on_the_in_catalog_path() {
+    let fake = Fake::default();
+    let runtime = runtime_with_store();
+    create_backup(
+        &fake,
+        &runtime,
+        ACCOUNT,
+        REGION,
+        "Music",
+        "nightly",
+        Ok(active_table("Music")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(fake.creates.lock().unwrap().len(), 1);
+}
+
+/// DeleteBackup of a row of the configured store deletes the manifest first
+/// (a `delete_prefix` on its exact key), then the prefix, and moves the row
+/// to DELETED once the prefix lists nothing; a retry on a DELETING row runs
+/// the same deletion. The identity file and other backups' prefixes stay.
+#[tokio::test]
+async fn delete_backup_of_a_configured_store_row_deletes_manifest_prefix_then_marks_deleted() {
+    let mem = Arc::new(MemStore::default());
+    let prefix = BackupArn::parse(&arn(ACCOUNT)).unwrap().store_prefix();
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    mem.insert(&manifest_key(&arn(ACCOUNT)), b"{}");
+    mem.insert(&format!("{prefix}data/00001.json.gz"), b"gz");
+    mem.insert(&format!("{prefix}manifest-files.json"), b"{}");
+    mem.insert(&manifest_key(&newer_arn(ACCOUNT)), b"{}");
+    let fake = fake_with_rows(&[
+        (arn(ACCOUNT), BackupStatus::Deleting),
+        (newer_arn(ACCOUNT), BackupStatus::Available),
+    ]);
+    let runtime = runtime_on(&mem, store());
+    let desc = delete_backup(&fake, &runtime, ACCOUNT, REGION, &own(&arn(ACCOUNT)))
+        .await
+        .unwrap();
+    assert_eq!(desc.backup_details.backup_status, "DELETED");
+    assert_eq!(
+        mem.deletes.lock().unwrap().as_slice(),
+        [manifest_key(&arn(ACCOUNT)), prefix.clone()],
+        "the manifest first, then the prefix"
+    );
+    assert_eq!(
+        mem.keys(),
+        [
+            manifest_key(&newer_arn(ACCOUNT)),
+            STORE_IDENTITY_KEY.to_owned()
+        ],
+        "the other backup and the identity file stay"
+    );
+    assert_eq!(fake.set_deleted.lock().unwrap().as_slice(), [arn(ACCOUNT)]);
+    assert_eq!(
+        fake.rows.lock().unwrap()[&arn(ACCOUNT)].status,
+        BackupStatus::Deleted
+    );
+}
+
+/// A store failure during the deletion leaves the row DELETING and answers
+/// InternalServerError; the reconciler's next cycle finishes it once the
+/// store answers, and leaves it alone while the store is unhealthy.
+#[tokio::test]
+async fn a_failed_deletion_stays_deleting_and_the_reconciler_finishes_it() {
+    let mem = Arc::new(MemStore::default());
+    let prefix = BackupArn::parse(&arn(ACCOUNT)).unwrap().store_prefix();
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    mem.insert(&manifest_key(&arn(ACCOUNT)), b"{}");
+    mem.insert(&format!("{prefix}data/00001.json.gz"), b"gz");
+    let fake = fake_with_rows(&[(arn(ACCOUNT), BackupStatus::Deleting)]);
+    let runtime = runtime_on(&mem, store());
+
+    mem.set_down(true);
+    let err = delete_backup(&fake, &runtime, ACCOUNT, REGION, &own(&arn(ACCOUNT)))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::InternalServerError(_)),
+        "{err:?}"
+    );
+    assert_eq!(
+        fake.rows.lock().unwrap()[&arn(ACCOUNT)].status,
+        BackupStatus::Deleting
+    );
+    assert_eq!(mem.keys().len(), 3, "nothing was deleted");
+
+    // The reconciler finds the store down: unhealthy, and no row touched.
+    let report = reconciler::cycle(
+        &fake,
+        &runtime,
+        Duration::from_secs(300),
+        "test",
+        &mut reconciler::ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.store_healthy, Some(false));
+    assert!(report.deletions_finished.is_empty());
+    assert!(runtime.require_healthy_store().is_err());
+
+    // The store answers again: the cycle recovers the health and finishes
+    // the deletion.
+    mem.set_down(false);
+    let report = reconciler::cycle(
+        &fake,
+        &runtime,
+        Duration::from_secs(300),
+        "test",
+        &mut reconciler::ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.store_healthy, Some(true));
+    assert_eq!(report.deletions_finished, [arn(ACCOUNT)]);
+    assert_eq!(mem.keys(), [STORE_IDENTITY_KEY]);
+    assert_eq!(
+        fake.rows.lock().unwrap()[&arn(ACCOUNT)].status,
+        BackupStatus::Deleted
+    );
+    // Nothing left to finish.
+    let report = reconciler::cycle(
+        &fake,
+        &runtime,
+        Duration::from_secs(300),
+        "test",
+        &mut reconciler::ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert!(report.deletions_finished.is_empty());
+}
+
+/// The reconciler finishes DELETING rows of the configured store only: a
+/// DELETING row of another store is left alone, and so is one whose prefix
+/// still lists an object after the deletion (a put that overlapped it).
+#[tokio::test]
+async fn the_reconciler_finishes_only_the_configured_stores_deleting_rows() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = fake_with_rows(&[(arn(ACCOUNT), BackupStatus::Deleting)]);
+    let mut other = row(&newer_arn(ACCOUNT), BackupStatus::Deleting);
+    other.store.store_id = "store-9".to_owned();
+    other.store.store_root = "/elsewhere".to_owned();
+    fake.rows.lock().unwrap().insert(newer_arn(ACCOUNT), other);
+    let runtime = runtime_on(&mem, store());
+    let report = reconciler::cycle(
+        &fake,
+        &runtime,
+        Duration::from_secs(300),
+        "test",
+        &mut reconciler::ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.deletions_finished, [arn(ACCOUNT)]);
+    assert_eq!(
+        fake.rows.lock().unwrap()[&newer_arn(ACCOUNT)].status,
+        BackupStatus::Deleting,
+        "another store's row is not touched"
+    );
+    assert!(
+        mem.deletes
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|p| !p.contains("0badf00d")),
+        "nothing of the other store's prefix was deleted"
+    );
+}
+
+/// `finish_backup_delete` reports a prefix that still lists an object after
+/// the deletion and leaves the row DELETING for the next run.
+#[tokio::test]
+async fn a_prefix_that_still_lists_an_object_is_left_deleting() {
+    struct Refilling(MemStore);
+    impl extenddb_backup_store::BackupStore for Refilling {
+        fn put<'a>(
+            &'a self,
+            key: &'a str,
+            body: extenddb_backup_store::ByteStream,
+        ) -> BoxedFuture<
+            'a,
+            Result<extenddb_backup_store::ObjectMeta, extenddb_backup_store::StoreError>,
+        > {
+            self.0.put(key, body)
+        }
+        fn put_if_absent<'a>(
+            &'a self,
+            key: &'a str,
+            body: extenddb_backup_store::ByteStream,
+        ) -> BoxedFuture<
+            'a,
+            Result<Option<extenddb_backup_store::ObjectMeta>, extenddb_backup_store::StoreError>,
+        > {
+            self.0.put_if_absent(key, body)
+        }
+        fn get<'a>(
+            &'a self,
+            key: &'a str,
+        ) -> BoxedFuture<
+            'a,
+            Result<extenddb_backup_store::ByteStream, extenddb_backup_store::StoreError>,
+        > {
+            self.0.get(key)
+        }
+        fn head<'a>(
+            &'a self,
+            key: &'a str,
+        ) -> BoxedFuture<
+            'a,
+            Result<Option<extenddb_backup_store::ObjectMeta>, extenddb_backup_store::StoreError>,
+        > {
+            self.0.head(key)
+        }
+        fn list<'a>(
+            &'a self,
+            prefix: &'a str,
+        ) -> BoxStream<
+            'a,
+            Result<extenddb_backup_store::ObjectMeta, extenddb_backup_store::StoreError>,
+        > {
+            self.0.list(prefix)
+        }
+        /// The deletion runs, and a late put lands under the prefix after
+        /// it.
+        fn delete_prefix<'a>(
+            &'a self,
+            prefix: &'a str,
+        ) -> BoxedFuture<'a, Result<u64, extenddb_backup_store::StoreError>> {
+            Box::pin(async move {
+                let n = self.0.delete_prefix(prefix).await?;
+                if !prefix.ends_with(MANIFEST_KEY_SUFFIX) {
+                    self.0
+                        .insert(&format!("{prefix}data/late.json.gz"), b"late");
+                }
+                Ok(n)
+            })
+        }
+        fn validate(&self) -> BoxedFuture<'_, Result<(), extenddb_backup_store::StoreError>> {
+            self.0.validate()
+        }
+    }
+    let store_handle = Refilling(MemStore::default());
+    let fake = fake_with_rows(&[(arn(ACCOUNT), BackupStatus::Deleting)]);
+    let parsed = BackupArn::parse(&arn(ACCOUNT)).unwrap();
+    let err = finish_backup_delete(&fake, &store_handle, &parsed)
+        .await
+        .unwrap_err();
+    assert!(err.contains("still lists"), "{err}");
+    assert_eq!(
+        fake.rows.lock().unwrap()[&arn(ACCOUNT)].status,
+        BackupStatus::Deleting
     );
 }

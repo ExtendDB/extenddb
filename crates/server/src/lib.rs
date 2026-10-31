@@ -11,6 +11,7 @@
 pub(crate) mod authorization;
 pub mod authz_cache;
 pub(crate) mod authz_resource;
+pub mod backup_store;
 pub mod console;
 pub mod dev_credentials;
 mod handler;
@@ -281,9 +282,39 @@ pub async fn start_server(
     Ok(())
 }
 
-/// GET /health — REQ-OBS-006
-async fn health_check() -> impl IntoResponse {
-    (StatusCode::OK, axum::Json(json!({"status": "healthy"})))
+/// GET /health — REQ-OBS-006.
+///
+/// Always 200 while the server answers: the data plane is up. `status` is
+/// `healthy`, or `degraded` when a component is unhealthy, and `components`
+/// carries each component the server has. Today the one component is
+/// `backup_store`, present when a store is configured: `status` `healthy`,
+/// `checking` (an S3 store's first check has not returned; the server's
+/// `status` stays `healthy`) or `unhealthy`, `kind` (`filesystem` or `s3`)
+/// and, when unhealthy, `reason`, the problem's category in one or two
+/// words. The endpoint is unauthenticated, so the reason carries no id, ARN,
+/// table name or root; the operator's log line does. A store problem never
+/// takes the data plane out of rotation, which is why the HTTP status stays
+/// 200.
+async fn health_check(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let mut components = serde_json::Map::new();
+    let mut status = "healthy";
+    if let Some(store) = state.backup_runtime.store_health() {
+        let mut component = json!({
+            "status": store.status,
+            "kind": store.kind,
+        });
+        if let Some(reason) = store.reason {
+            component["reason"] = serde_json::Value::String(reason.to_owned());
+            status = "degraded";
+        }
+        components.insert("backup_store".to_owned(), component);
+    }
+    (
+        StatusCode::OK,
+        axum::Json(json!({ "status": status, "components": components })),
+    )
 }
 
 async fn graceful_shutdown(pid_file: Option<PathBuf>) {

@@ -53,8 +53,30 @@ SIGTERM directly. Alternatively start it with
 
 ```bash
 curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/health
-# {"status":"healthy"}
+# {"status":"healthy","components":{}}
+# with a backup store configured:
+# {"status":"healthy","components":{"backup_store":{"status":"healthy","kind":"filesystem"}}}
+# while it cannot be reached:
+# {"status":"degraded","components":{"backup_store":{"status":"unhealthy","kind":"s3","reason":"unreachable"}}}
+# right after startup, before an S3 store's first check has returned:
+# {"status":"healthy","components":{"backup_store":{"status":"checking","kind":"s3"}}}
 ```
+
+`status` is `healthy`, or `degraded` when a component is unhealthy; the HTTP
+status stays 200 either way, because a component problem never takes the data
+plane out of rotation. The one component is `backup_store`, present when
+`[backup.store]` configures a store; its `reason` is the problem's category in
+one or two words (`unreachable`, `permission denied`, `failed validation`,
+`identity file unreadable`, `identity file missing`, `identity mismatch`,
+`owned by another catalog`, `manifest probe failed`, `catalog unreadable`) and
+nothing else: the endpoint is unauthenticated, so the ids, ARNs and table
+names a problem involves are in the server's log line only. An S3 store's
+first check runs after the listener is up (the next section); until it
+returns the component is `checking`, with the server `healthy`. The
+reconciler re-runs the store's checks every `reconcile_interval_secs`, each
+run bounded (5 s for a filesystem root, 30 s for a bucket, after which the
+check is abandoned and the store is `unreachable` until a later check
+answers), and the component recovers on its own.
 
 Or without `curl` — useful inside a minimal container image, and what a Docker
 `HEALTHCHECK` should call:
@@ -67,9 +89,8 @@ echo $?   # 0 = healthy, 1 = not
 `healthcheck` reads the port from the config file, or takes an explicit
 `--endpoint https://host:port`. It accepts the server's self-signed certificate.
 
-This checks liveness, not readiness. `/health` is a static handler that does not
-query PostgreSQL, so it reports healthy even when the database has become
-unreachable since startup. That is intentional for a liveness probe: one that
+This checks liveness, not readiness. `/health` does not query the database, so
+it reports healthy even when the database has become unreachable since startup. That is intentional for a liveness probe: one that
 failed on a database outage would restart every replica at once and prolong the
 outage. A database that is unreachable at startup stops the server from listening
 at all, so that case is still caught.
@@ -129,7 +150,25 @@ The knobs backup and restore jobs and the reconciler read; every key has a defau
 | `failed_row_retention_secs` | `604800` | How long FAILED backup rows are kept for the operator (7 days) |
 | `reconcile_interval_secs` | `60` | The reconciler's cycle; it also runs once at startup |
 | `max_concurrent_jobs` | `4` | Backup and restore jobs this instance runs at once (at most 1024); a request over it is `LimitExceededException`. On PostgreSQL the pool sizes are raised to `2 * max_concurrent_jobs + 10` when smaller |
-| `spool_path` | (unset) | Restore download area for an S3 store, used by a later release |
+| `spool_path` | (unset) | Restore download area for an S3 store, created `0700` with files `0600`, holding a `.lock` another instance on the host refuses. Required with an S3 store, except on file-backed SQLite where it defaults to `backup-spool/` beside the database file. Refused inside or containing a filesystem store root, and when it is or contains the database file's directory |
+
+#### [backup.store]
+
+The store CreateBackup's backups will live in, and the one restores and deletes of store-backed backups read. The section's keys, defaults and the refusals of a bad value are the backup store crate's (`crates/backup-store/src/config.rs`); the table below is what the server adds. One definition of the shape exists, so an unknown key anywhere under `[backup]` is refused at load.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `kind` | see below | `filesystem`, `s3`, or `disabled` |
+| `filesystem.path` | `backups/` beside a SQLite database file | The root directory of a filesystem store. It must exist, be owned by the extenddb user with mode `0700`, and sit under directories owned by root or that user which others cannot write to; `validate` refuses anything else at startup. A relative path, like a relative `spool_path`, is resolved against the working directory the server was started from (the daemon's own working directory is `/`) |
+| `s3.bucket`, `s3.prefix`, `s3.region`, `s3.endpoint`, `s3.force_path_style`, `s3.allow_insecure_endpoint`, `s3.upload_part_size_bytes`, `s3.max_concurrent_uploads` | | The S3 store; see the crate's `config` module doc. Credentials come from the AWS SDK's chain and are never in the file |
+
+When the section is absent, the backend decides: on file-backed SQLite it is a filesystem store at `backups/` beside the database file, created `0700` if missing, whose validation or identity-check failure is a logged warning that leaves the store unconfigured rather than a startup error or an unhealthy store while the catalog has no backup rows for that root (so an upgrade never stops a server that never configured backups, and CreateBackup keeps working on one); once the catalog has rows for the default root, the root has been used and is handled as a configured one: a failure of its identity check or manifest probe is an unhealthy store (reported on `/health`, its rows' restores and deletes refused, `backup purge` refusing on it rather than reporting no store), and a refusal of its `open` or validation a startup error naming the root; on PostgreSQL, MongoDB, Cassandra and an in-memory SQLite database there is no default and the store is unconfigured, logged at startup. `kind = "disabled"` leaves it unconfigured on purpose on any backend. Without a configured store, CreateBackup writes the in-catalog backup format and logs a deprecation warning naming `[backup.store]` on each call; with one configured, this release's CreateBackup still writes the in-catalog format (the store-backed writer is a later release's) and the store serves restores and deletes of the backups it holds. Backups of either format stay listable, describable, restorable and deletable.
+
+Startup opens the configured store and, for a filesystem store, validates it and checks its identity before the listener is up (bounded by 5 s: a mount that stops answering after the root is opened leaves the server starting with the store `checking`; a root that does not answer at startup holds the server before the listener, as the database directory would, with the port bound and silent); an S3 store's validation and identity check are requests to the endpoint, and run after the listener is up, in the reconciler's first cycle, so an endpoint that stalls never holds the data plane down (the component is `checking` until the first result, and the operations that touch the store refuse meanwhile as they do while it is unhealthy). A configuration error, every one decided without a request to the store, stops startup with the key, path or bucket in the message: a root that does not exist or fails the owner-only rule, a filesystem root another user can reach, a filesystem root that is or contains the database directory, a bucket name the SDK routes to S3 Express, a bad part size or prefix, an insecure endpoint, an S3 store without `spool_path` on a backend with no default, a `spool_path` that breaks its placement rule, that another live instance holds or that exists with a mode other than `0700`. A transport failure (no region, no credentials, an endpoint that refuses connections or does not answer within the check's bound), a missing or denied bucket, an I/O failure of a filesystem root's probe write or resolution (a full or read-only disk, a stale network handle), or a failed identity check leaves the server running with the store unhealthy: the problem is logged once at error, `/health` reports the `backup_store` component unhealthy (status `degraded`), the restore and delete of a store-backed backup are refused with a `ValidationException` that names the store's kind and the problem's category and not its root, the reconciler acts on no row of the store, and the check runs again each `reconcile_interval_secs` until it passes, at which point the server logs `is healthy again` and resumes without a restart. Each check is bounded (5 s for a filesystem root, 30 s for a bucket): a store that has stopped answering costs a reconciler cycle that bound and nothing more, the cycle's other duties run as before, and the abandoned check is logged; on a filesystem root the abandoned check's call stays parked on one thread until the mount answers, no later cycle starts a check while it is (logged each cycle, the store staying `unreachable`), and `stop` or SIGTERM ends the server within 5 s with that thread still parked. CreateBackup is not refused by an unhealthy store in this release: it writes the in-catalog format, which touches no store; the store-backed create of a later release is.
+
+The store identity. The root carries `extenddb-store.json`: a random store id and the id of the catalog that owns the root. Startup creates it when the root has no file and the catalog has no rows for the root, and otherwise reads it and compares: a file naming another catalog, a store id that differs from the one the catalog's rows for the root carry, a root with no file while rows exist, or rows carrying more than one id each mark the store unhealthy. Instances that share a catalog must share one store root (one S3 bucket and prefix, or one shared mount): host-local roots configured at the same path give each instance different bytes under one root label, so each check also `head`s the manifest of the newest AVAILABLE backup and marks the store unhealthy when it is absent, which is what a second instance with a local copy of the directory sees. The file is left by `backup purge` and by every deletion; remove it only when retiring the root, or after `extenddb destroy`: a catalog re-created with `init` has a new id, and the old root's file names the old one, so the re-initialised server reports the store owned by another catalog until the file is removed or a new root configured (on the default SQLite root, that is the logged warning above and CreateBackup keeps the in-catalog path). While the catalog has no rows for a root, two host-local directories at one path cannot be told apart (each instance creates its own file and id); point every instance at one shared root before the first backup. The identity file is read up to 64 KiB; a larger object under its key is reported unreadable.
+
+`extenddb destroy` removes the databases and leaves the store untouched: it is the copy that survives destroy. `extenddb backup list [--failed]` prints the catalog's rows for the configured store's root, every store id they carry, with each row's `store_root` and `store_id`; it is a read that runs beside a server (on SQLite it takes no serve lock), reads the identity file without creating one, and runs on an unhealthy store, naming the problem in its header. `extenddb backup purge --confirm` deletes every backup of the configured store, each backup's objects (its own prefix, never a whole account prefix, so a prefix the catalog has no row for survives) and its catalog row outright, leaving no tombstone, and leaves `extenddb-store.json` and the `exports/` component; it needs the store healthy. It takes the catalog-level maintenance claim first and heartbeats it for the command's whole run, waits up to `2 * stale_job_after_secs` until no store-backed CreateBackup is running on any instance (a CREATING or FAILED row with a heartbeat within `stale_job_after_secs`) and no restore is RUNNING, refuses and releases the claim if they have not finished, deletes a CREATING row the wait saw no live owner for as it deletes any other row, finishes any DeleteBackup left in progress as part of the purge (a backup a DeleteBackup finishes while the purge runs is counted as deleted, not left), and logs each deletion under the `extenddb::audit` target with the account and the ARN. While the claim is held, CreateBackup and RestoreTableFromBackup on every instance answer `LimitExceededException` naming the command, and a second maintenance command fails at once naming the holder. Without `--confirm` it prints the plan, changes nothing and exits 0. `--config` is accepted before or after the subcommand. On SQLite the command opens the database as `serve` does and so takes the serve lock: stop the server first; under that lock it first resolves what the stopped server left (a RUNNING restore is failed and its target removed, the CREATING target of a FAILED restore removed, an in-catalog CREATING backup removed, a DELETING row finished) and deletes a CREATING or FAILED row whatever its heartbeat says (the server that wrote it is stopped, and its clock is this host's), so such a job never makes it wait or refuse; the one exception is a RUNNING restore of kind `manifest`, which no release before PR 9a writes: the command leaves it for the reconciler that resumes it, waits on it as on any RUNNING restore and refuses naming the table; and a server starting on the file removes a claim a killed purge left, so no job is refused for the stale window. On the other backends it runs beside live servers, and a claim whose holder died expires after `stale_job_after_secs`. On every backend Ctrl-C or `SIGTERM` makes the command release the claim and exit: at once while it waits, and before its next backup while it deletes, so an interrupted purge leaves no half-deleted backup and no claim to wait out; run it again for the rest.
 
 #### [auth]
 
@@ -887,8 +926,11 @@ JSON metrics endpoint with DynamoDB CloudWatch-style metric names and dimensions
 
 ```bash
 curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/health
-# {"status":"healthy"}
+# {"status":"healthy","components":{}}
 ```
+
+The `components` object carries the `backup_store` component when a backup
+store is configured (see [Health Check](#health-check) under Server Lifecycle).
 
 ## Troubleshooting
 

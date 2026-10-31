@@ -24,14 +24,22 @@
 //! (`WriteOutcome::Unknown`: the statement may have reached the server);
 //! a server error (a command or write error) is `Err`, as a statement error
 //! is on PostgreSQL.
+//!
+//! The maintenance claim is one document (`_id: "claim"`) in
+//! `backup_maintenance`: a record whose heartbeat is older than the stale
+//! window is taken over by a conditional update, a missing one is inserted by
+//! an upsert whose filter a live record never matches (its insert then trips
+//! the `_id` index and the claim is refused), and heartbeats and the release
+//! are conditioned on the generation. `$expr` is not allowed in an upsert's
+//! filter, which is why the takeover and the insert are two writes.
 
 use std::time::Duration;
 
 use extenddb_core::backup_format::BackupArn;
 use extenddb_storage::backup_catalog::{
     BackupCatalog, BackupKey, BackupRow, BackupStatus, DeleteStart, Heartbeat, JobClaim, JobRow,
-    JobStatus, RestoreJobRow, RestoreKind, RestoreTargetKey, StatusFields, StoreIdentity,
-    StoreKind, TimeBounds, WriteOutcome, new_generation,
+    JobStatus, MaintenanceClaim, RestoreJobRow, RestoreKind, RestoreTargetKey, StatusFields,
+    StoreIdentity, StoreKind, TimeBounds, WriteOutcome, new_generation,
 };
 use extenddb_storage::error::StorageError;
 use futures::TryStreamExt;
@@ -648,6 +656,24 @@ impl BackupCatalog for MongoEngine {
         })
     }
 
+    fn remove_dead_creating_backup_row<'a>(
+        &'a self,
+        key: &'a BackupKey,
+        stale_after: Duration,
+    ) -> BoxFuture<'a, Result<bool, StorageError>> {
+        Box::pin(async move {
+            let mut filter = key_filter(key);
+            filter.insert("status", BackupStatus::Creating.as_str());
+            filter.insert("$expr", age_is_stale(&["heartbeat_at"], stale_after));
+            let result = self
+                .backup_index()
+                .delete_one(filter)
+                .await
+                .map_err(internal)?;
+            Ok(result.deleted_count == 1)
+        })
+    }
+
     fn backup_in_use<'a>(
         &'a self,
         key: &'a BackupKey,
@@ -777,15 +803,177 @@ impl BackupCatalog for MongoEngine {
         })
     }
 
-    fn check_maintenance_claim(&self) -> BoxFuture<'_, Result<bool, StorageError>> {
+    fn read_store_ids<'a>(
+        &'a self,
+        store_kind: StoreKind,
+        store_root: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<String>, StorageError>> {
+        Box::pin(async move {
+            let ids = self
+                .backup_index()
+                .distinct(
+                    "store_id",
+                    doc! { "store_kind": store_kind.as_str(), "store_root": store_root },
+                )
+                .await
+                .map_err(internal)?;
+            let mut ids: Vec<String> = ids
+                .into_iter()
+                .filter_map(|v| match v {
+                    Bson::String(s) => Some(s),
+                    _ => None,
+                })
+                .collect();
+            ids.sort();
+            Ok(ids)
+        })
+    }
+
+    fn maintenance_claim<'a>(
+        &'a self,
+        holder: &'a str,
+        stale_after: Duration,
+    ) -> BoxFuture<'a, Result<Box<dyn MaintenanceClaim>, StorageError>> {
+        Box::pin(async move {
+            // The record is the claim, as a backup row is: one document under
+            // a fixed `_id`. Two writes: the first takes over a record whose
+            // heartbeat is stale (a dead holder's), the second inserts the
+            // record when there is none. A live record matches neither
+            // filter, so the second write's upsert trips the `_id` index and
+            // the claim is refused; two commands racing for a stale record
+            // both run the first write, and the one whose filter no longer
+            // matches falls to the second and is refused the same way.
+            // (`$expr` is not allowed in an upsert's filter, which is why
+            // the two are not one write.)
+            let generation = new_generation();
+            let collection = self.maintenance();
+            let set = doc! { "$set": {
+                "holder": { "$literal": holder },
+                "owner_generation": { "$literal": generation_field(generation) },
+                "claimed_at": "$$NOW",
+                "heartbeat_at": "$$NOW",
+            } };
+            let refused = |current: Option<String>| {
+                StorageError::AlreadyExists(format!(
+                    "the backup maintenance claim is held by {}",
+                    current.as_deref().unwrap_or("another maintenance command")
+                ))
+            };
+            let taken_over = collection
+                .update_one(
+                    doc! {
+                        "_id": MAINTENANCE_CLAIM_ID,
+                        "$expr": age_is_stale(&["heartbeat_at"], stale_after),
+                    },
+                    vec![set.clone()],
+                )
+                .await
+                .map_err(internal)?
+                .matched_count
+                == 1;
+            if !taken_over {
+                match collection
+                    .update_one(
+                        doc! {
+                            "_id": MAINTENANCE_CLAIM_ID,
+                            "owner_generation": { "$exists": false },
+                        },
+                        vec![set],
+                    )
+                    .upsert(true)
+                    .await
+                {
+                    Ok(result) if result.upserted_id.is_some() => {}
+                    Ok(_) => return Err(refused(None)),
+                    Err(e) if is_duplicate_key(&e) => {
+                        let current = collection
+                            .find_one(doc! { "_id": MAINTENANCE_CLAIM_ID })
+                            .await
+                            .map_err(internal)?
+                            .and_then(|d| d.get_str("holder").ok().map(str::to_owned));
+                        return Err(refused(current));
+                    }
+                    Err(e) => return Err(internal(e)),
+                }
+            }
+            Ok(Box::new(MongoMaintenanceClaim {
+                collection,
+                generation,
+            }) as Box<dyn MaintenanceClaim>)
+        })
+    }
+
+    fn check_maintenance_claim(
+        &self,
+        stale_after: Duration,
+    ) -> BoxFuture<'_, Result<bool, StorageError>> {
         Box::pin(async move {
             let held = self
-                .catalog_db
-                .collection::<Document>(BACKUP_MAINTENANCE)
-                .find_one(doc! {})
+                .maintenance()
+                .find_one(doc! {
+                    "$nor": [ { "$expr": age_is_stale(&["heartbeat_at"], stale_after) } ],
+                })
                 .await
                 .map_err(internal)?;
             Ok(held.is_some())
+        })
+    }
+}
+
+/// The `_id` of the one maintenance claim document.
+const MAINTENANCE_CLAIM_ID: &str = "claim";
+
+impl MongoEngine {
+    fn maintenance(&self) -> mongodb::Collection<Document> {
+        self.catalog_db.collection::<Document>(BACKUP_MAINTENANCE)
+    }
+}
+
+/// The holder's handle on the maintenance claim document.
+struct MongoMaintenanceClaim {
+    collection: mongodb::Collection<Document>,
+    generation: u64,
+}
+
+impl MongoMaintenanceClaim {
+    fn owned_filter(&self) -> Document {
+        doc! {
+            "_id": MAINTENANCE_CLAIM_ID,
+            "owner_generation": generation_field(self.generation),
+        }
+    }
+}
+
+impl MaintenanceClaim for MongoMaintenanceClaim {
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn heartbeat(&self) -> BoxFuture<'_, Result<Heartbeat, StorageError>> {
+        Box::pin(async move {
+            let result = self
+                .collection
+                .update_one(
+                    self.owned_filter(),
+                    vec![doc! { "$set": { "heartbeat_at": "$$NOW" } }],
+                )
+                .await
+                .map_err(|e| StorageError::Internal(format!("maintenance heartbeat: {e}")))?;
+            Ok(if result.matched_count == 1 {
+                Heartbeat::Confirmed
+            } else {
+                Heartbeat::Lost
+            })
+        })
+    }
+
+    fn release(&self) -> BoxFuture<'_, Result<(), StorageError>> {
+        Box::pin(async move {
+            self.collection
+                .delete_one(self.owned_filter())
+                .await
+                .map_err(internal)?;
+            Ok(())
         })
     }
 }

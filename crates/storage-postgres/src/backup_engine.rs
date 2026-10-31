@@ -112,6 +112,14 @@ impl ClaimSession {
         &mut self.conn
     }
 
+    /// End the session, releasing its advisory lock; a close that fails is
+    /// logged (the server reaps the connection either way).
+    pub(crate) async fn close(self) {
+        if let Err(e) = <sqlx::PgConnection as sqlx::Connection>::close(self.conn).await {
+            tracing::warn!("closing a claim session: {e}");
+        }
+    }
+
     /// Run `statement`, bound with the record's key and this generation, on
     /// the claim connection and report whether it refreshed exactly one row.
     pub(crate) async fn confirm(

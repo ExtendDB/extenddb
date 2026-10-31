@@ -36,7 +36,9 @@ pub mod vector_catalog;
 pub mod vector_lifecycle;
 
 pub use backend::{Backend, BackendAlreadySet, backend_name, set_backend, try_backend};
-pub use backup_catalog::{BackupCatalog, JobClaim, JobPermit, LegacyBackupReader};
+pub use backup_catalog::{
+    BackupCatalog, JobClaim, JobPermit, LegacyBackupReader, MaintenanceClaim,
+};
 pub use backup_definition::{BackupRestoreSource, RestoreRequest, RestoreTableOverrides};
 pub use snapshot::{SnapshotEngine, SnapshotInfo, TableSnapshot};
 

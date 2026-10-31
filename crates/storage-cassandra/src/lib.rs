@@ -300,7 +300,7 @@ async fn make_catalog_store_from_connection_string(
 fn server_components_factory(
     config: &dyn extenddb_storage::config::StorageConfig,
     region: &str,
-    _options: extenddb_storage::server_components::ServerComponentsOptions,
+    options: extenddb_storage::server_components::ServerComponentsOptions,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<ServerComponents, BackendError>> + Send>,
 > {
@@ -332,14 +332,18 @@ fn server_components_factory(
         let control_plane_notify = engine.control_plane_notify.clone();
         let engine = Arc::new(engine);
 
-        match engine.process_control_plane_transitions().await {
-            Ok(ref t) if t.is_empty() => {}
-            Ok(transitions) => {
-                for (name, transition) in &transitions {
-                    tracing::info!("Recovered table '{name}': {transition}");
+        // The startup recovery is a server's; a command reading beside one
+        // leaves it to the server.
+        if !options.beside_server {
+            match engine.process_control_plane_transitions().await {
+                Ok(ref t) if t.is_empty() => {}
+                Ok(transitions) => {
+                    for (name, transition) in &transitions {
+                        tracing::info!("Recovered table '{name}': {transition}");
+                    }
                 }
+                Err(e) => tracing::error!("Failed to recover control plane transitions: {e}"),
             }
-            Err(e) => tracing::error!("Failed to recover control plane transitions: {e}"),
         }
 
         // Load encryption key from catalog.

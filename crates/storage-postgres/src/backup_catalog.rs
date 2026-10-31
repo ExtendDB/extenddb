@@ -17,6 +17,19 @@
 //! registration is `FOR UPDATE` on the `backup_index` row. Staleness is
 //! measured on the catalog's clock.
 //!
+//! The maintenance claim is the same mechanism on the `backup_maintenance`
+//! row: an advisory lock (`backup_maintenance` in the same key space) on a
+//! dedicated connection is the proof of a live holder, so a second command
+//! finds it taken and a holder whose session ended has released it; the row
+//! carries the holder, the generation and the heartbeat.
+//! `check_maintenance_claim` reports the claim held while a session holds
+//! the lock (a transaction-scoped shared try-lock in one autocommit
+//! statement fails while the exclusive lock is held, and holds nothing past
+//! its statement, so a request dropped mid-check leaves no lock on the
+//! pool), whatever the row's heartbeat says, and otherwise while the row's
+//! heartbeat is younger than the stale window, so a dead holder's claim
+//! expires for the jobs that read it without anyone taking it over. `release` deletes the row and ends the session.
+//!
 //! A conditional write whose error is of the connection class (an I/O or TLS
 //! error, a pool or worker failure, SQLSTATE class 08, or 57P01 to 57P03)
 //! has an unknown outcome (`WriteOutcome::Unknown`: the statement may have
@@ -31,8 +44,8 @@ use std::time::Duration;
 use extenddb_core::backup_format::BackupArn;
 use extenddb_storage::backup_catalog::{
     BackupCatalog, BackupKey, BackupRow, BackupStatus, DeleteStart, Heartbeat, JobClaim, JobRow,
-    JobStatus, RestoreJobRow, RestoreKind, RestoreTargetKey, StatusFields, StoreIdentity,
-    StoreKind, TimeBounds, WriteOutcome,
+    JobStatus, MaintenanceClaim, RestoreJobRow, RestoreKind, RestoreTargetKey, StatusFields,
+    StoreIdentity, StoreKind, TimeBounds, WriteOutcome,
 };
 use extenddb_storage::error::StorageError;
 use futures::future::BoxFuture;
@@ -499,6 +512,28 @@ impl BackupCatalog for PostgresEngine {
         })
     }
 
+    fn remove_dead_creating_backup_row<'a>(
+        &'a self,
+        key: &'a BackupKey,
+        stale_after: Duration,
+    ) -> BoxFuture<'a, Result<bool, StorageError>> {
+        Box::pin(async move {
+            let affected = sqlx::query(
+                "DELETE FROM backup_index WHERE account_id = $1 AND backup_id = $2 \
+                 AND status = 'CREATING' \
+                 AND heartbeat_at < now() - make_interval(secs => $3)",
+            )
+            .bind(&key.account_id)
+            .bind(&key.backup_id)
+            .bind(stale_after.as_secs_f64())
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?
+            .rows_affected();
+            Ok(affected == 1)
+        })
+    }
+
     fn backup_in_use<'a>(
         &'a self,
         key: &'a BackupKey,
@@ -631,12 +666,160 @@ impl BackupCatalog for PostgresEngine {
         })
     }
 
-    fn check_maintenance_claim(&self) -> BoxFuture<'_, Result<bool, StorageError>> {
+    fn read_store_ids<'a>(
+        &'a self,
+        store_kind: StoreKind,
+        store_root: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<String>, StorageError>> {
         Box::pin(async move {
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM backup_maintenance)")
-                .fetch_one(&self.pool)
+            sqlx::query_scalar(
+                "SELECT DISTINCT store_id FROM backup_index \
+                 WHERE store_kind = $1 AND store_root = $2 ORDER BY store_id",
+            )
+            .bind(store_kind.as_str())
+            .bind(store_root)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)
+        })
+    }
+
+    fn maintenance_claim<'a>(
+        &'a self,
+        holder: &'a str,
+        stale_after: Duration,
+    ) -> BoxFuture<'a, Result<Box<dyn MaintenanceClaim>, StorageError>> {
+        Box::pin(async move {
+            // The advisory lock is the live-holder proof, as a job's is: a
+            // second command on any instance finds it taken while the first
+            // runs, and a holder whose session ended has released it. The
+            // row carries the generation the heartbeats and the release are
+            // conditioned on, and the heartbeat age jobs read.
+            let Some(mut session) = try_claim(&self.pool, MAINTENANCE_LOCK_KEY, None).await? else {
+                let current: Option<String> =
+                    sqlx::query_scalar("SELECT holder FROM backup_maintenance")
+                        .fetch_optional(&self.pool)
+                        .await
+                        .map_err(db_err)?;
+                return Err(StorageError::AlreadyExists(format!(
+                    "the backup maintenance claim is held by {}",
+                    current.as_deref().unwrap_or("another maintenance command")
+                )));
+            };
+            // With the lock held, a row whose heartbeat is still young is a
+            // holder whose lock session ended within the stale window: dead
+            // by this backend's rule (4(e)), so the row is taken over
+            // whatever its age. `stale_after` is the other backends' rule and
+            // the one `check_maintenance_claim` applies on every backend.
+            let _ = stale_after;
+            let generation = session.generation();
+            sqlx::query(
+                "INSERT INTO backup_maintenance (singleton, holder, owner_generation) \
+                 VALUES (TRUE, $1, $2) \
+                 ON CONFLICT (singleton) DO UPDATE SET holder = EXCLUDED.holder, \
+                 owner_generation = EXCLUDED.owner_generation, claimed_at = now(), \
+                 heartbeat_at = now()",
+            )
+            .bind(holder)
+            .bind(generation_column(generation))
+            .execute(session.connection())
+            .await
+            .map_err(db_err)?;
+            Ok(Box::new(PostgresMaintenanceClaim {
+                session: Mutex::new(Some(session)),
+                generation,
+            }) as Box<dyn MaintenanceClaim>)
+        })
+    }
+
+    fn check_maintenance_claim(
+        &self,
+        stale_after: Duration,
+    ) -> BoxFuture<'_, Result<bool, StorageError>> {
+        Box::pin(async move {
+            // A live holder's session holds the exclusive lock, so a shared
+            // try-lock fails; it succeeds when no session does. The lock is
+            // taken at transaction scope in one autocommit statement, so it
+            // ends with the statement and nothing is held on the pooled
+            // connection when the caller's future is dropped between awaits
+            // (this runs inside every CreateBackup and RestoreTableFromBackup
+            // request). Then the row a dead session left is held until its
+            // heartbeat ages past the window.
+            let unlocked: bool = sqlx::query_scalar(
+                "SELECT pg_try_advisory_xact_lock_shared(hashtextextended($1, $2))",
+            )
+            .bind(MAINTENANCE_LOCK_KEY)
+            .bind(crate::backup_engine::RESTORE_LOCK_SEED)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(db_err)?;
+            if !unlocked {
+                return Ok(true);
+            }
+            sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM backup_maintenance \
+                 WHERE heartbeat_at >= now() - make_interval(secs => $1))",
+            )
+            .bind(stale_after.as_secs_f64())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(db_err)
+        })
+    }
+}
+
+/// The advisory-lock key of the maintenance claim, in the one lock key space
+/// (`RESTORE_LOCK_SEED`) the job claims use.
+const MAINTENANCE_LOCK_KEY: &str = "backup_maintenance";
+
+/// The holder's handle on the `backup_maintenance` row: the lock session
+/// (`None` once released) and the generation its writes are conditioned on.
+struct PostgresMaintenanceClaim {
+    session: Mutex<Option<ClaimSession>>,
+    generation: u64,
+}
+
+impl MaintenanceClaim for PostgresMaintenanceClaim {
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn heartbeat(&self) -> BoxFuture<'_, Result<Heartbeat, StorageError>> {
+        Box::pin(async move {
+            let mut session = self.session.lock().await;
+            let Some(session) = session.as_mut() else {
+                return Ok(Heartbeat::Lost);
+            };
+            let confirmed = session
+                .confirm(
+                    "UPDATE backup_maintenance SET heartbeat_at = now() WHERE owner_generation = $1",
+                    &[],
+                )
                 .await
-                .map_err(db_err)
+                .map_err(|e| StorageError::Internal(format!("claim session: {e}")))?;
+            Ok(if confirmed {
+                Heartbeat::Confirmed
+            } else {
+                Heartbeat::Lost
+            })
+        })
+    }
+
+    /// Delete the row and end the lock session, which releases the advisory
+    /// lock; a second release finds no session and does nothing.
+    fn release(&self) -> BoxFuture<'_, Result<(), StorageError>> {
+        Box::pin(async move {
+            let mut slot = self.session.lock().await;
+            let Some(mut session) = slot.take() else {
+                return Ok(());
+            };
+            sqlx::query("DELETE FROM backup_maintenance WHERE owner_generation = $1")
+                .bind(generation_column(self.generation))
+                .execute(session.connection())
+                .await
+                .map_err(db_err)?;
+            session.close().await;
+            Ok(())
         })
     }
 }
