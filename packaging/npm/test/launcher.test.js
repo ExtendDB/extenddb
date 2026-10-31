@@ -15,21 +15,17 @@
 //      if memory mode silently fell back to a file, it would fail.
 //   3. dbPath + memory together are refused: silently ignoring the path a
 //      caller asked to persist to would be data loss by configuration.
-//   4. The startup timeout counts from the last line of catalog migration
-//      progress the server prints: a dev server migrating a large database
-//      reports progress for longer than the timeout and then serves. The
-//      server here is test/fake-server.js, which can take 20 s to start.
+//
+// The startup timeout and the reporting of a failed start are tested with a
+// stand-in server in test/start.test.js.
 
 "use strict";
 
 const assert = require("node:assert");
 const fs = require("node:fs");
-const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
-const { spawn } = require("node:child_process");
 const { start } = require("../index.js");
-const { waitForStartup } = require("../startup.js");
 
 if (!process.env.EXTENDDB_BINARY) {
   console.error("EXTENDDB_BINARY must point at a dev-mode extenddb binary");
@@ -131,42 +127,6 @@ async function createProbeTable(eb) {
   }
 }
 
-function freePort() {
-  return new Promise((resolve, reject) => {
-    const srv = net.createServer();
-    srv.listen(0, "127.0.0.1", () => {
-      const { port } = srv.address();
-      srv.close((err) => (err ? reject(err) : resolve(port)));
-    });
-    srv.on("error", reject);
-  });
-}
-
-// Wait, with the launcher's 15 s default, for a fake server that answers
-// /health after 20 s and prints a progress line every `progressEveryMs`
-// until then (none when 0). Resolves with the outcome and how long it took.
-async function fakeStartup(progressEveryMs) {
-  const port = await freePort();
-  const child = spawn(process.execPath, [path.join(__dirname, "fake-server.js")], {
-    env: {
-      ...process.env,
-      FAKE_PORT: String(port),
-      FAKE_READY_AFTER_MS: "20000",
-      FAKE_PROGRESS_EVERY_MS: String(progressEveryMs),
-    },
-    stdio: ["ignore", "ignore", "pipe"],
-  });
-  const started = Date.now();
-  try {
-    await waitForStartup(child, `http://127.0.0.1:${port}`, 15000);
-    return { error: null, elapsed: Date.now() - started };
-  } catch (error) {
-    return { error, elapsed: Date.now() - started };
-  } finally {
-    child.kill();
-  }
-}
-
 async function main() {
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "extenddb-launcher-test-"));
   const dbPath = path.join(scratch, "persisted.db");
@@ -259,29 +219,7 @@ async function main() {
     );
   }
 
-  // 5. The startup timeout applies after the last migration progress line:
-  //    a server that reports progress every 2 s for 20 s is waited for, and
-  //    one that prints nothing for 20 s is given up on at 15 s.
-  {
-    const [reporting, silent] = await Promise.all([fakeStartup(2000), fakeStartup(0)]);
-    assert.strictEqual(
-      reporting.error,
-      null,
-      `a server reporting migration progress must be waited for: ${reporting.error}`
-    );
-    assert.ok(
-      reporting.elapsed > 15000,
-      `the reporting server answered after ${reporting.elapsed}ms, within the plain timeout`
-    );
-    assert.ok(silent.error, "a server that prints nothing must time out");
-    assert.match(silent.error.message, /did not become healthy within 15000ms$/);
-    assert.ok(
-      silent.elapsed >= 15000 && silent.elapsed < 18000,
-      `the silent server was given up on after ${silent.elapsed}ms, not at 15 s`
-    );
-  }
-
-  console.log("launcher tests: 5 scenarios passed");
+  console.log("launcher tests: 4 scenarios passed");
 }
 
 main().catch((err) => {

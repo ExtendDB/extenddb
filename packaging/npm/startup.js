@@ -15,17 +15,20 @@ const PROGRESS_PREFIX = "catalog migration: ";
  * Wait for `child`, a server spawned to listen on `endpoint`, to answer
  * GET /health with 200.
  *
- * Rejects when the child exits first, naming its exit code and the end of
- * its stderr, or when `timeoutMs` pass without an answer, counted from the
+ * Rejects when the child exits first, with an error that names its exit
+ * code or signal and the end of its stderr and carries them as `exitCode`
+ * and `signal`, or when `timeoutMs` pass without an answer, counted from the
  * start or from the last migration progress line the child printed on
  * stderr, whichever is later.
  *
  * @param {import("node:child_process").ChildProcess} child  Spawned with a piped stderr.
  * @param {string} endpoint  The server's base URL.
  * @param {number} timeoutMs  How long to wait after the start or the last progress line.
+ * @param {(line: string) => void} [onProgress]  Called with each progress line,
+ *   as the child printed it, until the wait ends.
  * @returns {Promise<void>}
  */
-function waitForStartup(child, endpoint, timeoutMs) {
+function waitForStartup(child, endpoint, timeoutMs, onProgress) {
   return new Promise((resolve, reject) => {
     let tail = "";
     let partial = "";
@@ -42,21 +45,30 @@ function waitForStartup(child, endpoint, timeoutMs) {
       const lines = (partial + text).split("\n");
       // The start of an unfinished line is all the prefix check needs.
       partial = lines.pop().slice(0, 4096);
-      if (lines.some((line) => line.startsWith(PROGRESS_PREFIX))) {
+      for (const line of lines) {
+        if (!line.startsWith(PROGRESS_PREFIX)) continue;
         lastProgressAt = Date.now();
         progressSeen = true;
+        if (onProgress && !settled) onProgress(line);
       }
     });
 
-    const onExit = (code) =>
-      finish(reject, new Error(`extenddb exited during startup (code ${code}): ${tail}`));
-    child.once("exit", onExit);
+    // "close" comes after the child's stderr has ended, so the error holds
+    // the last lines it printed; "exit" can come before them.
+    const onClose = (code, signal) => {
+      const how = signal ? `signal ${signal}` : `code ${code}`;
+      const error = new Error(`extenddb exited during startup (${how}): ${tail}`);
+      error.exitCode = code;
+      error.signal = signal;
+      finish(reject, error);
+    };
+    child.once("close", onClose);
 
     function finish(settle, value) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      child.removeListener("exit", onExit);
+      child.removeListener("close", onClose);
       settle(value);
     }
 
@@ -78,7 +90,9 @@ function waitForStartup(child, endpoint, timeoutMs) {
         answered = true;
         retry();
       };
-      const req = http.get(`${endpoint}/health`, (res) => {
+      // The timeout option starts before the connect: a listener that is
+      // bound but not accepting can leave a connect waiting for minutes.
+      const req = http.get(`${endpoint}/health`, { timeout: 1000 }, (res) => {
         res.resume();
         if (res.statusCode === 200) {
           answered = true;
@@ -88,7 +102,7 @@ function waitForStartup(child, endpoint, timeoutMs) {
         next();
       });
       req.on("error", next);
-      req.setTimeout(1000, () => {
+      req.on("timeout", () => {
         req.destroy();
         next();
       });

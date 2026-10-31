@@ -23,7 +23,7 @@
     "node": ">=18"
   },
   "scripts": {
-    "test": "node test/launcher.test.js"
+    "test": "node test/launcher.test.js && node test/start.test.js"
   },
   "optionalDependencies": {
     "@extenddb/linux-x64": "0.1.14",

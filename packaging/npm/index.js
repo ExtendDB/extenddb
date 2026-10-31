@@ -89,6 +89,22 @@ function resolveStorage(options) {
 }
 
 /**
+ * Stop `child`: SIGTERM, then SIGKILL after 5 s. Resolves once it has
+ * exited, at once when it never started or has already exited.
+ */
+function stopChild(child) {
+  return new Promise((resolve) => {
+    if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) {
+      resolve();
+      return;
+    }
+    child.once("exit", () => resolve());
+    child.kill("SIGTERM");
+    setTimeout(() => child.kill("SIGKILL"), 5000).unref();
+  });
+}
+
+/**
  * Start an ExtendDB dev server.
  *
  * @param {object} [options]
@@ -101,8 +117,13 @@ function resolveStorage(options) {
  * @param {number} [options.startupTimeoutMs]  Readiness timeout (default
  *   15000), counted from the start or from the last catalog migration line
  *   the server printed, whichever is later.
+ * @param {(line: string) => void} [options.onProgress]  Called with each
+ *   catalog migration line the server prints on stderr while it starts.
  * @returns {Promise<{endpoint: string, port: number, credentials: object,
  *                    region: string, storage: string, stop: () => Promise<void>}>}
+ *   Rejects when the server does not become healthy, after stopping it.
+ *   When the server exited first, the error's `exitCode` and `signal` are
+ *   the server's.
  */
 async function start(options = {}) {
   const binary = resolveBinary(options.binary);
@@ -143,22 +164,26 @@ async function start(options = {}) {
       reject(err);
     });
   });
-  // A dev server migrates an existing database before it serves; while it
-  // reports progress, the timeout waits.
-  await Promise.race([
-    waitForStartup(child, endpoint, options.startupTimeoutMs ?? 15000),
-    spawned,
-  ]);
+  // A dev server migrates an existing database before it serves; the
+  // timeout restarts at each progress line.
+  try {
+    await Promise.race([
+      waitForStartup(child, endpoint, options.startupTimeoutMs ?? 15000, options.onProgress),
+      spawned,
+    ]);
+  } catch (err) {
+    // The caller gets no handle to a server that failed to start, and one
+    // left running would go on migrating and then serve on its port.
+    await stopChild(child);
+    throw err;
+  }
 
   let stopped = false;
-  const stop = () =>
-    new Promise((resolve) => {
-      if (stopped || child.exitCode !== null) return resolve();
-      stopped = true;
-      child.once("exit", () => resolve());
-      child.kill("SIGTERM");
-      setTimeout(() => child.kill("SIGKILL"), 5000).unref();
-    });
+  const stop = () => {
+    if (stopped) return Promise.resolve();
+    stopped = true;
+    return stopChild(child);
+  };
   // Best effort: do not outlive the caller.
   process.once("exit", () => child.kill("SIGKILL"));
 
