@@ -12,10 +12,19 @@
 //! stored in one partition per shard index, `shardId-{table_id}-{index:012}`,
 //! whatever stream is current, and a stream's shard is a range of that
 //! partition: the records after its `StartingSequenceNumber`, up to its
-//! `EndingSequenceNumber` once closed. A new stream's shard starts at a clock
-//! value drawn when the stream is enabled, above every sequence issued before,
-//! so a record belongs to at most one stream. The first stream of a table
-//! starts at zero.
+//! `EndingSequenceNumber` once closed. A new stream's shards start one above
+//! the larger of this server's next clock value and the last ending number
+//! among the table's shards, drawn when the stream is enabled, so a record
+//! belongs to at most one stream. The first stream of a table starts at zero.
+//!
+//! With several servers, the sequence a write draws is its own server's clock
+//! (`stream_util::HybridClock`), while the start is taken on the server that
+//! runs the enable. Taking the closed shards' ending numbers into the start
+//! keeps a record of the old stream, written by a server whose clock is ahead,
+//! from reading in both streams. A server whose clock is behind the start can
+//! still write a new-stream record below it, which no stream reads; that case
+//! stays with the deferred cross-instance consistency item in the design
+//! document.
 
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_core::types::{StreamSpecification, StreamViewType};
@@ -42,6 +51,14 @@ pub(crate) fn physical_shard_id(table_id: &str, shard_id: &str) -> String {
         || shard_id.to_owned(),
         |(_, index)| format!("shardId-{table_id}-{index:012}"),
     )
+}
+
+/// The sequence number one above `sequence`, in its 23-digit shape.
+fn next_sequence(sequence: &str) -> Result<String, StorageError> {
+    let n: u128 = sequence
+        .parse()
+        .map_err(|_| StorageError::Internal(format!("malformed sequence number {sequence}")))?;
+    Ok(format!("{:0width$}", n + 1, width = sequence.len()))
 }
 
 /// The table id a shard id names (`shardId-{table_id}-{digits}`).
@@ -100,7 +117,10 @@ impl PendingStream {
     /// after its inserts and, when the row no longer says enabled with this
     /// label, closes the shards it inserted. A disable written before the
     /// re-read is seen by it; one written after finds all four rows open and
-    /// closes them itself; the two closes carry the same ending number.
+    /// closes them itself. A shard keeps the ending number of the first close
+    /// that writes one (`close_stream_shards`), so a disable whose close runs
+    /// after an overlapping enable started the next stream cannot move the
+    /// closed shard's ending number up into the new stream's records.
     pub(crate) async fn apply(
         self,
         engine: &CassandraEngine,
@@ -117,18 +137,28 @@ impl PendingStream {
         let Some((label, view_type)) = self.open else {
             return Ok(());
         };
-        // Each new shard starts at a sequence number drawn now from the same
-        // clock the writers draw from, so it is above every sequence issued so
-        // far. A write of the closed stream that commits after the close (its
-        // LOGGED BATCH drew its sequence before the ending number was taken)
-        // then falls between the old shard's ending number and the new
+        // Each new shard starts one above the larger of a sequence number
+        // drawn now from the clock this server's writers draw from and the
+        // last ending number among the table's shards (the ones just closed
+        // included), so it is above every sequence issued so far on this
+        // server and every record the closed streams hold, whichever server
+        // wrote it. A write of the closed stream that commits after the close
+        // (its LOGGED BATCH drew its sequence before the ending number was
+        // taken) then falls between the old shard's ending number and the new
         // shard's starting number: in neither stream, rather than in the new
         // one under the old view type.
-        let start = engine
+        let local = engine
             .hlc
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .generate();
+        let last_end = engine
+            .stream_shard_rows(account_ks, Some(table_id))
+            .await?
+            .into_iter()
+            .filter_map(|r| r.ending_sequence_number)
+            .max();
+        let start = next_sequence(&last_end.map_or(local.clone(), |end| end.max(local)))?;
         let starts: Vec<String> = vec![start; SHARDS_PER_STREAM as usize];
         engine
             .insert_stream_shards(account_ks, table_id, &label, view_type, &starts)
@@ -295,6 +325,13 @@ impl CassandraEngine {
     /// Close every open shard of the table: its `EndingSequenceNumber` becomes
     /// the sequence number of its last record, or its starting number when it
     /// holds none (both measured 2026-10-24).
+    ///
+    /// A shard's range has no upper bound while it is open, so the ending
+    /// number is written only if the shard has none yet: a close that read the
+    /// shard as open and takes its ending after another close has written one
+    /// (a disable applying after an overlapping enable closed the stream and
+    /// started the next) would otherwise take a record of the next stream from
+    /// the shared partition.
     pub(crate) async fn close_stream_shards(
         &self,
         account_ks: &str,
@@ -303,10 +340,26 @@ impl CassandraEngine {
     ) -> Result<(), StorageError> {
         let rows = self.stream_shard_rows(account_ks, Some(table_id)).await?;
         let ids = open_shard_ids_of(table_id, label, &rows);
+        let open = rows
+            .into_iter()
+            .filter(|r| ids.contains(&r.shard_id))
+            .collect();
+        self.close_shards_as_read(account_ks, table_id, open).await
+    }
+
+    /// Write the ending numbers of `rows`, shard rows of table `table_id` this
+    /// close read as open: each one's last record after its start, or its
+    /// start when it holds none, unless the shard already has an ending
+    /// number. Public for the direct tests, which run a close that read its
+    /// rows before another close wrote them.
+    #[doc(hidden)]
+    pub async fn close_shards_as_read(
+        &self,
+        account_ks: &str,
+        table_id: &str,
+        rows: Vec<ShardRow>,
+    ) -> Result<(), StorageError> {
         for row in rows {
-            if !ids.contains(&row.shard_id) {
-                continue;
-            }
             let range = ShardRange {
                 physical: physical_shard_id(table_id, &row.shard_id),
                 after: row.starting_sequence_number.clone(),
@@ -320,7 +373,7 @@ impl CassandraEngine {
                 &self.session,
                 &format!(
                     "UPDATE {account_ks}.stream_shards SET ending_sequence_number = ? \
-                     WHERE shard_id = ?"
+                     WHERE shard_id = ? IF ending_sequence_number = null"
                 ),
                 cdrs_tokio::query_values!(ending.as_str(), row.shard_id.as_str()),
                 "close_stream_shards",
