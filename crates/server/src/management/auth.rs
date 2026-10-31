@@ -31,6 +31,15 @@ fn invalid_credentials() -> Response {
         .into_response()
 }
 
+/// The answer to a login attempt the rate limiter did not admit.
+fn refusal_response(refusal: LoginRefusal) -> Response {
+    match refusal {
+        LoginRefusal::TooManyAttempts(msg) => (StatusCode::TOO_MANY_REQUESTS, msg).into_response(),
+        LoginRefusal::InvalidCredentials => invalid_credentials(),
+        LoginRefusal::Internal => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
 /// Identifies the authenticated caller of a management API request.
 #[derive(Debug, Clone)]
 pub enum CallerIdentity {
@@ -55,6 +64,8 @@ pub enum CallerIdentity {
 /// (see [`crate::rate_limit`]); an attempt over either limit is answered 429
 /// before any password is checked. A wrong password is recorded as a failure;
 /// a storage error while checking it is answered 500 and recorded as nothing.
+/// A principal longer than [`crate::rate_limit::MAX_PRINCIPAL_LEN`] bytes is
+/// answered 401 and recorded as nothing.
 #[allow(clippy::result_large_err)] // axum Response as rejection is this module's idiom
 pub async fn authenticate(
     headers: &HeaderMap,
@@ -124,15 +135,9 @@ pub async fn authenticate(
 
     // Reserve the attempt before any password is checked, so a burst cannot
     // run more checks than the limits allow.
-    let attempt = match crate::rate_limit::begin_login(rate_limiter, username, peer).await {
-        Ok(attempt) => attempt,
-        Err(LoginRefusal::TooManyAttempts(msg)) => {
-            return Err((StatusCode::TOO_MANY_REQUESTS, msg).into_response());
-        }
-        Err(LoginRefusal::Internal) => {
-            return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
-        }
-    };
+    let attempt = crate::rate_limit::begin_login(rate_limiter, username, peer)
+        .await
+        .map_err(refusal_response)?;
 
     // Try admin auth first. A storage error returns 500 without recording a
     // failure: no password was checked, so nothing counts against the caller.
@@ -232,5 +237,29 @@ async fn try_iam_user_auth(
         }))
     } else {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rate_limit::PRINCIPAL_LIMITED;
+
+    #[test]
+    fn a_refused_attempt_is_answered_by_its_reason() {
+        let limited = refusal_response(LoginRefusal::TooManyAttempts(PRINCIPAL_LIMITED));
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // The attempts store could not be read: a server error, not a limit.
+        let internal = refusal_response(LoginRefusal::Internal);
+        assert_eq!(internal.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        // A principal over the length limit gets the wrong-password answer.
+        let too_long = refusal_response(LoginRefusal::InvalidCredentials);
+        assert_eq!(too_long.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            too_long.headers()[axum::http::header::WWW_AUTHENTICATE],
+            WWW_AUTHENTICATE_BASIC
+        );
     }
 }

@@ -40,14 +40,7 @@ pub async fn login_submit(
     // address out.
     let attempt = match rate_limit::begin_login(&*state.catalog_store, &form.username, addr).await {
         Ok(attempt) => attempt,
-        Err(LoginRefusal::TooManyAttempts(msg)) => {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Html(login_html(Some(msg), &state.listen_url)),
-            )
-                .into_response();
-        }
-        Err(LoginRefusal::Internal) => return internal_error(&state),
+        Err(refusal) => return refusal_page(refusal, &state.listen_url),
     };
 
     // Try admin auth first. A storage error (including a timed-out wait for
@@ -55,13 +48,13 @@ pub async fn login_submit(
     // was checked.
     let identity =
         match try_admin_login(&form.username, &form.password, &*state.catalog_store).await {
-            Err(()) => return internal_error(&state),
+            Err(()) => return internal_error(&state.listen_url),
             Ok(AdminLoginResult::Authenticated(id)) => Some(id),
             Ok(AdminLoginResult::WrongPassword) => None, // Admin exists, wrong password: do NOT fall through.
             Ok(AdminLoginResult::NotFound) => {
                 // Admin not found: try IAM user auth.
                 match try_iam_login(&form.username, &form.password, &*state.catalog_store).await {
-                    Err(()) => return internal_error(&state),
+                    Err(()) => return internal_error(&state.listen_url),
                     Ok(identity) => identity,
                 }
             }
@@ -69,11 +62,7 @@ pub async fn login_submit(
 
     let Some(identity) = identity else {
         attempt.record_failure(&*state.catalog_store).await;
-        return (
-            StatusCode::OK,
-            Html(login_html(Some("Invalid credentials"), &state.listen_url)),
-        )
-            .into_response();
+        return invalid_credentials(&state.listen_url);
     };
 
     let (token, _csrf) = state.sessions.create(identity).await;
@@ -147,15 +136,37 @@ enum AdminLoginResult {
 
 /// The login page with a server error, answered when the store failed before
 /// or while the password was checked. Nothing is recorded against the caller.
-fn internal_error(state: &ConsoleState) -> Response {
+fn internal_error(listen_url: &str) -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Html(login_html(
             Some("Internal error. Please try again later."),
-            &state.listen_url,
+            listen_url,
         )),
     )
         .into_response()
+}
+
+/// The login page answered to a wrong password or an unknown principal.
+fn invalid_credentials(listen_url: &str) -> Response {
+    (
+        StatusCode::OK,
+        Html(login_html(Some("Invalid credentials"), listen_url)),
+    )
+        .into_response()
+}
+
+/// The login page answered to an attempt the rate limiter did not admit.
+fn refusal_page(refusal: LoginRefusal, listen_url: &str) -> Response {
+    match refusal {
+        LoginRefusal::TooManyAttempts(msg) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            Html(login_html(Some(msg), listen_url)),
+        )
+            .into_response(),
+        LoginRefusal::InvalidCredentials => invalid_credentials(listen_url),
+        LoginRefusal::Internal => internal_error(listen_url),
+    }
 }
 
 /// `Err(())` is a storage error; the caller answers 500 and records nothing.
@@ -193,4 +204,35 @@ async fn try_iam_login(
         account_id: acct_id.to_owned(),
         user_name: uname.to_owned(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rate_limit::PRINCIPAL_LIMITED;
+
+    const LISTEN_URL: &str = "https://127.0.0.1:8443";
+
+    async fn body_text(response: Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_refused_attempt_is_answered_by_its_reason() {
+        let limited = refusal_page(LoginRefusal::TooManyAttempts(PRINCIPAL_LIMITED), LISTEN_URL);
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(body_text(limited).await.contains(PRINCIPAL_LIMITED));
+
+        // The attempts store could not be read: a server error, not a limit.
+        let internal = refusal_page(LoginRefusal::Internal, LISTEN_URL);
+        assert_eq!(internal.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        // A principal over the length limit gets the wrong-password page.
+        let too_long = refusal_page(LoginRefusal::InvalidCredentials, LISTEN_URL);
+        assert_eq!(too_long.status(), StatusCode::OK);
+        assert!(body_text(too_long).await.contains("Invalid credentials"));
+    }
 }

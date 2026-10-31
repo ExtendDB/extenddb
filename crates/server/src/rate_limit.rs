@@ -39,6 +39,11 @@ pub const MAX_FAILURES_PER_IP: i64 = 20;
 /// Lookback window in seconds for counting failed attempts.
 pub const WINDOW_SECONDS: i64 = 900; // 15 minutes
 
+/// Longest principal, in bytes, that a login attempt may name. Admin names
+/// are at most 64 bytes and `account_id/user_name` at most 141, so a longer
+/// principal cannot name anyone and is refused before the store is read.
+pub const MAX_PRINCIPAL_LEN: usize = 256;
+
 /// Message returned when the (principal, source) pair is over its limit.
 pub const PRINCIPAL_LIMITED: &str = "Too many failed login attempts. Please try again later.";
 
@@ -55,6 +60,9 @@ pub enum LoginRefusal {
     /// The attempts store could not be read. Callers answer 500; nothing is
     /// recorded, and no password is checked.
     Internal,
+    /// The principal is longer than [`MAX_PRINCIPAL_LEN`] bytes. Callers
+    /// answer as for a wrong password; nothing is read, reserved or recorded.
+    InvalidCredentials,
 }
 
 /// An admitted login attempt. It holds one reservation against the limits of
@@ -108,13 +116,18 @@ impl Drop for LoginAttempt {
 ///
 /// # Errors
 ///
-/// [`LoginRefusal::TooManyAttempts`] when a limit is reached and
-/// [`LoginRefusal::Internal`] when the store cannot be read.
+/// [`LoginRefusal::InvalidCredentials`] when the principal is longer than
+/// [`MAX_PRINCIPAL_LEN`] bytes, [`LoginRefusal::TooManyAttempts`] when a
+/// limit is reached and [`LoginRefusal::Internal`] when the store cannot be
+/// read.
 pub async fn begin_login(
     store: &dyn RateLimitStore,
     principal: &str,
     peer: SocketAddr,
 ) -> Result<LoginAttempt, LoginRefusal> {
+    if principal.len() > MAX_PRINCIPAL_LEN {
+        return Err(LoginRefusal::InvalidCredentials);
+    }
     begin_login_from(store, principal, limiter_source(&peer)).await
 }
 

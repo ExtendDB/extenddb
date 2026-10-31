@@ -258,6 +258,30 @@ async fn a_store_error_is_internal_and_holds_no_reservation() {
     assert!(!registry().tracks("198.51.100.50"));
 }
 
+#[tokio::test]
+async fn a_principal_over_the_length_limit_is_refused_before_the_store_is_read() {
+    let store = MemoryStore::default();
+    // Every read fails, so an attempt that reads the store is Internal.
+    store.broken.store(true, Ordering::SeqCst);
+    let too_long = "a".repeat(MAX_PRINCIPAL_LEN + 1);
+    assert_eq!(
+        begin_login(&store, &too_long, peer("198.51.100.80"))
+            .await
+            .err(),
+        Some(LoginRefusal::InvalidCredentials)
+    );
+    assert!(!registry().tracks("198.51.100.80"));
+
+    // A principal at the limit is checked against the store.
+    let at_limit = "a".repeat(MAX_PRINCIPAL_LEN);
+    assert_eq!(
+        begin_login(&store, &at_limit, peer("198.51.100.80"))
+            .await
+            .err(),
+        Some(LoginRefusal::Internal)
+    );
+}
+
 #[test]
 fn an_ipv6_peer_is_keyed_by_its_64_and_ipv4_by_its_address() {
     assert_eq!(
