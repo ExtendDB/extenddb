@@ -1268,6 +1268,10 @@ impl MongoEngine {
         let global_secondary_indexes = grouped.gsis;
         let local_secondary_indexes = grouped.lsis;
         let has_lsi = !local_secondary_indexes.is_empty();
+        let creation_date_time = table_doc
+            .get_datetime("creation_date_time")
+            .map(|dt| dt.timestamp_millis() as f64 / 1000.0)
+            .unwrap_or(0.0);
 
         let key_info = TableKeyInfo {
             table_name,
@@ -1280,6 +1284,7 @@ impl MongoEngine {
             global_secondary_indexes,
             local_secondary_indexes,
             stream_specification,
+            creation_date_time,
             // Fields for features this backend does not implement, vector
             // indexes today, take their defaults. Adding one to TableKeyInfo
             // then does not break this build.

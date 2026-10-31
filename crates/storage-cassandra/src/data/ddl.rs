@@ -80,7 +80,8 @@ impl CassandraEngine {
         let catalog_keyspace = format!("{}_catalog", self.keyspace_prefix);
 
         let query = format!(
-            "SELECT key_schema, attribute_definitions, table_status, table_id, stream_specification \
+            "SELECT key_schema, attribute_definitions, table_status, table_id, stream_specification, \
+             created_at \
              FROM {catalog_keyspace}.tables WHERE account_id = ? AND table_name = ?"
         );
         let values = cdrs_tokio::query_values!(account_id, table_name);
@@ -116,6 +117,9 @@ impl CassandraEngine {
             .map_err(|e| StorageError::Internal(format!("Parse table_id: {e}")))?;
         let stream_spec_text: Option<String> =
             row.get_by_name("stream_specification").ok().flatten();
+        let created_at: i64 = row
+            .get_r_by_name("created_at")
+            .map_err(|e| StorageError::Internal(format!("Parse created_at: {e}")))?;
 
         if status == "CREATING" || status == "DELETING" {
             return Err(StorageError::TableNotFound(table_name.to_owned()));
@@ -182,6 +186,7 @@ impl CassandraEngine {
             local_secondary_indexes,
             stream_specification,
             vector_indexes: Vec::new(),
+            creation_date_time: crate::cassandra_util::millis_to_seconds_f64(created_at),
         })
     }
 
