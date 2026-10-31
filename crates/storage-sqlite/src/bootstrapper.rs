@@ -118,7 +118,7 @@ impl SqliteBootstrapper {
                 ))
             })?;
         }
-        SqlitePoolOptions::new()
+        let options = SqlitePoolOptions::new()
             .max_connections(1)
             .after_connect(|conn, _| {
                 Box::pin(async move {
@@ -129,8 +129,8 @@ impl SqliteBootstrapper {
                     conn.execute("PRAGMA busy_timeout = 5000").await?;
                     Ok(())
                 })
-            })
-            .connect(&sqlite_url(&self.path))
+            });
+        crate::file_mode::connect(&self.path, options)
             .await
             .map_err(|e| OpError::Internal(format!("open SQLite database '{}': {e}", self.path)))
     }

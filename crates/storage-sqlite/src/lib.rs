@@ -30,6 +30,7 @@ mod create_table;
 mod credential_store;
 mod data;
 mod delete_table;
+mod file_mode;
 mod hooks;
 mod management_store;
 mod metadata;
@@ -38,6 +39,7 @@ mod operations;
 mod schema;
 mod serve_lock;
 mod snapshot_engine;
+mod sqlite_uri;
 mod sqlite_util;
 mod store;
 mod stream;
@@ -103,12 +105,10 @@ use extenddb_storage::management_store::{ManagementStore, SettingsStore};
 use extenddb_storage::management_store_factory::ManagementStoreError;
 use extenddb_storage::settings_store::SettingsStoreError;
 
-use crate::sqlite_util::sqlite_url;
-
 /// Open a small catalog-only pool for the settings/diagnostics factories,
-/// applying the same PRAGMAs as the engine.
-async fn catalog_pool(connection_string: &str) -> Result<sqlx::SqlitePool, sqlx::Error> {
-    sqlx::sqlite::SqlitePoolOptions::new()
+/// applying the same PRAGMAs and file modes as the engine.
+async fn catalog_pool(connection_string: &str) -> Result<sqlx::SqlitePool, String> {
+    let options = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(4)
         .after_connect(|conn, _| {
             Box::pin(async move {
@@ -118,9 +118,8 @@ async fn catalog_pool(connection_string: &str) -> Result<sqlx::SqlitePool, sqlx:
                 conn.execute("PRAGMA busy_timeout = 5000").await?;
                 Ok(())
             })
-        })
-        .connect(&sqlite_url(connection_string))
-        .await
+        });
+    file_mode::connect(connection_string, options).await
 }
 
 // ── Bootstrapper ───────────────────────────────────────────────────────

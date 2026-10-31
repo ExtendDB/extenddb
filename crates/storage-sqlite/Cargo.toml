@@ -39,6 +39,7 @@ bigdecimal = { workspace = true }
 crc32fast = { workspace = true }
 zeroize = { workspace = true }
 libc = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 # The crate's own tests need `test-hooks`; a dev-dependency on itself turns
