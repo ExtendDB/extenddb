@@ -12,7 +12,7 @@ This page gets a server running in one command and sends the first requests to i
 
 ## 1. Start a server
 
-The development image is one container over SQLite, plain HTTP, with a seeded example credential. It needs no database, no initialisation step and no certificate to trust. Data persists in the named volume.
+The development image is one container over SQLite, plain HTTP, with a seeded example credential. It needs no database, no initialization step and no certificate to trust. Data persists in the named volume.
 
 ```bash
 docker run -d --name extenddb -p 127.0.0.1:18080:18080 \
@@ -124,7 +124,8 @@ docker volume rm extenddb
 
 ## Next
 
+- [First requests](/first-requests/): tables, items, batches, transactions and streams from the AWS CLI against the server you have.
 - [Install](/start/install/): Docker Compose with PostgreSQL and TLS, or a build from source.
 - [Using ExtendDB](/manuals/usage-guide/): the operations, expressions, transactions and streams, with examples.
-- [Differences from DynamoDB](/differences-from-dynamodb/): every behaviour that is measured to differ from the service.
+- [Differences from DynamoDB](/differences-from-dynamodb/): every behavior that is measured to differ from the service.
 - [Deployment](/manuals/deployment-guide/): running ExtendDB on your own servers.

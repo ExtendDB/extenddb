@@ -44,7 +44,7 @@ export AWS_CA_BUNDLE=~/.extenddb/tls/cert.pem
 aws dynamodb list-tables --endpoint-url https://127.0.0.1:18443 --region us-east-1
 ```
 
-See [Getting Started](docs/getting-started.md) for the full walkthrough, or use the platform installer scripts:
+See [Install from source](docs/install-from-source.md) for the full steps, or use the platform installer scripts:
 
 ```bash
 scripts/install-linux.sh   # Linux
@@ -56,9 +56,9 @@ scripts/install-macos.sh   # macOS
 - Rust 1.88+ (`rustup update`)
 - Python 3.10+ (for test suites and documentation)
 - A storage backend:
-  - PostgreSQL 14+ (see `docs/local-postgres-setup.md`)
+  - PostgreSQL 14+ (see `docs/install-from-source.md`)
   - SQLite (embedded)
-  - MongoDB 7+ (see `docs/local-mongodb-setup.md`)
+  - MongoDB 7+ (see `docs/install-from-source.md`)
   - Cassandra 4.1+ (see `docs/cassandra-setup.md`)
 
 ### Python Environment
@@ -252,7 +252,8 @@ docs/
 
 | Document | Description |
 |----------|-------------|
-| [Getting Started](docs/getting-started.md) | Full setup walkthrough |
+| [Install from source](docs/install-from-source.md) | Database, build, init, serve and smoke test on Linux and macOS |
+| [First requests](docs/first-requests.md) | Tables, items, batches, transactions and streams from the AWS CLI |
 | [Architecture Guide](docs/manuals/01-architecture-guide.md) | System design and crate structure |
 | [Admin Guide](docs/manuals/05-admin-guide.md) | Server lifecycle, configuration, IAM management |
 | [Security Model](docs/manuals/10-security-model.md) | Threat model, authentication, authorization |

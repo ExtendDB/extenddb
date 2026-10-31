@@ -203,7 +203,7 @@
 #     import_export_root = "/var/lib/extenddb/data"
 
 # Runtime settings are managed via `extenddb settings set <key> <value>`, not this file.
-# See docs/getting-started.md for available runtime settings and their defaults.
+# See docs/manuals/05-admin-guide.md (Runtime Settings) for the keys and their defaults.
 
 # --- Production Configuration Example ---
 # Uncomment and adapt the following for production deployments:
