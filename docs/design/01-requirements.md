@@ -333,7 +333,7 @@ ExtendDB implements a local IAM identity model that mirrors the structure of AWS
   - `dynamodb:FullTableScan`: restricts whether Scan operations are allowed (`Bool` condition).
   - `dynamodb:EnclosingOperation`: identifies the parent operation for batch/transact sub-operations.
 - REQ-ABAC-005: The policy engine must build a **request context** for each operation containing all applicable context keys. The request context is populated by the server middleware before policy evaluation.
-- REQ-ABAC-006 (Deferred): **Policy variables** (`${aws:PrincipalTag/key}`, `${aws:username}`, etc.) in Resource ARNs and Condition values are not supported in v1. In AWS IAM, policy variables enable a single policy to grant access to resources that match the caller's own tags, e.g., `"Resource": "arn:aws:dynamodb:*:*:table/${aws:PrincipalTag/Team}-*"`. Without policy variables, each team or department requires a separate policy with hardcoded resource ARNs, which reduces the ABAC testing value. This is a high-priority enhancement for a future version.
+- REQ-ABAC-006 (Deferred): **Policy variables** (`${aws:PrincipalTag/key}`, `${aws:username}`, etc.) in Resource ARNs and Condition values were not supported in v1; variables in Condition values are expanded since, and substitution in Resource ARNs is not implemented. In AWS IAM, policy variables enable a single policy to grant access to resources that match the caller's own tags, e.g., `"Resource": "arn:aws:dynamodb:*:*:table/${aws:PrincipalTag/Team}-*"`. Without policy variables, each team or department requires a separate policy with hardcoded resource ARNs, which reduces the ABAC testing value. This is a high-priority enhancement for a future version.
 
 ### 4.5 Authorization: Caching
 
