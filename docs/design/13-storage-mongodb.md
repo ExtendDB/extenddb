@@ -296,19 +296,19 @@ names.
 
 Fields:
 
-- `_id` — netstring-encoded composite key `<len>:<pk>,<len>:<sk>,`.
+- `_id`: netstring-encoded composite key `<len>:<pk>,<len>:<sk>,`.
   Netstring framing gives an unambiguous boundary between `pk` and `sk`
   regardless of their contents. A naive `{pk}#{sk}` delimiter collides
   on `pk="a#b",sk="c"` vs `pk="a",sk="b#c"`. PK-only tables use raw `pk`
   text as `_id`.
-- `pk` — partition key text (matches `composite_pk_to_text` from
+- `pk`: partition key text (matches `composite_pk_to_text` from
   `extenddb_storage::util`).
 - `sk_s` / `sk_n` / `sk_b` — typed sort key, absent when the schema has
   no sort key. See §5.2 for the type-specific encoding.
-- `_v` — OCC version counter used by `UpdateItem`'s versioned filter
+- `_v`: OCC version counter used by `UpdateItem`'s versioned filter
   guard. Absent on freshly-inserted rows (treated as 0); bumped by every
   update, including the native fast path.
-- `item_data` — full DynamoDB item serialized as BSON via the
+- `item_data`: full DynamoDB item serialized as BSON via the
   `AttributeValue` JSON representation. Non-key attribute values retain
   their DynamoDB type tags (`{"S": "hello"}`, `{"N": "42"}`, ...).
 
@@ -513,12 +513,12 @@ provably in agreement with `evaluate_condition`:
 
 - Existence functions (`attribute_exists`, `attribute_not_exists`) — always
   pushable.
-- `attribute_type(path, :t)` — pushable when `:t` resolves to a placeholder
+- `attribute_type(path, :t)`: pushable when `:t` resolves to a placeholder
   whose value is one of the 10 valid DDB type tags
   (`S`, `N`, `B`, `BOOL`, `NULL`, `L`, `M`, `SS`, `NS`, `BS`). Without
   the whitelist a malicious `:t` could produce a `$`-prefixed pseudo-field.
-- `begins_with(path, :S)` — string-only.
-- `contains(path, :S)` — string-only.
+- `begins_with(path, :S)`: string-only.
+- `contains(path, :S)`: string-only.
 - `path <op> :S` for any comparator — string operands are stored
   verbatim, lex order matches wire order.
 - `path = :B` / `path <> :B` — binary equality only. Ordering
@@ -781,9 +781,9 @@ the existing-doc branch.
 Two TTL surfaces:
 
 **Storage-native TTL indexes** — configured at bootstrap:
-- `idempotency_tokens.created_at` — 540s (§4.6 for the rationale).
-- `stream_records.created_at` — 24 h.
-- `iam_sessions.expires_at` — `expireAfterSeconds: 0`.
+- `idempotency_tokens.created_at`: 540s (§4.6 for the rationale).
+- `stream_records.created_at`: 24 h.
+- `iam_sessions.expires_at`: `expireAfterSeconds: 0`.
 
 **Application-level DynamoDB TTL** — user-configured `TimeToLive`
 attribute per table. MongoDB's native TTL runs at the storage engine
@@ -951,20 +951,20 @@ layer redacts the password from it for display via the
    databases lazily on first write, so we explicitly create
    `schema_history` in the catalog db and `idempotency_tokens` in the
    data db).
-2. `run_catalog_migrations` — create the 17 catalog collections and
+2. `run_catalog_migrations`: create the 17 catalog collections and
    their indexes; seed `settings.catalog_version = 0.0.2`; record
    the migration in `schema_history`.
-3. `create_data_db` — create `idempotency_tokens` (TTL + unique index),
+3. `create_data_db`: create `idempotency_tokens` (TTL + unique index),
    `stream_shards` (unique on shard_id), `stream_records` (TTL + compound
    query index).
-4. `bootstrap_encryption_key` — generate a random 256-bit key,
+4. `bootstrap_encryption_key`: generate a random 256-bit key,
    base64-encode, insert into `settings` (idempotent — E11000 races are
    silently ignored).
-5. `bootstrap_default_account` — insert `default` account if none
+5. `bootstrap_default_account`: insert `default` account if none
    exists.
-6. `bootstrap_admin_user` — bcrypt-hash the password, insert into
+6. `bootstrap_admin_user`: bcrypt-hash the password, insert into
    `admin_users`.
-7. `record_data_connection` — record `data_database_name` and
+7. `record_data_connection`: record `data_database_name` and
    `data_connection_string` in `settings`.
 
 **`extenddb destroy`:** drop both databases.
@@ -973,17 +973,17 @@ layer redacts the password from it for display via the
 
 Six `inventory::submit!` blocks in `lib.rs`:
 
-- `BackendRegistration` — factory for `MongoBootstrapper`, called by
+- `BackendRegistration`: factory for `MongoBootstrapper`, called by
   `extenddb init`.
-- `OperationsEngineRegistration` — CLI operations (connection parsing,
+- `OperationsEngineRegistration`: CLI operations (connection parsing,
   redaction, identifier validation, sensitive-key detection).
-- `StorageConfigRegistration` — TOML deserializer for
+- `StorageConfigRegistration`: TOML deserializer for
   `[storage.mongodb]`.
-- `SettingsStoreRegistration` — factory for `MongoCatalogStore` acting
+- `SettingsStoreRegistration`: factory for `MongoCatalogStore` acting
   as `SettingsStore`.
-- `DiagnosticsStoreRegistration` — factory for `MongoCatalogStore`
+- `DiagnosticsStoreRegistration`: factory for `MongoCatalogStore`
   acting as `DiagnosticsStore`.
-- `ServerComponentsRegistration` — factory called by `extenddb serve`
+- `ServerComponentsRegistration`: factory called by `extenddb serve`
   that constructs `MongoEngine`, `MongoCatalogStore`,
   `MongoCredentialStore`, and `MongoRuntimeHooks` (which spawns the
   TTL, stream-cleanup, and GSI-backfill workers).
@@ -1030,26 +1030,26 @@ proptest = "1"   # pushdown parity harness
 The backend implements every trait in `extenddb-storage`:
 
 **Data plane**
-- `TableEngine` — Create/Delete/Describe/List/UpdateTable, including
+- `TableEngine`: Create/Delete/Describe/List/UpdateTable, including
   GSI create with async backfill, LSI create, and idempotent
   stream-enable on UpdateTable.
-- `DataEngine` — PutItem, GetItem, DeleteItem, UpdateItem, Query,
+- `DataEngine`: PutItem, GetItem, DeleteItem, UpdateItem, Query,
   Scan (including parallel scan), TransactGetItems, TransactWriteItems,
   BatchGetItem, BatchWriteItem. Condition expressions run session-
   scoped with an analyzer-gated pushdown fast path for a certified
   subset.
-- `StreamEngine` — session-scoped per-shard sequence numbers, four
+- `StreamEngine`: session-scoped per-shard sequence numbers, four
   shards per stream, CRC32 pk routing, TRIM_HORIZON / LATEST /
   AT_SEQUENCE_NUMBER / AFTER_SEQUENCE_NUMBER iterators, 24h retention.
-- `MetadataEngine` — TTL lifecycle, tags, table-size tracking.
-- `BackupEngine` — CreateBackup, RestoreTableFromBackup, DeleteBackup
+- `MetadataEngine`: TTL lifecycle, tags, table-size tracking.
+- `BackupEngine`: CreateBackup, RestoreTableFromBackup, DeleteBackup
   via server-side `$out` aggregation.
 
 **Control plane and catalog**
-- `Bootstrapper` — init, destroy, migrate, verify. Creates the
+- `Bootstrapper`: init, destroy, migrate, verify. Creates the
   catalog and data databases, seeds encryption key and admin user,
   applies index schema.
-- `WorkerStore` — `process_control_plane_transitions` flips tables
+- `WorkerStore`: `process_control_plane_transitions` flips tables
   from `CREATING` to `ACTIVE` once their `status_transition_at`
   passes. `create_table_impl` (and restore) write `CREATING` with a
   scheduled transition when `control_plane_delay_seconds` > 0, or
@@ -1057,19 +1057,19 @@ The backend implements every trait in `extenddb-storage`:
   (no `DELETING` transient state).
 - `ManagementStore`, `AdminStore`, `SettingsStore`, `MetricsStore`,
   `RateLimitStore` — the catalog trait surface.
-- `AuthorizationStore` — user/group/role/permissions-boundary/session
+- `AuthorizationStore`: user/group/role/permissions-boundary/session
   policy lookup for IAM evaluation.
-- `MongoCredentialStore` — SigV4 credential resolution with
+- `MongoCredentialStore`: SigV4 credential resolution with
   AES-GCM-decrypted secret keys.
 
 **Background workers** — spawned from `MongoRuntimeHooks::spawn_workers`:
-- `ttl_cleanup_worker` — sweep expired items every 60 s, emit
+- `ttl_cleanup_worker`: sweep expired items every 60 s, emit
   service-attributed stream records for the deletes.
-- `stream_record_cleanup_worker` — hourly defense-in-depth for the
+- `stream_record_cleanup_worker`: hourly defense-in-depth for the
   24 h retention TTL index.
-- `gsi_backfill_worker` — drain `indexes` rows in `CREATING` state,
+- `gsi_backfill_worker`: drain `indexes` rows in `CREATING` state,
   scan the base collection with a persistent cursor, flip to ACTIVE.
-- `control_plane_worker` — flip `tables` rows from `CREATING` to
+- `control_plane_worker`: flip `tables` rows from `CREATING` to
   `ACTIVE` once their scheduled `status_transition_at` passes.
 
 ## 13. Testing Strategy

@@ -10,11 +10,11 @@
 
 ## Options Considered
 
-1. **Version-based OCC via LWT** — Add a `version bigint` column to each data table. Every successful write increments it. The read-modify-write cycle is made atomic by conditioning the write on `version = <read_version> AND prepared_txn_id = NULL`. A `[applied] = false` response means another writer won the race; retry from the read.
+1. **Version-based OCC via LWT**: Add a `version bigint` column to each data table. Every successful write increments it. The read-modify-write cycle is made atomic by conditioning the write on `version = <read_version> AND prepared_txn_id = NULL`. A `[applied] = false` response means another writer won the race; retry from the read.
 
-2. **Serialized writes via a per-item lock service** — Acquire an external distributed lock per item key before each write. Rejected: adds infrastructure dependency and defeats Cassandra's distributed architecture.
+2. **Serialized writes via a per-item lock service**: Acquire an external distributed lock per item key before each write. Rejected: adds infrastructure dependency and defeats Cassandra's distributed architecture.
 
-3. **Accept last-writer-wins** — Document the behavior and leave it to callers to use conditional expressions. Rejected: DynamoDB's `UpdateItem` is defined to be atomic; silent data loss is not acceptable.
+3. **Accept last-writer-wins**: Document the behavior and leave it to callers to use conditional expressions. Rejected: DynamoDB's `UpdateItem` is defined to be atomic; silent data loss is not acceptable.
 
 ## Decision
 

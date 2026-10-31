@@ -14,12 +14,12 @@ This document defines extenddb's test strategy: how tests are organized, what re
 
 ## 2. Tenets (for testing)
 
-1. **Real DynamoDB is the oracle** — every expected behavior is captured by running against real DynamoDB, never assumed or copied from reference suites.
-2. **Reference suites tell us what to test, not how to answer** — we extract scenario names and API coverage from reference suites; we independently discover correct responses via golden files.
-3. **Python carries the fidelity burden** — the Python suite is the primary test suite with full golden file coverage. Other languages validate SDK integration.
-4. **Coverage grows with the code** — test coverage and coverage maps expand incrementally as phases progress, never front-loaded as prerequisites that gate implementation.
-5. **Same code, two targets** — every test runs against both real DynamoDB and extenddb with zero code changes, controlled by environment variables.
-6. **Standard operations only** — the test suite validates fidelity mode exclusively. Preview extensions have their own tests and never appear in the fidelity test suite.
+1. **Real DynamoDB is the oracle**: every expected behavior is captured by running against real DynamoDB, never assumed or copied from reference suites.
+2. **Reference suites tell us what to test, not how to answer**: we extract scenario names and API coverage from reference suites; we independently discover correct responses via golden files.
+3. **Python carries the fidelity burden**: the Python suite is the primary test suite with full golden file coverage. Other languages validate SDK integration.
+4. **Coverage grows with the code**: test coverage and coverage maps expand incrementally as phases progress, never front-loaded as prerequisites that gate implementation.
+5. **Same code, two targets**: every test runs against both real DynamoDB and extenddb with zero code changes, controlled by environment variables.
+6. **Standard operations only**: the test suite validates fidelity mode exclusively. Preview extensions have their own tests and never appear in the fidelity test suite.
 
 ## 3. Reference Suites
 
@@ -269,12 +269,12 @@ This pattern is standard for DynamoDB test suites and proven by the PostgreSQL e
 
 | Phase | Python | Java | Rust | C++ |
 |-------|--------|------|------|-----|
-| 1 (Server + table CRUD) | Full: table lifecycle, error paths, raw HTTP edge cases, health/metrics | — | — | — |
-| 2 (PutItem + GetItem) | Full: all attribute types, size limits, ReturnValues | Smoke: basic put/get | Smoke: basic put/get | — |
-| 3 (SigV4) | Full: valid/invalid credentials, clock skew, missing headers | Smoke: SigV4 with Java SDK | Smoke: SigV4 with Rust SDK | — |
-| 4 (Policy engine) | Full: policy enforcement, ABAC, management API | — | — | — |
-| 5 (DeleteItem + UpdateItem) | Full: CRUD + expressions | Java scenarios from PostgreSQL ext suite | — | — |
-| 6 (Full expressions) | Full: all operators, functions, Expected | — | — | — |
+| 1 (Server + table CRUD) | Full: table lifecycle, error paths, raw HTTP edge cases, health/metrics | none | none | none |
+| 2 (PutItem + GetItem) | Full: all attribute types, size limits, ReturnValues | Smoke: basic put/get | Smoke: basic put/get | none |
+| 3 (SigV4) | Full: valid/invalid credentials, clock skew, missing headers | Smoke: SigV4 with Java SDK | Smoke: SigV4 with Rust SDK | none |
+| 4 (Policy engine) | Full: policy enforcement, ABAC, management API | none | none | none |
+| 5 (DeleteItem + UpdateItem) | Full: CRUD + expressions | Java scenarios from PostgreSQL ext suite | none | none |
+| 6 (Full expressions) | Full: all operators, functions, Expected | none | none | none |
 | 7 (Query + Scan) | Full: key conditions, pagination, 1MB limit | Java scenarios from PostgreSQL ext suite | Smoke: basic query/scan | Smoke: basic CRUD + query |
 | 8+ | Python mandatory, Java for PostgreSQL ext counterparts, Rust/C++ extended smoke | | | |
 

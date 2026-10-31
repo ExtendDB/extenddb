@@ -6,8 +6,8 @@ extenddb needs a standard format for all documentation: design docs, ADRs, getti
 
 ## Options Considered
 
-1. **Markdown** — lightweight, renders natively on GitHub/GitLab, editable in any text editor, supported by all Rust documentation tooling (`rustdoc`, `mdbook`).
-2. **LaTeX** — typesetting system designed for academic papers and technical documents. Produces high-quality PDF output but requires a TeX distribution to build.
+1. **Markdown**: lightweight, renders natively on GitHub/GitLab, editable in any text editor, supported by all Rust documentation tooling (`rustdoc`, `mdbook`).
+2. **LaTeX**: typesetting system designed for academic papers and technical documents. Produces high-quality PDF output but requires a TeX distribution to build.
 
 ## Decision
 

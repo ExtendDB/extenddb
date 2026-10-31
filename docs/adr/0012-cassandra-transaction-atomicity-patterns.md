@@ -12,13 +12,13 @@ Cassandra does not support multi-statement transactions. Logged batches provide 
 
 ## Options Considered
 
-1. **Check-then-batch pattern** — Execute a SELECT to check for duplicates, then use a logged BATCH for the atomic writes. Accept a small race condition window between check and write.
+1. **Check-then-batch pattern**: Execute a SELECT to check for duplicates, then use a logged BATCH for the atomic writes. Accept a small race condition window between check and write.
 
-2. **Sequential LWTs** — Execute each insert with `IF NOT EXISTS` sequentially, rolling back manually on failure. Not truly atomic.
+2. **Sequential LWTs**: Execute each insert with `IF NOT EXISTS` sequentially, rolling back manually on failure. Not truly atomic.
 
-3. **Compensation pattern** — Allow writes to proceed without duplicate checks, then clean up on failure. Leaves temporary inconsistent state.
+3. **Compensation pattern**: Allow writes to proceed without duplicate checks, then clean up on failure. Leaves temporary inconsistent state.
 
-4. **Single LWT** — Combine both operations into a single denormalized record. Breaks schema compatibility with PostgreSQL.
+4. **Single LWT**: Combine both operations into a single denormalized record. Breaks schema compatibility with PostgreSQL.
 
 ## Decision
 

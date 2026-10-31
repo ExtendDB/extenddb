@@ -409,9 +409,9 @@ There is no in-memory locking (no `Mutex`, `RwLock`, or similar) on the data pat
 ### 7.1 DynamoDB Streams
 
 **Design space:**
-- **Option A: Application-layer capture** — The core operation handlers emit stream events after successful writes. The storage trait includes `write_stream_record()`. Stream records are stored in a dedicated table/collection managed by the storage backend.
-- **Option B: Storage-layer triggers** — The storage backend uses native CDC (e.g., PostgreSQL LISTEN/NOTIFY or logical replication). More efficient but ties stream behavior to the backend.
-- **Option C: Hybrid** — The core handler constructs the stream record (it has access to old/new images). The storage engine persists the stream record in the same transaction as the data write.
+- **Option A: Application-layer capture**: The core operation handlers emit stream events after successful writes. The storage trait includes `write_stream_record()`. Stream records are stored in a dedicated table/collection managed by the storage backend.
+- **Option B: Storage-layer triggers**: The storage backend uses native CDC (e.g., PostgreSQL LISTEN/NOTIFY or logical replication). More efficient but ties stream behavior to the backend.
+- **Option C: Hybrid**: The core handler constructs the stream record (it has access to old/new images). The storage engine persists the stream record in the same transaction as the data write.
 - **Recommended direction:** Option C (hybrid). The core crate controls what gets captured (portable), while the storage backend ensures atomicity by writing the data and stream record in a single transaction. This guarantees no stream record without a data write and no data write without a stream record (when streams are enabled).
 
 **Deferred decisions:**
@@ -423,8 +423,8 @@ There is no in-memory locking (no `Mutex`, `RwLock`, or similar) on the data pat
 ### 7.2 Global Tables
 
 **Design space:**
-- **Option A: Application-layer replication** — A replication agent reads stream records from one instance and replays them to another. Conflict resolution via last-writer-wins with vector clocks.
-- **Option B: Storage-layer replication** — Delegate to the storage backend's native replication (e.g., PostgreSQL logical replication). Simpler but less portable.
+- **Option A: Application-layer replication**: A replication agent reads stream records from one instance and replays them to another. Conflict resolution via last-writer-wins with vector clocks.
+- **Option B: Storage-layer replication**: Delegate to the storage backend's native replication (e.g., PostgreSQL logical replication). Simpler but less portable.
 - **Recommended direction:** Option A for portability, built on top of DynamoDB Streams.
 
 **Deferred decisions:**

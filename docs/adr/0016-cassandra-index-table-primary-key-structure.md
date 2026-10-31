@@ -9,11 +9,11 @@
 Global Secondary Indexes (GSI) and Local Secondary Indexes (LSI) require separate physical data tables to store indexed items with alternate keys. The PostgreSQL backend uses a PRIMARY KEY constraint of `(pk, base_pk, base_sk_*)` where all columns are part of a composite uniqueness constraint. Cassandra's PRIMARY KEY serves a fundamentally different purpose: it defines both the partition key (for data distribution) and clustering keys (for ordering within a partition). A direct translation of the PostgreSQL schema results in incorrect data distribution and query patterns.
 
 The index table stores:
-- `pk` — index partition key (computed from index key attributes)
-- `sk_*` — index sort keys (e.g., `sk_s`, `sk_n`, `sk_b` for different types)
-- `base_pk` — base table partition key (for uniqueness)
-- `base_sk_*` — base table sort keys (for uniqueness)
-- `item_data` — projected item attributes (JSON)
+- `pk`: index partition key (computed from index key attributes)
+- `sk_*`: index sort keys (e.g., `sk_s`, `sk_n`, `sk_b` for different types)
+- `base_pk`: base table partition key (for uniqueness)
+- `base_sk_*`: base table sort keys (for uniqueness)
+- `item_data`: projected item attributes (JSON)
 
 DynamoDB semantics require that:
 1. Queries against an index use the index keys (not base table keys)

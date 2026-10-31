@@ -120,11 +120,11 @@ Full SigV4 signature verification:
 
 After authentication, the authorization layer evaluates IAM policies using a 5-phase algorithm:
 
-1. **Explicit Deny** — scan all policies (identity, permissions boundary, session). Any matching Deny → access denied.
-2. **Permissions Boundary** — if set, must contain a matching Allow → else denied.
-3. **Session Policy** — if set (AssumeRole), must contain a matching Allow → else denied.
-4. **Identity Allow** — scan identity policies (user, group, role). Any matching Allow → access granted.
-5. **Implicit Deny** — no matching Allow → access denied.
+1. **Explicit Deny**: scan all policies (identity, permissions boundary, session). Any matching Deny → access denied.
+2. **Permissions Boundary**: if set, must contain a matching Allow → else denied.
+3. **Session Policy**: if set (AssumeRole), must contain a matching Allow → else denied.
+4. **Identity Allow**: scan identity policies (user, group, role). Any matching Allow → access granted.
+5. **Implicit Deny**: no matching Allow → access denied.
 
 Policy conditions support all IAM condition operators: `StringEquals`, `StringNotEquals`, `StringEqualsIgnoreCase`, `StringLike`, `StringNotLike`, `NumericEquals`, `NumericNotEquals`, `NumericLessThan`, `NumericLessThanEquals`, `NumericGreaterThan`, `NumericGreaterThanEquals`, `DateEquals`, `DateNotEquals`, `DateLessThan`, `DateLessThanEquals`, `DateGreaterThan`, `DateGreaterThanEquals`, `Bool`, `Null`, `ArnEquals`, `ArnNotEquals`, `ArnLike`, `ArnNotLike`, plus `ForAllValues`, `ForAnyValue`, and `IfExists` modifiers. Supported condition keys include `aws:PrincipalTag/*`, `aws:ResourceTag/*`, `dynamodb:LeadingKeys`, `dynamodb:Attributes`, `dynamodb:Select`, `dynamodb:ReturnValues`, `dynamodb:ReturnConsumedCapacity`, `dynamodb:FullTableScan`, and `dynamodb:EnclosingOperation`.
 

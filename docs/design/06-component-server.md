@@ -388,11 +388,11 @@ All management routes use `POST /management/<action>` with JSON request/response
 
 | Route | Description | Storage method(s) | Cache invalidation |
 |-------|-------------|-------------------|-------------------|
-| `POST /management/create-user` | Create an IAM user | `IdentityEngine::create_user` | — |
+| `POST /management/create-user` | Create an IAM user | `IdentityEngine::create_user` | none |
 | `POST /management/delete-user` | Delete an IAM user | `IdentityEngine::delete_user` | `invalidate_user`, `invalidate_policies` (user ARN + all group ARNs) |
-| `POST /management/create-role` | Create an IAM role with trust policy | `IdentityEngine::create_role` | — |
+| `POST /management/create-role` | Create an IAM role with trust policy | `IdentityEngine::create_role` | none |
 | `POST /management/delete-role` | Delete an IAM role | `IdentityEngine::delete_role` | `invalidate_role`, `invalidate_policies` |
-| `POST /management/create-group` | Create an IAM group | `IdentityEngine::create_group` | — |
+| `POST /management/create-group` | Create an IAM group | `IdentityEngine::create_group` | none |
 | `POST /management/delete-group` | Delete an IAM group | `IdentityEngine::delete_group` | `invalidate_policies` (group ARN) |
 | `POST /management/add-user-to-group` | Add a user to a group | `IdentityEngine::add_user_to_group` | `invalidate_user`, `invalidate_policies` (user ARN) |
 | `POST /management/remove-user-from-group` | Remove a user from a group | `IdentityEngine::remove_user_from_group` | `invalidate_user`, `invalidate_policies` (user ARN) |
@@ -400,7 +400,7 @@ All management routes use `POST /management/<action>` with JSON request/response
 | `POST /management/detach-policy` | Detach a policy from a principal | `IdentityEngine::detach_policy` | `invalidate_policies` (principal ARN) |
 | `POST /management/set-permissions-boundary` | Set or clear a permissions boundary | `IdentityEngine::set_permissions_boundary` | `invalidate_boundary` |
 | `POST /management/set-principal-tags` | Set tags on a user or role | `IdentityEngine::set_user_tags` or `set_role_tags` | `invalidate_user` or `invalidate_role` |
-| `POST /management/store-credential` | Create an access key for a user | `CredentialEngine::store_credential` | — |
+| `POST /management/store-credential` | Create an access key for a user | `CredentialEngine::store_credential` | none |
 | `POST /management/deactivate-credential` | Deactivate an access key | `CredentialEngine::deactivate_credential` | `invalidate_credential` |
 | `POST /management/assume-role` | Assume a role, get temporary credentials | Load role via `IdentityEngine::get_role` → evaluate trust policy via `evaluate_trust_policy` with `AssumeRoleContext` → `SessionEngine::create_session` + `CredentialEngine::store_credential` | — (creates new entries; no stale cache possible) |
 | `POST /management/revoke-session` | Revoke a role session | `SessionEngine::revoke_session` | `invalidate_session`, `invalidate_credential` |

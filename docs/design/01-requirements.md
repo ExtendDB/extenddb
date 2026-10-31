@@ -14,11 +14,11 @@ extenddb (ExtendDB) is a standalone, stateless Rust application that provides a 
 
 ### 1.1 Goals
 
-- **Full DynamoDB API compatibility** — byte-for-byte compatible wire protocol, error responses, and SDK behavior
-- **Pluggable storage** — clean trait-based abstraction allowing any database as a backend (PostgreSQL first)
-- **Pluggable authentication** — support local SigV4, AWS IAM, Azure AD, and custom providers
-- **Standalone & stateless** — single async Rust binary, no embedded database, horizontally scalable
-- **Production-ready** — TLS, observability, graceful shutdown, configurable limits, VM and Kubernetes deployment
+- **Full DynamoDB API compatibility**: byte-for-byte compatible wire protocol, error responses, and SDK behavior
+- **Pluggable storage**: clean trait-based abstraction allowing any database as a backend (PostgreSQL first)
+- **Pluggable authentication**: support local SigV4, AWS IAM, Azure AD, and custom providers
+- **Standalone & stateless**: single async Rust binary, no embedded database, horizontally scalable
+- **Production-ready**: TLS, observability, graceful shutdown, configurable limits, VM and Kubernetes deployment
 
 ### 1.2 Non-Goals / Out of Scope
 
@@ -322,13 +322,13 @@ extenddb implements a local IAM identity model that mirrors the structure of AWS
   - ARN operators: `ArnLike`, `ArnNotLike`, `ArnEquals`, `ArnNotEquals`
   - Set operators: `ForAllValues:StringEquals`, `ForAnyValue:StringEquals` (and other `ForAllValues`/`ForAnyValue` prefixes with any string/numeric operator)
 - REQ-ABAC-004: Support the following DynamoDB-specific condition context keys:
-  - `dynamodb:LeadingKeys` — restricts access based on the partition key value of items being accessed. Used with `ForAllValues:StringEquals` to limit a user to their own items.
-  - `dynamodb:Attributes` — restricts which attributes can be read or written. Used with `ForAllValues:StringEquals`.
-  - `dynamodb:Select` — restricts the `Select` parameter in Query/Scan (e.g., force `SPECIFIC_ATTRIBUTES` to prevent full-item reads).
-  - `dynamodb:ReturnValues` — restricts the `ReturnValues` parameter.
-  - `dynamodb:ReturnConsumedCapacity` — restricts the `ReturnConsumedCapacity` parameter.
-  - `dynamodb:FullTableScan` — restricts whether Scan operations are allowed (`Bool` condition).
-  - `dynamodb:EnclosingOperation` — identifies the parent operation for batch/transact sub-operations.
+  - `dynamodb:LeadingKeys`: restricts access based on the partition key value of items being accessed. Used with `ForAllValues:StringEquals` to limit a user to their own items.
+  - `dynamodb:Attributes`: restricts which attributes can be read or written. Used with `ForAllValues:StringEquals`.
+  - `dynamodb:Select`: restricts the `Select` parameter in Query/Scan (e.g., force `SPECIFIC_ATTRIBUTES` to prevent full-item reads).
+  - `dynamodb:ReturnValues`: restricts the `ReturnValues` parameter.
+  - `dynamodb:ReturnConsumedCapacity`: restricts the `ReturnConsumedCapacity` parameter.
+  - `dynamodb:FullTableScan`: restricts whether Scan operations are allowed (`Bool` condition).
+  - `dynamodb:EnclosingOperation`: identifies the parent operation for batch/transact sub-operations.
 - REQ-ABAC-005: The policy engine must build a **request context** for each operation containing all applicable context keys. The request context is populated by the server middleware before policy evaluation.
 - REQ-ABAC-006 (Deferred): **Policy variables** (`${aws:PrincipalTag/key}`, `${aws:username}`, etc.) in Resource ARNs and Condition values are not supported in v1. In AWS IAM, policy variables enable a single policy to grant access to resources that match the caller's own tags — e.g., `"Resource": "arn:aws:dynamodb:*:*:table/${aws:PrincipalTag/Team}-*"`. Without policy variables, each team or department requires a separate policy with hardcoded resource ARNs, which reduces the ABAC testing value. This is a high-priority enhancement for a future version.
 

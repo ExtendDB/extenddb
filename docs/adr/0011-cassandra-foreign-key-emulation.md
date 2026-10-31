@@ -12,11 +12,11 @@ Apache Cassandra does not support foreign key constraints. The database will acc
 
 ## Options Considered
 
-1. **Application-layer pre-checks** — Before inserting a child entity, execute a SELECT query to verify the parent entity exists. Return `OpError::NotFound` if the parent is missing, matching PostgreSQL FK violation behavior.
+1. **Application-layer pre-checks**: Before inserting a child entity, execute a SELECT query to verify the parent entity exists. Return `OpError::NotFound` if the parent is missing, matching PostgreSQL FK violation behavior.
 
-2. **Eventual consistency checks** — Allow writes to proceed without validation, then run periodic background jobs to detect and repair orphaned records.
+2. **Eventual consistency checks**: Allow writes to proceed without validation, then run periodic background jobs to detect and repair orphaned records.
 
-3. **Denormalization** — Embed parent entity data in child records to eliminate the need for referential integrity checks.
+3. **Denormalization**: Embed parent entity data in child records to eliminate the need for referential integrity checks.
 
 ## Decision
 

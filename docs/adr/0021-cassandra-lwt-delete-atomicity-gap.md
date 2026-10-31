@@ -25,10 +25,10 @@ must therefore use `DELETE ... IF EXISTS`, which cannot be batched.
 
 ### Concrete examples
 
-- `delete_user` — must cascade to `iam_users`, `iam_user_tags`, `access_keys`,
+- `delete_user`: must cascade to `iam_users`, `iam_user_tags`, `access_keys`,
   `iam_policies`, and `iam_group_members`. Each table uses LWT for creation.
-- `delete_group` — must cascade to `iam_groups` and `iam_group_members`.
-- `delete_account` — must cascade to `accounts`, `backups_by_arn`,
+- `delete_group`: must cascade to `iam_groups` and `iam_group_members`.
+- `delete_account`: must cascade to `accounts`, `backups_by_arn`,
   `backups_by_table`, `backups_by_account`, and `continuous_backups`.
 
 ### Current state (as of this ADR)

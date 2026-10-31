@@ -352,10 +352,10 @@ Unchanged from v2.0 §6. The engine evaluates all three access control patterns 
 1. Collect applicable policies (user + group policies, or role policies)
 2. Collect permissions boundary (if set)
 3. Collect session policy (if AssumeRole with inline policy)
-4. **Explicit Deny scan** — any Deny statement that matches → DENY
-5. **Permissions boundary check** — must find Allow in boundary → else DENY
-6. **Session policy check** — must find Allow in session policy → else DENY
-7. **Identity policy Allow** — find Allow in identity policies → ALLOW
+4. **Explicit Deny scan**: any Deny statement that matches → DENY
+5. **Permissions boundary check**: must find Allow in boundary → else DENY
+6. **Session policy check**: must find Allow in session policy → else DENY
+7. **Identity policy Allow**: find Allow in identity policies → ALLOW
 8. **Implicit Deny** → DENY
 
 ### 8.2 Condition Operators
@@ -364,13 +364,13 @@ Full set from v2.0 §6.5: StringEquals, StringLike, NumericEquals, DateEquals, B
 
 ### 8.3 DynamoDB Condition Keys
 
-- `aws:PrincipalTag/*` — from authenticated identity's tags
+- `aws:PrincipalTag/*`: from authenticated identity's tags
 - `aws:ResourceTag/*`, from target table's tags
-- `dynamodb:LeadingKeys` — partition key values being accessed
-- `dynamodb:Attributes` — attribute names being read/written
+- `dynamodb:LeadingKeys`: partition key values being accessed
+- `dynamodb:Attributes`: attribute names being read/written
 - `dynamodb:Select`, `dynamodb:ReturnValues`, `dynamodb:ReturnConsumedCapacity`
-- `dynamodb:FullTableScan` — true for Scan operations
-- `dynamodb:EnclosingOperation` — parent operation for batch/transact sub-ops
+- `dynamodb:FullTableScan`: true for Scan operations
+- `dynamodb:EnclosingOperation`: parent operation for batch/transact sub-ops
 
 ### 8.4 Management API Policy Evaluation
 
@@ -418,43 +418,43 @@ INSERT INTO settings (key, value) VALUES ('encryption_key', '<base64-encoded-32-
 All under `/management/*`. Authenticated via HTTP Basic auth (admin users use `admin_name:password`, IAM users use `account_id/user_name:password`).
 
 ### Admin endpoints:
-- `POST /management/admins` — create admin user
-- `PUT /management/admins/{name}/password` — change admin password
-- `DELETE /management/admins/{name}` — delete admin user
-- `POST /management/accounts` — create account
-- `DELETE /management/accounts/{id}` — delete account
-- `POST /management/accounts/{id}/users` — create IAM user
-- `DELETE /management/accounts/{id}/users/{name}` — delete IAM user
-- `POST /management/accounts/{id}/groups` — create group
-- `DELETE /management/accounts/{id}/groups/{name}` — delete group
-- `POST /management/accounts/{id}/groups/{name}/members` — add user to group
-- `DELETE /management/accounts/{id}/groups/{name}/members/{user}` — remove user from group
-- `POST /management/accounts/{id}/roles` — create role
-- `DELETE /management/accounts/{id}/roles/{name}` — delete role
-- `PUT /management/accounts/{id}/users/{name}/policy/{policy}` — put user policy
-- `PUT /management/accounts/{id}/groups/{name}/policy/{policy}` — put group policy
-- `PUT /management/accounts/{id}/roles/{name}/policy/{policy}` — put role policy
-- `DELETE /management/accounts/{id}/users/{name}/policy/{policy}` — delete user policy
-- `PUT /management/accounts/{id}/users/{name}/tags` — tag user
-- `PUT /management/accounts/{id}/roles/{name}/tags` — tag role
-- `PUT /management/accounts/{id}/users/{name}/permissions-boundary` — set boundary
-- `PUT /management/accounts/{id}/roles/{name}/permissions-boundary` — set boundary
-- `POST /management/accounts/{id}/roles/{name}/assume` — assume role
+- `POST /management/admins`: create admin user
+- `PUT /management/admins/{name}/password`: change admin password
+- `DELETE /management/admins/{name}`: delete admin user
+- `POST /management/accounts`: create account
+- `DELETE /management/accounts/{id}`: delete account
+- `POST /management/accounts/{id}/users`: create IAM user
+- `DELETE /management/accounts/{id}/users/{name}`: delete IAM user
+- `POST /management/accounts/{id}/groups`: create group
+- `DELETE /management/accounts/{id}/groups/{name}`: delete group
+- `POST /management/accounts/{id}/groups/{name}/members`: add user to group
+- `DELETE /management/accounts/{id}/groups/{name}/members/{user}`: remove user from group
+- `POST /management/accounts/{id}/roles`: create role
+- `DELETE /management/accounts/{id}/roles/{name}`: delete role
+- `PUT /management/accounts/{id}/users/{name}/policy/{policy}`: put user policy
+- `PUT /management/accounts/{id}/groups/{name}/policy/{policy}`: put group policy
+- `PUT /management/accounts/{id}/roles/{name}/policy/{policy}`: put role policy
+- `DELETE /management/accounts/{id}/users/{name}/policy/{policy}`: delete user policy
+- `PUT /management/accounts/{id}/users/{name}/tags`: tag user
+- `PUT /management/accounts/{id}/roles/{name}/tags`: tag role
+- `PUT /management/accounts/{id}/users/{name}/permissions-boundary`: set boundary
+- `PUT /management/accounts/{id}/roles/{name}/permissions-boundary`: set boundary
+- `POST /management/accounts/{id}/roles/{name}/assume`: assume role
 
 ### IAM user self-service endpoints:
-- `POST /management/accounts/{id}/users/{name}/access-keys` — create access key (self only)
-- `DELETE /management/accounts/{id}/users/{name}/access-keys/{key_id}` — delete access key (self only)
-- `GET /management/accounts/{id}/users/{name}/access-keys` — list access keys (self only)
-- `PUT /management/accounts/{id}/users/{name}/password` — change own password
+- `POST /management/accounts/{id}/users/{name}/access-keys`: create access key (self only)
+- `DELETE /management/accounts/{id}/users/{name}/access-keys/{key_id}`: delete access key (self only)
+- `GET /management/accounts/{id}/users/{name}/access-keys`: list access keys (self only)
+- `PUT /management/accounts/{id}/users/{name}/password`: change own password
 
 ### List/describe endpoints (admin only):
-- `GET /management/accounts` — list accounts
-- `GET /management/accounts/{id}/users` — list users
-- `GET /management/accounts/{id}/groups` — list groups
-- `GET /management/accounts/{id}/roles` — list roles
-- `GET /management/accounts/{id}/users/{name}/policies` — list user policies
-- `GET /management/accounts/{id}/groups/{name}/policies` — list group policies
-- `GET /management/accounts/{id}/roles/{name}/policies` — list role policies
+- `GET /management/accounts`: list accounts
+- `GET /management/accounts/{id}/users`: list users
+- `GET /management/accounts/{id}/groups`: list groups
+- `GET /management/accounts/{id}/roles`: list roles
+- `GET /management/accounts/{id}/users/{name}/policies`: list user policies
+- `GET /management/accounts/{id}/groups/{name}/policies`: list group policies
+- `GET /management/accounts/{id}/roles/{name}/policies`: list role policies
 
 ## 12. CLI Commands
 
@@ -481,11 +481,11 @@ The `[server].account_id` config key is used only when `provider = "none"`. When
 ## 14. Error Fidelity
 
 Auth-related DynamoDB errors:
-- `UnrecognizedClientException` — invalid access key or signature mismatch
-- `IncompleteSignatureException` — malformed Authorization header
-- `MissingAuthenticationTokenException` — no Authorization header
-- `ExpiredTokenException` — expired session credentials
-- `AccessDeniedException` — policy evaluation denied the request
+- `UnrecognizedClientException`: invalid access key or signature mismatch
+- `IncompleteSignatureException`: malformed Authorization header
+- `MissingAuthenticationTokenException`: no Authorization header
+- `ExpiredTokenException`: expired session credentials
+- `AccessDeniedException`: policy evaluation denied the request
 
 These must match real DynamoDB error format (HTTP status, error code, message structure).
 

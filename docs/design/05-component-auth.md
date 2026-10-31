@@ -957,9 +957,9 @@ accepted.
 > **Note:** Trust policies use `"Action": "sts:AssumeRole"` for compatibility with real IAM policy documents, even though extenddb exposes AssumeRole via `/management/assume-role` rather than an STS endpoint. The policy engine matches this action string during trust policy evaluation regardless of the actual HTTP endpoint used.
 
 Trust policy conditions are evaluated against an `AssumeRoleContext` (not the DynamoDB `RequestContext`), which contains:
-- `aws:PrincipalTag/*` — tags of the calling user (the entity assuming the role)
-- `aws:RequestTag/*` — session tags passed in the AssumeRole request
-- `sts:ExternalId` — the ExternalId parameter (if provided in the AssumeRole request)
+- `aws:PrincipalTag/*`: tags of the calling user (the entity assuming the role)
+- `aws:RequestTag/*`: session tags passed in the AssumeRole request
+- `sts:ExternalId`: the ExternalId parameter (if provided in the AssumeRole request)
 
 ```rust
 /// Context for trust policy condition evaluation.

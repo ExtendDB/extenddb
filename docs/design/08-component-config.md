@@ -15,10 +15,10 @@ This document covers the configuration system, configurable limits, logging, met
 ## 2. Configuration Layering
 
 Precedence (highest to lowest):
-1. **CLI flags** — `--config`, `--port`, `--version`, `--validate-config`
-2. **Environment variables** — `EXTENDDB__SERVER__PORT=18443`
-3. **Config file** — TOML format, path specified via `--config` or default `config.toml`
-4. **Defaults** — hardcoded in Rust structs via `Default` trait
+1. **CLI flags**: `--config`, `--port`, `--version`, `--validate-config`
+2. **Environment variables**: `EXTENDDB__SERVER__PORT=18443`
+3. **Config file**: TOML format, path specified via `--config` or default `config.toml`
+4. **Defaults**: hardcoded in Rust structs via `Default` trait
 
 ### 2.1 CLI (clap)
 

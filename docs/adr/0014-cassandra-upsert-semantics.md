@@ -14,11 +14,11 @@ Operations like `put_policy` must be idempotent: Calling the operation multiple 
 
 ## Options Considered
 
-1. **Natural INSERT behavior** — Use plain `INSERT` statements and rely on Cassandra's built-in overwrite semantics. Simpler code, same idempotent result.
+1. **Natural INSERT behavior**: Use plain `INSERT` statements and rely on Cassandra's built-in overwrite semantics. Simpler code, same idempotent result.
 
-2. **Explicit UPDATE with conditional INSERT** — Check if row exists via SELECT, then execute UPDATE or INSERT accordingly. Mimics PostgreSQL logic exactly but adds unnecessary complexity.
+2. **Explicit UPDATE with conditional INSERT**: Check if row exists via SELECT, then execute UPDATE or INSERT accordingly. Mimics PostgreSQL logic exactly but adds unnecessary complexity.
 
-3. **Lightweight transaction with IF EXISTS** — Use `UPDATE ... IF EXISTS` to make the upsert explicit. Adds LWT overhead for no behavioral benefit.
+3. **Lightweight transaction with IF EXISTS**: Use `UPDATE ... IF EXISTS` to make the upsert explicit. Adds LWT overhead for no behavioral benefit.
 
 ## Decision
 
