@@ -222,7 +222,7 @@ mod tests {
 
     #[test]
     fn keyword_tokens_show_the_source_text() {
-        // [d07] doubled AND; H501-1 s01, s30, k07: a lower-case keyword is
+        // [d07] doubled AND; a lower-case keyword (measured 2026-10-25) is
         // shown as written, in the token and in the window.
         assert_eq!(
             msg(ExpressionKind::Condition, "#v = :v AND AND #v = :v", 4),

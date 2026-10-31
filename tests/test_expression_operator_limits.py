@@ -503,7 +503,7 @@ class TestSyntaxErrorWording:
             ("d19", "#v = :v AND NOT", "<EOF>", "NOT"),
             ("d29", "=", "=", "="),
             ("d30", "= =", "=", "= ="),
-            ("H501-1 s30", "#v = :v and and #v = :v", "and", "and and #v"),
+            ("lower-case and", "#v = :v and and #v = :v", "and", "and and #v"),
         ],
     )
     def test_put_item_condition(self, dynamodb_client, table, case, expr, token, near):
@@ -531,7 +531,7 @@ class TestSyntaxErrorWording:
         assert _validation(scan(dynamodb_client, table, "#v = :v AND")) == syntax(
             "FilterExpression", "<EOF>", "AND"
         )
-        # [H501-1 s01]: a lower-case keyword is shown as written.
+        # Measured 2026-10-25: a lower-case keyword is shown as written.
         assert _validation(scan(dynamodb_client, table, "#v = :v and and #v = :v")) == syntax(
             "FilterExpression", "and", "and and #v"
         )
@@ -544,7 +544,7 @@ class TestSyntaxErrorWording:
         assert _validation(query(dynamodb_client, table, "pk = :v AND")) == syntax(
             "KeyConditionExpression", "<EOF>", "AND"
         )
-        # [H501-1 k07]
+        # Measured 2026-10-25: a lower-case keyword in a key condition.
         lower = query(
             dynamodb_client,
             table,
