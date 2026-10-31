@@ -297,10 +297,10 @@ html {
     min-width: 0;
     overflow-wrap: break-word;
   }
-  /* Key names and quoted defaults are single unbreakable words; let them
-     break anywhere so a reference table fits a phone-width column. */
-  article table td:nth-child(1) code,
-  article table td:nth-child(2) code {
+  /* Key names, quoted defaults and example assignments are single
+     unbreakable words; let code spans break anywhere so a reference table
+     fits a phone-width column. */
+  article table td code {
     overflow-wrap: anywhere;
   }
 }
