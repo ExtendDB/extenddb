@@ -61,6 +61,10 @@ pub async fn handle_update_item(
     let input: UpdateItemInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
     extenddb_core::validation::validate_table_name(&input.table_name, &ctx.limits)?;
+    // A number the service cannot read in the key comes next, ahead of the
+    // parameter and expression checks, the table lookup and the key schema
+    // checks (measured 2026-10-27).
+    extenddb_core::validation::number::operations::update_item_key(&input)?;
 
     // Validate Update/Condition expressions (and AttributeUpdates
     // desugaring) before the existence check; key, item-content nesting, and

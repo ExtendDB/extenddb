@@ -51,6 +51,10 @@ pub async fn handle_delete_item(
     let input: DeleteItemInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
     extenddb_core::validation::validate_table_name(&input.table_name, &ctx.limits)?;
+    // A number the service cannot read in the key comes next, ahead of the
+    // parameter checks, the condition, the table lookup and the key schema
+    // checks (measured 2026-10-27).
+    extenddb_core::validation::number::operations::delete_item_key(&input)?;
 
     // Validate expressions/`Expected` before the existence check,
     // so a missing table returns ValidationException, not ResourceNotFoundException.
@@ -68,6 +72,12 @@ pub async fn handle_delete_item(
         ],
         &[("ConditionExpression", has_condition)],
     )?;
+    // The numbers in ExpressionAttributeValues follow the mixed-parameter
+    // check and precede the other expression checks (measured 2026-10-27). A
+    // value nested too deep comes ahead of a malformed number, as before this
+    // check; the service answered either on two sends.
+    // The later nesting check repeats this one and cannot fail after it.
+    extenddb_core::validation::number::operations::delete_item_values(&input)?;
     extenddb_core::expression::validate_expression_param_usage(
         input.expression_attribute_names.as_ref(),
         has_condition,

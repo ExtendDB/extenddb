@@ -65,6 +65,11 @@ pub async fn handle_batch_write_item(
             }
         }
     }
+    // Every number in every request is checked before any table is looked up
+    // or written: the service reports a malformed number ahead of a missing
+    // table, a key type mismatch, a missing key and a duplicate key, and
+    // writes none of a batch whose later put holds one (measured 2026-10-27).
+    extenddb_core::validation::number::operations::batch_write_item(&input)?;
 
     let empty_maps = ExpressionMaps::default();
     let mut all_icm: HashMap<String, Vec<extenddb_core::types::ItemCollectionMetrics>> =
