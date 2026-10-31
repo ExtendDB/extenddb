@@ -112,30 +112,95 @@ async fn a_ledger_without_migration_1_is_at_migration_0() {
     assert_eq!((report.from, report.to), (Some(0), Some(LATEST)));
 }
 
+/// Id 4 is not convergent on the fake. While no store has a row for it, a
+/// reconverge applies it like any pending id. Once it is recorded, a
+/// reconverge leaves it as it is and names it in the report's notes, runs
+/// the convergent ids again, and repairs the catalog.
 #[tokio::test]
-async fn reconverge_refuses_a_non_convergent_id_and_repairs_otherwise() {
+async fn reconverge_skips_a_recorded_id_that_is_not_convergent() {
     let fake = Fake::new();
     runner(&fake)
         .migrate_through(MigrationId::SortKeyDefinitions)
         .await
         .unwrap();
-    fake.with_state(|s| {
-        s.traces.catalog_version = Some("0.0.3".into());
-        s.traces.resource_tag_marker = true;
-    });
+    let an_older_release_writes = || {
+        fake.with_state(|s| {
+            s.traces.catalog_version = Some("0.0.3".into());
+            s.traces.resource_tag_marker = true;
+        });
+    };
+    an_older_release_writes();
     let report = runner(&fake).reconverge().await.unwrap();
     assert_eq!(
         report.applied.len(),
         steps_after(0),
-        "every id ran again: {report:?}"
+        "every id ran: {report:?}"
+    );
+    assert!(
+        report.notes.iter().all(|n| !n.starts_with("Skipped")),
+        "{report:?}"
     );
     assert_eq!(
         runner(&fake).status().await.unwrap(),
         CatalogStatus::Current { version: LATEST }
     );
-    // Id 4 is not convergent on the fake, and is now in the ledger.
-    let err = runner(&fake).reconverge().await.unwrap_err();
-    assert!(matches!(err, MigrationError::Refused(_)), "{err:?}");
+
+    an_older_release_writes();
+    let four = MigrationId::IndexTableBaseKey;
+    let steps_of_four = steps_after(four.number() - 1) - steps_after(four.number());
+    let report = runner(&fake).reconverge().await.unwrap();
+    assert!(
+        report.applied.iter().all(|s| s.id != four.number()),
+        "{report:?}"
+    );
+    assert_eq!(report.applied.len(), steps_after(0) - steps_of_four);
+    assert!(
+        report.notes.contains(&format!(
+            "Skipped {four}: it is not convergent on fake, so it does not run again over \
+             data written since it was applied"
+        )),
+        "{report:?}"
+    );
+    assert_eq!(fake.version_row(), Some(LATEST.to_string()));
+    assert_eq!(
+        runner(&fake).status().await.unwrap(),
+        CatalogStatus::Current { version: LATEST }
+    );
+}
+
+/// A store without a row for an id that is not convergent gets one, as in
+/// `migrate`; a store that has a row is left as it is.
+#[tokio::test]
+async fn reconverge_applies_an_id_that_is_not_convergent_where_it_has_no_row() {
+    let fake = Fake::new();
+    current(&fake).await;
+    let four = MigrationId::IndexTableBaseKey.number();
+    fake.with_state(|s| {
+        if let Some(rows) = s.ledgers.get_mut("data-b") {
+            rows.retain(|r| r.id != four);
+        }
+        s.traces.resource_tag_marker = true;
+    });
+    let report = runner(&fake).reconverge().await.unwrap();
+    let ran: Vec<&str> = report
+        .applied
+        .iter()
+        .filter(|s| s.id == four)
+        .map(|s| s.store_name.as_str())
+        .collect();
+    assert_eq!(ran, ["data-b"], "{report:?}");
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.starts_with(&format!("Skipped {four} "))),
+        "{report:?}"
+    );
+    assert!(fake.rows("data-b").contains(&four));
+    assert_eq!(
+        runner(&fake).status().await.unwrap(),
+        CatalogStatus::Current { version: LATEST }
+    );
 }
 
 /// A reconverge reruns the bodies and writes the version row again, and

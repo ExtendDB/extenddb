@@ -228,9 +228,14 @@ change is code in `crates/storage-mongodb/src/bootstrapper.rs`.
    in the SQLite crate, and its PostgreSQL counterpart in `crates/bin`).
 
    Set `convergent: true` when every body is safe to run again on a store at
-   any later migration. `extenddb migrate --yes --reconverge`, which repairs a
-   catalog that a release before 1.0 wrote to, runs only convergent
-   migrations, and refuses a catalog that has one that is not.
+   any later migration, over data that clients wrote through the API since it
+   was applied. A body that rewrites such data is not convergent: migration 2
+   rewrites stored policies, and running it again would rewrite a policy
+   written after it and change that policy's decision.
+   `extenddb migrate --yes --reconverge`, which repairs a catalog that a
+   release before 1.0 wrote to, runs the convergent migrations again and
+   skips a recorded migration that is not convergent, with a line that names
+   it.
 
 5. Handle per-table objects. CreateTable and CreateAccount create objects at
    request time with the binary's own DDL: the `_ddb_<id>` tables and their

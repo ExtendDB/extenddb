@@ -6,9 +6,9 @@
 //! writing nothing, so it runs beside a server. `--yes` reads the status
 //! again under the migration lock and applies; it refuses a store that is
 //! not a catalog, which `extenddb init` creates. `--reconverge` reruns every
-//! migration on a catalog a release before 1.0 wrote to, `--forget` clears
-//! an unreleased migration, and `--list` prints the migrations without
-//! opening the catalog.
+//! convergent migration on a catalog a release before 1.0 wrote to,
+//! `--forget` clears an unreleased migration, and `--list` prints the
+//! migrations without opening the catalog.
 //!
 //! Exit status: 0 up to date, applied, or ahead by additive migrations only;
 //! 1 an error or an uninitialized catalog; 3 migrations pending (the
@@ -142,7 +142,7 @@ fn print_list(migrations: &dyn CatalogMigrations) {
             } => {
                 let stores: Vec<&str> = stores.iter().map(|s| s.as_str()).collect();
                 format!(
-                    "{:<9} {:<13} {}",
+                    "{:<9} {:<14} {}",
                     kind.as_str(),
                     if convergent {
                         "convergent"

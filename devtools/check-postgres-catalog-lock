@@ -192,7 +192,7 @@ def through_pooler(
     expect_exit(0, "migrate --yes through the pooler", migrate + ["--yes", "--lock-timeout", "5"], env)
     expect_exit(
         0,
-        "migrate --yes --reconverge through the pooler, every body run again",
+        "migrate --yes --reconverge through the pooler, every convergent body run again",
         migrate + ["--yes", "--reconverge", "--lock-timeout", "5"],
         env,
         contains="Ran again 1 baseline",

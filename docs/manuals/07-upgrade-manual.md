@@ -37,7 +37,7 @@ Running `extenddb migrate --yes` on an up-to-date catalog changes nothing.
 
 Exit status 6 means the migration lock, or a running server, was still held when `--lock-timeout` ran out; run the command again once it is free. Every refusal prints the command that resolves it. A dev build's `serve` applies a Behind or Uninitialized catalog at startup instead of refusing it. The `serve` codes are those of `serve --foreground`; in daemon mode `serve` exits 1 and writes the refusal to syslog.
 
-A migration is additive when the previous release serves the catalog correctly with it applied, and breaking otherwise. Migrations 1 to 4 are breaking: do not run a 0.1.x server against a migrated catalog. A 0.1.x binary that writes to a migrated catalog (its `migrate --yes`, or a SQLite dev server) leaves it WrittenByOlderRelease.
+A migration is additive when the previous release serves the catalog correctly with it applied, and breaking otherwise. Migrations 1 to 4 are breaking: do not run a 0.1.x server against a migrated catalog. A 0.1.x binary that writes to a migrated catalog (its `migrate --yes`, or a SQLite dev server) leaves it WrittenByOlderRelease. `migrate --yes --reconverge` repairs it by running the convergent migrations again. Migration 2, which rewrites stored policies, is not convergent: the repair skips it and prints a line that says so (see the v0.1.14 notes below).
 
 ## Writing a New Migration
 
@@ -556,6 +556,8 @@ for any of these changes.
 | `${dynamodb:ResourceTag/env}` policy variable in a value | Does not expand; the literal text `${dynamodb:ResourceTag/env}` is compared, which no request value equals |
 
 To get the intended behaviour, write the condition on `aws:ResourceTag/<key>`.
+
+**`--reconverge` and policies written after the upgrade.** From v1.0 the rewrite is catalog migration 2, which runs once. `migrate --yes --reconverge` skips it, so a policy written after the upgrade keeps its `dynamodb:ResourceTag/` keys and its decision. This includes a policy that a SQLite dev build from v0.1.7 to v0.1.13 wrote to the catalog after the upgrade: that build evaluated the key against the table's tags, and v1.0 leaves the key absent, as the table above describes. Rewrite such a policy to the `aws:ResourceTag/` form by hand. A v0.1.14 `migrate --yes` runs its rewrite whenever it finds the `dynamodb:` form, including in policies written through the API after the upgrade, so do not run it against a migrated catalog.
 
 **Sessions issued before the migration.** Session policies are stored in the catalog, so `migrate` rewrites them along with the identity policies. A session issued before the upgrade is evaluated with its rewritten policy once `migrate --yes` has run, and it does not need to be issued again. The new binary does not serve an unmigrated catalog, so no request is evaluated against the old policy text under the new rules.
 

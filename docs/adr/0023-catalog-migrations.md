@@ -113,7 +113,10 @@ that each backend implements, as follows.
    wildcard arm, so a backend without an entry for an id does not compile.
    An entry gives a body for each kind of store the migration changes, its
    kind (`Additive` or `Breaking`) and whether it is convergent, meaning safe
-   to run again on a store at any later id. An entry can instead be
+   to run again on a store at any later id, over data that clients wrote
+   through the API since it was applied. A body that rewrites such data is
+   not convergent: migration 2 would rewrite a policy written after it and
+   change that policy's decision. An entry can instead be
    `NotApplicable` with a reason that says why the change has no effect on
    that backend. A body is a SQL or CQL file embedded with `include_str!`, or
    a Rust code body with a read-only `detect` step and an idempotent `run`
@@ -287,7 +290,8 @@ that each backend implements, as follows.
    restore the backup taken before it. For development, use a dev build,
    which migrates at startup. For a catalog an older release wrote to, run
    `extenddb migrate --yes --reconverge`, which runs every convergent
-   migration again and rewrites the version row.
+   migration again, skips a recorded one that is not convergent and prints a
+   line that names it, and rewrites the version row.
 
 ## Rationale
 
@@ -362,7 +366,10 @@ that each backend implements, as follows.
   `devtools/check-sqlite-older-binary`: after the image's `migrate --yes` or
   its `serve` ran on a migrated catalog, 1.0 reported
   `WrittenByOlderRelease`, and `--reconverge` restored `Current` with the
-  schema the catalog had before.
+  schema the catalog had before. The repair does not run migration 2 again,
+  so a policy that a SQLite dev build from v0.1.7 to v0.1.13 wrote after the
+  upgrade keeps its `dynamodb:ResourceTag` keys: that build evaluated them
+  against the table's tags, and 1.0 leaves them absent.
 - A 0.1.x server that is still running while migration 1 adopts its catalog
   is not detected, because released servers do not register. On SQLite,
   servers from v0.1.14 on hold the `flock` that `migrate` takes, so only older

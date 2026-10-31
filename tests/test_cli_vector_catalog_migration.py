@@ -9,9 +9,9 @@ released catalog to the same schema. These tests load a deployment of a
 release from before the vector index schema, from its committed fixture, and
 check that the binary refuses to serve it, that `extenddb migrate` upgrades
 it, and that the upgraded deployment then serves. They also check that
-`--reconverge` runs every migration again on a current catalog, and that a
-catalog ledger row for a migration this binary does not carry makes `serve`
-refuse.
+`--reconverge` runs every convergent migration again on a current catalog,
+and that a catalog ledger row for a migration this binary does not carry
+makes `serve` refuse.
 
 Shared lifecycle helpers and the `cli_env` fixture live in `lifecycle_helpers.py`.
 Like the other CLI lifecycle tests these require a PostgreSQL instance
@@ -55,6 +55,22 @@ RELEASED_FIXTURES = os.path.join(
 LISTED = re.compile(
     r"^\s*(\d+)\s+\S+\s+(?:breaking|additive)\s+(?:convergent|not convergent)\s+(.+)$"
 )
+
+
+# The same lines, for a migration that is not convergent.
+NOT_CONVERGENT = re.compile(r"^\s*(\d+)\s+\S+\s+(?:breaking|additive)\s+not convergent\s")
+
+
+@functools.cache
+def _not_convergent():
+    """The ids `migrate --list` marks as not convergent, which `--reconverge`
+    does not run again once they are recorded."""
+    listed = _run_extenddb("migrate", "--list")
+    return {
+        int(match.group(1))
+        for match in map(NOT_CONVERGENT.match, listed.stdout.splitlines())
+        if match
+    }
 
 
 @functools.cache
@@ -314,14 +330,19 @@ class TestVectorCatalogMigration:
         assert again.returncode == 0, again_output
         assert "up to date" in again_output.lower(), again_output
 
-    def test_reconverge_runs_every_migration_again_on_a_current_catalog(self, cli_env):
-        """Every migration is convergent: `migrate --yes --reconverge` runs each
-        one again on a catalog at the latest migration and leaves it current,
-        with its ledger rows as they were.
+    def test_reconverge_runs_every_convergent_migration_again_on_a_current_catalog(
+        self, cli_env
+    ):
+        """`migrate --yes --reconverge` runs each convergent migration again on
+        a catalog at the latest migration, names each one that is not
+        convergent as skipped, and leaves the catalog current, with its ledger
+        rows as they were.
 
         This is the command an operator runs after a release before 1.0 wrote
         to a migrated catalog. Migration 1's check of its result does not run
         again, because a later migration may have changed what it created.
+        Migration 2 is not convergent: it would rewrite policies written
+        through the API since it ran.
         """
         _init(cli_env)
         stores = (cli_env["db_name"], _data_db(cli_env))
@@ -334,8 +355,13 @@ class TestVectorCatalogMigration:
         )
         output = rerun.stdout + rerun.stderr
         assert rerun.returncode == 0, output
+        assert 2 in _not_convergent(), _not_convergent()
         for i in _ids_in("catalog"):
-            assert f"Ran again {i} " in output, output
+            if i in _not_convergent():
+                assert re.search(rf"^\s*Skipped {i} \S+: ", output, re.M), output
+                assert f"Ran again {i} " not in output, output
+            else:
+                assert f"Ran again {i} " in output, output
         assert [_ledger_rows(database) for database in stores] == rows_before
         assert _catalog_version(cli_env) == str(_latest())
 

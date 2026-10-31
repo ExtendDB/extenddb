@@ -25,7 +25,9 @@ pub struct RunReport {
     /// The catalog version after it.
     pub to: Option<u32>,
     pub applied: Vec<AppliedStep>,
-    /// Lines from the backend's preparation (the SQLite copy's path).
+    /// Lines printed before the steps: the backend's preparation (the
+    /// SQLite copy's path), then one for each recorded migration a
+    /// reconverge skipped because it is not convergent.
     pub notes: Vec<String>,
 }
 

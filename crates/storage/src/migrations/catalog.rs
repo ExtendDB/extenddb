@@ -56,7 +56,8 @@ pub enum RunKind {
     Create,
     /// Apply every pending migration ([`Runner::migrate`](super::Runner::migrate)).
     Migrate,
-    /// Run every migration again ([`Runner::reconverge`](super::Runner::reconverge)).
+    /// Run every convergent migration again
+    /// ([`Runner::reconverge`](super::Runner::reconverge)).
     Reconverge,
 }
 
