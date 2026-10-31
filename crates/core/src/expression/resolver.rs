@@ -586,7 +586,7 @@ pub fn validate_begins_with_operands(
 
 /// Return the DynamoDB type code for an AttributeValue (S, N, B, BOOL, NULL,
 /// L, M, SS, NS, BS). Used in operand-type validation messages.
-pub(crate) fn attribute_type_code(val: &AttributeValue) -> &'static str {
+pub fn attribute_type_code(val: &AttributeValue) -> &'static str {
     match val {
         AttributeValue::S(_) => "S",
         AttributeValue::N(_) => "N",

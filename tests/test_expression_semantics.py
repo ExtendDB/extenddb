@@ -495,6 +495,29 @@ class TestConditionFunctions:
     @pytest.mark.parametrize(
         ("condition", "values"),
         [
+            ("foo(pk) AND", None),
+            ("ATTRIBUTE_EXISTS(pk) AND", None),
+            ("begins_with(pk, :n) AND", {":n": N}),
+            ("attribute_exists(#x) AND", None),
+        ],
+    )
+    def test_a_syntax_error_beats_the_semantic_errors(self, dynamodb_client, table, condition, values):
+        # The service answers 'Syntax error; token: "<EOF>", near: "AND"' for each of
+        # these (measured 2026-10-23): the grammar pass runs over the whole text
+        # before the function name, the operand type or the undefined name is
+        # looked at. ExtendDB's syntax wording differs today (tracked under #108
+        # message text); the guarantee pinned here is the order.
+        with pytest.raises(ClientError) as exc_info:
+            _put_cond(dynamodb_client, table, condition, values)()
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException", err
+        assert err["Message"].startswith(P + C), err
+        for semantic in ("Invalid function name", "Incorrect operand type", "is not defined"):
+            assert semantic not in err["Message"], err
+
+    @pytest.mark.parametrize(
+        ("condition", "values"),
+        [
             ("size(pk) = size(pk)", None),
             ("begins_with(:v, pk)", {":v": S}),
             ("contains(:v, :w)", {":v": S, ":w": S}),

@@ -378,29 +378,6 @@ pub fn check_key_condition_refs(
     Ok(())
 }
 
-/// Reject a desugared legacy `QueryFilter` or `ScanFilter` whose
-/// `BEGINS_WITH` value is not a string or binary, or whose ordering
-/// comparison (`LT`, `LE`, `GT`, `GE`, `BETWEEN`) has a non-orderable value,
-/// at request time, before any row is read. The expression form gets these
-/// checks from [`parse_condition_checked`]; the legacy form bypasses the
-/// parser, so they run here over the desugared tree with the maps
-/// `desugar_filter` produced. Behaviour and message are unchanged from before
-/// the semantic pass existed.
-///
-/// # Errors
-///
-/// Returns `DynamoDbError::ValidationException` with the `Invalid
-/// FilterExpression:` prefix.
-pub fn check_legacy_filter_operand_types(
-    filter: &Expr,
-    maps: &ExpressionMaps,
-) -> Result<(), DynamoDbError> {
-    extenddb_core::expression::validate_begins_with_operands(filter, maps)
-        .map_err(|e| prefix_expression_error(e, ExpressionKind::Filter))?;
-    extenddb_core::expression::validate_ordering_operand_types(filter, maps)
-        .map_err(|e| prefix_expression_error(e, ExpressionKind::Filter))
-}
-
 /// Prefix an expression error with the expression type, matching `DynamoDB`'s format.
 ///
 /// `FilterExpression` shares the condition parser, so its errors arrive labelled
