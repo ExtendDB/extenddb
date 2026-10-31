@@ -198,6 +198,11 @@ pub fn parse_condition_checked(
     include_length: bool,
     kind: ExpressionKind,
 ) -> Result<Expr, DynamoDbError> {
+    if expr.is_empty() {
+        return Err(DynamoDbError::ValidationException(format!(
+            "Invalid {kind}: The expression can not be empty;"
+        )));
+    }
     let parsed = parse_condition_expr_with(expr, limits, include_length)
         .map_err(|e| prefix_expression_error(e, kind))?;
     validate_condition_semantics(&parsed, maps, kind)?;

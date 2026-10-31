@@ -614,7 +614,7 @@ class TestReadExpressionReferences:
     def test_parameter_checks_come_before_the_expressions(self, dynamodb_client, dynamodb_client_no_validation, empty):
         _expect(lambda: dynamodb_client_no_validation.scan(TableName=empty, FilterExpression="#n = :q",
                                                            ExpressionAttributeValues={":q": S}, Limit=0),
-                P + "Value '0' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1")
+                P + "Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1")
         _expect(lambda: dynamodb_client.scan(TableName=empty, FilterExpression="x = :q", Segment=0),
                 "The TotalSegments parameter is required but was not present in the request when Segment parameter is present")
         _expect(lambda: dynamodb_client.scan(TableName=empty, ProjectionExpression="#p", ExpressionAttributeValues={":u": N}),

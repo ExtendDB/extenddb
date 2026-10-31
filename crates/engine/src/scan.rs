@@ -130,13 +130,14 @@ pub async fn handle_scan(
         (None, None) => {}
     }
 
-    // Validate Limit >= 1
+    // Validate Limit >= 1. The service's text carries neither the value nor a
+    // lower-case member name, for Scan as for Query (measured 2026-10-27).
     if let Some(limit) = input.limit
         && limit < 1
     {
-        return Err(DynamoDbError::ValidationException(format!(
-            "1 validation error detected: Value '{limit}' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"
-        )));
+        return Err(DynamoDbError::ValidationException(
+            "1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1".to_owned(),
+        ));
     }
 
     extenddb_core::validation::validate_no_expression_param_mixing(

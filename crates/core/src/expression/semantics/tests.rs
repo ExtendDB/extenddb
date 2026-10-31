@@ -387,3 +387,48 @@ fn condition_operand_counts_and_types() {
     );
     assert_eq!(condition_err("attribute_type(pk, :t)", &m), "OK");
 }
+
+fn key_condition_err(expr: &str) -> String {
+    let tokens = tokenize(expr).unwrap();
+    match crate::expression::parse_key_condition(&tokens) {
+        Ok(_) => "OK".to_owned(),
+        Err(DynamoDbError::ValidationException(msg)) => msg,
+        Err(other) => panic!("unexpected {other:?}"),
+    }
+}
+
+// Captured from Amazon DynamoDB on 2026-10-27: a condition function other than
+// `size` and `begins_with` is not a key condition operator, `size` is a nested
+// operation, and any other name (or `begins_with` in another case) is not a
+// function.
+#[test]
+fn key_condition_function_names() {
+    const K: &str = "Invalid KeyConditionExpression: ";
+    for call in [
+        "contains(sk, :v)",
+        "attribute_exists(sk)",
+        "attribute_not_exists(sk)",
+        "attribute_type(sk, :t)",
+    ] {
+        assert_eq!(
+            key_condition_err(&format!("pk = :p AND {call}")),
+            format!("{K}Invalid operator used in KeyConditionExpression"),
+            "{call}"
+        );
+    }
+    assert_eq!(
+        key_condition_err("contains(pk, :v) AND sk = :s"),
+        format!("{K}Invalid operator used in KeyConditionExpression")
+    );
+    assert_eq!(
+        key_condition_err("pk = :p AND size(sk) > :n"),
+        format!("{K}KeyConditionExpressions cannot contain nested operations")
+    );
+    for name in ["foo", "Begins_With", "Contains"] {
+        assert_eq!(
+            key_condition_err(&format!("pk = :p AND {name}(sk, :v)")),
+            format!("{K}Invalid function name; function: {name}"),
+        );
+    }
+    assert_eq!(key_condition_err("pk = :p AND begins_with(sk, :v)"), "OK");
+}

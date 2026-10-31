@@ -7,6 +7,7 @@
 //! inputs, dispatches operations by name, and translates storage errors into
 //! `DynamoDB`-format error responses.
 
+mod attribute_updates;
 mod backup;
 mod batch_get_item;
 mod batch_write_item;

@@ -53,6 +53,21 @@ const CONDITION_FUNCTIONS: [&str; 6] = [
 
 const UPDATE_FUNCTIONS: [&str; 2] = ["if_not_exists", "list_append"];
 
+/// The service's refusal of `name(` in a `KeyConditionExpression` clause
+/// (measured 2026-10-27). `size` is a nested operation, the other condition
+/// functions are not key condition operators (the message names no function),
+/// and any other name, in any case, is not a function (`Begins_With`, `foo`).
+/// `begins_with` itself is accepted and never reaches this.
+pub(super) fn key_condition_function_refusal(name: &str) -> String {
+    if name == "size" {
+        "KeyConditionExpressions cannot contain nested operations".to_owned()
+    } else if CONDITION_FUNCTIONS.contains(&name) {
+        "Invalid operator used in KeyConditionExpression".to_owned()
+    } else {
+        format!("Invalid function name; function: {name}")
+    }
+}
+
 mod condition_rules;
 mod errors;
 mod refs;

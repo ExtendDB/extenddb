@@ -92,6 +92,7 @@ pub async fn handle_update_item(
     // Desugar legacy AttributeUpdates into UpdateExpression if present.
     let (effective_update_expr, extra_expr_values, extra_expr_names) =
         if let Some(attr_updates) = &input.attribute_updates {
+            crate::attribute_updates::validate_action_value_types(attr_updates)?;
             desugar_attribute_updates(attr_updates)?
         } else {
             (
