@@ -129,8 +129,9 @@ impl PostgresEngine {
         // before the next request, causing stale DELETING rows. Synchronous
         // delete avoids this. Mirrors create_table's H-5 fast path.
         let delay_row: (f64,) = sqlx::query_as(
-            "SELECT COALESCE((SELECT value::FLOAT8 FROM settings WHERE key = 'control_plane_delay_seconds'), 0.25)",
+            "SELECT COALESCE((SELECT value::FLOAT8 FROM settings WHERE key = 'control_plane_delay_seconds'), $1)",
         )
+        .bind(crate::DEFAULT_CONTROL_PLANE_DELAY_SECONDS)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;

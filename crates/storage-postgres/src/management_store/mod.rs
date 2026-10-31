@@ -7,7 +7,7 @@
 //! file under the 500-line limit.
 
 use extenddb_storage::management_store::{
-    AccessKeyCreated, AccountDetail, GroupDetail, OpResult, RoleDetail, UserDetail,
+    AccessKeyCreated, AccountDetail, GroupDetail, OpError, OpResult, RoleDetail, UserDetail,
 };
 use futures::future::BoxFuture;
 
@@ -19,6 +19,22 @@ mod groups;
 mod policies;
 mod roles;
 mod users;
+
+/// The error of a failed statement, logged with `what`. It keeps the
+/// statement's SQLSTATE, so the migration runner tells a lock timeout or a
+/// missing privilege from other failures by its code; the driver's text
+/// goes to the log and to [`OpError::Database`], which API responses never
+/// show.
+pub(crate) fn database_error(what: &str, e: &sqlx::Error) -> OpError {
+    tracing::error!("{what}: {e}");
+    match e.as_database_error().and_then(|d| d.code()) {
+        Some(code) => OpError::Database {
+            message: format!("{what}: {e}"),
+            sqlstate: code.into_owned(),
+        },
+        None => OpError::Internal("Database error".to_owned()),
+    }
+}
 
 impl extenddb_storage::management_store::ManagementStore for PostgresCatalogStore {
     // ── Accounts ───────────────────────────────────────────────────

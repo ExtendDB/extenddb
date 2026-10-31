@@ -742,7 +742,9 @@ async fn set_lock_timeout_until(
 }
 
 /// SQLSTATE `lock_not_available` (55P03), which `lock_timeout` raises.
-const SQLSTATE_LOCK_NOT_AVAILABLE: &str = "55P03";
+/// The migration runner classifies a failed body by it too, from the code a
+/// `MigrationError` keeps (`migrations/failure.rs`).
+pub(crate) const SQLSTATE_LOCK_NOT_AVAILABLE: &str = "55P03";
 
 /// Whether `e` is a lock wait that ran out its `lock_timeout` (55P03): a
 /// session held a lock the statement needed, which a later attempt can get

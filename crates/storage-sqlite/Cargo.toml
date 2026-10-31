@@ -41,6 +41,11 @@ zeroize = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+extenddb-storage = { workspace = true, features = ["test-util"] }
+# The slow-statement test sets sqlx's threshold, a `log` level, and prints
+# every tracing event of a child process.
+log = "0.4"
+tracing-subscriber = { workspace = true }
 # The crate's own tests need `test-hooks`; a dev-dependency on itself turns
 # the feature on for test builds only.
 extenddb-storage-sqlite = { path = ".", features = ["test-hooks"] }

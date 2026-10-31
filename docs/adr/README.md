@@ -32,7 +32,7 @@ decision, write a new ADR.
 |---|-------|--------|
 | [0001](0001-documentation-format.md) | Documentation format — Markdown over LaTeX | Accepted |
 | [0002](0002-sql-injection-defense.md) | SQL injection defense | Accepted |
-| [0003](0003-catalog-migration-mechanism.md) | Adopt sqlx::migrate for PostgreSQL catalog and data schema migrations | Accepted |
+| [0003](0003-catalog-migration-mechanism.md) | Adopt sqlx::migrate for PostgreSQL catalog and data schema migrations | Superseded by [ADR-0023](0023-catalog-migrations.md) |
 | [0004](0004-vector-search-exact-scan.md) | Vector search is an exact scan over one row per vector | Accepted |
 | [0005](0005-index-build-lifecycle-ownership.md) | Index-build lifecycle stays in the backend until a second backend needs it | Accepted |
 | [0006](0006-pgvector-storage-and-scoring.md) | Vector storage on PostgreSQL uses pgvector's type, and the engine decides what it cannot compute | Accepted |
@@ -49,3 +49,4 @@ decision, write a new ADR.
 | [0020](0020-cassandra-occ-update-item.md) | Cassandra: optimistic concurrency control for UpdateItem and PutItem | Accepted |
 | [0021](0021-cassandra-lwt-delete-atomicity-gap.md) | Cassandra: LWT delete atomicity gap and required worker/saga pattern | Accepted |
 | [0022](0022-trust-policy-deny-over-allow.md) | Role trust-policy evaluation follows IAM Deny-over-Allow order | Accepted |
+| [0023](0023-catalog-migrations.md) | One list of catalog migrations for every backend, with a ledger in every store | Accepted |

@@ -448,9 +448,10 @@ mod tests {
     };
 
     async fn prepare(engine: &SqliteEngine) {
-        crate::schema::apply(&engine.pool).await.expect("schema");
+        crate::migrations::apply_for_tests(&engine.pool).await;
+        // Migration 1 seeds no setting, so the rows are written.
         for key in ["control_plane_delay_seconds", "index_propagation_delay_ms"] {
-            sqlx::query("UPDATE settings SET value = '0' WHERE key = ?")
+            sqlx::query("INSERT OR REPLACE INTO settings (key, value) VALUES (?, '0')")
                 .bind(key)
                 .execute(&engine.pool)
                 .await

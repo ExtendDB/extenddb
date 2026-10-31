@@ -11,14 +11,21 @@ license.workspace = true
 # Compiles the snapshot page-size setter the consistency test uses and the
 # shared conformance check. Production builds do not compile them.
 test-hooks = ["extenddb-storage/test-hooks"]
+# Test hooks: the runner without a lock, the lock and the registration with
+# another keepalive interval, the serving session's settings, and the
+# post-check's definitions.
+test-util = ["extenddb-storage/test-util"]
 
 [dev-dependencies]
 # The storage-level vector control-plane tests drive the engine directly against
 # a scratch database, so they need a runtime and the test macro.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-# The crate's own tests need `test-hooks`; a dev-dependency on itself turns
-# the feature on for test builds only.
-extenddb-storage-postgres = { path = ".", features = ["test-hooks"] }
+# The checksum test checks this backend's migration table with the framework's
+# test helper.
+extenddb-storage = { workspace = true, features = ["test-util"] }
+# The crate's own tests need `test-hooks` and `test-util`; a dev-dependency on
+# itself turns both features on for test builds only.
+extenddb-storage-postgres = { path = ".", features = ["test-hooks", "test-util"] }
 
 [dependencies]
 anyhow = { workspace = true }

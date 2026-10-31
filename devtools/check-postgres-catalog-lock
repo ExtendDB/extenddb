@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+"""Serve and migrate on one PostgreSQL catalog, with a release binary:
+
+    devtools/check-postgres-catalog-lock <extenddb binary> <admin URL> [port]
+
+<admin URL> is a superuser's URL without a database, for example
+postgresql://postgres:devpass@127.0.0.1:5432. The script creates its own
+role and two databases with `init` and removes them at the end. The data
+database's name is not the one `init` derives from the catalog's, and is
+given as `--data-db=<name>`, so `init` has to create the database it names.
+
+- verify names that data database;
+- the migrate preview and verify run beside a server and exit 0;
+- migrate --yes waits for the server's registration and exits 6, naming
+  "extenddb serve", when it outlasts --lock-timeout;
+- while another session holds the migration lock (the advisory key
+  migrate takes, held here by the script), serve and a second migrate --yes
+  exit 6, and the preview exits 0;
+- once the lock is free, migrate --yes and serve run;
+- a server whose registration session the database ends stops with exit 1;
+- with POOLER_URL set to a connection pooler in front of the same server
+  (for example postgresql://127.0.0.1:6432, a PgBouncer in transaction mode
+  that authenticates roles through auth_query), verify, the preview,
+  migrate --yes, a --reconverge, --forget 3 and its reapplication, and serve
+  run with the catalog reached through the pooler.
+
+init's HOME points into a temporary directory, so its TLS certificate is not
+written to the caller's home. The server binds 127.0.0.1 only.
+"""
+import os
+import secrets
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.parse
+
+import psycopg2
+
+from catalog_checks import expect_exit, finish, healthy, report, run, start, stop
+
+NAMESPACE = 0x0045_4442  # the advisory key namespace of crates/storage-postgres
+MIGRATION_KEY = 1
+
+def main(binary: str, admin_url: str, port: int) -> int:
+    binary = os.path.realpath(binary)
+    admin = urllib.parse.urlsplit(admin_url)
+    stem = f"eddb_lock_{secrets.token_hex(4)}"
+    app_password = f"App{secrets.token_hex(8)}"
+    work = tempfile.mkdtemp(prefix=f"{stem}.")
+    env = dict(os.environ, HOME=os.path.join(work, "home"))
+    config = os.path.join(work, "extenddb.toml")
+    serve = [binary, "serve", "--config", config, "--foreground", "--port", str(port)]
+    servers: list[subprocess.Popen] = []
+    holder = None
+    try:
+        code, output = run(
+            [
+                binary, "init", "--config", config,
+                "--pg-host", admin.hostname, "--pg-port", str(admin.port or 5432),
+                "--pg-user", urllib.parse.unquote(admin.username or "postgres"),
+                f"--catalog-db={stem}_catalog", f"--data-db={stem}_items",
+                "--extenddb-user", stem, "--bind-addr", "127.0.0.1",
+            ],
+            dict(
+                env,
+                EXTENDDB_PG_PASSWORD=urllib.parse.unquote(admin.password or ""),
+                EXTENDDB_APP_PASSWORD=app_password,
+            ),
+        )
+        if code != 0:
+            report(False, f"exit {code}: init", output)
+            return 1
+        print("ok   exit 0: init")
+        migrate = [binary, "migrate", "--config", config]
+        expect_exit(
+            0,
+            "verify reaches the data database --data-db= named",
+            [binary, "verify", "--config", config],
+            env,
+            contains=f"Connected to data database '{stem}_items'",
+        )
+
+        log = os.path.join(work, "serve.log")
+        server = start(serve, env, log)
+        servers.append(server)
+        if not healthy(f"https://127.0.0.1:{port}/health", server):
+            stop(server)
+            with open(log, encoding="utf-8") as f:
+                report(False, "the server became healthy", f.read())
+            return 1
+        print("ok   the server is healthy")
+        expect_exit(0, "migrate preview beside a server", migrate, env)
+        expect_exit(0, "verify beside a server", [binary, "verify", "--config", config], env)
+        expect_exit(
+            6,
+            "migrate --yes while a server runs",
+            migrate + ["--yes", "--lock-timeout", "1"],
+            env,
+            contains='"extenddb serve"',
+        )
+        stop(server)
+
+        holder = psycopg2.connect(f"{admin_url.rstrip('/')}/{stem}_catalog")
+        with holder.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(%s, %s)", (NAMESPACE, MIGRATION_KEY))
+        expect_exit(6, "serve while a migration holds the lock", serve, env)
+        expect_exit(
+            6,
+            "a second migrate --yes while a migration holds the lock",
+            migrate + ["--yes", "--lock-timeout", "1"],
+            env,
+        )
+        expect_exit(0, "migrate preview while a migration holds the lock", migrate, env)
+        holder.rollback()
+        holder.close()
+        holder = None
+
+        expect_exit(0, "migrate --yes once the lock is free", migrate + ["--yes", "--lock-timeout", "5"], env)
+        server = start(serve, env, log)
+        servers.append(server)
+        report(healthy(f"https://127.0.0.1:{port}/health", server), "serve once the lock is free")
+
+        # The database ends the registration's session, as it does when the
+        # serving host dies; the server's next keepalive finds it gone.
+        conn = psycopg2.connect(f"{admin_url.rstrip('/')}/postgres")
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity "
+                "WHERE datname = %s AND application_name = 'extenddb serve'",
+                (f"{stem}_catalog",),
+            )
+            ended = cur.fetchone()[0]
+        conn.close()
+        try:
+            code = server.wait(timeout=45)
+        except subprocess.TimeoutExpired:
+            code = None
+        report(
+            ended == 1 and code == 1,
+            f"a server whose registration session ended stops with exit {code} "
+            f"({ended} session ended)",
+        )
+
+        pooler = os.environ.get("POOLER_URL", "").strip().rstrip("/")
+        if pooler:
+            through_pooler(binary, env, work, pooler, stem, app_password, port, servers)
+        else:
+            print("skip the pass through a connection pooler: POOLER_URL is not set")
+    finally:
+        for server in servers:
+            stop(server)
+        if holder is not None:
+            holder.close()
+        cleanup(admin_url, stem)
+        shutil.rmtree(work, ignore_errors=True)
+    return finish()
+
+
+def through_pooler(
+    binary: str,
+    env: dict,
+    work: str,
+    pooler: str,
+    stem: str,
+    app_password: str,
+    port: int,
+    servers: list,
+) -> None:
+    """The commands with the catalog reached through a connection pooler,
+    which must refuse a login that sets parameters it does not track."""
+    parts = urllib.parse.urlsplit(pooler)
+    url = (
+        f"postgresql://{stem}:{urllib.parse.quote(app_password)}@{parts.hostname}:"
+        f"{parts.port or 5432}/{stem}_catalog"
+    )
+    config = os.path.join(work, "pooler.toml")
+    with open(os.path.join(work, "extenddb.toml"), encoding="utf-8") as f:
+        text = f.read()
+    with open(config, "w", encoding="utf-8") as f:
+        for line in text.splitlines():
+            if line.strip().startswith("connection_string"):
+                line = f'connection_string = "{url}"'
+            f.write(line + "\n")
+    os.chmod(config, 0o600)
+    migrate = [binary, "migrate", "--config", config]
+    expect_exit(0, "verify through the pooler", [binary, "verify", "--config", config], env, contains="HEALTHY")
+    expect_exit(0, "migrate preview through the pooler", migrate, env, contains="Up to date")
+    expect_exit(0, "migrate --yes through the pooler", migrate + ["--yes", "--lock-timeout", "5"], env)
+    expect_exit(
+        0,
+        "migrate --yes --reconverge through the pooler, every body run again",
+        migrate + ["--yes", "--reconverge", "--lock-timeout", "5"],
+        env,
+        contains="Ran again 1 baseline",
+    )
+    expect_exit(0, "migrate --forget 3 through the pooler", migrate + ["--forget", "3"], env)
+    expect_exit(
+        0,
+        "migrate --yes applies migration 3 again through the pooler",
+        migrate + ["--yes", "--lock-timeout", "5"],
+        env,
+        contains="Applied 3 sort_key_definitions",
+    )
+    log = os.path.join(work, "serve-pooler.log")
+    server = start([binary, "serve", "--config", config, "--foreground", "--port", str(port)], env, log)
+    servers.append(server)
+    up = healthy(f"https://127.0.0.1:{port}/health", server)
+    stop(server)
+    with open(log, encoding="utf-8") as f:
+        report(up, "serve through the pooler", f.read())
+
+
+def cleanup(admin_url: str, stem: str) -> None:
+    conn = psycopg2.connect(f"{admin_url.rstrip('/')}/postgres")
+    conn.autocommit = True
+    with conn.cursor() as cur:
+        for database in (f"{stem}_catalog", f"{stem}_items"):
+            cur.execute(f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)')
+        cur.execute(f'DROP ROLE IF EXISTS "{stem}"')
+    conn.close()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) not in (3, 4):
+        sys.exit(__doc__)
+    sys.exit(main(sys.argv[1], sys.argv[2], int(sys.argv[3]) if len(sys.argv) == 4 else 18452))

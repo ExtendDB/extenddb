@@ -86,6 +86,13 @@ fn shipped_migrations() -> Vec<String> {
 }
 
 fn skip(test: &str) {
+    let required =
+        std::env::var("EXTENDDB_TEST_PG_REQUIRED").is_ok_and(|v| !v.is_empty() && v != "0");
+    assert!(
+        !required,
+        "{test}: EXTENDDB_TEST_PG_CONNECTION_STRING is not set, and EXTENDDB_TEST_PG_REQUIRED \
+         says this job must run the PostgreSQL tests"
+    );
     eprintln!(
         "SKIP {test}: EXTENDDB_TEST_PG_CONNECTION_STRING is not set, so there is no PostgreSQL \
          to build a scratch catalog in."
@@ -119,14 +126,20 @@ async fn scratch() -> Scratch {
             .await
             .expect("apply a shipped migration");
     }
-    sqlx::query("UPDATE settings SET value = '0' WHERE key = 'control_plane_delay_seconds'")
-        .execute(&db)
-        .await
-        .expect("pin the control-plane delay to zero");
-    sqlx::query("UPDATE settings SET value = '0' WHERE key = 'index_propagation_delay_ms'")
-        .execute(&db)
-        .await
-        .expect("pin the propagation delay to zero");
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0') \
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .execute(&db)
+    .await
+    .expect("pin the control-plane delay to zero");
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ('index_propagation_delay_ms', '0') \
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .execute(&db)
+    .await
+    .expect("pin the propagation delay to zero");
     sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES ($1, $2)")
         .bind(ACCOUNT)
         .bind(format!("acct-{db_name}"))

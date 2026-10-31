@@ -8,6 +8,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
+# `test-util` exposes `migrations::check_released`, the checksum test each
+# backend crate runs on its migration table. Production code never enables it.
+test-util = []
 # Compiles the `snapshot_conformance` check that each backend's tests run
 # against a real database. Production builds do not compile it.
 test-hooks = []
@@ -24,6 +27,7 @@ futures = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }

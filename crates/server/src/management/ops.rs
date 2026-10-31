@@ -50,7 +50,9 @@ impl OpError {
             StorageOpError::AlreadyExists(msg) => Self::AlreadyExists(msg),
             StorageOpError::NotFound(msg) => Self::NotFound(msg),
             StorageOpError::HasDependents(msg) => Self::HasDependents(msg),
-            StorageOpError::Internal(msg) => Self::Internal(msg),
+            StorageOpError::Internal(msg) | StorageOpError::Database { message: msg, .. } => {
+                Self::Internal(msg)
+            }
         }
     }
 }

@@ -415,7 +415,8 @@ pub(crate) async fn pending_catalog_migrations(
             | OpError::AlreadyExists(m)
             | OpError::NotFound(m)
             | OpError::HasDependents(m)
-            | OpError::Internal(m) => StorageError::Internal(m),
+            | OpError::Internal(m)
+            | OpError::Database { message: m, .. } => StorageError::Internal(m),
         })?;
         if !recorded.contains(&version) {
             pending.push(*filename);

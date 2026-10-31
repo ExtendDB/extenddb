@@ -130,7 +130,7 @@ Check the version:
 ```bash
 ./target/release/extenddb version
 # extenddb 0.1.14
-# catalog 0.0.4 (postgres)
+# catalog migration 4 (postgres)
 # commit abc1234
 # built 2026-04-17T12:00:00Z
 ```
@@ -168,12 +168,15 @@ Expected output:
 
 ```
 === extenddb verify ===
+Config:           extenddb.toml
+Catalog database: extenddb_catalog
+
+--- Checking catalog migrations...
+  OK: Current: the catalog is at migration 4
 --- Checking catalog connection...
   OK: Connected to catalog.
---- Checking catalog version...
-  OK: Catalog version 0.0.4
 --- Checking data database...
-  OK: Connected to data database 'extenddb_catalog_data'.
+  OK: Connected to data database 'extenddb'.
 --- Enumerating tables...
   Tables: 0
   Indexes: 0
@@ -403,7 +406,7 @@ This drops both databases after confirmation.
 | Symptom | Fix |
 |---------|-----|
 | `connection refused` on port 18443 | Server not running. Start with `extenddb serve --config extenddb.toml` |
-| `CATALOG_VERSION_MISMATCH` | Run `extenddb migrate --config extenddb.toml` |
+| `serve` exits 3, naming pending catalog migrations | Run `extenddb migrate --config extenddb.toml --yes`, then start the server |
 | `ResourceNotFoundException` on CreateTable | Table is still in CREATING status. Poll DescribeTable until `TableStatus` is `ACTIVE` |
 | `UnrecognizedClientException` | Invalid access key. Check credentials — verify the access key ID and secret match what was returned by `create-access-key` |
 | `AccessDeniedException` | IAM policy does not allow the operation. Attach a policy with the required permissions |

@@ -9,6 +9,11 @@
 
 pub const CATALOG_VERSION: &str = "0.0.4";
 
+/// Default control-plane delay (seconds) when the `control_plane_delay_seconds`
+/// setting is absent or unparseable: CreateTable, the control-plane worker
+/// and the console's default all read this one value.
+pub(crate) const DEFAULT_CONTROL_PLANE_DELAY_SECONDS: f64 = 0.25;
+
 mod admin_store;
 mod authorization_store;
 mod backup_engine;
@@ -253,6 +258,8 @@ pub fn backend() -> extenddb_storage::Backend {
             })
         },
         server_components: server_components_factory,
+        // Migrates through its bootstrapper until it moves onto the runner.
+        catalog_migrations: None,
     }
 }
 

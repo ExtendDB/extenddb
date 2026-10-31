@@ -91,6 +91,61 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
+      # A fresh install's schema, from the catalog init created above before
+      # any test ran, against the committed file. On a difference the job
+      # fails with the diff and uploads the regenerated file to commit.
+      - name: Check the current schema
+        run: |
+          devtools/schema-dump postgres postgresql://postgres:devpass@127.0.0.1:5432 \
+            extenddb_catalog extenddb > schema-postgres.txt
+          if ! diff -u docs/schema/postgres.txt schema-postgres.txt; then
+            echo "docs/schema/postgres.txt differs from a fresh install: commit the schema-postgres artifact as docs/schema/postgres.txt"
+            exit 1
+          fi
+
+      - name: Upload the regenerated schema
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: schema-postgres
+          path: schema-postgres.txt
+          if-no-files-found: ignore
+
+      # PgBouncer 1.26.1 in transaction mode in front of the job's server, for
+      # the lock script's pass through a connection pooler. It logs every role
+      # in through auth_query as the superuser, so the script's own role needs
+      # no entry of its own.
+      - name: Start PgBouncer
+        run: >-
+          docker run -d --name pgbouncer --network host
+          -e DB_HOST=127.0.0.1 -e DB_PORT=5432
+          -e DB_USER=postgres -e DB_PASSWORD=devpass -e AUTH_USER=postgres
+          -e AUTH_TYPE=scram-sha-256 -e POOL_MODE=transaction
+          -e LISTEN_ADDR=127.0.0.1 -e LISTEN_PORT=6432
+          edoburu/pgbouncer@sha256:8638aa563607256d3c7440437534195f1066a92b68015d89ae9d6b935b444a6d
+
+      # The migration lock and the serving registration between serve and
+      # migrate, on a deployment of its own (port 18452), then the commands
+      # and serve with the catalog reached through PgBouncer.
+      - name: Check serve and migrate on one catalog
+        env:
+          POOLER_URL: postgresql://127.0.0.1:6432
+        run: >-
+          devtools/check-postgres-catalog-lock ./target/release/extenddb
+          postgresql://postgres:devpass@127.0.0.1:5432 18452
+
+      # The last 0.1.x image's verify, migrate --yes and serve against
+      # catalogs this binary created and migrated: what each writes, and that
+      # this binary then reports WrittenByOlderRelease and --reconverge
+      # restores Current.
+      - name: Check the last 0.1.x release against migrated catalogs
+        run: |
+          docker pull extenddb/extenddb-postgres:0.1.14
+          devtools/check-postgres-older-binary ./target/release/extenddb \
+            postgresql://postgres:devpass@127.0.0.1:5432 \
+            crates/storage-postgres/tests/fixtures/released/0.1.14 \
+            extenddb/extenddb-postgres:0.1.14 18453
+
       - name: Run integration tests
         env:
           EXTENDDB_TEST_ENDPOINT: https://127.0.0.1:18443
@@ -124,6 +179,21 @@ jobs:
       - name: Build release (SQLite backend)
         run: cargo build --release -p extenddb --no-default-features --features sqlite
 
+      # The migration lock between serve and migrate, on a catalog of its own
+      # (port 18450), before the suite's server starts.
+      - name: Check serve and migrate on one catalog
+        run: devtools/check-sqlite-catalog-lock ./target/release/extenddb 18450
+
+      # The last 0.1.x dev image's serve and migrate --yes against catalogs
+      # this binary migrated: what each writes, and that this binary then
+      # reports WrittenByOlderRelease and --reconverge restores Current.
+      - name: Check the last 0.1.x release against migrated catalogs
+        run: |
+          docker pull extenddb/extenddb-dev:0.1.14
+          devtools/check-sqlite-older-binary ./target/release/extenddb \
+            crates/storage-sqlite/tests/fixtures/released/dev-image-0.1.14.sql \
+            extenddb/extenddb-dev:0.1.14 18451
+
       - name: Initialize ExtendDB
         id: init
         run: |
@@ -131,6 +201,24 @@ jobs:
           echo "$output"
           password=$(echo "$output" | grep -oP 'Password: \K\S+')
           echo "admin_password=$password" >> "$GITHUB_OUTPUT"
+
+      # A fresh install's schema against the committed file. On a difference
+      # the job fails with the diff and uploads the regenerated file to commit.
+      - name: Check the current schema
+        run: |
+          devtools/schema-dump sqlite extenddb.sqlite > schema-sqlite.txt
+          if ! diff -u docs/schema/sqlite.txt schema-sqlite.txt; then
+            echo "docs/schema/sqlite.txt differs from a fresh install: commit the schema-sqlite artifact as docs/schema/sqlite.txt"
+            exit 1
+          fi
+
+      - name: Upload the regenerated schema
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: schema-sqlite
+          path: schema-sqlite.txt
+          if-no-files-found: ignore
 
       - name: Start ExtendDB
         run: |
@@ -240,6 +328,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          # migrations_tag_blobs reads the release tags.
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -311,7 +402,10 @@ jobs:
       # cases need catalog rows the current binary would not write; all need
       # direct access. The online GSI build tests reorder queue rows by hand and
       # pause writers with a test hook. They build their own throwaway databases;
-      # the connection string is the server, not a database.
+      # the connection string is the server, not a database. `--tests` runs
+      # every target of the crate, so a new test file needs no edit here, and
+      # EXTENDDB_TEST_PG_REQUIRED turns a test's skip for a missing connection
+      # string into a failure.
       - name: Run PostgreSQL storage-level tests
         # table_snapshot: the SnapshotEngine consistency check; it needs the
         # shared page-size hook, compiled only into the crate's own test
@@ -320,11 +414,7 @@ jobs:
           EXTENDDB_TEST_PG_CONNECTION_STRING: postgresql://postgres:devpass@127.0.0.1:5432
           # table_snapshot fails rather than skips without the string above.
           EXTENDDB_TEST_PG_REQUIRED: "1"
-        run: >-
-          cargo test --release -p extenddb-storage-postgres
-          --test vector_control_plane --test put_create_race --test twi_conflict
-          --test stream_shard_retention --test stream_shard_ownership --test stream_records_page_order --test backup_restore
-          --test gsi_online_build --test gsi_stale_writer --test table_snapshot
+        run: cargo test --release -p extenddb-storage-postgres --tests
 
       # The daemonized server logs to syslog; dump it so server-side failures
       # are diagnosable from the job log.
@@ -403,16 +493,24 @@ jobs:
           devtools/run-tests --extenddb --rust-integration --release
           --filter vector_index_unsupported
 
+      # The migration tests on a server without pgvector: the released vector
+      # states skip, naming pgvector, and every other case runs. The other
+      # storage-level tests build extension-free scratch databases and behave
+      # the same on either image, so the job above covers them.
+      - name: Run the PostgreSQL migration tests without pgvector
+        env:
+          EXTENDDB_TEST_PG_CONNECTION_STRING: postgresql://postgres:devpass@127.0.0.1:5432
+          EXTENDDB_TEST_PG_REQUIRED: "1"
+        run: >-
+          cargo test --release -p extenddb-storage-postgres
+          --test migrations_fresh --test migrations_released --test migrations_crash
+          --test migrations_golden --test migrations_guards --test migrations_runs
+
       # The daemonized server logs to syslog; dump it so server-side failures
       # are diagnosable from the job log.
       - name: Dump server syslog on failure
         if: failure()
         run: sudo journalctl -t extenddb --no-pager -n 500 || true
-
-      # No storage-level step here on purpose. Those tests build their own
-      # extension-free scratch databases, so they behave identically on either
-      # image and the job above already runs them; repeating them here would buy
-      # a second release build and no coverage.
   run-rust-integration-sqlite:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 40

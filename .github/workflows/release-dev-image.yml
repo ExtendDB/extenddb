@@ -137,6 +137,17 @@ jobs:
           cargo install --locked --version 0.9.0 --features cli cargo-about
           ./devtools/generate-dev-license-notices --check
 
+      - name: Gate - the release freezes the catalog migrations it ships
+        # As in release-image.yml: RELEASED_THROUGH must reach the last
+        # migration id. A tag before the migration framework passes.
+        run: |
+          set -euo pipefail
+          if [[ -e crates/storage/src/migrations/registry.rs ]]; then
+            python3 devtools/check-released-through
+          else
+            echo "the tagged commit has no catalog migration registry"
+          fi
+
   build:
     needs: gate
     strategy:

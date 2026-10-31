@@ -181,14 +181,6 @@ pub fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> Dynamo
         // "unsupported" error class, and the request is invalid against this
         // deployment rather than a server failure.
         StorageError::Unsupported(msg) => DynamoDbError::ValidationException(msg),
-        StorageError::CatalogVersionMismatch { expected, found } => {
-            tracing::error!("Catalog version mismatch: expected {expected}, found {found}");
-            DynamoDbError::InternalServerError("Internal server error".to_owned())
-        }
-        StorageError::CatalogNotInitialized => {
-            tracing::error!("Catalog not initialized");
-            DynamoDbError::InternalServerError("Internal server error".to_owned())
-        }
         // Generic path: discard the old item (callers that need it use
         // `storage_err_to_dynamo_with_ccf` instead).
         StorageError::ConditionFailed(_) => DynamoDbError::ConditionalCheckFailedException(

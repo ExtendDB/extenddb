@@ -1690,6 +1690,9 @@ dependencies = [
  "extenddb-storage-mongodb",
  "extenddb-storage-postgres",
  "extenddb-storage-sqlite",
+ "sqlx",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -1876,6 +1879,7 @@ dependencies = [
  "rand 0.9.4",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror",
  "time",
  "tokio",
@@ -1989,6 +1993,7 @@ dependencies = [
  "extenddb-storage-sqlite",
  "futures",
  "libc",
+ "log",
  "rand 0.9.4",
  "serde",
  "serde_json",
@@ -1997,6 +2002,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "zeroize",
 ]

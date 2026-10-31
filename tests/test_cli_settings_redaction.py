@@ -60,13 +60,18 @@ def _parse_list(stdout: str) -> dict[str, str]:
 
 def _assert_masked_list_and_get(config_path: str, secret_keys: dict[str, str]) -> None:
     """`secret_keys` maps each secret setting key to its stored value."""
+    # No catalog seeds the delay settings, so store a non-secret value to
+    # check that `list` and `get` print it unmasked.
+    res = _settings(config_path, "set", "control_plane_delay_seconds", "0.25")
+    assert res.returncode == 0, res.stderr
     res = _settings(config_path, "list")
     assert res.returncode == 0, res.stderr
     rows = _parse_list(res.stdout)
     for key, stored in secret_keys.items():
         assert rows.get(key) == MASK, f"{key} in list: {rows.get(key)!r}"
         assert stored not in res.stdout
-    # Non-secret keys seeded by `init` still print their values.
+    # Non-secret keys print their values: the one `init` writes, and the
+    # delay stored above.
     assert rows.get("data_database_name"), rows
     assert rows.get("control_plane_delay_seconds") == "0.25", rows
 

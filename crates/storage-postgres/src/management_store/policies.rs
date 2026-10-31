@@ -5,6 +5,7 @@
 
 use extenddb_storage::management_store::{OpError, OpResult};
 
+use super::database_error;
 use crate::catalog_store::PostgresCatalogStore;
 use crate::pg_util::is_fk_violation;
 
@@ -35,10 +36,7 @@ impl PostgresCatalogStore {
         match result {
             Ok(_) => Ok(()),
             Err(e) if is_fk_violation(&e) => Err(OpError::NotFound("Account not found".to_owned())),
-            Err(e) => {
-                tracing::error!("put_policy failed: {e}");
-                Err(OpError::Internal("Database error".to_owned()))
-            }
+            Err(e) => Err(database_error("put_policy", &e)),
         }
     }
 
@@ -87,10 +85,7 @@ impl PostgresCatalogStore {
         .bind(principal_name)
         .fetch_all(self.pool())
         .await
-        .map_err(|e| {
-            tracing::error!("list_policies: {e}");
-            OpError::Internal("Database error".to_owned())
-        })
+        .map_err(|e| database_error("list_policies", &e))
     }
 
     // ── Permissions boundaries ─────────────────────────────────────
@@ -117,10 +112,7 @@ impl PostgresCatalogStore {
         match result {
             Ok(_) => Ok(()),
             Err(e) if is_fk_violation(&e) => Err(OpError::NotFound("Account not found".to_owned())),
-            Err(e) => {
-                tracing::error!("set_boundary failed: {e}");
-                Err(OpError::Internal("Database error".to_owned()))
-            }
+            Err(e) => Err(database_error("set_boundary", &e)),
         }
     }
 
@@ -139,10 +131,7 @@ impl PostgresCatalogStore {
         .bind(principal_name)
         .fetch_optional(self.pool())
         .await
-        .map_err(|e| {
-            tracing::error!("get_boundary: {e}");
-            OpError::Internal("Database error".to_owned())
-        })?;
+        .map_err(|e| database_error("get_boundary", &e))?;
         Ok(row.map(|(doc,)| doc))
     }
 

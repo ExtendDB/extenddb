@@ -210,6 +210,18 @@ jobs:
           ./devtools/generate-software-license-notices --check \
             --backend '${{ steps.meta.outputs.license_backend }}'
 
+      - name: Gate - the release freezes the catalog migrations it ships
+        # RELEASED_THROUGH must reach the last migration id, so each
+        # backend's checksum test pins every body this tag ships. A tag
+        # before the migration framework has no registry and passes.
+        run: |
+          set -euo pipefail
+          if [[ -e crates/storage/src/migrations/registry.rs ]]; then
+            python3 devtools/check-released-through
+          else
+            echo "the tagged commit has no catalog migration registry"
+          fi
+
   build:
     needs: gate
     # If one architecture fails, cancel the other: nothing is published either

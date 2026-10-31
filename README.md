@@ -149,11 +149,12 @@ unreachable at startup does stop the server from listening. There is no separate
 ### One instance per database
 
 Run one `extenddb serve` per catalog. On SQLite this is enforced: the server takes an exclusive lock on `<database>.lock`
-next to the database file and a second server on the same file will refuse to start (`init`, `migrate`, and `destroy` take
-the same lock while they run). On PostgreSQL, MongoDB and Cassandra nothing prevents a second ExtendDB instance from
-running, but running more than one against the same catalog is not supported in this release: every instance runs every
-background worker, credential and policy caches are per instance with no cross-instance invalidation (a revoked key
-stays valid on the other instance for up to the cache TTL), and `/health` does not check the database.
+next to the database file and a second server on the same file will refuse to start (`init`, `migrate --yes`,
+`migrate --forget` and `destroy` take the same lock while they run; the `migrate` preview and `verify` take none). On
+PostgreSQL, MongoDB and Cassandra nothing prevents a second ExtendDB instance from running, but running more than one
+against the same catalog is not supported in this release: every instance runs every background worker, credential and
+policy caches are per instance with no cross-instance invalidation (a revoked key stays valid on the other instance for
+up to the cache TTL), and `/health` does not check the database.
 See the [deployment guide](docs/manuals/11-deployment-guide.md#multi-instance-considerations).
 
 To make the generated self-signed certificate valid for the name clients use — an in-cluster service DNS name, for example — pass `--tls-san` to `init` (repeatable):

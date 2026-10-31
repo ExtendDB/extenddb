@@ -478,14 +478,7 @@ mod tests {
             );
         }
 
-        let internal = [
-            StorageError::Internal("backend fault".to_owned()),
-            StorageError::CatalogVersionMismatch {
-                expected: "3".to_owned(),
-                found: "2".to_owned(),
-            },
-            StorageError::CatalogNotInitialized,
-        ];
+        let internal = [StorageError::Internal("backend fault".to_owned())];
         for err in internal {
             let out = key_info_for_authz(Err(err.clone()));
             assert!(

@@ -731,7 +731,7 @@ mod pending_context_tests {
         let engine = crate::SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
+        crate::migrations::apply_for_tests(&engine.pool).await;
 
         let the_item: extenddb_core::types::Item =
             serde_json::from_str(r#"{"pk":{"S":"shared-key"},"emb":{"L":[{"N":"1"}]}}"#)
@@ -772,9 +772,9 @@ mod pending_context_tests {
     /// A catalog created before the rename must keep honouring its operator's value.
     ///
     /// This is the compatibility property the whole fallback exists for, and the cost
-    /// of getting it wrong is not cosmetic: the server refuses to start on a
-    /// catalog-version mismatch rather than migrating, so nothing ever rewrites the old
-    /// row. Reading past it would silently reset a configured delay to the default, and
+    /// of getting it wrong is not cosmetic: no catalog migration rewrites the old row
+    /// yet, though one could. Reading past it would silently reset a configured delay
+    /// to the default, and
     /// since 0 means synchronous, the silent change would be from strict to eventually
     /// consistent, which is exactly the direction that turns a passing test suite into
     /// a flaky one somewhere else.
@@ -783,7 +783,7 @@ mod pending_context_tests {
         let engine = crate::SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
+        crate::migrations::apply_for_tests(&engine.pool).await;
 
         // Reshape the catalog to look as it did before the rename: the legacy key
         // only, carrying a deliberately non-default value.
@@ -814,7 +814,7 @@ mod pending_context_tests {
         let engine = crate::SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
+        crate::migrations::apply_for_tests(&engine.pool).await;
 
         sqlx::query(
             "INSERT OR REPLACE INTO settings (key, value) \

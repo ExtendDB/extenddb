@@ -1,0 +1,8 @@
+-- SELECT name, sql FROM sqlite_master WHERE name LIKE 'idx_base_key_%' ORDER BY name
+idx_base_key_457d180b-237e-4c52-b4f4-45c14c6373fa	CREATE INDEX "idx_base_key_457d180b-237e-4c52-b4f4-45c14c6373fa" ON "_ddb_457d180b-237e-4c52-b4f4-45c14c6373fa" (base_pk, base_sk_s)
+idx_base_key_fc40b212-8c5a-499b-9bb0-44bebe422a32	CREATE INDEX "idx_base_key_fc40b212-8c5a-499b-9bb0-44bebe422a32" ON "_ddb_fc40b212-8c5a-499b-9bb0-44bebe422a32" (base_pk, base_sk_s)
+-- SELECT notes FROM extenddb_migrations WHERE id = 4
+cu_orders index by_gpk: created idx_base_key_fc40b212-8c5a-499b-9bb0-44bebe422a32 on (base_pk, base_sk_s)
+cu_orders index by_lsk: created idx_base_key_457d180b-237e-4c52-b4f4-45c14c6373fa on (base_pk, base_sk_s)
+cu_orders index gone: skipped, its index table _ddb_6f9619ff-8b86-4011-b42d-00c04fc964ff does not exist
+going index by_gpk: skipped, the table is being deleted

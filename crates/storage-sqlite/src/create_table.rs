@@ -118,7 +118,7 @@ impl SqliteEngine {
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?
         .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(0.25);
+        .unwrap_or(crate::DEFAULT_CONTROL_PLANE_DELAY_SECONDS);
 
         let now = time::OffsetDateTime::now_utc();
         let creation_ts = format_timestamp(now);

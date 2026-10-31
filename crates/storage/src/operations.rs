@@ -33,6 +33,12 @@ pub trait OperationsEngine: Send + Sync {
 
     /// Check if a configuration key contains sensitive data that should be redacted.
     fn is_sensitive_key(&self, key: &str) -> bool;
+
+    /// The value this backend's engine uses for the runtime setting `key`
+    /// when the catalog has no row for it, or `None` for a key the engine
+    /// does not read. Displays that print a default read it here: no
+    /// catalog baseline seeds these rows.
+    fn setting_default(&self, key: &str) -> Option<String>;
 }
 
 /// Parsed connection string components (backend-agnostic).
@@ -65,6 +71,16 @@ pub fn get_operations_engine() -> Result<&'static dyn OperationsEngine, StorageE
 /// Get the catalog version for a backend.
 pub fn catalog_version() -> Result<String, StorageError> {
     get_operations_engine().map(OperationsEngine::catalog_version)
+}
+
+/// The installed backend's default for the runtime setting `key`
+/// ([`OperationsEngine::setting_default`]); `None` when no backend is
+/// installed or its engine does not read the key.
+#[must_use]
+pub fn setting_default(key: &str) -> Option<String> {
+    get_operations_engine()
+        .ok()
+        .and_then(|ops| ops.setting_default(key))
 }
 
 /// Redact sensitive information from a connection string.

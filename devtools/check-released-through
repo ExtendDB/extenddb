@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+"""Fail when a release would ship catalog migrations it does not freeze.
+
+    devtools/check-released-through [repository root]
+
+A migration body is frozen once `RELEASED_THROUGH` in
+crates/storage/src/migrations/registry.rs covers its id: each backend's
+checksum test then pins the body's checksum, kind and convergent flag, and
+`migrate --forget` refuses the id. The release PR raises the bound to the
+last id and pastes the checksum lines the test prints (CONTRIBUTING.md,
+"Adding a catalog migration", step 7). A tag cut without that step ships
+bodies that a later change can edit with every test passing, and every
+deployment that ran them would then refuse to serve.
+
+Exit 0 when the bound equals the last id of the `migration_ids!` list, or
+when the commit has no migration registry (a release before the migration
+framework). Exit 1, naming both numbers, otherwise. The release workflows'
+gate jobs run this on the tagged commit.
+"""
+
+import pathlib
+import re
+import sys
+
+
+def main() -> int:
+    root = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else pathlib.Path(__file__).resolve().parent.parent
+    registry = root / "crates/storage/src/migrations/registry.rs"
+    if not registry.exists():
+        print(f"{registry} does not exist; this commit has no catalog migrations to release")
+        return 0
+    text = registry.read_text(encoding="utf-8")
+    bound = re.search(r"pub const RELEASED_THROUGH: u32 = (\d+);", text)
+    if bound is None:
+        print(f"FAIL: no `pub const RELEASED_THROUGH: u32 = <n>;` in {registry}")
+        return 1
+    # Entries of `migration_ids!`: `Variant = <n>, "<name>",`
+    ids = [int(n) for n in re.findall(r"^\s*[A-Z][A-Za-z0-9]* = (\d+), \"", text, re.MULTILINE)]
+    if not ids:
+        print(f"FAIL: no migration ids found in {registry}")
+        return 1
+    released, last = int(bound.group(1)), max(ids)
+    if released < last:
+        print(
+            f"FAIL: RELEASED_THROUGH is {released} and the last migration is {last}. "
+            f"Raise RELEASED_THROUGH to {last} and paste the checksum lines each backend's "
+            "checksum test prints into its RELEASED list before tagging "
+            "(CONTRIBUTING.md, \"Adding a catalog migration\", step 7)."
+        )
+        return 1
+    if released > last:
+        print(f"FAIL: RELEASED_THROUGH is {released}, above the last migration, {last}")
+        return 1
+    print(f"ok: RELEASED_THROUGH is {released}, the last migration")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

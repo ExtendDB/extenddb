@@ -150,7 +150,7 @@ async fn read_control_plane_delay<S: SettingsStore + ?Sized>(store: &S) -> f64 {
         .flatten()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|&v| v >= 0.0)
-        .unwrap_or(0.25)
+        .unwrap_or(crate::DEFAULT_CONTROL_PLANE_DELAY_SECONDS)
 }
 
 pub(crate) async fn table_size_refresh_worker(

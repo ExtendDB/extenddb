@@ -1501,12 +1501,12 @@ mod restore_tests {
         let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
-        sqlx::query("UPDATE settings SET value = '0' WHERE key = 'control_plane_delay_seconds'")
+        crate::migrations::apply_for_tests(&engine.pool).await;
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0') ON CONFLICT(key) DO UPDATE SET value = excluded.value")
             .execute(&engine.pool)
             .await
             .expect("delay");
-        sqlx::query("UPDATE settings SET value = '0' WHERE key = 'index_propagation_delay_ms'")
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('index_propagation_delay_ms', '0') ON CONFLICT(key) DO UPDATE SET value = excluded.value")
             .execute(&engine.pool)
             .await
             .expect("propagation");
@@ -2119,9 +2119,9 @@ mod restore_tests {
 
     /// A database with the schema catalog 0.0.3 shipped, holding a backup in
     /// the row shape 0.0.3 wrote (`pk` empty, `sk` NULL, no definition), is
-    /// brought to 0.0.4 by re-applying the schema, which is what
-    /// `extenddb migrate` does on this backend; the old backup then restores
-    /// as it did before: keys and items, no secondary indexes.
+    /// brought to the latest migration by the runner, as `extenddb migrate
+    /// --yes` does; the old backup then restores as it did before: keys and
+    /// items, no secondary indexes.
     #[tokio::test]
     async fn a_0_0_3_database_migrates_and_its_backups_restore() {
         let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
@@ -2131,7 +2131,7 @@ mod restore_tests {
             .execute(&engine.pool)
             .await
             .expect("0.0.3 schema");
-        sqlx::query("UPDATE settings SET value = '0' WHERE key = 'control_plane_delay_seconds'")
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0') ON CONFLICT(key) DO UPDATE SET value = excluded.value")
             .execute(&engine.pool)
             .await
             .expect("delay");
@@ -2140,7 +2140,16 @@ mod restore_tests {
             .execute(&engine.pool)
             .await
             .expect("account");
-        assert!(engine.check_catalog_version().await.is_err());
+        let on_pool = crate::migrations::SqliteMigrations::on_pool(engine.pool.clone(), ":memory:")
+            .expect("one connection");
+        let runner = extenddb_storage::migrations::Runner::new(&on_pool, "test");
+        assert!(
+            matches!(
+                runner.status().await.expect("status"),
+                extenddb_storage::migrations::CatalogStatus::Behind { version: None, .. }
+            ),
+            "a 0.0.3 database has no ledger"
+        );
 
         // A backup exactly as the 0.0.3 binary wrote one.
         let arn = format!("arn:aws:dynamodb:us-east-1:{ACCOUNT}:table/old/backup/1-00000000");
@@ -2170,38 +2179,20 @@ mod restore_tests {
             .expect("old backup item");
         }
 
-        // The dry run names the rebuild, with the row count.
-        assert_eq!(
-            crate::schema::pending_shape_migrations(&engine.pool)
-                .await
-                .expect("pending"),
-            vec!["rebuild backup_items (3 rows)".to_owned()]
-        );
-        let (log_guard, logs) = crate::schema::log_capture::capture();
-        crate::schema::apply(&engine.pool).await.expect("migrate");
-        drop(log_guard);
-        let logs = logs.lock().expect("logs").clone();
+        // Migration 1 rebuilds backup_items and says how many rows it copied.
+        let report = runner.migrate().await.expect("migrate");
+        let baseline_notes = report.applied[0].notes.join("\n");
         assert!(
-            logs.iter().any(|l| l.starts_with("INFO")
-                && l.contains("rebuilding backup_items")
-                && l.contains("(3 rows)")),
-            "{logs:#?}"
+            baseline_notes.contains("copying 3 row(s)"),
+            "{baseline_notes}"
         );
         assert!(
-            logs.iter()
-                .any(|l| l.starts_with("INFO") && l.contains("rebuilt backup_items (3 rows)")),
-            "{logs:#?}"
+            matches!(
+                runner.status().await.expect("status after"),
+                extenddb_storage::migrations::CatalogStatus::Current { .. }
+            ),
+            "current after the run"
         );
-        assert!(
-            crate::schema::pending_shape_migrations(&engine.pool)
-                .await
-                .expect("pending after")
-                .is_empty()
-        );
-        engine
-            .check_catalog_version()
-            .await
-            .expect("0.0.4 after migrate");
         let id_is_primary_key: i64 = sqlx::query_scalar(
             "SELECT pk FROM pragma_table_info('backup_items') WHERE name = 'id'",
         )
@@ -2426,12 +2417,12 @@ mod restore_tests {
         )
         .await
         .expect("file engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
-        sqlx::query("UPDATE settings SET value = '0' WHERE key = 'control_plane_delay_seconds'")
+        crate::migrations::apply_for_tests(&engine.pool).await;
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0') ON CONFLICT(key) DO UPDATE SET value = excluded.value")
             .execute(&engine.pool)
             .await
             .expect("delay");
-        sqlx::query("UPDATE settings SET value = '0' WHERE key = 'index_propagation_delay_ms'")
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('index_propagation_delay_ms', '0') ON CONFLICT(key) DO UPDATE SET value = excluded.value")
             .execute(&engine.pool)
             .await
             .expect("propagation");
@@ -2446,7 +2437,7 @@ mod restore_tests {
     async fn close_file_engine(engine: SqliteEngine, path: &std::path::Path) {
         engine.pool.close().await;
         drop(engine);
-        for suffix in ["", "-wal", "-shm"] {
+        for suffix in ["", "-wal", "-shm", ".lock"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
     }

@@ -194,7 +194,7 @@ impl CassandraEngine {
                 let value: String = row.get_r_by_name("value").ok()?;
                 value.parse::<f64>().ok()
             })
-            .unwrap_or(0.25);
+            .unwrap_or(crate::DEFAULT_CONTROL_PLANE_DELAY_SECONDS);
 
         // Restore targets have no generic transition deadline; only the restore
         // path may publish them after payload verification.

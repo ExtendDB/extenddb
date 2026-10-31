@@ -1,0 +1,373 @@
+# catalog database
+table access_keys
+table accounts
+table admin_users
+table backup_definitions
+table backup_items
+table backups
+table continuous_backups
+table extenddb_migrations
+table iam_group_members
+table iam_groups
+table iam_permissions_boundaries
+table iam_policies
+table iam_role_tags
+table iam_roles
+table iam_sessions
+table iam_user_tags
+table iam_users
+table idempotency_tokens
+table indexes
+table login_attempts
+table metrics
+table schema_history
+table settings
+table stream_records
+table stream_shards
+table table_restores
+table tables
+table tags
+table vector_indexes
+column access_keys.access_key_id: text NOT NULL
+column access_keys.secret_key_encrypted: bytea NOT NULL
+column access_keys.account_id: text NOT NULL
+column access_keys.user_name: text NOT NULL
+column access_keys.is_active: boolean NOT NULL DEFAULT true
+column access_keys.created_at: timestamp with time zone NOT NULL DEFAULT now()
+column accounts.account_id: text NOT NULL
+column accounts.account_name: text NOT NULL
+column accounts.created_at: timestamp with time zone NOT NULL DEFAULT now()
+column admin_users.admin_name: text NOT NULL
+column admin_users.password_hash: text NOT NULL
+column admin_users.created_at: timestamp with time zone NOT NULL DEFAULT now()
+column backup_definitions.backup_arn: text NOT NULL
+column backup_definitions.definition: jsonb NOT NULL
+column backup_items.backup_arn: text NOT NULL
+column backup_items.pk: text NOT NULL
+column backup_items.sk: text
+column backup_items.item_data: jsonb NOT NULL
+column backups.backup_arn: text NOT NULL
+column backups.backup_name: text NOT NULL
+column backups.table_id: text NOT NULL
+column backups.table_name: text NOT NULL
+column backups.account_id: text NOT NULL
+column backups.backup_status: text NOT NULL DEFAULT 'AVAILABLE'::text
+column backups.backup_type: text NOT NULL DEFAULT 'USER'::text
+column backups.backup_size_bytes: bigint NOT NULL DEFAULT 0
+column backups.item_count: bigint NOT NULL DEFAULT 0
+column backups.key_schema: jsonb NOT NULL
+column backups.attribute_definitions: jsonb NOT NULL
+column backups.billing_mode: text NOT NULL DEFAULT 'PAY_PER_REQUEST'::text
+column backups.provisioned_throughput: jsonb
+column backups.stream_specification: jsonb
+column backups.created_at: timestamp with time zone NOT NULL DEFAULT now()
+column backups.vector_indexes: jsonb
+column continuous_backups.account_id: text NOT NULL
+column continuous_backups.table_name: text NOT NULL
+column continuous_backups.pitr_enabled: boolean NOT NULL DEFAULT false
+column continuous_backups.earliest_restorable: timestamp with time zone
+column continuous_backups.latest_restorable: timestamp with time zone
+column extenddb_migrations.id: integer NOT NULL
+column extenddb_migrations.name: text NOT NULL
+column extenddb_migrations.kind: text NOT NULL
+column extenddb_migrations.checksum: text NOT NULL
+column extenddb_migrations.outcome: text NOT NULL
+column extenddb_migrations.notes: text NOT NULL DEFAULT ''::text
+column extenddb_migrations.applied_at: timestamp with time zone NOT NULL DEFAULT now()
+column extenddb_migrations.applied_by: text NOT NULL
+column iam_group_members.account_id: text NOT NULL
+column iam_group_members.group_name: text NOT NULL
+column iam_group_members.user_name: text NOT NULL
+column iam_groups.account_id: text NOT NULL
+column iam_groups.group_name: text NOT NULL
+column iam_groups.group_arn: text NOT NULL
+column iam_groups.created_at: timestamp with time zone NOT NULL DEFAULT now()
+column iam_permissions_boundaries.account_id: text NOT NULL
+column iam_permissions_boundaries.principal_type: text NOT NULL
+column iam_permissions_boundaries.principal_name: text NOT NULL
+column iam_permissions_boundaries.policy_document: jsonb NOT NULL
+column iam_policies.account_id: text NOT NULL
+column iam_policies.principal_type: text NOT NULL
+column iam_policies.principal_name: text NOT NULL
+column iam_policies.policy_name: text NOT NULL
+column iam_policies.policy_document: jsonb NOT NULL
+column iam_policies.created_at: timestamp with time zone NOT NULL DEFAULT now()
+column iam_role_tags.account_id: text NOT NULL
+column iam_role_tags.role_name: text NOT NULL
+column iam_role_tags.tag_key: text NOT NULL
+column iam_role_tags.tag_value: text NOT NULL
+column iam_roles.account_id: text NOT NULL
+column iam_roles.role_name: text NOT NULL
+column iam_roles.role_arn: text NOT NULL
+column iam_roles.trust_policy: jsonb NOT NULL
+column iam_roles.permissions_boundary_arn: text
+column iam_roles.created_at: timestamp with time zone NOT NULL DEFAULT now()
+column iam_sessions.session_token: text NOT NULL
+column iam_sessions.access_key_id: text NOT NULL
+column iam_sessions.secret_key_encrypted: bytea NOT NULL
+column iam_sessions.account_id: text NOT NULL
+column iam_sessions.role_name: text NOT NULL
+column iam_sessions.session_name: text NOT NULL
+column iam_sessions.session_tags: jsonb
+column iam_sessions.session_policy: jsonb
+column iam_sessions.expires_at: timestamp with time zone NOT NULL
+column iam_sessions.created_at: timestamp with time zone NOT NULL DEFAULT now()
+column iam_user_tags.account_id: text NOT NULL
+column iam_user_tags.user_name: text NOT NULL
+column iam_user_tags.tag_key: text NOT NULL
+column iam_user_tags.tag_value: text NOT NULL
+column iam_users.account_id: text NOT NULL
+column iam_users.user_name: text NOT NULL
+column iam_users.user_arn: text NOT NULL
+column iam_users.password_hash: text
+column iam_users.created_at: timestamp with time zone NOT NULL DEFAULT now()
+column idempotency_tokens.token: text NOT NULL
+column idempotency_tokens.fingerprint: text NOT NULL
+column idempotency_tokens.created_at: timestamp with time zone NOT NULL DEFAULT now()
+column indexes.table_id: text NOT NULL
+column indexes.index_id: text NOT NULL DEFAULT (gen_random_uuid())::text
+column indexes.index_name: text NOT NULL
+column indexes.index_type: text NOT NULL
+column indexes.key_schema: jsonb NOT NULL
+column indexes.projection: jsonb NOT NULL
+column indexes.index_status: text NOT NULL DEFAULT 'ACTIVE'::text
+column indexes.provisioned_throughput: jsonb
+column indexes.propagation_delay_ms: integer
+column login_attempts.principal: text NOT NULL
+column login_attempts.attempted_at: timestamp with time zone NOT NULL DEFAULT now()
+column login_attempts.success: boolean NOT NULL
+column login_attempts.source_ip: text
+column metrics.bucket: timestamp with time zone NOT NULL
+column metrics.metric: text NOT NULL
+column metrics.table_name: text NOT NULL DEFAULT ''::text
+column metrics.index_name: text NOT NULL DEFAULT ''::text
+column metrics.operation: text NOT NULL DEFAULT ''::text
+column metrics.sum: double precision NOT NULL DEFAULT 0
+column metrics.count: bigint NOT NULL DEFAULT 0
+column metrics.min: double precision NOT NULL DEFAULT 'Infinity'::double precision
+column metrics.max: double precision NOT NULL DEFAULT '-Infinity'::double precision
+column schema_history.filename: text NOT NULL
+column schema_history.applied_at: timestamp with time zone NOT NULL DEFAULT now()
+column settings.key: text NOT NULL
+column settings.value: text NOT NULL
+column stream_records.shard_id: text NOT NULL
+column stream_records.sequence_number: text NOT NULL
+column stream_records.table_id: text NOT NULL
+column stream_records.event_name: text NOT NULL
+column stream_records.record_data: jsonb NOT NULL
+column stream_records.created_at: timestamp with time zone NOT NULL DEFAULT now()
+column stream_shards.shard_id: text NOT NULL
+column stream_shards.table_id: text NOT NULL
+column stream_shards.parent_shard_id: text
+column stream_shards.starting_sequence_number: text NOT NULL
+column stream_shards.ending_sequence_number: text
+column stream_shards.created_at: timestamp with time zone NOT NULL DEFAULT now()
+column table_restores.table_id: text NOT NULL
+column table_restores.source_backup_arn: text NOT NULL
+column table_restores.source_table_arn: text NOT NULL
+column table_restores.restore_date_time: timestamp with time zone NOT NULL
+column tables.account_id: text NOT NULL
+column tables.table_name: text NOT NULL
+column tables.key_schema: jsonb NOT NULL
+column tables.attribute_definitions: jsonb NOT NULL
+column tables.billing_mode: text NOT NULL DEFAULT 'PAY_PER_REQUEST'::text
+column tables.provisioned_throughput: jsonb
+column tables.stream_specification: jsonb
+column tables.table_status: text NOT NULL DEFAULT 'CREATING'::text
+column tables.creation_date_time: timestamp with time zone NOT NULL DEFAULT now()
+column tables.table_size_bytes: bigint NOT NULL DEFAULT 0
+column tables.item_count: bigint NOT NULL DEFAULT 0
+column tables.table_arn: text NOT NULL
+column tables.table_id: text NOT NULL
+column tables.ttl_attribute: text
+column tables.deletion_protection_enabled: boolean NOT NULL DEFAULT false
+column tables.status_transition_at: timestamp with time zone
+column tables.stream_label: text
+column tables.ttl_index_ready: boolean NOT NULL DEFAULT false
+column tables.table_class: text
+column tables.sse_specification: jsonb
+column tables.on_demand_throughput: jsonb
+column tags.resource_arn: text NOT NULL
+column tags.tag_key: text NOT NULL
+column tags.tag_value: text NOT NULL
+column vector_indexes.table_id: text NOT NULL
+column vector_indexes.index_id: text NOT NULL
+column vector_indexes.index_name: text NOT NULL
+column vector_indexes.dimensions: integer NOT NULL
+column vector_indexes.distance_function: text NOT NULL
+column vector_indexes.vector_attribute: jsonb NOT NULL
+column vector_indexes.search_schema: jsonb
+column vector_indexes.projection: jsonb NOT NULL
+column vector_indexes.index_status: text NOT NULL DEFAULT 'CREATING'::text
+column vector_indexes.backfilling: boolean
+column vector_indexes.skipped_item_count: bigint
+column vector_indexes.build_owner: text
+column vector_indexes.build_heartbeat_at: timestamp with time zone
+index access_keys_pkey: CREATE UNIQUE INDEX access_keys_pkey ON public.access_keys USING btree (access_key_id)
+index accounts_account_name_key: CREATE UNIQUE INDEX accounts_account_name_key ON public.accounts USING btree (account_name)
+index accounts_pkey: CREATE UNIQUE INDEX accounts_pkey ON public.accounts USING btree (account_id)
+index admin_users_pkey: CREATE UNIQUE INDEX admin_users_pkey ON public.admin_users USING btree (admin_name)
+index backup_definitions_pkey: CREATE UNIQUE INDEX backup_definitions_pkey ON public.backup_definitions USING btree (backup_arn)
+index backups_pkey: CREATE UNIQUE INDEX backups_pkey ON public.backups USING btree (backup_arn)
+index continuous_backups_pkey: CREATE UNIQUE INDEX continuous_backups_pkey ON public.continuous_backups USING btree (account_id, table_name)
+index extenddb_migrations_pkey: CREATE UNIQUE INDEX extenddb_migrations_pkey ON public.extenddb_migrations USING btree (id)
+index iam_group_members_pkey: CREATE UNIQUE INDEX iam_group_members_pkey ON public.iam_group_members USING btree (account_id, group_name, user_name)
+index iam_groups_group_arn_key: CREATE UNIQUE INDEX iam_groups_group_arn_key ON public.iam_groups USING btree (group_arn)
+index iam_groups_pkey: CREATE UNIQUE INDEX iam_groups_pkey ON public.iam_groups USING btree (account_id, group_name)
+index iam_permissions_boundaries_pkey: CREATE UNIQUE INDEX iam_permissions_boundaries_pkey ON public.iam_permissions_boundaries USING btree (account_id, principal_type, principal_name)
+index iam_policies_pkey: CREATE UNIQUE INDEX iam_policies_pkey ON public.iam_policies USING btree (account_id, principal_type, principal_name, policy_name)
+index iam_role_tags_pkey: CREATE UNIQUE INDEX iam_role_tags_pkey ON public.iam_role_tags USING btree (account_id, role_name, tag_key)
+index iam_roles_pkey: CREATE UNIQUE INDEX iam_roles_pkey ON public.iam_roles USING btree (account_id, role_name)
+index iam_roles_role_arn_key: CREATE UNIQUE INDEX iam_roles_role_arn_key ON public.iam_roles USING btree (role_arn)
+index iam_sessions_access_key_id_key: CREATE UNIQUE INDEX iam_sessions_access_key_id_key ON public.iam_sessions USING btree (access_key_id)
+index iam_sessions_pkey: CREATE UNIQUE INDEX iam_sessions_pkey ON public.iam_sessions USING btree (session_token)
+index iam_user_tags_pkey: CREATE UNIQUE INDEX iam_user_tags_pkey ON public.iam_user_tags USING btree (account_id, user_name, tag_key)
+index iam_users_pkey: CREATE UNIQUE INDEX iam_users_pkey ON public.iam_users USING btree (account_id, user_name)
+index iam_users_user_arn_key: CREATE UNIQUE INDEX iam_users_user_arn_key ON public.iam_users USING btree (user_arn)
+index idempotency_tokens_pkey: CREATE UNIQUE INDEX idempotency_tokens_pkey ON public.idempotency_tokens USING btree (token)
+index idx_backup_items_arn: CREATE INDEX idx_backup_items_arn ON public.backup_items USING btree (backup_arn)
+index idx_backups_table: CREATE INDEX idx_backups_table ON public.backups USING btree (account_id, table_name)
+index idx_idempotency_tokens_created: CREATE INDEX idx_idempotency_tokens_created ON public.idempotency_tokens USING btree (created_at)
+index idx_login_attempts_principal_time: CREATE INDEX idx_login_attempts_principal_time ON public.login_attempts USING btree (principal, attempted_at DESC)
+index idx_login_attempts_source_ip_time: CREATE INDEX idx_login_attempts_source_ip_time ON public.login_attempts USING btree (source_ip, attempted_at DESC) WHERE (source_ip IS NOT NULL)
+index idx_metrics_bucket: CREATE INDEX idx_metrics_bucket ON public.metrics USING btree (bucket)
+index idx_stream_records_created: CREATE INDEX idx_stream_records_created ON public.stream_records USING btree (created_at)
+index idx_stream_shards_table: CREATE INDEX idx_stream_shards_table ON public.stream_shards USING btree (table_id)
+index idx_table_restores_backup: CREATE INDEX idx_table_restores_backup ON public.table_restores USING btree (source_backup_arn)
+index idx_tables_pending_transition: CREATE INDEX idx_tables_pending_transition ON public.tables USING btree (status_transition_at) WHERE (status_transition_at IS NOT NULL)
+index idx_vector_indexes_index_id: CREATE UNIQUE INDEX idx_vector_indexes_index_id ON public.vector_indexes USING btree (index_id)
+index indexes_pkey: CREATE UNIQUE INDEX indexes_pkey ON public.indexes USING btree (table_id, index_name)
+index metrics_pkey: CREATE UNIQUE INDEX metrics_pkey ON public.metrics USING btree (bucket, metric, table_name, index_name, operation)
+index schema_history_pkey: CREATE UNIQUE INDEX schema_history_pkey ON public.schema_history USING btree (filename)
+index settings_pkey: CREATE UNIQUE INDEX settings_pkey ON public.settings USING btree (key)
+index stream_records_pkey: CREATE UNIQUE INDEX stream_records_pkey ON public.stream_records USING btree (shard_id, sequence_number)
+index stream_shards_pkey: CREATE UNIQUE INDEX stream_shards_pkey ON public.stream_shards USING btree (shard_id)
+index table_restores_pkey: CREATE UNIQUE INDEX table_restores_pkey ON public.table_restores USING btree (table_id)
+index tables_pkey: CREATE UNIQUE INDEX tables_pkey ON public.tables USING btree (account_id, table_name)
+index tables_table_id_unique: CREATE UNIQUE INDEX tables_table_id_unique ON public.tables USING btree (table_id)
+index tags_pkey: CREATE UNIQUE INDEX tags_pkey ON public.tags USING btree (resource_arn, tag_key)
+index vector_indexes_pkey: CREATE UNIQUE INDEX vector_indexes_pkey ON public.vector_indexes USING btree (table_id, index_name)
+constraint access_keys.access_keys_account_id_user_name_fkey: FOREIGN KEY (account_id, user_name) REFERENCES iam_users(account_id, user_name) ON DELETE CASCADE
+constraint access_keys.access_keys_pkey: PRIMARY KEY (access_key_id)
+constraint accounts.accounts_account_name_key: UNIQUE (account_name)
+constraint accounts.accounts_pkey: PRIMARY KEY (account_id)
+constraint admin_users.admin_users_pkey: PRIMARY KEY (admin_name)
+constraint backup_definitions.backup_definitions_backup_arn_fkey: FOREIGN KEY (backup_arn) REFERENCES backups(backup_arn) ON DELETE CASCADE
+constraint backup_definitions.backup_definitions_pkey: PRIMARY KEY (backup_arn)
+constraint backup_items.backup_items_backup_arn_fkey: FOREIGN KEY (backup_arn) REFERENCES backups(backup_arn) ON DELETE CASCADE
+constraint backups.backups_pkey: PRIMARY KEY (backup_arn)
+constraint continuous_backups.continuous_backups_pkey: PRIMARY KEY (account_id, table_name)
+constraint extenddb_migrations.extenddb_migrations_pkey: PRIMARY KEY (id)
+constraint iam_group_members.iam_group_members_account_id_group_name_fkey: FOREIGN KEY (account_id, group_name) REFERENCES iam_groups(account_id, group_name) ON DELETE CASCADE
+constraint iam_group_members.iam_group_members_account_id_user_name_fkey: FOREIGN KEY (account_id, user_name) REFERENCES iam_users(account_id, user_name) ON DELETE CASCADE
+constraint iam_group_members.iam_group_members_pkey: PRIMARY KEY (account_id, group_name, user_name)
+constraint iam_groups.iam_groups_account_id_fkey: FOREIGN KEY (account_id) REFERENCES accounts(account_id) ON DELETE CASCADE
+constraint iam_groups.iam_groups_group_arn_key: UNIQUE (group_arn)
+constraint iam_groups.iam_groups_pkey: PRIMARY KEY (account_id, group_name)
+constraint iam_permissions_boundaries.iam_permissions_boundaries_account_id_fkey: FOREIGN KEY (account_id) REFERENCES accounts(account_id) ON DELETE CASCADE
+constraint iam_permissions_boundaries.iam_permissions_boundaries_pkey: PRIMARY KEY (account_id, principal_type, principal_name)
+constraint iam_permissions_boundaries.iam_permissions_boundaries_principal_type_check: CHECK ((principal_type = ANY (ARRAY['user'::text, 'role'::text])))
+constraint iam_policies.iam_policies_account_id_fkey: FOREIGN KEY (account_id) REFERENCES accounts(account_id) ON DELETE CASCADE
+constraint iam_policies.iam_policies_pkey: PRIMARY KEY (account_id, principal_type, principal_name, policy_name)
+constraint iam_policies.iam_policies_principal_type_check: CHECK ((principal_type = ANY (ARRAY['user'::text, 'group'::text, 'role'::text])))
+constraint iam_role_tags.iam_role_tags_account_id_role_name_fkey: FOREIGN KEY (account_id, role_name) REFERENCES iam_roles(account_id, role_name) ON DELETE CASCADE
+constraint iam_role_tags.iam_role_tags_pkey: PRIMARY KEY (account_id, role_name, tag_key)
+constraint iam_roles.iam_roles_account_id_fkey: FOREIGN KEY (account_id) REFERENCES accounts(account_id) ON DELETE CASCADE
+constraint iam_roles.iam_roles_pkey: PRIMARY KEY (account_id, role_name)
+constraint iam_roles.iam_roles_role_arn_key: UNIQUE (role_arn)
+constraint iam_sessions.iam_sessions_access_key_id_key: UNIQUE (access_key_id)
+constraint iam_sessions.iam_sessions_account_id_role_name_fkey: FOREIGN KEY (account_id, role_name) REFERENCES iam_roles(account_id, role_name) ON DELETE CASCADE
+constraint iam_sessions.iam_sessions_pkey: PRIMARY KEY (session_token)
+constraint iam_user_tags.iam_user_tags_account_id_user_name_fkey: FOREIGN KEY (account_id, user_name) REFERENCES iam_users(account_id, user_name) ON DELETE CASCADE
+constraint iam_user_tags.iam_user_tags_pkey: PRIMARY KEY (account_id, user_name, tag_key)
+constraint iam_users.iam_users_account_id_fkey: FOREIGN KEY (account_id) REFERENCES accounts(account_id) ON DELETE CASCADE
+constraint iam_users.iam_users_pkey: PRIMARY KEY (account_id, user_name)
+constraint iam_users.iam_users_user_arn_key: UNIQUE (user_arn)
+constraint idempotency_tokens.idempotency_tokens_pkey: PRIMARY KEY (token)
+constraint indexes.chk_propagation_delay_ms_non_negative: CHECK (((propagation_delay_ms IS NULL) OR (propagation_delay_ms >= 0)))
+constraint indexes.indexes_pkey: PRIMARY KEY (table_id, index_name)
+constraint indexes.indexes_table_id_fkey: FOREIGN KEY (table_id) REFERENCES tables(table_id) ON DELETE CASCADE
+constraint metrics.metrics_pkey: PRIMARY KEY (bucket, metric, table_name, index_name, operation)
+constraint schema_history.schema_history_pkey: PRIMARY KEY (filename)
+constraint settings.settings_pkey: PRIMARY KEY (key)
+constraint stream_records.stream_records_pkey: PRIMARY KEY (shard_id, sequence_number)
+constraint stream_records.stream_records_shard_id_fkey: FOREIGN KEY (shard_id) REFERENCES stream_shards(shard_id) ON DELETE CASCADE
+constraint stream_shards.stream_shards_pkey: PRIMARY KEY (shard_id)
+constraint stream_shards.stream_shards_table_id_fkey: FOREIGN KEY (table_id) REFERENCES tables(table_id) ON DELETE CASCADE
+constraint table_restores.table_restores_pkey: PRIMARY KEY (table_id)
+constraint table_restores.table_restores_table_id_fkey: FOREIGN KEY (table_id) REFERENCES tables(table_id) ON DELETE CASCADE
+constraint tables.tables_account_id_fkey: FOREIGN KEY (account_id) REFERENCES accounts(account_id) ON DELETE CASCADE
+constraint tables.tables_pkey: PRIMARY KEY (account_id, table_name)
+constraint tables.tables_table_id_unique: UNIQUE (table_id)
+constraint tags.tags_pkey: PRIMARY KEY (resource_arn, tag_key)
+constraint vector_indexes.chk_vector_active_has_no_backfilling: CHECK (((index_status <> 'ACTIVE'::text) OR (backfilling IS NULL)))
+constraint vector_indexes.chk_vector_dimensions_positive: CHECK ((dimensions > 0))
+constraint vector_indexes.vector_indexes_pkey: PRIMARY KEY (table_id, index_name)
+constraint vector_indexes.vector_indexes_table_id_fkey: FOREIGN KEY (table_id) REFERENCES tables(table_id) ON DELETE CASCADE
+sequence stream_seq: bigint START 1 INCREMENT 1
+# data database
+table extenddb_migrations
+table gsi_pending
+table idempotency_tokens
+table schema_history
+table stream_records
+table stream_shards
+table vector_index_holds
+column extenddb_migrations.id: integer NOT NULL
+column extenddb_migrations.name: text NOT NULL
+column extenddb_migrations.kind: text NOT NULL
+column extenddb_migrations.checksum: text NOT NULL
+column extenddb_migrations.outcome: text NOT NULL
+column extenddb_migrations.notes: text NOT NULL DEFAULT ''::text
+column extenddb_migrations.applied_at: timestamp with time zone NOT NULL DEFAULT now()
+column extenddb_migrations.applied_by: text NOT NULL
+column gsi_pending.id: bigint NOT NULL DEFAULT nextval('gsi_pending_id_seq'::regclass)
+column gsi_pending.table_id: text NOT NULL
+column gsi_pending.worker_partition: integer NOT NULL
+column gsi_pending.old_item: jsonb
+column gsi_pending.new_item: jsonb
+column gsi_pending.index_context: jsonb NOT NULL
+column gsi_pending.ready_at: timestamp with time zone NOT NULL DEFAULT now()
+column idempotency_tokens.account_id: text NOT NULL
+column idempotency_tokens.token: text NOT NULL
+column idempotency_tokens.fingerprint: text NOT NULL
+column idempotency_tokens.created_at: timestamp with time zone NOT NULL DEFAULT now()
+column schema_history.filename: text NOT NULL
+column schema_history.applied_at: timestamp with time zone NOT NULL DEFAULT now()
+column stream_records.shard_id: text NOT NULL
+column stream_records.sequence_number: text NOT NULL
+column stream_records.table_id: text NOT NULL
+column stream_records.event_name: text NOT NULL
+column stream_records.record_data: jsonb NOT NULL
+column stream_records.created_at: timestamp with time zone NOT NULL DEFAULT now()
+column stream_shards.shard_id: text NOT NULL
+column stream_shards.table_id: text NOT NULL
+column stream_shards.parent_shard_id: text
+column stream_shards.starting_sequence_number: text NOT NULL
+column stream_shards.ending_sequence_number: text
+column stream_shards.created_at: timestamp with time zone NOT NULL DEFAULT now()
+column vector_index_holds.table_id: text NOT NULL
+column vector_index_holds.index_id: text NOT NULL
+column vector_index_holds.created_at: timestamp with time zone NOT NULL DEFAULT now()
+index extenddb_migrations_pkey: CREATE UNIQUE INDEX extenddb_migrations_pkey ON public.extenddb_migrations USING btree (id)
+index gsi_pending_pkey: CREATE UNIQUE INDEX gsi_pending_pkey ON public.gsi_pending USING btree (id)
+index idempotency_tokens_pkey: CREATE UNIQUE INDEX idempotency_tokens_pkey ON public.idempotency_tokens USING btree (account_id, token)
+index idx_gsi_pending_claim: CREATE INDEX idx_gsi_pending_claim ON public.gsi_pending USING btree (worker_partition, ready_at, id)
+index idx_idempotency_tokens_created: CREATE INDEX idx_idempotency_tokens_created ON public.idempotency_tokens USING btree (created_at)
+index idx_stream_records_created: CREATE INDEX idx_stream_records_created ON public.stream_records USING btree (created_at)
+index idx_stream_shards_table: CREATE INDEX idx_stream_shards_table ON public.stream_shards USING btree (table_id)
+index idx_vector_index_holds_table: CREATE INDEX idx_vector_index_holds_table ON public.vector_index_holds USING btree (table_id)
+index schema_history_pkey: CREATE UNIQUE INDEX schema_history_pkey ON public.schema_history USING btree (filename)
+index stream_records_pkey: CREATE UNIQUE INDEX stream_records_pkey ON public.stream_records USING btree (shard_id, sequence_number)
+index stream_shards_pkey: CREATE UNIQUE INDEX stream_shards_pkey ON public.stream_shards USING btree (shard_id)
+index vector_index_holds_pkey: CREATE UNIQUE INDEX vector_index_holds_pkey ON public.vector_index_holds USING btree (table_id, index_id)
+constraint extenddb_migrations.extenddb_migrations_pkey: PRIMARY KEY (id)
+constraint gsi_pending.gsi_pending_pkey: PRIMARY KEY (id)
+constraint idempotency_tokens.idempotency_tokens_pkey: PRIMARY KEY (account_id, token)
+constraint schema_history.schema_history_pkey: PRIMARY KEY (filename)
+constraint stream_records.stream_records_pkey: PRIMARY KEY (shard_id, sequence_number)
+constraint stream_records.stream_records_shard_id_fkey: FOREIGN KEY (shard_id) REFERENCES stream_shards(shard_id) ON DELETE CASCADE
+constraint stream_shards.stream_shards_pkey: PRIMARY KEY (shard_id)
+constraint vector_index_holds.vector_index_holds_pkey: PRIMARY KEY (table_id, index_id)
+sequence gsi_pending_id_seq: bigint START 1 INCREMENT 1
+sequence stream_seq: bigint START 1 INCREMENT 1
