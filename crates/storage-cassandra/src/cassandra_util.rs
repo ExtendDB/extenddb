@@ -147,6 +147,39 @@ pub async fn query_rows_quorum<E: FromDbError>(
     Ok(body.into_rows().unwrap_or_default())
 }
 
+/// Execute a query at `LOCAL_SERIAL` and return all rows: the read sees
+/// every Paxos round that committed, so a row an LWT wrote (a claim taken,
+/// a heartbeat refreshed) is read as written. For the reads whose answer
+/// decides whether another process's claim is live.
+pub async fn query_rows_serial<E: FromDbError>(
+    session: &Arc<CassandraSession>,
+    query: &str,
+    values: QueryValues,
+    context: &str,
+) -> Result<Vec<Row>, E> {
+    use cdrs_tokio::consistency::Consistency;
+    use cdrs_tokio::statement::StatementParamsBuilder;
+
+    let params = StatementParamsBuilder::new()
+        .with_consistency(Consistency::LocalSerial)
+        .with_values(values)
+        .build();
+    let result = session
+        .query_with_params(query, params)
+        .await
+        .map_err(|e| {
+            tracing::error!("{context} serial query failed: {e}");
+            E::db_error(format!("{context}: {e}"))
+        })?;
+
+    let body = result.response_body().map_err(|e| {
+        tracing::error!("{context} response_body failed: {e}");
+        E::db_error(format!("{context} response_body: {e}"))
+    })?;
+
+    Ok(body.into_rows().unwrap_or_default())
+}
+
 /// Execute a query and return the first row, if any.
 ///
 /// Similar to `sqlx::query().fetch_optional()`.

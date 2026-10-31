@@ -101,6 +101,15 @@ pub struct ServerComponentsOptions {
     /// sizes it from this ([`crate::backup_catalog::pool_size_for_jobs`]);
     /// `0` (the default outside a server) asks for no job capacity.
     pub max_concurrent_jobs: usize,
+    /// The caller is a command that reads the catalog beside a running
+    /// server (`extenddb backup list`), not a server: no serve lock is taken
+    /// (on SQLite the file is opened as another reader of a served
+    /// database) and none of the startup recovery a server runs (interrupted
+    /// control-plane transitions, incomplete indexes, interrupted restores)
+    /// is run, since the server that owns the catalog does that. A command
+    /// that writes (`backup purge`) leaves this `false` and opens the catalog
+    /// as a server does.
+    pub beside_server: bool,
 }
 
 /// Factory function type for creating server components.

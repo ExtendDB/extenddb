@@ -166,7 +166,10 @@ const _: () = {
 /// would otherwise hang a put for as long as the server keeps the socket.
 /// The attempt timeout includes sending the request body, so each part must
 /// upload within 60 s (see `upload_part_size_bytes` in the config module).
-const ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Exported as the crate's `S3_ATTEMPT_TIMEOUT`: a caller that bounds a
+/// sequence of small requests (the engine's store check) stays under one
+/// attempt, so its bound fires before the SDK starts a retry.
+pub const ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Longest wait for the next chunk of a `GetObject` body. The two timeouts
@@ -232,6 +235,8 @@ pub struct S3Store {
     /// Longest wait for the next chunk of a `GetObject` body;
     /// [`BODY_IDLE_TIMEOUT`] except in the crate's own tests.
     body_idle_timeout: std::time::Duration,
+    /// The root label catalog rows record for this store ([`Self::store_root`]).
+    root: String,
 }
 
 impl S3Store {
@@ -436,6 +441,14 @@ impl S3Store {
             // this keeps a client that reaches one (the test-only `open`)
             // from sending the request at all.
             .disable_s3_express_session_auth(true);
+        // The label names the endpoint the client uses, whichever source
+        // supplied it, so two servers reaching one bucket through one
+        // endpoint spell one label however each was told about it.
+        let root = store_root_label(
+            &config.bucket,
+            &prefix,
+            endpoint.as_ref().map(|(endpoint, _)| endpoint.as_str()),
+        );
         builder.set_endpoint_url(endpoint.map(|(endpoint, _)| endpoint));
         // The SDK's default client sends through the proxy named in
         // `HTTP_PROXY`, `http_proxy`, `ALL_PROXY` or `all_proxy`, which
@@ -472,7 +485,22 @@ impl S3Store {
             max_parts: MAX_PARTS,
             page_size: None,
             body_idle_timeout: BODY_IDLE_TIMEOUT,
+            root,
         })
+    }
+
+    /// The root label a catalog row records for this store:
+    /// `s3://<bucket>/<prefix>`, with `?endpoint=<url>` appended when the
+    /// client uses an endpoint other than the SDK's default (from `endpoint`
+    /// or from the SDK's environment and shared config), the URL in one
+    /// spelling: lowercase scheme and host, no default port, no `/` for an
+    /// empty path, no user information, query or fragment. Two servers
+    /// reaching the same bucket and prefix through the same endpoint spell
+    /// the same label however each was told about the endpoint, and so
+    /// address the same rows.
+    #[must_use]
+    pub fn store_root(&self) -> &str {
+        &self.root
     }
 
     /// Bucket-side key for a store key. S3 bounds the whole object key at
@@ -493,6 +521,36 @@ impl S3Store {
     }
 
     async fn put_impl(&self, key: &str, body: ByteStream) -> Result<ObjectMeta, StoreError> {
+        // `put_inner` answers `None` only to a conditional put.
+        self.put_inner(key, body, false)
+            .await?
+            .ok_or_else(|| StoreError::Other(format!("s3 PutObject of {key} returned no object")))
+    }
+
+    async fn put_if_absent_impl(
+        &self,
+        key: &str,
+        body: ByteStream,
+    ) -> Result<Option<ObjectMeta>, StoreError> {
+        self.put_inner(key, body, true).await
+    }
+
+    /// The one upload path behind `put` and `put_if_absent`. With
+    /// `if_none_match`, the request that creates the object (`PutObject` for
+    /// a body of one part, `CompleteMultipartUpload` otherwise) carries
+    /// `If-None-Match: *`: a 412 means an object is under the key and `None`
+    /// is returned (the multipart upload is aborted first, since the parts
+    /// would otherwise stay); a 409 `ConditionalRequestConflict` means a
+    /// concurrent conditional write on the key was in flight, and the request
+    /// is re-sent after a short back-off, up to [`CONDITIONAL_RETRIES`] times
+    /// (the parts already uploaded are reused), after which the last answer
+    /// is reported as the error it is.
+    async fn put_inner(
+        &self,
+        key: &str,
+        body: ByteStream,
+        if_none_match: bool,
+    ) -> Result<Option<ObjectMeta>, StoreError> {
         validate_key(key)?;
         let full_key = self.full_key(key)?;
         let mut chunks = std::pin::pin!(chunk_stream(body, self.part_size));
@@ -506,21 +564,38 @@ impl S3Store {
         let Some(second) = second else {
             // The whole body fits in one part: a single PutObject.
             let size = first.len() as u64;
-            let output = self
-                .client
-                .put_object()
-                .bucket(&self.bucket)
-                .key(&full_key)
-                .body(first.into())
-                .send()
-                .await
-                .map_err(|e| map_sdk_error("PutObject", e))?;
-            return Ok(ObjectMeta {
-                key: key.to_owned(),
-                size,
-                last_modified: None,
-                etag: output.e_tag().map(strip_etag_quotes),
-            });
+            let mut attempt = 0;
+            loop {
+                let mut request = self
+                    .client
+                    .put_object()
+                    .bucket(&self.bucket)
+                    .key(&full_key)
+                    .body(first.clone().into());
+                if if_none_match {
+                    request = request.if_none_match("*");
+                }
+                match request.send().await {
+                    Ok(output) => {
+                        return Ok(Some(ObjectMeta {
+                            key: key.to_owned(),
+                            size,
+                            last_modified: None,
+                            etag: output.e_tag().map(strip_etag_quotes),
+                        }));
+                    }
+                    Err(e) => match conditional_outcome(&e) {
+                        Some(Conditional::Present) if if_none_match => return Ok(None),
+                        Some(Conditional::Conflict)
+                            if if_none_match && attempt < CONDITIONAL_RETRIES =>
+                        {
+                            attempt += 1;
+                            tokio::time::sleep(conditional_backoff(attempt)).await;
+                        }
+                        _ => return Err(map_sdk_error("PutObject", e)),
+                    },
+                }
+            }
         };
 
         // Every failure after CreateMultipartUpload must reach the abort,
@@ -537,38 +612,62 @@ impl S3Store {
         // is in flight.
         let mut abort_guard = self.create_upload_guarded(&full_key).await?;
         let upload_id = abort_guard.upload_id.clone();
-        let outcome: Result<ObjectMeta, StoreError> = async {
+        let outcome: Result<Option<ObjectMeta>, StoreError> = async {
             let (parts, size) = self
                 .upload_parts(&full_key, &upload_id, first, second, chunks)
                 .await?;
-            let output = self
-                .client
-                .complete_multipart_upload()
-                .bucket(&self.bucket)
-                .key(&full_key)
-                .upload_id(&upload_id)
-                .multipart_upload(
-                    CompletedMultipartUpload::builder()
-                        .set_parts(Some(parts))
-                        .build(),
-                )
-                .send()
-                .await
-                .map_err(|e| map_sdk_error("CompleteMultipartUpload", e))?;
-            Ok(ObjectMeta {
-                key: key.to_owned(),
-                size,
-                last_modified: None,
-                etag: output.e_tag().map(strip_etag_quotes),
-            })
+            let mut attempt = 0;
+            loop {
+                let mut request = self
+                    .client
+                    .complete_multipart_upload()
+                    .bucket(&self.bucket)
+                    .key(&full_key)
+                    .upload_id(&upload_id)
+                    .multipart_upload(
+                        CompletedMultipartUpload::builder()
+                            .set_parts(Some(parts.clone()))
+                            .build(),
+                    );
+                if if_none_match {
+                    request = request.if_none_match("*");
+                }
+                match request.send().await {
+                    Ok(output) => {
+                        return Ok(Some(ObjectMeta {
+                            key: key.to_owned(),
+                            size,
+                            last_modified: None,
+                            etag: output.e_tag().map(strip_etag_quotes),
+                        }));
+                    }
+                    Err(e) => match conditional_outcome(&e) {
+                        Some(Conditional::Present) if if_none_match => return Ok(None),
+                        Some(Conditional::Conflict)
+                            if if_none_match && attempt < CONDITIONAL_RETRIES =>
+                        {
+                            attempt += 1;
+                            tokio::time::sleep(conditional_backoff(attempt)).await;
+                        }
+                        _ => return Err(map_sdk_error("CompleteMultipartUpload", e)),
+                    },
+                }
+            }
         }
         .await;
 
         // The guard stays armed until the inline abort has returned: a put
         // dropped while that abort is in flight (a caller's timeout) still
-        // has the guard abort the upload.
+        // has the guard abort the upload. A conditional complete that found
+        // the key present leaves its upload open too, so it is aborted the
+        // same way.
         let meta = match outcome {
-            Ok(meta) => meta,
+            Ok(Some(meta)) => meta,
+            Ok(None) => {
+                abort_upload(&self.client, &self.bucket, &full_key, &upload_id).await;
+                abort_guard.disarm();
+                return Ok(None);
+            }
             Err(e) => {
                 // Best effort: the original failure is what the caller needs.
                 abort_upload(&self.client, &self.bucket, &full_key, &upload_id).await;
@@ -577,7 +676,7 @@ impl S3Store {
             }
         };
         abort_guard.disarm();
-        Ok(meta)
+        Ok(Some(meta))
     }
 
     /// Send `CreateMultipartUpload` for the bucket-side key `full_key` and
@@ -1061,10 +1160,7 @@ impl S3Store {
                          ({}; {reason})",
                         self.bucket, PROBE_LIST_OBJECTS.grant
                     )),
-                    other => StoreError::Other(format!(
-                        "backup bucket {} failed validation: {other}",
-                        self.bucket
-                    )),
+                    other => validation_failure(&self.bucket, other),
                 }
             })?;
         self.validate_write_grants().await
@@ -1080,10 +1176,7 @@ impl S3Store {
                 "the configured credentials lack {grant} on backup bucket {} ({reason}){extra}",
                 self.bucket
             )),
-            other => StoreError::Other(format!(
-                "backup bucket {} failed validation: {other}",
-                self.bucket
-            )),
+            other => validation_failure(&self.bucket, other),
         };
         self.client
             .delete_object()
@@ -1183,6 +1276,14 @@ impl BackupStore for S3Store {
         self.put_impl(key, body).boxed()
     }
 
+    fn put_if_absent<'a>(
+        &'a self,
+        key: &'a str,
+        body: ByteStream,
+    ) -> BoxFuture<'a, Result<Option<ObjectMeta>, StoreError>> {
+        self.put_if_absent_impl(key, body).boxed()
+    }
+
     fn get<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<ByteStream, StoreError>> {
         self.get_impl(key).boxed()
     }
@@ -1261,6 +1362,59 @@ impl BackupStore for S3Store {
 /// Normalize the configured bucket prefix: strip leading `/`, require a
 /// trailing `/` when non-empty, and hold it to the same component rules as
 /// keys.
+/// [`S3Store::store_root`]'s rule, over the normalized prefix and the
+/// endpoint the client uses (the configured one, or the one the SDK's
+/// environment and shared config supplied). The endpoint is spelled one
+/// way whatever the operator typed: scheme and host lowercased, a default
+/// port (`80` for `http`, `443` for `https`) dropped, an empty path spelled
+/// without its `/`, and (defence in depth for a label built before `open`'s
+/// checks ran) user information, query and fragment removed. An endpoint
+/// `http::Uri` accepts but `url` does not parse is spelled as typed, minus
+/// those three parts.
+fn store_root_label(bucket: &str, prefix: &str, endpoint: Option<&str>) -> String {
+    let mut label = format!("s3://{bucket}/{prefix}");
+    if let Some(endpoint) = endpoint {
+        label.push_str("?endpoint=");
+        label.push_str(&normalized_endpoint(endpoint.trim()));
+    }
+    label
+}
+
+/// The one spelling of an endpoint URL the root label carries
+/// (`store_root_label`).
+fn normalized_endpoint(endpoint: &str) -> String {
+    if let Ok(url) = url::Url::parse(endpoint)
+        && let Some(host) = url.host_str()
+    {
+        // `Url` lowercases the scheme and the host (a domain, or an IPv6
+        // address's hex digits), and reports no port when it is the scheme's
+        // default.
+        let mut spelled = format!("{}://{host}", url.scheme());
+        if let Some(port) = url.port() {
+            spelled.push(':');
+            spelled.push_str(&port.to_string());
+        }
+        if url.path() != "/" {
+            spelled.push_str(url.path());
+        }
+        return spelled;
+    }
+    let authority_start = endpoint.find("//").map_or(0, |at| at + 2);
+    let rest = &endpoint[authority_start..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let authority = authority
+        .rfind('@')
+        .map_or(authority, |at| &authority[at + 1..]);
+    let path_end = rest.find(['?', '#']).unwrap_or(rest.len());
+    let path = &rest[authority_end..path_end];
+    format!(
+        "{}{}{path}",
+        endpoint[..authority_start].to_ascii_lowercase(),
+        authority.to_ascii_lowercase()
+    )
+}
+
 fn normalize_store_prefix(prefix: &str) -> Result<String, StoreError> {
     let trimmed = prefix.trim_start_matches('/');
     if trimmed.is_empty() {
@@ -1955,6 +2109,46 @@ fn is_no_such_upload<E: ProvideErrorMetadata>(err: &SdkError<E>) -> bool {
     matches!(err, SdkError::ServiceError(ctx) if ctx.err().code() == Some("NoSuchUpload"))
 }
 
+/// Why a request sent with `If-None-Match: *` did not store its object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Conditional {
+    /// 412 `PreconditionFailed`: an object is under the key.
+    Present,
+    /// 409 `ConditionalRequestConflict`: another conditional write on the
+    /// key was in flight; S3 asks the caller to retry.
+    Conflict,
+}
+
+/// Classify a conditional write's refusal, or `None` for any other error.
+/// S3 answers a failed `If-None-Match` with 412 and the code
+/// `PreconditionFailed`, and a collision of conditional writes with 409 and
+/// `ConditionalRequestConflict`; either the status or the code identifies
+/// the case, so a response carrying only one of them still classifies.
+fn conditional_outcome<E: ProvideErrorMetadata>(err: &SdkError<E>) -> Option<Conditional> {
+    let SdkError::ServiceError(ctx) = err else {
+        return None;
+    };
+    match (ctx.raw().status().as_u16(), ctx.err().code()) {
+        (412, _) | (_, Some("PreconditionFailed")) => Some(Conditional::Present),
+        (409, Some("ConditionalRequestConflict")) | (_, Some("ConditionalRequestConflict")) => {
+            Some(Conditional::Conflict)
+        }
+        _ => None,
+    }
+}
+
+/// How many times a conditional write answered `ConditionalRequestConflict`
+/// is re-sent before the conflict is reported. Each retry waits
+/// [`conditional_backoff`]; the eight waits sum to 7.9 s.
+const CONDITIONAL_RETRIES: u32 = 8;
+
+/// The wait before retry `attempt` (1-based) of a conflicting conditional
+/// write: 100 ms, doubling each retry (100, 200, 400, 800 ms), capped at
+/// 1.6 s from the fifth retry on.
+fn conditional_backoff(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(50u64.saturating_mul(1u64 << attempt.min(5)))
+}
+
 /// Best-effort abort of a multipart upload, after a put failure or from a
 /// drop guard; the original failure (if any) is what the caller needs, so
 /// an abort error is only logged. `NoSuchUpload` means the upload is no
@@ -2152,6 +2346,42 @@ where
     }
 }
 
+/// A `validate` failure that is not a denial, with the bucket named. A
+/// transport failure keeps its class: the caller tells a store it could not
+/// reach (which degrades the store) from a configuration it refuses (which
+/// stops startup), so the bucket goes in as a link of the error chain rather
+/// than flattening the error into text.
+fn validation_failure(bucket: &str, error: StoreError) -> StoreError {
+    match error {
+        StoreError::Transport { source } => StoreError::Transport {
+            source: Box::new(ValidationContext {
+                context: format!("backup bucket {bucket} failed validation"),
+                source,
+            }),
+        },
+        other => StoreError::Other(format!("backup bucket {bucket} failed validation: {other}")),
+    }
+}
+
+/// The context link `validation_failure` adds to a transport error's chain.
+#[derive(Debug)]
+struct ValidationContext {
+    context: String,
+    source: Box<dyn std::error::Error + Send + Sync>,
+}
+
+impl std::fmt::Display for ValidationContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.context)
+    }
+}
+
+impl std::error::Error for ValidationContext {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// The SDK's non-service errors display as a bare category ("dispatch
 /// failure"); the cause (no region configured, no credentials, connection
 /// refused) is in the `source()` chain. Join the chain so an operator reads
@@ -2173,6 +2403,81 @@ pub(crate) fn describe_error_chain(error: &(dyn std::error::Error + 'static)) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A transport failure through `validate` keeps its class and names the
+    /// bucket first in its chain; any other failure is `Other` with the same
+    /// prefix.
+    #[test]
+    fn a_validation_transport_failure_keeps_its_class() {
+        let transport: SdkError<aws_sdk_s3::operation::get_object::GetObjectError> =
+            SdkError::construction_failure("no region");
+        let wrapped = validation_failure("b", map_sdk_error("Op", transport));
+        assert!(
+            matches!(wrapped, StoreError::Transport { .. }),
+            "{wrapped:?}"
+        );
+        let text = wrapped.to_string();
+        assert!(
+            text.starts_with("transport error: backup bucket b failed validation: "),
+            "{text}"
+        );
+        assert!(text.contains("no region"), "{text}");
+        let other = validation_failure("b", StoreError::Other("x".to_owned()));
+        assert!(
+            matches!(&other, StoreError::Other(m) if m == "backup bucket b failed validation: x"),
+            "{other:?}"
+        );
+    }
+
+    /// The label spells the endpoint one way: the two spellings an operator
+    /// may type for one endpoint (a trailing `/`, upper-case letters, the
+    /// scheme's default port) give one label, and a credential, query or
+    /// fragment never reaches it.
+    #[test]
+    fn the_store_root_label_names_bucket_prefix_and_endpoint() {
+        assert_eq!(store_root_label("b", "", None), "s3://b/");
+        assert_eq!(store_root_label("b", "extenddb/", None), "s3://b/extenddb/");
+        assert_eq!(
+            store_root_label("b", "p/", Some("http://127.0.0.1:9000")),
+            "s3://b/p/?endpoint=http://127.0.0.1:9000"
+        );
+        assert_eq!(
+            store_root_label("b", "p/", Some("https://u:S3cretPW@h:1/base?x=1#f")),
+            "s3://b/p/?endpoint=https://h:1/base"
+        );
+        for spelling in [
+            "http://127.0.0.1:9000",
+            "http://127.0.0.1:9000/",
+            "HTTP://127.0.0.1:9000/",
+            " http://127.0.0.1:9000 ",
+        ] {
+            assert_eq!(
+                store_root_label("b", "p/", Some(spelling)),
+                "s3://b/p/?endpoint=http://127.0.0.1:9000",
+                "{spelling:?}"
+            );
+        }
+        for spelling in [
+            "https://S3.Example.com",
+            "https://s3.example.com/",
+            "https://s3.example.com:443",
+            "HTTPS://s3.example.com:443/",
+        ] {
+            assert_eq!(
+                store_root_label("b", "", Some(spelling)),
+                "s3://b/?endpoint=https://s3.example.com",
+                "{spelling:?}"
+            );
+        }
+        assert_eq!(
+            store_root_label("b", "", Some("http://LocalHost:80/base/")),
+            "s3://b/?endpoint=http://localhost/base/"
+        );
+        assert_eq!(
+            store_root_label("b", "", Some("http://[::1]:9000")),
+            "s3://b/?endpoint=http://[::1]:9000"
+        );
+    }
 
     #[test]
     fn store_prefix_normalization() {
@@ -2244,6 +2549,47 @@ mod tests {
             aws_sdk_s3::operation::get_object::GetObjectError::generic(meta.build()),
             raw,
         )
+    }
+
+    /// The two answers a conditional write classifies, from synthetic
+    /// service errors, by status alone, by code alone, and by both; every
+    /// other answer is `None` and takes `map_sdk_error`'s path.
+    #[test]
+    fn conditional_outcomes_from_a_reply_document() {
+        for (status, code, expected) in [
+            (412, Some("PreconditionFailed"), Some(Conditional::Present)),
+            (412, None, Some(Conditional::Present)),
+            (400, Some("PreconditionFailed"), Some(Conditional::Present)),
+            (
+                409,
+                Some("ConditionalRequestConflict"),
+                Some(Conditional::Conflict),
+            ),
+            (
+                503,
+                Some("ConditionalRequestConflict"),
+                Some(Conditional::Conflict),
+            ),
+            // A bare 409 is some other conflict (a bucket operation's), not
+            // a conditional one.
+            (409, None, None),
+            (409, Some("BucketAlreadyOwnedByYou"), None),
+            (403, Some("AccessDenied"), None),
+            (404, Some("NoSuchKey"), None),
+            (500, Some("InternalError"), None),
+        ] {
+            assert_eq!(
+                conditional_outcome(&service_error(status, code)),
+                expected,
+                "{status} {code:?}"
+            );
+        }
+        let transport: SdkError<aws_sdk_s3::operation::get_object::GetObjectError> =
+            SdkError::construction_failure("no region");
+        assert_eq!(conditional_outcome(&transport), None);
+        assert_eq!(conditional_backoff(1).as_millis(), 100);
+        assert_eq!(conditional_backoff(5).as_millis(), 1600);
+        assert_eq!(conditional_backoff(9).as_millis(), 1600, "capped");
     }
 
     /// Every cell of `map_sdk_error`'s table, from synthetic service errors,

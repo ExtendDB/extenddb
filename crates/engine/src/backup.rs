@@ -35,7 +35,12 @@ use extenddb_storage::{
 use futures::TryStreamExt;
 use serde_json::{Value, json};
 
-pub use runtime::BackupRuntime;
+pub use maintenance::HeldClaim;
+pub use runtime::{
+    BackupRuntime, ConfiguredStore, LOCAL_CHECK_TIMEOUT, S3_CHECK_TIMEOUT, Spool, StoreHealth,
+    StoreHealthReport, check_configured_store, read_identity_bounded,
+};
+pub use store_identity::{STORE_IDENTITY_KEY, StoreIdentityFile, StoreProblem};
 
 use crate::{OperationContext, serialize_output};
 
@@ -420,8 +425,9 @@ pub(crate) async fn handle_create_backup(
 /// `DescribeTable` of the table, which the handler ran.
 ///
 /// This is the in-catalog create, the path while no `[backup.store]` is
-/// configured; each call logs that the format is deprecated.
-async fn create_backup<S: LegacyBackupReader + ?Sized>(
+/// configured; each call logs that the format is deprecated. Last before the
+/// permit, the maintenance claim ([`refuse_while_maintenance_held`]).
+async fn create_backup<S: BackupCatalog + LegacyBackupReader + ?Sized>(
     storage: &S,
     runtime: &BackupRuntime,
     account_id: &str,
@@ -442,17 +448,77 @@ async fn create_backup<S: LegacyBackupReader + ?Sized>(
     };
     check_backup_arn_fits(region, account_id, table_name)?;
     refuse_backup_of_vector_table(&desc)?;
+    // A create that writes to the configured store needs it healthy, and is
+    // refused before a slot is taken when it is not, as every operation that
+    // touches the store is; the in-catalog create touches no store, so the
+    // store's health does not gate it (a backend bound to the in-catalog
+    // create, or a server with an unhealthy store, creates as a server
+    // without a store does).
+    let store_backed = runtime.configured_store().is_some()
+        && !runtime.legacy_create_only()
+        && STORE_BACKED_CREATE;
+    if store_backed {
+        runtime.require_healthy_store()?;
+    }
+    refuse_while_maintenance_held(storage, runtime).await?;
     let permit = runtime.take_permit()?;
-    tracing::warn!(
-        "CreateBackup of {table_name} (account {account_id}) is writing the in-catalog backup \
-         format, which a later release stops creating; configure [backup.store] to write \
-         backups to a backup store"
-    );
+    match runtime.configured_store() {
+        None => tracing::warn!(
+            "CreateBackup of {table_name} (account {account_id}) is writing the in-catalog \
+             backup format, which a later release stops creating; configure [backup.store] to \
+             write backups to a backup store"
+        ),
+        Some(store) => tracing::info!(
+            "CreateBackup of {table_name} (account {account_id}) is writing the in-catalog \
+             backup format; the configured {} backup store serves restores and deletes of the \
+             backups it holds, and a later release's CreateBackup writes to it",
+            store.kind
+        ),
+    }
     storage
         .create(account_id, table_name, backup_name, permit)
         .await
         .map_err(|e| create_backup_storage_err_to_dynamo(e, table_name))
 }
+
+/// The jobs' side of the catalog-level maintenance claim: a backup or
+/// restore job is refused with `LimitExceededException` while a maintenance
+/// command (`extenddb backup purge`) holds the claim, read with
+/// `stale_job_after_secs` so a dead command's claim expires. The check runs
+/// after every other refusal and before the permit, which on this head is
+/// before the job's row exists: the in-catalog create and restore commit
+/// their row inside the backend and detach, so the engine has no point
+/// between the row and the copy to check at. A claim taken between this
+/// check and the row's insert is therefore not seen by the job; the command
+/// create that slips through writes no object of the store the command
+/// deletes from, and a restore that slips through is a RUNNING record the
+/// command's wait lists, so the window costs nothing in this release. The
+/// store-backed job of a later release owns its row from the
+/// engine and checks after the row exists, as the design's 5.1 step 2 says.
+async fn refuse_while_maintenance_held<S: BackupCatalog + ?Sized>(
+    storage: &S,
+    runtime: &BackupRuntime,
+) -> Result<(), DynamoDbError> {
+    let held = storage
+        .check_maintenance_claim(runtime.stale_job_after())
+        .await
+        .map_err(storage_err_to_dynamo)?;
+    if held {
+        return Err(DynamoDbError::LimitExceededException(
+            "A maintenance command (extenddb backup purge) holds this catalog's maintenance \
+             claim; backup and restore jobs are refused until it finishes"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether CreateBackup writes to the configured store. No store-backed
+/// create exists on this head: every create writes the in-catalog format,
+/// whatever the store configuration, and the release that adds the
+/// store-backed job turns this on for a server with a store configured and
+/// not bound to the in-catalog create.
+const STORE_BACKED_CREATE: bool = false;
 
 /// The backup ARN rules a table name has to fit before a backup of it can be
 /// created, each refusal naming its cause: first the server's own region
@@ -1086,16 +1152,21 @@ async fn delete_backup<S: BackupCatalog + LegacyBackupReader + ?Sized>(
 /// `BackupNotFoundException`; a CREATING row is `BackupInUseException`; a
 /// backup a CREATING restore target still reads is `BackupInUseException`
 /// naming that table ([`BackupCatalog::backup_in_use`]); a row of a store
-/// other than the configured one is a `ValidationException` naming no root;
+/// other than the configured one is a `ValidationException` naming no root,
+/// and a row of the configured store while that store is unhealthy or its
+/// first check pending is a `ValidationException` naming the store's kind;
 /// then the in-use check runs again with the AVAILABLE-to-DELETING write in
 /// one transaction under the row's lock
 /// ([`BackupCatalog::start_backup_delete`]), so a restore's registration and
 /// this order wholly one before the other: a registration that won leaves
 /// this `BackupInUseException` naming its target. A DELETING row (a retried
-/// DeleteBackup) resumes the deletion. The request returns the description
-/// with `BackupStatus` DELETED; the store's objects are deleted by the
-/// duty a configured store brings, and the row stays DELETING until a
-/// listing of its prefix returns nothing.
+/// DeleteBackup) resumes the deletion. Then the deletion itself
+/// ([`finish_backup_delete`]): the manifest first, so the prefix is no longer
+/// a complete backup to any reader, then the rest of the prefix, then the row
+/// to DELETED once a listing of the prefix returns nothing. If any step fails
+/// the row stays DELETING, the request is an `InternalServerError`, and the
+/// reconciler finishes the deletion later. The request returns the
+/// description with `BackupStatus` DELETED.
 ///
 /// The description is built before the DELETING write: a row whose
 /// `source_table_details_json` this build cannot read is answered as an
@@ -1124,6 +1195,7 @@ async fn delete_catalog_backup<S: BackupCatalog + ?Sized>(
     if !runtime.is_configured_store(&row.store) {
         return Err(backup_in_another_store(&arn_text));
     }
+    let store = runtime.require_healthy_store()?;
     let mut desc = row.description().map_err(storage_err_to_dynamo)?;
     match storage
         .start_backup_delete(&key)
@@ -1148,8 +1220,66 @@ async fn delete_catalog_backup<S: BackupCatalog + ?Sized>(
             ))));
         }
     }
+    finish_backup_delete(storage, &*store.store, arn)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                "DeleteBackup {arn_text}: the row is DELETING but its objects could not be \
+                 deleted; the reconciler retries: {e}"
+            );
+            DynamoDbError::InternalServerError("Internal server error".to_owned())
+        })?;
     desc.backup_details.backup_status = BackupStatus::Deleted.as_str().to_owned();
     Ok(desc)
+}
+
+/// The deletion of a DELETING row's objects and the row's move to DELETED:
+/// `extenddb-manifest.json` first (a `delete_prefix` on its exact key, so the
+/// prefix is no longer a complete backup to any reader), then the rest of the
+/// prefix, then, once a listing of the prefix returns nothing,
+/// `set_backup_deleted`. Shared by DeleteBackup and the reconciler's duty for
+/// a DELETING row; either may run it on a row the other started, and a run
+/// that finds the row no longer DELETING (`false` from the catalog) changes
+/// nothing more. Returns whether this run moved the row.
+///
+/// # Errors
+///
+/// A store failure, a listing that still shows objects (a put that
+/// overlapped the deletion, which the next run removes), or a catalog write
+/// failure; the row stays DELETING for the next run.
+pub(crate) async fn finish_backup_delete<S: BackupCatalog + ?Sized>(
+    storage: &S,
+    store: &dyn extenddb_backup_store::BackupStore,
+    arn: &BackupArn,
+) -> Result<bool, String> {
+    let prefix = arn.store_prefix();
+    let manifest_key = format!(
+        "{prefix}{}",
+        extenddb_core::backup_format::EXTENDDB_MANIFEST_FILE
+    );
+    store
+        .delete_prefix(&manifest_key)
+        .await
+        .map_err(|e| format!("deleting the manifest: {e}"))?;
+    store
+        .delete_prefix(&prefix)
+        .await
+        .map_err(|e| format!("deleting the prefix: {e}"))?;
+    let remaining = store
+        .list(&prefix)
+        .try_next()
+        .await
+        .map_err(|e| format!("listing the prefix after the deletion: {e}"))?;
+    if let Some(object) = remaining {
+        return Err(format!(
+            "the prefix still lists {} after the deletion",
+            object.key
+        ));
+    }
+    storage
+        .set_backup_deleted(&BackupKey::from_arn(arn))
+        .await
+        .map_err(|e| format!("marking the row DELETED: {e}"))
 }
 
 /// Overrides refused outright. `VectorIndexOverride` is not in the botocore
@@ -1330,14 +1460,17 @@ where
 /// first ([`check_catalog_row_for_restore`]: a CREATING row or one in use is
 /// `BackupInUseException`, a DELETING, DELETED or FAILED row
 /// `BackupNotFoundException`, a row of another store a
-/// `ValidationException`), else the legacy reader's restore source;
-/// (5) refuse what no backend restores faithfully (multi-part key, vector
+/// `ValidationException`, a row of the configured store while it is
+/// unhealthy one naming the store's kind), else the legacy reader's restore
+/// source; (5) refuse what no backend restores faithfully (multi-part key, vector
 /// indexes); (6) check the throughput override against the backup's billing
 /// mode, build the target's `CreateTableInput`, and apply the index and
 /// on-demand throughput overrides to it, refusing what the service refuses
-/// ([`overrides`]); (7) validate that input as CreateTable does; (8) take the
-/// job permit, last among the checks (`LimitExceededException` when none is
-/// free), and ask the backend to create and register the target; (9) map
+/// ([`overrides`]); (7) validate that input as CreateTable does; (8) refuse
+/// while a maintenance command holds the catalog's claim
+/// ([`refuse_while_maintenance_held`]), then take the job permit, last among
+/// the checks (`LimitExceededException` for either), and ask the backend to
+/// create and register the target; (9) map
 /// its errors, a taken name being `TableAlreadyExistsException`, a name
 /// being restored into `TableInUseException` (the backend checks the name
 /// again, fenced, under the registration), a backup being restored from
@@ -1395,14 +1528,16 @@ async fn restore_table_from_backup<S: BackupCatalog + LegacyBackupReader + Table
     extenddb_core::validation::validate_create_table(&input, limits)?;
     let on_demand = input.billing_mode == Some(BillingMode::PayPerRequest);
 
-    // 8. The permit last: every refusal above needs no slot, and a job
-    // that waited for one would hold what it opened while it waited.
+    // 8. The maintenance claim, then the permit last: every refusal above
+    // needs no slot, and a job that waited for one would hold what it opened
+    // while it waited.
     let request = RestoreRequest {
         backup_arn: backup_arn.clone(),
         source_table_arn: source.source_table_arn.clone(),
         restore_date_time: source.backup_creation_date_time,
         input,
     };
+    refuse_while_maintenance_held(storage, runtime).await?;
     let permit = runtime.take_permit()?;
     let desc = storage
         .restore(account_id, request, permit)
@@ -1419,9 +1554,12 @@ async fn restore_table_from_backup<S: BackupCatalog + LegacyBackupReader + Table
 /// a DELETING, DELETED or FAILED row is `BackupNotFoundException`; a backup
 /// a CREATING restore target still reads is `BackupInUseException` naming
 /// that table ([`BackupCatalog::backup_in_use`]); a row of a store other
-/// than the configured one is a `ValidationException` naming no root. An
-/// AVAILABLE row of the configured store is a backup in a store, whose
-/// restore this release does not run.
+/// than the configured one is a `ValidationException` naming no root, and a
+/// row of the configured store while that store is unhealthy or its first
+/// check pending is a `ValidationException` naming the store's kind
+/// ([`BackupRuntime::require_healthy_store`]). An AVAILABLE row of a healthy
+/// configured store is a backup in a store, whose restore this release does
+/// not run.
 async fn check_catalog_row_for_restore<S: BackupCatalog + ?Sized>(
     storage: &S,
     runtime: &BackupRuntime,
@@ -1446,6 +1584,7 @@ async fn check_catalog_row_for_restore<S: BackupCatalog + ?Sized>(
     if !runtime.is_configured_store(&row.store) {
         return Err(backup_in_another_store(&arn_text));
     }
+    runtime.require_healthy_store()?;
     Err(DynamoDbError::ValidationException(format!(
         "Backup {arn_text} is in a backup store; this release restores in-catalog backups only"
     )))
@@ -1678,8 +1817,10 @@ fn storage_err_to_dynamo(e: StorageError) -> DynamoDbError {
     }
 }
 
+pub mod maintenance;
 mod overrides;
 pub mod reconciler;
 mod runtime;
+pub mod store_identity;
 #[cfg(test)]
 mod tests;

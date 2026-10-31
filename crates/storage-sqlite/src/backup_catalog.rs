@@ -22,6 +22,12 @@
 //! A conditional write never has an unknown outcome here (one process, one
 //! file: a statement either ran or errored), so `WriteOutcome::Unknown` is
 //! never returned.
+//!
+//! The maintenance claim is the `backup_maintenance` row, taken under the
+//! engine write lock: refused while a row with a heartbeat younger than the
+//! stale window exists, taken over (replaced) from a dead holder, heartbeated
+//! and released by generation. One process serves a file, so a holder is a
+//! command run while the server is stopped.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -31,8 +37,8 @@ use extenddb_core::backup_format::BackupArn;
 use extenddb_storage::JobPermit;
 use extenddb_storage::backup_catalog::{
     BackupCatalog, BackupKey, BackupRow, BackupStatus, DeleteStart, Heartbeat, JobClaim, JobRow,
-    JobStatus, RestoreJobRow, RestoreKind, RestoreTargetKey, StatusFields, StoreIdentity,
-    StoreKind, TimeBounds, WriteOutcome, new_generation,
+    JobStatus, MaintenanceClaim, RestoreJobRow, RestoreKind, RestoreTargetKey, StatusFields,
+    StoreIdentity, StoreKind, TimeBounds, WriteOutcome, new_generation,
 };
 use extenddb_storage::error::StorageError;
 use futures::future::BoxFuture;
@@ -468,6 +474,20 @@ impl SqliteEngine {
         tx.commit().await.map_err(db_err)?;
         Ok(names)
     }
+
+    /// Remove the maintenance claim, whoever holds it: the server's startup
+    /// step under the serve lock, where one process has the file and so no
+    /// holder can be alive (a `backup purge` that died, or was killed, left
+    /// the row with a heartbeat the jobs' check would otherwise honour for
+    /// the whole stale window). Returns the holder's label when a row was
+    /// removed.
+    pub(crate) async fn clear_maintenance_claim(&self) -> Result<Option<String>, StorageError> {
+        let _writer = self.write_lock.lock().await;
+        sqlx::query_scalar("DELETE FROM backup_maintenance RETURNING holder")
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)
+    }
 }
 
 impl BackupCatalog for SqliteEngine {
@@ -700,6 +720,29 @@ impl BackupCatalog for SqliteEngine {
         })
     }
 
+    fn remove_dead_creating_backup_row<'a>(
+        &'a self,
+        key: &'a BackupKey,
+        stale_after: Duration,
+    ) -> BoxFuture<'a, Result<bool, StorageError>> {
+        Box::pin(async move {
+            let _writer = self.write_lock.lock().await;
+            let affected = sqlx::query(
+                "DELETE FROM backup_index WHERE account_id = ? AND backup_id = ? \
+                 AND status = 'CREATING' \
+                 AND julianday(heartbeat_at) < julianday('now') - ? / 86400.0",
+            )
+            .bind(&key.account_id)
+            .bind(&key.backup_id)
+            .bind(stale_after.as_secs_f64())
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?
+            .rows_affected();
+            Ok(affected == 1)
+        })
+    }
+
     fn backup_in_use<'a>(
         &'a self,
         key: &'a BackupKey,
@@ -846,12 +889,121 @@ impl BackupCatalog for SqliteEngine {
         })
     }
 
-    fn check_maintenance_claim(&self) -> BoxFuture<'_, Result<bool, StorageError>> {
+    fn read_store_ids<'a>(
+        &'a self,
+        store_kind: StoreKind,
+        store_root: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<String>, StorageError>> {
         Box::pin(async move {
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM backup_maintenance)")
-                .fetch_one(&self.pool)
+            sqlx::query_scalar(
+                "SELECT DISTINCT store_id FROM backup_index \
+                 WHERE store_kind = ? AND store_root = ? ORDER BY store_id",
+            )
+            .bind(store_kind.as_str())
+            .bind(store_root)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)
+        })
+    }
+
+    fn maintenance_claim<'a>(
+        &'a self,
+        holder: &'a str,
+        stale_after: Duration,
+    ) -> BoxFuture<'a, Result<Box<dyn MaintenanceClaim>, StorageError>> {
+        Box::pin(async move {
+            // One process serves a file (the serve lock), so the row is the
+            // claim: taken under the engine write lock, refused while a row
+            // with a live heartbeat exists, taken over from a dead one.
+            let _writer = self.write_lock.lock().await;
+            let live: Option<String> = sqlx::query_scalar(
+                "SELECT holder FROM backup_maintenance \
+                 WHERE julianday(heartbeat_at) >= julianday('now') - ? / 86400.0",
+            )
+            .bind(stale_after.as_secs_f64())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?;
+            if let Some(current) = live {
+                return Err(StorageError::AlreadyExists(format!(
+                    "the backup maintenance claim is held by {current}"
+                )));
+            }
+            let generation = new_generation();
+            sqlx::query(&format!(
+                "INSERT OR REPLACE INTO backup_maintenance \
+                 (singleton, holder, owner_generation, claimed_at, heartbeat_at) \
+                 VALUES (1, ?, ?, {NOW}, {NOW})"
+            ))
+            .bind(holder)
+            .bind(generation_column(generation))
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+            Ok(Box::new(SqliteMaintenanceClaim {
+                engine: self.clone(),
+                generation,
+            }) as Box<dyn MaintenanceClaim>)
+        })
+    }
+
+    fn check_maintenance_claim(
+        &self,
+        stale_after: Duration,
+    ) -> BoxFuture<'_, Result<bool, StorageError>> {
+        Box::pin(async move {
+            sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM backup_maintenance \
+                 WHERE julianday(heartbeat_at) >= julianday('now') - ? / 86400.0)",
+            )
+            .bind(stale_after.as_secs_f64())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(db_err)
+        })
+    }
+}
+
+/// The holder's handle on the `backup_maintenance` row.
+struct SqliteMaintenanceClaim {
+    engine: SqliteEngine,
+    generation: u64,
+}
+
+impl MaintenanceClaim for SqliteMaintenanceClaim {
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn heartbeat(&self) -> BoxFuture<'_, Result<Heartbeat, StorageError>> {
+        Box::pin(async move {
+            let _writer = self.engine.write_lock.lock().await;
+            let affected = sqlx::query(&format!(
+                "UPDATE backup_maintenance SET heartbeat_at = {NOW} WHERE owner_generation = ?"
+            ))
+            .bind(generation_column(self.generation))
+            .execute(&self.engine.pool)
+            .await
+            .map_err(db_err)?
+            .rows_affected();
+            Ok(if affected == 1 {
+                Heartbeat::Confirmed
+            } else {
+                Heartbeat::Lost
+            })
+        })
+    }
+
+    fn release(&self) -> BoxFuture<'_, Result<(), StorageError>> {
+        Box::pin(async move {
+            let _writer = self.engine.write_lock.lock().await;
+            sqlx::query("DELETE FROM backup_maintenance WHERE owner_generation = ?")
+                .bind(generation_column(self.generation))
+                .execute(&self.engine.pool)
                 .await
-                .map_err(db_err)
+                .map_err(db_err)?;
+            Ok(())
         })
     }
 }

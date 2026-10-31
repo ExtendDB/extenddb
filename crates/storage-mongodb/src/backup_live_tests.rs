@@ -520,7 +520,12 @@ async fn live_claim_backup_excludes_a_second_owner_and_fences_its_writes() {
         uuid::Uuid::parse_str(&fx.engine.catalog_id().await.expect("id")).is_ok(),
         "the catalog has an id from the migration step"
     );
-    assert!(!fx.engine.check_maintenance_claim().await.expect("check"));
+    assert!(
+        !fx.engine
+            .check_maintenance_claim(std::time::Duration::from_secs(300))
+            .await
+            .expect("check")
+    );
     let row = row(ACCOUNT, "Music", "nightly");
     let claim = fx.engine.claim_backup(&row).await.expect("claim");
     assert_ne!(claim.generation(), UNOWNED_GENERATION);
@@ -664,14 +669,236 @@ async fn live_claim_backup_excludes_a_second_owner_and_fences_its_writes() {
         "{third:?}"
     );
 
-    // A maintenance record, once written, is seen by every job.
-    fx.engine
-        .catalog_db
-        .collection::<Document>(crate::backup_catalog::BACKUP_MAINTENANCE)
-        .insert_one(doc! { "holder": "backup purge", "owner_generation": 1_i64 })
+    fx.finish().await;
+}
+
+/// `read_store_ids`: the distinct ids of the rows for a root, of every
+/// status, scoped to the kind and the root.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_read_store_ids_lists_the_distinct_ids_of_a_root() {
+    let fx = Fixture::new().await;
+    let root = store().store_root.clone();
+    let ids = |kind: StoreKind, root: String| {
+        let engine = &fx.engine;
+        async move { engine.read_store_ids(kind, &root).await.expect("ids") }
+    };
+    assert!(ids(StoreKind::Filesystem, root.clone()).await.is_empty());
+    let first = row(ACCOUNT, "Music", "a");
+    let _c1 = fx.engine.claim_backup(&first).await.expect("claim");
+    let second = row(ACCOUNT, "Music", "b");
+    let c2 = fx.engine.claim_backup(&second).await.expect("claim");
+    c2.set_status(
+        JobStatus::Creating,
+        JobStatus::Failed,
+        &StatusFields::default(),
+    )
+    .await
+    .expect("fail");
+    assert_eq!(
+        ids(StoreKind::Filesystem, root.clone()).await,
+        ["store-1"],
+        "two rows of one store, of two statuses, are one id"
+    );
+    let mut other = row(ACCOUNT, "Songs", "c");
+    other.store.store_id = "store-2".to_owned();
+    let _c3 = fx.engine.claim_backup(&other).await.expect("claim");
+    assert_eq!(
+        ids(StoreKind::Filesystem, root.clone()).await,
+        ["store-1", "store-2"]
+    );
+    assert!(
+        ids(StoreKind::S3, root.clone()).await.is_empty(),
+        "another kind at the same root is another store"
+    );
+    assert!(
+        ids(StoreKind::Filesystem, "/elsewhere".to_owned())
+            .await
+            .is_empty()
+    );
+    fx.finish().await;
+}
+
+/// `remove_dead_creating_backup_row`: a CREATING row whose heartbeat is older
+/// than the window is removed outright; one with a live owner, one that is
+/// not CREATING, and one that is gone are left, answering `false`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_a_dead_creating_row_is_removed_and_a_live_or_moved_one_is_kept() {
+    let fx = Fixture::new().await;
+    let stale = std::time::Duration::from_secs(300);
+    let index = fx.engine.backup_index();
+    let age = |backup_id: String| {
+        let index = index.clone();
+        async move {
+            index
+                .update_one(
+                    doc! { "backup_id": backup_id },
+                    vec![doc! { "$set": { "heartbeat_at": { "$subtract": [ "$$NOW", 600_000_i64 ] } } }],
+                )
+                .await
+                .expect("age");
+        }
+    };
+    let creating = row(ACCOUNT, "Music", "a");
+    let key = creating.key();
+    let claim = fx.engine.claim_backup(&creating).await.expect("claim");
+    assert!(
+        !fx.engine
+            .remove_dead_creating_backup_row(&key, stale)
+            .await
+            .unwrap(),
+        "a live owner keeps its row"
+    );
+    age(creating.backup_id.clone()).await;
+    assert!(
+        fx.engine
+            .remove_dead_creating_backup_row(&key, stale)
+            .await
+            .unwrap()
+    );
+    assert!(
+        fx.engine
+            .read_backup_row(&arn_of(&creating))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !fx.engine
+            .remove_dead_creating_backup_row(&key, stale)
+            .await
+            .unwrap(),
+        "gone"
+    );
+    drop(claim);
+
+    let available = row(ACCOUNT, "Music", "b");
+    let claim = fx.engine.claim_backup(&available).await.expect("claim");
+    claim
+        .set_status(
+            JobStatus::Creating,
+            JobStatus::Available,
+            &StatusFields::default(),
+        )
         .await
-        .expect("maintenance record");
-    assert!(fx.engine.check_maintenance_claim().await.expect("check"));
+        .expect("available");
+    age(available.backup_id.clone()).await;
+    assert!(
+        !fx.engine
+            .remove_dead_creating_backup_row(&available.key(), stale)
+            .await
+            .unwrap(),
+        "only a CREATING row"
+    );
+    assert_eq!(
+        fx.engine
+            .read_backup_row(&arn_of(&available))
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        BackupStatus::Available
+    );
+    drop(claim);
+    fx.finish().await;
+}
+
+/// The maintenance claim: taken once, refused to a second holder naming the
+/// first, heartbeated on the server's clock, released; a holder whose
+/// heartbeat is older than the stale window is dead, so its claim is not
+/// reported held and is taken over, and its handle finds the claim lost. A
+/// record without a heartbeat (no release of this server wrote one) is
+/// stale.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_the_maintenance_claim_excludes_a_second_holder_and_expires_when_stale() {
+    let fx = Fixture::new().await;
+    let stale = std::time::Duration::from_secs(300);
+    let check = || fx.engine.check_maintenance_claim(stale);
+    let maintenance = fx
+        .engine
+        .catalog_db
+        .collection::<Document>(crate::backup_catalog::BACKUP_MAINTENANCE);
+    assert!(!check().await.expect("check"));
+    let first = fx
+        .engine
+        .maintenance_claim("purge on host-a", stale)
+        .await
+        .expect("claim");
+    assert_ne!(first.generation(), UNOWNED_GENERATION);
+    assert!(check().await.expect("check"), "a live claim is held");
+    match fx.engine.maintenance_claim("purge on host-b", stale).await {
+        Err(StorageError::AlreadyExists(m)) => assert!(m.contains("purge on host-a"), "{m}"),
+        Err(other) => panic!("a second holder is refused with AlreadyExists: {other:?}"),
+        Ok(_) => panic!("a second holder is refused"),
+    }
+    assert_eq!(
+        first.heartbeat().await.expect("heartbeat"),
+        Heartbeat::Confirmed
+    );
+    first.release().await.expect("release");
+    assert!(!check().await.expect("check"), "released");
+    assert_eq!(
+        maintenance.count_documents(doc! {}).await.expect("count"),
+        0
+    );
+    first.release().await.expect("a second release is a no-op");
+
+    // A dead holder: its heartbeat aged past the window.
+    let dead = fx
+        .engine
+        .maintenance_claim("purge on host-c", stale)
+        .await
+        .expect("claim");
+    maintenance
+        .update_one(
+            doc! {},
+            vec![doc! { "$set": { "heartbeat_at": { "$subtract": [ "$$NOW", 600_000_i64 ] } } }],
+        )
+        .await
+        .expect("age");
+    assert!(!check().await.expect("check"), "a stale claim is not held");
+    let taker = fx
+        .engine
+        .maintenance_claim("purge on host-d", stale)
+        .await
+        .expect("a dead holder's claim is taken over");
+    assert_ne!(taker.generation(), dead.generation());
+    assert!(check().await.expect("check"));
+    assert_eq!(
+        dead.heartbeat().await.expect("heartbeat"),
+        Heartbeat::Lost,
+        "the dead holder's handle finds the claim lost"
+    );
+    dead.release()
+        .await
+        .expect("a release by a lost holder changes nothing");
+    assert!(check().await.expect("check"), "the taker still holds it");
+    let holder = maintenance
+        .find_one(doc! {})
+        .await
+        .expect("find")
+        .expect("record");
+    assert_eq!(holder.get_str("holder").unwrap(), "purge on host-d");
+    taker.release().await.expect("release");
+    assert!(!check().await.expect("check"));
+
+    // A record with no heartbeat at all is stale: taken over, never held.
+    maintenance
+        .insert_one(
+            doc! { "_id": "claim", "holder": "an older release", "owner_generation": 1_i64 },
+        )
+        .await
+        .expect("record");
+    assert!(!check().await.expect("check"));
+    let over = fx
+        .engine
+        .maintenance_claim("purge on host-e", stale)
+        .await
+        .expect("taken over");
+    assert!(check().await.expect("check"));
+    over.release().await.expect("release");
     fx.finish().await;
 }
 

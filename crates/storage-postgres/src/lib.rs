@@ -909,23 +909,35 @@ fn server_components_factory(
             })?;
         engine.serving = Some(Arc::new(registration));
 
-        // Rebuild any vector index a crash left CREATING, before serving: an index
-        // in that state is not searchable, and nothing else will repair it.
-        match crate::data::vector_index::reconcile_incomplete_vector_indexes(&engine).await {
-            Ok(n) if n > 0 => {
-                tracing::info!("Reconciled {n} incomplete vector index(es) at startup");
+        // The startup recovery is a server's; a command reading beside one
+        // leaves it to the server.
+        if !options.beside_server {
+            // Rebuild any vector index a crash left CREATING, before serving:
+            // an index in that state is not searchable, and nothing else will
+            // repair it.
+            match crate::data::vector_index::reconcile_incomplete_vector_indexes(&engine).await {
+                Ok(n) if n > 0 => {
+                    tracing::info!("Reconciled {n} incomplete vector index(es) at startup");
+                }
+                Ok(_) => {}
+                Err(e) => tracing::error!("Failed to reconcile incomplete vector indexes: {e}"),
             }
-            Ok(_) => {}
-            Err(e) => tracing::error!("Failed to reconcile incomplete vector indexes: {e}"),
+
+            // Recover control plane transitions (errors are logged, not fatal).
+            // A drop deferred by a session still holding the table wakes the
+            // poller, which `spawn_workers` starts later.
+            workers::recover_control_plane_at_startup(&engine).await;
         }
 
-        // Recover control plane transitions (errors are logged, not fatal).
-        // A drop deferred by a session still holding the table wakes the
-        // poller, which `spawn_workers` starts later.
-        workers::recover_control_plane_at_startup(&engine).await;
-
-        // Start GSI workers
-        let engine = engine.start_gsi_workers();
+        // Start GSI workers: a server's. A command reading beside one
+        // (`backup list`, the purge's dry run) leaves the queue to the
+        // server that owns the catalog, so the command applies no pending
+        // index write and exits with none half-applied.
+        let engine = if options.beside_server {
+            engine
+        } else {
+            engine.start_gsi_workers()
+        };
 
         // Get data database name for logging (before wrapping in Arc)
         let data_db_name = engine

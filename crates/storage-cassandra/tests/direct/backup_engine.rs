@@ -2233,7 +2233,6 @@ async fn test_claim_backup_excludes_a_second_owner_and_fences_its_writes() {
         uuid::Uuid::parse_str(&engine.catalog_id().await.expect("id")).is_ok(),
         "the catalog has an id from the migration"
     );
-    assert!(!engine.check_maintenance_claim().await.expect("check"));
     let store = unique_store();
     let row = index_row(&account_id, "Music", "nightly", &store);
     let claim = engine.claim_backup(&row).await.expect("claim");
@@ -4290,4 +4289,256 @@ async fn test_a_migration_that_fails_in_its_step_leaves_the_version_behind_and_r
         uuid::Uuid::parse_str(&engine.catalog_id().await.expect("catalog id")).is_ok(),
         "the step wrote the catalog id"
     );
+}
+
+/// `read_store_ids`: the distinct ids of the rows for a root, of every
+/// status, scoped to the kind and the root, read from the status partitions.
+#[tokio::test]
+async fn test_read_store_ids_lists_the_distinct_ids_of_a_root() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, "extenddb_ttl_test").await;
+    let account_id = account.account_id.clone();
+    let store = unique_store();
+    let root = store.store_root.clone();
+    let ids = |kind: StoreKind| {
+        let engine = &engine;
+        let root = root.clone();
+        async move { engine.read_store_ids(kind, &root).await.expect("ids") }
+    };
+    assert!(ids(StoreKind::Filesystem).await.is_empty());
+    let first = index_row(&account_id, "Music", "a", &store);
+    let _c1 = engine.claim_backup(&first).await.expect("claim");
+    let second = index_row(&account_id, "Music", "b", &store);
+    let c2 = engine.claim_backup(&second).await.expect("claim");
+    assert_eq!(
+        c2.set_status(
+            JobStatus::Creating,
+            JobStatus::Failed,
+            &StatusFields::default()
+        )
+        .await
+        .expect("fail"),
+        WriteOutcome::Matched
+    );
+    assert_eq!(
+        ids(StoreKind::Filesystem).await,
+        ["store-1"],
+        "two rows of one store, of two statuses, are one id"
+    );
+    let mut other_store = store.clone();
+    other_store.store_id = "store-2".to_owned();
+    let other = index_row(&account_id, "Songs", "c", &other_store);
+    let _c3 = engine.claim_backup(&other).await.expect("claim");
+    assert_eq!(ids(StoreKind::Filesystem).await, ["store-1", "store-2"]);
+    assert!(
+        ids(StoreKind::S3).await.is_empty(),
+        "another kind at the same root is another store"
+    );
+    assert!(
+        engine
+            .read_store_ids(StoreKind::Filesystem, "/elsewhere")
+            .await
+            .expect("ids")
+            .is_empty()
+    );
+}
+
+/// `remove_dead_creating_backup_row`: a CREATING row whose heartbeat is older
+/// than the window is removed outright, its status-index entry with it; one
+/// with a live owner, one that is not CREATING, and one that is gone are left,
+/// answering `false`.
+#[tokio::test]
+async fn test_a_dead_creating_row_is_removed_and_a_live_or_moved_one_is_kept() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, "extenddb_ttl_test").await;
+    let account_id = account.account_id.clone();
+    let store = unique_store();
+    let stale = Duration::from_secs(300);
+    let ten_minutes_ago = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+        - 600_000;
+    let age = |backup_arn: String, generation: u64| {
+        let engine = &engine;
+        let account_id = account_id.clone();
+        async move {
+            apply(
+                engine,
+                &format!(
+                    "UPDATE {}.backups_by_arn SET heartbeat_at = ? \
+                     WHERE account_id = ? AND backup_arn = ? IF owner_generation = ?",
+                    engine.catalog_keyspace()
+                ),
+                cdrs_tokio::query_values!(
+                    ten_minutes_ago,
+                    account_id.as_str(),
+                    backup_arn.as_str(),
+                    i64::try_from(generation).unwrap()
+                ),
+            )
+            .await;
+        }
+    };
+    let creating = index_row(&account_id, "Music", "dead-a", &store);
+    let key = creating.key();
+    let claim = engine.claim_backup(&creating).await.expect("claim");
+    assert!(
+        !engine
+            .remove_dead_creating_backup_row(&key, stale)
+            .await
+            .unwrap(),
+        "a live owner keeps its row"
+    );
+    age(creating.backup_arn.clone(), claim.generation()).await;
+    assert!(
+        engine
+            .remove_dead_creating_backup_row(&key, stale)
+            .await
+            .unwrap()
+    );
+    assert!(
+        engine
+            .read_backup_row(&arn_of(&creating))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let creating_rows: Vec<BackupRow> = engine
+        .list_backup_rows(Some(BackupStatus::Creating), &store)
+        .try_collect()
+        .await
+        .unwrap();
+    assert!(
+        creating_rows.is_empty(),
+        "the status index entry went with the row: {creating_rows:?}"
+    );
+    assert!(
+        !engine
+            .remove_dead_creating_backup_row(&key, stale)
+            .await
+            .unwrap(),
+        "gone"
+    );
+    drop(claim);
+
+    let available = index_row(&account_id, "Music", "dead-b", &store);
+    let claim = engine.claim_backup(&available).await.expect("claim");
+    assert_eq!(
+        claim
+            .set_status(
+                JobStatus::Creating,
+                JobStatus::Available,
+                &StatusFields::default()
+            )
+            .await
+            .expect("available"),
+        WriteOutcome::Matched
+    );
+    age(available.backup_arn.clone(), claim.generation()).await;
+    assert!(
+        !engine
+            .remove_dead_creating_backup_row(&available.key(), stale)
+            .await
+            .unwrap(),
+        "only a CREATING row"
+    );
+    assert_eq!(
+        engine
+            .read_backup_row(&arn_of(&available))
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        BackupStatus::Available
+    );
+    drop(claim);
+}
+
+/// The maintenance claim: taken once, refused to a second holder naming the
+/// first, heartbeated on the coordinator's clock, released; a holder whose
+/// heartbeat is older than the stale window is dead, so its claim is not
+/// reported held and is taken over with a lightweight transaction on its
+/// generation, and its handle finds the claim lost. The catalog is shared by
+/// this binary's tests, so the test releases what it takes.
+#[tokio::test]
+async fn test_the_maintenance_claim_excludes_a_second_holder_and_expires_when_stale() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let stale = Duration::from_secs(300);
+    let check = || engine.check_maintenance_claim(stale);
+    // Another test of this binary never holds the claim; a stale row an
+    // interrupted run left is taken over below like any dead holder's.
+    let first = engine
+        .maintenance_claim("purge on host-a", stale)
+        .await
+        .expect("claim");
+    assert_ne!(first.generation(), UNOWNED_GENERATION);
+    assert!(check().await.expect("check"), "a live claim is held");
+    match engine.maintenance_claim("purge on host-b", stale).await {
+        Err(StorageError::AlreadyExists(m)) => assert!(m.contains("purge on host-a"), "{m}"),
+        Err(other) => panic!("a second holder is refused with AlreadyExists: {other:?}"),
+        Ok(_) => panic!("a second holder is refused"),
+    }
+    assert_eq!(
+        first.heartbeat().await.expect("heartbeat"),
+        Heartbeat::Confirmed
+    );
+    first.release().await.expect("release");
+    assert!(!check().await.expect("check"), "released");
+    first.release().await.expect("a second release is a no-op");
+
+    // A dead holder: its heartbeat aged past the window.
+    let dead = engine
+        .maintenance_claim("purge on host-c", stale)
+        .await
+        .expect("claim");
+    let aged = format!(
+        "UPDATE {}.backup_maintenance SET heartbeat_at = ? WHERE claim = 'claim' \
+         IF owner_generation = ?",
+        engine.catalog_keyspace()
+    );
+    let ten_minutes_ago = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+        - 600_000;
+    apply(
+        &engine,
+        &aged,
+        cdrs_tokio::query_values!(ten_minutes_ago, i64::try_from(dead.generation()).unwrap()),
+    )
+    .await;
+    assert!(!check().await.expect("check"), "a stale claim is not held");
+    let taker = engine
+        .maintenance_claim("purge on host-d", stale)
+        .await
+        .expect("a dead holder's claim is taken over");
+    assert_ne!(taker.generation(), dead.generation());
+    assert!(check().await.expect("check"));
+    assert_eq!(
+        dead.heartbeat().await.expect("heartbeat"),
+        Heartbeat::Lost,
+        "the dead holder's handle finds the claim lost"
+    );
+    dead.release()
+        .await
+        .expect("a release by a lost holder changes nothing");
+    assert!(check().await.expect("check"), "the taker still holds it");
+    taker.release().await.expect("release");
+    assert!(!check().await.expect("check"));
 }

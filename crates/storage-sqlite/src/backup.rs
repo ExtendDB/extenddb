@@ -4231,7 +4231,12 @@ mod restore_tests {
                 uuid::Uuid::parse_str(&engine.catalog_id().await.expect("id")).is_ok(),
                 "the catalog has an id from the migration"
             );
-            assert!(!engine.check_maintenance_claim().await.expect("check"));
+            assert!(
+                !engine
+                    .check_maintenance_claim(std::time::Duration::from_secs(300))
+                    .await
+                    .expect("check")
+            );
             let row = row(ACCOUNT, "Music", "nightly");
             let claim = engine.claim_backup(&row).await.expect("claim");
             assert_ne!(claim.generation(), UNOWNED_GENERATION);
@@ -4831,6 +4836,217 @@ mod restore_tests {
                 .delete(ACCOUNT, &backup.backup_arn)
                 .await
                 .expect("the backup is free");
+        }
+
+        /// `read_store_ids`: the distinct ids of the rows for a root, of
+        /// every status, scoped to the kind and the root.
+        #[tokio::test]
+        async fn read_store_ids_lists_the_distinct_ids_of_a_root() {
+            let engine = engine().await;
+            let root = store().store_root.clone();
+            assert!(
+                engine
+                    .read_store_ids(StoreKind::Filesystem, &root)
+                    .await
+                    .expect("ids")
+                    .is_empty()
+            );
+            let first = row(ACCOUNT, "Music", "a");
+            let _c1 = engine.claim_backup(&first).await.expect("claim");
+            let second = row(ACCOUNT, "Music", "b");
+            let c2 = engine.claim_backup(&second).await.expect("claim");
+            c2.set_status(
+                JobStatus::Creating,
+                JobStatus::Failed,
+                &StatusFields::default(),
+            )
+            .await
+            .expect("fail");
+            assert_eq!(
+                engine
+                    .read_store_ids(StoreKind::Filesystem, &root)
+                    .await
+                    .expect("ids"),
+                ["store-1"],
+                "two rows of one store, of two statuses, are one id"
+            );
+            let mut other = row(ACCOUNT, "Songs", "c");
+            other.store.store_id = "store-2".to_owned();
+            let _c3 = engine.claim_backup(&other).await.expect("claim");
+            assert_eq!(
+                engine
+                    .read_store_ids(StoreKind::Filesystem, &root)
+                    .await
+                    .expect("ids"),
+                ["store-1", "store-2"]
+            );
+            assert!(
+                engine
+                    .read_store_ids(StoreKind::S3, &root)
+                    .await
+                    .expect("ids")
+                    .is_empty(),
+                "another kind at the same root is another store"
+            );
+            assert!(
+                engine
+                    .read_store_ids(StoreKind::Filesystem, "/elsewhere")
+                    .await
+                    .expect("ids")
+                    .is_empty()
+            );
+        }
+
+        /// `remove_dead_creating_backup_row`: a CREATING row whose heartbeat
+        /// is older than the window is removed outright; one with a live
+        /// owner, one that is not CREATING, and one that is gone are left,
+        /// answering `false`.
+        #[tokio::test]
+        async fn a_dead_creating_row_is_removed_and_a_live_or_moved_one_is_kept() {
+            let engine = engine().await;
+            let stale = Duration::from_secs(300);
+            let age = |backup_id: String| {
+                let pool = engine.pool.clone();
+                async move {
+                    sqlx::query(
+                        "UPDATE backup_index SET heartbeat_at = \
+                         strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes') WHERE backup_id = ?",
+                    )
+                    .bind(backup_id)
+                    .execute(&pool)
+                    .await
+                    .expect("age");
+                }
+            };
+            let creating = row(ACCOUNT, "Music", "a");
+            let key = creating.key();
+            let claim = engine.claim_backup(&creating).await.expect("claim");
+            assert!(
+                !engine
+                    .remove_dead_creating_backup_row(&key, stale)
+                    .await
+                    .unwrap(),
+                "a live owner keeps its row"
+            );
+            age(creating.backup_id.clone()).await;
+            assert!(
+                engine
+                    .remove_dead_creating_backup_row(&key, stale)
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                engine
+                    .read_backup_row(&arn_of(&creating))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                !engine
+                    .remove_dead_creating_backup_row(&key, stale)
+                    .await
+                    .unwrap(),
+                "gone"
+            );
+            drop(claim);
+
+            let available = row(ACCOUNT, "Music", "b");
+            let claim = engine.claim_backup(&available).await.expect("claim");
+            claim
+                .set_status(
+                    JobStatus::Creating,
+                    JobStatus::Available,
+                    &StatusFields::default(),
+                )
+                .await
+                .expect("available");
+            age(available.backup_id.clone()).await;
+            assert!(
+                !engine
+                    .remove_dead_creating_backup_row(&available.key(), stale)
+                    .await
+                    .unwrap(),
+                "only a CREATING row"
+            );
+            assert_eq!(
+                engine
+                    .read_backup_row(&arn_of(&available))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                BackupStatus::Available
+            );
+        }
+
+        /// The maintenance claim: taken once, refused to a second holder
+        /// naming the first, heartbeated, released; a holder whose heartbeat
+        /// is older than the stale window is dead, so its claim is not
+        /// reported held and is taken over, and its handle finds the claim
+        /// lost.
+        #[tokio::test]
+        async fn the_maintenance_claim_excludes_a_second_holder_and_expires_when_stale() {
+            let engine = engine().await;
+            let stale = Duration::from_secs(300);
+            let check = || engine.check_maintenance_claim(stale);
+            assert!(!check().await.expect("check"));
+            let first = engine
+                .maintenance_claim("purge on host-a", stale)
+                .await
+                .expect("claim");
+            assert_ne!(first.generation(), UNOWNED_GENERATION);
+            assert!(check().await.expect("check"), "a live claim is held");
+            match engine.maintenance_claim("purge on host-b", stale).await {
+                Err(StorageError::AlreadyExists(m)) => {
+                    assert!(m.contains("purge on host-a"), "{m}");
+                }
+                Err(other) => panic!("a second holder is refused with AlreadyExists: {other:?}"),
+                Ok(_) => panic!("a second holder is refused"),
+            }
+            assert_eq!(
+                first.heartbeat().await.expect("heartbeat"),
+                Heartbeat::Confirmed
+            );
+            first.release().await.expect("release");
+            assert!(!check().await.expect("check"), "released");
+            first.release().await.expect("a second release is a no-op");
+
+            // A dead holder: its heartbeat aged past the window.
+            let dead = engine
+                .maintenance_claim("purge on host-c", stale)
+                .await
+                .expect("claim");
+            sqlx::query(
+                "UPDATE backup_maintenance SET heartbeat_at = \
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes')",
+            )
+            .execute(&engine.pool)
+            .await
+            .expect("age");
+            assert!(!check().await.expect("check"), "a stale claim is not held");
+            let taker = engine
+                .maintenance_claim("purge on host-d", stale)
+                .await
+                .expect("a dead holder's claim is taken over");
+            assert_ne!(taker.generation(), dead.generation());
+            assert!(check().await.expect("check"));
+            assert_eq!(
+                dead.heartbeat().await.expect("heartbeat"),
+                Heartbeat::Lost,
+                "the dead holder's handle finds the claim lost"
+            );
+            dead.release()
+                .await
+                .expect("a release by a lost holder changes nothing");
+            assert!(check().await.expect("check"), "the taker still holds it");
+            let holder: String = sqlx::query_scalar("SELECT holder FROM backup_maintenance")
+                .fetch_one(&engine.pool)
+                .await
+                .expect("holder");
+            assert_eq!(holder, "purge on host-d");
+            taker.release().await.expect("release");
+            assert!(!check().await.expect("check"));
         }
     }
 }
