@@ -154,9 +154,10 @@ pub async fn handle_batch_get_item(
     let mut total_rcu: f64 = 0.0;
     let mut total_pre_proj_bytes: usize = 0;
     let mut returned_count: u64 = 0;
-    // Keyed by table name so ConsumedCapacity lists the tables in name order,
-    // the order the service returned for two tables in both request orders
-    // (measured 2026-10-24).
+    // Keyed by table name so ConsumedCapacity lists the tables in a stable
+    // order. The service's order is not stable: twelve calls over three
+    // tables returned all six orders, and one request order came back in two
+    // different orders (measured 2026-10-24).
     let mut per_table_rcu: BTreeMap<String, f64> = BTreeMap::new();
 
     for (table_name, ka) in &input.request_items {
