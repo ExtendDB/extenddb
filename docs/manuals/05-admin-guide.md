@@ -91,8 +91,8 @@ These settings require a server restart to take effect.
 | `bind_addr` | `127.0.0.1` | Network interface to bind |
 | `port` | `18443` | HTTP port |
 | `region` | `us-east-1` | AWS region for ARN generation. Baked into every backup ARN the server issues, so it must stay within `[a-z0-9-]` (a value outside that class makes the server's own backup ARNs "not valid"; the server logs a warning at startup). A backup ARN of the caller's account in another region is resolved in the server's region first, then as written; see the upgrade manual before changing this on a deployment with backups |
-| `catalog_upgrade` | `refuse` (`apply` in a dev build) | What `serve` does with a catalog behind the binary: `refuse` exits 3 and names the pending migrations, and `apply` runs them at startup as `migrate --yes` does. `serve --migrate` sets `apply` for one run. Every status `serve` cannot serve is refused under both values; see the [upgrade manual](07-upgrade-manual.md#applying-migrations-at-startup) |
-| `catalog_upgrade_lock_timeout` | `60` | Seconds `serve` waits under `apply` for the migration lock and for running servers before it exits 6; at most 86400 |
+| `catalog_upgrade` | `refuse` (`apply` in a dev build) | What `serve` does with a catalog behind the binary: `refuse` exits 3 and names the pending migrations, and `apply` runs them at startup as `migrate --yes` does. `serve --migrate` sets `apply` for one run. Under both values `serve` refuses a catalog that is NeedsAttention, Changed, WrittenByOlderRelease, AheadIncompatible or Uninitialized, except that a dev build creates a catalog in a missing or empty database file; see the [upgrade manual](07-upgrade-manual.md#applying-migrations-at-startup) |
+| `catalog_upgrade_lock_timeout` | `60` | Under `apply`, the seconds a `serve` run may spend in all its waits together (for the migration lock, for running servers, and on PostgreSQL for an earlier migrator's statements) before it exits 6; 0 makes one attempt; at most 86400 |
 
 #### [storage]
 

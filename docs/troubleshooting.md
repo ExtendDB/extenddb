@@ -67,9 +67,9 @@ See `docs/local-postgres-setup.md` for full setup instructions.
 
 ### `serve`, `migrate` or `verify` exits 3, 4, 5 or 6 naming the catalog
 
-**Cause:** The catalog's status, read from its migration ledgers, is not one this binary serves: exit 3 means migrations are pending, 4 that the catalog has a breaking migration this binary does not know, 5 that a person must act, and 6 that the migration lock or a running server outlasted `--lock-timeout` (for `serve`, `[server] catalog_upgrade_lock_timeout`). The [status table](manuals/07-upgrade-manual.md#the-catalog-status) of the upgrade manual lists each status with its exit codes.
+**Cause:** The catalog's status, read from its migration ledgers, is not one this binary serves: exit 3 means migrations are pending, 4 that the catalog has a breaking migration this binary does not know, 5 that a person must act, and 6 that the migration lock or a running server outlasted `--lock-timeout`. The [status table](manuals/07-upgrade-manual.md#the-catalog-status) of the upgrade manual lists each status with its exit codes.
 
-**Fix:** Run the command the message prints. For pending migrations that is `extenddb migrate --config extenddb.toml --yes`, after the backup the message names, or start the server with `--migrate`.
+**Fix:** Run the command the message prints. For pending migrations that is `extenddb migrate --config extenddb.toml --yes`, after the backup the message names, or start the server with `--migrate`. For `serve`, exit 6 means that the wait outlasted `[server] catalog_upgrade_lock_timeout`, or that a migration held the lock when the server registered; start the server again once the lock is free.
 
 ### `the catalog at <location> is not initialized; create it with 'extenddb init'`
 

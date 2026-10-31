@@ -180,11 +180,14 @@ extenddb daemonizes by default. Pass `serve --foreground` (alias `--no-daemon`)
 to stay attached, which is what container runtimes and process supervisors
 expect.
 
-1. Parse CLI arguments and load configuration
-2. Bind TCP socket (port conflicts reported before forking)
-3. Read the catalog's status, and under `[server] catalog_upgrade = "apply"`
+1. Parse CLI arguments and load configuration. On a platform without daemon
+   mode, `serve` without `--foreground` stops here
+2. Read the catalog's status, and under `[server] catalog_upgrade = "apply"`
    or `serve --migrate` apply its pending migrations. A catalog the server
    cannot serve stops it here, before the fork, with the status's exit code
+3. Bind TCP socket. This comes after the catalog check, so the port accepts
+   no connection while the catalog migrates, and before the fork, so port
+   conflicts are reported to the invoking shell
 4. Fork to background via `daemonize`, writing a PID file to `run_dir`
    (skipped entirely in `--foreground` mode, so no run directory is needed and
    the root filesystem can be read-only)
@@ -209,7 +212,7 @@ extenddb uses a dual-database architecture:
 - **Data database** (e.g., `extenddb_catalog_data`): Stores user items, GSI/LSI data, and stream records. Each table gets its own PostgreSQL table.
 
 On PostgreSQL, SQLite, Cassandra and MongoDB the catalog is versioned by its migration ledger, the `extenddb_migrations` table (on MongoDB a collection, in the catalog database and in the data database): the catalog version is the highest migration recorded in every store, migration 4 for this release, and `serve` reads the catalog's status at startup and refuses a catalog that carries a breaking migration it does not know, and one that is behind it unless it runs under `[server] catalog_upgrade = "apply"` or `--migrate`. On Cassandra every account keyspace has a ledger beside the catalog keyspace's.
-A mismatch between the binary's migrations and the catalog's ledger prevents a server from starting; run `extenddb migrate --yes` to upgrade a catalog that is behind, or start the server with `--migrate`.
+A catalog behind the binary stops a server under `refuse`, the default in a production build; run `extenddb migrate --yes` to upgrade it, or start the server with `--migrate`.
 
 ## Pluggable Architecture
 

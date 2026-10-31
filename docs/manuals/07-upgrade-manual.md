@@ -35,52 +35,11 @@ Running `extenddb migrate --yes` on an up-to-date catalog changes nothing.
 | WrittenByOlderRelease | A 0.1.x release wrote to the catalog after it was migrated | 5 | 5 | 5; `--yes --reconverge` repairs it | 5 |
 | Uninitialized | Not a catalog; `extenddb init` creates one | 1 | 1 | 1 | 1 |
 
-Exit status 6 means the migration lock, or a running server, was still held when `--lock-timeout` ran out (for `serve`, `[server] catalog_upgrade_lock_timeout`); run the command again once it is free. Every refusal prints the command that resolves it. A dev build's `serve` applies a Behind catalog at startup instead of refusing it, by its default `catalog_upgrade = "apply"`, and creates a catalog in a missing or empty database file. `serve` has the same codes in daemon mode, its default, and with `--foreground`: [Exit codes of serve](#exit-codes-of-serve) gives the one case where they differ.
+Exit status 6 means the migration lock, or a running server, was still held when `--lock-timeout` ran out (for `serve`, `[server] catalog_upgrade_lock_timeout`), or that a migration held the lock when `serve` registered; run the command again once it is free. Every refusal prints the command that resolves it. A dev build's `serve` applies a Behind catalog at startup instead of refusing it, because `apply` is a dev build's default, and creates a catalog in a missing or empty database file. `serve` has the same codes in daemon mode, which is the default, and with `--foreground`: [Exit codes of serve](#exit-codes-of-serve) gives the one case where they differ.
 
 `verify` also checks the connection to the data database. When that check fails, `verify` exits 1 on a Behind catalog instead of 3, because `migrate --yes` cannot apply the pending migrations while the data database cannot be reached. It still exits 4 or 5 for the statuses that need a person.
 
 A migration is additive when the previous release serves the catalog correctly with it applied, and breaking otherwise. Migrations 1 to 4 are breaking: do not run a 0.1.x server against a migrated catalog. A 0.1.x binary that writes to a migrated catalog (its `migrate --yes`, or a SQLite dev server) leaves it WrittenByOlderRelease. `migrate --yes --reconverge` repairs it by running the convergent migrations again. Migration 2, which rewrites stored policies, is not convergent: the repair skips it and prints a line that says so (see the v0.1.14 notes below).
-
-### Applying Migrations at Startup
-
-`serve` reads the catalog's status before it opens the catalog. The `[server]` key `catalog_upgrade` sets what it does with a catalog that is behind it:
-
-| Value | A catalog behind the binary |
-|-------|-----------------------------|
-| `refuse` | `serve` exits 3. The message lists the pending migrations, says which servers to stop and what to back up, gives the `migrate --yes` command, and ends with `or start this server with --migrate`. The default in a production build |
-| `apply` | `serve` applies the pending migrations, then serves. The default in a dev build, which the dev image and the npm launcher run |
-
-`serve --migrate` sets `apply` for one run. `EXTENDDB__SERVER__CATALOG_UPGRADE` sets the key from the environment and overrides the config file, as it does for every key. `serve` refuses any other value with a configuration error.
-
-Under `apply`, `serve` migrates the catalog before it opens it, through the same run as `migrate --yes`:
-
-1. It takes the migration lock, waiting up to `[server] catalog_upgrade_lock_timeout` seconds (60 by default, at most 86400) for another migration and for running servers. `EXTENDDB__SERVER__CATALOG_UPGRADE_LOCK_TIMEOUT` sets the timeout from the environment.
-2. It reads the status again under the lock. When another process migrated the catalog while this one waited, the server releases the lock and starts.
-3. It runs the `detect` step of every pending code migration. When one finds items, `serve` exits 5 and names them, having written nothing.
-4. On SQLite it copies the database, as `migrate --yes` does.
-5. It applies the migrations, releases the lock, registers as the catalog's server, and serves.
-
-When the lock is still held at the timeout, the server reads the status once more. It starts on a catalog that another process migrated in the meantime, and exits 6 on any other. Of two servers started together with `--migrate`, one applies the migrations. The other waits until the timeout, because the lock waits for the first server's registration to end, then finds the catalog migrated and starts. On SQLite it exits 6 instead, because one server at a time can hold the database file.
-
-While it migrates, the server prints a line on stderr for each step, each starting with `catalog migration: `, and one every 5 seconds until the run ends. The npm launcher's startup timeout of 15 seconds counts from the last of these lines. The server binds its port before the run and answers no request until the migrations are done.
-
-`apply` changes only what `serve` does with a Behind catalog. Under both values `serve` serves a Current or AheadCompatible catalog, and refuses every other status with its code from the [status table](#the-catalog-status) before it takes the lock: NeedsAttention, Changed and WrittenByOlderRelease with 5, AheadIncompatible with 4, and Uninitialized with 1, except that a dev build creates a catalog in a missing or empty database file. No setting or flag makes `serve` open a catalog in any of these states.
-
-`serve` connects with the credentials in the config file, as `migrate` does, and that role does all the schema work. It has no admin role. On PostgreSQL it tries to create the pgvector extension as the application role and prints the result, as `migrate --yes` does without `--pg-user`; run `extenddb migrate --yes --pg-user <admin>` when the extension needs an admin. `serve` does not read the ownership notes that `migrate --yes` checks before it takes the lock, so a migration that fails on a table the application role does not own stops the run, commits nothing of that migration in that database, and prints the same note.
-
-`serve --migrate` does not detect a running server of a release before 1.0, and neither does `migrate --yes`. Stop every server before the upgrade from 0.1.x, as step 1 of the [general upgrade procedure](#general-upgrade-procedure) says.
-
-#### Deployment Recipes
-
-- Single host: stop the server and take the backup the general upgrade procedure describes, then start the new binary with `extenddb serve --migrate --config extenddb.toml`, or run `extenddb migrate --config extenddb.toml --yes` before `serve`.
-- Docker Compose: no change. The `extenddb-bootstrap` service runs `migrate --yes` before the server starts.
-- Kubernetes: one replica, the Deployment strategy `Recreate`, and a migration Job that runs `extenddb migrate --yes` with the serving Secret, applied in the same release as the new Deployment. The Job can start while the old pod is still in its termination grace period, because `migrate --yes` waits for that server's registration to end, for up to its `--lock-timeout`. A pod of the new release that starts before the Job finishes exits 3, and Kubernetes restarts it. Do not run the Job as a Helm pre-upgrade hook. Helm runs that hook while the old pod still serves, so from 1.0 on its `migrate --yes` would exit 6 on every upgrade, and on the upgrade from 0.1.x it would adopt the catalog while the old server, which it cannot see, still serves it. Run the Job rather than `serve --migrate` in the pod: the server answers no request while the migrations run, and a liveness probe would restart the pod during a long migration.
-
-#### Exit Codes of serve
-
-`serve` exits with the codes of the [status table](#the-catalog-status): 1 for an error, and in a production build for a store that is not a catalog; 3 for a catalog behind it under `refuse`; 4 and 5 as listed there; and 6 under `apply` when the lock or a running server outlasted `catalog_upgrade_lock_timeout`. Under both values a server also exits 6, without waiting, when a migration holds the lock as it registers.
-
-In daemon mode, the default, `serve` reads the status before it forks, and under `apply` it migrates before it forks too, so the invoking shell receives these codes and the message on stderr. After the fork the server reads the status again and registers. A server that stops there, for example with 6 because a `migrate --yes` started between the two reads, writes its message to syslog. The invoking shell then sees exit status 1 when the server stopped within about 3 seconds of the fork, and 0 when it stopped later. Under `--foreground` every code and message reaches the caller.
 
 ## Writing a New Migration
 
@@ -211,6 +170,62 @@ To discard data written after the upgrade as well, restore `<data-db>` from its 
 3. Rebuild the previous version and start it
 
 This manual has no tested rollback for Cassandra. Before migrating, with every server stopped, take a snapshot of the catalog keyspace and every account keyspace on every node with your usual Cassandra tooling; a rollback restores those snapshots, again with every server stopped, before the previous binary starts.
+
+## Applying Migrations at Startup
+
+`serve` reads the catalog's status before it opens the catalog. The `[server]` key `catalog_upgrade` sets what it does with a catalog that is behind it:
+
+| Value | A catalog behind the binary |
+|-------|-----------------------------|
+| `refuse` | `serve` exits 3. The message lists the pending migrations, says which servers to stop and what to back up, gives the `migrate --yes` command, and ends with `or start this server with --migrate`. The default in a production build |
+| `apply` | `serve` applies the pending migrations, then serves. The default in a dev build, which the dev image and the npm launcher run |
+
+`serve --migrate` sets `apply` for one run. `EXTENDDB__SERVER__CATALOG_UPGRADE` sets the key from the environment and overrides the config file, as it does for every key. `serve` refuses any other value with a configuration error.
+
+Under `apply`, `serve` migrates the catalog before it opens it, through the same run as `migrate --yes`:
+
+1. On PostgreSQL it reads the ownership notes before it takes the lock, as `migrate --yes` does. When the application role does not own every table, view and sequence in the public schema of both databases, `serve` exits 1 and prints the same notes, before any change. Step 4 of the [general upgrade procedure](#general-upgrade-procedure) describes the statements each note prints.
+2. It takes the migration lock, which waits for another migration and for running servers to stop. On PostgreSQL the run also waits for any statement an earlier migrator left running. On every backend `[server] catalog_upgrade_lock_timeout` bounds the time the run spends in all of these waits together, 60 seconds by default and at most 86400 seconds. With a timeout of 0 the run tries each once. `EXTENDDB__SERVER__CATALOG_UPGRADE_LOCK_TIMEOUT` sets the timeout from the environment.
+3. It reads the status again under the lock. When the catalog is Current or AheadCompatible by then, because another process migrated it while this one waited, the server releases the lock and starts, having written nothing.
+4. It runs the `detect` step of every pending code migration. When one finds items, `serve` exits 5 and names them, having written nothing.
+5. On SQLite it copies the database, as `migrate --yes` does.
+6. It applies the migrations, releases the lock, registers as the catalog's server, and serves.
+
+When the wait reaches the timeout, the server reads the status once more. It starts on a catalog that another process migrated in the meantime, and exits 6 on any other.
+
+Two servers started together under `apply` migrate the catalog once. One of them applies the migrations. The other finds nothing to apply, after it takes the lock or, when the first server already serves, after its wait for that server's registration reaches the timeout. Either of the two can exit 6 when it registers while the other holds the lock, and comes back under its restart loop. On SQLite one of them serves and the other exits 6, because one server at a time can hold the database file. On PostgreSQL, Cassandra and MongoDB both can end up serving the catalog, and v1.0 supports one server per catalog ([Multi-Instance Considerations](11-deployment-guide.md#multi-instance-considerations)), so start one.
+
+While it migrates, `serve` prints progress lines on stderr, each starting with `catalog migration: `. Before the run they name the catalog's migration and the pending migrations, and say that the server is taking the lock. While the run goes on, a line every 5 seconds says how long it has taken so far. When the run ends, a line names each migration applied, and the last line names the migration the catalog is at. On PostgreSQL the lines that say what the run waits for go to stdout, without the prefix. The npm launcher's startup timeout of 15 seconds counts from the last of the prefixed lines.
+
+`serve` binds its port after the status read and the run, so the port accepts no connection while the catalog migrates. It still binds before it forks, so in daemon mode a port that is in use is reported to the invoking shell, after the migrations have been applied. On a platform without daemon mode, `serve` without `--foreground` fails before it reads the catalog.
+
+`apply` changes only what `serve` does with a Behind catalog. Under both values `serve` serves a Current or AheadCompatible catalog, and refuses every other status with its code from the [status table](#the-catalog-status) before it takes the lock: NeedsAttention, Changed and WrittenByOlderRelease with 5, AheadIncompatible with 4, and Uninitialized with 1, except that a dev build creates a catalog in a missing or empty database file. No setting or flag makes `serve` open a catalog in any of these states.
+
+`serve` connects with the credentials in the config file, as `migrate` does, and that role does all the schema work. It takes no admin role. When it applies migrations on PostgreSQL, it also tries to create the pgvector extension as the application role, as `migrate --yes` does without `--pg-user`, and prints the result. When the extension needs a role that may create it, the note names the command to run, `extenddb migrate --yes --pg-user <role>`.
+
+On PostgreSQL, Cassandra and MongoDB, and on SQLite with a server older than 0.1.14, neither `serve --migrate` nor `migrate --yes` detects a running server of a release before 1.0. Stop every server before the upgrade from 0.1.x, as step 1 of the [general upgrade procedure](#general-upgrade-procedure) says.
+
+### Deployment Recipes
+
+- Single host: stop the server and take the backup the general upgrade procedure describes, then start the new binary with `extenddb serve --migrate --config extenddb.toml`, or run `extenddb migrate --config extenddb.toml --yes` before `serve`.
+- Docker Compose: no change. The `extenddb-bootstrap` service runs `migrate --yes` before the server starts.
+- Kubernetes: one replica, the Deployment strategy `Recreate`, and a migration Job applied in the same release as the new Deployment, as below.
+
+On Kubernetes the migration Job uses the serving Secret. It runs the preview first, which takes no lock, and `migrate --yes` only when the preview exits 3. Its container runs this as its `command`, with `CONFIG` set to the path of the config file:
+
+```sh
+sh -c 'extenddb migrate --config "$CONFIG"; rc=$?; [ "$rc" -eq 3 ] || exit "$rc"; exec extenddb migrate --config "$CONFIG" --yes'
+```
+
+On a release with nothing to apply, the preview exits 0, so the Job succeeds even when a pod of the new release is already serving; `migrate --yes` would wait for that server and exit 6. When migrations are pending, the Job can start while the old pod is still in its termination grace period, because `migrate --yes` waits for that server's registration to end, for up to its `--lock-timeout`. That timeout, 60 seconds by default, has to be longer than the old pod takes to stop. A pod of the new release that starts before the Job finishes exits 3, and Kubernetes restarts it after its CrashLoopBackOff delay, which grows up to 5 minutes, so the new server can start up to 5 minutes after the Job ends.
+
+Do not run the Job as a Helm pre-upgrade hook. Helm runs that hook while the old pod still serves, so from 1.0 on its `migrate --yes` would exit 6 on every release that has a migration to apply, and on the upgrade from 0.1.x it would migrate the catalog while the old server still serves it, because `migrate --yes` cannot see a 0.1.x server on PostgreSQL, Cassandra or MongoDB. Run the Job rather than `serve --migrate` in the pod: the port accepts no connection while the catalog migrates, so a liveness probe fails and Kubernetes restarts the pod during a long migration.
+
+### Exit Codes of serve
+
+`serve` exits with the codes of the [status table](#the-catalog-status): 1 for an error, for a store that is not a catalog in a production build, and under `apply` on PostgreSQL when the ownership notes refuse the run; 3 for a catalog behind it under `refuse`; 4 and 5 as listed there; and 6 under `apply` when the lock or a running server outlasted `catalog_upgrade_lock_timeout`. Under both values a server also exits 6, without waiting, when a migration holds the lock as it registers.
+
+In daemon mode, the default, `serve` reads the status before it forks, and under `apply` it migrates before it forks too, so the invoking shell receives these codes and the message on stderr. After the fork the server registers, then reads the lock and the status again. A server that stops there, for example with 6 because a `migrate --yes` started between the two reads of the status, writes its message to syslog. The invoking shell then sees exit status 1 when the server stopped within about 3 seconds of the fork, and 0 when it stopped later. Under `--foreground` every code and message reaches the caller.
 
 ## Version History
 
