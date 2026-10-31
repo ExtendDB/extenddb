@@ -449,7 +449,12 @@ class TestStreamArnScope:
 
         admin = self._principal(ALLOW_ALL)
         noperm = self._principal(NO_PERMISSIONS)
-        # Control: the same token shape with the issued ARN reads the stream.
+        # Control for this test only: the same hand-built token with the issued
+        # stream ARN reads the stream, so the refusals below come from the
+        # respelled ARN and not from the token shape. This is not parity: the
+        # service answers "Invalid ShardIterator" to every token it did not
+        # issue, including this one (measured 2026-10-23), while ExtendDB serves
+        # it because its iterators carry no signature. That gap exists on main.
         admin.streams.get_records(ShardIterator=token(self.table["stream_arn"]), Limit=10)
         for label in ("account_other", "partition_aws_cn", "region_other", "service_DYNAMODB"):
             for who, p in (("admin", admin), ("noperm", noperm)):
