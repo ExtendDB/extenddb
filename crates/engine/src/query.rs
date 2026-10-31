@@ -313,25 +313,37 @@ pub async fn handle_query(
     } else {
         &query_key_info.attribute_definitions
     };
-    key_condition.resolve_key_schema_with(
-        &query_key_info.key_schema,
-        &effective_maps.names,
-        |path, value| check_key_value_type(path, value, type_definitions, effective_maps),
-    )?;
-    refuse_begins_with_on_number(
-        &key_condition,
-        &query_key_info.attribute_definitions,
-        effective_maps,
-    )?;
-    // On a single-attribute key schema, validate that the partition key is
-    // actually referenced in the condition. The classifier has already required
-    // an equality on every HASH attribute of a multi-attribute one.
-    if !multipart {
-        let pk_resolved = resolve_path_attr_name(&key_condition.pk_path, &effective_maps.names);
-        if pk_resolved.as_deref() != Some(pk_attr.as_str()) {
-            return Err(DynamoDbError::ValidationException(format!(
-                "Query condition missed key schema element: {pk_attr}"
-            )));
+    // A key condition with no equality clause, and on a schema with one HASH
+    // attribute an equality on another attribute paired with a non-equality
+    // on the HASH attribute (`sk = :x AND pk > :y`), has no partition key
+    // clause to assign or check. It skips the classification and the value
+    // checks here and is refused after the expression validations below,
+    // where the key schema picks the wording (measured 2026-10-23: an unused
+    // value, an invalid FilterExpression or ProjectionExpression and an
+    // invalid Select are reported ahead of it, and an unused value and an
+    // invalid FilterExpression ahead of a wrong-typed value in its clause on
+    // the HASH attribute). See `refuse_without_hash_equality`.
+    if !key_condition.lacks_hash_equality(&query_key_info.key_schema, &effective_maps.names) {
+        key_condition.resolve_key_schema_with(
+            &query_key_info.key_schema,
+            &effective_maps.names,
+            |path, value| check_key_value_type(path, value, type_definitions, effective_maps),
+        )?;
+        refuse_begins_with_on_number(
+            &key_condition,
+            &query_key_info.attribute_definitions,
+            effective_maps,
+        )?;
+        // On a single-attribute key schema, validate that the partition key is
+        // referenced in the condition. The classifier has already required an
+        // equality on every HASH attribute of a multi-attribute one.
+        if !multipart {
+            let pk_resolved = resolve_path_attr_name(&key_condition.pk_path, &effective_maps.names);
+            if pk_resolved.as_deref() != Some(pk_attr.as_str()) {
+                return Err(DynamoDbError::ValidationException(format!(
+                    "Query condition missed key schema element: {pk_attr}"
+                )));
+            }
         }
     }
 
@@ -448,6 +460,21 @@ pub async fn handle_query(
             .is_some_and(|a| !a.is_empty()),
         input.index_name.is_some(),
         extenddb_core::validation::IS_QUERY,
+    )?;
+
+    // An undefined #name or :value in the key condition is reported first,
+    // with the KeyConditionExpression prefix, whatever the key schema says.
+    // Then a key condition that skipped the classification above is refused,
+    // the key schema of the table or index queried picking the wording. An
+    // ExclusiveStartKey or a key value size is checked after it (measured
+    // 2026-10-23). Legacy KeyConditions is desugared above with every
+    // reference defined and with an equality clause, or refused there, so it
+    // passes both checks.
+    refuse_without_hash_equality(
+        &key_condition,
+        &query_key_info.key_schema,
+        &query_key_info.attribute_definitions,
+        effective_maps,
     )?;
 
     // When Select=ALL_PROJECTED_ATTRIBUTES, capture the index info for post-read filtering.
@@ -670,6 +697,72 @@ fn refuse_begins_with_on_number(
     Ok(())
 }
 
+/// Check the references of a key condition, then refuse one that skipped the
+/// classification in `handle_query`: a key condition with no equality clause,
+/// and on a schema with one HASH attribute an equality on another attribute
+/// paired with a non-equality on the HASH attribute. `handle_query` calls this
+/// after the expression validations.
+///
+/// The order, measured on 2026-11-01 on a schema with one HASH attribute,
+/// two samples each:
+///
+/// 1. An undefined `#name` or `:value`.
+/// 2. Two conditions on one attribute, whatever their value types:
+///    `pk > :x AND pk < :n` answers `Invalid KeyConditionExpression:
+///    KeyConditionExpressions must only contain one condition per key`.
+/// 3. When a clause names the HASH attribute of the key schema queried, a
+///    value in that clause whose type differs from the attribute's
+///    definition: `pk > :n AND sk > :y`, `sk = :x AND pk > :n` and
+///    `pk BETWEEN :n AND :m` answer `One or more parameter values were
+///    invalid: Condition parameter type does not match schema type`. Then
+///    `begins_with` on a number HASH attribute, alone or with another clause
+///    on either side (measured 2026-10-23 for `begins_with(pk, :n)`, and
+///    2026-11-01 for `begins_with(pk, :n) AND sk > :x` and
+///    `sk > :x AND begins_with(pk, :n)`: `Incorrect operand type for
+///    operator or function; operator or function: begins_with, operand type:
+///    N`). The parser keeps a `begins_with` whole in `sk_condition`, which
+///    is the clause read here. When both clauses are `begins_with` it keeps
+///    the first, so a `begins_with` on the HASH attribute in the second is
+///    not recognised.
+/// 4. The key schema's wording. A value on another attribute is not
+///    checked: `pk > :x AND sk > :n` answers `Query key condition not
+///    supported`, and `sk > :n`, with no clause on the HASH attribute,
+///    `Query condition missed key schema element: pk`.
+///
+/// On a multi-attribute key schema the HASH wording comes before any value
+/// check (measured 2026-10-23: `h > :n` with an N value on an S HASH
+/// attribute answers `HASH key attributes h must have equality conditions
+/// specified in the query`), so step 3 does not run there.
+///
+/// Every other key condition went through the classification in
+/// `handle_query` and passes.
+fn refuse_without_hash_equality(
+    key_condition: &extenddb_core::expression::KeyCondition,
+    key_schema: &[extenddb_core::types::KeySchemaElement],
+    attribute_definitions: &[extenddb_core::types::AttributeDefinition],
+    maps: &ExpressionMaps,
+) -> Result<(), DynamoDbError> {
+    key_condition.validate_references(maps)?;
+    if !key_condition.lacks_hash_equality(key_schema, &maps.names) {
+        return Ok(());
+    }
+    key_condition.refuse_two_conditions_on_one_attribute(&maps.names)?;
+    if !extenddb_core::types::is_multipart_key_schema(key_schema)
+        && let Some(hash) = key_schema.iter().find(|ks| ks.key_type == KeyType::Hash)
+    {
+        let hash_definition: Vec<extenddb_core::types::AttributeDefinition> = attribute_definitions
+            .iter()
+            .filter(|def| def.attribute_name == hash.attribute_name)
+            .cloned()
+            .collect();
+        for (path, value) in key_condition.operands_naming(&hash.attribute_name, &maps.names) {
+            check_key_value_type(path, value, &hash_definition, maps)?;
+        }
+        refuse_begins_with_on_number(key_condition, &hash_definition, maps)?;
+    }
+    key_condition.refuse_without_hash_equality(key_schema, &maps.names)
+}
+
 /// Validate that all `#name` references in an expression AST are defined.
 fn validate_name_refs_in_expr(
     expr: &extenddb_core::expression::Expr,
@@ -771,3 +864,6 @@ mod empty_key_condition_tests {
         assert!(reject_empty_key_condition_expression(Some("pk = :v")).is_ok());
     }
 }
+
+#[cfg(test)]
+mod no_hash_equality_tests;
