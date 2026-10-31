@@ -20,6 +20,61 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # One release build per feature set. The jobs below download the binary
+  # instead of each compiling the same one, so the cargo flags and features of
+  # a test job live in the build job it needs.
+  build-postgres:
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          # Only pushes to main save, so other runs restore main's cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build release
+        run: cargo build --release
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: extenddb-postgres
+          path: target/release/extenddb
+          if-no-files-found: error
+          retention-days: 1
+          # A re-run of a failed job uploads the same name again.
+          overwrite: true
+
+  build-sqlite:
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          # Only pushes to main save, so other runs restore main's cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build release (SQLite backend)
+        run: cargo build --release -p extenddb --no-default-features --features sqlite
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: extenddb-sqlite
+          path: target/release/extenddb
+          if-no-files-found: error
+          retention-days: 1
+          # A re-run of a failed job uploads the same name again.
+          overwrite: true
+
   run-integration:
     # Dedicated ExtendDB runner group (4 vCPU / 16 GB, capped at 20 concurrent),
     # pinned to Ubuntu 24.04. ubuntu-latest is an Amazon-wide pool of 1,000
@@ -29,6 +84,15 @@ jobs:
     # 2026 and this compiles Rust; move to 26 deliberately.
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 40
+    needs: build-postgres
+    # Three shards by test file (devtools/test-shards); the integration job
+    # checks that together they collected every test of the whole suite.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    env:
+      EXTENDDB_TEST_SHARD: ${{ matrix.shard }}/3
     services:
       postgres:
         # pgvector's own image, which is postgres:16 plus the extension. The
@@ -49,16 +113,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
-          cache-on-failure: true
-          # Only pushes to main save, so other runs restore main's cache.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          name: extenddb-postgres
+          path: target/release
 
-      - name: Build release
-        run: cargo build --release
+      # Artifacts do not keep file modes.
+      - run: chmod +x target/release/extenddb
 
       - name: Initialize ExtendDB
         id: init
@@ -107,22 +168,37 @@ jobs:
         if: failure()
         run: sudo journalctl -t extenddb --no-pager -n 500 || true
 
+      # The integration job checks these lists.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        if: always()
+        with:
+          name: shards-run-integration-${{ matrix.shard }}
+          path: discussions/shards/
+          if-no-files-found: warn
+          retention-days: 1
+          # A re-run of a failed job uploads the same name again.
+          overwrite: true
+
   run-integration-sqlite:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 40
+    needs: build-sqlite
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    env:
+      EXTENDDB_TEST_SHARD: ${{ matrix.shard }}/3
     steps:
       - uses: actions/checkout@v6
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
-          cache-on-failure: true
-          # Only pushes to main save, so other runs restore main's cache.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          name: extenddb-sqlite
+          path: target/release
 
-      - name: Build release (SQLite backend)
-        run: cargo build --release -p extenddb --no-default-features --features sqlite
+      # Artifacts do not keep file modes.
+      - run: chmod +x target/release/extenddb
 
       - name: Initialize ExtendDB
         id: init
@@ -166,6 +242,17 @@ jobs:
       - name: Dump server syslog on failure
         if: failure()
         run: sudo journalctl -t extenddb --no-pager -n 500 || true
+
+      # The integration job checks these lists.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        if: always()
+        with:
+          name: shards-run-integration-sqlite-${{ matrix.shard }}
+          path: discussions/shards/
+          if-no-files-found: warn
+          retention-days: 1
+          # A re-run of a failed job uploads the same name again.
+          overwrite: true
 
   run-integration-dev-mode:
     # dev-mode was shipped with no CI coverage at all, which is how the batch and
@@ -225,6 +312,7 @@ jobs:
   run-rust-integration:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 40
+    needs: build-postgres
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -249,8 +337,14 @@ jobs:
           # Only pushes to main save, so other runs restore main's cache.
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Build release
-        run: cargo build --release
+      # After the cache restore, so a cached target/ cannot replace it.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: extenddb-postgres
+          path: target/release
+
+      # Artifacts do not keep file modes.
+      - run: chmod +x target/release/extenddb
 
       - name: Initialize ExtendDB
         id: init
@@ -303,6 +397,42 @@ jobs:
           EXTENDDB_EXPECT_VECTORS: "1"
         run: devtools/run-tests --extenddb --rust-integration --release
 
+      # The daemonized server logs to syslog; dump it so server-side failures
+      # are diagnosable from the job log.
+      - name: Dump server syslog on failure
+        if: failure()
+        run: sudo journalctl -t extenddb --no-pager -n 500 || true
+
+  # The PostgreSQL storage-level tests drive the storage layer directly and
+  # need only the database, not a running server, so they run beside
+  # run-rust-integration instead of after it.
+  run-postgres-storage-tests:
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 40
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: devpass
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 127.0.0.1:5432:5432
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          # Only pushes to main save, so other runs restore main's cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       # The control plane for vector indexes is not reachable over the wire while
       # this backend declares no vector search capability, so its tests drive the
       # storage layer directly against this job's PostgreSQL. The PutItem create
@@ -326,12 +456,6 @@ jobs:
           --test stream_shard_retention --test stream_shard_ownership --test stream_records_page_order --test backup_restore
           --test gsi_online_build --test gsi_stale_writer --test table_snapshot
 
-      # The daemonized server logs to syslog; dump it so server-side failures
-      # are diagnosable from the job log.
-      - name: Dump server syslog on failure
-        if: failure()
-        run: sudo journalctl -t extenddb --no-pager -n 500 || true
-
   # The runtime-detection proof: the same binary, against a PostgreSQL with no
   # pgvector, must refuse vector indexes over the wire. Today the job above runs
   # on a plain image too, so this looks like a duplicate of it; it is not, because
@@ -341,6 +465,7 @@ jobs:
   run-rust-integration-postgres-novector:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 40
+    needs: build-postgres
     services:
       postgres:
         image: postgres:16
@@ -365,8 +490,14 @@ jobs:
           # Only pushes to main save, so other runs restore main's cache.
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Build release
-        run: cargo build --release
+      # After the cache restore, so a cached target/ cannot replace it.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: extenddb-postgres
+          path: target/release
+
+      # Artifacts do not keep file modes.
+      - run: chmod +x target/release/extenddb
 
       - name: Initialize ExtendDB
         id: init
@@ -416,6 +547,7 @@ jobs:
   run-rust-integration-sqlite:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 40
+    needs: build-sqlite
 
     steps:
       - uses: actions/checkout@v6
@@ -428,8 +560,14 @@ jobs:
           # Only pushes to main save, so other runs restore main's cache.
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Build release (SQLite backend)
-        run: cargo build --release -p extenddb --no-default-features --features sqlite
+      # After the cache restore, so a cached target/ cannot replace it.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: extenddb-sqlite
+          path: target/release
+
+      # Artifacts do not keep file modes.
+      - run: chmod +x target/release/extenddb
 
       - name: Initialize ExtendDB
         id: init
@@ -491,6 +629,7 @@ jobs:
         run-integration-sqlite,
         run-integration-dev-mode,
         run-rust-integration,
+        run-postgres-storage-tests,
         run-rust-integration-postgres-novector,
         run-rust-integration-sqlite,
       ]
@@ -501,7 +640,22 @@ jobs:
              [ "${{ needs.run-integration-sqlite.result }}" != "success" ] || \
              [ "${{ needs.run-integration-dev-mode.result }}" != "success" ] || \
              [ "${{ needs.run-rust-integration.result }}" != "success" ] || \
+             [ "${{ needs.run-postgres-storage-tests.result }}" != "success" ] || \
              [ "${{ needs.run-rust-integration-postgres-novector.result }}" != "success" ] || \
              [ "${{ needs.run-rust-integration-sqlite.result }}" != "success" ]; then
             exit 1
           fi
+
+      # Fails unless the shards of each sharded job together collected every
+      # test of the whole suite exactly once, so a bad split cannot pass.
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          pattern: shards-run-integration-[0-9]*
+          path: shards/run-integration
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          pattern: shards-run-integration-sqlite-*
+          path: shards/run-integration-sqlite
+      - name: Check the shards ran every test
+        run: python3 devtools/test-shards check shards/run-integration shards/run-integration-sqlite
