@@ -67,7 +67,14 @@ async fn require_session(
     let Some(token) = extract_session_token(headers) else {
         return Err(Redirect::to("/console/login").into_response());
     };
-    match state.sessions.validate(&token, &*state.catalog_store).await {
+    session_response(state.sessions.validate(&token, &*state.catalog_store).await)
+}
+
+/// The session data for a session that passed its check, or the response a
+/// console request gets when it did not.
+#[allow(clippy::result_large_err)]
+fn session_response(check: SessionCheck) -> Result<SessionData, Response> {
+    match check {
         SessionCheck::Valid {
             identity,
             csrf_token,
@@ -156,5 +163,45 @@ fn op_error_message(e: extenddb_storage::management_store::OpError) -> String {
         | OpError::HasDependents(m)
         | OpError::NotFound(m)
         | OpError::Internal(m) => m,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::header::LOCATION;
+
+    use super::*;
+
+    #[test]
+    fn a_passed_check_returns_the_session() {
+        let Ok(session) = session_response(SessionCheck::Valid {
+            identity: CallerIdentity::Admin("alice".to_owned()),
+            csrf_token: "csrf".to_owned(),
+        }) else {
+            panic!("a session that passed its check was refused");
+        };
+        assert!(matches!(session.identity, CallerIdentity::Admin(ref n) if n == "alice"));
+        assert_eq!(session.csrf_token, "csrf");
+    }
+
+    #[test]
+    fn an_ended_session_gets_the_login_redirect() {
+        let Err(response) = session_response(SessionCheck::Invalid) else {
+            panic!("an ended session was accepted");
+        };
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers().get(LOCATION).map(|v| v.as_bytes()),
+            Some(&b"/console/login"[..])
+        );
+    }
+
+    #[test]
+    fn an_unreadable_catalog_gets_503() {
+        let Err(response) = session_response(SessionCheck::Unavailable) else {
+            panic!("a request was accepted while the catalog could not be read");
+        };
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().get(LOCATION).is_none());
     }
 }
