@@ -122,18 +122,23 @@ impl SessionStore {
 
     /// Check a session token for a console request.
     ///
-    /// Looks the session up, refreshing its last-active time, then reads the
-    /// principal's current password hash from `catalog`. The store lock is
+    /// Looks the session up, then reads the principal's current password hash
+    /// from `catalog`. Only a request that passes the check refreshes the
+    /// session's last-active time, so requests refused while the catalog
+    /// cannot be read do not keep an idle session alive. The store lock is
     /// not held during the read.
     pub async fn validate(&self, token: &str, catalog: &dyn PasswordHashStore) -> SessionCheck {
         let Some((identity, csrf_token, stamp)) = self.lookup(token).await else {
             return SessionCheck::Invalid;
         };
         match current_password_hash(catalog, &identity).await {
-            Ok(Some(hash)) if CredentialStamp::of(&hash) == stamp => SessionCheck::Valid {
-                identity,
-                csrf_token,
-            },
+            Ok(Some(hash)) if CredentialStamp::of(&hash) == stamp => {
+                self.touch(token).await;
+                SessionCheck::Valid {
+                    identity,
+                    csrf_token,
+                }
+            }
             Ok(_) => {
                 self.remove(token).await;
                 SessionCheck::Invalid
@@ -146,20 +151,26 @@ impl SessionStore {
     }
 
     /// Look up a session by token. Returns `(identity, csrf_token, stamp)` if
-    /// it has not expired, refreshing the last-active timestamp.
+    /// it has not expired. Does not refresh the last-active timestamp.
     async fn lookup(&self, token: &str) -> Option<(CallerIdentity, String, CredentialStamp)> {
         let mut map = self.sessions.lock().await;
-        let entry = map.get_mut(token)?;
+        let entry = map.get(token)?;
         if entry.last_active.elapsed() > SESSION_TTL {
             map.remove(token);
             return None;
         }
-        entry.last_active = Instant::now();
         Some((
             entry.identity.clone(),
             entry.csrf_token.clone(),
             entry.stamp.clone(),
         ))
+    }
+
+    /// Record activity on a session that passed its check.
+    async fn touch(&self, token: &str) {
+        if let Some(entry) = self.sessions.lock().await.get_mut(token) {
+            entry.last_active = Instant::now();
+        }
     }
 
     /// Remove a session (logout).

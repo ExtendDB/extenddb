@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use extenddb_storage::management_store::{OpError, OpResult, PasswordHashStore};
 use futures::future::BoxFuture;
@@ -209,6 +210,44 @@ async fn catalog_error_refuses_the_request_and_keeps_the_session() {
 
     catalog.failing.store(false, Ordering::SeqCst);
     assert!(is_valid(&store, &catalog, &alice).await);
+}
+
+/// Move a session's last-active time `by` into the past.
+async fn backdate(store: &SessionStore, token: &str, by: Duration) -> Instant {
+    let then = Instant::now()
+        .checked_sub(by)
+        .expect("the monotonic clock is past the backdate");
+    store
+        .sessions
+        .lock()
+        .await
+        .get_mut(token)
+        .expect("session exists")
+        .last_active = then;
+    then
+}
+
+async fn last_active(store: &SessionStore, token: &str) -> Instant {
+    store.sessions.lock().await[token].last_active
+}
+
+#[tokio::test]
+async fn only_a_request_that_passes_the_check_counts_as_activity() {
+    let store = SessionStore::new();
+    let catalog = FakeCatalog::default();
+    let alice = admin_session(&store, &catalog, "alice", "hash-alice").await;
+    let then = backdate(&store, &alice, Duration::from_secs(60)).await;
+
+    catalog.failing.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        store.validate(&alice, &catalog).await,
+        SessionCheck::Unavailable
+    ));
+    assert_eq!(last_active(&store, &alice).await, then);
+
+    catalog.failing.store(false, Ordering::SeqCst);
+    assert!(is_valid(&store, &catalog, &alice).await);
+    assert!(last_active(&store, &alice).await > then + Duration::from_secs(59));
 }
 
 #[tokio::test]
