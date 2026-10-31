@@ -34,6 +34,13 @@ fn tag_subresource_not_table_or_stream(resource: &str) -> bool {
     !matches!(segs.next(), None | Some("") | Some("stream"))
 }
 
+/// True for a `table/<name>/stream/<label>` resource.
+fn tag_subresource_is_stream(resource: &str) -> bool {
+    resource
+        .strip_prefix("table/")
+        .is_some_and(|tail| tail.split('/').nth(1) == Some("stream"))
+}
+
 /// Extract the table name from a `DynamoDB` table ARN, using the one shared
 /// resource parser ([`extenddb_core::arn::fields`]) so this layer splits an ARN
 /// the same way authorization and the engine stream resolver do.
@@ -60,6 +67,7 @@ fn extract_table_name_from_arn(arn: &str) -> Option<&str> {
 /// | Table ARN naming an index or other sub-resource | `ValidationException` (only table or stream is accepted) |
 /// | Account differs from the caller's | `AccessDeniedException` |
 /// | Table ARN with a different partition, service, or region | `ValidationException` (invalid `TableArn`) |
+/// | Stream ARN with a different partition, service, or region | `ValidationException` (`Invalid StreamArn`) |
 /// | Table does not exist | `ResourceNotFoundException` |
 ///
 /// Account is checked before the partition, service, and region, matching the
@@ -128,6 +136,18 @@ async fn validate_resource_arn(arn: &str, ctx: &OperationContext) -> Result<(), 
     }
 
     if partition != "aws" || service != "dynamodb" || region != ctx.region.as_ref() {
+        // A stream ARN with another partition, service or region reaches this
+        // point for an authorized principal (the server authorizes a tag
+        // operation's stream ARN as sent, and refuses another account before
+        // authorization). The service answers "Invalid StreamArn" here
+        // (measured live 2026-10-23, ListTagsOfResource and TagResource for an
+        // admin and for a principal with Allow * plus a Deny on the canonical
+        // ARN). The service's table message differs (measured live).
+        if tag_subresource_is_stream(resource) {
+            return Err(DynamoDbError::ValidationException(
+                "Invalid StreamArn".to_owned(),
+            ));
+        }
         return Err(DynamoDbError::ValidationException(format!(
             "Invalid TableArn: Invalid ResourceArn provided as input {arn}"
         )));
