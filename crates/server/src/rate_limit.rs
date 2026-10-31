@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Login rate limiting and account lockout.
+//! Login rate limiting per user and source address.
 //!
 //! Recorded failures live in the storage backend (the `login_attempts`
 //! table), keyed by principal and by the address the attempt came from, so

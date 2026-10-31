@@ -40,7 +40,7 @@ A new backend must implement **13 storage traits** plus the `CredentialStore` tr
 7. `AdminStore` — admin user management
 8. `SettingsStore` — runtime settings
 9. `MetricsStore` — historical metrics persistence and query
-10. `RateLimitStore` — login rate limiting and account lockout
+10. `RateLimitStore`: login rate limiting per user and source address
 11. `AuthorizationStore` — policy lookups for authorization decisions
 12. `BackupEngine` — backup and restore operations
 13. `Bootstrapper` — database initialization, destruction, migration, verification

@@ -87,7 +87,7 @@ pub trait MetricsStore: Send + Sync {
 
 // ── Rate limit store ───────────────────────────────────────────────────
 
-/// Login rate limiting and account lockout storage.
+/// Storage for login rate limiting per user and source address.
 pub trait RateLimitStore: Send + Sync {
     /// Count failed login attempts for a principal from one source IP within
     /// the lookback window. Failures from other sources do not count, so a

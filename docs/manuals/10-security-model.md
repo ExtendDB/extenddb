@@ -185,7 +185,15 @@ The console login form, the management API (HTTP Basic auth) and the `/metrics` 
 
 A successful login is not recorded. A storage error before or during the password check is answered `500` and is not counted against the caller.
 
-The source address is the peer address of the TCP connection, with an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) counted as the IPv4 address. Any other IPv6 address is counted by its /64 prefix, because a /64 is the block usually assigned to one host or site and a client can send from any address in it; all addresses in one /64 share one set of limits. ExtendDB does not read `X-Forwarded-For` or any other forwarded-address header (they are caller-supplied). Behind a reverse proxy or load balancer, every request arrives from the proxy's address, so all callers behind that proxy share one set of limits: 5 failures for a user from anyone behind the proxy, or 20 failures in total, lock that user or every user out for everyone behind the proxy for 15 minutes. Terminate TLS at the proxy only when callers are trusted not to lock each other out, or let clients connect to ExtendDB directly.
+The source address is the peer address of the TCP connection, with an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) counted as the IPv4 address. Any other IPv6 address is counted by its /64 prefix, because a /64 is the block usually assigned to one host or site and a client can send from any address in it; all addresses in one /64 share one set of limits. ExtendDB does not read `X-Forwarded-For` or any other forwarded-address header (they are caller-supplied).
+
+Callers that reach ExtendDB from one address share one set of limits. Five failures for a user from any of them refuse that user to all of them, and 20 failures in total refuse every user, until the oldest failure is 15 minutes old. Callers share an address in these cases:
+
+- **A reverse proxy or load balancer** that opens its own connections to ExtendDB, so every request arrives from the proxy's address. Put a proxy or load balancer in front of ExtendDB only when it preserves the client address, or when callers behind it are trusted not to lock each other out.
+- **The server host itself.** `extenddb manage` and a `/metrics` scraper running on the server host connect from the same address. A scraper with a stale password for an admin refuses that admin on the host after 5 failures, `extenddb manage` included.
+- **A NAT gateway**, whose egress address is shared by every client behind it.
+
+To recover an address that is refused, wait until its oldest failure is 15 minutes old, or delete the address's rows from the catalog's `login_attempts` table.
 
 A password can be guessed against one user from many addresses at 5 attempts per address per 15 minutes; only the source-address limit and the strength of the password bound that. Use long passwords for admin users and restrict which networks can reach the management and console ports.
 

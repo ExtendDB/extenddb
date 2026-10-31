@@ -44,7 +44,7 @@ ExtendDB defines **13 traits** across three categories:
 - `AdminStore` — admin user management
 - `SettingsStore` — runtime settings (key-value store)
 - `MetricsStore` — historical metrics persistence and query
-- `RateLimitStore` — login rate limiting and account lockout
+- `RateLimitStore`: login rate limiting per user and source address
 - `AuthorizationStore` — policy lookups for authorization decisions
 
 **Initialization and Lifecycle** (defined in `storage/src/bootstrapper.rs`):
@@ -207,7 +207,7 @@ storage.
 
 ### RateLimitStore
 
-Login rate limiting and account lockout:
+Login rate limiting per user and source address:
 - `count_principal_failures`, `count_ip_failures`, `record_failed_login`,
   `cleanup_old_attempts`
 
