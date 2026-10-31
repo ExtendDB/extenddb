@@ -749,3 +749,129 @@ async fn a_write_racing_a_disable_lands_before_the_ending_number_or_not_at_all()
     );
     s.cleanup().await;
 }
+
+async fn open_shard_ids(s: &Scratch, table_id: &str) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT shard_id FROM stream_shards \
+         WHERE table_id = $1 AND ending_sequence_number IS NULL ORDER BY shard_id",
+    )
+    .bind(table_id)
+    .fetch_all(&s.db)
+    .await
+    .expect("open shard ids")
+}
+
+/// A disable whose close failed after its catalog write, then an enable whose
+/// close of the label it read failed too: the table is enabled under a later
+/// label with no shards of its own, and the earlier stream's shards are still
+/// open. The next enable closes every earlier stream's open shards, whatever
+/// label it read.
+#[tokio::test]
+async fn an_enable_closes_an_earlier_stream_left_open() {
+    if base_conn().is_none() {
+        eprintln!("SKIP: EXTENDDB_TEST_PG_CONNECTION_STRING is not set");
+        return;
+    }
+    let s = scratch().await;
+    s.engine
+        .create_table(ACCOUNT, table_input("leftopen", true))
+        .await
+        .expect("create");
+    activate(&s, "leftopen").await;
+    put(&s, "leftopen", "k0", StreamViewType::NewAndOldImages).await;
+    let table = describe_table(&s, "leftopen").await;
+    let first_arn = table.latest_stream_arn.clone().expect("stream arn");
+    let first = describe_stream(&s, &first_arn).await;
+    let first_ids: Vec<String> = first.shards.iter().map(|x| x.shard_id.clone()).collect();
+    let later =
+        extenddb_storage::stream_lineage::next_stream_label(Some(first.stream_label.as_str()));
+    sqlx::query("UPDATE tables SET stream_label = $1 WHERE table_name = 'leftopen'")
+        .bind(&later)
+        .execute(&s.db)
+        .await
+        .expect("move the label on, as the enable's catalog write did");
+    assert_eq!(open_shard_ids(&s, &table.table_id).await, first_ids);
+
+    set_stream(&s, "leftopen", serde_json::json!({"StreamEnabled": false}))
+        .await
+        .expect("disable");
+    let reenabled = set_stream(
+        &s,
+        "leftopen",
+        serde_json::json!({"StreamEnabled": true, "StreamViewType": "KEYS_ONLY"}),
+    )
+    .await
+    .expect("enable");
+    let new = describe_stream(&s, &reenabled.latest_stream_arn.expect("new arn")).await;
+    let new_ids: Vec<String> = new.shards.iter().map(|x| x.shard_id.clone()).collect();
+    assert_eq!(
+        open_shard_ids(&s, &table.table_id).await,
+        new_ids,
+        "only the new stream's shards are open"
+    );
+    for id in &first_ids {
+        let (start, end): (String, Option<String>) = sqlx::query_as(
+            "SELECT starting_sequence_number, ending_sequence_number \
+             FROM stream_shards WHERE shard_id = $1",
+        )
+        .bind(id)
+        .fetch_one(&s.db)
+        .await
+        .expect("shard row");
+        let expected = last_record(&s, id).await.unwrap_or(start);
+        assert_eq!(end.as_deref(), Some(expected.as_str()));
+    }
+    s.cleanup().await;
+}
+
+/// A disable that read stream A and applies its shard changes only after an
+/// overlapping enable has closed A and created stream B: it closes A's
+/// shards, which are closed already, and leaves B's open.
+#[tokio::test]
+async fn a_disable_applying_after_an_overlapping_enable_leaves_the_new_stream_open() {
+    if base_conn().is_none() {
+        eprintln!("SKIP: EXTENDDB_TEST_PG_CONNECTION_STRING is not set");
+        return;
+    }
+    let s = scratch().await;
+    s.engine
+        .create_table(ACCOUNT, table_input("overlap", true))
+        .await
+        .expect("create");
+    activate(&s, "overlap").await;
+    put(&s, "overlap", "k0", StreamViewType::NewAndOldImages).await;
+    let table = describe_table(&s, "overlap").await;
+    let old_label = table.latest_stream_label.clone().expect("label");
+    set_stream(&s, "overlap", serde_json::json!({"StreamEnabled": false}))
+        .await
+        .expect("disable");
+    let closed = describe_stream(&s, &table.latest_stream_arn.clone().expect("arn")).await;
+    let reenabled = set_stream(
+        &s,
+        "overlap",
+        serde_json::json!({"StreamEnabled": true, "StreamViewType": "KEYS_ONLY"}),
+    )
+    .await
+    .expect("enable");
+    let new = describe_stream(&s, &reenabled.latest_stream_arn.expect("new arn")).await;
+    let new_ids: Vec<String> = new.shards.iter().map(|x| x.shard_id.clone()).collect();
+    put(&s, "overlap", "k1", StreamViewType::KeysOnly).await;
+
+    s.engine
+        .apply_disable_shard_changes_for_tests(ACCOUNT, "overlap", &table.table_id, &old_label)
+        .await
+        .expect("the late disable's shard changes");
+    assert_eq!(
+        open_shard_ids(&s, &table.table_id).await,
+        new_ids,
+        "the new stream's four shards stay open"
+    );
+    let old_again = describe_stream(&s, &closed.stream_arn).await;
+    for (a, b) in old_again.shards.iter().zip(&closed.shards) {
+        assert_eq!(
+            a.sequence_number_range.ending_sequence_number,
+            b.sequence_number_range.ending_sequence_number
+        );
+    }
+    s.cleanup().await;
+}

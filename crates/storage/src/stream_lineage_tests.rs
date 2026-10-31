@@ -539,3 +539,30 @@ fn a_table_has_a_labelled_shard_once_an_enable_wrote_one() {
     }];
     assert!(!has_labelled_shard(TID, &foreign));
 }
+
+#[test]
+fn an_enable_closes_the_open_shards_of_every_earlier_stream() {
+    const LATEST: &str = "2026-10-24T08:55:00.000";
+    let mut rows: Vec<ShardRow> = (0..SHARDS_PER_STREAM)
+        .map(|i| row(format!("shardId-{TID}-{i:016}"), None))
+        .collect();
+    rows.extend(stream_rows(OLD, StreamViewType::KeysOnly, None));
+    rows.extend(stream_rows(NEW, StreamViewType::NewImage, Some("5")));
+    rows.extend(stream_rows(LATEST, StreamViewType::NewImage, None));
+    let mut expected: Vec<String> = (0..SHARDS_PER_STREAM)
+        .map(|i| format!("shardId-{TID}-{i:016}"))
+        .collect();
+    expected.extend(
+        stream_rows(OLD, StreamViewType::KeysOnly, None)
+            .into_iter()
+            .map(|r| r.shard_id),
+    );
+    expected.sort();
+    // The legacy rows and the open OLD rows; NEW's rows are closed and
+    // LATEST's are not earlier.
+    assert_eq!(open_shard_ids_before(TID, LATEST, &rows), expected);
+    assert!(
+        open_shard_ids_before(TID, OLD, &stream_rows(OLD, StreamViewType::KeysOnly, None))
+            .is_empty()
+    );
+}

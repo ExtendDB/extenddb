@@ -9,16 +9,19 @@
 //! data database, so a stream change is two commits. `UpdateTable` changes the
 //! catalog row (specification and label) in its transaction and changes the
 //! shards after that transaction commits ([`PendingStream`]). A failure between
-//! the two leaves the catalog's answer in force: a disabled stream whose shards
-//! are still open (closed by the next change of that stream), or an enabled stream with no
-//! shards, which records nothing and is replaced by a disable and an enable.
+//! the two leaves the catalog's answer in force. A disable whose close failed
+//! leaves a disabled stream whose shards are still open: a retried disable is
+//! refused and closes them, and an enable closes them too, since an enable
+//! closes the open shards of every earlier stream of the table. An enable whose
+//! shard insert failed leaves an enabled stream with no shards, which records
+//! nothing and is replaced by a disable and an enable.
 
 use extenddb_core::types::{StreamSpecification, StreamViewType};
 use extenddb_storage::error::StorageError;
 use extenddb_storage::stream_lineage::{
     SHARDS_PER_STREAM, ShardRow, StreamChange, TableStreamRow, disabled_stream_to_close,
-    enable_still_current, next_stream_label, open_shard_ids_of, shard_id, stored_specification,
-    stream_change,
+    enable_still_current, next_stream_label, open_shard_ids_before, open_shard_ids_of, shard_id,
+    stored_specification, stream_change,
 };
 use sqlx::PgPool;
 
@@ -37,9 +40,10 @@ fn spec_of(value: Option<serde_json::Value>) -> Result<Option<StreamSpecificatio
         .map_err(internal)
 }
 
-/// The shard changes of a committed `UpdateTable` stream change: close the
-/// open shards of the stream the change read (`close`, the table's label at
-/// that time), then, on an enable, create the new stream's shards.
+/// The shard changes of a committed `UpdateTable` stream change: on a
+/// disable, close the open shards of the stream the change read (`close`, the
+/// table's label at that time); on an enable, close the open shards of every
+/// earlier stream, then create the new stream's shards.
 #[must_use]
 pub(crate) struct PendingStream {
     table_id: String,
@@ -48,6 +52,17 @@ pub(crate) struct PendingStream {
 }
 
 impl PendingStream {
+    /// The shard changes of a disable that read stream `label`, for tests that
+    /// apply one after an overlapping enable's.
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn disable_of(table_id: &str, label: &str) -> Self {
+        Self {
+            table_id: table_id.to_owned(),
+            close: Some(label.to_owned()),
+            open: None,
+        }
+    }
+
     /// Run the shard changes once the catalog transaction has committed.
     ///
     /// The enable's shards are inserted after its catalog row is visible, so a
@@ -58,7 +73,9 @@ impl PendingStream {
     /// label, closes the shards it inserted. A disable committed before the
     /// re-read is seen by it; one committed after finds all four rows open
     /// and closes them itself; both closing is idempotent through the
-    /// `ending_sequence_number IS NULL` guard.
+    /// `ending_sequence_number IS NULL` guard. A disable closes only the
+    /// stream it read, so one applying after an overlapping enable leaves the
+    /// new stream open.
     pub(crate) async fn apply(
         self,
         engine: &PostgresEngine,
@@ -66,16 +83,17 @@ impl PendingStream {
         table_name: &str,
     ) -> Result<(), StorageError> {
         let data_pool = &engine.data_pool;
-        if let Some(label) = &self.close {
-            PostgresEngine::close_stream_shards(data_pool, &self.table_id, label).await?;
-        }
-        if let Some((label, view_type)) = self.open {
-            PostgresEngine::insert_stream_shards(data_pool, &self.table_id, &label, view_type)
-                .await?;
-            let row = engine.stream_table_row(account_id, table_name).await?;
-            if !enable_still_current(row.as_ref().map(|(t, _)| t), &label) {
-                PostgresEngine::close_stream_shards(data_pool, &self.table_id, &label).await?;
+        let Some((label, view_type)) = self.open else {
+            if let Some(label) = &self.close {
+                PostgresEngine::close_stream_shards(data_pool, &self.table_id, label).await?;
             }
+            return Ok(());
+        };
+        PostgresEngine::close_streams_before(data_pool, &self.table_id, &label).await?;
+        PostgresEngine::insert_stream_shards(data_pool, &self.table_id, &label, view_type).await?;
+        let row = engine.stream_table_row(account_id, table_name).await?;
+        if !enable_still_current(row.as_ref().map(|(t, _)| t), &label) {
+            PostgresEngine::close_stream_shards(data_pool, &self.table_id, &label).await?;
         }
         Ok(())
     }
@@ -177,6 +195,26 @@ impl PostgresEngine {
         table_id: &str,
         label: &str,
     ) -> Result<(), StorageError> {
+        Self::close_selected_shards(data_pool, table_id, label, open_shard_ids_of).await
+    }
+
+    /// Close the open shards of every stream of the table older than `label`
+    /// (`stream_lineage::open_shard_ids_before`), as [`Self::close_stream_shards`]
+    /// closes one stream's.
+    async fn close_streams_before(
+        data_pool: &PgPool,
+        table_id: &str,
+        label: &str,
+    ) -> Result<(), StorageError> {
+        Self::close_selected_shards(data_pool, table_id, label, open_shard_ids_before).await
+    }
+
+    async fn close_selected_shards(
+        data_pool: &PgPool,
+        table_id: &str,
+        label: &str,
+        select: fn(&str, &str, &[ShardRow]) -> Vec<String>,
+    ) -> Result<(), StorageError> {
         let rows: Vec<ShardTuple> = sqlx::query_as(
             "SELECT table_id, shard_id, parent_shard_id, starting_sequence_number, \
                     ending_sequence_number \
@@ -186,7 +224,7 @@ impl PostgresEngine {
         .fetch_all(data_pool)
         .await
         .map_err(internal)?;
-        let ids = open_shard_ids_of(table_id, label, &shard_rows(rows));
+        let ids = select(table_id, label, &shard_rows(rows));
         if ids.is_empty() {
             return Ok(());
         }
@@ -383,6 +421,23 @@ impl PostgresEngine {
         .await
         .map_err(internal)?;
         Ok(shard_rows(rows))
+    }
+
+    /// Apply the shard changes of a disable that read stream `label` of table
+    /// `table_id`, as a disable whose apply runs after an overlapping enable's
+    /// would.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub async fn apply_disable_shard_changes_for_tests(
+        &self,
+        account_id: &str,
+        table_name: &str,
+        table_id: &str,
+        label: &str,
+    ) -> Result<(), StorageError> {
+        PendingStream::disable_of(table_id, label)
+            .apply(self, account_id, table_name)
+            .await
     }
 }
 

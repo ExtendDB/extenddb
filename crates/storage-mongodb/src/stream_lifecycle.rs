@@ -10,7 +10,13 @@
 //! in the data database. `UpdateTable` sets the specification and label on the
 //! table document first and changes the shards after that write
 //! ([`PendingStream`]), the order the PostgreSQL backend uses for the same
-//! two-database split.
+//! two-database split. A failure between the two leaves the table document's
+//! answer in force. A disable whose close failed leaves a disabled stream whose
+//! shards are still open: a retried disable is refused and closes them, and an
+//! enable closes them too, since an enable closes the open shards of every
+//! earlier stream of the table. An enable whose shard insert failed leaves an
+//! enabled stream with no shards, which records nothing and is replaced by a
+//! disable and an enable.
 
 use futures::TryStreamExt;
 use mongodb::bson::DateTime as BsonDateTime;
@@ -21,8 +27,8 @@ use extenddb_core::types::{StreamSpecification, StreamViewType};
 use extenddb_storage::error::StorageError;
 use extenddb_storage::stream_lineage::{
     SHARDS_PER_STREAM, ShardRow, StreamChange, TableStreamRow, disabled_stream_to_close,
-    enable_still_current, next_stream_label, open_shard_ids_of, shard_id, stored_specification,
-    stream_change,
+    enable_still_current, next_stream_label, open_shard_ids_before, open_shard_ids_of, shard_id,
+    stored_specification, stream_change,
 };
 
 use crate::MongoEngine;
@@ -50,9 +56,10 @@ fn table_row(table_name: &str, doc: &Document) -> TableStreamRow {
     }
 }
 
-/// The shard changes of an applied `UpdateTable` stream change: close the
-/// open shards of the stream the change read (`close`, the table's label at
-/// that time), then, on an enable, create the new stream's shards.
+/// The shard changes of an applied `UpdateTable` stream change: on a disable,
+/// close the open shards of the stream the change read (`close`, the table's
+/// label at that time); on an enable, close the open shards of every earlier
+/// stream, then create the new stream's shards.
 #[must_use]
 pub(crate) struct PendingStream {
     table_id: String,
@@ -71,24 +78,28 @@ impl PendingStream {
     /// with this label, closes the shards it inserted. A disable written
     /// before the re-read is seen by it; one written after finds all four
     /// shards open and closes them itself; both closing is idempotent through
-    /// the `ending_sequence_number: null` filter.
+    /// the `ending_sequence_number: null` filter. A disable closes only the
+    /// stream it read, so one applying after an overlapping enable leaves the
+    /// new stream open.
     pub(crate) async fn apply(
         self,
         engine: &MongoEngine,
         account_id: &str,
         table_name: &str,
     ) -> Result<(), StorageError> {
-        if let Some(label) = &self.close {
-            engine.close_stream_shards(&self.table_id, label).await?;
-        }
-        if let Some((label, view_type)) = self.open {
-            engine
-                .init_stream_shards(&self.table_id, &label, view_type)
-                .await?;
-            let row = engine.stream_table_row(account_id, table_name).await?;
-            if !enable_still_current(row.as_ref().map(|(t, _)| t), &label) {
-                engine.close_stream_shards(&self.table_id, &label).await?;
+        let Some((label, view_type)) = self.open else {
+            if let Some(label) = &self.close {
+                engine.close_stream_shards(&self.table_id, label).await?;
             }
+            return Ok(());
+        };
+        engine.close_streams_before(&self.table_id, &label).await?;
+        engine
+            .init_stream_shards(&self.table_id, &label, view_type)
+            .await?;
+        let row = engine.stream_table_row(account_id, table_name).await?;
+        if !enable_still_current(row.as_ref().map(|(t, _)| t), &label) {
+            engine.close_stream_shards(&self.table_id, &label).await?;
         }
         Ok(())
     }
@@ -139,12 +150,30 @@ impl MongoEngine {
         table_id: &str,
         label: &str,
     ) -> Result<(), StorageError> {
+        self.close_selected_shards(table_id, label, open_shard_ids_of)
+            .await
+    }
+
+    /// Close the open shards of every stream of the table older than `label`
+    /// (`stream_lineage::open_shard_ids_before`), as [`Self::close_stream_shards`]
+    /// closes one stream's.
+    async fn close_streams_before(&self, table_id: &str, label: &str) -> Result<(), StorageError> {
+        self.close_selected_shards(table_id, label, open_shard_ids_before)
+            .await
+    }
+
+    async fn close_selected_shards(
+        &self,
+        table_id: &str,
+        label: &str,
+        select: fn(&str, &str, &[ShardRow]) -> Vec<String>,
+    ) -> Result<(), StorageError> {
         let shards_coll = self.data_db.collection::<Document>("stream_shards");
         let records_coll = self.data_db.collection::<Document>("stream_records");
         let rows = self
             .stream_shard_rows(std::slice::from_ref(&table_id.to_owned()))
             .await?;
-        let ids = open_shard_ids_of(table_id, label, &rows);
+        let ids = select(table_id, label, &rows);
         if ids.is_empty() {
             return Ok(());
         }

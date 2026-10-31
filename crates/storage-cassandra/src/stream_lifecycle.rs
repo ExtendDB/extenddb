@@ -25,14 +25,22 @@
 //! still write a new-stream record below it, which no stream reads; that case
 //! stays with the deferred cross-instance consistency item in the design
 //! document.
+//!
+//! `UpdateTable` writes the catalog row first and changes the shards after it
+//! ([`PendingStream`]), as on PostgreSQL and MongoDB. A disable whose close
+//! failed leaves a disabled stream whose shards are still open: a retried
+//! disable is refused and closes them, and an enable closes them too, since an
+//! enable closes the open shards of every earlier stream of the table. An
+//! enable whose shard insert failed leaves an enabled stream with no shards,
+//! which no record belongs to, replaced by a disable and an enable.
 
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_core::types::{StreamSpecification, StreamViewType};
 use extenddb_storage::error::StorageError;
 use extenddb_storage::stream_lineage::{
     SHARDS_PER_STREAM, ShardRow, StreamChange, TableStreamRow, disabled_stream_to_close,
-    enable_still_current, next_stream_label, open_shard_ids_of, parse_shard_id, shard_id,
-    stored_specification, stream_change,
+    enable_still_current, next_stream_label, open_shard_ids_before, open_shard_ids_of,
+    parse_shard_id, shard_id, stored_specification, stream_change,
 };
 
 use crate::CassandraEngine;
@@ -94,9 +102,10 @@ pub(crate) fn shard_range_of(physical: String, row: &cdrs_tokio::types::rows::Ro
 /// The `tables` columns an `UpdateTable` stream change sets, as text.
 pub(crate) type StreamColumns = Vec<(&'static str, String)>;
 
-/// The shard changes of an applied `UpdateTable` stream change: close the
-/// open shards of the stream the change read (`close`, the table's label at
-/// that time), then, on an enable, create the new stream's shards.
+/// The shard changes of an applied `UpdateTable` stream change: on a disable,
+/// close the open shards of the stream the change read (`close`, the table's
+/// label at that time); on an enable, close the open shards of every earlier
+/// stream, then create the new stream's shards.
 #[must_use]
 pub(crate) struct PendingStream {
     /// The specification JSON and label the change was decided on; the
@@ -129,14 +138,17 @@ impl PendingStream {
         table_name: &str,
         table_id: &str,
     ) -> Result<(), StorageError> {
-        if let Some(label) = &self.close {
-            engine
-                .close_stream_shards(account_ks, table_id, label)
-                .await?;
-        }
         let Some((label, view_type)) = self.open else {
+            if let Some(label) = &self.close {
+                engine
+                    .close_stream_shards(account_ks, table_id, label)
+                    .await?;
+            }
             return Ok(());
         };
+        engine
+            .close_streams_before(account_ks, table_id, &label)
+            .await?;
         // Each new shard starts one above the larger of a sequence number
         // drawn now from the clock this server's writers draw from and the
         // last ending number among the table's shards (the ones just closed
@@ -338,8 +350,32 @@ impl CassandraEngine {
         table_id: &str,
         label: &str,
     ) -> Result<(), StorageError> {
+        self.close_selected_shards(account_ks, table_id, label, open_shard_ids_of)
+            .await
+    }
+
+    /// Close the open shards of every stream of the table older than `label`
+    /// (`stream_lineage::open_shard_ids_before`), as [`Self::close_stream_shards`]
+    /// closes one stream's.
+    async fn close_streams_before(
+        &self,
+        account_ks: &str,
+        table_id: &str,
+        label: &str,
+    ) -> Result<(), StorageError> {
+        self.close_selected_shards(account_ks, table_id, label, open_shard_ids_before)
+            .await
+    }
+
+    async fn close_selected_shards(
+        &self,
+        account_ks: &str,
+        table_id: &str,
+        label: &str,
+        select: fn(&str, &str, &[ShardRow]) -> Vec<String>,
+    ) -> Result<(), StorageError> {
         let rows = self.stream_shard_rows(account_ks, Some(table_id)).await?;
-        let ids = open_shard_ids_of(table_id, label, &rows);
+        let ids = select(table_id, label, &rows);
         let open = rows
             .into_iter()
             .filter(|r| ids.contains(&r.shard_id))

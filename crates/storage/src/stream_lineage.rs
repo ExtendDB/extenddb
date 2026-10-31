@@ -437,6 +437,26 @@ pub fn open_shard_ids_of(table_id: &str, label: &str, shards: &[ShardRow]) -> Ve
     ids
 }
 
+/// The ids of the open shards of every stream of table `table_id` older than
+/// `label`: the labelled rows carrying an earlier label, and the legacy rows.
+/// An enable creating stream `label` closes these, so a stream left open by a
+/// close that failed after its catalog write is closed by the next enable,
+/// whatever label that enable read.
+#[must_use]
+pub fn open_shard_ids_before(table_id: &str, label: &str, shards: &[ShardRow]) -> Vec<String> {
+    let mut ids: Vec<String> = shards
+        .iter()
+        .filter(|r| r.table_id == table_id && r.ending_sequence_number.is_none())
+        .filter(|r| match parse_shard_id(table_id, &r.shard_id) {
+            Some((ShardStream::Labelled { label: l, .. }, _)) => l.as_str() < label,
+            Some((ShardStream::Legacy, _)) | None => true,
+        })
+        .map(|r| r.shard_id.clone())
+        .collect();
+    ids.sort();
+    ids
+}
+
 /// A stream's status: only the table's newest stream, while its specification
 /// is enabled, is `ENABLED` (`DISABLING` once the table is being deleted);
 /// every other stream of the table is `DISABLED`.
