@@ -385,16 +385,16 @@ pub fn batch_write_capacity<'a>(
 ///
 /// This is a firmer guarantee than Amazon DynamoDB gives, not a copy of its
 /// order. The service documents no order for the `ConsumedCapacity` entries
-/// of a transaction, and the measured order (2026-10-23) does not follow the
-/// request: with two tables, a TransactGetItems naming table 2, then 1, then
-/// 2 and one naming 1, 2, 1 both returned table 1 before table 2, and the two
-/// TransactWriteItems with the same shapes did the same. A client cannot
-/// depend on the service's position of an entry, so any deterministic order
-/// is compatible with it (docs/differences-from-dynamodb.md, Capacity and
-/// Throttling). Before this change ExtendDB aggregated into a `HashMap`, so
-/// the order changed from one process to the next and differed between
-/// backends; first appearance is stable, matches the request as the caller
-/// wrote it, and lets the tests assert the array.
+/// of a transaction, and the measured order (2026-10-23, three tables, eight
+/// request orders, TransactGetItems and TransactWriteItems) did not follow
+/// the request: every response listed the tables in their name order, which
+/// was also their creation order. A client cannot depend on the position of
+/// an entry against the service, so any deterministic order is compatible
+/// with it (docs/differences-from-dynamodb.md, Capacity and Throttling).
+/// Before this change ExtendDB aggregated into a `HashMap`, so the order
+/// changed from one process to the next and differed between backends; first
+/// appearance is stable, matches the request as the caller wrote it, and lets
+/// the tests assert the array.
 #[derive(Default)]
 pub struct PerTableCapacity(Vec<(String, f64)>);
 

@@ -24,7 +24,7 @@ mod update_evaluator;
 mod update_parser;
 
 pub use ast::{ArithOp, CompareOp, Expr, PathElement, UpdateAction};
-pub use evaluator::evaluate_condition;
+pub use evaluator::{compare_orderable, evaluate_condition};
 pub use key_condition::{
     KeyClauseOperand, KeyCondition, SortKeyCondition, key_condition_clause_operands,
     parse_key_condition,
