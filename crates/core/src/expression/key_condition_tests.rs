@@ -395,7 +395,8 @@ fn clause_operands_name_every_single_operand_clause() {
 }
 
 /// The same syntax errors and unsupported constructs `parse_key_condition`
-/// rejects before classification.
+/// rejects before classification, with the same error: both read the clauses
+/// through one parser.
 #[test]
 fn clause_operands_reject_what_the_parser_rejects() {
     for expr in [
@@ -409,9 +410,16 @@ fn clause_operands_reject_what_the_parser_rejects() {
         let Ok(tokens) = tokenize(expr) else {
             continue;
         };
-        assert!(
-            key_condition_clause_operands(&tokens).is_err(),
-            "expr {expr} should be rejected"
+        let Err(operands_err) = key_condition_clause_operands(&tokens) else {
+            panic!("expr {expr} should be rejected");
+        };
+        let Err(parser_err) = parse_key_condition(&tokens) else {
+            panic!("expr {expr} should be rejected by parse_key_condition");
+        };
+        assert_eq!(
+            format!("{operands_err:?}"),
+            format!("{parser_err:?}"),
+            "expr {expr}"
         );
     }
 }
@@ -928,6 +936,15 @@ fn repeated_operator_quotes_the_source_window() {
     assert_eq!(
         kce_msg("pk = :v AND sk = = :s"),
         "Invalid KeyConditionExpression: Syntax error; token: \"=\", near: \"= = :s\""
+    );
+}
+
+#[test]
+fn a_lower_case_keyword_is_shown_as_written() {
+    // Measured 2026-10-25: the token and the window are the source text.
+    assert_eq!(
+        kce_msg("pk = :p and and sk = :s"),
+        "Invalid KeyConditionExpression: Syntax error; token: \"and\", near: \"and and sk\""
     );
 }
 

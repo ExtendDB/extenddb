@@ -20,7 +20,8 @@ use super::kind::ExpressionKind;
 use super::tokenizer::Token;
 use crate::error::DynamoDbError;
 
-/// The text a token is shown as in a syntax error.
+/// The text a token is shown as in a syntax error when the source it came
+/// from is not available. With a source, the token is shown as written.
 #[must_use]
 pub fn token_text(token: &Token) -> String {
     match token {
@@ -120,9 +121,17 @@ pub fn syntax_error(
     tokens: &[Token],
     pos: usize,
 ) -> DynamoDbError {
-    let token = tokens
-        .get(pos)
-        .map_or_else(|| "<EOF>".to_owned(), token_text);
+    // The token is shown as the client wrote it: a lower-case `and` answers
+    // `token: "and"` (measured 2026-10-25 on FilterExpression,
+    // ConditionExpression and KeyConditionExpression).
+    let spans = (!source.is_empty())
+        .then(|| token_spans(source, tokens))
+        .flatten();
+    let token = match (tokens.get(pos), &spans) {
+        (None, _) => "<EOF>".to_owned(),
+        (Some(_), Some(spans)) => source[spans[pos].clone()].to_owned(),
+        (Some(t), None) => token_text(t),
+    };
     let near = near_window(source, tokens, pos);
     DynamoDbError::ValidationException(format!(
         "Invalid {kind}: Syntax error; token: \"{token}\", near: \"{near}\""
@@ -212,15 +221,16 @@ mod tests {
     }
 
     #[test]
-    fn keyword_tokens_show_upper_case_and_match_their_source_length() {
-        // [d07] doubled AND; a lower-case keyword still lines up with the source.
+    fn keyword_tokens_show_the_source_text() {
+        // [d07] doubled AND; H501-1 s01, s30, k07: a lower-case keyword is
+        // shown as written, in the token and in the window.
         assert_eq!(
             msg(ExpressionKind::Condition, "#v = :v AND AND #v = :v", 4),
             "Invalid ConditionExpression: Syntax error; token: \"AND\", near: \"AND AND #v\""
         );
-        assert!(
-            msg(ExpressionKind::Condition, "#v = :v and and #v", 4)
-                .ends_with("near: \"and and #v\"")
+        assert_eq!(
+            msg(ExpressionKind::Filter, "#v = :v and and #v = :v", 4),
+            "Invalid FilterExpression: Syntax error; token: \"and\", near: \"and and #v\""
         );
     }
 

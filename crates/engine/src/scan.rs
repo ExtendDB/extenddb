@@ -141,8 +141,11 @@ pub async fn handle_scan(
 
     // The operator cap runs before the unused placeholder check and the table
     // lookup (measured 2026-10-25: the count beats an unused value, a missing
-    // table and an unknown IndexName).
-    if let Some(ref f) = filter {
+    // table and an unknown IndexName). It applies to a FilterExpression only:
+    // a legacy ScanFilter of 160 conditions is accepted (measured 2026-10-25).
+    if filter_maps.is_none()
+        && let Some(ref f) = filter
+    {
         crate::expression_helpers::check_operator_count(f, ExpressionKind::Filter)?;
     }
 
