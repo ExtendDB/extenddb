@@ -129,14 +129,15 @@ pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext
             // `dynamodb:LeadingKeys` and `dynamodb:Attributes`. For a
             // multivalued key the context decides whether that answer applies:
             // it is right only where ExtendDB leaves the key absent on the same
-            // requests the service does. ExtendDB leaves `dynamodb:Attributes`
-            // absent on writes, on `AttributesToGet` reads and on batch and
-            // transaction targets, and `dynamodb:LeadingKeys` absent on query
-            // shapes it cannot pin to a partition value, where the service
-            // populates them; matching there would grant an Allow the service
-            // refuses, so those keys keep the no-match rule. `aws:TagKeys` is
-            // populated on exactly the three operations the service reference
-            // lists it for, so its absent-key answer is IAM's.
+            // requests the service does. ExtendDB leaves `dynamodb:LeadingKeys`
+            // absent on query shapes it cannot pin to a partition value, where
+            // the service populates it, and `dynamodb:Attributes` absent only
+            // on a request that names no attribute, where the service's answer
+            // for a bare negated operator was not measured; matching there
+            // could grant an Allow the service refuses, so those keys keep the
+            // no-match rule. `aws:TagKeys` is populated on exactly the three
+            // operations the service reference lists it for, so its absent-key
+            // answer is IAM's.
             None => {
                 is_negative_operator(other)
                     && (!is_multivalued

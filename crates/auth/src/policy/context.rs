@@ -457,13 +457,15 @@ impl ConditionContext for RequestContext {
         // ExtendDB applies that only to `aws:TagKeys`, which it populates on
         // exactly the three operations the AWS service authorization reference
         // lists it for (TagResource, UntagResource, CreateTable with Tags), so
-        // its absence here is the service's absence. `dynamodb:Attributes` is
-        // left absent on writes, on reads that project with `AttributesToGet`
-        // and on batch and transaction targets, and `dynamodb:LeadingKeys` on
-        // query shapes the extractor cannot pin to a partition value, where the
-        // service populates both; for those two an absent key keeps the
-        // no-match rule, so an Allow gated on a bare negated operator over them
-        // grants nothing, as the service grants nothing for the present key.
+        // its absence here is the service's absence. `dynamodb:LeadingKeys` is
+        // left absent on query shapes the extractor cannot pin to a partition
+        // value, where the service populates it. `dynamodb:Attributes` is
+        // absent only on a request that names no attribute (a `Scan` that
+        // projects and filters nothing, or a request on a table that does not
+        // exist), where the service's answer for a bare negated operator was
+        // not measured. For those two an absent key keeps the no-match rule,
+        // so an Allow gated on a bare negated operator over them grants
+        // nothing.
         super::casefold::case_fold(key) == "aws:tagkeys"
     }
 }

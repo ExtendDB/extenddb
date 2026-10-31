@@ -6,13 +6,16 @@
 
 use std::collections::HashMap;
 
+use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::TableKeyInfo;
 use serde_json::Value;
 
 use super::{NumberForm, hash_attr, pk_from_map};
+use crate::request_attributes::{batch_table_attributes, transact_item_attributes};
 
 /// A single `(action, table)` authorization to perform for a batch or
-/// transaction operation, carrying the LeadingKeys the service would evaluate.
+/// transaction operation, carrying the LeadingKeys and Attributes the service
+/// would evaluate.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct AuthzTarget {
     /// The bare operation string the action maps to (no `dynamodb:` prefix).
@@ -22,10 +25,14 @@ pub(crate) struct AuthzTarget {
     /// The partition key value(s) for this authorization, or `None` when the
     /// key cannot be determined (the engine then rejects the request).
     pub leading_keys: Option<Vec<String>>,
+    /// The `dynamodb:Attributes` names for this authorization, or `None` when
+    /// it names no attribute. See `crate::request_attributes`.
+    pub attributes: Option<Vec<String>>,
 }
 
 /// The per-(action, table) or per-item authorizations for a batch or
-/// transaction operation, each carrying the LeadingKeys the service evaluates.
+/// transaction operation, each carrying the LeadingKeys and Attributes the
+/// service evaluates.
 ///
 /// Returns `None` for non-batch/transact operations. Batch operations
 /// authorize once per table with the set of all keys for that table;
@@ -34,22 +41,25 @@ pub(crate) struct AuthzTarget {
 /// two (a batch of one own and one other key passes `ForAnyValue`; a
 /// transaction of the same two does not). Transaction items that give the same
 /// target are returned once, in the order of their first occurrence: the
-/// decision for a target depends only on its action, table and LeadingKeys, so
-/// a hundred `ConditionCheck`s on one partition need one evaluation.
+/// decision for a target depends only on its action, table, LeadingKeys and
+/// Attributes, so a hundred identical `ConditionCheck`s on one partition need
+/// one evaluation.
 ///
 /// `key_info_by_table` is the authorization snapshot; a `None` entry is a table
-/// that does not exist, whose targets carry no LeadingKeys (the engine returns
-/// `ResourceNotFoundException`).
+/// that does not exist, whose targets carry no LeadingKeys and none of the
+/// table's key attributes in Attributes (the engine returns
+/// `ResourceNotFoundException`). `limits` are the engine's expression limits,
+/// under which the expressions are read for Attributes.
 pub(crate) fn batch_transact_targets(
     operation: &str,
     input: &Value,
     key_info_by_table: &HashMap<String, Option<TableKeyInfo>>,
+    limits: &LimitsConfig,
 ) -> Option<Vec<AuthzTarget>> {
+    let key_info_of =
+        |table: &str| -> Option<&TableKeyInfo> { key_info_by_table.get(table)?.as_ref() };
     let pk_attr_of = |table: &str| -> Option<String> {
-        key_info_by_table
-            .get(table)
-            .and_then(Option::as_ref)
-            .and_then(|ki| hash_attr(&ki.key_schema).map(ToOwned::to_owned))
+        key_info_of(table).and_then(|ki| hash_attr(&ki.key_schema).map(ToOwned::to_owned))
     };
     let mut seen = std::collections::HashSet::new();
     let mut push_unique = |out: &mut Vec<AuthzTarget>, target: AuthzTarget| {
@@ -68,6 +78,7 @@ pub(crate) fn batch_transact_targets(
                     action: operation.to_owned(),
                     table: table.clone(),
                     leading_keys: keys,
+                    attributes: batch_table_attributes(operation, body, key_info_of(table), limits),
                 });
             }
             Some(out)
@@ -91,6 +102,12 @@ pub(crate) fn batch_transact_targets(
                             action: "GetItem".to_owned(),
                             table: table.to_owned(),
                             leading_keys: lk,
+                            attributes: transact_item_attributes(
+                                "Get",
+                                get,
+                                key_info_of(table),
+                                limits,
+                            ),
                         },
                     );
                 }
@@ -122,6 +139,12 @@ pub(crate) fn batch_transact_targets(
                                 action: action.to_owned(),
                                 table: table.to_owned(),
                                 leading_keys: lk,
+                                attributes: transact_item_attributes(
+                                    sub,
+                                    op,
+                                    key_info_of(table),
+                                    limits,
+                                ),
                             },
                         );
                     }
