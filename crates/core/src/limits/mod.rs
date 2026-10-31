@@ -1,9 +1,9 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// All configurable limits with DynamoDB-compatible defaults.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LimitsConfig {
     #[serde(default = "default_max_item_size")]
