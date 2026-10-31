@@ -13,7 +13,7 @@
 use std::path::PathBuf;
 
 use extenddb_core::limits::LimitsConfig;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -48,7 +48,7 @@ pub struct AppConfig {
 }
 
 /// Configuration for import or export allowed paths.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImportExportPathConfig {
     /// Allowed directories. All file paths are canonicalized and must resolve
@@ -57,7 +57,7 @@ pub struct ImportExportPathConfig {
     pub paths: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     #[serde(default = "default_bind_addr")]
@@ -109,7 +109,7 @@ impl ServerConfig {
 ///
 /// TLS is always enabled. The `enabled` field is accepted for backward
 /// compatibility but the server refuses to start if set to `false`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     /// TLS is mandatory. Accepted for backward compatibility; the server
@@ -241,7 +241,7 @@ impl<'de> serde::Deserialize<'de> for StorageConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     /// Auth provider: `"builtin"` (`SigV4` + IAM policies). The `"none"` value
@@ -269,7 +269,7 @@ impl Default for AuthConfig {
 /// Each `*_seconds` field has a sensible default; operators only need to
 /// override values when they want to deviate from the docs. The configuration
 /// is static — values are read once at startup.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthCacheConfigToml {
     /// Master switch. When `false`, all caches operate in pass-through mode
@@ -322,7 +322,7 @@ fn default_cache_max_entries() -> u64 {
     10_000
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     #[serde(default = "default_log_level")]
@@ -497,6 +497,11 @@ pub fn pid_file_path_default(port: u16) -> PathBuf {
 
 mod display;
 pub use display::{MASK, build_config_entries, should_redact};
+
+#[cfg(test)]
+mod sample_toml_support;
+#[cfg(test)]
+mod sample_toml_tests;
 
 #[cfg(test)]
 mod tests {

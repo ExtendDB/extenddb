@@ -30,6 +30,7 @@ use serde::Deserialize;
 /// from `pool_size` 4 up a flood of backups leaves at least half the pool to
 /// other requests; with 2 or 3 the one admitted backup holds two of them.
 #[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 #[serde(deny_unknown_fields)]
 pub struct SqliteConfig {
     #[serde(default = "default_path")]

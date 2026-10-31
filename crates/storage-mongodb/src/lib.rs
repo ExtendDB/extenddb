@@ -21,6 +21,11 @@ mod management_store;
 mod metadata_engine;
 mod operations;
 pub mod pushdown;
+#[cfg(test)]
+#[path = "../../config/src/sample_toml_support.rs"]
+mod sample_toml_support;
+#[cfg(test)]
+mod sample_toml_tests;
 mod snapshot_engine;
 mod stream_engine;
 mod table_engine;

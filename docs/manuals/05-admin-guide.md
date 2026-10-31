@@ -88,58 +88,17 @@ for backend failures.
 
 ### extenddb.toml: Static Configuration
 
-These settings require a server restart to take effect.
+Every key of `extenddb.toml`, its default and what it controls is listed on the [Configuration](../configuration.md) page, which is generated from `extenddb.sample.toml` and checked against the configuration structs by the test suite. These settings take effect at the next server start. Every key can also be set through an environment variable with the `EXTENDDB__` prefix and `__` between levels (`EXTENDDB__SERVER__PORT=9000`); a list key (`import.paths`, `export.paths`, `storage.cassandra.contact_points`) takes one comma-delimited string (`EXTENDDB__IMPORT__PATHS="/data/in,/data/shared"`), with items trimmed and empty items dropped. Precedence, highest first, is environment variables, the configuration file, then the built-in defaults; `extenddb serve --port` overrides `server.port` on top of all three.
 
-#### [server]
+#### PostgreSQL connection budget and restores
 
-| Key | Default | Description |
-|-----|---------|-------------|
-| `bind_addr` | `127.0.0.1` | Network interface to bind |
-| `port` | `18443` | HTTP port |
-| `region` | `us-east-1` | AWS region for ARN generation. Baked into every backup ARN the server issues, so it must stay within `[a-z0-9-]` (a value outside that class makes the server's own backup ARNs "not valid"; the server logs a warning at startup). A backup ARN of the caller's account in another region is resolved in the server's region first, then as written; see the upgrade manual before changing this on a deployment with backups |
-
-#### [storage]
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `backend` | `postgres` | Storage backend: `postgres`, `mongodb`, `sqlite` or `cassandra`. Must match the feature the binary was built with; see [Storage backends](../storage-backends.md) |
-
-#### [storage.postgres]
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `connection_string` | `postgresql://extenddb:extenddb-local-dev@localhost:5432/extenddb_catalog` | Catalog database connection string |
-| `pool_size` | `20` | Maximum concurrent database connections (minimum: 10) |
-| `catalog_pool_size` | (= `pool_size`) | Maximum connections for management/authz pool (minimum: 10) |
+The `pool_size` key of `[storage.postgres]` sizes two pools, one against the catalog database and one against the data database; the Configuration page gives the connection arithmetic. Restores draw on the same pool.
 
 Restores on PostgreSQL are bounded per server process: at most 4 per account and at most half of `pool_size` in total (after its minimum of 10 is applied, capped at 16; 10 with the default `pool_size` of 20). A restore that cannot get both within 30 seconds is refused with `LimitExceededException`. Each running restore holds one connection from this pool for its whole copy, plus one dedicated connection outside the pool for its lock.
 
 `RestoreTableFromBackup` on PostgreSQL holds a session-level advisory lock for the whole copy, so ExtendDB must reach the catalog database directly or through a session-mode pooler. Behind a transaction-mode pooler (for example PgBouncer with `pool_mode = transaction`) restore locks are not released and the abandoned-restore sweep can remove a restore that is still running; do not run restores through one.
 
-#### [storage.sqlite]
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `path` | `extenddb.sqlite` | Database file (`init --sqlite-path` writes it); `:memory:` for an ephemeral database |
-| `pool_size` | `10` | Maximum connections. Writes are serialized by the engine whatever the size. A file database raises `pool_size = 1` to 2 and logs it at info (`SQLite pool_size 1 raised to 2 for a file-backed database: ...`), because a backup holds one reader connection for its whole duration while its batches write through another. Use 3 or more so a running backup does not contend with ordinary requests for connections |
-
-#### [auth]
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `provider` | `builtin` | Auth provider: `builtin` (SigV4 + IAM). The server refuses to start with `"none"`. |
-
-#### [auth.cache]
-
-In-memory stale-while-revalidate caches eliminate the per-request catalog roundtrip for credentials, IAM policies, principal/resource tags, and table key info. Self-induced changes (admin API and console mutations) propagate instantly via write-through invalidation; off-instance changes take up to `ttl_seconds` to propagate.
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `enabled` | `true` | Master kill switch. When `false`, all caches operate in pass-through mode. |
-| `ttl_seconds` | `60` | Hard TTL: entries older than this trigger a fresh, request-blocking load. |
-| `soft_ttl_seconds` | `30` | Stale-but-usable threshold; older entries still serve immediately while a background task refreshes them. |
-| `negative_ttl_seconds` | `5` | Negative-cache TTL for "not found" results. |
-| `max_entries` | `10000` | Per-cache LRU cap. |
+#### Auth cache statistics and invalidation timing
 
 Statistics are exposed at `/management/auth-cache-metrics` (JSON, admin-authenticated). The per-cache `pass_through` flag distinguishes "cache disabled" from "cache cold." The report includes every authorization sub-cache, among them the two principal creation-time caches (`user_created_at`, `role_created_at`) consulted on each user and role-session request to derive `aws:userid` and `aws:TokenIssueTime`.
 
@@ -148,41 +107,6 @@ Statistics are exposed at `/management/auth-cache-metrics` (JSON, admin-authenti
 - **Single-key invalidations** (e.g. `DeleteAccessKey`, `PutUserPolicy`) drop the cached entry immediately; the next request sees the post-mutation state.
 - **Fanout invalidations** (e.g. `DeleteAccount`, `DeleteRole` session sweep, `DeleteGroup` member fanout) are **asynchronous**: there is a small window (~ms) between the API returning success and the matching entries being evicted. For hard cutover (e.g. revoking a compromised key), prefer the single-key path (`DeleteAccessKey`) over the cascade.
 - **Off-instance changes** (multi-node deployments, or direct catalog writes) wait up to `ttl_seconds` to be observed locally.
-
-#### [server.tls]
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `enabled` | `true` | TLS is mandatory. The server refuses to start with `enabled = false`. |
-| `cert_path` | `~/.extenddb/tls/cert.pem` | PEM certificate file |
-| `key_path` | `~/.extenddb/tls/key.pem` | PEM private key file |
-
-`extenddb init` generates a self-signed certificate. Replace with a CA-signed certificate for production.
-
-#### [limits]
-
-All defaults match the DynamoDB service limits. Override only for testing edge cases.
-
-#### [logging]
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `level` | `info` | Initial log level (overridden by runtime setting) |
-| `format` | `pretty` | Log format: `pretty` or `json` |
-
-Logging always goes to syslog (facility: daemon, ident: extenddb).
-
-### Environment Variable Overrides
-
-Any config key can be overridden via environment variables using the `EXTENDDB__` prefix with `__` as separator:
-
-```bash
-EXTENDDB__SERVER__PORT=9000
-EXTENDDB__STORAGE__POSTGRES__CONNECTION_STRING="postgresql://..."
-EXTENDDB__AUTH__PROVIDER=builtin
-```
-
-Precedence: CLI flags > environment variables > config file > defaults.
 
 ### Runtime Settings
 

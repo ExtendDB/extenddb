@@ -88,12 +88,7 @@ const sidebars: SidebarsConfig = {
       items: [
         {type: 'doc', id: 'differences-from-dynamodb', label: 'Differences from DynamoDB'},
         {type: 'doc', id: 'dynamodb-limits', label: 'Limits'},
-        {
-          type: 'link',
-          label: 'Configuration',
-          href: '/manuals/admin-guide/#configuration-reference',
-          description: 'Every key in extenddb.toml, its default and what it controls (in the administration guide).',
-        },
+        {type: 'doc', id: 'configuration', label: 'Configuration'},
         {type: 'doc', id: 'troubleshooting', label: 'Troubleshooting'},
       ],
     },
