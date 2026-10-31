@@ -274,7 +274,7 @@ The management web console is a server-rendered HTML interface mounted at `/cons
 
 ### Architecture
 
-The console reads all data through the `ManagementStore` and `PasswordHashStore` traits and never queries the database directly. Write operations route through shared functions in `management::ops`, ensuring validation and business logic are defined once. This means every action available in the console is also available through the management REST API.
+The console reads all data through four of the traits that `CatalogStore` combines (`ManagementStore`, `PasswordHashStore`, `SettingsStore` and `RateLimitStore`) and never queries the database directly. Write operations route through shared functions in `management::ops`, ensuring validation and business logic are defined once. This means every action available in the console is also available through the management REST API.
 
 ### Authentication Model
 
