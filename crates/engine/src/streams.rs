@@ -114,18 +114,15 @@ pub async fn handle_get_shard_iterator(
     // The service's ShardId bound is 28 to 65 characters, checked before any
     // lookup with the model's constraint sentences (both measured 2026-10-24).
     // A SequenceNumber, when given, is at least 21 characters (measured with
-    // "0" on AT_SEQUENCE_NUMBER).
+    // "0" on AT_SEQUENCE_NUMBER). The maximum is applied once the shard is
+    // not found (`shard_lookup_error`): the shards a release before v0.1.14
+    // wrote are named after the table, and a table name over 40 characters
+    // puts them past 65.
     let shard_len = input.shard_id.chars().count();
     if shard_len < SHARD_ID_MIN_LEN {
         return Err(DynamoDbError::ValidationException(
             SHARD_ID_TOO_SHORT.to_owned(),
         ));
-    }
-    if shard_len > SHARD_ID_MAX_LEN {
-        return Err(DynamoDbError::ValidationException(constraint(
-            "shardId",
-            "have length less than or equal to 65",
-        )));
     }
     if input
         .sequence_number
@@ -142,7 +139,7 @@ pub async fn handle_get_shard_iterator(
     ctx.storage
         .validate_shard(&ctx.account_id, &input.stream_arn, &input.shard_id)
         .await
-        .map_err(storage_to_dynamo)?;
+        .map_err(|e| shard_lookup_error(shard_len, e))?;
 
     let seq = match input.shard_iterator_type {
         ShardIteratorType::TrimHorizon => String::new(),
@@ -214,6 +211,22 @@ pub async fn handle_get_shard_iterator(
         shard_iterator: Some(encoded),
     };
     serialize_output(&output)
+}
+
+/// The answer when the shard a `GetShardIterator` names is not found: for a
+/// `ShardId` of `shard_len` characters over the service's maximum, the model's
+/// constraint sentence (the service checks it before any lookup, and never has
+/// a shard that long); otherwise the storage layer's not-found answer. A shard
+/// that long and found passes, so a stream from before v0.1.14 on a table whose
+/// name is over 40 characters stays readable.
+fn shard_lookup_error(shard_len: usize, err: StorageError) -> DynamoDbError {
+    if shard_len > SHARD_ID_MAX_LEN {
+        return DynamoDbError::ValidationException(constraint(
+            "shardId",
+            "have length less than or equal to 65",
+        ));
+    }
+    storage_to_dynamo(err)
 }
 
 /// Shard iterator expiration: 15 minutes (900 seconds), matching real `DynamoDB`.
@@ -584,6 +597,32 @@ mod tests {
 
     fn b64(s: &str) -> String {
         base64::Engine::encode(&base64::engine::general_purpose::STANDARD, s)
+    }
+
+    #[test]
+    fn the_shard_id_maximum_applies_once_the_shard_is_not_found() {
+        // A shard of a table named with 41 characters, as a release before
+        // v0.1.14 wrote it: 8 + 41 + 1 + 16 = 66 characters. Found, it is not
+        // this function's case at all; not found, the model's sentence.
+        let long = format!("shardId-{}-{:016}", "t".repeat(41), 3);
+        assert_eq!(long.chars().count(), 66);
+        let sentence = "1 validation error detected: Value at 'shardId' failed to satisfy constraint: Member must have length less than or equal to 65";
+        for err in [
+            extenddb_storage::util::shard_does_not_exist(),
+            extenddb_storage::util::stream_does_not_exist(),
+        ] {
+            match super::shard_lookup_error(long.chars().count(), err) {
+                super::DynamoDbError::ValidationException(msg) => assert_eq!(msg, sentence),
+                other => panic!("expected ValidationException, got {other:?}"),
+            }
+        }
+        // Within the bound, the lookup's own answer stands.
+        match super::shard_lookup_error(65, extenddb_storage::util::shard_does_not_exist()) {
+            super::DynamoDbError::ResourceNotFoundException(msg) => {
+                assert_eq!(msg, extenddb_storage::util::SHARD_DOES_NOT_EXIST);
+            }
+            other => panic!("expected ResourceNotFoundException, got {other:?}"),
+        }
     }
 
     #[test]
