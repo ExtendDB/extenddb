@@ -177,8 +177,11 @@ async fn begin_login_from(
             LoginRefusal::Internal
         })?;
     if recorded_for_pair + pair_in_flight > MAX_FAILURES_PER_PRINCIPAL {
+        // The principal is the caller's text, at most MAX_PRINCIPAL_LEN bytes
+        // here. `{:?}` escapes newlines and control characters, so it cannot
+        // start a new log line.
         tracing::warn!(
-            "Account lockout: principal {} from {} has {recorded_for_pair} failed attempts \
+            "Account lockout: principal {:?} from {} has {recorded_for_pair} failed attempts \
              and {} in flight in window",
             attempt.principal,
             attempt.source_ip,

@@ -105,6 +105,40 @@ pub(crate) fn peer(ip: &str) -> SocketAddr {
     format!("{ip}:40000").parse().unwrap()
 }
 
+/// Log output collected by [`capture_logs`].
+#[derive(Clone, Default)]
+pub(crate) struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+impl CapturedLogs {
+    pub(crate) fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for CapturedLogs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Collect this thread's log output until the guard drops. Use it from a
+/// test on the default current-thread runtime, where the code under test
+/// logs on the test's own thread.
+pub(crate) fn capture_logs() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
+    let logs = CapturedLogs::default();
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+    (logs, tracing::subscriber::set_default(subscriber))
+}
+
 async fn fail_times(store: &MemoryStore, principal: &str, ip: &str, times: usize) {
     for _ in 0..times {
         let attempt = begin_login(store, principal, peer(ip)).await.unwrap();
@@ -256,6 +290,27 @@ async fn a_store_error_is_internal_and_holds_no_reservation() {
         Some(LoginRefusal::Internal)
     );
     assert!(!registry().tracks("198.51.100.50"));
+}
+
+#[tokio::test]
+async fn the_lockout_log_line_escapes_the_principal() {
+    let store = MemoryStore::default();
+    let principal = "admin\nERROR forged line";
+    fail_times(&store, principal, "198.51.100.85", 5).await;
+
+    let (logs, _guard) = capture_logs();
+    assert_eq!(
+        begin_login(&store, principal, peer("198.51.100.85"))
+            .await
+            .err(),
+        Some(LoginRefusal::TooManyAttempts(PRINCIPAL_LIMITED))
+    );
+    let text = logs.text();
+    assert!(
+        text.contains(r#"principal "admin\nERROR forged line" from 198.51.100.85"#),
+        "{text}"
+    );
+    assert!(!text.contains("\nERROR forged line"), "{text}");
 }
 
 #[tokio::test]
