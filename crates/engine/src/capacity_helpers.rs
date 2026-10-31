@@ -380,6 +380,31 @@ pub fn batch_write_capacity<'a>(
     }
 }
 
+/// Per-table capacity totals in the order the tables first appear in the
+/// request.
+///
+/// Amazon DynamoDB's own order of the `ConsumedCapacity` entries of a
+/// transaction follows no documented rule (measured 2026-10-14: hash order of
+/// the table names, which differs between name sets), so no client can depend
+/// on it. A `HashMap` here made ExtendDB's order change from one process to
+/// the next; first appearance is stable and is what a reader of the request
+/// expects.
+#[derive(Default)]
+pub struct PerTableCapacity(Vec<(String, f64)>);
+
+impl PerTableCapacity {
+    pub fn add(&mut self, table: &str, units: f64) {
+        match self.0.iter_mut().find(|(t, _)| t == table) {
+            Some((_, total)) => *total += units,
+            None => self.0.push((table.to_owned(), units)),
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, f64)> {
+        self.0.iter().map(|(t, cu)| (t.as_str(), *cu))
+    }
+}
+
 /// Build a `Vec<ConsumedCapacity>` for `TransactGetItems`, or `None` if not requested.
 ///
 /// Transactions differ from single-item/batch reads: real DynamoDB emits the
