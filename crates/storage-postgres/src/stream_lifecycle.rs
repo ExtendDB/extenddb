@@ -217,9 +217,9 @@ impl PostgresEngine {
     /// Apply an `UpdateTable` `StreamSpecification` in the caller's catalog
     /// transaction, which holds the table row `FOR UPDATE`.
     ///
-    /// Disabling clears the stored specification, so DescribeTable omits
-    /// `StreamSpecification`, and keeps `stream_label`, so `LatestStreamArn`
-    /// keeps naming the disabled stream. Enabling stores the specification and
+    /// Disabling stores `{StreamEnabled: false}` with the stream's view type,
+    /// which DescribeTable omits, and keeps `stream_label`, so
+    /// `LatestStreamArn` keeps naming the disabled stream. Enabling stores the specification and
     /// a new label. The shard changes are returned, for the caller to apply
     /// with [`PendingStream::apply`] once the catalog has committed: a request
     /// refused after this point (an invalid index update in the same call)

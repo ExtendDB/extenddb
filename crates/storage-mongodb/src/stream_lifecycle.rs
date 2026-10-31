@@ -194,9 +194,9 @@ impl MongoEngine {
     /// Decide an `UpdateTable` `StreamSpecification` against the table
     /// document and add its catalog fields to `update_doc`.
     ///
-    /// Disabling sets the specification to null, so DescribeTable omits
-    /// `StreamSpecification`, and keeps `stream_label`, so `LatestStreamArn`
-    /// keeps naming the disabled stream. Enabling stores the specification and
+    /// Disabling stores `{StreamEnabled: false}` with the stream's view type,
+    /// which DescribeTable omits, and keeps `stream_label`, so
+    /// `LatestStreamArn` keeps naming the disabled stream. Enabling stores the specification and
     /// a new label. The returned shard changes run once `update_doc` is
     /// written. This backend has no transaction around UpdateTable, so two
     /// concurrent stream changes can both pass the check.

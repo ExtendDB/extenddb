@@ -319,6 +319,35 @@ Catalog upgrades change the schema; behavior changes alter how the running serve
 interprets existing data or configuration. Review these before upgrading a live
 deployment, even when no catalog migration is required.
 
+### Streams: disabling closes the shards, enabling creates a new stream
+
+**What changed.** `UpdateTable` with `StreamEnabled: false` now closes the
+stream's shards (each gets an `EndingSequenceNumber`), and `StreamEnabled: true`
+afterwards creates a new stream with a new ARN and four new shard ids, as on
+DynamoDB. Before this release a disable left the shards open and a re-enable
+kept the same ARN. Each stream's identity is carried in its shard ids, so no
+catalog migration is needed and no catalog version gate stops an earlier release
+from serving the same database.
+
+**Upgrade every server before changing a table's stream.** A server still on
+the earlier release does not know closed shards: it writes records past a
+shard's `EndingSequenceNumber`, where no reader finds them, and re-enables a
+disabled stream under its old ARN instead of creating a new one. In a
+deployment with several servers, finish upgrading all of them before any
+`UpdateTable` changes a `StreamSpecification`. A stream disabled by the earlier
+release keeps its four shards open until the first `UpdateTable` on that table
+under the new release (an enable, or a disable, which is refused as before and
+closes them).
+
+**MongoDB.** An existing deployment gets the new `{table_id: 1, shard_id: 1}`
+index on `stream_shards` from `extenddb migrate --yes`; `extenddb init` creates
+it on a new one.
+
+**Rollback.** Going back to the earlier release means restoring the
+pre-upgrade database as in [Rollback Procedure](#rollback-procedure); the
+earlier release does not read the closed shards' ending numbers or the labelled
+shard ids the new release writes.
+
 ### v0.1.14 LeadingKeys now enforced on Query, batch and transaction operations
 
 **What changed.** `dynamodb:LeadingKeys` is now evaluated on `Query`,
