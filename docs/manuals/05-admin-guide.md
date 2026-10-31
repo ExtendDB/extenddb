@@ -88,7 +88,7 @@ for backend failures.
 
 ### extenddb.toml: Static Configuration
 
-Every key of `extenddb.toml`, its default and what it controls is listed on the [Configuration](../configuration.md) page, which is generated from `extenddb.sample.toml` and checked against the configuration structs by the test suite. These settings take effect at the next server start. Any key can be set through an environment variable with the `EXTENDDB__` prefix and `__` between levels (`EXTENDDB__SERVER__PORT=9000`); precedence, highest first, is CLI flags, environment variables, the configuration file, then the built-in defaults.
+Every key of `extenddb.toml`, its default and what it controls is listed on the [Configuration](../configuration.md) page, which is generated from `extenddb.sample.toml` and checked against the configuration structs by the test suite. These settings take effect at the next server start. Scalar keys can also be set through an environment variable with the `EXTENDDB__` prefix and `__` between levels (`EXTENDDB__SERVER__PORT=9000`); the list keys (`import.paths`, `export.paths`, `storage.cassandra.contact_points`) and the numeric keys of `[storage.sqlite]` and `[storage.cassandra]` are file only. Precedence, highest first, is environment variables, the configuration file, then the built-in defaults; `extenddb serve --port` overrides `server.port` on top of all three.
 
 #### PostgreSQL connection budget and restores
 

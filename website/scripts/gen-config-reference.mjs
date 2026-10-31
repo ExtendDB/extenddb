@@ -15,7 +15,12 @@
 //     section's introduction and becomes prose.
 //   - `# key = value` is a key line. The comment lines directly above it are
 //     its description. A description containing "no default" marks a key whose
-//     value is an example, shown as "none" in the Default column.
+//     value is an example: the Default column shows "none", the trailing
+//     "No default." sentence is dropped and the value is appended to the
+//     description as an example. A value may not carry a trailing ` #`
+//     comment outside a string literal; the value is the whole rest of the
+//     line.
+//   - Markdown links and code spans in comments pass through to the page.
 //
 // Usage: node scripts/gen-config-reference.mjs [--check]
 //   --check  regenerate to a string and exit 1 with a unified diff when it
@@ -60,9 +65,17 @@ function parseSample(text) {
     }
     const key = line.match(KEY_LINE);
     if (key) {
-      const description = joinComment(pending);
+      const value = key[2].trim();
+      if (hasInlineComment(value)) throw new Error(`${samplePath}:${lineNo}: key ${key[1]} has a trailing comment on its value line; put it in the description above`);
+      let description = joinComment(pending);
       if (!description) throw new Error(`${samplePath}:${lineNo}: key ${key[1]} has no description`);
-      section.keys.push({name: key[1], value: key[2].trim(), description, hasDefault: !/\bno default\b/i.test(description)});
+      const hasDefault = !/\bno default\b/i.test(description);
+      if (!hasDefault) {
+        description = description.replace(/[;,]?\s*\bNo default( of its own)?\.\s*$/i, '');
+        if (!/[.!?]$/.test(description)) description += '.';
+        description += ` Example: \`${key[1]} = ${value}\``;
+      }
+      section.keys.push({name: key[1], value, description, hasDefault});
       pending = [];
       expectIntro = false;
       continue;
@@ -82,6 +95,20 @@ function parseSample(text) {
   }
   if (pending.length) throw new Error(`${samplePath}: trailing comment block is attached to nothing`);
   return sections;
+}
+
+/** True when `value` has a ` #` outside a double-quoted string (a TOML inline comment). */
+function hasInlineComment(value) {
+  let inString = false;
+  for (let i = 0; i < value.length; i++) {
+    const c = value[i];
+    if (inString) {
+      if (c === '\\') i++;
+      else if (c === '"') inString = false;
+    } else if (c === '"') inString = true;
+    else if (c === '#' && (i === 0 || value[i - 1] === ' ')) return true;
+  }
+  return false;
 }
 
 /** Join comment lines into one string; an empty comment line separates paragraphs. */
@@ -116,13 +143,14 @@ function render(sections) {
   const out = [];
   out.push('---');
   out.push('description: "Every key of extenddb.toml, its default and what it controls, generated from extenddb.sample.toml."');
+  out.push('custom_edit_url: https://github.com/ExtendDB/extenddb/edit/main/extenddb.sample.toml');
   out.push('---');
   out.push('');
   out.push('# Configuration');
   out.push('');
   out.push('This page is generated from [`extenddb.sample.toml`](https://github.com/ExtendDB/extenddb/blob/main/extenddb.sample.toml) by `npm run gen:config` in `website/`; edit the sample, not this file. Tests in the `extenddb-config` crate and in each storage backend crate compare the sample with the configuration structs, so a key listed here exists in the code with the default shown.');
   out.push('');
-  out.push('The server reads `extenddb.toml` (or the file named by `--config`) at startup. Every key can also be set through an environment variable: the name is `EXTENDDB__` followed by the key path in upper case with `__` between levels, for example `EXTENDDB__SERVER__PORT=9000` or `EXTENDDB__STORAGE__POSTGRES__CONNECTION_STRING="postgresql://..."`. Precedence, highest first: environment variables, the configuration file, built-in defaults; `extenddb serve --port` overrides `server.port` on top of all three.');
+  out.push('The server reads `extenddb.toml` (or the file named by `--config`) at startup. Scalar keys can also be set through an environment variable: the name is `EXTENDDB__` followed by the key path in upper case with `__` between levels, for example `EXTENDDB__SERVER__PORT=9000` or `EXTENDDB__STORAGE__POSTGRES__CONNECTION_STRING="postgresql://..."`. The list keys (`import.paths`, `export.paths`, `storage.cassandra.contact_points`) and the numeric keys of `[storage.sqlite]` and `[storage.cassandra]` are file only. Precedence, highest first: environment variables, the configuration file, built-in defaults; `extenddb serve --port` overrides `server.port` on top of all three.');
   out.push('');
   out.push('The keys below are static: a change takes effect at the next server start. Settings that change on a running server (log level, control plane delay, throttling at runtime) are set with `extenddb settings set` and are listed under [Runtime Settings](./manuals/05-admin-guide.md#runtime-settings) in the administration guide.');
   for (const section of sections) {
