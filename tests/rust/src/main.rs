@@ -66,6 +66,10 @@ mod misc_control_plane;
 #[cfg(test)]
 mod number_validation;
 #[cfg(test)]
+mod number_validation_all_ops;
+#[cfg(test)]
+mod number_validation_order;
+#[cfg(test)]
 mod put_item;
 #[cfg(test)]
 mod put_item_edge;
