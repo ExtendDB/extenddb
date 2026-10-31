@@ -1211,7 +1211,9 @@ mod tests {
         let err_msg = |op: &str, input: Value| match validate_operation_arns(op, &input, R, A) {
             Err(DynamoDbError::ValidationException(m)) => Some(m),
             Ok(()) => None,
-            other => panic!("unexpected {other:?}"),
+            // The error's text is not printed: it carries the account id
+            // from the checked ARN.
+            Err(_) => panic!("unexpected non-validation error for {op}"),
         };
 
         // Export: only an UNPARSEABLE TableArn is refused before authz, with the
