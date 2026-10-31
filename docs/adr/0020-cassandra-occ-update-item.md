@@ -6,15 +6,15 @@
 
 ## Context
 
-`update_item_impl` and the conditional path of `put_item_impl` use a read-check-write pattern: read `item_data`, mutate in Rust, write back. This is not atomic. Under concurrent writes to the same item, the last writer wins and intermediate updates are silently lost. This affects all `UpdateItem` calls — not just conditional ones. The root cause is the non-atomic read-modify-write cycle itself.
+`update_item_impl` and the conditional path of `put_item_impl` use a read-check-write pattern: read `item_data`, mutate in Rust, write back. This is not atomic. Under concurrent writes to the same item, the last writer wins and intermediate updates are silently lost. This affects all `UpdateItem` calls, not just conditional ones. The root cause is the non-atomic read-modify-write cycle itself.
 
 ## Options Considered
 
-1. **Version-based OCC via LWT** — Add a `version bigint` column to each data table. Every successful write increments it. The read-modify-write cycle is made atomic by conditioning the write on `version = <read_version> AND prepared_txn_id = NULL`. A `[applied] = false` response means another writer won the race; retry from the read.
+1. **Version-based OCC via LWT**: Add a `version bigint` column to each data table. Every successful write increments it. The read-modify-write cycle is made atomic by conditioning the write on `version = <read_version> AND prepared_txn_id = NULL`. A `[applied] = false` response means another writer won the race; retry from the read.
 
-2. **Serialized writes via a per-item lock service** — Acquire an external distributed lock per item key before each write. Rejected: adds infrastructure dependency and defeats Cassandra's distributed architecture.
+2. **Serialized writes via a per-item lock service**: Acquire an external distributed lock per item key before each write. Rejected: adds infrastructure dependency and defeats Cassandra's distributed architecture.
 
-3. **Accept last-writer-wins** — Document the behavior and leave it to callers to use conditional expressions. Rejected: DynamoDB's `UpdateItem` is defined to be atomic; silent data loss is not acceptable.
+3. **Accept last-writer-wins**: Document the behavior and leave it to callers to use conditional expressions. Rejected: DynamoDB's `UpdateItem` is defined to be atomic; silent data loss is not acceptable.
 
 ## Decision
 
@@ -32,9 +32,9 @@ Version-based OCC via LWT (option 1).
 
 - **Max retries:** 20
 - **Base delay:** 2 ms
-- **Backoff:** full jitter — `sleep = random(0, base * 2^min(attempt, 3))`, capped at a 16 ms window to bound tail latency
+- **Backoff:** full jitter (`sleep = random(0, base * 2^min(attempt, 3))`), capped at a 16 ms window to bound tail latency
 - **Retry on:** `[applied] = false` (clean lost race) only
-- **Do not retry on:** Cassandra errors (timeout, unavailable) — propagate immediately
+- **Do not retry on:** Cassandra errors (timeout, unavailable), which propagate immediately
 
 ## Consequences
 
@@ -50,6 +50,6 @@ Version-based OCC via LWT (option 1).
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is
-a trademark of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is maintained by
+engineers at Amazon Web Services. It is not Amazon DynamoDB and contains no DynamoDB source
+code. "DynamoDB" is a trademark of Amazon.com, Inc.

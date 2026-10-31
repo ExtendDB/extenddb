@@ -80,9 +80,9 @@ failed on a database outage would restart every replica at once and prolong the
 outage. A database that is unreachable at startup stops the server from listening
 at all, so that case is still caught.
 
-There is no readiness endpoint yet, so nothing will currently drain traffic from
-a replica whose backend is gone. Until one exists, gate on `/health` for restarts
-only, and rely on client retries for backend failures.
+There is no readiness endpoint, so nothing drains traffic from a replica whose
+backend is gone. Gate on `/health` for restarts only, and rely on client retries
+for backend failures.
 
 ## Configuration Reference
 
@@ -1246,6 +1246,6 @@ psql -f data_backup.sql extenddb_catalog_data
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is maintained by
+engineers at Amazon Web Services. It is not Amazon DynamoDB and contains no DynamoDB source
+code. "DynamoDB" is a trademark of Amazon.com, Inc.

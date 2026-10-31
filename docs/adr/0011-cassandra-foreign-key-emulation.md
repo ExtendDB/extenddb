@@ -12,11 +12,11 @@ Apache Cassandra does not support foreign key constraints. The database will acc
 
 ## Options Considered
 
-1. **Application-layer pre-checks** — Before inserting a child entity, execute a SELECT query to verify the parent entity exists. Return `OpError::NotFound` if the parent is missing, matching PostgreSQL FK violation behavior.
+1. **Application-layer pre-checks**: Before inserting a child entity, execute a SELECT query to verify the parent entity exists. Return `OpError::NotFound` if the parent is missing, matching PostgreSQL FK violation behavior.
 
-2. **Eventual consistency checks** — Allow writes to proceed without validation, then run periodic background jobs to detect and repair orphaned records.
+2. **Eventual consistency checks**: Allow writes to proceed without validation, then run periodic background jobs to detect and repair orphaned records.
 
-3. **Denormalization** — Embed parent entity data in child records to eliminate the need for referential integrity checks.
+3. **Denormalization**: Embed parent entity data in child records to eliminate the need for referential integrity checks.
 
 ## Decision
 
@@ -48,6 +48,6 @@ Application-layer pre-checks for all child entity creation operations.
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is
-a trademark of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is maintained by
+engineers at Amazon Web Services. It is not Amazon DynamoDB and contains no DynamoDB source
+code. "DynamoDB" is a trademark of Amazon.com, Inc.

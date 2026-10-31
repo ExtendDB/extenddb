@@ -17,7 +17,7 @@ architecture with no single write bottleneck: a deployment profile the reference
 
 The non-trivial design work is in conforming to DynamoDB semantics on a database that provides neither multi-row ACID
 transactions nor native sequence primitives. This document focuses on those gaps, the decisions made to close them, and
-the places where full parity with Amazon DynamoDB is not yet achieved.
+the places where full parity with Amazon DynamoDB is not achieved.
 
 ## Motivation
 
@@ -27,11 +27,11 @@ need linear, horizontal write scaling, geographic distribution with active-activ
 with no single point of failure often already operate Cassandra, and will want DynamoDB API compatibility without adopting
 a new infrastructure dependency.
 
-Cassandra is a natural fit for this role. Its data model — partition key for distribution, clustering key for ordering
-within a partition — maps directly onto DynamoDB's data architecture. Both systems are designed for high write throughput
+Cassandra is a natural fit for this role. Its data model (partition key for distribution, clustering key for ordering
+within a partition) maps directly onto DynamoDB's data architecture. Both systems are designed for high write throughput
 with tunable consistency, both treat non-key attributes as schemaless, and both support native multi-datacenter replication.
 The design challenges addressed in this RFC arise not from a mismatch between the two systems but from the specific
-DynamoDB features — transactions, TTL with Streams integration, eventually consistent GSIs — that require capabilities
+DynamoDB features (transactions, TTL with Streams integration, eventually consistent GSIs) that require capabilities
 Cassandra does not provide natively.
 
 The Cassandra backend is not a replacement for the PostgreSQL backend. It targets a different operational profile:
@@ -57,11 +57,11 @@ and server component construction.
 The backend uses Cassandra keyspaces to independently manage cross-account 'catalog' data, and individual account-owned
 data.
 
-**`{prefix}_catalog`** — system-wide metadata, created during `extenddb init`. Holds accounts, IAM entities (users,
+**`{prefix}_catalog`**: system-wide metadata, created during `extenddb init`. Holds accounts, IAM entities (users,
 groups, roles, policies, access keys), table definitions, stream shard metadata, idempotency tokens, settings, and schema
 migration history.
 
-**`{prefix}_account_{account_id}`** — one keyspace per ExtendDB account, created when the account is created. Holds item
+**`{prefix}_account_{account_id}`**: one keyspace per ExtendDB account, created when the account is created. Holds item
 tables (one per DynamoDB table), secondary index tables, stream records, transaction ledger, TTL expiration queues, and
 backup payloads. Account deletion drops the entire keyspace, atomically removing all the account's data.
 
@@ -80,7 +80,7 @@ linearizable within a datacenter. Background workers use `LOCAL_ONE` where event
 
 ### Catalog integrity
 
-The IAM catalog — which has parent-child relationships between accounts, users, roles, policies, and access keys — relies
+The IAM catalog, which has parent-child relationships between accounts, users, roles, policies, and access keys, relies
 on referential integrity and transactional mutations across entities to maintain consistency. Cassandra does not support
 referential integrity constraints, and Cassandra's logged batches (atomic batch updates) impose significant constraints
 on LWT statements (`IF NOT EXISTS`, `IF EXISTS`) within a batch. Duplicate detection and multi-row atomic writes cannot
@@ -118,7 +118,7 @@ return the last committed value and ignore the marker entirely, matching DynamoD
 non-transactional reads.
 
 **Durable ledger.** Before touching any item, a ledger entry is written to `transaction_ledger` in the account keyspace
-containing the complete write set. The ledger lives in the account keyspace — not the catalog — because transactions are
+containing the complete write set. The ledger lives in the account keyspace, not the catalog, because transactions are
 scoped to a single account's data, and co-locating the ledger with the data it describes means it is dropped atomically
 with the account. The ledger is written in two phases: key information before PREPARE begins, full computed write data
 after all claims succeed and before transitioning to COMMITTING. A transaction in COMMITTING state therefore always has
@@ -209,7 +209,7 @@ history are not restored; this is a known gap.
 
 Backup creation and restore execute synchronously within the API request. This is consistent with the current behavior
 of all ExtendDB backends, but differs from Amazon DynamoDB, where these are asynchronous operations. The same applies
-to `ExportTableToPointInTime` and `ImportTable`. Moving these to background jobs is planned future work.
+to `ExportTableToPointInTime` and `ImportTable`.
 
 ## 4. Behavioral Differences from DynamoDB
 
@@ -252,9 +252,7 @@ per table with no change to the claim protocol. This is the highest-value follow
 and the API call blocks for its duration. Large tables will need a durable, checkpointed background backfill before this
 path is suitable at scale.
 
-**Backup and restore are synchronous.** Moving `CreateBackup`, `RestoreTableFromBackup`, `ExportTableToPointInTime`, and
-`ImportTable` to background jobs with status polling is planned but not yet implemented. This applies to all current
-ExtendDB backends.
+**Backup and restore are synchronous.** This applies to all current ExtendDB backends.
 
 **Restore does not recover GSI/LSI definitions, tags, TTL configuration, or stream history.**
 
@@ -264,5 +262,5 @@ the dependency on stable JSON encoding.
 
 **Transaction recovery does not reconcile pre-commit images.** The transaction ledger does not persist the pre-commit
 item image, so a transaction that crashes between COMMIT and TTL queue reconciliation can leave the item's previous
-expiration entry in the queue until it comes due. The entry is inert — the worker revalidates before deleting — but it
+expiration entry in the queue until it comes due. The entry is inert (the worker revalidates before deleting) but it
 is queue garbage.

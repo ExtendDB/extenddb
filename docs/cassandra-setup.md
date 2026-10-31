@@ -25,7 +25,7 @@ These steps start a single-node Cassandra 4.1 container for local development.
 1. Start the container:
 
    ```bash
-   docker run -d --name cassandra -p 9042:9042 \
+   docker run -d --name cassandra -p 127.0.0.1:9042:9042 \
        -e CASSANDRA_CLUSTER_NAME=extenddb-dev \
        cassandra:4.1
    ```
@@ -122,13 +122,14 @@ application role with a password, so it fails against an unauthenticated
 
 init creates:
 - The catalog keyspace (`extenddb_catalog` by default)
+- The default account's keyspace (`<keyspace_prefix>_account_<account_id>`)
 - The application role ExtendDB uses at serve time (named `extenddb` by
   default; override with `--extenddb-user` / `--extenddb-pass`)
 - Admin user credentials (printed to stdout once; save them)
 - A self-signed TLS certificate at `~/.extenddb/tls/cert.pem`
 - The config file `extenddb.toml`
 
-Per-account keyspaces are created later, when accounts are added.
+Further accounts get their own keyspace when they are created.
 
 > **Save the admin credentials.** They are printed once and cannot be retrieved
 > later.
@@ -224,7 +225,7 @@ topologies, containers, the production checklist, systemd, multi-instance
 limits), see the [deployment guide](manuals/11-deployment-guide.md). This
 section covers only what is specific to Cassandra.
 
-> **Not recommended for production yet.** As of October 2026 the Cassandra
+> **Not recommended for production.** As of October 2026 the Cassandra
 > backend is experimental. It has known limitations: some multi-entity
 > management operations are not atomic, and a few concurrency issues are still
 > open (see Known Limitations below). Treat a Cassandra deployment as
@@ -292,9 +293,12 @@ backend is experimental rather than production-ready.
   operations use `LOCAL_QUORUM` / `LOCAL_SERIAL`, which are linearizable only
   within one datacenter. Serve writes for a given table from one Cassandra
   datacenter.
-- **Multi-node ExtendDB needs node-id configuration.** Running more than one
-  ExtendDB instance against the cluster requires a distinct node ID per
-  instance (used to derive stream sequence numbers).
+- **One instance per catalog.** Running more than one ExtendDB instance against
+  one catalog is not supported; see the deployment guide's
+  [Multi-Instance Considerations](manuals/11-deployment-guide.md#multi-instance-considerations).
+  Stream sequence numbers carry a node component derived from each instance's
+  bind address and port, so two instances with the same bind address and port
+  on different hosts would derive the same one.
 - **TTL throughput.** The TTL sweeper is sized for roughly 1,000 expirations
   per table per minute; a table expiring faster accumulates backlog. Enable TTL
   before opening a table to writes, or quiesce it briefly while enable and
@@ -315,6 +319,6 @@ rationale are documented in the Cassandra ADRs (`docs/adr/0010` to `0021`).
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is maintained by
+engineers at Amazon Web Services. It is not Amazon DynamoDB and contains no DynamoDB source
+code. "DynamoDB" is a trademark of Amazon.com, Inc.

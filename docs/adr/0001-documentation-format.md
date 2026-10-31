@@ -2,12 +2,12 @@
 
 ## Context
 
-extenddb needs a standard format for all documentation: design docs, ADRs, getting-started guides, and troubleshooting references. The two candidates are Markdown and LaTeX.
+ExtendDB needs a standard format for all documentation: design docs, ADRs, getting-started guides, and troubleshooting references. The two candidates are Markdown and LaTeX.
 
 ## Options Considered
 
-1. **Markdown** — lightweight, renders natively on GitHub/GitLab, editable in any text editor, supported by all Rust documentation tooling (`rustdoc`, `mdbook`).
-2. **LaTeX** — typesetting system designed for academic papers and technical documents. Produces high-quality PDF output but requires a TeX distribution to build.
+1. **Markdown**: lightweight, renders natively on GitHub/GitLab, editable in any text editor, supported by all Rust documentation tooling (`rustdoc`, `mdbook`).
+2. **LaTeX**: typesetting system designed for academic papers and technical documents. Produces high-quality PDF output but requires a TeX distribution to build.
 
 ## Decision
 
@@ -15,8 +15,8 @@ Markdown for all documentation.
 
 ## Rationale
 
-- All existing extenddb documentation is already Markdown. Switching would require migrating dozens of files.
-- Markdown renders in-place on code hosting platforms — no build step, no PDF artifacts to manage.
+- All existing ExtendDB documentation is already Markdown. Switching would require migrating dozens of files.
+- Markdown renders in-place on code hosting platforms: no build step, no PDF artifacts to manage.
 - Rust's `rustdoc` uses Markdown natively. Keeping external docs in the same format reduces context switching.
 - LaTeX adds a build dependency (TeX Live is ~4 GB) with no corresponding benefit for a software project's documentation needs.
 - Contributors can edit Markdown with zero tooling beyond a text editor.
@@ -33,6 +33,6 @@ Markdown for all documentation.
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is maintained by
+engineers at Amazon Web Services. It is not Amazon DynamoDB and contains no DynamoDB source
+code. "DynamoDB" is a trademark of Amazon.com, Inc.

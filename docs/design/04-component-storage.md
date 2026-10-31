@@ -1,13 +1,12 @@
 ---
 description: "The storage traits every backend implements and the PostgreSQL implementation of them."
+version: "3.0"
+date: "2026-05-19"
+status: "Active"
+crates: "storage (traits), storage-postgres (PostgreSQL backend)"
 ---
 
 # Component design: Storage
-
-**Version:** 3.0
-**Date:** 2026-05-19
-**Status:** Active
-**Crates:** `storage` (traits), `storage-postgres` (PostgreSQL backend)
 
 ## 1. Purpose
 
@@ -36,26 +35,26 @@ backends to implement traits incrementally, and allows consumers to depend only 
 ExtendDB defines **13 traits** across three categories:
 
 **DynamoDB Data Path** (defined in `storage/src/lib.rs`):
-- `TableEngine` — table lifecycle operations
-- `DataEngine` — item CRUD, query, scan, batch, transactions
-- `MetadataEngine` — TTL, tags, table statistics
-- `StreamEngine` — DynamoDB Streams record storage and retrieval
-- `WorkerStore` — background worker operations (control plane transitions)
-- `BackupEngine` — backup and restore operations
+- `TableEngine`: table lifecycle operations
+- `DataEngine`: item CRUD, query, scan, batch, transactions
+- `MetadataEngine`: TTL, tags, table statistics
+- `StreamEngine`: DynamoDB Streams record storage and retrieval
+- `WorkerStore`: background worker operations (control plane transitions)
+- `BackupEngine`: backup and restore operations
 
 **Management and Operational** (defined in `storage/src/management_store.rs` and related modules):
-- `ManagementStore` — auth-related CRUD (users, groups, roles, policies, access keys, accounts)
-- `AdminStore` — admin user management
-- `SettingsStore` — runtime settings (key-value store)
-- `MetricsStore` — historical metrics persistence and query
-- `RateLimitStore` — login rate limiting and account lockout
-- `AuthorizationStore` — policy lookups for authorization decisions
+- `ManagementStore`: auth-related CRUD (users, groups, roles, policies, access keys, accounts)
+- `AdminStore`: admin user management
+- `SettingsStore`: runtime settings (key-value store)
+- `MetricsStore`: historical metrics persistence and query
+- `RateLimitStore`: login rate limiting and account lockout
+- `AuthorizationStore`: policy lookups for authorization decisions
 
 **Initialization and Lifecycle** (defined in `storage/src/bootstrapper.rs`):
-- `Bootstrapper` — database initialization, migration, verification, destruction
+- `Bootstrapper`: database initialization, migration, verification, destruction
 
 **Authentication** (defined in `auth/src/lib.rs`):
-- `CredentialStore` — access key and session credential lookup for SigV4 verification
+- `CredentialStore`: access key and session credential lookup for SigV4 verification
 
 ### 2.2 Composite Traits
 
@@ -116,9 +115,9 @@ The `CredentialStore` trait in the `auth` crate uses `#[async_trait]` instead
 
 **TableEngine** (table lifecycle):
 - `create_table`, `delete_table`, `describe_table`, `list_tables`, `update_table`
-- `table_key_info` — returns lightweight metadata (key schema, attribute definitions)
+- `table_key_info`: returns lightweight metadata (key schema, attribute definitions)
   for data operations, avoiding the overhead of a full `describe_table` call
-- `index_info` — returns GSI/LSI metadata for query operations
+- `index_info`: returns GSI/LSI metadata for query operations
 
 All table operations are scoped by `account_id` for multi-account isolation.
 
@@ -136,17 +135,17 @@ written atomically with data writes when `stream` is `Some`.
 **MetadataEngine** (TTL, tags, table statistics):
 - `describe_ttl`, `update_ttl`
 - `tag_resource`, `untag_resource`, `list_tags`
-- `refresh_table_size` — updates cached table size and item count
-- `create_ttl_index`, `find_expired_items_indexed` — TTL cleanup support
+- `refresh_table_size`: updates cached table size and item count
+- `create_ttl_index`, `find_expired_items_indexed`: TTL cleanup support
 
 **StreamEngine** (DynamoDB Streams):
-- `write_stream_record` — writes stream record atomically with data write
-- `get_stream_records` — retrieves stream records for a shard
+- `write_stream_record`: writes stream record atomically with data write
+- `get_stream_records`: retrieves stream records for a shard
 - `describe_stream`, `list_streams`
-- `cleanup_expired_stream_records` — removes records older than 24 hours
+- `cleanup_expired_stream_records`: removes records older than 24 hours
 
 **WorkerStore** (background worker operations):
-- `process_control_plane_transitions` — handles table state transitions
+- `process_control_plane_transitions`: handles table state transitions
   (CREATING → ACTIVE, DELETING → deleted)
 
 **BackupEngine** (backup and restore):
@@ -248,16 +247,16 @@ pub type Item = BTreeMap<String, AttributeValue>;
 ```
 
 `AttributeValue` is an enum representing all supported data types:
-- `S(String)` — string
-- `N(String)` — number (stored as string to preserve precision)
-- `B(Vec<u8>)` — binary
-- `SS(Vec<String>)` — string set
-- `NS(Vec<String>)` — number set
-- `BS(Vec<Vec<u8>>)` — binary set
-- `L(Vec<AttributeValue>)` — list
-- `M(BTreeMap<String, AttributeValue>)` — map
-- `BOOL(bool)` — boolean
-- `NULL(bool)` — null (always true)
+- `S(String)`: string
+- `N(String)`: number (stored as string to preserve precision)
+- `B(Vec<u8>)`: binary
+- `SS(Vec<String>)`: string set
+- `NS(Vec<String>)`: number set
+- `BS(Vec<Vec<u8>>)`: binary set
+- `L(Vec<AttributeValue>)`: list
+- `M(BTreeMap<String, AttributeValue>)`: map
+- `BOOL(bool)`: boolean
+- `NULL(bool)`: null (always true)
 
 Storage backends must preserve the exact type and value of each attribute.
 
@@ -265,23 +264,23 @@ Storage backends must preserve the exact type and value of each attribute.
 
 **CreateTableInput**: Specifies table schema for `TableEngine::create_table`:
 - `table_name: String`
-- `key_schema: Vec<KeySchemaElement>` — partition key and optional sort key
-- `attribute_definitions: Vec<AttributeDefinition>` — types for key attributes
-- `billing_mode: BillingMode` — PAY_PER_REQUEST or PROVISIONED
+- `key_schema: Vec<KeySchemaElement>`: partition key and optional sort key
+- `attribute_definitions: Vec<AttributeDefinition>`: types for key attributes
+- `billing_mode: BillingMode`: PAY_PER_REQUEST or PROVISIONED
 - `global_secondary_indexes: Option<Vec<GlobalSecondaryIndex>>`
 - `local_secondary_indexes: Option<Vec<LocalSecondaryIndex>>`
 - `stream_specification: Option<StreamSpecification>`
 
 **TableDescription**: Returned by table operations, includes:
 - `table_name: String`
-- `table_status: TableStatus` — CREATING, ACTIVE, DELETING, UPDATING
+- `table_status: TableStatus`: CREATING, ACTIVE, DELETING, UPDATING
 - `table_arn: String`
-- `table_id: String` — backend-specific unique identifier
+- `table_id: String`: backend-specific unique identifier
 - `key_schema: Vec<KeySchemaElement>`
 - `attribute_definitions: Vec<AttributeDefinition>`
 - `table_size_bytes: i64`
 - `item_count: i64`
-- `creation_date_time: f64` — Unix timestamp
+- `creation_date_time: f64`: Unix timestamp
 
 **TableKeyInfo**: Lightweight metadata for data operations:
 - `account_id: String`
@@ -298,12 +297,12 @@ Storage backends must preserve the exact type and value of each attribute.
 - Storage backends call `extenddb_core::expression::evaluate()` to evaluate conditions
 
 **ExpressionMaps**: Name and value substitutions for expressions:
-- `names: HashMap<String, String>` — maps `#name` placeholders to attribute names
-- `values: HashMap<String, AttributeValue>` — maps `:value` placeholders to values
+- `names: HashMap<String, String>`: maps `#name` placeholders to attribute names
+- `values: HashMap<String, AttributeValue>`: maps `:value` placeholders to values
 
 **KeyCondition**: Parsed key condition for Query operations:
-- `partition_key: (String, AttributeValue)` — partition key name and value
-- `sort_key_condition: Option<SortKeyCondition>` — optional sort key condition
+- `partition_key: (String, AttributeValue)`: partition key name and value
+- `sort_key_condition: Option<SortKeyCondition>`: optional sort key condition
 
 **UpdateAction**: Parsed update expression action:
 - `SET`, `REMOVE`, `ADD`, `DELETE` operations
@@ -313,15 +312,15 @@ Storage backends must preserve the exact type and value of each attribute.
 
 **StreamRecord**: Complete stream record for persistence:
 - `event_id: String`
-- `event_name: StreamEventName` — INSERT, MODIFY, REMOVE
+- `event_name: StreamEventName`: INSERT, MODIFY, REMOVE
 - `event_version: String`
 - `event_source: String`
 - `aws_region: String`
-- `dynamodb: StreamRecordData` — keys, old_image, new_image, size_bytes
+- `dynamodb: StreamRecordData`: keys, old_image, new_image, size_bytes
 
 **StreamCapture**: Metadata for constructing stream records inside transactions:
-- `view_type: StreamViewType` — KEYS_ONLY, NEW_IMAGE, OLD_IMAGE, NEW_AND_OLD_IMAGES
-- `user_identity: Option<UserIdentity>` — set for TTL-originated deletions
+- `view_type: StreamViewType`: KEYS_ONLY, NEW_IMAGE, OLD_IMAGE, NEW_AND_OLD_IMAGES
+- `user_identity: Option<UserIdentity>`: set for TTL-originated deletions
 - `region: Arc<str>`
 
 Storage backends write stream records atomically with data writes when `stream` is `Some`.
@@ -329,15 +328,15 @@ Storage backends write stream records atomically with data writes when `stream` 
 ### Error Types
 
 **StorageError**: Errors returned by storage trait methods:
-- `TableNotFound(String)` — table does not exist
-- `TableAlreadyExists(String)` — table already exists
-- `TableNotActive(String)` — table is CREATING, DELETING, or UPDATING
-- `ConditionFailed { old_item: Option<Item> }` — condition expression evaluated to false
-- `TransactionCanceled(Vec<CancellationReason>)` — transaction failed with per-item reasons
-- `IdempotentReplay` — idempotency token matched previous request
-- `IdempotentMismatch` — idempotency token exists with different operations
-- `IndexNotFound` — secondary index does not exist
-- `Internal(String)` — backend-specific error
+- `TableNotFound(String)`: table does not exist
+- `TableAlreadyExists(String)`: table already exists
+- `TableNotActive(String)`: table is CREATING, DELETING, or UPDATING
+- `ConditionFailed { old_item: Option<Item> }`: condition expression evaluated to false
+- `TransactionCanceled(Vec<CancellationReason>)`: transaction failed with per-item reasons
+- `IdempotentReplay`: idempotency token matched previous request
+- `IdempotentMismatch`: idempotency token exists with different operations
+- `IndexNotFound`: secondary index does not exist
+- `Internal(String)`: backend-specific error
 
 The `engine` crate maps `StorageError` to wire protocol error responses.
 
@@ -348,22 +347,22 @@ The `engine` crate maps `StorageError` to wire protocol error responses.
 The PostgreSQL backend uses two categories of tables:
 
 **Catalog tables** (metadata, created by migrations):
-- `tables` — DynamoDB table metadata (key schema, status, ARN, table_id)
-- `indexes` — GSI/LSI metadata (key schema, projection, status, index_id)
-- `tags` — resource tags
-- `_dynamodb_credentials` — access keys and session tokens
-- `_dynamodb_users`, `_dynamodb_roles`, `_dynamodb_groups` — IAM-type entities
-- `_dynamodb_group_members` — group membership
-- `_dynamodb_principal_tags` — user/role tags
-- `_dynamodb_policies` — IAM-type policy documents
-- `_dynamodb_sessions` — temporary role session credentials
-- `_dynamodb_stream_records` — DynamoDB Streams records
-- `_dynamodb_import_jobs`, `_dynamodb_export_jobs` — import/export tracking
-- `_dynamodb_idempotency_tokens` — TransactWriteItems idempotency
+- `tables`: DynamoDB table metadata (key schema, status, ARN, table_id)
+- `indexes`: GSI/LSI metadata (key schema, projection, status, index_id)
+- `tags`: resource tags
+- `_dynamodb_credentials`: access keys and session tokens
+- `_dynamodb_users`, `_dynamodb_roles`, `_dynamodb_groups`: IAM-type entities
+- `_dynamodb_group_members`: group membership
+- `_dynamodb_principal_tags`: user/role tags
+- `_dynamodb_policies`: IAM-type policy documents
+- `_dynamodb_sessions`: temporary role session credentials
+- `_dynamodb_stream_records`: DynamoDB Streams records
+- `_dynamodb_import_jobs`, `_dynamodb_export_jobs`: import/export tracking
+- `_dynamodb_idempotency_tokens`: TransactWriteItems idempotency
 
 **Data tables** (created dynamically per DynamoDB table):
-- `_ddb_<table_id>` — base table (table_id is a UUID)
-- `_ddb_<index_id>` — GSI/LSI projection tables (index_id is a UUID)
+- `_ddb_<table_id>`: base table (table_id is a UUID)
+- `_ddb_<index_id>`: GSI/LSI projection tables (index_id is a UUID)
 
 **Schema files:**
 - Catalog schema: `crates/storage-postgres/migrations/001_schema.sql`
@@ -412,8 +411,8 @@ The PostgreSQL backend uses two categories of tables:
 
 - **GSI tables**: GSI tables include base table primary key columns (`base_pk`,
   `base_sk_*`) as actual SQL columns (not just inside `item_data` JSONB). This
-  is required because: (1) GSI keys are not unique — two base table items can
-  project to the same GSI key, so the base table PK is needed for uniqueness;
+  is required because: (1) GSI keys are not unique (two base table items can
+  project to the same GSI key), so the base table PK is needed for uniqueness;
   (2) pagination requires a tiebreaker when GSI keys collide; (3) the base
   table PK is needed to look up the full item for projections.
 
@@ -483,7 +482,7 @@ parameter is accepted and correctly reflected in capacity calculations (eventual
 **Read replica mode (`read_replica_url` configured):** Eventually consistent reads (`consistent_read=false`) are routed
 to a PostgreSQL streaming replica that is naturally a few milliseconds behind the primary. Strongly consistent reads
 (`consistent_read=true`) always read from the primary. This mirrors how DynamoDB achieves eventual consistency
-— via storage node replicas — and surfaces the exact class of bugs that applications may encounter in production
+(via storage node replicas) and surfaces the exact class of bugs that applications may encounter in production
 DynamoDB (e.g., read-after-write without `ConsistentRead=true` returning stale data).
 
 **Which operations are affected:**
@@ -491,7 +490,7 @@ DynamoDB (e.g., read-after-write without `ConsistentRead=true` returning stale d
 - `Query`: uses `consistent_read` field (default `false` in DynamoDB)
 - `Scan`: uses `consistent_read` field (default `false` in DynamoDB)
 - `BatchGetItem`: uses per-table `consistent_read` field
-- `TransactGetItems`: always strongly consistent (DynamoDB spec — serializable isolation)
+- `TransactGetItems`: always strongly consistent (DynamoDB spec: serializable isolation)
 - All write operations: always use the primary pool
 
 The `read_pool()` helper method on `PostgresEngine` encapsulates this routing. All read implementations call
@@ -613,8 +612,8 @@ All data plane operations (PutItem, GetItem, Query, etc.) must check `table_stat
 not `ACTIVE`, return `StorageError::TableNotActive` (mapped to `ResourceInUseException`). Control plane operations that
 modify the table (`UpdateTable`, `DeleteTable`) must:
 
-1. Atomically set `table_status` to `UPDATING` or `DELETING` (using `UPDATE ... WHERE table_status = 'ACTIVE'` — if
- zero rows affected, the table is already being modified, return `ResourceInUseException`)
+1. Atomically set `table_status` to `UPDATING` or `DELETING` (using `UPDATE ... WHERE table_status = 'ACTIVE'`: if
+ zero rows are affected, the table is already being modified, so return `ResourceInUseException`)
 2. Perform the operation
 3. Set `table_status` back to `ACTIVE` (or remove the row for `DeleteTable`)
 
@@ -622,8 +621,8 @@ This prevents concurrent DDL operations on the same table.
 
 ### 6.1.1 Async Control Plane Transitions (Phase 1c)
 
-Real DynamoDB control plane operations are not instantaneous — `CreateTable` returns `CREATING` status and the table
-transitions to `ACTIVE` asynchronously. extenddb emulates this behavior.
+Real DynamoDB control plane operations are not instantaneous: `CreateTable` returns `CREATING` status and the table
+transitions to `ACTIVE` asynchronously. ExtendDB emulates this behavior.
 
 **Implementation:**
 
@@ -654,13 +653,13 @@ on the `indexes` table when GSI operations are implemented.
   DynamoDB emulation (Phase 2).
 - Startup recovery will reset stuck `CREATING` tables to
   `NOW() + random[5, 20]` instead of instant activation (Phase 2).
-- `control_plane_delay_seconds` is a runtime setting (0–300 range), managed
+- `control_plane_delay_seconds` is a runtime setting (0-300 range), managed
   via `extenddb settings set`. It is not a `.toml` config key.
 
 **Crash recovery and in-flight operation tracking:**
 
 The `status_transition_at` column on the `tables` table serves as the
-in-flight operation tracker. When the extenddb server shuts down (cleanly or
+in-flight operation tracker. When the ExtendDB server shuts down (cleanly or
 via crash) while tables have pending transitions, the state is durable in
 PostgreSQL. On the next startup, `process_control_plane_transitions()` scans
 for rows where `status_transition_at IS NOT NULL AND
@@ -1046,12 +1045,12 @@ pub struct WorkerContext {
 **Worker classification:**
 
 **Backend-agnostic workers** (spawned in `cmd_serve`, use trait methods only):
-1. `poll_log_level` — uses `SettingsStore::get_setting`
-2. `poll_throttling_enabled` — uses `SettingsStore::get_setting`
-3. `metrics_prune_worker` — uses in-memory `MetricsCollector`
-4. `metrics_flush_worker` — uses `MetricsStore::insert_metrics`
-5. `capacity_warning_worker` — uses in-memory metrics
-6. `login_attempt_cleanup_worker` — uses `RateLimitStore::cleanup_old_attempts`
+1. `poll_log_level`: uses `SettingsStore::get_setting`
+2. `poll_throttling_enabled`: uses `SettingsStore::get_setting`
+3. `metrics_prune_worker`: uses in-memory `MetricsCollector`
+4. `metrics_flush_worker`: uses `MetricsStore::insert_metrics`
+5. `capacity_warning_worker`: uses in-memory metrics
+6. `login_attempt_cleanup_worker`: uses `RateLimitStore::cleanup_old_attempts`
 
 **Backend-specific workers** (spawned via `RuntimeHooks`, access backend
 internals):
@@ -1398,6 +1397,6 @@ backups).
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is maintained by
+engineers at Amazon Web Services. It is not Amazon DynamoDB and contains no DynamoDB source
+code. "DynamoDB" is a trademark of Amazon.com, Inc.

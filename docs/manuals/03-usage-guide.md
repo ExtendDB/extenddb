@@ -551,33 +551,11 @@ ExtendDB returns the DynamoDB error types and, where measured against the servic
 | `UnrecognizedClientException` | 403 | Invalid access key |
 | `InternalServerError` | 500 | Unexpected server error |
 
-## Supported Features Summary
+## Supported features
 
-| Feature | Status |
-|---------|--------|
-| CreateTable / DeleteTable / DescribeTable / ListTables / UpdateTable | ✓ |
-| PutItem / GetItem / UpdateItem / DeleteItem | ✓ |
-| Query / Scan (with filter, projection, pagination) | ✓ |
-| BatchWriteItem / BatchGetItem | ✓ |
-| TransactWriteItems / TransactGetItems | ✓ |
-| Global Secondary Indexes (GSI) | ✓ |
-| Vector indexes and SearchVectors | ✓ (PostgreSQL requires the pgvector extension) |
-| Local Secondary Indexes (LSI) | ✓ |
-| DynamoDB Streams | ✓ |
-| ConditionExpression / FilterExpression / UpdateExpression / ProjectionExpression | ✓ |
-| KeyConditionExpression | ✓ |
-| ReturnValues / ReturnConsumedCapacity | ✓ |
-| TTL (DescribeTimeToLive / UpdateTimeToLive) | ✓ |
-| Tagging (TagResource / UntagResource / ListTagsOfResource) | ✓ |
-| SigV4 Authentication | ✓ |
-| IAM Policy Evaluation | ✓ |
-| Legacy API (Expected, AttributeUpdates, AttributesToGet) | ✓ |
-| PartiQL (ExecuteStatement, BatchExecuteStatement, ExecuteTransaction) | ✗ (not implemented; returns UnknownOperationException) |
-| DAX | ✗ (not applicable) |
-| Global Tables | ✗ (not implemented; returns UnknownOperationException) |
-| On-demand backups (CreateBackup, RestoreTableFromBackup, DescribeBackup, ListBackups, DeleteBackup) | ✓ (see the backup rows on the differences page) |
-| Point-in-time recovery | ✗ (RestoreTableToPointInTime is refused with ValidationException) |
-| Import/Export (local filesystem) | ✓ (FileSource instead of S3) |
+The status of every feature area (implemented, not implemented, or implemented with a difference) is
+recorded in one place: the [Feature Status](../differences-from-dynamodb.md#feature-status) table on
+the Differences from DynamoDB page. That page also lists every measured behavioral difference by area.
 
 ---
 
@@ -586,6 +564,6 @@ ExtendDB returns the DynamoDB error types and, where measured against the servic
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is maintained by
+engineers at Amazon Web Services. It is not Amazon DynamoDB and contains no DynamoDB source
+code. "DynamoDB" is a trademark of Amazon.com, Inc.

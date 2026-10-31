@@ -2,11 +2,11 @@
 
 ## Status
 
-Accepted — 2026-04-07. Revised — 2026-04-21 (P30: reflect actual design).
+Accepted: 2026-04-07. Revised: 2026-04-21 to reflect the implemented design.
 
 ## Context
 
-extenddb stores DynamoDB table metadata and item data in PostgreSQL. User-supplied strings — table names, attribute names, key values, filter expressions — flow from HTTP requests through the engine layer into SQL queries. A SQL injection vulnerability here would allow arbitrary database access.
+ExtendDB stores DynamoDB table metadata and item data in PostgreSQL. User-supplied strings (table names, attribute names, key values, filter expressions) flow from HTTP requests through the engine layer into SQL queries. A SQL injection vulnerability here would allow arbitrary database access.
 
 ## Decision
 
@@ -14,9 +14,9 @@ extenddb stores DynamoDB table metadata and item data in PostgreSQL. User-suppli
 
 **Tier 1: Engine-layer validation.** All user-supplied strings are validated at the engine layer before reaching storage. The storage layer trusts that inputs have been validated.
 
-- Table names: validated against DynamoDB's regex (`[a-zA-Z0-9_.-]+`, 3–255 chars) in `validate_table_name()`
+- Table names: validated against DynamoDB's regex (`[a-zA-Z0-9_.-]+`, 3-255 chars) in `validate_table_name()`
 - Index names: validated against the same character set
-- Account IDs: validated in `PostgresEngine::validate_account_id()` — rejects `"`, `\0`, and non-ASCII
+- Account IDs: validated in `PostgresEngine::validate_account_id()` (rejects `"`, `\0`, and non-ASCII)
 - Attribute names: validated in expression parsing
 - Key values: type-checked via `AttributeValue` deserialization
 
@@ -43,8 +43,8 @@ fn data_table_name(account_id: &str, table_name: &str) -> String {
 
 These identifiers are interpolated into SQL strings via `format!`. This is safe because:
 
-1. `account_id` is validated by `validate_account_id()` — rejects `"`, `\0`, non-ASCII
-2. `table_name` is validated by `validate_table_name()` — only `[a-zA-Z0-9_.-]`
+1. `account_id` is validated by `validate_account_id()`: rejects `"`, `\0`, non-ASCII
+2. `table_name` is validated by `validate_table_name()`: only `[a-zA-Z0-9_.-]`
 3. The result is double-quoted, preventing interpretation as SQL keywords
 4. No character in the validated set can escape a double-quoted identifier
 
@@ -65,8 +65,8 @@ This is **not** the same as raw string interpolation of user input. The validati
 ## Audit Trail
 
 - 2026-04-07: Initial ADR. All SQL used parameterized queries.
-- 2026-04-07: `ListTables.ExclusiveStartTableName` gap closed — `validate_table_name_chars()` added.
-- 2026-04-21: ADR rewritten to accurately describe the two-tier design. The original ADR claimed "no dynamic SQL" which was misleading — validated identifier interpolation via `format!` is used extensively for per-table storage tables. The defense is validation + quoting, not absence of interpolation.
+- 2026-04-07: `ListTables.ExclusiveStartTableName` gap closed: `validate_table_name_chars()` added.
+- 2026-04-21: ADR rewritten to accurately describe the two-tier design. The original ADR claimed "no dynamic SQL" which was misleading: validated identifier interpolation via `format!` is used extensively for per-table storage tables. The defense is validation + quoting, not absence of interpolation.
 
 ---
 
@@ -75,6 +75,6 @@ This is **not** the same as raw string interpolation of user input. The validati
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is maintained by
+engineers at Amazon Web Services. It is not Amazon DynamoDB and contains no DynamoDB source
+code. "DynamoDB" is a trademark of Amazon.com, Inc.

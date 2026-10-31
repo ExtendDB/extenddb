@@ -1,22 +1,23 @@
 ---
 description: "The third revision of the auth crate: local credential management, policy evaluation and the IAM data model."
+version: "3.0"
+date: "2026-04-15"
+status: "Approved (interactive review session 2026-04-15)"
+crate: "extenddb-auth"
+supersedes: "05-component-auth.md (v2.0)"
 ---
 
 # Component design: Authentication and authorization (v3)
 
-**Version:** 3.0
-**Date:** 2026-04-15
-**Status:** Approved (interactive review session 2026-04-15)
-**Crate:** `extenddb-auth`
-**Supersedes:** 05-component-auth.md (v2.0)
+This document supersedes the [second revision](05-component-auth.md) of the authentication design.
 
 ## 1. Purpose
 
-The `auth` crate provides pluggable authentication and authorization for extenddb. It defines the `AuthProvider` trait, implements the built-in SigV4 provider with local credential management, and contains the IAM policy evaluation engine supporting identity-based access control (IBAC), role-based access control (RBAC), and fine-grained/tag-based access control (ABAC/FGAC).
+The `auth` crate provides pluggable authentication and authorization for ExtendDB. It defines the `AuthProvider` trait, implements the built-in SigV4 provider with local credential management, and contains the IAM policy evaluation engine supporting identity-based access control (IBAC), role-based access control (RBAC), and fine-grained/tag-based access control (ABAC/FGAC).
 
 The crate depends on `extenddb-core` (for types and errors) and `async_trait` (for object-safe async trait dispatch). It has no HTTP framework or storage dependencies.
 
-> **No caching.** All credential lookups, policy fetches, and identity resolution read directly from Postgres on every request. The latency is sub-millisecond for indexed lookups, and this approach eliminates stale-cache bugs and cache invalidation complexity entirely. Multiple extenddb instances sharing the same catalog see consistent data without coordination. If profiling under production load shows database round-trips are a bottleneck, caching can be added as a transparent layer without changing any interfaces.
+> **No caching.** All credential lookups, policy fetches, and identity resolution read directly from Postgres on every request. The latency is sub-millisecond for indexed lookups, and this approach eliminates stale-cache bugs and cache invalidation complexity entirely. Multiple ExtendDB instances sharing the same catalog see consistent data without coordination. If profiling under production load shows database round-trips are a bottleneck, caching can be added as a transparent layer without changing any interfaces.
 
 ## 2. Key Design Decisions (from 2026-04-15 review session)
 
@@ -30,7 +31,7 @@ The crate depends on `extenddb-core` (for types and errors) and `async_trait` (f
 
 5. **Multi-account support.** The catalog schema is scoped by `account_id`. Different accounts can have tables with the same name. The `account_id` is resolved from the authenticated identity, not from config.
 
-6. **Auth provider is config-only.** Set in `extenddb.toml` as `auth.provider = "builtin"`. The `"none"` value is no longer accepted — the server refuses to start with it. Cannot be changed at runtime via settings.
+6. **Auth provider is config-only.** Set in `extenddb.toml` as `auth.provider = "builtin"`. The `"none"` value is no longer accepted; the server refuses to start with it. Cannot be changed at runtime via settings.
 
 7. **No catalog migration.** `extenddb init` is required. The schema includes auth tables from the start.
 
@@ -58,7 +59,7 @@ JWT-based auth with Azure AD group-to-role mapping. Design unchanged from v2.0 �
 
 ## 4. Admin User Model
 
-Admin users are organizational administrators who manage accounts, IAM users, roles, groups, and policies. They are separate from IAM users — they do not make DynamoDB requests.
+Admin users are organizational administrators who manage accounts, IAM users, roles, groups, and policies. They are separate from IAM users; they do not make DynamoDB requests.
 
 ### 4.1 Bootstrap
 
@@ -305,9 +306,9 @@ Per-table Postgres tables change from `_ddb_{table_name}` to `_ddb_{account_id}_
 
 ### 6.3 Indexes, Streams, Tags
 
-- `indexes` FK is on `table_id` (UUID) — no change needed, already account-independent.
-- `stream_shards` and `stream_records` reference `table_name` — must add `account_id` or switch to `table_id` FK.
-- `tags` keyed by `resource_arn` — ARNs embed account_id, so no change needed.
+- `indexes` FK is on `table_id` (UUID): no change needed, already account-independent.
+- `stream_shards` and `stream_records` reference `table_name`: must add `account_id` or switch to `table_id` FK.
+- `tags` keyed by `resource_arn`: ARNs embed account_id, so no change needed.
 
 ### 6.4 Account ID Flow
 
@@ -352,10 +353,10 @@ Unchanged from v2.0 §6. The engine evaluates all three access control patterns 
 1. Collect applicable policies (user + group policies, or role policies)
 2. Collect permissions boundary (if set)
 3. Collect session policy (if AssumeRole with inline policy)
-4. **Explicit Deny scan** — any Deny statement that matches → DENY
-5. **Permissions boundary check** — must find Allow in boundary → else DENY
-6. **Session policy check** — must find Allow in session policy → else DENY
-7. **Identity policy Allow** — find Allow in identity policies → ALLOW
+4. **Explicit Deny scan**: any Deny statement that matches → DENY
+5. **Permissions boundary check**: must find Allow in boundary → else DENY
+6. **Session policy check**: must find Allow in session policy → else DENY
+7. **Identity policy Allow**: find Allow in identity policies → ALLOW
 8. **Implicit Deny** → DENY
 
 ### 8.2 Condition Operators
@@ -364,17 +365,17 @@ Full set from v2.0 §6.5: StringEquals, StringLike, NumericEquals, DateEquals, B
 
 ### 8.3 DynamoDB Condition Keys
 
-- `aws:PrincipalTag/*` — from authenticated identity's tags
+- `aws:PrincipalTag/*`: from authenticated identity's tags
 - `aws:ResourceTag/*`, from target table's tags
-- `dynamodb:LeadingKeys` — partition key values being accessed
-- `dynamodb:Attributes` — attribute names being read/written
+- `dynamodb:LeadingKeys`: partition key values being accessed
+- `dynamodb:Attributes`: attribute names being read/written
 - `dynamodb:Select`, `dynamodb:ReturnValues`, `dynamodb:ReturnConsumedCapacity`
-- `dynamodb:FullTableScan` — true for Scan operations
-- `dynamodb:EnclosingOperation` — parent operation for batch/transact sub-ops
+- `dynamodb:FullTableScan`: true for Scan operations
+- `dynamodb:EnclosingOperation`: parent operation for batch/transact sub-ops
 
 ### 8.4 Management API Policy Evaluation
 
-Management API calls are treated as IAM actions (`iam:CreateUser`, `iam:PutUserPolicy`, etc.) and evaluated against the caller's policies using the same engine. This is how admin vs IAM user permissions are enforced — via default policies, not hard-coded logic.
+Management API calls are treated as IAM actions (`iam:CreateUser`, `iam:PutUserPolicy`, etc.) and evaluated against the caller's policies using the same engine. This is how admin vs IAM user permissions are enforced: via default policies, not hard-coded logic.
 
 The only exception is the bootstrap admin created by `extenddb init`: if no policies exist for this principal, the system allows the operation. Once the seed policy is in place, normal evaluation takes over.
 
@@ -418,43 +419,43 @@ INSERT INTO settings (key, value) VALUES ('encryption_key', '<base64-encoded-32-
 All under `/management/*`. Authenticated via HTTP Basic auth (admin users use `admin_name:password`, IAM users use `account_id/user_name:password`).
 
 ### Admin endpoints:
-- `POST /management/admins` — create admin user
-- `PUT /management/admins/{name}/password` — change admin password
-- `DELETE /management/admins/{name}` — delete admin user
-- `POST /management/accounts` — create account
-- `DELETE /management/accounts/{id}` — delete account
-- `POST /management/accounts/{id}/users` — create IAM user
-- `DELETE /management/accounts/{id}/users/{name}` — delete IAM user
-- `POST /management/accounts/{id}/groups` — create group
-- `DELETE /management/accounts/{id}/groups/{name}` — delete group
-- `POST /management/accounts/{id}/groups/{name}/members` — add user to group
-- `DELETE /management/accounts/{id}/groups/{name}/members/{user}` — remove user from group
-- `POST /management/accounts/{id}/roles` — create role
-- `DELETE /management/accounts/{id}/roles/{name}` — delete role
-- `PUT /management/accounts/{id}/users/{name}/policy/{policy}` — put user policy
-- `PUT /management/accounts/{id}/groups/{name}/policy/{policy}` — put group policy
-- `PUT /management/accounts/{id}/roles/{name}/policy/{policy}` — put role policy
-- `DELETE /management/accounts/{id}/users/{name}/policy/{policy}` — delete user policy
-- `PUT /management/accounts/{id}/users/{name}/tags` — tag user
-- `PUT /management/accounts/{id}/roles/{name}/tags` — tag role
-- `PUT /management/accounts/{id}/users/{name}/permissions-boundary` — set boundary
-- `PUT /management/accounts/{id}/roles/{name}/permissions-boundary` — set boundary
-- `POST /management/accounts/{id}/roles/{name}/assume` — assume role
+- `POST /management/admins`: create admin user
+- `PUT /management/admins/{name}/password`: change admin password
+- `DELETE /management/admins/{name}`: delete admin user
+- `POST /management/accounts`: create account
+- `DELETE /management/accounts/{id}`: delete account
+- `POST /management/accounts/{id}/users`: create IAM user
+- `DELETE /management/accounts/{id}/users/{name}`: delete IAM user
+- `POST /management/accounts/{id}/groups`: create group
+- `DELETE /management/accounts/{id}/groups/{name}`: delete group
+- `POST /management/accounts/{id}/groups/{name}/members`: add user to group
+- `DELETE /management/accounts/{id}/groups/{name}/members/{user}`: remove user from group
+- `POST /management/accounts/{id}/roles`: create role
+- `DELETE /management/accounts/{id}/roles/{name}`: delete role
+- `PUT /management/accounts/{id}/users/{name}/policy/{policy}`: put user policy
+- `PUT /management/accounts/{id}/groups/{name}/policy/{policy}`: put group policy
+- `PUT /management/accounts/{id}/roles/{name}/policy/{policy}`: put role policy
+- `DELETE /management/accounts/{id}/users/{name}/policy/{policy}`: delete user policy
+- `PUT /management/accounts/{id}/users/{name}/tags`: tag user
+- `PUT /management/accounts/{id}/roles/{name}/tags`: tag role
+- `PUT /management/accounts/{id}/users/{name}/permissions-boundary`: set boundary
+- `PUT /management/accounts/{id}/roles/{name}/permissions-boundary`: set boundary
+- `POST /management/accounts/{id}/roles/{name}/assume`: assume role
 
 ### IAM user self-service endpoints:
-- `POST /management/accounts/{id}/users/{name}/access-keys` — create access key (self only)
-- `DELETE /management/accounts/{id}/users/{name}/access-keys/{key_id}` — delete access key (self only)
-- `GET /management/accounts/{id}/users/{name}/access-keys` — list access keys (self only)
-- `PUT /management/accounts/{id}/users/{name}/password` — change own password
+- `POST /management/accounts/{id}/users/{name}/access-keys`: create access key (self only)
+- `DELETE /management/accounts/{id}/users/{name}/access-keys/{key_id}`: delete access key (self only)
+- `GET /management/accounts/{id}/users/{name}/access-keys`: list access keys (self only)
+- `PUT /management/accounts/{id}/users/{name}/password`: change own password
 
 ### List/describe endpoints (admin only):
-- `GET /management/accounts` — list accounts
-- `GET /management/accounts/{id}/users` — list users
-- `GET /management/accounts/{id}/groups` — list groups
-- `GET /management/accounts/{id}/roles` — list roles
-- `GET /management/accounts/{id}/users/{name}/policies` — list user policies
-- `GET /management/accounts/{id}/groups/{name}/policies` — list group policies
-- `GET /management/accounts/{id}/roles/{name}/policies` — list role policies
+- `GET /management/accounts`: list accounts
+- `GET /management/accounts/{id}/users`: list users
+- `GET /management/accounts/{id}/groups`: list groups
+- `GET /management/accounts/{id}/roles`: list roles
+- `GET /management/accounts/{id}/users/{name}/policies`: list user policies
+- `GET /management/accounts/{id}/groups/{name}/policies`: list group policies
+- `GET /management/accounts/{id}/roles/{name}/policies`: list role policies
 
 ## 12. CLI Commands
 
@@ -481,11 +482,11 @@ The `[server].account_id` config key is used only when `provider = "none"`. When
 ## 14. Error Fidelity
 
 Auth-related DynamoDB errors:
-- `UnrecognizedClientException` — invalid access key or signature mismatch
-- `IncompleteSignatureException` — malformed Authorization header
-- `MissingAuthenticationTokenException` — no Authorization header
-- `ExpiredTokenException` — expired session credentials
-- `AccessDeniedException` — policy evaluation denied the request
+- `UnrecognizedClientException`: invalid access key or signature mismatch
+- `IncompleteSignatureException`: malformed Authorization header
+- `MissingAuthenticationTokenException`: no Authorization header
+- `ExpiredTokenException`: expired session credentials
+- `AccessDeniedException`: policy evaluation denied the request
 
 These must match real DynamoDB error format (HTTP status, error code, message structure).
 
@@ -496,6 +497,6 @@ These must match real DynamoDB error format (HTTP status, error code, message st
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is maintained by
+engineers at Amazon Web Services. It is not Amazon DynamoDB and contains no DynamoDB source
+code. "DynamoDB" is a trademark of Amazon.com, Inc.

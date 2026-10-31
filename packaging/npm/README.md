@@ -93,9 +93,7 @@ startup; whoever holds it can do anything. Do not expose it beyond localhost
 and do not keep real data in it. For a durable, TLS-terminated deployment,
 use [`extenddb/extenddb-postgres`](https://hub.docker.com/r/extenddb/extenddb-postgres).
 
-ExtendDB is an independent open source project managed by Amazon Web
-Services. It is not Amazon DynamoDB and does not contain any DynamoDB source
-code. "DynamoDB" is a trademark of Amazon.com, Inc. ExtendDB is a clean-room
+ExtendDB is an open source project under the Apache License 2.0, maintained by engineers at Amazon Web Services. It is not Amazon DynamoDB and contains no DynamoDB source code. "DynamoDB" is a trademark of Amazon.com, Inc. ExtendDB is a clean-room
 implementation that speaks the DynamoDB wire protocol.
 
 More at [extenddb.org](https://extenddb.org) and

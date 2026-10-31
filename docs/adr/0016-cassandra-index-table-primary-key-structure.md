@@ -9,24 +9,24 @@
 Global Secondary Indexes (GSI) and Local Secondary Indexes (LSI) require separate physical data tables to store indexed items with alternate keys. The PostgreSQL backend uses a PRIMARY KEY constraint of `(pk, base_pk, base_sk_*)` where all columns are part of a composite uniqueness constraint. Cassandra's PRIMARY KEY serves a fundamentally different purpose: it defines both the partition key (for data distribution) and clustering keys (for ordering within a partition). A direct translation of the PostgreSQL schema results in incorrect data distribution and query patterns.
 
 The index table stores:
-- `pk` — index partition key (computed from index key attributes)
-- `sk_*` — index sort keys (e.g., `sk_s`, `sk_n`, `sk_b` for different types)
-- `base_pk` — base table partition key (for uniqueness)
-- `base_sk_*` — base table sort keys (for uniqueness)
-- `item_data` — projected item attributes (JSON)
+- `pk`: index partition key (computed from index key attributes)
+- `sk_*`: index sort keys (e.g., `sk_s`, `sk_n`, `sk_b` for different types)
+- `base_pk`: base table partition key (for uniqueness)
+- `base_sk_*`: base table sort keys (for uniqueness)
+- `item_data`: projected item attributes (JSON)
 
 DynamoDB semantics require that:
 1. Queries against an index use the index keys (not base table keys)
-2. Index keys are not unique — multiple base items can have the same index keys
+2. Index keys are not unique: multiple base items can have the same index keys
 3. Each base item appears at most once in the index
 
 ## Options Considered
 
-1. **PostgreSQL-style ordering: `PRIMARY KEY (pk, base_pk, base_sk_*)`** — Partition by index PK, cluster by base keys only, with index sort keys as regular columns.
+1. **PostgreSQL-style ordering: `PRIMARY KEY (pk, base_pk, base_sk_*)`**: Partition by index PK, cluster by base keys only, with index sort keys as regular columns.
 
-2. **Cassandra-optimized ordering: `PRIMARY KEY ((pk), sk_*, base_pk, base_sk_*)`** — Partition by index PK, cluster first by index sort keys, then by base keys.
+2. **Cassandra-optimized ordering: `PRIMARY KEY ((pk), sk_*, base_pk, base_sk_*)`**: Partition by index PK, cluster first by index sort keys, then by base keys.
 
-3. **Composite partition key: `PRIMARY KEY ((pk, base_pk), sk_*, base_sk_*)`** — Include base PK in partition key for uniqueness.
+3. **Composite partition key: `PRIMARY KEY ((pk, base_pk), sk_*, base_sk_*)`**: Include base PK in partition key for uniqueness.
 
 ## Decision
 
@@ -67,6 +67,6 @@ Cassandra-optimized ordering: `PRIMARY KEY ((pk), sk_*, base_pk, base_sk_*)`
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is
-a trademark of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is maintained by
+engineers at Amazon Web Services. It is not Amazon DynamoDB and contains no DynamoDB source
+code. "DynamoDB" is a trademark of Amazon.com, Inc.

@@ -1,13 +1,16 @@
 ---
 description: "The auth crate: the AuthProvider trait, the SigV4 provider and the IAM policy evaluation engine."
+version: "2.0"
+date: "2026-04-06"
+status: "Draft"
+crate: "extenddb-auth"
 ---
 
 # Component design: Authentication and authorization
 
-**Version:** 2.0
-**Date:** 2026-04-06
-**Status:** Draft
-**Crate:** `extenddb-auth`
+:::note
+This is the second revision of the authentication design. [Authentication and authorization (v3)](05-component-auth-v3.md) supersedes it.
+:::
 
 ## 1. Purpose
 
@@ -44,7 +47,7 @@ crates/auth/src/
 
 ## 3. Identity Model
 
-extenddb implements a local IAM identity model that mirrors AWS IAM structure for DynamoDB access control.
+ExtendDB implements a local IAM identity model that mirrors AWS IAM structure for DynamoDB access control.
 
 ### 3.1 Principal Types
 
@@ -505,14 +508,14 @@ pub enum ConditionOperator {
 }
 ```
 
-> **Deferred: Policy Variables.** AWS IAM supports variable substitution in `Resource` ARNs and `Condition` values — e.g., `"Resource": "arn:aws:dynamodb:*:*:table/${aws:PrincipalTag/Team}-*"` grants access to tables matching the caller's own team tag. extenddb v1 does not support policy variables; all Resource and Condition values are treated as literal strings (with wildcard matching where applicable). This means ABAC policies that use variables to generalize across principals must be written as separate per-principal policies. Policy variable support is tracked as REQ-ABAC-006.
+> **Deferred: Policy Variables.** AWS IAM supports variable substitution in `Resource` ARNs and `Condition` values, e.g., `"Resource": "arn:aws:dynamodb:*:*:table/${aws:PrincipalTag/Team}-*"` grants access to tables matching the caller's own team tag. ExtendDB v1 does not support policy variables; all Resource and Condition values are treated as literal strings (with wildcard matching where applicable). This means ABAC policies that use variables to generalize across principals must be written as separate per-principal policies. Policy variable support is tracked as REQ-ABAC-006.
 
 **JSON deserialization:**
 
 IAM policy documents are JSON. Both Mode 2 (management API) and Mode 3 (IAM retrieval) receive policies as JSON strings. Deserialization uses `serde_json` with the following rules:
 
 - `Effect`: case-insensitive match to `"Allow"` or `"Deny"`. Any other value is a parse error.
-- `Action` / `NotAction`: a single string or array of strings. Mutually exclusive — a statement with both is a parse error. Mapped to `ActionMatch::Actions` or `ActionMatch::NotActions`.
+- `Action` / `NotAction`: a single string or array of strings. Mutually exclusive: a statement with both is a parse error. Mapped to `ActionMatch::Actions` or `ActionMatch::NotActions`.
 - `Resource` / `NotResource`: same pattern as Action. Mapped to `ResourceMatch`.
 - `Principal` / `NotPrincipal`: same pattern. Only present in trust policies; absent in identity-based policies. Mapped to `Option<PrincipalMatch>`.
 - `Condition`: a nested object `{ "OperatorName": { "key": "value" | ["values"] } }`. The operator name is parsed by splitting on `:` to detect `ForAllValues:` / `ForAnyValue:` prefixes and `IfExists` suffix, then matching the base operator name (e.g., `StringEquals`, `ArnLike`). Unknown operator names are a parse error.
@@ -556,11 +559,11 @@ pub trait ConditionContext {
 condition key as single-valued or multivalued (`ArrayOfString`) in the service
 authorization reference. For DynamoDB, `dynamodb:Attributes`,
 `dynamodb:LeadingKeys` and `aws:TagKeys` are multivalued; everything else
-extenddb resolves (`dynamodb:Select`, `dynamodb:ReturnValues`,
+ExtendDB resolves (`dynamodb:Select`, `dynamodb:ReturnValues`,
 `aws:RequestTag/<key>`, etc.) is single-valued.
 A **bare** operator (one without a `ForAllValues:`/`ForAnyValue:` qualifier)
-applied to a multivalued key **never matches** — verified against real AWS IAM
-(BR-7085), and independent of how many values are present. Only the set-operator
+applied to a multivalued key **never matches**. This is verified against AWS IAM
+and is independent of how many values are present. Only the set-operator
 qualifiers evaluate multivalued keys. This is fail-safe: a bare `Deny` on such a
 key is a no-op (the author must use `ForAnyValue:` to build a denylist), and a
 bare `Allow` allowlist grants nothing (implicit deny).
@@ -754,7 +757,7 @@ pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext
         ConditionOperator::IfExists(inner) => {
             match context_values {
                 None => true,  // key absent → condition passes
-                // bare operator on a multivalued key never matches (BR-7085)
+                // bare operator on a multivalued key never matches
                 Some(_) if is_multivalued => false,
                 Some(vals) => evaluate_single_value_condition(inner, &vals, &condition.values)
             }
@@ -762,7 +765,7 @@ pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext
         other => {
             match context_values {
                 None => false,  // key absent → condition fails (unless IfExists)
-                // bare operator on a multivalued key never matches (BR-7085)
+                // bare operator on a multivalued key never matches
                 Some(_) if is_multivalued => false,
                 Some(vals) => evaluate_single_value_condition(other, &vals, &condition.values)
             }
@@ -868,7 +871,7 @@ pub fn arn_match(pattern: &str, value: &str) -> bool;
 
 ## 7. Role Assumption (AssumeRole)
 
-extenddb provides a local AssumeRole mechanism for testing role-based access patterns. This is not exposed as an STS API — it's a extenddb management API.
+ExtendDB provides a local AssumeRole mechanism for testing role-based access patterns. This is not exposed as an STS API; it's an ExtendDB management API.
 
 ### 7.1 AssumeRole Flow
 
@@ -954,12 +957,12 @@ a trust policy are rejected, and those it accepts (a missing `Version`, a
 single-object `Statement`, numeric condition values, unknown condition keys) are
 accepted.
 
-> **Note:** Trust policies use `"Action": "sts:AssumeRole"` for compatibility with real IAM policy documents, even though extenddb exposes AssumeRole via `/management/assume-role` rather than an STS endpoint. The policy engine matches this action string during trust policy evaluation regardless of the actual HTTP endpoint used.
+> **Note:** Trust policies use `"Action": "sts:AssumeRole"` for compatibility with real IAM policy documents, even though ExtendDB exposes AssumeRole via `/management/assume-role` rather than an STS endpoint. The policy engine matches this action string during trust policy evaluation regardless of the actual HTTP endpoint used.
 
 Trust policy conditions are evaluated against an `AssumeRoleContext` (not the DynamoDB `RequestContext`), which contains:
-- `aws:PrincipalTag/*` — tags of the calling user (the entity assuming the role)
-- `aws:RequestTag/*` — session tags passed in the AssumeRole request
-- `sts:ExternalId` — the ExternalId parameter (if provided in the AssumeRole request)
+- `aws:PrincipalTag/*`: tags of the calling user (the entity assuming the role)
+- `aws:RequestTag/*`: session tags passed in the AssumeRole request
+- `sts:ExternalId`: the ExternalId parameter (if provided in the AssumeRole request)
 
 ```rust
 /// Context for trust policy condition evaluation.
@@ -988,10 +991,10 @@ impl ConditionContext for AssumeRoleContext {
 
 ## 8. Auth Providers
 
-### 8.1 No-Auth Provider (Mode 1) — REMOVED
+### 8.1 No-Auth Provider (Mode 1, removed)
 
 > **Historical note (P63b):** The `NoopAuthProvider` and `AuthIdentity::Anonymous`
-> variant were removed in v0.0.67. Authentication is now mandatory — the server
+> variant were removed in v0.0.67. Authentication is now mandatory; the server
 > refuses to start with `auth.provider = "none"`. The code below is preserved
 > for historical reference only.
 
@@ -1083,7 +1086,7 @@ impl AuthProvider for BuiltinAuthProvider {
 
 ### 8.3 AWS IAM Provider (Mode 3)
 
-When extenddb runs in an environment with AWS connectivity (EC2, ECS, Lambda, corporate network with VPN), the AWS IAM provider delegates authentication to STS and retrieves real IAM policies for local evaluation. This gives full IAM fidelity without maintaining a local credential store.
+When ExtendDB runs in an environment with AWS connectivity (EC2, ECS, Lambda, corporate network with VPN), the AWS IAM provider delegates authentication to STS and retrieves real IAM policies for local evaluation. This gives full IAM fidelity without maintaining a local credential store.
 
 #### 8.3.1 Architecture
 
@@ -1122,15 +1125,15 @@ Client (with extenddb wrapper)
 └─────────────────────────────────────────────┘
 ```
 
-This is the same pattern used by EKS (`aws-iam-authenticator`) and Vault's AWS auth method. The client generates a pre-signed STS `GetCallerIdentity` request using its own credentials (signed for the `sts` service), and extenddb calls STS with that pre-signed request to validate the caller's identity.
+This is the same pattern used by EKS (`aws-iam-authenticator`) and Vault's AWS auth method. The client generates a pre-signed STS `GetCallerIdentity` request using its own credentials (signed for the `sts` service), and ExtendDB calls STS with that pre-signed request to validate the caller's identity.
 
-> **Why pre-signed tokens instead of header forwarding?** SigV4 signatures are bound to the service name, host, and request body they were generated for. A request signed for `dynamodb` / `localhost:18443` cannot be replayed against `sts` / `sts.amazonaws.com` — STS will reject the signature because the credential scope, signed host, and body hash all mismatch. Pre-signed URLs solve this: the client signs a separate request specifically for STS, and extenddb uses that to authenticate.
+> **Why pre-signed tokens instead of header forwarding?** SigV4 signatures are bound to the service name, host, and request body they were generated for. A request signed for `dynamodb` / `localhost:18443` cannot be replayed against `sts` / `sts.amazonaws.com`: STS will reject the signature because the credential scope, signed host, and body hash all mismatch. Pre-signed URLs solve this: the client signs a separate request specifically for STS, and ExtendDB uses that to authenticate.
 
 #### 8.3.2 Authentication: Pre-Signed STS GetCallerIdentity
 
 STS `GetCallerIdentity` is unique among AWS APIs: it validates the caller's credentials and returns their identity without requiring any IAM permissions on the caller. Any valid AWS credential can call it.
 
-**Client-side token generation (performed by the extenddb wrapper):**
+**Client-side token generation (performed by the ExtendDB wrapper):**
 
 ```
 1. Using the caller's AWS credentials, generate a pre-signed URL for:
@@ -1238,7 +1241,7 @@ struct CachedPolicies {
 
 #### 8.3.3 Authorization: IAM Policy Retrieval
 
-After authentication, extenddb needs the caller's policies to make authorization decisions. Rather than trusting IAM blindly (which would mean no fine-grained access control), extenddb fetches the actual policies and evaluates them locally using the same policy engine as Mode 2.
+After authentication, ExtendDB needs the caller's policies to make authorization decisions. Rather than trusting IAM blindly (which would mean no fine-grained access control), ExtendDB fetches the actual policies and evaluates them locally using the same policy engine as Mode 2.
 
 **Policy retrieval flow for a User principal:**
 
@@ -1312,9 +1315,9 @@ Tags are fetched alongside policies and cached together.
 These populate aws:PrincipalTag/* for ABAC condition evaluation.
 ```
 
-#### 8.3.4 IAM Permissions Required by extenddb Host
+#### 8.3.4 IAM Permissions Required by ExtendDB Host
 
-The EC2 instance (or IAM role) running extenddb in Mode 3 needs the following permissions:
+The EC2 instance (or IAM role) running ExtendDB in Mode 3 needs the following permissions:
 
 ```json
 {
@@ -1347,25 +1350,25 @@ The EC2 instance (or IAM role) running extenddb in Mode 3 needs the following pe
 }
 ```
 
-> `sts:GetCallerIdentity` requires no permissions — any valid AWS credential can call it.
+> `sts:GetCallerIdentity` requires no permissions: any valid AWS credential can call it.
 
 #### 8.3.5 Known Limitations (Mode 3)
 
-1. **Session policies are not enforceable.** When a caller assumed a role with an inline session policy, that policy is not retrievable from IAM after the fact. extenddb evaluates only the role's attached policies and permissions boundary. This means Mode 3 is slightly more permissive than real DynamoDB for callers using session policies.
+1. **Session policies are not enforceable.** When a caller assumed a role with an inline session policy, that policy is not retrievable from IAM after the fact. ExtendDB evaluates only the role's attached policies and permissions boundary. This means Mode 3 is slightly more permissive than real DynamoDB for callers using session policies.
 
 2. **Resource-based policies are not evaluated.** Consistent with the overall deferral of resource-based policies (see Non-Goals table).
 
-3. **Service control policies (SCPs) are not evaluated.** SCPs are an Organizations-level feature. extenddb does not query Organizations APIs.
+3. **Service control policies (SCPs) are not evaluated.** SCPs are an Organizations-level feature. ExtendDB does not query Organizations APIs.
 
 4. **Policy variable substitution is not supported.** Consistent with REQ-ABAC-006 deferral. Fetched policies containing `${aws:PrincipalTag/key}` will treat the variable syntax as a literal string.
 
-5. **Cross-account access is not evaluated.** extenddb assumes all callers are in the same account. Cross-account role assumption and resource policies are not supported.
+5. **Cross-account access is not evaluated.** ExtendDB assumes all callers are in the same account. Cross-account role assumption and resource policies are not supported.
 
-6. **Latency on cache miss.** Policy retrieval for a user with multiple groups and managed policies can require 10+ IAM API calls. With caching (default 300s TTL), this only happens once per principal per TTL window. First-request latency for a new principal may be 500ms–2s.
+6. **Latency on cache miss.** Policy retrieval for a user with multiple groups and managed policies can require 10+ IAM API calls. With caching (default 300s TTL), this only happens once per principal per TTL window. First-request latency for a new principal may be 500ms-2s.
 
 7. **Identity cache eventual consistency.** If a user rotates their access key, the old key's identity remains cached for up to one `identity_cache_ttl_seconds` window. During this window, a pre-signed token generated with the old key (before deletion) that hasn't expired could still produce a cache hit. In practice, the short token expiry (60s) and short default identity cache TTL (60s) limit this window. For security-sensitive deployments, lower the identity cache TTL.
 
-8. **Policy cache eventual consistency.** If an admin detaches or modifies a policy in IAM, extenddb continues using the cached (now-stale) policies for up to `policy_cache_ttl_seconds`. This is analogous to real DynamoDB's IAM propagation delay (typically seconds). This is a conscious design choice — the TTL trades freshness for reduced IAM API call volume.
+8. **Policy cache eventual consistency.** If an admin detaches or modifies a policy in IAM, ExtendDB continues using the cached (now-stale) policies for up to `policy_cache_ttl_seconds`. This is analogous to real DynamoDB's IAM propagation delay (typically seconds). This is a conscious design choice: the TTL trades freshness for reduced IAM API call volume.
 
 9. **Client wrapper required.** Unlike Modes 1 and 2, Mode 3 requires a thin client-side wrapper to generate the pre-signed STS token. The wrapper is provided for Python, Rust, and Java. Applications that cannot use the wrapper cannot use Mode 3.
 
@@ -1527,7 +1530,7 @@ impl AuthProvider for AwsIamProvider {
 }
 ```
 
-### 8.4 Azure AD Provider (Sketch — Deferred)
+### 8.4 Azure AD Provider (Sketch, Deferred)
 
 ```rust
 pub struct AzureAdProvider {
@@ -1614,6 +1617,6 @@ pub fn decrypt_secret(ciphertext: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, Auth
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is maintained by
+engineers at Amazon Web Services. It is not Amazon DynamoDB and contains no DynamoDB source
+code. "DynamoDB" is a trademark of Amazon.com, Inc.

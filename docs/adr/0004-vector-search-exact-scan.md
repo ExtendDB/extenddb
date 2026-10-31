@@ -31,15 +31,15 @@ than preferences:
 
 ## Options Considered
 
-1. **`sqlite-vec`** (asg017) — dual Apache-2.0/MIT, index in in-database shadow
+1. **`sqlite-vec`** (asg017): dual Apache-2.0/MIT, index in in-database shadow
    tables, native partition-key columns that pre-filter. The closest fit.
-2. **`sqlite-vss`** (asg017) — Faiss-backed, real ANN.
-3. **`sqliteai/sqlite-vector`** — SIMD, works on existing table schemas.
-4. **`vectorlite`** — real HNSW via hnswlib.
-5. **`usearch`'s SQLite extension** — from the usearch project.
-6. **`sqlite-muninn`** — HNSW, loadable extension.
-7. **libSQL / Turso native vector search** — LM-DiskANN built into a SQLite fork.
-8. **A Rust index crate persisted in the database** — `hnsw_rs`,
+2. **`sqlite-vss`** (asg017): Faiss-backed, real ANN.
+3. **`sqliteai/sqlite-vector`**: SIMD, works on existing table schemas.
+4. **`vectorlite`**: real HNSW via hnswlib.
+5. **`usearch`'s SQLite extension**: from the usearch project.
+6. **`sqlite-muninn`**: HNSW, loadable extension.
+7. **libSQL / Turso native vector search**: LM-DiskANN built into a SQLite fork.
+8. **A Rust index crate persisted in the database**: `hnsw_rs`,
    `instant-distance`, `usearch` as a library, `arroy`, `hannoy`.
 9. **An exact scan written in Rust**, with vectors stored as ordinary rows.
 

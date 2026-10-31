@@ -20,7 +20,7 @@ This guide covers deploying ExtendDB in various environments beyond local develo
 
 ExtendDB is a single Rust binary that connects to the storage backend it was built with (PostgreSQL by default; see [Storage backends](../storage-backends.md)). All durable state lives in the backend; ExtendDB keeps only short-lived credential, policy, and table-metadata caches in process. This means:
 
-- Running more than one ExtendDB instance against one catalog is not supported in this release (see [Multi-Instance Considerations](#multi-instance-considerations))
+- Running more than one ExtendDB instance against one catalog is not supported (see [Multi-Instance Considerations](#multi-instance-considerations))
 - The backend's own HA, backup, and replication tools provide durability
 - ExtendDB can run anywhere the storage backend is reachable
 
@@ -126,10 +126,9 @@ want: one that failed on a database outage would restart every replica at once.
 A backend that is unreachable at startup does stop the server from listening, so
 container start-up failures are still caught.
 
-There is no readiness endpoint yet, so do not expect a Kubernetes
-`readinessProbe` on `/health` to remove a replica from service when its database
-becomes unreachable. Until a readiness endpoint that probes the storage layer
-exists, treat backend failures as something clients retry through.
+There is no readiness endpoint, so do not expect a Kubernetes `readinessProbe`
+on `/health` to remove a replica from service when its database becomes
+unreachable. Treat backend failures as something clients retry through.
 
 For Kubernetes, run `extenddb init` as an init container or a one-time Job, then deploy ExtendDB as a Deployment with the generated `extenddb.toml` mounted as a ConfigMap or Secret.
 
@@ -267,7 +266,7 @@ sudo systemctl start extenddb
 
 ## Multi-Instance Considerations
 
-Run one ExtendDB instance per catalog. Multiple instances behind a load balancer are not supported in this release:
+Run one ExtendDB instance per catalog. Multiple instances behind a load balancer are not supported:
 
 - Credentials, policies, and table metadata are cached in each process (see the cache TTLs in the admin guide). Nothing invalidates a cache on another instance, so a key revoked or a policy changed through one instance stays in force on the others until the TTL expires.
 - Every instance runs every background worker (TTL expiry, GSI backfill, stream retention, control-plane transitions). The workers are safe to run twice, but the work is duplicated.
@@ -341,6 +340,6 @@ ORDER BY mean_exec_time DESC LIMIT 10;
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is maintained by
+engineers at Amazon Web Services. It is not Amazon DynamoDB and contains no DynamoDB source
+code. "DynamoDB" is a trademark of Amazon.com, Inc.

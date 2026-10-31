@@ -190,7 +190,7 @@ fn assign_shard(partition_key: &str, table_id: &str) -> String {
 - CRC32 provides stable, deterministic hashing
 - Same partition key always routes to same shard (consistent)
 - Good distribution across shards
-- Uses `table_id` (UUID), not `table_name` — prevents shard ID collision if a table is deleted and recreated with the same name (criterion 8.2)
+- Uses `table_id` (UUID), not `table_name`: prevents shard ID collision if a table is deleted and recreated with the same name (criterion 8.2)
 - Matches PostgreSQL implementation
 
 ### Atomic Stream + Data Writes
@@ -283,7 +283,7 @@ For `StreamViewType` of `OLD_IMAGE` or `NEW_AND_OLD_IMAGES`:
 
 ### OLD_IMAGE Capture
 
-For `StreamViewType` of `OLD_IMAGE` or `NEW_AND_OLD_IMAGES`, the pre-mutation item state is required. This is already guaranteed: index maintenance requires a pre-image read on every write path that can affect indexed attributes. Stream record capture piggybacks on this existing read — no additional round-trip is needed in the common case.
+For `StreamViewType` of `OLD_IMAGE` or `NEW_AND_OLD_IMAGES`, the pre-mutation item state is required. This is already guaranteed: index maintenance requires a pre-image read on every write path that can affect indexed attributes. Stream record capture piggybacks on this existing read; no additional round-trip is needed in the common case.
 
 ### Stream APIs
 
@@ -451,13 +451,13 @@ This refactoring should be done **as part of the Cassandra streams implementatio
 
 ## Resolved Questions
 
-1. **Node ID assignment strategy:** Derived as `crc32(format!("{}:{}", hostname, port)) % 9999 + 1`. Hostname alone is insufficient — multiple instances on the same host listening on different ports must have distinct node IDs. Hostname + port is stable across restarts, requires no configuration, and works correctly in containerized environments where the hostname is a pod/container ID and the port is the service binding. Hash collision (two instances mapping to the same node ID) is not a correctness problem — it only creates a theoretical ordering ambiguity that requires matching timestamp + counter on the same shard simultaneously.
+1. **Node ID assignment strategy:** Derived as `crc32(format!("{}:{}", hostname, port)) % 9999 + 1`. Hostname alone is insufficient: multiple instances on the same host listening on different ports must have distinct node IDs. Hostname + port is stable across restarts, requires no configuration, and works correctly in containerized environments where the hostname is a pod/container ID and the port is the service binding. Hash collision (two instances mapping to the same node ID) is not a correctness problem; it only creates a theoretical ordering ambiguity that requires matching timestamp + counter on the same shard simultaneously.
 
 2. **HLC state persistence:** Not needed. On restart, `now_ms` will always be greater than any previously generated timestamp (restarts take at least 1ms). Clock-going-backwards is handled by clamping to `last_timestamp_ms` and incrementing the counter, with a WARN log.
 
-3. **TTL configuration:** Global setting (`stream_retention_hours`, default 30). Per-stream configuration adds complexity with no practical benefit — DynamoDB itself uses a fixed 24-hour retention.
+3. **TTL configuration:** Global setting (`stream_retention_hours`, default 30). Per-stream configuration adds complexity with no practical benefit; DynamoDB itself uses a fixed 24-hour retention.
 
-4. **Clock skew handling:** Log a WARN if `now_ms < last_timestamp_ms`. Clamp to `last_timestamp_ms` and increment counter. No hard error — the sequence remains valid and ordered.
+4. **Clock skew handling:** Log a WARN if `now_ms < last_timestamp_ms`. Clamp to `last_timestamp_ms` and increment counter. No hard error: the sequence remains valid and ordered.
 
 ## References
 
