@@ -63,36 +63,40 @@
 # Listening port for the DynamoDB API, the management API and the console.
 # port = 18443
 
-# AWS region used when generating ARNs. Every backup ARN the server issues
-# carries it, so the value must stay within [a-z0-9-]; the server logs a
-# warning at startup for a value outside that class. See the upgrade manual
-# before changing it on a deployment that has backups.
+# AWS region used when generating Amazon Resource Names (ARNs). Every backup
+# ARN the server issues carries it, so the value must stay within [a-z0-9-];
+# the server logs a warning at startup for a value outside that class. See
+# the upgrade manual before changing it on a deployment that has backups.
 # region = "us-east-1"
 
-# Directory for runtime files (the PID file). A leading ~ expands to $HOME.
+# Directory for runtime files (the process ID file). A leading ~ expands to
+# $HOME.
 # run_dir = "~/.extenddb/run"
 
 # Provisioned throughput throttling via in-memory token buckets. When true,
-# tables with provisioned capacity are rate limited to their configured RCU
-# and WCU, on-demand tables use the default ceilings (12,000 RCU and 4,000
-# WCU), and the account-level aggregate limits in [limits] apply. This key
-# sets the value the server starts with; once the throttling_enabled runtime
-# setting has been written with `extenddb settings set`, the runtime setting
-# takes precedence. Unset means throttling is off. No default.
+# tables with provisioned capacity are rate limited to their configured read
+# capacity units (RCU) and write capacity units (WCU), on-demand tables use
+# the default ceilings (12,000 RCU and 4,000 WCU), and the account-level
+# aggregate limits in [limits] apply. This key sets the value the server
+# starts with; once the throttling_enabled runtime setting has been written
+# with `extenddb settings set`, the runtime setting takes precedence. Unset
+# means throttling is off. No default.
 # throttling_enabled = false
 
 [server.tls]
-# TLS is mandatory. `extenddb init` generates a self-signed certificate;
-# replace it with a CA-signed certificate for production use.
+# Transport Layer Security (TLS) is mandatory. `extenddb init` generates a
+# self-signed certificate; replace it with one signed by a certificate
+# authority for production use.
 
 # Accepted for backward compatibility. The server refuses to start when this
 # is set to false.
 # enabled = true
 
-# Path to the PEM certificate file. A leading ~ expands to $HOME.
+# Path to the certificate file in Privacy Enhanced Mail (PEM) format. A
+# leading ~ expands to $HOME.
 # cert_path = "~/.extenddb/tls/cert.pem"
 
-# Path to the PEM private key file. A leading ~ expands to $HOME.
+# Path to the private key file in PEM format. A leading ~ expands to $HOME.
 # key_path = "~/.extenddb/tls/key.pem"
 
 [storage]
@@ -149,17 +153,17 @@
 # pool_size = 20
 
 # Maximum connections for the management and catalog pool (authorization,
-# IAM, console). Minimum 10, raised with a startup warning. With auth enabled
-# each DynamoDB request makes concurrent authorization queries, so size this
-# to match the expected request concurrency. Defaults to pool_size when
-# absent, so it has no value of its own.
+# Identity and Access Management (IAM), console). Minimum 10, raised with a
+# startup warning. With auth enabled each DynamoDB request makes concurrent
+# authorization queries, so size this to match the expected request
+# concurrency. Falls back to pool_size when absent. No default of its own.
 # catalog_pool_size = 20
 
 [storage.sqlite]
 # Developer mode backend. Select it with `extenddb init --backend sqlite`.
 # The database path can be given at init time (`extenddb init --sqlite-path
 # <path>`, written into this file) or set here; at serve time the
-# EXTENDDB__STORAGE__SQLITE__PATH environment variable overrides it.
+# `EXTENDDB__STORAGE__SQLITE__PATH` environment variable overrides it.
 
 # Database file. A relative path is resolved against the working directory
 # when the configuration loads, before `serve` daemonizes. ":memory:" selects
@@ -233,9 +237,9 @@
 # Authentication is mandatory. Run `extenddb init` to create the encryption
 # key and the admin user before the first start.
 
-# Auth provider. "builtin" verifies SigV4 signatures against the local
-# credential store and evaluates IAM policies. The server refuses to start
-# with "none".
+# Auth provider. "builtin" verifies Signature Version 4 (SigV4) signatures
+# against the local credential store and evaluates IAM policies. The server
+# refuses to start with "none".
 # provider = "builtin"
 
 [auth.cache]

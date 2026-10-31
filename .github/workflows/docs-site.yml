@@ -14,6 +14,7 @@ on:
     paths:
       - 'docs/**'
       - 'website/**'
+      - 'extenddb.sample.toml'
       - 'Cargo.toml'
       - '.github/workflows/docs-site.yml'
   push:
@@ -21,6 +22,7 @@ on:
     paths:
       - 'docs/**'
       - 'website/**'
+      - 'extenddb.sample.toml'
       - 'Cargo.toml'
       - '.github/workflows/docs-site.yml'
   workflow_dispatch:
@@ -61,6 +63,9 @@ jobs:
       - name: Typecheck
         working-directory: website
         run: npm run typecheck
+      - name: Configuration reference matches extenddb.sample.toml
+        working-directory: website
+        run: npm run check:config
       - name: Build
         working-directory: website
         env:
