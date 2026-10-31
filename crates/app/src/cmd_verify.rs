@@ -7,9 +7,10 @@
 //! connects to data database, reports healthy/unhealthy.
 //!
 //! On a backend on the migration runner the version check is the catalog
-//! status, read without a lock or a write, and `verify` exits with the
-//! status's code (3 pending, 4 ahead by a breaking migration, 5 a person
-//! must act) before the 1 of a failed check.
+//! status, read without a lock or a write. `verify` exits with the status's
+//! code 4 (ahead by a breaking migration) or 5 (a person must act) before
+//! the 1 of a failed check, and with that 1 before the 3 of pending
+//! migrations, which `migrate --yes` cannot apply while a check fails.
 //!
 //! This command uses raw `sqlx` queries intentionally. It is a diagnostic
 //! tool that runs outside the server process and needs direct database
@@ -151,17 +152,30 @@ pub async fn run(args: VerifyArgs, release: &str) -> anyhow::Result<u8> {
     println!("  Indexes: {index_count}");
 
     println!();
-    let status_code = status_code.unwrap_or(0);
-    if errors == 0 && status_code == 0 {
+    let code = exit_code(status_code.unwrap_or(0), errors);
+    if code == 0 {
         println!("=== HEALTHY: All checks passed ===");
-        return Ok(0);
-    }
-    if errors > 0 {
+    } else if errors > 0 {
         println!("=== UNHEALTHY: {errors} check(s) failed ===");
     } else {
         println!("=== UNHEALTHY: the catalog needs the action above ===");
     }
-    Ok(if status_code == 0 { 1 } else { status_code })
+    Ok(code)
+}
+
+/// The exit status of a `verify` whose catalog status exits `status_code`
+/// and in which `failed` checks failed: the status's 4 or 5, which ask a
+/// person to act whatever the checks found, else 1 when a check failed,
+/// else the status's code. A failed check comes before the 3 of pending
+/// migrations because `migrate --yes` cannot apply them while the check
+/// fails, for example while the data database cannot be reached.
+fn exit_code(status_code: u8, failed: u32) -> u8 {
+    use extenddb_storage::migrations::exit;
+    match status_code {
+        exit::AHEAD_INCOMPATIBLE | exit::ATTENTION => status_code,
+        _ if failed > 0 => exit::ERROR,
+        _ => status_code,
+    }
 }
 
 /// The lines `verify` prints for the notes the catalog ledger records: per
@@ -258,9 +272,9 @@ async fn check_migrations(
 
 #[cfg(test)]
 mod tests {
-    use extenddb_storage::migrations::{Kind, LedgerRow, Outcome};
+    use extenddb_storage::migrations::{Kind, LedgerRow, Outcome, exit};
 
-    use super::ledger_note_lines;
+    use super::{exit_code, ledger_note_lines};
 
     fn row(id: u32, notes: usize) -> LedgerRow {
         LedgerRow {
@@ -303,5 +317,19 @@ mod tests {
         assert!(all.iter().all(|l| !l.contains("more")), "{all:?}");
         let five = ledger_note_lines(&[row(3, 5)], false);
         assert_eq!(five.len(), 6, "{five:?}");
+    }
+
+    /// A failed check, such as an unreachable data database, exits 1 before
+    /// the 3 of pending migrations; 4 and 5 still ask a person to act.
+    #[test]
+    fn a_failed_check_exits_one_before_a_pending_status() {
+        assert_eq!(exit_code(exit::PENDING, 1), exit::ERROR);
+        assert_eq!(exit_code(exit::PENDING, 0), exit::PENDING);
+        assert_eq!(exit_code(exit::OK, 1), exit::ERROR);
+        assert_eq!(exit_code(exit::OK, 0), exit::OK);
+        for code in [exit::AHEAD_INCOMPATIBLE, exit::ATTENTION] {
+            assert_eq!(exit_code(code, 1), code);
+            assert_eq!(exit_code(code, 0), code);
+        }
     }
 }

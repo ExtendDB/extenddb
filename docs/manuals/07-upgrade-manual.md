@@ -37,6 +37,8 @@ Running `extenddb migrate --yes` on an up-to-date catalog changes nothing.
 
 Exit status 6 means the migration lock, or a running server, was still held when `--lock-timeout` ran out; run the command again once it is free. Every refusal prints the command that resolves it. A dev build's `serve` applies a Behind or Uninitialized catalog at startup instead of refusing it. The `serve` codes are those of `serve --foreground`; in daemon mode `serve` exits 1 and writes the refusal to syslog.
 
+`verify` also checks the connection to the data database. When that check fails, `verify` exits 1 on a Behind catalog instead of 3, because `migrate --yes` cannot apply the pending migrations while the data database cannot be reached. It still exits 4 or 5 for the statuses that need a person.
+
 A migration is additive when the previous release serves the catalog correctly with it applied, and breaking otherwise. Migrations 1 to 4 are breaking: do not run a 0.1.x server against a migrated catalog. A 0.1.x binary that writes to a migrated catalog (its `migrate --yes`, or a SQLite dev server) leaves it WrittenByOlderRelease. `migrate --yes --reconverge` repairs it by running the convergent migrations again. Migration 2, which rewrites stored policies, is not convergent: the repair skips it and prints a line that says so (see the v0.1.14 notes below).
 
 ## Writing a New Migration
