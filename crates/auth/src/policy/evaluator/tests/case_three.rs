@@ -7,7 +7,8 @@
 //! same holds when the key is named by a `${key}` variable in `Resource` or
 //! `NotResource` of a `2012-10-17` document; a `2008-10-17` or no-`Version`
 //! document matches such a pattern as written. A variable naming the key in a
-//! condition value is compared as written, with or without a default.
+//! condition value fails the condition closed in the same way, with or without
+//! a default.
 //!
 //! Every expectation here is an ExtendDB rule with no service measurement:
 //! the service has a value for such a key, so there is no service case to
@@ -281,15 +282,43 @@ fn get_t_as_blue(policies: &[PolicyDocument], ctx: Ctx) -> AuthzDecision {
 }
 
 #[test]
-fn a_condition_value_naming_an_unresolvable_key_is_compared_as_written() {
+fn a_condition_value_naming_an_unresolvable_key_fails_closed_with_or_without_a_default() {
+    // As for the Deny gated on the key in a Condition above: the variable has
+    // no value to expand to, and the default is not used, because the service
+    // would have a value for the key. The Deny applies whatever the operator.
+    for (operator, value) in [
+        ("StringEquals", "${aws:PrincipalOrgID}"),
+        ("StringEquals", "${aws:PrincipalOrgID, 'blue'}"),
+        ("StringNotEquals", "${aws:PrincipalOrgID, 'blue'}"),
+    ] {
+        let p = allow_all_and(&format!(
+            r#"{{"Effect":"Deny","Action":"dynamodb:GetItem","Resource":"*",
+                "Condition":{{"{operator}":{{"aws:PrincipalTag/team":"{value}"}}}}}}"#
+        ));
+        let unresolvable = Ctx::empty().unresolvable("aws:PrincipalOrgID");
+        assert_eq!(
+            get_t_as_blue(&p, unresolvable),
+            AuthzDecision::Deny,
+            "{operator} {value}"
+        );
+    }
+    // An Allow gated the same way does not grant, under either operator.
+    for operator in ["StringEquals", "StringNotEquals"] {
+        let allow = [only(&format!(
+            r#"{{"Effect":"Allow","Action":"dynamodb:GetItem","Resource":"*",
+                "Condition":{{"{operator}":{{"aws:PrincipalTag/team":"${{aws:PrincipalOrgID, 'blue'}}"}}}}}}"#
+        ))];
+        let unresolvable = Ctx::empty().unresolvable("aws:PrincipalOrgID");
+        assert_eq!(
+            get_t_as_blue(&allow, unresolvable),
+            AuthzDecision::Deny,
+            "{operator}"
+        );
+    }
     let p = allow_all_and(
         r#"{"Effect":"Deny","Action":"dynamodb:GetItem","Resource":"*",
             "Condition":{"StringEquals":{"aws:PrincipalTag/team":"${aws:PrincipalOrgID, 'blue'}"}}}"#,
     );
-    // Unresolvable: the value is compared as written, which is not `blue`, so
-    // the Deny does not apply. The default is not used.
-    let unresolvable = Ctx::empty().unresolvable("aws:PrincipalOrgID");
-    assert_eq!(get_t_as_blue(&p, unresolvable), AuthzDecision::Allow);
     // Absent: the default `blue` is used and the Deny applies.
     assert_eq!(get_t_as_blue(&p, Ctx::empty()), AuthzDecision::Deny);
     // Present: the key's value is used, not the default.

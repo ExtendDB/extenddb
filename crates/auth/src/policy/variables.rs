@@ -275,13 +275,31 @@ pub fn resource_pattern_is_unresolvable(
         && expand_tokens(pattern, context) == Err(Missing::Unresolvable)
 }
 
+/// The key names the `${key}` and `${key, 'default'}` variables in `value`
+/// read, in the order [`expand_condition_value`] reads them.
+///
+/// The default is not part of the name, so a caller that asks the context
+/// about each name sees the key behind `${aws:RequestTag/env, 'x'}` as it
+/// sees the one behind `${aws:RequestTag/env}`. The `${*}`, `${?}` and `${$}`
+/// escapes name no key, and neither does a `${` with no closing brace, as
+/// both expand to themselves.
+pub fn variable_key_names(value: &str) -> impl Iterator<Item = &str> {
+    parts(value).into_iter().filter_map(|part| match part {
+        Part::Ref(_, Reference::Key { name, .. }) => Some(name),
+        Part::Text(_) | Part::Ref(_, Reference::Escape(_)) => None,
+    })
+}
+
 /// Expand variables in a condition value.
 ///
 /// `${key}` and `${key, 'default'}` are replaced by their value; a variable
 /// whose key the request does not carry, with no default, is left as written,
 /// and so are the `${*}`, `${?}` and `${$}` escapes, as before. A variable
-/// whose key the context cannot resolve is also left as written, with or
-/// without a default; a condition value does not fail closed on it.
+/// whose key the context reports unresolvable is also left as written, with
+/// or without a default: the service would have a value for the key, so the
+/// default is not used, and the caller fails the condition closed instead of
+/// comparing the text (`condition::evaluate_condition_match`, which finds the
+/// key through [`variable_key_names`]).
 #[must_use]
 pub fn expand_condition_value(value: &str, context: &impl ConditionContext) -> String {
     if !value.contains("${") {

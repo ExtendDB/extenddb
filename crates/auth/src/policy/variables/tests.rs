@@ -350,6 +350,27 @@ fn condition_value_leaves_unresolved_and_escapes_literal() {
 }
 
 #[test]
+fn variable_key_names_strip_the_default_and_skip_escapes() {
+    let names: Vec<&str> = variable_key_names(
+        "${aws:PrincipalTag/team}-${aws:RequestTag/env, 'x'}${*}${aws:username,'y'}${open",
+    )
+    .collect();
+    assert_eq!(
+        names,
+        [
+            "aws:PrincipalTag/team",
+            "aws:RequestTag/env",
+            "aws:username"
+        ]
+    );
+    // A comma whose right side is not single-quoted is part of the name, as
+    // `expand_condition_value` reads it.
+    let names: Vec<&str> = variable_key_names("${a, b}").collect();
+    assert_eq!(names, ["a, b"]);
+    assert_eq!(variable_key_names("plain").count(), 0);
+}
+
+#[test]
 fn condition_value_present_key_without_values_is_empty() {
     let ctx = Ctx::empty().with(TEAM, &[]);
     assert_eq!(

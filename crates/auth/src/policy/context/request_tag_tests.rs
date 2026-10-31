@@ -206,6 +206,51 @@ fn ambiguous_request_tag_as_a_policy_variable_fails_the_statement_closed() {
 }
 
 #[test]
+fn ambiguous_request_tag_as_a_defaulted_policy_variable_fails_the_statement_closed() {
+    use crate::policy::condition::{ConditionMatch, evaluate_statement_conditions};
+    use crate::policy::document::{Condition, ConditionOperator};
+
+    let mut resource = HashMap::new();
+    resource.insert("env".to_owned(), "prod".to_owned());
+    let with_resource_tag = |tags: &[(&str, &str)]| {
+        let mut ctx = ctx_with(tags, &[]);
+        ctx.resource_tags = resource.clone();
+        ctx
+    };
+    let deny = [Condition {
+        operator: ConditionOperator::StringEquals,
+        key: "aws:ResourceTag/env".to_owned(),
+        values: vec!["${aws:RequestTag/env, 'prod'}".to_owned()],
+    }];
+    // Two spellings with differing values have no value to expand to, and the
+    // default is not used: the statement fails closed as it does for the plain
+    // form, so the default cannot route around the rule.
+    for tags in [
+        [("Env", "prod"), ("env", "dev")],
+        [("env", "dev"), ("Env", "prod")],
+    ] {
+        assert_eq!(
+            evaluate_statement_conditions(&deny, &with_resource_tag(&tags)),
+            ConditionMatch::Unresolvable
+        );
+    }
+    // One spelling expands to its value, and the default is not used.
+    assert_eq!(
+        evaluate_statement_conditions(&deny, &with_resource_tag(&[("Env", "prod")])),
+        ConditionMatch::Match
+    );
+    assert_eq!(
+        evaluate_statement_conditions(&deny, &with_resource_tag(&[("env", "dev")])),
+        ConditionMatch::NoMatch
+    );
+    // An absent request tag is not ambiguous: the default is used.
+    assert_eq!(
+        evaluate_statement_conditions(&deny, &with_resource_tag(&[("team", "x")])),
+        ConditionMatch::Match
+    );
+}
+
+#[test]
 fn policy_variable_naming_aws_tagkeys_is_left_literal_for_every_tag_order() {
     use crate::policy::condition::{ConditionMatch, evaluate_statement_conditions};
     use crate::policy::document::{Condition, ConditionOperator};

@@ -179,9 +179,10 @@ pub enum ConditionMatch {
 ///
 /// Returns [`ConditionMatch::Unresolvable`] when the key is unresolved and the
 /// context reports it as service-populated (case 3), and when a condition value
-/// reads such a key through a `${name}` policy variable, since the variable has
-/// no value to expand to. Otherwise returns `Match` or `NoMatch` from the
-/// ordinary evaluation, so cases 1 and 2 are unchanged.
+/// reads such a key through a `${name}` or `${name, 'default'}` policy
+/// variable, since the variable has no value to expand to and the service,
+/// which has one, would not use the default. Otherwise returns `Match` or
+/// `NoMatch` from the ordinary evaluation, so cases 1 and 2 are unchanged.
 pub fn evaluate_condition_match(
     condition: &Condition,
     context: &impl ConditionContext,
@@ -202,26 +203,15 @@ fn is_unresolvable(key: &str, context: &impl ConditionContext) -> bool {
     context.resolve_key(key).is_none() && context.is_unresolvable_key(key)
 }
 
-/// Whether a value of `condition` names, as a `${name}` policy variable, a key
-/// [`is_unresolvable`] reports.
+/// Whether a value of `condition` names, as a `${name}` or `${name, 'default'}`
+/// policy variable, a key [`is_unresolvable`] reports.
+///
+/// The names come from [`super::variables::variable_key_names`], which reads
+/// the default form the way [`expand_policy_variables`] expands it, so a
+/// default written beside such a key does not hide the key from this check.
 fn reads_unresolvable_variable(condition: &Condition, context: &impl ConditionContext) -> bool {
-    condition
-        .values
-        .iter()
-        .any(|value| policy_variable_names(value).any(|name| is_unresolvable(name, context)))
-}
-
-/// The names of the `${name}` policy variables in `value`, in the order
-/// [`expand_policy_variables`] reads them. A `${` with no closing brace names
-/// nothing, as it expands to itself.
-fn policy_variable_names(value: &str) -> impl Iterator<Item = &str> {
-    let mut rest = value;
-    std::iter::from_fn(move || {
-        let start = rest.find("${")?;
-        let after_start = &rest[start + 2..];
-        let end = after_start.find('}')?;
-        rest = &after_start[end + 1..];
-        Some(&after_start[..end])
+    condition.values.iter().any(|value| {
+        super::variables::variable_key_names(value).any(|name| is_unresolvable(name, context))
     })
 }
 
@@ -254,10 +244,19 @@ pub fn evaluate_statement_conditions(
 ///
 /// Replaces `${variable}` and `${variable, 'default'}` patterns with their
 /// resolved values from the context (see [`super::variables`]). Supported
-/// variables: `aws:PrincipalTag/*` and any key the context can resolve.
-/// Unresolved variables with no default are left as-is (IAM behavior). A
-/// variable naming a key the context cannot resolve is also left as-is, with
-/// or without a default; see [`super::variables::expand_condition_value`].
+/// variables: `aws:PrincipalTag/*` and any single-valued key the context can
+/// resolve. A variable whose key the request does not carry, with no default,
+/// stays literal, which gives IAM's answer except when the compared value
+/// holds the variable's text. A variable that names a multivalued key
+/// (`aws:TagKeys`, `dynamodb:LeadingKeys`, `dynamodb:Attributes`) also stays
+/// literal: a set of values has no one value to expand to. IAM leaves such a
+/// variable as text (measured 2026-10-27: a Deny on `aws:ResourceTag/team`
+/// equal to `${aws:TagKeys}` applies to no request, whatever order the
+/// request lists its tag keys in, and the same Deny under `StringNotEquals`
+/// applies to every request). A variable naming a key the context reports
+/// unresolvable also stays literal here, with or without a default; the
+/// condition fails closed on it before this expansion is compared
+/// ([`evaluate_condition_match`]).
 fn expand_policy_variables(value: &str, context: &impl ConditionContext) -> String {
     super::variables::expand_condition_value(value, context)
 }

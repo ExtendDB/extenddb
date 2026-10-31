@@ -69,6 +69,60 @@ fn unresolvable_key_is_unresolvable_for_every_operator() {
 }
 
 #[test]
+fn variable_naming_unresolvable_key_is_unresolvable_with_or_without_default() {
+    // Case 3 read through a condition value: the variable has no value to
+    // expand to, and the service, which has one, would not use the default.
+    // Every operator yields Unresolvable, so a Deny applies and an Allow does
+    // not grant whatever the operator says. A later value of the condition
+    // that names the key counts as the first one does.
+    let ctx = TestContext::new()
+        .with("aws:PrincipalTag/team", vec!["blue"])
+        .unresolvable("aws:PrincipalOrgID");
+    for values in [
+        vec!["${aws:PrincipalOrgID}"],
+        vec!["${aws:PrincipalOrgID, 'blue'}"],
+        vec!["${aws:PrincipalOrgID,'blue'}"],
+        vec!["x-${aws:PrincipalOrgID, 'blue'}-y"],
+        vec!["red", "${aws:PrincipalOrgID, 'blue'}"],
+    ] {
+        for op in [
+            ConditionOperator::StringEquals,
+            ConditionOperator::StringNotEquals,
+            ConditionOperator::StringLike,
+        ] {
+            let c = cond(op, "aws:PrincipalTag/team", values.clone());
+            assert_eq!(
+                evaluate_condition_match(&c, &ctx),
+                ConditionMatch::Unresolvable,
+                "{values:?}"
+            );
+        }
+    }
+    // The key present: its value is used, not the default.
+    let present = TestContext::new()
+        .with("aws:PrincipalTag/team", vec!["blue"])
+        .with("aws:PrincipalOrgID", vec!["blue"])
+        .unresolvable("aws:PrincipalOrgID");
+    let c = cond(
+        ConditionOperator::StringEquals,
+        "aws:PrincipalTag/team",
+        vec!["${aws:PrincipalOrgID, 'red'}"],
+    );
+    assert_eq!(
+        evaluate_condition_match(&c, &present),
+        ConditionMatch::Match
+    );
+    // The key absent, not unresolvable: the default is used.
+    let absent = TestContext::new().with("aws:PrincipalTag/team", vec!["blue"]);
+    let c = cond(
+        ConditionOperator::StringEquals,
+        "aws:PrincipalTag/team",
+        vec!["${aws:PrincipalOrgID, 'blue'}"],
+    );
+    assert_eq!(evaluate_condition_match(&c, &absent), ConditionMatch::Match);
+}
+
+#[test]
 fn resolved_unresolvable_key_uses_its_value() {
     // If the context both lists a key as unresolvable and resolves it, the
     // resolved value wins (the guard only fires when resolve_key is None).
