@@ -96,6 +96,12 @@ def _denied(exc: ClientError) -> bool:
     return exc.value.response["Error"]["Code"] == "AccessDeniedException"
 
 
+ONE_PER_KEY = (
+    "Invalid KeyConditionExpression: "
+    "KeyConditionExpressions must only contain one condition per key"
+)
+
+
 # The values a Query on the multi-attribute key table may name; each query
 # carries only the ones its key condition uses.
 _MK_VALUES = {":v": {"S": OWN}, ":g": {"S": "blue"}, ":x": {"S": "x1"},
@@ -371,12 +377,31 @@ class TestLeadingKeys:
             c.scan(TableName=table)
         assert _denied(e)
 
-    # -- An equality on the partition key decides the key ------------------
+    # -- A second clause on the partition key binds nothing ----------------
 
     def test_unreadable_partition_equality_does_not_bind_another_clause(self, table):
-        # An equality on the partition key decides the key. When its value
-        # cannot be read (`:u = {"N": "bob"}`), a second clause naming the
-        # fenced value must not be bound in its place.
+        # An equality on the partition key and a second clause on it name the
+        # partition key twice, so the duplicate check leaves
+        # dynamodb:LeadingKeys absent and the fenced value in the second
+        # clause (`:v`) is never bound. A principal allowed everything gets
+        # the one-condition-per-key error. A policy that needs a LeadingKeys
+        # value denies the request, whether the equality's value can be read
+        # (`:u = {"S": "bob"}`) or not (`:u = {"N": "bob"}`, refused either
+        # way).
+        kces = ("pk = :u AND pk > :v", "pk > :v AND pk = :u")
+        readable = {":u": {"S": OTHER}, ":v": {"S": OWN}}
+        unreadable = {":u": {"N": OTHER}, ":v": {"S": OWN}}
+        owner = self._user_client([("all", {
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow", "Action": "dynamodb:*", "Resource": "*"}],
+        })])
+        for kce in kces:
+            with pytest.raises(ClientError) as e:
+                owner.query(TableName=table, KeyConditionExpression=kce,
+                            ExpressionAttributeValues=readable)
+            err = e.value.response["Error"]
+            assert err["Code"] == "ValidationException", kce
+            assert err["Message"] == ONE_PER_KEY, kce
         for form in ("ForAnyValue", "ForAllValues+Null"):
             if form == "ForAnyValue":
                 policy = self._leading_keys_policy("ForAnyValue", [OWN], table)
@@ -385,15 +410,16 @@ class TestLeadingKeys:
                 stmt = policy["Statement"][0]
                 stmt["Condition"]["Null"] = {"dynamodb:LeadingKeys": "false"}
             c = self._user_client([("lk", policy)])
-            for kce in ("pk = :u AND pk > :v", "pk > :v AND pk = :u"):
-                try:
-                    got = c.query(
-                        TableName=table, KeyConditionExpression=kce,
-                        ExpressionAttributeValues={":u": {"N": OTHER}, ":v": {"S": OWN}})
-                except ClientError:
-                    continue
-                parts = {it["pk"]["S"] for it in got["Items"]}
-                assert OTHER not in parts, (form, kce, parts)
+            for kce in kces:
+                with pytest.raises(ClientError) as e:
+                    c.query(TableName=table, KeyConditionExpression=kce,
+                            ExpressionAttributeValues=readable)
+                assert _denied(e), (form, kce)
+                with pytest.raises(ClientError) as e:
+                    c.query(TableName=table, KeyConditionExpression=kce,
+                            ExpressionAttributeValues=unreadable)
+                assert e.value.response["Error"]["Code"] in (
+                    "AccessDeniedException", "ValidationException"), (form, kce)
 
     def test_non_equality_partition_with_sort_clause_is_refused(self, table):
         # The fix binds the partition operand of these shapes; the engine still

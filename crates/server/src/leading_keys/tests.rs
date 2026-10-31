@@ -622,11 +622,10 @@ fn query_between_on_the_partition_key_is_absent() {
     assert_eq!(r, None);
 }
 
-/// An equality on the partition key decides the key, even when its value
-/// cannot be read and another clause names the partition key: the other
-/// clause's operand is never bound in its place. With `:u = {"N": "bob"}`
-/// (not a number) the key stays absent, as on main, rather than becoming
-/// `alice`.
+/// An equality on the partition key and a second clause on the partition key
+/// name the partition key twice, so the duplicate check refuses the condition
+/// and the key stays absent: the other clause's operand (`alice`) is never
+/// bound, whether the equality's value can be read or not.
 #[test]
 fn query_unreadable_partition_equality_binds_no_other_clause() {
     for (kce, u) in [
@@ -634,6 +633,7 @@ fn query_unreadable_partition_equality_binds_no_other_clause() {
         ("pk > :v AND pk = :u", json!({"N": "bob"})),
         ("#p = :u AND pk > :v", json!({"N": "bob"})),
         ("pk = :u AND begins_with(pk, :v)", json!({"N": "1e"})),
+        ("pk = :u AND pk > :v", json!({"S": "bob"})),
     ] {
         let input = json!({
             "TableName": "t",
@@ -644,18 +644,40 @@ fn query_unreadable_partition_equality_binds_no_other_clause() {
         let r = single_table_leading_keys(&input, "Query", Some(&main_table()), MAX_TOKENS);
         assert_eq!(r, None, "{kce}");
     }
-    // A readable equality keeps its own value with another partition clause.
-    let input = json!({
-        "TableName": "t",
-        "KeyConditionExpression": "pk = :u AND pk > :v",
-        "ExpressionAttributeValues": {":u": {"S": "bob"}, ":v": {"S": "alice"}},
-    });
-    let r = single_table_leading_keys(&input, "Query", Some(&main_table()), MAX_TOKENS);
-    assert_ne!(r, Some(vec!["alice".to_owned()]));
 }
 
-/// Two non-equality clauses on the partition key: which operand the service
-/// binds is not measured, so neither is bound, in either clause order.
+/// A second condition on one key attribute, written with plain names or
+/// through a `#name` reference, leaves the key absent, including when the
+/// only partition clause is a non-equality whose operand would otherwise be
+/// bound. The engine refuses all of these.
+#[test]
+fn query_duplicate_key_condition_leaves_the_key_absent() {
+    for kce in [
+        "pk = :a AND pk = :b",
+        "#p = :a AND pk = :b",
+        "pk = :a AND sk = :b AND sk = :c",
+        "pk = :a AND #s = :b AND sk = :c",
+        "pk > :a AND sk = :b AND sk = :c",
+        "pk > :a AND #s = :b AND sk = :c",
+    ] {
+        let input = json!({
+            "TableName": "t",
+            "KeyConditionExpression": kce,
+            "ExpressionAttributeNames": {"#p": "pk", "#s": "sk"},
+            "ExpressionAttributeValues": {
+                ":a": {"S": "alice"},
+                ":b": {"S": "bob"},
+                ":c": {"S": "carol"},
+            },
+        });
+        let r = single_table_leading_keys(&input, "Query", Some(&main_table()), MAX_TOKENS);
+        assert_eq!(r, None, "{kce}");
+    }
+}
+
+/// Two non-equality clauses on the partition key name it twice, so the
+/// duplicate check refuses the condition and neither operand is bound, in
+/// either clause order.
 #[test]
 fn query_two_non_equality_partition_clauses_bind_nothing() {
     for kce in [
