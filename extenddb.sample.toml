@@ -18,9 +18,11 @@
 # separator between levels:
 #   EXTENDDB__SERVER__PORT=9000
 #   EXTENDDB__STORAGE__POSTGRES__CONNECTION_STRING="postgresql://..."
-# Scalar keys accept this form. The list keys (import.paths, export.paths,
-# storage.cassandra.contact_points) and the numeric keys of [storage.sqlite]
-# and [storage.cassandra] are file only.
+# Every key accepts this form. A list key (import.paths, export.paths,
+# storage.cassandra.contact_points) takes one comma-delimited string:
+#   EXTENDDB__IMPORT__PATHS="/data/in,/data/shared"
+# Items are trimmed and empty items dropped, so an empty variable is an empty
+# list; an item that itself contains a comma can only be written as an array.
 # Precedence: environment variables, then this file, then the built-in
 # defaults. `extenddb serve --port` overrides server.port on top of all three.
 #
@@ -33,8 +35,8 @@
 
 # These keys sit at the top level and must appear before the first [section]
 # header of the file. A top-level key placed after a header lands inside that
-# section, and every section except [storage.cassandra] refuses to start the
-# server with "unknown field".
+# section, and every section refuses to start the server with "unknown field"
+# and the key named.
 
 # Path to the rendered documentation directory (HTML and PDF files) produced
 # by `python3 docs/build-docs.py`. When set, the web console serves the

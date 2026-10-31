@@ -7,13 +7,13 @@ custom_edit_url: https://github.com/ExtendDB/extenddb/edit/main/extenddb.sample.
 
 This page is generated from [`extenddb.sample.toml`](https://github.com/ExtendDB/extenddb/blob/main/extenddb.sample.toml) by `npm run gen:config` in `website/`; edit the sample, not this file. Tests in the `extenddb-config` crate and in each storage backend crate compare the sample with the configuration structs, so a key listed here exists in the code with the default shown.
 
-The server reads `extenddb.toml` (or the file named by `--config`) at startup. Scalar keys can also be set through an environment variable: the name is `EXTENDDB__` followed by the key path in upper case with `__` between levels, for example `EXTENDDB__SERVER__PORT=9000` or `EXTENDDB__STORAGE__POSTGRES__CONNECTION_STRING="postgresql://..."`. The list keys (`import.paths`, `export.paths`, `storage.cassandra.contact_points`) and the numeric keys of `[storage.sqlite]` and `[storage.cassandra]` are file only. Precedence, highest first: environment variables, the configuration file, built-in defaults; `extenddb serve --port` overrides `server.port` on top of all three.
+The server reads `extenddb.toml` (or the file named by `--config`) at startup. Every key can also be set through an environment variable: the name is `EXTENDDB__` followed by the key path in upper case with `__` between levels, for example `EXTENDDB__SERVER__PORT=9000` or `EXTENDDB__STORAGE__POSTGRES__CONNECTION_STRING="postgresql://..."`. A list key (`import.paths`, `export.paths`, `storage.cassandra.contact_points`) takes one comma-delimited string, `EXTENDDB__IMPORT__PATHS="/data/in,/data/shared"`; items are trimmed and empty items dropped, and an item that itself contains a comma can only be written as an array in the file. Precedence, highest first: environment variables, the configuration file, built-in defaults; `extenddb serve --port` overrides `server.port` on top of all three.
 
 The keys below are static: a change takes effect at the next server start. Settings that change on a running server (log level, control plane delay, throttling at runtime) are set with `extenddb settings set` and are listed under [Runtime Settings](./manuals/05-admin-guide.md#runtime-settings) in the administration guide.
 
 ## Top-level keys
 
-These keys sit at the top level and must appear before the first [section] header of the file. A top-level key placed after a header lands inside that section, and every section except [storage.cassandra] refuses to start the server with "unknown field".
+These keys sit at the top level and must appear before the first [section] header of the file. A top-level key placed after a header lands inside that section, and every section refuses to start the server with "unknown field" and the key named.
 
 | Key | Default | Description |
 |-----|---------|-------------|
