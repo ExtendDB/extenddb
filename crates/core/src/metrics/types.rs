@@ -129,6 +129,8 @@ pub enum QuerySource {
     ControlPlane,
     /// Background: login attempt cleanup.
     LoginAttemptCleanup,
+    /// Background: the backup reconciler.
+    BackupReconciler,
     /// Management CLI commands.
     Management,
 }
@@ -149,6 +151,7 @@ impl std::fmt::Display for QuerySource {
             Self::TableSizeRefresh => f.write_str("TableSizeRefresh"),
             Self::ControlPlane => f.write_str("ControlPlane"),
             Self::LoginAttemptCleanup => f.write_str("LoginAttemptCleanup"),
+            Self::BackupReconciler => f.write_str("BackupReconciler"),
             Self::Management => f.write_str("Management"),
         }
     }

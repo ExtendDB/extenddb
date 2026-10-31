@@ -13,7 +13,7 @@ use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{index_arn, stream_arn, table_arn};
 
 use crate::CassandraEngine;
-use crate::backup_engine::RestoreHeartbeat;
+use crate::backup_engine::JobHeartbeat;
 
 impl CassandraEngine {
     /// Initialize stream shards for a table atomically.
@@ -101,8 +101,11 @@ impl CassandraEngine {
     }
 
     /// Create a restore target: CREATING, with no generic transition deadline,
-    /// carrying the restore registration columns. Only the restore copy (which
-    /// activates it) or the abandoned-restore sweep (which removes it) moves it
+    /// carrying the restore registration and its job record (RUNNING, kind
+    /// legacy, the claim's generation, a fresh heartbeat) in the one
+    /// `INSERT ... IF NOT EXISTS`, so no crash leaves a CREATING target
+    /// without a job record. Only the restore copy (which activates it) or
+    /// the reconciler (which removes it once its heartbeat is stale) moves it
     /// out of CREATING. Returns the target's heartbeat, started right after
     /// the row insert; dropping it stops it.
     pub(crate) async fn create_table_for_restore_impl(
@@ -110,7 +113,7 @@ impl CassandraEngine {
         account_id: &str,
         input: CreateTableInput,
         restore: &RestoreTargetColumns,
-    ) -> Result<(TableDescription, RestoreHeartbeat), StorageError> {
+    ) -> Result<(TableDescription, JobHeartbeat), StorageError> {
         let (description, heartbeat) = self
             .create_table_impl_inner(account_id, input, Some(restore))
             .await?;
@@ -125,7 +128,7 @@ impl CassandraEngine {
         account_id: &str,
         input: CreateTableInput,
         restore: Option<&RestoreTargetColumns>,
-    ) -> Result<(TableDescription, Option<RestoreHeartbeat>), StorageError> {
+    ) -> Result<(TableDescription, Option<JobHeartbeat>), StorageError> {
         let schedule_activation = restore.is_none();
         Self::validate_account_id(account_id)?;
 
@@ -220,10 +223,10 @@ impl CassandraEngine {
         }
 
         // Insert table metadata with LWT (IF NOT EXISTS). Only a restore
-        // target names the restore columns (added by catalog migration V005),
-        // so an ordinary CreateTable also works on a catalog that has not run
-        // V005; CQL rejects a statement naming an undefined column even when
-        // no value is bound to it.
+        // target names the restore columns (added by catalog migrations V005
+        // and V006), so an ordinary CreateTable also works on a catalog that
+        // has not run them; CQL rejects a statement naming an undefined column
+        // even when no value is bound to it.
         let mut columns = String::from(
             "account_id, table_name, table_id, table_arn, key_schema, \
              attribute_definitions, billing_mode, provisioned_throughput, stream_specification, \
@@ -263,20 +266,26 @@ impl CassandraEngine {
             Value::from(deletion_protection),
             Value::from(status_transition_at),
         ];
+        let mut placeholders = vec!["?"; values.len()];
         if let Some(r) = restore {
+            // The job record: RUNNING under the claim's generation, kind
+            // legacy, the heartbeat stamped on the coordinator's clock.
             columns.push_str(
                 ", restore_source_backup_arn, restore_source_table_arn, restore_date_time, \
-                 restore_owner, restore_heartbeat",
+                 restore_status, restore_kind, restore_owner_generation, restore_heartbeat_at",
             );
             values.extend([
                 Value::from(r.source_backup_arn.as_str()),
                 Value::from(r.source_table_arn.as_str()),
                 Value::from(r.restore_date_time_ms),
-                Value::from(r.owner),
-                Value::from(creation_timestamp),
+                Value::from("RUNNING"),
+                Value::from("legacy"),
+                Value::from(crate::backup_catalog::generation_column(r.owner_generation)),
             ]);
+            placeholders.extend(["?"; 6]);
+            placeholders.push("toTimestamp(now())");
         }
-        let placeholders = vec!["?"; values.len()].join(", ");
+        let placeholders = placeholders.join(", ");
         let insert_table_cql = format!(
             "INSERT INTO {catalog_keyspace}.tables ({columns}) VALUES ({placeholders}) IF NOT EXISTS"
         );
@@ -331,7 +340,12 @@ impl CassandraEngine {
         // A restore target's heartbeat runs from here, before the DDL below.
         // An error return from this function drops it, which stops it.
         let heartbeat = restore.map(|r| {
-            self.start_restore_heartbeat(account_id, &input.table_name, &r.table_id, r.owner)
+            self.start_restore_heartbeat(
+                account_id,
+                &input.table_name,
+                &r.table_id,
+                r.owner_generation,
+            )
         });
 
         // Insert GSI metadata
@@ -658,6 +672,7 @@ pub(crate) struct RestoreTargetColumns {
     pub(crate) source_table_arn: String,
     /// `RestoreSummary.RestoreDateTime`, epoch milliseconds.
     pub(crate) restore_date_time_ms: i64,
-    /// The engine instance running the copy; see `CassandraEngine::restore_owner`.
-    pub(crate) owner: uuid::Uuid,
+    /// The claim's fencing token (`tables.restore_owner_generation`): every
+    /// write the copy makes to the target row is conditioned on it.
+    pub(crate) owner_generation: u64,
 }

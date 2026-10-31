@@ -470,7 +470,6 @@ mod tests {
             .insert_one(doc! { "_id": "control_plane_delay_seconds", "value": "0" })
             .await
             .expect("setting");
-        let slots = crate::backup_engine::restore_server_slot_count(10);
         let engine = MongoEngine {
             client: client.clone(),
             catalog_db,
@@ -479,9 +478,6 @@ mod tests {
             gsi_cache: Arc::default(),
             tx_read_concern: ReadConcern::majority(),
             backup_liveness: crate::backup_engine::BackupLiveness::default(),
-            restore_server_slot_count: slots,
-            restore_server_slots: Arc::new(tokio::sync::Semaphore::new(slots)),
-            restore_account_slots: crate::backup_engine::RestoreAccountSlots::default(),
         };
         let worker = tokio::spawn(crate::ttl_worker::gsi_backfill_worker(Arc::new(
             engine.clone(),

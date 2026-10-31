@@ -307,7 +307,16 @@ async fn every_released_catalog_upgrades_to_the_fresh_schema() {
         for (key, value) in state.settings {
             expected_settings.insert((*key).to_owned(), (*value).to_owned());
         }
-        assert_eq!(settings(&db).await, expected_settings, "{name}: settings");
+        // Migration 5 writes a random catalog id on every catalog.
+        let mut actual_settings = settings(&db).await;
+        let catalog_id = actual_settings
+            .remove("catalog_id")
+            .unwrap_or_else(|| panic!("{name}: no catalog_id"));
+        assert!(
+            uuid::Uuid::parse_str(&catalog_id).is_ok(),
+            "{name}: {catalog_id}"
+        );
+        assert_eq!(actual_settings, expected_settings, "{name}: settings");
 
         // No post-check note: no released state has a pre-release shape.
         let notes = scalar(&db, "SELECT notes FROM extenddb_migrations WHERE id = 1").await;

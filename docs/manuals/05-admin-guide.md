@@ -90,7 +90,7 @@ These settings require a server restart to take effect.
 |-----|---------|-------------|
 | `bind_addr` | `127.0.0.1` | Network interface to bind |
 | `port` | `18443` | HTTP port |
-| `region` | `us-east-1` | AWS region for ARN generation. Baked into every backup ARN the server issues, so it must stay within `[a-z0-9-]` (a value outside that class makes the server's own backup ARNs "not valid"; the server logs a warning at startup). A backup ARN of the caller's account in another region is resolved in the server's region first, then as written; see the upgrade manual before changing this on a deployment with backups |
+| `region` | `us-east-1` | AWS region for ARN generation. Baked into every backup ARN the server issues, so it must stay within `[a-z0-9-]` (under a value outside that class `CreateBackup` is refused with a `ValidationException` naming `server.region`, since no backup ARN can be formed; backups taken before the upgrade under such a region keep an ARN `DescribeBackup`, `DeleteBackup`, and `RestoreTableFromBackup` refuse as "not valid"; the server logs a warning at startup). A backup ARN of the caller's account in another region is resolved in the server's region first, then as written; see the upgrade manual before changing this on a deployment with backups |
 
 #### [storage]
 
@@ -106,9 +106,9 @@ These settings require a server restart to take effect.
 | `pool_size` | `20` | Maximum concurrent database connections (minimum: 10) |
 | `catalog_pool_size` | (= `pool_size`) | Maximum connections for management/authz pool (minimum: 10) |
 
-Restores on PostgreSQL are bounded per server process: at most 4 per account and at most half of `pool_size` in total (after its minimum of 10 is applied, capped at 16; 10 with the default `pool_size` of 20). A restore that cannot get both within 30 seconds is refused with `LimitExceededException`. Each running restore holds one connection from this pool for its whole copy, plus one dedicated connection outside the pool for its lock.
+Backup and restore jobs are bounded per server process by `[backup] max_concurrent_jobs` (default 4, below), not per account, and a request over the bound is refused at once with `LimitExceededException`. The server raises `pool_size` and `catalog_pool_size` to at least `2 * max_concurrent_jobs + 10` and logs the raise with both numbers, so every job the bound admits has a connection. Each running restore holds one connection from this pool for its whole copy, plus one dedicated connection outside the pool for its claim.
 
-`RestoreTableFromBackup` on PostgreSQL holds a session-level advisory lock for the whole copy, so ExtendDB must reach the catalog database directly or through a session-mode pooler. Behind a transaction-mode pooler (for example PgBouncer with `pool_mode = transaction`) restore locks are not released and the abandoned-restore sweep can remove a restore that is still running; do not run restores through one.
+`RestoreTableFromBackup` on PostgreSQL holds a session-level advisory lock (the job's claim) for the whole copy, so ExtendDB must reach the catalog database directly or through a session-mode pooler. Behind a transaction-mode pooler (for example PgBouncer with `pool_mode = transaction`) the lock lands on a pooled server connection and is not released with the job, so later jobs can be refused as already claimed; do not run backups or restores through one.
 
 #### [storage.sqlite]
 
@@ -116,6 +116,20 @@ Restores on PostgreSQL are bounded per server process: at most 4 per account and
 |-----|---------|-------------|
 | `path` | `extenddb.sqlite` | Database file (`init --sqlite-path` writes it); `:memory:` for an ephemeral database |
 | `pool_size` | `10` | Maximum connections. Writes are serialized by the engine whatever the size. A file database raises `pool_size = 1` to 2 and logs it at info (`SQLite pool_size 1 raised to 2 for a file-backed database: ...`), because a backup holds one reader connection for its whole duration while its batches write through another. Use 3 or more so a running backup does not contend with ordinary requests for connections |
+
+#### [backup]
+
+The knobs backup and restore jobs and the reconciler read; every key has a default, and the section may be left out.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `data_file_target_bytes` | `67108864` | Uncompressed bytes per backup data file (minimum 32 MiB); read by the store-backed backup writer |
+| `heartbeat_interval_secs` | `15` | The job heartbeat timer. The in-catalog backup and restore paths of this release heartbeat every 15 s whatever this says |
+| `stale_job_after_secs` | `300` | Heartbeat age after which a job's owner is dead and the reconciler fails the job and removes its restore target. Must be at least three heartbeat periods, where the period is the larger of `heartbeat_interval_secs` and the 15 s the jobs of this release heartbeat at (so 45 at the least, whatever `heartbeat_interval_secs` says); on SQLite a long write transaction delays a heartbeat, so keep a margin above that floor |
+| `failed_row_retention_secs` | `604800` | How long FAILED backup rows are kept for the operator (7 days) |
+| `reconcile_interval_secs` | `60` | The reconciler's cycle; it also runs once at startup |
+| `max_concurrent_jobs` | `4` | Backup and restore jobs this instance runs at once (at most 1024); a request over it is `LimitExceededException`. On PostgreSQL the pool sizes are raised to `2 * max_concurrent_jobs + 10` when smaller |
+| `spool_path` | (unset) | Restore download area for an S3 store, used by a later release |
 
 #### [auth]
 

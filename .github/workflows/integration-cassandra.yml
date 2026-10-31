@@ -92,8 +92,10 @@ jobs:
       - name: Direct storage-trait integration tests
         # Ported from the plug-in repo's tests/rust suite. Parallel-safe:
         # each test provisions its own account and keyspace; the shared
-        # control-plane setting test restores what it mutates.
-        run: cargo test -p extenddb-storage-cassandra --test direct_integration
+        # control-plane setting test restores what it mutates. The
+        # test-hooks feature compiles the tests that pause an operation or
+        # shorten a heartbeat (crates/storage-cassandra/src/test_hooks.rs).
+        run: cargo test -p extenddb-storage-cassandra --features test-hooks --test direct_integration
         env:
           EXTENDDB_TEST_CASSANDRA: required
 

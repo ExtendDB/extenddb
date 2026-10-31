@@ -147,6 +147,7 @@ pub(crate) async fn handle_request(
     // Dispatch
     let ctx = OperationContext {
         storage: state.storage.clone(),
+        backup: state.backup_runtime.clone(),
         limits: state.limits.clone(),
         region: state.region.clone(),
         account_id,

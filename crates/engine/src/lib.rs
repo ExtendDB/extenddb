@@ -8,6 +8,7 @@
 //! `DynamoDB`-format error responses.
 
 mod backup;
+pub use backup::{BackupRuntime, reconciler};
 mod batch_get_item;
 mod batch_write_item;
 pub mod capacity_helpers;
@@ -341,6 +342,9 @@ pub type AuthorizedKeyInfo = std::collections::HashMap<String, Option<TableKeyIn
 /// the discussion file and principal reviewer approval.
 pub struct OperationContext {
     pub storage: Arc<dyn extenddb_storage::StorageEngine>,
+    /// The process's job slots and configured backup store, which the backup
+    /// operations read.
+    pub backup: Arc<BackupRuntime>,
     pub limits: Arc<LimitsConfig>,
     pub region: Arc<str>,
     pub account_id: Arc<str>,

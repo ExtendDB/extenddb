@@ -10,6 +10,7 @@
 
 mod admin_store;
 mod authorization_store;
+mod backup_catalog;
 mod backup_engine;
 mod bootstrapper;
 mod catalog_store;
@@ -39,6 +40,8 @@ mod vector_search;
 mod worker_store;
 mod workers;
 
+#[doc(hidden)]
+pub use backup_engine::RESTORE_LOCK_SEED;
 pub use bootstrapper::PostgresBootstrapper;
 pub use catalog_store::PostgresCatalogStore;
 pub use config::PostgresStorageConfig;
@@ -261,15 +264,6 @@ pub struct PostgresEngine {
     /// the search path exists, so this backend still refuses vector operations
     /// over the wire; the flag is what that decision will read.
     pub(crate) vector_capable: bool,
-    /// Restores this engine (one per server process) may have in flight
-    /// across all accounts; see `backup_engine::restore_server_slot_count`.
-    pub(crate) restore_server_slots: Arc<tokio::sync::Semaphore>,
-    /// The number of permits `restore_server_slots` was created with, for
-    /// the refusal message.
-    pub(crate) restore_server_slot_count: usize,
-    /// Restores each account may run at once in this process; see
-    /// `backup_engine::RestoreAccountSlots`.
-    pub(crate) restore_account_slots: backup_engine::RestoreAccountSlots,
     /// The serving registration a server holds for its life, so `migrate
     /// --yes` refuses while it serves. `None` outside a server.
     pub(crate) serving: Option<Arc<migrations::ServingRegistration>>,
@@ -289,9 +283,10 @@ pub struct PostgresEngine {
     ///
     /// What the permits do not prevent: request load alone exhausting a pool
     /// (an open then waits for its connection up to the acquire timeout like
-    /// any request), and restores, which take their own slots (half the
-    /// pool, at most 16: `backup_engine::restore_server_slot_count`), so
-    /// snapshots and restores together can hold the whole pool. On the separate layout requests that block on
+    /// any request), and restores, which hold no snapshot slot (their bound
+    /// is the engine's `max_concurrent_jobs`, which the pool is raised to
+    /// twice plus ten), so snapshots and restores together can hold the
+    /// whole pool. On the separate layout requests that block on
     /// the `tables` row an open holds `FOR SHARE` (`UpdateTable`,
     /// `DeleteTable` of that table) hold catalog connections while they
     /// wait; the open needs only a data connection by then, so they delay it
@@ -412,7 +407,6 @@ impl PostgresEngine {
             ),
         }
 
-        let server_slots = backup_engine::restore_server_slot_count(pool_size);
         Ok(Self {
             pool,
             data_pool,
@@ -424,9 +418,6 @@ impl PostgresEngine {
                 initial_gsi_delay,
             )),
             vector_capable,
-            restore_server_slots: Arc::new(tokio::sync::Semaphore::new(server_slots)),
-            restore_server_slot_count: server_slots,
-            restore_account_slots: backup_engine::RestoreAccountSlots::default(),
             serving: None,
             snapshot_open_slots: Arc::new(tokio::sync::Semaphore::new(snapshot_slot_count(
                 pool_size,
@@ -850,6 +841,24 @@ async fn register_and_check(
     }
 }
 
+/// A pool size raised to what `max_concurrent_jobs` jobs need, when it is
+/// smaller (`pool_size_for_jobs`: twice the jobs plus ten, so a snapshot
+/// bound of half the pool admits every job the permit allows; the job's
+/// claim connection is outside the pool). A raise is logged at warn,
+/// naming both numbers, as the clamp to [`MIN_POOL_SIZE`] is; a size at or
+/// above the floor is returned as configured, and the minimum clamp still
+/// applies to it.
+fn raise_pool_size_for_jobs(key: &str, configured: u32, floor: u32, jobs: usize) -> u32 {
+    if configured >= floor || floor <= MIN_POOL_SIZE {
+        return configured;
+    }
+    tracing::warn!(
+        "{key} = {configured} is below the {floor} connections backup.max_concurrent_jobs = \
+         {jobs} needs (2 * max_concurrent_jobs + 10); raising it to {floor}"
+    );
+    floor
+}
+
 /// Build server components for the Postgres backend (registered in [`register`]).
 fn server_components_factory(
     config: &(dyn extenddb_storage::config::StorageConfig + 'static),
@@ -857,13 +866,27 @@ fn server_components_factory(
     // PostgreSQL bootstrap needs operator input (databases, roles, admin
     // credentials), so `bootstrap_if_uninitialized` is not honored here:
     // an uninitialized catalog fails with the explicit-`init` guidance.
-    _options: extenddb_storage::server_components::ServerComponentsOptions,
+    options: extenddb_storage::server_components::ServerComponentsOptions,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<ServerComponents, BackendError>> + Send>,
 > {
     let connection_string = config.connection_config().to_string();
-    let max_connections = config.max_connections();
-    let max_catalog_connections = config.max_catalog_connections();
+    // Both pools admit the jobs the instance may run at once (the rule is
+    // `pool_size_for_jobs`'s).
+    let job_floor =
+        extenddb_storage::backup_catalog::pool_size_for_jobs(options.max_concurrent_jobs);
+    let max_connections = raise_pool_size_for_jobs(
+        "storage.postgres.pool_size",
+        config.max_connections(),
+        job_floor,
+        options.max_concurrent_jobs,
+    );
+    let max_catalog_connections = raise_pool_size_for_jobs(
+        "storage.postgres.catalog_pool_size",
+        config.max_catalog_connections(),
+        job_floor,
+        options.max_concurrent_jobs,
+    );
     let region = region.to_string();
     Box::pin(async move {
         let registration = register_and_check(&connection_string)
@@ -980,4 +1003,26 @@ fn server_components_factory(
             runtime_hooks: Some(runtime_hooks),
         })
     })
+}
+
+#[cfg(test)]
+mod pool_size_tests {
+    use super::{MIN_POOL_SIZE, raise_pool_size_for_jobs};
+    use extenddb_storage::backup_catalog::pool_size_for_jobs;
+
+    #[test]
+    fn a_pool_under_the_job_floor_is_raised_and_one_at_it_is_kept() {
+        let floor = pool_size_for_jobs(4);
+        assert_eq!(floor, 18);
+        assert_eq!(raise_pool_size_for_jobs("pool_size", 12, floor, 4), 18);
+        assert_eq!(raise_pool_size_for_jobs("pool_size", 18, floor, 4), 18);
+        assert_eq!(raise_pool_size_for_jobs("pool_size", 20, floor, 4), 20);
+        // No jobs asked for: the floor is the minimum, which the minimum
+        // clamp applies on its own.
+        assert_eq!(
+            raise_pool_size_for_jobs("pool_size", 5, pool_size_for_jobs(0), 0),
+            5
+        );
+        assert!(pool_size_for_jobs(0) <= MIN_POOL_SIZE);
+    }
 }

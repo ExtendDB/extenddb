@@ -60,6 +60,12 @@ migration_ids! {
     /// Gives every index table its base key index.
     IndexTableBaseKey = 4, "index_table_base_key",
         "give every secondary index table its base key index";
+    /// Creates the catalog index of backups (`backup_index`), the restore
+    /// job fields on the restore registrations, the maintenance claim record
+    /// and the catalog id.
+    BackupCatalogIndex = 5, "backup_catalog_index",
+        "create the backup catalog index, the restore job fields, the maintenance claim \
+         record and the catalog id";
 }
 
 /// Highest id that has shipped in a release. Bodies at or below it are frozen:

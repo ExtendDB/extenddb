@@ -29,6 +29,9 @@ mod m0003_sort_key_definitions;
 #[rustfmt::skip]
 #[allow(clippy::all, deprecated)]
 mod m0004_index_table_base_key;
+#[rustfmt::skip]
+#[allow(clippy::all, deprecated)]
+mod m0005_backup_catalog_index;
 mod postcheck;
 
 use std::time::Duration;
@@ -91,6 +94,15 @@ pub fn migration(id: MigrationId) -> Migration<SqliteStores> {
                 StoreKind::Catalog,
                 &m0004_index_table_base_key::IndexTableBaseKey,
                 m0004_index_table_base_key::SOURCE,
+            )],
+        },
+        MigrationId::BackupCatalogIndex => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![StoreBody::code(
+                StoreKind::Catalog,
+                &m0005_backup_catalog_index::BackupCatalogIndex,
+                m0005_backup_catalog_index::SOURCE,
             )],
         },
     }

@@ -7,6 +7,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Coordination hooks used only by this crate's integration test binary
+# (`src/test_hooks.rs`). Production builds do not compile them.
+test-hooks = []
+
 [dependencies]
 extenddb-core = { workspace = true }
 extenddb-storage = { workspace = true }

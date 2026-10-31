@@ -97,11 +97,6 @@ pub struct CassandraEngine {
     pub(crate) ttl_repair_scan_cursors:
         Arc<std::sync::Mutex<std::collections::HashMap<(String, i32), uuid::Uuid>>>,
 
-    /// Identifies this engine instance as the owner of the restore copies it
-    /// runs (`tables.restore_owner`). Random per process start, so a restore
-    /// left behind by a crashed process is never mistaken for a live one.
-    pub(crate) restore_owner: uuid::Uuid,
-
     /// Set once `schema_history` was seen to record every catalog migration
     /// this binary carries; until then each CreateBackup, DeleteBackup and
     /// RestoreTableFromBackup re-reads it (see `require_migrated_catalog`), so
@@ -150,7 +145,6 @@ impl CassandraEngine {
             ttl_repair_scan_cursors: Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
-            restore_owner: uuid::Uuid::new_v4(),
             catalog_migrated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
@@ -233,6 +227,59 @@ impl CassandraEngine {
     #[must_use]
     pub fn catalog_keyspace(&self) -> String {
         format!("{}_catalog", self.keyspace_prefix)
+    }
+
+    /// `serve`'s catalog guard: the catalog's `catalog_version` row must be
+    /// [`crate::CATALOG_VERSION`], else the server does not start and the
+    /// refusal names `extenddb migrate --yes`. The rule is
+    /// [`extenddb_storage::util::require_served_catalog_version`], shared
+    /// with the MongoDB factory; the PostgreSQL and SQLite factories read
+    /// their ledgers for the same refusal. A catalog whose `settings` table
+    /// does not exist is not a catalog (`Uninitialized`, with `extenddb
+    /// init` advice). `require_migrated_catalog` stays beside this for an
+    /// engine built without the factory (the tests) and refuses a backup
+    /// operation on a catalog behind the binary with the file it lacks.
+    ///
+    /// # Errors
+    ///
+    /// A failed read as `Store`; a version other than this binary's as the
+    /// refusal `serve` prints.
+    pub async fn require_served_catalog(
+        &self,
+    ) -> Result<(), extenddb_storage::migrations::MigrationError> {
+        use extenddb_storage::migrations::MigrationError;
+        let keyspace = self.catalog_keyspace();
+        let settings_exists = crate::migrations::table_exists(&self.session, &keyspace, "settings")
+            .await
+            .map_err(|e| MigrationError::Store(format!("{e:?}")))?;
+        let stored = if settings_exists {
+            let rows = crate::cassandra_util::query_rows::<StorageError>(
+                &self.session,
+                &format!("SELECT value FROM {keyspace}.settings WHERE key = 'catalog_version'"),
+                query_values!(),
+                "catalog version",
+            )
+            .await
+            .map_err(|e| MigrationError::Store(e.to_string()))?;
+            match rows.first() {
+                Some(row) => Some(
+                    crate::cassandra_util::get_column::<String, StorageError>(
+                        row,
+                        "value",
+                        "catalog version",
+                    )
+                    .map_err(|e| MigrationError::Store(e.to_string()))?,
+                ),
+                None => None,
+            }
+        } else {
+            None
+        };
+        extenddb_storage::util::require_served_catalog_version(
+            stored.as_deref(),
+            crate::CATALOG_VERSION,
+            "Cassandra",
+        )
     }
 
     /// Get the account keyspace name for a given account ID.

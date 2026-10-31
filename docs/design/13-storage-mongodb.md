@@ -835,9 +835,13 @@ construction.
 ### 5.10 Catalog version check
 
 `read_catalog_version` returns the `settings.catalog_version` value;
-`expected_catalog_version` returns the compiled-in `0.0.2`. The bin
-layer compares them on `extenddb serve` startup — same pattern as the
-PostgreSQL backend.
+`expected_catalog_version` returns the compiled-in `CATALOG_VERSION`
+(`0.0.5`, one constant in `bootstrapper.rs`, which the last migration
+step writes). `extenddb migrate` compares them and runs the pending
+steps, and the server component factory refuses to serve a catalog at
+another version (`require_served_catalog`, naming `extenddb migrate
+--yes`), the same refusal the PostgreSQL backend reads from its
+migration ledger.
 
 ## 6. Crate Structure
 

@@ -99,8 +99,11 @@ async fn a_fresh_install_is_current_and_a_second_run_changes_nothing() {
         settings_rows.get("data_database_connection_string"),
         Some(&s.data_url())
     );
-    // No baseline seeds a setting: the version and the connection rows only.
-    assert_eq!(settings_rows.len(), 3, "{settings_rows:?}");
+    // No baseline seeds a setting: the version, the connection rows, and the
+    // catalog id migration 5 writes once.
+    assert_eq!(settings_rows.len(), 4, "{settings_rows:?}");
+    let catalog_id = settings_rows.get("catalog_id").expect("a catalog id");
+    assert!(uuid::Uuid::parse_str(catalog_id).is_ok(), "{catalog_id}");
     assert_eq!(
         legacy_rows(&catalog).await,
         [

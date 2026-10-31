@@ -8,8 +8,8 @@
 
 mod admin_store;
 mod authorization_store;
+mod backup_catalog;
 mod backup_engine;
-pub use backup_engine::BackupSweep;
 mod bootstrapper;
 mod catalog_store;
 pub mod condition;
@@ -126,17 +126,6 @@ fn server_components_factory(
             details: e.to_string(),
         })?;
 
-        // A crash can leave a backup's metadata claimed by a restore or a
-        // delete that will never finish, or a restore target nothing will
-        // finish. The sweep removes only state whose heartbeat has stopped, so
-        // it is safe while another process shares this catalog; the GSI
-        // backfill worker repeats it periodically.
-        match engine.sweep_stale_backup_claims().await {
-            Ok(sweep) if sweep.is_empty() => {}
-            Ok(sweep) => tracing::warn!("startup backup sweep: {sweep}"),
-            Err(e) => tracing::error!("Failed to sweep stale backup claims: {e}"),
-        }
-
         let engine = Arc::new(engine);
 
         // Create one shared catalog/management client. MongoDB Client clones
@@ -155,6 +144,11 @@ fn server_components_factory(
         // panic in aes_gcm (`Key::from_slice` requires 32 bytes). Refuse to
         // start instead, matching the postgres backend.
         let catalog_db = catalog_client.database("extenddb_catalog");
+        // The catalog's version is this binary's, or `serve` does not start:
+        // the refusal names `extenddb migrate --yes`, as on the ledger backends.
+        bootstrapper::require_served_catalog(&catalog_db)
+            .await
+            .map_err(BackendError::Catalog)?;
         let settings_coll = catalog_db.collection::<mongodb::bson::Document>("settings");
         let enc_key = settings_coll
             .find_one(mongodb::bson::doc! { "_id": "encryption_key" })
@@ -357,17 +351,8 @@ pub struct MongoEngine {
     /// [`crate::config::MongoStorageConfig::transaction_read_concern`] for
     /// MongoDB-wire-compatible backends that don't support snapshot reads.
     tx_read_concern: mongodb::options::ReadConcern,
-    /// Heartbeat timing for backup claims and restore targets
-    /// (see [`backup_engine`]).
+    /// Heartbeat timing of a restore's job record (see [`backup_engine`]).
     pub(crate) backup_liveness: backup_engine::BackupLiveness,
-    /// Restores this process may run at once across accounts, and the
-    /// semaphore that enforces it; see
-    /// [`backup_engine::restore_server_slot_count`].
-    pub(crate) restore_server_slot_count: usize,
-    pub(crate) restore_server_slots: Arc<tokio::sync::Semaphore>,
-    /// Restores each account may run at once in this process; see
-    /// [`backup_engine::RestoreAccountSlots`].
-    pub(crate) restore_account_slots: backup_engine::RestoreAccountSlots,
 }
 
 /// Build a MongoDB client from a connection string, applying the shared
@@ -435,22 +420,6 @@ async fn guarded_client_options(
     Ok(options)
 }
 
-/// The connection pool size the driver will use for `options`: the explicit
-/// `maxPoolSize`, else the driver's default of 10 (`mongodb` 3.x). The driver
-/// does not enforce `waitQueueTimeoutMS` (its `ClientOptions::wait_queue_timeout`
-/// documents it as not supported), so a checkout waits for as long as every
-/// connection stays checked out; the work this backend admits at once is
-/// therefore bounded from the pool size instead (see
-/// [`backup_engine::restore_server_slot_count`]).
-pub(crate) fn effective_pool_size(options: &mongodb::options::ClientOptions) -> u32 {
-    options
-        .max_pool_size
-        .unwrap_or(DRIVER_DEFAULT_MAX_POOL_SIZE)
-}
-
-/// `mongodb::cmap::DEFAULT_MAX_POOL_SIZE`, which the driver does not export.
-const DRIVER_DEFAULT_MAX_POOL_SIZE: u32 = 10;
-
 async fn client_options_with_pool_size(
     connection_string: &str,
     max_pool_size: Option<u32>,
@@ -471,9 +440,10 @@ fn apply_max_pool_size(options: &mut mongodb::options::ClientOptions, max_pool_s
 
 /// Refuse a connection-string write concern weaker than `majority`.
 ///
-/// The backup claim protocol (DeleteBackup, restores and the stale-claim
-/// sweep, see [`backup_engine`]) treats an acknowledged claim or CREATING
-/// target as permanent. A write acknowledged under `w=1` (or any node count or
+/// The backup protocol (DeleteBackup's DELETING write, a restore's CREATING
+/// target and its job record, the catalog index's claims, see
+/// [`backup_engine`] and [`backup_catalog`]) treats an acknowledged write as
+/// permanent. A write acknowledged under `w=1` (or any node count or
 /// tag, whose relation to a majority this cannot see) can be rolled back when
 /// the primary fails over, and `journal=false` lets a majority acknowledge a
 /// write none of them has journaled. Accepted: no write concern (the server
@@ -501,7 +471,7 @@ fn check_write_concern(wc: Option<&mongodb::options::WriteConcern>) -> Result<()
         None => Ok(()),
         Some(found) => Err(StorageError::Connection(format!(
             "MongoDB connection string must leave the write concern at the server \
-             default or set w=majority (found {found}). Backup claims and restore \
+             default or set w=majority (found {found}). Backup rows and restore \
              targets assume an acknowledged write survives a primary failover, \
              which a weaker write concern does not guarantee."
         ))),
@@ -528,10 +498,11 @@ pub(crate) fn majority_write_concern(
 /// whatever the client's options or the server default say (inside a
 /// transaction the transaction's own options apply).
 ///
-/// The backup claim protocol depends on this: DeleteBackup, a restore, and
-/// the stale-claim sweep each check the other's marker or CREATING target
-/// with a `find_one` after writing their own, and that check must see every
-/// write the primary has acknowledged. A secondary can lag, and a `majority`
+/// The backup protocol depends on this: DeleteBackup and a restore's
+/// registration each check for the other's CREATING target or status write
+/// (under their transactions, and DeleteBackup's unlocked first check
+/// before), and the reconciler reads the job records' heartbeats; every such
+/// read must see what the primary has acknowledged. A secondary can lag, and a `majority`
 /// or `snapshot` read can miss a write acknowledged with `w: 1`; a write
 /// acknowledged with `w: 1` can also be rolled back on failover, after the
 /// other side has acted on it.
@@ -564,14 +535,12 @@ impl MongoEngine {
         tx_read_concern: mongodb::options::ReadConcern,
     ) -> Result<Self, StorageError> {
         let options = guarded_client_options(connection_string, max_connections, true).await?;
-        let pool_size = effective_pool_size(&options);
         let client = mongodb::Client::with_options(options)
             .map_err(|e| StorageError::Connection(e.to_string()))?;
 
         let catalog_db = catalog_database(&client);
         let data_db = client.database("extenddb_data");
 
-        let restore_server_slot_count = backup_engine::restore_server_slot_count(pool_size);
         Ok(Self {
             client,
             catalog_db,
@@ -580,9 +549,6 @@ impl MongoEngine {
             gsi_cache: Arc::default(),
             tx_read_concern,
             backup_liveness: backup_engine::BackupLiveness::default(),
-            restore_server_slot_count,
-            restore_server_slots: Arc::new(tokio::sync::Semaphore::new(restore_server_slot_count)),
-            restore_account_slots: backup_engine::RestoreAccountSlots::default(),
         })
     }
 
@@ -647,27 +613,7 @@ impl MongoEngine {
 mod tests {
     use super::GsiCache;
     use super::client_options_with_pool_size;
-    use super::effective_pool_size;
     use std::time::Duration;
-
-    /// The restore bound is sized from the pool the driver will really use:
-    /// the URI's maxPoolSize, the configured override, or the driver default.
-    #[tokio::test]
-    async fn effective_pool_size_follows_uri_override_and_default() {
-        let uri = client_options_with_pool_size("mongodb://localhost:27017/?maxPoolSize=30", None)
-            .await
-            .expect("parse");
-        assert_eq!(effective_pool_size(&uri), 30);
-        let configured =
-            client_options_with_pool_size("mongodb://localhost:27017/?maxPoolSize=30", Some(8))
-                .await
-                .expect("parse");
-        assert_eq!(effective_pool_size(&configured), 8);
-        let default = client_options_with_pool_size("mongodb://localhost:27017", None)
-            .await
-            .expect("parse");
-        assert_eq!(effective_pool_size(&default), 10);
-    }
 
     #[tokio::test]
     async fn absent_pool_override_preserves_uri_max_pool_size() {

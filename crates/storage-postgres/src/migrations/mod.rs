@@ -111,6 +111,15 @@ pub fn migration(id: MigrationId) -> Migration<PostgresStores> {
                 m0004_index_table_base_key::SOURCE,
             )],
         },
+        MigrationId::BackupCatalogIndex => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Catalog,
+                "migrations",
+                "0005_backup_catalog_index.sql"
+            )],
+        },
     }
 }
 
@@ -131,7 +140,8 @@ pub(crate) const fn runs_in(id: MigrationId) -> RunsIn {
     match id {
         MigrationId::Baseline
         | MigrationId::ResourceTagConditionKeys
-        | MigrationId::SortKeyDefinitions => RunsIn::Transaction,
+        | MigrationId::SortKeyDefinitions
+        | MigrationId::BackupCatalogIndex => RunsIn::Transaction,
         MigrationId::IndexTableBaseKey => RunsIn::Autocommit,
     }
 }

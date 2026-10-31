@@ -33,7 +33,7 @@ use extenddb_core::types::{
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::{
-    BackupEngine, DataEngine, RestoreRequest, RestoreTableOverrides, TableEngine,
+    DataEngine, JobPermit, LegacyBackupReader, RestoreRequest, RestoreTableOverrides, TableEngine,
 };
 use extenddb_storage_postgres::{PostgresConfig, PostgresEngine};
 use sqlx::PgPool;
@@ -415,11 +415,11 @@ async fn restore(
     target: &str,
     backup_arn: &str,
 ) -> Result<Option<String>, StorageError> {
-    let source = s.engine.backup_restore_source(ACCOUNT, backup_arn).await?;
+    let source = s.engine.restore_source(ACCOUNT, backup_arn).await?;
     source.ensure_restorable()?;
     let input = source.restore_input(target, &RestoreTableOverrides::default());
     s.engine
-        .restore_table_from_backup(
+        .restore(
             ACCOUNT,
             RestoreRequest {
                 backup_arn: backup_arn.to_owned(),
@@ -427,6 +427,7 @@ async fn restore(
                 restore_date_time: source.backup_creation_date_time,
                 input,
             },
+            JobPermit::detached(),
         )
         .await?;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -990,7 +991,7 @@ async fn restoring_a_backup_that_carries_vector_indexes_is_refused() {
         .expect("create a table with a vector index");
     let details = s
         .engine
-        .create_backup(ACCOUNT, "t_source", "b_vector")
+        .create(ACCOUNT, "t_source", "b_vector", JobPermit::detached())
         .await
         .expect("back up a table with a vector index");
 
@@ -1019,7 +1020,7 @@ async fn restoring_a_backup_that_carries_vector_indexes_is_refused() {
         .expect("drop the definition row");
     let legacy = s
         .engine
-        .backup_restore_source(ACCOUNT, &details.backup_arn)
+        .restore_source(ACCOUNT, &details.backup_arn)
         .await
         .expect("legacy source");
     assert!(legacy.definition.is_none());
@@ -1047,7 +1048,7 @@ async fn restoring_a_backup_that_carries_vector_indexes_is_refused() {
         .expect("create a plain table");
     let plain = s
         .engine
-        .create_backup(ACCOUNT, "t_plain_source", "b_plain")
+        .create(ACCOUNT, "t_plain_source", "b_plain", JobPermit::detached())
         .await
         .expect("back up a plain table");
     let status = restore(&s, "t_plain_restored", &plain.backup_arn)
@@ -1302,7 +1303,7 @@ async fn a_backup_snapshot_carries_the_wire_shape_behind_a_version() {
         .expect("create a table with a vector index");
     let details = s
         .engine
-        .create_backup(ACCOUNT, "t_snapshot", "b_snapshot")
+        .create(ACCOUNT, "t_snapshot", "b_snapshot", JobPermit::detached())
         .await
         .expect("back up the table");
 
@@ -1356,7 +1357,7 @@ async fn a_backup_taken_before_the_snapshot_column_existed_still_restores() {
         .expect("create a plain table");
     let details = s
         .engine
-        .create_backup(ACCOUNT, "t_legacy", "b_legacy")
+        .create(ACCOUNT, "t_legacy", "b_legacy", JobPermit::detached())
         .await
         .expect("back up the table");
 
@@ -1378,7 +1379,7 @@ async fn a_backup_taken_before_the_snapshot_column_existed_still_restores() {
         .expect("drop the definition row");
     let source = s
         .engine
-        .backup_restore_source(ACCOUNT, &details.backup_arn)
+        .restore_source(ACCOUNT, &details.backup_arn)
         .await
         .expect("source");
     assert!(source.definition.is_none());

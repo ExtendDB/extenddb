@@ -85,9 +85,9 @@ pub use key_order::{KeyOrder, hash_key_text};
 pub use layout::{
     BACKUP_ID_MILLIS_DIGITS, BackupArn, BackupArnError, BackupArnParts, DATA_PREFIX,
     EXTENDDB_MANIFEST_FILE, FILES_MANIFEST_FILE, MANIFEST_CHECKSUM_FILE, MAX_BACKUP_ARN_LEN,
-    SUMMARY_MANIFEST_FILE, backup_creation_date_time, backup_id_epoch_millis, check_backup_arn,
-    data_file_key, format_backup_arn, format_backup_id, is_backup_id, parse_backup_arn,
-    trim_backup_arn,
+    MAX_TABLE_NAME_LEN, SUMMARY_MANIFEST_FILE, backup_creation_date_time, backup_id_epoch_millis,
+    check_backup_arn, check_store_prefix_table_name, data_file_key, format_backup_arn,
+    format_backup_id, is_backup_id, is_region, parse_backup_arn, trim_backup_arn,
 };
 pub use manifest::{
     CURRENT_FORMAT_VERSION, DataFileEntry, DataFileReader, ExtenddbManifest, ItemOrder, KeyRange,

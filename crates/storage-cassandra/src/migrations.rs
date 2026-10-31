@@ -33,6 +33,9 @@
 //! 5. Name tables without a keyspace. The runner writes the keyspace it
 //!    migrates into each `CREATE TABLE`, `CREATE INDEX`, `ALTER TABLE` and
 //!    `INSERT INTO` statement, and rejects any other statement form.
+//! 6. Do not write `settings.catalog_version` in the file: the runner writes
+//!    [`crate::CATALOG_VERSION`] once every file is recorded
+//!    (`write_catalog_version`). Bump that constant with the file.
 
 use cdrs_tokio::cluster::TcpConnectionManager;
 use cdrs_tokio::cluster::session::Session;
@@ -87,7 +90,19 @@ pub(crate) const CATALOG_MIGRATIONS: &[(&str, &str)] = &[
         "V005__backup_definitions_and_restore_registration.cql",
         include_str!("../migrations/catalog/V005__backup_definitions_and_restore_registration.cql"),
     ),
+    (
+        BACKUP_CATALOG_INDEX_MIGRATION,
+        include_str!("../migrations/catalog/V006__backup_catalog_index.cql"),
+    ),
 ];
+
+/// The catalog migration that adds the backup catalog index. Its statements
+/// are followed by a step in Rust ([`backfill_backup_catalog_index`]): CQL
+/// has no `UPDATE ... WHERE` on a non-key predicate, so the restore
+/// registrations that exist are backfilled row by row, and the catalog id is
+/// a random value the runner generates. The version is written after the
+/// step and the `schema_history` row ([`write_catalog_version`]).
+pub(crate) const BACKUP_CATALOG_INDEX_MIGRATION: &str = "V006__backup_catalog_index.cql";
 
 /// Embedded data migration files, applied in order.
 pub(crate) const DATA_MIGRATIONS: &[(&str, &str)] = &[
@@ -120,9 +135,130 @@ pub async fn run_catalog_migrations(
         }
         println!("    Applying {filename}...");
         execute_migration(session, keyspace, filename, sql).await?;
+        if *filename == BACKUP_CATALOG_INDEX_MIGRATION {
+            backfill_backup_catalog_index(session, keyspace).await?;
+        }
         record_migration(session, keyspace, filename).await?;
     }
+    write_catalog_version(session, keyspace).await?;
     println!("    Migrations applied.");
+    Ok(())
+}
+
+/// Write `settings.catalog_version` = [`crate::CATALOG_VERSION`], the version
+/// every file of [`CATALOG_MIGRATIONS`] brings the catalog to. The runner
+/// writes it last, after the last file's statements, its step and its
+/// `schema_history` row: a run that fails before this leaves the version
+/// where it was, so `extenddb migrate` reports the catalog pending and
+/// `migrate --yes` runs the unrecorded file again (every statement and step
+/// is idempotent), and `serve` refuses the catalog until then. V001 to V005
+/// (released before this rule) also write their version as their last
+/// statement; from V006 on a file does not name `catalog_version`.
+async fn write_catalog_version(session: &Arc<CassandraSession>, keyspace: &str) -> OpResult<()> {
+    let insert =
+        format!("INSERT INTO {keyspace}.settings (key, value) VALUES ('catalog_version', ?)");
+    session
+        .query_with_values(insert, cdrs_tokio::query_values!(crate::CATALOG_VERSION))
+        .await
+        .map_err(|e| OpError::Internal(format!("Write catalog version: {e}")))?;
+    Ok(())
+}
+
+/// The step after the statements of [`BACKUP_CATALOG_INDEX_MIGRATION`]:
+/// every `tables` row carrying a restore registration without a job status
+/// gets `restore_kind = legacy` and `restore_owner_generation = 0` (the
+/// unowned sentinel), with `restore_status = DONE` and `restore_completed_at`
+/// the table's creation time where the table is not CREATING, and
+/// `restore_status = RUNNING` with `restore_heartbeat_at` at the epoch where
+/// it is (a restore the upgrade's stop interrupted, which the reconciler's
+/// first pass fails and removes); then `settings.catalog_id` is written if
+/// absent. Each write is a lightweight transaction conditioned on the field
+/// being unset, so a second run changes nothing.
+async fn backfill_backup_catalog_index(
+    session: &Arc<CassandraSession>,
+    keyspace: &str,
+) -> OpResult<()> {
+    use cdrs_tokio::types::IntoRustByName;
+    let rows = crate::cassandra_util::query_rows_quorum::<OpError>(
+        session,
+        &format!(
+            "SELECT account_id, table_name, table_id, table_status, created_at, \
+             restore_source_backup_arn, restore_status FROM {keyspace}.tables"
+        ),
+        cdrs_tokio::query_values!(),
+        "backfill restore registrations",
+    )
+    .await?;
+    let (mut done, mut running) = (0_u32, 0_u32);
+    for row in rows {
+        let source: Option<String> = row.get_by_name("restore_source_backup_arn").ok().flatten();
+        let status: Option<String> = row.get_by_name("restore_status").ok().flatten();
+        if source.is_none() || status.is_some() {
+            continue;
+        }
+        let account_id: String =
+            crate::cassandra_util::get_column(&row, "account_id", "backfill registrations")?;
+        let table_name: String =
+            crate::cassandra_util::get_column(&row, "table_name", "backfill registrations")?;
+        let table_id: String =
+            crate::cassandra_util::get_column(&row, "table_id", "backfill registrations")?;
+        let table_status: Option<String> = row.get_by_name("table_status").ok().flatten();
+        let created_at: i64 = row.get_by_name("created_at").ok().flatten().unwrap_or(0);
+        let interrupted = table_status.as_deref() == Some("CREATING");
+        let update = if interrupted {
+            format!(
+                "UPDATE {keyspace}.tables SET restore_status = 'RUNNING', restore_kind = 'legacy', \
+                 restore_owner_generation = 0, restore_heartbeat_at = 0 \
+                 WHERE account_id = ? AND table_name = ? \
+                 IF table_id = ? AND restore_status = null"
+            )
+        } else {
+            format!(
+                "UPDATE {keyspace}.tables SET restore_status = 'DONE', restore_kind = 'legacy', \
+                 restore_owner_generation = 0, restore_heartbeat_at = 0, restore_completed_at = ? \
+                 WHERE account_id = ? AND table_name = ? \
+                 IF table_id = ? AND restore_status = null"
+            )
+        };
+        let values = if interrupted {
+            cdrs_tokio::query_values!(account_id.as_str(), table_name.as_str(), table_id.as_str())
+        } else {
+            cdrs_tokio::query_values!(
+                created_at,
+                account_id.as_str(),
+                table_name.as_str(),
+                table_id.as_str()
+            )
+        };
+        let applied = crate::cassandra_util::query_lwt(session, &update, values)
+            .await
+            .and_then(|result| crate::cassandra_util::lwt_applied(&result))
+            .map_err(|e| OpError::Internal(format!("backfill restore registration: {e}")))?;
+        if applied {
+            if interrupted {
+                running += 1;
+            } else {
+                done += 1;
+            }
+        }
+    }
+    println!("    Backfilled {done} finished and {running} interrupted restore registration(s).");
+
+    let catalog_id = uuid::Uuid::new_v4().to_string();
+    let insert_id = format!(
+        "INSERT INTO {keyspace}.settings (key, value) VALUES ('catalog_id', ?) IF NOT EXISTS"
+    );
+    let written = crate::cassandra_util::query_lwt(
+        session,
+        &insert_id,
+        cdrs_tokio::query_values!(catalog_id.as_str()),
+    )
+    .await
+    .and_then(|result| crate::cassandra_util::lwt_applied(&result))
+    .map_err(|e| OpError::Internal(format!("write catalog_id: {e}")))?;
+    if written {
+        println!("    Catalog id {catalog_id}.");
+    }
     Ok(())
 }
 
