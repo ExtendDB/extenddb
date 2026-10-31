@@ -365,10 +365,12 @@ impl CancellationReason {
     /// `ValidationError` and the other members keep their own outcomes beside
     /// it (measured: `[ValidationError, ConditionalCheckFailed]`).
     ///
-    /// The storage layers run the key checks of every member that need only
-    /// the request before any member is applied, and resolve those faults on
-    /// their own; the reasons of the members that ran then carry only an
-    /// Update member's empty index key beside plain reasons.
+    /// The storage layers run two checks over every member before any member
+    /// is applied, each resolved on its own: the faults supplied in the
+    /// request (table keys, a Put item's index keys, an Update's literal
+    /// types), then an Update's empty index-key literal. The reasons of the
+    /// members that ran then carry only an empty value an Update wrote from
+    /// the item beside plain reasons.
     ///
     /// # Errors
     ///

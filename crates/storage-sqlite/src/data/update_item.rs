@@ -44,20 +44,23 @@ impl SqliteEngine {
         // added GSI (UpdateTable holds the same lock) is not missed.
         let indexes = fetch_indexes_for_table(&key_info.table_id, &self.pool).await?;
         // Literal operands assigned to a secondary-index key, checked on the
-        // statement ahead of the condition as the service checks them. The
-        // engine ran this check against its cached key info, which does not list
-        // a GSI until the UpdateTable that adds it returns; a write that read the
-        // cache before then and takes the write lock after the build sees the GSI
-        // only in this read, and a literal of the wrong type for it gets the same
-        // per-index wording.
+        // statement ahead of the condition as the service checks them: the type
+        // first, then an empty value. The engine ran these checks against its
+        // cached key info, which does not list a GSI until the UpdateTable that
+        // adds it returns; a write that read the cache before then and takes the
+        // write lock after the build sees the GSI only in this read, and a
+        // literal for it gets the same answer.
         if !indexes.is_empty() {
+            let idx_refs = index_key_refs(&indexes);
             validation::validate_index_key_literal_operands(
                 actions,
-                &index_key_refs(&indexes),
+                &idx_refs,
                 super::index::fresh_attr_defs(&indexes, &key_info.attribute_definitions),
                 maps,
             )
             .map_err(|e| StorageError::Validation(e.to_string()))?;
+            validation::validate_index_key_empty_literals(actions, &idx_refs, maps)
+                .map_err(|e| StorageError::Validation(e.to_string()))?;
         }
 
         let mut tx = self

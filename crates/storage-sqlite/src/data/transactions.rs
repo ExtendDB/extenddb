@@ -14,7 +14,8 @@ use extenddb_core::types::{CancellationReason, Item, ReturnValuesOnConditionChec
 use extenddb_core::validation;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::{
-    IdempotencyKey, TransactGetOp, TransactWriteOp, transact_key_check_pass, transact_op_key_checks,
+    IdempotencyKey, TransactGetOp, TransactWriteOp, transact_key_check_pass,
+    transact_op_empty_literal_checks, transact_op_key_checks,
 };
 
 use super::index::{
@@ -108,8 +109,10 @@ impl SqliteEngine {
         // locked. They need only the request and the table metadata, and a
         // fault among them decides the request under the service's precedence
         // (the first such fault in request order), so a decided request never
-        // waits on a later member's row. Dropping `tx` rolls back the
-        // idempotency token checked above.
+        // waits on a later member's row. Then every Update member's empty
+        // index-key literal, which ranks below those faults and above
+        // everything the members find once they run. Dropping `tx` rolls back
+        // the idempotency token checked above.
         transact_key_check_pass(ops.iter().map(|op| {
             let indexes = &table_indexes[op_table_name(op)];
             transact_op_key_checks(
@@ -117,6 +120,9 @@ impl SqliteEngine {
                 &index_key_refs(indexes),
                 fresh_attr_defs(indexes, &op_key_info(op).attribute_definitions),
             )
+        }))?;
+        transact_key_check_pass(ops.iter().map(|op| {
+            transact_op_empty_literal_checks(op, &index_key_refs(&table_indexes[op_table_name(op)]))
         }))?;
 
         let mut reasons: Vec<CancellationReason> = Vec::with_capacity(ops.len());
@@ -425,7 +431,8 @@ async fn execute_transact_write_op(
             // Secondary-index keys on the written item: a wrong-typed value
             // the statement wrote from an attribute reference or from
             // if_not_exists, reported with the service's computed-value
-            // wording, and a key left empty. With the path absent the
+            // wording, and a key such a value leaves empty (an empty literal
+            // was found before any member ran). With the path absent the
             // if_not_exists fallback is a literal from the request, which the
             // service ranks with the values taken from the item. The type
             // fault is a plain positional reason: the service leaves the

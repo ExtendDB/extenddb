@@ -177,7 +177,8 @@ impl CassandraEngine {
     /// reason) ahead of the member's condition, then the condition against the
     /// pre-update image, then the statement itself, then on the written item a
     /// computed index-key value of the wrong type (a cancellation reason) and
-    /// an index key left empty (a top-level abort).
+    /// an index key such a value leaves empty (a top-level abort). An empty
+    /// literal never reaches this: the request-level checks find it first.
     ///
     /// Used on the first PREPARE pass and again on every create-race retry, so
     /// the two paths cannot drift apart.
@@ -454,7 +455,17 @@ impl CassandraEngine {
                 &Self::transact_index_key_refs(key_info),
                 &key_info.attribute_definitions,
             )
-        }));
+        }))
+        // Then every Update member's empty index-key literal, which ranks
+        // below those faults and above everything PREPARE finds.
+        .and_then(|()| {
+            extenddb_storage::transact_key_check_pass(ops.iter().map(|op| {
+                extenddb_storage::transact_op_empty_literal_checks(
+                    op,
+                    &Self::transact_index_key_refs(transact_write_op_key_info(op)),
+                )
+            }))
+        });
         if let Err(answer) = key_check {
             if let Some((idempotency_account, token, _)) = idempotency {
                 self.delete_idempotency_token(&self.catalog_keyspace(), idempotency_account, token)

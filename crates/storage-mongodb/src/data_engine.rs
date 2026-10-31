@@ -2294,7 +2294,23 @@ impl MongoEngine {
                 &idx_refs,
                 &op.key_info().attribute_definitions,
             )
-        }));
+        }))
+        // Then every Update member's empty index-key literal, which ranks
+        // below those faults and above everything the members find once they
+        // run.
+        .and_then(|()| {
+            extenddb_storage::transact_key_check_pass(ops.iter().map(|op| {
+                let idx_refs: Vec<extenddb_core::validation::IndexKeyRef<'_>> = index_schemas
+                    [op.table_id()]
+                .iter()
+                .map(|(n, ks)| extenddb_core::validation::IndexKeyRef {
+                    index_name: n.as_str(),
+                    key_schema: ks.as_slice(),
+                })
+                .collect();
+                extenddb_storage::transact_op_empty_literal_checks(&op.as_op(), &idx_refs)
+            }))
+        });
 
         // Rehydrate the `IdempotencyKey` per attempt from owned strings.
         // The input struct holds `&str`s, so it cannot be moved across
@@ -2853,12 +2869,14 @@ impl MongoEngine {
                 // Secondary-index keys on the written item: a wrong-typed value
                 // the statement wrote from an attribute reference or from
                 // if_not_exists, reported with the service's computed-value
-                // wording, and a key left empty. With the path absent the
+                // wording, and a key such a value leaves empty (an empty
+                // literal was found by the second check of
+                // transact_write_items_impl). With the path absent the
                 // if_not_exists fallback is a literal from the request, which
                 // the service ranks with the values taken from the item. The
                 // type fault is a plain positional reason: the service leaves
                 // the other members' outcomes in place beside it, where a
-                // wrong type supplied in the request (the key-check pass of
+                // wrong type supplied in the request (the first check of
                 // transact_write_items_impl) masks them.
                 if !idx_refs.is_empty() {
                     extenddb_core::validation::validate_index_key_types_after_update(

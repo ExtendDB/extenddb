@@ -309,6 +309,105 @@ async fn a_deadlock_cancels_with_transaction_conflict_on_the_waiting_item() {
 }
 
 #[tokio::test]
+async fn a_deadlock_after_an_empty_index_key_answers_the_empty_key() {
+    // An Update member that sets an index key to the empty string records
+    // that fault once its statement is applied, and the member after it in
+    // execution order then deadlocks. The request answers the empty key's
+    // ValidationException, as it does without the conflict, and no internal
+    // cancellation code reaches the caller.
+    let test = "a_deadlock_after_an_empty_index_key_answers_the_empty_key";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let s = scratch().await;
+    let key_info = gsi_table(&s).await;
+    let plain = ExpressionMaps::default();
+    for pk in ["a", "b"] {
+        s.engine
+            .put_item(&key_info, item(pk, "seed"), false, None, &plain, None)
+            .await
+            .expect("seed an item");
+    }
+    let table = data_table(&s.db).await;
+
+    // An outside transaction holds `b`. The ops run in key order, so the
+    // Update of `a` runs first: it locks `a`, applies `SET a1 = :e` and
+    // records the empty key. The Put of `b` then waits on `b`, and the
+    // outside transaction asks for `a`, which closes the cycle. The write
+    // transaction waited first, so PostgreSQL aborts it.
+    let mut holder = s.db.begin().await.expect("begin the outside transaction");
+    let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *holder)
+        .await
+        .expect("read the backend pid");
+    sqlx::query(&format!("SELECT 1 FROM {table} WHERE pk = 'b' FOR UPDATE"))
+        .execute(&mut *holder)
+        .await
+        .expect("lock b");
+
+    let empty = ExpressionMaps::new(
+        std::collections::HashMap::new(),
+        std::collections::HashMap::from([("e".to_owned(), AttributeValue::S(String::new()))]),
+    );
+    let tokens = expression::tokenize("SET a1 = :e").expect("tokenize");
+    let actions = expression::parse_update(&tokens).expect("parse");
+    let (key_a, new_b) = (key("a"), item("b", "twi"));
+    // Request order is b, a; the empty key decides wherever it is.
+    let ops = [
+        put(&key_info, &new_b, &plain),
+        TransactWriteOp::Update {
+            key_info: &key_info,
+            key: &key_a,
+            actions: &actions,
+            condition: None,
+            maps: &empty,
+            return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+            stream: None,
+        },
+    ];
+    let twi = s.engine.transact_write_items(&ops, None);
+    let close_cycle = async {
+        wait_for_lock_waiters(&s.db, holder_pid, 1).await;
+        sqlx::query(&format!("SELECT 1 FROM {table} WHERE pk = 'a' FOR UPDATE"))
+            .execute(&mut *holder)
+            .await
+            .expect("the outside transaction gets a once the write transaction aborts");
+    };
+    // Bounded, so a transaction that never closes the cycle fails the test
+    // instead of hanging it.
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(twi, close_cycle)
+    })
+    .await
+    .expect("the write transaction finished");
+    holder.rollback().await.expect("release the outside locks");
+
+    match result {
+        Err(StorageError::Validation(msg)) => assert_eq!(
+            msg,
+            "One or more parameter values are not valid. The update expression attempted to \
+             update a secondary index key to a value that is not supported. The AttributeValue \
+             for a key attribute cannot contain an empty string value."
+        ),
+        other => panic!("expected the empty key's ValidationException, got {other:?}"),
+    }
+    // The canceled transaction applied nothing.
+    for pk in ["a", "b"] {
+        let (v, a1): (String, Option<String>) = sqlx::query_as(&format!(
+            "SELECT item_data->'v'->>'S', item_data->'a1'->>'S' FROM {table} WHERE pk = $1"
+        ))
+        .bind(pk)
+        .fetch_one(&s.db)
+        .await
+        .expect("read the item");
+        assert_eq!(v, "seed", "item {pk}");
+        assert_eq!(a1, None, "item {pk}");
+    }
+
+    s.cleanup().await;
+}
+
+#[tokio::test]
 async fn opposite_request_orders_do_not_deadlock() {
     let test = "opposite_request_orders_do_not_deadlock";
     if base_conn().is_none() {

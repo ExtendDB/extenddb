@@ -111,9 +111,9 @@ pub enum TransactWriteOp<'a> {
 ///
 /// `index_keys` and `index_attr_defs` are the table's secondary indexes and
 /// the attribute definitions the backend checks their keys against. An
-/// Update's empty literal and the values an Update writes from the stored
-/// item are not checked here; the member's arm checks them once the statement
-/// is applied.
+/// Update's empty literal is the second check,
+/// [`transact_op_empty_literal_checks`]; the values an Update writes from the
+/// stored item are checked by the member's arm once the statement is applied.
 ///
 /// # Errors
 ///
@@ -176,9 +176,39 @@ pub fn transact_op_key_checks(
     }
 }
 
-/// The request-level answer of the key-check pass: `member_checks` yields
-/// each member's [`transact_op_key_checks`] result in request order. When
-/// every member passes the request goes on to its members; otherwise
+/// The second request-level check of a transaction member, run only when no
+/// member failed [`transact_op_key_checks`]: an Update member's empty
+/// index-key literal (`SET k = :v`, `:v` an empty string or binary), carried
+/// as [`CancellationReason::index_key_empty_abort`] with the update wording.
+/// The service reports it on the statement, below every fault of the first
+/// check and ahead of the member's condition, of an action that cannot apply
+/// and of anything computed from the item, on every member. An empty value
+/// written from the item or from the fallback of `if_not_exists` is not
+/// checked here; the member's arm finds it on the written item.
+///
+/// # Errors
+///
+/// Returns the member's empty literal as its internal cancellation reason.
+pub fn transact_op_empty_literal_checks(
+    op: &TransactWriteOp<'_>,
+    index_keys: &[IndexKeyRef<'_>],
+) -> Result<(), CancellationReason> {
+    match op {
+        TransactWriteOp::Update { actions, maps, .. } => {
+            validation::validate_index_key_empty_literals(actions, index_keys, maps)
+                .map_err(|e| CancellationReason::index_key_empty_abort(e.to_string()))
+        }
+        TransactWriteOp::Put { .. }
+        | TransactWriteOp::Delete { .. }
+        | TransactWriteOp::ConditionCheck { .. } => Ok(()),
+    }
+}
+
+/// The request-level answer of one check over every member: `member_checks`
+/// yields each member's result in request order, from
+/// [`transact_op_key_checks`] for the first pass and from
+/// [`transact_op_empty_literal_checks`] for the second. When every member
+/// passes the request goes on; otherwise
 /// [`CancellationReason::resolve_key_faults`] decides it from those reasons
 /// alone, before any member is applied.
 ///
