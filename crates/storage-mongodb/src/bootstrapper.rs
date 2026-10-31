@@ -12,6 +12,34 @@ use extenddb_storage::bootstrapper::{AdminBootstrapResult, Bootstrapper};
 use extenddb_storage::error::StorageError;
 use extenddb_storage::management_store::{OpError, OpResult};
 
+/// The name of the `{table_id: 1, shard_id: 1}` index on `stream_shards`
+/// (the name `MongoDB` gives those keys by default).
+const STREAM_SHARDS_TABLE_INDEX: &str = "table_id_1_shard_id_1";
+
+/// Create the `{table_id: 1, shard_id: 1}` index on `stream_shards`.
+///
+/// Every write to a streamed table selects the table's open shards by
+/// `table_id` and sorts them by `shard_id`, and `DescribeStream`,
+/// `GetShardIterator` and `ListStreams` read a table's shard rows the same
+/// way. Without it those reads scan the whole collection across all
+/// accounts, and each enable adds four documents that are never removed.
+async fn create_stream_shards_table_index(db: &mongodb::Database) -> OpResult<()> {
+    db.collection::<Document>("stream_shards")
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "table_id": 1, "shard_id": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name(STREAM_SHARDS_TABLE_INDEX.to_owned())
+                        .build(),
+                )
+                .build(),
+        )
+        .await
+        .map_err(|e| OpError::Internal(format!("stream_shards table_id index: {e}")))?;
+    Ok(())
+}
+
 /// `MongoDB` bootstrapper for init/destroy/migrate operations.
 pub struct MongoBootstrapper {
     client: mongodb::Client,
@@ -129,8 +157,8 @@ impl Bootstrapper for MongoBootstrapper {
         // stream_shards: unique index on shard_id so a subsequent init/
         // recreate can never insert a duplicate shard document under the
         // same shard_id. Combined with `table_id`-derived shard_ids
-        // (see stream_engine::build_shard_id) this rules out cross-tenant
-        // shard collisions structurally.
+        // (see extenddb_storage::stream_lineage::shard_id) this rules out
+        // cross-tenant shard collisions structurally.
         db.create_collection("stream_shards")
             .await
             .map_err(|e| OpError::Internal(format!("Failed to create stream_shards: {e}")))?;
@@ -143,6 +171,7 @@ impl Bootstrapper for MongoBootstrapper {
             )
             .await
             .map_err(|e| OpError::Internal(format!("stream_shards shard_id index: {e}")))?;
+        create_stream_shards_table_index(&db).await?;
 
         // stream_records: TTL index enforcing DDB's 24-hour retention.
         // The `expireAfterSeconds` is the delta from the field value,
@@ -378,15 +407,38 @@ impl Bootstrapper for MongoBootstrapper {
 
     async fn run_data_migrations(&self) -> OpResult<()> {
         // Data database schema is minimal for MongoDB (just idempotency_tokens)
-        // Table collections are created on-demand
-        Ok(())
+        // Table collections are created on-demand. The one index added to a
+        // collection create_data_db makes, `stream_shards` by
+        // `{table_id, shard_id}`, is created here too, so a deployment
+        // initialised before it gets it from `extenddb migrate --yes`;
+        // creating an index that exists with the same keys and name is a
+        // no-op.
+        create_stream_shards_table_index(&self.data_db()).await
     }
 
     async fn pending_data_migrations(&self) -> OpResult<Vec<String>> {
-        // MongoDB has no versioned data-database migrations — table
+        // MongoDB has no versioned data-database migrations: table
         // collections are created on-demand, and the idempotency_tokens
-        // collection is created in create_data_db. Nothing to apply.
-        Ok(Vec::new())
+        // collection is created in create_data_db. The `stream_shards`
+        // `{table_id, shard_id}` index is pending while it is missing.
+        let names = match self
+            .data_db()
+            .collection::<Document>("stream_shards")
+            .list_index_names()
+            .await
+        {
+            Ok(names) => names,
+            // NamespaceNotFound: no `stream_shards` collection yet.
+            Err(e) if matches!(*e.kind, mongodb::error::ErrorKind::Command(ref c) if c.code == 26) => {
+                Vec::new()
+            }
+            Err(e) => return Err(OpError::Internal(format!("stream_shards indexes: {e}"))),
+        };
+        Ok(if names.iter().any(|n| n == STREAM_SHARDS_TABLE_INDEX) {
+            Vec::new()
+        } else {
+            vec![format!("stream_shards index {STREAM_SHARDS_TABLE_INDEX}")]
+        })
     }
 
     async fn record_data_connection(&self) -> OpResult<()> {
@@ -669,6 +721,65 @@ fn redact_connection_string(uri: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::redact_connection_string;
+
+    /// A data database created before the `stream_shards`
+    /// `{table_id, shard_id}` index: the data migration `extenddb migrate
+    /// --yes` runs reports it pending, creates it, and is a no-op the second
+    /// time. Uses the `extenddb_data` database of the server in
+    /// `EXTENDDB_TEST_MONGODB_URI`, as `extenddb init` does.
+    #[tokio::test]
+    #[ignore = "needs a MongoDB server in EXTENDDB_TEST_MONGODB_URI"]
+    async fn live_stream_shards_index_comes_from_the_data_migration() {
+        use bson::{Document, doc};
+        use extenddb_storage::bootstrapper::Bootstrapper;
+
+        let uri = std::env::var("EXTENDDB_TEST_MONGODB_URI")
+            .expect("set EXTENDDB_TEST_MONGODB_URI to a MongoDB server");
+        let client = crate::connect_guarded(&uri, None, false)
+            .await
+            .expect("connect");
+        let boot = super::MongoBootstrapper {
+            client,
+            connection_string: uri,
+        };
+        let shards = boot.data_db().collection::<Document>("stream_shards");
+        // The collection as an earlier init left it: the unique shard_id
+        // index and no {table_id, shard_id} index.
+        let _ = boot.data_db().create_collection("stream_shards").await;
+        let _ = shards.drop_index(super::STREAM_SHARDS_TABLE_INDEX).await;
+        let names = shards.list_index_names().await.expect("index names");
+        assert!(!names.iter().any(|n| n == super::STREAM_SHARDS_TABLE_INDEX));
+        assert_eq!(
+            boot.pending_data_migrations().await.expect("pending"),
+            vec![format!(
+                "stream_shards index {}",
+                super::STREAM_SHARDS_TABLE_INDEX
+            )]
+        );
+
+        boot.run_data_migrations().await.expect("data migration");
+        let indexes: Vec<Document> = {
+            use futures::TryStreamExt;
+            shards
+                .list_indexes()
+                .await
+                .expect("list indexes")
+                .map_ok(|m| m.keys)
+                .try_collect()
+                .await
+                .expect("index keys")
+        };
+        assert!(indexes.contains(&doc! { "table_id": 1, "shard_id": 1 }));
+        assert!(
+            boot.pending_data_migrations()
+                .await
+                .expect("pending")
+                .is_empty()
+        );
+        boot.run_data_migrations()
+            .await
+            .expect("the second run is a no-op");
+    }
 
     #[test]
     fn redact_userinfo_with_password() {
