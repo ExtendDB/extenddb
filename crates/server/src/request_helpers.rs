@@ -137,6 +137,73 @@ pub(crate) async fn authorize_request(
         }
     }
 
+    // The checks from here to the dev-mode return are input validation, not the
+    // IAM decision. The service applies them to every principal, so they run in
+    // dev mode too, and a dev-mode server refuses the same malformed,
+    // out-of-scope and unissued resources as any other build (#450, #451).
+    //
+    // Tag operations validate the ResourceArn shape before the IAM decision, as
+    // the service does: an index ARN (tags are accepted only on a table or
+    // stream) is rejected with ValidationException for every principal, before
+    // authorization. A table ARN passes; its account, region, and existence
+    // are checked after authorization by the engine tag handler. A stream ARN
+    // must name the caller's account here, before authorization, as the
+    // service does (AccessDeniedException "Access is denied" for every
+    // principal, #450); its partition, service and region are checked by the
+    // engine after authorization, which runs on the ARN as sent (#451).
+    if matches!(
+        operation,
+        "TagResource" | "UntagResource" | "ListTagsOfResource"
+    ) && let Some(arn) = input.get("ResourceArn").and_then(Value::as_str)
+        && !arn.is_empty()
+    {
+        authz_resource::validate_tag_resource_arn_shape(arn, account_id)?;
+    }
+
+    // A StreamArn (DescribeStream, GetShardIterator) or BackupArn
+    // (DescribeBackup, DeleteBackup) that is not a well-formed ARN of that kind,
+    // and an export TableArn that does not parse, are refused with
+    // ValidationException before the IAM decision. Without this, an ARN the
+    // engine resolves one way and authorization reads another lets a Deny on
+    // the real resource be bypassed. A StreamArn must also be in this
+    // deployment's scope (partition, service, region) and the caller's account,
+    // so the stream authorized is the stream the engine reads and a respelled
+    // ARN is never served (#450, #451). A restore's source ARN, and an export
+    // TableArn of another kind, are refused by the engine after the IAM
+    // decision.
+    authz_resource::validate_operation_arns(operation, input, &state.region, account_id)?;
+
+    // GetRecords carries its resource only inside the opaque shard iterator, not
+    // in a request body field, so the iterator is decoded here for the stream
+    // ARN the IAM decision below authorizes against.
+    //
+    // A token that does not decode, or decodes to neither a current token nor
+    // the pre-upgrade shape, is rejected with ValidationException "Invalid
+    // ShardIterator" before authorization. A pre-upgrade token (the four
+    // pre-stream-ARN fields with a parseable timestamp) is answered with
+    // ExpiredIteratorException before authorization, so a consumer reading
+    // across the upgrade renews its iterator instead of failing on the
+    // non-retryable "Invalid ShardIterator". The service answers an iterator it
+    // did not issue the same way whatever the caller's policy (measured
+    // 2026-10-20).
+    let getrecords_stream = if operation == "GetRecords" {
+        match authz_resource::getrecords_resource(input, &state.region, account_id) {
+            authz_resource::GetRecordsResource::Stream(arn) => Some(arn),
+            authz_resource::GetRecordsResource::Expired => {
+                return Err(DynamoDbError::ExpiredIteratorException(
+                    extenddb_engine::SHARD_ITERATOR_EXPIRED_MESSAGE.to_owned(),
+                ));
+            }
+            authz_resource::GetRecordsResource::Invalid => {
+                return Err(DynamoDbError::ValidationException(
+                    "Invalid ShardIterator".to_owned(),
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
     // Developer mode opens authorization for the authenticated caller. SigV4
     // verification already ran upstream, so the request is authenticated; only
     // the IAM policy decision is skipped. The key info is still returned so the
@@ -186,58 +253,11 @@ pub(crate) async fn authorize_request(
         return Ok(authorized_key_info);
     }
 
-    // Tag operations validate the ResourceArn shape before the IAM decision, as
-    // the service does: an index ARN (tags are accepted only on a table or
-    // stream) is rejected with ValidationException for every principal, before
-    // authorization. A table or stream ARN passes; its account, region, and
-    // existence are checked after authorization by the engine tag handler.
-    if matches!(
-        operation,
-        "TagResource" | "UntagResource" | "ListTagsOfResource"
-    ) && let Some(arn) = input.get("ResourceArn").and_then(Value::as_str)
-        && !arn.is_empty()
-    {
-        authz_resource::validate_tag_resource_arn_shape(arn)?;
-    }
-
-    // Every other ARN-bearing field (StreamArn, BackupArn, the export TableArn,
-    // a restore SourceTableArn) must parse to the resource kind the operation
-    // takes, or the request is refused with ValidationException before the IAM
-    // decision. Without this, an ARN the engine resolves one way and
-    // authorization reads another lets a Deny on the real resource be bypassed.
-    authz_resource::validate_operation_arns(operation, input)?;
-
-    // GetRecords carries its resource only inside the opaque shard iterator, not
-    // in a request body field. Decode the iterator for the stream ARN and
-    // authorize against that specific stream, as the service does. The storage
-    // read resolves the shard against that stream as part of the read, so a
-    // token that names an allowed stream but a different stream's shard reads
-    // nothing.
-    //
-    // A token that does not decode, or decodes to neither a current token nor
-    // the pre-upgrade shape, is rejected with ValidationException "Invalid
-    // ShardIterator" before authorization. A pre-upgrade token (the four
-    // pre-stream-ARN fields with a parseable timestamp) is answered with
-    // ExpiredIteratorException before authorization, so a consumer reading
-    // across the upgrade renews its iterator instead of failing on the
-    // non-retryable "Invalid ShardIterator". The service answers an iterator it
-    // did not issue the same way whatever the caller's policy (measured
-    // 2026-10-20).
-    if operation == "GetRecords" {
-        let resource_arn =
-            match authz_resource::getrecords_resource(input, &state.region, account_id) {
-                authz_resource::GetRecordsResource::Stream(arn) => arn,
-                authz_resource::GetRecordsResource::Expired => {
-                    return Err(DynamoDbError::ExpiredIteratorException(
-                        extenddb_engine::SHARD_ITERATOR_EXPIRED_MESSAGE.to_owned(),
-                    ));
-                }
-                authz_resource::GetRecordsResource::Invalid => {
-                    return Err(DynamoDbError::ValidationException(
-                        "Invalid ShardIterator".to_owned(),
-                    ));
-                }
-            };
+    // GetRecords is authorized against the specific stream its iterator names,
+    // as the service does. The storage read resolves the shard against that
+    // stream as part of the read, so a token that names an allowed stream but a
+    // different stream's shard reads nothing.
+    if let Some(resource_arn) = getrecords_stream {
         authorization::check_authorization(
             state.authz_cache.as_ref(),
             identity,

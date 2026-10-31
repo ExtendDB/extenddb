@@ -314,8 +314,9 @@ pub async fn handle_get_records(
     // Cassandra after reading the table. A forged token that pairs an
     // authorized stream ARN with another stream's shard id reads nothing and
     // gets the "stream does not exist" answer. A token with no stream ARN gets
-    // the answer the authorization layer gives it (`classify_shard_iterator`);
-    // the layer is skipped in developer mode, so the engine answers the same.
+    // the answer the authorization layer gives it (`classify_shard_iterator`)
+    // in every build, developer mode included; the engine answers the same for
+    // a caller that reaches it without the layer.
     let Some(stream_arn) = it.stream_arn.as_deref() else {
         return Err(no_stream_arn_error(&it));
     };

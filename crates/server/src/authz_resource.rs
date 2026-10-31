@@ -29,14 +29,40 @@
 //! | `ListTables` | `ListTables` | `table/*` |
 //! | item/table ops | same | the table ARN (from `TableName`, name or ARN) |
 //!
-//! Every resource ARN produced here is CANONICAL for this deployment: the
-//! partition, service, region, and account are fixed to this server's, and only
-//! the resource identity (table name and optional sub-resource) is taken from
-//! the request. ExtendDB's stream and backup resolvers ignore the partition,
-//! service, region, and account of a supplied ARN and act within this
-//! deployment's account, so a caller who respells those fields would otherwise
-//! evade a Deny written against the canonical ARN. Canonicalizing here closes
-//! that bypass: a Deny on the real resource always matches.
+//! Every resource ARN produced here, except a tag operation's stream ARN, is
+//! CANONICAL for this deployment: the partition, service, region, and account
+//! are fixed to this server's, and only the resource identity (table name and
+//! optional sub-resource) is taken from the request. ExtendDB's stream and
+//! backup resolvers ignore the partition, service, region, and account of a
+//! supplied ARN and act within this deployment's account, so a caller who
+//! respells those fields would otherwise evade a Deny written against the
+//! canonical ARN. Canonicalizing here closes that bypass: a Deny on the real
+//! resource matches every canonical ARN. A tag operation's stream ARN is
+//! authorized as sent, so a Deny on the real stream ARN does not match a
+//! respelled one; the engine's `validate_resource_arn` refuses it after the IAM
+//! decision, before any tag row is read or written, unless its partition,
+//! service, region and account are this deployment's.
+//!
+//! A stream ARN is held to a stricter rule than canonicalization (issues #450
+//! and #451; measured live 2026-10-23 and 2026-10-28, tabled in the module
+//! docstring of `tests/test_stream_arn_scope.py`). Its account must be the
+//! caller's: a well-formed stream ARN in another account is
+//! `AccessDeniedException` "Access is denied" before the IAM decision, on
+//! `StreamArn` and on a tag operation's `ResourceArn`
+//! ([`check_stream_arn_account`]). On `StreamArn` the shape step runs first, so
+//! a value that is not a stream ARN, or has an empty partition, service or
+//! account field, is `Invalid StreamArn` in any account. Its partition, service
+//! and region must be this deployment's: on `StreamArn` (DescribeStream,
+//! GetShardIterator) another spelling is refused before the IAM decision with
+//! `Invalid StreamArn` ([`check_stream_arn_scope`]); on a tag operation's
+//! `ResourceArn` the IAM decision runs first, on the ARN as sent, and the
+//! engine refuses the spelling afterwards with the same message. A `GetRecords`
+//! iterator whose stream ARN is out of scope in any field, the account
+//! included, is refused before the IAM decision with ValidationException
+//! `Invalid ShardIterator` ([`getrecords_resource`]); GetShardIterator issues
+//! no such iterator. So a respelled stream ARN is never served as the
+//! caller's own stream, and a stream ARN that reaches the engine spells the
+//! stream the engine reads.
 //!
 //! Fail-closed: a missing or unparseable resource field never falls back to
 //! `table/*`. It yields the field value verbatim (often empty), which an
@@ -49,6 +75,10 @@ use serde_json::Value;
 /// Partition and service are fixed to this deployment's; see module docs.
 const PARTITION: &str = "aws";
 const SERVICE: &str = "dynamodb";
+
+/// Scope check for stream ARNs (issues #450 and #451).
+mod stream_scope;
+use stream_scope::{check_stream_arn_account, check_stream_arn_scope, stream_arn_in_scope};
 
 /// The item actions the service requires on the target table of a restore, in
 /// addition to the restore action itself (measured live). A Deny on any of
@@ -147,32 +177,25 @@ fn backup_arn_field(input: &Value) -> String {
 /// The resource ARN a tag operation authorizes against.
 ///
 /// `validate_tag_resource_arn_shape` has already run: the value is a table ARN,
-/// a stream ARN, or a foreign-service ARN (an index, a backup, or a non-table
-/// `DynamoDB` ARN is rejected before authorization). A table or stream ARN is
-/// canonicalized to this deployment; a foreign-service ARN is left verbatim so
-/// authorization denies it, matching the service (measured, arn-1 table).
+/// a stream ARN in the caller's account, or a foreign-service ARN (an index, a
+/// backup, a non-table `DynamoDB` ARN, or a stream ARN in another account is
+/// rejected before authorization). A table ARN is canonicalized to this
+/// deployment. A stream ARN is authorized as sent: the service evaluates the
+/// IAM decision on the spelling the caller gave (a no-permissions principal's
+/// denial names `arn:aws-cn:...` as sent, and a principal allowed the exact
+/// canonical ARN is denied the `aws-cn` spelling; measured 2026-10-23, module
+/// docstring of `tests/test_stream_arn_scope.py`), and the engine refuses
+/// another partition, service or region after authorization with
+/// `Invalid StreamArn`. A foreign-service ARN is left
+/// verbatim so authorization denies it, matching the service (measured, arn-1
+/// table).
 fn tag_resource_arn(arn: &str, region: &str, account_id: &str) -> String {
     match parse_resource_identity(arn) {
-        Some(rid @ ResourceId { sub: None, .. })
-        | Some(
-            rid @ ResourceId {
-                sub: Some(Sub::Stream(_)),
-                ..
-            },
-        ) => canonical(region, account_id, &rid),
-        // A foreign-service ARN (or, defensively, an index/backup the shape
-        // check already rejected): authorization denies it.
+        Some(rid @ ResourceId { sub: None, .. }) => canonical(region, account_id, &rid),
+        // A stream ARN (authorized as sent), a foreign-service ARN, or,
+        // defensively, an index/backup the shape check already rejected.
         _ => arn.to_owned(),
     }
-}
-
-/// The resource kind a strictly validated ARN-bearing request field must name.
-/// Only stream and backup fields are validated before authorization; an export
-/// `TableArn` is checked only for parseability (see `validate_operation_arns`).
-#[derive(Clone, Copy)]
-enum ArnKind {
-    Stream,
-    Backup,
 }
 
 /// Messages DynamoDB returns, before the IAM decision, for a request field
@@ -183,11 +206,11 @@ const INVALID_BACKUP_ARN_MESSAGE: &str = "Invalid Backup ARN";
 const INVALID_EXPORT_TABLE_ARN_MESSAGE: &str =
     "One or more parameter values were invalid: tableArn is not a valid ARN";
 
-/// True when `arn` is a well-formed DynamoDB resource ARN of `kind`: it parses
-/// to that kind and its partition, service, region, and account are all
-/// non-empty. The field checks catch an empty-partition ARN
-/// (`arn::dynamodb:...`), which the service rejects with `Invalid StreamArn`.
-fn arn_is_kind(arn: &str, kind: ArnKind) -> bool {
+/// True when `arn` is a well-formed DynamoDB backup ARN: it parses to a backup
+/// and its partition, service, region, and account are all non-empty. A
+/// `StreamArn` takes [`check_stream_arn_scope`] instead, which runs the account
+/// check between its field checks in the order the service does.
+fn arn_is_backup(arn: &str) -> bool {
     let Some(f) = extenddb_core::arn::fields(arn) else {
         return false;
     };
@@ -196,25 +219,18 @@ fn arn_is_kind(arn: &str, kind: ArnKind) -> bool {
         return false;
     }
     matches!(
-        (parse_resource_identity(arn), kind),
-        (
-            Some(ResourceId {
-                sub: Some(Sub::Stream(_)),
-                ..
-            }),
-            ArnKind::Stream
-        ) | (
-            Some(ResourceId {
-                sub: Some(Sub::Backup(_)),
-                ..
-            }),
-            ArnKind::Backup
-        )
+        parse_resource_identity(arn),
+        Some(ResourceId {
+            sub: Some(Sub::Backup(_)),
+            ..
+        })
     )
 }
 
 /// Validate ARN-bearing fields before the IAM decision, matching the service
-/// (measured live, `live-r2/arn-kinds-live.json`).
+/// (measured live, `live-r2/arn-kinds-live.json`; for `StreamArn`, the tables
+/// in the module docstring of `tests/test_stream_arn_scope.py`, measured
+/// 2026-10-23 and 2026-10-28).
 ///
 /// The two field families differ, as the service does:
 ///
@@ -222,7 +238,12 @@ fn arn_is_kind(arn: &str, kind: ArnKind) -> bool {
 ///   (DescribeBackup, DeleteBackup) are validated strictly: a value that is not
 ///   a well-formed stream (resp. backup) ARN of the correct kind, including a
 ///   table ARN, an `xrn:` ARN, or an empty partition, is refused before
-///   authorization with `Invalid StreamArn` (resp. `Invalid Backup ARN`).
+///   authorization with `Invalid StreamArn` (resp. `Invalid Backup ARN`). A
+///   stream ARN is checked by [`check_stream_arn_scope`] in the service's
+///   order: its shape, then the account (another account is
+///   `AccessDeniedException` whatever the region field holds), then the
+///   partition, service and region values (another value, or an empty region,
+///   is `Invalid StreamArn`).
 /// - An export `TableArn` is validated loosely: only an UNPARSEABLE value (a
 ///   repeated `table/` segment such as `.../table/a/stream/table/b`, a bare
 ///   `table/x`, or an `xrn:` ARN) is refused before authorization, with
@@ -237,7 +258,12 @@ fn arn_is_kind(arn: &str, kind: ArnKind) -> bool {
 /// principal is denied) and the engine refuses it afterwards. Tag operations
 /// keep their own measured shape check (`validate_tag_resource_arn_shape`);
 /// `GetRecords` is handled through its iterator by [`getrecords_resource`].
-pub(crate) fn validate_operation_arns(operation: &str, input: &Value) -> Result<(), DynamoDbError> {
+pub(crate) fn validate_operation_arns(
+    operation: &str,
+    input: &Value,
+    region: &str,
+    account_id: &str,
+) -> Result<(), DynamoDbError> {
     let present = |key: &str| {
         input
             .get(key)
@@ -246,20 +272,13 @@ pub(crate) fn validate_operation_arns(operation: &str, input: &Value) -> Result<
     };
     match operation {
         "DescribeStream" | "GetShardIterator" => {
-            if let Some(arn) = present("StreamArn")
-                && !arn_is_kind(arn, ArnKind::Stream)
-            {
-                return Err(DynamoDbError::ValidationException(
-                    INVALID_STREAM_ARN_MESSAGE.to_owned(),
-                ));
+            if let Some(arn) = present("StreamArn") {
+                check_stream_arn_scope(arn, region, account_id)?;
             }
         }
         "DescribeBackup" | "DeleteBackup" => {
             if let Some(arn) = present("BackupArn")
-                && !arn_is_kind(
-                    extenddb_core::backup_format::trim_backup_arn(arn),
-                    ArnKind::Backup,
-                )
+                && !arn_is_backup(extenddb_core::backup_format::trim_backup_arn(arn))
             {
                 return Err(DynamoDbError::ValidationException(
                     INVALID_BACKUP_ARN_MESSAGE.to_owned(),
@@ -337,9 +356,16 @@ pub(crate) enum GetRecordsResource {
 ///
 /// The iterator is decoded once by the engine
 /// ([`extenddb_engine::classify_shard_iterator`]). A current token's stream ARN
-/// is canonicalized through the shared parser; a decoded stream ARN that does
-/// not parse to a stream is refused as Invalid rather than authorized verbatim,
-/// so no respelled or forged stream ARN is served.
+/// must parse to a stream and name this deployment's partition, service and
+/// region and the caller's account, or the token is refused as Invalid rather
+/// than canonicalized and served as the caller's own stream. GetShardIterator
+/// encodes the `StreamArn` it is sent and refuses one outside that scope, so
+/// every iterator issued from the canonical stream ARN passes. An iterator an
+/// earlier build issued from a respelled `StreamArn` (`aws-cn`, `US-EAST-1`,
+/// `DYNAMODB`), every iterator chained from it, and every iterator issued
+/// before a change of `server.region` are refused as Invalid. The service
+/// answers a token it did not issue with `Invalid ShardIterator` (measured
+/// 2026-10-22, `live-r2/iter-live.json`).
 pub(crate) fn getrecords_resource(
     input: &Value,
     region: &str,
@@ -356,7 +382,9 @@ pub(crate) fn getrecords_resource(
                     sub: Some(Sub::Stream(_)),
                     ..
                 },
-            ) => GetRecordsResource::Stream(canonical(region, account_id, &rid)),
+            ) if stream_arn_in_scope(&arn, region, account_id) => {
+                GetRecordsResource::Stream(canonical(region, account_id, &rid))
+            }
             _ => GetRecordsResource::Invalid,
         },
         extenddb_engine::ShardIteratorClass::Expired => GetRecordsResource::Expired,
@@ -401,23 +429,37 @@ fn backup_wildcard(region: &str, account_id: &str) -> String {
 /// as the service does (measured live). The service returns ValidationException
 /// to every principal, before the IAM decision, for an ARN that does not start
 /// with `arn:`, a DynamoDB ARN whose resource is not a table or stream, or an
-/// index ARN (tags are accepted only on a table or stream). A table or stream
-/// ARN passes; so does a foreign-service ARN (for example an S3 bucket), which
+/// index ARN (tags are accepted only on a table or stream). A table ARN passes;
+/// so does a foreign-service ARN (for example an S3 bucket), which
 /// authorization then denies. The partition, service, region, account, and
 /// existence of a table ARN are checked after authorization by the engine
 /// handler, so for those a no-permissions principal is denied first and only an
 /// authorized principal sees the shape error.
-pub(crate) fn validate_tag_resource_arn_shape(arn: &str) -> Result<(), DynamoDbError> {
+///
+/// A stream ARN's account is also checked here ([`check_stream_arn_account`]):
+/// the service answers `AccessDeniedException` "Access is denied" for a stream
+/// ARN in another account on ListTagsOfResource and TagResource, to every
+/// principal, before the IAM decision (measured 2026-10-23, module docstring
+/// of `tests/test_stream_arn_scope.py`). Its
+/// partition, service and region are not checked here: the service runs the
+/// IAM decision on the ARN as sent and refuses `aws-cn`, `DYNAMODB` or
+/// `us-west-2` afterwards with `Invalid StreamArn`, which the engine's
+/// `validate_resource_arn` answers for an authorized principal.
+pub(crate) fn validate_tag_resource_arn_shape(
+    arn: &str,
+    account_id: &str,
+) -> Result<(), DynamoDbError> {
     if !arn.starts_with("arn:") {
         return Err(DynamoDbError::ValidationException(format!(
             "One or more parameter values were invalid: ARNs must start with 'arn:': {arn}"
         )));
     }
     match parse_resource_identity(arn) {
+        Some(ResourceId { sub: None, .. }) => Ok(()),
         Some(ResourceId {
-            sub: None | Some(Sub::Stream(_)),
+            sub: Some(Sub::Stream(_)),
             ..
-        }) => Ok(()),
+        }) => check_stream_arn_account(arn, account_id),
         // A backup ARN is not a taggable resource kind (measured live, with a
         // real backup ARN and a short backup id).
         Some(ResourceId {
@@ -680,7 +722,9 @@ mod tests {
             format!("\t{arn}\r\n"),
         ] {
             for op in ["DescribeBackup", "DeleteBackup"] {
-                assert!(validate_operation_arns(op, &json!({ "BackupArn": spelled })).is_ok());
+                assert!(
+                    validate_operation_arns(op, &json!({ "BackupArn": spelled }), R, A).is_ok()
+                );
                 assert_eq!(
                     only(op, json!({ "BackupArn": spelled })),
                     arn,
@@ -759,26 +803,6 @@ mod tests {
             parse_resource_identity("arn:aws:dynamodb:us-east-1:1:table/T/weird/x"),
             None
         );
-    }
-
-    // -- canonicalization closes the respelling bypass --
-
-    #[test]
-    fn respelled_partition_service_region_account_canonicalize_to_same_arn() {
-        let canonical =
-            "arn:aws:dynamodb:us-east-1:964157134968:table/T/stream/2026-10-20T16:17:40.188";
-        for respelled in [
-            "arn:aws-cn:dynamodb:us-east-1:964157134968:table/T/stream/2026-10-20T16:17:40.188",
-            "arn:aws:s3:us-east-1:964157134968:table/T/stream/2026-10-20T16:17:40.188",
-            "arn:aws:dynamodb:us-west-2:964157134968:table/T/stream/2026-10-20T16:17:40.188",
-            "arn:aws:dynamodb:us-east-1:111122223333:table/T/stream/2026-10-20T16:17:40.188",
-        ] {
-            assert_eq!(
-                only("DescribeStream", json!({ "StreamArn": respelled })),
-                canonical,
-                "respelled {respelled} must canonicalize"
-            );
-        }
     }
 
     // -- per-operation resource derivation (matches live DynamoDB) --
@@ -968,7 +992,7 @@ mod tests {
         // Both measured live.
         let index = "arn:aws:dynamodb:us-east-1:964157134968:table/bb/index/gsi1";
         assert!(matches!(
-            validate_tag_resource_arn_shape(index),
+            validate_tag_resource_arn_shape(index, A),
             Err(DynamoDbError::ValidationException(ref m))
                 if m.contains("only table or stream is accepted") && m.contains(index)
         ));
@@ -978,7 +1002,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    validate_tag_resource_arn_shape(backup),
+                    validate_tag_resource_arn_shape(backup, A),
                     Err(DynamoDbError::ValidationException(ref m))
                         if m == &format!(
                             "One or more parameter values were invalid: Provided Arn is not a \
@@ -990,12 +1014,13 @@ mod tests {
         }
         // A table ARN and a stream ARN pass the shape check.
         assert!(
-            validate_tag_resource_arn_shape("arn:aws:dynamodb:us-east-1:964157134968:table/bb")
+            validate_tag_resource_arn_shape("arn:aws:dynamodb:us-east-1:964157134968:table/bb", A)
                 .is_ok()
         );
         assert!(
             validate_tag_resource_arn_shape(
-                "arn:aws:dynamodb:us-east-1:964157134968:table/bb/stream/2026-10-20T16:17:40.188"
+                "arn:aws:dynamodb:us-east-1:964157134968:table/bb/stream/2026-10-20T16:17:40.188",
+                A
             )
             .is_ok()
         );
@@ -1005,14 +1030,14 @@ mod tests {
     fn tag_resource_arn_shape_matches_service_ordering() {
         // Measured live. ValidationException before authorization, every
         // principal:
-        let not_arn = validate_tag_resource_arn_shape("banana");
+        let not_arn = validate_tag_resource_arn_shape("banana", A);
         assert!(matches!(
             not_arn,
             Err(DynamoDbError::ValidationException(ref m))
                 if m.contains("ARNs must start with 'arn:': banana")
         ));
         let bad_type =
-            validate_tag_resource_arn_shape("arn:aws:dynamodb:us-east-1:964157134968:banana/x");
+            validate_tag_resource_arn_shape("arn:aws:dynamodb:us-east-1:964157134968:banana/x", A);
         assert!(matches!(
             bad_type,
             Err(DynamoDbError::ValidationException(ref m))
@@ -1020,16 +1045,20 @@ mod tests {
         ));
         // A foreign-service ARN whose resource is not a table passes the shape
         // check and is left to authorization (which denies it).
-        assert!(validate_tag_resource_arn_shape("arn:aws:s3:::mybucket").is_ok());
+        assert!(validate_tag_resource_arn_shape("arn:aws:s3:::mybucket", A).is_ok());
         // A table ARN whose partition, service, or region is this deployment's
         // or not passes the shape check; the engine handler validates those
         // fields after authorization.
         assert!(
-            validate_tag_resource_arn_shape("arn:aws-cn:dynamodb:us-east-1:964157134968:table/bb")
-                .is_ok()
+            validate_tag_resource_arn_shape(
+                "arn:aws-cn:dynamodb:us-east-1:964157134968:table/bb",
+                A
+            )
+            .is_ok()
         );
         assert!(
-            validate_tag_resource_arn_shape("arn:aws:s3:us-east-1:964157134968:table/bb").is_ok()
+            validate_tag_resource_arn_shape("arn:aws:s3:us-east-1:964157134968:table/bb", A)
+                .is_ok()
         );
     }
 
@@ -1163,17 +1192,17 @@ mod tests {
         let a1 = "arn:aws:dynamodb:us-east-1:1:table/allowed/stream/table/secret";
         assert!(arn::parse(a1).is_none());
         assert!(matches!(
-            validate_operation_arns("ExportTableToPointInTime", &json!({ "TableArn": a1 })),
+            validate_operation_arns("ExportTableToPointInTime", &json!({ "TableArn": a1 }), R, A),
             Err(DynamoDbError::ValidationException(ref m)) if m == INVALID_EXPORT_TABLE_ARN_MESSAGE
         ));
     }
 
     #[test]
     fn validate_operation_arns_matches_measured_live_behaviour() {
-        let err_msg = |op: &str, input: Value| match validate_operation_arns(op, &input) {
+        let err_msg = |op: &str, input: Value| match validate_operation_arns(op, &input, R, A) {
             Err(DynamoDbError::ValidationException(m)) => Some(m),
             Ok(()) => None,
-            other => panic!("unexpected {other:?}"),
+            Err(_) => panic!("unexpected non-validation error for {op}"),
         };
 
         // Export: only an UNPARSEABLE TableArn is refused before authz, with the
@@ -1221,10 +1250,11 @@ mod tests {
                 );
             }
         }
+        // A stream ARN in this deployment and the caller's account passes.
         assert_eq!(
             err_msg(
                 "DescribeStream",
-                json!({ "StreamArn": "arn:aws:dynamodb:us-east-1:1:table/t/stream/2026-10-20T16:17:40.188" })
+                json!({ "StreamArn": format!("arn:aws:dynamodb:{R}:{A}:table/t/stream/2026-10-20T16:17:40.188") })
             ),
             None
         );
@@ -1288,8 +1318,12 @@ mod tests {
 
     #[test]
     fn getrecords_resource_classifies_and_canonicalizes() {
-        // A current token authorizes against its canonical stream ARN.
-        let stream = "arn:aws:dynamodb:us-east-1:1:table/T/stream/2026-10-20T16:17:40.188";
+        // A current token issued by this server authorizes against the stream
+        // ARN it carries (a token naming any other account, partition, service
+        // or region is Invalid; see
+        // `getrecords_iterator_with_respelled_stream_arn_is_invalid`).
+        let stream =
+            "arn:aws:dynamodb:us-east-1:964157134968:table/T/stream/2026-10-20T16:17:40.188";
         let tok = extenddb_engine::encode_shard_iterator(
             "shardId-1",
             "AFTER_SEQUENCE_NUMBER",
@@ -1298,10 +1332,7 @@ mod tests {
             stream,
         );
         match getrecords_resource(&json!({ "ShardIterator": tok }), R, A) {
-            GetRecordsResource::Stream(arn) => assert_eq!(
-                arn,
-                "arn:aws:dynamodb:us-east-1:964157134968:table/T/stream/2026-10-20T16:17:40.188"
-            ),
+            GetRecordsResource::Stream(arn) => assert_eq!(arn, stream),
             _ => panic!("expected Stream"),
         }
         // A token that carries no stream ARN but a parseable timestamp is the

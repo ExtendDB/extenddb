@@ -570,13 +570,18 @@ class TestExplicitDenyOnResourceArn:
     # -- fail closed: a respelled ARN cannot evade a Deny on the canonical ARN --
 
     def test_respelled_stream_arn_cannot_bypass_deny(self, table):
-        """A Deny on the canonical stream ARN must also block a request that
-        respells the partition. ExtendDB resolves the stream in this account
-        regardless of the ARN's partition, so authorizing the respelled string
-        verbatim would bypass the Deny."""
+        """A principal with a Deny on the canonical stream ARN gets no stream
+        back for a request that respells the partition. The service refuses the
+        respelled ARN before the IAM decision with ValidationException "Invalid
+        StreamArn" (measured 2026-10-22), so ExtendDB does the same instead of
+        canonicalizing it; the fuller matrix is in test_stream_arn_scope.py."""
         respelled = table["stream_arn"].replace("arn:aws:", "arn:aws-cn:")
         s = self._ddb(_allow_all_deny("DescribeStream", table["stream_arn"]), "dynamodbstreams")
-        self._assert_denied(lambda: s.describe_stream(StreamArn=respelled))
+        with pytest.raises(ClientError) as exc:
+            s.describe_stream(StreamArn=respelled)
+        err = exc.value.response["Error"]
+        assert err["Code"] == "ValidationException", err
+        assert err.get("Message") == "Invalid StreamArn", err
 
     def test_table_arn_in_tablename_deny_blocks(self, table):
         """A Deny on the table ARN blocks GetItem whether TableName is the bare
