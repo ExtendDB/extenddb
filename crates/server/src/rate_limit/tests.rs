@@ -9,17 +9,22 @@ use std::time::Duration;
 
 use extenddb_storage::management_store::{OpError, OpResult};
 use futures::future::BoxFuture;
+use tokio::sync::{Notify, Semaphore};
 
 use super::*;
 
 /// An attempts store in memory: recorded failures as (principal, source)
 /// rows. `delay` slows the count queries so concurrent attempts overlap,
-/// and `broken` makes every read fail.
+/// and `broken` makes every read fail. With `write_gate` set, a failure
+/// write announces itself on `write_started` and then waits for a permit
+/// before the row lands.
 #[derive(Default)]
 struct MemoryStore {
     rows: Mutex<Vec<(String, Option<String>)>>,
     delay: Option<Duration>,
     broken: AtomicBool,
+    write_gate: Option<Semaphore>,
+    write_started: Notify,
 }
 
 impl MemoryStore {
@@ -81,6 +86,12 @@ impl RateLimitStore for MemoryStore {
     fn record_failed_login(&self, principal: &str, source_ip: Option<&str>) -> BoxFuture<'_, ()> {
         let row = (principal.to_owned(), source_ip.map(str::to_owned));
         Box::pin(async move {
+            if let Some(gate) = &self.write_gate {
+                self.write_started.notify_one();
+                let _permit = gate.acquire().await.unwrap();
+                self.rows.lock().unwrap().push(row);
+                return;
+            }
             self.rows.lock().unwrap().push(row);
         })
     }
@@ -184,6 +195,42 @@ async fn a_concurrent_burst_admits_no_more_than_the_cap() {
             .err(),
         Some(LoginRefusal::TooManyAttempts(PRINCIPAL_LIMITED))
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_admission_while_a_failure_is_being_written_still_counts_it() {
+    let store = Arc::new(MemoryStore {
+        write_gate: Some(Semaphore::new(0)),
+        ..MemoryStore::default()
+    });
+    let source = "198.51.100.70";
+    let mut admitted = Vec::new();
+    for _ in 0..MAX_FAILURES_PER_PRINCIPAL {
+        admitted.push(begin_login(&*store, "admin", peer(source)).await.unwrap());
+    }
+
+    // Record one failure and hold its row write open.
+    let first = admitted.pop().unwrap();
+    let writer = {
+        let store = Arc::clone(&store);
+        tokio::spawn(async move { first.record_failure(&*store).await })
+    };
+    store.write_started.notified().await;
+
+    // The failure has neither landed as a row nor finished. It must still
+    // count against the pair, so the pair stays at its cap.
+    assert_eq!(
+        begin_login(&*store, "admin", peer(source)).await.err(),
+        Some(LoginRefusal::TooManyAttempts(PRINCIPAL_LIMITED))
+    );
+
+    store.write_gate.as_ref().unwrap().add_permits(8);
+    writer.await.unwrap();
+    for attempt in admitted {
+        attempt.record_failure(&*store).await;
+    }
+    assert_eq!(store.rows_for("admin", source), MAX_FAILURES_PER_PRINCIPAL);
+    assert!(!registry().tracks(source));
 }
 
 #[tokio::test]
