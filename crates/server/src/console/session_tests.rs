@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use extenddb_storage::management_store::{OpError, OpResult, PasswordHashStore};
 use futures::future::BoxFuture;
 
-use super::{CredentialStamp, SessionCheck, SessionStore};
+use super::{CredentialStamp, SESSION_TTL, SessionCheck, SessionStore};
 use crate::management::CallerIdentity;
 
 const ACCOUNT: &str = "111111111111";
@@ -248,6 +248,29 @@ async fn only_a_request_that_passes_the_check_counts_as_activity() {
     catalog.failing.store(false, Ordering::SeqCst);
     assert!(is_valid(&store, &catalog, &alice).await);
     assert!(last_active(&store, &alice).await > then + Duration::from_secs(59));
+}
+
+#[test]
+fn sessions_last_eight_hours_without_activity() {
+    assert_eq!(SESSION_TTL, Duration::from_secs(8 * 3600));
+    assert_eq!(SessionStore::new().ttl, SESSION_TTL);
+}
+
+#[tokio::test]
+async fn a_session_idle_longer_than_the_ttl_ends_and_stays_ended() {
+    let store = SessionStore::with_ttl(Duration::from_secs(60));
+    let catalog = FakeCatalog::default();
+    let alice = admin_session(&store, &catalog, "alice", "hash-alice").await;
+    let bob = admin_session(&store, &catalog, "bob", "hash-bob").await;
+    backdate(&store, &alice, Duration::from_secs(61)).await;
+    backdate(&store, &bob, Duration::from_secs(50)).await;
+
+    assert!(is_invalid(&store, &catalog, &alice).await);
+    assert!(!store.sessions.lock().await.contains_key(&alice));
+    // A later request with the same token does not bring the session back.
+    assert!(is_invalid(&store, &catalog, &alice).await);
+
+    assert!(is_valid(&store, &catalog, &bob).await);
 }
 
 #[tokio::test]

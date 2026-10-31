@@ -78,6 +78,9 @@ pub enum SessionCheck {
 /// points and poisons on panic.
 pub struct SessionStore {
     sessions: Mutex<HashMap<String, SessionEntry>>,
+    /// How long a session lasts without activity: [`SESSION_TTL`], except in
+    /// tests.
+    ttl: Duration,
 }
 
 impl Default for SessionStore {
@@ -92,6 +95,17 @@ impl SessionStore {
     pub fn new() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
+            ttl: SESSION_TTL,
+        }
+    }
+
+    /// Create an empty session store whose sessions last `ttl` without
+    /// activity.
+    #[cfg(test)]
+    fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            sessions: Mutex::new(HashMap::new()),
+            ttl,
         }
     }
 
@@ -114,7 +128,8 @@ impl SessionStore {
         // Lazy prune if too many sessions.
         if map.len() >= MAX_SESSIONS {
             let now = Instant::now();
-            map.retain(|_, e| now.duration_since(e.last_active) < SESSION_TTL);
+            let ttl = self.ttl;
+            map.retain(|_, e| now.duration_since(e.last_active) < ttl);
         }
         map.insert(token.clone(), entry);
         (token, csrf)
@@ -155,7 +170,7 @@ impl SessionStore {
     async fn lookup(&self, token: &str) -> Option<(CallerIdentity, String, CredentialStamp)> {
         let mut map = self.sessions.lock().await;
         let entry = map.get(token)?;
-        if entry.last_active.elapsed() > SESSION_TTL {
+        if entry.last_active.elapsed() > self.ttl {
             map.remove(token);
             return None;
         }
