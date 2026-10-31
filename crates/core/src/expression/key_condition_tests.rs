@@ -972,6 +972,15 @@ fn stripped_outer_parentheses_keep_the_source_window() {
 }
 
 #[test]
+fn a_fault_at_the_first_token_keeps_leading_whitespace() {
+    // Measured 2026-10-25: the window starts at the start of the expression.
+    assert_eq!(
+        kce_msg("  = pk = :v"),
+        "Invalid KeyConditionExpression: Syntax error; token: \"=\", near: \"  = pk\""
+    );
+}
+
+#[test]
 fn other_key_condition_texts_are_unchanged() {
     assert_eq!(
         kce_msg("pk = :v OR sk = :s"),

@@ -139,8 +139,10 @@ pub fn syntax_error(
 }
 
 /// The window of source text around the token at `pos`: from the previous
-/// token to the next one, each dropped when absent. At end of input the window
-/// is the last token alone.
+/// token to the next one, each dropped when absent. When the faulty token is
+/// the first one, the window starts at the start of the source, leading
+/// whitespace kept (measured 2026-10-25: `  = #v = :v` answers
+/// `near: "  = #v"`). At end of input the window is the last token alone.
 fn near_window(source: &str, tokens: &[Token], pos: usize) -> String {
     if tokens.is_empty() {
         return String::new();
@@ -154,7 +156,8 @@ fn near_window(source: &str, tokens: &[Token], pos: usize) -> String {
         .then(|| token_spans(source, tokens))
         .flatten()
     {
-        return source[spans[first].start..spans[last].end].to_owned();
+        let start = if pos == 0 { 0 } else { spans[first].start };
+        return source[start..spans[last].end].to_owned();
     }
     tokens[first..=last]
         .iter()
@@ -205,6 +208,18 @@ mod tests {
         assert!(msg(ExpressionKind::Condition, "#v = :v =", 3).ends_with("near: \":v =\""));
         assert!(msg(ExpressionKind::Condition, "=", 0).ends_with("near: \"=\""));
         assert!(msg(ExpressionKind::Condition, "= =", 0).ends_with("near: \"= =\""));
+    }
+
+    #[test]
+    fn a_fault_at_the_first_token_keeps_leading_whitespace() {
+        // Measured 2026-10-25 on FilterExpression, KeyConditionExpression and
+        // ProjectionExpression.
+        assert!(msg(ExpressionKind::Filter, "  = #v = :v", 0).ends_with("near: \"  = #v\""));
+        assert!(msg(ExpressionKind::Filter, "\t= #v = :v", 0).ends_with("near: \"\t= #v\""));
+        assert!(msg(ExpressionKind::Filter, "  AND #v = :v", 0).ends_with("near: \"  AND #v\""));
+        assert!(msg(ExpressionKind::KeyCondition, "  = pk = :v", 0).ends_with("near: \"  = pk\""));
+        assert!(msg(ExpressionKind::Projection, "  , #v", 0).ends_with("near: \"  , #v\""));
+        assert!(msg(ExpressionKind::Filter, "= #v = :v", 0).ends_with("near: \"= #v\""));
     }
 
     #[test]
