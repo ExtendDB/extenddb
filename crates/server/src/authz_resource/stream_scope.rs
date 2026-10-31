@@ -7,9 +7,7 @@
 
 use extenddb_core::error::DynamoDbError;
 
-use super::{
-    INVALID_STREAM_ARN_MESSAGE, PARTITION, ResourceId, SERVICE, Sub, parse_resource_identity,
-};
+use super::{INVALID_STREAM_ARN_MESSAGE, ResourceId, Sub, parse_resource_identity};
 
 /// Refuse a stream ARN whose account is not the caller's with
 /// `AccessDeniedException` "Access is denied". The service answers this before
@@ -50,7 +48,9 @@ pub(super) fn check_stream_arn_account(arn: &str, account_id: &str) -> Result<()
 /// 3. a partition other than `aws` (`aws-cn`, `aws-us-gov`), a service other
 ///    than `dynamodb` (`DynamoDB`, `DYNAMODB`), or a region other than this
 ///    server's (empty, `us-west-2`, `US-EAST-1`): `ValidationException`
-///    `Invalid StreamArn`.
+///    `Invalid StreamArn`. This is the rule the engine applies to a tag
+///    operation's `ResourceArn`, through the one predicate
+///    [`extenddb_core::arn::ArnFields::in_deployment`].
 ///
 /// The order was measured on DescribeStream from 20:47 to 20:48 UTC and on
 /// GetShardIterator at 21:51 UTC. An empty service field, measured on both
@@ -90,7 +90,7 @@ pub(super) fn check_stream_arn_scope(
         return invalid();
     }
     check_stream_arn_account(arn, account_id)?;
-    if f.partition != PARTITION || f.service != SERVICE || f.region != region {
+    if !f.in_deployment(region) {
         return invalid();
     }
     Ok(())
@@ -276,6 +276,25 @@ mod tests {
             only("TagResource", json!({ "ResourceArn": STREAM })),
             STREAM
         );
+    }
+
+    /// In the caller's account, the StreamArn check refuses exactly the stream
+    /// ARNs the shared predicate puts outside this deployment, the predicate the
+    /// engine tag handler applies to a tag ResourceArn
+    /// (`deployment_scope_error` in `crates/engine/src/tagging.rs`).
+    #[test]
+    fn stream_arn_scope_uses_the_shared_predicate() {
+        let mut arns = respellings().to_vec();
+        arns.push(STREAM.replace("us-east-1", ""));
+        arns.push(STREAM.to_owned());
+        for arn in &arns {
+            let f = extenddb_core::arn::fields(arn).unwrap();
+            assert_eq!(
+                check_stream_arn_scope(arn, R, A).is_ok(),
+                f.in_deployment(R),
+                "{arn}"
+            );
+        }
     }
 
     /// Account is checked before the partition, service and region (measured
