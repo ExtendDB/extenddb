@@ -7,25 +7,28 @@
 //!
 //! The status is read with no lock. `Current` serves, and so does
 //! `AheadCompatible`, with a warning. Under `apply` a catalog behind this
-//! binary is migrated first, by the run `migrate --yes` makes
+//! binary is migrated first: the status notes `migrate --yes` checks before
+//! it takes the lock ([`before_lock`]), then the run `migrate --yes` makes
 //! ([`run_with_lock`]): the migration lock, which waits for another
 //! migration and for running servers, the status read again under it, so a
-//! catalog another process migrated meanwhile is left as it is, `detect`
-//! for every pending code body before the first write, the SQLite copy, the
-//! runner, and the release. Under `refuse`, and under `apply` for every
-//! other status, the server stops with the status's exit code: no setting
-//! serves a catalog this binary cannot use.
+//! catalog another process migrated meanwhile is served as it is without
+//! the backend's run, `detect` for every pending code body before the first
+//! write, the SQLite copy, the runner, and the release. Under `refuse`, and
+//! under `apply` for every other status, the server stops with the status's
+//! exit code: no setting serves a catalog this binary cannot use.
 //!
 //! A dev build serves a store that is not a catalog yet, which its server
-//! creates. A store that exists only inside the server (an in-memory SQLite
-//! database) is created by the server when it starts and is not read here.
+//! creates, unless the backend's server refuses that store
+//! ([`CatalogMigrations::server_creates_catalog`]). A store that exists only
+//! inside the server (an in-memory SQLite database) is created by the
+//! server when it starts and is not read here.
 
 use std::time::Duration;
 
 use tokio::time::Instant;
 
 use super::advice::pending_line;
-use super::catalog::{CatalogMigrations, RunKind, Target, run_with_lock};
+use super::catalog::{CatalogMigrations, RunKind, Target, WhenCurrent, before_lock, run_with_lock};
 use super::registry::MigrationId;
 use super::status::{CatalogStatus, MigrationError, RunReport};
 
@@ -36,7 +39,9 @@ pub struct Startup<'a> {
     /// refusing it (`catalog_upgrade = "apply"`).
     pub apply: bool,
     /// Leave a store that is not a catalog yet to the server, which creates
-    /// it: a dev build, which needs no `init`.
+    /// it: a dev build, which needs no `init`. A store the backend's server
+    /// would refuse ([`CatalogMigrations::server_creates_catalog`]) is
+    /// refused here.
     pub creates_uninitialized: bool,
     /// The ExtendDB release, recorded in the ledger rows the run writes.
     pub release: &'a str,
@@ -66,18 +71,32 @@ pub struct Prepared {
     pub warning: Option<String>,
 }
 
+/// The command a refusal before the lock names on the server's path.
+const SERVER_APPLYING: &str = "serve with --migrate or catalog_upgrade = \"apply\"";
+
+/// The line before the first status read.
+const READING: &str = "reading the catalog status";
+
+/// The line before the status read that follows a wait that reached the
+/// lock timeout.
+const READING_AGAIN: &str = "the wait reached the lock timeout; reading the catalog status again";
+
 /// Read the status of the catalog at `target` and decide whether a server
 /// may open it, applying its pending migrations first when `startup` says
-/// so. `progress` receives a line for each step of a run, and one every
-/// [`Startup::heartbeat`] while it goes on, which the server prints on
-/// stderr.
+/// so. `progress` receives the lines the server prints on stderr: one
+/// before the status is read; for a run, the pending migrations, the status
+/// notes the run checks before the lock, the wait for the lock, and one
+/// line every [`Startup::heartbeat`] while the run goes on; and when the
+/// run ends, the lines of what it did: the SQLite copy, each migration it
+/// applied, and the migration the catalog is at.
 ///
 /// # Errors
 ///
 /// [`MigrationError::Status`] with the status a server refuses, which
-/// carries its exit code; [`MigrationError::Locked`] (exit 6) when the lock
-/// or a running server outlasted the timeout and the catalog is still
-/// behind; or as [`run_with_lock`].
+/// carries its exit code; [`MigrationError::Refused`] (exit 1) when a status
+/// note refuses the run ([`before_lock`]); [`MigrationError::Locked`]
+/// (exit 6) when the lock or a running server outlasted the timeout and the
+/// catalog is still behind; or as [`run_with_lock`].
 pub async fn prepare_to_serve(
     migrations: &dyn CatalogMigrations,
     target: &Target,
@@ -87,11 +106,20 @@ pub async fn prepare_to_serve(
     if migrations.in_process(target) {
         return Ok(Prepared::default());
     }
+    // The read runs `detect` for every pending code body, which can take a
+    // while on a large catalog.
+    progress(READING);
     let status = migrations.status(target).await?;
     match &status {
         CatalogStatus::Current { .. } => Ok(Prepared::default()),
         CatalogStatus::AheadCompatible { .. } => Ok(served_ahead(&status)),
-        CatalogStatus::Uninitialized if startup.creates_uninitialized => Ok(Prepared::default()),
+        CatalogStatus::Uninitialized if startup.creates_uninitialized => {
+            if migrations.server_creates_catalog(target).await? {
+                Ok(Prepared::default())
+            } else {
+                Err(MigrationError::Status(CatalogStatus::Uninitialized))
+            }
+        }
         CatalogStatus::Behind { version, pending } if startup.apply => {
             let latest = MigrationId::LATEST.number();
             progress(&match version {
@@ -105,6 +133,12 @@ pub async fn prepare_to_serve(
                 ),
             });
             progress(&pending_line(pending));
+            // The notes `migrate --yes` checks before it takes the lock: a
+            // note that refuses runs stops the server here, before any
+            // change, with the refusal `migrate --yes` gives.
+            for note in before_lock(migrations, target, RunKind::Migrate, SERVER_APPLYING).await? {
+                progress(&format!("note: {}", note.text));
+            }
             apply(migrations, target, startup, progress).await
         }
         _ => Err(MigrationError::Status(status)),
@@ -134,12 +168,16 @@ async fn apply(
         startup.lock_timeout.as_secs()
     ));
     let started = Instant::now();
+    // A catalog that another process migrated while this one waited is
+    // served as it is: the backend's run, which on PostgreSQL makes the
+    // pgvector attempt and opens the runner's sessions, is not called.
     let run = run_with_lock(
         migrations,
         target,
         startup.release,
         RunKind::Migrate,
         startup.lock_timeout,
+        WhenCurrent::Release,
     );
     let mut run = std::pin::pin!(run);
     let mut heartbeat = tokio::time::interval_at(started + startup.heartbeat, startup.heartbeat);
@@ -156,27 +194,50 @@ async fn apply(
             for line in report_lines(&report) {
                 progress(&line);
             }
+            // A run that applied nothing found the catalog migrated by
+            // another process, which may have left it ahead of this binary
+            // by additive migrations: the status says so, as `migrate --yes`
+            // reads it after such a run.
+            let warning = if report.applied.is_empty() {
+                ahead_warning(migrations, target).await
+            } else {
+                None
+            };
             Ok(Prepared {
                 run: Some(report),
-                warning: None,
+                warning,
             })
         }
         // A process that migrated the catalog while this one waited, and
         // then started serving it, holds what the lock waits for. The
         // catalog then needs nothing, and the server starts as `serve`
         // would on it; the server's own checks decide whether it may.
-        Err(MigrationError::Locked(message)) => match migrations.status(target).await {
-            Ok(CatalogStatus::Current { .. }) => {
-                progress(MIGRATED_ELSEWHERE);
-                Ok(Prepared::default())
+        Err(MigrationError::Locked(message)) => {
+            progress(READING_AGAIN);
+            match migrations.status(target).await {
+                Ok(CatalogStatus::Current { .. }) => {
+                    progress(MIGRATED_ELSEWHERE);
+                    Ok(Prepared::default())
+                }
+                Ok(status @ CatalogStatus::AheadCompatible { .. }) => {
+                    progress(MIGRATED_ELSEWHERE);
+                    Ok(served_ahead(&status))
+                }
+                _ => Err(MigrationError::Locked(message)),
             }
-            Ok(status @ CatalogStatus::AheadCompatible { .. }) => {
-                progress(MIGRATED_ELSEWHERE);
-                Ok(served_ahead(&status))
-            }
-            _ => Err(MigrationError::Locked(message)),
-        },
+        }
         Err(error) => Err(error),
+    }
+}
+
+/// The warning for a catalog ahead of this binary by additive migrations,
+/// read after a run that applied nothing. `None` for any other status, and
+/// when the read fails: the server reads the status again when it
+/// registers.
+async fn ahead_warning(migrations: &dyn CatalogMigrations, target: &Target) -> Option<String> {
+    match migrations.status(target).await {
+        Ok(status @ CatalogStatus::AheadCompatible { .. }) => served_ahead(&status).warning,
+        _ => None,
     }
 }
 

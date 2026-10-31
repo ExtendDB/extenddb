@@ -22,8 +22,8 @@ use extenddb_config as config;
 use extenddb_storage::migrations::advice::{self, Advice, AdviceFor};
 use extenddb_storage::migrations::{
     AdminRole, CatalogMigrations, CatalogStatus, Listed, MigrationError, MigrationId, Pending,
-    RunKind, RunReport, Target, before_lock, behind_line, exit, forget_locked, run_with_lock,
-    stores_behind,
+    RunKind, RunReport, Target, WhenCurrent, before_lock, behind_line, exit, forget_locked,
+    run_with_lock, stores_behind,
 };
 
 use crate::cmd_migrate::MigrateArgs;
@@ -305,14 +305,25 @@ async fn apply(
     kind: RunKind,
     lock_timeout: Duration,
 ) -> Result<u8, MigrationError> {
-    for note in before_lock(migrations, target, kind).await? {
+    for note in before_lock(migrations, target, kind, "migrate --yes").await? {
         println!("Note: {}", note.text);
     }
     println!(
         "--- Taking the migration lock (waiting up to {} s for a server or another migration)...",
         lock_timeout.as_secs()
     );
-    let report = run_with_lock(migrations, target, release, kind, lock_timeout).await?;
+    // On a current catalog the backend's run still goes ahead: it makes the
+    // steps the backend takes beside the ledger (PostgreSQL's pgvector
+    // attempt), which an operator who installs pgvector later relies on.
+    let report = run_with_lock(
+        migrations,
+        target,
+        release,
+        kind,
+        lock_timeout,
+        WhenCurrent::Run,
+    )
+    .await?;
     print_report(&report, kind);
     if report.applied.is_empty() && kind == RunKind::Migrate {
         // A catalog ahead by additive migrations has nothing to apply and

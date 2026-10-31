@@ -891,6 +891,7 @@ async fn a_create_account_stopped_before_its_row_leaves_a_current_catalog_a_retr
         backup: "back up the keyspaces",
         config: None,
         assignment: None,
+        serving: false,
     };
     let message = status_message(&status, &advice);
     assert!(

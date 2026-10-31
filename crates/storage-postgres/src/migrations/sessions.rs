@@ -428,7 +428,8 @@ fn give_to(
 /// they run and each with the role that runs it ([`give_to`]). Every
 /// migration that alters such an object fails with SQLSTATE 42501, and so
 /// does one that creates a table where the role may not, so the note
-/// refuses `migrate --yes` before it takes the lock.
+/// refuses `migrate --yes`, and a server under `catalog_upgrade = "apply"`,
+/// before they take the lock.
 ///
 /// # Errors
 ///
@@ -501,9 +502,10 @@ pub(crate) async fn ownership_note(
     .join(" ");
     Ok(Some(StatusNote {
         text: format!(
-            "{}. Migrations run as {role}, so migrate --yes refuses to apply any while this \
-             holds. Connected to {name}, run these statements in this order, each as the role \
-             named before it: {steps}",
+            "{}. Migrations run as {role}, so migrate --yes, and serve with --migrate or \
+             catalog_upgrade = \"apply\", refuse to apply any while this holds. Connected to \
+             {name}, run these statements in this order, each as the role named before it: \
+             {steps}",
             found.join("; "),
         ),
         refuses_runs: true,

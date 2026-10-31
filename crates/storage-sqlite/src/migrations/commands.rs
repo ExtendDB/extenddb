@@ -14,7 +14,8 @@ use extenddb_storage::migrations::{
 };
 
 use super::{
-    MigrationLock, SqliteMigrations, catalog_status, in_memory_refusal, lock_for_migration,
+    MigrationLock, SqliteMigrations, catalog_status, holds_tables, in_memory_refusal,
+    lock_for_migration,
 };
 
 /// The SQLite backend's catalog migrations for the commands.
@@ -55,6 +56,13 @@ impl CatalogMigrations for SqliteCatalogMigrations {
     /// server that opened it.
     fn in_process(&self, target: &Target) -> bool {
         matches!(crate::serve_lock::database_file(&target.location), Ok(None))
+    }
+
+    /// A dev server creates its catalog in a missing or empty file, and its
+    /// factory refuses a file that holds tables, another program's database,
+    /// as `Uninitialized` (`prepare_for_serve`).
+    async fn server_creates_catalog(&self, target: &Target) -> Result<bool, MigrationError> {
+        Ok(!holds_tables(&target.location).await?)
     }
 
     async fn status(&self, target: &Target) -> Result<CatalogStatus, MigrationError> {
