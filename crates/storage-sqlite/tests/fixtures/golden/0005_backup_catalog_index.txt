@@ -1,0 +1,47 @@
+-- SELECT t.table_name, t.table_status, r.status, r.kind, r.owner_generation, r.heartbeat_at, r.store_kind, r.completed_at = t.creation_date_time FROM table_restores r JOIN tables t ON t.table_id = r.table_id ORDER BY t.table_name
+cu_orders	ACTIVE	DONE	legacy	0	1970-01-01T00:00:00.000Z	NULL	1
+interrupted	CREATING	RUNNING	legacy	0	1970-01-01T00:00:00.000Z	NULL	NULL
+-- SELECT name FROM pragma_table_info('table_restores') ORDER BY cid
+table_id
+source_backup_arn
+source_table_arn
+restore_date_time
+status
+kind
+store_kind
+store_root
+store_id
+owner_generation
+heartbeat_at
+spool_host
+file_index
+items_applied
+failure_reason
+completed_at
+-- SELECT name, type FROM sqlite_master WHERE name LIKE 'backup_%' OR name LIKE 'idx_backup_%' OR name = 'idx_table_restores_status' ORDER BY name
+backup_definitions	table
+backup_index	table
+backup_items	table
+backup_maintenance	table
+backups	table
+idx_backup_index_account_table	index
+idx_backup_index_backup_id	index
+idx_backup_index_store_status	index
+idx_backup_items_arn	index
+idx_backups_table	index
+idx_table_restores_status	index
+-- SELECT notes FROM extenddb_migrations WHERE id = 5
+added table_restores.status
+added table_restores.kind
+added table_restores.store_kind
+added table_restores.store_root
+added table_restores.store_id
+added table_restores.owner_generation
+added table_restores.heartbeat_at
+added table_restores.spool_host
+added table_restores.file_index
+added table_restores.items_applied
+added table_restores.failure_reason
+added table_restores.completed_at
+backfilled 2 restore registration(s) as legacy restores, 1 of them RUNNING with a dead owner for the reconciler to remove
+wrote settings.catalog_id

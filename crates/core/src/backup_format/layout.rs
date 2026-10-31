@@ -53,9 +53,9 @@ pub const DATA_PREFIX: &str = "data/";
 /// the engine accepted is a valid ARN component. The engine's
 /// `max_table_name_length` can be raised above 255; a table with a longer
 /// name has a backup ARN `check_backup_arn` accepts and this type refuses,
-/// so the off-host backup path cannot write it (the design has `CreateBackup`
-/// refuse it up front).
-const MAX_TABLE_NAME_LEN: usize = 255;
+/// so the off-host backup path cannot write it (`CreateBackup` refuses it up
+/// front through [`check_store_prefix_table_name`]).
+pub const MAX_TABLE_NAME_LEN: usize = 255;
 
 /// The key of the `index`-th data file within a backup prefix:
 /// `data/000001.json.gz` for index 1.
@@ -195,9 +195,39 @@ fn ascii_word(s: &str, allowed: &[u8]) -> bool {
 }
 
 /// The region shape a backup ARN may carry: non-empty `[a-z0-9-]`. The
-/// manifest checks a table ARN's region with the same predicate.
-pub(super) fn is_region(s: &str) -> bool {
+/// manifest checks a table ARN's region with the same predicate, the engine
+/// checks `server.region` with it before forming a backup ARN at
+/// `CreateBackup`, and the startup warning about `server.region` speaks for
+/// it.
+#[must_use]
+pub fn is_region(s: &str) -> bool {
     ascii_word(s, b"-") && !s.bytes().any(|b| b.is_ascii_uppercase())
+}
+
+/// The store-prefix rules on a table name, the two inputs [`check_backup_arn`]
+/// accepts that a [`BackupArn`] refuses: a name over [`MAX_TABLE_NAME_LEN`]
+/// bytes, or made only of dots (`.` and `..` are path components; a longer
+/// run of dots is a legal `DynamoDB` name but is refused to keep the rule
+/// simple). The engine applies them at `CreateBackup`, before the ARN is
+/// formed, so the refusal names the rule whatever the name's length.
+///
+/// # Errors
+///
+/// [`FormatError::InvalidArn`] naming the rule the name breaks.
+pub fn check_store_prefix_table_name(table_name: &str) -> Result<(), FormatError> {
+    if table_name.len() > MAX_TABLE_NAME_LEN {
+        return Err(FormatError::InvalidArn(format!(
+            "table name of {} bytes is longer than {MAX_TABLE_NAME_LEN}",
+            table_name.len()
+        )));
+    }
+    if table_name.bytes().all(|b| b == b'.') {
+        return Err(FormatError::InvalidArn(format!(
+            "table name {:?} is only dots",
+            truncated(table_name)
+        )));
+    }
+    Ok(())
 }
 
 /// Strip surrounding ASCII whitespace from a `BackupArn`. Measured on
@@ -377,22 +407,12 @@ impl BackupArn {
         })
     }
 
-    /// The store-prefix rules over already-checked parts: the two rules
-    /// `check_backup_arn` does not apply, and the only two inputs it accepts
-    /// that this type refuses.
+    /// The store-prefix rules over already-checked parts
+    /// ([`check_store_prefix_table_name`]): the two rules `check_backup_arn`
+    /// does not apply, and the only two inputs it accepts that this type
+    /// refuses.
     fn from_parts(parts: &BackupArnParts<'_>) -> Result<Self, FormatError> {
-        if parts.table_name.len() > MAX_TABLE_NAME_LEN {
-            return Err(FormatError::InvalidArn(format!(
-                "table name of {} bytes is longer than {MAX_TABLE_NAME_LEN}",
-                parts.table_name.len()
-            )));
-        }
-        if parts.table_name.bytes().all(|b| b == b'.') {
-            return Err(FormatError::InvalidArn(format!(
-                "table name {:?} is only dots",
-                truncated(parts.table_name)
-            )));
-        }
+        check_store_prefix_table_name(parts.table_name)?;
         Ok(Self {
             partition: parts.partition.to_owned(),
             region: parts.region.to_owned(),
@@ -752,8 +772,22 @@ mod tests {
         assert!(BackupArn::new(" aws", "us-east-1", "1234", "Music", ID).is_err());
         assert!(BackupArn::new("aws", "us-east-1", "1234", "Music", &format!("{ID}\n")).is_err());
         assert!(BackupArn::new("aws", "us-east-1", "1234", "Music", &format!("{ID} ")).is_err());
-        // Dots inside names are fine; DynamoDB allows them.
-        BackupArn::new("aws", "us-east-1", "1234", "a.b.c", ID).unwrap();
+        // Dots inside names are fine; DynamoDB allows them. So are a leading
+        // dot, a trailing dot and a run of dots beside other characters: the
+        // rule refuses a name made only of dots, not one that starts with
+        // them.
+        for dotted in ["a.b.c", ".cfg", "a.", "a..b", "..a", "a.."] {
+            BackupArn::new("aws", "us-east-1", "1234", dotted, ID)
+                .unwrap_or_else(|e| panic!("{dotted}: {e}"));
+            check_store_prefix_table_name(dotted).unwrap_or_else(|e| panic!("{dotted}: {e}"));
+        }
+        for only_dots in [".", "..", "...", "...."] {
+            let err = check_store_prefix_table_name(only_dots).unwrap_err();
+            assert!(
+                err.to_string().contains("is only dots"),
+                "{only_dots}: {err}"
+            );
+        }
     }
 
     #[test]

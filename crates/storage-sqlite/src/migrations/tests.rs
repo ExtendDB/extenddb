@@ -275,9 +275,13 @@ async fn a_fresh_database_is_current_after_one_run_and_seeds_nothing() {
     assert_eq!(version_row(&db).await, Some(LATEST.to_string()));
     assert_eq!(
         count(&db, "SELECT COUNT(*) FROM settings").await,
-        1,
-        "only the version row"
+        2,
+        "the version row and the catalog id migration 5 writes"
     );
+    let catalog_id = scalar(&db, "SELECT value FROM settings WHERE key = 'catalog_id'")
+        .await
+        .expect("a catalog id");
+    assert!(uuid::Uuid::parse_str(&catalog_id).is_ok(), "{catalog_id}");
     assert!(run(&db).await.expect("again").applied.is_empty());
 }
 

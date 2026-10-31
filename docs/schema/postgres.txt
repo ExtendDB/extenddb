@@ -3,7 +3,9 @@ table access_keys
 table accounts
 table admin_users
 table backup_definitions
+table backup_index
 table backup_items
+table backup_maintenance
 table backups
 table continuous_backups
 table extenddb_migrations
@@ -42,10 +44,32 @@ column admin_users.password_hash: text NOT NULL
 column admin_users.created_at: timestamp with time zone NOT NULL DEFAULT now()
 column backup_definitions.backup_arn: text NOT NULL
 column backup_definitions.definition: jsonb NOT NULL
+column backup_index.account_id: text NOT NULL
+column backup_index.backup_id: text NOT NULL
+column backup_index.table_name: text NOT NULL
+column backup_index.backup_arn: text NOT NULL COLLATE "C"
+column backup_index.backup_name: text NOT NULL
+column backup_index.status: text NOT NULL
+column backup_index.store_kind: text NOT NULL
+column backup_index.store_root: text NOT NULL
+column backup_index.store_id: text NOT NULL
+column backup_index.size_bytes: bigint NOT NULL DEFAULT 0
+column backup_index.item_count: bigint NOT NULL DEFAULT 0
+column backup_index.created_at: timestamp with time zone NOT NULL
+column backup_index.completed_at: timestamp with time zone
+column backup_index.failure_reason: text
+column backup_index.source_table_details_json: jsonb NOT NULL
+column backup_index.owner_generation: bigint NOT NULL
+column backup_index.heartbeat_at: timestamp with time zone NOT NULL
 column backup_items.backup_arn: text NOT NULL
 column backup_items.pk: text NOT NULL
 column backup_items.sk: text
 column backup_items.item_data: jsonb NOT NULL
+column backup_maintenance.singleton: boolean NOT NULL DEFAULT true
+column backup_maintenance.holder: text NOT NULL
+column backup_maintenance.owner_generation: bigint NOT NULL
+column backup_maintenance.claimed_at: timestamp with time zone NOT NULL DEFAULT now()
+column backup_maintenance.heartbeat_at: timestamp with time zone NOT NULL DEFAULT now()
 column backups.backup_arn: text NOT NULL
 column backups.backup_name: text NOT NULL
 column backups.table_id: text NOT NULL
@@ -166,6 +190,18 @@ column table_restores.table_id: text NOT NULL
 column table_restores.source_backup_arn: text NOT NULL
 column table_restores.source_table_arn: text NOT NULL
 column table_restores.restore_date_time: timestamp with time zone NOT NULL
+column table_restores.status: text NOT NULL
+column table_restores.kind: text NOT NULL
+column table_restores.store_kind: text
+column table_restores.store_root: text
+column table_restores.store_id: text
+column table_restores.owner_generation: bigint NOT NULL
+column table_restores.heartbeat_at: timestamp with time zone NOT NULL
+column table_restores.spool_host: text
+column table_restores.file_index: bigint
+column table_restores.items_applied: bigint
+column table_restores.failure_reason: text
+column table_restores.completed_at: timestamp with time zone
 column tables.account_id: text NOT NULL
 column tables.table_name: text NOT NULL
 column tables.key_schema: jsonb NOT NULL
@@ -208,6 +244,8 @@ index accounts_account_name_key: CREATE UNIQUE INDEX accounts_account_name_key O
 index accounts_pkey: CREATE UNIQUE INDEX accounts_pkey ON public.accounts USING btree (account_id)
 index admin_users_pkey: CREATE UNIQUE INDEX admin_users_pkey ON public.admin_users USING btree (admin_name)
 index backup_definitions_pkey: CREATE UNIQUE INDEX backup_definitions_pkey ON public.backup_definitions USING btree (backup_arn)
+index backup_index_pkey: CREATE UNIQUE INDEX backup_index_pkey ON public.backup_index USING btree (account_id, backup_id)
+index backup_maintenance_pkey: CREATE UNIQUE INDEX backup_maintenance_pkey ON public.backup_maintenance USING btree (singleton)
 index backups_pkey: CREATE UNIQUE INDEX backups_pkey ON public.backups USING btree (backup_arn)
 index continuous_backups_pkey: CREATE UNIQUE INDEX continuous_backups_pkey ON public.continuous_backups USING btree (account_id, table_name)
 index extenddb_migrations_pkey: CREATE UNIQUE INDEX extenddb_migrations_pkey ON public.extenddb_migrations USING btree (id)
@@ -225,6 +263,9 @@ index iam_user_tags_pkey: CREATE UNIQUE INDEX iam_user_tags_pkey ON public.iam_u
 index iam_users_pkey: CREATE UNIQUE INDEX iam_users_pkey ON public.iam_users USING btree (account_id, user_name)
 index iam_users_user_arn_key: CREATE UNIQUE INDEX iam_users_user_arn_key ON public.iam_users USING btree (user_arn)
 index idempotency_tokens_pkey: CREATE UNIQUE INDEX idempotency_tokens_pkey ON public.idempotency_tokens USING btree (token)
+index idx_backup_index_account_table: CREATE INDEX idx_backup_index_account_table ON public.backup_index USING btree (account_id, table_name)
+index idx_backup_index_backup_id: CREATE UNIQUE INDEX idx_backup_index_backup_id ON public.backup_index USING btree (backup_id)
+index idx_backup_index_store_status: CREATE INDEX idx_backup_index_store_status ON public.backup_index USING btree (store_kind, store_root, store_id, status)
 index idx_backup_items_arn: CREATE INDEX idx_backup_items_arn ON public.backup_items USING btree (backup_arn)
 index idx_backups_table: CREATE INDEX idx_backups_table ON public.backups USING btree (account_id, table_name)
 index idx_idempotency_tokens_created: CREATE INDEX idx_idempotency_tokens_created ON public.idempotency_tokens USING btree (created_at)
@@ -234,6 +275,7 @@ index idx_metrics_bucket: CREATE INDEX idx_metrics_bucket ON public.metrics USIN
 index idx_stream_records_created: CREATE INDEX idx_stream_records_created ON public.stream_records USING btree (created_at)
 index idx_stream_shards_table: CREATE INDEX idx_stream_shards_table ON public.stream_shards USING btree (table_id)
 index idx_table_restores_backup: CREATE INDEX idx_table_restores_backup ON public.table_restores USING btree (source_backup_arn)
+index idx_table_restores_status: CREATE INDEX idx_table_restores_status ON public.table_restores USING btree (status, heartbeat_at)
 index idx_tables_pending_transition: CREATE INDEX idx_tables_pending_transition ON public.tables USING btree (status_transition_at) WHERE (status_transition_at IS NOT NULL)
 index idx_vector_indexes_index_id: CREATE UNIQUE INDEX idx_vector_indexes_index_id ON public.vector_indexes USING btree (index_id)
 index indexes_pkey: CREATE UNIQUE INDEX indexes_pkey ON public.indexes USING btree (table_id, index_name)
@@ -254,7 +296,10 @@ constraint accounts.accounts_pkey: PRIMARY KEY (account_id)
 constraint admin_users.admin_users_pkey: PRIMARY KEY (admin_name)
 constraint backup_definitions.backup_definitions_backup_arn_fkey: FOREIGN KEY (backup_arn) REFERENCES backups(backup_arn) ON DELETE CASCADE
 constraint backup_definitions.backup_definitions_pkey: PRIMARY KEY (backup_arn)
+constraint backup_index.backup_index_pkey: PRIMARY KEY (account_id, backup_id)
 constraint backup_items.backup_items_backup_arn_fkey: FOREIGN KEY (backup_arn) REFERENCES backups(backup_arn) ON DELETE CASCADE
+constraint backup_maintenance.backup_maintenance_pkey: PRIMARY KEY (singleton)
+constraint backup_maintenance.backup_maintenance_singleton_check: CHECK (singleton)
 constraint backups.backups_pkey: PRIMARY KEY (backup_arn)
 constraint continuous_backups.continuous_backups_pkey: PRIMARY KEY (account_id, table_name)
 constraint extenddb_migrations.extenddb_migrations_pkey: PRIMARY KEY (id)

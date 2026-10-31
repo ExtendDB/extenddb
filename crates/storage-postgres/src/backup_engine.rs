@@ -1,15 +1,22 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Backup and restore implementation for `PostgreSQL` storage.
+//! The in-catalog backup format on `PostgreSQL`: the create, describe, list,
+//! delete, restore-source and restore paths of [`LegacyBackupReader`], frozen
+//! apart from the restore's registration, which writes the restore job
+//! fields and holds the job claim ([`ClaimSession`]) the catalog index's jobs
+//! hold too (`backup_catalog.rs`).
 
-use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use extenddb_core::types::{
     BackupDescription, BackupDetails, BackupSummary, ContinuousBackupsDescription, GsiInput, Item,
     KeySchemaElement, LsiInput, PointInTimeRecoveryDescription, Projection, RestoreSummary,
     ScalarAttributeType, SourceTableDetails, StreamSpecification, TableDescription,
+};
+use extenddb_storage::backup_catalog::{
+    AbandonedLegacyBackup, JOB_HEARTBEAT_INTERVAL, JobBound, limit_exceeded_message, new_generation,
 };
 use extenddb_storage::backup_definition::{
     BACKUP_DEFINITION_VERSION, BackupTableDefinition, COPY_BATCH_BYTES, COPY_BATCH_ITEMS,
@@ -20,9 +27,8 @@ use extenddb_storage::util::{
     SortKeyValue, backup_arn, backup_id_epoch_millis, composite_pk_to_text, new_backup_id,
     parse_sk, sk_column_n,
 };
-use extenddb_storage::{BackupEngine, BackupRestoreSource, RestoreRequest};
+use extenddb_storage::{BackupRestoreSource, JobPermit, LegacyBackupReader, RestoreRequest};
 use futures::future::BoxFuture;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::PostgresEngine;
 use crate::create_table::RestoreRegistration;
@@ -48,119 +54,15 @@ fn pg_timestamp_to_epoch(ts: time::OffsetDateTime) -> f64 {
     }
 }
 
-/// Seed for the 64-bit restore lock key. Restore locks use the single-`bigint`
-/// advisory lock form, which PostgreSQL keeps in a key space separate from the
-/// two-`int4` form the migration and vector-build locks use, so they cannot
-/// meet; the seed keeps this key space distinct from any other `bigint` user.
-const RESTORE_LOCK_SEED: i64 = 0x0045_4452; // 'E', 'D', 'R'
-
-/// Restores one account may have in flight at once in this process. Each
-/// holds one dedicated connection for its lock on top of its pooled ones. A
-/// restore beyond the limit waits for one of its own account's slots, so one
-/// account cannot hold every other account's restores back.
-const RESTORE_SLOTS_PER_ACCOUNT: usize = 4;
-
-/// Upper limit on [`restore_server_slot_count`].
-const RESTORE_SERVER_SLOTS_MAX: usize = 16;
-
-/// Restores the whole process may have in flight at once, across accounts:
-/// `min(16, pool_size / 2)`, at least 1.
-///
-/// Each running copy holds one connection of the engine's catalog pool
-/// (`pool_size`) for its whole duration, for the REPEATABLE READ snapshot it
-/// reads the backup's items from. Without a process-wide bound, enough
-/// accounts each running their per-account allowance would hold every
-/// catalog connection and stall every other request that needs the catalog.
-/// Half the pool stays free for them. A restore takes its account slot
-/// first, then one of these; the two waits share one deadline of
-/// [`RESTORE_SLOT_WAIT_SECS`].
-pub(crate) fn restore_server_slot_count(pool_size: u32) -> usize {
-    usize::try_from(pool_size / 2)
-        .unwrap_or(usize::MAX)
-        .clamp(1, RESTORE_SERVER_SLOTS_MAX)
-}
-
-/// The two slots a running restore holds until its copy ends.
-struct RestorePermits {
-    _account: OwnedSemaphorePermit,
-    _server: OwnedSemaphorePermit,
-}
-
-/// Take an account slot, then a server slot, waiting at most `wait` for
-/// both together. Running out of time on either is `LimitExceeded`, with a
-/// message naming the limit that was full.
-async fn acquire_restore_permits(
-    account: Arc<Semaphore>,
-    server: Arc<Semaphore>,
-    server_slots: usize,
-    wait: std::time::Duration,
-) -> Result<RestorePermits, StorageError> {
-    let deadline = tokio::time::Instant::now() + wait;
-    let closed =
-        |e: tokio::sync::AcquireError| StorageError::Internal(format!("restore slot: {e}"));
-    let account_permit = tokio::time::timeout_at(deadline, account.acquire_owned())
-        .await
-        .map_err(|_| {
-            StorageError::LimitExceeded(format!(
-                "Too many restores are in progress for this account (at most \
-                 {RESTORE_SLOTS_PER_ACCOUNT} at once); retry later"
-            ))
-        })?
-        .map_err(closed)?;
-    let server_permit = tokio::time::timeout_at(deadline, server.acquire_owned())
-        .await
-        .map_err(|_| {
-            StorageError::LimitExceeded(format!(
-                "Too many restores are in progress on this server (at most {server_slots} at \
-                 once); retry later"
-            ))
-        })?
-        .map_err(closed)?;
-    Ok(RestorePermits {
-        _account: account_permit,
-        _server: server_permit,
-    })
-}
-
-/// Per-account restore slots of one engine (shared by its clones, so one
-/// per server process). An entry nobody holds (no permit, no waiter) is
-/// pruned the next time any account takes a slot, so the map does not grow
-/// with every account that ever restored.
-#[derive(Clone, Default)]
-pub(crate) struct RestoreAccountSlots(Arc<std::sync::Mutex<HashMap<String, Arc<Semaphore>>>>);
-
-impl RestoreAccountSlots {
-    /// The slot semaphore for `account_id`.
-    pub(crate) fn for_account(&self, account_id: &str) -> Arc<Semaphore> {
-        let mut slots = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // A permit and a waiter each hold a clone, so a count of one means
-        // the account has nothing in flight.
-        slots.retain(|_, s| Arc::strong_count(s) > 1);
-        Arc::clone(
-            slots
-                .entry(account_id.to_owned())
-                .or_insert_with(|| Arc::new(Semaphore::new(RESTORE_SLOTS_PER_ACCOUNT))),
-        )
-    }
-}
-
-/// How long a restore waits for its account slot and a server slot,
-/// together, before it is refused with `LimitExceededException`.
-const RESTORE_SLOT_WAIT_SECS: u64 = 30;
-
-/// How often the restore's lock session is exercised while its copy runs.
-/// Shorter than the idle-session timeouts managed services apply (minutes),
-/// and a quarter of [`ABANDONED_RESTORE_GRACE_SECS`].
-const RESTORE_HEARTBEAT_SECS: u64 = 15;
-
-/// How old an unowned restore target must be before it is treated as
-/// abandoned. The owner takes its lock before creating the target, so this
-/// only has to cover clock skew between the catalog and the sweep, with a
-/// wide margin.
-const ABANDONED_RESTORE_GRACE_SECS: i32 = 60;
+/// Seed for the 64-bit job lock keys: a restore's lock on its target name
+/// and a backup job's lock on its backup id share this one key space. The
+/// locks use the single-`bigint` advisory lock form, which PostgreSQL keeps
+/// in a key space separate from the two-`int4` form the migration and
+/// vector-build locks use, so they cannot meet; the seed keeps this key
+/// space distinct from any other `bigint` user. Public for the tests that
+/// hold or look up a lock; not an interface.
+#[doc(hidden)]
+pub const RESTORE_LOCK_SEED: i64 = 0x0045_4452; // 'E', 'D', 'R'
 
 /// A secondary index of a restore target, as the copy needs it.
 struct RestoreIndex {
@@ -169,81 +71,133 @@ struct RestoreIndex {
     projection: Projection,
 }
 
-/// Session-scoped ownership of one restore, held for the life of the copy.
+/// Session-scoped ownership of one job, held for the job's life: a
+/// session-level `pg_try_advisory_lock` on a dedicated, non-pooled connection
+/// to the catalog database, the job's `owner_generation`, and the job permit
+/// the engine handed it.
 ///
-/// A session-level `pg_try_advisory_lock` on a dedicated connection: it dies
-/// with the session, so a crashed process's claim disappears on its own and
-/// the abandoned-restore sweep can tell a dead restore from a running one.
-///
-/// This needs the connection to be one server session for its whole life:
-/// a direct connection to the catalog database, or one through a
+/// The lock dies with the session, so a crashed process's claim disappears on
+/// its own. This needs the connection to be one server session for its whole
+/// life: a direct connection to the catalog database, or one through a
 /// session-mode pooler. Behind a transaction-mode pooler (PgBouncer
 /// `pool_mode = transaction`) the lock stays on whichever server session ran
 /// the statement, is not released when this connection closes, and can be
-/// observed as free by the sweep on that same session; restore is not
-/// supported there.
+/// observed as free on that same session; jobs are not supported there.
 ///
-/// The connection would otherwise sit idle for the whole copy, and some
+/// The connection would otherwise sit idle for the whole job, and some
 /// servers end idle sessions (`idle_session_timeout`, or a managed service's
-/// own reaping). [`RestoreOwner::heartbeat`] issues
-/// a statement on it every [`RESTORE_HEARTBEAT_SECS`]; when one fails, the
-/// copy is stopped and the target removed, rather than copying on into a
-/// target the sweep may claim. The sweep's claim and the copy's flip to
-/// ACTIVE are both conditional on CREATING, so if the two still race (the
-/// session ends between heartbeats), exactly one wins.
-struct RestoreOwner {
+/// own reaping). The job's heartbeats go through this connection every
+/// [`JOB_HEARTBEAT_INTERVAL`] (shorter than the idle-session timeouts managed
+/// services apply, and a small fraction of the stale window the reconciler
+/// waits): each refreshes the record's `heartbeat_at`
+/// conditioned on the generation, so a session the server dropped, or a
+/// record a successor took over, surfaces as a lost heartbeat and the job
+/// stops rather than continuing unowned. A free lock shows that the owner's
+/// catalog session ended, not that its process stopped, so the reconciler
+/// acts on a record only once its heartbeat is older than the stale window.
+pub(crate) struct ClaimSession {
     conn: sqlx::PgConnection,
-    _slots: Option<RestorePermits>,
+    generation: u64,
+    _permit: Option<JobPermit>,
 }
 
-impl RestoreOwner {
-    /// Exercise the lock session every [`RESTORE_HEARTBEAT_SECS`] until a
-    /// statement on it fails; returns that failure. Never returns while the
-    /// session is alive.
-    async fn heartbeat(&mut self) -> sqlx::Error {
-        let period = std::time::Duration::from_secs(RESTORE_HEARTBEAT_SECS);
+impl ClaimSession {
+    /// The fencing token this claim was taken with.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The claim connection, for the job's conditional writes.
+    pub(crate) fn connection(&mut self) -> &mut sqlx::PgConnection {
+        &mut self.conn
+    }
+
+    /// Run `statement`, bound with the record's key and this generation, on
+    /// the claim connection and report whether it refreshed exactly one row.
+    pub(crate) async fn confirm(
+        &mut self,
+        statement: &str,
+        key: &[&str],
+    ) -> Result<bool, sqlx::Error> {
+        let mut query = sqlx::query(statement);
+        for part in key {
+            query = query.bind(*part);
+        }
+        let affected = query
+            .bind(generation_column(self.generation))
+            .execute(&mut self.conn)
+            .await?
+            .rows_affected();
+        Ok(affected == 1)
+    }
+
+    /// Heartbeat the record every [`JOB_HEARTBEAT_INTERVAL`] with
+    /// `statement` (as [`Self::confirm`] runs it) until a heartbeat fails or
+    /// refreshes no row; returns why. Never returns while the claim is
+    /// confirmed.
+    async fn heartbeat_loop(&mut self, statement: &str, key: &[&str]) -> StorageError {
+        let period = JOB_HEARTBEAT_INTERVAL;
         let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            if let Err(e) = sqlx::query("SELECT 1").execute(&mut self.conn).await {
-                return e;
+            match self.confirm(statement, key).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return StorageError::Internal(
+                        "the job record no longer carries this claim's generation".to_owned(),
+                    );
+                }
+                Err(e) => return StorageError::Internal(format!("claim session: {e}")),
             }
         }
     }
 }
 
+/// An `owner_generation` as the catalog stores it (`BIGINT`); generations
+/// are minted below `i64::MAX`.
+pub(crate) fn generation_column(generation: u64) -> i64 {
+    i64::try_from(generation).unwrap_or(i64::MAX)
+}
+
+/// The heartbeat of a legacy restore: refresh its job record while it is
+/// RUNNING under this generation.
+const RESTORE_HEARTBEAT: &str = "UPDATE table_restores SET heartbeat_at = now() \
+     WHERE table_id = $1 AND status = 'RUNNING' AND owner_generation = $2";
+
 /// The advisory-lock key for a restore into `table_name` in `account_id`.
 ///
 /// Keyed by name rather than table id so the restore can hold it before the
-/// target exists: the sweep must never see an unowned target, including in
-/// the window while `create_table_impl` is still running DDL. The key is a
-/// 64-bit `hashtextextended`, so a collision is negligible, and one would
-/// only make the sweep skip a table while the other name's lock is held,
-/// never remove a table it should not.
+/// target exists: nothing must ever see an unowned target, including in the
+/// window while `create_table_impl` is still running DDL. The key is a 64-bit
+/// `hashtextextended`, so a collision is negligible, and one would only make
+/// a second restore into the other name wait, never remove a table it should
+/// not.
 fn restore_lock_key(account_id: &str, table_name: &str) -> String {
     format!("{account_id}/{table_name}")
 }
 
-/// Take the restore lock for `table_name` on a new dedicated connection.
-/// `Ok(None)`: another session holds it.
+/// The advisory-lock key of a backup job's claim on `backup_id`.
+pub(crate) fn backup_lock_key(backup_id: &str) -> String {
+    format!("backup:{backup_id}")
+}
+
+/// Take the lock `key` on a new dedicated connection, with a fresh
+/// generation. `Ok(None)`: another session holds it.
 ///
 /// A connection the server refuses for lack of connection slots is reported
 /// as `LimitExceeded`; any other failure to open it is `Internal` (see
 /// [`lock_connection_error`]).
-async fn try_restore_lock(
+pub(crate) async fn try_claim(
     pool: &sqlx::PgPool,
-    account_id: &str,
-    table_name: &str,
-    slots: Option<RestorePermits>,
-) -> Result<Option<RestoreOwner>, StorageError> {
+    key: &str,
+    permit: Option<JobPermit>,
+) -> Result<Option<ClaimSession>, StorageError> {
     let options = pool.connect_options();
     let mut conn = <sqlx::PgConnection as sqlx::Connection>::connect_with(&options)
         .await
         .map_err(|e| {
-            tracing::warn!(
-                "could not open the restore lock connection for {account_id}/{table_name}: {e}"
-            );
+            tracing::warn!("could not open the claim connection for {key}: {e}");
             lock_connection_error(&e)
         })?;
     // A server-side idle_session_timeout would end this session between
@@ -256,38 +210,54 @@ async fn try_restore_lock(
         .await
     {
         tracing::warn!(
-            "could not disable idle_session_timeout for the restore lock session; \
-             continuing with the server setting: {e}"
+            "could not disable idle_session_timeout for the claim session; continuing with \
+             the server setting: {e}"
         );
     }
     let taken: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtextextended($1, $2))")
-        .bind(restore_lock_key(account_id, table_name))
+        .bind(key)
         .bind(RESTORE_LOCK_SEED)
         .fetch_one(&mut conn)
         .await
-        .map_err(|e| StorageError::Internal(format!("restore lock: {e}")))?;
-    Ok(taken.then_some(RestoreOwner {
+        .map_err(|e| StorageError::Internal(format!("claim lock: {e}")))?;
+    Ok(taken.then(|| ClaimSession {
         conn,
-        _slots: slots,
+        generation: new_generation(),
+        _permit: permit,
     }))
+}
+
+/// Take the restore lock for `table_name` on a new dedicated connection.
+async fn try_restore_lock(
+    pool: &sqlx::PgPool,
+    account_id: &str,
+    table_name: &str,
+    permit: JobPermit,
+) -> Result<Option<ClaimSession>, StorageError> {
+    try_claim(
+        pool,
+        &restore_lock_key(account_id, table_name),
+        Some(permit),
+    )
+    .await
 }
 
 /// SQLSTATE `too_many_connections`: the server (or the role or database)
 /// has no connection slot left.
 const SQLSTATE_TOO_MANY_CONNECTIONS: &str = "53300";
 
-/// Map a failure to open the restore lock connection. Only the server's
+/// Map a failure to open a claim connection. Only the server's
 /// `too_many_connections` refusal is `LimitExceeded` (a client should back
-/// off and retry); authentication, TLS, DNS, network, and every other
-/// failure, including one that carries no SQLSTATE, is `Internal`.
+/// off and retry), in the one job-refusal text
+/// ([`limit_exceeded_message`]) naming the server's connection slots as the
+/// bound; authentication, TLS, DNS, network, and every other failure,
+/// including one that carries no SQLSTATE, is `Internal`.
 fn lock_connection_error(e: &sqlx::Error) -> StorageError {
     let code = e.as_database_error().and_then(|d| d.code());
     if code.as_deref() == Some(SQLSTATE_TOO_MANY_CONNECTIONS) {
-        StorageError::LimitExceeded(
-            "Too many restores are in progress on this server; retry later".to_owned(),
-        )
+        StorageError::LimitExceeded(limit_exceeded_message(JobBound::ServerConnections))
     } else {
-        StorageError::Internal(format!("restore lock connection: {e}"))
+        StorageError::Internal(format!("claim connection: {e}"))
     }
 }
 
@@ -452,7 +422,8 @@ impl PostgresEngine {
     }
 
     /// Copy a backup's items into a freshly created restore target, populate
-    /// its secondary indexes, and mark it ACTIVE.
+    /// its secondary indexes, and mark it ACTIVE, which marks the job record
+    /// DONE in the same catalog transaction, conditioned on `generation`.
     ///
     /// Every key column is derived from the item itself, so the copy does not
     /// depend on how the source table's columns were laid out. Rows are plain
@@ -474,6 +445,7 @@ impl PostgresEngine {
         &self,
         desc: &TableDescription,
         backup_arn: &str,
+        generation: u64,
     ) -> Result<(), StorageError> {
         use futures::TryStreamExt;
 
@@ -561,34 +533,80 @@ impl PostgresEngine {
         .await
         .map_err(db_err)?;
 
-        // Mark the restored table ACTIVE now that every batch has committed.
-        // The table was created with the transition deferred, so this is the
-        // first point it can become ACTIVE, by ordering rather than by timing.
+        // Mark the restored table ACTIVE now that every batch has committed,
+        // and its job record DONE, in one catalog transaction. The table was
+        // created with the transition deferred, so this is the first point it
+        // can become ACTIVE, by ordering rather than by timing.
         //
-        // Only from CREATING. DeleteTable refuses a restore target, but the
-        // abandoned-restore sweep can claim one whose lock session was lost
-        // (moving it to DELETING); that claim wins, and flipping the row back
-        // to ACTIVE would leave a table whose data tables are being dropped.
-        let activated = sqlx::query(
-            "UPDATE tables SET item_count = $1, table_size_bytes = $2, table_status = 'ACTIVE', \
-             status_transition_at = NULL WHERE table_id = $3 AND table_status = 'CREATING'",
+        // Only from CREATING, and only while the job record is RUNNING under
+        // this generation. DeleteTable refuses a restore target, but the
+        // reconciler can claim one whose owner it found dead (moving it to
+        // DELETING); that claim wins, and flipping the row back to ACTIVE
+        // would leave a table whose data tables are being dropped.
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let done = sqlx::query(
+            "UPDATE table_restores SET status = 'DONE', completed_at = now() \
+             WHERE table_id = $1 AND status = 'RUNNING' AND owner_generation = $2",
         )
-        .bind(item_count)
-        .bind(table_size)
         .bind(&desc.table_id)
-        .execute(&self.pool)
+        .bind(generation_column(generation))
+        .execute(&mut *tx)
         .await
-        .map_err(db_err)?;
-        if activated.rows_affected() == 0 {
-            // The target was claimed for removal while the copy ran; the
-            // copy's rows go with it.
+        .map_err(db_err)?
+        .rows_affected();
+        let activated = if done == 1 {
+            sqlx::query(
+                "UPDATE tables SET item_count = $1, table_size_bytes = $2, \
+                 table_status = 'ACTIVE', status_transition_at = NULL \
+                 WHERE table_id = $3 AND table_status = 'CREATING'",
+            )
+            .bind(item_count)
+            .bind(table_size)
+            .bind(&desc.table_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .rows_affected()
+        } else {
+            0
+        };
+        if activated == 0 {
+            tx.rollback().await.map_err(db_err)?;
+            // The target was claimed for removal while the copy ran, or the
+            // job record passed to another claim; the copy's rows go with it.
             return Err(StorageError::TableNotFound(format!(
                 "restore of {backup_arn} into {} did not complete: the table was deleted \
                  while it was being restored",
                 desc.table_name
             )));
         }
+        tx.commit().await.map_err(db_err)?;
         Ok(())
+    }
+
+    /// RUNNING to FAILED on the job record of `table_id`, conditioned on
+    /// `generation`: the write a failing job makes before it removes its
+    /// target. `Ok(false)` when the record is not RUNNING under that
+    /// generation.
+    async fn fail_restore_job_as(
+        &self,
+        table_id: &str,
+        generation: u64,
+        reason: &str,
+    ) -> Result<bool, StorageError> {
+        let affected = sqlx::query(
+            "UPDATE table_restores SET status = 'FAILED', failure_reason = $3, \
+             completed_at = now() \
+             WHERE table_id = $1 AND status = 'RUNNING' AND owner_generation = $2",
+        )
+        .bind(table_id)
+        .bind(generation_column(generation))
+        .bind(reason)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        Ok(affected == 1)
     }
 
     /// Write and commit one batch of restored items: one multi-row INSERT
@@ -698,7 +716,11 @@ impl PostgresEngine {
     /// exactly one wins. The claim also schedules the row for the ordinary
     /// DELETING removal, so if a drop below fails, the row stays DELETING with
     /// its index rows and the control plane finishes the job later.
-    async fn abort_restore(&self, table_id: &str) -> Result<bool, StorageError> {
+    ///
+    /// Public for the test that runs it against an ACTIVE table; not an
+    /// interface.
+    #[doc(hidden)]
+    pub async fn abort_restore(&self, table_id: &str) -> Result<bool, StorageError> {
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         let claimed = sqlx::query(
             "UPDATE tables SET table_status = 'DELETING', status_transition_at = NOW() \
@@ -736,61 +758,16 @@ impl PostgresEngine {
         Ok(true)
     }
 
-    /// Remove restore targets whose restore died with its process.
-    ///
-    /// A restore target is the only table that sits CREATING with no
-    /// scheduled transition. One older than the grace period whose restore
-    /// lock is free has no live owner: the process that created it crashed or
-    /// was killed mid-copy, or its lock session ended, and nothing else would
-    /// ever move it on. Removing it frees the name; the client sees the table
-    /// disappear, as it would after a failed restore. A target whose lock is
-    /// held is being copied by a live process, here or on another instance,
-    /// and is left alone.
-    ///
-    /// Each removal is logged at warn with the account, the table, and the
-    /// backup it was being restored from, so a table that vanishes from
-    /// ListTables has a server record of why.
-    ///
-    /// Returns the names of the tables removed.
-    pub(crate) async fn sweep_abandoned_restores(&self) -> Result<Vec<String>, StorageError> {
-        let candidates: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
-            "SELECT t.table_id, t.account_id, t.table_name, r.source_backup_arn FROM tables t \
-             LEFT JOIN table_restores r ON r.table_id = t.table_id \
-             WHERE t.table_status = 'CREATING' AND t.status_transition_at IS NULL \
-             AND t.creation_date_time < NOW() - make_interval(secs => $1)",
-        )
-        .bind(f64::from(ABANDONED_RESTORE_GRACE_SECS))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db_err)?;
-        let mut removed = Vec::new();
-        for (table_id, account_id, table_name, source_backup_arn) in candidates {
-            let Some(_owner) = try_restore_lock(&self.pool, &account_id, &table_name, None).await?
-            else {
-                continue;
-            };
-            if self.abort_restore(&table_id).await? {
-                tracing::warn!(
-                    "removed abandoned restore target {table_name} ({table_id}) in account \
-                     {account_id}, restoring from {}: its restore did not finish and no \
-                     process owns it",
-                    source_backup_arn
-                        .as_deref()
-                        .unwrap_or("<no table_restores row>")
-                );
-                removed.push(table_name);
-            }
-        }
-        Ok(removed)
-    }
-
-    /// The detached task of RestoreTableFromBackup: wait for the account and
-    /// server slots, take the restore lock, register the CREATING target,
-    /// report the registration to the request (which may be gone), then copy.
+    /// The detached task of RestoreTableFromBackup: take the restore lock,
+    /// register the CREATING target with its job record, report the
+    /// registration to the request (which may be gone), then copy. `permit`
+    /// is the job slot the engine took, held by the claim until the copy
+    /// ends.
     async fn run_restore(
         self,
         account_id: String,
         request: RestoreRequest,
+        permit: JobPermit,
         registered: tokio::sync::oneshot::Sender<Result<TableDescription, StorageError>>,
     ) {
         let RestoreRequest {
@@ -803,7 +780,8 @@ impl PostgresEngine {
         // A refusal the request is no longer there to receive (its client
         // went away) would otherwise vanish, so it is logged. A refused restore
         // removes what it created; a cleanup that failed is logged on its own,
-        // and the abandoned-restore sweep finishes it.
+        // and the reconciler finishes it (the FAILED-target duty, once the
+        // record is stale).
         let refuse = |registered: tokio::sync::oneshot::Sender<_>, e: StorageError| {
             if let Err(Err(e)) = registered.send(Err(e)) {
                 tracing::warn!(
@@ -812,15 +790,13 @@ impl PostgresEngine {
                 );
             }
         };
-        // The name first, unfenced, as on the other backends and before a
-        // slot is taken: a restore into a name that is a CREATING restore
-        // target is refused as the name (TableBeingRestored, the service's
-        // TableInUseException) at once, whatever state the backup is in and
-        // whether or not that target's restore is still running (an
-        // abandoned target holds no restore lock until the sweep removes
-        // it). A client retrying its own restore is answered here instead of
-        // waiting for a slot. The restore lock and the target insert stay
-        // the fence.
+        // The name first, unfenced, as on the other backends: a restore into
+        // a name that is a CREATING restore target is refused as the name
+        // (TableBeingRestored, the service's TableInUseException) at once,
+        // whatever state the backup is in and whether or not that target's
+        // restore is still running (an abandoned target holds no restore
+        // lock until the reconciler removes it). The restore lock and the
+        // target insert stay the fence.
         if let Some(source_backup_arn) = self.restoring_into(&account_id, &target).await {
             refuse(
                 registered,
@@ -831,32 +807,15 @@ impl PostgresEngine {
             );
             return;
         }
-        // Admission: at most RESTORE_SLOTS_PER_ACCOUNT restores per account
-        // and restore_server_slot_count per process at once. The permits
-        // travel with the lock owner and are released when the copy ends.
-        let slots = match acquire_restore_permits(
-            self.restore_account_slots.for_account(&account_id),
-            Arc::clone(&self.restore_server_slots),
-            self.restore_server_slot_count,
-            std::time::Duration::from_secs(RESTORE_SLOT_WAIT_SECS),
-        )
-        .await
-        {
-            Ok(slots) => slots,
-            Err(e) => {
-                refuse(registered, e);
-                return;
-            }
-        };
-        // Ownership first, before the target exists, so the abandoned-restore
-        // sweep never sees this target without an owner, including while the
-        // DDL runs. It is held until the copy ends; a crash anywhere releases
-        // it with the connection, and the sweep then removes the target. A
-        // lock already held means another restore into this name is in
-        // flight right now: TableBeingRestored naming its source backup once
-        // its CREATING row is visible, else the name is taken as CreateTable
-        // would report it.
-        let owner = match try_restore_lock(&self.pool, &account_id, &target, Some(slots)).await {
+        // Ownership first, before the target exists, so nothing ever sees
+        // this target without an owner, including while the DDL runs. It is
+        // held until the copy ends; a crash anywhere releases it with the
+        // connection, and the reconciler removes the target once the job
+        // record's heartbeat is stale. A lock already held means another
+        // restore into this name is in flight right now: TableBeingRestored
+        // naming its source backup once its CREATING row is visible, else
+        // the name is taken as CreateTable would report it.
+        let owner = match try_restore_lock(&self.pool, &account_id, &target, permit).await {
             Ok(Some(owner)) => owner,
             Ok(None) => {
                 let error = self.name_taken_error(&account_id, &target, true).await;
@@ -877,6 +836,7 @@ impl PostgresEngine {
             backup_arn: &backup_arn,
             source_table_arn: &source_table_arn,
             restore_date_time,
+            owner_generation: owner.generation(),
         };
         let mut desc = match self
             .create_table_for_restore(&account_id, input, &registration)
@@ -905,29 +865,31 @@ impl PostgresEngine {
     }
 
     /// The detached half of RestoreTableFromBackup: copy the backup into the
-    /// registered CREATING target while heartbeating the lock session, then
-    /// flip the target ACTIVE, or remove it on failure. Owns everything it
-    /// uses; the request that spawned it may be gone.
+    /// registered CREATING target while heartbeating the job record through
+    /// the claim session, then flip the target ACTIVE (which marks the job
+    /// record DONE, conditioned on the generation), or remove it on failure.
+    /// Owns everything it uses; the request that spawned it may be gone.
     async fn run_restore_copy(
         self,
-        mut owner: RestoreOwner,
+        mut owner: ClaimSession,
         account_id: String,
         desc: TableDescription,
         backup_arn: String,
     ) {
         let table_name = desc.table_name.clone();
         let outcome = {
-            let copy = self.copy_backup_items(&desc, &backup_arn);
-            let heartbeat = owner.heartbeat();
+            let key = [desc.table_id.as_str()];
+            let copy = self.copy_backup_items(&desc, &backup_arn, owner.generation());
+            let heartbeat = owner.heartbeat_loop(RESTORE_HEARTBEAT, &key);
             tokio::select! {
                 copied = copy => copied,
                 lost = heartbeat => {
                     tracing::error!(
                         "restore of {backup_arn} into {table_name} (account {account_id}): the \
-                         restore lock session failed its heartbeat ({lost}); stopping the copy"
+                         claim session failed its heartbeat ({lost}); stopping the copy"
                     );
                     Err(StorageError::Internal(format!(
-                        "restore lock session lost: {lost}"
+                        "claim session lost: {lost}"
                     )))
                 }
             }
@@ -943,17 +905,44 @@ impl PostgresEngine {
         };
         // The target must not stay behind: it is CREATING with no scheduled
         // transition, so nothing else would move it on, and the name would
-        // stay taken. Removing it cascades its table_restores row. The lock
-        // is still held here (unless its session is what failed), so the
-        // sweep does not race this removal; both are conditional on CREATING
-        // in any case.
+        // stay taken. The job record is marked FAILED first, conditioned on
+        // the generation and on RUNNING; only if that matched is the target
+        // removed (which cascades the record). A record another generation
+        // owns, or a failed FAILED write (on a pooled connection, not the
+        // claim's), means the claim holder owns the target, and nothing
+        // further is touched.
+        let failed = self
+            .fail_restore_job_as(&desc.table_id, owner.generation(), &e.to_string())
+            .await;
+        match failed {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    "restore of {backup_arn} into {table_name} (account {account_id}) ended \
+                     with \"{e}\"; its job record was no longer RUNNING under this claim, so \
+                     the target ({}) was left to its owner",
+                    desc.table_id
+                );
+                drop(owner);
+                return;
+            }
+            Err(write) => {
+                tracing::error!(
+                    "restore of {backup_arn} into {table_name} (account {account_id}) failed \
+                     ({e}), and its job record could not be marked FAILED ({write}); the \
+                     reconciler removes the target once its heartbeat is stale"
+                );
+                drop(owner);
+                return;
+            }
+        }
         match self.abort_restore(&desc.table_id).await {
             Ok(true) => tracing::error!(
                 "restore of {backup_arn} into {table_name} (account {account_id}) failed and \
                  the partial table was removed: {e}"
             ),
-            // Already claimed by the sweep (whose own removal is logged), or
-            // the activation committed before the copy was stopped.
+            // Already claimed by the reconciler (whose own removal is logged),
+            // or the activation committed before the copy was stopped.
             Ok(false) => tracing::warn!(
                 "restore of {backup_arn} into {table_name} (account {account_id}) ended with \
                  \"{e}\"; the target ({}) was no longer CREATING, so it was left to its \
@@ -963,8 +952,8 @@ impl PostgresEngine {
             Err(cleanup) => tracing::error!(
                 "restore of {backup_arn} into {table_name} (account {account_id}) failed ({e}), \
                  and the partial table ({}) could not be removed yet; the control plane (if it \
-                 reached DELETING) or the abandoned-restore sweep (if still CREATING) finishes \
-                 the removal: {cleanup}",
+                 reached DELETING) or the reconciler (if still CREATING, once the FAILED record \
+                 is older than stale_job_after_secs) finishes the removal: {cleanup}",
                 desc.table_id
             ),
         }
@@ -972,17 +961,21 @@ impl PostgresEngine {
     }
 }
 
-impl BackupEngine for PostgresEngine {
-    fn create_backup(
+impl LegacyBackupReader for PostgresEngine {
+    fn create(
         &self,
         account_id: &str,
         table_name: &str,
         backup_name: &str,
+        permit: JobPermit,
     ) -> BoxFuture<'_, Result<BackupDetails, StorageError>> {
         let account_id = account_id.to_string();
         let table_name = table_name.to_string();
         let backup_name = backup_name.to_string();
         Box::pin(async move {
+            // The slot is the create's for its whole run; the copy is
+            // synchronous, so it is given back when this returns.
+            let _permit = permit;
             // The table's definition and its items must describe one instant.
             // They live in different databases, so no single snapshot covers
             // both. Instead the table row is held FOR SHARE from the first
@@ -1265,7 +1258,7 @@ impl BackupEngine for PostgresEngine {
         })
     }
 
-    fn describe_backup(
+    fn describe(
         &self,
         account_id: &str,
         backup_arn: &str,
@@ -1349,7 +1342,7 @@ impl BackupEngine for PostgresEngine {
         })
     }
 
-    fn list_backups(
+    fn list(
         &self,
         account_id: &str,
         table_name: Option<&str>,
@@ -1425,7 +1418,7 @@ impl BackupEngine for PostgresEngine {
         })
     }
 
-    fn delete_backup(
+    fn delete(
         &self,
         account_id: &str,
         backup_arn: &str,
@@ -1435,7 +1428,7 @@ impl BackupEngine for PostgresEngine {
         Box::pin(async move {
             // Resolves account-scoped, so a backup owned by another account is
             // reported missing here and the writes below never run.
-            let desc = self.describe_backup(&account_id, &backup_arn).await?;
+            let desc = self.describe(&account_id, &backup_arn).await?;
 
             // One transaction, so a restore reading its snapshot sees either
             // the whole backup or a DELETED one, never AVAILABLE with its rows
@@ -1455,18 +1448,10 @@ impl BackupEngine for PostgresEngine {
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
-            let restoring: Option<String> = sqlx::query_scalar(
-                "SELECT t.table_name FROM table_restores r JOIN tables t ON t.table_id = r.table_id \
-                 WHERE r.source_backup_arn = $1 AND t.table_status = 'CREATING' LIMIT 1",
-            )
-            .bind(&backup_arn)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(db_err)?;
-            if let Some(table) = restoring {
-                return Err(StorageError::BackupInUse(format!(
-                    "Backup is being used to restore table {table}: {backup_arn}"
-                )));
+            if let Some(table) =
+                crate::backup_catalog::creating_restore_target(&mut *tx, &backup_arn).await?
+            {
+                return Err(crate::backup_catalog::backup_in_use(&table, &backup_arn));
             }
             sqlx::query(
                 "DELETE FROM backup_items WHERE backup_arn = $1 AND EXISTS (\
@@ -1510,7 +1495,7 @@ impl BackupEngine for PostgresEngine {
         })
     }
 
-    fn backup_restore_source(
+    fn restore_source(
         &self,
         account_id: &str,
         backup_arn: &str,
@@ -1628,30 +1613,38 @@ impl BackupEngine for PostgresEngine {
     /// runs in a detached task.
     ///
     /// The request hands everything to a `tokio::spawn`ed task that owns its
-    /// own clones: wait for a slot of its account's
-    /// ([`RESTORE_SLOTS_PER_ACCOUNT`]) and then a slot of the server's
-    /// ([`restore_server_slot_count`]), take the restore lock, create the
-    /// target and its `table_restores` row in one catalog transaction (which
-    /// re-checks the backup is AVAILABLE and owned by the account, holding it
-    /// FOR UPDATE), report that result back through a channel, then copy.
-    /// Dropping the request future at any point therefore changes nothing:
-    /// a restore refused for want of a slot creates nothing, the
-    /// registration still commits or fails on its own, and a registered
-    /// target is still copied and flipped ACTIVE, or removed on failure.
-    fn restore_table_from_backup(
+    /// own clones: take the restore lock, create the target and its
+    /// `table_restores` row (the job record, RUNNING under the claim's
+    /// generation) in one catalog transaction (which re-checks the backup is
+    /// AVAILABLE and owned by the account, holding it FOR UPDATE), report
+    /// that result back through a channel, then copy. Dropping the request
+    /// future at any point therefore changes nothing: the registration still
+    /// commits or fails on its own, and a registered target is still copied
+    /// and flipped ACTIVE, or removed on failure.
+    fn restore(
         &self,
         account_id: &str,
         request: RestoreRequest,
+        permit: JobPermit,
     ) -> BoxFuture<'_, Result<TableDescription, StorageError>> {
         let account_id = account_id.to_string();
         Box::pin(async move {
             let (registered_tx, registered_rx) = tokio::sync::oneshot::channel();
             let engine = self.clone();
-            tokio::spawn(engine.run_restore(account_id, request, registered_tx));
+            tokio::spawn(engine.run_restore(account_id, request, permit, registered_tx));
             registered_rx.await.map_err(|_| {
                 StorageError::Internal("the restore task ended before registering".to_owned())
             })?
         })
+    }
+
+    /// The in-catalog create commits its row AVAILABLE in one transaction
+    /// with the items, so it never leaves a CREATING row.
+    fn abandoned_creating_backups(
+        &self,
+        _stale_after: Duration,
+    ) -> BoxFuture<'_, Result<Vec<AbandonedLegacyBackup>, StorageError>> {
+        Box::pin(async { Ok(Vec::new()) })
     }
 
     fn describe_continuous_backups(
@@ -1759,7 +1752,6 @@ impl BackupEngine for PostgresEngine {
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
-    use std::time::Duration;
 
     use super::*;
 
@@ -1804,10 +1796,14 @@ mod tests {
 
     #[test]
     fn only_too_many_connections_is_limit_exceeded() {
-        assert!(matches!(
-            lock_connection_error(&reply(Some("53300"))),
-            StorageError::LimitExceeded(_)
-        ));
+        match lock_connection_error(&reply(Some("53300"))) {
+            StorageError::LimitExceeded(m) => assert_eq!(
+                m,
+                limit_exceeded_message(JobBound::ServerConnections),
+                "the one job-refusal text, naming the server's connection slots"
+            ),
+            other => panic!("too_many_connections is LimitExceeded: {other:?}"),
+        }
         // invalid_password, invalid_catalog_name, cannot_connect_now,
         // insufficient_resources (53000, same class), and no SQLSTATE.
         for code in [
@@ -1892,92 +1888,5 @@ mod tests {
                 "{what} must be Internal"
             );
         }
-    }
-
-    #[test]
-    fn the_server_bound_is_half_the_pool_within_one_and_sixteen() {
-        assert_eq!(restore_server_slot_count(0), 1);
-        assert_eq!(restore_server_slot_count(1), 1);
-        assert_eq!(restore_server_slot_count(3), 1);
-        assert_eq!(restore_server_slot_count(10), 5);
-        assert_eq!(restore_server_slot_count(20), 10);
-        assert_eq!(restore_server_slot_count(32), 16);
-        assert_eq!(restore_server_slot_count(33), 16);
-        assert_eq!(restore_server_slot_count(1000), 16);
-    }
-
-    /// A full server bound refuses with LimitExceeded naming the server, a
-    /// full account with LimitExceeded naming the account; a free slot of
-    /// each is granted, and releasing a held one lets the next restore in.
-    #[tokio::test]
-    async fn restore_permits_wait_then_limit_exceeded() {
-        let wait = Duration::from_millis(50);
-        let account = Arc::new(Semaphore::new(RESTORE_SLOTS_PER_ACCOUNT));
-        let server = Arc::new(Semaphore::new(1));
-
-        let held = acquire_restore_permits(Arc::clone(&account), Arc::clone(&server), 1, wait)
-            .await
-            .expect("the first restore gets both slots");
-        let other_account = Arc::new(Semaphore::new(RESTORE_SLOTS_PER_ACCOUNT));
-        match acquire_restore_permits(Arc::clone(&other_account), Arc::clone(&server), 1, wait)
-            .await
-        {
-            Err(StorageError::LimitExceeded(m)) => {
-                assert!(m.contains("on this server (at most 1"), "{m}");
-            }
-            other => panic!("a full server bound must refuse: {:?}", other.err()),
-        }
-        // The refused restore gave its account slot back.
-        assert_eq!(other_account.available_permits(), RESTORE_SLOTS_PER_ACCOUNT);
-        drop(held);
-        acquire_restore_permits(Arc::clone(&other_account), Arc::clone(&server), 1, wait)
-            .await
-            .expect("a freed server slot is granted");
-
-        let full_account = Arc::new(Semaphore::new(0));
-        let roomy_server = Arc::new(Semaphore::new(4));
-        match acquire_restore_permits(full_account, Arc::clone(&roomy_server), 4, wait).await {
-            Err(StorageError::LimitExceeded(m)) => {
-                assert!(m.contains("for this account"), "{m}");
-            }
-            other => panic!("a full account must refuse: {:?}", other.err()),
-        }
-        assert_eq!(roomy_server.available_permits(), 4);
-    }
-
-    /// One engine's account slots are shared by its clones and by nothing
-    /// else: a second engine in the same process has its own full allowance
-    /// for the same account.
-    #[test]
-    fn account_restore_slots_belong_to_one_engine() {
-        let slots = RestoreAccountSlots::default();
-        let held = slots
-            .for_account("123456789012")
-            .try_acquire_owned()
-            .expect("a free slot");
-        assert_eq!(
-            slots
-                .clone()
-                .for_account("123456789012")
-                .available_permits(),
-            RESTORE_SLOTS_PER_ACCOUNT - 1,
-            "a clone sees the same account map"
-        );
-        assert_eq!(
-            RestoreAccountSlots::default()
-                .for_account("123456789012")
-                .available_permits(),
-            RESTORE_SLOTS_PER_ACCOUNT,
-            "another engine has its own"
-        );
-        drop(held);
-        // Nothing in flight for the account: its entry is pruned on the next
-        // lookup of any account, and a fresh one has the full allowance.
-        slots.for_account("other");
-        assert_eq!(slots.0.lock().unwrap().len(), 1);
-        assert_eq!(
-            slots.for_account("123456789012").available_permits(),
-            RESTORE_SLOTS_PER_ACCOUNT
-        );
     }
 }

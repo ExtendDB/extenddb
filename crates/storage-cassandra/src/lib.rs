@@ -7,7 +7,7 @@
 //! as the underlying database. It provides a DynamoDB-compatible API backed
 //! by Cassandra's distributed architecture.
 
-pub const CATALOG_VERSION: &str = "0.0.4";
+pub const CATALOG_VERSION: &str = "0.0.5";
 
 /// Default control-plane delay (seconds) when the `control_plane_delay_seconds`
 /// setting is absent or unparseable: CreateTable, the control-plane worker
@@ -16,6 +16,7 @@ pub(crate) const DEFAULT_CONTROL_PLANE_DELAY_SECONDS: f64 = 0.25;
 
 mod admin_store;
 mod authorization_store;
+mod backup_catalog;
 mod backup_engine;
 pub mod bootstrapper;
 pub mod cassandra_util;
@@ -37,12 +38,14 @@ mod stream_engine;
 pub mod stream_util;
 pub mod table_engine;
 mod table_helpers;
+#[doc(hidden)]
+pub mod test_hooks;
 pub mod ttl_worker;
 mod update_table;
 mod worker_store;
 pub mod workers;
 
-pub use backup_engine::poll_abandoned_restores;
+pub use backup_catalog::heartbeat_backup_row;
 pub use bootstrapper::CassandraBootstrapper;
 pub use catalog_store::CassandraCatalogStore;
 pub use config::CassandraStorageConfig;
@@ -162,16 +165,6 @@ impl ServerRuntimeHooks for CassandraRuntimeHooks {
                 .await
         });
 
-        // Removes restore targets whose copy stopped heartbeating (the
-        // process running it died): once now, then periodically until
-        // shutdown.
-        let restore_sweep_engine = self.engine.clone();
-        let restore_sweep_shutdown = ctx.shutdown.clone();
-        let restore_sweep = tokio::spawn(async move {
-            backup_engine::poll_abandoned_restores(restore_sweep_engine, restore_sweep_shutdown)
-                .await;
-        });
-
         vec![
             control_plane,
             transaction_recovery,
@@ -180,7 +173,6 @@ impl ServerRuntimeHooks for CassandraRuntimeHooks {
             ttl_cleanup,
             ttl_repair,
             ttl_audit,
-            restore_sweep,
         ]
     }
 
@@ -329,6 +321,13 @@ fn server_components_factory(
                 backend: "cassandra".to_string(),
                 details: e.to_string(),
             })?;
+
+        // The catalog's version is this binary's, or `serve` does not start:
+        // the refusal names `extenddb migrate --yes`, as on the ledger backends.
+        engine
+            .require_served_catalog()
+            .await
+            .map_err(BackendError::Catalog)?;
 
         let control_plane_notify = engine.control_plane_notify.clone();
         let engine = Arc::new(engine);

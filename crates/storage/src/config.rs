@@ -88,38 +88,39 @@ impl Clone for Box<dyn StorageConfig> {
 }
 
 /// The warning for a `server.region` outside `[a-z0-9-]`, or `None` when the
-/// region is in that class.
+/// region is in that class (the `BackupArn` parser's predicate,
+/// [`extenddb_core::backup_format::is_region`], so the warning and the parser
+/// cannot disagree).
 ///
 /// The region is baked into every backup ARN the server issues
 /// (`arn:aws:dynamodb:<region>:<account>:table/<name>/backup/<id>`), and the
 /// `BackupArn` parser accepts a region in `[a-z0-9-]` only, as the service
-/// does. A deployment configured outside that class therefore issues ARNs
-/// it refuses on `DescribeBackup`, `DeleteBackup`, and
-/// `RestoreTableFromBackup` with `ValidationException` "Invalid Request:
-/// BackupArn is not valid". The server starts anyway (the setting is
-/// pre-existing and the data plane does not depend on it); the operator is
-/// told at startup.
+/// does. The engine checks the region before forming a backup ARN, so on a
+/// deployment configured outside that class `CreateBackup` is refused with a
+/// `ValidationException` naming `server.region`; backups taken before the
+/// upgrade under such a region keep their stored ARN, which `DescribeBackup`,
+/// `DeleteBackup` and `RestoreTableFromBackup` refuse as "Invalid Request:
+/// BackupArn is not valid" as before. The server starts anyway (the setting
+/// is pre-existing and the data plane does not depend on it); the operator
+/// is told at startup.
 #[must_use]
 pub fn server_region_warning(region: &str) -> Option<StartupWarning> {
-    let well_formed = !region.is_empty()
-        && region
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-    if well_formed {
+    if extenddb_core::backup_format::is_region(region) {
         return None;
     }
     Some(StartupWarning {
         title: format!(
-            "server.region {region:?} is outside [a-z0-9-]; the backup ARNs this server \
-             issues will not resolve."
+            "server.region {region:?} is outside [a-z0-9-]; CreateBackup is refused on this \
+             server."
         ),
         details: vec![
             "Every backup ARN carries the configured region, and BackupArn is accepted \
-             only with a region in [a-z0-9-], so DescribeBackup, DeleteBackup, and \
-             RestoreTableFromBackup answer ValidationException \"Invalid Request: \
-             BackupArn is not valid\" for every backup this server creates, and \
-             ListBackups refuses the cursor it hands out, so a listing stops at its \
-             first page."
+             only with a region in [a-z0-9-], so CreateBackup answers ValidationException \
+             naming server.region (no backup ARN can be formed), and the backups created \
+             under this region before the upgrade keep an ARN that DescribeBackup, \
+             DeleteBackup, and RestoreTableFromBackup refuse with ValidationException \
+             \"Invalid Request: BackupArn is not valid\"; ListBackups refuses a cursor that is \
+             such an ARN (a listing of backups created under a valid region pages)."
                 .to_owned(),
             "Set server.region to a value in [a-z0-9-] (for example us-east-1). Backups \
              already created keep the old region in their stored ARN; see the upgrade \
@@ -160,6 +161,15 @@ mod tests {
                 "{region:?}: {text}"
             );
             assert!(text.contains("DescribeBackup"), "{region:?}: {text}");
+            assert!(
+                text.contains("ListBackups refuses a cursor that is such an ARN"),
+                "{region:?}: {text}"
+            );
+            assert!(!text.contains("first page"), "{region:?}: {text}");
+            assert!(
+                text.contains("CreateBackup answers ValidationException naming server.region"),
+                "{region:?}: {text}"
+            );
             // The warning agrees with the parser it speaks for.
             let arn =
                 crate::util::backup_arn(region, "123456789012", "Music", "01489602797149-73d8d5bc");

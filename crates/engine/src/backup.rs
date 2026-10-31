@@ -16,6 +16,7 @@
 
 use std::sync::Arc;
 
+use extenddb_core::backup_format::{BackupArn, check_store_prefix_table_name, is_region};
 use extenddb_core::error::{DynamoDbError, ErrorMessageKey, error_message};
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{
@@ -23,10 +24,18 @@ use extenddb_core::types::{
     LocalSecondaryIndexInfo, ProvisionedThroughput, RestoreSummary, SourceTableFeatureDetails,
     SseDescription, TableDescription, TableStatus,
 };
-use extenddb_storage::BackupEngine;
+use extenddb_storage::backup_catalog::{
+    BackupKey, BackupRow, BackupStatus, DeleteStart, TimeBounds, is_backup_not_found,
+};
 use extenddb_storage::error::StorageError;
-use extenddb_storage::{BackupRestoreSource, RestoreRequest, RestoreTableOverrides};
+use extenddb_storage::{
+    BackupCatalog, BackupRestoreSource, LegacyBackupReader, RestoreRequest, RestoreTableOverrides,
+    TableEngine,
+};
+use futures::TryStreamExt;
 use serde_json::{Value, json};
+
+pub use runtime::BackupRuntime;
 
 use crate::{OperationContext, serialize_output};
 
@@ -84,20 +93,37 @@ fn backup_arn_field(
 /// The spellings of one `BackupArn` the engine looks a backup up under:
 /// the ARN this deployment issues for the backup the caller named
 /// ([`canonical_backup_arn`]) and, when it differs, the ARN as the caller
-/// wrote it, trimmed.
+/// wrote it, trimmed. The strings are what the legacy reader is addressed
+/// by, built as main built them; each is also parsed once, here, into the
+/// [`BackupArn`] the catalog index is addressed by. `BackupArn` applies two
+/// store-prefix rules `check_backup_arn` does not (a table name over 255
+/// bytes, or made only of dots), which a legacy backup can break: main's
+/// CreateTable and CreateBackup accept `...`, and an operator can raise
+/// `limits.max_table_name_length`. A spelling that fails them (or one built
+/// under a `server.region` outside the ARN alphabet, which the legacy path
+/// never checked) has no parsed form and no catalog-index read (no index row
+/// can carry such an ARN, since `check_backup_arn_fits` refuses the name at
+/// CreateBackup), and the legacy reader is tried under its string as on
+/// main.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BackupArnSpellings {
     canonical: String,
     as_written: Option<String>,
+    canonical_arn: Option<BackupArn>,
+    as_written_arn: Option<BackupArn>,
 }
 
 impl BackupArnSpellings {
     fn new(parts: &extenddb_storage::util::BackupArnParts<'_>, region: &str) -> Self {
         let canonical = canonical_backup_arn(parts, region);
         let as_written = (parts.arn != canonical).then(|| parts.arn.to_owned());
+        let canonical_arn = BackupArn::parse(&canonical).ok();
+        let as_written_arn = as_written.as_deref().and_then(|a| BackupArn::parse(a).ok());
         Self {
             canonical,
             as_written,
+            canonical_arn,
+            as_written_arn,
         }
     }
 
@@ -105,11 +131,57 @@ impl BackupArnSpellings {
     fn canonical(&self) -> &str {
         &self.canonical
     }
+
+    /// The parsed spellings in lookup order: canonical, then as written;
+    /// none for a name the store-prefix rules refuse.
+    fn arns(&self) -> impl Iterator<Item = &BackupArn> {
+        self.canonical_arn
+            .iter()
+            .chain(self.as_written_arn.as_ref())
+    }
 }
 
-/// Whether a backend error says the backup is not there.
-fn is_backup_not_found(e: &StorageError) -> bool {
-    matches!(e, StorageError::Validation(m) if m.contains("Backup not found"))
+/// The catalog row one of `arn`'s spellings names, read in [`resolve_backup`]'s
+/// order, with the spelling that resolved. A row read by account and backup
+/// id is returned by the backend only when its account, table and ARN equal
+/// the spelling's, so an ARN of account B carrying the id of account A's
+/// backup finds nothing (and never A's row). `None` when neither spelling
+/// has a row: the caller falls back to the legacy reader.
+async fn read_catalog_row<S: BackupCatalog + ?Sized>(
+    storage: &S,
+    arn: &BackupArnSpellings,
+) -> Result<Option<(BackupArn, BackupRow)>, StorageError> {
+    for spelling in arn.arns() {
+        if let Some(row) = storage.read_backup_row(spelling).await? {
+            return Ok(Some((spelling.clone(), row)));
+        }
+    }
+    Ok(None)
+}
+
+/// The error for a backup the catalog index has no describable row for.
+fn backup_not_found(arn: &str) -> DynamoDbError {
+    DynamoDbError::BackupNotFoundException(format!(
+        "{}: {arn}",
+        extenddb_storage::backup_catalog::BACKUP_NOT_FOUND
+    ))
+}
+
+/// The error for a CREATING row, or one whose backup a CREATING restore
+/// target still reads: `BackupInUseException`, as the service answers.
+fn backup_in_use(arn: &str, restoring_into: Option<&str>) -> DynamoDbError {
+    DynamoDbError::BackupInUseException(match restoring_into {
+        Some(table) => extenddb_storage::backup_catalog::backup_in_use_message(table, arn),
+        None => format!("Backup is being created: {arn}"),
+    })
+}
+
+/// The error for a row of a store other than the configured one. Names no
+/// root: an API error never does.
+fn backup_in_another_store(arn: &str) -> DynamoDbError {
+    DynamoDbError::ValidationException(format!(
+        "Backup {arn} is in a backup store other than the one this server is configured with"
+    ))
 }
 
 /// Look a backup up by `lookup`, first under the canonical ARN, then, if that
@@ -136,8 +208,8 @@ where
     }
 }
 
-/// [`resolve_backup`]'s lookup for one `BackupEngine` method taking the ARN:
-/// `by!(storage, account_id, method)`.
+/// [`resolve_backup`]'s lookup for one [`LegacyBackupReader`] method taking
+/// the ARN: `by!(storage, account_id, method)`.
 macro_rules! by {
     ($storage:expr, $account_id:expr, $method:ident) => {{
         let storage = $storage;
@@ -255,8 +327,8 @@ fn table_name_bounds(limits: &LimitsConfig) -> (usize, usize) {
     (limits.min_table_name_length, limits.max_table_name_length)
 }
 
-/// The `TableName` of `CreateBackup`, which the service accepts as the
-/// table's name or its ARN (measured on DynamoDB; the model
+/// The `TableName` of `CreateBackup` and `ListBackups`, which the service
+/// accepts as the table's name or its ARN (measured on DynamoDB; the model
 /// gives the member the `TableName` shape, max 255, so an SDK built from it
 /// refuses the ARN form client-side and only a hand-built request sends it).
 /// An ARN is `arn:aws:dynamodb:<region>:<account>:table/<name>`: another
@@ -313,13 +385,7 @@ pub(crate) async fn handle_create_backup(
     let table_name = create_backup_table_name(&body, &ctx.account_id, &ctx.limits)?;
     let backup_name = required_str(&body, "BackupName", "backupName")?;
     validate_name_member(backup_name, "backupName", BACKUP_NAME_BOUNDS)?;
-
-    // A backup of a table with vector indexes could never be restored (the
-    // restore refuses it), so refuse it here with the restore's own reason
-    // rather than hand back an AVAILABLE backup the customer finds out about
-    // at restore time. A lookup failure is left to create_backup, which
-    // reports a missing table in its own terms.
-    if let Ok(desc) = ctx
+    let probe = ctx
         .storage
         .describe_table(
             &ctx.account_id,
@@ -327,18 +393,108 @@ pub(crate) async fn handle_create_backup(
                 table_name: table_name.to_owned(),
             },
         )
-        .await
-    {
-        refuse_backup_of_vector_table(&desc)?;
-    }
-
-    let details = ctx
-        .storage
-        .create_backup(&ctx.account_id, table_name, backup_name)
-        .await
-        .map_err(|e| create_backup_storage_err_to_dynamo(e, table_name))?;
-
+        .await;
+    let details = create_backup(
+        &*ctx.storage,
+        &ctx.backup,
+        &ctx.account_id,
+        &ctx.region,
+        table_name,
+        backup_name,
+        probe,
+    )
+    .await?;
     serialize_output(&json!({ "BackupDetails": details }))
+}
+
+/// One CreateBackup after its members are checked, in the service's order,
+/// every check before the permit: the table exists and is ACTIVE for the
+/// account (`TableNotFoundException`, "Table not found: <name>", otherwise,
+/// whether or not a permit is free); the server's region and the table name
+/// fit a backup ARN and its store prefix (`check_backup_arn_fits`: a
+/// `server.region` outside `[a-z0-9-]` is a `ValidationException` naming the
+/// setting, a name over 255 bytes or made only of dots one naming the rule);
+/// the table has no vector index
+/// (the in-catalog format cannot restore one); then the job permit
+/// (`LimitExceededException` when none is free). `probe` is the
+/// `DescribeTable` of the table, which the handler ran.
+///
+/// This is the in-catalog create, the path while no `[backup.store]` is
+/// configured; each call logs that the format is deprecated.
+async fn create_backup<S: LegacyBackupReader + ?Sized>(
+    storage: &S,
+    runtime: &BackupRuntime,
+    account_id: &str,
+    region: &str,
+    table_name: &str,
+    backup_name: &str,
+    probe: Result<TableDescription, StorageError>,
+) -> Result<extenddb_core::types::BackupDetails, DynamoDbError> {
+    let desc = match probe {
+        Ok(desc) if desc.table_status == TableStatus::Active => desc,
+        Ok(_) => {
+            return Err(create_backup_storage_err_to_dynamo(
+                StorageError::TableNotActive(table_name.to_owned()),
+                table_name,
+            ));
+        }
+        Err(e) => return Err(create_backup_storage_err_to_dynamo(e, table_name)),
+    };
+    check_backup_arn_fits(region, account_id, table_name)?;
+    refuse_backup_of_vector_table(&desc)?;
+    let permit = runtime.take_permit()?;
+    tracing::warn!(
+        "CreateBackup of {table_name} (account {account_id}) is writing the in-catalog backup \
+         format, which a later release stops creating; configure [backup.store] to write \
+         backups to a backup store"
+    );
+    storage
+        .create(account_id, table_name, backup_name, permit)
+        .await
+        .map_err(|e| create_backup_storage_err_to_dynamo(e, table_name))
+}
+
+/// The backup ARN rules a table name has to fit before a backup of it can be
+/// created, each refusal naming its cause: first the server's own region
+/// (`server.region` outside `[a-z0-9-]` forms no backup ARN whatever the
+/// name, so the message names the setting, not the table), then the two
+/// store-prefix rules on the name (over 255 bytes, or made only of dots;
+/// [`check_store_prefix_table_name`] names the limit whatever the name's
+/// length, where forming the ARN first would answer "not a backup ARN" for a
+/// name that takes the ARN over 1024 bytes), then the ARN itself. The id is
+/// a placeholder of the right shape; only the region and the name are being
+/// checked.
+fn check_backup_arn_fits(
+    region: &str,
+    account_id: &str,
+    table_name: &str,
+) -> Result<(), DynamoDbError> {
+    if !is_region(region) {
+        return Err(DynamoDbError::ValidationException(format!(
+            "CreateBackup is refused on this server: server.region {region:?} is outside \
+             [a-z0-9-], so no backup ARN can be formed; set server.region to a value in \
+             that class"
+        )));
+    }
+    check_store_prefix_table_name(table_name).map_err(|e| {
+        DynamoDbError::ValidationException(format!(
+            "TableName cannot be backed up: a backup ARN cannot be formed for it: {e}"
+        ))
+    })?;
+    let placeholder = extenddb_core::backup_format::format_backup_id(0, 0);
+    BackupArn::new(
+        extenddb_storage::util::ARN_PARTITION,
+        region,
+        account_id,
+        table_name,
+        &placeholder,
+    )
+    .map(drop)
+    .map_err(|e| {
+        DynamoDbError::ValidationException(format!(
+            "TableName cannot be backed up: a backup ARN cannot be formed for it: {e}"
+        ))
+    })
 }
 
 /// [`storage_err_to_dynamo`] for CreateBackup, where a table that does not
@@ -379,21 +535,33 @@ pub(crate) async fn handle_describe_backup(
     serialize_output(&json!({ "BackupDescription": desc }))
 }
 
-/// The DescribeBackup body: the backend's description, with
+/// The DescribeBackup body. The catalog index is consulted first: a row of
+/// one of the ARN's spellings answers on its own, derived from its recorded
+/// source table ([`BackupRow::description`]), with DELETING reported as
+/// DELETED and a DELETED or FAILED row `BackupNotFoundException`. With no
+/// row, the legacy reader's description, with
 /// `SourceTableDetails.ProvisionedThroughput` and `SourceTableFeatureDetails`
 /// filled from the backup's recorded source when the backup is AVAILABLE.
 /// The backup is looked up under the ARN's spellings in [`resolve_backup`]'s
 /// order; the source is then read under the spelling that resolved.
-async fn describe_backup<S: BackupEngine + ?Sized>(
+async fn describe_backup<S: BackupCatalog + LegacyBackupReader + ?Sized>(
     storage: &S,
     account_id: &str,
     region: &str,
     backup_arn: &BackupArnSpellings,
 ) -> Result<BackupDescription, DynamoDbError> {
-    let (backup_arn, mut desc) =
-        resolve_backup(backup_arn, by!(storage, account_id, describe_backup))
-            .await
-            .map_err(storage_err_to_dynamo)?;
+    if let Some((arn, row)) = read_catalog_row(storage, backup_arn)
+        .await
+        .map_err(storage_err_to_dynamo)?
+    {
+        if !row.status.is_described() {
+            return Err(backup_not_found(&arn.to_arn_string()));
+        }
+        return row.description().map_err(storage_err_to_dynamo);
+    }
+    let (backup_arn, mut desc) = resolve_backup(backup_arn, by!(storage, account_id, describe))
+        .await
+        .map_err(storage_err_to_dynamo)?;
     let backup_arn = backup_arn.as_str();
 
     // A CREATING or DELETED backup has no restore source to read; it is
@@ -408,9 +576,9 @@ async fn describe_backup<S: BackupEngine + ?Sized>(
     // answer for a database failure, while RestoreTableFromBackup on the same
     // read is a 500.
     let source = if desc.backup_details.backup_status == "AVAILABLE" {
-        match storage.backup_restore_source(account_id, backup_arn).await {
+        match storage.restore_source(account_id, backup_arn).await {
             Ok(source) => Some(source),
-            Err(StorageError::Validation(m)) if m.contains("Backup not found") => None,
+            Err(e) if is_backup_not_found(&e) => None,
             Err(StorageError::Unsupported(m)) => {
                 tracing::warn!("DescribeBackup {backup_arn}: definition not described: {m}");
                 None
@@ -524,10 +692,14 @@ pub(crate) async fn handle_list_backups(
     serialize_output(&page)
 }
 
-/// `TableName` here is a table name only: unlike `CreateBackup`, the ARN form
-/// is refused with the pattern clause (the service's behaviour for
-/// `ListBackups` with an ARN was not measured).
-async fn list_backups<S: BackupEngine + ?Sized>(
+/// `TableName` is a table name or a table ARN, as `CreateBackup` accepts it
+/// (the service accepts both, measured on DynamoDB). The listing merges the
+/// catalog index's rows (CREATING and AVAILABLE ones, summarized from their
+/// recorded source table) with the legacy reader's summaries into one list,
+/// which is then filtered and paged in (`BackupCreationDateTime`, ARN) order:
+/// `created_at` is the id's instant on both sides, so a cursor places itself
+/// in the merged order the same way whichever side issued it.
+async fn list_backups<S: BackupCatalog + LegacyBackupReader + ?Sized>(
     storage: &S,
     account_id: &str,
     region: &str,
@@ -560,10 +732,7 @@ async fn list_backups<S: BackupEngine + ?Sized>(
     };
     let table_name = match body.get("TableName") {
         None | Some(Value::Null) => None,
-        Some(Value::String(name)) => {
-            validate_name_member(name, "tableName", table_name_bounds(limits))?;
-            Some(name.as_str())
-        }
+        Some(Value::String(_)) => Some(create_backup_table_name(body, account_id, limits)?),
         Some(_) => {
             return Err(DynamoDbError::SerializationException(
                 "Start of structure or map found where not expected: TableName".to_owned(),
@@ -584,10 +753,41 @@ async fn list_backups<S: BackupEngine + ?Sized>(
     };
     let filter = ListBackupsFilter::parse(body)?;
 
-    let summaries = storage
-        .list_backups(account_id, table_name)
+    let bounds = TimeBounds {
+        lower: filter.lower,
+        upper: filter.upper,
+    };
+    // A row whose summary does not derive (a `source_table_details_json`
+    // this build cannot read) is logged and left out, so one such row does
+    // not turn every ListBackups of the account into an internal error; a
+    // failure to read the rows propagates.
+    let mut summaries: Vec<BackupSummary> = storage
+        .list_account_backup_rows(account_id, table_name, &bounds)
+        .try_filter_map(|row| async move {
+            if !row.status.is_listed() {
+                return Ok(None);
+            }
+            match row.summary() {
+                Ok(summary) => Ok(Some(summary)),
+                Err(e) => {
+                    tracing::warn!(
+                        "ListBackups (account {account_id}): backup {} left out of the \
+                         listing: {e}",
+                        row.backup_arn
+                    );
+                    Ok(None)
+                }
+            }
+        })
+        .try_collect()
         .await
         .map_err(storage_err_to_dynamo)?;
+    summaries.extend(
+        storage
+            .list(account_id, table_name)
+            .await
+            .map_err(storage_err_to_dynamo)?,
+    );
     let start = start.map(|cursor| cursor.resolve(&summaries)).transpose()?;
     let summaries = summaries.into_iter().filter(|s| filter.keeps(s)).collect();
     let (page, last) = page_backups(
@@ -812,13 +1012,23 @@ pub(crate) async fn handle_delete_backup(
     ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
     let backup_arn = backup_arn_field(&body, &ctx.account_id, &ctx.region)?;
-    let desc = delete_backup(&*ctx.storage, &ctx.account_id, &ctx.region, &backup_arn).await?;
+    let desc = delete_backup(
+        &*ctx.storage,
+        &ctx.backup,
+        &ctx.account_id,
+        &ctx.region,
+        &backup_arn,
+    )
+    .await?;
     serialize_output(&json!({ "BackupDescription": desc }))
 }
 
 /// The DeleteBackup body: the full DescribeBackup description of the backup
 /// as it was, with `BackupStatus` `DELETED` (measured on DynamoDB). `SourceTableDetails.ProvisionedThroughput` is a required member
 /// of the shape and a typed SDK can fail to unmarshal a response without it.
+///
+/// The catalog index is consulted first ([`delete_catalog_backup`]); with no
+/// row of either spelling, the legacy reader's delete.
 ///
 /// The restore source is read before the delete, since it is gone after,
 /// under the ARN spelling that resolves ([`resolve_backup`]); the delete then
@@ -832,14 +1042,21 @@ pub(crate) async fn handle_delete_backup(
 /// means a damaged `PROVISIONED` backup is described with on-demand `{0, 0}`
 /// (ExtendDB's choice: deletability over the throughput member); a failure to
 /// reach the database propagates, as the delete itself would fail on it.
-async fn delete_backup<S: BackupEngine + ?Sized>(
+async fn delete_backup<S: BackupCatalog + LegacyBackupReader + ?Sized>(
     storage: &S,
+    runtime: &BackupRuntime,
     account_id: &str,
     region: &str,
     backup_arn: &BackupArnSpellings,
 ) -> Result<BackupDescription, DynamoDbError> {
+    if let Some((arn, row)) = read_catalog_row(storage, backup_arn)
+        .await
+        .map_err(storage_err_to_dynamo)?
+    {
+        return delete_catalog_backup(storage, runtime, &arn, &row).await;
+    }
     let (resolved, source) =
-        match resolve_backup(backup_arn, by!(storage, account_id, backup_restore_source)).await {
+        match resolve_backup(backup_arn, by!(storage, account_id, restore_source)).await {
             Ok((resolved, source)) => (Some(resolved), Some(source)),
             Err(e) if is_backup_not_found(&e) => (None, None),
             Err(StorageError::Unsupported(m) | StorageError::Internal(m)) => {
@@ -852,14 +1069,86 @@ async fn delete_backup<S: BackupEngine + ?Sized>(
             Err(e) => return Err(storage_err_to_dynamo(e)),
         };
     let mut desc = match resolved {
-        Some(resolved) => storage.delete_backup(account_id, &resolved).await,
-        None => resolve_backup(backup_arn, by!(storage, account_id, delete_backup))
+        Some(resolved) => storage.delete(account_id, &resolved).await,
+        None => resolve_backup(backup_arn, by!(storage, account_id, delete))
             .await
             .map(|(_, desc)| desc),
     }
     .map_err(storage_err_to_dynamo)?;
     desc.backup_details.backup_status = "DELETED".to_owned();
     apply_source_to_description(&mut desc, source.as_ref(), region, account_id);
+    Ok(desc)
+}
+
+/// DeleteBackup of a backup the catalog index has a row for. In the order
+/// the request's checks run, the same order as a restore's
+/// ([`check_catalog_row_for_restore`]): a DELETED or FAILED row is
+/// `BackupNotFoundException`; a CREATING row is `BackupInUseException`; a
+/// backup a CREATING restore target still reads is `BackupInUseException`
+/// naming that table ([`BackupCatalog::backup_in_use`]); a row of a store
+/// other than the configured one is a `ValidationException` naming no root;
+/// then the in-use check runs again with the AVAILABLE-to-DELETING write in
+/// one transaction under the row's lock
+/// ([`BackupCatalog::start_backup_delete`]), so a restore's registration and
+/// this order wholly one before the other: a registration that won leaves
+/// this `BackupInUseException` naming its target. A DELETING row (a retried
+/// DeleteBackup) resumes the deletion. The request returns the description
+/// with `BackupStatus` DELETED; the store's objects are deleted by the
+/// duty a configured store brings, and the row stays DELETING until a
+/// listing of its prefix returns nothing.
+///
+/// The description is built before the DELETING write: a row whose
+/// `source_table_details_json` this build cannot read is answered as an
+/// internal error with the row still AVAILABLE, rather than moved to DELETING
+/// and then refused on every retry.
+async fn delete_catalog_backup<S: BackupCatalog + ?Sized>(
+    storage: &S,
+    runtime: &BackupRuntime,
+    arn: &BackupArn,
+    row: &BackupRow,
+) -> Result<BackupDescription, DynamoDbError> {
+    let arn_text = arn.to_arn_string();
+    match row.status {
+        BackupStatus::Deleted | BackupStatus::Failed => return Err(backup_not_found(&arn_text)),
+        BackupStatus::Creating => return Err(backup_in_use(&arn_text, None)),
+        BackupStatus::Available | BackupStatus::Deleting => {}
+    }
+    let key = BackupKey::from_arn(arn);
+    if let Some(table) = storage
+        .backup_in_use(&key)
+        .await
+        .map_err(storage_err_to_dynamo)?
+    {
+        return Err(backup_in_use(&arn_text, Some(&table)));
+    }
+    if !runtime.is_configured_store(&row.store) {
+        return Err(backup_in_another_store(&arn_text));
+    }
+    let mut desc = row.description().map_err(storage_err_to_dynamo)?;
+    match storage
+        .start_backup_delete(&key)
+        .await
+        .map_err(storage_err_to_dynamo)?
+    {
+        DeleteStart::Deleting | DeleteStart::Status(BackupStatus::Deleting) => {}
+        DeleteStart::InUse(table) => return Err(backup_in_use(&arn_text, Some(&table))),
+        DeleteStart::Status(BackupStatus::Creating) => {
+            return Err(backup_in_use(&arn_text, None));
+        }
+        DeleteStart::Status(BackupStatus::Deleted | BackupStatus::Failed) => {
+            return Err(backup_not_found(&arn_text));
+        }
+        // The contract says an AVAILABLE row becomes `Deleting`; a backend
+        // that answers its status instead has broken it, which is reported
+        // as the fault it is rather than as an absent backup.
+        DeleteStart::Status(BackupStatus::Available) => {
+            return Err(storage_err_to_dynamo(StorageError::Internal(format!(
+                "start_backup_delete of {arn_text} answered Status(AVAILABLE), which the \
+                 contract excludes"
+            ))));
+        }
+    }
+    desc.backup_details.backup_status = BackupStatus::Deleted.as_str().to_owned();
     Ok(desc)
 }
 
@@ -969,6 +1258,7 @@ pub(crate) async fn handle_restore_table_from_backup(
     let auth_cache = ctx.auth_cache.clone();
     restore_table_from_backup_detached(
         Arc::clone(&ctx.storage),
+        Arc::clone(&ctx.backup),
         Arc::clone(&ctx.account_id),
         Arc::clone(&ctx.region),
         Arc::clone(&ctx.limits),
@@ -1001,6 +1291,7 @@ pub(crate) async fn handle_restore_table_from_backup(
 /// the request before the backend registered the restore, and no restore ran.
 async fn restore_table_from_backup_detached<S, F, Fut>(
     storage: Arc<S>,
+    runtime: Arc<BackupRuntime>,
     account_id: Arc<str>,
     region: Arc<str>,
     limits: Arc<LimitsConfig>,
@@ -1008,13 +1299,14 @@ async fn restore_table_from_backup_detached<S, F, Fut>(
     after: F,
 ) -> Result<Value, DynamoDbError>
 where
-    S: BackupEngine + ?Sized + Send + Sync + 'static,
+    S: BackupCatalog + LegacyBackupReader + TableEngine + ?Sized + Send + Sync + 'static,
     F: FnOnce(Arc<str>, String) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send,
 {
     tokio::spawn(async move {
         let (target_table_name, response) =
-            restore_table_from_backup(&*storage, &account_id, &region, &limits, &body).await?;
+            restore_table_from_backup(&*storage, &runtime, &account_id, &region, &limits, &body)
+                .await?;
         after(account_id, target_table_name).await;
         Ok(response)
     })
@@ -1029,17 +1321,30 @@ where
 /// order: (1) parse the overrides and check their shape, with no storage
 /// read; (2) check `BackupArn`: missing or malformed is a
 /// `ValidationException`, another account's is an `AccessDeniedException`;
-/// (3) check `TargetTableName`; (4) read the backup's restore source;
+/// (3) check `TargetTableName`: its syntax, then the name under the account
+/// through `describe_table` ([`check_restore_target_name`]: a table of that
+/// name is `TableAlreadyExistsException`, a CREATING restore target
+/// `TableInUseException` naming its source backup), so a client retrying its
+/// own restore is answered at once whatever the backup's state and whether
+/// or not a permit is free; (4) read the backup: the catalog index's row
+/// first ([`check_catalog_row_for_restore`]: a CREATING row or one in use is
+/// `BackupInUseException`, a DELETING, DELETED or FAILED row
+/// `BackupNotFoundException`, a row of another store a
+/// `ValidationException`), else the legacy reader's restore source;
 /// (5) refuse what no backend restores faithfully (multi-part key, vector
 /// indexes); (6) check the throughput override against the backup's billing
 /// mode, build the target's `CreateTableInput`, and apply the index and
 /// on-demand throughput overrides to it, refusing what the service refuses
-/// ([`overrides`]); (7) validate that input as CreateTable does; (8) ask the
-/// backend to create and register the target; (9) map its errors, a taken
-/// name being `TableAlreadyExistsException`, a name being restored into
-/// `TableInUseException`, a backup being restored from `BackupInUseException`.
-async fn restore_table_from_backup<S: BackupEngine + ?Sized>(
+/// ([`overrides`]); (7) validate that input as CreateTable does; (8) take the
+/// job permit, last among the checks (`LimitExceededException` when none is
+/// free), and ask the backend to create and register the target; (9) map
+/// its errors, a taken name being `TableAlreadyExistsException`, a name
+/// being restored into `TableInUseException` (the backend checks the name
+/// again, fenced, under the registration), a backup being restored from
+/// `BackupInUseException`.
+async fn restore_table_from_backup<S: BackupCatalog + LegacyBackupReader + TableEngine + ?Sized>(
     storage: &S,
+    runtime: &BackupRuntime,
     account_id: &str,
     region: &str,
     limits: &LimitsConfig,
@@ -1056,14 +1361,22 @@ async fn restore_table_from_backup<S: BackupEngine + ?Sized>(
     // first (measured on DynamoDB with two invalid inputs).
     let backup_arn = backup_arn_field(body, account_id, region)?;
 
-    // 3.
+    // 3. The name's syntax, then the name itself, before the backup is read.
     let target_table_name = required_str(body, "TargetTableName", "targetTableName")?;
     extenddb_core::validation::validate_table_name(target_table_name, limits)?;
+    check_restore_target_name(storage, account_id, target_table_name).await?;
 
-    // 4. Under the ARN spelling that resolves; the restore is registered
-    // against that spelling, the one the backend stored.
+    // 4. The catalog index first, then, with no row, the legacy reader under
+    // the ARN spelling that resolves; the restore is registered against that
+    // spelling, the one the backend stored.
+    if let Some((arn, row)) = read_catalog_row(storage, &backup_arn)
+        .await
+        .map_err(storage_err_to_dynamo)?
+    {
+        check_catalog_row_for_restore(storage, runtime, &arn, &row).await?;
+    }
     let (backup_arn, source) =
-        resolve_backup(&backup_arn, by!(storage, account_id, backup_restore_source))
+        resolve_backup(&backup_arn, by!(storage, account_id, restore_source))
             .await
             .map_err(storage_err_to_dynamo)?;
 
@@ -1082,21 +1395,101 @@ async fn restore_table_from_backup<S: BackupEngine + ?Sized>(
     extenddb_core::validation::validate_create_table(&input, limits)?;
     let on_demand = input.billing_mode == Some(BillingMode::PayPerRequest);
 
-    // 8.
+    // 8. The permit last: every refusal above needs no slot, and a job
+    // that waited for one would hold what it opened while it waited.
     let request = RestoreRequest {
         backup_arn: backup_arn.clone(),
         source_table_arn: source.source_table_arn.clone(),
         restore_date_time: source.backup_creation_date_time,
         input,
     };
+    let permit = runtime.take_permit()?;
     let desc = storage
-        .restore_table_from_backup(account_id, request)
+        .restore(account_id, request, permit)
         .await
         // 9.
         .map_err(restore_storage_err_to_dynamo)?;
 
     let response = restore_response(desc, &source, on_demand)?;
     Ok((target_table_name.to_owned(), response))
+}
+
+/// Step 4 of a restore for a backup the catalog index has a row for, before
+/// the permit and reading no store: a CREATING row is `BackupInUseException`;
+/// a DELETING, DELETED or FAILED row is `BackupNotFoundException`; a backup
+/// a CREATING restore target still reads is `BackupInUseException` naming
+/// that table ([`BackupCatalog::backup_in_use`]); a row of a store other
+/// than the configured one is a `ValidationException` naming no root. An
+/// AVAILABLE row of the configured store is a backup in a store, whose
+/// restore this release does not run.
+async fn check_catalog_row_for_restore<S: BackupCatalog + ?Sized>(
+    storage: &S,
+    runtime: &BackupRuntime,
+    arn: &BackupArn,
+    row: &BackupRow,
+) -> Result<(), DynamoDbError> {
+    let arn_text = arn.to_arn_string();
+    match row.status {
+        BackupStatus::Creating => return Err(backup_in_use(&arn_text, None)),
+        BackupStatus::Deleting | BackupStatus::Deleted | BackupStatus::Failed => {
+            return Err(backup_not_found(&arn_text));
+        }
+        BackupStatus::Available => {}
+    }
+    if let Some(table) = storage
+        .backup_in_use(&BackupKey::from_arn(arn))
+        .await
+        .map_err(storage_err_to_dynamo)?
+    {
+        return Err(backup_in_use(&arn_text, Some(&table)));
+    }
+    if !runtime.is_configured_store(&row.store) {
+        return Err(backup_in_another_store(&arn_text));
+    }
+    Err(DynamoDbError::ValidationException(format!(
+        "Backup {arn_text} is in a backup store; this release restores in-catalog backups only"
+    )))
+}
+
+/// Step 3 of a restore, the target name under the account, read through
+/// `describe_table` before the backup and the permit: a CREATING table with a
+/// `RestoreSummary` is a restore target, `TableInUseException` naming its
+/// source backup (the text the backend's own registration answers with,
+/// [`StorageError::TableBeingRestored`]); any other table of that name is
+/// `TableAlreadyExistsException`; no table passes. Unfenced: the backend
+/// checks the name again under its registration, so two restores into one
+/// free name still have one winner.
+async fn check_restore_target_name<S: TableEngine + ?Sized>(
+    storage: &S,
+    account_id: &str,
+    target_table_name: &str,
+) -> Result<(), DynamoDbError> {
+    let probe = storage
+        .describe_table(
+            account_id,
+            extenddb_core::types::DescribeTableInput {
+                table_name: target_table_name.to_owned(),
+            },
+        )
+        .await;
+    match probe {
+        Ok(desc) => {
+            let source = desc
+                .restore_summary
+                .as_ref()
+                .filter(|_| desc.table_status == TableStatus::Creating)
+                .and_then(|s| s.source_backup_arn.clone());
+            Err(restore_storage_err_to_dynamo(match source {
+                Some(backup_arn) => StorageError::TableBeingRestored {
+                    table_name: target_table_name.to_owned(),
+                    backup_arn,
+                },
+                None => StorageError::TableAlreadyExists(target_table_name.to_owned()),
+            }))
+        }
+        Err(StorageError::TableNotFound(_)) => Ok(()),
+        Err(e) => Err(storage_err_to_dynamo(e)),
+    }
 }
 
 /// The RestoreTableFromBackup response body for the backend's description.
@@ -1235,7 +1628,7 @@ pub(crate) async fn handle_update_continuous_backups(
 /// faked a restore by snapshotting the current table state (ignoring
 /// `RestoreDateTime`), which violates tenet 1 (fidelity over features).
 /// Until real PITR is implemented, return an error. There is no storage
-/// method behind this; it was removed from `BackupEngine` as unreachable.
+/// method behind this; it was removed from the storage trait as unreachable.
 pub(crate) async fn handle_restore_table_to_point_in_time(
     _body: Value,
     _ctx: &OperationContext,
@@ -1264,7 +1657,7 @@ fn storage_err_to_dynamo(e: StorageError) -> DynamoDbError {
             // A missing (or deleted) backup surfaces from the backend as a
             // Validation error carrying "Backup not found"; DynamoDB reports
             // this as BackupNotFoundException, not ResourceNotFoundException.
-            if msg.contains("Backup not found") {
+            if msg.contains(extenddb_storage::backup_catalog::BACKUP_NOT_FOUND) {
                 DynamoDbError::BackupNotFoundException(msg)
             } else {
                 DynamoDbError::ValidationException(msg)
@@ -1286,5 +1679,7 @@ fn storage_err_to_dynamo(e: StorageError) -> DynamoDbError {
 }
 
 mod overrides;
+pub mod reconciler;
+mod runtime;
 #[cfg(test)]
 mod tests;

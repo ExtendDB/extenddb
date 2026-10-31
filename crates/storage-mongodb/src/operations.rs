@@ -109,9 +109,7 @@ impl OperationsEngine for MongoOperationsEngine {
     }
 
     fn catalog_version(&self) -> String {
-        // Mongo catalog version — matches the constant enforced by
-        // MongoBootstrapper::expected_catalog_version.
-        "0.0.2".to_owned()
+        crate::bootstrapper::CATALOG_VERSION.to_owned()
     }
 
     fn setting_default(&self, key: &str) -> Option<String> {

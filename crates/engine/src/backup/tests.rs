@@ -1,24 +1,36 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Engine backup rules, against a `BackupEngine` double that records what the
-//! engine asked of it.
+//! Engine backup rules, against a double of the catalog index and the legacy
+//! reader that records what the engine asked of it.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::Duration;
 
+use extenddb_core::backup_format::BackupArn;
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{
     AttributeDefinition, BackupDescription, BackupDetails, BackupSummary, BillingMode,
-    BillingModeSummary, ContinuousBackupsDescription, GsiDescription, GsiInput, KeySchemaElement,
-    KeyType, LsiInput, OnDemandThroughput, Projection, ProjectionType, ProvisionedThroughput,
-    ProvisionedThroughputDescription, ScalarAttributeType, SourceTableDetails, StreamSpecification,
-    StreamViewType, TableDescription, TableStatus, TimeToLiveDescription, TimeToLiveStatus,
+    BillingModeSummary, ContinuousBackupsDescription, CreateTableInput, DeleteTableInput,
+    DescribeTableInput, GsiDescription, GsiInput, IndexInfo, KeySchemaElement, KeyType,
+    ListTablesInput, ListTablesOutput, LsiInput, OnDemandThroughput, Projection, ProjectionType,
+    ProvisionedThroughput, ProvisionedThroughputDescription, RestoreSummary, ScalarAttributeType,
+    SourceTableDetails, StreamSpecification, StreamViewType, TableDescription, TableKeyInfo,
+    TableStatus, TimeToLiveDescription, TimeToLiveStatus, UpdateTableInput,
+};
+use extenddb_storage::backup_catalog::{
+    AbandonedLegacyBackup, BackupKey, BackupRow, BackupStatus, DeleteStart, JobClaim,
+    RestoreJobRow, RestoreTargetKey, StoreIdentity, StoreKind, TimeBounds,
 };
 use extenddb_storage::backup_definition::{BACKUP_DEFINITION_VERSION, BackupTableDefinition};
 use extenddb_storage::error::StorageError;
-use extenddb_storage::{BackupEngine, BackupRestoreSource, BoxedFuture, RestoreRequest};
+use extenddb_storage::{
+    BackupCatalog, BackupRestoreSource, BoxedFuture, JobPermit, LegacyBackupReader, RestoreRequest,
+    TableEngine,
+};
+use futures::stream::BoxStream;
 use serde_json::{Value, json};
 
 use super::*;
@@ -43,13 +55,50 @@ struct Fake {
     descriptions: Mutex<HashMap<String, BackupDescription>>,
     summaries: Mutex<Vec<BackupSummary>>,
     restore_error: Mutex<Option<StorageError>>,
-    /// Returned (once) by `backup_restore_source` instead of the stored source.
+    /// Returned (once) by `restore_source` instead of the stored source.
     source_error: Mutex<Option<StorageError>>,
     restores: Mutex<Vec<RestoreRequest>>,
+    /// The permits the legacy restore and create were handed, held as the
+    /// backend would hold them for the job's life.
+    permits: Mutex<Vec<JobPermit>>,
+    creates: Mutex<Vec<(String, String)>>,
     source_reads: Mutex<usize>,
     listed_for: Mutex<Vec<Option<String>>>,
-    /// When set, `backup_restore_source` waits for a permit before answering.
+    /// When set, `restore_source` waits for a permit before answering.
     source_gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+    /// The catalog index: rows by ARN.
+    rows: Mutex<HashMap<String, BackupRow>>,
+    /// `backup_in_use` answers: the CREATING target's name, by backup ARN.
+    in_use: Mutex<HashMap<String, String>>,
+    /// What `start_backup_delete` answers after the row check, by ARN.
+    delete_starts: Mutex<HashMap<String, DeleteStart>>,
+    delete_starts_seen: Mutex<Vec<BackupKey>>,
+    row_reads: Mutex<Vec<String>>,
+    dead_jobs: Mutex<Vec<RestoreJobRow>>,
+    failed_jobs: Mutex<Vec<(RestoreTargetKey, String)>>,
+    removed_targets: Mutex<Vec<RestoreTargetKey>>,
+    /// Whether `remove_restore_target` answers `true` (the target was a
+    /// CREATING restore target with the key's id).
+    target_still_creating: Mutex<bool>,
+    /// Whether `fail_restore_job` answers `true` (the record was RUNNING);
+    /// separate from `target_still_creating` so the FAILED write matching
+    /// while the removal finds the target moved is a reachable state.
+    record_still_running: Mutex<bool>,
+    abandoned_backups: Mutex<Vec<AbandonedLegacyBackup>>,
+    deleted: Mutex<Vec<String>>,
+    maintenance_held: Mutex<bool>,
+    /// How many times `check_maintenance_claim` ran: one per reconciler
+    /// cycle, so a test can see that a cycle ran.
+    maintenance_checks: Mutex<usize>,
+    /// When set, `check_maintenance_claim` fails with it (every call).
+    maintenance_error: Mutex<Option<String>>,
+    /// The `TimeBounds` `list_account_backup_rows` received.
+    bounds_seen: Mutex<Vec<TimeBounds>>,
+    /// The account's tables, by name, as `describe_table` reports them; a
+    /// name absent is `TableNotFound`.
+    tables: Mutex<HashMap<String, TableDescription>>,
+    /// The names `describe_table` was asked for.
+    table_reads: Mutex<Vec<String>>,
 }
 
 impl Fake {
@@ -73,17 +122,299 @@ fn unused<T: Send + 'static>() -> BoxedFuture<'static, Result<T, StorageError>> 
     Box::pin(async { Err(StorageError::Internal("not used by these tests".to_owned())) })
 }
 
-impl BackupEngine for Fake {
-    fn create_backup(
-        &self,
-        _: &str,
-        _: &str,
-        _: &str,
-    ) -> BoxedFuture<'_, Result<BackupDetails, StorageError>> {
+/// The runtime the tests run with: four slots, no configured store.
+fn runtime() -> BackupRuntime {
+    BackupRuntime::new(4)
+}
+
+fn store() -> StoreIdentity {
+    StoreIdentity {
+        store_kind: StoreKind::Filesystem,
+        store_root: "/var/lib/extenddb/backups".to_owned(),
+        store_id: "store-1".to_owned(),
+    }
+}
+
+/// A catalog row for `arn`, with the manifest fixture's source table (the
+/// `Music` table of account 123456789012).
+fn row(arn: &str, status: BackupStatus) -> BackupRow {
+    let parsed = BackupArn::parse(arn).unwrap();
+    let manifest: Value = serde_json::from_str(include_str!(
+        "../../../core/testdata/extenddb-manifest/v1.json"
+    ))
+    .unwrap();
+    BackupRow {
+        backup_id: parsed.backup_id().to_owned(),
+        account_id: parsed.account_id().to_owned(),
+        table_name: parsed.table_name().to_owned(),
+        backup_arn: arn.to_owned(),
+        backup_name: "music-nightly".to_owned(),
+        status,
+        store: store(),
+        size_bytes: 61828,
+        item_count: 100_000,
+        created_at: extenddb_storage::util::backup_creation_date_time(arn).unwrap(),
+        completed_at: None,
+        failure_reason: None,
+        source_table_details_json: manifest["source_table"].clone(),
+        owner_generation: 7,
+        heartbeat_at: 1.0,
+    }
+}
+
+impl BackupCatalog for Fake {
+    fn catalog_id(&self) -> BoxedFuture<'_, Result<String, StorageError>> {
+        Box::pin(async { Ok("catalog-1".to_owned()) })
+    }
+
+    fn claim_backup<'a>(
+        &'a self,
+        _row: &'a BackupRow,
+    ) -> BoxedFuture<'a, Result<Box<dyn JobClaim>, StorageError>> {
         unused()
     }
 
-    fn describe_backup(
+    fn list_backup_rows<'a>(
+        &'a self,
+        _status: Option<BackupStatus>,
+        _store: &'a StoreIdentity,
+    ) -> BoxStream<'a, Result<BackupRow, StorageError>> {
+        Box::pin(futures::stream::empty())
+    }
+
+    fn list_account_backup_rows<'a>(
+        &'a self,
+        account_id: &'a str,
+        table_name: Option<&'a str>,
+        bounds: &'a TimeBounds,
+    ) -> BoxStream<'a, Result<BackupRow, StorageError>> {
+        self.bounds_seen.lock().unwrap().push(*bounds);
+        let rows: Vec<BackupRow> = self
+            .rows
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|r| r.account_id == account_id)
+            .filter(|r| table_name.is_none_or(|t| r.table_name == t))
+            .filter(|r| bounds.contains(r.created_at))
+            .cloned()
+            .collect();
+        Box::pin(futures::stream::iter(rows.into_iter().map(Ok)))
+    }
+
+    /// The backend's rule: the row of (account, id), and only when its
+    /// account, table and ARN equal the request's.
+    fn read_backup_row<'a>(
+        &'a self,
+        arn: &'a BackupArn,
+    ) -> BoxedFuture<'a, Result<Option<BackupRow>, StorageError>> {
+        self.row_reads.lock().unwrap().push(arn.to_arn_string());
+        let found = self
+            .rows
+            .lock()
+            .unwrap()
+            .values()
+            .find(|r| r.account_id == arn.account_id() && r.backup_id == arn.backup_id())
+            .filter(|r| r.table_name == arn.table_name() && r.backup_arn == arn.to_arn_string())
+            .cloned();
+        Box::pin(async move { Ok(found) })
+    }
+
+    fn start_backup_delete<'a>(
+        &'a self,
+        key: &'a BackupKey,
+    ) -> BoxedFuture<'a, Result<DeleteStart, StorageError>> {
+        self.delete_starts_seen.lock().unwrap().push(key.clone());
+        let answer = self
+            .delete_starts
+            .lock()
+            .unwrap()
+            .get(&key.backup_arn)
+            .cloned();
+        let status = self
+            .rows
+            .lock()
+            .unwrap()
+            .get(&key.backup_arn)
+            .map(|r| r.status);
+        Box::pin(async move {
+            match (answer, status) {
+                (Some(answer), _) => Ok(answer),
+                (None, Some(BackupStatus::Available)) => Ok(DeleteStart::Deleting),
+                (None, Some(status)) => Ok(DeleteStart::Status(status)),
+                (None, None) => Err(StorageError::Validation("Backup not found: x".to_owned())),
+            }
+        })
+    }
+
+    fn set_backup_deleted<'a>(
+        &'a self,
+        _key: &'a BackupKey,
+    ) -> BoxedFuture<'a, Result<bool, StorageError>> {
+        unused()
+    }
+
+    fn remove_backup_row<'a>(
+        &'a self,
+        _key: &'a BackupKey,
+    ) -> BoxedFuture<'a, Result<bool, StorageError>> {
+        unused()
+    }
+
+    fn backup_in_use<'a>(
+        &'a self,
+        key: &'a BackupKey,
+    ) -> BoxedFuture<'a, Result<Option<String>, StorageError>> {
+        let found = self.in_use.lock().unwrap().get(&key.backup_arn).cloned();
+        Box::pin(async move { Ok(found) })
+    }
+
+    fn remove_restore_target<'a>(
+        &'a self,
+        key: &'a RestoreTargetKey,
+    ) -> BoxedFuture<'a, Result<bool, StorageError>> {
+        self.removed_targets.lock().unwrap().push(key.clone());
+        let answer = *self.target_still_creating.lock().unwrap();
+        Box::pin(async move { Ok(answer) })
+    }
+
+    fn list_dead_restore_jobs(
+        &self,
+        _stale_after: Duration,
+    ) -> BoxedFuture<'_, Result<Vec<RestoreJobRow>, StorageError>> {
+        let jobs = self.dead_jobs.lock().unwrap().clone();
+        Box::pin(async move { Ok(jobs) })
+    }
+
+    fn fail_restore_job<'a>(
+        &'a self,
+        key: &'a RestoreTargetKey,
+        reason: &'a str,
+    ) -> BoxedFuture<'a, Result<bool, StorageError>> {
+        self.failed_jobs
+            .lock()
+            .unwrap()
+            .push((key.clone(), reason.to_owned()));
+        let answer = *self.record_still_running.lock().unwrap();
+        Box::pin(async move { Ok(answer) })
+    }
+
+    fn check_maintenance_claim(&self) -> BoxedFuture<'_, Result<bool, StorageError>> {
+        *self.maintenance_checks.lock().unwrap() += 1;
+        let held = *self.maintenance_held.lock().unwrap();
+        let error = self.maintenance_error.lock().unwrap().clone();
+        Box::pin(async move {
+            match error {
+                Some(e) => Err(StorageError::Internal(e)),
+                None => Ok(held),
+            }
+        })
+    }
+}
+
+impl TableEngine for Fake {
+    fn create_table(
+        &self,
+        _account_id: &str,
+        _input: CreateTableInput,
+    ) -> BoxedFuture<'_, Result<TableDescription, StorageError>> {
+        unused()
+    }
+
+    fn delete_table(
+        &self,
+        _account_id: &str,
+        _input: DeleteTableInput,
+    ) -> BoxedFuture<'_, Result<TableDescription, StorageError>> {
+        unused()
+    }
+
+    /// The account's table of that name, or `TableNotFound`.
+    fn describe_table(
+        &self,
+        _account_id: &str,
+        input: DescribeTableInput,
+    ) -> BoxedFuture<'_, Result<TableDescription, StorageError>> {
+        self.table_reads
+            .lock()
+            .unwrap()
+            .push(input.table_name.clone());
+        let found = self.tables.lock().unwrap().get(&input.table_name).cloned();
+        Box::pin(async move {
+            found.ok_or_else(|| {
+                StorageError::TableNotFound(format!("Table not found: {}", input.table_name))
+            })
+        })
+    }
+
+    fn list_tables(
+        &self,
+        _account_id: &str,
+        _input: ListTablesInput,
+    ) -> BoxedFuture<'_, Result<ListTablesOutput, StorageError>> {
+        unused()
+    }
+
+    fn update_table(
+        &self,
+        _account_id: &str,
+        _input: UpdateTableInput,
+    ) -> BoxedFuture<'_, Result<TableDescription, StorageError>> {
+        unused()
+    }
+
+    fn table_key_info(
+        &self,
+        _account_id: &str,
+        _table_name: &str,
+    ) -> BoxedFuture<'_, Result<TableKeyInfo, StorageError>> {
+        unused()
+    }
+
+    fn index_info(
+        &self,
+        _account_id: &str,
+        _table_name: &str,
+        _index_name: &str,
+    ) -> BoxedFuture<'_, Result<IndexInfo, StorageError>> {
+        unused()
+    }
+
+    fn index_info_by_table_id(
+        &self,
+        _table_id: &str,
+        _index_name: &str,
+    ) -> BoxedFuture<'_, Result<IndexInfo, StorageError>> {
+        unused()
+    }
+}
+
+impl LegacyBackupReader for Fake {
+    fn create(
+        &self,
+        _: &str,
+        table_name: &str,
+        backup_name: &str,
+        permit: JobPermit,
+    ) -> BoxedFuture<'_, Result<BackupDetails, StorageError>> {
+        self.creates
+            .lock()
+            .unwrap()
+            .push((table_name.to_owned(), backup_name.to_owned()));
+        self.permits.lock().unwrap().push(permit);
+        Box::pin(async {
+            Ok(BackupDetails {
+                backup_arn: arn(ACCOUNT),
+                backup_name: "nightly".to_owned(),
+                backup_status: "AVAILABLE".to_owned(),
+                backup_type: "USER".to_owned(),
+                backup_size_bytes: 0,
+                backup_creation_date_time: CREATED,
+            })
+        })
+    }
+
+    fn describe(
         &self,
         _account_id: &str,
         backup_arn: &str,
@@ -95,7 +426,7 @@ impl BackupEngine for Fake {
         })
     }
 
-    fn list_backups(
+    fn list(
         &self,
         _account_id: &str,
         table_name: Option<&str>,
@@ -111,11 +442,12 @@ impl BackupEngine for Fake {
     /// Removes the backup and answers its description as the backends do:
     /// the row's status (not yet `DELETED`), `SourceTableDetails` without
     /// `ProvisionedThroughput`, no feature details.
-    fn delete_backup(
+    fn delete(
         &self,
         _account_id: &str,
         backup_arn: &str,
     ) -> BoxedFuture<'_, Result<BackupDescription, StorageError>> {
+        self.deleted.lock().unwrap().push(backup_arn.to_owned());
         let found = self.descriptions.lock().unwrap().remove(backup_arn);
         self.sources.lock().unwrap().remove(backup_arn);
         let backup_arn = backup_arn.to_owned();
@@ -124,7 +456,7 @@ impl BackupEngine for Fake {
         })
     }
 
-    fn backup_restore_source(
+    fn restore_source(
         &self,
         _account_id: &str,
         backup_arn: &str,
@@ -145,20 +477,32 @@ impl BackupEngine for Fake {
         })
     }
 
-    fn restore_table_from_backup(
+    fn restore(
         &self,
         _account_id: &str,
         request: RestoreRequest,
+        permit: JobPermit,
     ) -> BoxedFuture<'_, Result<TableDescription, StorageError>> {
         let err = self.restore_error.lock().unwrap().take();
         let desc = described(&request);
         self.restores.lock().unwrap().push(request);
+        if err.is_none() {
+            self.permits.lock().unwrap().push(permit);
+        }
         Box::pin(async move {
             match err {
                 Some(e) => Err(e),
                 None => Ok(desc),
             }
         })
+    }
+
+    fn abandoned_creating_backups(
+        &self,
+        _stale_after: Duration,
+    ) -> BoxedFuture<'_, Result<Vec<AbandonedLegacyBackup>, StorageError>> {
+        let found = self.abandoned_backups.lock().unwrap().clone();
+        Box::pin(async move { Ok(found) })
     }
 
     fn describe_continuous_backups(
@@ -322,9 +666,16 @@ fn restore_body(extra: Value) -> Value {
 }
 
 async fn restore(fake: &Fake, body: Value) -> Result<Value, DynamoDbError> {
-    restore_table_from_backup(fake, ACCOUNT, REGION, &LimitsConfig::default(), &body)
-        .await
-        .map(|(_, v)| v)
+    restore_table_from_backup(
+        fake,
+        &runtime(),
+        ACCOUNT,
+        REGION,
+        &LimitsConfig::default(),
+        &body,
+    )
+    .await
+    .map(|(_, v)| v)
 }
 
 fn validation_message(err: DynamoDbError) -> String {
@@ -613,7 +964,7 @@ async fn a_backup_stored_under_another_region_resolves_as_written() {
 
     // DeleteBackup: the full description, and the stored row is gone.
     let fake = with_stored();
-    let deleted = delete_backup(&fake, ACCOUNT, REGION, &spellings)
+    let deleted = delete_backup(&fake, &runtime(), ACCOUNT, REGION, &spellings)
         .await
         .unwrap();
     assert_eq!(deleted.backup_details.backup_status, "DELETED");
@@ -637,7 +988,7 @@ async fn a_backup_stored_under_another_region_resolves_as_written() {
         .unwrap();
     assert_eq!(fake.restores()[0].backup_arn, ours);
     assert_eq!(fake.source_reads(), 1);
-    let deleted = delete_backup(&fake, ACCOUNT, REGION, &spellings)
+    let deleted = delete_backup(&fake, &runtime(), ACCOUNT, REGION, &spellings)
         .await
         .unwrap();
     assert_eq!(deleted.backup_details.backup_status, "DELETED");
@@ -664,7 +1015,7 @@ async fn a_backup_stored_under_another_region_resolves_as_written() {
             DynamoDbError::BackupNotFoundException(_)
         ));
         assert!(matches!(
-            delete_backup(&fake, ACCOUNT, REGION, &own(&body))
+            delete_backup(&fake, &runtime(), ACCOUNT, REGION, &own(&body))
                 .await
                 .unwrap_err(),
             DynamoDbError::BackupNotFoundException(_)
@@ -760,6 +1111,7 @@ async fn a_restore_request_dropped_while_the_backup_is_read_still_restores() {
     let notify = Arc::clone(&after_ran);
     let mut request = Box::pin(restore_table_from_backup_detached(
         Arc::clone(&fake),
+        Arc::new(runtime()),
         Arc::from(ACCOUNT),
         Arc::from(REGION),
         Arc::new(LimitsConfig::default()),
@@ -2497,7 +2849,7 @@ async fn delete_backup_answers_the_full_description_as_deleted() {
         let on_demand = def.billing_mode == "PAY_PER_REQUEST";
         let fake = fake_with_backup("AVAILABLE", source(Some(def)));
         let described = describe(&fake).await;
-        let deleted = delete_backup(&fake, ACCOUNT, REGION, &own(&arn(ACCOUNT)))
+        let deleted = delete_backup(&fake, &runtime(), ACCOUNT, REGION, &own(&arn(ACCOUNT)))
             .await
             .unwrap();
         let deleted = serde_json::to_value(deleted).unwrap();
@@ -2524,7 +2876,7 @@ async fn delete_backup_answers_the_full_description_as_deleted() {
         assert_eq!(deleted, expected);
         // The backup is gone.
         assert!(matches!(
-            delete_backup(&fake, ACCOUNT, REGION, &own(&arn(ACCOUNT)))
+            delete_backup(&fake, &runtime(), ACCOUNT, REGION, &own(&arn(ACCOUNT)))
                 .await
                 .unwrap_err(),
             DynamoDbError::BackupNotFoundException(_)
@@ -2545,7 +2897,7 @@ async fn delete_backup_answers_the_full_description_as_deleted() {
         let what = format!("{err:?}");
         let fake = fake_with_backup("AVAILABLE", source(Some(definition("PROVISIONED"))));
         *fake.source_error.lock().unwrap() = Some(err);
-        let deleted = delete_backup(&fake, ACCOUNT, REGION, &own(&arn(ACCOUNT)))
+        let deleted = delete_backup(&fake, &runtime(), ACCOUNT, REGION, &own(&arn(ACCOUNT)))
             .await
             .unwrap_or_else(|e| panic!("{what}: {e:?}"));
         assert_eq!(deleted.backup_details.backup_status, "DELETED", "{what}");
@@ -2566,7 +2918,7 @@ async fn delete_backup_answers_the_full_description_as_deleted() {
     let fake = fake_with_backup("AVAILABLE", source(Some(definition("PROVISIONED"))));
     *fake.source_error.lock().unwrap() = Some(StorageError::Connection("refused".to_owned()));
     assert!(matches!(
-        delete_backup(&fake, ACCOUNT, REGION, &own(&arn(ACCOUNT)))
+        delete_backup(&fake, &runtime(), ACCOUNT, REGION, &own(&arn(ACCOUNT)))
             .await
             .unwrap_err(),
         DynamoDbError::InternalServerError(_)
@@ -3299,4 +3651,1419 @@ async fn list_backups_filters_on_the_time_range_before_paging() {
             DynamoDbError::SerializationException(m) if m.contains(member)
         ));
     }
+}
+
+// --- the catalog index ---------------------------------------------------------
+
+/// An ARN of the `Music` table in account `account` with backup id `id`.
+fn music_arn(account: &str, id: &str) -> String {
+    format!("arn:aws:dynamodb:{REGION}:{account}:table/Music/backup/{id}")
+}
+
+fn fake_with_row(status: BackupStatus) -> Fake {
+    let fake = Fake::default();
+    fake.rows
+        .lock()
+        .unwrap()
+        .insert(arn(ACCOUNT), row(&arn(ACCOUNT), status));
+    fake
+}
+
+fn runtime_with_store() -> BackupRuntime {
+    runtime().with_store(store())
+}
+
+/// DescribeBackup answers from the catalog row when one exists, derived from
+/// the recorded source table, and never reads the legacy reader for it.
+#[tokio::test]
+async fn describe_backup_reads_the_catalog_row_first() {
+    let fake = fake_with_row(BackupStatus::Available);
+    // A legacy description under the same ARN would answer differently.
+    fake.descriptions.lock().unwrap().insert(
+        arn(ACCOUNT),
+        backup_description("AVAILABLE", "PAY_PER_REQUEST"),
+    );
+    let desc = describe_backup(&fake, ACCOUNT, REGION, &own(&arn(ACCOUNT)))
+        .await
+        .unwrap();
+    assert_eq!(desc.backup_details.backup_name, "music-nightly");
+    assert_eq!(desc.backup_details.backup_status, "AVAILABLE");
+    assert_eq!(desc.backup_details.backup_size_bytes, 61828);
+    assert_eq!(
+        desc.source_table_details.table_id,
+        "12345a12-abcd-123a-ab12-1234abc12345"
+    );
+    assert_eq!(
+        desc.source_table_details.billing_mode.as_deref(),
+        Some("PROVISIONED")
+    );
+    let features = desc.source_table_feature_details.expect("features");
+    assert_eq!(
+        features.global_secondary_indexes.unwrap()[0].index_name,
+        "GenreIndex"
+    );
+    assert_eq!(
+        fake.source_reads(),
+        0,
+        "the legacy reader was not consulted"
+    );
+}
+
+/// The status mapping of the catalog index: CREATING as itself, DELETING as
+/// DELETED, DELETED and FAILED as `BackupNotFoundException`, with no fall
+/// back to the legacy reader for a tombstone.
+#[tokio::test]
+async fn describe_backup_maps_the_row_status() {
+    let fake = fake_with_row(BackupStatus::Creating);
+    let desc = describe_backup(&fake, ACCOUNT, REGION, &own(&arn(ACCOUNT)))
+        .await
+        .unwrap();
+    assert_eq!(desc.backup_details.backup_status, "CREATING");
+
+    let fake = fake_with_row(BackupStatus::Deleting);
+    let desc = describe_backup(&fake, ACCOUNT, REGION, &own(&arn(ACCOUNT)))
+        .await
+        .unwrap();
+    assert_eq!(desc.backup_details.backup_status, "DELETED");
+
+    for status in [BackupStatus::Deleted, BackupStatus::Failed] {
+        let fake = fake_with_row(status);
+        fake.descriptions
+            .lock()
+            .unwrap()
+            .insert(arn(ACCOUNT), backup_description("AVAILABLE", "PROVISIONED"));
+        let err = describe_backup(&fake, ACCOUNT, REGION, &own(&arn(ACCOUNT)))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DynamoDbError::BackupNotFoundException(ref m) if m.contains(&arn(ACCOUNT))),
+            "{status}: {err:?}"
+        );
+        assert_eq!(fake.source_reads(), 0, "{status}");
+    }
+}
+
+/// An ARN of account B that carries the id of account A's backup is read by
+/// B's account and the id, matches no row, and is BackupNotFound: never A's
+/// row.
+#[tokio::test]
+async fn describe_backup_of_another_accounts_id_is_not_found() {
+    const OTHER: &str = "999999999999";
+    let fake = fake_with_row(BackupStatus::Available);
+    let other = own_for(&music_arn(OTHER, "01791976431438-73d8d5bc"), OTHER);
+    let err = describe_backup(&fake, OTHER, REGION, &other)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::BackupNotFoundException(_)),
+        "{err:?}"
+    );
+    // The lookup carried B's account, so B's own rows (none) were read.
+    assert_eq!(
+        fake.row_reads.lock().unwrap().as_slice(),
+        [music_arn(OTHER, "01791976431438-73d8d5bc")]
+    );
+}
+
+/// `own` for another account.
+fn own_for(arn: &str, account: &str) -> BackupArnSpellings {
+    backup_arn_field(&json!({ "BackupArn": arn }), account, REGION).unwrap()
+}
+
+/// A row stored under another region resolves under the ARN as written,
+/// after the canonical spelling found nothing, as a legacy backup does.
+#[tokio::test]
+async fn describe_backup_tries_the_row_under_the_arn_as_written() {
+    let stored =
+        format!("arn:aws:dynamodb:eu-west-1:{ACCOUNT}:table/Music/backup/01791976431438-73d8d5bc");
+    let fake = Fake::default();
+    fake.rows
+        .lock()
+        .unwrap()
+        .insert(stored.clone(), row(&stored, BackupStatus::Available));
+    let desc = describe_backup(&fake, ACCOUNT, REGION, &own(&stored))
+        .await
+        .unwrap();
+    assert_eq!(desc.backup_details.backup_arn, stored);
+    assert_eq!(
+        fake.row_reads.lock().unwrap().as_slice(),
+        [arn(ACCOUNT), stored.clone()],
+        "canonical first, then as written"
+    );
+}
+
+/// ListBackups merges the catalog's rows with the legacy reader's summaries
+/// into one (creation time, ARN) order, lists CREATING and AVAILABLE rows
+/// only, and pages the merged list with one cursor.
+#[tokio::test]
+async fn list_backups_merges_the_catalog_rows_with_the_legacy_summaries() {
+    let fake = fake_with_summaries(vec![summary(1, 1_000), summary(3, 3_000)]);
+    let ids = |n: u32, millis: u64| extenddb_storage::util::format_backup_id(millis, n);
+    let catalog = |n: u32, millis: u64, status: BackupStatus| {
+        let a = music_arn(ACCOUNT, &ids(n, millis));
+        row(&a, status)
+    };
+    {
+        let mut rows = fake.rows.lock().unwrap();
+        for r in [
+            catalog(2, 2_000, BackupStatus::Available),
+            catalog(4, 4_000, BackupStatus::Creating),
+            catalog(5, 5_000, BackupStatus::Deleting),
+            catalog(6, 6_000, BackupStatus::Deleted),
+            catalog(7, 7_000, BackupStatus::Failed),
+        ] {
+            rows.insert(r.backup_arn.clone(), r);
+        }
+    }
+    let page = list(&fake, json!({ "Limit": 3 })).await.unwrap();
+    assert_eq!(
+        arns(&page),
+        [
+            summary(1, 1_000).backup_arn,
+            music_arn(ACCOUNT, &ids(2, 2_000)),
+            summary(3, 3_000).backup_arn,
+        ]
+    );
+    let cursor = page["LastEvaluatedBackupArn"].as_str().unwrap().to_owned();
+    let page = list(&fake, json!({ "ExclusiveStartBackupArn": cursor }))
+        .await
+        .unwrap();
+    assert_eq!(arns(&page), [music_arn(ACCOUNT, &ids(4, 4_000))]);
+    assert!(page.get("LastEvaluatedBackupArn").is_none());
+    let creating = &page["BackupSummaries"][0];
+    assert_eq!(creating["BackupStatus"], "CREATING");
+    assert_eq!(creating["TableId"], "12345a12-abcd-123a-ab12-1234abc12345");
+}
+
+/// `TableName` may be the table's ARN: it lists what the name lists, and the
+/// cursor's table check runs against the resolved name.
+#[tokio::test]
+async fn list_backups_accepts_a_table_arn_as_table_name() {
+    let fake = fake_with_summaries(vec![summary(1, 1_000)]);
+    let by_name = list(&fake, json!({ "TableName": "Music" })).await.unwrap();
+    let by_arn = list(&fake, json!({ "TableName": source_arn() }))
+        .await
+        .unwrap();
+    assert_eq!(arns(&by_name), arns(&by_arn));
+    assert_eq!(
+        fake.listed_for.lock().unwrap().as_slice(),
+        [Some("Music".to_owned()), Some("Music".to_owned())]
+    );
+    let cursor = summary(1, 1_000).backup_arn;
+    list(
+        &fake,
+        json!({ "TableName": source_arn(), "ExclusiveStartBackupArn": cursor }),
+    )
+    .await
+    .unwrap();
+    let other = format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/Other");
+    let msg = validation_message(
+        list(
+            &fake,
+            json!({ "TableName": other, "ExclusiveStartBackupArn": summary(1, 1_000).backup_arn }),
+        )
+        .await
+        .unwrap_err(),
+    );
+    assert!(msg.contains("table name predicate"), "{msg}");
+    let foreign = format!("arn:aws:dynamodb:{REGION}:999999999999:table/Music");
+    assert!(matches!(
+        list(&fake, json!({ "TableName": foreign }))
+            .await
+            .unwrap_err(),
+        DynamoDbError::AccessDeniedException(_)
+    ));
+}
+
+/// The time range is handed to the catalog as bounds and applied to the
+/// legacy summaries as before, so both sides are filtered before paging.
+#[tokio::test]
+async fn list_backups_applies_the_time_range_to_both_sources() {
+    let fake = fake_with_summaries(vec![summary(1, 1_000), summary(3, 3_000)]);
+    let a2 = music_arn(ACCOUNT, &extenddb_storage::util::format_backup_id(2_000, 2));
+    let a4 = music_arn(ACCOUNT, &extenddb_storage::util::format_backup_id(4_000, 4));
+    {
+        let mut rows = fake.rows.lock().unwrap();
+        rows.insert(a2.clone(), row(&a2, BackupStatus::Available));
+        rows.insert(a4.clone(), row(&a4, BackupStatus::Available));
+    }
+    let page = list(
+        &fake,
+        json!({ "TimeRangeLowerBound": 2.0, "TimeRangeUpperBound": 4.0 }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(arns(&page), [a2, summary(3, 3_000).backup_arn]);
+    assert_eq!(
+        fake.bounds_seen.lock().unwrap().as_slice(),
+        [TimeBounds {
+            lower: Some(2.0),
+            upper: Some(4.0),
+        }],
+        "the bounds reached the catalog as bounds"
+    );
+}
+
+/// DeleteBackup over a catalog row, in the request's order: a tombstone is
+/// BackupNotFound, a CREATING row BackupInUse, a row of another store a
+/// ValidationException that names no root, and nothing reaches the row's
+/// lock for any of them.
+#[tokio::test]
+async fn delete_backup_over_a_row_refuses_before_the_lock() {
+    for status in [BackupStatus::Deleted, BackupStatus::Failed] {
+        let fake = fake_with_row(status);
+        let err = delete_backup(
+            &fake,
+            &runtime_with_store(),
+            ACCOUNT,
+            REGION,
+            &own(&arn(ACCOUNT)),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, DynamoDbError::BackupNotFoundException(_)),
+            "{status}: {err:?}"
+        );
+        assert!(fake.delete_starts_seen.lock().unwrap().is_empty());
+    }
+    let fake = fake_with_row(BackupStatus::Creating);
+    let err = delete_backup(
+        &fake,
+        &runtime_with_store(),
+        ACCOUNT,
+        REGION,
+        &own(&arn(ACCOUNT)),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::BackupInUseException(_)),
+        "{err:?}"
+    );
+    assert!(fake.delete_starts_seen.lock().unwrap().is_empty());
+
+    // No store configured: every row is a row of another store.
+    let fake = fake_with_row(BackupStatus::Available);
+    let msg = validation_message(
+        delete_backup(&fake, &runtime(), ACCOUNT, REGION, &own(&arn(ACCOUNT)))
+            .await
+            .unwrap_err(),
+    );
+    assert!(msg.contains("store other than"), "{msg}");
+    assert!(
+        !msg.contains(&store().store_root),
+        "no root is named: {msg}"
+    );
+    assert!(fake.delete_starts_seen.lock().unwrap().is_empty());
+    // The legacy reader was never asked.
+    assert!(fake.deleted.lock().unwrap().is_empty());
+    assert_eq!(fake.source_reads(), 0);
+
+    // The in-use check precedes the other-store check, as it does for a
+    // restore: a row of another store with a CREATING target registered
+    // from it (by an instance configured with that store) is BackupInUse
+    // naming the target, not the other-store refusal.
+    let fake = fake_with_row(BackupStatus::Available);
+    fake.in_use
+        .lock()
+        .unwrap()
+        .insert(arn(ACCOUNT), "Earlier".to_owned());
+    let err = delete_backup(&fake, &runtime(), ACCOUNT, REGION, &own(&arn(ACCOUNT)))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::BackupInUseException(ref m) if m.contains("Earlier")),
+        "{err:?}"
+    );
+    assert!(fake.delete_starts_seen.lock().unwrap().is_empty());
+}
+
+/// DeleteBackup over an AVAILABLE row of the configured store: the in-use
+/// check and the DELETING write run under the row's lock
+/// (`start_backup_delete`), whose answer decides: a registration that won is
+/// BackupInUse naming its target; a row that was CREATING under the lock is
+/// BackupInUse; one that moved to a tombstone is BackupNotFound; DELETING
+/// (new or resumed) answers the full description as DELETED.
+#[tokio::test]
+async fn delete_backup_over_a_row_runs_the_in_use_check_under_the_lock() {
+    let fake = fake_with_row(BackupStatus::Available);
+    let desc = delete_backup(
+        &fake,
+        &runtime_with_store(),
+        ACCOUNT,
+        REGION,
+        &own(&arn(ACCOUNT)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(desc.backup_details.backup_status, "DELETED");
+    assert_eq!(desc.backup_details.backup_name, "music-nightly");
+    assert!(desc.source_table_details.provisioned_throughput.is_some());
+    assert!(desc.source_table_feature_details.is_some());
+    assert_eq!(
+        fake.delete_starts_seen.lock().unwrap().as_slice(),
+        [BackupKey::from_arn(
+            &BackupArn::parse(&arn(ACCOUNT)).unwrap()
+        )]
+    );
+
+    let fake = fake_with_row(BackupStatus::Deleting);
+    let desc = delete_backup(
+        &fake,
+        &runtime_with_store(),
+        ACCOUNT,
+        REGION,
+        &own(&arn(ACCOUNT)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        desc.backup_details.backup_status, "DELETED",
+        "a retry resumes"
+    );
+
+    for (answer, want) in [
+        (
+            DeleteStart::InUse("MusicRestored".to_owned()),
+            "BackupInUseException",
+        ),
+        (
+            DeleteStart::Status(BackupStatus::Creating),
+            "BackupInUseException",
+        ),
+        (
+            DeleteStart::Status(BackupStatus::Deleted),
+            "BackupNotFoundException",
+        ),
+        (
+            DeleteStart::Status(BackupStatus::Failed),
+            "BackupNotFoundException",
+        ),
+    ] {
+        let fake = fake_with_row(BackupStatus::Available);
+        fake.delete_starts
+            .lock()
+            .unwrap()
+            .insert(arn(ACCOUNT), answer.clone());
+        let err = delete_backup(
+            &fake,
+            &runtime_with_store(),
+            ACCOUNT,
+            REGION,
+            &own(&arn(ACCOUNT)),
+        )
+        .await
+        .unwrap_err();
+        let got = err.full_error_type();
+        assert!(got.ends_with(want), "{answer:?}: {got}");
+        if let DeleteStart::InUse(table) = &answer {
+            let DynamoDbError::BackupInUseException(m) = err else {
+                unreachable!()
+            };
+            assert!(m.contains(table), "{m}");
+        }
+    }
+
+    // `Status(AVAILABLE)` is an answer the contract excludes (an AVAILABLE
+    // row becomes `Deleting`): a backend that gives it has broken the
+    // contract, which is an internal error, not an absent backup.
+    let fake = fake_with_row(BackupStatus::Available);
+    fake.delete_starts
+        .lock()
+        .unwrap()
+        .insert(arn(ACCOUNT), DeleteStart::Status(BackupStatus::Available));
+    let err = delete_backup(
+        &fake,
+        &runtime_with_store(),
+        ACCOUNT,
+        REGION,
+        &own(&arn(ACCOUNT)),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::InternalServerError(_)),
+        "{err:?}"
+    );
+}
+
+/// A row whose `source_table_details_json` this build cannot describe: the
+/// listing leaves it out and lists the rest (not an internal error for the
+/// whole account), and DeleteBackup answers the internal error before the
+/// DELETING write, so the row stays AVAILABLE and a retry sees the same.
+#[tokio::test]
+async fn an_unreadable_source_table_is_left_out_of_the_listing_and_stops_a_delete_before_the_write()
+{
+    let readable = music_arn(ACCOUNT, &extenddb_storage::util::format_backup_id(1_000, 1));
+    let unreadable = music_arn(ACCOUNT, &extenddb_storage::util::format_backup_id(2_000, 2));
+    let fake = Fake::default();
+    {
+        let mut rows = fake.rows.lock().unwrap();
+        rows.insert(readable.clone(), row(&readable, BackupStatus::Available));
+        let mut damaged = row(&unreadable, BackupStatus::Available);
+        damaged.source_table_details_json = json!({ "table_name": "Music" });
+        rows.insert(unreadable.clone(), damaged);
+    }
+    let page = list(&fake, json!({})).await.unwrap();
+    assert_eq!(arns(&page), std::slice::from_ref(&readable));
+
+    let err = delete_backup(
+        &fake,
+        &runtime_with_store(),
+        ACCOUNT,
+        REGION,
+        &own(&unreadable),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::InternalServerError(_)),
+        "{err:?}"
+    );
+    assert!(
+        fake.delete_starts_seen.lock().unwrap().is_empty(),
+        "the description is built before the DELETING write"
+    );
+    assert_eq!(
+        fake.rows.lock().unwrap()[&unreadable].status,
+        BackupStatus::Available
+    );
+    // A row the summary can still read (its `table_id` and `table_arn` are
+    // there, the rest is not) lists; its description is the internal error.
+    fake.rows
+        .lock()
+        .unwrap()
+        .get_mut(&unreadable)
+        .unwrap()
+        .source_table_details_json = json!({
+        "table_id": "tid-2",
+        "table_arn": source_arn(),
+    });
+    let page = list(&fake, json!({})).await.unwrap();
+    assert_eq!(arns(&page), [readable, unreadable.clone()]);
+    assert_eq!(page["BackupSummaries"][1]["TableId"], "tid-2");
+    let err = describe_backup(&fake, ACCOUNT, REGION, &own(&unreadable))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::InternalServerError(_)),
+        "{err:?}"
+    );
+}
+
+/// A legacy backup of a table whose name the store-prefix rules refuse (a
+/// name made only of dots, which main's CreateTable and CreateBackup accept;
+/// a name over 255 bytes under a raised `limits.max_table_name_length`) has
+/// no parsed ARN and no catalog-index read, and describes, restores and
+/// deletes through the legacy reader as on main.
+#[tokio::test]
+async fn a_backup_of_a_name_the_store_prefix_refuses_resolves_through_the_legacy_reader() {
+    for table in ["...", &"x".repeat(256)] {
+        let id = "01791976431438-73d8d5bc";
+        let legacy_arn = format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/{table}/backup/{id}");
+        assert!(
+            BackupArn::parse(&legacy_arn).is_err(),
+            "the store-prefix rules refuse {table:?}"
+        );
+        let spellings = own(&legacy_arn);
+        assert_eq!(spellings.canonical(), legacy_arn);
+        assert_eq!(spellings.arns().count(), 0, "no parsed spelling");
+
+        let mut src = source(Some(definition("PROVISIONED")));
+        src.backup_arn = legacy_arn.clone();
+        src.source_table_name = table.to_owned();
+        let fake = Fake::with_source(src);
+        let mut description = backup_description("AVAILABLE", "PROVISIONED");
+        description.backup_details.backup_arn = legacy_arn.clone();
+        description.source_table_details.table_name = table.to_owned();
+        fake.descriptions
+            .lock()
+            .unwrap()
+            .insert(legacy_arn.clone(), description);
+
+        let desc = describe_backup(&fake, ACCOUNT, REGION, &spellings)
+            .await
+            .unwrap();
+        assert_eq!(desc.backup_details.backup_arn, legacy_arn);
+        assert_eq!(desc.source_table_details.table_name, table);
+        assert!(desc.source_table_feature_details.is_some());
+
+        let limits = LimitsConfig {
+            max_table_name_length: 1024,
+            ..LimitsConfig::default()
+        };
+        let (_, response) = restore_table_from_backup(
+            &fake,
+            &runtime(),
+            ACCOUNT,
+            REGION,
+            &limits,
+            &json!({ "BackupArn": legacy_arn, "TargetTableName": "Restored" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["TableDescription"]["TableName"], "Restored");
+        assert_eq!(fake.restores().len(), 1);
+        assert_eq!(fake.restores()[0].backup_arn, legacy_arn);
+
+        let desc = delete_backup(&fake, &runtime(), ACCOUNT, REGION, &spellings)
+            .await
+            .unwrap();
+        assert_eq!(desc.backup_details.backup_status, "DELETED");
+        assert_eq!(
+            fake.deleted.lock().unwrap().as_slice(),
+            std::slice::from_ref(&legacy_arn)
+        );
+        assert!(
+            fake.row_reads.lock().unwrap().is_empty(),
+            "the catalog index was not read for {table:?}"
+        );
+    }
+}
+
+/// RestoreTableFromBackup over a catalog row, before the permit and reading
+/// no store: CREATING is BackupInUse; DELETING, DELETED and FAILED are
+/// BackupNotFound; a backup in use is BackupInUse naming the target, whether
+/// or not the row is of the configured store (the in-use check runs before
+/// the other-store check, as the delete's does); a row
+/// of another store is a ValidationException, with no store configured and
+/// with a different one configured; and an AVAILABLE row of the
+/// configured store is refused by this release. The runtime has no free
+/// slot, so a permit taken anywhere before the row's refusal, even one
+/// dropped again, would turn the refusal into LimitExceeded; the legacy
+/// reader is never reached.
+#[tokio::test]
+async fn restore_over_a_row_refuses_before_the_permit() {
+    async fn check(fake: Fake, runtime: &BackupRuntime) -> DynamoDbError {
+        assert_eq!(runtime.free_slots(), 0, "every slot is held");
+        let err = restore_table_from_backup(
+            &fake,
+            runtime,
+            ACCOUNT,
+            REGION,
+            &LimitsConfig::default(),
+            &restore_body(json!({})),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            !matches!(err, DynamoDbError::LimitExceededException(_)),
+            "the row's refusal, not the permit's: {err:?}"
+        );
+        assert_eq!(fake.source_reads(), 0, "the legacy reader was not reached");
+        assert!(fake.restores().is_empty());
+        err
+    }
+    let configured = BackupRuntime::new(1).with_store(store());
+    let _held_configured = JobPermit::try_acquire(configured.slots()).unwrap();
+    let none = BackupRuntime::new(1);
+    let _held_none = JobPermit::try_acquire(none.slots()).unwrap();
+    let err = check(fake_with_row(BackupStatus::Creating), &configured).await;
+    assert!(
+        matches!(err, DynamoDbError::BackupInUseException(_)),
+        "{err:?}"
+    );
+    for status in [
+        BackupStatus::Deleting,
+        BackupStatus::Deleted,
+        BackupStatus::Failed,
+    ] {
+        let err = check(fake_with_row(status), &configured).await;
+        assert!(
+            matches!(err, DynamoDbError::BackupNotFoundException(_)),
+            "{status}: {err:?}"
+        );
+    }
+    let fake = fake_with_row(BackupStatus::Available);
+    fake.in_use
+        .lock()
+        .unwrap()
+        .insert(arn(ACCOUNT), "Earlier".to_owned());
+    let err = check(fake, &configured).await;
+    assert!(
+        matches!(err, DynamoDbError::BackupInUseException(ref m) if m.contains("Earlier")),
+        "{err:?}"
+    );
+    // The in-use check runs before the other-store check, as the delete's
+    // does: a row of another store that is in use is BackupInUse, not the
+    // other-store ValidationException.
+    let fake = fake_with_row(BackupStatus::Available);
+    fake.in_use
+        .lock()
+        .unwrap()
+        .insert(arn(ACCOUNT), "Earlier".to_owned());
+    let err = check(fake, &none).await;
+    assert!(
+        matches!(err, DynamoDbError::BackupInUseException(ref m) if m.contains("Earlier")),
+        "the in-use check runs before the other-store check: {err:?}"
+    );
+    let msg = validation_message(check(fake_with_row(BackupStatus::Available), &configured).await);
+    assert!(msg.contains("in-catalog backups only"), "{msg}");
+    let msg = validation_message(check(fake_with_row(BackupStatus::Available), &none).await);
+    assert!(msg.contains("store other than"), "{msg}");
+    // A configured store that is not the row's: the row is of another store,
+    // not of "the" store because one is configured.
+    let other = BackupRuntime::new(1).with_store(StoreIdentity {
+        store_id: "store-2".to_owned(),
+        ..store()
+    });
+    let _held_other = JobPermit::try_acquire(other.slots()).unwrap();
+    let msg = validation_message(check(fake_with_row(BackupStatus::Available), &other).await);
+    assert!(
+        msg.contains("store other than"),
+        "a configured store other than the row's: {msg}"
+    );
+}
+
+/// The job permit is the last check of a restore: a request refused earlier
+/// takes no slot, a request that reaches the backend hands its slot to the
+/// backend for the job's life, and with no slot free the request is
+/// LimitExceeded after every other check passed, with the backend untouched.
+#[tokio::test]
+async fn restore_takes_the_permit_last() {
+    async fn restore_with(
+        fake: &Fake,
+        runtime: &BackupRuntime,
+    ) -> Result<(String, Value), DynamoDbError> {
+        let body = restore_body(json!({}));
+        restore_table_from_backup(
+            fake,
+            runtime,
+            ACCOUNT,
+            REGION,
+            &LimitsConfig::default(),
+            &body,
+        )
+        .await
+    }
+    let runtime = BackupRuntime::new(1);
+    let fake = Fake::with_source(source(Some(definition("PROVISIONED"))));
+    restore_with(&fake, &runtime).await.unwrap();
+    assert_eq!(runtime.free_slots(), 0, "the backend holds the slot");
+    assert_eq!(fake.restores().len(), 1);
+
+    let err = restore_with(&fake, &runtime).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            DynamoDbError::LimitExceededException(ref m)
+                if m.contains("(at most 1 at once, the [backup] max_concurrent_jobs bound)")
+        ),
+        "the refusal names the bound: {err:?}"
+    );
+    assert_eq!(fake.restores().len(), 1, "the backend was not asked");
+    assert_eq!(
+        fake.source_reads(),
+        2,
+        "the source was read before the permit"
+    );
+
+    // A refusal earlier in the order takes no slot: a missing backup.
+    let runtime = BackupRuntime::new(1);
+    let empty = Fake::default();
+    let err = restore_with(&empty, &runtime).await.unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::BackupNotFoundException(_)),
+        "{err:?}"
+    );
+    assert_eq!(runtime.free_slots(), 1);
+
+    // The backend's refusal returns the slot with the dropped permit.
+    let fake = Fake::with_source(source(Some(definition("PROVISIONED"))));
+    *fake.restore_error.lock().unwrap() =
+        Some(StorageError::TableAlreadyExists("MusicRestored".to_owned()));
+    let err = restore_with(&fake, &runtime).await.unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::TableAlreadyExistsException(_)),
+        "{err:?}"
+    );
+    assert_eq!(runtime.free_slots(), 1);
+
+    // Dropping the backend's permit frees the slot.
+    fake.permits.lock().unwrap().clear();
+    assert_eq!(runtime.free_slots(), 1);
+}
+
+/// The target name is checked before the backup and before the permit: with
+/// every permit held and the backup restorable, a restore into a name a table
+/// has is TableAlreadyExists, a retry into a CREATING restore target is
+/// TableInUse naming the target's source backup in the backend's own text, a
+/// CREATING table with no RestoreSummary (an ordinary create) and an ACTIVE
+/// former target (its summary no longer in progress) are TableAlreadyExists;
+/// the backup is not read and the backend not asked. A free name passes.
+#[tokio::test]
+async fn restore_checks_the_target_name_before_the_backup_and_the_permit() {
+    fn table(status: TableStatus, source_backup_arn: Option<&str>) -> TableDescription {
+        TableDescription {
+            table_name: "MusicRestored".to_owned(),
+            table_status: status,
+            restore_summary: source_backup_arn.map(|arn| RestoreSummary {
+                source_backup_arn: Some(arn.to_owned()),
+                source_table_arn: Some(source_arn()),
+                restore_date_time: CREATED,
+                restore_in_progress: status == TableStatus::Creating,
+            }),
+            ..Default::default()
+        }
+    }
+    async fn check(target: TableDescription) -> DynamoDbError {
+        let full = BackupRuntime::new(1);
+        let _held = full.take_permit().unwrap();
+        let fake = Fake::with_source(source(Some(definition("PROVISIONED"))));
+        fake.tables
+            .lock()
+            .unwrap()
+            .insert("MusicRestored".to_owned(), target);
+        let err = restore_table_from_backup(
+            &fake,
+            &full,
+            ACCOUNT,
+            REGION,
+            &LimitsConfig::default(),
+            &restore_body(json!({})),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            !matches!(err, DynamoDbError::LimitExceededException(_)),
+            "the name's refusal, not the permit's: {err:?}"
+        );
+        assert_eq!(
+            fake.table_reads.lock().unwrap().as_slice(),
+            ["MusicRestored"],
+            "the name was read once, under the request's spelling"
+        );
+        assert_eq!(fake.source_reads(), 0, "the backup was not read");
+        assert!(fake.row_reads.lock().unwrap().is_empty());
+        assert!(fake.restores().is_empty(), "the backend was not asked");
+        err
+    }
+
+    let err = check(table(TableStatus::Active, None)).await;
+    assert!(
+        matches!(err, DynamoDbError::TableAlreadyExistsException(ref m) if m.contains("MusicRestored")),
+        "{err:?}"
+    );
+    let err = check(table(TableStatus::Creating, Some(&arn(ACCOUNT)))).await;
+    let text = format!(
+        "Table: MusicRestored is already being restored from backup: {}",
+        arn(ACCOUNT)
+    );
+    assert!(
+        matches!(err, DynamoDbError::TableInUseException(ref m) if *m == text),
+        "{err:?}"
+    );
+    let err = check(table(TableStatus::Creating, None)).await;
+    assert!(
+        matches!(err, DynamoDbError::TableAlreadyExistsException(_)),
+        "an ordinary CREATING table: {err:?}"
+    );
+    let err = check(table(TableStatus::Active, Some(&arn(ACCOUNT)))).await;
+    assert!(
+        matches!(err, DynamoDbError::TableAlreadyExistsException(_)),
+        "an ACTIVE former target: {err:?}"
+    );
+
+    // A free name: the check passes and the restore reaches the backend.
+    let runtime = BackupRuntime::new(1);
+    let fake = Fake::with_source(source(Some(definition("PROVISIONED"))));
+    restore_table_from_backup(
+        &fake,
+        &runtime,
+        ACCOUNT,
+        REGION,
+        &LimitsConfig::default(),
+        &restore_body(json!({})),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        fake.table_reads.lock().unwrap().as_slice(),
+        ["MusicRestored"]
+    );
+    assert_eq!(fake.restores().len(), 1);
+}
+
+/// CreateBackup's checks run in the service's order, every one before the
+/// permit: a missing or not-ACTIVE table is TableNotFound whether or not a
+/// slot is free; a table with vector indexes is refused; then the permit,
+/// LimitExceeded when none is free; then the in-catalog create holds the slot.
+#[tokio::test]
+async fn create_backup_checks_the_table_then_takes_the_permit_last() {
+    let active = TableDescription {
+        table_name: "Music".to_owned(),
+        table_status: TableStatus::Active,
+        ..Default::default()
+    };
+    let full = BackupRuntime::new(1);
+    let _held = full.take_permit().unwrap();
+    let fake = Fake::default();
+
+    let err = create_backup(
+        &fake,
+        &full,
+        ACCOUNT,
+        REGION,
+        "Music",
+        "nightly",
+        Err(StorageError::TableNotFound("Music".to_owned())),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::TableNotFoundException(ref m) if m == "Table not found: Music"),
+        "{err:?}"
+    );
+    let creating = TableDescription {
+        table_status: TableStatus::Creating,
+        ..active.clone()
+    };
+    let err = create_backup(
+        &fake,
+        &full,
+        ACCOUNT,
+        REGION,
+        "Music",
+        "nightly",
+        Ok(creating),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::TableNotFoundException(_)),
+        "{err:?}"
+    );
+
+    let with_vectors: TableDescription = serde_json::from_value(json!({
+        "TableName": "Music",
+        "KeySchema": [],
+        "AttributeDefinitions": [],
+        "TableStatus": "ACTIVE",
+        "CreationDateTime": 0.0,
+        "TableSizeBytes": 0,
+        "ItemCount": 0,
+        "TableArn": "",
+        "TableId": "",
+        "ProvisionedThroughput": { "ReadCapacityUnits": 0, "WriteCapacityUnits": 0,
+                                   "NumberOfDecreasesToday": 0 },
+        "DeletionProtectionEnabled": false,
+        "VectorIndexes": [{
+            "IndexName": "v",
+            "VectorAttribute": { "AttributeName": "emb" },
+            "Dimensions": 3,
+            "DistanceFunction": "COSINE",
+            "IndexStatus": "ACTIVE",
+            "IndexSizeBytes": 0,
+            "ItemCount": 0,
+            "IndexArn": ""
+        }]
+    }))
+    .unwrap();
+    let msg = validation_message(
+        create_backup(
+            &fake,
+            &full,
+            ACCOUNT,
+            REGION,
+            "Music",
+            "nightly",
+            Ok(with_vectors),
+        )
+        .await
+        .unwrap_err(),
+    );
+    assert!(msg.contains("vector"), "{msg}");
+
+    let err = create_backup(
+        &fake,
+        &full,
+        ACCOUNT,
+        REGION,
+        "Music",
+        "nightly",
+        Ok(active.clone()),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::LimitExceededException(_)),
+        "{err:?}"
+    );
+    assert!(
+        fake.creates.lock().unwrap().is_empty(),
+        "the backend was not asked"
+    );
+
+    let free = BackupRuntime::new(1);
+    create_backup(
+        &fake,
+        &free,
+        ACCOUNT,
+        REGION,
+        "Music",
+        "nightly",
+        Ok(active),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        fake.creates.lock().unwrap().as_slice(),
+        [("Music".to_owned(), "nightly".to_owned())]
+    );
+    assert_eq!(free.free_slots(), 0, "the backend holds the slot");
+    fake.permits.lock().unwrap().clear();
+    assert_eq!(free.free_slots(), 1);
+}
+
+/// A table name that fits CreateTable but not a backup ARN's store prefix
+/// is refused before the permit, naming the limit: the runtime's one permit
+/// is held, so a check placed after the permit would answer LimitExceeded.
+#[tokio::test]
+async fn create_backup_refuses_a_name_no_backup_arn_can_carry() {
+    let runtime = BackupRuntime::new(1);
+    let _held = runtime.take_permit().unwrap();
+    let fake = Fake::default();
+    // 256 bytes, and 1024 bytes: a name the handler admits under a raised
+    // `limits.max_table_name_length` that takes the ARN itself over its
+    // 1024-byte bound, so the limit must be named before the ARN is formed.
+    for len in [256, 1024] {
+        let long = "x".repeat(len);
+        let desc = TableDescription {
+            table_name: long.clone(),
+            table_status: TableStatus::Active,
+            ..Default::default()
+        };
+        let msg = validation_message(
+            create_backup(&fake, &runtime, ACCOUNT, REGION, &long, "nightly", Ok(desc))
+                .await
+                .unwrap_err(),
+        );
+        assert!(
+            msg.contains(&format!("{len} bytes")) && msg.contains("255"),
+            "{len}: {msg}"
+        );
+        assert!(!msg.contains("not a backup ARN"), "{len}: {msg}");
+    }
+    let dots = "...";
+    let desc = TableDescription {
+        table_name: dots.to_owned(),
+        table_status: TableStatus::Active,
+        ..Default::default()
+    };
+    let msg = validation_message(
+        create_backup(&fake, &runtime, ACCOUNT, REGION, dots, "nightly", Ok(desc))
+            .await
+            .unwrap_err(),
+    );
+    assert!(
+        msg.contains("TableName") && msg.contains("only dots"),
+        "{msg}"
+    );
+    assert_eq!(runtime.free_slots(), 0, "the test still holds the permit");
+    assert!(fake.creates.lock().unwrap().is_empty());
+}
+
+/// Under a `server.region` outside `[a-z0-9-]` no backup ARN can be formed
+/// for any table, so CreateBackup is refused naming `server.region`, not the
+/// table name, before the permit (the runtime's one permit is held). The
+/// other operations are not affected for a backup created under a valid
+/// region: its stored ARN is reached as written, the canonical spelling in
+/// the server's region having no parsed form. A backup an earlier release
+/// created under such a region keeps an ARN `check_backup_arn` refuses as
+/// not valid, before any lookup.
+#[tokio::test]
+async fn create_backup_under_a_region_outside_the_arn_alphabet_names_the_setting() {
+    let runtime = BackupRuntime::new(1);
+    let _held = runtime.take_permit().unwrap();
+    let fake = Fake::default();
+    let desc = TableDescription {
+        table_name: "Music".to_owned(),
+        table_status: TableStatus::Active,
+        ..Default::default()
+    };
+    let msg = validation_message(
+        create_backup(
+            &fake,
+            &runtime,
+            ACCOUNT,
+            "LOCAL",
+            "Music",
+            "nightly",
+            Ok(desc),
+        )
+        .await
+        .unwrap_err(),
+    );
+    assert!(
+        msg.contains("server.region") && msg.contains("\"LOCAL\"") && msg.contains("[a-z0-9-]"),
+        "{msg}"
+    );
+    assert!(
+        !msg.contains("TableName"),
+        "the table is not the cause: {msg}"
+    );
+    assert_eq!(runtime.free_slots(), 0, "the test still holds the permit");
+    assert!(fake.creates.lock().unwrap().is_empty());
+
+    // A backup created under a valid region, described under "LOCAL": the
+    // row is read under the ARN as written, and only that spelling.
+    let stored = arn(ACCOUNT);
+    fake.rows
+        .lock()
+        .unwrap()
+        .insert(stored.clone(), row(&stored, BackupStatus::Available));
+    let spellings = backup_arn_field(&json!({ "BackupArn": stored }), ACCOUNT, "LOCAL").unwrap();
+    let desc = describe_backup(&fake, ACCOUNT, "LOCAL", &spellings)
+        .await
+        .unwrap();
+    assert_eq!(desc.backup_details.backup_arn, stored);
+    assert_eq!(
+        fake.row_reads.lock().unwrap().as_slice(),
+        std::slice::from_ref(&stored),
+        "as written only: the canonical spelling under \"LOCAL\" has no parsed form"
+    );
+
+    // A backup created under "LOCAL" by an earlier release: its ARN is
+    // refused before any lookup.
+    let local =
+        format!("arn:aws:dynamodb:LOCAL:{ACCOUNT}:table/Music/backup/01791976431438-73d8d5bc");
+    let msg = validation_message(
+        backup_arn_field(&json!({ "BackupArn": local }), ACCOUNT, "LOCAL").unwrap_err(),
+    );
+    assert_eq!(msg, BACKUP_ARN_NOT_VALID);
+    assert_eq!(fake.row_reads.lock().unwrap().len(), 1, "no further read");
+}
+
+// --- the reconciler -------------------------------------------------------------
+
+fn dead_job(kind: extenddb_storage::backup_catalog::RestoreKind, name: &str) -> RestoreJobRow {
+    RestoreJobRow {
+        target: RestoreTargetKey {
+            account_id: ACCOUNT.to_owned(),
+            table_name: name.to_owned(),
+            table_id: format!("tid-{name}"),
+        },
+        source_backup_arn: arn(ACCOUNT),
+        kind,
+        status: extenddb_storage::backup_catalog::JobStatus::Running,
+        owner_generation: 0,
+        heartbeat_at: 0.0,
+    }
+}
+
+/// A legacy restore whose owner is dead is marked FAILED and its target
+/// removed; a manifest restore is left for its resumer; an abandoned
+/// in-catalog CREATING backup is removed through the reader's delete.
+#[tokio::test]
+async fn the_reconciler_fails_dead_legacy_restores_and_removes_abandoned_backups() {
+    use extenddb_storage::backup_catalog::RestoreKind;
+    let fake = Fake::default();
+    *fake.target_still_creating.lock().unwrap() = true;
+    *fake.record_still_running.lock().unwrap() = true;
+    fake.dead_jobs.lock().unwrap().extend([
+        dead_job(RestoreKind::Legacy, "LegacyTarget"),
+        dead_job(RestoreKind::Manifest, "ManifestTarget"),
+    ]);
+    fake.abandoned_backups
+        .lock()
+        .unwrap()
+        .push(AbandonedLegacyBackup {
+            account_id: ACCOUNT.to_owned(),
+            backup_arn: arn(ACCOUNT),
+        });
+    fake.descriptions
+        .lock()
+        .unwrap()
+        .insert(arn(ACCOUNT), backup_description("CREATING", "PROVISIONED"));
+
+    let report = reconciler::cycle(
+        &fake,
+        Duration::from_secs(300),
+        &mut reconciler::ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert!(!report.maintenance_held);
+    assert_eq!(report.legacy_restores_removed, ["LegacyTarget"]);
+    assert!(report.failed_targets_removed.is_empty());
+    assert_eq!(report.manifest_restores_seen, ["ManifestTarget"]);
+    assert_eq!(report.manifest_restores_logged, ["ManifestTarget"]);
+    assert_eq!(report.legacy_backups_removed, [arn(ACCOUNT)]);
+
+    let failed = fake.failed_jobs.lock().unwrap().clone();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].0.table_name, "LegacyTarget");
+    assert_eq!(failed[0].1, reconciler::OWNER_DEAD);
+    assert_eq!(
+        fake.removed_targets.lock().unwrap().as_slice(),
+        [dead_job(RestoreKind::Legacy, "LegacyTarget").target]
+    );
+    assert_eq!(fake.deleted.lock().unwrap().as_slice(), [arn(ACCOUNT)]);
+}
+
+/// A record that is no longer RUNNING when the reconciler reaches it belongs
+/// to whoever moved it: the target is not removed.
+#[tokio::test]
+async fn the_reconciler_leaves_a_target_whose_record_moved() {
+    use extenddb_storage::backup_catalog::RestoreKind;
+    let fake = Fake::default();
+    *fake.record_still_running.lock().unwrap() = false;
+    *fake.target_still_creating.lock().unwrap() = true;
+    fake.dead_jobs
+        .lock()
+        .unwrap()
+        .push(dead_job(RestoreKind::Legacy, "LegacyTarget"));
+    let report = reconciler::cycle(
+        &fake,
+        Duration::from_secs(300),
+        &mut reconciler::ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert!(report.legacy_restores_removed.is_empty());
+    assert!(report.targets_left_to_owner.is_empty());
+    assert_eq!(fake.failed_jobs.lock().unwrap().len(), 1);
+    assert!(fake.removed_targets.lock().unwrap().is_empty());
+}
+
+/// A removal that finds the target no longer a CREATING restore target
+/// (`remove_restore_target` answered `false`: the target flipped ACTIVE, was
+/// deleted, or was re-created under another id) leaves it to its current
+/// owner: the target is not counted as removed, the cycle reports it as left,
+/// and the record is not written again, whether this cycle wrote the FAILED
+/// (a dead legacy restore) or found it (the FAILED-target duty).
+#[tokio::test]
+async fn the_reconciler_leaves_a_target_that_is_no_longer_creating_after_the_failed_write() {
+    use extenddb_storage::backup_catalog::{JobStatus, RestoreKind};
+    let fake = Fake::default();
+    *fake.record_still_running.lock().unwrap() = true;
+    *fake.target_still_creating.lock().unwrap() = false;
+    let dead = dead_job(RestoreKind::Legacy, "LegacyTarget");
+    let mut failed = dead_job(RestoreKind::Legacy, "FailedTarget");
+    failed.status = JobStatus::Failed;
+    fake.dead_jobs
+        .lock()
+        .unwrap()
+        .extend([dead.clone(), failed.clone()]);
+    let report = reconciler::cycle(
+        &fake,
+        Duration::from_secs(300),
+        &mut reconciler::ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        report.legacy_restores_removed.is_empty() && report.failed_targets_removed.is_empty(),
+        "a target the removal found moved is not counted as removed: {report:?}"
+    );
+    assert_eq!(
+        report.targets_left_to_owner,
+        ["LegacyTarget", "FailedTarget"]
+    );
+    assert_eq!(
+        fake.removed_targets.lock().unwrap().as_slice(),
+        [dead.target.clone(), failed.target]
+    );
+    assert_eq!(
+        fake.failed_jobs.lock().unwrap().as_slice(),
+        [(dead.target, reconciler::OWNER_DEAD.to_owned())],
+        "the dead record is written FAILED once; the FAILED record is not written again"
+    );
+}
+
+/// The maintenance claim is checked first and reported; the duties that
+/// resolve dead owners still run while it is held.
+#[tokio::test]
+async fn the_reconciler_reports_a_held_maintenance_claim_and_still_resolves_dead_owners() {
+    use extenddb_storage::backup_catalog::RestoreKind;
+    let fake = Fake::default();
+    *fake.maintenance_held.lock().unwrap() = true;
+    *fake.target_still_creating.lock().unwrap() = true;
+    *fake.record_still_running.lock().unwrap() = true;
+    fake.dead_jobs
+        .lock()
+        .unwrap()
+        .push(dead_job(RestoreKind::Legacy, "LegacyTarget"));
+    let report = reconciler::cycle(
+        &fake,
+        Duration::from_secs(300),
+        &mut reconciler::ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert!(report.maintenance_held);
+    assert_eq!(report.legacy_restores_removed, ["LegacyTarget"]);
+}
+
+/// The worker runs a cycle at once (observed through the maintenance check,
+/// the cycle's first read), records the worker metrics the other workers
+/// record, then waits an interval, and stops at the shutdown token.
+#[tokio::test]
+async fn the_reconciler_worker_runs_at_startup_and_stops_on_shutdown() {
+    use extenddb_core::metrics::{MetricName, MetricsCollector};
+    let fake = Arc::new(Fake::default());
+    *fake.maintenance_held.lock().unwrap() = true;
+    let metrics = Arc::new(MetricsCollector::new());
+    let shutdown = extenddb_storage::CancellationToken::new();
+    let worker = tokio::spawn(reconciler::run(
+        Arc::clone(&fake),
+        reconciler::ReconcilerSettings {
+            interval: Duration::from_secs(3600),
+            stale_job_after: Duration::from_secs(300),
+        },
+        Arc::clone(&metrics),
+        shutdown.clone(),
+    ));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while *fake.maintenance_checks.lock().unwrap() == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the first cycle did not run"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        *fake.maintenance_checks.lock().unwrap(),
+        1,
+        "one cycle before the first interval"
+    );
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .expect("the worker stops at shutdown")
+        .unwrap();
+    assert_eq!(*fake.maintenance_checks.lock().unwrap(), 1);
+    let recorded: Vec<MetricName> = metrics
+        .drain(Duration::ZERO)
+        .into_iter()
+        .filter(|b| b.operation == "BackupReconciler")
+        .map(|b| b.metric)
+        .collect();
+    assert!(
+        recorded.contains(&MetricName::WorkerLastSuccess)
+            && recorded.contains(&MetricName::WorkerCycleLatency),
+        "{recorded:?}"
+    );
+    assert!(!recorded.contains(&MetricName::WorkerErrorCount));
+}
+
+/// A cycle that fails is recorded as a worker error, as the other workers
+/// record theirs, and the worker goes on to the next cycle.
+#[tokio::test]
+async fn a_failed_reconciler_cycle_records_a_worker_error() {
+    use extenddb_core::metrics::{MetricName, MetricsCollector};
+    let fake = Arc::new(Fake::default());
+    *fake.maintenance_error.lock().unwrap() = Some("catalog unreachable".to_owned());
+    let metrics = Arc::new(MetricsCollector::new());
+    let shutdown = extenddb_storage::CancellationToken::new();
+    let worker = tokio::spawn(reconciler::run(
+        Arc::clone(&fake),
+        reconciler::ReconcilerSettings {
+            interval: Duration::from_millis(5),
+            stale_job_after: Duration::from_secs(300),
+        },
+        Arc::clone(&metrics),
+        shutdown.clone(),
+    ));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while *fake.maintenance_checks.lock().unwrap() < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the worker did not go on after a failed cycle"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .expect("the worker stops at shutdown")
+        .unwrap();
+    let errors: f64 = metrics
+        .drain(Duration::ZERO)
+        .into_iter()
+        .filter(|b| b.operation == "BackupReconciler")
+        .filter(|b| b.metric == MetricName::WorkerErrorCount)
+        .map(|b| b.sum)
+        .sum();
+    assert!(errors >= 2.0, "{errors} worker errors recorded");
+}
+
+/// The FAILED-target duty: a FAILED record whose target is still CREATING
+/// (the FAILED write landed, the removal did not) is listed by the backend
+/// once stale, and the reconciler removes the target with no second FAILED
+/// write.
+#[tokio::test]
+async fn the_reconciler_removes_the_target_of_a_failed_record_without_writing_failed_again() {
+    use extenddb_storage::backup_catalog::{JobStatus, RestoreKind};
+    let fake = Fake::default();
+    *fake.target_still_creating.lock().unwrap() = true;
+    let mut failed = dead_job(RestoreKind::Legacy, "FailedTarget");
+    failed.status = JobStatus::Failed;
+    let mut failed_manifest = dead_job(RestoreKind::Manifest, "FailedManifestTarget");
+    failed_manifest.status = JobStatus::Failed;
+    fake.dead_jobs
+        .lock()
+        .unwrap()
+        .extend([failed.clone(), failed_manifest.clone()]);
+    let report = reconciler::cycle(
+        &fake,
+        Duration::from_secs(300),
+        &mut reconciler::ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        fake.failed_jobs.lock().unwrap().is_empty(),
+        "a FAILED record is not written FAILED again"
+    );
+    assert_eq!(
+        report.failed_targets_removed,
+        ["FailedTarget", "FailedManifestTarget"]
+    );
+    assert!(report.legacy_restores_removed.is_empty());
+    assert!(report.manifest_restores_seen.is_empty());
+    assert_eq!(
+        fake.removed_targets.lock().unwrap().as_slice(),
+        [failed.target, failed_manifest.target]
+    );
+}
+
+/// A dead manifest record, which this release cannot act on, is reported
+/// once per record for as long as the process runs, not every cycle.
+#[tokio::test]
+async fn a_dead_manifest_record_is_logged_once_per_record() {
+    use extenddb_storage::backup_catalog::RestoreKind;
+    let fake = Fake::default();
+    fake.dead_jobs
+        .lock()
+        .unwrap()
+        .push(dead_job(RestoreKind::Manifest, "ManifestTarget"));
+    let mut state = reconciler::ReconcilerState::default();
+    let first = reconciler::cycle(&fake, Duration::from_secs(300), &mut state)
+        .await
+        .unwrap();
+    assert_eq!(first.manifest_restores_seen, ["ManifestTarget"]);
+    assert_eq!(first.manifest_restores_logged, ["ManifestTarget"]);
+    let second = reconciler::cycle(&fake, Duration::from_secs(300), &mut state)
+        .await
+        .unwrap();
+    assert_eq!(second.manifest_restores_seen, ["ManifestTarget"]);
+    assert!(
+        second.manifest_restores_logged.is_empty(),
+        "the same record is not reported twice"
+    );
+    fake.dead_jobs
+        .lock()
+        .unwrap()
+        .push(dead_job(RestoreKind::Manifest, "Another"));
+    let third = reconciler::cycle(&fake, Duration::from_secs(300), &mut state)
+        .await
+        .unwrap();
+    assert_eq!(third.manifest_restores_logged, ["Another"]);
+    assert!(
+        fake.failed_jobs.lock().unwrap().is_empty()
+            && fake.removed_targets.lock().unwrap().is_empty(),
+        "a manifest record is never acted on by this release"
+    );
 }

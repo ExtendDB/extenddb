@@ -29,6 +29,9 @@ pub struct AppConfig {
     pub limits: LimitsConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    /// The knobs backup and restore jobs read ([`backup::BackupConfig`]).
+    #[serde(default)]
+    pub backup: backup::BackupConfig,
     /// Import configuration. Lists allowed source directories for import
     /// operations. If empty or absent, imports are denied (secure default).
     #[serde(default, rename = "import")]
@@ -92,8 +95,8 @@ impl Default for ServerConfig {
 
 impl ServerConfig {
     /// Operator-facing warnings for server settings that work but cost
-    /// something: today a `region` outside `[a-z0-9-]`, which makes the
-    /// backup ARNs the server issues unresolvable (see
+    /// something: today a `region` outside `[a-z0-9-]`, under which
+    /// `CreateBackup` is refused (see
     /// [`extenddb_storage::config::server_region_warning`]). Shown in the
     /// `serve` banner; the same warning is logged when the storage components
     /// are created.
@@ -417,7 +420,13 @@ pub fn load(config_path: &str) -> anyhow::Result<AppConfig> {
         .add_source(config::File::with_name(config_path).required(false))
         .add_source(config::Environment::with_prefix("EXTENDDB").separator("__"))
         .build()?;
-    Ok(config.try_deserialize()?)
+    validated(config.try_deserialize()?)
+}
+
+/// The cross-field checks a deserialized config still has to pass.
+fn validated(config: AppConfig) -> anyhow::Result<AppConfig> {
+    config.backup.validate().map_err(|e| anyhow::anyhow!(e))?;
+    Ok(config)
 }
 
 /// Load `AppConfig` entirely from built-in defaults and environment variables,
@@ -448,7 +457,7 @@ pub fn load_builtin_defaults() -> anyhow::Result<AppConfig> {
         ))
         .add_source(config::Environment::with_prefix("EXTENDDB").separator("__"))
         .build()?;
-    Ok(config.try_deserialize()?)
+    validated(config.try_deserialize()?)
 }
 
 /// Redact password from a connection string for safe logging (REQ-LOG-002).
@@ -495,6 +504,7 @@ pub fn pid_file_path_default(port: u16) -> PathBuf {
     pid_file_path(&ServerConfig::default().run_dir, port)
 }
 
+pub mod backup;
 mod display;
 pub use display::{MASK, build_config_entries, should_redact};
 

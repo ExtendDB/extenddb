@@ -2,6 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Bootstrapper implementation for `MongoDB`.
+//!
+//! The catalog migrates through this bootstrapper, not the shared runner:
+//! [`Bootstrapper::run_catalog_migrations`] runs its steps in order, each
+//! idempotent and recorded in `schema_history`, and the last step writes
+//! [`CATALOG_VERSION`], the one value `extenddb migrate` compares the stored
+//! `catalog_version` with.
 
 use async_trait::async_trait;
 use bson::{Document, doc};
@@ -11,6 +17,196 @@ use mongodb::options::IndexOptions;
 use extenddb_storage::bootstrapper::{AdminBootstrapResult, Bootstrapper};
 use extenddb_storage::error::StorageError;
 use extenddb_storage::management_store::{OpError, OpResult};
+
+use crate::backup_catalog::{
+    BACKUP_INDEX, BACKUP_MAINTENANCE, CATALOG_ID, RESTORE_JOB, RESTORE_JOB_HEARTBEAT,
+    RESTORE_JOB_STATUS,
+};
+
+/// The catalog version this build expects. The last step of
+/// [`Bootstrapper::run_catalog_migrations`] writes it, `extenddb migrate`
+/// compares the stored version with it, and `extenddb version` prints it.
+pub(crate) const CATALOG_VERSION: &str = "0.0.5";
+
+/// The version the first step seeds on a fresh catalog; the steps after it
+/// bring the catalog to [`CATALOG_VERSION`].
+const INITIAL_CATALOG_VERSION: &str = "0.0.2";
+
+/// `serve`'s catalog guard: the stored `catalog_version` must be
+/// [`CATALOG_VERSION`], else the server refuses to start with the command
+/// that brings the catalog forward (`extenddb migrate --yes`). The rule is
+/// [`extenddb_storage::util::require_served_catalog_version`], the one the
+/// Cassandra factory applies too; the PostgreSQL and SQLite factories read
+/// their ledgers for the same refusal. A server on an older catalog would
+/// serve table and item operations and fail every backup operation on the
+/// collections and indexes the missing step creates (a `claim_backup` upsert
+/// without the unique index would not refuse a second claim).
+///
+/// # Errors
+///
+/// A read failure of `settings` as `Store`; a version other than this
+/// binary's as the refusal `serve` prints.
+pub(crate) async fn require_served_catalog(
+    catalog_db: &mongodb::Database,
+) -> Result<(), extenddb_storage::migrations::MigrationError> {
+    use extenddb_storage::migrations::MigrationError;
+    let stored = catalog_db
+        .collection::<Document>("settings")
+        .find_one(doc! { "_id": "catalog_version" })
+        .await
+        .map_err(|e| MigrationError::Store(format!("read catalog_version: {e}")))?
+        .and_then(|d| d.get_str("value").ok().map(str::to_owned));
+    extenddb_storage::util::require_served_catalog_version(
+        stored.as_deref(),
+        CATALOG_VERSION,
+        "MongoDB",
+    )
+}
+
+/// What the backup catalog index step did, for the log and the tests.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct BackupCatalogIndexStep {
+    /// Restore registrations that gained a job record.
+    pub(crate) registrations_backfilled: u64,
+    /// Whether the catalog id was written by this run (false when it existed).
+    pub(crate) catalog_id_written: bool,
+}
+
+/// The catalog migration step that adds the backup catalog index: the
+/// `backup_index` collection and its indexes, the job record on the restore
+/// registrations that exist, the `backup_maintenance` collection, the
+/// `catalog_id` settings document, and the version. Every statement is
+/// idempotent and the backfill touches only registrations without a job
+/// record, so a second run changes nothing.
+///
+/// The backfill: every registration that exists was written by a release
+/// without the job record, so each is a legacy restore. One whose table is
+/// not CREATING, or whose copy had finished and was handed to the backfill
+/// worker (`restore_backfill_pending`), is DONE, completed when the table was
+/// created. One whose table is CREATING with no hand-over is a restore the
+/// upgrade's stop interrupted: RUNNING, with a heartbeat at the epoch (not
+/// absent, so the staleness test selects it) and an owner generation no job
+/// holds (0), so the first reconciler pass fails it and removes its target.
+/// The owner and heartbeat fields of the earlier registration shape are
+/// removed; the job record replaces them.
+pub(crate) async fn apply_backup_catalog_index(
+    db: &mongodb::Database,
+) -> OpResult<BackupCatalogIndexStep> {
+    fn index_err(what: &'static str) -> impl Fn(mongodb::error::Error) -> OpError {
+        move |e| OpError::Internal(format!("{what}: {e}"))
+    }
+    let unique = || IndexOptions::builder().unique(true).build();
+
+    for coll_name in [BACKUP_INDEX, BACKUP_MAINTENANCE] {
+        // Idempotent on the versions this backend supports.
+        let _ = db.create_collection(coll_name).await;
+    }
+    let backup_index = db.collection::<Document>(BACKUP_INDEX);
+    backup_index
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "account_id": 1, "backup_id": 1 })
+                .options(unique())
+                .build(),
+        )
+        .await
+        .map_err(index_err("backup_index (account_id, backup_id) index"))?;
+    backup_index
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "backup_id": 1 })
+                .options(unique())
+                .build(),
+        )
+        .await
+        .map_err(index_err("backup_index backup_id index"))?;
+    backup_index
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "account_id": 1, "table_name": 1, "created_at": 1 })
+                .build(),
+        )
+        .await
+        .map_err(index_err("backup_index account and table index"))?;
+    backup_index
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "store_kind": 1, "store_root": 1, "store_id": 1, "status": 1 })
+                .build(),
+        )
+        .await
+        .map_err(index_err("backup_index store and status index"))?;
+
+    let tables = db.collection::<Document>("tables");
+    tables
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { RESTORE_JOB_STATUS: 1, RESTORE_JOB_HEARTBEAT: 1 })
+                .build(),
+        )
+        .await
+        .map_err(index_err("tables restore job index"))?;
+
+    let interrupted = doc! { "$and": [
+        { "$eq": ["$table_status", "CREATING"] },
+        { "$ne": ["$restore_backfill_pending", true] },
+    ] };
+    let backfilled = tables
+        .update_many(
+            doc! {
+                "restore_source_backup_arn": { "$exists": true },
+                RESTORE_JOB: { "$exists": false },
+            },
+            vec![
+                doc! { "$set": { RESTORE_JOB: {
+                    "status": { "$cond": [interrupted.clone(), "RUNNING", "DONE"] },
+                    "kind": "legacy",
+                    "owner_generation": 0_i64,
+                    "heartbeat_at": bson::DateTime::from_millis(0),
+                    "completed_at": { "$cond": [interrupted, "$$REMOVE", "$creation_date_time"] },
+                } } },
+                doc! { "$unset": ["restore_operation_id", "restore_heartbeat_at"] },
+            ],
+        )
+        .await
+        .map_err(index_err("backfill the restore job records"))?
+        .modified_count;
+
+    let settings = db.collection::<Document>("settings");
+    let catalog_id_written = settings
+        .update_one(
+            doc! { "_id": CATALOG_ID },
+            doc! { "$setOnInsert": { "value": uuid::Uuid::new_v4().to_string() } },
+        )
+        .upsert(true)
+        .await
+        .map_err(index_err("write catalog_id"))?
+        .upserted_id
+        .is_some();
+
+    settings
+        .update_one(
+            doc! { "_id": "catalog_version" },
+            doc! { "$set": { "value": CATALOG_VERSION } },
+        )
+        .upsert(true)
+        .await
+        .map_err(index_err("write catalog_version"))?;
+
+    // Ignore E11000 (already recorded).
+    let _ = db
+        .collection::<Document>("schema_history")
+        .insert_one(doc! {
+            "_id": "002_backup_catalog_index",
+            "applied_at": bson::DateTime::now(),
+        })
+        .await;
+
+    Ok(BackupCatalogIndexStep {
+        registrations_backfilled: backfilled,
+        catalog_id_written,
+    })
+}
 
 /// `MongoDB` bootstrapper for init/destroy/migrate operations.
 pub struct MongoBootstrapper {
@@ -342,12 +538,12 @@ impl Bootstrapper for MongoBootstrapper {
             .await
             .map_err(|e| OpError::Internal(format!("backups index: {e}")))?;
 
-        // Seed catalog_version in settings
+        // Seed catalog_version in settings; the later steps move it on.
         let settings = db.collection::<Document>("settings");
         let _ = settings
             .update_one(
                 doc! { "_id": "catalog_version" },
-                doc! { "$setOnInsert": { "value": "0.0.2" } },
+                doc! { "$setOnInsert": { "value": INITIAL_CATALOG_VERSION } },
             )
             .upsert(true)
             .await;
@@ -372,6 +568,14 @@ impl Bootstrapper for MongoBootstrapper {
                 "applied_at": bson::DateTime::now(),
             })
             .await; // Ignore E11000 (already applied)
+
+        let step = apply_backup_catalog_index(&db).await?;
+        if step.registrations_backfilled > 0 {
+            println!(
+                "  Backfilled the job record on {} restore registration(s)",
+                step.registrations_backfilled
+            );
+        }
 
         Ok(())
     }
@@ -614,7 +818,7 @@ impl Bootstrapper for MongoBootstrapper {
     }
 
     fn expected_catalog_version(&self) -> String {
-        "0.0.2".to_string()
+        CATALOG_VERSION.to_string()
     }
 
     fn catalog_database_name(&self) -> String {

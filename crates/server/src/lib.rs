@@ -53,6 +53,8 @@ use tower_http::set_header::SetResponseHeaderLayer;
 /// Application state shared across all handlers.
 pub struct AppState {
     pub storage: Arc<dyn extenddb_storage::StorageEngine>,
+    /// The job slots and configured backup store the backup operations read.
+    pub backup_runtime: Arc<extenddb_engine::BackupRuntime>,
     pub auth: Arc<dyn AuthProvider>,
     pub limits: Arc<LimitsConfig>,
     // Fix #9: Use Arc<str> to avoid per-request cloning

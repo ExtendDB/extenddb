@@ -63,6 +63,10 @@ pub enum StorageError {
     /// `BackupInUseException`.
     #[error("{0}")]
     BackupInUse(String),
+    /// A catalog row that already exists, or whose claim a live owner holds
+    /// (`BackupCatalog::claim_backup`).
+    #[error("Already exists: {0}")]
+    AlreadyExists(String),
     /// A failure that is expected to succeed on retry: I/O errors, pool
     /// timeouts, SQLITE_BUSY / SQLITE_LOCKED. Exists so queue workers can tell
     /// "this row can never be applied" (drop it, or the whole queue stalls)

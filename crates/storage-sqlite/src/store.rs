@@ -86,6 +86,9 @@ pub struct SqliteEngine {
     /// it; see [`crate::backup::backup_server_slot_count`].
     pub(crate) backup_server_slot_count: usize,
     pub(crate) backup_server_slots: Arc<tokio::sync::Semaphore>,
+    /// The in-process claims of the backup and restore jobs this process
+    /// runs; see [`crate::backup_catalog::JobSlots`].
+    pub(crate) job_slots: Arc<crate::backup_catalog::JobSlots>,
 }
 
 impl SqliteEngine {
@@ -177,6 +180,7 @@ impl SqliteEngine {
             serve_lock: None,
             backup_server_slot_count,
             backup_server_slots: Arc::new(tokio::sync::Semaphore::new(backup_server_slot_count)),
+            job_slots: Arc::default(),
         })
     }
 
@@ -560,20 +564,26 @@ mod d1_write_lock_tests {
 
     #[tokio::test]
     async fn delete_backup_waits_for_the_write_lock() {
-        use extenddb_storage::BackupEngine;
+        use extenddb_storage::{JobPermit, LegacyBackupReader};
         let engine = engine().await;
         create_table(&engine, "d1-bkp-t").await;
         // The backup must exist before the lock window: delete_backup resolves
         // it with a read first and returns early when it is missing, which
         // would complete without ever reaching the writes under test.
-        let details = BackupEngine::create_backup(&engine, "000000000000", "d1-bkp-t", "b")
-            .await
-            .expect("backup");
+        let details = LegacyBackupReader::create(
+            &engine,
+            "000000000000",
+            "d1-bkp-t",
+            "b",
+            JobPermit::detached(),
+        )
+        .await
+        .expect("backup");
         let e = engine.clone();
         assert_serialized(
             &engine,
             async move {
-                BackupEngine::delete_backup(&e, "000000000000", &details.backup_arn)
+                LegacyBackupReader::delete(&e, "000000000000", &details.backup_arn)
                     .await
                     .expect("delete backup");
             },
@@ -584,7 +594,7 @@ mod d1_write_lock_tests {
 
     #[tokio::test]
     async fn update_continuous_backups_waits_for_the_write_lock() {
-        use extenddb_storage::BackupEngine;
+        use extenddb_storage::LegacyBackupReader;
         let engine = engine().await;
         // The table must exist before the lock window: the pre-lock existence
         // check returns TableNotFound otherwise, completing without reaching
@@ -594,9 +604,14 @@ mod d1_write_lock_tests {
         assert_serialized(
             &engine,
             async move {
-                BackupEngine::update_continuous_backups(&e, "000000000000", "d1-pitr-t", true)
-                    .await
-                    .expect("update continuous backups");
+                LegacyBackupReader::update_continuous_backups(
+                    &e,
+                    "000000000000",
+                    "d1-pitr-t",
+                    true,
+                )
+                .await
+                .expect("update continuous backups");
             },
             "update_continuous_backups",
         )

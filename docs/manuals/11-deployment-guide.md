@@ -211,7 +211,7 @@ extenddb init \
 ### Database (PostgreSQL)
 
 - [ ] Use a dedicated PostgreSQL user for extenddb with minimal privileges
-- [ ] Configure PostgreSQL `max_connections` ≥ extenddb `pool_size` + 3
+- [ ] Configure PostgreSQL `max_connections` ≥ `2 * pool_size + catalog_pool_size + max_concurrent_jobs`, plus one per overlapping vector index build and one during a schema migration
 - [ ] Enable PostgreSQL TLS
 - [ ] Set up automated backups (pg_dump, WAL archiving, or managed service snapshots)
 - [ ] Monitor PostgreSQL disk usage, connection count, and query performance
@@ -286,7 +286,7 @@ pool_size = 50  # Increase for higher concurrency
 
 Ensure PostgreSQL `max_connections` accommodates the total pool size plus overhead.
 
-Backup and restore work is admitted against the pool so it cannot take every connection from ordinary requests. On PostgreSQL and MongoDB one server runs at most 4 `RestoreTableFromBackup` copies per account and `min(16, pool/2)` in total (PostgreSQL: `pool_size`; MongoDB: the engine's driver pool, `maxPoolSize` in the connection string or `max_connections`, default 10, so 5 restores); a restore that waits more than 30 seconds for a slot is refused with `LimitExceededException` and creates nothing. On SQLite one server runs at most `pool_size / 2 - 1` `CreateBackup` copies at once (between 1 and 16; 4 for the default `pool_size` of 10), each holding its snapshot connection for its duration, and refuses a backup that waited 30 seconds with `LimitExceededException`. A MongoDB restore request that is not registered within 60 seconds answers an internal error while the restore goes on in the background; the MongoDB driver does not enforce `waitQueueTimeoutMS`, so the admission bound is what keeps a flood of restores from holding every pooled connection.
+Backup and restore work is bounded per server by `[backup] max_concurrent_jobs` (default 4): `CreateBackup` and `RestoreTableFromBackup` jobs together, on every backend, and a request over the bound is refused at once with `LimitExceededException` and creates nothing (there is no wait). On PostgreSQL each running job holds one pooled connection for its copy plus one dedicated connection outside the pool for its claim, and startup raises `pool_size` and `catalog_pool_size` to at least `2 * max_concurrent_jobs + 10` with a warning naming both numbers (the admin guide's `[backup]` table). On SQLite a `CreateBackup` also holds its snapshot connection for its duration, and a server admits at most `pool_size / 2 - 1` of them at once (between 1 and 16; 4 for the default `pool_size` of 10), so that half the pool stays free for ordinary requests; a `CreateBackup` over that bound is refused at once with the same `LimitExceededException`. A MongoDB restore request that is not registered within 60 seconds answers an internal error while the restore goes on in the background; the MongoDB driver does not enforce `waitQueueTimeoutMS`, so the admission bound is what keeps a flood of restores from holding every pooled connection.
 
 ### PostgreSQL Tuning
 
@@ -295,7 +295,7 @@ Key PostgreSQL settings for extenddb workloads:
 - `shared_buffers`: 25% of available RAM
 - `effective_cache_size`: 75% of available RAM
 - `work_mem`: 64MB (for sort operations in Query/Scan)
-- `max_connections`: ≥ `2 * pool_size + catalog_pool_size`, plus one per vector index build you expect to overlap and one during a schema migration. `pool_size` sizes both the catalog and the data pool, and `max_connections` is per cluster, so the default pool sizes need 60 of PostgreSQL's default 100
+- `max_connections`: ≥ `2 * pool_size + catalog_pool_size + max_concurrent_jobs`, plus one per vector index build you expect to overlap and one during a schema migration. `pool_size` sizes both the catalog and the data pool, each backup or restore job holds one claim connection outside every pool, and `max_connections` is per cluster, so the default pool sizes and the default `max_concurrent_jobs` of 4 need 64 of PostgreSQL's default 100
 
 ### Monitoring Queries
 

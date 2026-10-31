@@ -4,7 +4,7 @@
 
 ## Current Status
 
-This release versions the PostgreSQL and SQLite catalogs by a migration ledger and carries catalog migrations 1 to 4, which `extenddb migrate --list` prints. **Every PostgreSQL and SQLite deployment created by a 0.1.x release runs `extenddb migrate --yes` once** before a server of this release starts on it: the server refuses a catalog with pending migrations. Migration 1 brings the catalog of every 0.1.x release to the v1.0 schema. Cassandra stays at catalog 0.0.4 and MongoDB at 0.0.2, and their sections below apply unchanged. <!-- version-literal-ok: names the Cassandra and MongoDB catalog versions -->
+This release versions the PostgreSQL and SQLite catalogs by a migration ledger and carries catalog migrations 1 to 5, which `extenddb migrate --list` prints. **Every PostgreSQL and SQLite deployment created by a 0.1.x release runs `extenddb migrate --yes` once** before a server of this release starts on it: the server refuses a catalog with pending migrations. Migration 1 brings the catalog of every 0.1.x release to the v1.0 schema. Cassandra and MongoDB keep their version strings and both move to catalog 0.0.5 (Cassandra `0.0.4 -> 0.0.5` through `V006__backup_catalog_index.cql`, MongoDB `0.0.2 -> 0.0.5` through its step `002_backup_catalog_index`), the same change as migration 5: run `extenddb migrate --yes` once on each with every pre-upgrade server stopped, as [the section below](#cassandra-and-mongodb-catalog-005) says. <!-- version-literal-ok: names the Cassandra and MongoDB catalog versions -->
 
 A backup that a 0.1.x release took can restore without its global and local secondary indexes: a SQLite backup taken by 0.1.14 records only the table's key schema and attribute definitions, and its restore creates the table with its items and no index. Take a new backup of each table after upgrading to v1.0, and keep the 0.1.x backups for their items only.
 
@@ -37,7 +37,24 @@ Running `extenddb migrate --yes` on an up-to-date catalog changes nothing.
 
 Exit status 6 means the migration lock, or a running server, was still held when `--lock-timeout` ran out; run the command again once it is free. Every refusal prints the command that resolves it. A dev build's `serve` applies a Behind or Uninitialized catalog at startup instead of refusing it. The `serve` codes are those of `serve --foreground`; in daemon mode `serve` exits 1 and writes the refusal to syslog.
 
-A migration is additive when the previous release serves the catalog correctly with it applied, and breaking otherwise. Migrations 1 to 4 are breaking: do not run a 0.1.x server against a migrated catalog. A 0.1.x binary that writes to a migrated catalog (its `migrate --yes`, or a SQLite dev server) leaves it WrittenByOlderRelease.
+A migration is additive when the previous release serves the catalog correctly with it applied, and breaking otherwise. Migrations 1 to 5 are breaking: do not run a 0.1.x server against a migrated catalog. A 0.1.x binary that writes to a migrated catalog (its `migrate --yes`, or a SQLite dev server) leaves it WrittenByOlderRelease.
+
+Migration 5 adds the catalog index of backups kept in a backup store (`backup_index`), turns each restore registration into a restore job record (`table_restores` gains its status, kind, claim and progress columns), adds the maintenance claim record and writes the catalog's random id. Stop every server built before this migration before running `extenddb migrate --yes`: such a server neither reads `backup_index` nor marks the restore registrations it writes, so a restore it ran during the upgrade would be owned by nobody. A restore in flight at that stop is left as a RUNNING job record whose owner is dead; the first reconciler pass of the new server (within `backup.reconcile_interval_secs`, default 60 s) marks it FAILED and removes its CREATING target, so the name is free again and the table has to be restored anew.
+
+A rollback to the previous binary needs two things: the catalog restored from the pre-upgrade dump (the previous binary refuses a catalog carrying migration 5, exit status 4), and the `[backup]` section removed from the configuration file, which the previous binary refuses as an unknown field before it reaches the catalog (`unknown field 'backup'`). No backup store exists yet in this release, so the dump loses nothing a server wrote outside the catalog.
+
+### Cassandra and MongoDB: catalog 0.0.5
+
+Cassandra and MongoDB migrate through their bootstrappers, not the ledger, and keep a version string; this release moves both to `0.0.5` with the change migration 5 makes on the SQL backends: Cassandra's `V006__backup_catalog_index.cql` (the index columns and `backup_index_by_status`, the restore job columns on `tables`, `backup_maintenance`, the catalog id) and MongoDB's step `002_backup_catalog_index` (the `backup_index` and `backup_maintenance` collections and their indexes, the `restore_job` record on the restore targets, the catalog id), each recorded in `schema_history`. <!-- version-literal-ok: names the Cassandra and MongoDB catalog versions -->
+
+```bash
+extenddb stop --config extenddb.toml                 # every server of the previous release
+extenddb migrate --config extenddb.toml              # exit 3: catalog 0.0.4 -> 0.0.5 (Cassandra) or 0.0.2 -> 0.0.5 (MongoDB)
+extenddb migrate --config extenddb.toml --yes
+extenddb serve --config extenddb.toml
+```
+
+Stop every pre-upgrade server first, for the reason given for migration 5: a server of the previous release neither reads the index nor marks the restore registrations it writes. A restore in flight at that stop is backfilled as a RUNNING job record whose owner is dead, and the first reconciler pass of the new server fails it and removes its CREATING target. On both backends `serve` now refuses to start on a catalog whose version is not the one it serves (exit status 1, the message naming `extenddb migrate --yes`); the previous release's Cassandra server started on an unmigrated catalog and refused only the backup operations, logging an abandoned-restore sweep error every 15 seconds, and this release has no such sweep: the reconciler runs every `backup.reconcile_interval_secs`. The Cassandra `migrate` takes the admin credentials as the [0.0.4 section](#cassandra) shows. On a 0.0.4 Cassandra catalog the step takes seconds (a filtered scan of `tables` for restore registrations); on a 0.0.2 MongoDB catalog likewise. On Cassandra the version is written last, after the step and the `schema_history` row: a `migrate --yes` that fails in the step leaves the catalog at 0.0.4 with V006 unrecorded, `serve` keeps refusing it, and the next `migrate --yes` runs V006 again (every statement of it is idempotent) and finishes. Neither upgrade is reversible in place; take a snapshot of the catalog with your usual tooling before migrating.
 
 ## Writing a New Migration
 
@@ -182,7 +199,7 @@ To roll back, stop the server, put the copied files back in place of the current
 
 On SQLite, `extenddb serve` reads the catalog's migration ledger before it opens the database and refuses a catalog with pending migrations, exiting 3 under `--foreground` with each pending migration and the `extenddb migrate --config <config> --yes` command to run (in daemon mode it exits 1 and writes the refusal to syslog); a dev build applies them at startup instead, taking the same copy.
 
-On startup the SQLite server removes any restore target left in `CREATING` by a server that stopped mid-copy, which is only safe because one server at a time can hold the file. A backup keeps a WAL read snapshot open while it copies; checkpoints cannot reclaim pages needed by that snapshot, so allow disk headroom for WAL growth proportional to the backup duration and concurrent write volume. Set `pool_size` to 3 or more (see the Admin Guide); the server runs at most `pool_size / 2 - 1` backups at once (4 with the default of 10) and answers `LimitExceededException` to a `CreateBackup` that waited 30 seconds for a slot. Running backups hold one connection each for their read snapshot plus one shared writer (`n` backups hold `n + 1` connections), so from `pool_size` 4 up a flood of backups leaves at least half the pool to other requests; with a `pool_size` of 2 or 3 the one admitted backup holds two of them. A GSI added by `UpdateTable` with `ProvisionedThroughput` on a `PROVISIONED` table made every `DescribeTable` of that table fail on earlier builds (`Internal("index pt: missing field NumberOfDecreasesToday")`); this build writes the index's throughput in the shape `DescribeTable` reads and reads the shape earlier builds wrote (as the same units with `NumberOfDecreasesToday` 0), so such a table is describable again after the upgrade without any change to the database file.
+On startup the SQLite server removes any restore target left in `CREATING` by a server that stopped mid-copy, which is only safe because one server at a time can hold the file. A backup keeps a WAL read snapshot open while it copies; checkpoints cannot reclaim pages needed by that snapshot, so allow disk headroom for WAL growth proportional to the backup duration and concurrent write volume. Set `pool_size` to 3 or more (see the Admin Guide); the server runs at most `pool_size / 2 - 1` backups at once (4 with the default of 10) and answers `LimitExceededException` at once to a `CreateBackup` that finds no slot free. Running backups hold one connection each for their read snapshot plus one shared writer (`n` backups hold `n + 1` connections), so from `pool_size` 4 up a flood of backups leaves at least half the pool to other requests; with a `pool_size` of 2 or 3 the one admitted backup holds two of them. A GSI added by `UpdateTable` with `ProvisionedThroughput` on a `PROVISIONED` table made every `DescribeTable` of that table fail on earlier builds (`Internal("index pt: missing field NumberOfDecreasesToday")`); this build writes the index's throughput in the shape `DescribeTable` reads and reads the shape earlier builds wrote (as the same units with `NumberOfDecreasesToday` 0), so such a table is describable again after the upgrade without any change to the database file.
 
 #### Cassandra
 
@@ -196,7 +213,7 @@ extenddb serve --config extenddb.toml
 
 `<admin>` is the role `init` used (`--cassandra-user`). `EXTENDDB_CASSANDRA_PASSWORD` keeps the password out of process arguments; `--cassandra-pass` still works and wins if both are given. Without a user and password `migrate` connects as the operating-system user with no password, which a cluster using `PasswordAuthenticator` refuses; the error reports a connection timeout.
 
-There is no startup version gate on Cassandra. A 0.0.4 server started before `extenddb migrate --yes` serves every table and item operation normally; CreateBackup, RestoreTableFromBackup, and DeleteBackup are refused with a `ValidationException` ("Backups are unavailable until the ExtendDB catalog is migrated: ... Run `extenddb migrate --yes` with the admin credentials.") until the catalog is migrated; a running server notices the migration without a restart, and the server logs an abandoned-restore sweep error (`Undefined column name restore_source_backup_arn`) at startup and every 15 seconds. ListBackups and DescribeBackup work and show backups taken before the upgrade. V005 only adds columns. This manual has no tested rollback for Cassandra; take a snapshot of the catalog and account keyspaces with your usual Cassandra tooling before migrating.
+The 0.0.4 server had no startup version gate on Cassandra. A 0.0.4 server started before `extenddb migrate --yes` serves every table and item operation normally; CreateBackup, RestoreTableFromBackup, and DeleteBackup are refused with a `ValidationException` ("Backups are unavailable until the ExtendDB catalog is migrated: ... Run `extenddb migrate --yes` with the admin credentials.") until the catalog is migrated; a running server notices the migration without a restart, and the 0.0.4 server logs an abandoned-restore sweep error (`Undefined column name restore_source_backup_arn`) at startup and every 15 seconds (this release's server has no such sweep, and does not start on a catalog behind it: see [catalog 0.0.5](#cassandra-and-mongodb-catalog-005)). ListBackups and DescribeBackup work and show backups taken before the upgrade. V005 only adds columns. This manual has no tested rollback for Cassandra; take a snapshot of the catalog and account keyspaces with your usual Cassandra tooling before migrating.
 
 Upgrade every server to 0.0.4 before restoring a backup. A 0.0.3 server still running against the migrated catalog does not know about restores in progress: its DeleteTable deletes a table that is being restored and its DeleteBackup deletes a backup a restore is copying from, and that restore then fails and its target table is removed. <!-- version-literal-ok: names both ends of the upgrade -->
 
@@ -395,12 +412,14 @@ region the caller wrote, so after a change a statement must name the new region
 admin guide covers this).
 
 Keep `server.region` within `[a-z0-9-]`. The `BackupArn` parser accepts only
-that class, as the service does, so a region such as `LOCAL`, `us_east_1`, or
-`dev.local` makes every backup ARN the server issues `ValidationException`
-"Invalid Request: BackupArn is not valid" on `DescribeBackup`, `DeleteBackup`,
-and `RestoreTableFromBackup`, and `ListBackups` refuses the cursor it hands out,
-so every listing stops at its first page. The server starts with such a region
-and logs a warning naming the consequence at startup.
+that class, as the service does, so under a region such as `LOCAL`, `us_east_1`,
+or `dev.local` no backup ARN can be formed: `CreateBackup` is refused with
+`ValidationException` naming `server.region`, every backup an earlier release
+issued under such a region keeps an ARN that is `ValidationException` "Invalid
+Request: BackupArn is not valid" on `DescribeBackup`, `DeleteBackup`, and
+`RestoreTableFromBackup`, and `ListBackups` refuses a cursor that is such an ARN
+(a listing of backups created under a valid region pages). The server starts
+with such a region and logs a warning naming the consequence at startup.
 
 ### v0.1.6 — IAM: bare operators on multivalued condition keys are no-ops (BR-7085)
 

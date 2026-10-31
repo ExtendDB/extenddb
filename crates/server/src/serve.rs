@@ -320,6 +320,7 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
 
     component_options.bootstrap_if_uninitialized = dev_mode;
     component_options.release = build.version;
+    component_options.max_concurrent_jobs = app_config.backup.max_concurrent_jobs;
 
     // Wire the node's own bind address as the instance ID so each ExtendDB node
     // has a distinct node ID (to support logical clocks for sequences, etc.).
@@ -627,8 +628,12 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         initial_throttling,
     ));
 
+    let backup_runtime = Arc::new(extenddb_engine::BackupRuntime::new(
+        app_config.backup.max_concurrent_jobs,
+    ));
     let state = AppState {
-        storage,
+        storage: storage.clone(),
+        backup_runtime,
         auth,
         limits,
         region: Arc::from(app_config.server.region.as_str()),
@@ -704,6 +709,18 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         };
         worker_handles.extend(hooks.spawn_workers(&worker_ctx).await);
     }
+
+    // The backup reconciler: backend-agnostic, so it runs here beside the
+    // backends' workers rather than in each backend's `spawn_workers`.
+    worker_handles.push(tokio::spawn(extenddb_engine::reconciler::run(
+        storage.clone(),
+        extenddb_engine::reconciler::ReconcilerSettings {
+            interval: std::time::Duration::from_secs(app_config.backup.reconcile_interval_secs),
+            stale_job_after: std::time::Duration::from_secs(app_config.backup.stale_job_after_secs),
+        },
+        metrics.clone(),
+        shutdown.clone(),
+    )));
 
     let tls_config = if tls_enabled {
         let cert_path = config::expand_tilde(&app_config.server.tls.cert_path);

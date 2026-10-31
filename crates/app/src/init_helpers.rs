@@ -300,6 +300,20 @@ key_path = "{tls_key}"
 # max_import_item_count = 10000000
 # max_export_item_count = 10000000
 
+# [backup]
+# Backup and restore jobs. stale_job_after_secs must be at least three
+# heartbeat periods, the larger of heartbeat_interval_secs and the 15 s the
+# jobs of this release heartbeat at (45 at the least); pool_size is raised to
+# at least 2 * max_concurrent_jobs + 10 on PostgreSQL; max_concurrent_jobs
+# is at most 1024.
+# data_file_target_bytes = 67108864    # Uncompressed bytes per data file (minimum 32 MiB)
+# heartbeat_interval_secs = 15         # Job heartbeat timer
+# stale_job_after_secs = 300           # Heartbeat age after which a job's owner is dead
+# failed_row_retention_secs = 604800   # FAILED tombstones kept for the operator (7 days)
+# reconcile_interval_secs = 60         # Reconciler cycle
+# max_concurrent_jobs = 4              # Backup and restore jobs running at once on this instance
+# spool_path = "/var/lib/extenddb/spool" # Restore download area for an S3 store
+
 # [import]
 # paths = []                     # Allowed directories for import operations
 

@@ -23,6 +23,7 @@
 mod admin_store;
 mod authorization_store;
 mod backup;
+mod backup_catalog;
 mod bootstrapper;
 mod catalog_store;
 pub mod config;
@@ -286,31 +287,24 @@ fn sqlite_server_components_factory(
             Err(e) => tracing::error!("Failed to recover control plane transitions: {e}"),
         }
 
-        // Remove any restore target a prior crash left mid-copy. Before the
-        // server takes requests, so no restore can be in flight.
-        match engine.sweep_abandoned_restores().await {
+        // A restore the previous run left mid-copy: one process serves this
+        // file, so its owner is gone. Age every RUNNING job record so the
+        // engine's reconciler fails it and removes its target on its first
+        // cycle rather than after the stale window. Before the server takes
+        // requests, so no restore of this process can be in flight. A backup
+        // the previous run left CREATING is reported to the reconciler by
+        // `abandoned_creating_backups` without a step here: no task of this
+        // process holds its slot.
+        match engine.expire_restore_job_heartbeats().await {
             Ok(names) => {
                 for name in &names {
                     tracing::warn!(
-                        "removed table '{name}': its restore did not finish before the last \
-                         shutdown"
+                        "table '{name}': its restore did not finish before the last shutdown; \
+                         the reconciler removes it"
                     );
                 }
             }
-            Err(e) => tracing::error!("Failed to sweep abandoned restores: {e}"),
-        }
-
-        // Likewise a backup a prior crash left CREATING: its items were only
-        // partly copied, and nothing will finish them.
-        match engine.sweep_incomplete_backups().await {
-            Ok(arns) => {
-                for arn in &arns {
-                    tracing::warn!(
-                        "removed backup {arn}: its copy did not finish before the last shutdown"
-                    );
-                }
-            }
-            Err(e) => tracing::error!("Failed to sweep incomplete backups: {e}"),
+            Err(e) => tracing::error!("Failed to mark interrupted restores: {e}"),
         }
 
         // Rebuild any GSI left mid-backfill (status CREATING) by a prior crash.
