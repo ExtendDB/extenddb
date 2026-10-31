@@ -250,6 +250,22 @@ async fn disable_closes_every_shard_and_re_enable_creates_a_new_stream() {
             .len();
     }
     assert_eq!(on_new, 1);
+    // A token pairing one stream's ARN with the other stream's shard id names
+    // a shard the stream does not have.
+    for (arn, shard) in [
+        (&new_arn, &closed.shards[0].shard_id),
+        (&old_arn, &new.shards[0].shard_id),
+    ] {
+        match engine
+            .get_stream_records(&account, arn, shard, None, 1000)
+            .await
+        {
+            Err(StorageError::TableNotFound(m)) => {
+                assert_eq!(m, extenddb_storage::util::STREAM_DOES_NOT_EXIST);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
     // LATEST on a closed shard resolves to its last record, not to the new
     // stream's.
     for shard in &closed.shards {
