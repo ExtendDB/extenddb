@@ -103,15 +103,16 @@ extenddb serve --port 19443 --config extenddb.toml  # use a different port
 
 ### `cannot set the mode of SQLite file <path>: <error>` or `cannot set the mode of SQLite database <path>: <error>`
 
-**Cause:** The SQLite database holds the encryption key next to the secrets it protects, so it must be readable by its owner only. `init`, `migrate`, `settings`, `verify` and `serve` create a missing database file with mode 0600, and set the database file and its `-wal`, `-shm` and `-journal` files to 0600 when they are wider. Only regular files are changed, and a file already at 0600 or narrower is left as it is. A symlink at the database name is followed to the file SQLite opens. The `SQLite file` message means a file wider than 0600 could not be set to 0600; the `SQLite database` message means the command created the database file and could not set its mode. Possible causes:
+**Cause:** The SQLite database holds the encryption key next to the secrets it protects, so it must be readable by its owner only. `init`, `migrate`, `settings`, `verify` and `serve` create a missing database file with mode 0600, and set the database file and its `-wal`, `-shm` and `-journal` files to 0600 when they are wider. Only regular files are changed, and a file already at 0600 or narrower is left as it is. A symlink at the database name is followed to the file SQLite opens. The `SQLite file` message means a file wider than 0600 could not be set to 0600, or that the command could not look up the database file or one of its `-wal`, `-shm` or `-journal` files. The `SQLite database` message means the filesystem refused to set the mode of the database file the command created. Causes of the `SQLite file` message:
 - The database is on a read-only mount (`Read-only file system (os error 30)`) and its files are wider than 0600, for example files left at 0644 by an earlier version.
 - The database files belong to another user (`Operation not permitted (os error 1)`), for example a database shared through group permissions, or a host directory mounted into a container that runs as a different user.
+- The user running the command cannot search the directory that holds the database (`Permission denied (os error 13)`).
 
 **Fix:** For a read-only mount, run one command against the same files on a writable mount first, as the user who owns them, for example `extenddb verify --config <config>`. It sets the files to 0600, and later commands on the read-only mount find nothing to change. Or set the modes yourself as the owner:
 ```bash
 chmod 600 extenddb.sqlite extenddb.sqlite-wal extenddb.sqlite-shm
 ```
-For files that belong to another user, run extenddb as that user. The lock file next to the database has the same requirement for `serve`, `migrate`, `init` and `destroy`.
+For files that belong to another user, run extenddb as that user. The lock file next to the database has the same requirement for `serve`, `migrate`, `init` and `destroy`. For a directory the user cannot search, run extenddb as a user who can, or give that user search permission on the directory.
 
 ### `Failed to load TLS certificates: <error>`
 
