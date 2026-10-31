@@ -59,9 +59,11 @@ pub struct ServeArgs {
     migrate: bool,
 }
 
-/// Bind the listening socket, daemonize, then start the tokio runtime.
-/// Binding before forking ensures port conflicts are reported to stderr
-/// before the parent process exits (D-4).
+/// Check the catalog, bind the listening socket, daemonize, then start the
+/// tokio runtime. The catalog check comes first, so the port accepts no
+/// connection while the catalog migrates; binding before forking ensures
+/// port conflicts are reported to stderr before the parent process exits
+/// (D-4).
 pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
     // Load config early so bind address is known before fork. A dev-mode
     // build serves with built-in defaults when no config file exists
@@ -105,19 +107,26 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
         );
     }
 
-    if app_config.server.catalog_upgrade_lock_timeout > config::MAX_CATALOG_UPGRADE_LOCK_TIMEOUT {
-        anyhow::bail!(
-            "server.catalog_upgrade_lock_timeout is {} s; it may be at most {} s (a day)",
-            app_config.server.catalog_upgrade_lock_timeout,
-            config::MAX_CATALOG_UPGRADE_LOCK_TIMEOUT
-        );
-    }
+    crate::serve_catalog::lock_timeout(&app_config.server)?;
 
     // Fail fast, before binding the port, when no backend is installed.
     let backend = &app_config.storage.backend;
     extenddb_storage::backend_name()
         .ok_or_else(|| anyhow::anyhow!("no storage backend installed"))?;
     let catalog_version = extenddb_storage::migrations::binary_catalog_label();
+
+    // Daemon mode (double fork, PID file, syslog) is POSIX-only. On Windows
+    // the server must be run with `--foreground` under an external
+    // supervisor (a terminal, a service wrapper, or the npm launcher, which
+    // always passes `--foreground`). Refused before the catalog is read, so
+    // a server that cannot start migrates nothing.
+    #[cfg(not(unix))]
+    if !args.foreground {
+        anyhow::bail!(
+            "daemon mode is not supported on this platform; \
+             run `extenddb serve --foreground`"
+        );
+    }
 
     let port = args.port.unwrap_or(app_config.server.port);
 
@@ -159,6 +168,23 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
     }
 
     let bind_addr = format!("{}:{}", app_config.server.bind_addr, port);
+
+    // The catalog's status, and under `apply` its migrations: before the
+    // port is bound, so the port accepts no connection while the catalog
+    // migrates, and before the fork, so that in daemon mode a refusal's exit
+    // code and message reach the invoking shell. The server checks the
+    // catalog again when it registers.
+    let code = crate::serve_catalog::check_catalog(&crate::serve_catalog::ServeStart {
+        server: &app_config.server,
+        location: app_config.storage.connection_config(),
+        migrate: args.migrate,
+        release: build.version,
+        config_file: config_exists.then_some(args.config.as_str()),
+        daemonizes: !args.foreground,
+    })?;
+    if code != extenddb_storage::migrations::exit::OK {
+        std::process::exit(i32::from(code));
+    }
 
     // Bind in sync context — errors go to stderr before daemonizing.
     let std_listener = TcpListener::bind(&bind_addr)
@@ -211,25 +237,6 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
         print_dev_mode_banner(&app_config, args.foreground)?;
     }
 
-    // The catalog's status, and under `apply` its migrations, before the
-    // fork, so that in daemon mode a refusal's exit code and message reach
-    // the invoking shell. The server checks the catalog again when it
-    // registers.
-    let upgrade = if args.migrate {
-        config::CatalogUpgrade::Apply
-    } else {
-        app_config.server.catalog_upgrade
-    };
-    let code = crate::serve_catalog::check_catalog(
-        &app_config,
-        upgrade,
-        build.version,
-        config_exists.then_some(args.config.as_str()),
-    )?;
-    if code != extenddb_storage::migrations::exit::OK {
-        std::process::exit(i32::from(code));
-    }
-
     // D-3: A PID file lets `extenddb status` and `extenddb stop` find the
     // process. Daemon mode always writes one. Foreground mode writes one only on
     // request, so by default it needs no run directory at all and the container
@@ -251,16 +258,7 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
     // can be supervised by Docker, Kubernetes, systemd Type=simple, etc.
     // Graceful shutdown on SIGINT/SIGTERM still works.
     if !args.foreground {
-        // Daemon mode (double fork, PID file, syslog) is POSIX-only. On
-        // Windows the server must be run with `--foreground` under an
-        // external supervisor (a terminal, a service wrapper, or the npm
-        // launcher, which always passes `--foreground`).
-        #[cfg(not(unix))]
-        anyhow::bail!(
-            "daemon mode is not supported on this platform; \
-             run `extenddb serve --foreground`"
-        );
-
+        // Daemon mode is POSIX-only; other platforms were refused above.
         #[cfg(unix)]
         {
             let pid_file = pid_file
