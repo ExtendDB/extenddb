@@ -146,7 +146,8 @@ impl StreamEngine for PostgresEngine {
             // shard that is not that table's (another table, or another
             // account) returns no rows. Whether the shard belongs to the stream
             // the ARN's label names is decided in Rust from the table's label
-            // and the shard id (`shard_in_stream`).
+            // and the shard id (`shard_in_stream`), with a third round trip for
+            // a legacy id only: whether the table has a labelled shard.
             let table: Option<(String, Option<String>)> = sqlx::query_as(
                 "SELECT table_id, stream_label FROM tables \
                  WHERE account_id = $1 AND table_name = $2",
@@ -187,7 +188,10 @@ impl StreamEngine for PostgresEngine {
                 row_shard_id,
                 table_label.as_deref(),
                 &stream_label,
-            ) {
+                || self.table_has_labelled_shard(&table_id),
+            )
+            .await?
+            {
                 return Err(extenddb_storage::util::stream_does_not_exist());
             }
 
@@ -382,5 +386,25 @@ impl StreamEngine for PostgresEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
             Ok(row.map(|(s,)| s))
         })
+    }
+}
+
+impl PostgresEngine {
+    /// Whether table `table_id` has a labelled shard row
+    /// (`stream_lineage::labelled_shard_id_range`, compared in byte order
+    /// whatever the database's collation), which makes its legacy rows an
+    /// earlier, closed stream (`util::shard_in_stream`).
+    async fn table_has_labelled_shard(&self, table_id: &str) -> Result<bool, StorageError> {
+        let (from, to) = extenddb_storage::stream_lineage::labelled_shard_id_range(table_id);
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM stream_shards WHERE table_id = $1 \
+             AND shard_id COLLATE \"C\" >= $2 AND shard_id COLLATE \"C\" < $3)",
+        )
+        .bind(table_id)
+        .bind(&from)
+        .bind(&to)
+        .fetch_one(&self.data_pool)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))
     }
 }

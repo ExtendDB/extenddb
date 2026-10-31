@@ -463,3 +463,41 @@ fn an_enable_re_read_sees_whether_its_stream_is_still_current() {
     assert!(!enable_still_current(Some(&table(Some(NEW), None)), NEW));
     assert!(!enable_still_current(None, NEW));
 }
+
+#[test]
+fn the_labelled_range_holds_labelled_ids_and_no_legacy_ones() {
+    let (from, to) = labelled_shard_id_range(TID);
+    let inside = |id: &str| id >= from.as_str() && id < to.as_str();
+    for view in [StreamViewType::KeysOnly, StreamViewType::NewAndOldImages] {
+        for i in 0..SHARDS_PER_STREAM {
+            assert!(inside(&shard_id(TID, OLD, view, i).unwrap()));
+        }
+    }
+    for i in 0..SHARDS_PER_STREAM {
+        assert!(!inside(&format!("shardId-{TID}-{i:016}")));
+    }
+    // The name forms sort on either side of the table id.
+    assert!(!inside("shardId-Orders-0000000000000002"));
+    assert!(!inside("shardId-00-orders-0000000000000002"));
+    assert!(!inside("shardId-zz-orders-0000000000000002"));
+}
+
+#[test]
+fn a_table_has_a_labelled_shard_once_an_enable_wrote_one() {
+    let legacy: Vec<ShardRow> = (0..SHARDS_PER_STREAM)
+        .map(|i| row(format!("shardId-{TID}-{i:012}"), Some("1")))
+        .collect();
+    assert!(!has_labelled_shard(TID, &legacy));
+    let mut both = legacy;
+    both.extend(stream_rows(NEW, StreamViewType::KeysOnly, None));
+    assert!(has_labelled_shard(TID, &both));
+    // Another table's labelled rows do not count.
+    let foreign = vec![ShardRow {
+        table_id: "other".to_owned(),
+        ..row(
+            shard_id("other", OLD, StreamViewType::KeysOnly, 0).unwrap(),
+            None,
+        )
+    }];
+    assert!(!has_labelled_shard(TID, &foreign));
+}

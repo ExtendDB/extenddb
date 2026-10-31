@@ -83,7 +83,9 @@ impl StreamEngine for SqliteEngine {
             // all. The sequence bound sits in the join condition so the LEFT
             // JOIN keeps its one row for an idle shard. Whether the shard
             // belongs to the stream the ARN's label names is decided in Rust
-            // from the table's label and the shard id (`shard_in_stream`).
+            // from the table's label and the shard id (`shard_in_stream`),
+            // with a second query for a legacy id only: whether the table has
+            // a labelled shard.
             let rows: Vec<(String, Option<String>, String, Option<String>)> =
                 if let Some(after) = after {
                     sqlx::query_as(
@@ -127,7 +129,10 @@ impl StreamEngine for SqliteEngine {
                 row_shard_id,
                 table_label.as_deref(),
                 &stream_label,
-            ) {
+                || self.table_has_labelled_shard(table_id),
+            )
+            .await?
+            {
                 return Err(extenddb_storage::util::stream_does_not_exist());
             }
 
@@ -326,5 +331,25 @@ impl StreamEngine for SqliteEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
             Ok(row.map(|(s,)| s))
         })
+    }
+}
+
+impl SqliteEngine {
+    /// Whether table `table_id` has a labelled shard row
+    /// (`stream_lineage::labelled_shard_id_range`), which makes its legacy
+    /// rows an earlier, closed stream (`util::shard_in_stream`).
+    async fn table_has_labelled_shard(&self, table_id: &str) -> Result<bool, StorageError> {
+        let (from, to) = stream_lineage::labelled_shard_id_range(table_id);
+        let found: i64 = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM stream_shards \
+             WHERE table_id = ? AND shard_id >= ? AND shard_id < ?)",
+        )
+        .bind(table_id)
+        .bind(&from)
+        .bind(&to)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        Ok(found != 0)
     }
 }

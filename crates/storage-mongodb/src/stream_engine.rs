@@ -248,7 +248,9 @@ impl StreamEngine for MongoEngine {
             // shard that is not that table's (another table, or another
             // account) returns no document. Whether the shard belongs to the
             // stream the ARN's label names is decided in Rust from the table's
-            // label and the shard id (`shard_in_stream`).
+            // label and the shard id (`shard_in_stream`), with a third round
+            // trip for a legacy id only: whether the table has a labelled
+            // shard.
             let table_doc = self
                 .catalog_db
                 .collection::<Document>("tables")
@@ -308,7 +310,11 @@ impl StreamEngine for MongoEngine {
             let Some(row_shard_id) = docs.first().and_then(|d| d.get_str("shard_id").ok()) else {
                 return Err(extenddb_storage::util::stream_does_not_exist());
             };
-            if !shard_in_stream(&table_id, row_shard_id, table_label, &stream_label) {
+            if !shard_in_stream(&table_id, row_shard_id, table_label, &stream_label, || {
+                self.table_has_labelled_shard(&table_id)
+            })
+            .await?
+            {
                 return Err(extenddb_storage::util::stream_does_not_exist());
             }
 
@@ -598,6 +604,26 @@ mod tests {
 
 /// The records in the result of the `get_stream_records` aggregation; see the
 /// module documentation.
+impl MongoEngine {
+    /// Whether table `table_id` has a labelled shard document
+    /// (`stream_lineage::labelled_shard_id_pattern`, on the
+    /// `{table_id, shard_id}` index), which makes its legacy shards an
+    /// earlier, closed stream (`util::shard_in_stream`).
+    async fn table_has_labelled_shard(&self, table_id: &str) -> Result<bool, StorageError> {
+        let found = self
+            .data_db
+            .collection::<Document>("stream_shards")
+            .find_one(doc! {
+                "table_id": table_id,
+                "shard_id": { "$regex": stream_lineage::labelled_shard_id_pattern(table_id) },
+            })
+            .projection(doc! { "_id": 0, "shard_id": 1 })
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        Ok(found.is_some())
+    }
+}
+
 #[path = "stream_record_docs.rs"]
 mod record_docs;
 

@@ -99,7 +99,8 @@ impl StreamEngine for CassandraEngine {
             // row and the records, issued together and awaited together on the
             // account keyspace. The shard is the table's when its row carries
             // that table id, and the stream's when `shard_in_stream` says so
-            // from the table's label and the shard id; otherwise (another
+            // from the table's label and the shard id (with a read of the
+            // table's shard rows for a legacy id only); otherwise (another
             // table, another account, or a stream of the same table the shard
             // is not part of) the answer is the "stream does not exist" error
             // and the records read are discarded. The keyspace follows from the
@@ -167,15 +168,29 @@ impl StreamEngine for CassandraEngine {
                 .as_ref()
                 .and_then(|row| row.get_r_by_name("table_id").ok());
             let range = match shard_row {
-                Some(row)
-                    if shard_table_id.as_deref() == Some(table.table_id.as_str())
-                        && shard_in_stream(
-                            &table.table_id,
-                            &shard_id,
-                            table.stream_label.as_deref(),
-                            &stream_label,
-                        ) =>
-                {
+                Some(row) if shard_table_id.as_deref() == Some(table.table_id.as_str()) => {
+                    // A legacy id needs the table's shard rows: it is an
+                    // earlier, closed stream once the table has a labelled
+                    // shard.
+                    let owned = shard_in_stream(
+                        &table.table_id,
+                        &shard_id,
+                        table.stream_label.as_deref(),
+                        &stream_label,
+                        || async {
+                            let rows = self
+                                .stream_shard_rows(&keyspace, Some(&table.table_id))
+                                .await?;
+                            Ok::<bool, StorageError>(stream_lineage::has_labelled_shard(
+                                &table.table_id,
+                                &rows,
+                            ))
+                        },
+                    )
+                    .await?;
+                    if !owned {
+                        return Err(extenddb_storage::util::stream_does_not_exist());
+                    }
                     shard_range_of(physical, &row)
                 }
                 _ => return Err(extenddb_storage::util::stream_does_not_exist()),
