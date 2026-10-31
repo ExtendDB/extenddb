@@ -129,13 +129,14 @@ fn strip_prefix_ci<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
 /// begins populating before ExtendDB resolves it can be made to fail closed by
 /// listing it.
 ///
-/// Two places read the set, through `is_unresolvable_key`: a condition whose
-/// key is listed fails closed (`condition::evaluate_condition_match`), and so
-/// does a `Resource` or `NotResource` pattern whose `${key}` variable names a
-/// listed key (`variables::resource_pattern_is_unresolvable`). A variable that
-/// names a listed key inside a condition value is left as written, as an
-/// unresolved variable is there, so listing a key does not make such a
-/// condition fail closed.
+/// Two places read the set, through `is_unresolvable_key`. A condition fails
+/// closed when its key is listed, or when one of its values names a listed key
+/// through a `${key}` or `${key, 'default'}` variable
+/// (`condition::evaluate_condition_match`). A `Resource` or `NotResource`
+/// pattern whose variable names a listed key fails closed in the same way
+/// (`variables::resource_pattern_is_unresolvable`). In both, a default written
+/// beside a listed key is not used, because the service would have a value
+/// for the key.
 const FAIL_CLOSED_GLOBAL_KEYS: &[&str] = &[];
 
 /// Whether an unresolved condition key must fail closed for the context that
@@ -450,10 +451,10 @@ impl ConditionContext for RequestContext {
         // A request tag key the request names under two or more spellings that
         // fold to one name and do not all carry one value cannot be read as one
         // value: the statement fails closed (a Deny blocks, an Allow does not
-        // grant). Every other unresolved aws: global key that is neither a tag
-        // sub-key nor on the absent-ok allowlist is one the service populates
-        // but this context has no value for (for example aws:PrincipalOrgID,
-        // aws:SourceIp): it fails closed. Keys resolved above never reach here.
+        // grant). Any other key is unresolvable only when it is listed in
+        // FAIL_CLOSED_GLOBAL_KEYS, which is empty in this build, so every other
+        // unresolved key, aws:PrincipalOrgID and aws:SourceIp among them, keeps
+        // absent-key semantics. Keys resolved above never reach here.
         if let Some(sub) = strip_prefix_ci(key, "aws:RequestTag/") {
             return self.request_tag_values(sub) == RequestTagLookup::Ambiguous;
         }
@@ -484,11 +485,11 @@ impl ConditionContext for RequestContext {
 /// `aws:RequestTag/*` / `aws:TagKeys`, and the request-wide keys
 /// `aws:SecureTransport`, `aws:RequestedRegion`, `aws:CurrentTime`,
 /// `aws:EpochTime`, `aws:ViaAWSService` and `aws:PrincipalIsAWSService`, all of
-/// which this context resolves. A global key STS populates that this context
-/// cannot resolve (for example `aws:PrincipalOrgID` or `aws:SourceIp`, neither
-/// on the absent-ok allowlist) is reported as unresolvable (fail closed). Keys
-/// that are legitimately absent for this caller model keep absent-key
-/// semantics. `DynamoDB`-specific keys are not applicable.
+/// which this context resolves. Another key is reported as unresolvable (fail
+/// closed) only when it is listed in `FAIL_CLOSED_GLOBAL_KEYS`, which is
+/// empty in this build; every other key this context does not resolve, such
+/// as `aws:PrincipalOrgID` or `aws:SourceIp`, keeps absent-key semantics.
+/// `DynamoDB`-specific keys are not applicable.
 #[derive(Debug)]
 pub struct AssumeRoleContext {
     /// Tags on the calling principal.
@@ -592,10 +593,10 @@ impl ConditionContext for AssumeRoleContext {
     fn is_unresolvable_key(&self, key: &str) -> bool {
         // Keys this context resolves (tags, external id, principal ARN and
         // account, region, secure transport, time, principal type, user name)
-        // never reach here. Any other unresolved aws: global key that is not on
-        // the absent-ok allowlist is one STS populates but this context has no
-        // value for, so a Deny gated on it fails closed and an Allow does not
-        // grant.
+        // never reach here. Another key is unresolvable only when it is listed
+        // in FAIL_CLOSED_GLOBAL_KEYS, which is empty in this build: a Deny gated
+        // on a listed key fails closed and an Allow does not grant, and every
+        // other unresolved key keeps absent-key semantics.
         aws_key_is_unresolvable(key)
     }
 }
