@@ -175,8 +175,9 @@ jobs:
       - name: Build release (SQLite backend)
         run: cargo build --release -p extenddb --no-default-features --features sqlite
 
-      # The migration lock between serve and migrate, on a catalog of its own
-      # (port 18450), before the suite's server starts.
+      # The migration lock between serve and migrate, on a catalog of its own,
+      # before the suite's server starts. The script serves on ports 18450 and
+      # 18451; the next step uses 18451 after this one has ended.
       - name: Check serve and migrate on one catalog
         run: devtools/check-sqlite-catalog-lock ./target/release/extenddb 18450
 

@@ -22,7 +22,8 @@ extenddb-check-lock-<mongo port>, published on 127.0.0.1 only:
 - the startup policy on a catalog behind this binary: serve names
   --migrate, and in daemon mode the invoking process exits 3 with the
   message on its stderr; while another migration holds the lock, serve
-  --migrate waits for catalog_upgrade_lock_timeout and exits 6; serve
+  --migrate waits for catalog_upgrade_lock_timeout, 3 s here and not the
+  60 s default, and exits 6 naming the lock; once the lock is free, serve
   --migrate applies the migration and serves;
 - a server killed with SIGKILL keeps migrate --yes waiting until its
   registration expires, at most 45 s after its last renewal;
@@ -46,15 +47,7 @@ import tempfile
 import time
 
 from catalog_checks import (
-    docker,
-    expect_exit,
-    finish,
-    healthy,
-    mongosh,
-    report,
-    start,
-    start_mongo,
-    stop,
+    docker, expect_exit, finish, healthy, kill_daemon, mongosh, report, run_split, start, start_mongo, stop,
     watch_lost_registration,
 )
 
@@ -74,6 +67,8 @@ def main(binary: str, mongo_port: int, api_port: int) -> int:
     container = f"extenddb-check-lock-{mongo_port}"
     work = tempfile.mkdtemp()
     servers = []
+    # The run directory is EXTENDDB__SERVER__RUN_DIR below.
+    pid_file = os.path.join(work, "run", f"extenddb-{api_port}.pid")
     try:
         if not start_mongo(container, mongo_port):
             return finish()
@@ -144,22 +139,25 @@ def main(binary: str, mongo_port: int, api_port: int) -> int:
 
         # The startup policy on a catalog behind this binary.
         mongosh(container, mongo_port, "db.getSiblingDB('extenddb_catalog').extenddb_migrations.deleteOne({_id: 4})")
-        expect_exit(3, "serve on a catalog behind this binary", serve, env, timeout=60,
+        expect_exit(3, "serve on a catalog behind this binary names --migrate", serve, env, timeout=60,
                     contains="or start this server with --migrate")
         # The parent reads the status before it forks, so the code and the
         # message reach the invoking shell.
         daemon = [binary, "serve", "--config", "extenddb.toml", "--port", str(api_port)]
-        done = subprocess.run(daemon, env=env, capture_output=True, text=True, timeout=120, check=False)
-        report(done.returncode == 3 and "or start this server with --migrate" in done.stderr,
-               f"exit {done.returncode}: serve in daemon mode on a catalog behind this binary, "
-               "the message on stderr", done.stdout + done.stderr)
+        code, out, err = run_split(daemon, env)
+        kill_daemon(pid_file, binary)
+        report(code == 3 and "or start this server with --migrate" in err,
+               f"exit {code}: serve in daemon mode on a catalog behind this binary, the message on stderr",
+               out + err)
         mongosh(container, mongo_port, "db.getSiblingDB('extenddb_catalog').settings.insertOne("
                 "{_id: 'migration_lock', owner: 'check', expires_at: new Date(Date.now() + 120000)})")
+        # Under 30 s tells the 3 s set here from the 60 s default.
         started = time.monotonic()
         expect_exit(6, "serve --migrate while another migration holds the lock", serve + ["--migrate"],
-                    dict(env, EXTENDDB__SERVER__CATALOG_UPGRADE_LOCK_TIMEOUT="3"), timeout=60)
+                    dict(env, EXTENDDB__SERVER__CATALOG_UPGRADE_LOCK_TIMEOUT="3"), timeout=60,
+                    contains="held the migration lock")
         waited = time.monotonic() - started
-        report(waited >= 3, f"serve --migrate waited {waited:.1f} s for the lock, its 3 s timeout")
+        report(3 <= waited < 30, f"serve --migrate waited {waited:.1f} s for the lock, its 3 s timeout")
         mongosh(container, mongo_port, "db.getSiblingDB('extenddb_catalog').settings.deleteOne({_id: 'migration_lock'})")
         server = start(serve + ["--migrate"], env, "serve-migrate.log")
         servers.append(server)
@@ -193,7 +191,6 @@ def main(binary: str, mongo_port: int, api_port: int) -> int:
         # PID file.
         server = start(serve + ["--write-pid-file"], env, "serve-paused.log")
         servers.append(server)
-        pid_file = os.path.join(work, "run", f"extenddb-{api_port}.pid")
         if healthy(url, server, 60) and report(os.path.exists(pid_file), "the server wrote its PID file"):
             docker("pause", container)
             first_503, code, took = watch_lost_registration(server, url, 120)
@@ -218,6 +215,7 @@ def main(binary: str, mongo_port: int, api_port: int) -> int:
             if server.poll() is None:
                 server.send_signal(signal.SIGTERM)
                 stop(server)
+        kill_daemon(pid_file, binary)
         docker("unpause", container)
         docker("rm", "-f", "-v", container)
         os.chdir("/")
