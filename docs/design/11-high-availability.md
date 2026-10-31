@@ -161,7 +161,7 @@ The "No Caching Rule" applies to data-path state: items, query results, throttle
 - Self-induced changes (admin API mutations) propagate **instantly** within a single instance via write-through invalidation hooks. Off-instance changes (multi-frontend, or direct DB writes) are bounded by the configured TTL.
 - The kill switch (`auth.cache.enabled = false`) restores the original "no caching" behavior without restart-triggered code changes.
 
-**Rationale (still valid for the data path):** Multiple frontends sharing a catalog would have stale caches. For data, that's intolerable. For IAM, bounded staleness is the same trade-off real AWS IAM exposes. Cross-frontend invalidation fanout for the IAM cache is designed in [Appendix B of `12-auth-authz-cache.md`](12-auth-authz-cache.md#appendix-b--multi-instance-cache-invalidation-deferred) but not yet implemented; deployments running multiple frontends should treat `auth.cache.ttl_seconds` as the worst-case lag for off-instance IAM mutations.
+**Rationale (still valid for the data path):** Multiple frontends sharing a catalog would have stale caches. For data, that's intolerable. For IAM, bounded staleness is the same trade-off real AWS IAM exposes. Cross-frontend invalidation fanout for the IAM cache is designed in [Appendix B of `12-auth-authz-cache.md`](12-auth-authz-cache.md#appendix-b-multi-instance-cache-invalidation-deferred) but not yet implemented; deployments running multiple frontends should treat `auth.cache.ttl_seconds` as the worst-case lag for off-instance IAM mutations.
 
 ### D2: Consistency Routing Lives in the Storage Adapter
 

@@ -1,15 +1,12 @@
 ---
 description: "The in-process cache of IAM data (credentials, policies, tags, table key information) and its invalidation."
+status: "Implemented for a single instance; the multi-instance fanout in Appendix B is designed and deferred"
 ---
 
 # Component design: Authorization cache
 
-> Status: implemented (single-instance). Multi-instance fanout in
-> Appendix B is designed but deferred; implementation is gated on a
-> separate review.
-> Author: assisted, reviewed by repository owner
-> Companion document to: [05-component-auth.md](05-component-auth.md), [06-component-server.md](06-component-server.md)
->
+Companion to the [authentication design](05-component-auth.md) and the [HTTP server design](06-component-server.md).
+
 > Note: this cache is a deliberate exception to the rule that the server
 > holds no in-process state. The exception is scoped to IAM data only
 > (credentials, policies, tags, table key info). The data path remains

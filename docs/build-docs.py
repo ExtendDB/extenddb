@@ -251,9 +251,9 @@ LICENSE_HTML = """<div class="license-page">
 <h2>License &amp; Disclaimer</h2>
 <p>Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See the LICENSE file in the project root for the full text.</p>
-<p>This software is provided &ldquo;as is&rdquo; without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. &ldquo;DynamoDB&rdquo; is a trademark
-of Amazon.com, Inc.</p>
+<p>This software is provided &ldquo;as is&rdquo; without warranty of any kind. ExtendDB is an open source
+project under the Apache License 2.0, maintained by engineers at Amazon Web Services. It is not Amazon DynamoDB
+and contains no DynamoDB source code. &ldquo;DynamoDB&rdquo; is a trademark of Amazon.com, Inc.</p>
 </div>
 <div style="page-break-after: always"></div>
 """

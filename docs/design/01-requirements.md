@@ -9,13 +9,13 @@ status: "Draft"
 
 ## 1. Overview
 
-ExtendDB is a standalone, stateless Rust application that provides a 100% DynamoDB-compatible API backed by pluggable storage engines. Any AWS SDK client (Java, Python, Go, Node.js, Rust, .NET, etc.) connects directly with zero code changes. The system runs as its own process, completely independent of any specific database, and supports pluggable authentication providers and pluggable storage backends.
+ExtendDB is a standalone, stateless Rust application that provides a DynamoDB-compatible API backed by pluggable storage engines (the [Feature status](../differences-from-dynamodb.md#feature-status) table on the Differences from DynamoDB page records what is implemented). Any AWS SDK client (Java, Python, Go, Node.js, Rust, .NET, etc.) connects directly with zero code changes. The system runs as its own process, completely independent of any specific database, and supports pluggable authentication providers and pluggable storage backends.
 
 ### 1.1 Goals
 
-- **Full DynamoDB API compatibility**: byte-for-byte compatible wire protocol, error responses, and SDK behavior
+- **Wire compatibility**: the same wire protocol, error responses and SDK behavior for every implemented operation
 - **Pluggable storage**: clean trait-based abstraction allowing any database as a backend (PostgreSQL first)
-- **Pluggable authentication**: support local SigV4, AWS IAM, Azure AD, and custom providers
+- **Pluggable authentication**: support local SigV4 and AWS IAM, with the provider interface open to Azure AD and custom providers
 - **Standalone & stateless**: single async Rust binary, no embedded database, horizontally scalable
 - **Production-ready**: TLS, observability, graceful shutdown, configurable limits, VM and Kubernetes deployment
 
@@ -263,7 +263,7 @@ These are the core CRUD operations. All must be fully implemented.
 
 ### 4.1.1 Auth Modes
 
-ExtendDB supports three authentication modes, selectable by configuration. The mode determines how credentials are validated and how authorization decisions are made.
+ExtendDB supports two authentication modes, selectable by configuration: Mode 2 (local credential store) and Mode 3 (AWS IAM). Mode 1 (no auth) existed in early builds and has been removed. The mode determines how credentials are validated and how authorization decisions are made.
 
 **Mode 1: No auth** (removed: `auth.provider = "none"` is no longer accepted)
 Previously accepted any request regardless of the Authorization header. This mode has been removed. The server refuses to start with `provider = "none"`.
@@ -427,7 +427,7 @@ The catalog database stores ExtendDB metadata: table definitions, indexes, tags,
 - REQ-CAT-006: The expected catalog version is a build-time constant compiled into the binary, not configurable at runtime
 - REQ-CAT-007: On startup, the server validates the catalog version matches the version compiled into the binary. Mismatch → refuse to start with a clear error directing the user to run `extenddb migrate`
 - REQ-CAT-008: `extenddb --version` prints both binary version and expected catalog version: `extenddb 0.1.0 (catalog 1.0.0)`. Binary version and catalog version are independent
-- REQ-CAT-009: Any PR that modifies catalog schema or migration files must bump the catalog version. This is a hard review gate for developer, reviewer, and principal reviewer
+- REQ-CAT-009: Any change that modifies catalog schema or migration files must bump the catalog version
 
 ### 7.3 Lifecycle Tools
 
@@ -637,7 +637,7 @@ DynamoDB SDKs support optional endpoint discovery via the `DescribeEndpoints` op
 ## 13. Testing Requirements
 
 - REQ-TEST-001: A minimal test suite must exist for every phase, covering all implemented operations. No phase exits without a passing test suite
-- REQ-TEST-002: Tests are written in Python (boto3) and AWS CLI, covering all Phase 1 operations: CreateTable, DescribeTable, ListTables, DeleteTable, and key error paths
+- REQ-TEST-002: Tests are written in Python (boto3) and AWS CLI, covering the table operations: CreateTable, DescribeTable, ListTables, DeleteTable, and key error paths
 - REQ-TEST-003: Tests must be dual-target: run against both real DynamoDB and ExtendDB with identical assertions, controlled by an endpoint parameter. No target-specific branching
 - REQ-TEST-004: If behavior differs between real DynamoDB and ExtendDB, that is a bug in ExtendDB
 - REQ-TEST-005: Tests must clean up after themselves: all created resources are deleted on exit, even on failure
@@ -666,8 +666,8 @@ DynamoDB SDKs support optional endpoint discovery via the `DescribeEndpoints` op
 
 ### 15.3 Log Hygiene
 
-- REQ-LOG-007: Reviewers verify that log statements use appropriate levels. Every `error` and `critical` log message must have a corresponding entry in `docs/troubleshooting.md`
-- REQ-LOG-008: Any PR that adds or changes error/critical messages must update the troubleshooting doc
+- REQ-LOG-007: Log statements use appropriate levels. Every `error` and `critical` log message must have a corresponding entry in `docs/troubleshooting.md`
+- REQ-LOG-008: Any change that adds or changes error/critical messages must update the troubleshooting doc
 
 ---
 

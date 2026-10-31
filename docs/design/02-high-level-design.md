@@ -263,7 +263,7 @@ sequenceDiagram
 **Decision:** The entire stack is async (tokio runtime), including the storage trait.
 
 **Rationale:**
-- The original pg_dynamodb extension was forced into blocking mode by PostgreSQL SPI constraints. As a standalone process, we have no such limitation
+- An earlier design as a PostgreSQL extension (pg_dynamodb) was forced into blocking mode by the extension interface. A standalone process has no such limitation
 - Async I/O is essential for handling thousands of concurrent connections efficiently
 - sqlx provides native async PostgreSQL support
 - The storage trait being async allows backends that use network I/O (e.g., a future DynamoDB-backed backend for testing, or a distributed storage backend)
@@ -275,7 +275,7 @@ sequenceDiagram
 **Rationale:**
 - DynamoDB's eventual consistency is a consequence of reading from storage replicas that haven't received the latest write yet; it's not artificial delays or queues
 - Strongly consistent is strictly stronger than eventually consistent: any application that works against eventually consistent DynamoDB also works against a strongly consistent backend
-- For migration testing (relational → DynamoDB), teams need to surface bugs where application code assumes strong consistency on default reads. A real read replica provides genuine staleness without synthetic delays
+- For migration testing (relational → DynamoDB), teams need to surface bugs where application code assumes strong consistency on default reads. A read replica provides the staleness of a replica that has not yet received the write, without synthetic delays
 - The read replica is opt-in via `storage.postgres.read_replica_url`. When unset, all reads hit the primary: simple, correct, and matching what DynamoDB Local and other emulators do
 - Writes always go to the primary. `ConsistentRead=true` always reads from the primary. Only `ConsistentRead=false` reads route to the replica
 - Capacity calculations always reflect the consistency mode (0.5 RCU for eventually consistent, 1.0 RCU for strongly consistent) regardless of whether a replica is configured
@@ -404,6 +404,8 @@ There is no in-memory locking (no `Mutex`, `RwLock`, or similar) on the data pat
 - **Different items have no contention.** Parallel inserts to different keys proceed fully concurrently up to the pool size.
 
 ## 7. High-Level Design Choices: Deferred Components
+
+This section records the design space as it stood when the document was written (April 2026). DynamoDB Streams has since been implemented; see the [DynamoDB Streams component design](07-component-streams.md). Global Tables remain not implemented.
 
 ### 7.1 DynamoDB Streams
 
