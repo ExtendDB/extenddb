@@ -248,7 +248,7 @@ TLS is supported via rustls. `extenddb init` generates a self-signed certificate
 - CSRF tokens on all state-changing POST handlers
 - HttpOnly session cookies
 - Security headers: X-Content-Type-Options, X-Frame-Options, Referrer-Policy
-- 8-hour session expiry
+- Sessions expire after 8 hours of inactivity
 
 ### Input Validation
 
@@ -274,11 +274,11 @@ The management web console is a server-rendered HTML interface mounted at `/cons
 
 ### Architecture
 
-The console uses the `ManagementStore` trait for all data access — it never queries the database directly. Write operations route through shared functions in `management::ops`, ensuring validation and business logic are defined once. This means every action available in the console is also available through the management REST API.
+The console reads all data through the `ManagementStore` and `PasswordHashStore` traits and never queries the database directly. Write operations route through shared functions in `management::ops`, ensuring validation and business logic are defined once. This means every action available in the console is also available through the management REST API.
 
 ### Authentication Model
 
-- Session-based authentication with 8-hour expiry
+- Session-based authentication; sessions expire after 8 hours of inactivity
 - Sessions stored in-memory with random tokens in HttpOnly cookies (`SameSite=Strict`, `Path=/console`)
 - Each request reads the principal's password hash from the catalog and ends the session if the principal was deleted or its password changed
 - CSRF tokens on all state-changing POST handlers

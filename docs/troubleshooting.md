@@ -856,7 +856,7 @@ The error log line names the exact relations for one leaked table and gives this
 
 **Cause:** The console checks every session against the catalog database, and that read failed. The session is kept.
 
-**Fix:** Check that the catalog database is reachable from the server, then reload the page.
+**Fix:** Check that the catalog database is reachable from the server, then reload the page. After a PostgreSQL restart the first reloads can still answer 503: each pooled catalog connection that the restart closed fails once and is then replaced.
 
 ### Console shows "Encryption key not found" when creating access keys
 
