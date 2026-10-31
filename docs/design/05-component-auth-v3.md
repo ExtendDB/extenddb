@@ -1,14 +1,13 @@
 ---
 description: "The third revision of the auth crate: local credential management, policy evaluation and the IAM data model."
+version: "3.0"
+date: "2026-04-15"
+status: "Approved (interactive review session 2026-04-15)"
+crate: "`extenddb-auth`"
+supersedes: "05-component-auth.md (v2.0)"
 ---
 
 # Component design: Authentication and authorization (v3)
-
-**Version:** 3.0
-**Date:** 2026-04-15
-**Status:** Approved (interactive review session 2026-04-15)
-**Crate:** `extenddb-auth`
-**Supersedes:** 05-component-auth.md (v2.0)
 
 ## 1. Purpose
 
@@ -496,6 +495,6 @@ These must match real DynamoDB error format (HTTP status, error code, message st
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is maintained by
+engineers at Amazon Web Services. It is not Amazon DynamoDB and contains no DynamoDB source
+code. "DynamoDB" is a trademark of Amazon.com, Inc.

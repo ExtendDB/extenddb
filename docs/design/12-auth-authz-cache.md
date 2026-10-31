@@ -10,10 +10,10 @@ description: "The in-process cache of IAM data (credentials, policies, tags, tab
 > Author: assisted, reviewed by repository owner
 > Companion document to: [05-component-auth.md](05-component-auth.md), [06-component-server.md](06-component-server.md)
 >
-> Note: this cache is the deliberate revision of the "No In-Process State"
-> rule in the [high availability design draft](https://github.com/ExtendDB/extenddb/blob/main/docs/design/11-high-availability.md) §D1. The
-> revision is scoped to IAM data only (credentials, policies, tags, table
-> key info). The data path remains uncached.
+> Note: this cache is a deliberate exception to the rule that the server
+> holds no in-process state. The exception is scoped to IAM data only
+> (credentials, policies, tags, table key info). The data path remains
+> uncached.
 
 ## 1. Motivation
 

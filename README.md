@@ -1,9 +1,6 @@
 # ExtendDB
 
-> **ExtendDB is an independent open source project managed by Amazon Web Services. It is not Amazon DynamoDB and does
-> not contain any DynamoDB source code.** "DynamoDB" is a trademark of Amazon.com, Inc. ExtendDB is a clean-room
-> implementation that speaks the DynamoDB wire protocol. Behavioral differences from the real service are documented
-> in [Differences from DynamoDB](docs/differences-from-dynamodb.md).
+> **ExtendDB is an open source project under the Apache License 2.0, maintained by engineers at Amazon Web Services. It is not Amazon DynamoDB and contains no DynamoDB source code.** "DynamoDB" is a trademark of Amazon.com, Inc. ExtendDB is a clean-room implementation that speaks the DynamoDB wire protocol. Behavioral differences from the real service are documented in [Differences from DynamoDB](docs/differences-from-dynamodb.md).
 
 A DynamoDB-compatible API adapter, ExtendDB speaks the DynamoDB wire protocol — any AWS SDK, CLI, or tool that works
 with DynamoDB works with ExtendDB, unchanged.
