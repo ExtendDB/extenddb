@@ -316,6 +316,8 @@ jobs:
         # table_snapshot: the SnapshotEngine consistency check; it needs the
         # shared page-size hook, compiled only into the crate's own test
         # build, and scratch databases it creates and drops itself.
+        # catalog_check: the data relations the engine creates compared with
+        # the catalog, on a deployment with a separate data database.
         env:
           EXTENDDB_TEST_PG_CONNECTION_STRING: postgresql://postgres:devpass@127.0.0.1:5432
           # table_snapshot fails rather than skips without the string above.
@@ -324,7 +326,7 @@ jobs:
           cargo test --release -p extenddb-storage-postgres
           --test vector_control_plane --test put_create_race --test twi_conflict
           --test stream_shard_retention --test stream_shard_ownership --test stream_records_page_order --test backup_restore
-          --test gsi_online_build --test gsi_stale_writer --test table_snapshot
+          --test gsi_online_build --test gsi_stale_writer --test table_snapshot --test catalog_check
 
       # The daemonized server logs to syslog; dump it so server-side failures
       # are diagnosable from the job log.
