@@ -21,15 +21,19 @@ ExtendDB is a standalone, stateless Rust application that provides a 100% Dynamo
 
 ### 1.2 Non-Goals / Out of Scope
 
+This table records the scope decided when the document was written (April 2026). Where the
+implementation has since moved, the [Feature status](../differences-from-dynamodb.md#feature-status)
+table on the Differences from DynamoDB page is the current record.
+
 | Feature | Reason |
 |---------|--------|
 | PartiQL (ExecuteStatement, BatchExecuteStatement, ExecuteTransaction) | Deferred: focus on JSON wire protocol first |
-| Backup/Restore (CreateBackup, DeleteBackup, DescribeBackup, ListBackups, RestoreTableFromBackup, DescribeContinuousBackups, UpdateContinuousBackups, RestoreTableToPointInTime) | Excluded: backup is a storage-layer concern, not an API concern |
+| Backup/Restore (CreateBackup, DeleteBackup, DescribeBackup, ListBackups, RestoreTableFromBackup, DescribeContinuousBackups, UpdateContinuousBackups, RestoreTableToPointInTime) | Implemented since this document was written: on-demand backup and restore ship, and point-in-time restore is refused (see Feature status) |
 | Auto-scaling APIs (DescribeTableReplicaAutoScaling, UpdateTableReplicaAutoScaling) | Excluded: auto-scaling is an infrastructure concern |
 | Contributor Insights (DescribeContributorInsights, ListContributorInsights, UpdateContributorInsights) | Excluded: analytics feature, not core API |
 | Kinesis Streaming Destination (DescribeKinesisStreamingDestination, EnableKinesisStreamingDestination, DisableKinesisStreamingDestination, UpdateKinesisStreamingDestination) | Excluded: AWS-specific integration |
 | Resource Policies (GetResourcePolicy, PutResourcePolicy, DeleteResourcePolicy) | Deferred: resource-based policies are a future enhancement |
-| IAM Policy Variables (`${aws:PrincipalTag/key}`, `${aws:username}`, etc.) | Deferred: variable substitution in Resource ARNs and Condition values is a future enhancement (see REQ-ABAC-006) |
+| IAM Policy Variables (`${aws:PrincipalTag/key}`, `${aws:username}`, etc.) | Partly implemented since this document was written: variables are expanded in Condition values; substitution in Resource ARNs is not implemented (see REQ-ABAC-006) |
 | Federated Role Assumption (AssumeRoleWithSAML, AssumeRoleWithWebIdentity) | Deferred: v1 supports basic AssumeRole only (see REQ-IDENT-008) |
 | Role Chaining (role assumes role) | Deferred: v1 requires CallerArn to be a user; SourceIdentity and TransitiveTagKeys are deferred alongside (see REQ-IDENT-009) |
 | Role MaxSessionDuration | Deferred: v1 accepts any DurationSeconds with no per-role cap (see REQ-IDENT-010) |

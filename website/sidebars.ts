@@ -172,7 +172,7 @@ const sidebars: SidebarsConfig = {
             type: 'generated-index',
             title: 'Component designs',
             slug: '/design',
-            description: 'The requirements and the design of each component: core, storage, authentication, server, streams, configuration and testing.',
+            description: 'The requirements and the design of each component (core, storage, authentication, server, streams, configuration and testing), written as the system was built. Where behaviour has since changed, the Differences from DynamoDB page is the current record.',
           },
           items: [
             {type: 'doc', id: 'design/requirements', label: 'Requirements'},

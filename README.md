@@ -2,21 +2,20 @@
 
 > **ExtendDB is an open source project under the Apache License 2.0, maintained by engineers at Amazon Web Services. It is not Amazon DynamoDB and contains no DynamoDB source code.** "DynamoDB" is a trademark of Amazon.com, Inc. ExtendDB is a clean-room implementation that speaks the DynamoDB wire protocol. Behavioral differences from the real service are documented in [Differences from DynamoDB](docs/differences-from-dynamodb.md).
 
-A DynamoDB-compatible API adapter, ExtendDB speaks the DynamoDB wire protocol — any AWS SDK, CLI, or tool that works
-with DynamoDB works with ExtendDB, unchanged.
+ExtendDB is a DynamoDB-compatible API adapter. It speaks the DynamoDB wire protocol, so any AWS SDK, CLI, or tool that works with DynamoDB works with ExtendDB, unchanged.
 
 ## Use Cases
 
-- **Local development** — run DynamoDB workloads on your laptop with zero cloud dependency
-- **CI/CD pipelines** — deterministic integration tests against a DynamoDB-compatible backend
-- **Self-hosted deployments** — run DynamoDB workloads on your own infrastructure (on-premises, private cloud, edge)
-- **Multi-cloud** — use DynamoDB semantics on any cloud that runs an ExtendDB-supported database backend
-- **Air-gapped environments** — DynamoDB functionality with no internet connectivity
+- **Local development**: run DynamoDB workloads on your laptop with zero cloud dependency
+- **CI/CD pipelines**: deterministic integration tests against a DynamoDB-compatible backend
+- **Self-hosted deployments**: run DynamoDB workloads on your own infrastructure (on-premises, private cloud, edge)
+- **Multi-cloud**: use DynamoDB semantics on any cloud that runs one of the supported databases
+- **Air-gapped environments**: DynamoDB functionality with no internet connectivity
 
 ## Features
 
 - Full DynamoDB wire protocol: CRUD, Query, Scan, Batch, Transactions, Streams, TTL, Import/Export
-- Pluggable storage: PostgreSQL (default), SQLite, MongoDB, and Cassandra
+- Pluggable storage: PostgreSQL (default), SQLite, MongoDB and Cassandra, with the database's own backup and replication tools
 - SigV4 authentication with IAM compatibility: users, groups, roles, policies, permissions boundaries
 - Web management console for account and credential administration
 - TLS with automatic self-signed certificate generation (replaceable with CA-signed certs)
@@ -36,7 +35,7 @@ cargo build --release
 # Start
 ./target/release/extenddb serve --config extenddb.toml
 
-# Use with any AWS SDK (TLS with self-signed cert — trust via AWS_CA_BUNDLE)
+# Use with any AWS SDK (TLS with a self-signed certificate; trust it via AWS_CA_BUNDLE)
 export AWS_CA_BUNDLE=~/.extenddb/tls/cert.pem
 aws dynamodb list-tables --endpoint-url https://127.0.0.1:18443 --region us-east-1
 ```
@@ -127,7 +126,7 @@ Use this with Docker, Kubernetes, `systemd Type=simple`, runit, s6, or any other
 In `--foreground` mode extenddb writes no PID file and never creates `run_dir`, so the container can run with a read-only root filesystem. Two consequences:
 
 - `extenddb status` still works (it probes the port) but reports the PID as unknown.
-- `extenddb stop` cannot signal the process — there is no PID file to read. Stop it through your supervisor, which delivers `SIGTERM` and triggers the same graceful shutdown.
+- `extenddb stop` cannot signal the process, because there is no PID file to read. Stop it through your supervisor, which delivers `SIGTERM` and triggers the same graceful shutdown.
 
 Pass `--write-pid-file` to opt back in when you do want `stop` and `status` to work against a foreground server, for example when running it from a shell rather than under a supervisor. The file goes to the usual `run_dir` path, so neither command needs extra arguments, and `run_dir` has to be writable.
 
@@ -153,7 +152,7 @@ background worker, credential and policy caches are per instance with no cross-i
 stays valid on the other instance for up to the cache TTL), and `/health` does not check the database.
 See the [deployment guide](docs/manuals/11-deployment-guide.md#multi-instance-considerations).
 
-To make the generated self-signed certificate valid for the name clients use — an in-cluster service DNS name, for example — pass `--tls-san` to `init` (repeatable):
+To make the generated self-signed certificate valid for the name clients use (an in-cluster service DNS name, for example), pass `--tls-san` to `init` (repeatable):
 
 ```bash
 extenddb init --catalog-db extenddb_catalog \
