@@ -80,9 +80,9 @@ failed on a database outage would restart every replica at once and prolong the
 outage. A database that is unreachable at startup stops the server from listening
 at all, so that case is still caught.
 
-There is no readiness endpoint yet, so nothing will currently drain traffic from
-a replica whose backend is gone. Until one exists, gate on `/health` for restarts
-only, and rely on client retries for backend failures.
+There is no readiness endpoint, so nothing drains traffic from a replica whose
+backend is gone. Gate on `/health` for restarts only, and rely on client retries
+for backend failures.
 
 ## Configuration Reference
 

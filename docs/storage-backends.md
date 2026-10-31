@@ -44,7 +44,7 @@ The DynamoDB API surface is the same on every backend. Where a backend's behavio
 - SQLite: one server per database file, enforced with a lock file next to the database. The `extenddb/extenddb-dev` image compiles this backend in developer mode: plain HTTP, open authorization, a seeded credential, for local development and CI only ([development image](/dev-image/)).
 - Cassandra: the backend is experimental. It does not implement vector indexes or `SearchVectors`, so every vector operation is refused. PutItem, UpdateItem and a conditional DeleteItem on a table without TTL, and the writes of a TransactWriteItems, commit the item before its stream record is written, so a failure between the two leaves the item changed with no stream record. Backups copy the live table and are not point-in-time. The vector, stream and backup rows on the differences page give the detail.
 
-Running more than one server against one PostgreSQL, MongoDB or Cassandra catalog is not supported in this release; the [deployment guide](/manuals/deployment-guide/#multi-instance-considerations) explains why.
+Running more than one server against one PostgreSQL, MongoDB or Cassandra catalog is not supported; the [deployment guide](/manuals/deployment-guide/#multi-instance-considerations) explains why.
 
 ## Developer notes
 

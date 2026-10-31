@@ -225,7 +225,7 @@ topologies, containers, the production checklist, systemd, multi-instance
 limits), see the [deployment guide](manuals/11-deployment-guide.md). This
 section covers only what is specific to Cassandra.
 
-> **Not recommended for production yet.** As of October 2026 the Cassandra
+> **Not recommended for production.** As of October 2026 the Cassandra
 > backend is experimental. It has known limitations: some multi-entity
 > management operations are not atomic, and a few concurrency issues are still
 > open (see Known Limitations below). Treat a Cassandra deployment as

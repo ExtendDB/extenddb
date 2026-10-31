@@ -17,7 +17,7 @@ architecture with no single write bottleneck: a deployment profile the reference
 
 The non-trivial design work is in conforming to DynamoDB semantics on a database that provides neither multi-row ACID
 transactions nor native sequence primitives. This document focuses on those gaps, the decisions made to close them, and
-the places where full parity with Amazon DynamoDB is not yet achieved.
+the places where full parity with Amazon DynamoDB is not achieved.
 
 ## Motivation
 
@@ -209,7 +209,7 @@ history are not restored; this is a known gap.
 
 Backup creation and restore execute synchronously within the API request. This is consistent with the current behavior
 of all ExtendDB backends, but differs from Amazon DynamoDB, where these are asynchronous operations. The same applies
-to `ExportTableToPointInTime` and `ImportTable`. Moving these to background jobs is planned future work.
+to `ExportTableToPointInTime` and `ImportTable`.
 
 ## 4. Behavioral Differences from DynamoDB
 
@@ -252,9 +252,7 @@ per table with no change to the claim protocol. This is the highest-value follow
 and the API call blocks for its duration. Large tables will need a durable, checkpointed background backfill before this
 path is suitable at scale.
 
-**Backup and restore are synchronous.** Moving `CreateBackup`, `RestoreTableFromBackup`, `ExportTableToPointInTime`, and
-`ImportTable` to background jobs with status polling is planned but not yet implemented. This applies to all current
-ExtendDB backends.
+**Backup and restore are synchronous.** This applies to all current ExtendDB backends.
 
 **Restore does not recover GSI/LSI definitions, tags, TTL configuration, or stream history.**
 

@@ -113,7 +113,7 @@ key_path = "/etc/extenddb/tls/key.pem"
 The production images contain ExtendDB only. The storage backend runs as a separate service. See
 [`docker/README.md`](docker/README.md) for the PostgreSQL image and [`docker/README-mongodb.md`](docker/README-mongodb.md) for the MongoDB image,
 external database requirements, hardened local Compose stacks, smoke tests, and explicit init/migrate/serve
-production lifecycle. The SQLite and Cassandra backends have no dedicated container guide yet.
+production lifecycle. The SQLite and Cassandra backends have no dedicated container guide.
 
 By default `extenddb serve` daemonizes itself, which doesn't play well with container runtimes and process supervisors that expect PID 1 to stay attached. Pass `--foreground` (alias `--no-daemon`) to keep the process in the foreground and stream logs to stderr instead of syslog:
 
@@ -140,14 +140,14 @@ extenddb healthcheck --endpoint https://127.0.0.1:18443 # explicit target
 This is a liveness check, which is what a container `HEALTHCHECK` wants. The `/health` path does not query the storage
 backend, so it will report healthy even if the storage backend becomes unreachable after startup. That is deliberate,
 since a liveness probe that failed on a database outage would restart every replica at once. A backend that is
-unreachable at startup does stop the server from listening. There is no separate readiness endpoint yet.
+unreachable at startup does stop the server from listening. There is no separate readiness endpoint.
 
 ### One instance per database
 
 Run one `extenddb serve` per catalog. On SQLite this is enforced: the server takes an exclusive lock on `<database>.lock`
 next to the database file and a second server on the same file will refuse to start (`init`, `migrate`, and `destroy` take
 the same lock while they run). On PostgreSQL, MongoDB and Cassandra nothing prevents a second ExtendDB instance from
-running, but running more than one against the same catalog is not supported in this release: every instance runs every
+running, but running more than one against the same catalog is not supported: every instance runs every
 background worker, credential and policy caches are per instance with no cross-instance invalidation (a revoked key
 stays valid on the other instance for up to the cache TTL), and `/health` does not check the database.
 See the [deployment guide](docs/manuals/11-deployment-guide.md#multi-instance-considerations).

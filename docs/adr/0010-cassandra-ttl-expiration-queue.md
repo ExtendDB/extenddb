@@ -117,7 +117,7 @@ This version is suitable for production when the deployment stays inside the sup
 * keep Cassandra coordinators and ExtendDB hosts time-synchronized, because request batches use explicit timestamps, with request deadlines well below the request claim lifetime; and
 * accept DynamoDB-style eventual expiration plus the documented brief internal effects-before-delete window.
 
-Within that envelope, item renewal, crash recovery, generation changes, synchronous index cleanup, transaction reconciliation, ordinary write contention, and deterministic stream removal are covered by durable state and real-Cassandra tests. This is not yet a claim of unrestricted DynamoDB parity for every Cassandra table configuration.
+Within that envelope, item renewal, crash recovery, generation changes, synchronous index cleanup, transaction reconciliation, ordinary write contention, and deterministic stream removal are covered by durable state and real-Cassandra tests. This is not a claim of unrestricted DynamoDB parity for every Cassandra table configuration.
 
 ### Parity with the PostgreSQL backend
 
