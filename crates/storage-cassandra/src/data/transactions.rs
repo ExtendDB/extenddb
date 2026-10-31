@@ -1499,11 +1499,11 @@ impl CassandraEngine {
     /// For Delete: Update `partition_max_delete_timestamp`, then delete the item
     ///
     /// `prepared_item` is the post-image PREPARE computed for an Update, as it
-    /// went into the ledger. `None` there means the update writes nothing (its
-    /// actions only remove and the key held no item), which is the one case
-    /// COMMIT cannot re-derive: PREPARE's marker row carries the key in
-    /// `item_data`, so a re-read cannot tell it from an item that was already
-    /// there. Ignored for the other three kinds.
+    /// went into the ledger. `None` there means the update writes nothing: its
+    /// actions only remove, and the key held no item when PREPARE read it.
+    /// PREPARE makes that decision and the ledger records it because recovery
+    /// replays from the ledger, which carries `item_data` and not the update's
+    /// actions. Ignored for the other three kinds.
     async fn commit_single_operation(
         &self,
         op: &TransactWriteOp<'_>,
