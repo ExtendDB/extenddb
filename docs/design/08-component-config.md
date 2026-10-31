@@ -509,7 +509,7 @@ CMD ["--config", "/etc/extenddb/config.toml"]
 
 ## 10. SDK Client Configuration
 
-extenddb serves both DynamoDB and DynamoDB Streams on a single port. An unmodified application that works against AWS must work against extenddb by changing only endpoint configuration.
+ExtendDB serves both DynamoDB and DynamoDB Streams on a single port. An unmodified application that works against AWS must work against ExtendDB by changing only endpoint configuration.
 
 ### 10.1 Recommended Setup: Environment Variables
 
@@ -534,11 +534,11 @@ This works with every AWS SDK (Python/boto3, Java v2, Rust, Go v2, .NET, Node.js
 export AWS_ENDPOINT_URL=https://127.0.0.1:18443
 ```
 
-This sends all AWS SDK calls to extenddb. Simpler, but breaks if the application also calls non-DynamoDB services.
+This sends all AWS SDK calls to ExtendDB. Simpler, but breaks if the application also calls non-DynamoDB services.
 
 ### 10.2 Alternative Setup: AWS Config File
 
-For teams that prefer file-based configuration or need to switch between extenddb and real DynamoDB:
+For teams that prefer file-based configuration or need to switch between ExtendDB and real DynamoDB:
 
 ```ini
 # ~/.aws/config
@@ -574,7 +574,7 @@ AWS SDKs resolve endpoints in this order (highest priority first):
 
 When any override is set, the SDK disables endpoint discovery (`DescribeEndpoints` is never called automatically). All requests go directly to the configured URL.
 
-extenddb accepts both `DynamoDB_20120810.*` and `DynamoDBStreams_20120810.*` target prefixes on the same port. Both use `dynamodb` as the SigV4 signing name, so authentication is identical.
+ExtendDB accepts both `DynamoDB_20120810.*` and `DynamoDBStreams_20120810.*` target prefixes on the same port. Both use `dynamodb` as the SigV4 signing name, so authentication is identical.
 
 ### 10.4 DescribeEndpoints Response
 
@@ -595,9 +595,9 @@ The `Address` is derived from the server's configured `bind_addr` and `port`. If
 
 ### 10.5 Credential Pairing
 
-The credentials in `~/.aws/credentials` (or env vars) are what the SDK uses to sign requests. extenddb validates these signatures against its own credential store. The access key and secret key must match on both sides:
+The credentials in `~/.aws/credentials` (or env vars) are what the SDK uses to sign requests. ExtendDB validates these signatures against its own credential store. The access key and secret key must match on both sides:
 
-1. Register credentials in extenddb's credential store (via admin API or database seeding)
+1. Register credentials in ExtendDB's credential store (via admin API or database seeding)
 2. Configure the same `aws_access_key_id` / `aws_secret_access_key` in the SDK client's environment
 
 For development environments, a default credential pair can be seeded automatically on first startup (configurable via `auth.seed_credentials` in `config.toml`).

@@ -9,7 +9,7 @@ status: "Draft"
 
 ## 1. Overview
 
-extenddb (ExtendDB) is a standalone, stateless Rust application that provides a 100% DynamoDB-compatible API backed by pluggable storage engines. Any AWS SDK client (Java, Python, Go, Node.js, Rust, .NET, etc.) connects directly with zero code changes. The system runs as its own process, completely independent of any specific database, and supports pluggable authentication providers and pluggable storage backends.
+ExtendDB is a standalone, stateless Rust application that provides a 100% DynamoDB-compatible API backed by pluggable storage engines. Any AWS SDK client (Java, Python, Go, Node.js, Rust, .NET, etc.) connects directly with zero code changes. The system runs as its own process, completely independent of any specific database, and supports pluggable authentication providers and pluggable storage backends.
 
 ### 1.1 Goals
 
@@ -259,28 +259,28 @@ These are the core CRUD operations. All must be fully implemented.
 
 ### 4.1.1 Auth Modes
 
-extenddb supports three authentication modes, selectable by configuration. The mode determines how credentials are validated and how authorization decisions are made.
+ExtendDB supports three authentication modes, selectable by configuration. The mode determines how credentials are validated and how authorization decisions are made.
 
 **Mode 1: No auth** (removed: `auth.provider = "none"` is no longer accepted)
 Previously accepted any request regardless of the Authorization header. This mode has been removed. The server refuses to start with `provider = "none"`.
 
 **Mode 2: Local credential store** (`auth.provider = "builtin"`)
-extenddb maintains its own credential store and policy documents. SigV4 signatures are validated against locally stored secret keys. Authorization is evaluated against locally stored IAM-style policies. Credentials and policies are managed via the management API or seed configuration. This is the default for production in disconnected or semi-connected environments.
+ExtendDB maintains its own credential store and policy documents. SigV4 signatures are validated against locally stored secret keys. Authorization is evaluated against locally stored IAM-style policies. Credentials and policies are managed via the management API or seed configuration. This is the default for production in disconnected or semi-connected environments.
 
 **Mode 3: AWS IAM** (`auth.provider = "aws_iam"`)
-When extenddb has network connectivity to AWS (e.g., running on EC2), it delegates authentication and authorization to real AWS IAM. This mode has three sub-capabilities:
+When ExtendDB has network connectivity to AWS (e.g., running on EC2), it delegates authentication and authorization to real AWS IAM. This mode has three sub-capabilities:
 
-- REQ-AUTH-008: **STS authentication via pre-signed GetCallerIdentity token.** The client generates a pre-signed STS `GetCallerIdentity` URL (signed for the `sts` service) and sends it as an `X-Extenddb-Auth-Token` header alongside the normal DynamoDB request. extenddb calls STS using this pre-signed URL to validate the credential and resolve the caller's IAM ARN, account ID, and user ID. Cache validated identities with configurable TTL to avoid per-request STS calls. This is the same pattern used by EKS (`aws-iam-authenticator`) and Vault's AWS auth method.
+- REQ-AUTH-008: **STS authentication via pre-signed GetCallerIdentity token.** The client generates a pre-signed STS `GetCallerIdentity` URL (signed for the `sts` service) and sends it as an `X-Extenddb-Auth-Token` header alongside the normal DynamoDB request. ExtendDB calls STS using this pre-signed URL to validate the credential and resolve the caller's IAM ARN, account ID, and user ID. Cache validated identities with configurable TTL to avoid per-request STS calls. This is the same pattern used by EKS (`aws-iam-authenticator`) and Vault's AWS auth method.
 - REQ-AUTH-009: **IAM policy retrieval.** Fetch the caller's attached policies, group policies, and permissions boundaries from IAM using `iam:GetUserPolicy`, `iam:ListAttachedUserPolicies`, `iam:GetPolicy`, `iam:GetPolicyVersion`, `iam:ListGroupsForUser`, `iam:GetRolePolicy`, `iam:ListAttachedRolePolicies`, and `iam:GetUserPermissionsBoundary` / `iam:GetRolePermissionsBoundary`. Retrieved policies are evaluated by the same local policy engine used in Mode 2. Cache retrieved policies with configurable TTL.
-- REQ-AUTH-010: **Near-seamless SDK experience with thin client wrapper.** A lightweight extenddb client wrapper generates the pre-signed STS token and attaches it as `X-Extenddb-Auth-Token` before each request. The wrapper uses the same AWS credentials and SDK configuration as normal DynamoDB calls. Switching between extenddb and real DynamoDB requires changing `endpoint_url` and adding/removing the wrapper. The wrapper is provided for Python (boto3 plugin), Rust, and Java.
-- REQ-AUTH-011: **Graceful degradation.** If STS or IAM is unreachable (network partition, transient failure), extenddb must return a clear error (`ServiceUnavailable` with a message indicating the auth backend is unreachable) rather than silently allowing or denying requests. Cached identities and policies remain valid for their TTL during outages.
-- REQ-AUTH-012: **IAM permissions required.** The EC2 instance (or IAM principal) running extenddb must have permissions to call `sts:GetCallerIdentity` (always allowed, no policy needed) and the `iam:Get*`/`iam:List*` actions above. The required IAM policy for the extenddb host is documented in the deployment guide.
+- REQ-AUTH-010: **Near-seamless SDK experience with thin client wrapper.** A lightweight ExtendDB client wrapper generates the pre-signed STS token and attaches it as `X-Extenddb-Auth-Token` before each request. The wrapper uses the same AWS credentials and SDK configuration as normal DynamoDB calls. Switching between ExtendDB and real DynamoDB requires changing `endpoint_url` and adding/removing the wrapper. The wrapper is provided for Python (boto3 plugin), Rust, and Java.
+- REQ-AUTH-011: **Graceful degradation.** If STS or IAM is unreachable (network partition, transient failure), ExtendDB must return a clear error (`ServiceUnavailable` with a message indicating the auth backend is unreachable) rather than silently allowing or denying requests. Cached identities and policies remain valid for their TTL during outages.
+- REQ-AUTH-012: **IAM permissions required.** The EC2 instance (or IAM principal) running ExtendDB must have permissions to call `sts:GetCallerIdentity` (always allowed, no policy needed) and the `iam:Get*`/`iam:List*` actions above. The required IAM policy for the ExtendDB host is documented in the deployment guide.
 
-> **Design note:** Mode 3 enables a powerful workflow: develop locally with Mode 2 (local credentials + policies), then deploy to EC2 with Mode 3 (real IAM) using the same application code and SDK configuration (only `endpoint_url` changes, plus adding the extenddb client wrapper). The same policy documents work in both modes because the policy engine is shared. The pre-signed token approach is a proven pattern used by EKS and Vault. It works because the token is signed for the `sts` service by the client's own credentials, avoiding the SigV4 service-binding problem.
+> **Design note:** Mode 3 enables a powerful workflow: develop locally with Mode 2 (local credentials + policies), then deploy to EC2 with Mode 3 (real IAM) using the same application code and SDK configuration (only `endpoint_url` changes, plus adding the ExtendDB client wrapper). The same policy documents work in both modes because the policy engine is shared. The pre-signed token approach is a proven pattern used by EKS and Vault. It works because the token is signed for the `sts` service by the client's own credentials, avoiding the SigV4 service-binding problem.
 
 ### 4.2 Identity Model
 
-extenddb implements a local IAM identity model that mirrors the structure of AWS IAM for DynamoDB access control. This enables testing of IAM policies, role-based access, and tag-based access control (ABAC) against extenddb with the same policy documents used in production.
+ExtendDB implements a local IAM identity model that mirrors the structure of AWS IAM for DynamoDB access control. This enables testing of IAM policies, role-based access, and tag-based access control (ABAC) against ExtendDB with the same policy documents used in production.
 
 - REQ-IDENT-001: Support IAM-style principals: users and roles. A **user** has long-term credentials (access key + secret key). A **role** has a trust policy and is assumed by users to obtain temporary credentials.
 - REQ-IDENT-002: Support **groups**. A group contains zero or more users. Policies attached to a group apply to all member users. A user can belong to multiple groups.
@@ -289,9 +289,9 @@ extenddb implements a local IAM identity model that mirrors the structure of AWS
 - REQ-IDENT-005: Support **session tags** passed during role assumption. Session tags override principal tags for the duration of the session and are available as `aws:PrincipalTag/{key}`.
 - REQ-IDENT-006: Support **AssumeRole**: a user assumes a role to obtain temporary session credentials (access key, secret key, session token). The session has an expiration time. The role's trust policy controls who can assume it.
 - REQ-IDENT-007: Session credentials include an `aws:PrincipalTag/*` namespace populated from the role's tags, the user's tags, and any session tags passed at assumption time (session tags take precedence).
-- REQ-IDENT-008 (Deferred): **Federated role assumption** (`AssumeRoleWithSAML`, `AssumeRoleWithWebIdentity`) is not supported in v1. Applications that use web identity federation (e.g., Lambda functions, EKS pods) to access DynamoDB cannot replicate that auth path against extenddb. Workaround: use basic AssumeRole with equivalent policies.
+- REQ-IDENT-008 (Deferred): **Federated role assumption** (`AssumeRoleWithSAML`, `AssumeRoleWithWebIdentity`) is not supported in v1. Applications that use web identity federation (e.g., Lambda functions, EKS pods) to access DynamoDB cannot replicate that auth path against ExtendDB. Workaround: use basic AssumeRole with equivalent policies.
 - REQ-IDENT-009 (Deferred): **Role chaining** (a role assuming another role) is not supported in v1. `CallerArn` in AssumeRole must reference a user. `SourceIdentity` (tracks the original caller through a chain) and `TransitiveTagKeys` (session tags that persist through chains) are deferred alongside role chaining since they only apply in chained scenarios.
-- REQ-IDENT-010 (Deferred): **MaxSessionDuration** per role is not enforced in v1. AWS IAM roles have a configurable maximum session duration (default 1 hour, up to 12 hours) that caps the `DurationSeconds` parameter in AssumeRole. extenddb v1 accepts any `DurationSeconds` value with no per-role validation.
+- REQ-IDENT-010 (Deferred): **MaxSessionDuration** per role is not enforced in v1. AWS IAM roles have a configurable maximum session duration (default 1 hour, up to 12 hours) that caps the `DurationSeconds` parameter in AssumeRole. ExtendDB v1 accepts any `DurationSeconds` value with no per-role validation.
 
 ### 4.3 Authorization: Identity-Based Policies
 
@@ -410,9 +410,9 @@ All limits must be enforced by default with DynamoDB-compatible values. All limi
 
 ### 7.1 Catalog Database
 
-The catalog database stores extenddb metadata: table definitions, indexes, tags, and the data database connection info. The data database stores user item data. This follows the PostgreSQL/MySQL pattern of system catalog vs. user databases.
+The catalog database stores ExtendDB metadata: table definitions, indexes, tags, and the data database connection info. The data database stores user item data. This follows the PostgreSQL/MySQL pattern of system catalog vs. user databases.
 
-- REQ-CAT-001: extenddb metadata (table definitions, indexes, tags) must reside in a catalog database, separate from user item data
+- REQ-CAT-001: ExtendDB metadata (table definitions, indexes, tags) must reside in a catalog database, separate from user item data
 - REQ-CAT-002: User item data must reside in a data database whose connection info is recorded in the catalog
 - REQ-CAT-003: The `extenddb.toml` connection string points to the catalog database; the catalog stores the data database location
 - REQ-CAT-004: The catalog database name is user-chosen via the connection string, never hardcoded. Multiple independent catalogs can coexist on one PostgreSQL instance
@@ -544,7 +544,7 @@ The system must support all 10 DynamoDB attribute value types:
 
 ## 12. SDK Client Configuration Requirements
 
-An unmodified application that works against AWS DynamoDB must work against extenddb by changing only endpoint configuration: no code changes, no SDK patches, no custom plugins.
+An unmodified application that works against AWS DynamoDB must work against ExtendDB by changing only endpoint configuration: no code changes, no SDK patches, no custom plugins.
 
 ### 12.1 Endpoint Override Mechanism
 
@@ -562,16 +562,16 @@ The service-specific environment variables for DynamoDB and DynamoDB Streams are
 | DynamoDB | `dynamodb` | `AWS_ENDPOINT_URL_DYNAMODB` |
 | DynamoDB Streams | `dynamodbstreams` | `AWS_ENDPOINT_URL_DYNAMODB_STREAMS` |
 
-Both must point to the same extenddb address (extenddb serves both services on a single port).
+Both must point to the same ExtendDB address (ExtendDB serves both services on a single port).
 
 **Requirements:**
-- REQ-SDK-001: extenddb serves both DynamoDB and DynamoDB Streams on a single `host:port`. No separate Streams port or path prefix is needed; the `X-Amz-Target` prefix distinguishes the two services.
+- REQ-SDK-001: ExtendDB serves both DynamoDB and DynamoDB Streams on a single `host:port`. No separate Streams port or path prefix is needed; the `X-Amz-Target` prefix distinguishes the two services.
 - REQ-SDK-002: `DescribeEndpoints` must return the server's own `host:port` as the `Address` with a `CachePeriodInMinutes` of 10. This is a no-op for SDK clients that set `endpoint_url` (endpoint discovery is disabled when a custom endpoint is set), but must return a valid response if called directly.
 - REQ-SDK-003: SigV4 signing name is `dynamodb` for both DynamoDB and DynamoDB Streams requests. The auth layer does not need to distinguish between the two services.
 
 ### 12.2 AWS Configuration Files
 
-extenddb requires credentials for SigV4 authentication. The standard `~/.aws/credentials` and `~/.aws/config` files are used by the SDK client, not by extenddb itself. extenddb has its own credential store (see §4). The credentials configured in `~/.aws/credentials` must match a credential pair registered in extenddb's credential store.
+ExtendDB requires credentials for SigV4 authentication. The standard `~/.aws/credentials` and `~/.aws/config` files are used by the SDK client, not by ExtendDB itself. ExtendDB has its own credential store (see §4). The credentials configured in `~/.aws/credentials` must match a credential pair registered in ExtendDB's credential store.
 
 **Minimal setup: environment variables only (simplest):**
 
@@ -586,7 +586,7 @@ export AWS_SECRET_ACCESS_KEY=local-dev-secret
 export AWS_DEFAULT_REGION=us-east-1
 ```
 
-With this setup, any application using `boto3.client('dynamodb')` or `boto3.client('dynamodbstreams')`, or the equivalent in any other SDK, automatically talks to extenddb with zero code changes.
+With this setup, any application using `boto3.client('dynamodb')` or `boto3.client('dynamodbstreams')`, or the equivalent in any other SDK, automatically talks to ExtendDB with zero code changes.
 
 **Alternative: `~/.aws/config` with services section:**
 
@@ -609,7 +609,7 @@ aws_access_key_id = local-dev-key
 aws_secret_access_key = local-dev-secret
 ```
 
-Usage: `export AWS_PROFILE=extenddb`; then all SDK clients in the process use extenddb.
+Usage: `export AWS_PROFILE=extenddb`; then all SDK clients in the process use ExtendDB.
 
 **Alternative: global endpoint override (all AWS services go to one place):**
 
@@ -617,25 +617,25 @@ Usage: `export AWS_PROFILE=extenddb`; then all SDK clients in the process use ex
 export AWS_ENDPOINT_URL=https://127.0.0.1:18443
 ```
 
-This sends every AWS SDK call to extenddb. Only useful when the application exclusively uses DynamoDB.
+This sends every AWS SDK call to ExtendDB. Only useful when the application exclusively uses DynamoDB.
 
 ### 12.3 Endpoint Discovery Behavior
 
 DynamoDB SDKs support optional endpoint discovery via the `DescribeEndpoints` operation. The behavior varies by SDK:
 
-- **When `endpoint_url` is set:** Endpoint discovery is completely disabled. The SDK sends all requests to the configured URL. This is the normal extenddb usage path.
+- **When `endpoint_url` is set:** Endpoint discovery is completely disabled. The SDK sends all requests to the configured URL. This is the normal ExtendDB usage path.
 - **When `endpoint_url` is NOT set:** The SDK may call `DescribeEndpoints` to discover the optimal endpoint. This only happens against real AWS.
 
 **Requirements:**
-- REQ-SDK-004: extenddb must handle `DescribeEndpoints` requests and return a valid response pointing to itself. This ensures correctness if an application explicitly calls `DescribeEndpoints`, even though SDKs skip it when `endpoint_url` is set.
-- REQ-SDK-005: Endpoint discovery must not redirect clients away from extenddb. The returned `Address` must always be the server's own listen address.
+- REQ-SDK-004: ExtendDB must handle `DescribeEndpoints` requests and return a valid response pointing to itself. This ensures correctness if an application explicitly calls `DescribeEndpoints`, even though SDKs skip it when `endpoint_url` is set.
+- REQ-SDK-005: Endpoint discovery must not redirect clients away from ExtendDB. The returned `Address` must always be the server's own listen address.
 
 ## 13. Testing Requirements
 
 - REQ-TEST-001: A minimal test suite must exist for every phase, covering all implemented operations. No phase exits without a passing test suite
 - REQ-TEST-002: Tests are written in Python (boto3) and AWS CLI, covering all Phase 1 operations: CreateTable, DescribeTable, ListTables, DeleteTable, and key error paths
-- REQ-TEST-003: Tests must be dual-target: run against both real DynamoDB and extenddb with identical assertions, controlled by an endpoint parameter. No target-specific branching
-- REQ-TEST-004: If behavior differs between real DynamoDB and extenddb, that is a bug in extenddb
+- REQ-TEST-003: Tests must be dual-target: run against both real DynamoDB and ExtendDB with identical assertions, controlled by an endpoint parameter. No target-specific branching
+- REQ-TEST-004: If behavior differs between real DynamoDB and ExtendDB, that is a bug in ExtendDB
 - REQ-TEST-005: Tests must clean up after themselves: all created resources are deleted on exit, even on failure
 
 ## 14. Documentation Requirements
@@ -650,12 +650,12 @@ DynamoDB SDKs support optional endpoint discovery via the `DescribeEndpoints` op
 
 ### 15.1 Startup Banner
 
-- REQ-LOG-001: On launch, extenddb logs a summary of its effective configuration: binary version, catalog version, bind address, region, account ID, auth provider, catalog database, data database, log level
+- REQ-LOG-001: On launch, ExtendDB logs a summary of its effective configuration: binary version, catalog version, bind address, region, account ID, auth provider, catalog database, data database, log level
 - REQ-LOG-002: Connection strings must redact passwords in log output
 
 ### 15.2 Syslog Integration
 
-- REQ-LOG-003: extenddb logs to syslog with ident `extenddb` and facility `daemon`. Read logs with `journalctl -t extenddb`
+- REQ-LOG-003: ExtendDB logs to syslog with ident `extenddb` and facility `daemon`. Read logs with `journalctl -t extenddb`
 - REQ-LOG-004: Default log level is `debug`
 - REQ-LOG-005: Supported levels: `debug`, `info`, `error`, `critical`
 - REQ-LOG-006: Log format follows syslog convention: ISO 8601 timestamp, level, message

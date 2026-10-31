@@ -9,7 +9,7 @@ status: "Draft"
 
 ## 1. Architecture Overview
 
-extenddb (ExtendDB) is a standalone async Rust application structured as a Cargo workspace. It receives DynamoDB wire protocol requests over HTTP, authenticates and authorizes them via a pluggable auth provider, executes the operation logic in a backend-agnostic core, and delegates persistence to a pluggable storage engine.
+ExtendDB (ExtendDB) is a standalone async Rust application structured as a Cargo workspace. It receives DynamoDB wire protocol requests over HTTP, authenticates and authorizes them via a pluggable auth provider, executes the operation logic in a backend-agnostic core, and delegates persistence to a pluggable storage engine.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -358,7 +358,7 @@ UpdateItem is more complex than PutItem because the storage backend must also ap
 
 ## 6. Concurrency Model
 
-extenddb handles concurrent requests through three cooperating layers:
+ExtendDB handles concurrent requests through three cooperating layers:
 
 ### 6.1 Async Runtime (tokio)
 

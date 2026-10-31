@@ -622,7 +622,7 @@ This prevents concurrent DDL operations on the same table.
 ### 6.1.1 Async Control Plane Transitions (Phase 1c)
 
 Real DynamoDB control plane operations are not instantaneous: `CreateTable` returns `CREATING` status and the table
-transitions to `ACTIVE` asynchronously. extenddb emulates this behavior.
+transitions to `ACTIVE` asynchronously. ExtendDB emulates this behavior.
 
 **Implementation:**
 
@@ -659,7 +659,7 @@ on the `indexes` table when GSI operations are implemented.
 **Crash recovery and in-flight operation tracking:**
 
 The `status_transition_at` column on the `tables` table serves as the
-in-flight operation tracker. When the extenddb server shuts down (cleanly or
+in-flight operation tracker. When the ExtendDB server shuts down (cleanly or
 via crash) while tables have pending transitions, the state is durable in
 PostgreSQL. On the next startup, `process_control_plane_transitions()` scans
 for rows where `status_transition_at IS NOT NULL AND

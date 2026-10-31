@@ -375,7 +375,7 @@ convert from this JSON externally.
 
 ## 8. Management API
 
-The management API provides identity and credential management for extenddb's built-in auth provider. These endpoints are the only way to create users, roles, groups, credentials, and policies; the DynamoDB API surface is not used for identity management.
+The management API provides identity and credential management for ExtendDB's built-in auth provider. These endpoints are the only way to create users, roles, groups, credentials, and policies; the DynamoDB API surface is not used for identity management.
 
 ### 8.1 Authentication Model
 

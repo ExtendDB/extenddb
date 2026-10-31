@@ -448,7 +448,7 @@ Each phase is a separate PR. After each phase the test suite runs green and the 
 
 ### B.1 Why the current state is not enough for multi-instance deployments
 
-In a multi-instance deployment (multiple extenddb processes sharing a catalog DB), each instance's in-memory cache is local. Self-induced changes propagate instantly **on the local instance** via the existing write-through hooks. Off-instance changes (an admin-API mutation on instance A, where instance B is serving the same principal) only become visible on instance B when its cache entry expires (`auth.cache.ttl_seconds`, default 60 s).
+In a multi-instance deployment (multiple ExtendDB processes sharing a catalog DB), each instance's in-memory cache is local. Self-induced changes propagate instantly **on the local instance** via the existing write-through hooks. Off-instance changes (an admin-API mutation on instance A, where instance B is serving the same principal) only become visible on instance B when its cache entry expires (`auth.cache.ttl_seconds`, default 60 s).
 
 For an auth/authz cache, "60 seconds of stale policy" can mean a deleted access key still authenticates, or a Deny statement still being shadowed by a stale Allow. That window is acceptable for soft state but not for IAM revocation.
 
@@ -542,7 +542,7 @@ If the catch-up scan exceeds the cleanup window (B.4), assume too much state has
 ### B.4 Latency expectations
 
 - Within-DC: typical NOTIFY roundtrip < 50 ms.
-- Across-region (rare; multi-region should usually use one extenddb cluster per region): bounded by the catalog DB's replication lag.
+- Across-region (rare; multi-region should usually use one ExtendDB cluster per region): bounded by the catalog DB's replication lag.
 - Worst case (listener disconnected): catch-up window equals the cleanup window (default 4 min). Operators tune by adjusting the cleanup interval.
 
 ### B.5 What this does **not** solve

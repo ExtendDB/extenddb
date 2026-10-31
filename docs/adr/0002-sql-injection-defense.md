@@ -6,7 +6,7 @@ Accepted: 2026-04-07. Revised: 2026-04-21 (P30: reflect actual design).
 
 ## Context
 
-extenddb stores DynamoDB table metadata and item data in PostgreSQL. User-supplied strings (table names, attribute names, key values, filter expressions) flow from HTTP requests through the engine layer into SQL queries. A SQL injection vulnerability here would allow arbitrary database access.
+ExtendDB stores DynamoDB table metadata and item data in PostgreSQL. User-supplied strings (table names, attribute names, key values, filter expressions) flow from HTTP requests through the engine layer into SQL queries. A SQL injection vulnerability here would allow arbitrary database access.
 
 ## Decision
 

@@ -2,7 +2,7 @@
 
 ## Context
 
-extenddb needs a standard format for all documentation: design docs, ADRs, getting-started guides, and troubleshooting references. The two candidates are Markdown and LaTeX.
+ExtendDB needs a standard format for all documentation: design docs, ADRs, getting-started guides, and troubleshooting references. The two candidates are Markdown and LaTeX.
 
 ## Options Considered
 
@@ -15,7 +15,7 @@ Markdown for all documentation.
 
 ## Rationale
 
-- All existing extenddb documentation is already Markdown. Switching would require migrating dozens of files.
+- All existing ExtendDB documentation is already Markdown. Switching would require migrating dozens of files.
 - Markdown renders in-place on code hosting platforms: no build step, no PDF artifacts to manage.
 - Rust's `rustdoc` uses Markdown natively. Keeping external docs in the same format reduces context switching.
 - LaTeX adds a build dependency (TeX Live is ~4 GB) with no corresponding benefit for a software project's documentation needs.

@@ -11,11 +11,11 @@ supersedes: "05-component-auth.md (v2.0)"
 
 ## 1. Purpose
 
-The `auth` crate provides pluggable authentication and authorization for extenddb. It defines the `AuthProvider` trait, implements the built-in SigV4 provider with local credential management, and contains the IAM policy evaluation engine supporting identity-based access control (IBAC), role-based access control (RBAC), and fine-grained/tag-based access control (ABAC/FGAC).
+The `auth` crate provides pluggable authentication and authorization for ExtendDB. It defines the `AuthProvider` trait, implements the built-in SigV4 provider with local credential management, and contains the IAM policy evaluation engine supporting identity-based access control (IBAC), role-based access control (RBAC), and fine-grained/tag-based access control (ABAC/FGAC).
 
 The crate depends on `extenddb-core` (for types and errors) and `async_trait` (for object-safe async trait dispatch). It has no HTTP framework or storage dependencies.
 
-> **No caching.** All credential lookups, policy fetches, and identity resolution read directly from Postgres on every request. The latency is sub-millisecond for indexed lookups, and this approach eliminates stale-cache bugs and cache invalidation complexity entirely. Multiple extenddb instances sharing the same catalog see consistent data without coordination. If profiling under production load shows database round-trips are a bottleneck, caching can be added as a transparent layer without changing any interfaces.
+> **No caching.** All credential lookups, policy fetches, and identity resolution read directly from Postgres on every request. The latency is sub-millisecond for indexed lookups, and this approach eliminates stale-cache bugs and cache invalidation complexity entirely. Multiple ExtendDB instances sharing the same catalog see consistent data without coordination. If profiling under production load shows database round-trips are a bottleneck, caching can be added as a transparent layer without changing any interfaces.
 
 ## 2. Key Design Decisions (from 2026-04-15 review session)
 
