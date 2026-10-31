@@ -18,15 +18,22 @@ use std::path::PathBuf;
 pub(crate) struct FileUri {
     /// The path, decoded.
     path: Vec<u8>,
-    /// The query options in order, decoded.
+    /// The query options in order, decoded. Read only by `creates_file`,
+    /// which the Unix file mode code uses.
+    #[cfg_attr(not(unix), allow(dead_code))]
     options: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 /// SQLite's `SQLITE_OPEN_*` access flags.
+#[cfg(unix)]
 const READONLY: u32 = 0x1;
+#[cfg(unix)]
 const READWRITE: u32 = 0x2;
+#[cfg(unix)]
 const CREATE: u32 = 0x4;
+#[cfg(unix)]
 const MEMORY: u32 = 0x80;
+#[cfg(unix)]
 const ACCESS: u32 = READONLY | READWRITE | CREATE | MEMORY;
 
 impl FileUri {
@@ -128,6 +135,7 @@ impl FileUri {
     /// options. Every `cache` and `mode` value must be one SQLite knows; a
     /// `mode` may not ask for more access than the flags before it allow; the
     /// last `mode` decides; and the last `vfs` must be in the unix family.
+    #[cfg(unix)]
     pub(crate) fn creates_file(&self) -> bool {
         let mut flags = READWRITE | CREATE;
         let mut vfs: Option<&[u8]> = None;
@@ -224,6 +232,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn creates_file_follows_the_last_mode_and_vfs() {
         for (rest, creates) in [
             ("/d", true),
