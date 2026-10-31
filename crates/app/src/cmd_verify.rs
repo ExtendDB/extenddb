@@ -26,7 +26,15 @@ pub struct VerifyArgs {
     /// without one reads the EXTENDDB__ environment variables, as serve does)
     #[arg(short, long)]
     config: Option<String>,
+
+    /// Print every note the migration ledger records. Without it, verify
+    /// prints the number of notes of each migration and its first 5
+    #[arg(long)]
+    all_notes: bool,
 }
+
+/// How many notes of each migration `verify` prints without `--all-notes`.
+const NOTES_SHOWN: usize = 5;
 
 /// Run `extenddb verify`; returns the process exit status.
 pub async fn run(args: VerifyArgs, release: &str) -> anyhow::Result<u8> {
@@ -56,8 +64,14 @@ pub async fn run(args: VerifyArgs, release: &str) -> anyhow::Result<u8> {
     // exist is reported, not created.
     let status_code = match extenddb_storage::migrations::installed() {
         Some(migrations) => {
-            let code =
-                check_migrations(migrations, config_file.as_deref(), &app_config, release).await;
+            let code = check_migrations(
+                migrations,
+                config_file.as_deref(),
+                &app_config,
+                release,
+                args.all_notes,
+            )
+            .await;
             if code == extenddb_storage::migrations::exit::ERROR {
                 println!();
                 println!("=== UNHEALTHY: see the catalog check above ===");
@@ -150,13 +164,41 @@ pub async fn run(args: VerifyArgs, release: &str) -> anyhow::Result<u8> {
     Ok(if status_code == 0 { 1 } else { status_code })
 }
 
+/// The lines `verify` prints for the notes the catalog ledger records: per
+/// migration with notes, how many it has and the first [`NOTES_SHOWN`], or
+/// every note with `all`.
+fn ledger_note_lines(rows: &[extenddb_storage::migrations::LedgerRow], all: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    for row in rows.iter().filter(|r| !r.notes.is_empty()) {
+        let notes: Vec<&str> = row.notes.lines().collect();
+        let count = notes.len();
+        let shown = if all { count } else { count.min(NOTES_SHOWN) };
+        lines.push(format!(
+            "  Notes of migration {} {} ({count} note{}):",
+            row.id,
+            row.name,
+            if count == 1 { "" } else { "s" }
+        ));
+        lines.extend(notes.iter().take(shown).map(|note| format!("    {note}")));
+        if shown < count {
+            lines.push(format!(
+                "    and {} more; verify --all-notes prints every note",
+                count - shown
+            ));
+        }
+    }
+    lines
+}
+
 /// Print the catalog status, what its pending migrations change, and the
-/// notes the ledger records, and return the status's exit code.
+/// notes the ledger records (each migration's first [`NOTES_SHOWN`], or
+/// every note with `all_notes`), and return the status's exit code.
 async fn check_migrations(
     migrations: &dyn extenddb_storage::migrations::CatalogMigrations,
     config_file: Option<&str>,
     app_config: &config::AppConfig,
     release: &str,
+    all_notes: bool,
 ) -> u8 {
     use extenddb_storage::migrations::advice::{self, AdviceFor};
     use extenddb_storage::migrations::{CatalogStatus, Target};
@@ -207,12 +249,59 @@ async fn check_migrations(
         Err(e) => println!("  WARN: {}", advice::error_message(&e, &advice)),
     }
     if let Ok(rows) = migrations.catalog_ledger(&target).await {
-        for row in rows.iter().filter(|r| !r.notes.is_empty()) {
-            println!("  Notes of migration {} {}:", row.id, row.name);
-            for note in row.notes.lines() {
-                println!("    {note}");
-            }
+        for line in ledger_note_lines(&rows, all_notes) {
+            println!("{line}");
         }
     }
     status.exit_code()
+}
+
+#[cfg(test)]
+mod tests {
+    use extenddb_storage::migrations::{Kind, LedgerRow, Outcome};
+
+    use super::ledger_note_lines;
+
+    fn row(id: u32, notes: usize) -> LedgerRow {
+        LedgerRow {
+            id,
+            name: format!("m{id}"),
+            kind: Kind::Breaking,
+            checksum: "c".to_owned(),
+            outcome: Outcome::Applied,
+            notes: (0..notes)
+                .map(|i| format!("note {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            applied_at: String::new(),
+            applied_by: "1.0.0".to_owned(),
+        }
+    }
+
+    /// Each migration's note count and first 5 notes; `--all-notes` prints
+    /// every one.
+    #[test]
+    fn the_ledger_notes_are_counted_and_the_first_five_printed() {
+        let rows = [row(1, 0), row(2, 7), row(4, 1)];
+        assert_eq!(
+            ledger_note_lines(&rows, false),
+            [
+                "  Notes of migration 2 m2 (7 notes):",
+                "    note 0",
+                "    note 1",
+                "    note 2",
+                "    note 3",
+                "    note 4",
+                "    and 2 more; verify --all-notes prints every note",
+                "  Notes of migration 4 m4 (1 note):",
+                "    note 0",
+            ]
+        );
+        let all = ledger_note_lines(&rows, true);
+        assert_eq!(all.len(), 1 + 7 + 1 + 1, "{all:?}");
+        assert_eq!(all[7], "    note 6");
+        assert!(all.iter().all(|l| !l.contains("more")), "{all:?}");
+        let five = ledger_note_lines(&[row(3, 5)], false);
+        assert_eq!(five.len(), 6, "{five:?}");
+    }
 }

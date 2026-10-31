@@ -101,7 +101,7 @@ On PostgreSQL `migrate --yes` can also print:
 extenddb verify --config extenddb.toml
 ```
 
-`verify` prints the catalog status, and on a Behind catalog the policies migration 2 rewrites, as the preview does.
+`verify` prints the catalog status, and on a Behind catalog the policies migration 2 rewrites, as the preview does. For each migration that recorded notes in the ledger, such as the policies migration 2 rewrote, it prints the number of notes and the first 5; `verify --all-notes` prints every note.
 
 6. **Start the server**
 
