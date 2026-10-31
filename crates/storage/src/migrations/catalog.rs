@@ -157,11 +157,14 @@ pub trait CatalogMigrations: Send + Sync {
     /// clause: "back up ...". Opens nothing.
     fn backup_advice(&self, target: &Target) -> String;
 
-    /// The environment assignment that names this deployment's store to a
-    /// command run without a config file, such as
-    /// `EXTENDDB__STORAGE__SQLITE__PATH=<absolute path>`, for the command a
-    /// server started without one advises. `None` (the default) when the
-    /// backend's location cannot be given that way without a secret in it.
+    /// The environment assignment that names this deployment's store by its
+    /// absolute location, such as
+    /// `EXTENDDB__STORAGE__SQLITE__PATH=<absolute path>`, with the value
+    /// quoted for a POSIX shell, for an advised command that must reach the
+    /// store from any directory: one run without a config file, or with a
+    /// config file that names the store by a relative location. `None` (the
+    /// default) when the backend's location cannot be given that way
+    /// without a secret in it.
     fn location_assignment(&self, target: &Target) -> Option<String> {
         let _ = target;
         None
