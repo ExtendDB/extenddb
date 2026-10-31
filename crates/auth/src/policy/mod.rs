@@ -7,6 +7,7 @@
 //! permissions boundary → session policy → identity allow → implicit deny.
 //! Supports IBAC, RBAC, and ABAC/FGAC patterns through a unified evaluator.
 
+pub mod arn_value;
 pub mod casefold;
 pub mod condition;
 pub mod context;

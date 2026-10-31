@@ -44,12 +44,12 @@ impl AuthorizationStore for SqliteCatalogStore {
         &self,
         account_id: &str,
         user_name: &str,
-    ) -> BoxFuture<'_, OpResult<Vec<String>>> {
+    ) -> BoxFuture<'_, OpResult<Vec<(String, String)>>> {
         let account_id = account_id.to_owned();
         let user_name = user_name.to_owned();
         Box::pin(async move {
-            let rows: Vec<(String,)> = sqlx::query_as(
-                "SELECT p.policy_document FROM iam_policies p \
+            let rows: Vec<(String, String)> = sqlx::query_as(
+                "SELECT m.group_name, p.policy_document FROM iam_policies p \
                  JOIN iam_group_members m \
                    ON m.account_id = p.account_id AND m.group_name = p.principal_name \
                  WHERE p.account_id = ? AND p.principal_type = 'group' AND m.user_name = ?",
@@ -59,7 +59,7 @@ impl AuthorizationStore for SqliteCatalogStore {
             .fetch_all(self.pool())
             .await
             .map_err(|e| db_err("fetch_user_group_policies", e))?;
-            Ok(rows.into_iter().map(|(d,)| d).collect())
+            Ok(rows)
         })
     }
 
