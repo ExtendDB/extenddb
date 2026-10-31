@@ -1,6 +1,10 @@
-# Developer & Test Guide
+---
+description: "Building ExtendDB, running the unit and integration test suites, and the conventions the code follows."
+---
 
-> See [NOTICE](../NOTICE.md) for important disclaimers.
+# Developer and test guide
+
+> See [NOTICE](https://github.com/ExtendDB/extenddb/blob/main/docs/NOTICE.md) for important disclaimers.
 
 ## Project Structure
 
@@ -52,7 +56,7 @@ Both debug and release builds must pass before any phase exit.
 
 ### Crate Boundaries
 
-- `core` is pure sync Rust — no async runtime, no database drivers, no HTTP framework
+- `core` is pure sync Rust: no async runtime, no database drivers, no HTTP framework
 - `storage` defines traits and backend-agnostic utilities (ARN, key parsing)
 - `engine` contains async operation handlers that call storage traits
 - `storage-postgres` implements storage traits for PostgreSQL
@@ -66,7 +70,7 @@ Both debug and release builds must pass before any phase exit.
 - `core` defines `DynamoDbError` for all DynamoDB-fidelity errors
 - `storage` defines `StorageError` for storage-layer errors
 - Use `thiserror` for library error types, `anyhow` for the binary
-- No `.unwrap()` in production code — use `?`, `.expect("reason")`, or handle explicitly
+- No `.unwrap()` in production code: use `?`, `.expect("reason")`, or handle explicitly
 
 ### Ownership
 
@@ -98,7 +102,7 @@ Every source file must carry:
 4. Add storage trait methods to `crates/storage/src/lib.rs` if needed
 5. Implement the storage methods in `crates/storage-postgres/src/`
 6. Add Python integration tests in `tests/`
-7. Update the Usage Guide (`docs/manuals/03-usage-guide.md`)
+7. Update the [Usage Guide](03-usage-guide.md)
 
 ## Testing
 
@@ -147,7 +151,7 @@ devtools/run-tests --extenddb --pytest --filter test_put_item
 
 **Prerequisites for integration tests (pytest, external, comprehensive, rust-integration):**
 
-1. A running extenddb server: `./target/debug/extenddb serve --config extenddb.toml`
+1. A running ExtendDB server: `./target/debug/extenddb serve --config extenddb.toml`
 2. `EXTENDDB_TEST_ENDPOINT=https://localhost:18443`
 3. `EXTENDDB_ADMIN_PASSWORD=<password from extenddb init>`
 
@@ -162,13 +166,13 @@ The `run-tests` script automatically:
 - Extracts and exports `EXTENDDB_TEST_PG_CONNECTION_STRING` for CLI lifecycle tests
 
 **Test artifacts** are written to `discussions/` with the code repo's HEAD commit hash:
-- `test-rust-<hash>.txt` — Rust unit test output
-- `test-rust-integration-<hash>.txt` — Rust integration test output
-- `test-pytest-<hash>.txt` — Pytest output
-- `test-external-<hash>.json` — External test results (structured)
-- `test-external-<hash>.txt` — External test output (verbose)
-- `test-comprehensive-<hash>.txt` — Comprehensive test output
-- `test-cli-<hash>.txt` — CLI lifecycle test output
+- `test-rust-<hash>.txt`: Rust unit test output
+- `test-rust-integration-<hash>.txt`: Rust integration test output
+- `test-pytest-<hash>.txt`: Pytest output
+- `test-external-<hash>.json`: External test results (structured)
+- `test-external-<hash>.txt`: External test output (verbose)
+- `test-comprehensive-<hash>.txt`: Comprehensive test output
+- `test-cli-<hash>.txt`: CLI lifecycle test output
 
 ### Test Suites
 
@@ -182,7 +186,7 @@ The `run-tests` script automatically:
 
 ### Python Integration Tests
 
-The primary test suite is in Python, testing extenddb through the same AWS SDK interface that customers use.
+The primary test suite is in Python, testing ExtendDB through the same AWS SDK interface that customers use.
 
 ```bash
 # Via run-tests script (recommended)
@@ -204,7 +208,7 @@ The `--parallel` flag enables pytest-xdist with `--dist loadfile`, which
 distributes entire test files across workers. This keeps module/class-scoped
 fixtures on a single worker while running independent files concurrently. The
 default worker count (1/3 of CPU cores, minimum 2) leaves headroom for the
-extenddb server and its Postgres backend.
+ExtendDB server and its Postgres backend.
 
 ### Comprehensive Tests
 
@@ -248,7 +252,7 @@ Unit tests in `core` require no database and no async runtime.
 
 - Every failure path should have a test
 - Avoid redundant tests covering the same failure path
-- Test error messages exactly — they are part of the API contract (tenet 4)
+- Test error messages exactly: they are part of the API contract (tenet 4)
 - Use `pytest.mark.parametrize` for multiple test cases
 - Mock external dependencies, not your own code
 
@@ -269,27 +273,27 @@ python3 docs/build-docs.py --list
 python3 docs/build-docs.py --doc 4
 ```
 
-If you haven't set up the virtual environment yet, see the [Python Environment Setup](../../README.md#python-environment-setup) section in the README.
+If you haven't set up the virtual environment yet, see the [Python Environment Setup](https://github.com/ExtendDB/extenddb/blob/main/README.md#python-environment-setup) section in the README.
 
 Output goes to `pdfs/` (gitignored).
 
 ## Project Tenets
 
-1. **Fidelity over features** — match real DynamoDB behavior exactly
-2. **Fidelity is the default** — standard operations behave identically to real DynamoDB
-3. **Fast feedback loops** — startup time, query latency, and test cycle speed matter
-4. **Errors are contracts** — error responses are part of the API surface
-5. **Rust-safe by default** — rely on the type system and ownership model
-6. **Tests live outside the core** — test suites are clients
-7. **Readable over clever** — straightforward implementations over compact ones
-8. **Console is an API client** — every piece of data and every action visible in the web console is available through the management API; the console never queries the database directly
+1. **Fidelity over features**: match the DynamoDB service behavior exactly
+2. **Fidelity is the default**: standard operations behave identically to the DynamoDB service
+3. **Fast feedback loops**: startup time, query latency, and test cycle speed matter
+4. **Errors are contracts**: error responses are part of the API surface
+5. **Rust-safe by default**: rely on the type system and ownership model
+6. **Tests live outside the core**: test suites are clients
+7. **Readable over clever**: straightforward implementations over compact ones
+8. **Console is an API client**: every piece of data and every action visible in the web console is available through the management API; the console never queries the database directly
 
 ---
 
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
-See [LICENSE](../../LICENSE) for the full text.
+See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
 This software is provided "as is" without warranty of any kind. ExtendDB is not
 affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark

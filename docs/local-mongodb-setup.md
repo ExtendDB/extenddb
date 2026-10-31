@@ -1,4 +1,8 @@
-# Local MongoDB Setup
+---
+description: "Set up a single-node MongoDB replica set on a development machine for building and testing ExtendDB."
+---
+
+# Local MongoDB setup (development)
 
 ## Prerequisites
 
@@ -157,11 +161,11 @@ export EXTENDDB__STORAGE__MONGODB__CONNECTION_STRING="mongodb://localhost:27017/
 
 ```bash
 # Health check
-curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:8000/health
+curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/health
 
 # List tables (should return empty)
 aws dynamodb list-tables \
-    --endpoint-url https://127.0.0.1:8000 \
+    --endpoint-url https://127.0.0.1:18443 \
     --region us-east-1
 ```
 
@@ -190,7 +194,7 @@ brew services stop mongodb-community@7.0
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
-See [LICENSE](../LICENSE) for the full text.
+See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
 This software is provided "as is" without warranty of any kind. ExtendDB is not
 affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark

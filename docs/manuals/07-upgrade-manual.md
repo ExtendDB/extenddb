@@ -1,6 +1,10 @@
-# Upgrade Manual
+---
+description: "Upgrading an ExtendDB deployment from one version to the next, with the catalog migrations each release requires."
+---
 
-> See [NOTICE](../NOTICE.md) for important disclaimers.
+# Upgrading
+
+> See [NOTICE](https://github.com/ExtendDB/extenddb/blob/main/docs/NOTICE.md) for important disclaimers.
 
 ## Current Status
 
@@ -120,8 +124,8 @@ The consolidated schema file is what fresh installs get. Add your new column/tab
 **No data migrations in DDL files.** If a schema change requires backfilling data, do it in Rust code triggered by `extenddb migrate`, not in raw SQL. This gives you error handling, progress reporting, and the ability to batch large updates.
 
 **Test both paths.** Every migration must be tested two ways:
-1. Fresh install (`extenddb init`) — verifies `001_schema.sql` is correct
-2. Upgrade (`extenddb migrate` on a catalog at the previous version) — verifies the incremental migration works
+1. Fresh install (`extenddb init`): verifies `001_schema.sql` is correct
+2. Upgrade (`extenddb migrate` on a catalog at the previous version): verifies the incremental migration works
 
 ## General Upgrade Procedure
 
@@ -319,7 +323,7 @@ Catalog upgrades change the schema; behavior changes alter how the running serve
 interprets existing data or configuration. Review these before upgrading a live
 deployment, even when no catalog migration is required.
 
-### v0.1.14 LeadingKeys now enforced on Query, batch and transaction operations
+### v0.1.14: LeadingKeys enforced on Query, batch and transaction operations
 
 **What changed.** `dynamodb:LeadingKeys` is now evaluated on `Query`,
 `BatchGetItem`, `BatchWriteItem`, `TransactGetItems` and `TransactWriteItems`.
@@ -476,12 +480,12 @@ and `RestoreTableFromBackup`, and `ListBackups` refuses the cursor it hands out,
 so every listing stops at its first page. The server starts with such a region
 and logs a warning naming the consequence at startup.
 
-### v0.1.6 — IAM: bare operators on multivalued condition keys are no-ops (BR-7085)
+### v0.1.6: IAM bare operators on multivalued condition keys are no-ops
 
 **What changed.** A **bare** condition operator (no `ForAnyValue:` / `ForAllValues:`
-qualifier) applied to a *multivalued* condition key — `dynamodb:Attributes` or
-`dynamodb:LeadingKeys` — now **never matches**, matching real AWS IAM exactly. Before
-v0.1.6, extenddb evaluated a bare operator as an implicit AND across the request's values,
+qualifier) applied to a *multivalued* condition key, `dynamodb:Attributes` or
+`dynamodb:LeadingKeys`, now **never matches**, matching AWS IAM exactly. Before
+v0.1.6, ExtendDB evaluated a bare operator as an implicit AND across the request's values,
 so such a condition could match and appear to enforce a restriction.
 
 **Who is affected.** Any deployment with an IAM policy that uses a bare operator (e.g.
@@ -494,7 +498,7 @@ denylist that *appeared* to protect an attribute:
 ```
 
 Under the old behavior this could deny a single-attribute request; after the upgrade it is a
-no-op (as it always was on real AWS). **This is a security-relevant change: policies relying
+no-op (as it always was on the DynamoDB service). **This is a security-relevant change: policies relying
 on the old semantics no longer restrict access.**
 
 **Migration.** Rewrite affected policies to use a set qualifier before upgrading:
@@ -670,7 +674,7 @@ No catalog migration is required. Before upgrading a deployment that restricts t
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
-See [LICENSE](../../LICENSE) for the full text.
+See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
 This software is provided "as is" without warranty of any kind. ExtendDB is not
 affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark

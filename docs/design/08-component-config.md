@@ -1,4 +1,8 @@
-# extenddb — Component Design: Configuration & Operations
+---
+description: "The configuration system, configurable limits, logging, metrics, health checks and deployment settings."
+---
+
+# Component design: Configuration and operations
 
 **Version:** 1.0
 **Date:** 2026-04-03
@@ -604,7 +608,7 @@ For development environments, a default credential pair can be seeded automatica
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
-See [LICENSE](../../LICENSE) for the full text.
+See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
 This software is provided "as is" without warranty of any kind. ExtendDB is not
 affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark

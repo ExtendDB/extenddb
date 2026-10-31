@@ -1,6 +1,10 @@
-# Cassandra Setup
+---
+description: "Run ExtendDB on Apache Cassandra: a local single-node setup, initialization, the configuration keys, cluster deployment and the backend's known limitations."
+---
 
-> See [NOTICE](NOTICE.md) for important disclaimers.
+# Cassandra setup
+
+> See [NOTICE](https://github.com/ExtendDB/extenddb/blob/main/docs/NOTICE.md) for important disclaimers.
 
 > **Experimental.** As of October 2026, the Cassandra backend is experimental.
 > Validate it against your workload before you rely on it in production. This
@@ -108,7 +112,7 @@ application role:
 
 The node must run `PasswordAuthenticator` (step 3). `init` always creates its
 application role with a password, so it fails against an unauthenticated
-(`AllowAllAuthenticator`) node — there is no credential-free path.
+(`AllowAllAuthenticator`) node; there is no credential-free path.
 
 > **Authorizer.** Run the node with `AllowAllAuthorizer` (the default). `init`
 > creates the application role but grants it no permissions, so under
@@ -120,7 +124,7 @@ init creates:
 - The catalog keyspace (`extenddb_catalog` by default)
 - The application role ExtendDB uses at serve time (named `extenddb` by
   default; override with `--extenddb-user` / `--extenddb-pass`)
-- Admin user credentials (printed to stdout once — save them)
+- Admin user credentials (printed to stdout once; save them)
 - A self-signed TLS certificate at `~/.extenddb/tls/cert.pem`
 - The config file `extenddb.toml`
 
@@ -149,30 +153,30 @@ max_connections = 10
 
 Fields:
 
-- `contact_points` — one or more `host:port` entries. One reachable node is
+- `contact_points`: one or more `host:port` entries. One reachable node is
   enough; the driver discovers the rest of the cluster.
-- `username` / `password` — the application credentials ExtendDB uses at serve
+- `username` / `password`: the application credentials ExtendDB uses at serve
   time. Required against any authenticated node (which `init` requires anyway).
-- `keyspace_prefix` — prefix for this deployment's keyspaces (default
+- `keyspace_prefix`: prefix for this deployment's keyspaces (default
   `extenddb`).
-- `replication_factor` — keyspace replication factor. `init` always writes `1`,
+- `replication_factor`: keyspace replication factor. `init` always writes `1`,
   regardless of the cluster. For a multi-node cluster, edit this to 3 or more
   **after** `init`; keyspaces created later (per account) use the config value.
   Existing keyspaces are not altered retroactively.
-- `datacenter` — the local datacenter name for `NetworkTopologyStrategy`. Currently,
+- `datacenter`: the local datacenter name for `NetworkTopologyStrategy`. Currently,
   `init` always writes `datacenter1` and has no flag to change it, and the keyspaces
   it creates reference `datacenter1`, so the cluster's local datacenter must be
   named `datacenter1`. A node started with a different datacenter name (for
   example `CASSANDRA_DC=dc1`) fails keyspace creation with
   `Unrecognized strategy option {datacenter1} ... for keyspace extenddb_catalog`.
-- `max_connections` — maximum connections per host.
+- `max_connections`: maximum connections per host.
 
 Edit these values in `extenddb.toml` after `init`. Unlike the PostgreSQL and
 MongoDB backends, the Cassandra backend has no single connection-string field;
 set `contact_points` and the other fields directly in the config section above.
 
 > **Connections are not encrypted.** The Cassandra backend connects over plain
-> TCP — the driver is built without TLS — so credentials and item data cross the
+> TCP (the driver is built without TLS), so credentials and item data cross the
 > network in clear text. Run ExtendDB and Cassandra on a trusted network (for
 > example a private subnet or an encrypted overlay); do not send Cassandra
 > traffic across an untrusted network.
@@ -215,13 +219,13 @@ docker stop cassandra
 
 ## Cluster Deployment
 
-For deployment concerns common to every backend — single-node vs separated
+For deployment concerns common to every backend (single-node vs separated
 topologies, containers, the production checklist, systemd, multi-instance
-limits — see the [Deployment Guide](manuals/11-deployment-guide.md). This
+limits), see the [deployment guide](manuals/11-deployment-guide.md). This
 section covers only what is specific to Cassandra.
 
 > **Not recommended for production yet.** As of October 2026 the Cassandra
-> backend is experimental. It has known limitations — some multi-entity
+> backend is experimental. It has known limitations: some multi-entity
 > management operations are not atomic, and a few concurrency issues are still
 > open (see Known Limitations below). Treat a Cassandra deployment as
 > evaluation or pre-production, and test it against your own workload before you
@@ -250,7 +254,7 @@ max_connections = 10
 
 ### Authentication
 
-Run the cluster with authentication enabled — `init` requires
+Run the cluster with authentication enabled: `init` requires
 `PasswordAuthenticator` or stronger, since it creates its application role with
 a password. Give ExtendDB a dedicated application role rather than the
 `cassandra` superuser, and supply its credentials through `username` and
@@ -302,14 +306,14 @@ backend is experimental rather than production-ready.
 
 If you do evaluate a deployment, monitor the TTL expiration backlog, Cassandra
 LWT latency, and background-worker health. The design decisions and their
-rationale are documented in the Cassandra ADRs (`docs/adr/0010`–`0021`).
+rationale are documented in the Cassandra ADRs (`docs/adr/0010` to `0021`).
 
 ---
 
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
-See [LICENSE](../LICENSE) for the full text.
+See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
 This software is provided "as is" without warranty of any kind. ExtendDB is not
 affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark

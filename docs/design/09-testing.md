@@ -1,4 +1,8 @@
-# extenddb — Test Strategy Design
+---
+description: "How tests are organized, how golden files work and how multi-language suites check SDK compatibility."
+---
+
+# Test strategy
 
 **Version:** 1.0
 **Date:** 2026-04-06
@@ -313,7 +317,7 @@ Phase exit criteria are defined in the implementation plan. This document adds t
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
-See [LICENSE](../../LICENSE) for the full text.
+See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
 This software is provided "as is" without warranty of any kind. ExtendDB is not
 affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
