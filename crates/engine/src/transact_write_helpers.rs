@@ -6,12 +6,17 @@
 //! Extracted from `transact_write_items.rs` to keep both files under the
 //! 500-line limit.
 
+use std::collections::HashMap;
+
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{ExpressionMaps, PathElement, UpdateAction};
+use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{
-    ReturnItemCollectionMetrics, ReturnValuesOnConditionCheckFailure, TableKeyInfo,
-    attribute_value_size, extract_key, item_size_bytes,
+    AttributeValue, CancellationReason, ReturnItemCollectionMetrics,
+    ReturnValuesOnConditionCheckFailure, TableKeyInfo, attribute_value_size, extract_key,
+    item_size_bytes,
 };
+use extenddb_core::validation::{validate_attribute_values_nesting_depth, validate_key_not_empty};
 use extenddb_storage::TransactWriteOp;
 use hmac::{Hmac, Mac};
 use serde_json::Value;
@@ -222,13 +227,13 @@ impl PreparedOp {
     /// item keeps the single-item wording ("Type mismatch for key ..."), a
     /// `Delete`, `Update`, or `ConditionCheck` key gets "The provided key
     /// element does not match the schema". An empty key value is a top-level
-    /// `ValidationException` and is checked before this runs.
+    /// `ValidationException`; `key_pass_failure` checks it after this.
     pub(crate) fn key_schema_reason(
         &self,
         limits: &extenddb_core::limits::LimitsConfig,
     ) -> Option<extenddb_core::types::CancellationReason> {
         use extenddb_core::validation::{
-            validate_batch_key_only, validate_item_keys, validate_key_size_limits,
+            validate_item_keys, validate_key_shape_only, validate_key_size_limits,
         };
         let (key_info, item_or_key) = match self {
             Self::Put { key_info, item, .. } => (key_info, item),
@@ -242,7 +247,7 @@ impl PreparedOp {
                 &key_info.key_schema,
                 &key_info.attribute_definitions,
             ),
-            _ => validate_batch_key_only(
+            _ => validate_key_shape_only(
                 item_or_key,
                 &key_info.key_schema,
                 &key_info.attribute_definitions,
@@ -257,6 +262,92 @@ impl PreparedOp {
             )),
         }
     }
+
+    /// The per-item cancellation reason for an `Update` that names a key
+    /// attribute in one of its actions, or `None`. The service reports it as a
+    /// `ValidationError` reason, not as a top-level exception (measured).
+    fn key_update_reason(&self) -> Option<CancellationReason> {
+        let Self::Update {
+            key_info,
+            actions,
+            maps,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        validate_no_key_updates(actions, key_info, maps)
+            .err()
+            .map(|e| match e {
+                DynamoDbError::ValidationException(message) => {
+                    CancellationReason::validation_error(message)
+                }
+                other => CancellationReason::validation_error(other.to_string()),
+            })
+    }
+
+    /// An empty string or binary key value, as the top-level
+    /// `ValidationException` the service answers.
+    fn validate_key_value_not_empty(&self) -> Result<(), DynamoDbError> {
+        match self {
+            Self::Put { key_info, item, .. } => validate_key_not_empty(item, &key_info.key_schema),
+            Self::Delete { key_info, key, .. }
+            | Self::Update { key_info, key, .. }
+            | Self::ConditionCheck { key_info, key, .. } => {
+                validate_key_not_empty(key, &key_info.key_schema)
+            }
+        }
+    }
+}
+
+/// The key pass of `TransactWriteItems`, run once every table is known.
+///
+/// One item after another, the first failing item decides. Inside an item the
+/// order is the service's (measured): a key that does not fit the schema, then
+/// a key attribute named in an `Update`, both returned as the index and
+/// cancellation reason of that item, then an empty key value, returned as a
+/// top-level `ValidationException`.
+pub(crate) fn key_pass_failure(
+    prepared: &[PreparedOp],
+    limits: &LimitsConfig,
+) -> Result<Option<(usize, CancellationReason)>, DynamoDbError> {
+    for (index, op) in prepared.iter().enumerate() {
+        if let Some(reason) = op
+            .key_schema_reason(limits)
+            .or_else(|| op.key_update_reason())
+        {
+            return Ok(Some((index, reason)));
+        }
+        op.validate_key_value_not_empty()?;
+    }
+    Ok(None)
+}
+
+/// Check the nesting of every `ExpressionAttributeValues` value of one item,
+/// used or not, as the service does at the start of that item's validation.
+/// The message names the offending placeholder; keys are visited in sorted
+/// order so the one reported is deterministic when several values are too
+/// deep.
+pub(crate) fn validate_value_map_nesting(
+    values: Option<&HashMap<String, AttributeValue>>,
+) -> Result<(), DynamoDbError> {
+    let Some(values) = values else {
+        return Ok(());
+    };
+    let mut keys: Vec<&String> = values.keys().collect();
+    keys.sort();
+    for key in keys {
+        match validate_attribute_values_nesting_depth(std::iter::once(&values[key])) {
+            Ok(()) => {}
+            Err(DynamoDbError::ValidationException(inner)) => {
+                return Err(DynamoDbError::ValidationException(format!(
+                    "ExpressionAttributeValues contains invalid value: {inner} for key {key}"
+                )));
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    Ok(())
 }
 
 /// Validate `ClientRequestToken` format.

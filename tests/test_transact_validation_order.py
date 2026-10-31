@@ -12,15 +12,15 @@ of these phases whichever item carries it:
      size, all as a top-level ValidationException;
   2. a table that does not exist, as ResourceNotFoundException;
   3. the 4 MB request total, as a top-level ValidationException;
-  4. a key that does not fit the table's key schema, as
-     TransactionCanceledException with a ValidationError reason on the first
-     offending item and None on every other item, even when several keys
-     fail: conditions are not evaluated and runtime update errors are not
-     reported when any item fails here;
+  4. a key that does not fit the table's key schema, or a key attribute
+     named in an Update, as TransactionCanceledException with a
+     ValidationError reason on the first offending item and None on every
+     other item; conditions are not evaluated and runtime update errors are
+     not reported when any item fails here;
   5. two operations on one item, as a top-level ValidationException.
 
-Every expected response below was captured from Amazon DynamoDB (issue #108).
-Dual-target: runs against the service and against ExtendDB on every backend.
+Captured from Amazon DynamoDB (issue #108); the per-item checks of phases 1
+and 4 are in test_transact_write_phase_order.py. Dual-target (all backends).
 """
 
 from __future__ import annotations

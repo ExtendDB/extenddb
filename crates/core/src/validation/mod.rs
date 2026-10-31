@@ -1309,6 +1309,32 @@ pub fn validate_key_only(
     key_schema: &[KeySchemaElement],
     attr_defs: &[AttributeDefinition],
 ) -> Result<(), DynamoDbError> {
+    validate_key_shape(key, key_schema, attr_defs, true)
+}
+
+/// [`validate_key_only`] without the empty-value rule: the count, the missing
+/// attribute and the type of every key attribute, and nothing else. The
+/// transaction key pass uses it because the service reports an empty key value
+/// only after every shape error of the same item, even one on a later key
+/// attribute (measured 2026-10-27).
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` if the key has extra/missing attributes or wrong types.
+pub fn validate_key_shape_only(
+    key: &Item,
+    key_schema: &[KeySchemaElement],
+    attr_defs: &[AttributeDefinition],
+) -> Result<(), DynamoDbError> {
+    validate_key_shape(key, key_schema, attr_defs, false)
+}
+
+fn validate_key_shape(
+    key: &Item,
+    key_schema: &[KeySchemaElement],
+    attr_defs: &[AttributeDefinition],
+    reject_empty: bool,
+) -> Result<(), DynamoDbError> {
     // Must contain exactly the key attributes
     let expected_count = key_schema.len();
     if key.len() != expected_count {
@@ -1321,7 +1347,9 @@ pub fn validate_key_only(
             .ok_or_else(key_schema_mismatch)?;
         validate_key_attribute_type(&ks.attribute_name, value, attr_defs)
             .map_err(remap_key_shape_errors)?;
-        validate_no_empty_key_value(&ks.attribute_name, value)?;
+        if reject_empty {
+            validate_no_empty_key_value(&ks.attribute_name, value)?;
+        }
     }
     Ok(())
 }
