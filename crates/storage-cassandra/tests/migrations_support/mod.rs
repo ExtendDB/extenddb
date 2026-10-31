@@ -146,22 +146,22 @@ impl SilencingProxy {
         self.silent.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// A session to the test node whose requests all go through the proxy.
-    /// On two nodes a session from `session()` would also send them straight
+    /// A session to the test node whose query plans hold only the proxy. On
+    /// two nodes a session from `session()` would also send requests straight
     /// to the second node, which answers while the proxy is silent.
     pub async fn session(&self) -> Arc<CassandraSession> {
         pinned_session(&self.address).await
     }
 }
 
-/// A session whose requests all go to the node reached at `contact_point`.
-/// The driver reads the other nodes of a cluster from `system.peers_v2`
-/// (`system.peers` before Cassandra 4.0) and sends requests to every node in
-/// turn; this session leaves every node but that one out of its query plans.
-/// The schema agreement wait still asks every node for its version, on a
-/// connection to each. Like `CassandraEngine::create_session`, it logs in
-/// with the test credentials when both are set and gives up on the connect
-/// after 10 s.
+/// A session whose query plans hold only the node reached at
+/// `contact_point`, a host name or address with a port. The driver reads
+/// the other nodes of a cluster from `system.peers_v2` (`system.peers`
+/// before Cassandra 4.0) and sends requests to every node in turn; this
+/// session leaves every node but that one out of its query plans. The schema
+/// agreement wait still asks every node for its version, on a connection to
+/// each. Like `CassandraEngine::create_session`, it logs in with the test
+/// credentials when both are set and gives up on the connect after 10 s.
 // tests/migrations_stopped.rs compiles this module too and uses no pinned
 // session.
 #[allow(dead_code)]
@@ -184,10 +184,15 @@ pub async fn pinned_session(contact_point: &str) -> Arc<CassandraSession> {
     }
 
     let config = helpers::test_config();
-    let address = contact_point
-        .parse()
-        .unwrap_or_else(|e| panic!("contact point {contact_point}: {e}"));
-    let nodes = NodeTcpConfigBuilder::new().with_contact_point(contact_point.to_owned().into());
+    // The node reached at the contact point carries the address the driver
+    // connected to, so the contact point is resolved once and the session is
+    // given that address.
+    let address = tokio::net::lookup_host(contact_point)
+        .await
+        .ok()
+        .and_then(|mut found| found.next())
+        .unwrap_or_else(|| panic!("contact point {contact_point} does not resolve"));
+    let nodes = NodeTcpConfigBuilder::new().with_contact_point(address.to_string().into());
     let nodes = if let (Some(username), Some(password)) = (&config.username, &config.password) {
         nodes.with_authenticator_provider(Arc::new(StaticPasswordAuthenticatorProvider::new(
             username, password,

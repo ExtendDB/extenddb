@@ -65,11 +65,11 @@ fn target_of(prefix: &str) -> Target {
     ))
 }
 
-/// Two sessions for two migrators, each sending all its requests to one
+/// Two sessions for two migrators, each with query plans that hold one
 /// node: the test node, and the node `EXTENDDB_TEST_CASSANDRA_SECOND_CONTACT_POINT`
 /// names, the second node of a two-node cluster, so the two migrators reach
-/// the catalog through different coordinators. Both go to the test node
-/// when it is not set.
+/// the catalog through different coordinators. Both hold the test node when
+/// it is not set.
 async fn migrator_sessions() -> (Arc<CassandraSession>, Arc<CassandraSession>) {
     let first = helpers::test_contact_point();
     let second = std::env::var("EXTENDDB_TEST_CASSANDRA_SECOND_CONTACT_POINT")

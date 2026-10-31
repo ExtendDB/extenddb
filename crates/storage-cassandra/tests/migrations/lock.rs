@@ -214,12 +214,16 @@ async fn a_bodys_request_to_a_node_that_stops_answering_fails_at_the_request_tim
     let migrations = CassandraMigrations::for_status(session, "p2m_silent");
     let store = migrations.stores().management_store();
     // Through the proxy, a request is answered: the node reports that the
-    // keyspace does not exist.
+    // keyspace does not exist, and the driver names the proxy as the server
+    // that answered.
     let answered = format!(
         "{:?}",
         store.list_policies("000000000000", "user", "alice").await
     );
-    assert!(answered.contains("does not exist"), "{answered}");
+    assert!(
+        answered.contains("does not exist") && answered.contains(&proxy.address),
+        "{answered}"
+    );
     proxy.go_silent();
     let started = Instant::now();
     let answer = tokio::time::timeout(
