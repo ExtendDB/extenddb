@@ -211,7 +211,7 @@ These are the core CRUD operations. All must be fully implemented.
 - REQ-IMPEXP-003: Import/export must work with local filesystem paths (S3 support is a future enhancement)
 - REQ-IMPEXP-004: Import/export jobs must be tracked with status (IN_PROGRESS, COMPLETED, FAILED, CANCELLED)
 
-### 3.4 DynamoDB Streams Operations (In Scope: Deferred Detail)
+### 3.4 DynamoDB Streams Operations (In Scope, Detail Deferred)
 
 | # | Operation | Description |
 |---|-----------|-------------|
@@ -227,7 +227,7 @@ These are the core CRUD operations. All must be fully implemented.
 - REQ-STREAM-004: Stream records must be ordered by sequence number within a shard
 - REQ-STREAM-005: Detailed shard management and retention design is deferred
 
-### 3.5 Global Tables Operations (In Scope: Deferred Detail)
+### 3.5 Global Tables Operations (In Scope, Detail Deferred)
 
 | # | Operation | Description |
 |---|-----------|-------------|
@@ -428,10 +428,10 @@ The catalog database stores ExtendDB metadata: table definitions, indexes, tags,
 ### 7.3 Lifecycle Tools
 
 - REQ-CAT-010: The server does not run migrations on startup. Migrations are an explicit step via `extenddb init` or `extenddb migrate`. Server startup is read-only against the catalog schema
-- REQ-CAT-011: `extenddb init`: subcommand that initializes a new deployment: creates (or connects to) the catalog database, runs initial migrations, creates (or connects to) the data database, records the data database connection in the catalog, generates `extenddb.toml` if needed. Documented in `docs/`
-- REQ-CAT-012: `extenddb destroy`: subcommand that tears down a deployment: reads config, connects to catalog, enumerates all user tables, prints what will be destroyed, requires `--yes` to confirm, drops data database, drops catalog database. Documented in `docs/`
-- REQ-CAT-013: `extenddb verify`: subcommand that validates a deployment: connects to catalog, checks version, enumerates all tables and indexes in catalog, connects to data database, verifies corresponding storage structures exist. Reports healthy/missing/inconsistent. Documented in `docs/`
-- REQ-CAT-014: `extenddb migrate`: subcommand that applies schema migrations to an existing catalog: reads current version, determines required migrations, shows plan, requires `--yes` to confirm, runs migrations, updates catalog version. Documented in `docs/`
+- REQ-CAT-011: `extenddb init` is the subcommand that initializes a new deployment. It creates (or connects to) the catalog database, runs initial migrations, creates (or connects to) the data database, records the data database connection in the catalog, generates `extenddb.toml` if needed. Documented in `docs/`
+- REQ-CAT-012: `extenddb destroy` is the subcommand that tears down a deployment. It reads config, connects to catalog, enumerates all user tables, prints what will be destroyed, requires `--yes` to confirm, drops data database, drops catalog database. Documented in `docs/`
+- REQ-CAT-013: `extenddb verify` is the subcommand that validates a deployment. It connects to catalog, checks version, enumerates all tables and indexes in catalog, connects to data database, verifies corresponding storage structures exist. Reports healthy/missing/inconsistent. Documented in `docs/`
+- REQ-CAT-014: `extenddb migrate` is the subcommand that applies schema migrations to an existing catalog. It reads current version, determines required migrations, shows plan, requires `--yes` to confirm, runs migrations, updates catalog version. Documented in `docs/`
 
 ## 8. Storage Backend Requirements
 
@@ -573,7 +573,7 @@ Both must point to the same ExtendDB address (ExtendDB serves both services on a
 
 ExtendDB requires credentials for SigV4 authentication. The standard `~/.aws/credentials` and `~/.aws/config` files are used by the SDK client, not by ExtendDB itself. ExtendDB has its own credential store (see §4). The credentials configured in `~/.aws/credentials` must match a credential pair registered in ExtendDB's credential store.
 
-**Minimal setup: environment variables only (simplest):**
+**Minimal setup, environment variables only (simplest):**
 
 ```bash
 # Point both services at extenddb
@@ -609,7 +609,7 @@ aws_access_key_id = local-dev-key
 aws_secret_access_key = local-dev-secret
 ```
 
-Usage: `export AWS_PROFILE=extenddb`; then all SDK clients in the process use ExtendDB.
+Usage: `export AWS_PROFILE=extenddb`. All SDK clients in the process then use ExtendDB.
 
 **Alternative: global endpoint override (all AWS services go to one place):**
 

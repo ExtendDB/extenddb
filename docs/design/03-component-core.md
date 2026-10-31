@@ -3,7 +3,7 @@ description: "The core crate: DynamoDB types, expression parsing and evaluation,
 version: "1.0"
 date: "2026-04-03"
 status: "Draft"
-crate: "`dynamodb-core`"
+crate: "dynamodb-core"
 ---
 
 # Component design: Core
@@ -309,7 +309,7 @@ The `engine` crate depends on `core` (for types, expressions, validation) and `s
 1. Deserialize and validate input (using `core::validation`)
 2. Parse expressions (using `core::expression`)
 3. Call the storage engine (async)
-4. Apply post-read processing (filter expressions, projections, using `core::expression`)
+4. Apply post-read processing (filter expressions and projections, using `core::expression`)
 5. Calculate consumed capacity (using `core::capacity`)
 6. Format the response
 

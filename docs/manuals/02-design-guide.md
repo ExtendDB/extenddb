@@ -14,7 +14,7 @@ ExtendDB manages two kinds of stored state in every storage backend. The
 examples below name the PostgreSQL databases; other backends map the same two
 roles onto their own structures (see backend-specific documentation).
 
-- **Catalog** (e.g., the `extenddb_catalog` PostgreSQL database): All metadata: table definitions, indexes, accounts, IAM entities, settings, stream metadata, and schema history.
+- **Catalog** (e.g., the `extenddb_catalog` PostgreSQL database): All metadata, meaning table definitions, indexes, accounts, IAM entities, settings, stream metadata, and schema history.
 - **Data** (e.g., the `extenddb_catalog_data` PostgreSQL database): User item data. Each DynamoDB table maps to a PostgreSQL table. GSI and LSI data are stored in separate PostgreSQL tables.
 
 On PostgreSQL, the data database connection string is stored in the catalog's `settings` table under the key `data_database_url`. This allows the catalog and data databases to live on different PostgreSQL instances.

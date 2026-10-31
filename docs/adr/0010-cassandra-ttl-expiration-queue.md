@@ -123,7 +123,7 @@ Within that envelope, item renewal, crash recovery, generation changes, synchron
 
 The bar for this feature is the production readiness of the PostgreSQL TTL implementation. Most of what looks like a Cassandra limitation is in fact the shared TTL design, and it is worth separating the two so that reviewers and operators know which items are Cassandra's to answer.
 
-**Shared with PostgreSQL: same behaviour, same code path or same shared handler:**
+**Shared with PostgreSQL (same behaviour, same code path or same shared handler):**
 
 | Behaviour | Evidence |
 | --- | --- |

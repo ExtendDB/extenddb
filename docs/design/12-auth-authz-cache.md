@@ -151,7 +151,7 @@ Composite scopes (`user`, `role`) match what an operator most often actually wan
 { "scope": "user", "invalidated": ["user_policies", "user_group_policies", "user_boundary", "user_tags", "principal_credentials"] }
 ```
 
-The `invalidated` array tells operators which subcaches were touched, useful for confirming that composite scopes did what was expected, and for the console UI's success banner.
+The `invalidated` array tells operators which subcaches were touched, which is useful for confirming that composite scopes did what was expected and for the console UI's success banner.
 
 ### Audit trail
 

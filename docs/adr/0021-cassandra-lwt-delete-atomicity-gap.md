@@ -6,8 +6,8 @@
 
 ## Context
 
-Cassandra's LWT (Lightweight Transaction) mechanism (`INSERT ... IF NOT EXISTS`,
-`UPDATE ... IF ...`, `DELETE ... IF EXISTS`) uses Paxos under the hood. A
+Cassandra's LWT (Lightweight Transaction) mechanism, meaning `INSERT ... IF NOT EXISTS`,
+`UPDATE ... IF ...` and `DELETE ... IF EXISTS`, uses Paxos under the hood. A
 fundamental Cassandra constraint is that **LWT statements cannot appear inside a
 logged batch**. Attempting to do so is rejected by the coordinator at runtime.
 

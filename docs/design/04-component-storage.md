@@ -3,7 +3,7 @@ description: "The storage traits every backend implements and the PostgreSQL imp
 version: "3.0"
 date: "2026-05-19"
 status: "Active"
-crates: "`storage` (traits), `storage-postgres` (PostgreSQL backend)"
+crates: "storage (traits), storage-postgres (PostgreSQL backend)"
 ---
 
 # Component design: Storage
@@ -411,8 +411,8 @@ The PostgreSQL backend uses two categories of tables:
 
 - **GSI tables**: GSI tables include base table primary key columns (`base_pk`,
   `base_sk_*`) as actual SQL columns (not just inside `item_data` JSONB). This
-  is required because: (1) GSI keys are not unique: two base table items can
-  project to the same GSI key, so the base table PK is needed for uniqueness;
+  is required because: (1) GSI keys are not unique (two base table items can
+  project to the same GSI key), so the base table PK is needed for uniqueness;
   (2) pagination requires a tiebreaker when GSI keys collide; (3) the base
   table PK is needed to look up the full item for projections.
 
@@ -612,8 +612,8 @@ All data plane operations (PutItem, GetItem, Query, etc.) must check `table_stat
 not `ACTIVE`, return `StorageError::TableNotActive` (mapped to `ResourceInUseException`). Control plane operations that
 modify the table (`UpdateTable`, `DeleteTable`) must:
 
-1. Atomically set `table_status` to `UPDATING` or `DELETING` (using `UPDATE ... WHERE table_status = 'ACTIVE'`; if
- zero rows affected, the table is already being modified, return `ResourceInUseException`)
+1. Atomically set `table_status` to `UPDATING` or `DELETING` (using `UPDATE ... WHERE table_status = 'ACTIVE'`: if
+ zero rows are affected, the table is already being modified, so return `ResourceInUseException`)
 2. Perform the operation
 3. Set `table_status` back to `ACTIVE` (or remove the row for `DeleteTable`)
 

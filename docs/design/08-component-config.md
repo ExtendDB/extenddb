@@ -513,7 +513,7 @@ ExtendDB serves both DynamoDB and DynamoDB Streams on a single port. An unmodifi
 
 ### 10.1 Recommended Setup: Environment Variables
 
-The simplest approach: set two service-specific endpoint variables and credentials:
+The simplest approach is to set two service-specific endpoint variables and credentials:
 
 ```bash
 # Endpoint overrides (both point to the same extenddb instance)

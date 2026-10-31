@@ -3,7 +3,7 @@ description: "The HTTP server: routing, the middleware pipeline, response format
 version: "1.0"
 date: "2026-04-03"
 status: "Draft"
-crate: "`dynamodb-server`"
+crate: "dynamodb-server"
 ---
 
 # Component design: HTTP server
@@ -401,7 +401,7 @@ All management routes use `POST /management/<action>` with JSON request/response
 | `POST /management/set-principal-tags` | Set tags on a user or role | `IdentityEngine::set_user_tags` or `set_role_tags` | `invalidate_user` or `invalidate_role` |
 | `POST /management/store-credential` | Create an access key for a user | `CredentialEngine::store_credential` | none |
 | `POST /management/deactivate-credential` | Deactivate an access key | `CredentialEngine::deactivate_credential` | `invalidate_credential` |
-| `POST /management/assume-role` | Assume a role, get temporary credentials | Load role via `IdentityEngine::get_role` → evaluate trust policy via `evaluate_trust_policy` with `AssumeRoleContext` → `SessionEngine::create_session` + `CredentialEngine::store_credential` | (creates new entries; no stale cache possible) |
+| `POST /management/assume-role` | Assume a role, get temporary credentials | Load role via `IdentityEngine::get_role` → evaluate trust policy via `evaluate_trust_policy` with `AssumeRoleContext` → `SessionEngine::create_session` + `CredentialEngine::store_credential` | none (creates new entries; no stale cache possible) |
 | `POST /management/revoke-session` | Revoke a role session | `SessionEngine::revoke_session` | `invalidate_session`, `invalidate_credential` |
 
 ### 8.3 Request/Response Formats

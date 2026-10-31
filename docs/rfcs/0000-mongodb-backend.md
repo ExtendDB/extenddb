@@ -50,7 +50,7 @@ This RFC does not propose:
 
 The backend lives at `crates/storage-mongodb/` in the main ExtendDB repository, following the mono-repo structure prescribed by RFC-0002. It is selected at build time via a `mongodb` Cargo feature flag on the `extenddb` binary crate.
 
-Feature flag definition: `crates/bin/Cargo.toml`; `[features]` section defines `mongodb = ["extenddb-storage-mongodb"]` with the crate as an optional dependency. The `postgres` feature remains the default. Both features can be enabled together to compile a binary supporting both backends.
+Feature flag definition: the `[features]` section of `crates/bin/Cargo.toml` defines `mongodb = ["extenddb-storage-mongodb"]` with the crate as an optional dependency. The `postgres` feature remains the default. Both features can be enabled together to compile a binary supporting both backends.
 
 ### Plugin registration
 
@@ -66,7 +66,7 @@ The backend uses two MongoDB databases:
 
 **`extenddb_data`**: item data. One MongoDB collection per DynamoDB table, named `_ddb_{table_id}`. One additional collection per GSI/LSI, named `_ddb_{index_id}`. Shared collections: `stream_records` and `stream_shards` for DynamoDB Streams, `counters` for per-shard sequence-number counters, `idempotency_tokens` for transaction deduplication, and one `_backup_{backup_id}` collection per user-created backup.
 
-Catalog collection creation and index setup: `crates/storage-mongodb/src/bootstrapper.rs`, `run_catalog_migrations()`. Data-database setup (`idempotency_tokens`, `stream_shards`, `stream_records` and their indexes): `create_data_db()` in the same file. Collection naming: `data/mod.rs`, `data_collection_name()`, shared between base-table and index collections.
+Catalog collection creation and index setup: `run_catalog_migrations()` in `crates/storage-mongodb/src/bootstrapper.rs`. Data-database setup (`idempotency_tokens`, `stream_shards`, `stream_records` and their indexes): `create_data_db()` in the same file. Collection naming: `data_collection_name()` in `data/mod.rs`, shared between base-table and index collections.
 
 ### Document structure for DynamoDB items
 
@@ -104,7 +104,7 @@ This delivers DynamoDB's atomicity contract for conditional writes and matches `
 
 An optional filter-pushdown fast path (`pushdown.rs` + `condition.rs`) skips the session for a restricted subset of conditions on tables that have no GSIs and no stream capture. A compile-time analyzer (`is_pushable`) certifies that a condition's compiled MongoDB filter agrees with `evaluate_condition` on every item; when it says yes, the backend collapses read + check + write into a single `find_one_and_replace` / `find_one_and_delete` or replace with a merged key+condition filter. The analyzer is the correctness boundary: the compiler in `condition.rs` covers a broader syntax (numeric compare, sets, `IN`, `BETWEEN`, `size`, arbitrary `NOT`) than the analyzer certifies, and only the analyzer-approved subset ever reaches production. Anything else falls through to the session-scoped path, which is always authoritative.
 
-Session-scoped condition path: `data_engine.rs`, `put_item_impl`, `delete_item_impl`, `update_item_impl`, and each `OwnedTransactWriteOp` arm in `execute_transact_write_op_in_session`. Pushdown fast path: `delete_item_pushdown` and `update_item_pushdown` in the same file, gated on `is_pushable(cond, maps) == Yes && stream.is_none() && gsi_cache_get_fresh(table_id) == Some(false)`.
+Session-scoped condition path: `put_item_impl`, `delete_item_impl`, `update_item_impl` in `data_engine.rs`, and each `OwnedTransactWriteOp` arm in `execute_transact_write_op_in_session`. Pushdown fast path: `delete_item_pushdown` and `update_item_pushdown` in the same file, gated on `is_pushable(cond, maps) == Yes && stream.is_none() && gsi_cache_get_fresh(table_id) == Some(false)`.
 
 ### Query and Scan
 
@@ -136,7 +136,7 @@ Idempotency tokens live in the `idempotency_tokens` collection in `extenddb_data
 
 `TransactGetItems` performs a consistent snapshot read using a `ClientSession` with snapshot read concern.
 
-Transaction implementation: `data_engine.rs`, `transact_write_items_impl`, `transact_get_items_impl`, `execute_transact_write_op_in_session`.
+Transaction implementation: `transact_write_items_impl`, `transact_get_items_impl` and `execute_transact_write_op_in_session` in `data_engine.rs`.
 
 ### Write conflict handling
 
@@ -170,7 +170,7 @@ The `StreamEngine::write_stream_record` trait method is not used on this backend
 
 When TTL is enabled on a table, the backend creates a sparse MongoDB index on `item_data.{ttl_attribute}.N` for ordinary attribute names and marks `ttl_index_ready: true` on the table doc. This flag means that the table's TTL cleanup path is ready. Dotted attribute names use the literal-field expression path instead of a physical index, but are also marked ready. A background TTL worker (spawned at server startup by `MongoRuntimeHooks::spawn_workers`) sweeps expired items every 60 seconds in batches of 100 per table. Each deletion goes through `DataEngine::delete_item` with a condition expression re-checking expiry, preventing races with concurrent writes. TTL deletions carry `UserIdentity { type: "Service", principalId: "dynamodb.amazonaws.com" }` on their stream records, matching DynamoDB's TTL stream record format.
 
-TTL index creation: `metadata_engine.rs`, `create_ttl_index`. Background worker and stream/GSI companions: `ttl_worker.rs`, `ttl_cleanup_worker`, `stream_record_cleanup_worker`, `gsi_backfill_worker`. Worker spawn: `lib.rs`, `MongoRuntimeHooks::spawn_workers`.
+TTL index creation: `create_ttl_index` in `metadata_engine.rs`. Background worker and stream/GSI companions: `ttl_cleanup_worker`, `stream_record_cleanup_worker` and `gsi_backfill_worker` in `ttl_worker.rs`. Worker spawn: `MongoRuntimeHooks::spawn_workers` in `lib.rs`.
 
 ### Control plane state transitions
 

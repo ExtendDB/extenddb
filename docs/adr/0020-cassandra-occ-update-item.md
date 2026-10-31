@@ -34,7 +34,7 @@ Version-based OCC via LWT (option 1).
 - **Base delay:** 2 ms
 - **Backoff:** full jitter (`sleep = random(0, base * 2^min(attempt, 3))`), capped at a 16 ms window to bound tail latency
 - **Retry on:** `[applied] = false` (clean lost race) only
-- **Do not retry on:** Cassandra errors (timeout, unavailable); propagate immediately
+- **Do not retry on:** Cassandra errors (timeout, unavailable), which propagate immediately
 
 ## Consequences
 

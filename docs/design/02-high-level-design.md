@@ -9,7 +9,7 @@ status: "Draft"
 
 ## 1. Architecture Overview
 
-ExtendDB (ExtendDB) is a standalone async Rust application structured as a Cargo workspace. It receives DynamoDB wire protocol requests over HTTP, authenticates and authorizes them via a pluggable auth provider, executes the operation logic in a backend-agnostic core, and delegates persistence to a pluggable storage engine.
+ExtendDB is a standalone async Rust application structured as a Cargo workspace. It receives DynamoDB wire protocol requests over HTTP, authenticates and authorizes them via a pluggable auth provider, executes the operation logic in a backend-agnostic core, and delegates persistence to a pluggable storage engine.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐

@@ -3,10 +3,14 @@ description: "The auth crate: the AuthProvider trait, the SigV4 provider and the
 version: "2.0"
 date: "2026-04-06"
 status: "Draft"
-crate: "`extenddb-auth`"
+crate: "extenddb-auth"
 ---
 
 # Component design: Authentication and authorization
+
+:::note
+This is the second revision of the authentication design. [Authentication and authorization (v3)](05-component-auth-v3.md) supersedes it.
+:::
 
 ## 1. Purpose
 
@@ -558,8 +562,8 @@ authorization reference. For DynamoDB, `dynamodb:Attributes`,
 ExtendDB resolves (`dynamodb:Select`, `dynamodb:ReturnValues`,
 `aws:RequestTag/<key>`, etc.) is single-valued.
 A **bare** operator (one without a `ForAllValues:`/`ForAnyValue:` qualifier)
-applied to a multivalued key **never matches**, verified against real AWS IAM
-(BR-7085), and independent of how many values are present. Only the set-operator
+applied to a multivalued key **never matches**. This is verified against AWS IAM
+and is independent of how many values are present. Only the set-operator
 qualifiers evaluate multivalued keys. This is fail-safe: a bare `Deny` on such a
 key is a no-op (the author must use `ForAnyValue:` to build a denylist), and a
 bare `Allow` allowlist grants nothing (implicit deny).
@@ -753,7 +757,7 @@ pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext
         ConditionOperator::IfExists(inner) => {
             match context_values {
                 None => true,  // key absent → condition passes
-                // bare operator on a multivalued key never matches (BR-7085)
+                // bare operator on a multivalued key never matches
                 Some(_) if is_multivalued => false,
                 Some(vals) => evaluate_single_value_condition(inner, &vals, &condition.values)
             }
@@ -761,7 +765,7 @@ pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext
         other => {
             match context_values {
                 None => false,  // key absent → condition fails (unless IfExists)
-                // bare operator on a multivalued key never matches (BR-7085)
+                // bare operator on a multivalued key never matches
                 Some(_) if is_multivalued => false,
                 Some(vals) => evaluate_single_value_condition(other, &vals, &condition.values)
             }
@@ -867,7 +871,7 @@ pub fn arn_match(pattern: &str, value: &str) -> bool;
 
 ## 7. Role Assumption (AssumeRole)
 
-ExtendDB provides a local AssumeRole mechanism for testing role-based access patterns. This is not exposed as an STS API; it's a ExtendDB management API.
+ExtendDB provides a local AssumeRole mechanism for testing role-based access patterns. This is not exposed as an STS API; it's an ExtendDB management API.
 
 ### 7.1 AssumeRole Flow
 
@@ -987,7 +991,7 @@ impl ConditionContext for AssumeRoleContext {
 
 ## 8. Auth Providers
 
-### 8.1 No-Auth Provider (Mode 1): REMOVED
+### 8.1 No-Auth Provider (Mode 1, removed)
 
 > **Historical note (P63b):** The `NoopAuthProvider` and `AuthIdentity::Anonymous`
 > variant were removed in v0.0.67. Authentication is now mandatory; the server

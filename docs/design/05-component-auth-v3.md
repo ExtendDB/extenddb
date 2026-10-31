@@ -3,11 +3,13 @@ description: "The third revision of the auth crate: local credential management,
 version: "3.0"
 date: "2026-04-15"
 status: "Approved (interactive review session 2026-04-15)"
-crate: "`extenddb-auth`"
+crate: "extenddb-auth"
 supersedes: "05-component-auth.md (v2.0)"
 ---
 
 # Component design: Authentication and authorization (v3)
+
+This document supersedes the [second revision](05-component-auth.md) of the authentication design.
 
 ## 1. Purpose
 

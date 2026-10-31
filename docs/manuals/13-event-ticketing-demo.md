@@ -677,7 +677,7 @@ If your `extenddb.toml` doesn't have an `[export]` section, add one:
 paths = ["/tmp/extenddb-exports"]
 ```
 
-Then restart extenddb:
+Then restart ExtendDB:
 
 ```bash
 ./target/release/extenddb stop --config extenddb.toml

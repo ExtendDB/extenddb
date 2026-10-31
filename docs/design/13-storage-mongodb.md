@@ -438,8 +438,8 @@ drops the collection.
 
 ### 5.1 Session-scoped conditional writes
 
-`PutItem`, `DeleteItem`, and `UpdateItem`, when they carry a
-`ConditionExpression`, a `StreamCapture`, or write to a table with GSIs,
+`PutItem`, `DeleteItem`, and `UpdateItem` (when they carry a
+`ConditionExpression`, a `StreamCapture`, or write to a table with GSIs)
 run inside a MongoDB client session bound to a multi-document transaction
 with the configured `transaction_read_concern` (default `"snapshot"`) and
 majority write concern. Within the session:
@@ -1077,8 +1077,8 @@ The backend implements every trait in `extenddb-storage`:
 - **Unit tests:** netstring `_id` encoding, hex sort-key ordering,
   condition compiler, shard-id derivation, next_string_prefix,
   Decimal128 rejection, index-doc key disambiguation.
-- **Property tests:** `tests/pushdown_parity.rs`: random items and
-  expressions checked for agreement between the compiled BSON filter
+- **Property tests:** `tests/pushdown_parity.rs` checks random items and
+  expressions for agreement between the compiled BSON filter
   and `evaluate_condition`.
 - **Integration tests:** The dual-target `tests/rust/` SDK suite (the
   same AWS-SDK wire tests the PostgreSQL backend runs) executed against a

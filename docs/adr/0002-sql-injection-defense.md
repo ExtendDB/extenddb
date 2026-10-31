@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted: 2026-04-07. Revised: 2026-04-21 (P30: reflect actual design).
+Accepted: 2026-04-07. Revised: 2026-04-21 to reflect the implemented design.
 
 ## Context
 
