@@ -23,7 +23,7 @@ This document describes the security architecture of extenddb, including the thr
 ### Out of Scope
 
 - **PostgreSQL security**: extenddb relies on PostgreSQL access controls and network security. Securing the PostgreSQL instance (firewall rules, TLS, authentication) is the operator's responsibility.
-- **Operating system security**: File permissions on `extenddb.toml`, TLS keys, and the PID file are the operator's responsibility.
+- **Operating system security**: File permissions on `extenddb.toml`, TLS keys, and the PID file are the operator's responsibility. With the SQLite backend, extenddb creates the database file with mode 0600 and, whenever a command opens the database, sets the database file and its `-wal`, `-shm` and `-journal` files to 0600 if they are wider. `init`, `migrate`, `settings`, `verify` and `serve` fail if a mode cannot be set (see `cannot set the mode of SQLite file` in `docs/troubleshooting.md`).
 - **Key management**: Access key secrets are encrypted with a locally generated AES key stored in the catalog database. For HSM-grade key management, use a KMS-backed encryption layer at the PostgreSQL level.
 
 ## Authentication
