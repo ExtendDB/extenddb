@@ -555,9 +555,13 @@ transaction mode, logging roles in through `auth_query` as the superuser),
 it the script prints a skip line. `check-postgres-older-binary` names the
 image's containers `$CONTAINER` (default `extenddb-older-binary`).
 
-The four scripts are Python and import `devtools/catalog_checks.py`, which
-runs a command with a time limit, checks its exit code and prints one `ok`
-or `FAIL` line per check; a new check script imports it too.
+The four scripts are Python and need Python 3.10 or later.
+`check-sqlite-catalog-lock`, `check-sqlite-older-binary` and
+`check-postgres-catalog-lock` also call `curl` to read a server's `/health`
+endpoint, so `curl` must be on the `PATH`. The scripts import
+`devtools/catalog_checks.py`, which runs a command with a time limit, checks
+its exit code and prints one `ok` or `FAIL` line per check; a new check
+script imports it too.
 
 ## License
 
