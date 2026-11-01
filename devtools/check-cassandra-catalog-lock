@@ -32,8 +32,9 @@ with `init` and removes them at the end.
   and neither 2, which is not convergent, nor 3 and 4, which do not apply on
   Cassandra; migrate --forget 2 and the migrate --yes that applies 2 again
   run, and serve runs;
-- a server that cannot renew its registration for 30 s, with the node
-  paused, stops with exit 1 and removes its PID file.
+- with the node paused, a server that cannot renew its registration answers
+  503 before the registration's 45 s TTL ends, then tries to register again
+  for 30 s, stops with exit 1 and removes its PID file.
 
 init's HOME points into a temporary directory, so its TLS certificate is not
 written to the caller's home. The server binds 127.0.0.1 only.
@@ -47,7 +48,7 @@ import tempfile
 import time
 import tomllib
 
-from catalog_checks import expect_exit, finish, healthy, report, run, start, stop
+from catalog_checks import expect_exit, finish, healthy, report, run, start, stop, watch_lost_registration
 
 ADMIN_USER = os.environ.get("CASSANDRA_ADMIN_USER", "cassandra")
 ADMIN_PASSWORD = os.environ.get("CASSANDRA_ADMIN_PASSWORD", "cassandra")
@@ -282,25 +283,31 @@ def main(binary: str, container: str, contact_point: str, port: int) -> int:
         if not report(healthy(f"https://127.0.0.1:{port}/health", server), "serve once the lock is free"):
             return finish()
         report(os.path.exists(pid_file), f"the server wrote its PID file {pid_file}")
-        # The node stops answering: the server cannot renew its registration
-        # and must stop before the row's 45 s TTL ends.
+        # The node stops answering, so the server cannot renew its
+        # registration. It must answer 503 before the row's 45 s TTL ends,
+        # when a migrator could find no server, and stop with exit 1 once it
+        # cannot register again.
         subprocess.run(["docker", "pause", container], check=True, capture_output=True)
         paused = True
-        started = time.monotonic()
-        try:
-            code = server.wait(timeout=60)
-        except subprocess.TimeoutExpired:
-            code = None
-        waited = time.monotonic() - started
+        first_503, code, waited = watch_lost_registration(
+            server, f"https://127.0.0.1:{port}/health", 120
+        )
         subprocess.run(["docker", "unpause", container], check=True, capture_output=True)
         paused = False
         with open(log, encoding="utf-8") as f:
-            report(
-                code == 1 and waited < 45,
-                f"a server that cannot renew its registration stops with exit {code} after "
-                f"{waited:.0f} s",
-                f.read()[-3000:],
-            )
+            output = f.read()[-3000:]
+        report(
+            first_503 is not None and first_503 < 45,
+            "the server answered 503 "
+            + ("never" if first_503 is None else f"{first_503:.0f} s after the node stopped answering")
+            + ", before its registration's 45 s TTL ends",
+            output,
+        )
+        report(
+            code == 1,
+            f"a server that cannot register again stops with exit {code} after {waited:.0f} s",
+            output,
+        )
         report(not os.path.exists(pid_file), "the stopped server removed its PID file")
     finally:
         if paused:

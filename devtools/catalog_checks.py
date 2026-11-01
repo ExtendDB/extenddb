@@ -86,6 +86,28 @@ def healthy(url: str, proc: subprocess.Popen | None = None, seconds: float = 60)
     return False
 
 
+def watch_lost_registration(
+    proc: subprocess.Popen, url: str, seconds: float
+) -> tuple[float | None, int | None, float]:
+    """Poll `url` (a server's /health) every 0.5 s, while the server's
+    database does not answer, until `proc` exits or `seconds` pass. Returns
+    the seconds to the first 503 (None without one), the exit code (None
+    while the server runs) and the seconds waited."""
+    started = time.monotonic()
+    first_503 = None
+    while time.monotonic() - started < seconds and proc.poll() is None:
+        probe = subprocess.run(
+            ["curl", "-sk", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "2", url],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if first_503 is None and probe.stdout.strip() == "503":
+            first_503 = time.monotonic() - started
+        time.sleep(0.5)
+    return first_503, proc.poll(), time.monotonic() - started
+
+
 def start(cmd: list[str], env: dict | None, log: str, cwd: str | None = None) -> subprocess.Popen:
     """Start `cmd` in the background with its output in the file `log`."""
     with open(log, "w", encoding="utf-8") as out:

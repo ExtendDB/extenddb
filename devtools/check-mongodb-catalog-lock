@@ -21,9 +21,10 @@ extenddb-check-lock-<mongo port>, published on 127.0.0.1 only:
   prints, run exactly as printed, applies what is missing;
 - a server killed with SIGKILL keeps migrate --yes waiting until its
   registration expires, at most 45 s after its last renewal;
-- a server whose database stops answering exits 1 within 30 s, because its
-  registration counts as lost 30 s after its last renewal, which it sent
-  before the database stopped answering, and removes its PID file.
+- a server whose database stops answering answers 503 before its
+  registration's 45 s expiry, since the registration counts as lost 30 s
+  after its last successful renewal, then tries to register again for 30 s,
+  exits 1 and removes its PID file.
 
 Everything runs in a new temporary directory, with HOME pointed into it so
 init's TLS certificate is not written to the caller's home. The server
@@ -34,12 +35,22 @@ import shlex
 import shutil
 import signal
 import socket
-import subprocess
 import sys
 import tempfile
 import time
 
-from catalog_checks import docker, expect_exit, finish, healthy, mongosh, report, start, start_mongo, stop
+from catalog_checks import (
+    docker,
+    expect_exit,
+    finish,
+    healthy,
+    mongosh,
+    report,
+    start,
+    start_mongo,
+    stop,
+    watch_lost_registration,
+)
 
 
 def live_servers(container: str, port: int) -> int:
@@ -141,24 +152,24 @@ def main(binary: str, mongo_port: int, api_port: int) -> int:
         else:
             report(False, "the server did not start for the kill check")
 
-        # A server whose database stops answering exits 1 and removes its
-        # PID file.
+        # A server whose database stops answering answers 503 before its
+        # registration's 45 s expiry, when a migrator could find no server,
+        # then exits 1 once it cannot register again, and removes its PID
+        # file.
         server = start(serve + ["--write-pid-file"], env, "serve-paused.log")
         servers.append(server)
         pid_file = os.path.join(work, "run", f"extenddb-{api_port}.pid")
         if healthy(url, server, 60) and report(os.path.exists(pid_file), "the server wrote its PID file"):
             docker("pause", container)
-            paused = time.monotonic()
-            try:
-                server.wait(timeout=90)
-            except subprocess.TimeoutExpired:
-                pass
-            took = time.monotonic() - paused
+            first_503, code, took = watch_lost_registration(server, url, 120)
             docker("unpause", container)
             with open("serve-paused.log", encoding="utf-8") as f:
                 log = f.read()
-            report(server.returncode == 1 and took <= 31,
-                   f"the server exited {server.returncode} {took:.0f} s after its database stopped answering", log)
+            report(first_503 is not None and first_503 < 45,
+                   "the server answered 503 "
+                   + ("never" if first_503 is None else f"{first_503:.0f} s after its database stopped answering")
+                   + ", before its registration's 45 s expiry", log)
+            report(code == 1, f"the server exited {code} {took:.0f} s after its database stopped answering", log)
             report("registration" in log, "its last line names the lost registration", log)
             report(not os.path.exists(pid_file), "the server removed its PID file")
         else:
