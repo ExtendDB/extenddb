@@ -313,12 +313,18 @@ def through_pooler(
     expect_exit(0, "verify through the pooler", [binary, "verify", "--config", config], env, contains="HEALTHY")
     expect_exit(0, "migrate preview through the pooler", migrate, env, contains="Up to date")
     expect_exit(0, "migrate --yes through the pooler", migrate + ["--yes", "--lock-timeout", "5"], env)
-    expect_exit(
+    output = expect_exit(
         0,
-        "migrate --yes --reconverge through the pooler, every convergent body run again",
+        "migrate --yes --reconverge through the pooler",
         migrate + ["--yes", "--reconverge", "--lock-timeout", "5"],
         env,
         contains="Ran again 1 baseline",
+    )
+    report(
+        all(f"Ran again {n} " in output for n in (1, 3, 4))
+        and "Skipped 2 resource_tag_condition_keys:" in output,
+        "the reconverge through the pooler ran migrations 1, 3 and 4 again and skipped 2",
+        output,
     )
     expect_exit(0, "migrate --forget 3 through the pooler", migrate + ["--forget", "3"], env)
     expect_exit(
