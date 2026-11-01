@@ -3,8 +3,8 @@
 
 //! Unit tests for `dynamodb:Attributes` extraction.
 //!
-//! The rows named "measured" mirror the service's answers of 2026-10-31; the
-//! rest follow the IAM documentation for the key.
+//! The rows named "measured" mirror the service's answers of 2026-10-31 and
+//! 2026-11-01; the rest follow the IAM documentation for the key.
 
 use std::collections::HashMap;
 
@@ -215,7 +215,7 @@ fn return_values_and_select_add_no_names() {
         names(&["pk"])
     );
     let input = json!({"TableName": "t", "Select": "ALL_ATTRIBUTES"});
-    assert_eq!(single("Scan", &input, Some(&hash_table())), None);
+    assert_eq!(single("Scan", &input, Some(&hash_table())), names(&["pk"]));
 }
 
 // ---- reads ----------------------------------------------------------------
@@ -308,18 +308,70 @@ fn query_holds_the_legacy_filter_and_attributes_to_get() {
 }
 
 #[test]
-fn scan_with_no_named_attribute_leaves_the_key_absent() {
-    // Measured: Scan with Limit=2 and no projection is allowed under a Deny on
-    // ssn and returns whole items.
+fn scan_with_no_named_attribute_holds_the_table_key_attributes() {
+    // Measured: a Deny on pk refuses a Scan with no projection, and a Deny
+    // gated on Null true refuses none, so the key holds pk. A Scan with
+    // Limit=2 and no projection is allowed under a Deny on ssn and returns
+    // whole items.
+    let input = json!({"TableName": "t"});
+    assert_eq!(single("Scan", &input, Some(&hash_table())), names(&["pk"]));
     let input = json!({"TableName": "t", "Limit": 2});
-    assert_eq!(single("Scan", &input, Some(&hash_table())), None);
+    assert_eq!(single("Scan", &input, Some(&hash_table())), names(&["pk"]));
+}
+
+#[test]
+fn a_select_count_scan_holds_the_table_key_attributes() {
+    // Measured: an Allow of Scan gated on ForAllValues ["name"], or on Null
+    // true, grants no Select COUNT Scan.
+    let input = json!({"TableName": "t", "Select": "COUNT"});
+    assert_eq!(single("Scan", &input, Some(&hash_table())), names(&["pk"]));
+}
+
+#[test]
+fn scan_holds_the_sort_key_of_the_table() {
+    let input = json!({"TableName": "i", "Limit": 1});
+    assert_eq!(
+        single("Scan", &input, Some(&indexed_table())),
+        names(&["pk", "sk"])
+    );
+}
+
+#[test]
+fn scan_on_an_index_holds_the_index_key_attributes() {
+    // Follows the IAM guide's rule for the key attributes of an index; not
+    // measured.
+    let gsi = json!({"TableName": "i", "IndexName": "gsi1"});
+    assert_eq!(
+        single("Scan", &gsi, Some(&indexed_table())),
+        names(&["gpk", "gsk", "pk", "sk"])
+    );
+    let lsi = json!({"TableName": "i", "IndexName": "lsi1"});
+    assert_eq!(
+        single("Scan", &lsi, Some(&indexed_table())),
+        names(&["lsk", "pk", "sk"])
+    );
+    let unknown = json!({"TableName": "i", "IndexName": "nope"});
+    assert_eq!(
+        single("Scan", &unknown, Some(&indexed_table())),
+        names(&["pk", "sk"])
+    );
+}
+
+#[test]
+fn a_scan_of_a_table_that_does_not_exist_names_only_what_it_gives() {
+    assert_eq!(single("Scan", &json!({"TableName": "gone"}), None), None);
+    let input = json!({"TableName": "gone", "ExclusiveStartKey": {"pk": {"S": "a"}}});
+    assert_eq!(single("Scan", &input, None), names(&["pk"]));
 }
 
 #[test]
 fn scan_holds_its_filter_projection_and_start_key_names() {
     // Measured: Scan with AttributesToGet=[ssn] matches a Deny on ssn.
     let input = json!({"TableName": "t", "AttributesToGet": ["ssn"]});
-    assert_eq!(single("Scan", &input, Some(&hash_table())), names(&["ssn"]));
+    assert_eq!(
+        single("Scan", &input, Some(&hash_table())),
+        names(&["pk", "ssn"])
+    );
     let input = json!({
         "TableName": "t",
         "FilterExpression": "begins_with(#c, :p)",

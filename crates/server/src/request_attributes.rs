@@ -9,7 +9,9 @@
 //! `Name, Address.City` gives `Name` and `Address`. The names come from the
 //! request alone. A `DeleteItem` and a read with no projection hold only the
 //! names the request gives, not the names of the stored item they delete or
-//! return (measured 2026-10-31), and `ReturnValues` and `Select` add no names.
+//! return (measured 2026-10-31). `ReturnValues`,
+//! `ReturnValuesOnConditionCheckFailure` and `Select` add no names
+//! (`ReturnValuesOnConditionCheckFailure` measured 2026-11-01).
 //!
 //! What the key holds for each operation:
 //!
@@ -29,36 +31,52 @@
 //!   `AttributesToGet`, `QueryFilter`, `ExclusiveStartKey`, and the paths in
 //!   `FilterExpression` and `ProjectionExpression`. A key condition can name
 //!   only key attributes, which the key already holds.
-//! - `Scan`: `AttributesToGet`, `ScanFilter`, `ExclusiveStartKey`, and the paths
-//!   in `FilterExpression` and `ProjectionExpression`. A `Scan` names no key, so
-//!   a `Scan` that gives none of these leaves the key absent.
-//! - `SearchVectors`: the paths in `ProjectionExpression`.
+//! - `Scan`: the key attributes of the table and of the scanned index,
+//!   `AttributesToGet`, `ScanFilter`, `ExclusiveStartKey`, and the paths in
+//!   `FilterExpression` and `ProjectionExpression`. A `Scan` that names no
+//!   attribute, a `Select COUNT` `Scan` included, holds the table's key
+//!   attributes (measured 2026-11-01).
+//! - `SearchVectors`: the paths in `ProjectionExpression`. A `SearchVectors`
+//!   with no `ProjectionExpression` leaves the key absent.
 //! - `BatchGetItem`: per table, the attributes of every key, the table's key
 //!   attributes, `AttributesToGet`, and the paths in `ProjectionExpression`.
 //! - `BatchWriteItem`: per table, the attributes of every `PutRequest` item and
-//!   every `DeleteRequest` key, and the table's key attributes.
+//!   every `DeleteRequest` key, and the table's key attributes. Each table's
+//!   part is evaluated once, with the union of its items' names, as on the
+//!   service (measured 2026-11-01).
 //! - `TransactGetItems` and `TransactWriteItems`: per item, as for the
 //!   single-item operation the item maps to. A `ConditionCheck` holds the
 //!   table's key attributes and the paths in its `ConditionExpression`.
 //!
 //! The service's answers were measured on 2026-10-31 and 2026-11-01 for the
-//! item attributes of `PutItem`, every kind of `UpdateExpression` action and
-//! `SET` value, `DeleteItem`, `ConditionExpression` on `PutItem` and
-//! `DeleteItem`, `FilterExpression` on `Query` and `Scan`, `Expected`,
-//! `AttributeUpdates`, `ScanFilter`, `AttributesToGet` on `GetItem` and `Scan`,
-//! the table's key attributes on `GetItem`, a `ProjectionExpression` naming a
-//! document path, reads with no projection, a `ConditionCheck`, and the batch
-//! and transaction forms of `GetItem` and `PutItem`. The rest follows the same
-//! rules: `ExclusiveStartKey`, `QueryFilter`, `AttributesToGet` on `Query` and
-//! `BatchGetItem`, the queried index's key attributes, `DeleteRequest` keys,
-//! and the `Update` and `Delete` items of a transaction.
+//! item attributes of `PutItem`; every kind of `UpdateExpression` action and
+//! `SET` value; `DeleteItem`; `ConditionExpression` on `PutItem`, `DeleteItem`,
+//! a `ConditionCheck` and a transaction `Delete`; `FilterExpression` on `Query`
+//! and `Scan`; `Expected` on `PutItem`; `AttributeUpdates`; `ScanFilter` and
+//! `QueryFilter`; `AttributesToGet` on `GetItem`, `Query`, `Scan` and
+//! `BatchGetItem`; the table's key attributes on `GetItem`, `Query`, `Scan`,
+//! `UpdateItem`, `DeleteItem` and a `DeleteRequest`; a `ProjectionExpression`
+//! naming a document path; reads with no projection; a transaction `Update`;
+//! and the batch and transaction forms of `GetItem` and `PutItem`. The rest
+//! follows the rules measured for the same parameter on other operations:
+//! `ProjectionExpression` on `Query` and `Scan`, `Expected` and
+//! `ConditionExpression` on `UpdateItem`, and `Expected` on `DeleteItem`. The
+//! key attributes of the queried or scanned index follow the IAM guide's rule
+//! that a policy on the key lists the primary key and index key attributes of
+//! the table and of every secondary index the policy covers; they were not
+//! measured. Whether `ExclusiveStartKey` adds names of its own cannot be told
+//! on the service: a valid start key holds only key attributes, which the key
+//! already holds.
 //!
 //! An expression is read with the tokenizer and parser the engine uses, under
-//! the same size, token and depth limits, so every expression the engine
-//! accepts gives its names here. An expression the engine refuses gives none:
-//! the engine then answers `ValidationException` without reading or writing an
-//! item. A `#name` with no `ExpressionAttributeNames` entry is skipped for the
-//! same reason.
+//! the same size, token and depth limits, so on every operation other than
+//! `SearchVectors` an expression the engine accepts gives all its names here.
+//! `SearchVectors` matches a `#name` against `ExpressionAttributeNames` keys
+//! with their leading `#` removed, so it accepts keys this module does not
+//! resolve, and its `SearchConditionExpression` is not read here (both #729).
+//! An expression the engine refuses gives none: the engine then answers
+//! `ValidationException` without reading or writing an item. A `#name` with no
+//! `ExpressionAttributeNames` entry is skipped for the same reason.
 
 use std::collections::BTreeSet;
 
@@ -92,6 +110,8 @@ pub(crate) fn single_table_attributes(
             names.range_read(input);
         }
         "Scan" => {
+            names.key_schema(key_info);
+            names.index_key_schema(input, key_info);
             names.map_keys(input.get("ScanFilter"));
             names.range_read(input);
         }
@@ -227,8 +247,8 @@ impl<'a> Names<'a> {
         }
     }
 
-    /// The key attributes of the index a `Query` names. An index the table
-    /// does not have adds none: the engine refuses that request.
+    /// The key attributes of the index a `Query` or `Scan` names. An index the
+    /// table does not have adds none: the engine refuses that request.
     fn index_key_schema(&mut self, request: &Value, key_info: Option<&TableKeyInfo>) {
         let (Some(key_info), Some(index)) =
             (key_info, request.get("IndexName").and_then(Value::as_str))
