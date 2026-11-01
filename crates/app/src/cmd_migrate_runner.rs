@@ -22,7 +22,8 @@ use extenddb_config as config;
 use extenddb_storage::migrations::advice::{self, Advice, AdviceFor};
 use extenddb_storage::migrations::{
     AdminRole, CatalogMigrations, CatalogStatus, Listed, MigrationError, MigrationId, Pending,
-    RunKind, RunReport, Target, before_lock, exit, forget_locked, run_locked,
+    RunKind, RunReport, Target, before_lock, behind_line, exit, forget_locked, run_locked,
+    stores_behind,
 };
 
 use crate::cmd_migrate::MigrateArgs;
@@ -227,15 +228,7 @@ async fn preview(
                      release before 1.0 is not detected while it runs."
                 );
             }
-            match version {
-                Some(v) => {
-                    println!("The catalog is at migration {v}; this binary carries {latest}.")
-                }
-                None => println!(
-                    "The catalog has no migration ledger (a release before 1.0 created it); this \
-                     binary carries migrations 1 to {latest}."
-                ),
-            }
+            println!("{}", behind_summary(*version, pending, latest));
             println!("Pending:");
             for line in pending_lines(pending) {
                 println!("{line}");
@@ -261,6 +254,28 @@ async fn preview(
         }
     }
     Ok(status.exit_code())
+}
+
+/// The preview's first line for a `Behind` status: the stores a stopped run
+/// left behind the catalog store, when there are any, else the catalog's
+/// migration, then the latest migration this binary carries.
+fn behind_summary(version: Option<u32>, pending: &[Pending], latest: u32) -> String {
+    match (stores_behind(pending), version) {
+        (Some((catalog_at, behind)), _) => {
+            let mut line = behind_line(catalog_at, &behind);
+            if let Some(first) = line.get(..1).map(str::to_uppercase) {
+                line.replace_range(..1, &first);
+            }
+            format!("{line}; this binary carries {latest}.")
+        }
+        (None, Some(v)) => {
+            format!("The catalog is at migration {v}; this binary carries {latest}.")
+        }
+        (None, None) => format!(
+            "The catalog has no migration ledger (a release before 1.0 created it); this binary \
+             carries migrations 1 to {latest}."
+        ),
+    }
 }
 
 /// The preview's lines for `pending`, one per id, kind of store and kind:

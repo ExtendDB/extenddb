@@ -51,7 +51,10 @@ pub use ledger::{CatalogTraces, LedgerColumns, LedgerRow, Outcome};
 pub use record::{LedgerWrites, in_transaction, record_rows, sql_ledger_ddl};
 pub use registry::{MigrationId, RELEASED_THROUGH};
 pub use runner::Runner;
-pub use status::{AppliedStep, CatalogStatus, MigrationError, Pending, RunReport, exit};
+pub use status::{
+    AppliedStep, CatalogStatus, MigrationError, Pending, RunReport, behind_line, exit,
+    stores_behind,
+};
 #[cfg(any(test, feature = "test-util"))]
 pub use table::refuse_additive;
 pub use table::{Body, Kind, Migration, StoreBody, StoreKind};

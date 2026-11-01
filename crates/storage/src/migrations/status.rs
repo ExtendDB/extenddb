@@ -72,7 +72,7 @@ pub struct Pending {
 /// catalog store lacks too is not behind it, as on an upgrade, where every
 /// store waits for the same migration. `None` when no store is behind.
 #[must_use]
-pub(crate) fn stores_behind(pending: &[Pending]) -> Option<(u32, Vec<(&Pending, u32)>)> {
+pub fn stores_behind(pending: &[Pending]) -> Option<(u32, Vec<(&Pending, u32)>)> {
     let catalog_at = pending
         .iter()
         .filter(|p| p.store == StoreKind::Catalog)
@@ -99,7 +99,7 @@ pub(crate) fn stores_behind(pending: &[Pending]) -> Option<(u32, Vec<(&Pending, 
 /// migration 4`, or for several, `account store x (at migration 0) and data
 /// store y (at migration 3) are behind the catalog store at migration 4`.
 #[must_use]
-pub(crate) fn behind_line(catalog_at: u32, behind: &[(&Pending, u32)]) -> String {
+pub fn behind_line(catalog_at: u32, behind: &[(&Pending, u32)]) -> String {
     let named = |p: &Pending| format!("{} store {}", p.store.as_str(), p.store_name);
     if let [(p, at)] = behind {
         return format!(

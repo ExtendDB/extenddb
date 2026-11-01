@@ -529,3 +529,47 @@ fn the_preview_lists_a_body_for_many_stores_once() {
         "{lines:?}"
     );
 }
+
+/// A run stopped after the catalog store leaves stores behind it, and the
+/// preview's first line names them with the catalog store's migration,
+/// where the catalog's own migration (0 here) would read as nothing
+/// applied. An upgrade, where every store waits for the same migration,
+/// keeps the catalog's migration.
+#[test]
+fn the_preview_names_the_stores_behind_the_catalog_store() {
+    let pending_in = |id: MigrationId, store: StoreKind, store_name: &str| Pending {
+        id: id.number(),
+        name: id.name(),
+        store,
+        store_name: store_name.to_owned(),
+        kind: Kind::Breaking,
+    };
+    let latest = MigrationId::LATEST.number();
+    let stopped = [pending_in(
+        MigrationId::Baseline,
+        StoreKind::Account,
+        "ks_account_1",
+    )];
+    assert_eq!(
+        super::behind_summary(Some(0), &stopped, latest),
+        format!(
+            "Account store ks_account_1 is at migration 0, behind the catalog store at \
+             migration {latest}; this binary carries {latest}."
+        )
+    );
+    let upgrade = [
+        pending_in(MigrationId::LATEST, StoreKind::Catalog, "ks_catalog"),
+        pending_in(MigrationId::LATEST, StoreKind::Account, "ks_account_1"),
+    ];
+    assert_eq!(
+        super::behind_summary(Some(latest - 1), &upgrade, latest),
+        format!(
+            "The catalog is at migration {}; this binary carries {latest}.",
+            latest - 1
+        )
+    );
+    assert!(
+        super::behind_summary(None, &upgrade, latest)
+            .starts_with("The catalog has no migration ledger"),
+    );
+}
