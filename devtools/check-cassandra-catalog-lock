@@ -33,8 +33,9 @@ with `init` and removes them at the end.
   Cassandra; migrate --forget 2 and the migrate --yes that applies 2 again
   run, and serve runs;
 - with the node paused, a server that cannot renew its registration answers
-  503 before the registration's 45 s TTL ends, then tries to register again
-  for 30 s, stops with exit 1 and removes its PID file.
+  503 within 40 s of the pause, before its row can expire (45 s after its
+  last renewal, which came up to 5 s before the pause), then tries to
+  register again for 30 s, stops with exit 1 and removes its PID file.
 
 init's HOME points into a temporary directory, so its TLS certificate is not
 written to the caller's home. The server binds 127.0.0.1 only.
@@ -284,9 +285,11 @@ def main(binary: str, container: str, contact_point: str, port: int) -> int:
             return finish()
         report(os.path.exists(pid_file), f"the server wrote its PID file {pid_file}")
         # The node stops answering, so the server cannot renew its
-        # registration. It must answer 503 before the row's 45 s TTL ends,
-        # when a migrator could find no server, and stop with exit 1 once it
-        # cannot register again.
+        # registration. Its row expires 45 s after its last renewal, which
+        # came up to 5 s before the pause, so it must answer 503 within 40 s
+        # of the pause, before a migrator could find no server. It then tries
+        # to register again for 30 s and stops with exit 1: after the window
+        # and at most its 10 s bound on the release later.
         subprocess.run(["docker", "pause", container], check=True, capture_output=True)
         paused = True
         first_503, code, waited = watch_lost_registration(
@@ -297,15 +300,16 @@ def main(binary: str, container: str, contact_point: str, port: int) -> int:
         with open(log, encoding="utf-8") as f:
             output = f.read()[-3000:]
         report(
-            first_503 is not None and first_503 < 45,
+            first_503 is not None and first_503 < 40,
             "the server answered 503 "
-            + ("never" if first_503 is None else f"{first_503:.0f} s after the node stopped answering")
-            + ", before its registration's 45 s TTL ends",
+            + ("never" if first_503 is None else f"{first_503:.1f} s after the node stopped answering")
+            + ", within 40 s, before its row can expire",
             output,
         )
         report(
-            code == 1,
-            f"a server that cannot register again stops with exit {code} after {waited:.0f} s",
+            code == 1 and first_503 is not None and first_503 + 25 <= waited <= first_503 + 50,
+            f"a server that cannot register again stops with exit {code} {waited:.0f} s after the "
+            "pause, 25 to 50 s after its first 503",
             output,
         )
         report(not os.path.exists(pid_file), "the stopped server removed its PID file")

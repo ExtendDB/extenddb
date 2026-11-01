@@ -21,10 +21,11 @@ extenddb-check-lock-<mongo port>, published on 127.0.0.1 only:
   prints, run exactly as printed, applies what is missing;
 - a server killed with SIGKILL keeps migrate --yes waiting until its
   registration expires, at most 45 s after its last renewal;
-- a server whose database stops answering answers 503 before its
-  registration's 45 s expiry, since the registration counts as lost 30 s
-  after its last successful renewal, then tries to register again for 30 s,
-  exits 1 and removes its PID file.
+- a server whose database stops answering answers 503 within 40 s, before
+  its registration can expire (45 s after its last renewal, which came up to
+  5 s before the pause), since the registration counts as lost 30 s after
+  its last successful renewal, then tries to register again for 30 s, exits
+  1 and removes its PID file.
 
 Everything runs in a new temporary directory, with HOME pointed into it so
 init's TLS certificate is not written to the caller's home. The server
@@ -152,10 +153,12 @@ def main(binary: str, mongo_port: int, api_port: int) -> int:
         else:
             report(False, "the server did not start for the kill check")
 
-        # A server whose database stops answering answers 503 before its
-        # registration's 45 s expiry, when a migrator could find no server,
-        # then exits 1 once it cannot register again, and removes its PID
-        # file.
+        # A server whose database stops answering answers 503 within 40 s,
+        # before its registration can expire (45 s after its last renewal,
+        # up to 5 s before the pause) and a migrator could find no server,
+        # then tries to register again for 30 s and exits 1, after the window
+        # and at most its 10 s bound on the release later, and removes its
+        # PID file.
         server = start(serve + ["--write-pid-file"], env, "serve-paused.log")
         servers.append(server)
         pid_file = os.path.join(work, "run", f"extenddb-{api_port}.pid")
@@ -165,11 +168,13 @@ def main(binary: str, mongo_port: int, api_port: int) -> int:
             docker("unpause", container)
             with open("serve-paused.log", encoding="utf-8") as f:
                 log = f.read()
-            report(first_503 is not None and first_503 < 45,
+            report(first_503 is not None and first_503 < 40,
                    "the server answered 503 "
-                   + ("never" if first_503 is None else f"{first_503:.0f} s after its database stopped answering")
-                   + ", before its registration's 45 s expiry", log)
-            report(code == 1, f"the server exited {code} {took:.0f} s after its database stopped answering", log)
+                   + ("never" if first_503 is None else f"{first_503:.1f} s after its database stopped answering")
+                   + ", within 40 s, before its registration can expire", log)
+            report(code == 1 and first_503 is not None and first_503 + 25 <= took <= first_503 + 50,
+                   f"the server exited {code} {took:.0f} s after its database stopped answering, "
+                   "25 to 50 s after its first 503", log)
             report("registration" in log, "its last line names the lost registration", log)
             report(not os.path.exists(pid_file), "the server removed its PID file")
         else:
