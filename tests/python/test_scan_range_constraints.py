@@ -7,8 +7,9 @@ Every request below is sent as raw signed JSON, so a number keeps the form
 written here (``0.0``, ``1e2``, ``9223372036854775808``). Each request is a
 row of the table measured against DynamoDB (us-east-1) on 2026-10-25 at 09:23,
 09:25, 09:28, 10:38, 10:55 and 12:56 UTC, or of the ones measured on
-2026-10-30 at 12:40 UTC and 2026-10-31 at 12:36 UTC where a row says so, each
-sent twice, and each expected answer is the service's. Where a table records
+2026-10-30 at 12:40 UTC, 2026-10-31 at 12:36 UTC and 2026-10-31 between 23:54
+and 23:56 UTC where a row says so, each sent twice, and each expected answer
+is the service's. Where a table records
 only that the service accepted a request, the test asserts what a Scan with
 that limit returns on this table of 12 items. ``Segment: 0, TotalSegments: 1``
 with ``ConsistentRead: true`` returned the whole table in one page on
@@ -18,10 +19,12 @@ When each field present is an integer inside the int32 range, a fault reads
 ``Value at '<Field>' failed to satisfy constraint: ...`` with the field
 capitalised and no value echoed, and several faults are reported in one
 message in the order Limit, Segment, TotalSegments. When a field is a float
-or outside int32, or an ``ExpressionAttributeValues`` entry is not one
-AttributeValue (an ``L`` or ``M`` member included), the service saturates or
-truncates the value and uses the older form, ``Value '<n>' at '<field>' ...``,
-in the order totalSegments, segment, limit. A float or an out-of-range integer
+or outside int32, or a value is not one AttributeValue (an
+``ExpressionAttributeValues`` entry or an ``L`` or ``M`` member of one, an
+``ExclusiveStartKey`` value, or an ``AttributeValueList`` entry of
+``ScanFilter``, or on Query of ``KeyConditions`` or ``QueryFilter``), the
+service saturates or truncates the value and uses the older form,
+``Value '<n>' at '<field>' ...``, in the order totalSegments, segment, limit. A float or an out-of-range integer
 that satisfies the constraint is accepted.
 """
 
@@ -130,6 +133,45 @@ READABLE = [("empty-NS", {"NS": []}), ("duplicate-NS", {"NS": ["1", "1"]})]
 UNREADABLE_MEMBERS = [("L-empty-member", {"L": [{}]}),
                       ("M-member-type-X", {"M": {"k": {"X": "1"}}}),
                       ("lower-case-s", {"s": "x"})]
+
+
+def _conditions(name: str, entry: dict) -> dict:
+    return {name: {"ComparisonOperator": "EQ", "AttributeValueList": [entry]}}
+
+
+def _scan_filter(entry: dict) -> str:
+    return '"ScanFilter": ' + json.dumps(_conditions("a", entry))
+
+
+# Measured 2026-10-31 between 23:54 and 23:56 UTC: a value that is not one
+# AttributeValue in ExclusiveStartKey or in a condition list answers the older
+# form; a readable one, also of the wrong type for the key, the newer form.
+KEY_AND_LISTS = [
+    ("ExclusiveStartKey-empty", '"Limit": 0, "ExclusiveStartKey": {"pk": {}, "sk": {"S": "x"}}',
+     one(OLDER_LIMIT_0)),
+    ("ExclusiveStartKey-type-X",
+     '"Limit": 0, "ExclusiveStartKey": {"pk": {"X": "1"}, "sk": {"S": "x"}}', one(OLDER_LIMIT_0)),
+    ("ScanFilter-empty", '"Limit": 0, ' + _scan_filter({}), one(OLDER_LIMIT_0)),
+    ("ScanFilter-type-X", '"Limit": 0, ' + _scan_filter({"X": "1"}), one(OLDER_LIMIT_0)),
+    ("Segment-beside-ExclusiveStartKey-empty",
+     '"Segment": -1, "TotalSegments": 2, "ExclusiveStartKey": {"pk": {}, "sk": {"S": "x"}}',
+     one(older("-1", "segment", "greater than or equal to 0"))),
+    ("ExclusiveStartKey-N-on-an-S-key",
+     '"Limit": 0, "ExclusiveStartKey": {"pk": {"N": "1"}, "sk": {"S": "x"}}', one(LIMIT)),
+    ("ScanFilter-N", '"Limit": 0, ' + _scan_filter({"N": "1"}), one(LIMIT)),
+]
+QUERY_KEY_AND_LISTS = [
+    ("ExclusiveStartKey-empty",
+     {"KeyConditionExpression": "pk = :p", "Limit": 0,
+      "ExpressionAttributeValues": {":p": {"S": "p0"}},
+      "ExclusiveStartKey": {"pk": {}, "sk": {"S": "x"}}}, one(OLDER_LIMIT_0)),
+    ("QueryFilter-empty",
+     {"KeyConditions": _conditions("pk", {"S": "p0"}), "Limit": 0,
+      "QueryFilter": _conditions("a", {})}, one(OLDER_LIMIT_0)),
+    ("KeyConditions-empty", {"KeyConditions": _conditions("pk", {}), "Limit": 0},
+     one(OLDER_LIMIT_0)),
+    ("KeyConditions-S", {"KeyConditions": _conditions("pk", {"S": "p0"}), "Limit": 0}, one(LIMIT)),
+]
 
 
 def _raw(client, operation: str, body_text: str):
@@ -288,3 +330,21 @@ class TestBesideAnExpressionAttributeValuesEntry:
             "ExpressionAttributeValues": {":p": {"S": "p0"}, ":d": entry},
         })
         assert _validation_message(*_raw(dynamodb_client, "Query", body)) == one(OLDER_LIMIT_0)
+
+
+class TestBesideAnUnreadableValueInTheKeyOrAConditionList:
+    """Measured 2026-10-31 between 23:54 and 23:56 UTC: a value that is not one
+    AttributeValue in ExclusiveStartKey, or in the AttributeValueList of a
+    ScanFilter, KeyConditions or QueryFilter condition, switches to the older
+    form, as an ExpressionAttributeValues entry does."""
+
+    @pytest.mark.parametrize("fields, expected", [r[1:] for r in KEY_AND_LISTS],
+                             ids=[r[0] for r in KEY_AND_LISTS])
+    def test_scan(self, dynamodb_client, table, fields, expected):
+        assert _validation_message(*_scan(dynamodb_client, table, fields)) == expected
+
+    @pytest.mark.parametrize("fields, expected", [r[1:] for r in QUERY_KEY_AND_LISTS],
+                             ids=[r[0] for r in QUERY_KEY_AND_LISTS])
+    def test_query(self, dynamodb_client, table, fields, expected):
+        body = json.dumps({"TableName": table, **fields})
+        assert _validation_message(*_raw(dynamodb_client, "Query", body)) == expected

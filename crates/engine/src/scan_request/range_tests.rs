@@ -5,8 +5,8 @@
 //!
 //! Every row is a request sent to the service (us-east-1, each request twice,
 //! a Scan of an existing table) with the answer it gave: on 2026-10-25 between
-//! 09:23 and 12:56 UTC, and on 2026-10-30 at 12:40 UTC or 2026-10-31 at 12:36
-//! UTC where a test says so.
+//! 09:23 and 12:56 UTC, and on 2026-10-30 at 12:40 UTC, 2026-10-31 at 12:36
+//! UTC or 2026-10-31 between 23:54 and 23:56 UTC where a test says so.
 
 use extenddb_core::error::DynamoDbError;
 use serde_json::Value;
@@ -210,6 +210,46 @@ fn an_unreadable_member_of_a_list_or_map_entry_switches_to_the_older_form() {
             Some(older_limit.as_str()),
             "{entry}"
         );
+    }
+}
+
+/// Measured 2026-10-31 between 23:54 and 23:56 UTC: an empty value or one with
+/// an unknown type descriptor in `ExclusiveStartKey` or in a `ScanFilter`
+/// `AttributeValueList` switches to the older form, for a `Segment` fault too;
+/// a readable value keeps the newer form, also a number for an `S` key.
+#[test]
+fn an_unreadable_value_in_the_start_key_or_a_scan_filter_switches_to_the_older_form() {
+    let older_limit = one(&older("0", "limit", "greater than or equal to 1"));
+    let filter = |entry: &str| {
+        format!(
+            r#""ScanFilter": {{"a": {{"ComparisonOperator": "EQ", "AttributeValueList": [{entry}]}}}}"#
+        )
+    };
+    for fields in [
+        r#""ExclusiveStartKey": {"pk": {}, "sk": {"S": "x"}}"#.to_owned(),
+        r#""ExclusiveStartKey": {"pk": {"X": "1"}, "sk": {"S": "x"}}"#.to_owned(),
+        filter("{}"),
+        filter(r#"{"X": "1"}"#),
+    ] {
+        let fields = format!(r#""Limit": 0, {fields}"#);
+        assert_eq!(
+            check(&scan(&fields)).as_deref(),
+            Some(older_limit.as_str()),
+            "{fields}"
+        );
+    }
+    let segment =
+        r#""Segment": -1, "TotalSegments": 2, "ExclusiveStartKey": {"pk": {}, "sk": {"S": "x"}}"#;
+    assert_eq!(
+        check(&scan(segment)),
+        Some(one(&older("-1", "segment", "greater than or equal to 0")))
+    );
+    for fields in [
+        r#""ExclusiveStartKey": {"pk": {"N": "1"}, "sk": {"S": "x"}}"#.to_owned(),
+        filter(r#"{"N": "1"}"#),
+    ] {
+        let fields = format!(r#""Limit": 0, {fields}"#);
+        assert_eq!(check(&scan(&fields)), Some(one(LIMIT)), "{fields}");
     }
 }
 

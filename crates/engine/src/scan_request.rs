@@ -13,7 +13,8 @@
 //!    constraint: Member must have value greater than or equal to 1`, or `2
 //!    validation errors detected: ...; ...` in the order `Limit`, `Segment`,
 //!    `TotalSegments`. A float or a value outside int32 in any of the three,
-//!    or an `ExpressionAttributeValues` entry that is not one AttributeValue,
+//!    or a value that is not one AttributeValue in `ExpressionAttributeValues`,
+//!    in `ExclusiveStartKey` or in a `ScanFilter` `AttributeValueList`,
 //!    switches the message to the older form, `Value '-2147483648' at 'limit'
 //!    ...`, with the value saturated or truncated, in the order
 //!    `totalSegments`, `segment`, `limit`; see `validate_ranges`;
@@ -41,7 +42,7 @@ use extenddb_core::types::{AttributeValue, ScanInput, saturated_int32};
 use serde_json::Value;
 
 use crate::query_key_values::{
-    has_unreadable_attribute_value, non_empty, present, shape_fault_first,
+    SCAN_CONDITIONS, has_unreadable_attribute_value, non_empty, present, shape_fault_first,
     validate_expression_attribute_value_numbers,
 };
 
@@ -123,8 +124,9 @@ fn scan_request_checks(body: &Value) -> Result<(), DynamoDbError> {
 /// When each field present is an integer inside the int32 range, the newer
 /// form: `Value at '<Field>' failed to satisfy constraint: ...` with the field
 /// capitalised and no value echoed, in the order `Limit`, `Segment`,
-/// `TotalSegments`. When any of the three is a float or outside int32, or an
-/// `ExpressionAttributeValues` entry is not one AttributeValue (see
+/// `TotalSegments`. When any of the three is a float or outside int32, or a
+/// value in `ExpressionAttributeValues`, `ExclusiveStartKey` or a `ScanFilter`
+/// `AttributeValueList` is not one AttributeValue (see
 /// [`has_unreadable_attribute_value`]), the older form: `Value '<n>' at
 /// '<field>' ...` with the value as [`saturated_int32`] reads it and the field
 /// in lower camel case, in the reverse of the newer form's order:
@@ -140,7 +142,7 @@ fn validate_ranges(body: &Value) -> Result<(), DynamoDbError> {
                 .map(|number| (range, number))
         })
         .collect();
-    let older_form = has_unreadable_attribute_value(body)
+    let older_form = has_unreadable_attribute_value(body, SCAN_CONDITIONS)
         || numbers.iter().any(|(_, number)| {
             number
                 .as_i64()
