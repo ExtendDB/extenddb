@@ -90,7 +90,7 @@ mod tests {
 
     fn refusal(identity: &CallerIdentity, account_id: &str) -> Response {
         match account_scope(identity, account_id) {
-            Ok(()) => panic!("{identity:?} was let into account {account_id}"),
+            Ok(()) => panic!("the session was let into account {account_id}"),
             Err(response) => response,
         }
     }
