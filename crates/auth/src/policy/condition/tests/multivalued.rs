@@ -459,12 +459,18 @@ fn bare_negated_op_absent_tagkeys_matches() {
 #[test]
 fn bare_negated_op_absent_dynamodb_keys_do_not_match() {
     // IAM matches a bare negated operator on absent dynamodb:Attributes and
-    // dynamodb:LeadingKeys too, but ExtendDB leaves both absent on requests
-    // where the service populates them (Attributes on writes, AttributesToGet
-    // reads and batch and transaction targets; LeadingKeys on query shapes the
-    // extractor cannot pin). Matching there would grant an Allow the service
-    // refuses for the present key, so for these two keys an absent key keeps
-    // the no-match rule (BR-7085).
+    // dynamodb:LeadingKeys too. ExtendDB leaves dynamodb:LeadingKeys absent on
+    // query shapes it cannot pin to a partition value, where the service
+    // populates it. It leaves dynamodb:Attributes absent only on a
+    // SearchVectors with no ProjectionExpression (#729) and, on a table that
+    // does not exist, on a GetItem or transaction Get that names no attribute
+    // outside its Key, a Query that names none outside its key condition and a
+    // Scan that names none. On the service the key holds the table's key
+    // attributes on every item request measured, a Scan that names no
+    // attribute included, and an Allow gated on a bare StringNotEquals over it
+    // grants no Scan (measured 2026-11-01). Matching on those absent keys could
+    // grant an Allow the service refuses, so for these two keys an absent key
+    // keeps the no-match rule (BR-7085).
     let ctx = TestContext::new();
     for key in ["dynamodb:Attributes", "dynamodb:LeadingKeys"] {
         for op in [

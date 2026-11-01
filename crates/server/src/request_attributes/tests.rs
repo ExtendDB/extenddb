@@ -3,8 +3,11 @@
 
 //! Unit tests for `dynamodb:Attributes` extraction.
 //!
-//! The rows named "measured" mirror the service's answers of 2026-10-31 and
-//! 2026-11-01; the rest follow the IAM documentation for the key.
+//! Rows marked "Measured" mirror the service's answers of 2026-10-31 and
+//! 2026-11-01; the parent module's docs list what was measured. Index key
+//! attributes and a table's sort key follow the IAM guide's rule, not measured
+//! (the measured table was keyed on `pk` alone). Other unmeasured parameters
+//! follow the rule measured for the same parameter on another operation.
 
 use std::collections::HashMap;
 

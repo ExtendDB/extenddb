@@ -9,9 +9,9 @@
 //! `Name, Address.City` gives `Name` and `Address`. The names come from the
 //! request alone. A `DeleteItem` and a read with no projection hold only the
 //! names the request gives, not the names of the stored item they delete or
-//! return (measured 2026-10-31). `ReturnValues`,
-//! `ReturnValuesOnConditionCheckFailure` and `Select` add no names
-//! (`ReturnValuesOnConditionCheckFailure` measured 2026-11-01).
+//! return (measured 2026-10-31). `ReturnValues` and
+//! `ReturnValuesOnConditionCheckFailure` add no names (measured 2026-11-01),
+//! and `Select` adds none (not measured).
 //!
 //! What the key holds for each operation:
 //!
