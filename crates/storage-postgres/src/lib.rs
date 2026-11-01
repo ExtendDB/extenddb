@@ -21,6 +21,7 @@ mod delete_table;
 pub(crate) mod gsi_queue;
 mod management_store;
 mod metadata_engine;
+mod migration_004_keys;
 mod migrations;
 mod operations;
 mod pg_util;

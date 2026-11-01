@@ -662,21 +662,49 @@ async fn is_table_marked(pool: &PgPool, migration: &str, table: &str) -> OpResul
 }
 
 /// One physical table's rewrite work for `004_escape_control_chars`: the text
-/// key columns that get the single-statement SQL replace, and the jsonb
-/// columns whose rows are re-encoded one by one.
+/// key columns, and the jsonb columns whose rows are re-encoded one by one.
 struct EscapeWork {
     /// Bare (unquoted) table name, e.g. `_ddb_<id>` or `gsi_pending`.
     table: String,
-    text_columns: Vec<String>,
+    text_columns: Vec<TextKeyColumn>,
     jsonb_columns: Vec<String>,
+    /// `gsi_pending` only: recompute `worker_partition` after the re-encode
+    /// (`migration_004_keys::recompute_worker_partitions`).
+    recompute_worker_partition: bool,
+}
+
+/// A text key column and the rows of it that hold a composite partition key.
+struct TextKeyColumn {
+    name: String,
+    /// SQL boolean expression over the row, true where the column holds the
+    /// netstring join of several HASH attributes. Those rows are rebuilt one
+    /// by one (`migration_004_keys::rebuild_composite_rows`); the others hold
+    /// one attribute's text and get the single-statement SQL replace.
+    composite_rows: String,
+}
+
+impl TextKeyColumn {
+    fn new(name: String, composite: bool) -> Self {
+        let composite_rows = if composite { "TRUE" } else { "FALSE" }.to_owned();
+        Self {
+            name,
+            composite_rows,
+        }
+    }
 }
 
 /// Rewrite work for a dynamically named `_ddb_*` table, read from
 /// `information_schema.columns` so that exactly the sort key columns this
 /// table has (`sk_s`, `sk<N>_s`, `base_sk<N>_s`, ...) are covered. Returns
 /// `None` when the physical table does not exist (a catalog row mid-create or
-/// mid-delete): such a table has no legacy rows to re-encode.
-async fn dynamic_table_work(pool: &PgPool, table: String) -> OpResult<Option<EscapeWork>> {
+/// mid-delete): such a table has no legacy rows to re-encode. `composite`
+/// names the columns whose key schema has more than one HASH attribute, so
+/// they hold a netstring join on every row.
+async fn dynamic_table_work(
+    pool: &PgPool,
+    table: String,
+    composite: &[&str],
+) -> OpResult<Option<EscapeWork>> {
     let text_columns: Vec<String> = sqlx::query_scalar(
         "SELECT column_name::text FROM information_schema.columns \
          WHERE table_schema = 'public' AND table_name = $1 AND data_type = 'text' \
@@ -701,10 +729,18 @@ async fn dynamic_table_work(pool: &PgPool, table: String) -> OpResult<Option<Esc
     if text_columns.is_empty() && jsonb_columns.is_empty() {
         return Ok(None);
     }
+    let text_columns = text_columns
+        .into_iter()
+        .map(|name| {
+            let composite = composite.contains(&name.as_str());
+            TextKeyColumn::new(name, composite)
+        })
+        .collect();
     Ok(Some(EscapeWork {
         table,
         text_columns,
         jsonb_columns,
+        recompute_worker_partition: false,
     }))
 }
 
@@ -746,8 +782,12 @@ async fn fixed_table_work(
     .map_err(|e| OpError::Internal(format!("List jsonb columns of {table}: {e}")))?;
     Ok(Some(EscapeWork {
         table: table.to_owned(),
-        text_columns,
+        text_columns: text_columns
+            .into_iter()
+            .map(|name| TextKeyColumn::new(name, false))
+            .collect(),
         jsonb_columns,
+        recompute_worker_partition: false,
     }))
 }
 
@@ -832,22 +872,40 @@ async fn escape_rows_in_table(pool: &PgPool, work: &EscapeWork) -> OpResult<u64>
     let quoted = format!("\"{}\"", work.table);
     let mut rewritten: u64 = 0;
 
-    // Key text columns: TEXT has no escaping layer, so a single SQL statement
-    // per column is exact. NULL columns never match (position() is NULL).
+    // Key text columns holding one attribute's text: TEXT has no escaping
+    // layer, so a single SQL statement per column is exact. NULL columns never
+    // match (position() is NULL). Rows holding a composite key are rebuilt
+    // part by part instead, before any other column of the row changes.
     for col in &work.text_columns {
+        let TextKeyColumn {
+            name,
+            composite_rows,
+        } = col;
         let sql = format!(
-            "UPDATE {quoted} SET \"{col}\" = replace(\"{col}\", chr(1), chr(1) || chr(2)) \
-             WHERE position(chr(1) IN \"{col}\") > 0"
+            "UPDATE {quoted} SET \"{name}\" = replace(\"{name}\", chr(1), chr(1) || chr(2)) \
+             WHERE position(chr(1) IN \"{name}\") > 0 AND NOT ({composite_rows})"
         );
         let done = sqlx::query(&sql)
             .execute(&mut *tx)
             .await
-            .map_err(|e| OpError::Internal(format!("Re-encode {}.{col}: {e}", work.table)))?;
+            .map_err(|e| OpError::Internal(format!("Re-encode {}.{name}: {e}", work.table)))?;
         rewritten += done.rows_affected();
+        if composite_rows != "FALSE" {
+            rewritten += crate::migration_004_keys::rebuild_composite_rows(
+                &mut tx,
+                &quoted,
+                name,
+                composite_rows,
+            )
+            .await?;
+        }
     }
 
     for col in &work.jsonb_columns {
         rewritten += escape_jsonb_rows(&mut tx, &quoted, col).await?;
+    }
+    if work.recompute_worker_partition {
+        rewritten += crate::migration_004_keys::recompute_worker_partitions(&mut tx).await?;
     }
 
     sqlx::query(&format!(
@@ -911,41 +969,64 @@ async fn escape_legacy_control_chars(catalog_pool: &PgPool, data_pool: &PgPool) 
 
     // Every data table, index table, and vector index table, enumerated from
     // the catalog. Their text key columns are read from information_schema so
-    // single-sort-key, multi-sort-key, and base_* layouts are all covered.
-    let table_ids: Vec<String> =
-        sqlx::query_scalar("SELECT table_id FROM tables ORDER BY table_id")
+    // single-sort-key, multi-sort-key, and base_* layouts are all covered. A
+    // partition key column whose key schema has more than one HASH attribute
+    // holds a netstring join (`key_text::composite_pk_to_text`): `pk` of a
+    // table or index with such a key schema, and `base_pk` of the index and
+    // vector tables of a table with one.
+    use crate::migration_004_keys::has_composite_partition_key as composite;
+    let tables: Vec<(String, serde_json::Value)> =
+        sqlx::query_as("SELECT table_id, key_schema FROM tables ORDER BY table_id")
             .fetch_all(catalog_pool)
             .await
             .map_err(|e| OpError::Internal(format!("Enumerate tables: {e}")))?;
-    for id in table_ids {
-        if let Some(w) = dynamic_table_work(data_pool, format!("_ddb_{id}")).await? {
+    let composite_tables: std::collections::HashSet<&str> = tables
+        .iter()
+        .filter(|(_, ks)| composite(ks))
+        .map(|(id, _)| id.as_str())
+        .collect();
+    for (id, ks) in &tables {
+        let cols: &[&str] = if composite(ks) { &["pk"] } else { &[] };
+        if let Some(w) = dynamic_table_work(data_pool, format!("_ddb_{id}"), cols).await? {
             work.push((data_pool, w));
         }
     }
-    let index_ids: Vec<String> =
-        sqlx::query_scalar("SELECT index_id FROM indexes ORDER BY index_id")
+    let indexes: Vec<(String, String, serde_json::Value)> =
+        sqlx::query_as("SELECT index_id, table_id, key_schema FROM indexes ORDER BY index_id")
             .fetch_all(catalog_pool)
             .await
             .map_err(|e| OpError::Internal(format!("Enumerate indexes: {e}")))?;
-    for id in index_ids {
-        if let Some(w) = dynamic_table_work(data_pool, format!("_ddb_{id}")).await? {
+    for (id, table_id, ks) in &indexes {
+        let mut cols: Vec<&str> = Vec::new();
+        if composite(ks) {
+            cols.push("pk");
+        }
+        if composite_tables.contains(table_id.as_str()) {
+            cols.push("base_pk");
+        }
+        if let Some(w) = dynamic_table_work(data_pool, format!("_ddb_{id}"), &cols).await? {
             work.push((data_pool, w));
         }
     }
-    let vector_ids: Vec<String> =
-        sqlx::query_scalar("SELECT index_id FROM vector_indexes ORDER BY index_id")
+    let vectors: Vec<(String, String)> =
+        sqlx::query_as("SELECT index_id, table_id FROM vector_indexes ORDER BY index_id")
             .fetch_all(catalog_pool)
             .await
             .map_err(|e| OpError::Internal(format!("Enumerate vector indexes: {e}")))?;
-    for id in vector_ids {
-        if let Some(w) = dynamic_table_work(data_pool, format!("_ddb_vec_{id}")).await? {
+    for (id, table_id) in &vectors {
+        let cols: &[&str] = if composite_tables.contains(table_id.as_str()) {
+            &["base_pk"]
+        } else {
+            &[]
+        };
+        if let Some(w) = dynamic_table_work(data_pool, format!("_ddb_vec_{id}"), cols).await? {
             work.push((data_pool, w));
         }
     }
 
     // Fixed tables holding item documents. gsi_pending and stream_records live
     // in the data database; backup_items lives in the catalog database.
-    if let Some(w) = fixed_table_work(
+    if let Some(mut w) = fixed_table_work(
         data_pool,
         "gsi_pending",
         &[],
@@ -953,14 +1034,23 @@ async fn escape_legacy_control_chars(catalog_pool: &PgPool, data_pool: &PgPool) 
     )
     .await?
     {
+        w.recompute_worker_partition = true;
         work.push((data_pool, w));
     }
     if let Some(w) = fixed_table_work(data_pool, "stream_records", &[], &["record_data"]).await? {
         work.push((data_pool, w));
     }
-    if let Some(w) =
+    if let Some(mut w) =
         fixed_table_work(catalog_pool, "backup_items", &["pk", "sk"], &["item_data"]).await?
     {
+        // `pk` is the data table's `pk` as the backup copied it, so a backup of
+        // a table with several HASH attributes holds a netstring join there.
+        for col in &mut w.text_columns {
+            if col.name == "pk" {
+                col.composite_rows =
+                    crate::migration_004_keys::BACKUP_ITEMS_COMPOSITE_ROWS.to_owned();
+            }
+        }
         work.push((catalog_pool, w));
     }
 
@@ -1238,7 +1328,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod live_reencode {
+pub(crate) mod live_reencode {
     //! Live checks for `004_escape_control_chars` against a scratch database.
     //!
     //! Follows the convention of `tests/key_collation.rs`: each test needs
@@ -1259,14 +1349,14 @@ mod live_reencode {
         unapplied_required_data_migrations,
     };
 
-    struct Scratch {
-        db: PgPool,
+    pub(crate) struct Scratch {
+        pub(crate) db: PgPool,
         admin: PgPool,
         db_name: String,
     }
 
     impl Scratch {
-        async fn cleanup(self) {
+        pub(crate) async fn cleanup(self) {
             let Scratch { db, admin, db_name } = self;
             db.close().await;
             sqlx::query(&format!(
@@ -1279,19 +1369,19 @@ mod live_reencode {
         }
     }
 
-    fn base_conn() -> Option<String> {
+    pub(crate) fn base_conn() -> Option<String> {
         let conn = std::env::var("EXTENDDB_TEST_PG_CONNECTION_STRING").ok()?;
         (!conn.trim().is_empty()).then(|| conn.trim_end_matches('/').to_owned())
     }
 
-    fn skip(test: &str) {
+    pub(crate) fn skip(test: &str) {
         eprintln!(
             "SKIP {test}: EXTENDDB_TEST_PG_CONNECTION_STRING is not set, so there is no \
              PostgreSQL to build a scratch database in."
         );
     }
 
-    async fn scratch() -> Scratch {
+    pub(crate) async fn scratch() -> Scratch {
         let base = base_conn().expect("caller checks base_conn() first");
         let db_name = format!("eddb_esc_{}", uuid::Uuid::new_v4().simple())[..24].to_owned();
         let admin = PgPoolOptions::new()
