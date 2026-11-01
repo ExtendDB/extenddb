@@ -214,6 +214,16 @@ Import/export file paths are validated:
 - Symlinks detected and rejected, including one planted at the export filename
 - Export refuses to overwrite an existing file, so it cannot truncate a file it
   did not create
+- An export that fails removes the file it created. On Unix it first checks
+  that the path still names that file (the same device and inode), and leaves
+  the path alone when it names another file, such as one a second export
+  created after the first file was removed. The check and the unlink are two
+  calls, so a file put at the path between them is removed. If the server
+  cannot read the file's device and inode (it has no spare file descriptor),
+  the export fails before it writes a line and unlinks the path without the
+  check. On other platforms the export unlinks the path without the check.
+  The unlink never follows a symlink, and a file the server cannot remove
+  stays, with a warning in the server log
 - Both operations record the acting account, the operation and the resolved path
 - Error messages use generic text (no raw paths leaked)
 
