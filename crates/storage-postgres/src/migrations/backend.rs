@@ -244,8 +244,11 @@ impl PostgresMigrations {
                     (&catalog, catalog_name.as_str()),
                     (&data, data_name.as_str()),
                 ];
+                // The time the lock's waits left: with none left, as at a
+                // zero lock timeout, the earlier runners' sessions are
+                // looked at once.
                 if let Err(e) =
-                    wait_for_earlier_runners(&databases, &application, lock.timeout()).await
+                    wait_for_earlier_runners(&databases, &application, lock.remaining()).await
                 {
                     if let Some(watch) = &data_watch {
                         watch.close().await;

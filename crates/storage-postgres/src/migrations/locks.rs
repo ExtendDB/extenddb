@@ -9,7 +9,8 @@
 //!
 //! - The migration lock is the `(NAMESPACE, 1)` key releases since v0.1.3
 //!   take, exclusive. A migrator takes it and then the serving key
-//!   exclusively, waiting up to its timeout for running servers to stop.
+//!   exclusively, waiting for another migrator and then for running servers
+//!   to stop, both within its one timeout.
 //! - A server holds the serving key `(NAMESPACE, 2)` shared, then checks that
 //!   no migrator holds the migration lock. Each side takes its own key before
 //!   it looks for the other, so two that start together cannot both miss
@@ -33,7 +34,7 @@
 //! host's connection, which its own keepalive settings decide.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use extenddb_storage::migrations::MigrationError;
 use sqlx::postgres::PgConnectOptions;
@@ -60,6 +61,9 @@ const TCP_KEEPALIVES: [(&str, &str); 3] = [
     ("tcp_keepalives_interval", "5"),
     ("tcp_keepalives_count", "4"),
 ];
+
+/// The longest wait a lock timeout can ask for that `Instant` can add.
+const MAX_LOCK_WAIT: Duration = Duration::from_secs(86_400);
 
 /// The statement that turns off `idle_in_transaction_session_timeout` for
 /// the transaction that holds a key.
@@ -97,11 +101,11 @@ async fn keep_open(conn: &mut PgConnection) -> Result<(), sqlx::Error> {
 }
 
 /// What the runner keeps of the migration lock: a way to check that it is
-/// still held, and how long the lock was allowed to wait.
+/// still held, and the deadline its waits share.
 #[derive(Clone)]
 pub(crate) struct LockHandle {
     held: Arc<Held>,
-    timeout: Duration,
+    deadline: Instant,
 }
 
 impl LockHandle {
@@ -109,11 +113,24 @@ impl LockHandle {
         self.held.ping().await
     }
 
-    /// The `--lock-timeout` the lock was taken with, which bounds the other
-    /// waits of the run.
-    pub(crate) fn timeout(&self) -> Duration {
-        self.timeout
+    /// The time left of the `--lock-timeout` the lock was taken with,
+    /// counted from when it was asked for: the bound of the run's later
+    /// waits, so every wait of a run together stays within the timeout.
+    pub(crate) fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
     }
+}
+
+/// `timeout` from now, or a day when the clock cannot add it.
+fn deadline_after(timeout: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(timeout).unwrap_or(now + MAX_LOCK_WAIT)
+}
+
+/// Whole seconds for a message about a wait, rounded up, so a wait with
+/// time left never reads as 0 s.
+fn shown_secs(wait: Duration) -> u128 {
+    wait.as_millis().div_ceil(1000)
 }
 
 async fn try_key(conn: &mut PgConnection, function: &str, key: i32) -> Result<bool, sqlx::Error> {
@@ -173,13 +190,16 @@ fn listed(names: &[String]) -> String {
 pub struct MigrationLock {
     held: Arc<Held>,
     keepalive: JoinHandle<()>,
-    timeout: Duration,
+    deadline: Instant,
 }
 
 impl MigrationLock {
-    /// Take the migration lock, then the serving key exclusively, waiting up
-    /// to `timeout` for each, and keep the transaction alive every
-    /// [`KEEPALIVE_INTERVAL`].
+    /// Take the migration lock, then the serving key exclusively, and keep
+    /// the transaction alive every [`KEEPALIVE_INTERVAL`]. The waits for the
+    /// two keys, and the runner's later wait for an earlier migrator's
+    /// statements, share one deadline: `timeout` from this call. A key that
+    /// is held when no time is left, as at a zero `timeout`, is not waited
+    /// for.
     ///
     /// # Errors
     ///
@@ -211,8 +231,9 @@ impl MigrationLock {
         timeout: Duration,
         keepalive: Duration,
     ) -> Result<Self, MigrationError> {
+        let deadline = deadline_after(timeout);
         let mut conn = connect(catalog, "extenddb migrate").await?;
-        if let Err(e) = take_migration_keys(&mut conn, timeout).await {
+        if let Err(e) = take_migration_keys(&mut conn, timeout, deadline).await {
             let _ = conn.close().await;
             return Err(e);
         }
@@ -226,14 +247,14 @@ impl MigrationLock {
         Ok(Self {
             held,
             keepalive,
-            timeout,
+            deadline,
         })
     }
 
     pub(crate) fn handle(&self) -> LockHandle {
         LockHandle {
             held: Arc::clone(&self.held),
-            timeout: self.timeout,
+            deadline: self.deadline,
         }
     }
 
@@ -259,60 +280,46 @@ impl Drop for MigrationLock {
     }
 }
 
+/// One of the two keys a migrator takes, as its messages name it.
+struct Key {
+    key: i32,
+    /// What holds the key, in the error after the wait.
+    held_by: &'static str,
+    /// The line printed when the run starts to wait, given the holders and
+    /// the seconds left.
+    waiting: fn(&str, u128) -> String,
+}
+
+const MIGRATION: Key = Key {
+    key: MIGRATION_KEY,
+    held_by: "another migrator holds the migration lock",
+    waiting: migrator_waiting,
+};
+
+const SERVING: Key = Key {
+    key: SERVING_KEY,
+    held_by: "servers are serving this catalog",
+    waiting: servers_waiting,
+};
+
+fn migrator_waiting(names: &str, secs: u128) -> String {
+    format!("--- Another migrator holds the migration lock ({names}); waiting up to {secs} s...")
+}
+
+fn servers_waiting(names: &str, secs: u128) -> String {
+    format!("--- Waiting up to {secs} s for the servers serving this catalog to stop: {names}")
+}
+
 async fn take_migration_keys(
     conn: &mut PgConnection,
     timeout: Duration,
+    deadline: Instant,
 ) -> Result<(), MigrationError> {
     let fail = |e: sqlx::Error| MigrationError::store("take the migration lock", e);
     statement(conn, "BEGIN").await.map_err(fail)?;
     keep_open(conn).await.map_err(fail)?;
-    let _: String = sqlx::query_scalar("SELECT set_config('lock_timeout', $1, true)")
-        .bind(format!("{}ms", timeout.as_millis()))
-        .fetch_one(&mut *conn)
-        .await
-        .map_err(fail)?;
-    if !try_key(conn, "pg_try_advisory_xact_lock", MIGRATION_KEY)
-        .await
-        .map_err(fail)?
-    {
-        let names = holders(conn, MIGRATION_KEY).await.unwrap_or_default();
-        println!(
-            "--- Another migrator holds the migration lock ({}); waiting up to {} s...",
-            listed(&names),
-            timeout.as_secs()
-        );
-        if let Err(e) = try_key_waiting(conn, MIGRATION_KEY).await {
-            return Err(timed_out(
-                conn,
-                e,
-                MIGRATION_KEY,
-                timeout,
-                "another migrator holds the migration lock",
-            )
-            .await);
-        }
-    }
-    if !try_key(conn, "pg_try_advisory_xact_lock", SERVING_KEY)
-        .await
-        .map_err(fail)?
-    {
-        let names = holders(conn, SERVING_KEY).await.unwrap_or_default();
-        println!(
-            "--- Waiting up to {} s for the servers serving this catalog to stop: {}",
-            timeout.as_secs(),
-            listed(&names)
-        );
-        if let Err(e) = try_key_waiting(conn, SERVING_KEY).await {
-            return Err(timed_out(
-                conn,
-                e,
-                SERVING_KEY,
-                timeout,
-                "servers are serving this catalog",
-            )
-            .await);
-        }
-    }
+    take_key(conn, &MIGRATION, timeout, deadline).await?;
+    take_key(conn, &SERVING, timeout, deadline).await?;
     let both: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND classid = $1 \
          AND objid IN ($2, $3) AND objsubid = 2 AND mode = 'ExclusiveLock' AND granted \
@@ -334,33 +341,62 @@ async fn take_migration_keys(
     Ok(())
 }
 
-async fn try_key_waiting(conn: &mut PgConnection, key: i32) -> Result<(), sqlx::Error> {
-    sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
-        .bind(NAMESPACE)
-        .bind(key)
-        .execute(&mut *conn)
+/// Take `key` exclusively in the lock's transaction: at once when it is
+/// free, else by waiting for it until `deadline`, with `lock_timeout` set to
+/// the time left. With no time left, as at a zero `timeout` or after an
+/// earlier wait used the time up, a held key is `Locked` at once:
+/// PostgreSQL reads a `lock_timeout` of 0 as no limit, and counts it in
+/// whole milliseconds.
+async fn take_key(
+    conn: &mut PgConnection,
+    key: &Key,
+    timeout: Duration,
+    deadline: Instant,
+) -> Result<(), MigrationError> {
+    let fail = |e: sqlx::Error| MigrationError::store("take the migration lock", e);
+    if try_key(conn, "pg_try_advisory_xact_lock", key.key)
         .await
-        .map(|_| ())
+        .map_err(fail)?
+    {
+        return Ok(());
+    }
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.as_millis() == 0 {
+        return Err(still_held(conn, key, timeout).await);
+    }
+    let names = holders(conn, key.key).await.unwrap_or_default();
+    println!("{}", (key.waiting)(&listed(&names), shown_secs(left)));
+    let _: String = sqlx::query_scalar("SELECT set_config('lock_timeout', $1, true)")
+        .bind(format!("{}ms", left.as_millis()))
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(fail)?;
+    let waited = sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+        .bind(NAMESPACE)
+        .bind(key.key)
+        .execute(&mut *conn)
+        .await;
+    match waited {
+        Ok(_) => Ok(()),
+        Err(e) if crate::data::lock_not_available(&e) => Err(still_held(conn, key, timeout).await),
+        Err(e) => {
+            let _ = statement(conn, "ROLLBACK").await;
+            Err(fail(e))
+        }
+    }
 }
 
-/// The error after a wait for `key` failed: the holders when it timed out.
-async fn timed_out(
-    conn: &mut PgConnection,
-    e: sqlx::Error,
-    key: i32,
-    timeout: Duration,
-    what: &str,
-) -> MigrationError {
+/// The error when `key` is still held at the deadline: the lock's
+/// transaction is rolled back, and the holders are named.
+async fn still_held(conn: &mut PgConnection, key: &Key, timeout: Duration) -> MigrationError {
     let _ = statement(conn, "ROLLBACK").await;
-    if !crate::data::lock_not_available(&e) {
-        return MigrationError::store("take the migration lock", e);
-    }
-    let names = match holders(conn, key).await {
+    let names = match holders(conn, key.key).await {
         Ok(names) => listed(&names),
         Err(e) => format!("(pg_locks could not be read: {e})"),
     };
     MigrationError::Locked(format!(
-        "{what}, still after {} s: {names}",
+        "{}, still after {} s: {names}",
+        key.held_by,
         timeout.as_secs()
     ))
 }
@@ -513,7 +549,8 @@ async fn register_on(conn: &mut PgConnection) -> Result<(), MigrationError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AGE_OFF, IDLE_OFF, timeouts_off};
+    use super::{AGE_OFF, IDLE_OFF, shown_secs, timeouts_off};
+    use std::time::Duration;
 
     #[test]
     fn transaction_timeout_is_turned_off_from_postgresql_17() {
@@ -523,5 +560,13 @@ mod tests {
         assert_eq!(timeouts_off(180_001), [IDLE_OFF, AGE_OFF]);
         // A version that does not parse gets the setting every server has.
         assert_eq!(timeouts_off(0), [IDLE_OFF]);
+    }
+
+    #[test]
+    fn a_wait_with_time_left_never_reads_as_zero_seconds() {
+        assert_eq!(shown_secs(Duration::from_millis(1)), 1);
+        assert_eq!(shown_secs(Duration::from_millis(1000)), 1);
+        assert_eq!(shown_secs(Duration::from_millis(1001)), 2);
+        assert_eq!(shown_secs(Duration::ZERO), 0);
     }
 }

@@ -261,9 +261,10 @@ pub async fn status_notes(target: &PostgresTarget) -> Result<Vec<StatusNote>, Mi
     notes
 }
 
-/// Apply every pending migration: take the migration lock, waiting up to
-/// `lock_timeout` for another migrator and then for running servers, apply,
-/// and release the lock and close every connection on every exit path.
+/// Apply every pending migration: take the migration lock, waiting for
+/// another migrator, then for running servers, then for an earlier
+/// migrator's statements, all within `lock_timeout`, apply, and release the
+/// lock and close every connection on every exit path.
 ///
 /// # Errors
 ///
