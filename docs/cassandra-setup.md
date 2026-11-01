@@ -260,9 +260,12 @@ until that is configurable. ExtendDB creates its keyspaces with
 
 With a replication factor of 1, the catalog has one replica, so a restart of
 that node stops every request to it. A running server renews its serving
-registration every 5 s and keeps serving while renewals fail. Once it has not
-renewed for 30 s, it answers new requests with `ServiceUnavailable`, stops its
-background workers, and tries to register again every second for up to 30 s.
+registration every 5 s and keeps serving while renewals fail. It tries its
+renewals for 30 s after the last one that succeeded, so it keeps serving
+through an outage of 25 to 30 s, depending on when the outage starts. After
+that, 30 to 35 s after its last successful renewal, it answers new requests
+with `ServiceUnavailable`, stops its background workers, and tries to register
+again every second for up to 30 s.
 It registers again, starts its workers again and serves on only when the
 Cassandra driver has reconnected to the node within that time, which after a
 restart of 30 s or more it often has not; otherwise it stops with exit 1. Run

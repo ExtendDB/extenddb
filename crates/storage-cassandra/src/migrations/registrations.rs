@@ -277,8 +277,11 @@ impl ServingRegistration {
 }
 
 /// A registration dropped without [`ServingRegistration::release`], as an
-/// attempt to register again that the server drops at its bound, deletes
-/// its row from a task of its own, so it leaves no registration behind.
+/// attempt to register again that the server drops at its bound after the
+/// INSERT returned, deletes its row from a task of its own. An attempt
+/// dropped while its INSERT is in flight has no registration yet: a row
+/// that INSERT writes stays until its TTL ends, and `migrate --yes` counts
+/// it as a running server until then.
 impl Drop for ServingRegistration {
     fn drop(&mut self) {
         self.renewal.abort();

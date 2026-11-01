@@ -54,7 +54,8 @@ pub trait ServerRuntimeHooks: Send + Sync {
     /// Return the spawned tasks' join handles so the server can await them
     /// after cancelling [`WorkerContext::shutdown`]; the server aborts the
     /// ones still running 5 s later. Every worker this spawns must be among
-    /// the handles and return once that token fires.
+    /// the handles and return once that token fires, and a task a worker
+    /// starts must end before the worker returns, so the stop covers it too.
     ///
     /// Called again for each new set of workers: a server whose serving
     /// registration is lost stops its workers, and starts a new set with a

@@ -7,18 +7,25 @@
 //! A migration can start on the catalog once the registration is gone, so
 //! from that moment the server admits no new request: each one gets
 //! `ServiceUnavailable` (HTTP 503), which the AWS SDKs retry, and `/health`
-//! answers the same. It also stops its background workers: their token
-//! fires, and the ones still running after 5 s are aborted. Requests already
-//! running go on. The server then asks the backend to register again at once
-//! and then every second, and when the backend reports a new registration
-//! with the catalog's status unchanged, it starts a new set of workers and
-//! serves again. When the backend refuses (a migration holds the migration
-//! lock or waits for the servers to stop, or the status changed), when 30 s
-//! pass without a registration, or when a worker could not be stopped, the
-//! server asks for a stop: `serve` then stops the way a shutdown signal
-//! stops it (the listener drains, letting requests already running finish,
-//! the PID file is removed) and exits 1. A signal that came first decides
-//! the exit status, also when a stop is asked for during its drain.
+//! answers the same. It also stops its background workers and the tasks
+//! they started: their token fires, and the ones still running after 5 s are
+//! aborted. What requests started goes on until it ends or the process
+//! exits: the requests already running, and the work they left running in
+//! the background, which is a `RestoreTableFromBackup`'s item copy on every
+//! backend, an `UpdateTimeToLive` backfill on Cassandra and PostgreSQL, and
+//! a GSI or vector index build on PostgreSQL. PostgreSQL's GSI propagation
+//! workers, which the engine starts with itself and which write only the
+//! data database, go on too. The server then asks the backend to register
+//! again at once and then every second, and when the backend reports a new
+//! registration with the catalog's status unchanged, it starts a new set of
+//! workers and serves again. When the backend refuses (a migration holds the
+//! migration lock or waits for the servers to stop, or the status changed),
+//! when 30 s pass without a registration, or when a worker could not be
+//! stopped, the server asks for a stop: `serve` then stops the way a
+//! shutdown signal stops it (the listener drains, letting requests already
+//! running finish, the PID file is removed) and exits 1. A signal that came
+//! first decides the exit status, also when a stop is asked for during its
+//! drain.
 //!
 //! The server learns of a loss at its backend's next renewal, and serves as
 //! before until then; a migration that takes the catalog in that time runs
