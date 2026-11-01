@@ -252,3 +252,60 @@ async fn an_attempt_the_database_cannot_answer_is_unavailable() {
     );
     admin.close().await;
 }
+
+/// The server drops an attempt at the bound of its window, and at
+/// shutdown. An attempt dropped after it took the serving key, while its
+/// status read waits on a lock, leaves no key held: a migration that then
+/// asks for the catalog sees no server.
+#[tokio::test]
+async fn an_attempt_dropped_while_its_status_read_waits_leaves_no_key() {
+    let Some(base) = base_conn() else {
+        return skip("a dropped attempt");
+    };
+    let s = installed(&base, "pgm_drop").await;
+    let admin = pool(&format!("{base}/postgres"), 1).await;
+    let registration = ServerRegistration::register_with(&s.catalog_url(), KEEPALIVE)
+        .await
+        .expect("register");
+    end_the_serving_session(&admin, &s).await;
+    lost(&registration).await;
+    // The status read of the next attempt waits on this lock.
+    let catalog = s.catalog().await;
+    let mut blocker = catalog.begin().await.expect("begin");
+    sqlx::query("LOCK TABLE extenddb_migrations IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *blocker)
+        .await
+        .expect("lock the ledger");
+    let attempt = tokio::spawn(async move {
+        let answer =
+            tokio::time::timeout(Duration::from_secs(3), registration.register_again()).await;
+        (answer.is_err(), registration)
+    });
+    let mut held_while_waiting = Vec::new();
+    for _ in 0..20 {
+        held_while_waiting = serving_sessions(&admin, &s).await;
+        if !held_while_waiting.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let (dropped, _registration) = attempt.await.expect("the attempt's task");
+    let since = std::time::Instant::now();
+    let mut held = serving_sessions(&admin, &s).await;
+    while !held.is_empty() && since.elapsed() < Duration::from_secs(5) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        held = serving_sessions(&admin, &s).await;
+    }
+    blocker.rollback().await.expect("release the ledger");
+    catalog.close().await;
+    assert!(
+        dropped,
+        "the attempt finished within 3 s, so it was not dropped"
+    );
+    assert!(
+        !held_while_waiting.is_empty(),
+        "the attempt never took the key, so its drop shows nothing"
+    );
+    assert_eq!(held, [], "a dropped attempt left the serving key held");
+    admin.close().await;
+}
