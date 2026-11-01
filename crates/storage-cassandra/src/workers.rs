@@ -467,8 +467,9 @@ async fn gsi_apply_index(
 /// Woken immediately when `apply_table_update` commits a new `CREATING` index,
 /// and also sweeps periodically as a backstop. Treats a NULL `backfill_heartbeat`
 /// (never started) and a heartbeat older than `stale_threshold` (crashed) the
-/// same way: drop+recreate the data table and rerun the backfill. Returns once
-/// `shutdown` fires, before the next keyspace.
+/// same way: drop+recreate the data table and rerun the backfill. Once
+/// `shutdown` fires it takes no further index, and it returns only after the
+/// backfills it started have ended, so the server's stop covers them too.
 pub(crate) async fn poll_gsi_backfill_recovery(
     engine: Arc<CassandraEngine>,
     notify: Arc<tokio::sync::Notify>,
@@ -476,12 +477,15 @@ pub(crate) async fn poll_gsi_backfill_recovery(
     scan_interval: Duration,
     shutdown: CancellationToken,
 ) {
-    loop {
+    let mut backfills = tokio::task::JoinSet::new();
+    'scan: loop {
         // Wait for an explicit wake or the periodic backstop timeout.
         tokio::select! {
-            () = shutdown.cancelled() => return,
+            () = shutdown.cancelled() => break,
             _ = tokio::time::timeout(scan_interval, notify.notified()) => {}
         }
+        // Collect the backfills that have ended.
+        while backfills.try_join_next().is_some() {}
 
         let keyspaces = match list_account_keyspaces(&engine).await {
             Ok(ks) => ks,
@@ -493,19 +497,55 @@ pub(crate) async fn poll_gsi_backfill_recovery(
 
         for account_ks in &keyspaces {
             if shutdown.is_cancelled() {
-                return;
+                break 'scan;
             }
-            if let Err(e) = recover_stale_backfills(&engine, account_ks, stale_threshold).await {
+            if let Err(e) = recover_stale_backfills(
+                &engine,
+                account_ks,
+                stale_threshold,
+                &shutdown,
+                &mut backfills,
+            )
+            .await
+            {
                 tracing::warn!("gsi_recovery: {account_ks}: {e}");
             }
         }
     }
+    // A backfill stops at its next request once `shutdown` fires; one that
+    // has finished its scan completes the activation and the hold's release.
+    while backfills.join_next().await.is_some() {}
 }
 
+/// The GSI backfill recovery worker `serve` runs, with the stale threshold
+/// and scan interval given, until `shutdown` fires; for tests.
+#[cfg(any(test, feature = "test-util"))]
+#[doc(hidden)]
+#[must_use]
+pub fn spawn_gsi_backfill_recovery_for_tests(
+    engine: Arc<CassandraEngine>,
+    stale_threshold: Duration,
+    scan_interval: Duration,
+    shutdown: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    let notify = engine.gsi_backfill_notify.clone();
+    tokio::spawn(poll_gsi_backfill_recovery(
+        engine,
+        notify,
+        stale_threshold,
+        scan_interval,
+        shutdown,
+    ))
+}
+
+/// Rerun the stale backfills of `account_ks`, each in a task of
+/// `backfills` that stops once `shutdown` fires.
 async fn recover_stale_backfills(
     engine: &Arc<CassandraEngine>,
     account_ks: &str,
     stale_threshold: Duration,
+    shutdown: &CancellationToken,
+    backfills: &mut tokio::task::JoinSet<()>,
 ) -> Result<(), extenddb_storage::error::StorageError> {
     use cdrs_tokio::types::IntoRustByName as _;
 
@@ -531,6 +571,9 @@ async fn recover_stale_backfills(
     .await?;
 
     for row in rows {
+        if shutdown.is_cancelled() {
+            return Ok(());
+        }
         let heartbeat_ms: Option<i64> = row.get_by_name("backfill_heartbeat").ok().flatten();
         let is_stale = heartbeat_ms.is_none_or(|hb| hb < cutoff_ms);
         if !is_stale {
@@ -651,7 +694,8 @@ async fn recover_stale_backfills(
             continue;
         }
 
-        // Spawn the backfill so the recovery loop is not blocked.
+        // Run the backfill in a task of its own so the recovery loop is not
+        // blocked, and in `backfills` so the worker returns only after it.
         let session = engine.session_arc();
         let gsi_queue = Arc::clone(&engine.gsi_queue);
         let account_ks_owned = account_ks.to_owned();
@@ -659,21 +703,33 @@ async fn recover_stale_backfills(
         let table_id_owned = table_id.clone();
         let index_id_owned = index_id.clone();
         let index_name_owned = index_name.clone();
-        tokio::spawn(async move {
-            let result = crate::data::ddl::backfill_gsi(
-                &session,
-                &account_ks_owned,
-                &catalog_ks_owned,
-                &table_id_owned,
-                &index_id_owned,
-                &index_name_owned,
-                &index_key_schema,
-                &base_attr_defs,
-                &base_key_schema,
-                &base_attr_defs,
-                &projection,
-            )
-            .await;
+        let shutdown = shutdown.clone();
+        backfills.spawn(async move {
+            // Once `shutdown` fires the backfill stops at its next request
+            // and the task writes nothing more: the index stays CREATING
+            // under its hold, its heartbeat goes stale, and a later pass runs
+            // the backfill again, as after a crash.
+            let Some(result) = shutdown
+                .run_until_cancelled(crate::data::ddl::backfill_gsi(
+                    &session,
+                    &account_ks_owned,
+                    &catalog_ks_owned,
+                    &table_id_owned,
+                    &index_id_owned,
+                    &index_name_owned,
+                    &index_key_schema,
+                    &base_attr_defs,
+                    &base_key_schema,
+                    &base_attr_defs,
+                    &projection,
+                ))
+                .await
+            else {
+                tracing::info!(
+                    "gsi_recovery: backfill for '{index_name_owned}' stopped by the shutdown"
+                );
+                return;
+            };
 
             if let Err(e) = result {
                 tracing::error!(
