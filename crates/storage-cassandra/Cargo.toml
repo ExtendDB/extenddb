@@ -37,3 +37,4 @@ test-util = ["extenddb-storage/test-util"]
 [dev-dependencies]
 extenddb-storage = { workspace = true, features = ["test-util"] }
 extenddb-storage-cassandra = { path = ".", features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util"] }

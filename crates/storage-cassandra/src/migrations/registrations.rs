@@ -7,9 +7,12 @@
 //! with a TTL of 45 s and again every 5 s at `LOCAL_QUORUM`. A renewal that
 //! fails is tried again every second. The registration counts as lost only
 //! when no renewal has succeeded for 30 s, after a last attempt at that
-//! deadline, so the server stops admitting requests at least 10 s before its
+//! deadline. Each attempt is bounded by 5 s, and one sent before the
+//! deadline also by the time left to it, so the loss is reported at most
+//! 35 s after the last successful renewal was sent, at least 10 s before its
 //! row expires and `migrate --yes`, which waits while a row exists, can see
-//! it gone. The server then registers again with a new row
+//! it gone. The server then stops admitting requests and stops its
+//! background workers, and registers again with a new row
 //! ([`super::registrar`]).
 
 use std::sync::Arc;
@@ -35,9 +38,11 @@ pub struct RegistrationTimes {
     pub renew_every: Duration,
     /// How soon a renewal that failed is tried again.
     pub retry_every: Duration,
-    /// How long after the last successful renewal the registration counts
-    /// as lost. Each renewal is bounded by `renew_every`, so the loss is
-    /// reported by `lost_after + renew_every`, which must stay under the TTL.
+    /// How long after the last successful renewal was sent the registration
+    /// counts as lost. A renewal sent before then is bounded by the time
+    /// left, and the last attempt, at that deadline, by `renew_every`, so
+    /// the loss is reported by `lost_after + renew_every`, which must stay
+    /// under the TTL.
     pub lost_after: Duration,
 }
 
@@ -308,10 +313,10 @@ async fn delete_row(
     .map(drop)
 }
 
-/// Write the row again every `renew_every`, each write bounded by
-/// `renew_every`; after a failure try again every `retry_every`. Report the
-/// registration lost once the attempt at `lost_after` after the last
-/// successful renewal fails too.
+/// Write the row again every `renew_every`; after a failure try again every
+/// `retry_every`. Report the registration lost once the attempt at the
+/// deadline, `lost_after` after the last successful renewal was sent, fails
+/// too.
 async fn renew_registration(
     session: Arc<CassandraSession>,
     cql: String,
@@ -319,12 +324,7 @@ async fn renew_registration(
     times: RegistrationTimes,
     lost: watch::Sender<Option<String>>,
 ) {
-    let mut last_ok = Instant::now();
-    let mut next = last_ok + times.renew_every;
-    loop {
-        let deadline = last_ok + times.lost_after;
-        tokio::time::sleep_until(next.min(deadline)).await;
-        let sent = Instant::now();
+    renew_with(times, lost, || {
         // LOCAL_QUORUM, so a running server stays up while a remote
         // datacenter is unreachable.
         let renewal = send(
@@ -335,14 +335,44 @@ async fn renew_registration(
             None,
             "renew the serving registration",
         );
-        let why = match tokio::time::timeout(times.renew_every, renewal).await {
-            Ok(Ok(_)) => {
+        async move { renewal.await.map(drop).map_err(|e| e.to_string()) }
+    })
+    .await;
+}
+
+/// [`renew_registration`]'s schedule, with the renewal given. An attempt
+/// sent before the deadline is bounded by `renew_every` and by the time left
+/// to the deadline, so the attempt at the deadline is never late; that last
+/// attempt is bounded by `renew_every`. The loss is therefore reported at
+/// most `lost_after + renew_every` after the last successful renewal was
+/// sent.
+async fn renew_with<F, Fut>(
+    times: RegistrationTimes,
+    lost: watch::Sender<Option<String>>,
+    mut renew: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let mut last_ok = Instant::now();
+    let mut next = last_ok + times.renew_every;
+    loop {
+        let deadline = last_ok + times.lost_after;
+        tokio::time::sleep_until(next.min(deadline)).await;
+        let sent = Instant::now();
+        let bound = if sent < deadline {
+            times.renew_every.min(deadline - sent)
+        } else {
+            times.renew_every
+        };
+        let why = match tokio::time::timeout(bound, renew()).await {
+            Ok(Ok(())) => {
                 last_ok = sent;
                 next = sent + times.renew_every;
                 continue;
             }
-            Ok(Err(e)) => e.to_string(),
-            Err(_) => format!("no answer within {} s", times.renew_every.as_secs()),
+            Ok(Err(e)) => e,
+            Err(_) => format!("no answer within {} ms", bound.as_millis()),
         };
         if sent >= deadline {
             let _ = lost.send(Some(format!(
@@ -358,7 +388,12 @@ async fn renew_registration(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
+
+    use tokio::sync::watch;
+    use tokio::time::Instant;
 
     /// The loss is reported by `lost_after + renew_every`, the last
     /// attempt's bound, before the row's TTL ends.
@@ -369,6 +404,48 @@ mod tests {
         assert!(times.lost_after + times.renew_every < ttl);
         assert!(times.retry_every < times.renew_every);
         assert!(times.renew_every < times.lost_after);
+    }
+
+    /// With every renewal after the first unanswered, the loss is reported
+    /// no earlier than `lost_after` and no later than `lost_after +
+    /// renew_every` after the last successful renewal was sent: the attempt
+    /// sent just before the deadline ends at it, so the last attempt starts
+    /// on time.
+    #[tokio::test(start_paused = true)]
+    async fn the_loss_is_reported_one_renewal_bound_after_the_deadline() {
+        let times = super::RegistrationTimes::DEFAULT;
+        let calls = Arc::new(AtomicU32::new(0));
+        let (lost, mut reported) = watch::channel(None);
+        let started = Instant::now();
+        let renew = {
+            let calls = calls.clone();
+            move || {
+                let first = calls.fetch_add(1, Ordering::SeqCst) == 0;
+                async move {
+                    if first {
+                        Ok(())
+                    } else {
+                        std::future::pending().await
+                    }
+                }
+            }
+        };
+        tokio::spawn(super::renew_with(times, lost, renew));
+        reported.changed().await.expect("reported");
+        let lost_at = started.elapsed();
+        // The first renewal, the one that succeeded, was sent one interval
+        // after the start.
+        let last_ok = times.renew_every;
+        assert!(
+            lost_at >= last_ok + times.lost_after,
+            "lost {lost_at:?} after the start"
+        );
+        assert!(
+            lost_at <= last_ok + times.lost_after + times.renew_every,
+            "lost {lost_at:?} after the start"
+        );
+        let reason = reported.borrow().clone().expect("a reason");
+        assert!(reason.contains("not renewed for 30 s"), "{reason}");
     }
 
     /// The times ADR-0023 (decision 5) and the module documentation give the
