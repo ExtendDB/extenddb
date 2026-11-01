@@ -12,9 +12,16 @@
 //! again when the backend reports a new registration with the catalog's
 //! status unchanged. When the backend refuses (a migration holds the
 //! migration lock or waits for the servers to stop, or the status changed),
-//! or 30 s pass without a registration, the server asks for a stop: `serve`
-//! then stops the way a shutdown signal stops it (the listener drains, the
-//! workers' shutdown token fires, the PID file is removed) and exits 1.
+//! or 30 s pass without a registration, the server asks for a stop: the
+//! workers' shutdown token fires at once, and `serve` then stops the way a
+//! shutdown signal stops it (the listener drains, letting requests already
+//! running finish, the PID file is removed) and exits 1. A signal that came
+//! first decides the exit status, also when a stop is asked for during its
+//! drain.
+//!
+//! The server learns of a loss at its backend's next renewal, and serves as
+//! before until then; a migration that takes the catalog in that time runs
+//! beside it, as it would beside a server whose host stopped answering.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -49,6 +56,9 @@ struct Inner {
     refusing: AtomicBool,
     stop: CancellationToken,
     reason: OnceLock<String>,
+    /// A shutdown signal ended the server's wait before any stop was asked
+    /// for.
+    signalled: AtomicBool,
 }
 
 impl Admission {
@@ -80,6 +90,20 @@ impl Admission {
     /// Why a stop was asked for, or `None` when none was.
     pub(crate) fn stop_reason(&self) -> Option<&str> {
         self.inner.reason.get().map(String::as_str)
+    }
+
+    /// Record that a shutdown signal, not a stop, ended the server's wait.
+    pub(crate) fn mark_signalled(&self) {
+        self.inner.signalled.store(true, Ordering::Release);
+    }
+
+    /// Why the server stopped, when a stop it asked for ended its wait: a
+    /// stop asked for while a signal's drain ran is not why it stopped.
+    pub(crate) fn stopped_for(&self) -> Option<&str> {
+        if self.inner.signalled.load(Ordering::Acquire) {
+            return None;
+        }
+        self.stop_reason()
     }
 }
 
@@ -151,6 +175,10 @@ async fn supervise_within(
                 let message =
                     format!("the server stops: {reason}, and it could not register again: {why}");
                 tracing::error!("{message}");
+                // A migration may hold the catalog now: the background
+                // workers stop at once, before the listener's drain, which
+                // lets requests already running finish.
+                shutdown.cancel();
                 admission.stop(message);
                 return;
             }
@@ -342,11 +370,17 @@ mod tests {
         let registrar = Scripted::answering(vec![Some(Reregistration::Refused(
             "a migration is running on this catalog".to_owned(),
         ))]);
-        let (admission, _shutdown, task) = start(&registrar, Duration::from_secs(5));
+        let (admission, shutdown, task) = start(&registrar, Duration::from_secs(5));
         registrar.lose.notify_one();
         tokio::time::timeout(Duration::from_secs(10), admission.stop_requested())
             .await
             .expect("a stop is asked for");
+        // A migration may hold the catalog by now: the background workers'
+        // token fires with the stop, before the listener drains.
+        assert!(
+            shutdown.is_cancelled(),
+            "the workers run on beside the migration"
+        );
         task.await.unwrap();
         let reason = admission.stop_reason().unwrap();
         assert!(
@@ -356,6 +390,20 @@ mod tests {
         );
         assert!(admission.refusing(), "admitting after a refusal");
         assert_eq!(registrar.attempts(), 1);
+        assert_eq!(admission.stopped_for(), Some(reason));
+    }
+
+    /// A signal that ended the server's wait first decides how it ends: a
+    /// stop asked for during the signal's drain leaves the exit status 0.
+    #[test]
+    fn a_stop_during_a_signals_drain_is_not_why_the_server_stopped() {
+        let signalled = Admission::default();
+        signalled.mark_signalled();
+        signalled.stop("the window passed".to_owned());
+        assert_eq!(signalled.stopped_for(), None);
+        let stopped = Admission::default();
+        stopped.stop("the window passed".to_owned());
+        assert_eq!(stopped.stopped_for(), Some("the window passed"));
     }
 
     #[tokio::test]

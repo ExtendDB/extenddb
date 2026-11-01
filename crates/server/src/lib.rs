@@ -434,7 +434,7 @@ fn send_https_redirect(stream: &tokio::net::TcpStream, addr: std::net::SocketAdd
 /// because the serving registration could not be taken again.
 async fn signal_or_stop(admission: &registration::Admission) {
     tokio::select! {
-        () = shutdown_signal() => {}
+        () = shutdown_signal() => admission.mark_signalled(),
         () = admission.stop_requested() => {
             tracing::info!(
                 "Stopping because the serving registration could not be taken again, draining \

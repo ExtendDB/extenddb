@@ -768,7 +768,7 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
 
     // The listener stopped because the registration could not be taken
     // again, not on a signal: end with exit status 1.
-    if let Some(reason) = admission.stop_reason() {
+    if let Some(reason) = admission.stopped_for() {
         return Err(RegistrationLost {
             message: reason.to_owned(),
         }
