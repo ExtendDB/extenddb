@@ -527,8 +527,6 @@ pub async fn foreign_contents(
     Ok(foreign)
 }
 
-/// The `schema_history` rows migration 1's catalog body inserts, as
-/// `(version, description)`.
 /// The (table, column) pairs migration 1 adds to the catalog keyspace with
 /// `ALTER TABLE ... ADD IF NOT EXISTS`: a table an `init` or a 0.1.x release
 /// created before such a statement lacks them, and migration 1 adds them.
@@ -544,6 +542,8 @@ fn baseline_added_columns() -> std::collections::BTreeSet<(&'static str, &'stati
         .collect()
 }
 
+/// The `schema_history` rows migration 1's catalog body inserts, as
+/// `(version, description)`.
 fn baseline_history() -> Vec<(i32, &'static str)> {
     CATALOG_BASELINE
         .lines()
