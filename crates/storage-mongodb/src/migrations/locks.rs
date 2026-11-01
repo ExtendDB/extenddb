@@ -57,8 +57,15 @@ pub struct Timing {
     pub idle_limit: Duration,
     /// A registration's `expires_at` after its server's last renewal.
     pub registration: Duration,
-    /// A server that has not renewed its registration for this long stops.
+    /// A server that has not renewed its registration for this long counts
+    /// it as lost.
     pub registration_deadline: Duration,
+    /// How often a server renews its registration; each renewal is bounded
+    /// by this too.
+    pub registration_renew_every: Duration,
+    /// How soon a server tries again after a renewal of its registration
+    /// failed.
+    pub registration_retry_every: Duration,
     /// How often a claimant tries again while another process holds the
     /// lock, and `migrate --yes` reads the registrations again.
     pub retry_every: Duration,
@@ -66,7 +73,8 @@ pub struct Timing {
 
 impl Timing {
     /// The production timings: a 60 s lease renewed every 15 s with a 25 s
-    /// margin, and 45 s registrations renewed every 15 s.
+    /// margin, and 45 s registrations renewed every 5 s, tried again every
+    /// second after a failure, and lost after 30 s without a renewal.
     pub const PRODUCTION: Self = Self {
         lease: Duration::from_secs(60),
         renew_every: Duration::from_secs(15),
@@ -74,6 +82,8 @@ impl Timing {
         idle_limit: Duration::from_secs(30),
         registration: Duration::from_secs(45),
         registration_deadline: Duration::from_secs(30),
+        registration_renew_every: Duration::from_secs(5),
+        registration_retry_every: Duration::from_secs(1),
         retry_every: Duration::from_millis(500),
     };
 
@@ -465,6 +475,8 @@ pub(super) mod tests {
         assert_eq!(timing.idle_limit, Duration::from_secs(30));
         assert_eq!(timing.registration, Duration::from_secs(45));
         assert_eq!(timing.registration_deadline, Duration::from_secs(30));
+        assert_eq!(timing.registration_renew_every, Duration::from_secs(5));
+        assert_eq!(timing.registration_retry_every, Duration::from_secs(1));
     }
 
     /// A database that stopped answering: it accepts connections and never

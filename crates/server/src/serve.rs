@@ -390,6 +390,8 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     let registrar = runtime_hooks
         .as_ref()
         .and_then(|hooks| hooks.serving_registrar());
+    // Released after the drain, once no worker writes to the catalog.
+    let held = registrar.clone();
     let admission = crate::registration::Admission::default();
 
     // Dev mode: seed the credentials the SDK may sign with and verify against
@@ -738,8 +740,9 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     let server_result = crate::start_server(listener, state, pid_file, tls_config).await;
 
     // The HTTP server has stopped accepting; drain the workers so in-flight
-    // cycles finish and the metrics flush worker writes its final bucket.
-    drain_workers(&shutdown, worker_handles).await;
+    // cycles finish and the metrics flush worker writes its final bucket,
+    // then give up the serving registration.
+    drain_then_release(&shutdown, worker_handles, held.as_deref()).await;
 
     server_result?;
 
@@ -753,6 +756,30 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Drain the workers, then release the serving registration: a migration
+/// that waits for the servers starts once the registration is gone, so
+/// releasing it first would let the migration run beside a worker that
+/// still writes to the catalog. The release is bounded, like the drain.
+async fn drain_then_release(
+    shutdown: &CancellationToken,
+    handles: Vec<tokio::task::JoinHandle<()>>,
+    registrar: Option<&dyn extenddb_storage::hooks::ServingRegistrar>,
+) {
+    const RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
+
+    drain_workers(shutdown, handles).await;
+    if let Some(registrar) = registrar
+        && tokio::time::timeout(RELEASE_TIMEOUT, registrar.release())
+            .await
+            .is_err()
+    {
+        tracing::warn!(
+            "The serving registration was not released within {}s; it expires by itself",
+            RELEASE_TIMEOUT.as_secs()
+        );
+    }
 }
 
 /// Cancel the shutdown token and wait for every worker to return.
@@ -809,4 +836,52 @@ pub fn log_to_syslog_raw(msg: &str) {
 #[cfg(not(unix))]
 pub fn log_to_syslog_raw(msg: &str) {
     eprintln!("{msg}");
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use extenddb_storage::CancellationToken;
+    use extenddb_storage::hooks::{Reregistration, ServingRegistrar};
+
+    /// A registrar that records when it is released.
+    struct Recorder(Arc<Mutex<Vec<&'static str>>>);
+
+    #[async_trait::async_trait]
+    impl ServingRegistrar for Recorder {
+        async fn lost(&self) -> String {
+            std::future::pending().await
+        }
+
+        async fn register_again(&self) -> Reregistration {
+            Reregistration::Unavailable(String::new())
+        }
+
+        async fn release(&self) {
+            self.0.lock().unwrap().push("released");
+        }
+    }
+
+    /// The registration is released after every worker has returned, so a
+    /// migration that waits for the servers cannot start while a worker
+    /// still writes to the catalog.
+    #[tokio::test]
+    async fn the_registration_is_released_after_the_workers_stop() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let shutdown = CancellationToken::new();
+        let worker = {
+            let (events, shutdown) = (events.clone(), shutdown.clone());
+            tokio::spawn(async move {
+                shutdown.cancelled().await;
+                // A last write after the shutdown signal.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                events.lock().unwrap().push("worker stopped");
+            })
+        };
+        let registrar = Recorder(events.clone());
+        super::drain_then_release(&shutdown, vec![worker], Some(&registrar)).await;
+        assert_eq!(*events.lock().unwrap(), ["worker stopped", "released"]);
+    }
 }

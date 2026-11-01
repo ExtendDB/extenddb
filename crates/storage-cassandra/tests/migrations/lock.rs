@@ -4,12 +4,15 @@
 //! The migration lock's lease, the serving registration and the bound on
 //! a code body's requests under the lock.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use extenddb_storage::hooks::{Reregistration, ServingRegistrar};
 use extenddb_storage::migrations::{CatalogMigrations, CatalogStatus, MigrationError};
+use extenddb_storage_cassandra::cassandra_util::CassandraSession;
 use extenddb_storage_cassandra::migrations::{
-    CassandraCatalogMigrations, LeaseTimes, MigrationLock, ServingRegistration, register_server,
-    schema_statement_bounds,
+    CassandraCatalogMigrations, LeaseTimes, MigrationLock, RegistrationTimes, ServerRegistration,
+    ServingRegistration, register_server, schema_statement_bounds,
 };
 
 use super::{deployment, target_of};
@@ -174,7 +177,7 @@ async fn a_server_and_a_migration_refuse_each_other() {
     );
     migrations.release(lock).await;
     // The status read and the preview take no lock beside a server.
-    let registration: ServingRegistration =
+    let registration: ServerRegistration =
         register_server(session.clone(), &prefix, "127.0.0.1:3", "test")
             .await
             .expect("register once the lock is free");
@@ -294,4 +297,178 @@ async fn an_account_run_under_a_lapsed_lease_writes_nothing() {
         "{} tables written to {account} under a lapsed lease",
         tables.len()
     );
+}
+
+/// The ids of the servers registered in `catalog`.
+async fn server_ids(session: &Arc<CassandraSession>, catalog: &str) -> Vec<String> {
+    use cdrs_tokio::types::IntoRustByName;
+    session
+        .query(format!("SELECT server_id FROM {catalog}.extenddb_servers"))
+        .await
+        .expect("read")
+        .response_body()
+        .expect("body")
+        .into_rows()
+        .unwrap_or_default()
+        .iter()
+        .map(|row| {
+            let id: String = row.get_r_by_name("server_id").expect("id");
+            id
+        })
+        .collect()
+}
+
+/// Wait up to 10 s for `catalog` to hold `count` server rows.
+async fn wait_for_rows(
+    session: &Arc<CassandraSession>,
+    catalog: &str,
+    count: usize,
+) -> Vec<String> {
+    let started = Instant::now();
+    loop {
+        let ids = server_ids(session, catalog).await;
+        if ids.len() == count || started.elapsed() > Duration::from_secs(10) {
+            return ids;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// An attempt to register again writes a new row, reads the lock and the
+/// status, and serves on when the status is the one the server started
+/// with; the row it replaces is deleted. While a migration holds the lock,
+/// or once the status changed, the attempt is refused and leaves no row.
+#[tokio::test]
+async fn a_server_registers_again_unless_a_migration_holds_the_catalog_or_its_status_changed() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
+    let session = session().await;
+    let (prefix, _drops) = new_prefix("again");
+    deployment(&session, &prefix).await;
+    let catalog = format!("{prefix}_catalog");
+    let registration = register_server(session.clone(), &prefix, "127.0.0.1:4", "test")
+        .await
+        .expect("register");
+    let rows = wait_for_rows(&session, &catalog, 1).await;
+    let [first] = rows.as_slice() else {
+        panic!("one row: {rows:?}");
+    };
+    let first = first.clone();
+
+    assert_eq!(
+        registration.register_again().await,
+        Reregistration::Registered
+    );
+    let ids = wait_for_rows(&session, &catalog, 1).await;
+    assert_eq!(ids.len(), 1, "{ids:?}");
+    assert_ne!(
+        ids[0], first,
+        "the lost row is deleted and a new one written"
+    );
+
+    let lock = MigrationLock::acquire(session.clone(), &catalog, LeaseTimes::DEFAULT, TIMEOUT)
+        .await
+        .expect("take the lock");
+    let refused = registration.register_again().await;
+    assert!(
+        matches!(&refused, Reregistration::Refused(why) if why.contains("migration lock")),
+        "{refused:?}"
+    );
+    assert_eq!(wait_for_rows(&session, &catalog, 1).await, ids);
+    lock.release().await;
+
+    cql(
+        &session,
+        &format!(
+            "INSERT INTO {catalog}.settings (key, value) VALUES ('resource_tag_migration', \
+             'applied')"
+        ),
+    )
+    .await;
+    let refused = registration.register_again().await;
+    assert!(
+        matches!(&refused, Reregistration::Refused(why) if why.contains("status changed")),
+        "{refused:?}"
+    );
+    assert_eq!(wait_for_rows(&session, &catalog, 1).await, ids);
+    registration.release().await;
+    assert_eq!(
+        wait_for_rows(&session, &catalog, 0).await,
+        Vec::<String>::new()
+    );
+}
+
+/// A registration whose renewals get no answer is reported lost once no
+/// renewal has succeeded for `lost_after`, after a last attempt at that
+/// deadline, each attempt bounded by `renew_every`: before its row expires.
+/// One dropped without a release deletes its row.
+#[tokio::test]
+async fn a_registration_that_gets_no_answer_is_lost_before_its_row_expires() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
+    let session = session().await;
+    let (prefix, _drops) = new_prefix("silent");
+    deployment(&session, &prefix).await;
+    let catalog = format!("{prefix}_catalog");
+    // A TTL long enough that no row expires during the test: a row that
+    // goes is deleted.
+    let times = RegistrationTimes {
+        ttl_secs: 60,
+        renew_every: Duration::from_millis(800),
+        retry_every: Duration::from_millis(200),
+        lost_after: Duration::from_secs(3),
+    };
+    let proxy = migrations_support::SilencingProxy::in_front_of(
+        helpers::test_config().contact_points[0].clone(),
+    )
+    .await;
+    let silent = proxy.session().await;
+    let registration =
+        ServingRegistration::register_timed(silent, &catalog, "127.0.0.1:5", "test", times)
+            .await
+            .expect("register");
+    let mut lost = registration.lost();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let silenced = Instant::now();
+    proxy.go_silent();
+    tokio::time::timeout(Duration::from_secs(10), lost.changed())
+        .await
+        .expect("reported")
+        .expect("changed");
+    let after = silenced.elapsed();
+    assert!(
+        after <= times.lost_after + times.renew_every + Duration::from_millis(500),
+        "lost {after:?} after the node went silent"
+    );
+    let reason = lost.borrow().clone().expect("a reason");
+    assert!(reason.contains("was not renewed for"), "{reason}");
+    drop(registration);
+
+    let before = server_ids(&session, &catalog).await;
+    let dropped = ServingRegistration::register_timed(
+        session.clone(),
+        &catalog,
+        "127.0.0.1:6",
+        "test",
+        times,
+    )
+    .await
+    .expect("register");
+    let after = server_ids(&session, &catalog).await;
+    let new: Vec<&String> = after.iter().filter(|id| !before.contains(id)).collect();
+    let [id] = new.as_slice() else {
+        panic!("one new row: {before:?} then {after:?}");
+    };
+    let id = (*id).clone();
+    drop(dropped);
+    let started = Instant::now();
+    while server_ids(&session, &catalog).await.contains(&id) {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the dropped registration's row is still there"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }

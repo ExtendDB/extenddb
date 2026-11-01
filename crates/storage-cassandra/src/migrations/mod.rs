@@ -27,6 +27,7 @@ mod cql;
 mod guarded;
 mod locks;
 pub mod postcheck;
+mod registrar;
 mod registrations;
 
 use std::sync::Arc;
@@ -50,7 +51,8 @@ pub use connect::Deployment;
 pub(crate) use connect::{LOCKED_DDL_TIMEOUT, REQUEST_TIMEOUT};
 pub(crate) use locks::LeaseHandle;
 pub use locks::{LeaseTimes, MigrationLock};
-pub use registrations::ServingRegistration;
+pub use registrar::ServerRegistration;
+pub use registrations::{RegistrationTimes, ServingRegistration};
 
 use crate::cassandra_util::CassandraSession;
 
@@ -627,7 +629,29 @@ pub async fn register_server(
     keyspace_prefix: &str,
     host: &str,
     release: &str,
-) -> Result<ServingRegistration, MigrationError> {
+) -> Result<ServerRegistration, MigrationError> {
+    register_server_timed(
+        session,
+        keyspace_prefix,
+        host,
+        release,
+        RegistrationTimes::DEFAULT,
+    )
+    .await
+}
+
+/// [`register_server`] with other registration times, for tests.
+///
+/// # Errors
+///
+/// As [`register_server`].
+pub async fn register_server_timed(
+    session: Arc<CassandraSession>,
+    keyspace_prefix: &str,
+    host: &str,
+    release: &str,
+    times: RegistrationTimes,
+) -> Result<ServerRegistration, MigrationError> {
     let catalog = format!("{keyspace_prefix}_catalog");
     agreement::wait_for_agreement(&session, AGREEMENT_TIMEOUT).await?;
     if !connect::table_exists(&session, &catalog, "extenddb_servers").await? {
@@ -642,7 +666,8 @@ pub async fn register_server(
         });
     }
     let registration =
-        ServingRegistration::register(session.clone(), &catalog, host, release).await?;
+        ServingRegistration::register_timed(session.clone(), &catalog, host, release, times)
+            .await?;
     let checked = async {
         if let Some(holder) = locks::lock_holder(&session, &catalog).await? {
             return Err(MigrationError::Locked(format!(
@@ -656,15 +681,23 @@ pub async fn register_server(
                     "{status}; serving it, because a binary may serve migrations it does not \
                      know when every one of them is additive"
                 );
-                Ok(())
+                Ok(status)
             }
-            CatalogStatus::Current { .. } => Ok(()),
+            status @ CatalogStatus::Current { .. } => Ok(status),
             status => Err(MigrationError::Status(status)),
         }
     }
     .await;
     match checked {
-        Ok(()) => Ok(registration),
+        Ok(status) => Ok(ServerRegistration::new(
+            session,
+            keyspace_prefix,
+            host,
+            release,
+            times,
+            status,
+            registration,
+        )),
         Err(e) => {
             registration.release().await;
             Err(e)

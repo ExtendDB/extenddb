@@ -41,34 +41,20 @@ use extenddb_storage::error::StorageError;
 // Backend registration
 // ============================================================================
 
-use extenddb_storage::hooks::{ServerRuntimeHooks, WorkerContext};
+use extenddb_storage::hooks::{ServerRuntimeHooks, ServingRegistrar, WorkerContext};
 use extenddb_storage::server_components::{BackendError, ServerComponents};
 
 /// Backend-specific runtime hooks for `MongoDB`.
 struct MongoRuntimeHooks {
     engine: Arc<MongoEngine>,
-    /// The serving registration, released when the server shuts down.
-    registration: Arc<std::sync::Mutex<Option<migrations::ServingRegistration>>>,
+    /// The serving registration, which the server takes again when it is
+    /// lost and releases after its workers stop.
+    registration: Arc<migrations::ServerRegistration>,
 }
 
 #[async_trait::async_trait]
 impl ServerRuntimeHooks for MongoRuntimeHooks {
     async fn spawn_workers(&self, ctx: &WorkerContext) -> Vec<tokio::task::JoinHandle<()>> {
-        let registration = self
-            .registration
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        let token = ctx.shutdown.clone();
-        // The drain after the listener closes waits for this task, so the
-        // registration is deleted before the process ends and a migration
-        // can start at once.
-        let release_registration = tokio::spawn(async move {
-            token.cancelled().await;
-            if let Some(registration) = registration {
-                registration.release().await;
-            }
-        });
         let storage_for_ttl = self.engine.clone();
         let metrics = ctx.metrics.clone();
         let ttl = tokio::spawn(async move {
@@ -89,30 +75,17 @@ impl ServerRuntimeHooks for MongoRuntimeHooks {
         tracing::info!(
             "MongoDB backend: TTL, stream cleanup, GSI backfill, and control-plane workers spawned"
         );
-        vec![ttl, stream, backfill, control_plane, release_registration]
+        vec![ttl, stream, backfill, control_plane]
     }
 
     fn backend_info(&self) -> Option<String> {
         Some("mongodb".to_string())
     }
-}
 
-/// End the process with exit status 1 once the serving registration is
-/// lost: it has not been renewed for 30 s, so `migrate --yes` may no longer
-/// see this server. The PID file is removed at exit. A registration released
-/// at shutdown ends this task without exiting.
-async fn stop_when_registration_lost(mut lost: tokio::sync::watch::Receiver<Option<String>>) {
-    while lost.changed().await.is_ok() {
-        let reason = lost.borrow().clone();
-        if let Some(reason) = reason {
-            let message = format!(
-                "extenddb fatal: {reason}; the server stops, because a migration can start on \
-                 the catalog once the serving registration is gone"
-            );
-            tracing::error!("{message}");
-            eprintln!("{message}");
-            std::process::exit(1);
-        }
+    /// The registration is lost when its document is deleted or cannot be
+    /// renewed for 30 s; the server then registers again or stops.
+    fn serving_registrar(&self) -> Option<Arc<dyn ServingRegistrar>> {
+        Some(self.registration.clone() as Arc<dyn ServingRegistrar>)
     }
 }
 
@@ -160,8 +133,7 @@ fn server_components_factory(
         )
         .await
         .map_err(BackendError::Catalog)?;
-        tokio::spawn(stop_when_registration_lost(registration.lost()));
-        let registration = Arc::new(std::sync::Mutex::new(Some(registration)));
+        let registration = Arc::new(registration);
         let built = build_components(
             &connection_string,
             &region,
@@ -172,13 +144,7 @@ fn server_components_factory(
         )
         .await;
         if built.is_err() {
-            let taken = registration
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take();
-            if let Some(registration) = taken {
-                registration.release().await;
-            }
+            ServingRegistrar::release(registration.as_ref()).await;
         }
         built
     })
@@ -192,7 +158,7 @@ async fn build_components(
     max_connections: Option<u32>,
     max_catalog_connections: Option<u32>,
     tx_read_concern: mongodb::options::ReadConcern,
-    registration: Arc<std::sync::Mutex<Option<migrations::ServingRegistration>>>,
+    registration: Arc<migrations::ServerRegistration>,
 ) -> Result<ServerComponents, BackendError> {
     // Create MongoEngine
     let engine = MongoEngine::new(connection_string, region, max_connections, tx_read_concern)

@@ -79,7 +79,8 @@ pub trait ServerRuntimeHooks: Send + Sync {
     /// [`Reregistration::Refused`], or when 30 s pass without a
     /// registration, it stops as a shutdown signal stops it (the listener
     /// drains, [`WorkerContext::shutdown`] fires, the PID file is removed)
-    /// and exits 1.
+    /// and exits 1. On every shutdown it calls [`ServingRegistrar::release`]
+    /// once the background workers have stopped.
     fn serving_registrar(&self) -> Option<Arc<dyn ServingRegistrar>> {
         None
     }
@@ -110,6 +111,14 @@ pub trait ServingRegistrar: Send + Sync {
     /// the timeout passes, so a dropped attempt must leave no registration
     /// behind.
     async fn register_again(&self) -> Reregistration;
+
+    /// Give up the registration the server holds, so a migration need not
+    /// wait for it to expire. `serve` calls it once, after the background
+    /// workers have stopped, so a migration cannot start while one of them
+    /// still writes to the catalog. The default does nothing, for a
+    /// registration that ends with the process, such as PostgreSQL's key,
+    /// which the database frees when the session closes.
+    async fn release(&self) {}
 }
 
 /// The outcome of one [`ServingRegistrar::register_again`].

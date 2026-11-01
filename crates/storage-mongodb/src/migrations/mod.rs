@@ -27,6 +27,7 @@ mod backend;
 mod commands;
 mod guarded;
 mod locks;
+mod registrar;
 mod registrations;
 // Frozen once released: neither rustfmt nor a later clippy lint may require
 // an edit that changes its checksum.
@@ -52,6 +53,7 @@ pub(crate) use locks::{Lease, is_duplicate_key};
 pub use locks::{MigrationLock, Timing};
 #[cfg(feature = "test-util")]
 pub use postcheck::{Collection, Definitions, Index, describe_store};
+pub use registrar::ServerRegistration;
 pub use registrations::ServingRegistration;
 
 /// The catalog database every MongoDB deployment uses.
@@ -264,7 +266,7 @@ pub async fn register_and_check(
     target: &MongoTarget,
     release: &str,
     timing: Timing,
-) -> Result<ServingRegistration, MigrationError> {
+) -> Result<ServerRegistration, MigrationError> {
     let registration = ServingRegistration::register(target, release, timing).await?;
     let status = match catalog_status(target).await {
         Ok(status) => status,
@@ -274,19 +276,25 @@ pub async fn register_and_check(
         }
     };
     match status {
-        CatalogStatus::Current { .. } => Ok(registration),
+        CatalogStatus::Current { .. } => {}
         CatalogStatus::AheadCompatible { .. } => {
             tracing::warn!(
                 "{status}; serving it, because a binary may serve migrations it does not know \
                  when every one of them is additive"
             );
-            Ok(registration)
         }
         status => {
             registration.release().await;
-            Err(MigrationError::Status(status))
+            return Err(MigrationError::Status(status));
         }
     }
+    Ok(ServerRegistration::new(
+        target,
+        release,
+        timing,
+        status,
+        registration,
+    ))
 }
 
 #[cfg(test)]

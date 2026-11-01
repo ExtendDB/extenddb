@@ -250,6 +250,14 @@ change it, so your cluster's local datacenter has to be named `datacenter1`
 until that is configurable. ExtendDB creates its keyspaces with
 `NetworkTopologyStrategy` using these values.
 
+With a replication factor of 1, the catalog has one replica, so a restart of
+that node stops every request to it. A running server renews its serving
+registration every 5 s and keeps serving while renewals fail. Once it has not
+renewed for 30 s, it answers new requests with `ServiceUnavailable` and tries
+to register again every second for up to 30 s. When the node answers in that
+time, the server registers again and serves on; otherwise it stops with
+exit 1.
+
 ```toml
 [storage.cassandra]
 contact_points = ["cass-1:9042", "cass-2:9042", "cass-3:9042"]

@@ -9,6 +9,7 @@ mod migrations_support;
 use std::time::{Duration, Instant};
 
 use bson::{Document, doc};
+use extenddb_storage::hooks::ServingRegistrar;
 use extenddb_storage::migrations::{CatalogStatus, MigrationError, Runner};
 use extenddb_storage_mongodb::migrations::{
     MigrationLock, MongoMigrations, ServingRegistration, Timing, lock, migrate_holding,
@@ -27,6 +28,8 @@ const SHORT: Timing = Timing {
     idle_limit: Duration::from_secs(30),
     registration: Duration::from_secs(6),
     registration_deadline: Duration::from_secs(4),
+    registration_renew_every: Duration::from_secs(1),
+    registration_retry_every: Duration::from_millis(100),
     retry_every: Duration::from_millis(100),
 };
 
@@ -270,5 +273,95 @@ async fn a_registration_that_cannot_be_renewed_is_reported_lost() {
     let reason = lost.borrow().clone().expect("a reason");
     assert!(reason.contains("deleted"), "{reason}");
     registration.release().await;
+    d.drop_databases().await;
+}
+
+/// The ids of the registrations in `extenddb_servers`.
+async fn registration_ids(d: &Deployment) -> Vec<String> {
+    Deployment::documents(&d.catalog(), "extenddb_servers")
+        .await
+        .iter()
+        .map(|r| r.get_str("_id").expect("id").to_owned())
+        .collect()
+}
+
+/// A server whose registration was lost registers again: a new document,
+/// the lock read, then the status, and it serves on when the status is the
+/// one it started with. While a migration holds the lock, or once the
+/// status changed, the attempt is refused and leaves no document.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_registers_again_unless_a_migration_holds_the_catalog_or_its_status_changed() {
+    use extenddb_storage::hooks::Reregistration;
+
+    let Some(uri) = server() else { return };
+    let d = Deployment::new(&uri, "again").await;
+    d.create().await;
+    let serving = register_and_check(&d.target, "test", SHORT)
+        .await
+        .expect("serve");
+    let first = registration_ids(&d).await;
+    assert_eq!(first.len(), 1, "{first:?}");
+    d.catalog()
+        .collection::<Document>("extenddb_servers")
+        .delete_many(doc! {})
+        .await
+        .expect("delete");
+    let reason = tokio::time::timeout(Duration::from_secs(5), serving.lost())
+        .await
+        .expect("reported within a renewal");
+    assert!(reason.contains("deleted"), "{reason}");
+
+    assert_eq!(serving.register_again().await, Reregistration::Registered);
+    let again = registration_ids(&d).await;
+    assert_eq!(again.len(), 1, "{again:?}");
+    assert_ne!(again, first);
+
+    let held = MigrationLock::acquire(&d.target, Duration::from_secs(5), Timing::PRODUCTION)
+        .await
+        .expect("lock");
+    let refused = serving.register_again().await;
+    assert!(
+        matches!(&refused, Reregistration::Refused(why) if why.contains("holds the migration lock")),
+        "{refused:?}"
+    );
+    assert_eq!(registration_ids(&d).await, again);
+    held.release().await;
+
+    d.catalog()
+        .collection::<Document>("settings")
+        .insert_one(doc! { "_id": "resource_tag_migration", "value": "applied" })
+        .await
+        .expect("marker");
+    let refused = serving.register_again().await;
+    assert!(
+        matches!(&refused, Reregistration::Refused(why) if why.contains("status changed")),
+        "{refused:?}"
+    );
+    assert_eq!(registration_ids(&d).await, again);
+    serving.release().await;
+    assert_eq!(registration_ids(&d).await, Vec::<String>::new());
+    d.drop_databases().await;
+}
+
+/// A registration dropped without a release, as an attempt the server drops
+/// at its bound, deletes its document well before the document expires.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_registration_deletes_its_document() {
+    let Some(uri) = server() else { return };
+    let d = Deployment::new(&uri, "dropped").await;
+    d.create().await;
+    let registration = ServingRegistration::register(&d.target, "test", Timing::PRODUCTION)
+        .await
+        .expect("register");
+    assert_eq!(registration_ids(&d).await.len(), 1);
+    drop(registration);
+    let started = Instant::now();
+    while !registration_ids(&d).await.is_empty() {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the dropped registration's document is still there"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
     d.drop_databases().await;
 }

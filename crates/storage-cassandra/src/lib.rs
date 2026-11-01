@@ -48,7 +48,7 @@ pub use engine::{CassandraEngine, CassandraSession};
 pub use metadata_engine::TtlBackfillCursor;
 
 use cdrs_tokio::types::IntoRustByName;
-use extenddb_storage::hooks::{ServerRuntimeHooks, WorkerContext};
+use extenddb_storage::hooks::{ServerRuntimeHooks, ServingRegistrar, WorkerContext};
 use extenddb_storage::server_components::{BackendError, ServerComponents};
 use std::sync::Arc;
 
@@ -61,8 +61,10 @@ struct CassandraRuntimeHooks {
     engine: Arc<CassandraEngine>,
     control_plane_notify: Arc<tokio::sync::Notify>,
     gsi_worker_guard: std::sync::OnceLock<workers::GsiWorkerGuard>,
-    /// The registration this server holds while it serves.
-    registration: Arc<migrations::ServingRegistration>,
+    /// The registration this server holds while it serves, which the
+    /// server takes again when it is lost and releases after its workers
+    /// stop.
+    registration: Arc<migrations::ServerRegistration>,
 }
 
 #[async_trait::async_trait]
@@ -168,11 +170,6 @@ impl ServerRuntimeHooks for CassandraRuntimeHooks {
                 .await;
         });
 
-        let registration = tokio::spawn(hold_registration(
-            self.registration.clone(),
-            ctx.shutdown.clone(),
-        ));
-
         vec![
             control_plane,
             transaction_recovery,
@@ -182,47 +179,17 @@ impl ServerRuntimeHooks for CassandraRuntimeHooks {
             ttl_repair,
             ttl_audit,
             restore_sweep,
-            registration,
         ]
     }
 
     fn backend_info(&self) -> Option<String> {
         Some(format!("keyspace_prefix={}", self.engine.keyspace_prefix))
     }
-}
 
-/// Hold the serving registration for the server's life: release it when
-/// the server shuts down, so a migration need not wait for its TTL, and end
-/// the process with exit status 1 once it could not be renewed for 30 s,
-/// before its row expires and a migration could start under this server.
-/// The exit runs the `atexit` handler that removes the PID file.
-async fn hold_registration(
-    registration: Arc<migrations::ServingRegistration>,
-    shutdown: extenddb_storage::hooks::CancellationToken,
-) {
-    let mut lost = registration.lost();
-    loop {
-        tokio::select! {
-            () = shutdown.cancelled() => {
-                registration.release().await;
-                return;
-            }
-            changed = lost.changed() => {
-                if changed.is_err() {
-                    return;
-                }
-                let reason = lost.borrow().clone();
-                if let Some(reason) = reason {
-                    let message = format!(
-                        "extenddb fatal: {reason}; the server stops, because a migration can \
-                         start on the catalog once the serving registration is gone"
-                    );
-                    tracing::error!("{message}");
-                    eprintln!("{message}");
-                    std::process::exit(1);
-                }
-            }
-        }
+    /// The registration's row is lost when it cannot be renewed for 30 s;
+    /// the server then registers again or stops.
+    fn serving_registrar(&self) -> Option<Arc<dyn ServingRegistrar>> {
+        Some(self.registration.clone() as Arc<dyn ServingRegistrar>)
     }
 }
 
@@ -369,7 +336,7 @@ fn server_components_factory(
         let engine = match CassandraEngine::new(cassandra_config, &region).await {
             Ok(engine) => engine,
             Err(e) => {
-                registration.release().await;
+                ServingRegistrar::release(registration.as_ref()).await;
                 return Err(BackendError::ConnectionFailed {
                     backend: "cassandra".to_string(),
                     details: e.to_string(),

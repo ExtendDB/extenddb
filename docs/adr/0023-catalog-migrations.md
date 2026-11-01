@@ -213,8 +213,8 @@ that each backend implements, as follows.
    |---|---|---|
    | PostgreSQL | A transaction-level advisory lock on the catalog database, on the same key that every release since v0.1.3 takes, held on a dedicated connection that runs `SELECT 1` every 15 s | `serve` holds a second advisory key in shared mode, on a connection whose TCP keepalive settings end the session within 30 s of the serving host dying; `migrate --yes` takes that key in exclusive mode |
    | SQLite | `flock` on `<db>.lock`, retried every 250 ms up to the lock timeout | The same `flock`, which `serve` holds while it runs |
-   | Cassandra | A row in the catalog's `settings` table, written only by lightweight transactions at `SERIAL`, with a 60 s TTL renewed every 15 s | A row per server in `extenddb_servers`, renewed every 15 s with a 45 s TTL |
-   | MongoDB | A document in the `settings` collection, claimed by a conditional update with majority write concern and renewed by its owner | A document per server in `extenddb_servers` that expires 45 s after its last renewal |
+   | Cassandra | A row in the catalog's `settings` table, written only by lightweight transactions at `SERIAL`, with a 60 s TTL renewed every 15 s | A row per server in `extenddb_servers`, renewed every 5 s (every second after a failure) with a 45 s TTL, and lost after 30 s without a renewal |
+   | MongoDB | A document in the `settings` collection, claimed by a conditional update with majority write concern and renewed by its owner | A document per server in `extenddb_servers`, renewed every 5 s (every second after a failure), that expires 45 s after its last renewal and is lost after 30 s without one |
 
    On SQLite `<db>.lock` is never removed, also not after a refused `serve`
    or `migrate --yes`. `flock` locks the open file: if one process removed

@@ -13,6 +13,7 @@ mod migrations_support;
 use std::time::{Duration, Instant};
 
 use bson::{Document, doc};
+use extenddb_storage::hooks::ServingRegistrar;
 use extenddb_storage::management_store::OpError;
 use extenddb_storage::migrations::{
     CatalogStatus, HasManagementStore, HeldLock, MigrationBackend, MigrationError,
@@ -216,8 +217,8 @@ async fn a_renewed_registration_outlives_three_registration_lifetimes() {
     let timing = Timing {
         registration: Duration::from_secs(2),
         registration_deadline: Duration::from_millis(1500),
-        renew_every: Duration::from_millis(200),
-        retry_every: Duration::from_millis(100),
+        registration_renew_every: Duration::from_millis(200),
+        registration_retry_every: Duration::from_millis(100),
         ..Timing::PRODUCTION
     };
     let serving = ServingRegistration::register(&d.target, "test", timing)

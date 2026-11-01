@@ -6,6 +6,7 @@
 //! `migrate --yes` waits on. The lock it is paired with is in `locks.rs`,
 //! whose module doc describes both.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use bson::{Document, doc};
@@ -63,12 +64,13 @@ fn host_name() -> String {
 }
 
 /// What a server holds while it serves: its document in `extenddb_servers`,
-/// renewed every [`Timing::renew_every`].
+/// renewed every [`Timing::registration_renew_every`].
 pub struct ServingRegistration {
     servers: mongodb::Collection<Document>,
     token: String,
     renewal: JoinHandle<()>,
     lost: watch::Receiver<Option<String>>,
+    released: AtomicBool,
 }
 
 impl ServingRegistration {
@@ -113,6 +115,7 @@ impl ServingRegistration {
             token,
             renewal,
             lost,
+            released: AtomicBool::new(false),
         };
         // The lock holds while its `expires_at` has not passed by the
         // database server's clock, as the claim decides.
@@ -148,7 +151,8 @@ impl ServingRegistration {
     }
 
     /// Stop renewing and delete the registration.
-    pub async fn release(self) {
+    pub async fn release(&self) {
+        self.released.store(true, Ordering::Release);
         self.renewal.abort();
         let _ = tokio::time::timeout(
             REQUEST_TIMEOUT,
@@ -158,17 +162,35 @@ impl ServingRegistration {
     }
 }
 
+/// A registration dropped without [`ServingRegistration::release`], as an
+/// attempt to register again that the server drops at its bound, deletes
+/// its document from a task of its own, so it leaves no registration
+/// behind.
 impl Drop for ServingRegistration {
     fn drop(&mut self) {
         self.renewal.abort();
+        if self.released.load(Ordering::Acquire) {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let (servers, token) = (self.servers.clone(), self.token.clone());
+        runtime.spawn(async move {
+            let _ =
+                tokio::time::timeout(REQUEST_TIMEOUT, servers.delete_one(doc! { "_id": &token }))
+                    .await;
+        });
     }
 }
 
-/// Renew a registration every `renew_every`. A renewal that matches no
-/// document, or no successful renewal for `registration_deadline`, reports
-/// the registration lost on `lost` and ends. No wait and no renewal outlasts
-/// the deadline, so the loss is reported `registration_deadline` after the
-/// send time of the last successful renewal, not a request timeout later.
+/// Renew a registration every `registration_renew_every`, each renewal
+/// bounded by that interval, and every `registration_retry_every` after a
+/// renewal failed. A renewal that matches no document, or no successful
+/// renewal for `registration_deadline`, reports the registration lost on
+/// `lost` and ends. No wait and no renewal outlasts the deadline, so the
+/// loss is reported `registration_deadline` after the send time of the last
+/// successful renewal, not a request timeout later.
 fn spawn_registration_renewal(
     servers: mongodb::Collection<Document>,
     token: String,
@@ -178,7 +200,7 @@ fn spawn_registration_renewal(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut renewed = registered;
-        let mut wait = timing.renew_every;
+        let mut wait = timing.registration_renew_every;
         let left = |renewed: Instant| {
             timing
                 .registration_deadline
@@ -191,18 +213,21 @@ fn spawn_registration_renewal(
                 doc! { "_id": &token },
                 vec![doc! { "$set": { "expires_at": { "$add": ["$$NOW", millis(timing.registration)] } } }],
             );
-            let answer = tokio::time::timeout(REQUEST_TIMEOUT.min(left(renewed)), renewal).await;
+            let bound = REQUEST_TIMEOUT
+                .min(timing.registration_renew_every)
+                .min(left(renewed));
+            let answer = tokio::time::timeout(bound, renewal).await;
             let reason = match answer {
                 Ok(Ok(result)) if result.matched_count == 1 => {
                     renewed = sent;
-                    wait = timing.renew_every;
+                    wait = timing.registration_renew_every;
                     continue;
                 }
                 Ok(Ok(_)) => {
                     "this server's registration in extenddb_servers was deleted".to_owned()
                 }
                 Ok(Err(_)) | Err(_) if renewed.elapsed() < timing.registration_deadline => {
-                    wait = timing.retry_every;
+                    wait = timing.registration_retry_every;
                     continue;
                 }
                 Ok(Err(e)) => format!(
@@ -245,9 +270,9 @@ mod tests {
             .database("silent")
             .collection::<Document>("extenddb_servers");
         let timing = Timing {
-            renew_every: Duration::from_millis(200),
+            registration_renew_every: Duration::from_millis(200),
             registration_deadline: Duration::from_secs(1),
-            retry_every: Duration::from_millis(50),
+            registration_retry_every: Duration::from_millis(50),
             ..Timing::PRODUCTION
         };
         let (tx, mut lost) = watch::channel(None);
