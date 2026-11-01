@@ -1,27 +1,33 @@
 # Copyright 2026 ExtendDB contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""dynamodb:Attributes on writes, AttributesToGet reads, document paths, and
-batch and transaction requests.
+"""dynamodb:Attributes on writes, reads, document paths, conditions, filters,
+legacy parameters, and batch and transaction requests.
 
-Every request shape here was sent to live DynamoDB on 2026-10-31 under a
-session policy of the same shape as the user policy the test attaches, twice,
-with the same answer both times. The policies:
+Every request shape here was sent to live DynamoDB on 2026-10-31 or
+2026-11-01 under a session policy of the same shape as the user policy the
+test attaches, twice, with the same answer both times. The policies:
 
   * deny(X): Allow dynamodb:* on the table, and Deny dynamodb:* on the table
     with ForAnyValue:StringEquals {"dynamodb:Attributes": [X]}.
-  * allow-put for-all(pk): the only statement allows dynamodb:PutItem on the
-    table with ForAllValues:StringEquals {"dynamodb:Attributes": ["pk"]}.
+  * allow-only(action, condition): the only statement allows the action on
+    the table under the condition: ForAllValues:StringEquals over a list of
+    names, or a bare StringNotEquals {"dynamodb:Attributes": "ssn"}.
+  * deny-get-when-absent: Allow dynamodb:* on the table, and Deny
+    dynamodb:GetItem with Null {"dynamodb:Attributes": "true"}.
 
-Under deny(ssn) the service refused a PutItem, BatchWriteItem or
-TransactWriteItems Put of an item holding ssn, an UpdateItem that sets ssn,
-and a GetItem, Scan, BatchGetItem or TransactGetItems read that names ssn in
-AttributesToGet or ProjectionExpression. Under deny(secret) it refused the
-projections `secret.a` and `#s.a`, so a document path is matched by its
-top-level name. It allowed a DeleteItem of an item holding ssn, an UpdateItem
-that sets another attribute through a name placeholder, and reads with no
-projection, which returned whole items. allow-put for-all(pk) admitted a
-PutItem of {pk} and refused one of {pk, ssn}.
+Under deny(ssn) the service refused every request that names ssn as an item
+attribute, the target of a SET, REMOVE, ADD or DELETE action, an attribute a
+condition, filter, Expected, AttributeUpdates or ScanFilter reads, or an entry
+of AttributesToGet or ProjectionExpression, in the single, batch and
+transaction forms measured. A document path is matched by its top-level name.
+It authorized an UpdateItem whose only mention of ssn is in a SET value, which
+copies ssn into another attribute. It allowed a DeleteItem of an item holding
+ssn and reads with no projection, which returned whole items: the key holds
+the names the request gives, and on GetItem the table's key attribute too, so
+an Allow for all of ["name"] refused a GetItem of name and deny-get-when-absent
+did not refuse a GetItem with no projection. A bare StringNotEquals granted no
+Scan, whether the Scan named an attribute or not.
 
 Prerequisites:
   - extenddb running with `auth.provider = "builtin"` on EXTENDDB_TEST_ENDPOINT
@@ -124,19 +130,37 @@ def _deny(arn: str, attribute: str) -> dict:
     }
 
 
-def _allow_put_for_all(arn: str, attributes: list[str]) -> dict:
-    """allow-put for-all: PutItem only, and only of the listed attributes."""
+def _allow_only(arn: str, action: str, condition: dict) -> dict:
+    """A policy whose only statement allows `action` on the table under `condition`."""
     return {
         "Version": "2012-10-17",
         "Statement": [
             {
                 "Effect": "Allow",
-                "Action": "dynamodb:PutItem",
+                "Action": f"dynamodb:{action}",
                 "Resource": arn,
-                "Condition": {
-                    "ForAllValues:StringEquals": {"dynamodb:Attributes": attributes}
-                },
+                "Condition": condition,
             }
+        ],
+    }
+
+
+def _for_all(attributes: list[str]) -> dict:
+    return {"ForAllValues:StringEquals": {"dynamodb:Attributes": attributes}}
+
+
+def _deny_get_when_absent(arn: str) -> dict:
+    """Everything on the table, except a GetItem whose key is absent."""
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {"Effect": "Allow", "Action": "dynamodb:*", "Resource": arn},
+            {
+                "Effect": "Deny",
+                "Action": "dynamodb:GetItem",
+                "Resource": arn,
+                "Condition": {"Null": {"dynamodb:Attributes": "true"}},
+            },
         ],
     }
 
@@ -148,6 +172,10 @@ class Env:
     deny_ssn: Any
     deny_secret: Any
     allow_put_pk: Any
+    allow_scan_unless_ssn: Any
+    deny_get_when_absent: Any
+    allow_get_name: Any
+    allow_get_pk_name: Any
 
 
 @pytest.fixture(scope="module")
@@ -212,7 +240,13 @@ def env(auth_env, mgmt, account_id, region) -> Env:
         table=table,
         deny_ssn=client_with(_deny(arn, "ssn")),
         deny_secret=client_with(_deny(arn, "secret")),
-        allow_put_pk=client_with(_allow_put_for_all(arn, ["pk"])),
+        allow_put_pk=client_with(_allow_only(arn, "PutItem", _for_all(["pk"]))),
+        allow_scan_unless_ssn=client_with(
+            _allow_only(arn, "Scan", {"StringNotEquals": {"dynamodb:Attributes": "ssn"}})
+        ),
+        deny_get_when_absent=client_with(_deny_get_when_absent(arn)),
+        allow_get_name=client_with(_allow_only(arn, "GetItem", _for_all(["name"]))),
+        allow_get_pk_name=client_with(_allow_only(arn, "GetItem", _for_all(["pk", "name"]))),
     )
     try:
         admin.delete_table(TableName=table)
