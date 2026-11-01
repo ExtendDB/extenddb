@@ -18,9 +18,11 @@
 //! - `PutItem`: the table's key attributes, the item's attributes, `Expected`,
 //!   and the paths in `ConditionExpression`.
 //! - `UpdateItem`: the `Key` attributes, the table's key attributes,
-//!   `AttributeUpdates`, `Expected`, and the paths in `UpdateExpression` (the
-//!   attribute each action names and the paths in its value) and in
-//!   `ConditionExpression`.
+//!   `AttributeUpdates`, `Expected`, the paths in `ConditionExpression`, and
+//!   the attribute each `SET`, `REMOVE`, `ADD` and `DELETE` action in
+//!   `UpdateExpression` names. The paths a `SET` value reads are not in the
+//!   key: the service authorizes `SET #n = ssn`, which copies `ssn` into
+//!   `name`, under a Deny on `ssn` (measured 2026-11-01).
 //! - `DeleteItem`: the `Key` attributes, the table's key attributes, `Expected`,
 //!   and the paths in `ConditionExpression`.
 //! - `Query`: the key attributes of the table and of the queried index,
@@ -39,15 +41,17 @@
 //!   single-item operation the item maps to. A `ConditionCheck` holds the
 //!   table's key attributes and the paths in its `ConditionExpression`.
 //!
-//! The service's answers were measured on 2026-10-31 for the item attributes of
-//! `PutItem`, the attribute a `SET` action names (by name and through
-//! `ExpressionAttributeNames`), `DeleteItem`, `AttributesToGet` on `GetItem` and
-//! `Scan`, a `ProjectionExpression` naming a document path, reads with no
-//! projection, and the batch and transaction forms of those requests. The rest
-//! follows the IAM documentation for the key: it holds the attributes a request
-//! names, including those read in a condition or a filter, and a policy that
-//! lists the allowed attributes must list the key attributes of the table and of
-//! its indexes.
+//! The service's answers were measured on 2026-10-31 and 2026-11-01 for the
+//! item attributes of `PutItem`, every kind of `UpdateExpression` action and
+//! `SET` value, `DeleteItem`, `ConditionExpression` on `PutItem` and
+//! `DeleteItem`, `FilterExpression` on `Query` and `Scan`, `Expected`,
+//! `AttributeUpdates`, `ScanFilter`, `AttributesToGet` on `GetItem` and `Scan`,
+//! the table's key attributes on `GetItem`, a `ProjectionExpression` naming a
+//! document path, reads with no projection, a `ConditionCheck`, and the batch
+//! and transaction forms of `GetItem` and `PutItem`. The rest follows the same
+//! rules: `ExclusiveStartKey`, `QueryFilter`, `AttributesToGet` on `Query` and
+//! `BatchGetItem`, the queried index's key attributes, `DeleteRequest` keys,
+//! and the `Update` and `Delete` items of a transaction.
 //!
 //! An expression is read with the tokenizer and parser the engine uses, under
 //! the same size, token and depth limits, so every expression the engine
@@ -280,8 +284,8 @@ impl<'a> Names<'a> {
         }
     }
 
-    /// The attribute each `UpdateExpression` action names and the paths in its
-    /// value.
+    /// The attribute each `UpdateExpression` action names. The paths a value
+    /// reads are left out, as the service leaves them out.
     fn update(&mut self, value: Option<&Value>) {
         let Some(text) = self.text(value) else {
             return;
@@ -294,13 +298,10 @@ impl<'a> Names<'a> {
         .and_then(|tokens| parse_update_from(&tokens, text));
         for action in parsed.iter().flatten() {
             match action {
-                UpdateAction::Set { path, value }
-                | UpdateAction::Add { path, value }
-                | UpdateAction::Delete { path, value } => {
-                    self.path(path);
-                    self.expr(value);
-                }
-                UpdateAction::Remove { path } => self.path(path),
+                UpdateAction::Set { path, .. }
+                | UpdateAction::Remove { path }
+                | UpdateAction::Add { path, .. }
+                | UpdateAction::Delete { path, .. } => self.path(path),
             }
         }
     }

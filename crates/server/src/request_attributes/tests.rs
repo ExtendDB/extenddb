@@ -141,7 +141,10 @@ fn update_item_holds_the_attribute_set_names() {
 }
 
 #[test]
-fn update_item_holds_every_action_target_and_value_path() {
+fn update_item_holds_every_action_target_but_not_the_paths_a_value_reads() {
+    // Measured: REMOVE, ADD and DELETE of ssn match a Deny on ssn, and a SET
+    // value that reads ssn (`ssn`, `#s`, `if_not_exists`, `list_append`,
+    // `ssn + :one`) does not.
     let input = json!({
         "TableName": "t",
         "Key": {"pk": {"S": "a"}},
@@ -152,7 +155,17 @@ fn update_item_holds_every_action_target_and_value_path() {
     });
     assert_eq!(
         single("UpdateItem", &input, Some(&hash_table())),
-        names(&["a", "b", "c", "e", "f", "g", "i", "k", "mset", "pk", "x"])
+        names(&["a", "c", "f", "i", "k", "mset", "pk", "x"])
+    );
+    let copy = json!({
+        "TableName": "t",
+        "Key": {"pk": {"S": "a"}},
+        "UpdateExpression": "SET #n = #s, o = if_not_exists(ssn, :d), p = :one + ssn",
+        "ExpressionAttributeNames": {"#n": "name", "#s": "ssn"},
+    });
+    assert_eq!(
+        single("UpdateItem", &copy, Some(&hash_table())),
+        names(&["name", "o", "p", "pk"])
     );
 }
 
