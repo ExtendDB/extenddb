@@ -115,7 +115,8 @@ pub(crate) async fn wait_for_earlier_runners(
         if started.elapsed() >= timeout {
             return Err(MigrationError::Blocked(format!(
                 "statements of an earlier migrator that stopped are still running, still after \
-                 {secs} s: {sessions}. They do not end by themselves; end them with SELECT \
+                 {secs} s, the part of this run's lock timeout its earlier waits left: \
+                 {sessions}. They do not end by themselves; end them with SELECT \
                  pg_cancel_backend(<pid>), as their role or a superuser, then run again"
             )));
         }
