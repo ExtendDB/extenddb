@@ -101,6 +101,18 @@ impl<'a, B: MigrationBackend> Runner<'a, B> {
         self.status_of(&snap).await
     }
 
+    /// Whether the store is a catalog, from its ledgers and settings alone:
+    /// the first of the status's tests, without the reads of the pending
+    /// migrations' `detect`, so a command can refuse a store that is not a
+    /// catalog before it takes the lock without reading every policy.
+    ///
+    /// # Errors
+    ///
+    /// A ledger or the settings could not be read.
+    pub async fn initialized(&self) -> Result<bool, MigrationError> {
+        Ok(self.read().await?.initialized())
+    }
+
     /// Apply every pending migration this binary carries.
     ///
     /// # Errors

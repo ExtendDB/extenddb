@@ -126,7 +126,9 @@ impl CatalogMigrations for MongoCatalogMigrations {
 /// Take the migration lock on `target`, waiting up to `timeout` for another
 /// migrator and then, within the same timeout, for running servers to stop.
 /// Unless `creating` (`init`), a store that is not a catalog is refused
-/// first, with nothing written.
+/// first, with nothing written, from its ledgers and settings alone: the
+/// status read under the lock is the one that runs the pending migrations'
+/// `detect`.
 ///
 /// # Errors
 ///
@@ -140,9 +142,11 @@ pub async fn lock(
     timing: Timing,
 ) -> Result<(MigrationLock, MongoTarget), MigrationError> {
     if !creating {
-        let status = catalog_status(target).await?;
-        if status == CatalogStatus::Uninitialized {
-            return Err(MigrationError::Status(status));
+        let migrations = MongoMigrations::open(target, None).await?;
+        let initialized = Runner::new(&migrations, "").initialized().await;
+        migrations.close().await;
+        if !initialized? {
+            return Err(MigrationError::Status(CatalogStatus::Uninitialized));
         }
     }
     let started = Instant::now();

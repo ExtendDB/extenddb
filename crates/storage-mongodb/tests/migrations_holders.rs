@@ -449,3 +449,43 @@ async fn an_undecodable_policy_is_named_and_the_others_are_rewritten() {
     assert_eq!(carol, ["b_tagged", "<permissions-boundary>"]);
     d.drop_databases().await;
 }
+
+/// Before it takes the lock, `migrate --yes` decides whether the store is a
+/// catalog from its ledgers and settings alone, without migration 2's
+/// `detect` over every principal, so against another holder of the lock it
+/// gives up at its lock timeout however many policies the catalog holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_lock_timeout_bounds_migrate_yes_on_a_catalog_with_many_policies() {
+    let Some(uri) = server() else { return };
+    let d = Deployment::new(&uri, "manypolicies").await;
+    fixture::load(&d, &fixture::read("0.1.14")).await;
+    let account = first_account(&d).await;
+    let tagged = doc! {
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Deny", "Action": "dynamodb:*", "Resource": "*",
+            "Condition": { "StringEquals": { "dynamodb:ResourceTag/env": "prod" } },
+        }],
+    };
+    add_users(&d, &account, "many", 6000, &tagged).await;
+    let started = Instant::now();
+    let status = d.status().await;
+    let detect = started.elapsed();
+    assert!(matches!(status, CatalogStatus::Behind { .. }), "{status:?}");
+    let held = MigrationLock::acquire(&d.target, Duration::from_secs(5), Timing::PRODUCTION)
+        .await
+        .expect("another migrator's lock");
+    let started = Instant::now();
+    let refused = lock(&d.target, false, Duration::from_secs(2), Timing::PRODUCTION).await;
+    let waited = started.elapsed();
+    held.release().await;
+    let error = refused
+        .err()
+        .expect("refused while another migrator holds the lock");
+    assert_eq!(error.exit_code(), 6, "{error}");
+    assert!(
+        waited < Duration::from_secs(4),
+        "waited {waited:?} with a 2 s lock timeout; the status with its detect took {detect:?}"
+    );
+    d.drop_databases().await;
+}
