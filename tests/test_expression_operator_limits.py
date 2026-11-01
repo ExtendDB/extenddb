@@ -29,8 +29,6 @@ Dual-target against Amazon DynamoDB and extenddb.
 
 from __future__ import annotations
 
-import os
-
 import pytest
 from botocore.exceptions import ClientError
 
@@ -39,19 +37,6 @@ from conftest import scoped_table
 PREFIX = "1 validation error detected: "
 
 TOO_MANY = "The expression contains too many operators; operator count: "
-
-# On MongoDB an UpdateItem condition is compiled to a filter whose OR and AND
-# chains nest one level per operator, and a chain of 150 terms fails inside
-# MongoDB with InternalServerError. This change does not touch that compiler.
-# The MongoDB test runner sets EXTENDDB_TEST_MONGODB_CONTAINER.
-# TODO: remove this marker once the MongoDB filter compiler flattens chains.
-XFAIL_ON_MONGODB_DEEP_OR = pytest.mark.xfail(
-    bool(os.environ.get("EXTENDDB_TEST_MONGODB_CONTAINER", "").strip()),
-    reason="MongoDB answers InternalServerError for a condition chain of 150 terms",
-    raises=AssertionError,
-    strict=True,
-)
-
 
 def _error(func) -> tuple[str, str]:
     with pytest.raises(ClientError) as exc_info:
@@ -200,7 +185,6 @@ class TestOperatorCount:
         )
         assert _after_prefix(msg) == f"Invalid ConditionExpression: {TOO_MANY}599"
 
-    @XFAIL_ON_MONGODB_DEEP_OR
     def test_update_item_condition_at_the_cap_is_evaluated(self, dynamodb_client, table):
         # [u03] 300 accepted (condition evaluated).
         code, _ = _error(
