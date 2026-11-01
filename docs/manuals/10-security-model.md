@@ -173,6 +173,7 @@ The management web console (`/console/*`) implements:
 - **Security headers**: X-Content-Type-Options (nosniff), X-Frame-Options (DENY), Referrer-Policy (strict-origin-when-cross-origin)
 - **HSTS**: Sent automatically (TLS is always enabled)
 - **Login rate limiting**: Failed login attempts are tracked per user. Excessive failures trigger account lockout.
+- **Admin-only metrics**: The metrics dashboard (`/console/metrics`) and its data feed (`/console/metrics-data`) serve admin sessions only. The metrics table has no account column, so the feed carries the table names, index names and traffic of every account. An IAM-user session is redirected from the page and gets HTTP 403 with no metric data from the feed.
 
 ## Provisioned Throughput Throttling
 
