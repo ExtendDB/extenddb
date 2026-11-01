@@ -16,6 +16,33 @@ use crate::CassandraEngine;
 /// Poll `index_propagation_delay_ms` from settings every 5 seconds and update
 /// the in-memory atomic used by `put_item/update_item/delete_item`, until
 /// `shutdown` fires.
+/// How long `spawn_workers` waits for the GSI delay setting before it spawns
+/// the workers. A set starts after every registration again, while the
+/// server admits nothing and acts on no loss, so the read is bounded; the
+/// poller reads the setting again every 5 s.
+pub(crate) const INITIAL_GSI_DELAY_READ: Duration = Duration::from_secs(2);
+
+/// The GSI delay setting, `index_propagation_delay_ms` or else the legacy
+/// `gsi_propagation_delay_ms`, read within `bound`: `None` when neither is
+/// set to a number, a read fails, or the bound passes first.
+pub(crate) async fn read_gsi_delay<S: SettingsStore + ?Sized>(
+    store: &S,
+    bound: Duration,
+) -> Option<u64> {
+    let read = async {
+        let value = match store.get_setting("index_propagation_delay_ms").await {
+            Ok(Some(v)) => Some(v),
+            _ => store
+                .get_setting("gsi_propagation_delay_ms")
+                .await
+                .ok()
+                .flatten(),
+        };
+        value.and_then(|v| v.parse::<u64>().ok())
+    };
+    tokio::time::timeout(bound, read).await.ok().flatten()
+}
+
 pub(crate) async fn poll_gsi_delay<S: SettingsStore + ?Sized>(
     store: Arc<S>,
     gsi_delay: Arc<AtomicU64>,
@@ -779,5 +806,89 @@ pub(crate) fn is_table_not_found(err: &extenddb_storage::error::StorageError) ->
             msg.contains("unconfigured table") || msg.contains("does not exist")
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use extenddb_storage::management_store::{OpResult, SettingsStore};
+    use futures::future::BoxFuture;
+    use tokio::time::Instant;
+
+    /// A settings store holding `rows`, or one whose reads never answer.
+    struct Settings {
+        rows: Vec<(&'static str, &'static str)>,
+        hang: bool,
+    }
+
+    impl SettingsStore for Settings {
+        fn get_setting(&self, key: &str) -> BoxFuture<'_, OpResult<Option<String>>> {
+            let value = self
+                .rows
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| (*v).to_owned());
+            let hang = self.hang;
+            Box::pin(async move {
+                if hang {
+                    std::future::pending::<()>().await;
+                }
+                Ok(value)
+            })
+        }
+        fn set_setting(&self, _key: &str, _value: &str) -> BoxFuture<'_, OpResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn list_settings(&self) -> BoxFuture<'_, OpResult<Vec<(String, String)>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    /// A read of the GSI delay that gets no answer ends at its bound, so a
+    /// set started after a registration again spawns its workers.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_of_the_gsi_delay_that_gets_no_answer_ends_at_its_bound() {
+        let store = Settings {
+            rows: Vec::new(),
+            hang: true,
+        };
+        let started = Instant::now();
+        let read = tokio::time::timeout(
+            Duration::from_secs(60),
+            super::read_gsi_delay(&store, super::INITIAL_GSI_DELAY_READ),
+        )
+        .await;
+        assert_eq!(read, Ok(None), "the read was not bounded");
+        assert_eq!(started.elapsed(), super::INITIAL_GSI_DELAY_READ);
+    }
+
+    /// The delay is read from `index_propagation_delay_ms`, else from the
+    /// legacy `gsi_propagation_delay_ms`; a value that is not a number reads
+    /// as none.
+    #[tokio::test]
+    async fn the_gsi_delay_is_read_from_the_setting_or_its_legacy_name() {
+        let bound = super::INITIAL_GSI_DELAY_READ;
+        let read = |rows| async move {
+            super::read_gsi_delay(&Settings { rows, hang: false }, bound).await
+        };
+        assert_eq!(
+            read(vec![
+                ("index_propagation_delay_ms", "250"),
+                ("gsi_propagation_delay_ms", "40")
+            ])
+            .await,
+            Some(250)
+        );
+        assert_eq!(
+            read(vec![("gsi_propagation_delay_ms", "40")]).await,
+            Some(40)
+        );
+        assert_eq!(
+            read(vec![("index_propagation_delay_ms", "soon")]).await,
+            None
+        );
+        assert_eq!(read(Vec::new()).await, None);
     }
 }
