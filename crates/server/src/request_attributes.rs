@@ -164,7 +164,7 @@ pub(crate) fn transact_item_attributes(
 /// against.
 struct Names<'a> {
     found: BTreeSet<String>,
-    expression_names: Option<&'a Map<String, Value>>,
+    placeholders: Option<&'a Map<String, Value>>,
     limits: &'a LimitsConfig,
 }
 
@@ -172,7 +172,7 @@ impl<'a> Names<'a> {
     fn new(request: &'a Value, limits: &'a LimitsConfig) -> Self {
         Self {
             found: BTreeSet::new(),
-            expression_names: request
+            placeholders: request
                 .get("ExpressionAttributeNames")
                 .and_then(Value::as_object),
             limits,
@@ -325,16 +325,19 @@ impl<'a> Names<'a> {
         match expr {
             Expr::Path(path) => self.path(path),
             Expr::Placeholder(_) => {}
-            Expr::Compare { left, right, .. } | Expr::Arithmetic { left, right, .. } => {
-                self.expr(left);
-                self.expr(right);
-            }
-            Expr::And(left, right) | Expr::Or(left, right) => {
+            Expr::Compare { left, right, .. }
+            | Expr::Arithmetic { left, right, .. }
+            | Expr::And(left, right)
+            | Expr::Or(left, right) => {
                 self.expr(left);
                 self.expr(right);
             }
             Expr::Not(inner) => self.expr(inner),
-            Expr::Function { args, .. } => args.iter().for_each(|arg| self.expr(arg)),
+            Expr::Function { args, .. } => {
+                for arg in args {
+                    self.expr(arg);
+                }
+            }
             Expr::Between { operand, low, high } => {
                 self.expr(operand);
                 self.expr(low);
@@ -342,7 +345,9 @@ impl<'a> Names<'a> {
             }
             Expr::In { operand, list } => {
                 self.expr(operand);
-                list.iter().for_each(|item| self.expr(item));
+                for item in list {
+                    self.expr(item);
+                }
             }
         }
     }
@@ -355,7 +360,7 @@ impl<'a> Names<'a> {
         };
         let name = if first.starts_with('#') {
             match self
-                .expression_names
+                .placeholders
                 .and_then(|names| names.get(first))
                 .and_then(Value::as_str)
             {
