@@ -216,6 +216,11 @@ that each backend implements, as follows.
    | Cassandra | A row in the catalog's `settings` table, written only by lightweight transactions at `SERIAL`, with a 60 s TTL renewed every 15 s | A row per server in `extenddb_servers`, renewed every 15 s with a 45 s TTL |
    | MongoDB | A document in the `settings` collection, claimed by a conditional update with majority write concern and renewed by its owner | A document per server in `extenddb_servers` that expires 45 s after its last renewal |
 
+   On SQLite `<db>.lock` is never removed, also not after a refused `serve`
+   or `migrate --yes`. `flock` locks the open file: if one process removed
+   the file while another held it, a third could create and lock a new file
+   of the same name, and the two holders would not exclude each other.
+
    The Cassandra and MongoDB rows are the design those backends implement
    when they move onto the runner; their intervals and TTLs may change then.
 
