@@ -3,13 +3,17 @@
 
 """Catalog migration tests against a live PostgreSQL deployment.
 
-The vector index schema (catalog 0.0.3) and the backup table definitions
-(catalog 0.0.4) are exercised through an upgrade from the pre-vector shape.
+The vector index schema, the backup table definitions, and the removal of the
+`continuous_backups` table are exercised through an upgrade from the
+pre-vector shape.
 
-These exercise the migration against a live deployment rather than asserting the
-SQL text: init one, roll its catalog back to the pre-vector shape, and check that
-the binary refuses to serve it, that `extenddb migrate` upgrades it, and that the
-upgraded deployment then serves.
+These exercise the migration chain end to end rather than asserting the SQL
+text: init a deployment, roll its catalog back to the pre-vector shape, and
+check that the binary refuses to serve it, that `extenddb migrate` upgrades it,
+and that the upgraded deployment then serves.
+
+The version the binary expects is pinned once in `CURRENT_CATALOG_VERSION`; a
+release that adds a catalog migration updates that one constant.
 
 Shared lifecycle helpers and the `cli_env` fixture live in `lifecycle_helpers.py`.
 Like the other CLI lifecycle tests these require a PostgreSQL instance
@@ -33,13 +37,14 @@ from lifecycle_helpers import (
 
 VECTOR_MIGRATION = "002_vector_indexes.sql"
 BACKUP_DEFINITIONS_MIGRATION = "003_backup_definitions.sql"
+CONTINUOUS_BACKUPS_MIGRATION = "004_drop_continuous_backups.sql"
 
 # The version the binary expects, written by the last catalog migration. Every
 # current-version assertion reads it from here so the next bump is one edit.
-CURRENT_CATALOG_VERSION = "0.0.4"
+CURRENT_CATALOG_VERSION = "0.0.5"
 
 # A version no release has reached, for the symmetric version-gate test.
-FUTURE_CATALOG_VERSION = "0.0.5"
+FUTURE_CATALOG_VERSION = "0.0.6"
 
 
 def _catalog_conn(cli_env):
@@ -84,6 +89,12 @@ def _backup_definitions_table_exists(cli_env):
     )
 
 
+def _continuous_backups_table_exists(cli_env):
+    return _catalog_query(
+        cli_env, "SELECT to_regclass('public.continuous_backups') IS NOT NULL"
+    )
+
+
 def _init(cli_env):
     result = _run_extenddb(
         "init", *_init_args(cli_env),
@@ -107,9 +118,20 @@ def _roll_catalog_back_to_pre_vector(cli_env):
             cur.execute("DROP TABLE IF EXISTS backup_definitions")
             cur.execute("DROP TABLE IF EXISTS vector_indexes")
             cur.execute("ALTER TABLE backups DROP COLUMN IF EXISTS vector_indexes")
+            # A 0.0.2 deployment still has the continuous_backups table (created
+            # by 001, dropped by 004 at init), so put it back the way 001 made it.
             cur.execute(
-                "DELETE FROM schema_history WHERE filename IN (%s, %s)",
-                (VECTOR_MIGRATION, BACKUP_DEFINITIONS_MIGRATION),
+                "CREATE TABLE IF NOT EXISTS continuous_backups ("
+                "account_id TEXT NOT NULL, "
+                "table_name TEXT NOT NULL, "
+                "pitr_enabled BOOLEAN NOT NULL DEFAULT false, "
+                "earliest_restorable TIMESTAMPTZ, "
+                "latest_restorable TIMESTAMPTZ, "
+                "PRIMARY KEY (account_id, table_name))"
+            )
+            cur.execute(
+                "DELETE FROM schema_history WHERE filename IN (%s, %s, %s)",
+                (VECTOR_MIGRATION, BACKUP_DEFINITIONS_MIGRATION, CONTINUOUS_BACKUPS_MIGRATION),
             )
             cur.execute("UPDATE settings SET value = '0.0.2' WHERE key = 'catalog_version'")
     finally:
@@ -132,6 +154,7 @@ class TestVectorCatalogMigration:
         assert _vector_table_exists(cli_env) is True
         assert _backups_has_vector_column(cli_env) is True
         assert _backup_definitions_table_exists(cli_env) is True
+        assert _continuous_backups_table_exists(cli_env) is False
 
         conn = _catalog_conn(cli_env)
         try:
@@ -145,6 +168,7 @@ class TestVectorCatalogMigration:
         # so a replay after a crash between applying and recording is harmless.
         assert VECTOR_MIGRATION in tracked, tracked
         assert BACKUP_DEFINITIONS_MIGRATION in tracked, tracked
+        assert CONTINUOUS_BACKUPS_MIGRATION in tracked, tracked
 
     def test_migrate_upgrades_a_pre_vector_deployment(self, cli_env):
         """A 0.0.2 deployment is refused, upgraded by migrate, and then serves."""
@@ -188,6 +212,7 @@ class TestVectorCatalogMigration:
         assert _catalog_version(cli_env) == CURRENT_CATALOG_VERSION
         assert _vector_table_exists(cli_env) is True
         assert _backups_has_vector_column(cli_env) is True
+        assert _continuous_backups_table_exists(cli_env) is False
 
         # The upgraded deployment serves, which is the assertion the version and
         # the table shape are both really for.
