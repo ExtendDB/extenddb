@@ -185,7 +185,10 @@ pub async fn handle_import_table(
 
 /// Handle an `ExportTableToPointInTime` request.
 ///
-/// Reads all items from the table and writes them to a local file.
+/// Reads all items from the table and writes them to a local file. It answers
+/// `COMPLETED` once the file is complete and synced to disk, and an export
+/// that fails leaves no file at its `FilePath`, apart from a file the server
+/// could not remove and the other cases the `export_file` module lists.
 ///
 /// # Errors
 ///
@@ -271,49 +274,32 @@ pub async fn handle_export_table(
             }
         })?;
 
-    let mut item_count: i64 = 0;
-    let max_export_items = ctx.limits.max_export_item_count;
-    let mut exclusive_start_key: Option<Item> = None;
-    loop {
-        let (items, last_key) = ctx
-            .storage
-            .scan(
-                &key_info,
-                Some(1000),
-                exclusive_start_key.as_ref(),
-                None,
-                None,
-                None,
-            )
-            .await
-            .map_err(storage_err_to_dynamo)?;
-
-        item_count += i64::from(u16::try_from(items.len()).unwrap_or(u16::MAX));
-
-        if u64::try_from(item_count).unwrap_or(u64::MAX) > max_export_items {
-            return Err(DynamoDbError::ValidationException(format!(
-                "Export item count exceeds maximum ({max_export_items})"
-            )));
-        }
-
-        for item in &items {
-            // One encoding for the export line and the backup data file.
-            let line = extenddb_core::backup_format::encode_item_line(item).map_err(|e| {
-                tracing::error!(internal_error = %e, "failed to serialize export item");
-                DynamoDbError::InternalServerError("Internal server error".to_owned())
-            })?;
-            tokio::io::AsyncWriteExt::write_all(&mut file, &line)
-                .await
-                .map_err(|_| {
-                    DynamoDbError::ValidationException("Cannot write export file".to_owned())
-                })?;
-        }
-
-        if last_key.is_none() {
-            break;
-        }
-        exclusive_start_key = last_key;
-    }
+    // The file at `output_path` is this export's own: `create_new` made it.
+    // `write_export_file` answers once every line is flushed and synced, and
+    // on any error or a dropped future removes the file while `output_path`
+    // still names it.
+    let item_count = crate::export_file::write_export_file(
+        &mut file,
+        &output_path,
+        ctx.limits.max_export_item_count,
+        |exclusive_start_key: Option<Item>| {
+            let (storage, key_info) = (&ctx.storage, &key_info);
+            async move {
+                storage
+                    .scan(
+                        key_info,
+                        Some(1000),
+                        exclusive_start_key.as_ref(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .map_err(storage_err_to_dynamo)
+            }
+        },
+    )
+    .await?;
 
     let end_time = epoch_seconds();
     let export_arn = format!("{}:export/{}", input.table_arn, uuid::Uuid::new_v4());
