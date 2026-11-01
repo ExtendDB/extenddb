@@ -14,7 +14,8 @@ use serde::Deserialize;
 use crate::console::ConsoleState;
 use crate::console::html;
 
-use super::{CsrfOnly, identity_label, is_admin, op_error_message, require_csrf, require_session};
+use super::account_scope::require_account_session;
+use super::{CsrfOnly, identity_label, is_admin, op_error_message, require_csrf};
 
 // ── User policies ──────────────────────────────────────────────────────
 
@@ -190,7 +191,7 @@ async fn policy_form(
     principal_type: &str,
     principal_name: &str,
 ) -> Response {
-    let session = match require_session(headers, state).await {
+    let session = match require_account_session(headers, state, account_id).await {
         Ok(s) => s,
         Err(r) => return r,
     };
@@ -256,7 +257,7 @@ async fn put_policy(
     form: PolicyForm,
     redirect_url: &str,
 ) -> Response {
-    let session = match require_session(headers, state).await {
+    let session = match require_account_session(headers, state, account_id).await {
         Ok(s) => s,
         Err(r) => return r,
     };
@@ -351,7 +352,7 @@ async fn delete_policy(
     redirect_url: &str,
     csrf_token: &str,
 ) -> Response {
-    let session = match require_session(headers, state).await {
+    let session = match require_account_session(headers, state, account_id).await {
         Ok(s) => s,
         Err(r) => return r,
     };

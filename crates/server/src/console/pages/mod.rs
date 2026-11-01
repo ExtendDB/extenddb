@@ -9,6 +9,7 @@
 
 mod access_key_pages;
 mod account_pages;
+mod account_scope;
 mod auth_pages;
 mod cache_pages;
 mod docs_page;

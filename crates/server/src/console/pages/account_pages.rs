@@ -15,6 +15,7 @@ use serde::Deserialize;
 use crate::console::ConsoleState;
 use crate::console::html;
 
+use super::account_scope::require_account_session;
 use super::{CsrfOnly, identity_label, is_admin, op_error_message, require_csrf, require_session};
 
 /// GET /console/ — dashboard showing account count and quick links.
@@ -245,7 +246,7 @@ pub async fn account_detail(
     headers: HeaderMap,
     Path(account_id): Path<String>,
 ) -> Response {
-    let session = match require_session(&headers, &state).await {
+    let session = match require_account_session(&headers, &state, &account_id).await {
         Ok(s) => s,
         Err(r) => return r,
     };
@@ -364,7 +365,7 @@ pub async fn delete_account(
     Path(account_id): Path<String>,
     Form(form): Form<CsrfOnly>,
 ) -> Response {
-    let session = match require_session(&headers, &state).await {
+    let session = match require_account_session(&headers, &state, &account_id).await {
         Ok(s) => s,
         Err(r) => return r,
     };

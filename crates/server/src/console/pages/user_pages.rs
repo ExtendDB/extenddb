@@ -15,7 +15,8 @@ use serde::Deserialize;
 use crate::console::ConsoleState;
 use crate::console::html;
 
-use super::{CsrfOnly, identity_label, is_admin, op_error_message, require_csrf, require_session};
+use super::account_scope::require_account_session;
+use super::{CsrfOnly, identity_label, is_admin, op_error_message, require_csrf};
 
 /// GET /console/accounts/{id}/users/new
 pub async fn new_user_form(
@@ -23,7 +24,7 @@ pub async fn new_user_form(
     headers: HeaderMap,
     Path(account_id): Path<String>,
 ) -> Response {
-    let session = match require_session(&headers, &state).await {
+    let session = match require_account_session(&headers, &state, &account_id).await {
         Ok(s) => s,
         Err(r) => return r,
     };
@@ -80,7 +81,7 @@ pub async fn create_user(
     Path(account_id): Path<String>,
     Form(form): Form<CreateUserForm>,
 ) -> Response {
-    let session = match require_session(&headers, &state).await {
+    let session = match require_account_session(&headers, &state, &account_id).await {
         Ok(s) => s,
         Err(r) => return r,
     };
@@ -183,7 +184,7 @@ pub async fn user_detail(
     headers: HeaderMap,
     Path((account_id, user_name)): Path<(String, String)>,
 ) -> Response {
-    let session = match require_session(&headers, &state).await {
+    let session = match require_account_session(&headers, &state, &account_id).await {
         Ok(s) => s,
         Err(r) => return r,
     };
@@ -320,7 +321,7 @@ pub async fn delete_user(
     Path((account_id, user_name)): Path<(String, String)>,
     Form(form): Form<CsrfOnly>,
 ) -> Response {
-    let session = match require_session(&headers, &state).await {
+    let session = match require_account_session(&headers, &state, &account_id).await {
         Ok(s) => s,
         Err(r) => return r,
     };
