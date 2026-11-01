@@ -63,6 +63,10 @@ impl SqliteEngine {
     /// it before the next one. The lock is a FIFO tokio mutex, so a write that
     /// queued during a statement runs before the next statement, and waits for
     /// one batch instead of the whole cleanup.
+    ///
+    /// A statement that fails ends the run with its error. The statements
+    /// before it stay committed, so a warning logs the records they deleted
+    /// before the error is returned.
     pub(crate) async fn delete_stream_records_before(
         &self,
         cutoff: &str,
@@ -72,7 +76,16 @@ impl SqliteEngine {
         let mut deleted = 0;
         let mut statements = 0;
         loop {
-            let batch = self.delete_stream_record_batch(cutoff, batch_rows).await?;
+            let batch = match self.delete_stream_record_batch(cutoff, batch_rows).await {
+                Ok(batch) => batch,
+                Err(e) => {
+                    tracing::warn!(
+                        "Stream record cleanup stopped after deleting {deleted} record(s) \
+                         in {statements} statement(s): {e}"
+                    );
+                    return Err(e);
+                }
+            };
             deleted += batch;
             statements += 1;
             if batch < u64::from(batch_rows) {

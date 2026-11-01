@@ -311,6 +311,44 @@ async fn the_cleanup_stops_after_the_first_short_batch() {
     assert_eq!(sequence_numbers(&engine).await, sequence_range(26, 5));
 }
 
+/// A statement that fails ends the cleanup with its error. The batches before
+/// it stay deleted, and a warning reports how many records they removed.
+#[tokio::test]
+async fn a_failed_batch_returns_its_error_and_logs_the_records_already_deleted() {
+    let engine = engine_at(":memory:").await;
+    let table_id = stream_table(&engine).await.table_id;
+    insert_records(&engine, &table_id, 1, 25, BEFORE_CUTOFF, RECORD_DATA).await;
+    // Record 25 is the oldest and record 1 the newest, so in batches of 10
+    // record 15 is in the second batch.
+    sqlx::raw_sql(
+        "CREATE TEMP TRIGGER fail_on_record_15 BEFORE DELETE ON stream_records \
+         WHEN OLD.sequence_number = '000000000000000000015' \
+         BEGIN SELECT RAISE(ABORT, 'injected failure'); END",
+    )
+    .execute(&engine.pool)
+    .await
+    .expect("trigger");
+
+    let (log_guard, logs) = crate::schema::log_capture::capture();
+    let outcome = engine.delete_stream_records_before(CUTOFF, 10).await;
+    drop(log_guard);
+
+    let err = outcome.expect_err("the second batch fails");
+    assert!(err.to_string().contains("injected failure"), "{err}");
+    assert_eq!(
+        sequence_numbers(&engine).await,
+        sequence_range(1, 15),
+        "the first batch stays deleted and the failed batch deletes nothing"
+    );
+    let logs = logs.lock().expect("logs").clone();
+    assert!(
+        logs.iter().any(|l| l.starts_with("WARN")
+            && l.contains("stopped after deleting 10 record(s) in 1 statement(s)")
+            && l.contains("injected failure")),
+        "{logs:#?}"
+    );
+}
+
 #[tokio::test]
 async fn a_whole_number_of_batches_ends_on_an_empty_statement() {
     let engine = engine_at(":memory:").await;
