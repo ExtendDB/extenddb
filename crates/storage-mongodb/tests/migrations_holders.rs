@@ -19,9 +19,10 @@ use extenddb_storage::migrations::{
     CatalogStatus, HasManagementStore, HeldLock, MigrationBackend, MigrationError,
 };
 use extenddb_storage_mongodb::migrations::{
-    MigrationLock, MongoMigrations, ServingRegistration, Timing, lock, migrate_holding,
-    register_and_check, status_holding,
+    MigrationLock, MongoMigrations, MongoTarget, ServingRegistration, Timing, lock,
+    migrate_holding, register_and_check, status_holding,
 };
+use migrations_support::proxy::PausingProxy;
 use migrations_support::{Deployment, fixture, server};
 
 /// The id of the deployment's first account: `account_id`, or `_id` for the
@@ -488,4 +489,42 @@ async fn the_lock_timeout_bounds_migrate_yes_on_a_catalog_with_many_policies() {
         "waited {waited:?} with a 2 s lock timeout; the status with its detect took {detect:?}"
     );
     d.drop_databases().await;
+}
+
+/// A primary that stops answering just before a renewal is due, and answers
+/// again before the registration's deadline, does not take the registration:
+/// the renewal sent into the silence is bounded, the next ones go out every
+/// retry interval, and one gets through once the primary answers. The
+/// primary's silence is a proxy that holds every byte while it is paused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_primary_that_hangs_before_a_renewal_and_answers_again_keeps_the_registration() {
+    let Some(uri) = server() else { return };
+    let d = Deployment::new(&uri, "hang").await;
+    let proxy = PausingProxy::in_front_of(&uri).await;
+    let through_proxy =
+        MongoTarget::with_databases(proxy.uri(), d.target.catalog.clone(), d.target.data.clone());
+    let timing = Timing {
+        registration_renew_every: Duration::from_millis(400),
+        registration_deadline: Duration::from_secs(2),
+        registration_retry_every: Duration::from_millis(50),
+        ..Timing::PRODUCTION
+    };
+    let registration = ServingRegistration::register(&through_proxy, "test", timing)
+        .await
+        .expect("register");
+    let mut lost = registration.lost();
+    // The first renewal is due 400 ms after the registration: the silence
+    // starts 50 ms before it and lasts 1.2 s, inside the 2 s deadline.
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    proxy.pause();
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    proxy.resume();
+    let changed = tokio::time::timeout(Duration::from_secs(3), lost.changed()).await;
+    let reason = lost.borrow().clone();
+    registration.release().await;
+    d.drop_databases().await;
+    assert!(
+        changed.is_err() && reason.is_none(),
+        "the registration was lost: {reason:?}"
+    );
 }

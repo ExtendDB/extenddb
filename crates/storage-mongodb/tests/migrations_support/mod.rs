@@ -12,6 +12,7 @@
 #![allow(dead_code)]
 
 pub mod fixture;
+pub mod proxy;
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
