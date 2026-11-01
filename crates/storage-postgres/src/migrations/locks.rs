@@ -179,7 +179,12 @@ impl MigrationLock {
             let _ = conn.close().await;
             return Err(e);
         }
-        let held = Held::new(conn, "migration lock", keepalive);
+        let held = Held::new(
+            conn,
+            "migration lock",
+            "; nothing more is applied",
+            keepalive,
+        );
         let keepalive = spawn_keepalive(Arc::clone(&held), keepalive, None);
         Ok(Self {
             held,
@@ -323,8 +328,10 @@ async fn timed_out(
 }
 
 /// What a server holds while it serves: the serving key, shared. A
-/// migration cannot start while it is held, and the server must stop serving
-/// once [`ServingRegistration::lost`] reports the connection lost.
+/// migration cannot start while it is held. Once
+/// [`ServingRegistration::lost`] reports the connection lost, the server
+/// admits no new request until it holds a registration again
+/// ([`super::ServerRegistration`]).
 pub struct ServingRegistration {
     held: Arc<Held>,
     keepalive: JoinHandle<()>,
@@ -332,7 +339,9 @@ pub struct ServingRegistration {
 }
 
 impl ServingRegistration {
-    /// Register, with the session named `extenddb serve`.
+    /// Register, with the session named `extenddb serve`. The key is taken
+    /// with a try: a migration that holds or waits for it is never waited
+    /// for.
     ///
     /// # Errors
     ///
@@ -356,7 +365,7 @@ impl ServingRegistration {
         Self::register_keepalive(catalog, keepalive).await
     }
 
-    async fn register_keepalive(
+    pub(crate) async fn register_keepalive(
         catalog: &PgConnectOptions,
         keepalive: Duration,
     ) -> Result<Self, MigrationError> {
@@ -369,7 +378,7 @@ impl ServingRegistration {
                 return Err(e);
             }
         }
-        let held = Held::new(conn, "serving registration", keepalive);
+        let held = Held::new(conn, "serving registration", "", keepalive);
         let (tx, lost) = watch::channel(None);
         let keepalive = spawn_keepalive(Arc::clone(&held), keepalive, Some(tx));
         Ok(Self {

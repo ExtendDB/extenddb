@@ -286,6 +286,14 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
     {
         std::process::exit(i32::from(refusal.exit_code));
     }
+    // `serve` stopped through its shutdown path, which removed the PID file,
+    // and has logged why.
+    if let Err(e) = &result
+        && e.downcast_ref::<extenddb_server::RegistrationLost>()
+            .is_some()
+    {
+        std::process::exit(1);
+    }
     result
 }
 
