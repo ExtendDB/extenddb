@@ -127,8 +127,10 @@ impl CatalogMigrations for CassandraCatalogMigrations {
     }
 
     /// Take the lock, then wait for every registered server to go away,
-    /// both within `timeout`: a migration needs every replica of the catalog
-    /// keyspace, and no server may run while the catalog changes. An
+    /// both within one `timeout` from the start: a migration needs every
+    /// replica of the catalog keyspace, and no server may run while the
+    /// catalog changes. A server that starts while this waits for the
+    /// servers sees the lock and exits 6. An
     /// uninitialized keyspace that holds another program's tables or
     /// `settings` rows is refused before anything is written to it, and
     /// named, since `init` refuses it too. A keyspace without the catalog's
@@ -143,8 +145,9 @@ impl CatalogMigrations for CassandraCatalogMigrations {
         if !has_columns(&session, &catalog, "settings", &["key", "value"]).await? {
             return Err(MigrationError::Status(CatalogStatus::Uninitialized));
         }
+        let started = tokio::time::Instant::now();
         let lock = MigrationLock::acquire(session, &catalog, LeaseTimes::DEFAULT, timeout).await?;
-        if let Err(e) = wait_for_no_servers(&lock, timeout).await {
+        if let Err(e) = wait_for_no_servers(&lock, started, timeout).await {
             lock.release().await;
             return Err(e);
         }

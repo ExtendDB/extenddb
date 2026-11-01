@@ -106,18 +106,19 @@ pub(crate) async fn registered_servers(
         .collect()
 }
 
-/// Wait, while holding `lock`, for every registered server to go away, for
-/// up to `timeout`.
+/// Wait, while holding `lock`, for every registered server to go away,
+/// until `timeout` after `started`, the start of the run's wait for the
+/// lock: one timeout bounds both waits.
 ///
 /// # Errors
 ///
 /// [`MigrationError::Locked`] (exit 6) naming the servers, or the error of
-/// the read at `ALL`, when `timeout` passes first.
+/// the read at `ALL`, when the deadline passes first.
 pub(crate) async fn wait_for_no_servers(
     lock: &MigrationLock,
+    started: Instant,
     timeout: Duration,
 ) -> Result<(), MigrationError> {
-    let started = Instant::now();
     loop {
         lock.check()?;
         let read = registered_servers(lock.session(), lock.keyspace()).await;
@@ -142,11 +143,12 @@ pub(crate) async fn wait_for_no_servers(
         };
         if started.elapsed() >= timeout {
             return Err(MigrationError::Locked(format!(
-                "after waiting {} s, {outcome}",
-                timeout.as_secs()
+                "after waiting {} s for the lock and the servers, {outcome}",
+                started.elapsed().as_secs()
             )));
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(1).min(timeout.saturating_sub(started.elapsed())))
+            .await;
     }
 }
 

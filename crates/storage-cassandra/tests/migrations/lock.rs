@@ -472,3 +472,52 @@ async fn a_registration_that_gets_no_answer_is_lost_before_its_row_expires() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
+
+/// One lock timeout bounds a migrator's wait for the lock and its wait for
+/// the servers together. With a server registered, migrator A takes the
+/// lock and waits for the server; migrator B, started 1 s later, waits for
+/// the lock until A gives up and then for the server, and gives up at its
+/// own timeout from its start, not one timeout after it took the lock.
+#[tokio::test]
+async fn one_lock_timeout_bounds_the_waits_for_the_lock_and_the_servers() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
+    let session = session().await;
+    let (prefix, _drops) = new_prefix("deadline");
+    deployment(&session, &prefix).await;
+    let registration = register_server(session.clone(), &prefix, "127.0.0.1:7", "test")
+        .await
+        .expect("register");
+    let target = target_of(&prefix);
+    let first = {
+        let target = target.clone();
+        tokio::spawn(async move {
+            CassandraCatalogMigrations
+                .lock(&target, Duration::from_secs(4))
+                .await
+                .map(drop)
+        })
+    };
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let started = Instant::now();
+    let second = CassandraCatalogMigrations
+        .lock(&target, Duration::from_secs(6))
+        .await
+        .map(drop);
+    let waited = started.elapsed();
+    assert!(
+        matches!(&second, Err(MigrationError::Locked(m)) if m.contains("for the lock and the servers")),
+        "{second:?}"
+    );
+    assert!(
+        waited < Duration::from_secs(8),
+        "B waited {waited:?} with a 6 s lock timeout"
+    );
+    let first = first.await.expect("join");
+    assert!(
+        matches!(&first, Err(MigrationError::Locked(_))),
+        "{first:?}"
+    );
+    registration.release().await;
+}
