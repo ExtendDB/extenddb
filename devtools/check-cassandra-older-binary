@@ -309,7 +309,13 @@ def older_binary_runs(label: str, d: Deployment, binary: str, old: str, containe
         for line in output.strip().splitlines()[-3:]:
             print(f"     | > {line}")
         if command[0] == "serve":
-            report(code not in (0, -1), f"exit {code}: {label}: the 0.1.14 serve refuses a v1.0 catalog", output)
+            # For the marker that migration 1 removes, not for any other
+            # failure (a port in use, a config it cannot parse).
+            report(
+                code not in (0, -1) and "resource-tag condition-key migration" in output,
+                f"exit {code}: {label}: the 0.1.14 serve refuses a v1.0 catalog for its marker",
+                output,
+            )
         if not changes:
             expect_exit(0, f"{label}: after the 0.1.14 {what}, the catalog is Current", migrate, d.env)
             continue
