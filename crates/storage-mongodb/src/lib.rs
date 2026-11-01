@@ -54,23 +54,29 @@ struct MongoRuntimeHooks {
 
 #[async_trait::async_trait]
 impl ServerRuntimeHooks for MongoRuntimeHooks {
+    /// Each worker returns once `ctx.shutdown` fires, and its handle is
+    /// returned so `serve` can drain it.
     async fn spawn_workers(&self, ctx: &WorkerContext) -> Vec<tokio::task::JoinHandle<()>> {
         let storage_for_ttl = self.engine.clone();
         let metrics = ctx.metrics.clone();
+        let token = ctx.shutdown.clone();
         let ttl = tokio::spawn(async move {
-            ttl_worker::ttl_cleanup_worker(storage_for_ttl, metrics).await;
+            ttl_worker::ttl_cleanup_worker(storage_for_ttl, metrics, token).await;
         });
         let storage_for_stream = self.engine.clone();
+        let token = ctx.shutdown.clone();
         let stream = tokio::spawn(async move {
-            ttl_worker::stream_record_cleanup_worker(storage_for_stream).await;
+            ttl_worker::stream_record_cleanup_worker(storage_for_stream, token).await;
         });
         let storage_for_backfill = self.engine.clone();
+        let token = ctx.shutdown.clone();
         let backfill = tokio::spawn(async move {
-            ttl_worker::gsi_backfill_worker(storage_for_backfill).await;
+            ttl_worker::gsi_backfill_worker(storage_for_backfill, token).await;
         });
         let storage_for_control_plane = self.engine.clone();
+        let token = ctx.shutdown.clone();
         let control_plane = tokio::spawn(async move {
-            ttl_worker::control_plane_worker(storage_for_control_plane).await;
+            ttl_worker::control_plane_worker(storage_for_control_plane, token).await;
         });
         tracing::info!(
             "MongoDB backend: TTL, stream cleanup, GSI backfill, and control-plane workers spawned"

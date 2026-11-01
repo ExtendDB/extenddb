@@ -9,20 +9,21 @@ use std::time::Duration;
 use std::sync::atomic::AtomicU64;
 
 use extenddb_storage::management_store::SettingsStore;
+use extenddb_storage::{CancellationToken, sleep_or_shutdown};
 
 use crate::CassandraEngine;
 
-/// Poll `index_propagation_delay_ms` from settings every 30 seconds and update
-/// the in-memory atomic used by `put_item/update_item/delete_item`.
+/// Poll `index_propagation_delay_ms` from settings every 5 seconds and update
+/// the in-memory atomic used by `put_item/update_item/delete_item`, until
+/// `shutdown` fires.
 pub(crate) async fn poll_gsi_delay<S: SettingsStore + ?Sized>(
     store: Arc<S>,
     gsi_delay: Arc<AtomicU64>,
+    shutdown: CancellationToken,
 ) {
     const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
-    loop {
-        tokio::time::sleep(POLL_INTERVAL).await;
-
+    while sleep_or_shutdown(&shutdown, POLL_INTERVAL).await {
         match store.get_setting("index_propagation_delay_ms").await {
             Ok(Some(val)) => {
                 if let Ok(ms) = val.parse::<u64>() {
@@ -51,6 +52,7 @@ pub(crate) async fn poll_control_plane_transitions<S: SettingsStore + ?Sized>(
     storage: Arc<CassandraEngine>,
     notify: Arc<tokio::sync::Notify>,
     settings: Arc<S>,
+    shutdown: CancellationToken,
 ) {
     const ACTIVE_POLL: Duration = Duration::from_secs(1);
     const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -58,7 +60,10 @@ pub(crate) async fn poll_control_plane_transitions<S: SettingsStore + ?Sized>(
 
     loop {
         // Idle: wait for a wake signal or timeout (defensive sweep)
-        let _ = tokio::time::timeout(IDLE_TIMEOUT, notify.notified()).await;
+        tokio::select! {
+            () = shutdown.cancelled() => return,
+            _ = tokio::time::timeout(IDLE_TIMEOUT, notify.notified()) => {}
+        }
 
         // Read control_plane_delay_seconds from settings to compute active window
         let delay_secs = read_control_plane_delay(&*settings).await;
@@ -82,7 +87,9 @@ pub(crate) async fn poll_control_plane_transitions<S: SettingsStore + ?Sized>(
             if tokio::time::Instant::now() >= deadline {
                 break;
             }
-            tokio::time::sleep(ACTIVE_POLL).await;
+            if !sleep_or_shutdown(&shutdown, ACTIVE_POLL).await {
+                return;
+            }
         }
     }
 }
@@ -91,15 +98,15 @@ pub(crate) async fn poll_control_plane_transitions<S: SettingsStore + ?Sized>(
 ///
 /// Scans every account keyspace for transactions older than `timeout` and
 /// resumes COMMIT or executes ROLLBACK as appropriate.  Runs every
-/// `scan_interval` seconds for the lifetime of the process.
+/// `scan_interval` seconds until `shutdown` fires, and stops before the next
+/// keyspace once it has.
 pub(crate) async fn poll_transaction_recovery(
     engine: Arc<CassandraEngine>,
     timeout: Duration,
     scan_interval: Duration,
+    shutdown: CancellationToken,
 ) {
-    loop {
-        tokio::time::sleep(scan_interval).await;
-
+    while sleep_or_shutdown(&shutdown, scan_interval).await {
         #[allow(clippy::cast_possible_truncation)]
         let cutoff = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -116,6 +123,9 @@ pub(crate) async fn poll_transaction_recovery(
         };
 
         for keyspace in &keyspaces {
+            if shutdown.is_cancelled() {
+                return;
+            }
             let entries = match engine.scan_old_transactions(keyspace, cutoff).await {
                 Ok(e) => e,
                 Err(e) => {
@@ -186,13 +196,12 @@ async fn read_control_plane_delay<S: SettingsStore + ?Sized>(store: &S) -> f64 {
 
 /// Handle that stops GSI workers when dropped.
 pub struct GsiWorkerGuard {
-    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    shutdown: CancellationToken,
 }
 
 impl Drop for GsiWorkerGuard {
     fn drop(&mut self) {
-        self.shutdown
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.shutdown.cancel();
     }
 }
 
@@ -201,28 +210,35 @@ impl Drop for GsiWorkerGuard {
 /// Returns a `GsiWorkerGuard`; workers stop when it is dropped.
 #[must_use]
 pub fn spawn_gsi_workers(engine: Arc<CassandraEngine>) -> GsiWorkerGuard {
-    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    for worker_id in 0..crate::gsi_queue::NUM_WORKERS {
-        let engine = engine.clone();
-        let shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            gsi_worker(worker_id, engine, shutdown).await;
-        });
-    }
+    let shutdown = CancellationToken::new();
+    drop(spawn_gsi_workers_until(engine, &shutdown));
     GsiWorkerGuard { shutdown }
 }
 
-async fn gsi_worker(
-    worker_id: u64,
+/// Spawn GSI propagation workers, one per partition, that return once
+/// `shutdown` fires; their handles, for the server's drain.
+pub(crate) fn spawn_gsi_workers_until(
     engine: Arc<CassandraEngine>,
-    shutdown: Arc<std::sync::atomic::AtomicBool>,
-) {
+    shutdown: &CancellationToken,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    (0..crate::gsi_queue::NUM_WORKERS)
+        .map(|worker_id| {
+            let engine = engine.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                gsi_worker(worker_id, engine, shutdown).await;
+            })
+        })
+        .collect()
+}
+
+async fn gsi_worker(worker_id: u64, engine: Arc<CassandraEngine>, shutdown: CancellationToken) {
     const MAX_IDLE: Duration = Duration::from_secs(1);
 
     tracing::debug!("GSI worker {worker_id} started");
 
     loop {
-        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+        if shutdown.is_cancelled() {
             tracing::debug!("GSI worker {worker_id} shutting down");
             return;
         }
@@ -233,14 +249,15 @@ async fn gsi_worker(
                     .await
                     .unwrap_or(MAX_IDLE)
                     .min(MAX_IDLE);
-                tokio::time::timeout(wait, engine.gsi_queue.notify.notified())
-                    .await
-                    .ok();
+                tokio::select! {
+                    () = shutdown.cancelled() => {}
+                    _ = tokio::time::timeout(wait, engine.gsi_queue.notify.notified()) => {}
+                }
             }
             Ok(_) => continue,
             Err(e) => {
                 tracing::error!("GSI worker {worker_id}: {e}");
-                tokio::time::sleep(MAX_IDLE).await;
+                let _ = sleep_or_shutdown(&shutdown, MAX_IDLE).await;
             }
         }
     }
@@ -450,16 +467,21 @@ async fn gsi_apply_index(
 /// Woken immediately when `apply_table_update` commits a new `CREATING` index,
 /// and also sweeps periodically as a backstop. Treats a NULL `backfill_heartbeat`
 /// (never started) and a heartbeat older than `stale_threshold` (crashed) the
-/// same way: drop+recreate the data table and rerun the backfill.
+/// same way: drop+recreate the data table and rerun the backfill. Returns once
+/// `shutdown` fires, before the next keyspace.
 pub(crate) async fn poll_gsi_backfill_recovery(
     engine: Arc<CassandraEngine>,
     notify: Arc<tokio::sync::Notify>,
     stale_threshold: Duration,
     scan_interval: Duration,
+    shutdown: CancellationToken,
 ) {
     loop {
         // Wait for an explicit wake or the periodic backstop timeout.
-        let _ = tokio::time::timeout(scan_interval, notify.notified()).await;
+        tokio::select! {
+            () = shutdown.cancelled() => return,
+            _ = tokio::time::timeout(scan_interval, notify.notified()) => {}
+        }
 
         let keyspaces = match list_account_keyspaces(&engine).await {
             Ok(ks) => ks,
@@ -470,6 +492,9 @@ pub(crate) async fn poll_gsi_backfill_recovery(
         };
 
         for account_ks in &keyspaces {
+            if shutdown.is_cancelled() {
+                return;
+            }
             if let Err(e) = recover_stale_backfills(&engine, account_ks, stale_threshold).await {
                 tracing::warn!("gsi_recovery: {account_ks}: {e}");
             }

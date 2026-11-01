@@ -7,17 +7,18 @@
 //! A migration can start on the catalog once the registration is gone, so
 //! from that moment the server admits no new request: each one gets
 //! `ServiceUnavailable` (HTTP 503), which the AWS SDKs retry, and `/health`
-//! answers the same. Requests already running go on. The server asks the
-//! backend to register again at once and then every second, and serves
-//! again when the backend reports a new registration with the catalog's
-//! status unchanged. When the backend refuses (a migration holds the
-//! migration lock or waits for the servers to stop, or the status changed),
-//! or 30 s pass without a registration, the server asks for a stop: the
-//! workers' shutdown token fires at once, and `serve` then stops the way a
-//! shutdown signal stops it (the listener drains, letting requests already
-//! running finish, the PID file is removed) and exits 1. A signal that came
-//! first decides the exit status, also when a stop is asked for during its
-//! drain.
+//! answers the same. It also stops its background workers: their token
+//! fires, and the ones still running after 5 s are aborted. Requests already
+//! running go on. The server then asks the backend to register again at once
+//! and then every second, and when the backend reports a new registration
+//! with the catalog's status unchanged, it starts a new set of workers and
+//! serves again. When the backend refuses (a migration holds the migration
+//! lock or waits for the servers to stop, or the status changed), when 30 s
+//! pass without a registration, or when a worker could not be stopped, the
+//! server asks for a stop: `serve` then stops the way a shutdown signal
+//! stops it (the listener drains, letting requests already running finish,
+//! the PID file is removed) and exits 1. A signal that came first decides
+//! the exit status, also when a stop is asked for during its drain.
 //!
 //! The server learns of a loss at its backend's next renewal, and serves as
 //! before until then; a migration that takes the catalog in that time runs
@@ -37,6 +38,18 @@ use extenddb_storage::hooks::{Reregistration, ServingRegistrar};
 /// How long the server tries to register again before it stops: the bound
 /// the Cassandra and MongoDB backends give a registration they cannot renew.
 pub(crate) const WINDOW: Duration = Duration::from_secs(30);
+
+/// The server's background workers, which the supervisor stops while the
+/// server holds no registration and starts again once it holds a new one.
+#[async_trait::async_trait]
+pub(crate) trait WorkerControl: Send + Sync {
+    /// Stop the workers that run now, and report whether every worker the
+    /// server started has ended.
+    async fn stop(&self) -> bool;
+
+    /// Start a new set of workers.
+    async fn start(&self);
+}
 
 /// The pause between two attempts to register again.
 const RETRY: Duration = Duration::from_secs(1);
@@ -126,13 +139,15 @@ pub(crate) async fn refuse_while_unregistered(
 }
 
 /// Watch the registration until `shutdown` fires: on each loss refuse new
-/// requests and register again within [`WINDOW`], or ask for a stop.
+/// requests, stop the workers and register again within [`WINDOW`], or ask
+/// for a stop.
 pub(crate) async fn supervise(
     registrar: Arc<dyn ServingRegistrar>,
     admission: Admission,
     shutdown: CancellationToken,
+    workers: Arc<dyn WorkerControl>,
 ) {
-    supervise_within(registrar, admission, shutdown, WINDOW, RETRY).await;
+    supervise_within(registrar, admission, shutdown, workers, WINDOW, RETRY).await;
 }
 
 /// How one loss ended.
@@ -148,6 +163,7 @@ async fn supervise_within(
     registrar: Arc<dyn ServingRegistrar>,
     admission: Admission,
     shutdown: CancellationToken,
+    workers: Arc<dyn WorkerControl>,
     window: Duration,
     retry: Duration,
 ) {
@@ -158,33 +174,53 @@ async fn supervise_within(
         };
         admission.refuse();
         tracing::warn!(
-            "{reason}; new requests get ServiceUnavailable while the server registers again, for \
-             up to {} s",
+            "{reason}; new requests get ServiceUnavailable and the background workers stop while \
+             the server registers again, for up to {} s",
             window.as_secs()
         );
+        // A migration can take the catalog once the lost registration
+        // expires, so the workers stop now, before it can, and start again
+        // only under a new registration.
+        if !workers.stop().await {
+            ask_for_stop(
+                &admission,
+                &shutdown,
+                format!(
+                    "the server stops: {reason}, and a background worker did not stop, so it does \
+                     not register again"
+                ),
+            );
+            return;
+        }
         match register_again(registrar.as_ref(), &shutdown, window, retry).await {
             Outcome::Registered { attempts, after } => {
+                workers.start().await;
                 admission.admit();
                 tracing::info!(
                     "registered again with the catalog after {} ms and {attempts} attempt(s), and \
-                     its status is the one the server started with; serving requests again",
+                     its status is the one the server started with; the background workers run \
+                     again and requests are served",
                     after.as_millis()
                 );
             }
             Outcome::Stop(why) => {
-                let message =
-                    format!("the server stops: {reason}, and it could not register again: {why}");
-                tracing::error!("{message}");
-                // A migration may hold the catalog now: the background
-                // workers stop at once, before the listener's drain, which
-                // lets requests already running finish.
-                shutdown.cancel();
-                admission.stop(message);
+                ask_for_stop(
+                    &admission,
+                    &shutdown,
+                    format!("the server stops: {reason}, and it could not register again: {why}"),
+                );
                 return;
             }
             Outcome::Shutdown => return,
         }
     }
+}
+
+/// Log `message`, fire the shutdown token and ask `serve` to stop.
+fn ask_for_stop(admission: &Admission, shutdown: &CancellationToken, message: String) {
+    tracing::error!("{message}");
+    shutdown.cancel();
+    admission.stop(message);
 }
 
 /// Attempts until one registers, the backend refuses, `window` passes or
@@ -252,7 +288,47 @@ mod tests {
     use tokio::sync::Notify;
     use tower::ServiceExt;
 
-    use super::{Admission, refuse_while_unregistered, supervise_within};
+    use super::{Admission, WorkerControl, refuse_while_unregistered, supervise_within};
+
+    /// Workers that record when the supervisor stops and starts them, and
+    /// whether the server was refusing requests then; `stops` says whether
+    /// a stop ends them.
+    struct Recorded {
+        events: Mutex<Vec<(&'static str, bool)>>,
+        admission: OnceLock<Admission>,
+        stops: bool,
+    }
+
+    impl Recorded {
+        fn new(stops: bool) -> Arc<Self> {
+            Arc::new(Self {
+                events: Mutex::new(Vec::new()),
+                admission: OnceLock::new(),
+                stops,
+            })
+        }
+
+        fn record(&self, event: &'static str) {
+            let refusing = self.admission.get().is_some_and(Admission::refusing);
+            self.events.lock().unwrap().push((event, refusing));
+        }
+
+        fn events(&self) -> Vec<(&'static str, bool)> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl WorkerControl for Recorded {
+        async fn stop(&self) -> bool {
+            self.record("stop");
+            self.stops
+        }
+
+        async fn start(&self) {
+            self.record("start");
+        }
+    }
 
     /// A registrar whose losses a test fires, and whose attempts answer from
     /// a script; an empty script answers `Unavailable`, and `None` in it is
@@ -316,13 +392,23 @@ mod tests {
         registrar: &Arc<Scripted>,
         window: Duration,
     ) -> (Admission, CancellationToken, tokio::task::JoinHandle<()>) {
+        start_with(registrar, window, &Recorded::new(true))
+    }
+
+    fn start_with(
+        registrar: &Arc<Scripted>,
+        window: Duration,
+        workers: &Arc<Recorded>,
+    ) -> (Admission, CancellationToken, tokio::task::JoinHandle<()>) {
         let admission = Admission::default();
         let _ = registrar.admission.set(admission.clone());
+        let _ = workers.admission.set(admission.clone());
         let shutdown = CancellationToken::new();
         let task = tokio::spawn(supervise_within(
             Arc::clone(registrar) as Arc<dyn ServingRegistrar>,
             admission.clone(),
             shutdown.clone(),
+            Arc::clone(workers) as Arc<dyn WorkerControl>,
             window,
             Duration::from_millis(20),
         ));
@@ -336,7 +422,8 @@ mod tests {
             Some(Reregistration::Unavailable("connection refused".to_owned())),
             Some(Reregistration::Registered),
         ]);
-        let (admission, shutdown, task) = start(&registrar, Duration::from_secs(5));
+        let workers = Recorded::new(true);
+        let (admission, shutdown, task) = start_with(&registrar, Duration::from_secs(5), &workers);
         assert!(!admission.refusing());
         registrar.lose.notify_one();
         until("three attempts", || registrar.attempts() == 3).await;
@@ -346,6 +433,9 @@ mod tests {
             [true, true, true],
             "requests were admitted while the server held no registration"
         );
+        // The workers stopped while new requests were refused, before the
+        // first attempt, and started again under the new registration.
+        assert_eq!(workers.events(), [("stop", true), ("start", true)]);
         assert_eq!(admission.stop_reason(), None);
         // A second loss is handled the same way.
         registrar
@@ -360,9 +450,44 @@ mod tests {
             registrar.refusing_at_attempts.lock().unwrap()[3],
             "requests were admitted while the server held no registration"
         );
+        assert_eq!(
+            workers.events(),
+            [
+                ("stop", true),
+                ("start", true),
+                ("stop", true),
+                ("start", true)
+            ]
+        );
         shutdown.cancel();
         task.await.unwrap();
         assert_eq!(admission.stop_reason(), None);
+    }
+
+    /// A worker that a stop could not end may still write when a migration
+    /// takes the catalog, so the server stops instead of registering again.
+    #[tokio::test]
+    async fn a_worker_that_does_not_stop_stops_the_server_without_an_attempt() {
+        let registrar = Scripted::answering(vec![Some(Reregistration::Registered)]);
+        let workers = Recorded::new(false);
+        let (admission, shutdown, task) = start_with(&registrar, Duration::from_secs(5), &workers);
+        registrar.lose.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), admission.stop_requested())
+            .await
+            .expect("a stop is asked for");
+        task.await.unwrap();
+        assert!(shutdown.is_cancelled());
+        assert_eq!(registrar.attempts(), 0, "it registered again");
+        assert_eq!(workers.events(), [("stop", true)]);
+        let reason = admission.stop_reason().unwrap();
+        assert!(
+            reason.contains("the session ended") && reason.contains("did not stop"),
+            "{reason}"
+        );
+        assert!(
+            admission.refusing(),
+            "admitting after a worker kept running"
+        );
     }
 
     #[tokio::test]
@@ -370,17 +495,16 @@ mod tests {
         let registrar = Scripted::answering(vec![Some(Reregistration::Refused(
             "a migration is running on this catalog".to_owned(),
         ))]);
-        let (admission, shutdown, task) = start(&registrar, Duration::from_secs(5));
+        let workers = Recorded::new(true);
+        let (admission, shutdown, task) = start_with(&registrar, Duration::from_secs(5), &workers);
         registrar.lose.notify_one();
         tokio::time::timeout(Duration::from_secs(10), admission.stop_requested())
             .await
             .expect("a stop is asked for");
-        // A migration may hold the catalog by now: the background workers'
-        // token fires with the stop, before the listener drains.
-        assert!(
-            shutdown.is_cancelled(),
-            "the workers run on beside the migration"
-        );
+        // The workers stopped at the loss and do not start again, and the
+        // shutdown token fires with the stop, before the listener drains.
+        assert_eq!(workers.events(), [("stop", true)]);
+        assert!(shutdown.is_cancelled(), "the shutdown token did not fire");
         task.await.unwrap();
         let reason = admission.stop_reason().unwrap();
         assert!(

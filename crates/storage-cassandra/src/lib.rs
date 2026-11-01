@@ -60,7 +60,6 @@ use std::sync::Arc;
 struct CassandraRuntimeHooks {
     engine: Arc<CassandraEngine>,
     control_plane_notify: Arc<tokio::sync::Notify>,
-    gsi_worker_guard: std::sync::OnceLock<workers::GsiWorkerGuard>,
     /// The registration this server holds while it serves, which the
     /// server takes again when it is lost and releases after its workers
     /// stop.
@@ -70,23 +69,32 @@ struct CassandraRuntimeHooks {
 #[async_trait::async_trait]
 impl ServerRuntimeHooks for CassandraRuntimeHooks {
     async fn spawn_workers(&self, ctx: &WorkerContext) -> Vec<tokio::task::JoinHandle<()>> {
-        // Backend-specific workers that need Cassandra internals.
-        // Each handle is returned so `serve` can drain them on shutdown.
+        // Backend-specific workers that need Cassandra internals. Each one
+        // returns once `ctx.shutdown` fires, and its handle is returned so
+        // `serve` can drain it.
 
         let storage_for_poller = self.engine.clone();
         let cp_notify = self.control_plane_notify.clone();
         let catalog_store = ctx.catalog_store.clone();
+        let token = ctx.shutdown.clone();
         let control_plane = tokio::spawn(async move {
-            workers::poll_control_plane_transitions(storage_for_poller, cp_notify, catalog_store)
-                .await;
+            workers::poll_control_plane_transitions(
+                storage_for_poller,
+                cp_notify,
+                catalog_store,
+                token,
+            )
+            .await;
         });
 
         let engine_for_recovery = self.engine.clone();
+        let token = ctx.shutdown.clone();
         let transaction_recovery = tokio::spawn(async move {
             workers::poll_transaction_recovery(
                 engine_for_recovery,
                 std::time::Duration::from_secs(60),
                 std::time::Duration::from_secs(30),
+                token,
             )
             .await;
         });
@@ -113,24 +121,25 @@ impl ServerRuntimeHooks for CassandraRuntimeHooks {
             gsi_delay.store(ms, std::sync::atomic::Ordering::Relaxed);
         }
         let catalog_store_for_gsi = ctx.catalog_store.clone();
-        let gsi_delay_poller =
-            tokio::spawn(
-                async move { workers::poll_gsi_delay(catalog_store_for_gsi, gsi_delay).await },
-            );
+        let token = ctx.shutdown.clone();
+        let gsi_delay_poller = tokio::spawn(async move {
+            workers::poll_gsi_delay(catalog_store_for_gsi, gsi_delay, token).await;
+        });
 
         // GSI propagation workers (one per partition).
-        let guard = workers::spawn_gsi_workers(self.engine.clone());
-        let _ = self.gsi_worker_guard.set(guard);
+        let gsi_propagation = workers::spawn_gsi_workers_until(self.engine.clone(), &ctx.shutdown);
 
         // GSI backfill recovery worker.
         let engine_for_gsi_recovery = self.engine.clone();
         let gsi_backfill_notify = self.engine.gsi_backfill_notify.clone();
+        let token = ctx.shutdown.clone();
         let gsi_backfill_recovery = tokio::spawn(async move {
             workers::poll_gsi_backfill_recovery(
                 engine_for_gsi_recovery,
                 gsi_backfill_notify,
                 std::time::Duration::from_secs(120), // stale threshold
                 std::time::Duration::from_secs(60),  // scan interval backstop
+                token,
             )
             .await;
         });
@@ -170,7 +179,7 @@ impl ServerRuntimeHooks for CassandraRuntimeHooks {
                 .await;
         });
 
-        vec![
+        let mut handles = vec![
             control_plane,
             transaction_recovery,
             gsi_delay_poller,
@@ -179,7 +188,9 @@ impl ServerRuntimeHooks for CassandraRuntimeHooks {
             ttl_repair,
             ttl_audit,
             restore_sweep,
-        ]
+        ];
+        handles.extend(gsi_propagation);
+        handles
     }
 
     fn backend_info(&self) -> Option<String> {
@@ -401,7 +412,6 @@ fn server_components_factory(
         let runtime_hooks = Box::new(CassandraRuntimeHooks {
             engine: engine.clone(),
             control_plane_notify,
-            gsi_worker_guard: std::sync::OnceLock::new(),
             registration,
         });
 
