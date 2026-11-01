@@ -175,7 +175,9 @@ def main(binary: str, mongo_port: int, api_port: int) -> int:
             report(code == 1 and first_503 is not None and first_503 + 25 <= took <= first_503 + 50,
                    f"the server exited {code} {took:.0f} s after its database stopped answering, "
                    "25 to 50 s after its first 503", log)
-            report("registration" in log, "its last line names the lost registration", log)
+            last = next((line for line in reversed(log.splitlines()) if line.strip()), "")
+            report("registration" in last,
+                   f"its last line names the lost registration: {last.strip()[-300:]!r}", log)
             report(not os.path.exists(pid_file), "the server removed its PID file")
         else:
             report(False, "the server did not start for the pause check")
