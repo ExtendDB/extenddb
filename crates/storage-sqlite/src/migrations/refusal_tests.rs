@@ -775,3 +775,66 @@ async fn a_failed_pragma_after_a_commit_keeps_the_copy() {
         "the copy of a changed database was removed"
     );
 }
+
+/// A body and its ledger row commit together: when the row's insert fails
+/// after the body ran, none of the body's changes are left, and the id is
+/// still pending. Migration 2's body rewrites the policy this test stores.
+#[tokio::test]
+async fn a_failed_ledger_insert_leaves_nothing_of_the_body() {
+    let db = temp_db("ledger-insert");
+    load_dump(&db, DEV_0_1_14).await;
+    let location = db.to_string_lossy().into_owned();
+    let migrations = SqliteMigrations::open(&location).await.expect("open");
+    Runner::new(&migrations, RELEASE)
+        .migrate_through(MigrationId::Baseline)
+        .await
+        .expect("migration 1");
+    migrations.close().await;
+    let pool = plain_pool(&db).await;
+    let (account, user): (String, String) =
+        sqlx::query_as("SELECT account_id, user_name FROM iam_users LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .expect("an IAM user");
+    sqlx::query(
+        "INSERT INTO iam_policies (account_id, principal_type, principal_name, policy_name, \
+         policy_document) VALUES (?, 'user', ?, 'tagged', ?)",
+    )
+    .bind(&account)
+    .bind(&user)
+    .bind(
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"dynamodb:*","Resource":"*","Condition":{"StringEquals":{"dynamodb:ResourceTag/env":"prod"}}}]}"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("policy");
+    pool.close().await;
+    let document = "SELECT policy_document FROM iam_policies WHERE policy_name = 'tagged'";
+    let before = scalar(&db, document).await;
+
+    let migrations = SqliteMigrations::open(&location).await.expect("open");
+    migrations
+        .fail_insert_row
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let result = Runner::new(&migrations, RELEASE).migrate().await;
+    let result = migrations.discard_unused_copy(result);
+    migrations.close().await;
+    let err = result.expect_err("the insert fails");
+    assert!(err.to_string().contains("record migration 2"), "{err}");
+    assert_eq!(
+        scalar(&db, document).await,
+        before,
+        "the body's rewrite is left"
+    );
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM extenddb_migrations").await,
+        1
+    );
+    let CatalogStatus::Behind { pending, .. } = status(&db).await else {
+        panic!("migration 2 is pending");
+    };
+    assert_eq!(
+        pending[0].id,
+        MigrationId::ResourceTagConditionKeys.number()
+    );
+}

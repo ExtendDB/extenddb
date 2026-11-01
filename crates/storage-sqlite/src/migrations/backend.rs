@@ -56,7 +56,12 @@ impl HasManagementStore for SqliteStores {
 const APPLIED_AT: &str = "TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))";
 
 /// The ledger rows of the runner's connection, in SQLite's statements.
-struct Rows<'a>(&'a SqlitePool);
+struct Rows<'a> {
+    pool: &'a SqlitePool,
+    /// Tests make the ledger row's insert fail, after the body ran.
+    #[cfg(test)]
+    fail_insert: bool,
+}
 
 #[async_trait]
 impl LedgerWrites for Rows<'_> {
@@ -65,13 +70,20 @@ impl LedgerWrites for Rows<'_> {
     async fn create_ledger(&self) -> Result<(), MigrationError> {
         let ddl = sql_ledger_ddl(APPLIED_AT);
         sqlx::raw_sql(&ddl)
-            .execute(self.0)
+            .execute(self.pool)
             .await
             .map(|_| ())
             .map_err(|e| MigrationError::store(&ddl, e))
     }
 
     async fn insert_row(&self, row: &LedgerRow) -> Result<(), MigrationError> {
+        #[cfg(test)]
+        if self.fail_insert {
+            return Err(MigrationError::Store(format!(
+                "record migration {} {}: the test failed the insert",
+                row.id, row.name
+            )));
+        }
         sqlx::query(
             "INSERT INTO extenddb_migrations \
              (id, name, kind, checksum, outcome, notes, applied_by) \
@@ -84,7 +96,7 @@ impl LedgerWrites for Rows<'_> {
         .bind(row.outcome.as_str())
         .bind(&row.notes)
         .bind(&row.applied_by)
-        .execute(self.0)
+        .execute(self.pool)
         .await
         .map(|_| ())
         .map_err(|e| MigrationError::store(format!("record migration {} {}", row.id, row.name), e))
@@ -96,7 +108,7 @@ impl LedgerWrites for Rows<'_> {
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         )
         .bind(version.to_string())
-        .execute(self.0)
+        .execute(self.pool)
         .await
         .map(|_| ())
         .map_err(|e| MigrationError::store("write catalog_version", e))
@@ -123,6 +135,9 @@ pub struct SqliteMigrations {
     /// Tests make the pragma after a commit fail with this.
     #[cfg(test)]
     pub(crate) fail_restore: std::sync::atomic::AtomicBool,
+    /// Tests make the ledger row's insert fail after a body ran.
+    #[cfg(test)]
+    pub(crate) fail_insert_row: std::sync::atomic::AtomicBool,
 }
 
 impl SqliteMigrations {
@@ -280,6 +295,17 @@ impl SqliteMigrations {
             restore_failed: Mutex::new(None),
             #[cfg(test)]
             fail_restore: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_insert_row: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// The ledger writes on the runner's connection.
+    fn rows(&self) -> Rows<'_> {
+        Rows {
+            pool: &self.stores.pool,
+            #[cfg(test)]
+            fail_insert: self.fail_insert_row.load(Ordering::SeqCst),
         }
     }
 
@@ -418,7 +444,7 @@ impl SqliteMigrations {
             done.notes
                 .extend(super::postcheck::check(pool, super::BASELINE_EXPECTED).await?);
         }
-        record_rows(&Rows(pool), row, &done.notes, catalog_version).await?;
+        record_rows(&self.rows(), row, &done.notes, catalog_version).await?;
         Ok(done)
     }
 }
@@ -584,7 +610,7 @@ impl MigrationBackend for SqliteMigrations {
     }
 
     async fn write_catalog_version(&self, version: u32) -> Result<(), MigrationError> {
-        Rows(&self.stores.pool).write_version(version).await
+        self.rows().write_version(version).await
     }
 
     async fn delete_ledger_row(&self, _store: &StoreRef, id: u32) -> Result<(), MigrationError> {
