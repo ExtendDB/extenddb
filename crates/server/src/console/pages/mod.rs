@@ -45,6 +45,7 @@ use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Redirect, Response};
 
 use crate::console::ConsoleState;
+use crate::console::html;
 use crate::management::CallerIdentity;
 
 /// Session data returned by `require_session`: identity + CSRF token.
@@ -119,9 +120,10 @@ fn extract_session_token(headers: &HeaderMap) -> Option<String> {
     None
 }
 
-/// Format a `CallerIdentity` for display in the nav bar.
-fn identity_label(identity: &CallerIdentity) -> String {
-    match identity {
+/// Describe a `CallerIdentity` for the nav bar: its display label, and
+/// whether it is an admin, which decides the admin-only links.
+fn identity_label(identity: &CallerIdentity) -> html::NavIdentity {
+    let label = match identity {
         CallerIdentity::Admin(name) => format!("Admin: {name}"),
         CallerIdentity::IamUser {
             account_id,
@@ -129,6 +131,10 @@ fn identity_label(identity: &CallerIdentity) -> String {
         } => {
             format!("{account_id}/{user_name}")
         }
+    };
+    html::NavIdentity {
+        label,
+        is_admin: is_admin(identity),
     }
 }
 

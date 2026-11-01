@@ -5,8 +5,12 @@
 //!
 //! Renders a dashboard with line charts (D13), latency drill-down with
 //! p50/avg/p99 and operation selector (D14), control/data plane split (D15),
-//! availability chart (D16), admin vs user views (D17), and CSV/JSON
-//! data export (D19). Charts use inline `<canvas>` — no external deps.
+//! availability chart (D16), and CSV/JSON data export (D19). Charts use
+//! inline `<canvas>` and no external dependencies.
+//!
+//! The dashboard and its data feed are for admins only. The `metrics` table
+//! has no account column, so the feed holds the table names, index names,
+//! operations, request counts and latencies of every account.
 //!
 //! HTML and JS content live in `metrics_content` to stay under the 500-line
 //! file limit.
@@ -15,13 +19,14 @@ use std::sync::Arc;
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Redirect, Response};
+use extenddb_storage::management_store::MetricsStore;
 
 use crate::console::ConsoleState;
 use crate::console::html;
 use crate::management::CallerIdentity;
 
-use super::{identity_label, metrics_content, require_session};
+use super::{SessionData, identity_label, is_admin, metrics_content, require_session};
 
 /// Data plane operations (reads + writes on items).
 const DATA_OPS: &[&str] = &[
@@ -38,22 +43,25 @@ const DATA_OPS: &[&str] = &[
 ];
 
 /// GET /console/metrics — metrics dashboard.
+///
+/// Admin sessions only: an IAM-user session is redirected to the console
+/// dashboard.
 pub async fn metrics_page(State(state): State<Arc<ConsoleState>>, headers: HeaderMap) -> Response {
-    let session = match require_session(&headers, &state).await {
-        Ok(s) => s,
-        Err(redirect) => return redirect,
-    };
+    match require_session(&headers, &state).await {
+        Ok(session) => render_metrics_page(&session, &state.version_info),
+        Err(redirect) => redirect,
+    }
+}
+
+/// The dashboard page for `session`, or a redirect to the console dashboard
+/// when the session is not an admin's.
+fn render_metrics_page(session: &SessionData, version_info: &str) -> Response {
+    if !is_admin(&session.identity) {
+        return Redirect::to("/console").into_response();
+    }
 
     let nav = html::nav_bar(&identity_label(&session.identity));
     let breadcrumb = html::breadcrumb(&[("Console", Some("/console")), ("Metrics", None)]);
-
-    // D17: For non-admin users, inject their account_id so JS can filter.
-    let account_filter = match &session.identity {
-        CallerIdentity::IamUser { account_id, .. } => {
-            format!("const accountFilter = '{}';", html::escape(account_id))
-        }
-        CallerIdentity::Admin(_) => "const accountFilter = null;".to_owned(),
-    };
 
     // Build the data-ops list for JS to classify control vs data plane.
     let data_ops_js: String = DATA_OPS
@@ -65,7 +73,6 @@ pub async fn metrics_page(State(state): State<Arc<ConsoleState>>, headers: Heade
     let content = format!(
         "{breadcrumb}\n{html}\n<script>\n\
          const DATA_OPS = new Set([{data_ops_js}]);\n\
-         {account_filter}\n\
          {js}\n</script>",
         html = metrics_content::METRICS_HTML,
         js = metrics_content::METRICS_JS,
@@ -74,39 +81,62 @@ pub async fn metrics_page(State(state): State<Arc<ConsoleState>>, headers: Heade
         "Metrics",
         &nav,
         &content,
-        Some(&state.version_info),
+        Some(version_info),
         &session.csrf_token,
     ))
     .into_response()
 }
 
-/// GET /console/metrics-data — session-authed JSON metrics for the dashboard.
+/// GET /console/metrics-data: JSON metrics for the dashboard.
 ///
-/// Returns the same payload as the top-level `/metrics` (per-table
-/// CloudWatch-style dimensions), but is gated by a console **session** instead
-/// of admin Basic auth, so the browser dashboard can fetch it with its session
-/// cookie. Both routes require authentication while preserving the per-table
-/// dashboard.
+/// Returns the same payload as the top-level `/metrics`: per-table
+/// CloudWatch-style dimensions for every account. It authenticates with a
+/// console session cookie instead of admin Basic auth, so the browser
+/// dashboard can fetch it, and like `/metrics` it serves admins only. An
+/// IAM-user session gets HTTP 403 and no metric data.
 pub async fn metrics_data(
     State(state): State<Arc<ConsoleState>>,
     headers: HeaderMap,
     axum::extract::Query(params): axum::extract::Query<extenddb_core::metrics::MetricsQuery>,
 ) -> Response {
-    // Require a valid console session (same gate as the dashboard page).
-    if let Err(redirect) = require_session(&headers, &state).await {
-        return redirect;
+    match require_session(&headers, &state).await {
+        Ok(session) => {
+            metrics_json(
+                &session.identity,
+                state.catalog_store.as_ref(),
+                &state.metrics,
+                &params,
+            )
+            .await
+        }
+        Err(redirect) => redirect,
+    }
+}
+
+/// The metrics payload for `identity`, or HTTP 403 when the caller is not an
+/// admin. The refusal is returned before the store or the collector is read.
+async fn metrics_json(
+    identity: &CallerIdentity,
+    store: &dyn MetricsStore,
+    collector: &Arc<extenddb_core::metrics::MetricsCollector>,
+    params: &extenddb_core::metrics::MetricsQuery,
+) -> Response {
+    if !is_admin(identity) {
+        let body = serde_json::json!({
+            "__type": "AccessDeniedException",
+            "message": "Metrics are visible to admin users only",
+        });
+        return (StatusCode::FORBIDDEN, axum::Json(body)).into_response();
     }
 
-    match crate::metrics_endpoint::query_metrics_from_store(state.catalog_store.as_ref(), &params)
-        .await
-    {
+    match crate::metrics_endpoint::query_metrics_from_store(store, params).await {
         Ok(mut response) => {
-            // Enrich with in-memory latency segments (not persisted to DB) —
-            // mirrors the top-level `/metrics` handler.
+            // Add the in-memory latency segments, which are not persisted to
+            // the database, as the top-level `/metrics` handler does.
             let window = params
                 .window
                 .unwrap_or(extenddb_core::metrics::TimeWindow::Last5Minutes);
-            let seg_metrics = state.metrics.clone();
+            let seg_metrics = Arc::clone(collector);
             response.segments =
                 tokio::task::spawn_blocking(move || seg_metrics.query_segments(window))
                     .await
@@ -122,3 +152,7 @@ pub async fn metrics_data(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "metrics_pages_tests.rs"]
+mod tests;
