@@ -680,6 +680,26 @@ impl Bootstrapper for CassandraBootstrapper {
         })
     }
 
+    /// Read at `LOCAL_QUORUM`, since `init` finishes a catalog this answers
+    /// `false` for: at `ONE` a replica that missed the admin user's write
+    /// would read as empty.
+    async fn has_admin_user(&self) -> OpResult<bool> {
+        let keyspace = self.engine.catalog_keyspace();
+        let rows = self
+            .held
+            .request(
+                "Read the admin users",
+                crate::cassandra_util::query_rows_quorum::<extenddb_storage::error::StorageError>(
+                    &self.engine.session_arc(),
+                    &format!("SELECT admin_name FROM {keyspace}.admin_users LIMIT 1"),
+                    cdrs_tokio::query_values!(),
+                    "has_admin_user",
+                ),
+            )
+            .await?;
+        Ok(!rows.is_empty())
+    }
+
     async fn list_table_names(&self) -> OpResult<Vec<String>> {
         let keyspace = self.engine.catalog_keyspace();
 

@@ -838,3 +838,114 @@ async fn the_default_account_step_run_again_keeps_one_account_and_completes_its_
         CatalogStatus::Current { version: 4 }
     );
 }
+
+/// An `init` killed after its default account, before its admin user,
+/// leaves a catalog whose status is `Current` and that has no admin user,
+/// since the account's keyspace is migrated before its row. The next
+/// `init`, a new process, takes the keyspace as `init` does, and its steps
+/// under the lock run no migration, keep the key, create no second account
+/// and write the admin user; the `init` after that is refused as
+/// initialized.
+#[tokio::test]
+async fn init_finishes_a_catalog_stopped_before_its_admin_user() {
+    use extenddb_storage::bootstrapper::{
+        Bootstrapper, finishes_a_stopped_init, write_bootstrap_rows,
+    };
+    use extenddb_storage::migrations::run_with_status;
+
+    if helpers::skip_without_cassandra() {
+        return;
+    }
+    let session = session().await;
+    let (prefix, mut drops) = new_prefix("finish");
+    let migrations = CassandraCatalogMigrations;
+    let store = CassandraCatalogStore::catalog_only(session.clone(), prefix.clone());
+
+    // The stopped init.
+    let first = bootstrapper(&prefix).await;
+    let target = first.init_target();
+    first
+        .create_catalog_db()
+        .await
+        .expect("the catalog keyspace");
+    let lock = migrations.lock(&target, TIMEOUT).await.expect("lock");
+    let status = migrations
+        .status_under_lock(&lock, &target)
+        .await
+        .expect("status");
+    run_with_status(&migrations, &status, &lock, "test", RunKind::Create)
+        .await
+        .expect("create");
+    first.hold(&lock);
+    first.bootstrap_encryption_key().await.expect("key");
+    first.bootstrap_default_account().await.expect("account");
+    migrations.release(lock).await;
+    let key = store.get_setting("encryption_key").await.expect("read");
+    let accounts = store.list_all_accounts().await.expect("list");
+    assert_eq!(accounts.len(), 1, "{accounts:?}");
+    drops.0.push(format!("{prefix}_account_{}", accounts[0].0));
+    // `first` holds the lease of the lock it released, so its requests are
+    // refused; a bootstrapper of its own reads the admin users.
+    assert!(
+        !bootstrapper(&prefix)
+            .await
+            .has_admin_user()
+            .await
+            .expect("read")
+    );
+
+    // The next init finishes it.
+    let next = bootstrapper(&prefix).await;
+    next.create_catalog_db()
+        .await
+        .expect("init takes the existing catalog keyspace");
+    let lock = migrations.lock(&target, TIMEOUT).await.expect("lock");
+    let status = migrations
+        .status_under_lock(&lock, &target)
+        .await
+        .expect("status");
+    assert_eq!(status, CatalogStatus::Current { version: 4 });
+    assert!(
+        finishes_a_stopped_init(&next, &status)
+            .await
+            .expect("decided")
+    );
+    next.hold(&lock);
+    let admin = write_bootstrap_rows(&next, None, None).await.expect("rows");
+    next.record_data_connection()
+        .await
+        .expect("data connection");
+    migrations.release(lock).await;
+    assert_eq!(admin.username, "admin");
+    assert!(!admin.already_existed && admin.generated_password.is_some());
+    assert_eq!(
+        store.get_setting("encryption_key").await.expect("read"),
+        key
+    );
+    assert_eq!(store.list_all_accounts().await.expect("list"), accounts);
+
+    // The init after that is refused.
+    let last = bootstrapper(&prefix).await;
+    let lock = migrations.lock(&target, TIMEOUT).await.expect("lock");
+    let status = migrations
+        .status_under_lock(&lock, &target)
+        .await
+        .expect("status");
+    assert!(
+        !finishes_a_stopped_init(&last, &status)
+            .await
+            .expect("decided")
+    );
+    let refused = run_with_status(&migrations, &status, &lock, "test", RunKind::Create)
+        .await
+        .expect_err("refused");
+    migrations.release(lock).await;
+    assert!(
+        refused
+            .to_string()
+            .starts_with("the catalog is already initialized"),
+        "{refused}"
+    );
+    drop(drops);
+    helpers::flush_pending_drops(&session).await;
+}

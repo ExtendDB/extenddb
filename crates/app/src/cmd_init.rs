@@ -309,10 +309,13 @@ pub async fn run(args: InitArgs, release: &str) -> anyhow::Result<u8> {
 }
 
 /// `init` on a backend on the migration runner, all under the migration
-/// lock: the catalog's status, which must be `Uninitialized` (another `init`
-/// may have created the catalog while this one waited), then every
-/// migration, then the rows a server needs before it can start, then the
-/// data connection rows. Holding the lock through the rows keeps a server
+/// lock: the catalog's status, then every migration on a store that is not
+/// a catalog (`Uninitialized`), then the rows a server needs before it can
+/// start, then the data connection rows. A catalog whose migrations are all
+/// applied (`Current`) and that has no admin user, which an `init` that
+/// stopped after its migrations leaves, gets no migration and the rows it
+/// lacks; any other catalog is refused (another `init` may have created it
+/// while this one waited). Holding the lock through the rows keeps a server
 /// from starting on a catalog that has no encryption key yet. The target
 /// carries what the bootstrapper resolved from the command line, so the
 /// backend reads no flag itself.
@@ -321,7 +324,8 @@ async fn init_on_runner(
     migrations: &dyn extenddb_storage::migrations::CatalogMigrations,
     release: &str,
 ) -> anyhow::Result<extenddb_storage::bootstrapper::AdminBootstrapResult> {
-    use extenddb_storage::migrations::{RunKind, run_locked};
+    use extenddb_storage::bootstrapper::{finishes_a_stopped_init, write_bootstrap_rows};
+    use extenddb_storage::migrations::{RunKind, run_with_status};
 
     let target = bootstrapper.init_target();
     let lock = migrations
@@ -329,16 +333,29 @@ async fn init_on_runner(
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let result = async {
-        println!("--- Creating the catalog through its migrations...");
-        let report = run_locked(migrations, &target, &lock, release, RunKind::Create)
+        let status = migrations
+            .status_under_lock(&lock, &target)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        for note in &report.notes {
-            println!("    {note}");
+        if !finishes_a_stopped_init(bootstrapper, &status)
+            .await
+            .map_err(crate::cmd_migrate::op_err)?
+        {
+            println!("--- Creating the catalog through its migrations...");
+            let report = run_with_status(migrations, &status, &lock, release, RunKind::Create)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            for note in &report.notes {
+                println!("    {note}");
+            }
+            crate::util::print_applied(&report, "    ", "Applied", "migration");
         }
-        crate::util::print_applied(&report, "    ", "Applied", "migration");
         bootstrapper.hold(&lock);
-        let admin = write_bootstrap_rows(bootstrapper).await?;
+        let env_user = std::env::var("EXTENDDB_ADMIN_USER").ok();
+        let env_pass = std::env::var("EXTENDDB_ADMIN_PASSWORD").ok();
+        let admin = write_bootstrap_rows(bootstrapper, env_user.as_deref(), env_pass.as_deref())
+            .await
+            .map_err(crate::cmd_migrate::op_err)?;
         bootstrapper
             .record_data_connection()
             .await
@@ -350,29 +367,9 @@ async fn init_on_runner(
     result
 }
 
-/// The rows a server needs before it can start: encryption key, default
-/// account, admin user.
-async fn write_bootstrap_rows(
-    bootstrapper: &dyn extenddb_storage::bootstrapper::Bootstrapper,
-) -> anyhow::Result<extenddb_storage::bootstrapper::AdminBootstrapResult> {
-    bootstrapper
-        .bootstrap_encryption_key()
-        .await
-        .map_err(crate::cmd_migrate::op_err)?; // REQ-AUTH-010
-
-    bootstrapper
-        .bootstrap_default_account()
-        .await
-        .map_err(crate::cmd_migrate::op_err)?;
-
-    // REQ-AUTH-003
-    let env_user = std::env::var("EXTENDDB_ADMIN_USER").ok();
-    let env_pass = std::env::var("EXTENDDB_ADMIN_PASSWORD").ok();
-    bootstrapper
-        .bootstrap_admin_user(env_user.as_deref(), env_pass.as_deref())
-        .await
-        .map_err(crate::cmd_migrate::op_err)
-}
+#[cfg(test)]
+#[path = "cmd_init_tests.rs"]
+mod runner_tests;
 
 #[cfg(test)]
 mod tests {

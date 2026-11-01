@@ -77,6 +77,16 @@ pub trait Bootstrapper: Send + Sync {
         env_password: Option<&str>,
     ) -> OpResult<AdminBootstrapResult>;
 
+    /// Whether the catalog's `admin_users` table or collection holds a user.
+    /// `init` writes the admin user last, so a catalog whose migrations are
+    /// all applied and that has none is one an `init` stopped in, which
+    /// [`finishes_a_stopped_init`] has `init` finish. The default answers
+    /// `true`, so on a backend that does not read the table `init` refuses
+    /// such a catalog as an initialized one.
+    async fn has_admin_user(&self) -> OpResult<bool> {
+        Ok(true)
+    }
+
     /// List table names in the catalog (for destroy confirmation display).
     async fn list_table_names(&self) -> OpResult<Vec<String>>;
 
@@ -113,6 +123,50 @@ pub trait Bootstrapper: Send + Sync {
     /// Generate the backend-specific configuration subsection for extenddb.toml.
     /// Returns only the [`storage.backend_name`] section content, not the [storage] header.
     fn generate_backend_config_section(&self) -> String;
+}
+
+/// Whether `init`, holding the migration lock on a catalog whose status it
+/// read under the lock as `status`, finishes that catalog instead of
+/// refusing it as initialized: every migration is applied (`Current`) and
+/// the catalog has no admin user, the last of the rows `init` writes, which
+/// is what an `init` that stopped after its migrations leaves. `init` then
+/// runs no migration and writes the bootstrap rows the catalog lacks
+/// ([`write_bootstrap_rows`]). A catalog with an admin user is refused.
+///
+/// # Errors
+///
+/// The admin users cannot be read.
+pub async fn finishes_a_stopped_init(
+    bootstrapper: &dyn Bootstrapper,
+    status: &crate::migrations::CatalogStatus,
+) -> OpResult<bool> {
+    if !matches!(status, crate::migrations::CatalogStatus::Current { .. }) {
+        return Ok(false);
+    }
+    Ok(!bootstrapper.has_admin_user().await?)
+}
+
+/// The rows a server needs before it can start, in the order `init` writes
+/// them: the encryption key, the default account, the admin user. Each step
+/// writes its row only when the catalog lacks it, so on a catalog an earlier
+/// `init` stopped in this writes the rows that `init` did not.
+/// `admin_user` and `admin_password` come from `EXTENDDB_ADMIN_USER` and
+/// `EXTENDDB_ADMIN_PASSWORD`.
+///
+/// # Errors
+///
+/// As the backend's bootstrap steps.
+pub async fn write_bootstrap_rows(
+    bootstrapper: &dyn Bootstrapper,
+    admin_user: Option<&str>,
+    admin_password: Option<&str>,
+) -> OpResult<AdminBootstrapResult> {
+    bootstrapper.bootstrap_encryption_key().await?; // REQ-AUTH-010
+    bootstrapper.bootstrap_default_account().await?;
+    // REQ-AUTH-003
+    bootstrapper
+        .bootstrap_admin_user(admin_user, admin_password)
+        .await
 }
 
 use std::future::Future;
@@ -532,7 +586,8 @@ pub mod helpers {
 /// new required method is added, or a defaulted one loses its default, this
 /// stops compiling, which is the same breakage an out-of-tree backend crate
 /// would hit. It also pins object safety by boxing as `dyn Bootstrapper`, and
-/// checks that the defaulted `hold` is a usable no-op.
+/// checks that the defaulted `hold` is a usable no-op and that the defaulted
+/// `has_admin_user` keeps `init` refusing an initialized catalog.
 #[cfg(test)]
 mod out_of_tree_compat_tests {
     use super::*;
@@ -596,6 +651,21 @@ mod out_of_tree_compat_tests {
         fn generate_backend_config_section(&self) -> String {
             String::new()
         }
+    }
+
+    /// A backend that does not read its admin users takes the default
+    /// `has_admin_user`, under which `init` refuses a catalog whose
+    /// migrations are applied instead of finishing it.
+    #[tokio::test]
+    async fn has_admin_user_defaults_to_true_so_init_refuses_a_current_catalog() {
+        let bootstrapper = MinimalBootstrapper;
+        assert!(bootstrapper.has_admin_user().await.expect("answered"));
+        let current = crate::migrations::CatalogStatus::Current { version: 4 };
+        assert!(
+            !finishes_a_stopped_init(&bootstrapper, &current)
+                .await
+                .expect("decided")
+        );
     }
 
     /// A backend that keeps no lease takes the default `hold`, which keeps

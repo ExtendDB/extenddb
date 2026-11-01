@@ -380,3 +380,76 @@ async fn the_post_check_stops_a_different_shape_and_accepts_the_pre_release_one(
     assert_eq!(s.status().await, CatalogStatus::Current { version: LATEST });
     catalog.close().await;
 }
+
+/// An `init` stopped after its migrations and its encryption key leaves a
+/// catalog whose status is `Current` and that has no admin user. The next
+/// `init`'s steps keep the key and write the default account and the admin
+/// user; after that the catalog is not finished again, and `init` refuses it
+/// as initialized.
+#[tokio::test]
+async fn init_finishes_a_catalog_stopped_before_its_admin_user() {
+    use extenddb_storage::bootstrapper::{
+        BootstrapConfig, Bootstrapper, finishes_a_stopped_init, write_bootstrap_rows,
+    };
+    use extenddb_storage_postgres::PostgresBootstrapper;
+
+    let Some(base) = base_conn() else {
+        return skip("init finishes a stopped init");
+    };
+    let s = Scratch::new(&base, "pgm_finish").await;
+    let options = s.options();
+    let user = options.get_username().to_owned();
+    let password = url_password(&base);
+    let bootstrapper = PostgresBootstrapper::new(BootstrapConfig {
+        host: options.get_host().to_owned(),
+        port: options.get_port(),
+        admin_user: user.clone(),
+        admin_password: password.clone(),
+        app_user: user,
+        app_password: password.unwrap_or_default(),
+        catalog_db: s.catalog_name.clone(),
+        data_db: s.data_name.clone(),
+    });
+    migrate(&s.target(), RELEASE, std::time::Duration::from_secs(5))
+        .await
+        .expect("the migrations");
+    bootstrapper.bootstrap_encryption_key().await.expect("key");
+    let catalog = s.catalog().await;
+    let key = settings(&catalog).await.get("encryption_key").cloned();
+    assert!(key.is_some());
+    assert!(!bootstrapper.has_admin_user().await.expect("read"));
+
+    let status = s.status().await;
+    assert_eq!(status, CatalogStatus::Current { version: LATEST });
+    assert!(
+        finishes_a_stopped_init(&bootstrapper, &status)
+            .await
+            .expect("decided")
+    );
+    let admin = write_bootstrap_rows(&bootstrapper, None, None)
+        .await
+        .expect("rows");
+    bootstrapper
+        .record_data_connection()
+        .await
+        .expect("data connection");
+    assert_eq!(admin.username, "admin");
+    assert!(!admin.already_existed && admin.generated_password.is_some());
+    assert_eq!(settings(&catalog).await.get("encryption_key").cloned(), key);
+    assert_eq!(count(&catalog, "SELECT COUNT(*) FROM accounts").await, 1);
+    assert_eq!(count(&catalog, "SELECT COUNT(*) FROM admin_users").await, 1);
+    assert!(
+        !finishes_a_stopped_init(&bootstrapper, &s.status().await)
+            .await
+            .expect("decided"),
+        "a catalog with an admin user is refused"
+    );
+    catalog.close().await;
+}
+
+/// The password in a `postgresql://user:password@host:port` URL.
+fn url_password(url: &str) -> Option<String> {
+    let rest = url.split_once("://")?.1;
+    let (userinfo, _) = rest.split_once('@')?;
+    userinfo.split_once(':').map(|(_, p)| p.to_owned())
+}

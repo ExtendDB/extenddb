@@ -376,7 +376,24 @@ pub async fn run_locked(
     kind: RunKind,
 ) -> Result<RunReport, MigrationError> {
     let status = migrations.status_under_lock(lock, target).await?;
-    if let Some(refusal) = refusal(&status, kind) {
+    run_with_status(migrations, &status, lock, release, kind).await
+}
+
+/// [`run_locked`] for a caller that has read the status under `lock`
+/// itself, as `status`: `init`, which reads it first to decide whether it
+/// finishes a catalog an earlier `init` stopped in, and so reads it once.
+///
+/// # Errors
+///
+/// As [`run_locked`].
+pub async fn run_with_status(
+    migrations: &dyn CatalogMigrations,
+    status: &CatalogStatus,
+    lock: &HeldLock,
+    release: &str,
+    kind: RunKind,
+) -> Result<RunReport, MigrationError> {
+    if let Some(refusal) = refusal(status, kind) {
         return Err(refusal);
     }
     migrations.run(lock, release, kind).await

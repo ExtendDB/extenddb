@@ -41,7 +41,7 @@ pub use backend::{MigrationBackend, Step, StoreRef};
 pub use catalog::{
     AdminRole, CatalogMigrations, HeldLock, Listed, RunKind, StatusNote, Target, before_lock,
     binary_catalog_label, forget_locked, installed, policy_rewrite_lines, policy_rewrite_pending,
-    run_locked,
+    run_locked, run_with_status,
 };
 #[cfg(any(test, feature = "test-util"))]
 pub use checksum::check_released;

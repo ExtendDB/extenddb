@@ -347,6 +347,14 @@ impl Bootstrapper for PostgresBootstrapper {
         })
     }
 
+    async fn has_admin_user(&self) -> OpResult<bool> {
+        let pool = self.app_pool(&self.config.catalog_db).await?;
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM admin_users)")
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| OpError::Internal(format!("Check admin users: {e}")))
+    }
+
     async fn list_table_names(&self) -> OpResult<Vec<String>> {
         let Ok(pool) = self.app_pool(&self.config.catalog_db).await else {
             return Ok(Vec::new());

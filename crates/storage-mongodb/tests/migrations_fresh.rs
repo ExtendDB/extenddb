@@ -224,6 +224,80 @@ async fn init_refuses_another_programs_database_before_it_writes_anything() {
     }
 }
 
+/// An `init` stopped after its migrations and its encryption key, before
+/// its default account and its admin user, leaves a catalog whose status is
+/// `Current` and that has no admin user. The next `init`'s steps under the
+/// lock run no migration, keep the key and write the account and the admin
+/// user; after that a catalog with an admin user is not finished, and
+/// `init` refuses it as initialized.
+#[tokio::test(flavor = "multi_thread")]
+async fn init_finishes_a_catalog_stopped_before_its_admin_user() {
+    use extenddb_storage::bootstrapper::{
+        Bootstrapper, finishes_a_stopped_init, write_bootstrap_rows,
+    };
+    use extenddb_storage_mongodb::MongoBootstrapper;
+    use extenddb_storage_mongodb::migrations::status_holding;
+
+    let Some(uri) = server() else { return };
+    let d = Deployment::new(&uri, "finish").await;
+    let bootstrapper = MongoBootstrapper::for_target(&d.target)
+        .await
+        .expect("bootstrapper");
+    d.create().await;
+    bootstrapper.bootstrap_encryption_key().await.expect("key");
+    let key = d.setting("encryption_key").await.expect("a key");
+    assert!(!bootstrapper.has_admin_user().await.expect("read"));
+
+    let (held, target) = lock(&d.target, true, Duration::from_secs(10), Timing::PRODUCTION)
+        .await
+        .expect("lock");
+    let status = status_holding(&target, &held).await.expect("status");
+    assert_eq!(
+        status,
+        CatalogStatus::Current {
+            version: MigrationId::LATEST.number()
+        }
+    );
+    assert!(
+        finishes_a_stopped_init(&bootstrapper, &status)
+            .await
+            .expect("decided")
+    );
+    let admin = write_bootstrap_rows(&bootstrapper, None, None)
+        .await
+        .expect("rows");
+    bootstrapper
+        .record_data_connection()
+        .await
+        .expect("data connection");
+    held.release().await;
+    assert_eq!(admin.username, "admin");
+    assert!(!admin.already_existed && admin.generated_password.is_some());
+    assert_eq!(
+        d.setting("encryption_key").await,
+        Some(key),
+        "the key is kept"
+    );
+    assert_eq!(
+        Deployment::documents(&d.catalog(), "accounts").await.len(),
+        1
+    );
+    assert_eq!(
+        Deployment::documents(&d.catalog(), "admin_users")
+            .await
+            .len(),
+        1
+    );
+    assert!(bootstrapper.has_admin_user().await.expect("read"));
+    assert!(
+        !finishes_a_stopped_init(&bootstrapper, &d.status().await)
+            .await
+            .expect("decided"),
+        "a catalog with an admin user is refused"
+    );
+    d.drop_databases().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_fresh_store_gets_every_migration_and_the_expected_definitions() {
     let Some(uri) = server() else { return };

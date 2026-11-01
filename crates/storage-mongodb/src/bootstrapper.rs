@@ -13,12 +13,16 @@ use extenddb_storage::error::StorageError;
 use extenddb_storage::management_store::{OpError, OpResult};
 use extenddb_storage::migrations::HeldLock;
 
-use crate::migrations::{Lease, REQUEST_TIMEOUT};
+use crate::migrations::{CATALOG_DATABASE, DATA_DATABASE, Lease, REQUEST_TIMEOUT};
 
 /// `MongoDB` bootstrapper for init/destroy/migrate operations.
 pub struct MongoBootstrapper {
     client: mongodb::Client,
     connection_string: String,
+    /// The catalog database, [`CATALOG_DATABASE`] outside the tests.
+    catalog: String,
+    /// The data database, [`DATA_DATABASE`] outside the tests.
+    data: String,
     /// The lease of the migration lock `init` holds while it writes the
     /// bootstrap rows, set by [`Bootstrapper::hold`]; every row's requests
     /// check it first.
@@ -58,12 +62,34 @@ impl MongoBootstrapper {
         Ok(Self {
             client,
             connection_string,
+            catalog: CATALOG_DATABASE.to_owned(),
+            data: DATA_DATABASE.to_owned(),
+            lease: OnceLock::new(),
+        })
+    }
+
+    /// A bootstrapper for the deployment `target` names, whose databases
+    /// may have other names, for tests that share one server.
+    ///
+    /// # Errors
+    ///
+    /// The client cannot be built from the connection string.
+    #[cfg(feature = "test-util")]
+    pub async fn for_target(target: &crate::migrations::MongoTarget) -> Result<Self, StorageError> {
+        let client = crate::migrations::connect(&target.connection_string)
+            .await
+            .map_err(|e| StorageError::Connection(e.to_string()))?;
+        Ok(Self {
+            client,
+            connection_string: target.connection_string.clone(),
+            catalog: target.catalog.clone(),
+            data: target.data.clone(),
             lease: OnceLock::new(),
         })
     }
 
     fn catalog_db(&self) -> mongodb::Database {
-        self.client.database("extenddb_catalog")
+        self.client.database(&self.catalog)
     }
 
     /// Send one of `init`'s bootstrap requests as the runner sends a
@@ -95,7 +121,7 @@ impl MongoBootstrapper {
     }
 
     fn data_db(&self) -> mongodb::Database {
-        self.client.database("extenddb_data")
+        self.client.database(&self.data)
     }
 }
 
@@ -293,6 +319,14 @@ impl Bootstrapper for MongoBootstrapper {
         })
     }
 
+    async fn has_admin_user(&self) -> OpResult<bool> {
+        let admin_users = self.catalog_db().collection::<Document>("admin_users");
+        let found = self
+            .request("check for an admin user", admin_users.find_one(doc! {}))
+            .await?;
+        Ok(found.is_some())
+    }
+
     async fn list_table_names(&self) -> OpResult<Vec<String>> {
         use futures::TryStreamExt;
 
@@ -350,7 +384,7 @@ impl Bootstrapper for MongoBootstrapper {
     }
 
     fn catalog_database_name(&self) -> String {
-        "extenddb_catalog".to_string()
+        self.catalog.clone()
     }
 
     fn endpoint_info(&self) -> String {
@@ -358,7 +392,7 @@ impl Bootstrapper for MongoBootstrapper {
     }
 
     fn catalog_connection_url(&self) -> String {
-        format!("{}/extenddb_catalog", self.connection_string)
+        format!("{}/{}", self.connection_string, self.catalog)
     }
 
     /// The connection string the config file names, which the server uses
