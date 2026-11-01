@@ -250,17 +250,17 @@ class TestRateLimiting:
     def test_admin_wrong_password_is_counted_on_the_management_api(self):
         name, password = self._new_admin()
         for i in range(_LOCKOUT_THRESHOLD):
-            resp = self._get_as(self.address_a, "/management/admins", name, "wrongpassword")
+            resp = self._get_as(self.address_a, "/management/accounts", name, "wrongpassword")
             assert resp.status_code == 401, (
                 f"Expected 401 on attempt {i + 1}, got {resp.status_code}: {resp.text}"
             )
-        resp = self._get_as(self.address_a, "/management/admins", name, password)
+        resp = self._get_as(self.address_a, "/management/accounts", name, password)
         assert resp.status_code == 429, (
             f"Expected 429 for the right password after {_LOCKOUT_THRESHOLD} failures, "
             f"got {resp.status_code}: {resp.text}"
         )
 
-        resp = self._get_as(self.address_b, "/management/admins", name, password)
+        resp = self._get_as(self.address_b, "/management/accounts", name, password)
         assert resp.status_code == 200, (
             f"Expected 200 from another address, got {resp.status_code}: {resp.text}"
         )
