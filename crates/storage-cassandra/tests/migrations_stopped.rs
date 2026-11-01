@@ -554,3 +554,99 @@ async fn the_status_read_under_the_lock_keeps_it_through_a_long_scan() {
     );
     kept.expect("the status read kept the lock");
 }
+
+/// Both forms on one key with different values, which migration 2 refuses.
+const COLLIDING: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"dynamodb:*","Resource":"*","Condition":{"StringEquals":{"dynamodb:ResourceTag/env":"prod","aws:ResourceTag/env":"dev"}}}]}"#;
+
+/// From 1.0 on a `dynamodb:ResourceTag` key written through the API has no
+/// effect, as on the service. Migration 2 is not convergent, so a reconverge
+/// leaves the policies written after it, in each place a policy is stored,
+/// with the text they were written with, one that names both forms of a key
+/// included, and names migration 2 as skipped.
+#[tokio::test]
+async fn a_reconverge_leaves_policies_written_after_migration_2_as_they_are() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
+    let session = session().await;
+    let (prefix, _drops) = new_prefix("m2rc");
+    released_catalog(&session, &prefix).await;
+    let (done, _) =
+        run_stopped_after(&session, &prefix, usize::MAX, false, MigrationId::LATEST).await;
+    done.expect("migrate");
+    let store = CassandraCatalogStore::catalog_only(session.clone(), prefix.clone());
+    let tagged: serde_json::Value = serde_json::from_str(TAGGED).expect("json");
+    let colliding: serde_json::Value = serde_json::from_str(COLLIDING).expect("json");
+    for (principal_type, name, policy) in [
+        ("user", "dev", "tagged-user"),
+        ("group", "devs", "tagged-group"),
+        ("role", "app", "tagged-role"),
+    ] {
+        store
+            .put_policy(ACCOUNT, principal_type, name, policy, &tagged)
+            .await
+            .expect("policy");
+    }
+    store
+        .put_policy(ACCOUNT, "user", "dev", "both-forms", &colliding)
+        .await
+        .expect("policy");
+    store
+        .set_user_boundary(ACCOUNT, "dev", &tagged)
+        .await
+        .expect("user boundary");
+    store
+        .set_role_boundary(ACCOUNT, "app", &tagged)
+        .await
+        .expect("role boundary");
+    let before = policies(&store).await;
+    assert_eq!(
+        before.matches("dynamodb:ResourceTag/env").count(),
+        6,
+        "{before}"
+    );
+    // What a release before 1.0 leaves when it writes to a migrated catalog.
+    cql(
+        &session,
+        &format!(
+            "INSERT INTO {prefix}_catalog.settings (key, value) VALUES \
+             ('resource_tag_migration', 'applied')"
+        ),
+    )
+    .await;
+    assert_eq!(
+        catalog_status(session.clone(), &prefix)
+            .await
+            .expect("status")
+            .label(),
+        "WrittenByOlderRelease"
+    );
+
+    let catalog = format!("{prefix}_catalog");
+    let lock = MigrationLock::acquire(session.clone(), &catalog, LeaseTimes::DEFAULT, TIMEOUT)
+        .await
+        .expect("take the lock");
+    let report = {
+        let migrations = CassandraMigrations::locked(&lock, &prefix);
+        Runner::new(&migrations, "test").reconverge().await
+    };
+    lock.release().await;
+    let report = report.expect("reconverge");
+    assert!(report.applied.iter().all(|step| step.id != 2), "{report:?}");
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.starts_with("Skipped 2 resource_tag_condition_keys:")),
+        "{report:?}"
+    );
+    assert_eq!(
+        catalog_status(session.clone(), &prefix)
+            .await
+            .expect("status"),
+        CatalogStatus::Current {
+            version: MigrationId::LATEST.number()
+        }
+    );
+    assert_eq!(policies(&store).await, before);
+}

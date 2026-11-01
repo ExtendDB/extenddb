@@ -55,7 +55,7 @@ fn every_body_is_code_and_three_and_four_do_not_apply() {
         assert!(!reason.is_empty(), "{id}");
     }
     assert!(migration(MigrationId::Baseline).convergent());
-    assert!(migration(MigrationId::ResourceTagConditionKeys).convergent());
+    assert!(!migration(MigrationId::ResourceTagConditionKeys).convergent());
 }
 
 /// The lock, the registrations and the ledgers are read and written through

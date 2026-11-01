@@ -311,3 +311,94 @@ async fn migration_1_upgrades_the_oldest_release_as_the_golden_file_records() {
     );
     d.drop_databases().await;
 }
+
+/// From 1.0 on a `dynamodb:ResourceTag` key written through the API has no
+/// effect, as on the service. Migration 2 is not convergent, so a reconverge
+/// leaves the policies written after it with the text they were written
+/// with, one that names both forms of a key, which the rewrite refuses,
+/// included, and names migration 2 as skipped.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reconverge_leaves_policies_written_after_migration_2_as_they_are() {
+    let Some(uri) = server() else { return };
+    let d = Deployment::new(&uri, "reconverge2").await;
+    fixture::load(&d, &fixture::read("0.1.14")).await;
+    d.migrate().await.expect("migrate");
+    let account = Deployment::documents(&d.catalog(), "accounts").await[0]
+        .get_str("_id")
+        .unwrap()
+        .to_owned();
+    let tagged = doc! { "Version": "2012-10-17", "Statement": [{
+        "Effect": "Deny", "Action": "dynamodb:*", "Resource": "*",
+        "Condition": { "StringEquals": { "dynamodb:ResourceTag/env": "prod" } },
+    }] };
+    let both_forms = doc! { "Version": "2012-10-17", "Statement": [{
+        "Effect": "Deny", "Action": "dynamodb:*", "Resource": "*",
+        "Condition": { "StringEquals": {
+            "dynamodb:ResourceTag/env": "prod", "aws:ResourceTag/env": "dev",
+        } },
+    }] };
+    d.catalog()
+        .collection::<Document>("iam_users")
+        .insert_one(doc! {
+            "account_id": &account, "user_name": "after",
+            "user_arn": format!("arn:aws:iam::{account}:user/after"),
+            "created_at": bson::DateTime::from_millis(1_793_235_168_000),
+        })
+        .await
+        .unwrap();
+    for (name, document) in [("tagged-after", &tagged), ("both-forms-after", &both_forms)] {
+        d.catalog()
+            .collection::<Document>("iam_policies")
+            .insert_one(doc! {
+                "account_id": &account, "principal_type": "user", "principal_name": "after",
+                "policy_name": name, "policy_document": document,
+                "created_at": bson::DateTime::from_millis(1_793_235_168_000),
+            })
+            .await
+            .unwrap();
+    }
+    let documents = |policies: Vec<Document>| -> Vec<String> {
+        policies
+            .iter()
+            .map(|p| {
+                format!(
+                    "{} {}",
+                    p.get_str("policy_name").unwrap(),
+                    p.get_document("policy_document").unwrap()
+                )
+            })
+            .collect()
+    };
+    let before = documents(Deployment::documents(&d.catalog(), "iam_policies").await);
+    assert_eq!(
+        before
+            .iter()
+            .filter(|p| p.contains("dynamodb:ResourceTag/env"))
+            .count(),
+        2,
+        "{before:?}"
+    );
+    // What a release before 1.0 leaves when it writes to a migrated catalog.
+    d.catalog()
+        .collection::<Document>("settings")
+        .insert_one(doc! { "_id": "resource_tag_migration", "value": "applied" })
+        .await
+        .unwrap();
+    assert_eq!(d.status().await.label(), "WrittenByOlderRelease");
+
+    let report = d.reconverge().await.expect("reconverge");
+    assert!(report.applied.iter().all(|step| step.id != 2), "{report:?}");
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.starts_with("Skipped 2 resource_tag_condition_keys:")),
+        "{report:?}"
+    );
+    assert_eq!(d.status().await, CatalogStatus::Current { version: 4 });
+    assert_eq!(
+        documents(Deployment::documents(&d.catalog(), "iam_policies").await),
+        before
+    );
+    d.drop_databases().await;
+}

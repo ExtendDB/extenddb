@@ -165,7 +165,19 @@ async fn a_second_run_applies_nothing_and_reconverge_keeps_the_rows() {
     assert_eq!((again.from, again.to), (Some(4), Some(4)));
 
     let reconverged = d.reconverge().await.expect("reconverge");
-    assert_eq!(reconverged.applied.len(), 5);
+    // Every step but migration 2's, which is not convergent.
+    assert_eq!(reconverged.applied.len(), 4, "{reconverged:?}");
+    assert!(
+        reconverged.applied.iter().all(|step| step.id != 2),
+        "{reconverged:?}"
+    );
+    assert!(
+        reconverged
+            .notes
+            .iter()
+            .any(|n| n.starts_with("Skipped 2 resource_tag_condition_keys:")),
+        "{reconverged:?}"
+    );
     assert_eq!(
         d.catalog_ledger().await,
         before,

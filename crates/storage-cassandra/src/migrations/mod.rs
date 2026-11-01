@@ -98,7 +98,10 @@ pub fn migration(id: MigrationId) -> Migration<CassandraStores> {
         },
         MigrationId::ResourceTagConditionKeys => Migration::Applies {
             kind: Kind::Breaking,
-            convergent: true,
+            // A `dynamodb:ResourceTag` key written through the API after the
+            // rewrite has no effect, as on the service; running the rewrite
+            // again would give it one.
+            convergent: false,
             bodies: vec![StoreBody::code(
                 StoreKind::Catalog,
                 &ResourceTagConditionKeys,
