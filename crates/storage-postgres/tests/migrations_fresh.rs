@@ -300,17 +300,28 @@ async fn the_post_check_stops_a_different_shape_and_accepts_the_pre_release_one(
     let s = Scratch::new(&base, "pgm_post").await;
     s.load("0.1.14").await;
     let catalog = s.catalog().await;
-    sqlx::query("ALTER TABLE accounts ADD COLUMN extra TEXT NOT NULL DEFAULT 'x'")
-        .execute(&catalog)
-        .await
-        .unwrap();
+    sqlx::raw_sql(
+        "ALTER TABLE accounts ADD COLUMN extra TEXT NOT NULL DEFAULT 'x'; \
+         ALTER TABLE accounts ALTER COLUMN created_at SET DEFAULT '2020-01-01 00:00:00+00'",
+    )
+    .execute(&catalog)
+    .await
+    .unwrap();
     let err = migrate(&s.target(), RELEASE, std::time::Duration::from_secs(5))
         .await
         .expect_err("refused");
+    let message = err.to_string();
     assert!(
-        err.to_string()
-            .contains("column accounts.extra is not part of the v1.0 schema"),
-        "{err}"
+        message.contains("differs from the v1.0 schema in 2 place(s)")
+            && message.contains("column accounts.extra is not part of the v1.0 schema; drop it")
+            && message.contains("column accounts.created_at has default '2020-01-01")
+            && message.contains(
+                "where v1.0 has now(); change it to timestamp with time zone NOT NULL DEFAULT \
+                 now()"
+            )
+            && message.contains("then run migrate --yes again")
+            && !message.contains("Column {"),
+        "{message}"
     );
     assert_eq!(
         count(
@@ -334,10 +345,13 @@ async fn the_post_check_stops_a_different_shape_and_accepts_the_pre_release_one(
         .await,
         0
     );
-    sqlx::query("ALTER TABLE accounts DROP COLUMN extra")
-        .execute(&catalog)
-        .await
-        .unwrap();
+    sqlx::raw_sql(
+        "ALTER TABLE accounts DROP COLUMN extra; \
+         ALTER TABLE accounts ALTER COLUMN created_at SET DEFAULT now()",
+    )
+    .execute(&catalog)
+    .await
+    .unwrap();
 
     // The pre-release revision of legacy 003, then migrate.
     sqlx::raw_sql(include_str!("fixtures/003_backup_definitions_earlier.sql"))
