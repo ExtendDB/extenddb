@@ -11,9 +11,9 @@ license.workspace = true
 # Compiles the snapshot page-size setter the consistency test uses and the
 # shared conformance check. Production builds do not compile them.
 test-hooks = ["extenddb-storage/test-hooks"]
-# Test hooks: the runner without a lock, the lock and the registration with
-# another keepalive interval, the serving session's settings, and the
-# post-check's definitions.
+# Test hooks: the runner without a lock and its catalog connection, the lock
+# and the registration with another keepalive interval, the serving
+# session's settings, and the post-check's definitions.
 test-util = ["extenddb-storage/test-util"]
 
 [dev-dependencies]

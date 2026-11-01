@@ -30,6 +30,9 @@ use super::{MigrationLock, PostgresTarget, catalog_status, migrate_holding};
 /// SQLSTATE `insufficient_privilege`.
 const INSUFFICIENT_PRIVILEGE: &str = "42501";
 
+/// How long [`CatalogMigrations::data_store_name`] waits for the catalog.
+const NAME_LOOKUP: Duration = Duration::from_secs(2);
+
 /// The PostgreSQL backend's catalog migrations for the commands.
 pub struct PostgresCatalogMigrations;
 
@@ -64,6 +67,22 @@ impl CatalogMigrations for PostgresCatalogMigrations {
                  database"
             ),
         }
+    }
+
+    /// `--data-db` when given, else the data database [`resolve`] finds:
+    /// the catalog's `data_database_name` row, or the catalog's name without
+    /// its `_catalog` suffix. The read is bounded by [`NAME_LOOKUP`], since
+    /// the name only completes the backup clause and an unreachable catalog
+    /// is reported by the status read that follows.
+    async fn data_store_name(&self, target: &Target) -> Option<String> {
+        if target.data_store.is_some() {
+            return target.data_store.clone();
+        }
+        tokio::time::timeout(NAME_LOOKUP, resolve(target))
+            .await
+            .ok()?
+            .ok()?
+            .map(|resolved| resolved.data_database)
     }
 
     async fn status(&self, target: &Target) -> Result<CatalogStatus, MigrationError> {
@@ -307,5 +326,25 @@ mod tests {
             "{advice}"
         );
         assert!(!advice.contains(":p@"), "{advice}");
+    }
+
+    /// A catalog that accepts the connection and never answers gives no
+    /// name, after the lookup's bound and not the connect timeout of 10 s.
+    #[tokio::test]
+    async fn a_catalog_that_does_not_answer_gives_no_data_database_name() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a listener");
+        let port = listener.local_addr().expect("its address").port();
+        let target = Target::at(format!("postgresql://u:p@127.0.0.1:{port}/acme_catalog"));
+        let started = std::time::Instant::now();
+        assert_eq!(
+            PostgresCatalogMigrations.data_store_name(&target).await,
+            None
+        );
+        let took = started.elapsed();
+        assert!(
+            took >= super::NAME_LOOKUP && took < std::time::Duration::from_secs(6),
+            "{took:?}"
+        );
+        drop(listener);
     }
 }

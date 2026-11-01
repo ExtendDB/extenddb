@@ -29,8 +29,8 @@ use async_trait::async_trait;
 use extenddb_storage::management_store::ManagementStore;
 use extenddb_storage::migrations::{
     CatalogTraces, Done, HasManagementStore, LedgerColumns, LedgerRow, LedgerWrites, Migration,
-    MigrationBackend, MigrationError, MigrationId, Released, RunReport, Step, StoreKind, StoreRef,
-    in_transaction, record_rows, sql_ledger_ddl,
+    MigrationBackend, MigrationError, MigrationId, Released, RunReport, Runner, Step, StoreKind,
+    StoreRef, in_transaction, record_rows, sql_ledger_ddl,
 };
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{ConnectOptions, Connection, SqlitePool};
@@ -56,7 +56,12 @@ impl HasManagementStore for SqliteStores {
 const APPLIED_AT: &str = "TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))";
 
 /// The ledger rows of the runner's connection, in SQLite's statements.
-struct Rows<'a>(&'a SqlitePool);
+struct Rows<'a> {
+    pool: &'a SqlitePool,
+    /// Tests make the ledger row's insert fail, after the body ran.
+    #[cfg(test)]
+    fail_insert: bool,
+}
 
 #[async_trait]
 impl LedgerWrites for Rows<'_> {
@@ -65,13 +70,20 @@ impl LedgerWrites for Rows<'_> {
     async fn create_ledger(&self) -> Result<(), MigrationError> {
         let ddl = sql_ledger_ddl(APPLIED_AT);
         sqlx::raw_sql(&ddl)
-            .execute(self.0)
+            .execute(self.pool)
             .await
             .map(|_| ())
             .map_err(|e| MigrationError::store(&ddl, e))
     }
 
     async fn insert_row(&self, row: &LedgerRow) -> Result<(), MigrationError> {
+        #[cfg(test)]
+        if self.fail_insert {
+            return Err(MigrationError::Store(format!(
+                "record migration {} {}: the test failed the insert",
+                row.id, row.name
+            )));
+        }
         sqlx::query(
             "INSERT INTO extenddb_migrations \
              (id, name, kind, checksum, outcome, notes, applied_by) \
@@ -84,7 +96,7 @@ impl LedgerWrites for Rows<'_> {
         .bind(row.outcome.as_str())
         .bind(&row.notes)
         .bind(&row.applied_by)
-        .execute(self.0)
+        .execute(self.pool)
         .await
         .map(|_| ())
         .map_err(|e| MigrationError::store(format!("record migration {} {}", row.id, row.name), e))
@@ -96,7 +108,7 @@ impl LedgerWrites for Rows<'_> {
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         )
         .bind(version.to_string())
-        .execute(self.0)
+        .execute(self.pool)
         .await
         .map(|_| ())
         .map_err(|e| MigrationError::store("write catalog_version", e))
@@ -113,6 +125,9 @@ pub struct SqliteMigrations {
     owned: bool,
     /// The copy this run took before its first write, if it took one.
     copy: Mutex<Option<PathBuf>>,
+    /// The lines naming the earlier copies this run's copy replaced,
+    /// reported with the run, also when it stops before its first commit.
+    replaced: Mutex<Vec<String>>,
     /// The lines naming the partial copies of stopped runs that opening the
     /// database for writing removed, reported with the run.
     removed: Mutex<Vec<String>>,
@@ -123,6 +138,9 @@ pub struct SqliteMigrations {
     /// Tests make the pragma after a commit fail with this.
     #[cfg(test)]
     pub(crate) fail_restore: std::sync::atomic::AtomicBool,
+    /// Tests make the ledger row's insert fail after a body ran.
+    #[cfg(test)]
+    pub(crate) fail_insert_row: std::sync::atomic::AtomicBool,
 }
 
 impl SqliteMigrations {
@@ -276,10 +294,40 @@ impl SqliteMigrations {
             file,
             owned,
             copy: Mutex::new(None),
+            replaced: Mutex::new(Vec::new()),
             removed: Mutex::new(Vec::new()),
             restore_failed: Mutex::new(None),
             #[cfg(test)]
             fail_restore: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_insert_row: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// [`Runner::forget`] in one transaction, so the ledger row and the
+    /// version row change together.
+    ///
+    /// # Errors
+    ///
+    /// As [`Runner::forget`]; the database is then as it was.
+    pub(crate) async fn forget(&self, id: u32) -> Result<(), MigrationError> {
+        in_transaction(
+            self.exec("BEGIN IMMEDIATE"),
+            Runner::new(self, "").forget(id),
+            self.exec("COMMIT"),
+            async {
+                let _ = self.exec("ROLLBACK").await;
+            },
+        )
+        .await
+    }
+
+    /// The ledger writes on the runner's connection.
+    fn rows(&self) -> Rows<'_> {
+        Rows {
+            pool: &self.stores.pool,
+            #[cfg(test)]
+            fail_insert: self.fail_insert_row.load(Ordering::SeqCst),
         }
     }
 
@@ -293,7 +341,8 @@ impl SqliteMigrations {
 
     /// `result` as the caller reports it: a run that stopped before it
     /// committed anything left the database as it was, so the copy it took
-    /// is removed and the error is returned alone. A run whose last step
+    /// is removed, and the error is returned with the lines naming the files
+    /// the run removed, or alone when it removed none. A run whose last step
     /// committed and whose pragma after it failed stops with that error and
     /// keeps its copy. A report starts with the partial copies of stopped
     /// runs that opening the database removed.
@@ -310,34 +359,40 @@ impl SqliteMigrations {
         };
         let removed =
             std::mem::take(&mut *self.removed.lock().unwrap_or_else(PoisonError::into_inner));
-        let result = match result {
+        let replaced =
+            std::mem::take(&mut *self.replaced.lock().unwrap_or_else(PoisonError::into_inner));
+        match result {
             Ok(mut report) => {
                 report.notes.splice(0..0, removed);
+                report.notes.extend(replaced);
                 Ok(report)
             }
-            Err(MigrationError::Stopped { error, mut report }) => {
-                report.notes.splice(0..0, removed);
-                Err(MigrationError::Stopped { error, report })
-            }
-            other => other,
-        };
-        match result {
             Err(MigrationError::Stopped { error, report }) if report.applied.is_empty() => {
+                // The run's own notes name the copy removed here, so only
+                // the lines naming the other files it removed are kept.
                 let copy = self
                     .copy
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .take();
-                match copy.map(|copy| super::copy::remove_copy(&copy)) {
-                    Some(Err(note)) => Err(MigrationError::Stopped {
-                        error,
-                        report: RunReport {
-                            notes: vec![note],
-                            ..report
-                        },
-                    }),
-                    _ => Err(*error),
+                let mut notes = removed;
+                notes.extend(replaced);
+                if let Some(Err(note)) = copy.map(|copy| super::copy::remove_copy(&copy)) {
+                    notes.push(note);
                 }
+                if notes.is_empty() {
+                    Err(*error)
+                } else {
+                    Err(MigrationError::Stopped {
+                        error,
+                        report: RunReport { notes, ..report },
+                    })
+                }
+            }
+            Err(MigrationError::Stopped { error, mut report }) => {
+                report.notes.splice(0..0, removed);
+                report.notes.extend(replaced);
+                Err(MigrationError::Stopped { error, report })
             }
             other => other,
         }
@@ -418,7 +473,7 @@ impl SqliteMigrations {
             done.notes
                 .extend(super::postcheck::check(pool, super::BASELINE_EXPECTED).await?);
         }
-        record_rows(&Rows(pool), row, &done.notes, catalog_version).await?;
+        record_rows(&self.rows(), row, &done.notes, catalog_version).await?;
         Ok(done)
     }
 }
@@ -531,10 +586,18 @@ impl MigrationBackend for SqliteMigrations {
             &self.stores.pool,
             file,
             &copy,
-            super::copy::free_space,
-            |_| {},
+            super::copy::Hooks::RUN,
         )
         .await?;
+        // An earlier copy with the same bytes holds nothing this copy does
+        // not, so it is removed now, before the run's first commit: a crash
+        // loop that kills each run before that commit then leaves one copy,
+        // not one per run.
+        let replaced = super::copy::remove_superseded(file, &copy).await;
+        self.replaced
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(replaced);
         *self.copy.lock().unwrap_or_else(PoisonError::into_inner) = Some(copy);
         Ok(lines)
     }
@@ -584,7 +647,7 @@ impl MigrationBackend for SqliteMigrations {
     }
 
     async fn write_catalog_version(&self, version: u32) -> Result<(), MigrationError> {
-        Rows(&self.stores.pool).write_version(version).await
+        self.rows().write_version(version).await
     }
 
     async fn delete_ledger_row(&self, _store: &StoreRef, id: u32) -> Result<(), MigrationError> {

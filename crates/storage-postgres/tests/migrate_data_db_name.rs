@@ -273,3 +273,34 @@ async fn a_catalog_without_a_recorded_name_falls_back_to_the_derivation() {
     );
     drop(d);
 }
+
+/// The commands give the backup clause the data database the catalog
+/// records, through `data_store_name`, when no `--data-db` is given; a given
+/// name wins.
+#[tokio::test]
+async fn the_backup_advice_names_the_recorded_data_database() {
+    let Some(_) = base_conn() else {
+        skip_unless_required();
+        return;
+    };
+    let d = Deployment::new().await;
+    let name = PostgresCatalogMigrations
+        .data_store_name(&d.target(None))
+        .await;
+    assert_eq!(name.as_deref(), Some(d.data_db.as_str()));
+    let advice = PostgresCatalogMigrations.backup_advice(&Target {
+        data_store: name,
+        ..d.target(None)
+    });
+    assert!(
+        advice.ends_with(&format!("and the data database {}", d.data_db)),
+        "{advice}"
+    );
+    assert_eq!(
+        PostgresCatalogMigrations
+            .data_store_name(&d.target(Some(&d.derived_db)))
+            .await,
+        Some(d.derived_db.clone())
+    );
+    drop(d);
+}

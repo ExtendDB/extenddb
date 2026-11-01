@@ -439,15 +439,15 @@ async fn a_rebuild_of_tables_keeps_its_index_shard_and_stream_rows() {
     assert_eq!(children(&control).await, (0, 0, 0));
 }
 
+/// The copy is owner-only whatever the database's mode: 0644 is the mode of
+/// a catalog that 0.1.x `init` created and no server opened.
 #[cfg(unix)]
 #[tokio::test]
-async fn the_copy_has_the_database_mode_and_a_name_no_run_reuses() {
+async fn the_copy_is_owner_only_and_has_a_name_no_run_reuses() {
     use std::os::unix::fs::PermissionsExt;
     let db = temp_db("copy");
     load_dump(&db, DEV_0_1_14).await;
-    // A mode a plain VACUUM INTO, which creates the file from 0644 less the
-    // umask, cannot produce.
-    std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o660)).expect("chmod");
+    std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).expect("chmod");
     let report = run(&db).await.expect("migrate");
     let found = copies(&db);
     assert_eq!(found.len(), 1, "{found:?}");
@@ -471,7 +471,7 @@ async fn the_copy_has_the_database_mode_and_a_name_no_run_reuses() {
         "{report:?}"
     );
     let mode = std::fs::metadata(copy).expect("copy").permissions().mode() & 0o777;
-    assert_eq!(mode, 0o660, "the copy has the database's mode");
+    assert_eq!(mode, 0o600, "the copy is owner-only");
     assert_eq!(
         version_row(copy).await.as_deref(),
         Some("0.0.3"),

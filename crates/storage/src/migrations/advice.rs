@@ -21,13 +21,17 @@ pub struct Advice<'a> {
     /// The config file the commands were given, as an absolute path; `None`
     /// when the command ran without one (a dev-mode server configured by
     /// `EXTENDDB__` variables), so the advised command names none either.
+    /// The advised command quotes it for a POSIX shell.
     pub config: Option<&'a str>,
     /// The backend's
     /// [`location_assignment`](super::CatalogMigrations::location_assignment)
-    /// when there is no config file, or when the environment named the
-    /// store over the config file's location: the advised command starts
-    /// with it, so it acts on this deployment's store wherever it runs and
-    /// whatever `extenddb.toml` the directory holds.
+    /// when there is no config file, when the environment named the store
+    /// over the config file's location, or when the config file does not
+    /// name the store by its absolute location (a relative location, or
+    /// none, resolves against the directory the command runs in): the
+    /// advised command starts with it, so it acts on this deployment's
+    /// store wherever it runs and whatever `extenddb.toml` the directory
+    /// holds.
     pub assignment: Option<&'a str>,
 }
 
@@ -37,10 +41,55 @@ impl Advice<'_> {
             .assignment
             .map_or_else(String::new, |a| format!("{a} "));
         match self.config {
-            Some(config) => format!("  {assignment}extenddb migrate --config {config} {flags}"),
+            Some(config) => format!(
+                "  {assignment}extenddb migrate --config {} {flags}",
+                shell_word(config)
+            ),
             None => format!("  {assignment}extenddb migrate {flags}"),
         }
     }
+}
+
+/// `word` as one word of a POSIX shell command: as it is when every
+/// character is one a shell leaves alone, else in single quotes, with each
+/// single quote in it written as `'\''`.
+#[must_use]
+pub fn shell_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/._-+:@%".contains(&b));
+    if plain {
+        word.to_owned()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
+}
+
+/// Whether the config file at `path` names the store by its absolute
+/// `location`: a value in one of its `[storage.<backend>]` sections is
+/// `location`, and `location` is absolute. A relative location in the
+/// file, or none (the backend's default), resolves against the directory a
+/// command runs in, and a file this cannot read or parse is treated the
+/// same way.
+fn names_location(path: &str, location: &str) -> bool {
+    if !std::path::Path::new(location).is_absolute() {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(file) = text.parse::<toml::Table>() else {
+        return false;
+    };
+    file.get("storage")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|storage| {
+            storage
+                .values()
+                .filter_map(toml::Value::as_table)
+                .any(|section| section.values().any(|v| v.as_str() == Some(location)))
+        })
 }
 
 /// The values an [`Advice`] borrows, built once by each command that prints
@@ -57,6 +106,8 @@ pub struct AdviceFor {
 impl AdviceFor {
     /// The advice for the deployment at `target`, shown as `location` (the
     /// caller redacts any password), with the backup clause of `migrations`.
+    /// Reads the config file `config` to see whether it names the store by
+    /// its absolute location.
     #[must_use]
     pub fn new(
         release: &str,
@@ -76,7 +127,11 @@ impl AdviceFor {
                 std::path::absolute(c).map_or_else(|_| c.to_owned(), |p| p.display().to_string())
             }),
             assignment: migrations
-                .filter(|m| config.is_none() || m.location_from_environment())
+                .filter(|m| {
+                    config.is_none_or(|c| {
+                        m.location_from_environment() || !names_location(c, &target.location)
+                    })
+                })
                 .and_then(|m| m.location_assignment(target)),
         }
     }
@@ -249,6 +304,10 @@ fn pending_line(pending: &[Pending]) -> String {
         _ => format!("Pending: {}.", items.join(", ")),
     }
 }
+
+#[cfg(test)]
+#[path = "advice_tests.rs"]
+mod quoting_tests;
 
 #[cfg(test)]
 mod tests {

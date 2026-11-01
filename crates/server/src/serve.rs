@@ -174,10 +174,29 @@ impl std::fmt::Display for CatalogRefusal {
 
 impl std::error::Error for CatalogRefusal {}
 
+/// `serve` stopped because the backend's serving registration was lost and
+/// could not be taken again. It stopped through the shutdown path a signal
+/// takes: the listener drained, the workers stopped and the PID file was
+/// removed. The process should end with exit status 1; the message, which
+/// `serve` has logged, says why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistrationLost {
+    pub message: String,
+}
+
+impl std::fmt::Display for RegistrationLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RegistrationLost {}
+
 /// Run the ExtendDB server on the pre-bound listener in `params` until shutdown.
 ///
-/// On any error before the HTTP server starts, the PID file is removed and a
-/// fatal message is written to the configured [`LogTarget`].
+/// On any error before the HTTP server starts, and on [`RegistrationLost`]
+/// after it stopped, the PID file is removed and a fatal message is written
+/// to the configured [`LogTarget`].
 ///
 /// # Errors
 ///
@@ -239,7 +258,6 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     if let Some(ref path) = pid_file {
         std::fs::write(path, format!("{}\n", std::process::id()))
             .map_err(|e| anyhow::anyhow!("Failed to write PID file {}: {e}", path.display()))?;
-        crate::pid_exit::remove_at_exit(path);
     }
 
     // Init logging (REQ-LOG-003, REQ-LOG-006) — the caller chose the target via
@@ -339,12 +357,21 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
             use extenddb_storage::migrations::{Target, advice, installed};
             // A server started without a config file (a dev server configured
             // by `EXTENDDB__` variables) advises `migrate` without one, which
-            // reads the same variables.
+            // reads the same variables. The backup clause names the data
+            // store the catalog records.
+            let target = Target::at(app_config.storage.connection_config());
+            let named = match installed() {
+                Some(migrations) => Target {
+                    data_store: migrations.data_store_name(&target).await,
+                    ..target
+                },
+                None => target,
+            };
             let advice = advice::AdviceFor::new(
                 build.version,
                 config::redact_password(app_config.storage.connection_config()),
                 installed(),
-                &Target::at(app_config.storage.connection_config()),
+                &named,
                 config_path.as_deref(),
             );
             return Err(CatalogRefusal {
@@ -360,6 +387,10 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     let catalog_store = components.catalog_store;
     let cred_store = components.credential_store;
     let runtime_hooks = components.runtime_hooks;
+    let registrar = runtime_hooks
+        .as_ref()
+        .and_then(|hooks| hooks.serving_registrar());
+    let admission = crate::registration::Admission::default();
 
     // Dev mode: seed the credentials the SDK may sign with and verify against
     // them (see `dev_credentials` for the vending contract). Seeded here so it
@@ -629,6 +660,7 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         table_key_info_cache,
         config_entries,
         docs_store,
+        admission: admission.clone(),
     };
 
     // Workers run until `shutdown` is cancelled, which happens after the HTTP
@@ -681,6 +713,16 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         };
         worker_handles.extend(hooks.spawn_workers(&worker_ctx).await);
     }
+    // A backend whose registration the database can end: the supervisor
+    // refuses requests while it is lost, and asks for a stop when it cannot
+    // be taken again. It is drained with the other workers.
+    if let Some(registrar) = registrar {
+        worker_handles.push(tokio::spawn(crate::registration::supervise(
+            registrar,
+            admission.clone(),
+            shutdown.clone(),
+        )));
+    }
 
     let tls_config = if tls_enabled {
         let cert_path = config::expand_tilde(&app_config.server.tls.cert_path);
@@ -700,6 +742,15 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     drain_workers(&shutdown, worker_handles).await;
 
     server_result?;
+
+    // The listener stopped because the registration could not be taken
+    // again, not on a signal: end with exit status 1.
+    if let Some(reason) = admission.stopped_for() {
+        return Err(RegistrationLost {
+            message: reason.to_owned(),
+        }
+        .into());
+    }
 
     Ok(())
 }

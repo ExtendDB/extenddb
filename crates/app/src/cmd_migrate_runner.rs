@@ -6,9 +6,9 @@
 //! writing nothing, so it runs beside a server. `--yes` reads the status
 //! again under the migration lock and applies; it refuses a store that is
 //! not a catalog, which `extenddb init` creates. `--reconverge` reruns every
-//! migration on a catalog a release before 1.0 wrote to, `--forget` clears
-//! an unreleased migration, and `--list` prints the migrations without
-//! opening the catalog.
+//! convergent migration on a catalog a release before 1.0 wrote to,
+//! `--forget` clears an unreleased migration, and `--list` prints the
+//! migrations without opening the catalog.
 //!
 //! Exit status: 0 up to date, applied, or ahead by additive migrations only;
 //! 1 an error or an uninitialized catalog; 3 migrations pending (the
@@ -57,11 +57,17 @@ pub(crate) async fn run(
         )?,
         data_connection: None,
     };
+    // The backup clause names the data store the catalog records when the
+    // command names none.
+    let named = Target {
+        data_store: migrations.data_store_name(&target).await,
+        ..target.clone()
+    };
     let advice = AdviceFor::new(
         release,
         shown.clone(),
         Some(migrations),
-        &target,
+        &named,
         config_file.as_deref(),
     );
     let advice = advice.advice();
@@ -172,7 +178,7 @@ fn print_list(migrations: &dyn CatalogMigrations) {
             } => {
                 let stores: Vec<&str> = stores.iter().map(|s| s.as_str()).collect();
                 format!(
-                    "{:<9} {:<13} {}",
+                    "{:<9} {:<14} {}",
                     kind.as_str(),
                     if convergent {
                         "convergent"
@@ -233,6 +239,14 @@ async fn preview(
             println!("Pending:");
             for line in pending_lines(pending) {
                 println!("{line}");
+            }
+            match migrations.pending_changes(target, &status).await {
+                Ok(lines) => {
+                    for line in lines {
+                        println!("{line}");
+                    }
+                }
+                Err(e) => println!("WARNING: {}", advice::error_message(&e, advice)),
             }
             println!();
             println!(

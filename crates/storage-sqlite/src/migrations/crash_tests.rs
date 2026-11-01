@@ -169,8 +169,10 @@ async fn copy_kill_test_child_process() {
         migrations.pool(),
         std::path::Path::new(&db),
         std::path::Path::new(&copy),
-        super::copy::free_space,
-        wait_before_rename,
+        super::copy::Hooks {
+            before_rename: wait_before_rename,
+            ..super::copy::Hooks::RUN
+        },
     )
     .await;
 }

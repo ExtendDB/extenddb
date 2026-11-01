@@ -373,7 +373,18 @@ async fn a_catalog_an_older_release_wrote_to_is_reported_and_reconverged() {
 
         next_second().await;
         let report = reconverge(&db).await.expect("reconverge");
-        assert_eq!(report.applied.len(), MigrationId::ALL.len());
+        // Every convergent migration ran again; migration 2, which is not
+        // convergent, is named as skipped.
+        let convergent = MigrationId::ALL
+            .into_iter()
+            .filter(|id| super::migration(*id).convergent())
+            .count();
+        assert_eq!(report.applied.len(), convergent, "{trace}: {report:?}");
+        let skipped = format!("Skipped {}:", MigrationId::ResourceTagConditionKeys);
+        assert!(
+            report.notes.iter().any(|n| n.starts_with(&skipped)),
+            "{trace}: {report:?}"
+        );
         assert_eq!(
             status(&db).await,
             CatalogStatus::Current { version: LATEST },

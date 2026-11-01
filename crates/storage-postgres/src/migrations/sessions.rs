@@ -55,11 +55,12 @@ pub(crate) async fn connection_check_supported(pool: &PgPool) -> bool {
 
 /// Wait until no session of another runner runs a statement in any of
 /// `databases`, each a database and the runner's connection to it, up to
-/// `timeout`; `own` is this runner's `application_name`. Each database is
-/// looked at through its own connection, which reaches its server as the
-/// role an earlier runner's sessions there used. An idle session is not
-/// waited for: a dead client's idle session has already ended, and a
-/// pooler's idle backend keeps the last client's name.
+/// `timeout`, the time the run's lock timeout has left (with none left, the
+/// sessions are looked at once); `own` is this runner's `application_name`.
+/// Each database is looked at through its own connection, which reaches its
+/// server as the role an earlier runner's sessions there used. An idle
+/// session is not waited for: a dead client's idle session has already
+/// ended, and a pooler's idle backend keeps the last client's name.
 ///
 /// # Errors
 ///
@@ -108,19 +109,21 @@ pub(crate) async fn wait_for_earlier_runners(
             })
             .collect::<Vec<_>>()
             .join("; ");
+        // Whole seconds rounded up: the run's lock timeout may leave this
+        // wait a part of a second.
+        let secs = timeout.as_millis().div_ceil(1000);
         if started.elapsed() >= timeout {
             return Err(MigrationError::Blocked(format!(
                 "statements of an earlier migrator that stopped are still running, still after \
-                 {} s: {sessions}. They do not end by themselves; end them with SELECT \
-                 pg_cancel_backend(<pid>), as their role or a superuser, then run again",
-                timeout.as_secs()
+                 {secs} s, the part of this run's lock timeout its earlier waits left: \
+                 {sessions}. They do not end by themselves; end them with SELECT \
+                 pg_cancel_backend(<pid>), as their role or a superuser, then run again"
             )));
         }
         if !announced {
             println!(
-                "--- Waiting up to {} s for the statements of an earlier migrator that stopped: \
-                 {sessions}",
-                timeout.as_secs()
+                "--- Waiting up to {secs} s for the statements of an earlier migrator that \
+                 stopped: {sessions}"
             );
             announced = true;
         }

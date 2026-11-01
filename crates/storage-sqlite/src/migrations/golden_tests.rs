@@ -10,8 +10,8 @@ use std::path::Path;
 use extenddb_storage::migrations::{CatalogStatus, MigrationError, exit};
 
 use super::tests::{
-    DEV_0_1_7, DEV_0_1_14, copies, count, exec, load_dump, plain_pool, run, scalar, status,
-    temp_db, version_row,
+    DEV_0_1_7, DEV_0_1_14, LATEST, copies, count, exec, load_dump, plain_pool, reconverge, run,
+    scalar, status, temp_db, version_row,
 };
 
 /// Rows of a query, one tab-separated line each: text as it is (JSON with
@@ -299,6 +299,84 @@ async fn migration_2_collisions_stop_the_run_before_any_write() {
     );
     assert_eq!(version_row(&db).await.as_deref(), Some("0.0.3"));
     assert!(copies(&db).is_empty(), "no copy before a refusal");
+}
+
+/// The text of every stored policy, in a fixed order.
+async fn every_policy_document(db: &Path) -> String {
+    let mut text = dump(
+        db,
+        "SELECT principal_type, principal_name, policy_name, policy_document \
+         FROM iam_policies ORDER BY principal_type, principal_name, policy_name",
+    )
+    .await;
+    text.push_str(
+        &dump(
+            db,
+            "SELECT principal_type, principal_name, policy_document \
+             FROM iam_permissions_boundaries ORDER BY principal_type, principal_name",
+        )
+        .await,
+    );
+    text.push_str(
+        &dump(
+            db,
+            "SELECT session_token, session_policy FROM iam_sessions ORDER BY session_token",
+        )
+        .await,
+    );
+    text
+}
+
+/// Record what a release before 1.0 leaves when it writes to a migrated
+/// catalog, then reconverge: migration 2 is named as skipped, and the
+/// catalog is current again.
+async fn reconverge_after_an_older_release_wrote(db: &Path) {
+    exec(
+        db,
+        "INSERT INTO settings (key, value) VALUES ('resource_tag_migration', 'applied')",
+    )
+    .await;
+    assert_eq!(status(db).await.label(), "WrittenByOlderRelease");
+    let report = reconverge(db).await.expect("reconverge");
+    assert!(report.applied.iter().all(|s| s.id != 2), "{report:?}");
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.starts_with("Skipped 2 resource_tag_condition_keys:")),
+        "{report:?}"
+    );
+    assert_eq!(status(db).await, CatalogStatus::Current { version: LATEST });
+}
+
+/// From 1.0 on a `dynamodb:ResourceTag` key written through the API has no
+/// effect, as on the service. Migration 2 is not convergent, so a reconverge
+/// leaves a policy written after it, in each of the six places, with the
+/// text it was written with, and so with the decision it had.
+#[tokio::test]
+async fn a_reconverge_leaves_policies_written_after_migration_2_as_they_are() {
+    let db = temp_db("m2-reconverge");
+    load_dump(&db, DEV_0_1_14).await;
+    run(&db).await.expect("upgrade");
+    tag_every_place(&db).await;
+    let before = every_policy_document(&db).await;
+    assert!(before.contains("dynamodb:ResourceTag/env"), "{before}");
+    reconverge_after_an_older_release_wrote(&db).await;
+    assert_eq!(every_policy_document(&db).await, before);
+}
+
+/// A policy written after migration 2 with both forms on one key, which
+/// the rewrite would refuse, does not stop a reconverge.
+#[tokio::test]
+async fn a_reconverge_is_not_stopped_by_a_policy_migration_2_would_refuse() {
+    let db = temp_db("m2-reconverge-c");
+    load_dump(&db, DEV_0_1_14).await;
+    run(&db).await.expect("upgrade");
+    let (_, user) = principal(&db).await;
+    put_policy(&db, "user", &user, "colliding", COLLIDING).await;
+    let before = every_policy_document(&db).await;
+    reconverge_after_an_older_release_wrote(&db).await;
+    assert_eq!(every_policy_document(&db).await, before);
 }
 
 #[tokio::test]

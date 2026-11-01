@@ -271,8 +271,9 @@ pub struct PostgresEngine {
     /// `backup_engine::RestoreAccountSlots`.
     pub(crate) restore_account_slots: backup_engine::RestoreAccountSlots,
     /// The serving registration a server holds for its life, so `migrate
-    /// --yes` refuses while it serves. `None` outside a server.
-    pub(crate) serving: Option<Arc<migrations::ServingRegistration>>,
+    /// --yes` refuses while it serves, and takes again after the database
+    /// ended its session. `None` outside a server.
+    pub(crate) serving: Option<Arc<migrations::ServerRegistration>>,
     /// Bounds how many table snapshots may be open at once (one permit from
     /// the open until the stream's transaction ends): half the pool
     /// ([`snapshot_slot_count`]) on either layout.
@@ -658,8 +659,7 @@ impl PostgresEngine {
 // ============================================================================
 
 use extenddb_auth::CredentialStore;
-use extenddb_storage::hooks::{ServerRuntimeHooks, WorkerContext};
-use extenddb_storage::migrations::{CatalogStatus, MigrationError, Target};
+use extenddb_storage::hooks::{ServerRuntimeHooks, ServingRegistrar, WorkerContext};
 use extenddb_storage::server_components::{BackendError, ServerComponents};
 
 /// Backend-specific runtime hooks for `PostgreSQL`.
@@ -756,7 +756,7 @@ impl ServerRuntimeHooks for PostgresRuntimeHooks {
             workers::poll_gsi_delay(catalog_store_for_gsi, gsi_delay, token).await;
         });
 
-        let mut handles = vec![
+        vec![
             control_plane,
             table_size,
             stream_cleanup,
@@ -766,87 +766,21 @@ impl ServerRuntimeHooks for PostgresRuntimeHooks {
             gsi_builds,
             pool_metrics,
             gsi_poller,
-        ];
-        if let Some(registration) = &self.engine.serving {
-            handles.push(tokio::spawn(stop_when_registration_lost(
-                registration.lost(),
-                ctx.shutdown.clone(),
-            )));
-        }
-        handles
+        ]
     }
 
     fn backend_info(&self) -> Option<String> {
         Some(format!("data_db={}", self.data_db_name))
     }
-}
 
-/// End the process with exit status 1 once the serving registration's
-/// connection is lost: the database has then freed the registration, and a
-/// migration could start under this server.
-async fn stop_when_registration_lost(
-    mut lost: tokio::sync::watch::Receiver<Option<String>>,
-    shutdown: extenddb_storage::hooks::CancellationToken,
-) {
-    loop {
-        tokio::select! {
-            () = shutdown.cancelled() => return,
-            changed = lost.changed() => {
-                if changed.is_err() {
-                    return;
-                }
-                let reason = lost.borrow().clone();
-                if let Some(reason) = reason {
-                    let message = format!(
-                        "extenddb fatal: {reason}; the server stops, because a migration can \
-                         start on the catalog once the serving registration is gone"
-                    );
-                    tracing::error!("{message}");
-                    eprintln!("{message}");
-                    std::process::exit(1);
-                }
-            }
-        }
-    }
-}
-
-/// Register as the catalog's server and read its status, before anything
-/// opens the engine: a server that refuses has written nothing. The
-/// registration is taken before the status is read, so a migration that
-/// starts in between waits for this server or makes it refuse.
-async fn register_and_check(
-    connection_string: &str,
-) -> Result<migrations::ServingRegistration, MigrationError> {
-    let target = Target::at(connection_string);
-    let Some(target) = migrations::resolve(&target).await? else {
-        return Err(MigrationError::Status(CatalogStatus::Uninitialized));
-    };
-    let registration = migrations::ServingRegistration::register(&target.catalog).await?;
-    let status = match migrations::catalog_status(&target).await {
-        Ok(status) => status,
-        Err(e) => {
-            registration.release().await;
-            return Err(e);
-        }
-    };
-    match status {
-        CatalogStatus::Current { .. } | CatalogStatus::AheadCompatible { .. } => {
-            if let Err(e) = migrations::require_data_connection_row(&target).await {
-                registration.release().await;
-                return Err(e);
-            }
-            if matches!(status, CatalogStatus::AheadCompatible { .. }) {
-                tracing::warn!(
-                    "{status}; serving it, because a binary may serve migrations it does not \
-                     know when every one of them is additive"
-                );
-            }
-            Ok(registration)
-        }
-        status => {
-            registration.release().await;
-            Err(MigrationError::Status(status))
-        }
+    /// The database can end the registration's session (a restart, a
+    /// failover, `pg_terminate_backend`, a pooler that drops it), which
+    /// frees the serving key; the server then registers again or stops.
+    fn serving_registrar(&self) -> Option<Arc<dyn ServingRegistrar>> {
+        self.engine
+            .serving
+            .clone()
+            .map(|registration| registration as Arc<dyn ServingRegistrar>)
     }
 }
 
@@ -866,7 +800,7 @@ fn server_components_factory(
     let max_catalog_connections = config.max_catalog_connections();
     let region = region.to_string();
     Box::pin(async move {
-        let registration = register_and_check(&connection_string)
+        let registration = migrations::ServerRegistration::register(&connection_string)
             .await
             .map_err(BackendError::Catalog)?;
 

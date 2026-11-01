@@ -130,8 +130,12 @@ pub enum Migration<H: 'static> {
     /// The migration changes this backend.
     Applies {
         kind: Kind,
-        /// Safe to run again on a store at any later id. `--reconverge` runs
-        /// only convergent migrations.
+        /// Safe to run again on a store at any later id, over data that
+        /// clients wrote through the API since it was applied. A body that
+        /// rewrites such data is not convergent: migration 2 would rewrite a
+        /// policy written after it and change that policy's decision.
+        /// `--reconverge` runs the convergent migrations again and skips a
+        /// recorded one that is not.
         convergent: bool,
         /// One body per kind of store, catalog first.
         bodies: Vec<StoreBody<H>>,

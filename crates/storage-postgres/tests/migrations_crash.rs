@@ -1,8 +1,8 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 //! A migrator that dies inside each kind of body, a concurrent index build
-//! cancelled part way, two migrators, the migration lock's keepalive, and the
-//! serving registration against `migrate`. A migrator is killed by ending
+//! cancelled part way, two migrators, the key transactions against a role's
+//! timeouts, and the serving registration against `migrate`. A migrator is killed by ending
 //! its sessions with `pg_terminate_backend`, which is what the database sees
 //! when the process dies. See `migrations_support` for the database these
 //! tests need.
@@ -16,7 +16,8 @@ use extenddb_storage_postgres::migrations::{
     MigrationLock, PostgresMigrations, PostgresTarget, ServingRegistration, catalog_status, migrate,
 };
 use migrations_support::{LATEST, Scratch, base_conn, count, ledger, pool, skip, step_count};
-use sqlx::PgPool;
+use sqlx::postgres::PgConnectOptions;
+use sqlx::{Connection, PgPool};
 
 const RELEASE: &str = "1.0.0-test";
 
@@ -255,58 +256,90 @@ async fn two_migrators_apply_once() {
     catalog.close().await;
 }
 
+/// A role whose `idle_in_transaction_session_timeout` (5 s) is shorter than
+/// the renewal interval (15 s), and on PostgreSQL 17 and later whose
+/// `transaction_timeout` (20 s) is shorter than the hold: the serving
+/// registration and the migration lock, renewed at the production interval,
+/// both hold their keys over two renewals, while a plain transaction of the
+/// same role left idle is ended by the setting.
 #[tokio::test]
-async fn the_lock_keepalive_outlasts_the_idle_in_transaction_timeout() {
+async fn the_key_transactions_outlast_the_roles_timeouts_at_the_production_interval() {
     let Some(base) = base_conn() else {
-        return skip("keepalive");
+        return skip("timeouts at 15 s");
     };
-    let s = Scratch::new(&base, "pgm_keep").await;
+    let s = Scratch::with_names(&base, "pgm_keep", "_c", "_d", &["_c2"]).await;
+    let lock_database = format!("{}2", s.catalog_name);
+    let role = format!("{}_short", s.catalog_name);
     let admin = pool(&format!("{base}/postgres"), 1).await;
     sqlx::query(&format!(
-        "ALTER DATABASE \"{}\" SET idle_in_transaction_session_timeout = '1s'",
-        s.catalog_name
+        "CREATE ROLE \"{role}\" LOGIN PASSWORD 'short-timeouts'"
     ))
     .execute(&admin)
     .await
     .unwrap();
-    let kept = MigrationLock::acquire_with(
-        &s.options(),
-        Duration::from_secs(5),
-        Duration::from_millis(300),
-    )
+    sqlx::query(&format!(
+        "ALTER ROLE \"{role}\" SET idle_in_transaction_session_timeout = '5s'"
+    ))
+    .execute(&admin)
     .await
     .unwrap();
-    let registered =
-        ServingRegistration::register_with(&s.options(), Duration::from_millis(300)).await;
-    // The registration waits for the lock's holder: it refuses while the
-    // migration lock is held.
-    assert!(matches!(registered, Err(MigrationError::Locked(_))));
-    tokio::time::sleep(Duration::from_millis(2500)).await;
-    kept.check_alive()
-        .await
-        .expect("the keepalive kept the lock's transaction open");
-    kept.release().await;
-    // Without a renewal inside the timeout the database ends the session.
-    let idle = MigrationLock::acquire_with(
-        &s.options(),
-        Duration::from_secs(5),
-        Duration::from_secs(60),
-    )
-    .await
-    .unwrap();
-    tokio::time::sleep(Duration::from_millis(2500)).await;
-    assert!(idle.check_alive().await.is_err());
-    idle.release().await;
-    let serving = ServingRegistration::register_with(&s.options(), Duration::from_millis(300))
+    let version: i32 = sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
+        .fetch_one(&admin)
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(2500)).await;
+    if version >= 170_000 {
+        sqlx::query(&format!(
+            "ALTER ROLE \"{role}\" SET transaction_timeout = '20s'"
+        ))
+        .execute(&admin)
+        .await
+        .unwrap();
+    }
+    let as_role = |database: &str| -> PgConnectOptions {
+        format!("{base}/{database}")
+            .parse::<PgConnectOptions>()
+            .expect("a postgres URL")
+            .username(&role)
+            .password("short-timeouts")
+    };
+    let serving = ServingRegistration::register(&as_role(&s.catalog_name))
+        .await
+        .expect("register as the role");
+    let lock = MigrationLock::acquire(&as_role(&lock_database), Duration::from_secs(5))
+        .await
+        .expect("the migration lock as the role");
+    // The role's setting ends a transaction it leaves idle.
+    let mut plain = sqlx::PgConnection::connect_with(&as_role(&s.catalog_name))
+        .await
+        .unwrap();
+    sqlx::raw_sql("BEGIN; SELECT 1")
+        .execute(&mut plain)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(32)).await;
+    assert!(
+        sqlx::query("SELECT 1").execute(&mut plain).await.is_err(),
+        "the role's idle_in_transaction_session_timeout did not end an idle transaction"
+    );
+    drop(plain);
+    assert_eq!(
+        serving.lost().borrow().clone(),
+        None,
+        "the registration was lost"
+    );
     serving
         .check_alive()
         .await
-        .expect("the registration's keepalive");
-    assert!(serving.lost().borrow().is_none());
+        .expect("the registration's session after two renewals");
+    lock.check_alive()
+        .await
+        .expect("the migration lock's session after two renewals");
     serving.release().await;
+    lock.release().await;
+    drop(s);
+    let _ = sqlx::query(&format!("DROP ROLE IF EXISTS \"{role}\""))
+        .execute(&admin)
+        .await;
     admin.close().await;
 }
 

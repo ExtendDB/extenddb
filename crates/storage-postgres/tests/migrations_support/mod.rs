@@ -11,6 +11,8 @@
 
 #![allow(dead_code)]
 
+pub mod proxy;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use extenddb_core::types::CreateTableInput;

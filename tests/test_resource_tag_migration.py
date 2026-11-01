@@ -21,7 +21,10 @@ started:
      restart, and confirm a GetItem gated on the resource tag that was denied
      before the migration is allowed after it.
   6. write the marker row again, as a release before 1.0 does, and confirm
-     serve refuses with exit 5 naming `--reconverge`, which repairs it.
+     serve refuses with exit 5 naming `--reconverge`, which repairs it. The
+     reconverge skips the condition-key rewrite, which is not convergent: a
+     policy written through the API after the upgrade keeps its
+     dynamodb:ResourceTag key, and the GetItem it would allow stays denied.
 
 The binary is found the way tests/lifecycle_helpers.py does, falling back to
 target/release/extenddb, so the SQLite integration job runs it against the
@@ -438,6 +441,21 @@ def test_resource_tag_migration_wire(deployment):
     got = scoped_client.get_item(TableName=table, Key={"pk": {"S": "k1"}})
     assert got["Item"]["v"]["S"] == "hi"
 
+    # A policy written through the API after the upgrade, on the
+    # dynamodb:ResourceTag form: the key is absent, as on the service, so the
+    # GetItem it would allow is denied.
+    assert mgmt.create_user(account_id, "later", "TestPass123!").status_code == 201
+    later = mgmt.create_access_key(account_id, "later").json()
+    assert mgmt.put_user_policy(
+        account_id, "later", "laterpolicy", _policy("dynamodb:ResourceTag/env"),
+    ).status_code == 204
+    later_client = _client(
+        endpoint, later["access_key_id"], later["secret_access_key"], region
+    )
+    with pytest.raises(ClientError) as exc:
+        later_client.get_item(TableName=table, Key={"pk": {"S": "k1"}})
+    assert exc.value.response["Error"]["Code"] == "AccessDeniedException"
+
     # A second migrate finds nothing to apply.
     server.stop()
     again = _run("migrate", "--config", deployment["config"])
@@ -460,9 +478,27 @@ def test_resource_tag_migration_wire(deployment):
     assert refused.returncode == EXIT_ATTENTION, out
     assert "--yes --reconverge" in out, out
     repaired = _run("migrate", "--yes", "--reconverge", "--config", deployment["config"])
-    assert repaired.returncode == 0, repaired.stdout + repaired.stderr
+    out = repaired.stdout + repaired.stderr
+    assert repaired.returncode == 0, out
     assert _sqlite_marker(sqlite_path) == []
+
+    # The reconverge skipped the rewrite, which is not convergent: the policy
+    # written after the upgrade keeps its key, and its GetItem stays denied,
+    # while the policy the migration rewrote still allows it.
+    assert "Skipped 2 resource_tag_condition_keys:" in out, out
+    assert "dynamodb:ResourceTag/env" in json.dumps(
+        _sqlite_policy(sqlite_path, "laterpolicy")
+    )
     server.start()
+    later_client = _client(
+        endpoint, later["access_key_id"], later["secret_access_key"], region
+    )
+    with pytest.raises(ClientError) as exc:
+        later_client.get_item(TableName=table, Key={"pk": {"S": "k1"}})
+    assert exc.value.response["Error"]["Code"] == "AccessDeniedException"
+    scoped_client = _client(endpoint, scoped_ak, scoped_sk, region)
+    got = scoped_client.get_item(TableName=table, Key={"pk": {"S": "k1"}})
+    assert got["Item"]["v"]["S"] == "hi"
 
 
 def _sqlite_marker(sqlite_path: str) -> list:

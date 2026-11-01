@@ -3,15 +3,14 @@
 //! The backend's guards that no released body reaches: a code body that
 //! commits the runner's transaction itself is stopped before its ledger
 //! row, the serving session carries its keepalive settings, a registration
-//! whose database stops answering is reported lost, an index build that
-//! waits on a lock is bounded, and a role that does not own the tables is
-//! told what to run. See `migrations_support` for the database these tests
-//! need.
+//! whose database stops answering is reported lost, a runner whose client
+//! goes away mid-body is ended by the database, an index build that waits
+//! on a lock is bounded, and a role that does not own the tables is told
+//! what to run. See `migrations_support` for the database these tests need.
 
 mod migrations_support;
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -20,13 +19,11 @@ use extenddb_storage::migrations::{
     MigrationId, Outcome, RunKind, Runner, Step, StoreKind, StoreRef, Target, before_lock, exit,
 };
 use extenddb_storage_postgres::migrations::{
-    MigrationLock, PostgresCatalogMigrations, PostgresMigrations, PostgresStores,
+    MigrationLock, PostgresCatalogMigrations, PostgresMigrations, PostgresStores, PostgresTarget,
     ServingRegistration, migrate, status_notes,
 };
+use migrations_support::proxy::Proxy;
 use migrations_support::{ACCOUNT, Scratch, base_conn, count, note_steps, pool, skip};
-use sqlx::postgres::PgConnectOptions;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
 
 /// Creates a user through the management store, which commits a
 /// transaction of its own on the runner's connection.
@@ -130,64 +127,6 @@ async fn the_serving_session_sets_its_keepalives_and_name() {
     serving.release().await;
 }
 
-/// A TCP proxy to the test server that can stop forwarding while it keeps
-/// both connections open: what a client sees when the database host is
-/// paused or vanishes without closing the connection.
-struct Proxy {
-    port: u16,
-    paused: Arc<AtomicBool>,
-}
-
-async fn pump(
-    mut from: tokio::net::tcp::OwnedReadHalf,
-    mut to: tokio::net::tcp::OwnedWriteHalf,
-    paused: Arc<AtomicBool>,
-) {
-    let mut buf = vec![0_u8; 16 * 1024];
-    loop {
-        if paused.load(Ordering::SeqCst) {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            continue;
-        }
-        // A read that times out is dropped before it completes, which loses
-        // nothing on a TcpStream, so the pause is noticed within 50 ms.
-        match tokio::time::timeout(Duration::from_millis(50), from.read(&mut buf)).await {
-            Err(_) => {}
-            Ok(Ok(0) | Err(_)) => return,
-            Ok(Ok(n)) => {
-                if to.write_all(&buf[..n]).await.is_err() {
-                    return;
-                }
-            }
-        }
-    }
-}
-
-impl Proxy {
-    async fn start(upstream: (String, u16)) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let paused = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&paused);
-        tokio::spawn(async move {
-            while let Ok((client, _)) = listener.accept().await {
-                let Ok(server) = TcpStream::connect((upstream.0.as_str(), upstream.1)).await else {
-                    continue;
-                };
-                let (client_read, client_write) = client.into_split();
-                let (server_read, server_write) = server.into_split();
-                tokio::spawn(pump(client_read, server_write, Arc::clone(&flag)));
-                tokio::spawn(pump(server_read, client_write, Arc::clone(&flag)));
-            }
-        });
-        Self { port, paused }
-    }
-
-    fn options(&self, s: &Scratch) -> PgConnectOptions {
-        s.options().host("127.0.0.1").port(self.port)
-    }
-}
-
 /// A database that stops answering without closing the connection: the
 /// registration counts as lost within twice its keepalive interval, and the
 /// migration lock's check fails instead of waiting.
@@ -266,6 +205,143 @@ async fn a_registration_is_lost_at_twice_its_interval_and_no_later() {
     );
     proxy.paused.store(false, Ordering::SeqCst);
     serving.release().await;
+}
+
+/// Writes a settings row and then sleeps for 60 s, inside the runner's
+/// transaction on the catalog.
+struct SleepsAfterAWrite;
+
+#[async_trait]
+impl CodeBody<PostgresStores> for SleepsAfterAWrite {
+    fn fingerprint(&self) -> &'static str {
+        "0002_resource_tag_condition_keys/test/2"
+    }
+
+    async fn detect(&self, _stores: &PostgresStores) -> Result<Vec<String>, MigrationError> {
+        Ok(Vec::new())
+    }
+
+    async fn run(&self, stores: &PostgresStores) -> Result<Done, MigrationError> {
+        let catalog = stores.catalog_connection();
+        for sql in [
+            "INSERT INTO settings (key, value) VALUES ('written_by_a_body', 'x')",
+            "SELECT pg_sleep(60)",
+        ] {
+            sqlx::query(sql)
+                .execute(catalog)
+                .await
+                .map_err(|e| MigrationError::store("the sleeping body", e))?;
+        }
+        Ok(Done::default())
+    }
+}
+
+/// A runner whose client side goes away in the middle of a body, as when
+/// the migrator's process dies: the database ends the body's statement and
+/// its session within seconds instead of running the statement to its end,
+/// and nothing of the body or its ledger row is committed.
+#[tokio::test]
+async fn a_runner_whose_client_goes_away_mid_body_is_ended_by_the_database() {
+    let Some(base) = base_conn() else {
+        return skip("client gone");
+    };
+    let s = Scratch::new(&base, "pgm_gone").await;
+    s.migrate_through(MigrationId::Baseline).await;
+    let options = s.options();
+    let proxy = Proxy::start((options.get_host().to_owned(), options.get_port())).await;
+    let target = PostgresTarget::new(proxy.options(&s), &s.data_name);
+    let store = StoreRef {
+        kind: StoreKind::Catalog,
+        name: s.catalog_name.clone(),
+    };
+    let run = tokio::spawn(async move {
+        let m = PostgresMigrations::open_unlocked(&target).await?;
+        let row = LedgerRow {
+            id: 2,
+            name: "resource_tag_condition_keys".to_owned(),
+            kind: Kind::Breaking,
+            checksum: "c".to_owned(),
+            outcome: Outcome::Applied,
+            notes: String::new(),
+            applied_at: String::new(),
+            applied_by: "test".to_owned(),
+        };
+        let applied = m
+            .apply(
+                &store,
+                MigrationId::ResourceTagConditionKeys,
+                Step::Code(&SleepsAfterAWrite),
+                Some(row),
+                Some(2),
+            )
+            .await;
+        m.close().await;
+        applied.map(|_| ())
+    });
+    let admin = pool(&format!("{base}/postgres"), 1).await;
+    let mut sleeping = None;
+    for _ in 0..400 {
+        sleeping = sqlx::query_scalar(
+            "SELECT pid FROM pg_stat_activity WHERE datname = $1 \
+             AND starts_with(application_name, 'extenddb migrate run ') \
+             AND query LIKE 'SELECT pg_sleep%' AND state = 'active'",
+        )
+        .bind(&s.catalog_name)
+        .fetch_optional(&admin)
+        .await
+        .unwrap();
+        if sleeping.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let pid: i32 = sleeping.expect("the body's statement never ran");
+    proxy.cut.store(true, Ordering::SeqCst);
+    let cut_at = Instant::now();
+    let mut ended = false;
+    while cut_at.elapsed() < Duration::from_secs(10) {
+        let present: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)")
+                .bind(pid)
+                .fetch_one(&admin)
+                .await
+                .unwrap();
+        if !present {
+            ended = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        ended,
+        "the session of pid {pid} still ran its statement 10 s after its client went away"
+    );
+    let err = run
+        .await
+        .unwrap()
+        .expect_err("a body whose client went away fails");
+    assert!(!err.to_string().is_empty());
+    let catalog = s.catalog().await;
+    assert_eq!(
+        count(
+            &catalog,
+            "SELECT count(*) FROM settings WHERE key = 'written_by_a_body'"
+        )
+        .await,
+        0,
+        "the body's row was committed"
+    );
+    assert_eq!(
+        count(
+            &catalog,
+            "SELECT count(*) FROM extenddb_migrations WHERE id = 2"
+        )
+        .await,
+        0,
+        "the body's ledger row was committed"
+    );
+    catalog.close().await;
+    admin.close().await;
 }
 
 /// Migration 4's concurrent build that waits on a lock is cancelled after the

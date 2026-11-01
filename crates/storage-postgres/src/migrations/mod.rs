@@ -14,9 +14,11 @@
 //! servers to stop), applies and releases; [`migrate_holding`] applies for a
 //! caller that took [`MigrationLock`] itself (the commands, which take it
 //! through [`PostgresCatalogMigrations`]); [`ServingRegistration`] is what a
-//! server holds while it serves; [`try_create_vector_extension`] is the
-//! pgvector attempt `migrate` makes on every run.
-//! [`PostgresCatalogMigrations`] is how the commands reach them.
+//! server holds while it serves, and [`ServerRegistration`] is the server's
+//! startup check around it and the backend's side of registering again;
+//! [`try_create_vector_extension`] is the pgvector attempt `migrate` makes
+//! on every run. [`PostgresCatalogMigrations`] is how the commands reach
+//! them.
 
 mod backend;
 mod commands;
@@ -34,6 +36,7 @@ mod m0003_sort_key_definitions;
 #[allow(clippy::all, deprecated)]
 mod m0004_index_table_base_key;
 mod postcheck;
+mod registrar;
 mod rows;
 mod sessions;
 mod vector_extension;
@@ -55,6 +58,7 @@ pub use commands::{PostgresCatalogMigrations, resolve};
 pub use locks::{KEEPALIVE_INTERVAL, MigrationLock, ServingRegistration};
 #[cfg(feature = "test-util")]
 pub use postcheck::{Column, Definitions, Index, compare, describe};
+pub use registrar::ServerRegistration;
 pub use sessions::{require_data_connection_row, served_data_options};
 pub use vector_extension::try_create_vector_extension;
 
@@ -86,7 +90,10 @@ pub fn migration(id: MigrationId) -> Migration<PostgresStores> {
         },
         MigrationId::ResourceTagConditionKeys => Migration::Applies {
             kind: Kind::Breaking,
-            convergent: true,
+            // A `dynamodb:ResourceTag` key written through the API after the
+            // rewrite has no effect, as on the service; running the rewrite
+            // again would give it one.
+            convergent: false,
             bodies: vec![StoreBody::code(
                 StoreKind::Catalog,
                 &ResourceTagConditionKeys,
@@ -254,9 +261,10 @@ pub async fn status_notes(target: &PostgresTarget) -> Result<Vec<StatusNote>, Mi
     notes
 }
 
-/// Apply every pending migration: take the migration lock, waiting up to
-/// `lock_timeout` for another migrator and then for running servers, apply,
-/// and release the lock and close every connection on every exit path.
+/// Apply every pending migration: take the migration lock, waiting for
+/// another migrator, then for running servers, then for an earlier
+/// migrator's statements, all within `lock_timeout`, apply, and release the
+/// lock and close every connection on every exit path.
 ///
 /// # Errors
 ///

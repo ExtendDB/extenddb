@@ -11,9 +11,9 @@ mod migrations_support;
 use std::fmt::Write as _;
 use std::time::Duration;
 
-use extenddb_storage::migrations::{CatalogStatus, MigrationError, MigrationId};
-use extenddb_storage_postgres::migrations::migrate;
-use migrations_support::{ACCOUNT, Scratch, base_conn, id_names, skip};
+use extenddb_storage::migrations::{CatalogStatus, MigrationError, MigrationId, Runner};
+use extenddb_storage_postgres::migrations::{PostgresMigrations, migrate};
+use migrations_support::{ACCOUNT, LATEST, Scratch, base_conn, id_names, skip};
 use sqlx::PgPool;
 
 fn golden(name: &str, actual: &str) {
@@ -39,6 +39,8 @@ async fn notes(catalog: &PgPool, id: i32) -> String {
 }
 
 const TAGGED: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"dynamodb:*","Resource":"*","Condition":{"StringEquals":{"dynamodb:ResourceTag/env":"prod"}}}]}"#;
+/// Both forms on one key with different values, which migration 2 refuses.
+const COLLIDING: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"dynamodb:*","Resource":"*","Condition":{"StringEquals":{"dynamodb:ResourceTag/env":"prod","aws:ResourceTag/env":"dev"}}}]}"#;
 
 /// A `dynamodb:ResourceTag` policy in every place a policy is stored.
 async fn tag_every_policy(catalog: &PgPool) {
@@ -158,11 +160,10 @@ async fn migration_2_collisions_stop_the_run_before_any_write() {
     let s = Scratch::new(&base, "pgm_g2c").await;
     s.load("0.1.14").await;
     let catalog = s.catalog().await;
-    let both = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"dynamodb:*","Resource":"*","Condition":{"StringEquals":{"dynamodb:ResourceTag/env":"prod","aws:ResourceTag/env":"dev"}}}]}"#;
     sqlx::query(
         "UPDATE iam_policies SET policy_document = $1::jsonb WHERE principal_name = 'tester'",
     )
-    .bind(both)
+    .bind(COLLIDING)
     .execute(&catalog)
     .await
     .unwrap();
@@ -187,6 +188,98 @@ async fn migration_2_collisions_stop_the_run_before_any_write() {
             .await
             .unwrap();
     assert!(!ledger, "a refused run wrote the ledger");
+    catalog.close().await;
+}
+
+/// The text of every stored policy, sorted by byte order.
+async fn every_policy_document(catalog: &PgPool) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT kind || ' ' || name || ': ' || document FROM (SELECT 'policy' AS kind, \
+         principal_type || ' ' || principal_name || ' ' || policy_name AS name, \
+         policy_document::text AS document FROM iam_policies UNION ALL \
+         SELECT 'boundary', principal_type || ' ' || principal_name, policy_document::text \
+         FROM iam_permissions_boundaries UNION ALL \
+         SELECT 'session', session_token, session_policy::text FROM iam_sessions) AS r \
+         ORDER BY kind COLLATE \"C\", name COLLATE \"C\"",
+    )
+    .fetch_all(catalog)
+    .await
+    .unwrap()
+}
+
+/// Record what a release before 1.0 leaves when it writes to a migrated
+/// catalog, then reconverge: migration 2 is named as skipped, and the
+/// catalog is current again.
+async fn reconverge_after_an_older_release_wrote(s: &Scratch, catalog: &PgPool) {
+    sqlx::query("INSERT INTO settings (key, value) VALUES ('resource_tag_migration', 'applied')")
+        .execute(catalog)
+        .await
+        .unwrap();
+    assert_eq!(s.status().await.label(), "WrittenByOlderRelease");
+    let m = PostgresMigrations::open_unlocked(&s.target())
+        .await
+        .unwrap();
+    let report = Runner::new(&m, "test").reconverge().await;
+    m.close().await;
+    let report = report.expect("reconverge");
+    assert!(report.applied.iter().all(|step| step.id != 2), "{report:?}");
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.starts_with("Skipped 2 resource_tag_condition_keys:")),
+        "{report:?}"
+    );
+    assert_eq!(s.status().await, CatalogStatus::Current { version: LATEST });
+}
+
+/// From 1.0 on a `dynamodb:ResourceTag` key written through the API has no
+/// effect, as on the service. Migration 2 is not convergent, so a reconverge
+/// leaves a policy written after it, in each place a policy is stored, with
+/// the text it was written with, and so with the decision it had.
+#[tokio::test]
+async fn a_reconverge_leaves_policies_written_after_migration_2_as_they_are() {
+    let Some(base) = base_conn() else {
+        return skip("reconverge after migration 2");
+    };
+    let s = Scratch::new(&base, "pgm_g2rc").await;
+    s.load("0.1.14").await;
+    s.migrate_through(MigrationId::LATEST).await;
+    let catalog = s.catalog().await;
+    tag_every_policy(&catalog).await;
+    let before = every_policy_document(&catalog).await;
+    assert!(
+        before
+            .iter()
+            .any(|d| d.contains("dynamodb:ResourceTag/env")),
+        "{before:?}"
+    );
+    reconverge_after_an_older_release_wrote(&s, &catalog).await;
+    assert_eq!(every_policy_document(&catalog).await, before);
+    catalog.close().await;
+}
+
+/// A policy written after migration 2 with both forms on one key, which
+/// the rewrite would refuse, does not stop a reconverge.
+#[tokio::test]
+async fn a_reconverge_is_not_stopped_by_a_policy_migration_2_would_refuse() {
+    let Some(base) = base_conn() else {
+        return skip("reconverge after migration 2, both forms");
+    };
+    let s = Scratch::new(&base, "pgm_g2rcc").await;
+    s.load("0.1.14").await;
+    s.migrate_through(MigrationId::LATEST).await;
+    let catalog = s.catalog().await;
+    sqlx::query(
+        "UPDATE iam_policies SET policy_document = $1::jsonb WHERE principal_name = 'tester'",
+    )
+    .bind(COLLIDING)
+    .execute(&catalog)
+    .await
+    .unwrap();
+    let before = every_policy_document(&catalog).await;
+    reconverge_after_an_older_release_wrote(&s, &catalog).await;
+    assert_eq!(every_policy_document(&catalog).await, before);
     catalog.close().await;
 }
 

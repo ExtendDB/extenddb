@@ -2,19 +2,23 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The runs a fresh install gets after `init`: `--reconverge` on a catalog
 //! that a later migration changed, `--forget`, a ledger that cannot be read,
-//! the data database the server serves, and a migrator that finds an
-//! earlier migrator's statement still running. See `migrations_support` for
-//! the database these tests need.
+//! the data database the server serves, a migrator that finds an earlier
+//! migrator's statement still running, a zero lock timeout, and one timeout
+//! across every wait of a run. See `migrations_support` for the database
+//! these tests need.
 
 mod migrations_support;
 
 use std::time::{Duration, Instant};
 
-use extenddb_storage::migrations::{CatalogStatus, MigrationError, MigrationId, Runner, StoreKind};
-use extenddb_storage_postgres::migrations::{
-    MigrationLock, PostgresMigrations, PostgresTarget, catalog_status, migrate,
+use extenddb_storage::migrations::{
+    CatalogMigrations, CatalogStatus, MigrationError, MigrationId, Runner, StoreKind, Target,
 };
-use migrations_support::{LATEST, Scratch, base_conn, ids_in, ledger, pool, skip};
+use extenddb_storage_postgres::migrations::{
+    MigrationLock, PostgresCatalogMigrations, PostgresMigrations, PostgresTarget,
+    ServerRegistration, ServingRegistration, catalog_status, migrate,
+};
+use migrations_support::{LATEST, Scratch, base_conn, count, ids_in, ledger, pool, skip};
 use sqlx::PgPool;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
@@ -254,4 +258,141 @@ async fn a_migrator_waits_for_an_earlier_migrators_statement_to_end() {
         .unwrap();
     admin.close().await;
     sleeper.close().await;
+}
+
+/// `f`, which must end within 10 s, and how long it took.
+async fn timed<T>(f: impl std::future::Future<Output = T>) -> (T, Duration) {
+    let started = Instant::now();
+    let out = tokio::time::timeout(Duration::from_secs(10), f)
+        .await
+        .expect("it ends within 10 s");
+    (out, started.elapsed())
+}
+
+/// A zero lock timeout tries each wait once and exits 6 at once: while
+/// another migrator holds the migration key, through the run `migrate
+/// --yes` takes (the backend's lock) and through the library's run, and the
+/// server's registration refuses at once; while a server holds the serving
+/// key; and while an earlier migrator's statement runs. Nothing is written.
+#[tokio::test]
+async fn a_zero_lock_timeout_tries_once_and_exits_6_at_once() {
+    let Some(base) = base_conn() else {
+        return skip("zero lock timeout");
+    };
+    let s = Scratch::new(&base, "pgm_zero").await;
+    s.load("0.1.14").await;
+    let at_once = Duration::from_secs(2);
+    let catalog = s.catalog().await;
+    let mut migrator = catalog.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(4539458, 1)")
+        .execute(&mut *migrator)
+        .await
+        .unwrap();
+    let target = Target::at(s.catalog_url().as_str());
+    let (locked, took) = timed(PostgresCatalogMigrations.lock(&target, Duration::ZERO)).await;
+    let Err(err) = locked else {
+        panic!("the command took the lock while a migrator held it");
+    };
+    assert_eq!(err.exit_code(), 6, "{err}");
+    assert!(
+        err.to_string()
+            .contains("another migrator holds the migration lock"),
+        "{err}"
+    );
+    assert!(took < at_once, "the command's lock took {took:?}");
+    let (run, took) = timed(migrate(&s.target(), RELEASE, Duration::ZERO)).await;
+    let err = run.expect_err("a run while a migrator holds the lock");
+    assert_eq!(err.exit_code(), 6, "{err}");
+    assert!(took < at_once, "the run took {took:?}");
+    let (registered, took) = timed(ServerRegistration::register(&s.catalog_url())).await;
+    let Err(err) = registered else {
+        panic!("a server registered while a migrator held the lock");
+    };
+    assert_eq!(err.exit_code(), 6, "{err}");
+    assert!(took < at_once, "the registration took {took:?}");
+    migrator.rollback().await.unwrap();
+
+    let serving = ServingRegistration::register(&s.options()).await.unwrap();
+    let (run, took) = timed(migrate(&s.target(), RELEASE, Duration::ZERO)).await;
+    let err = run.expect_err("a run while a server holds its key");
+    assert_eq!(err.exit_code(), 6, "{err}");
+    assert!(err.to_string().contains("\"extenddb serve\""), "{err}");
+    assert!(took < at_once, "the run took {took:?}");
+    serving.release().await;
+
+    let (sleeper, pid) = earlier_runner_statement(&s, &s.data_url(), 60).await;
+    let (run, took) = timed(migrate(&s.target(), RELEASE, Duration::ZERO)).await;
+    let err = run.expect_err("a run while an earlier migrator's statement runs");
+    assert!(matches!(err, MigrationError::Blocked(_)), "{err}");
+    assert!(err.to_string().contains(&format!("pid {pid}")), "{err}");
+    assert!(took < at_once, "the run took {took:?}");
+    let admin = pool_for_admin(&s).await;
+    sqlx::query("SELECT pg_cancel_backend($1)")
+        .bind(pid)
+        .execute(&admin)
+        .await
+        .unwrap();
+    admin.close().await;
+    sleeper.close().await;
+    assert_eq!(
+        count(
+            &catalog,
+            "SELECT count(*) FROM pg_class WHERE relname = 'extenddb_migrations'"
+        )
+        .await,
+        0,
+        "a run at a zero lock timeout wrote the ledger"
+    );
+    catalog.close().await;
+}
+
+/// Every wait of a run shares the one lock timeout: another migrator holds
+/// the migration key for 2 s, a server holds the serving key for 2 s more,
+/// and an earlier migrator's statement outlasts the rest, so a run with a
+/// 6 s timeout waits for all three and exits 6 within 7 s.
+#[tokio::test]
+async fn one_lock_timeout_bounds_every_wait_of_a_run() {
+    let Some(base) = base_conn() else {
+        return skip("one deadline");
+    };
+    let s = Scratch::new(&base, "pgm_deadline").await;
+    s.load("0.1.14").await;
+    let timeout = Duration::from_secs(6);
+    let (sleeper, pid) = earlier_runner_statement(&s, &s.data_url(), 60).await;
+    // The server registers first: it refuses to register beside a holder of
+    // the migration key.
+    let serving = ServingRegistration::register(&s.options()).await.unwrap();
+    let catalog = s.catalog().await;
+    let mut migrator = catalog.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(4539458, 1)")
+        .execute(&mut *migrator)
+        .await
+        .unwrap();
+    let holders = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        migrator.rollback().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        serving.release().await;
+    });
+    let started = Instant::now();
+    let err = migrate(&s.target(), RELEASE, timeout)
+        .await
+        .expect_err("the earlier statement outlasts the timeout");
+    let took = started.elapsed();
+    holders.await.unwrap();
+    assert!(matches!(err, MigrationError::Blocked(_)), "{err}");
+    assert!(err.to_string().contains(&format!("pid {pid}")), "{err}");
+    assert!(
+        took >= Duration::from_secs(5) && took < timeout + Duration::from_secs(1),
+        "the run took {took:?} with a {timeout:?} lock timeout: {err}"
+    );
+    let admin = pool_for_admin(&s).await;
+    sqlx::query("SELECT pg_cancel_backend($1)")
+        .bind(pid)
+        .execute(&admin)
+        .await
+        .unwrap();
+    admin.close().await;
+    sleeper.close().await;
+    catalog.close().await;
 }

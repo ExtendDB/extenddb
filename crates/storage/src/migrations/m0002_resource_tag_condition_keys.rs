@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use super::code::{CodeBody, Done, HasManagementStore};
 use super::status::{CatalogStatus, MigrationError};
 use crate::management_store::OpError;
-use crate::policy_migration::{MigrationReport, NeedsAttention, migrate_resource_tag_condition_keys};
+use crate::policy_migration::{MigrationReport, attention_items, failure_message, migrate_resource_tag_condition_keys};
 
 /// The condition-key prefix the live service does not populate.
 const DYNAMODB_PREFIX: &str = "dynamodb:ResourceTag/";
@@ -246,21 +246,21 @@ impl<H: HasManagementStore + Send + Sync + 'static> CodeBody<H> for ResourceTagC
     }
 
     /// The policies whose two resource-tag forms name the same key with
-    /// different values in one operator block. They cannot be rewritten, and
-    /// leaving them in the `dynamodb:` form can turn a Deny off.
+    /// different values in one operator block, and the policies whose stored
+    /// documents cannot be decoded. Neither can be rewritten, and leaving a
+    /// `dynamodb:` form in place can turn a Deny off.
     async fn detect(&self, stores: &H) -> Result<Vec<String>, MigrationError> {
         let report = migrate_resource_tag_condition_keys(stores.management_store(), false).await;
         refuse_lookup_errors(&report)?;
-        Ok(report.needs_attention.iter().map(collision_line).collect())
+        Ok(attention_items(&report))
     }
 
     async fn run(&self, stores: &H) -> Result<Done, MigrationError> {
         let report = migrate_resource_tag_condition_keys(stores.management_store(), true).await;
         refuse_lookup_errors(&report)?;
-        if !report.needs_attention.is_empty() {
-            return Err(MigrationError::Status(CatalogStatus::NeedsAttention {
-                items: report.needs_attention.iter().map(collision_line).collect(),
-            }));
+        let items = attention_items(&report);
+        if !items.is_empty() {
+            return Err(MigrationError::Status(CatalogStatus::NeedsAttention { items }));
         }
         let notes = report
             .rewritten
@@ -277,68 +277,49 @@ impl<H: HasManagementStore + Send + Sync + 'static> CodeBody<H> for ResourceTagC
 }
 
 /// A pass that could not read or write a policy must not be recorded: the
-/// next run finishes it. The error carries the first failure's text, such
-/// as a lapsed migration lock or a node that did not answer, and its
-/// database error code when it has one, so the runner runs the body again
-/// after a lock timeout.
+/// next run finishes it. The error names the failed lookups and writes,
+/// each with its own text, such as a lapsed migration lock or a node that
+/// did not answer, and carries the first failure's database error code, so
+/// the runner runs the body again after a lock timeout.
 fn refuse_lookup_errors(report: &MigrationReport) -> Result<(), MigrationError> {
     if report.errors == 0 {
         return Ok(());
     }
-    let failed = format!(
-        "resource-tag rewrite: {} policy lookup(s) or write(s) failed",
-        report.errors
-    );
+    let message = failure_message(report);
     Err(match &report.first_error {
-        Some(OpError::Database { message, sqlstate }) => MigrationError::Database {
-            message: format!("{failed}, the first with {message}"),
+        Some(OpError::Database { sqlstate, .. }) => MigrationError::Database {
+            message,
             sqlstate: sqlstate.clone(),
         },
-        Some(
-            OpError::Validation(message)
-            | OpError::AlreadyExists(message)
-            | OpError::NotFound(message)
-            | OpError::HasDependents(message)
-            | OpError::Internal(message),
-        ) => MigrationError::Store(format!("{failed}, the first with {message}")),
-        None => MigrationError::Store(failed),
+        _ => MigrationError::Store(message),
     })
-}
-
-fn collision_line(n: &NeedsAttention) -> String {
-    format!(
-        "account {} {} policy {} names aws:ResourceTag/<key> and dynamodb:ResourceTag/<key> \
-         for the same key with different values in one condition operator; remove one of the \
-         two forms",
-        n.account_id, n.principal, n.policy_name
-    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{MigrationError, MigrationReport, OpError, refuse_lookup_errors};
 
-    /// The first failure's own text reaches the operator whatever its kind:
-    /// a store under a lease that lapsed, or a request a node did not
-    /// answer, returns an internal error, and its text says which.
+    /// A failed lookup's own text reaches the operator whatever its kind: a
+    /// store under a lease that lapsed, or a request a node did not answer,
+    /// returns an internal error, and its text says which.
     #[test]
-    fn a_failed_pass_names_its_first_error() {
+    fn a_failed_pass_names_its_failures() {
+        let lapsed = "the migration lock in ks_catalog.settings was not renewed in time";
         let report = MigrationReport {
-            errors: 2,
-            first_error: Some(OpError::Internal(
-                "the migration lock in ks_catalog.settings was not renewed in time".to_owned(),
-            )),
+            errors: 1,
+            failures: vec![format!("list the policies of account 1 user/u: {lapsed}")],
+            first_error: Some(OpError::Internal(lapsed.to_owned())),
             ..MigrationReport::default()
         };
         let refused = refuse_lookup_errors(&report);
         let Err(MigrationError::Store(message)) = refused else {
             panic!("{refused:?}");
         };
-        assert_eq!(
-            message,
-            "resource-tag rewrite: 2 policy lookup(s) or write(s) failed, the first with the \
-             migration lock in ks_catalog.settings was not renewed in time"
+        assert!(
+            message.starts_with("resource-tag rewrite: 1 policy lookup(s) or write(s) failed:"),
+            "{message}"
         );
+        assert!(message.contains(lapsed), "{message}");
         assert!(refuse_lookup_errors(&MigrationReport::default()).is_ok());
     }
 }

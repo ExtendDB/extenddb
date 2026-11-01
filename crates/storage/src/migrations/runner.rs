@@ -124,16 +124,18 @@ impl<'a, B: MigrationBackend> Runner<'a, B> {
         self.run(id, false).await
     }
 
-    /// Run every migration again, repairing a catalog a release before 1.0
-    /// wrote to (`WrittenByOlderRelease`): the convergent bodies rerun, the
-    /// `catalog_version` row is written again, and the ledger rows already
-    /// there stay as they are, with their notes and `applied_at`. A store
-    /// without a row for an id gets one, as in [`Runner::migrate`].
+    /// Run the convergent migrations again, repairing a catalog a release
+    /// before 1.0 wrote to (`WrittenByOlderRelease`): each convergent body
+    /// reruns, the `catalog_version` row is written again, and the ledger
+    /// rows already there stay as they are, with their notes and
+    /// `applied_at`. A recorded migration that is not convergent does not
+    /// run again, and a line of the report's notes names it. A store without
+    /// a row for an id gets one, as in [`Runner::migrate`].
     ///
     /// # Errors
     ///
-    /// The ledger holds an id that is not convergent or that this binary
-    /// does not carry, or as [`Runner::migrate`].
+    /// The catalog ledger holds an id that this binary does not carry, or as
+    /// [`Runner::migrate`].
     pub async fn reconverge(&self) -> Result<RunReport, MigrationError> {
         self.run(MigrationId::LATEST, true).await
     }
@@ -143,19 +145,20 @@ impl<'a, B: MigrationBackend> Runner<'a, B> {
     ///
     /// # Errors
     ///
-    /// `id` is at or below the released bound, this binary does not carry
-    /// it, no store has a row for it, or a store failed.
+    /// This binary does not carry `id` (0 is no migration id), `id` is at or
+    /// below the released bound, no store has a row for it, or a store
+    /// failed.
     pub async fn forget(&self, id: u32) -> Result<(), MigrationError> {
-        if id <= self.released_through {
-            return Err(MigrationError::Refused(format!(
-                "migration {id} has been released; only migrations above {} can be forgotten",
-                self.released_through
-            )));
-        }
         if MigrationId::from_number(id).is_none() {
             return Err(MigrationError::Refused(format!(
                 "this binary carries no migration {id}; it carries migrations 1 to {}",
                 MigrationId::LATEST.number()
+            )));
+        }
+        if id <= self.released_through {
+            return Err(MigrationError::Refused(format!(
+                "migration {id} has been released; only migrations above {} can be forgotten",
+                self.released_through
             )));
         }
         let mut snap = self.read().await?;
@@ -255,11 +258,13 @@ impl<'a, B: MigrationBackend> Runner<'a, B> {
     }
 
     /// Every store without a row for an id up to `target`, in order: by id,
-    /// then catalog first. With `rerun`, every store, rows or not.
+    /// then catalog first. With `rerun`, also every store with a row for a
+    /// convergent id.
     fn planned(&self, snap: &Snapshot, target: MigrationId, rerun: bool) -> Vec<Planned> {
         let mut steps = Vec::new();
         for id in MigrationId::ALL.into_iter().filter(|id| *id <= target) {
             let migration = self.backend.migration(id);
+            let rerun = rerun && migration.convergent();
             for kind in migration.store_kinds() {
                 for store in snap.instances(kind) {
                     let recorded = snap.has_row(store, id.number());
@@ -430,14 +435,18 @@ impl<'a, B: MigrationBackend> Runner<'a, B> {
         if let Some(status) = self.forbidding(&snap, reconverge) {
             return Err(MigrationError::Status(status));
         }
-        if reconverge {
-            self.refuse_non_convergent(&snap)?;
-        }
+        let skipped = if reconverge {
+            self.refuse_unknown(&snap)?;
+            self.skipped(&snap, target)
+        } else {
+            Vec::new()
+        };
         let steps = self.planned(&snap, target, reconverge);
         if steps.is_empty() {
             return Ok(RunReport {
                 from,
                 to: from,
+                notes: skipped,
                 ..RunReport::default()
             });
         }
@@ -453,10 +462,12 @@ impl<'a, B: MigrationBackend> Runner<'a, B> {
                 items,
             }));
         }
-        let notes = self
+        let mut notes = self
             .backend
             .before_first_write(from, target.number())
             .await?;
+        let prepared = !notes.is_empty();
+        notes.extend(skipped);
         let mut applied = Vec::new();
         let result = self.apply_steps(&mut snap, &steps, &mut applied).await;
         let report = RunReport {
@@ -468,7 +479,7 @@ impl<'a, B: MigrationBackend> Runner<'a, B> {
         match result {
             Ok(()) => Ok(report),
             // Nothing was prepared or committed: the error says it all.
-            Err(error) if report.applied.is_empty() && report.notes.is_empty() => Err(error),
+            Err(error) if report.applied.is_empty() && !prepared => Err(error),
             Err(error) => Err(MigrationError::Stopped {
                 error: Box::new(error),
                 report,
@@ -503,27 +514,45 @@ impl<'a, B: MigrationBackend> Runner<'a, B> {
         Ok(())
     }
 
-    fn refuse_non_convergent(&self, snap: &Snapshot) -> Result<(), MigrationError> {
-        for row in snap.catalog_rows() {
-            match MigrationId::from_number(row.id) {
-                Some(id) if self.backend.migration(id).convergent() => {}
-                Some(id) => {
-                    return Err(MigrationError::Refused(format!(
-                        "migration {id} is not convergent on {}, so the catalog cannot be \
-                         reconverged; restore the backup taken before the upgrade",
-                        self.backend.backend_name()
-                    )));
-                }
-                None => {
-                    return Err(MigrationError::Refused(format!(
-                        "the catalog has migration {} {}, which this binary does not carry; \
-                         reconverge with the binary that applied it",
-                        row.id, row.name
-                    )));
-                }
-            }
+    /// Refuse a reconverge of a catalog whose ledger has an id this binary
+    /// does not carry, whose body it cannot run again.
+    fn refuse_unknown(&self, snap: &Snapshot) -> Result<(), MigrationError> {
+        match snap
+            .catalog_rows()
+            .iter()
+            .find(|row| MigrationId::from_number(row.id).is_none())
+        {
+            Some(row) => Err(MigrationError::Refused(format!(
+                "the catalog has migration {} {}, which this binary does not carry; \
+                 reconverge with the binary that applied it",
+                row.id, row.name
+            ))),
+            None => Ok(()),
         }
-        Ok(())
+    }
+
+    /// A line for each id up to `target` that is not convergent and that a
+    /// store has a row for: a reconverge leaves those stores as they are.
+    fn skipped(&self, snap: &Snapshot, target: MigrationId) -> Vec<String> {
+        MigrationId::ALL
+            .into_iter()
+            .filter(|id| *id <= target)
+            .filter(|id| {
+                let migration = self.backend.migration(*id);
+                !migration.convergent()
+                    && migration.store_kinds().into_iter().any(|kind| {
+                        snap.instances(kind)
+                            .any(|store| snap.has_row(store, id.number()))
+                    })
+            })
+            .map(|id| {
+                format!(
+                    "Skipped {id}: it is not convergent on {}, so it does not run again \
+                     over data written since it was applied",
+                    self.backend.backend_name()
+                )
+            })
+            .collect()
     }
 
     async fn apply_step(

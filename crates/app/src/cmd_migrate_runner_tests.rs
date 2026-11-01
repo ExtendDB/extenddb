@@ -80,6 +80,18 @@ impl CatalogMigrations for Fake {
     async fn status_notes(&self, _: &Target) -> Result<Vec<StatusNote>, MigrationError> {
         Ok(self.notes.clone())
     }
+    async fn pending_changes(
+        &self,
+        _: &Target,
+        status: &CatalogStatus,
+    ) -> Result<Vec<String>, MigrationError> {
+        self.call("pending_changes");
+        assert!(
+            matches!(status, CatalogStatus::Behind { .. }),
+            "asked for the changes of {status:?}"
+        );
+        Ok(vec!["Migration 2 rewrites no stored policy.".to_owned()])
+    }
 }
 
 const ADVICE: Advice<'static> = Advice {
@@ -137,7 +149,14 @@ async fn the_preview_reads_the_status_and_takes_no_lock() {
             Ok(code),
             "{status:?}"
         );
-        assert_eq!(fake.calls(), ["status"], "{status:?}");
+        // A catalog behind the binary also gets the list of what its pending
+        // migrations change (the policies migration 2 rewrites).
+        let calls: &[&str] = if code == exit::PENDING {
+            &["status", "pending_changes"]
+        } else {
+            &["status"]
+        };
+        assert_eq!(fake.calls(), calls, "{status:?}");
     }
 }
 
@@ -297,7 +316,7 @@ async fn a_refusing_note_stops_yes_before_the_lock() {
     assert!(fake.calls().contains(&"run"), "{:?}", fake.calls());
     let fake = with(behind(), &note);
     assert_eq!(preview(&fake, &target, &ADVICE).await, Ok(exit::PENDING));
-    assert_eq!(fake.calls(), ["status"]);
+    assert_eq!(fake.calls(), ["status", "pending_changes"]);
 }
 
 #[tokio::test]

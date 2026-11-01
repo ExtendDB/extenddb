@@ -60,6 +60,14 @@ pub struct PostgresStores {
 }
 
 impl PostgresStores {
+    /// The runner's connection to the catalog database, for a test body that
+    /// runs its own statements inside the runner's transaction.
+    #[cfg(feature = "test-util")]
+    #[must_use]
+    pub fn catalog_connection(&self) -> &PgPool {
+        &self.catalog
+    }
+
     /// Fail when the migration lock's connection is lost. A status session,
     /// or a test driving the runner itself, has no lock to check.
     pub(crate) async fn check_lock(&self) -> Result<(), MigrationError> {
@@ -244,8 +252,11 @@ impl PostgresMigrations {
                     (&catalog, catalog_name.as_str()),
                     (&data, data_name.as_str()),
                 ];
+                // The time the lock's waits left: with none left, as at a
+                // zero lock timeout, the earlier runners' sessions are
+                // looked at once.
                 if let Err(e) =
-                    wait_for_earlier_runners(&databases, &application, lock.timeout()).await
+                    wait_for_earlier_runners(&databases, &application, lock.remaining()).await
                 {
                     if let Some(watch) = &data_watch {
                         watch.close().await;

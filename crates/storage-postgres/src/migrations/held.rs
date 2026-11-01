@@ -35,15 +35,25 @@ pub(super) struct Held {
     pub(super) conn: Mutex<Option<PgConnection>>,
     lost: StdMutex<Option<String>>,
     pub(super) what: &'static str,
+    /// What the holder does once the key is lost, appended to the reason:
+    /// for the migration lock "; nothing more is applied", and nothing for
+    /// the serving registration, whose server decides.
+    then: &'static str,
     pub(super) ping_timeout: Duration,
 }
 
 impl Held {
-    pub(super) fn new(conn: PgConnection, what: &'static str, interval: Duration) -> Arc<Self> {
+    pub(super) fn new(
+        conn: PgConnection,
+        what: &'static str,
+        then: &'static str,
+        interval: Duration,
+    ) -> Arc<Self> {
         Arc::new(Self {
             conn: Mutex::new(Some(conn)),
             lost: StdMutex::new(None),
             what,
+            then,
             ping_timeout: ping_timeout(interval),
         })
     }
@@ -73,9 +83,8 @@ impl Held {
                 self.what
             ))),
             Ok(Err(Some(e))) => Renewal::Lost(self.mark_lost(format!(
-                "the {}'s connection was lost ({e}), so another process may hold it now; \
-                 nothing more is applied",
-                self.what
+                "the {}'s connection was lost ({e}), so another process may hold it now{}",
+                self.what, self.then
             ))),
             Err(_) => Renewal::NoAnswer,
         }
@@ -90,9 +99,10 @@ impl Held {
             Renewal::Lost(e) => Err(e),
             Renewal::NoAnswer => Err(self.mark_lost(format!(
                 "the {}'s connection did not answer within {} s, so this process cannot tell \
-                 that it still holds it; nothing more is applied",
+                 that it still holds it{}",
                 self.what,
-                self.ping_timeout.as_secs_f32()
+                self.ping_timeout.as_secs_f32(),
+                self.then
             ))),
         }
     }
