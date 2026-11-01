@@ -27,6 +27,7 @@ The `schema_history` table tracks which files have been applied. When `extenddb 
 2. Checks `schema_history` for each filename
 3. Applies any unapplied migrations in order
 4. Records each applied filename in `schema_history`
+5. Writes the catalog version the binary expects, so an upgrade interrupted between applying a migration and recording it converges on the expected version when `extenddb migrate` runs again
 
 Running `extenddb migrate` on an up-to-date catalog is a no-op.
 
