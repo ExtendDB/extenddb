@@ -5,11 +5,15 @@
 //! own hold of the engine write lock, so a write waits for one batch rather
 //! than for the whole delete.
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use extenddb_core::expression::ExpressionMaps;
-use extenddb_core::types::{AttributeValue, CreateTableInput, Item, TableKeyInfo};
-use extenddb_storage::{DataEngine, StreamEngine};
+use extenddb_core::types::{AttributeValue, CreateTableInput, Item, StreamViewType, TableKeyInfo};
+use extenddb_storage::{DataEngine, StreamCapture, StreamEngine};
 use serde_json::json;
 
 use crate::store::SqliteEngine;
@@ -132,6 +136,15 @@ async fn wait_until_the_write_lock_is_held(engine: &SqliteEngine) {
     }
 }
 
+/// Poll `task` once, so that it runs up to its first wait, and return it for
+/// `tokio::spawn`. Fails if the task finishes instead of waiting.
+async fn run_until_it_waits<F: Future>(task: F) -> Pin<Box<F>> {
+    let mut task = Box::pin(task);
+    let waiting = std::future::poll_fn(|cx| Poll::Ready(task.as_mut().poll(cx).is_pending())).await;
+    assert!(waiting, "the task finished without waiting");
+    task
+}
+
 /// A PutItem sent while the cleanup deletes two hundred batches of expired
 /// records completes while the cleanup is still running, in a small part of
 /// the cleanup's time. With one statement for the whole delete it waits for
@@ -201,6 +214,86 @@ async fn a_write_during_the_cleanup_waits_for_one_batch_not_the_whole_delete() {
         .await
         .expect("get");
     assert!(written.is_some(), "the PutItem's item is stored");
+}
+
+/// The write lock is FIFO and the cleanup takes it once per batch, so a write
+/// queued behind the cleanup runs after the cleanup's first batch. The test
+/// holds the lock while the cleanup and then a PutItem queue for it, in that
+/// order, and a temporary trigger records how many expired records were left
+/// when the PutItem wrote its stream record.
+#[tokio::test]
+async fn a_write_queued_behind_the_cleanup_runs_after_one_batch() {
+    const BATCHES: i64 = 20;
+    let engine = engine_at(":memory:").await;
+    let key_info = stream_table(&engine).await;
+    let batch = i64::from(STREAM_CLEANUP_BATCH_ROWS);
+    let expired = BATCHES * batch;
+    let old = ("now", "-48 hours");
+    insert_records(&engine, &key_info.table_id, 1, expired, old, RECORD_DATA).await;
+    // The in-memory engine has one connection, so a temporary trigger sees
+    // every statement. From here on only the PutItem inserts a stream record.
+    sqlx::raw_sql(
+        "CREATE TEMP TABLE expired_left_at_write (n INTEGER NOT NULL); \
+         CREATE TEMP TRIGGER count_expired_left AFTER INSERT ON stream_records \
+         BEGIN \
+             INSERT INTO expired_left_at_write SELECT COUNT(*) FROM stream_records \
+             WHERE created_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-24 hours'); \
+         END",
+    )
+    .execute(&engine.pool)
+    .await
+    .expect("trigger");
+
+    let lock = engine.write_lock.lock().await;
+    // The cleanup reads nothing before it asks for the lock, so one poll makes
+    // it the first waiter.
+    let cleanup = run_until_it_waits({
+        let engine = engine.clone();
+        async move { engine.cleanup_expired_stream_records(RETENTION_HOURS).await }
+    })
+    .await;
+    // The PutItem first reads the index propagation delay through the pool,
+    // and one poll has it holding, or waiting for, the pool's one connection.
+    let write = run_until_it_waits({
+        let engine = engine.clone();
+        let stream = StreamCapture {
+            view_type: StreamViewType::NewImage,
+            user_identity: None,
+            region: Arc::from("us-east-1"),
+        };
+        async move {
+            engine
+                .put_item(
+                    &key_info,
+                    item("queued-behind-the-cleanup"),
+                    false,
+                    None,
+                    &ExpressionMaps::default(),
+                    Some(&stream),
+                )
+                .await
+        }
+    })
+    .await;
+    let (cleanup, write) = (tokio::spawn(cleanup), tokio::spawn(write));
+    // The pool hands out its connection in request order, so this returns
+    // after the PutItem's read, which asks for the lock as soon as it ends.
+    drop(engine.pool.acquire().await.expect("connection"));
+    drop(lock);
+
+    write.await.expect("write task").expect("put");
+    let deleted = cleanup.await.expect("cleanup task").expect("cleanup");
+    assert_eq!(deleted, u64::try_from(expired).expect("count"));
+    let left: Vec<i64> = sqlx::query_scalar("SELECT n FROM expired_left_at_write")
+        .fetch_all(&engine.pool)
+        .await
+        .expect("counts");
+    let deleted_before_the_write: Vec<i64> = left.iter().map(|n| expired - n).collect();
+    assert!(
+        deleted_before_the_write == [batch],
+        "the PutItem wrote its stream record after {deleted_before_the_write:?} of \
+         {expired} expired records were deleted; one batch is {batch}"
+    );
 }
 
 #[tokio::test]
