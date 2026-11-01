@@ -527,14 +527,14 @@ impl MigrationBackend for SqliteMigrations {
         }
         let from = from.map_or_else(|| "legacy".to_owned(), |v| v.to_string());
         let copy = super::copy::copy_path(file, &from, to, std::time::SystemTime::now());
-        let lines = super::copy::pre_migration_copy(
+        let mut lines = super::copy::pre_migration_copy(
             &self.stores.pool,
             file,
             &copy,
-            super::copy::free_space,
-            |_| {},
+            super::copy::Hooks::RUN,
         )
         .await?;
+        lines.extend(super::copy::remove_superseded(file, &copy).await);
         *self.copy.lock().unwrap_or_else(PoisonError::into_inner) = Some(copy);
         Ok(lines)
     }

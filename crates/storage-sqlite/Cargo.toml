@@ -39,6 +39,7 @@ bigdecimal = { workspace = true }
 crc32fast = { workspace = true }
 zeroize = { workspace = true }
 libc = { workspace = true }
+libsqlite3-sys = { workspace = true }
 
 [dev-dependencies]
 extenddb-storage = { workspace = true, features = ["test-util"] }

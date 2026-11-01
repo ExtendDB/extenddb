@@ -347,7 +347,10 @@ that each backend implements, as follows.
   backend uses, running `extenddb migrate` to see what is pending (exit 3
   when something is), running `extenddb migrate --yes`, and starting `serve`.
   On SQLite `migrate --yes` copies the database beside it before its first
-  change, and nothing removes the copy. `extenddb migrate --list` prints every
+  change. A run that commits nothing removes its copy, and a run removes an
+  earlier copy that has the same bytes as its own, which a run killed
+  before it committed anything leaves; every other copy stays until the
+  operator removes it. `extenddb migrate --list` prints every
   migration the binary carries with its kind on that backend, `verify` prints
   the status, and `serve` refuses with the status's exit code and the command
   to run.

@@ -327,15 +327,9 @@ async fn a_file_at_the_copy_name_stops_the_run() {
     let at = std::time::SystemTime::now();
     let copy = super::copy::copy_path(&db, "legacy", LATEST, at);
     let full = super::copy::copy_path(&db, "earlier", LATEST, at);
-    super::copy::pre_migration_copy(
-        migrations.pool(),
-        &db,
-        &full,
-        super::copy::free_space,
-        |_| {},
-    )
-    .await
-    .expect("a full copy");
+    super::copy::pre_migration_copy(migrations.pool(), &db, &full, super::copy::Hooks::RUN)
+        .await
+        .expect("a full copy");
     let no_tables = db.with_file_name("no-tables.sqlite");
     exec(&no_tables, "PRAGMA user_version = 1").await;
     let first_page = std::fs::read(&full).expect("copy")[..4096].to_vec();
@@ -346,15 +340,10 @@ async fn a_file_at_the_copy_name_stops_the_run() {
         std::fs::read(&full).expect("copy"),
     ] {
         std::fs::write(&copy, &content).expect("plant");
-        let err = super::copy::pre_migration_copy(
-            migrations.pool(),
-            &db,
-            &copy,
-            super::copy::free_space,
-            |_| {},
-        )
-        .await
-        .expect_err("refused");
+        let err =
+            super::copy::pre_migration_copy(migrations.pool(), &db, &copy, super::copy::Hooks::RUN)
+                .await
+                .expect_err("refused");
         assert!(err.to_string().contains("already exists"), "{err}");
         assert_eq!(std::fs::read(&copy).expect("kept"), content);
     }
@@ -364,8 +353,8 @@ async fn a_file_at_the_copy_name_stops_the_run() {
 
 /// A copy that fails while it writes removes its partial file: the likeliest
 /// cause is a full disk, where that file is as large as the database. A
-/// directory in place of the journal `VACUUM INTO` writes beside the partial
-/// file makes the copy fail after the partial file exists.
+/// directory in place of the journal SQLite writes beside the partial file
+/// makes the copy fail after the partial file exists.
 #[tokio::test]
 async fn a_failed_copy_leaves_no_partial_file() {
     let db = temp_db("copy-fails");
@@ -377,15 +366,10 @@ async fn a_failed_copy_leaves_no_partial_file() {
     let partial = std::path::PathBuf::from(format!("{}.partial", copy.display()));
     let journal = std::path::PathBuf::from(format!("{}.partial-journal", copy.display()));
     std::fs::create_dir(&journal).expect("a directory at the journal's path");
-    let err = super::copy::pre_migration_copy(
-        migrations.pool(),
-        &db,
-        &copy,
-        super::copy::free_space,
-        |_| {},
-    )
-    .await
-    .expect_err("the copy fails");
+    let err =
+        super::copy::pre_migration_copy(migrations.pool(), &db, &copy, super::copy::Hooks::RUN)
+            .await
+            .expect_err("the copy fails");
     migrations.close().await;
     assert!(err.to_string().contains("copy the database"), "{err}");
     assert!(
@@ -394,6 +378,114 @@ async fn a_failed_copy_leaves_no_partial_file() {
         partial.display()
     );
     assert!(!copy.exists());
+}
+
+/// Another connection's reader whose snapshot holds frames of the WAL keeps
+/// every checkpoint from moving them into the main file. The copy reads the
+/// committed frames of the WAL with the main file, so it holds the write in
+/// them, and it is owner-only.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_copy_holds_the_writes_a_reader_keeps_in_the_wal() {
+    use std::os::unix::fs::PermissionsExt;
+    let db = temp_db("copy-wal");
+    load_dump(&db, DEV_0_1_14).await;
+    let reader = super::tests::plain_pool(&db).await;
+    sqlx::query("INSERT INTO settings (key, value) VALUES ('in_the_wal', '1')")
+        .execute(&reader)
+        .await
+        .expect("write");
+    let mut held = reader.acquire().await.expect("connection");
+    sqlx::raw_sql("BEGIN; SELECT COUNT(*) FROM settings;")
+        .execute(&mut *held)
+        .await
+        .expect("a read transaction on the WAL");
+    let migrations = SqliteMigrations::open(&db.to_string_lossy())
+        .await
+        .expect("open");
+
+    let copy = super::copy::copy_path(&db, "legacy", LATEST, std::time::SystemTime::now());
+    let lines =
+        super::copy::pre_migration_copy(migrations.pool(), &db, &copy, super::copy::Hooks::RUN)
+            .await
+            .expect("the copy");
+    let line = lines.last().expect("the copy's line");
+    assert!(line.contains(&copy.display().to_string()), "{line}");
+    let wal = std::fs::metadata(format!("{}-wal", db.display()))
+        .expect("the WAL")
+        .len();
+    assert!(wal > 0, "the write is no longer in the WAL");
+    let mode = std::fs::metadata(&copy).expect("copy").permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    sqlx::raw_sql("ROLLBACK")
+        .execute(&mut *held)
+        .await
+        .expect("end the read");
+    drop(held);
+    reader.close().await;
+    migrations.close().await;
+    assert_eq!(
+        count(
+            &copy,
+            "SELECT COUNT(*) FROM settings WHERE key = 'in_the_wal'"
+        )
+        .await,
+        1
+    );
+}
+
+/// The copy opens no file descriptor of the database outside SQLite.
+/// Closing one would release every POSIX lock this process holds on the
+/// file, the shared lock of the runner's connection included, and another
+/// process that then closed its connection would take itself for the last
+/// one and delete the WAL, with the commits the run makes after it.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn the_copy_leaves_the_runners_lock_on_the_database() {
+    let db = temp_db("copy-lock");
+    load_dump(&db, DEV_0_1_14).await;
+    let migrations = SqliteMigrations::open(&db.to_string_lossy())
+        .await
+        .expect("open");
+    // A connection in WAL mode keeps the shared lock its first read takes.
+    sqlx::query("SELECT COUNT(*) FROM sqlite_master")
+        .execute(migrations.pool())
+        .await
+        .expect("read");
+    let held = posix_locks(&db);
+    assert!(!held.is_empty(), "the runner's connection holds no lock");
+    let copy = super::copy::copy_path(&db, "legacy", LATEST, std::time::SystemTime::now());
+    super::copy::pre_migration_copy(migrations.pool(), &db, &copy, super::copy::Hooks::RUN)
+        .await
+        .expect("the copy");
+    assert_eq!(
+        posix_locks(&db),
+        held,
+        "the copy released the runner's lock"
+    );
+    migrations.close().await;
+}
+
+/// This process's POSIX locks on the file at `path`, from /proc/locks: one
+/// `<type> <start>-<end>` entry each.
+#[cfg(target_os = "linux")]
+fn posix_locks(path: &std::path::Path) -> Vec<String> {
+    use std::os::unix::fs::MetadataExt;
+    let inode = std::fs::metadata(path).expect("the file").ino().to_string();
+    let pid = std::process::id().to_string();
+    std::fs::read_to_string("/proc/locks")
+        .expect("/proc/locks")
+        .lines()
+        .filter_map(|line| {
+            // `1: POSIX  ADVISORY  READ 4242 08:01:131074 1073741826 1073742335`
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let ours = fields.len() >= 8
+                && fields[1] == "POSIX"
+                && fields[4] == pid
+                && fields[5].rsplit(':').next() == Some(inode.as_str());
+            ours.then(|| format!("{} {}-{}", fields[3], fields[6], fields[7]))
+        })
+        .collect()
 }
 
 /// The free space the probe reports is compared with three times the
@@ -412,10 +504,17 @@ async fn a_short_filesystem_stops_the_run_before_the_copy() {
         db.display()
     ));
     std::fs::write(&stopped, b"a stopped run's copy").expect("plant");
-    let err =
-        super::copy::pre_migration_copy(migrations.pool(), &db, &copy, |_| Some(4096), |_| {})
-            .await
-            .expect_err("short");
+    let err = super::copy::pre_migration_copy(
+        migrations.pool(),
+        &db,
+        &copy,
+        super::copy::Hooks {
+            free_space: |_| Some(4096),
+            ..super::copy::Hooks::RUN
+        },
+    )
+    .await
+    .expect_err("short");
     migrations.close().await;
     assert!(
         err.to_string().contains("three times the database's size"),
@@ -448,6 +547,75 @@ async fn a_run_with_nothing_to_apply_removes_stopped_partial_copies() {
             "{:?}",
             report.notes
         );
+    }
+}
+
+/// A run killed after its copy was complete, with nothing committed, leaves
+/// the copy. The next run's copy has the same bytes, so it replaces it
+/// whatever its `<to>`, and the run names it. A copy with other bytes, one a
+/// process opened (a `-wal` beside it) and one with another `<from>` stay,
+/// and a reconverge after the run, whose copy holds the migrated database,
+/// replaces none.
+#[tokio::test]
+async fn a_copy_of_the_same_contents_replaces_an_earlier_one() {
+    let db = temp_db("superseded");
+    load_dump(&db, DEV_0_1_14).await;
+    let at = |second: u64| {
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_767_225_600 + second)
+    };
+    let stopped = super::copy::copy_path(&db, "legacy", LATEST, at(0));
+    let migrations = SqliteMigrations::open(&db.to_string_lossy())
+        .await
+        .expect("open");
+    super::copy::pre_migration_copy(migrations.pool(), &db, &stopped, super::copy::Hooks::RUN)
+        .await
+        .expect("a stopped run's copy");
+    migrations.close().await;
+    let bytes = std::fs::read(&stopped).expect("copy");
+    let plant = |path: &std::path::Path, content: &[u8]| {
+        std::fs::write(path, content).expect("plant");
+    };
+    let older_binary = super::copy::copy_path(&db, "legacy", 3, at(1));
+    plant(&older_binary, &bytes);
+    let mut changed = bytes.clone();
+    *changed.last_mut().expect("a page") ^= 1;
+    let other_bytes = super::copy::copy_path(&db, "legacy", LATEST, at(2));
+    plant(&other_bytes, &changed);
+    let opened = super::copy::copy_path(&db, "legacy", LATEST, at(3));
+    plant(&opened, &bytes);
+    plant(
+        std::path::Path::new(&format!("{}-wal", opened.display())),
+        b"",
+    );
+    let other_version = super::copy::copy_path(&db, "2", LATEST, at(4));
+    plant(&other_version, &bytes);
+
+    let report = run(&db).await.expect("migrate");
+    for path in [&stopped, &older_binary] {
+        assert!(!path.exists(), "{} is left", path.display());
+        let removed = format!(
+            "removed {}, a copy an earlier run took of the same database contents",
+            path.display()
+        );
+        assert!(
+            report.notes.iter().any(|n| n.starts_with(&removed)),
+            "{:?}",
+            report.notes
+        );
+    }
+    for path in [&other_bytes, &opened, &other_version] {
+        assert!(path.exists(), "{} was removed", path.display());
+    }
+
+    super::tests::next_second().await;
+    let report = super::tests::reconverge(&db).await.expect("reconverge");
+    assert!(
+        report.notes.iter().all(|n| !n.starts_with("removed")),
+        "{:?}",
+        report.notes
+    );
+    for path in [&other_bytes, &opened, &other_version] {
+        assert!(path.exists(), "{} was removed", path.display());
     }
 }
 
