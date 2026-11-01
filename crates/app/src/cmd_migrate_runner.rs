@@ -56,11 +56,17 @@ pub(crate) async fn run(
         )?,
         data_connection: None,
     };
+    // The backup clause names the data store the catalog records when the
+    // command names none.
+    let named = Target {
+        data_store: migrations.data_store_name(&target).await,
+        ..target.clone()
+    };
     let advice = AdviceFor::new(
         release,
         shown.clone(),
         Some(migrations),
-        &target,
+        &named,
         config_file.as_deref(),
     );
     let advice = advice.advice();

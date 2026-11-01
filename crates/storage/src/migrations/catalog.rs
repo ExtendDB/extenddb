@@ -157,6 +157,14 @@ pub trait CatalogMigrations: Send + Sync {
     /// clause: "back up ...". Opens nothing.
     fn backup_advice(&self, target: &Target) -> String;
 
+    /// The name of the data store `target` resolves to, which the commands
+    /// put in the target they give [`backup_advice`](Self::backup_advice):
+    /// the one the target names, else the one the catalog records, or
+    /// `None` when it cannot be read. Read-only. The target's by default.
+    async fn data_store_name(&self, target: &Target) -> Option<String> {
+        target.data_store.clone()
+    }
+
     /// The environment assignment that names this deployment's store by its
     /// absolute location, such as
     /// `EXTENDDB__STORAGE__SQLITE__PATH=<absolute path>`, with the value

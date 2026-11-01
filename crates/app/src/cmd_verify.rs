@@ -220,11 +220,16 @@ async fn check_migrations(
     println!("--- Checking catalog migrations...");
     let location = app_config.storage.connection_config();
     let target = Target::at(location);
+    // The backup clause names the data store the catalog records.
+    let named = Target {
+        data_store: migrations.data_store_name(&target).await,
+        ..target.clone()
+    };
     let advice = AdviceFor::new(
         release,
         config::redact_password(location),
         Some(migrations),
-        &target,
+        &named,
         config_file,
     );
     let advice = advice.advice();

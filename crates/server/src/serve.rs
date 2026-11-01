@@ -357,12 +357,21 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
             use extenddb_storage::migrations::{Target, advice, installed};
             // A server started without a config file (a dev server configured
             // by `EXTENDDB__` variables) advises `migrate` without one, which
-            // reads the same variables.
+            // reads the same variables. The backup clause names the data
+            // store the catalog records.
+            let target = Target::at(app_config.storage.connection_config());
+            let named = match installed() {
+                Some(migrations) => Target {
+                    data_store: migrations.data_store_name(&target).await,
+                    ..target
+                },
+                None => target,
+            };
             let advice = advice::AdviceFor::new(
                 build.version,
                 config::redact_password(app_config.storage.connection_config()),
                 installed(),
-                &Target::at(app_config.storage.connection_config()),
+                &named,
                 config_path.as_deref(),
             );
             return Err(CatalogRefusal {
