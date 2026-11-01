@@ -15,20 +15,22 @@
 //!   it looks for the other, so two that start together cannot both miss
 //!   each other.
 //!
-//! The holder runs `SELECT 1` on the connection every 15 s, which resets
-//! `idle_in_transaction_session_timeout`, and the runner checks the
-//! connection before each migration and each statement outside a
-//! transaction. Each renewal waits at most 10 s for its answer, and a holder
-//! whose last renewal succeeded more than 30 s ago counts its lock as lost:
-//! a database that stops answering without closing the connection, such as a
-//! paused or vanished host, ends a server within that time. The serving
-//! session sets server-side TCP keepalives, which watch the database's
-//! connection to its peer: connected directly, the database ends the
-//! session, and frees the key, within 30 s of the serving host dying instead
-//! of after the operating system's default of hours. Behind PgBouncer that
-//! peer is PgBouncer, whose connection stays up when the serving host dies,
-//! so the key stays until PgBouncer closes the dead host's connection, which
-//! its own keepalive settings decide.
+//! Each of the two transactions turns off `idle_in_transaction_session_timeout`
+//! for itself, and on PostgreSQL 17 and later `transaction_timeout`, so a
+//! role or database setting of either does not end the session that holds
+//! the key. The holder runs `SELECT 1` on the connection every 15 s, and the
+//! runner checks the connection before each migration and each statement
+//! outside a transaction. Each renewal waits at most 10 s for its answer, and
+//! a holder whose last renewal succeeded more than 30 s ago counts its lock
+//! as lost: a database that stops answering without closing the connection,
+//! such as a paused or vanished host, is noticed within that time. The
+//! serving session sets server-side TCP keepalives, which watch the
+//! database's connection to its peer: connected directly, the database ends
+//! the session, and frees the key, within 30 s of the serving host dying
+//! instead of after the operating system's default of hours. Behind
+//! PgBouncer that peer is PgBouncer, whose connection stays up when the
+//! serving host dies, so the key stays until PgBouncer closes the dead
+//! host's connection, which its own keepalive settings decide.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,6 +60,41 @@ const TCP_KEEPALIVES: [(&str, &str); 3] = [
     ("tcp_keepalives_interval", "5"),
     ("tcp_keepalives_count", "4"),
 ];
+
+/// The statement that turns off `idle_in_transaction_session_timeout` for
+/// the transaction that holds a key.
+const IDLE_OFF: &str = "SET LOCAL idle_in_transaction_session_timeout = 0";
+
+/// The statement that turns off `transaction_timeout` (PostgreSQL 17 and
+/// later) for the transaction that holds a key.
+const AGE_OFF: &str = "SET LOCAL transaction_timeout = 0";
+
+/// What the transaction that holds a key sends after `BEGIN`, for a server
+/// whose `server_version_num` is `version`. A role or database setting of
+/// `idle_in_transaction_session_timeout` shorter than the renewal interval
+/// would end the session between two renewals, and `transaction_timeout`,
+/// which PostgreSQL 17 added, counts from the transaction's start, so no
+/// renewal resets it.
+fn timeouts_off(version: i32) -> &'static [&'static str] {
+    if version >= 170_000 {
+        &[IDLE_OFF, AGE_OFF]
+    } else {
+        &[IDLE_OFF]
+    }
+}
+
+/// Send [`timeouts_off`] for this server in the transaction open on `conn`.
+/// They are `SET LOCAL`s, so a transaction-mode pooler applies them to the
+/// backend the key lives on, and they last as long as the key is held.
+async fn keep_open(conn: &mut PgConnection) -> Result<(), sqlx::Error> {
+    let version: String = sqlx::query_scalar("SELECT current_setting('server_version_num')")
+        .fetch_one(&mut *conn)
+        .await?;
+    for sql in timeouts_off(version.trim().parse().unwrap_or(0)) {
+        statement(conn, sql).await?;
+    }
+    Ok(())
+}
 
 /// What the runner keeps of the migration lock: a way to check that it is
 /// still held, and how long the lock was allowed to wait.
@@ -228,6 +265,7 @@ async fn take_migration_keys(
 ) -> Result<(), MigrationError> {
     let fail = |e: sqlx::Error| MigrationError::store("take the migration lock", e);
     statement(conn, "BEGIN").await.map_err(fail)?;
+    keep_open(conn).await.map_err(fail)?;
     let _: String = sqlx::query_scalar("SELECT set_config('lock_timeout', $1, true)")
         .bind(format!("{}ms", timeout.as_millis()))
         .fetch_one(&mut *conn)
@@ -446,6 +484,7 @@ async fn register_on(conn: &mut PgConnection) -> Result<(), MigrationError> {
     // Inside the transaction that holds the key, so a transaction-mode pooler
     // applies them to the backend the key lives on; they last as long as the
     // transaction, which is the registration's life.
+    keep_open(conn).await.map_err(fail)?;
     for (setting, value) in TCP_KEEPALIVES {
         statement(conn, &format!("SET LOCAL {setting} = {value}"))
             .await
@@ -470,4 +509,19 @@ async fn register_on(conn: &mut PgConnection) -> Result<(), MigrationError> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AGE_OFF, IDLE_OFF, timeouts_off};
+
+    #[test]
+    fn transaction_timeout_is_turned_off_from_postgresql_17() {
+        assert_eq!(timeouts_off(160_010), [IDLE_OFF]);
+        assert_eq!(timeouts_off(169_999), [IDLE_OFF]);
+        assert_eq!(timeouts_off(170_000), [IDLE_OFF, AGE_OFF]);
+        assert_eq!(timeouts_off(180_001), [IDLE_OFF, AGE_OFF]);
+        // A version that does not parse gets the setting every server has.
+        assert_eq!(timeouts_off(0), [IDLE_OFF]);
+    }
 }
