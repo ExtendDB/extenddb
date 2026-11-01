@@ -313,7 +313,7 @@ mod quoting_tests;
 mod tests {
     use super::{Advice, error_message, status_message};
     use crate::migrations::{
-        AppliedStep, CatalogStatus, Kind, MigrationError, MigrationId, Pending, RunReport,
+        AppliedStep, CatalogStatus, Kind, MigrationError, MigrationId, Outcome, Pending, RunReport,
         StoreKind,
     };
 
@@ -573,6 +573,7 @@ mod tests {
                     id: 1,
                     name: "baseline",
                     store_name: "db".to_owned(),
+                    outcome: Outcome::Applied,
                     notes: Vec::new(),
                 }],
                 notes: vec!["copied the database to db.pre-migration-legacy-to-4-x".to_owned()],

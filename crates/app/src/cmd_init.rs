@@ -336,7 +336,7 @@ async fn init_on_runner(
         for note in &report.notes {
             println!("    {note}");
         }
-        crate::util::print_applied(&report, "    ", "Applied migration");
+        crate::util::print_applied(&report, "    ", "Applied", "migration");
         bootstrapper.hold(&lock);
         let admin = write_bootstrap_rows(bootstrapper).await?;
         bootstrapper

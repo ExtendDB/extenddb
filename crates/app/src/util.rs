@@ -43,31 +43,52 @@ pub(crate) fn command_config(
     )
 }
 
-/// Print each step a run applied, as `<indent><verb> <id> <name>`, naming
-/// the store only when the run touched more than one, and each step's notes
-/// below it.
+/// Print each step a run applied, as `<indent><verb> <noun> <id> <name>`
+/// (without `<noun> ` when `noun` is empty), naming the store only when the
+/// run touched more than one, and each step's notes below it. A step of a
+/// migration that does not apply on this backend recorded its ledger row and
+/// ran nothing, and is printed as `<indent>Recorded <noun> <id> <name> as not
+/// applicable`.
 pub(crate) fn print_applied(
     report: &extenddb_storage::migrations::RunReport,
     indent: &str,
     verb: &str,
+    noun: &str,
 ) {
+    for line in applied_lines(report, verb, noun) {
+        println!("{indent}{line}");
+    }
+}
+
+/// The lines [`print_applied`] prints, without the indent.
+fn applied_lines(
+    report: &extenddb_storage::migrations::RunReport,
+    verb: &str,
+    noun: &str,
+) -> Vec<String> {
+    use extenddb_storage::migrations::Outcome;
+
     let several = report
         .applied
         .windows(2)
         .any(|w| w[0].store_name != w[1].store_name);
+    let mut lines = Vec::new();
     for step in &report.applied {
-        if several {
-            println!(
-                "{indent}{verb} {} {} in {}",
-                step.id, step.name, step.store_name
-            );
+        let mut what = if noun.is_empty() {
+            format!("{} {}", step.id, step.name)
         } else {
-            println!("{indent}{verb} {} {}", step.id, step.name);
+            format!("{noun} {} {}", step.id, step.name)
+        };
+        if several {
+            what = format!("{what} in {}", step.store_name);
         }
-        for note in &step.notes {
-            println!("{indent}  {note}");
-        }
+        lines.push(match step.outcome {
+            Outcome::Applied => format!("{verb} {what}"),
+            Outcome::NotApplicable => format!("Recorded {what} as not applicable"),
+        });
+        lines.extend(step.notes.iter().map(|note| format!("  {note}")));
     }
+    lines
 }
 
 /// Append a secret to the backend argument vector when the corresponding CLI
@@ -101,8 +122,62 @@ pub(crate) fn append_secret_arg(
 
 #[cfg(test)]
 mod tests {
-    use super::append_secret_arg;
     use std::ffi::OsString;
+
+    use extenddb_storage::migrations::{AppliedStep, Outcome, RunReport};
+
+    use super::{append_secret_arg, applied_lines};
+
+    fn step(id: u32, name: &'static str, store: &str, outcome: Outcome) -> AppliedStep {
+        AppliedStep {
+            id,
+            name,
+            store_name: store.to_owned(),
+            outcome,
+            notes: Vec::new(),
+        }
+    }
+
+    /// A step of a migration that does not apply on the backend is printed
+    /// as recorded, with the verb's noun, never as applied or run again.
+    #[test]
+    fn a_step_that_does_not_apply_is_printed_as_recorded() {
+        let report = RunReport {
+            applied: vec![
+                step(1, "baseline", "ks_catalog", Outcome::Applied),
+                step(1, "baseline", "ks_a1", Outcome::Applied),
+                step(
+                    3,
+                    "sort_key_definitions",
+                    "ks_catalog",
+                    Outcome::NotApplicable,
+                ),
+            ],
+            ..RunReport::default()
+        };
+        assert_eq!(
+            applied_lines(&report, "Ran again", ""),
+            [
+                "Ran again 1 baseline in ks_catalog",
+                "Ran again 1 baseline in ks_a1",
+                "Recorded 3 sort_key_definitions in ks_catalog as not applicable",
+            ]
+        );
+        let one_store = RunReport {
+            applied: vec![
+                step(1, "baseline", "db", Outcome::Applied),
+                step(3, "sort_key_definitions", "db", Outcome::NotApplicable),
+            ],
+            ..RunReport::default()
+        };
+        assert_eq!(
+            applied_lines(&one_store, "Applied", "migration"),
+            [
+                "Applied migration 1 baseline",
+                "Recorded migration 3 sort_key_definitions as not applicable",
+            ]
+        );
+    }
 
     #[test]
     fn appends_environment_secret_when_flag_is_absent() {

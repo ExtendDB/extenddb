@@ -321,7 +321,7 @@ fn print_report(report: &RunReport, kind: RunKind) {
         RunKind::Create | RunKind::Migrate => "Applied",
         RunKind::Reconverge => "Ran again",
     };
-    crate::util::print_applied(report, "  ", verb);
+    crate::util::print_applied(report, "  ", verb, "");
     let show =
         |v: Option<u32>| v.map_or_else(|| "no ledger".to_owned(), |v| format!("migration {v}"));
     println!();

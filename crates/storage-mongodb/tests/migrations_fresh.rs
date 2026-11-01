@@ -110,6 +110,13 @@ async fn a_fresh_store_gets_every_migration_and_the_expected_definitions() {
             (4, d.target.catalog.clone()),
         ]
     );
+    let not_applicable: Vec<u32> = report
+        .applied
+        .iter()
+        .filter(|s| s.outcome == Outcome::NotApplicable)
+        .map(|s| s.id)
+        .collect();
+    assert_eq!(not_applicable, [3, 4], "{report:?}");
     assert_eq!(d.status().await, CatalogStatus::Current { version: 4 });
     let rows = d.catalog_ledger().await;
     let outcomes: Vec<(u32, Outcome)> = rows.iter().map(|r| (r.id, r.outcome)).collect();
@@ -165,10 +172,16 @@ async fn a_second_run_applies_nothing_and_reconverge_keeps_the_rows() {
     assert_eq!((again.from, again.to), (Some(4), Some(4)));
 
     let reconverged = d.reconverge().await.expect("reconverge");
-    // Every step but migration 2's, which is not convergent.
-    assert_eq!(reconverged.applied.len(), 4, "{reconverged:?}");
-    assert!(
-        reconverged.applied.iter().all(|step| step.id != 2),
+    // Migration 1's steps in the catalog and the data database: 2 is not
+    // convergent, and 3 and 4 do not apply on MongoDB.
+    let ran: Vec<(u32, String)> = reconverged
+        .applied
+        .iter()
+        .map(|step| (step.id, step.store_name.clone()))
+        .collect();
+    assert_eq!(
+        ran,
+        [(1, d.target.catalog.clone()), (1, d.target.data.clone())],
         "{reconverged:?}"
     );
     assert!(

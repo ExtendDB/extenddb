@@ -4,6 +4,7 @@
 //! The catalog status, the runner's errors, what a run did, and the process
 //! exit codes.
 
+use super::ledger::Outcome;
 use super::table::{Kind, StoreKind};
 
 /// One step a run applied.
@@ -12,6 +13,9 @@ pub struct AppliedStep {
     pub id: u32,
     pub name: &'static str,
     pub store_name: String,
+    /// `NotApplicable` for a migration that does not apply on this backend,
+    /// whose step recorded its ledger row and ran nothing.
+    pub outcome: Outcome,
     /// The body's notes from this run. A reconverge leaves the row's notes
     /// from the first application as they are, so these are printed only.
     pub notes: Vec<String>,

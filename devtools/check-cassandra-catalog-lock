@@ -28,8 +28,10 @@ with `init` and removes them at the end.
 - while another session holds the migration lock (the lock row, written by
   the script with a lightweight transaction as a migration would), serve and
   a second migrate --yes exit 6, and the preview exits 0;
-- once the lock is free, migrate --yes --reconverge, migrate --forget 3 and
-  the migrate --yes that applies 3 again run, and serve runs;
+- once the lock is free, migrate --yes --reconverge runs migration 1 again
+  and neither 2, which is not convergent, nor 3 and 4, which do not apply on
+  Cassandra; migrate --forget 2 and the migrate --yes that applies 2 again
+  run, and serve runs;
 - a server that cannot renew its registration for 30 s, with the node
   paused, stops with exit 1 and removes its PID file.
 
@@ -250,21 +252,29 @@ def main(binary: str, container: str, contact_point: str, port: int) -> int:
         )
         report(code == 0 and "True" in output, "the script releases the lock", output)
 
-        expect_exit(
+        output = expect_exit(
             0,
-            "migrate --yes --reconverge once the lock is free, every body run again",
+            "migrate --yes --reconverge once the lock is free, migration 1 run again",
             migrate + ["--yes", "--reconverge", "--lock-timeout", "5"],
             env,
             contains="Ran again 1 baseline",
         )
-        expect_exit(0, "migrate --forget 3", migrate + ["--forget", "3"], env)
-        expect_exit(3, "the preview lists migration 3 as pending", migrate, env, contains="3 sort_key_definitions")
+        report(
+            "Skipped 2 resource_tag_condition_keys: " in output
+            and not any(f"Ran again {n} " in output or f"Recorded {n} " in output for n in (2, 3, 4)),
+            "the reconverge skips migration 2 and does not name 3 or 4, which do not apply",
+            output,
+        )
+        expect_exit(0, "migrate --forget 2", migrate + ["--forget", "2"], env)
+        expect_exit(
+            3, "the preview lists migration 2 as pending", migrate, env, contains="2 resource_tag_condition_keys"
+        )
         expect_exit(
             0,
-            "migrate --yes applies migration 3 again",
+            "migrate --yes applies migration 2 again",
             migrate + ["--yes", "--lock-timeout", "5"],
             env,
-            contains="Applied 3 sort_key_definitions",
+            contains="Applied 2 resource_tag_condition_keys",
         )
 
         server = start(serve, env, log)
