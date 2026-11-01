@@ -7,10 +7,13 @@
 //!
 //! The catalog body creates the catalog collections and their indexes, the
 //! `extenddb_servers` collection the serving registration lives in, and the
-//! legacy ledger document `001_initial` that every released `init` wrote,
-//! and deletes the `resource_tag_migration` settings row every released
-//! `init` seeded. The data body creates the data database's collections and
-//! indexes, which before 1.0 only `init` created. Every request is safe to
+//! legacy ledger document `001_initial` that every released `init` wrote.
+//! The `resource_tag_migration` settings row every released `init` seeded
+//! is deleted by the backend, in the transaction that records this body,
+//! after the post-check: a body or post-check that fails leaves the row, so
+//! the 0.1.14 server still serves the catalog. The data body creates the
+//! data database's collections and indexes, which before 1.0 only `init`
+//! created. Every request is safe to
 //! send again: creating a collection that exists with the same options
 //! succeeds, one that exists with other options fails with NamespaceExists
 //! (code 48), which is accepted by its code and left to the post-check, and
@@ -199,14 +202,6 @@ impl CodeBody<MongoStores> for CatalogBaseline {
                     .upsert(true)
                     .await
                     .map(|_| ())
-            })
-            .await?;
-        // Every released `serve` from v0.1.14 requires this row, so deleting
-        // it makes them refuse this catalog.
-        let settings = db.collection::<Document>("settings");
-        stores
-            .request("delete the resource_tag_migration settings row", async {
-                settings.delete_one(doc! { "_id": "resource_tag_migration" }).await.map(|_| ())
             })
             .await?;
         Ok(Done::default())

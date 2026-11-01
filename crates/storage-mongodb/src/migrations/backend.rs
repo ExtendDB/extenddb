@@ -233,6 +233,23 @@ impl Writes<'_> {
         let mut session = self.session.lock().await;
         let _ = tokio::time::timeout(REQUEST_TIMEOUT, session.abort_transaction()).await;
     }
+
+    /// Delete the `resource_tag_migration` settings row in the transaction.
+    /// Every released `serve` from v0.1.14 requires it, so deleting it makes
+    /// them refuse this catalog.
+    async fn delete_marker(&self) -> Result<(), MigrationError> {
+        let settings = self.db.collection::<Document>("settings");
+        let mut session = self.session.lock().await;
+        self.stores
+            .request("delete the resource_tag_migration settings row", async {
+                settings
+                    .delete_one(doc! { "_id": "resource_tag_migration" })
+                    .session(&mut *session)
+                    .await
+                    .map(|_| ())
+            })
+            .await
+    }
 }
 
 /// Create a database's ledger collection, accepting one that exists.
@@ -466,9 +483,19 @@ impl MigrationBackend for MongoMigrations {
             db,
             session: tokio::sync::Mutex::new(session),
         };
+        // Migration 1's catalog step deletes the marker last, after its body
+        // and the post-check, with its ledger row: a step that fails leaves
+        // the marker, which the 0.1.14 server needs.
+        let delete_marker = id == MigrationId::Baseline && store.kind == StoreKind::Catalog;
         in_transaction(
             writes.begin(),
-            record_rows(&writes, row, &done.notes, catalog_version),
+            async {
+                record_rows(&writes, row, &done.notes, catalog_version).await?;
+                if delete_marker {
+                    writes.delete_marker().await?;
+                }
+                Ok(())
+            },
             writes.commit(),
             writes.abort(),
         )

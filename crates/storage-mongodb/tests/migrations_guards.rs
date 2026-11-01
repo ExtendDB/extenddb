@@ -292,3 +292,49 @@ async fn a_lock_left_by_a_killed_holder_is_taken_once_it_expires() {
     again.release().await;
     d.drop_databases().await;
 }
+
+/// Migration 1 deletes the resource-tag marker, which the 0.1.14 server
+/// needs, only with the catalog step's ledger row, after the post-check:
+/// a 0.1.14 catalog whose post-check fails keeps the marker and records
+/// nothing, so the 0.1.14 server still serves it. A run that passes deletes
+/// it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_post_check_keeps_the_marker_the_0_1_14_server_needs() {
+    let Some(uri) = server() else { return };
+    let d = Deployment::new(&uri, "keepmarker").await;
+    fixture::load(&d, &fixture::read("0.1.14")).await;
+    assert_eq!(
+        d.setting("resource_tag_migration").await.as_deref(),
+        Some("applied")
+    );
+    d.catalog()
+        .collection::<Document>("tags")
+        .drop()
+        .await
+        .expect("drop tags");
+    d.catalog()
+        .run_command(doc! { "create": "tags", "capped": true, "size": 4096 })
+        .await
+        .expect("capped");
+    let error = d.migrate().await.expect_err("the post-check refuses");
+    assert!(error.to_string().contains("the collection tags"), "{error}");
+    assert_eq!(
+        d.setting("resource_tag_migration").await.as_deref(),
+        Some("applied"),
+        "the marker is gone after a failed run"
+    );
+    assert!(
+        Deployment::documents(&d.catalog(), "extenddb_migrations")
+            .await
+            .is_empty()
+    );
+
+    d.catalog()
+        .collection::<Document>("tags")
+        .drop()
+        .await
+        .expect("drop tags");
+    d.migrate().await.expect("migrate");
+    assert_eq!(d.setting("resource_tag_migration").await, None);
+    d.drop_databases().await;
+}
