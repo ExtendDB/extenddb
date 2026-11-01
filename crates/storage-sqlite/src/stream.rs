@@ -36,10 +36,15 @@ const SHARDS_PER_STREAM: u32 = 4;
 /// 100,000 records took 10.5 to 14.8 s. A 500-record statement held it for a
 /// median of 8 to 17 ms and at most 236 to 362 ms; a pass took 7.6 to 8.1 s.
 /// A 1,000-record statement held it for a median of 20 to 22 ms and at most
-/// 265 to 849 ms; a pass took 5.1 to 7.7 s. 500 keeps the longest hold under
-/// half a second without the longer pass of 250. The single statement this
-/// replaces deleted 843 to 9,761 records per second in a soak run, which puts
-/// 500 records at 51 to 593 ms and 1,000 at up to 1.19 s.
+/// 265 to 849 ms; a pass took 5.1 to 7.7 s. In the two runs of this shape
+/// that included 250, the holds at 250 and 500 in the same round differed by
+/// at most 11 ms at the median and 119 ms at the longest, less than the spread
+/// between rounds at 500, and 250 made the pass 1.4 to 1.8 times longer. The
+/// longest 500-record hold was 236 to 512 ms across three runs of this shape
+/// and 931 ms in a run of 280,000 records during which the load fell from
+/// 75.4 to 18.2. The single statement this replaces deleted 843 to 9,761
+/// records per second in a soak run, which puts 500 records at 51 to 593 ms
+/// and 1,000 at up to 1.19 s.
 pub(crate) const STREAM_CLEANUP_BATCH_ROWS: u32 = 500;
 
 /// One cleanup batch: the oldest `?2` records created before the cutoff `?1`.
