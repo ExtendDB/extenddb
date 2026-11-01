@@ -127,7 +127,7 @@ impl CatalogMigrations for SqliteCatalogMigrations {
     async fn forget(&self, lock: &HeldLock, id: u32) -> Result<(), MigrationError> {
         let location = locked_location(lock)?;
         let migrations = SqliteMigrations::open(location).await?;
-        let result = Runner::new(&migrations, "").forget(id).await;
+        let result = migrations.forget(id).await;
         migrations.close().await;
         result
     }

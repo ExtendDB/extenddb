@@ -29,8 +29,8 @@ use async_trait::async_trait;
 use extenddb_storage::management_store::ManagementStore;
 use extenddb_storage::migrations::{
     CatalogTraces, Done, HasManagementStore, LedgerColumns, LedgerRow, LedgerWrites, Migration,
-    MigrationBackend, MigrationError, MigrationId, Released, RunReport, Step, StoreKind, StoreRef,
-    in_transaction, record_rows, sql_ledger_ddl,
+    MigrationBackend, MigrationError, MigrationId, Released, RunReport, Runner, Step, StoreKind,
+    StoreRef, in_transaction, record_rows, sql_ledger_ddl,
 };
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{ConnectOptions, Connection, SqlitePool};
@@ -298,6 +298,24 @@ impl SqliteMigrations {
             #[cfg(test)]
             fail_insert_row: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// [`Runner::forget`] in one transaction, so the ledger row and the
+    /// version row change together.
+    ///
+    /// # Errors
+    ///
+    /// As [`Runner::forget`]; the database is then as it was.
+    pub(crate) async fn forget(&self, id: u32) -> Result<(), MigrationError> {
+        in_transaction(
+            self.exec("BEGIN IMMEDIATE"),
+            Runner::new(self, "").forget(id),
+            self.exec("COMMIT"),
+            async {
+                let _ = self.exec("ROLLBACK").await;
+            },
+        )
+        .await
     }
 
     /// The ledger writes on the runner's connection.

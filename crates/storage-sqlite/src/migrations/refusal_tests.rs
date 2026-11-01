@@ -838,3 +838,47 @@ async fn a_failed_ledger_insert_leaves_nothing_of_the_body() {
         MigrationId::ResourceTagConditionKeys.number()
     );
 }
+
+/// `forget` deletes the ledger row and writes the version row in one
+/// transaction: when the version row cannot be written, the ledger row is
+/// still there.
+#[tokio::test]
+async fn a_forget_whose_version_row_fails_keeps_the_ledger_row() {
+    use extenddb_storage::migrations::{CatalogMigrations, Target};
+
+    use super::SqliteCatalogMigrations;
+
+    let db = temp_db("forget-one-transaction");
+    run(&db).await.expect("fresh");
+    exec(
+        &db,
+        "CREATE TRIGGER no_version BEFORE UPDATE ON settings \
+         WHEN NEW.key = 'catalog_version' \
+         BEGIN SELECT RAISE(ABORT, 'the version row cannot be written'); END;",
+    )
+    .await;
+    let target = Target::at(db.to_string_lossy());
+    let lock = SqliteCatalogMigrations
+        .lock(&target, std::time::Duration::ZERO)
+        .await
+        .expect("lock");
+    let err = SqliteCatalogMigrations
+        .forget(&lock, LATEST)
+        .await
+        .expect_err("the version row fails");
+    drop(lock);
+    assert!(
+        err.to_string()
+            .contains("the version row cannot be written"),
+        "{err}"
+    );
+    assert_eq!(
+        count(
+            &db,
+            &format!("SELECT COUNT(*) FROM extenddb_migrations WHERE id = {LATEST}")
+        )
+        .await,
+        1
+    );
+    assert_eq!(version_row(&db).await, Some(LATEST.to_string()));
+}
