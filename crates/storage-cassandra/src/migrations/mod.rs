@@ -187,7 +187,9 @@ pub async fn migrate_account(
 /// [`migrate_account`] under the lease of the migration lock the caller
 /// holds: `init`'s default account. Every write is checked against the
 /// lease, every completed request records progress on it, and each schema
-/// statement gets the bound of one sent under the lock.
+/// statement gets the bound of one sent under the lock. The run first waits
+/// for any other account run of this process, and that wait records no
+/// progress on the lease; `init`'s process runs no other.
 ///
 /// # Errors
 ///

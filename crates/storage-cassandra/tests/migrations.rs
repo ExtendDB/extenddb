@@ -33,6 +33,15 @@ use extenddb_storage_cassandra::migrations::{
 };
 use migrations_support::{TIMEOUT, cql, keyspace, new_prefix, pinned_session, session};
 
+/// Taken for reading by each test that runs an account migration, and for
+/// writing by the test that runs `init`'s default account under the
+/// migration lock. A process runs its account migrations one at a time
+/// (#453) and the tests of this binary run at once, so a run under the
+/// lock's lease would otherwise wait for other tests' account runs, and the
+/// wait records no progress on the lease: on two nodes it outlasted the
+/// lease's 30 s stall. `init`'s own process runs no other account migration.
+static ACCOUNT_RUNS: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
 /// A catalog keyspace at migration 4 and one account keyspace.
 async fn deployment(session: &Arc<CassandraSession>, prefix: &str) -> String {
     keyspace(session, &format!("{prefix}_catalog")).await;
@@ -49,9 +58,11 @@ async fn deployment(session: &Arc<CassandraSession>, prefix: &str) -> String {
         ),
     )
     .await;
+    let runs = ACCOUNT_RUNS.read().await;
     migrate_account(session.clone(), prefix, &account, "test")
         .await
         .expect("migrate the account");
+    drop(runs);
     account
 }
 
@@ -552,6 +563,7 @@ async fn create_account_runs_the_account_migrations_through_the_runner() {
     if helpers::skip_without_cassandra() {
         return;
     }
+    let _runs = ACCOUNT_RUNS.read().await;
     let session = session().await;
     let (prefix, _drops) = new_prefix("account");
     keyspace(&session, &format!("{prefix}_catalog")).await;
@@ -652,6 +664,7 @@ async fn a_create_account_stopped_before_its_row_leaves_a_current_catalog_a_retr
     if helpers::skip_without_cassandra() {
         return;
     }
+    let _runs = ACCOUNT_RUNS.read().await;
     let session = session().await;
     let (prefix, _drops) = new_prefix("stopacct");
     keyspace(&session, &format!("{prefix}_catalog")).await;
@@ -788,6 +801,7 @@ async fn the_default_account_step_run_again_keeps_one_account_and_completes_its_
     if helpers::skip_without_cassandra() {
         return;
     }
+    let _runs = ACCOUNT_RUNS.read().await;
     let session = session().await;
     let (prefix, mut drops) = new_prefix("defacct");
     keyspace(&session, &format!("{prefix}_catalog")).await;
@@ -856,6 +870,9 @@ async fn init_finishes_a_catalog_stopped_before_its_admin_user() {
     if helpers::skip_without_cassandra() {
         return;
     }
+    // Both inits run the default account's migrations under the lock's
+    // lease, so no other test's account run may be in flight.
+    let _runs = ACCOUNT_RUNS.write().await;
     let session = session().await;
     let (prefix, mut drops) = new_prefix("finish");
     let migrations = CassandraCatalogMigrations;
