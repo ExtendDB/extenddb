@@ -60,6 +60,14 @@ pub struct PostgresStores {
 }
 
 impl PostgresStores {
+    /// The runner's connection to the catalog database, for a test body that
+    /// runs its own statements inside the runner's transaction.
+    #[cfg(feature = "test-util")]
+    #[must_use]
+    pub fn catalog_connection(&self) -> &PgPool {
+        &self.catalog
+    }
+
     /// Fail when the migration lock's connection is lost. A status session,
     /// or a test driving the runner itself, has no lock to check.
     pub(crate) async fn check_lock(&self) -> Result<(), MigrationError> {
