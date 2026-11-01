@@ -41,6 +41,9 @@
 //! - `path <lt|le|gt|ge> :v` where `:v` is `B` (base64 string ordering
 //!   ≠ bytewise byte ordering across mismatched lengths)
 //! - Any operand type the analyzer doesn't yet classify
+//! - A condition whose `AND`, `OR` and `NOT` nest more than
+//!   64 levels deep (`MAX_LOGICAL_DEPTH`; the compiled filter would pass
+//!   MongoDB's BSON depth limit)
 
 use extenddb_core::expression::{CompareOp, Expr, ExpressionMaps, PathElement};
 use extenddb_core::types::AttributeValue;
@@ -62,6 +65,19 @@ impl Pushable {
     }
 }
 
+/// Deepest nesting of `AND`, `OR` and `NOT` compiled to a MongoDB filter.
+///
+/// The compiler emits one `$and`, `$or` or `$nor` level per operator, and
+/// MongoDB refuses a command nested past its BSON depth limit. Measured on
+/// mongo:7.0.45 through the calls the pushdown makes (`find_one` for
+/// UpdateItem, `find_one_and_delete` for DeleteItem), with the key filter
+/// merged in: a condition nested 98 levels runs and 99 answers error 15,
+/// "BSONObj exceeds maximum nested object depth"; with `contains` leaves, the
+/// deepest leaf the compiler emits, 97 runs and 98 fails. A deeper condition
+/// is evaluated in Rust instead; the margin below 97 leaves room for deeper
+/// leaves the compiler may emit later.
+const MAX_LOGICAL_DEPTH: usize = 64;
+
 /// Decide whether a compiled MongoDB filter for `expr` will agree with
 /// `evaluate_condition(expr, item, maps)` for every item.
 ///
@@ -70,7 +86,22 @@ pub fn is_pushable(expr: &Expr, maps: &ExpressionMaps) -> Pushable {
     if let Some(reason) = unsafe_attribute_reason(expr, maps) {
         return Pushable::No(reason);
     }
+    if logical_depth(expr) > MAX_LOGICAL_DEPTH {
+        return Pushable::No("AND, OR and NOT nest deeper than a MongoDB filter allows");
+    }
     walk(expr, maps)
+}
+
+/// Nesting depth of `AND`, `OR` and `NOT` in `expr`; a leaf is 0. A chain
+/// `a OR b OR c` parses left-nested, so `n` terms have depth `n - 1`.
+fn logical_depth(expr: &Expr) -> usize {
+    match expr {
+        Expr::And(left, right) | Expr::Or(left, right) => {
+            1 + logical_depth(left).max(logical_depth(right))
+        }
+        Expr::Not(inner) => 1 + logical_depth(inner),
+        _ => 0,
+    }
 }
 
 /// Return why an expression contains a literal DynamoDB attribute name that
