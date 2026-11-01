@@ -154,6 +154,21 @@ pub fn compare(expected: &Definitions, actual: &Definitions) -> Vec<String> {
     differences
 }
 
+/// The columns of `table` in `actual` that `expected` does not have, or
+/// defines otherwise, by name. A column `expected` has and `actual` lacks
+/// is not one of them.
+#[must_use]
+pub fn columns_not_in(expected: &Definitions, actual: &Definitions, table: &str) -> Vec<String> {
+    actual
+        .columns
+        .iter()
+        .filter_map(|(key, found)| {
+            let (t, name) = key.split_once('.')?;
+            (t == table && expected.columns.get(key) != Some(found)).then(|| name.to_owned())
+        })
+        .collect()
+}
+
 /// Compare `keyspace` with `expected_json`; stop naming every difference.
 ///
 /// # Errors

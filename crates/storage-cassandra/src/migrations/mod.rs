@@ -54,8 +54,8 @@ pub use registrations::ServingRegistration;
 
 use crate::cassandra_util::CassandraSession;
 
-/// Migration 1's catalog body, for the tests that read it.
-#[cfg(test)]
+/// Migration 1's catalog body: the tests read it, and
+/// [`foreign_contents`] reads the `schema_history` rows it inserts.
 pub(crate) const CATALOG_BASELINE: &str = file_body!("migrations/catalog", "0001_baseline.cql");
 
 /// Migration 1's account body, for the tests that read it.
@@ -394,24 +394,32 @@ pub async fn create_lock_table(
 }
 
 /// What an uninitialized `keyspace` holds that makes it another program's:
-/// the tables migration 1 does not create, a `settings` table without the
-/// catalog's `key` and `value` columns, and `settings` rows other than the
-/// migration lock's. Empty when the keyspace does not exist, and for
-/// one an `init` created and stopped in before migration 1 recorded
-/// anything, which holds only a catalog's tables (migration 1 converges
-/// them) and at most the lock row. Read before anything is written to the
-/// keyspace: `init` and the migration lock refuse it when this is not
-/// empty, so another program's `settings` table never receives the lock
-/// row. Call it only for a keyspace whose status is `Uninitialized`, since
-/// a catalog's `settings` table holds many rows.
+/// the tables migration 1 does not create; a table of a catalog table's
+/// name with a column migration 1 does not give it, or defines otherwise;
+/// a `settings` table without the catalog's `key` and `value` columns;
+/// `settings` rows other than the migration lock's; `schema_history` rows
+/// other than the ones migration 1 inserts; and a row in any other table.
+/// Empty when the keyspace does not exist, and for one an `init` created
+/// and stopped in before migration 1 recorded anything: that holds only
+/// tables migration 1 creates, with the columns it gives them (a column a
+/// later `ALTER TABLE ... ADD` adds may be missing, and migration 1 adds
+/// it), no rows but migration 1's `schema_history` rows, and at most the
+/// lock row. A table name alone shows nothing: the catalog's names
+/// (`metrics`, `tags`, `tables`, `accounts`) are common ones. Read before
+/// anything is written to the keyspace: `init` and the migration lock
+/// refuse it when this is not empty, so another program's `settings`
+/// table never receives the lock row. Call it only for a keyspace whose
+/// status is `Uninitialized`, since a catalog's tables hold rows.
 ///
 /// # Errors
 ///
-/// `system_schema` or the `settings` table cannot be read.
+/// `system_schema` or a table of the keyspace cannot be read.
 pub async fn foreign_contents(
     session: &CassandraSession,
     keyspace: &str,
 ) -> Result<Vec<String>, MigrationError> {
+    use cdrs_tokio::consistency::Consistency;
+
     let expected: postcheck::Definitions = serde_json::from_str(CATALOG_EXPECTED)
         .map_err(|e| MigrationError::Store(format!("read the expected definitions: {e}")))?;
     let ours: std::collections::BTreeSet<&str> = expected
@@ -425,28 +433,91 @@ pub async fn foreign_contents(
         .filter(|t| *t != "extenddb_migrations" && !ours.contains(t.as_str()))
         .map(|t| format!("the table {t}"))
         .collect();
-    if !connect::has_columns(session, keyspace, "settings", &["key", "value"]).await? {
-        if tables.iter().any(|t| t == "settings") {
+    let actual = postcheck::describe(session, keyspace).await?;
+    for table in tables.iter().filter(|t| ours.contains(t.as_str())) {
+        let differing = postcheck::columns_not_in(&expected, &actual, table);
+        if table == "settings"
+            && !connect::has_columns(session, keyspace, "settings", &["key", "value"]).await?
+        {
             foreign
                 .push("the table settings without the catalog's key and value columns".to_owned());
+            continue;
         }
-    } else {
-        let found = connect::rows(
-            session,
-            &format!("SELECT key FROM {keyspace}.settings LIMIT 3"),
-            cdrs_tokio::query_values!(),
-            cdrs_tokio::consistency::Consistency::Quorum,
-            &format!("read the settings rows of {keyspace}"),
-        )
-        .await?;
-        for row in &found {
-            let key: String = connect::column(row, "key", "read the settings rows")?;
-            if key != locks::LOCK_KEY {
-                foreign.push(format!("the settings row '{key}'"));
+        if !differing.is_empty() {
+            foreign.push(format!(
+                "the table {table}, whose column(s) {} migration 1 does not create",
+                differing.join(", ")
+            ));
+            continue;
+        }
+        let context = format!("read the rows of {keyspace}.{table}");
+        match table.as_str() {
+            "settings" => {
+                let found = connect::rows(
+                    session,
+                    &format!("SELECT key FROM {keyspace}.settings LIMIT 3"),
+                    cdrs_tokio::query_values!(),
+                    Consistency::Quorum,
+                    &context,
+                )
+                .await?;
+                for row in &found {
+                    let key: String = connect::column(row, "key", &context)?;
+                    if key != locks::LOCK_KEY {
+                        foreign.push(format!("the settings row '{key}'"));
+                    }
+                }
+            }
+            "schema_history" => {
+                let found = connect::rows(
+                    session,
+                    &format!("SELECT version, description FROM {keyspace}.schema_history"),
+                    cdrs_tokio::query_values!(),
+                    Consistency::Quorum,
+                    &context,
+                )
+                .await?;
+                let inserted = baseline_history();
+                for row in &found {
+                    let version: i32 = connect::column(row, "version", &context)?;
+                    let description: Option<String> =
+                        connect::nullable(row, "description", &context)?;
+                    if !inserted.contains(&(version, description.as_deref().unwrap_or_default())) {
+                        foreign.push(format!("the schema_history row of version {version}"));
+                    }
+                }
+            }
+            _ => {
+                let found = connect::rows(
+                    session,
+                    &format!("SELECT * FROM {keyspace}.{table} LIMIT 1"),
+                    cdrs_tokio::query_values!(),
+                    Consistency::Quorum,
+                    &context,
+                )
+                .await?;
+                if !found.is_empty() {
+                    foreign.push(format!("rows in the table {table}"));
+                }
             }
         }
     }
     Ok(foreign)
+}
+
+/// The `schema_history` rows migration 1's catalog body inserts, as
+/// `(version, description)`.
+fn baseline_history() -> Vec<(i32, &'static str)> {
+    CATALOG_BASELINE
+        .lines()
+        .filter_map(|line| {
+            let values = line
+                .trim()
+                .strip_prefix("INSERT INTO schema_history (version, description) VALUES (")?;
+            let (version, rest) = values.split_once(", '")?;
+            Some((version.parse().ok()?, rest.strip_suffix("');")?))
+        })
+        .collect()
 }
 
 /// The authorizer the node runs, read from `system_views.settings`

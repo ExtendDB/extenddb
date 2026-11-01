@@ -28,8 +28,8 @@ use extenddb_storage::migrations::{
 use extenddb_storage_cassandra::CassandraCatalogStore;
 use extenddb_storage_cassandra::cassandra_util::CassandraSession;
 use extenddb_storage_cassandra::migrations::{
-    CassandraCatalogMigrations, catalog_status, migrate_account, migrate_catalog_keyspace,
-    postcheck, run_baseline_unrecorded,
+    CassandraCatalogMigrations, catalog_status, foreign_contents, migrate_account,
+    migrate_catalog_keyspace, postcheck, run_baseline_unrecorded,
 };
 use migrations_support::{TIMEOUT, cql, keyspace, new_prefix, pinned_session, session};
 
@@ -263,7 +263,9 @@ async fn a_keyspace_that_is_not_a_catalog_is_uninitialized_and_migrate_refuses_i
                 message.contains("is not an ExtendDB catalog")
                     && message
                         .contains("the table settings without the catalog's key and value columns")
-                    && !message.contains("the table accounts"),
+                    && message.contains(
+                        "the table accounts, whose column(s) id migration 1 does not create"
+                    ),
                 "{message}"
             ),
             other => panic!("{:?}", other.err()),
@@ -318,6 +320,107 @@ async fn a_keyspace_that_is_not_a_catalog_is_uninitialized_and_migrate_refuses_i
         })
         .collect();
     assert_eq!(keys, ["theme"], "no lock row was written");
+}
+
+/// A table is not a catalog's for its name alone: another program's
+/// `metrics` and `tags`, with columns migration 1 does not create and a
+/// row each, are refused, and so is a `schema_history` with the catalog's
+/// columns and a row migration 1 does not insert. A keyspace an `init`
+/// left before migration 1 recorded anything, with migration 1's own
+/// `schema_history` rows, is still a catalog to finish.
+#[tokio::test]
+async fn tables_with_catalog_names_and_other_columns_or_rows_are_refused() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
+    let session = session().await;
+    let migrations = CassandraCatalogMigrations;
+    let (named, _named_drops) = new_prefix("named");
+    let catalog = format!("{named}_catalog");
+    keyspace(&session, &catalog).await;
+    for statement in [
+        format!("CREATE TABLE {catalog}.metrics (id int PRIMARY KEY, reading double)"),
+        format!("CREATE TABLE {catalog}.tags (name text PRIMARY KEY, color text)"),
+        format!("INSERT INTO {catalog}.metrics (id, reading) VALUES (1, 2.5)"),
+        format!("INSERT INTO {catalog}.tags (name, color) VALUES ('urgent', 'red')"),
+    ] {
+        cql(&session, &statement).await;
+    }
+    match migrations.lock(&target_of(&named), TIMEOUT).await {
+        Err(MigrationError::Refused(message)) => assert!(
+            message.contains("is not an ExtendDB catalog")
+                && message.contains("the table metrics, whose column(s) id, reading")
+                && message.contains("the table tags, whose column(s) color, name"),
+            "{message}"
+        ),
+        other => panic!("{:?}", other.err()),
+    }
+    assert_eq!(
+        helpers_tables(&session, &catalog).await,
+        ["metrics", "tags"],
+        "nothing was created"
+    );
+
+    let (history, _history_drops) = new_prefix("history");
+    let catalog = format!("{history}_catalog");
+    keyspace(&session, &catalog).await;
+    cql(
+        &session,
+        &format!(
+            "CREATE TABLE {catalog}.schema_history (version int PRIMARY KEY, description text, \
+             applied_at timestamp)"
+        ),
+    )
+    .await;
+    cql(
+        &session,
+        &format!(
+            "INSERT INTO {catalog}.schema_history (version, description) VALUES (1, \
+             'initial_schema')"
+        ),
+    )
+    .await;
+    assert_eq!(
+        foreign_contents(&session, &catalog).await.expect("read"),
+        Vec::<String>::new(),
+        "migration 1's own row"
+    );
+    cql(
+        &session,
+        &format!(
+            "INSERT INTO {catalog}.schema_history (version, description) VALUES (9, 'theirs')"
+        ),
+    )
+    .await;
+    match migrations.lock(&target_of(&history), TIMEOUT).await {
+        Err(MigrationError::Refused(message)) => assert!(
+            message.contains("the schema_history row of version 9")
+                && !message.contains("version 1"),
+            "{message}"
+        ),
+        other => panic!("{:?}", other.err()),
+    }
+}
+
+/// The tables of `keyspace`, in name order.
+async fn helpers_tables(session: &CassandraSession, keyspace: &str) -> Vec<String> {
+    use cdrs_tokio::types::IntoRustByName;
+    let mut names: Vec<String> = session
+        .query_with_values(
+            "SELECT table_name FROM system_schema.tables WHERE keyspace_name = ?",
+            cdrs_tokio::query_values!(keyspace),
+        )
+        .await
+        .expect("read")
+        .response_body()
+        .expect("body")
+        .into_rows()
+        .unwrap_or_default()
+        .iter()
+        .map(|row| row.get_r_by_name("table_name").expect("table_name"))
+        .collect();
+    names.sort();
+    names
 }
 
 #[tokio::test]

@@ -289,9 +289,42 @@ impl CassandraBootstrapper {
     }
 }
 
+impl CassandraBootstrapper {
+    /// Refuse a catalog keyspace that exists, is not a catalog, and holds
+    /// what another program put there ([`foreign_contents`]), naming it.
+    /// `init` calls it before it writes anything, the application role
+    /// included, and again before it creates the keyspace.
+    ///
+    /// [`foreign_contents`]: crate::migrations::foreign_contents
+    async fn refuse_a_foreign_keyspace(&self) -> OpResult<()> {
+        let keyspace = self.engine.catalog_keyspace();
+        let session = self.engine.session_arc();
+        let status = crate::migrations::catalog_status(session.clone(), &self.keyspace_prefix)
+            .await
+            .map_err(|e| OpError::Internal(e.to_string()))?;
+        if status != extenddb_storage::migrations::CatalogStatus::Uninitialized {
+            return Ok(());
+        }
+        let foreign = crate::migrations::foreign_contents(&session, &keyspace)
+            .await
+            .map_err(|e| OpError::Internal(e.to_string()))?;
+        if foreign.is_empty() {
+            return Ok(());
+        }
+        Err(OpError::AlreadyExists(format!(
+            "Keyspace '{keyspace}' exists and is not an ExtendDB catalog: it holds {}. Choose \
+             another --keyspace-prefix.",
+            foreign.join(", ")
+        )))
+    }
+}
+
 #[async_trait]
 impl Bootstrapper for CassandraBootstrapper {
     async fn ensure_app_user(&self) -> OpResult<()> {
+        // A keyspace of another program is refused before the role exists,
+        // so a refused `init` creates nothing.
+        self.refuse_a_foreign_keyspace().await?;
         let user = &self.config.app_user;
         let password = &self.config.app_password;
 
@@ -401,21 +434,7 @@ impl Bootstrapper for CassandraBootstrapper {
         let keyspace = self.engine.catalog_keyspace();
         println!("--- Creating catalog keyspace '{keyspace}'...");
         let session = self.engine.session_arc();
-        let status = crate::migrations::catalog_status(session.clone(), &self.keyspace_prefix)
-            .await
-            .map_err(|e| OpError::Internal(e.to_string()))?;
-        if status == extenddb_storage::migrations::CatalogStatus::Uninitialized {
-            let foreign = crate::migrations::foreign_contents(&session, &keyspace)
-                .await
-                .map_err(|e| OpError::Internal(e.to_string()))?;
-            if !foreign.is_empty() {
-                return Err(OpError::AlreadyExists(format!(
-                    "Keyspace '{keyspace}' exists and is not an ExtendDB catalog: it holds {}. \
-                     Choose another --keyspace-prefix.",
-                    foreign.join(", ")
-                )));
-            }
-        }
+        self.refuse_a_foreign_keyspace().await?;
         self.engine
             .create_keyspace(&keyspace)
             .await
