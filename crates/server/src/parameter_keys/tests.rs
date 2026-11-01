@@ -164,6 +164,10 @@ fn query_and_scan_keep_a_given_select() {
 
 #[test]
 fn single_item_writes_default_return_values_to_none() {
+    // The null case exercises the default path only: `given` treats a null
+    // member as absent, so the key holds NONE. A real request carrying
+    // `"ReturnValues": null` is refused by the engine with a
+    // SerializationException before authorization, so it never reaches here.
     for operation in ["PutItem", "UpdateItem", "DeleteItem"] {
         for input in [read(), with(&read(), &json!({"ReturnValues": null}))] {
             assert_eq!(

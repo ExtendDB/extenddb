@@ -7,7 +7,8 @@
 //! Each key holds the value of the request parameter it is named after. When a
 //! request that takes the parameter leaves it out, the service evaluates the
 //! value the operation then uses, so the key is present whether or not the
-//! caller spells that value out (measured 2026-11-01):
+//! caller spells that value out. The list after the bullets says which values
+//! were measured on 2026-11-01 and which follow them:
 //!
 //! - `dynamodb:Select` on `GetItem`, `Query`, `Scan`, each table of a
 //!   `BatchGetItem` and each `Get` of a `TransactGetItems`:
@@ -27,21 +28,26 @@
 //!
 //! Measured on 2026-11-01: `dynamodb:Select` on `GetItem` and `Query` with and
 //! without a projection, on `Scan` without one and with `Select` `COUNT`, on
-//! `Query` with `Select` `COUNT`, and on `BatchGetItem` and a `TransactGetItems`
-//! `Get` with and without a projection; `dynamodb:ReturnValues` on `PutItem`,
-//! `UpdateItem` and `DeleteItem` with and without the parameter, on a
-//! `BatchWriteItem`, and on the `Put`, `Update` and `Delete` items of a
+//! `Query` with `Select` `COUNT`, on a `BatchGetItem` with and without a
+//! projection, and on a `TransactGetItems` `Get` without one; `dynamodb:ReturnValues`
+//! on `PutItem`, `UpdateItem` and `DeleteItem` with and without the parameter,
+//! on a `BatchWriteItem`, and on the `Put`, `Update` and `Delete` items of a
 //! `TransactWriteItems`; `dynamodb:ReturnConsumedCapacity` on `GetItem` with and
 //! without the parameter, on a `BatchWriteItem` and on a `TransactGetItems`
 //! `Get`. `dynamodb:ReturnConsumedCapacity` on the other item operations follows
-//! those. A read that projects with `AttributesToGet` is treated as one with a
-//! `ProjectionExpression`, which the engine reads it as; that was not measured.
-//! A `Query` or `Scan` of an index with no projection and no `Select` holds
-//! `ALL_PROJECTED_ATTRIBUTES`, the default the DynamoDB API reference gives for
-//! a read of an index; that was not measured either.
+//! those and was not measured. A read that projects with `AttributesToGet` is
+//! treated as one with a `ProjectionExpression`, which the engine reads it as;
+//! that was not measured. `SPECIFIC_ATTRIBUTES` on a `Scan` with a projection
+//! follows the `Query` and `GetItem` rows and was not measured, and a
+//! `TransactGetItems` `Get` with a projection was measured only against a `Deny`
+//! on `ALL_ATTRIBUTES`, which it passed, so its `SPECIFIC_ATTRIBUTES` value
+//! follows the `BatchGetItem` and `GetItem` rows and was not measured directly.
+//! A `ConditionCheck` leaving `dynamodb:ReturnValues` absent follows the
+//! transaction write items and was not measured. A `Query` or `Scan` of an index
+//! with no projection and no `Select` holds `ALL_PROJECTED_ATTRIBUTES`, the
+//! default the DynamoDB API reference gives for a read of an index; that was not
+//! measured either.
 //!
-//! A key the operation does not take holds the request's parameter as given,
-//! as before: a `Select` member in a `PutItem` reaches the policy as written.
 //! The batch and transaction targets carry only the keys their operation takes.
 
 use serde_json::Value;
@@ -113,8 +119,11 @@ pub(crate) fn transact_item(sub: &str, item: &Value, request: &Value) -> Paramet
     }
 }
 
-/// The request's own value of `parameter`, when it is a string. A `null` is
-/// absent, as the engine reads it.
+/// The request's own value of `parameter`, when it is a string; `None` for a
+/// missing member or a `null`. The engine reads a `null` `Select` or projection
+/// member as absent, and refuses a `null` `ReturnValues` or
+/// `ReturnConsumedCapacity` with a `SerializationException`, so such a request
+/// is rejected before this value decides anything.
 fn given(request: &Value, parameter: &str) -> Option<String> {
     request
         .get(parameter)
