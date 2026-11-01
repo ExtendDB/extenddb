@@ -508,7 +508,7 @@ async fn a_primary_that_hangs_before_a_renewal_and_answers_again_keeps_the_regis
         MongoTarget::with_databases(proxy.uri(), d.target.catalog.clone(), d.target.data.clone());
     let timing = Timing {
         registration_renew_every: Duration::from_millis(400),
-        registration_deadline: Duration::from_secs(2),
+        registration_deadline: Duration::from_secs(4),
         registration_retry_every: Duration::from_millis(50),
         ..Timing::PRODUCTION
     };
@@ -516,13 +516,17 @@ async fn a_primary_that_hangs_before_a_renewal_and_answers_again_keeps_the_regis
         .await
         .expect("register");
     let mut lost = registration.lost();
-    // The first renewal is due 400 ms after the registration: the silence
-    // starts 50 ms before it and lasts 1.2 s, inside the 2 s deadline.
+    // The first renewal is due 400 ms after the registration's insert is
+    // answered, about when `register` returns: the silence starts 50 ms
+    // before it and lasts 1.2 s. The deadline counts from the insert's send,
+    // and on a busy server the insert and an attempt on a new connection
+    // after the silence can each take a few hundred milliseconds, so the
+    // deadline is 4 s.
     tokio::time::sleep(Duration::from_millis(350)).await;
     proxy.pause();
     tokio::time::sleep(Duration::from_millis(1200)).await;
     proxy.resume();
-    let changed = tokio::time::timeout(Duration::from_secs(3), lost.changed()).await;
+    let changed = tokio::time::timeout(Duration::from_secs(4), lost.changed()).await;
     let reason = lost.borrow().clone();
     registration.release().await;
     d.drop_databases().await;
