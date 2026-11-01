@@ -83,10 +83,12 @@ async fn a_store_whose_objects_differ_records_nothing_and_names_the_object() {
         .run_command(doc! { "create": "tags", "capped": true, "size": 4096 })
         .await
         .expect("capped");
-    let (held, target) = lock(&d.target, true, Duration::from_secs(5), Timing::PRODUCTION)
+    // `init` refuses this database before it takes the lock
+    // (tests/migrations_fresh.rs); the runner's own check is tested here.
+    let held = MigrationLock::acquire(&d.target, Duration::from_secs(5), Timing::PRODUCTION)
         .await
         .expect("lock");
-    let migrations = MongoMigrations::open(&target, Some(&held))
+    let migrations = MongoMigrations::open(&d.target, Some(&held))
         .await
         .expect("open");
     let error = Runner::new(&migrations, "test")
@@ -116,10 +118,10 @@ async fn a_store_whose_objects_differ_records_nothing_and_names_the_object() {
         )
         .await
         .expect("index");
-    let (held, target) = lock(&d.target, true, Duration::from_secs(5), Timing::PRODUCTION)
+    let held = MigrationLock::acquire(&d.target, Duration::from_secs(5), Timing::PRODUCTION)
         .await
         .expect("lock");
-    let migrations = MongoMigrations::open(&target, Some(&held))
+    let migrations = MongoMigrations::open(&d.target, Some(&held))
         .await
         .expect("open");
     let error = Runner::new(&migrations, "test")
@@ -147,10 +149,12 @@ async fn a_failed_write_stops_the_run_instead_of_being_discarded() {
         })
         .await
         .expect("validator");
-    let (held, target) = lock(&d.target, true, Duration::from_secs(5), Timing::PRODUCTION)
+    // `init` refuses this database before it takes the lock; the runner's
+    // handling of the refused write is tested here.
+    let held = MigrationLock::acquire(&d.target, Duration::from_secs(5), Timing::PRODUCTION)
         .await
         .expect("lock");
-    let migrations = MongoMigrations::open(&target, Some(&held))
+    let migrations = MongoMigrations::open(&d.target, Some(&held))
         .await
         .expect("open");
     let error = Runner::new(&migrations, "test")

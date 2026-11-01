@@ -89,6 +89,141 @@ async fn stores_that_are_not_catalogs_are_uninitialized_and_migrate_writes_nothi
     }
 }
 
+/// `init` takes the migration lock on a store that is not a catalog, and
+/// taking it writes the lock document into the catalog database's
+/// `settings`. A database that holds another program's collections or
+/// `settings` documents is refused before that write, naming them, and
+/// nothing is written; so is one with a catalog collection of another shape
+/// or holding documents. A database an `init` stopped in before migration 1
+/// recorded anything (the lock document, migration 1's collections and its
+/// `schema_history` document) is taken.
+#[tokio::test(flavor = "multi_thread")]
+async fn init_refuses_another_programs_database_before_it_writes_anything() {
+    let Some(uri) = server() else { return };
+    let other = Deployment::new(&uri, "foreign").await;
+    other
+        .catalog()
+        .collection::<Document>("orders")
+        .insert_one(doc! { "order": 1 })
+        .await
+        .expect("insert");
+    other
+        .catalog()
+        .collection::<Document>("settings")
+        .insert_one(doc! { "_id": "theme", "value": "dark" })
+        .await
+        .expect("insert");
+    let before = Deployment::documents(&other.catalog(), "settings").await;
+    let refused = lock(
+        &other.target,
+        true,
+        Duration::from_secs(2),
+        Timing::PRODUCTION,
+    )
+    .await
+    .err()
+    .expect("refused");
+    let message = refused.to_string();
+    assert!(
+        message.contains(&format!(
+            "the database {} is not an ExtendDB catalog: it holds the collection orders, the \
+             settings document 'theme'. Nothing was written to it.",
+            other.target.catalog
+        )),
+        "{message}"
+    );
+    assert_eq!(refused.exit_code(), exit::ERROR);
+    assert_eq!(
+        Deployment::collections(&other.catalog()).await,
+        ["orders", "settings"]
+    );
+    assert_eq!(
+        Deployment::documents(&other.catalog(), "settings").await,
+        before,
+        "no lock document was written"
+    );
+    assert!(Deployment::collections(&other.data()).await.is_empty());
+
+    // Catalog names alone: a capped `tags` and a `metrics` with a document.
+    let named = Deployment::new(&uri, "named").await;
+    named
+        .catalog()
+        .create_collection("tags")
+        .capped(true)
+        .size(4096)
+        .await
+        .expect("create");
+    named
+        .catalog()
+        .collection::<Document>("metrics")
+        .insert_one(doc! { "reading": 1.5 })
+        .await
+        .expect("insert");
+    let message = lock(
+        &named.target,
+        true,
+        Duration::from_secs(2),
+        Timing::PRODUCTION,
+    )
+    .await
+    .err()
+    .expect("refused")
+    .to_string();
+    assert!(
+        message.contains("documents in the collection metrics")
+            && message.contains("the collection tags, a collection with options"),
+        "{message}"
+    );
+    assert!(
+        Deployment::documents(&named.catalog(), "settings")
+            .await
+            .is_empty()
+    );
+
+    // What an `init` killed before migration 1's ledger row leaves, once its
+    // lock's lease has passed.
+    let stopped = Deployment::new(&uri, "stopped").await;
+    stopped
+        .catalog()
+        .collection::<Document>("settings")
+        .insert_one(doc! {
+            "_id": "migration_lock",
+            "owner": "a killed init",
+            "expires_at": bson::DateTime::from_millis(0),
+        })
+        .await
+        .expect("insert");
+    let expected: Definitions = serde_json::from_str(CATALOG_EXPECTED).expect("expected");
+    for name in expected.keys() {
+        if name != "settings" {
+            stopped
+                .catalog()
+                .create_collection(name)
+                .await
+                .expect("create");
+        }
+    }
+    stopped
+        .catalog()
+        .collection::<Document>("schema_history")
+        .insert_one(doc! { "_id": "001_initial" })
+        .await
+        .expect("insert");
+    assert_eq!(stopped.status().await, CatalogStatus::Uninitialized);
+    let (held, _) = lock(
+        &stopped.target,
+        true,
+        Duration::from_secs(60),
+        Timing::PRODUCTION,
+    )
+    .await
+    .expect("init takes the database");
+    held.release().await;
+    for d in [other, named, stopped] {
+        d.drop_databases().await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_fresh_store_gets_every_migration_and_the_expected_definitions() {
     let Some(uri) = server() else { return };

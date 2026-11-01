@@ -22,6 +22,7 @@ use extenddb_storage::migrations::{
     RunKind, RunReport, Runner, Target,
 };
 
+use super::foreign::foreign_unless_a_catalog;
 use super::{
     CATALOG_DATABASE, DATA_DATABASE, Lease, MigrationLock, MongoMigrations, MongoTarget, Timing,
     catalog_status, status_holding,
@@ -128,11 +129,15 @@ impl CatalogMigrations for MongoCatalogMigrations {
 /// Unless `creating` (`init`), a store that is not a catalog is refused
 /// first, with nothing written, from its ledgers and settings alone: the
 /// status read under the lock is the one that runs the pending migrations'
-/// `detect`.
+/// `detect`. With `creating`, a store that is not a catalog and holds
+/// another program's collections or `settings` documents is refused first,
+/// naming them, with nothing written: taking the lock writes its document
+/// into the catalog database's `settings`.
 ///
 /// # Errors
 ///
-/// The store is not a catalog (`Uninitialized`, exit 1), the lock or a
+/// The store is not a catalog (`Uninitialized`, exit 1), it holds another
+/// program's contents ([`MigrationError::Refused`], exit 1), the lock or a
 /// server outlasted `timeout` ([`MigrationError::Locked`], exit 6), or a
 /// request failed.
 pub async fn lock(
@@ -141,7 +146,18 @@ pub async fn lock(
     timeout: Duration,
     timing: Timing,
 ) -> Result<(MigrationLock, MongoTarget), MigrationError> {
-    if !creating {
+    if creating {
+        let foreign = foreign_unless_a_catalog(target).await?;
+        if !foreign.is_empty() {
+            return Err(MigrationError::Refused(format!(
+                "the database {} is not an ExtendDB catalog: it holds {}. Nothing was written \
+                 to it. ExtendDB keeps its catalog in a database of that name, so run init \
+                 against a MongoDB deployment where that database is empty or absent",
+                target.catalog,
+                foreign.join(", ")
+            )));
+        }
+    } else {
         let migrations = MongoMigrations::open(target, None).await?;
         let initialized = Runner::new(&migrations, "").initialized().await;
         migrations.close().await;

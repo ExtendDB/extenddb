@@ -25,6 +25,7 @@
 
 mod backend;
 mod commands;
+mod foreign;
 mod guarded;
 mod locks;
 mod registrar;
@@ -49,6 +50,7 @@ use extenddb_storage::migrations::{
 pub use backend::{MongoMigrations, MongoStores};
 pub(crate) use commands::lease_of;
 pub use commands::{MongoCatalogMigrations, lock};
+pub use foreign::foreign_contents;
 pub(crate) use locks::{Lease, is_duplicate_key};
 pub use locks::{MigrationLock, Timing};
 #[cfg(feature = "test-util")]
