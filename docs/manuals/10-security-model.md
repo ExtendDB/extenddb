@@ -110,7 +110,7 @@ Set operators and `IfExists` can be combined: `ForAllValues:StringEqualsIfExists
 | `aws:PrincipalTag/<key>` | String | Tag on the authenticated principal (user or role) |
 | `aws:ResourceTag/<key>` | String | Tag on the target DynamoDB table |
 | `dynamodb:LeadingKeys` | Multi-valued string | Partition key values being accessed |
-| `dynamodb:Attributes` | Multi-valued string | Attribute names being read or written |
+| `dynamodb:Attributes` | Multi-valued string | Top-level names of the attributes the request names (see below) |
 | `dynamodb:Select` | String | The `Select` parameter value |
 | `dynamodb:ReturnValues` | String | The `ReturnValues` parameter value |
 | `dynamodb:ReturnConsumedCapacity` | String | The `ReturnConsumedCapacity` parameter value |
@@ -132,6 +132,23 @@ extenddb supports the same access control patterns as real AWS IAM:
 **Fine-Grained Access Control (FGAC)**: Use `dynamodb:LeadingKeys` to restrict access to specific partition key values. Use `dynamodb:Attributes` to restrict which attributes can be read or written. Example: allow a user to access only items where the partition key matches their user ID.
 
 `dynamodb:LeadingKeys` is evaluated on `GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `Query`, `BatchGetItem`, `BatchWriteItem`, `TransactGetItems` and `TransactWriteItems`. A `Query` on a global secondary index binds the key to the index's partition key value (its first HASH attribute). `Scan` and `SearchVectors` target no single partition and carry no `dynamodb:LeadingKeys` value, so a `ForAllValues` condition does not fence them; fence a full-table read with `ForAnyValue:StringEquals` or a `Null` guard on the statement. A numeric partition key is compared as the normalized number on `GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `Query` and `BatchGetItem`, and as Java's `BigDecimal` prints it (`10.0` stays `10.0`, `1E1` is `1E+1`) on `BatchWriteItem`, `TransactGetItems` and `TransactWriteItems`, which is what DynamoDB does.
+
+`dynamodb:Attributes` holds the top-level names of the attributes a request names, with `ExpressionAttributeNames` placeholders resolved. A document path contributes its first name: a projection of `address.city` or `#a.city` gives `address`, and `tags[0]` gives `tags`. An entry of `AttributesToGet` is one name as written, dot included. The key holds:
+
+| Operation | `dynamodb:Attributes` holds |
+|-----------|-----------------------------|
+| `GetItem` | The table's key attributes, `AttributesToGet`, and the attributes in `ProjectionExpression` |
+| `PutItem` | The table's key attributes, the item's attributes, `Expected`, and the attributes in `ConditionExpression` |
+| `UpdateItem` | The `Key` attributes, the table's key attributes, `AttributeUpdates`, `Expected`, the attributes in `ConditionExpression`, and the attributes in `UpdateExpression`: the target of every `SET`, `REMOVE`, `ADD` and `DELETE` action and the attributes its value reads |
+| `DeleteItem` | The `Key` attributes, the table's key attributes, `Expected`, and the attributes in `ConditionExpression` |
+| `Query` | The key attributes of the table and of the queried index, `AttributesToGet`, `QueryFilter`, `ExclusiveStartKey`, and the attributes in `FilterExpression` and `ProjectionExpression` |
+| `Scan` | `AttributesToGet`, `ScanFilter`, `ExclusiveStartKey`, and the attributes in `FilterExpression` and `ProjectionExpression` |
+| `SearchVectors` | The attributes in `ProjectionExpression` |
+| `BatchGetItem` | Per table: the attributes of every key, the table's key attributes, `AttributesToGet`, and the attributes in `ProjectionExpression` |
+| `BatchWriteItem` | Per table: the attributes of every `PutRequest` item and `DeleteRequest` key, and the table's key attributes |
+| `TransactGetItems`, `TransactWriteItems` | Per item, what the single-item operation holds: `Get` as `GetItem`, `Put` as `PutItem`, `Update` as `UpdateItem`, `Delete` as `DeleteItem`; a `ConditionCheck` holds the table's key attributes and the attributes in its `ConditionExpression` |
+
+The names come from the request alone. A `DeleteItem` holds the key attributes of the item it deletes, not the item's other attributes, and a read with no projection holds the key attributes while it returns every attribute of the item, so a `Deny` on `ForAnyValue:StringEquals` over an attribute blocks neither (measured on DynamoDB 2026-10-31). A `Scan` that names no attribute is evaluated with the key absent. An allowlist written as an `Allow` on `ForAllValues:StringEquals` must list the key attributes of the table and of every index the statement covers, because every item request other than `Scan` and `SearchVectors` holds them. The entries for the item attributes of `PutItem`, the target of a `SET`, `DeleteItem`, `AttributesToGet` on `GetItem` and `Scan`, projected document paths, reads with no projection, and the batch and transaction forms of those requests were measured on DynamoDB on 2026-10-31. The other entries follow the IAM documentation for the key, which counts the attributes read in a condition or a filter and requires the key attributes in an allowlist.
 
 ### Resource ARNs
 

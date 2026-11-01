@@ -331,6 +331,11 @@ These errors occur when `auth.provider = "builtin"` is enabled.
 
 To allowlist attributes (allow only when *every* requested attribute is in the set), use `ForAllValues:` on an `Allow` statement. The same rule applies to `dynamodb:LeadingKeys`.
 
+`dynamodb:Attributes` holds the top-level names of the attributes the request names: the attributes of a `PutItem` item and of the items and keys in a `BatchWriteItem` request, the targets and operands of an `UpdateExpression`, `AttributesToGet`, the first name of each projected document path (`secret` for `secret.a`), the attributes a `ConditionExpression` or `FilterExpression` reads, and on every item operation other than `Scan` and `SearchVectors` the key attributes of the table (and of a queried index). Batch requests are evaluated per table and transactions per item. The [security model manual](manuals/10-security-model.md) lists what the key holds for each operation. Two cases follow from this:
+
+- A `Deny` on `ForAnyValue:StringEquals` over `ssn` does not block a `DeleteItem` of an item that holds `ssn`, or a read with no projection, which returns `ssn` with the rest of the item: neither request names `ssn`. DynamoDB answers the same way (measured 2026-10-31).
+- An `Allow` on `ForAllValues:StringEquals` that does not list the table's key attributes grants no `GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `Query`, batch or transaction request, because each of them holds the key attributes. List the key attributes of the table and of every index the statement covers.
+
 > Note: prior to v0.1.6, extenddb incorrectly treated a bare operator on these keys as an implicit AND across the requested values, so a single-attribute request appeared to be denied while a multi-attribute request leaked. That behavior diverged from AWS and gave a false sense of security. See the upgrade manual for migration guidance.
 
 ## Connection Issues
