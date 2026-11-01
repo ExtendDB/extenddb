@@ -254,7 +254,10 @@ pub async fn run(args: InitArgs, release: &str) -> anyhow::Result<u8> {
 
     let migrations = extenddb_storage::migrations::installed()
         .ok_or_else(|| anyhow::anyhow!("no storage backend is installed"))?;
-    let admin_result = init_on_runner(bootstrapper.as_ref(), migrations, release).await?;
+    let admin_result = init_on_runner(bootstrapper.as_ref(), migrations, release, &mut |line| {
+        println!("{line}");
+    })
+    .await?;
 
     if admin_result.already_existed {
         // Already printed by the bootstrap store.
@@ -318,11 +321,14 @@ pub async fn run(args: InitArgs, release: &str) -> anyhow::Result<u8> {
 /// while this one waited). Holding the lock through the rows keeps a server
 /// from starting on a catalog that has no encryption key yet. The target
 /// carries what the bootstrapper resolved from the command line, so the
-/// backend reads no flag itself.
+/// backend reads no flag itself. `say` prints this function's own lines:
+/// the one before the migrations, their notes, and the one that says a
+/// stopped `init` is being finished, before its rows.
 async fn init_on_runner(
     bootstrapper: &dyn extenddb_storage::bootstrapper::Bootstrapper,
     migrations: &dyn extenddb_storage::migrations::CatalogMigrations,
     release: &str,
+    say: &mut dyn FnMut(&str),
 ) -> anyhow::Result<extenddb_storage::bootstrapper::AdminBootstrapResult> {
     use extenddb_storage::bootstrapper::{finishes_a_stopped_init, write_bootstrap_rows};
     use extenddb_storage::migrations::{RunKind, run_with_status};
@@ -337,16 +343,20 @@ async fn init_on_runner(
             .status_under_lock(&lock, &target)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        if !finishes_a_stopped_init(bootstrapper, &status)
+        if finishes_a_stopped_init(bootstrapper, &status)
             .await
             .map_err(crate::cmd_migrate::op_err)?
         {
-            println!("--- Creating the catalog through its migrations...");
+            say(&format!(
+                "--- Finishing a stopped init: {status} and has no admin user."
+            ));
+        } else {
+            say("--- Creating the catalog through its migrations...");
             let report = run_with_status(migrations, &status, &lock, release, RunKind::Create)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             for note in &report.notes {
-                println!("    {note}");
+                say(&format!("    {note}"));
             }
             crate::util::print_applied(&report, "    ", "Applied", "migration");
         }

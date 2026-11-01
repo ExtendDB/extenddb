@@ -141,7 +141,8 @@ impl Bootstrapper for FakeBootstrapper {
 }
 
 /// `init_on_runner` on a catalog of `status` whose admin users `admin`
-/// says exist: its result and every call it made, in order.
+/// says exist: its result and every call it made and line it printed
+/// (`say: <line>`), in order.
 async fn init(status: CatalogStatus, admin: bool) -> (anyhow::Result<String>, Vec<String>) {
     let log = Log::default();
     let migrations = FakeMigrations {
@@ -152,12 +153,16 @@ async fn init(status: CatalogStatus, admin: bool) -> (anyhow::Result<String>, Ve
         admin,
         log: Arc::clone(&log),
     };
-    let result = init_on_runner(&bootstrapper, &migrations, "1.0.0-test")
+    let said = Arc::clone(&log);
+    let mut say = move |line: &str| record(&said, &format!("say: {line}"));
+    let result = init_on_runner(&bootstrapper, &migrations, "1.0.0-test", &mut say)
         .await
         .map(|admin| admin.username);
     let calls = log.lock().unwrap().clone();
     (result, calls)
 }
+
+const CREATING: &str = "say: --- Creating the catalog through its migrations...";
 
 const ROWS: [&str; 5] = [
     "hold",
@@ -175,29 +180,37 @@ fn calls(first: &[&str], last: &[&str]) -> Vec<String> {
 async fn a_store_that_is_not_a_catalog_is_created_then_given_its_rows() {
     let (result, log) = init(CatalogStatus::Uninitialized, false).await;
     assert_eq!(result.expect("init"), "admin");
-    let mut expected = calls(&["lock", "status", "run the migrations"], &ROWS);
+    let mut expected = calls(&["lock", "status", CREATING, "run the migrations"], &ROWS);
     expected.push("release".to_owned());
     assert_eq!(log, expected);
 }
 
 /// What an `init` stopped after its migrations leaves: every migration is
-/// recorded and there is no admin user. `init` runs no migration and writes
+/// recorded and there is no admin user. `init` runs no migration, prints
+/// one line saying it finishes a stopped `init` before the rows, and writes
 /// the rows, each of which the backend writes only when it is missing.
 #[tokio::test]
 async fn a_current_catalog_without_an_admin_user_is_finished_without_a_migration() {
-    let current = CatalogStatus::Current {
-        version: MigrationId::LATEST.number(),
-    };
+    let latest = MigrationId::LATEST.number();
+    let current = CatalogStatus::Current { version: latest };
     let (result, log) = init(current, false).await;
     assert_eq!(result.expect("init"), "admin");
-    let mut expected = calls(&["lock", "status", "has an admin user?"], &ROWS);
+    let finishing = format!(
+        "say: --- Finishing a stopped init: the catalog is at migration {latest} and has no \
+         admin user."
+    );
+    let mut expected = calls(
+        &["lock", "status", "has an admin user?", finishing.as_str()],
+        &ROWS,
+    );
     expected.push("release".to_owned());
     assert_eq!(log, expected);
 }
 
 /// A catalog with an admin user, and one whose migrations are not all
 /// applied, are refused as initialized, with nothing run or written and the
-/// lock released.
+/// lock released. The output is what `init` printed before it finished
+/// stopped catalogs: the line before the migrations, then the refusal.
 #[tokio::test]
 async fn a_catalog_with_an_admin_user_or_pending_migrations_is_refused() {
     let current = CatalogStatus::Current {
@@ -215,7 +228,10 @@ async fn a_catalog_with_an_admin_user_or_pending_migrations_is_refused() {
     );
     assert_eq!(
         log,
-        calls(&["lock", "status", "has an admin user?"], &["release"])
+        calls(
+            &["lock", "status", "has an admin user?", CREATING],
+            &["release"]
+        )
     );
 
     let behind = CatalogStatus::Behind {
@@ -231,5 +247,5 @@ async fn a_catalog_with_an_admin_user_or_pending_migrations_is_refused() {
     let (result, log) = init(behind, false).await;
     let message = result.expect_err("refused").to_string();
     assert!(message.contains("already initialized"), "{message}");
-    assert_eq!(log, calls(&["lock", "status"], &["release"]));
+    assert_eq!(log, calls(&["lock", "status", CREATING], &["release"]));
 }
