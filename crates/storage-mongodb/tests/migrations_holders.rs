@@ -493,9 +493,12 @@ async fn the_lock_timeout_bounds_migrate_yes_on_a_catalog_with_many_policies() {
 
 /// A primary that stops answering just before a renewal is due, and answers
 /// again before the registration's deadline, does not take the registration:
-/// the renewal sent into the silence is bounded, the next ones go out every
-/// retry interval, and one gets through once the primary answers. The
-/// primary's silence is a proxy that holds every byte while it is paused.
+/// the renewal sent into the silence is bounded by the renewal interval, the
+/// next ones go out every retry interval, and one sent after the silence gets
+/// through. The silence is a proxy on which a connection that carried bytes
+/// during it never answers, as a connection to a primary that hung does, so
+/// a renewal bounded only by the time left to the deadline waits on its
+/// connection until the deadline, and the registration is lost.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_primary_that_hangs_before_a_renewal_and_answers_again_keeps_the_registration() {
     let Some(uri) = server() else { return };

@@ -1,12 +1,17 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! A TCP proxy in front of the test server that stops passing bytes while it
-//! is paused and passes them again once it is resumed, as a primary that
-//! hangs and then answers again does. Bytes that arrive while it is paused
-//! are held, not dropped, and connections stay open.
+//! A TCP proxy in front of the test server that passes no bytes while it is
+//! paused, as a primary that hangs does. A connection that carried bytes
+//! during the silence stays silent after it: what it held is never
+//! delivered, and it stays open, as a connection to a primary that never
+//! answers what was sent to it. Connections that carried nothing during the
+//! silence, and connections opened after it, pass bytes again once it is
+//! resumed, as connections to the primary that answers do.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -42,15 +47,18 @@ impl PausingProxy {
                 };
                 let (client_read, client_write) = client.into_split();
                 let (server_read, server_write) = server.into_split();
-                tokio::spawn(copy_unless_paused(
+                let silent = Arc::new(AtomicBool::new(false));
+                tokio::spawn(copy_unless_silent(
                     client_read,
                     server_write,
                     watching.clone(),
+                    silent.clone(),
                 ));
-                tokio::spawn(copy_unless_paused(
+                tokio::spawn(copy_unless_silent(
                     server_read,
                     client_write,
                     watching.clone(),
+                    silent,
                 ));
             }
         });
@@ -61,10 +69,16 @@ impl PausingProxy {
         }
     }
 
-    /// The connection string of the proxy, for a direct connection.
+    /// The connection string of the proxy, for a direct connection. A
+    /// connection the driver opens during the silence never finishes its
+    /// handshake, and the driver opens at most two at a time by default, so
+    /// the string lets it open more.
     #[must_use]
     pub fn uri(&self) -> String {
-        format!("mongodb://{}/?directConnection=true", self.address)
+        format!(
+            "mongodb://{}/?directConnection=true&maxConnecting=20",
+            self.address
+        )
     }
 
     pub fn pause(&self) {
@@ -82,12 +96,14 @@ impl Drop for PausingProxy {
     }
 }
 
-/// Copy `from` to `to`, holding what is read while the proxy is paused
-/// until it is resumed.
-async fn copy_unless_paused(
+/// Copy `from` to `to`. Bytes read while the proxy is paused make the
+/// connection `silent`, both directions: from then on it passes nothing, and
+/// its halves are kept so the connection stays open.
+async fn copy_unless_silent(
     mut from: OwnedReadHalf,
     mut to: OwnedWriteHalf,
-    mut paused: watch::Receiver<bool>,
+    paused: watch::Receiver<bool>,
+    silent: Arc<AtomicBool>,
 ) {
     let mut buffer = vec![0_u8; 16 * 1024];
     loop {
@@ -95,7 +111,12 @@ async fn copy_unless_paused(
             Ok(0) | Err(_) => return,
             Ok(n) => n,
         };
-        if paused.wait_for(|paused| !*paused).await.is_err() {
+        if *paused.borrow() {
+            silent.store(true, Ordering::SeqCst);
+        }
+        if silent.load(Ordering::SeqCst) {
+            let _open = (from, to);
+            std::future::pending::<()>().await;
             return;
         }
         if to.write_all(&buffer[..read]).await.is_err() {
