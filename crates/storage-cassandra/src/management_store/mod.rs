@@ -7,7 +7,7 @@
 //! file under the 500-line limit.
 
 use extenddb_storage::management_store::{
-    AccessKeyCreated, AccountDetail, GroupDetail, OpResult, RoleDetail, UserDetail,
+    AccessKeyCreated, AccountDetail, GroupDetail, OpResult, RoleDetail, StoredDocument, UserDetail,
 };
 use futures::future::BoxFuture;
 
@@ -400,6 +400,21 @@ impl extenddb_storage::management_store::ManagementStore for CassandraCatalogSto
         })
     }
 
+    fn list_policy_documents(
+        &self,
+        account_id: &str,
+        principal_type: &str,
+        principal_name: &str,
+    ) -> BoxFuture<'_, OpResult<Vec<(String, StoredDocument)>>> {
+        let account_id = account_id.to_string();
+        let principal_type = principal_type.to_string();
+        let principal_name = principal_name.to_string();
+        Box::pin(async move {
+            self.list_policy_documents_impl(&account_id, &principal_type, &principal_name)
+                .await
+        })
+    }
+
     // ── Permissions boundaries ─────────────────────────────────────
 
     fn set_user_boundary(
@@ -469,6 +484,21 @@ impl extenddb_storage::management_store::ManagementStore for CassandraCatalogSto
         let role_name = role_name.to_string();
         Box::pin(async move {
             self.get_boundary_impl(&account_id, "role", &role_name)
+                .await
+        })
+    }
+
+    fn boundary_document(
+        &self,
+        account_id: &str,
+        principal_type: &str,
+        principal_name: &str,
+    ) -> BoxFuture<'_, OpResult<Option<StoredDocument>>> {
+        let account_id = account_id.to_string();
+        let principal_type = principal_type.to_string();
+        let principal_name = principal_name.to_string();
+        Box::pin(async move {
+            self.boundary_document_impl(&account_id, &principal_type, &principal_name)
                 .await
         })
     }

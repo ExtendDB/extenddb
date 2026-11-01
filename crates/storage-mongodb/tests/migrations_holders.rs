@@ -352,3 +352,99 @@ async fn a_collision_is_found_before_the_first_write_and_nothing_is_recorded() {
     );
     d.drop_databases().await;
 }
+
+/// A stored document that cannot be read as JSON, here a policy whose
+/// `policy_document` is binary data, is named, with its account, principal,
+/// policy and the error, as an item a person must fix: the status
+/// `migrate --yes` reads under the lock is NeedsAttention. The principal's
+/// other policies and its boundary are still read, and the rewrite through
+/// the store a migration uses rewrites them.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_undecodable_policy_is_named_and_the_others_are_rewritten() {
+    let Some(uri) = server() else { return };
+    let d = Deployment::new(&uri, "undecodable").await;
+    fixture::load(&d, &fixture::read("0.1.14")).await;
+    let account = first_account(&d).await;
+    let tagged = doc! {
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Deny", "Action": "dynamodb:*", "Resource": "*",
+            "Condition": { "StringEquals": { "dynamodb:ResourceTag/env": "prod" } },
+        }],
+    };
+    let now = bson::DateTime::now();
+    let catalog = d.catalog();
+    catalog
+        .collection::<Document>("iam_users")
+        .insert_one(doc! {
+            "account_id": &account, "user_name": "carol",
+            "user_arn": format!("arn:aws:iam::{account}:user/carol"), "created_at": now,
+        })
+        .await
+        .expect("user");
+    let binary = bson::Binary {
+        subtype: bson::spec::BinarySubtype::Generic,
+        bytes: b"{not json".to_vec(),
+    };
+    for (name, document) in [
+        ("a_broken", bson::Bson::Binary(binary)),
+        ("b_tagged", bson::Bson::Document(tagged.clone())),
+    ] {
+        catalog
+            .collection::<Document>("iam_policies")
+            .insert_one(doc! {
+                "account_id": &account, "principal_type": "user", "principal_name": "carol",
+                "policy_name": name, "policy_document": document, "created_at": now,
+            })
+            .await
+            .expect("policy");
+    }
+    catalog
+        .collection::<Document>("iam_permissions_boundaries")
+        .insert_one(doc! {
+            "account_id": &account, "principal_type": "user", "principal_name": "carol",
+            "policy_document": tagged, "created_at": now,
+        })
+        .await
+        .expect("boundary");
+
+    let held = MigrationLock::acquire(&d.target, Duration::from_secs(10), Timing::PRODUCTION)
+        .await
+        .expect("lock");
+    let status = status_holding(&d.target, &held).await;
+    let Ok(CatalogStatus::NeedsAttention { items }) = &status else {
+        panic!("expected NeedsAttention: {status:?}");
+    };
+    assert!(
+        items.iter().any(|i| i.contains(&format!(
+            "account {account} user/carol policy a_broken has a stored document that cannot be \
+             decoded"
+        ))),
+        "{items:?}"
+    );
+    let migrations = MongoMigrations::open(&d.target, Some(&held))
+        .await
+        .expect("open");
+    let report = extenddb_storage::policy_migration::migrate_resource_tag_condition_keys(
+        migrations.stores().management_store(),
+        true,
+    )
+    .await;
+    migrations.close().await;
+    held.release().await;
+    assert_eq!(report.errors, 0, "{:?}", report.failures);
+    assert_eq!(report.unreadable.len(), 1, "{report:?}");
+    assert!(
+        report.unreadable[0].error.contains("byte array"),
+        "{:?}",
+        report.unreadable
+    );
+    let carol: Vec<&str> = report
+        .rewritten
+        .iter()
+        .filter(|r| r.principal == "user/carol")
+        .map(|r| r.policy_name.as_str())
+        .collect();
+    assert_eq!(carol, ["b_tagged", "<permissions-boundary>"]);
+    d.drop_databases().await;
+}

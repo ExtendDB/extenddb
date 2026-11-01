@@ -20,7 +20,8 @@ use std::time::Duration;
 
 use extenddb_storage::management_store::{
     AccessKeyCreated, AccountDetail, GroupDetail, GroupListEntry, ManagementStore, OpError,
-    OpResult, RoleDetail, RoleListEntry, SessionPolicyEntry, UserDetail, UserListEntry,
+    OpResult, RoleDetail, RoleListEntry, SessionPolicyEntry, StoredDocument, UserDetail,
+    UserListEntry,
 };
 use futures::future::BoxFuture;
 
@@ -135,11 +136,13 @@ impl ManagementStore for LeasedManagementStore {
         fn put_policy(&self, account_id: &str, principal_type: &str, principal_name: &str, policy_name: &str, document: &serde_json::Value) -> BoxFuture<'_, OpResult<()>>;
         fn delete_policy(&self, account_id: &str, principal_type: &str, principal_name: &str, policy_name: &str) -> BoxFuture<'_, OpResult<()>>;
         fn list_policies(&self, account_id: &str, principal_type: &str, principal_name: &str) -> BoxFuture<'_, OpResult<Vec<(String, serde_json::Value, time::OffsetDateTime)>>>;
+        fn list_policy_documents(&self, account_id: &str, principal_type: &str, principal_name: &str) -> BoxFuture<'_, OpResult<Vec<(String, StoredDocument)>>>;
         fn set_user_boundary(&self, account_id: &str, user_name: &str, document: &serde_json::Value) -> BoxFuture<'_, OpResult<()>>;
         fn get_user_boundary(&self, account_id: &str, user_name: &str) -> BoxFuture<'_, OpResult<Option<serde_json::Value>>>;
         fn delete_user_boundary(&self, account_id: &str, user_name: &str) -> BoxFuture<'_, OpResult<()>>;
         fn set_role_boundary(&self, account_id: &str, role_name: &str, document: &serde_json::Value) -> BoxFuture<'_, OpResult<()>>;
         fn get_role_boundary(&self, account_id: &str, role_name: &str) -> BoxFuture<'_, OpResult<Option<serde_json::Value>>>;
+        fn boundary_document(&self, account_id: &str, principal_type: &str, principal_name: &str) -> BoxFuture<'_, OpResult<Option<StoredDocument>>>;
         fn delete_role_boundary(&self, account_id: &str, role_name: &str) -> BoxFuture<'_, OpResult<()>>;
         fn create_access_key(&self, account_id: &str, user_name: &str) -> BoxFuture<'_, OpResult<AccessKeyCreated>>;
         fn delete_access_key(&self, account_id: &str, user_name: &str, key_id: &str) -> BoxFuture<'_, OpResult<()>>;

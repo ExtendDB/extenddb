@@ -650,3 +650,72 @@ async fn a_reconverge_leaves_policies_written_after_migration_2_as_they_are() {
     );
     assert_eq!(policies(&store).await, before);
 }
+
+/// A stored document that does not decode is named, with its account,
+/// principal, policy and decode error, as an item a person must fix: the
+/// status `migrate --yes` reads under the lock is NeedsAttention. The
+/// principal's other policies and its boundary are still read, and the
+/// rewrite rewrites them.
+#[tokio::test]
+async fn an_undecodable_policy_is_named_and_the_others_are_rewritten() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
+    let session = session().await;
+    let (prefix, _drops) = new_prefix("m2bad");
+    released_catalog(&session, &prefix).await;
+    let store = CassandraCatalogStore::catalog_only(session.clone(), prefix.clone());
+    let tagged: serde_json::Value = serde_json::from_str(TAGGED).expect("json");
+    store
+        .create_user(ACCOUNT, "carol", None)
+        .await
+        .expect("user");
+    for name in ["a_broken", "b_tagged"] {
+        store
+            .put_policy(ACCOUNT, "user", "carol", name, &tagged)
+            .await
+            .expect("policy");
+    }
+    store
+        .set_user_boundary(ACCOUNT, "carol", &tagged)
+        .await
+        .expect("boundary");
+    cql(
+        &session,
+        &format!(
+            "UPDATE {prefix}_catalog.iam_policies SET policy_document = '{{not json' WHERE \
+             account_id = '{ACCOUNT}' AND principal_type = 'user' AND principal_name = 'carol' \
+             AND policy_name = 'a_broken'"
+        ),
+    )
+    .await;
+
+    let catalog = format!("{prefix}_catalog");
+    let lock = MigrationLock::acquire(session.clone(), &catalog, LeaseTimes::DEFAULT, TIMEOUT)
+        .await
+        .expect("take the lock");
+    let status = status_holding(&lock, &prefix).await;
+    lock.release().await;
+    let Ok(CatalogStatus::NeedsAttention { items }) = &status else {
+        panic!("expected NeedsAttention: {status:?}");
+    };
+    assert!(
+        items.iter().any(|i| i.contains(&format!(
+            "account {ACCOUNT} user/carol policy a_broken has a stored document that cannot \
+             be decoded"
+        )) && i.contains("line 1")),
+        "{items:?}"
+    );
+
+    let report =
+        extenddb_storage::policy_migration::migrate_resource_tag_condition_keys(&store, true).await;
+    assert_eq!(report.errors, 0, "{:?}", report.failures);
+    assert_eq!(report.unreadable.len(), 1, "{report:?}");
+    let carol: Vec<&str> = report
+        .rewritten
+        .iter()
+        .filter(|r| r.principal == "user/carol")
+        .map(|r| r.policy_name.as_str())
+        .collect();
+    assert_eq!(carol, ["b_tagged", "<permissions-boundary>"]);
+}

@@ -10,8 +10,8 @@ use mongodb::options::{FindOptions, UpdateOptions};
 
 use extenddb_storage::management_store::{
     AccessKeyCreated, AccountDetail, AdminEntry, GroupDetail, GroupListEntry, ManagementStore,
-    MetricsRow, OpError, OpResult, RoleDetail, RoleListEntry, SessionPolicyEntry, UserDetail,
-    UserListEntry,
+    MetricsRow, OpError, OpResult, RoleDetail, RoleListEntry, SessionPolicyEntry, StoredDocument,
+    UserDetail, UserListEntry,
 };
 
 use crate::catalog_store::MongoCatalogStore;
@@ -1451,6 +1451,54 @@ impl ManagementStore for MongoCatalogStore {
         })
     }
 
+    fn list_policy_documents(
+        &self,
+        account_id: &str,
+        principal_type: &str,
+        principal_name: &str,
+    ) -> BoxFuture<'_, OpResult<Vec<(String, StoredDocument)>>> {
+        let account_id = account_id.to_owned();
+        let principal_type = principal_type.to_owned();
+        let principal_name = principal_name.to_owned();
+        Box::pin(async move {
+            let coll = self.catalog_db().collection::<Document>("iam_policies");
+            let opts = FindOptions::builder()
+                .sort(doc! { "policy_name": 1 })
+                .build();
+            let cursor = coll
+                .find(doc! {
+                    "account_id": &account_id,
+                    "principal_type": &principal_type,
+                    "principal_name": &principal_name,
+                })
+                .with_options(opts)
+                .await
+                .map_err(|e| {
+                    tracing::error!("list_policy_documents: {e}");
+                    OpError::Internal("Database error".to_owned())
+                })?;
+            let docs: Vec<Document> = cursor.try_collect().await.map_err(|e| {
+                tracing::error!("list_policy_documents cursor: {e}");
+                OpError::Internal("Database error".to_owned())
+            })?;
+            Ok(docs
+                .iter()
+                .map(|d| {
+                    let name = d.get_str("policy_name").map_or_else(
+                        |_| {
+                            format!(
+                                "<the policy stored as {}>",
+                                d.get("_id").map(ToString::to_string).unwrap_or_default()
+                            )
+                        },
+                        str::to_owned,
+                    );
+                    (name, stored_document(d))
+                })
+                .collect())
+        })
+    }
+
     fn set_user_boundary(
         &self,
         account_id: &str,
@@ -1582,6 +1630,34 @@ impl ManagementStore for MongoCatalogStore {
                     OpError::Internal("Database error".to_owned())
                 })?;
             Ok(())
+        })
+    }
+
+    fn boundary_document(
+        &self,
+        account_id: &str,
+        principal_type: &str,
+        principal_name: &str,
+    ) -> BoxFuture<'_, OpResult<Option<StoredDocument>>> {
+        let account_id = account_id.to_owned();
+        let principal_type = principal_type.to_owned();
+        let principal_name = principal_name.to_owned();
+        Box::pin(async move {
+            let coll = self
+                .catalog_db()
+                .collection::<Document>("iam_permissions_boundaries");
+            let doc = coll
+                .find_one(doc! {
+                    "account_id": &account_id,
+                    "principal_type": &principal_type,
+                    "principal_name": &principal_name,
+                })
+                .await
+                .map_err(|e| {
+                    tracing::error!("boundary_document: {e}");
+                    OpError::Internal("Database error".to_owned())
+                })?;
+            Ok(doc.as_ref().map(stored_document))
         })
     }
 
@@ -2485,4 +2561,14 @@ fn encrypt_secret(plaintext: &str, key_b64: &str, aad: &str) -> Result<Vec<u8>, 
     result.extend_from_slice(&nonce_bytes);
     result.extend_from_slice(&ciphertext);
     Ok(result)
+}
+
+/// A stored policy or boundary as the resource-tag migration reads it: its
+/// `policy_document` as JSON, or why that cannot be read. `list_policies`
+/// and the boundary getters skip such a document.
+fn stored_document(d: &Document) -> StoredDocument {
+    match d.get("policy_document") {
+        None => Err("the stored policy has no policy_document field".to_owned()),
+        Some(b) => bson::from_bson::<serde_json::Value>(b.clone()).map_err(|e| e.to_string()),
+    }
 }
