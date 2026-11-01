@@ -122,14 +122,16 @@ fn with_defaults(
     rows
 }
 
-/// The value `get` prints for `key`: its row, else the row of its other
-/// name, which the engine reads in its place, else `default`'s value.
+/// The value `get` prints for `key`, under either name of a renamed key:
+/// the row the engine reads, which is the row of the current name, else
+/// the row of the deprecated alias, else `default`'s value.
 async fn stored_or_default(
     store: &dyn SettingsStore,
     key: &str,
     default: impl Fn(&str) -> Option<String>,
 ) -> anyhow::Result<Option<String>> {
-    for name in [Some(key), other_name(key)].into_iter().flatten() {
+    let current = extenddb_core::settings_keys::canonical_key(key);
+    for name in [Some(current), other_name(current)].into_iter().flatten() {
         let stored = store
             .get_setting(name)
             .await
@@ -138,7 +140,7 @@ async fn stored_or_default(
             return Ok(stored);
         }
     }
-    Ok(default(extenddb_core::settings_keys::canonical_key(key)))
+    Ok(default(current))
 }
 
 async fn list(store: &dyn SettingsStore) -> anyhow::Result<()> {
@@ -352,6 +354,18 @@ mod tests {
             .await
             .expect("get");
         assert_eq!(value.as_deref(), Some("10"));
+        // With rows under both names the engine reads the current name's,
+        // and either name prints it.
+        let both = Rows(rows(&[
+            ("gsi_propagation_delay_ms", "999"),
+            ("index_propagation_delay_ms", "7"),
+        ]));
+        for key in ["index_propagation_delay_ms", "gsi_propagation_delay_ms"] {
+            let value = stored_or_default(&both, key, engine_default)
+                .await
+                .expect("get");
+            assert_eq!(value.as_deref(), Some("7"), "{key}");
+        }
     }
 
     /// `list` adds a row for each writable key with an engine default and
