@@ -155,7 +155,7 @@ fn pitr_restore_unavailable_error(table_name: &str) -> DynamoDbError {
 /// a table whose recovery is disabled. Owned by the engine rather than the
 /// backends: the answer does not depend on stored state, so no backend is
 /// consulted and all of them report identically.
-fn disabled_continuous_backups_description() -> ContinuousBackupsDescription {
+fn default_continuous_backups_description() -> ContinuousBackupsDescription {
     ContinuousBackupsDescription {
         continuous_backups_status: "ENABLED".to_owned(),
         point_in_time_recovery_description: Some(PointInTimeRecoveryDescription {
@@ -271,7 +271,7 @@ pub(crate) async fn handle_describe_continuous_backups(
     check_table_name(table_name, super::table_name_bounds(&ctx.limits))?;
     require_table_exists(ctx, table_name).await?;
     serialize_output(
-        &json!({ "ContinuousBackupsDescription": disabled_continuous_backups_description() }),
+        &json!({ "ContinuousBackupsDescription": default_continuous_backups_description() }),
     )
 }
 
@@ -295,7 +295,7 @@ pub(crate) async fn handle_update_continuous_backups(
         return Err(pitr_unsupported_error());
     }
     serialize_output(
-        &json!({ "ContinuousBackupsDescription": disabled_continuous_backups_description() }),
+        &json!({ "ContinuousBackupsDescription": default_continuous_backups_description() }),
     )
 }
 

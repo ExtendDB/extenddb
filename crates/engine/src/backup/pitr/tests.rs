@@ -3,7 +3,7 @@
 
 use super::{
     NO_RESTORE_TIME, SOURCE_NAMED_TWICE, TABLE_NAME_REQUIRED, TWO_RESTORE_TIMES,
-    check_restore_time_members, disabled_continuous_backups_description,
+    check_restore_time_members, default_continuous_backups_description,
     pitr_restore_unavailable_error, pitr_unsupported_error, point_in_time_recovery_enabled,
     restore_source_table_name, table_name_member,
 };
@@ -30,7 +30,7 @@ fn validation_message(result: Result<impl std::fmt::Debug, DynamoDbError>) -> St
 /// service, which drops them entirely.
 #[test]
 fn the_continuous_backups_description_is_enabled_with_recovery_disabled() {
-    let desc = disabled_continuous_backups_description();
+    let desc = default_continuous_backups_description();
     let wire = serde_json::to_value(&desc).expect("serializes");
     assert_eq!(wire["ContinuousBackupsStatus"], "ENABLED");
     let pitr = &wire["PointInTimeRecoveryDescription"];
