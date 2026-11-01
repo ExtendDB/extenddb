@@ -213,7 +213,7 @@ extenddb init \
 - [ ] Use a dedicated PostgreSQL user for extenddb with minimal privileges
 - [ ] Configure PostgreSQL `max_connections` ≥ extenddb `pool_size` + 3
 - [ ] Enable PostgreSQL TLS
-- [ ] Set up automated backups (pg_dump, WAL archiving, or managed service snapshots)
+- [ ] Set up automated backups that copy the catalog and data databases as of one moment: `pg_basebackup` or managed service snapshots of the PostgreSQL server, or `pg_dump` of both databases with the servers stopped. Archived WAL restores only on top of a base backup, so WAL archiving needs `pg_basebackup` as well. Two `pg_dump` runs taken while a server runs disagree when a table is created or deleted between them; see [Database Backup and Restore](05-admin-guide.md#database-backup-and-restore)
 - [ ] Monitor PostgreSQL disk usage, connection count, and query performance
 
 ### Monitoring

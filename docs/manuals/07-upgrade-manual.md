@@ -142,6 +142,8 @@ pg_dump -h <host> -U <admin> <data-db> > data_backup_$(date +%Y%m%d).sql
 
 `pg_dump` refuses to dump a server of a newer major version than itself ("aborting because of server version mismatch"); use the client of the server's version.
 
+With the server stopped (step 1; check that `extenddb status` reports `is not running`), the two dumps agree. They are plain-text dumps: `pg_restore` refuses them (`input file appears to be a text format dump. Please use psql.`), and the [Rollback Procedure](#rollback-procedure) below restores them with `psql -f`. The Admin Guide's [Database Backup and Restore](05-admin-guide.md#database-backup-and-restore) gives the copies that can be taken while the server runs.
+
 3. **Build the new version**
 
 ```bash
