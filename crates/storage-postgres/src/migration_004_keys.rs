@@ -48,40 +48,28 @@ pub(crate) fn has_composite_partition_key(key_schema: &serde_json::Value) -> boo
 
 /// Rebuild the composite key text in `col` of the rows that `rows` (a boolean
 /// SQL expression over the row) selects and that hold U+0001, one row at a
-/// time. A SQL `replace()` over the whole text would leave each length prefix
-/// counting the raw part (`2:a\x01,1:b,` would become `2:a\x01\x02,1:b,`,
-/// where this build writes and looks up `3:a\x01\x02,1:b,`). A value that is
-/// not a netstring fails the migration, naming the table and column; the
-/// table's transaction rolls back and nothing is marked.
+/// time, longest legacy text first and in batches
+/// (`migration_004_order::rewrite_longest_first`). A SQL `replace()` over the
+/// whole text would leave each length prefix counting the raw part
+/// (`2:a\x01,1:b,` would become `2:a\x01\x02,1:b,`, where this build writes and
+/// looks up `3:a\x01\x02,1:b,`). A value that is not a netstring fails the
+/// migration, naming the table and column (`what`); the table's transaction
+/// rolls back and nothing is marked.
 pub(crate) async fn rebuild_composite_rows(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     quoted_table: &str,
     col: &str,
     rows: &str,
+    what: &str,
 ) -> OpResult<u64> {
-    let select = format!(
-        "SELECT ctid::text, \"{col}\" FROM {quoted_table} \
-         WHERE position(chr(1) IN \"{col}\") > 0 AND ({rows}) FOR UPDATE"
-    );
-    let found: Vec<(String, String)> = sqlx::query_as(&select)
-        .fetch_all(&mut **tx)
-        .await
-        .map_err(|e| OpError::Internal(format!("Find {quoted_table}.{col} to rebuild: {e}")))?;
-    let update = format!("UPDATE {quoted_table} SET \"{col}\" = $1 WHERE ctid = $2::tid");
-    for (ctid, legacy) in &found {
-        let rebuilt = reescape_legacy_composite(legacy).ok_or_else(|| {
+    crate::migration_004_order::rewrite_longest_first(tx, quoted_table, col, rows, what, |legacy| {
+        reescape_legacy_composite(legacy).ok_or_else(|| {
             OpError::Internal(format!(
-                "Re-encode {quoted_table}.{col}: the composite key {legacy:?} is not a netstring"
+                "Re-encode {what}: the composite key {legacy:?} is not a netstring"
             ))
-        })?;
-        sqlx::query(&update)
-            .bind(rebuilt)
-            .bind(ctid)
-            .execute(&mut **tx)
-            .await
-            .map_err(|e| OpError::Internal(format!("Rebuild {quoted_table}.{col}: {e}")))?;
-    }
-    Ok(found.len() as u64)
+        })
+    })
+    .await
 }
 
 /// The partition a row queued with these columns gets from this build's

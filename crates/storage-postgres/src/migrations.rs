@@ -671,6 +671,19 @@ struct EscapeWork {
     /// `gsi_pending` only: recompute `worker_partition` after the re-encode
     /// (`migration_004_keys::recompute_worker_partitions`).
     recompute_worker_partition: bool,
+    /// The DynamoDB table (and index) the physical table holds, for errors.
+    ddb_name: Option<String>,
+}
+
+impl EscapeWork {
+    /// `<table>.<col>`, with the DynamoDB name when known: how errors name a
+    /// column.
+    fn column(&self, col: &str) -> String {
+        match &self.ddb_name {
+            Some(ddb) => format!("{}.{col} ({ddb})", self.table),
+            None => format!("{}.{col}", self.table),
+        }
+    }
 }
 
 /// A text key column and the rows of it that hold a composite partition key.
@@ -741,6 +754,7 @@ async fn dynamic_table_work(
         text_columns,
         jsonb_columns,
         recompute_worker_partition: false,
+        ddb_name: None,
     }))
 }
 
@@ -788,6 +802,7 @@ async fn fixed_table_work(
             .collect(),
         jsonb_columns,
         recompute_worker_partition: false,
+        ddb_name: None,
     }))
 }
 
@@ -874,28 +889,67 @@ async fn escape_rows_in_table(pool: &PgPool, work: &EscapeWork) -> OpResult<u64>
 
     // Key text columns holding one attribute's text: TEXT has no escaping
     // layer, so a single SQL statement per column is exact. NULL columns never
-    // match (position() is NULL). Rows holding a composite key are rebuilt
-    // part by part instead, before any other column of the row changes.
+    // match (position() is NULL). The statement can fail on the primary key
+    // when two legacy keys differ only by a U+0002 after a U+0001, depending
+    // on the order it meets them (`migration_004_order`); it runs under a
+    // savepoint, and on a unique violation the column is rewritten again row
+    // by row, longest legacy text first. Rows holding a composite key are
+    // rebuilt part by part instead; the other columns of the row keep the
+    // replace().
     for col in &work.text_columns {
         let TextKeyColumn {
             name,
             composite_rows,
         } = col;
+        let what = work.column(name);
+        let single_rows = format!("NOT ({composite_rows})");
         let sql = format!(
             "UPDATE {quoted} SET \"{name}\" = replace(\"{name}\", chr(1), chr(1) || chr(2)) \
-             WHERE position(chr(1) IN \"{name}\") > 0 AND NOT ({composite_rows})"
+             WHERE position(chr(1) IN \"{name}\") > 0 AND {single_rows}"
         );
-        let done = sqlx::query(&sql)
+        sqlx::query("SAVEPOINT escape_column")
             .execute(&mut *tx)
             .await
-            .map_err(|e| OpError::Internal(format!("Re-encode {}.{name}: {e}", work.table)))?;
-        rewritten += done.rows_affected();
+            .map_err(|e| OpError::Internal(format!("Savepoint before {what}: {e}")))?;
+        match sqlx::query(&sql).execute(&mut *tx).await {
+            Ok(done) => {
+                sqlx::query("RELEASE SAVEPOINT escape_column")
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| OpError::Internal(format!("Release savepoint of {what}: {e}")))?;
+                rewritten += done.rows_affected();
+            }
+            Err(e) if crate::pg_util::is_unique_violation(&e) => {
+                sqlx::query("ROLLBACK TO SAVEPOINT escape_column")
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| OpError::Internal(format!("Roll back {what}: {e}")))?;
+                // Legacy text holds no U+0000, so the escape is the replace()
+                // above.
+                rewritten += crate::migration_004_order::rewrite_longest_first(
+                    &mut tx,
+                    &quoted,
+                    name,
+                    &single_rows,
+                    &what,
+                    |legacy| Ok(extenddb_storage::util::escape_control(legacy).into_owned()),
+                )
+                .await?;
+            }
+            Err(e) => {
+                return Err(OpError::Internal(format!(
+                    "Re-encode {what}: {}",
+                    crate::migration_004_order::with_detail(&e)
+                )));
+            }
+        }
         if composite_rows != "FALSE" {
             rewritten += crate::migration_004_keys::rebuild_composite_rows(
                 &mut tx,
                 &quoted,
                 name,
                 composite_rows,
+                &what,
             )
             .await?;
         }
@@ -975,28 +1029,42 @@ async fn escape_legacy_control_chars(catalog_pool: &PgPool, data_pool: &PgPool) 
     // table or index with such a key schema, and `base_pk` of the index and
     // vector tables of a table with one.
     use crate::migration_004_keys::has_composite_partition_key as composite;
-    let tables: Vec<(String, serde_json::Value)> =
-        sqlx::query_as("SELECT table_id, key_schema FROM tables ORDER BY table_id")
-            .fetch_all(catalog_pool)
-            .await
-            .map_err(|e| OpError::Internal(format!("Enumerate tables: {e}")))?;
+    let tables: Vec<(String, String, String, serde_json::Value)> = sqlx::query_as(
+        "SELECT table_id, table_name, account_id, key_schema FROM tables ORDER BY table_id",
+    )
+    .fetch_all(catalog_pool)
+    .await
+    .map_err(|e| OpError::Internal(format!("Enumerate tables: {e}")))?;
     let composite_tables: std::collections::HashSet<&str> = tables
         .iter()
-        .filter(|(_, ks)| composite(ks))
-        .map(|(id, _)| id.as_str())
+        .filter(|(_, _, _, ks)| composite(ks))
+        .map(|(id, _, _, _)| id.as_str())
         .collect();
-    for (id, ks) in &tables {
+    // How errors name the DynamoDB table of a physical table.
+    let ddb_tables: std::collections::HashMap<&str, String> = tables
+        .iter()
+        .map(|(id, name, account, _)| (id.as_str(), format!("table {name:?} of account {account}")))
+        .collect();
+    let ddb_table = |table_id: &str| {
+        ddb_tables
+            .get(table_id)
+            .cloned()
+            .unwrap_or_else(|| format!("table id {table_id}"))
+    };
+    for (id, _, _, ks) in &tables {
         let cols: &[&str] = if composite(ks) { &["pk"] } else { &[] };
-        if let Some(w) = dynamic_table_work(data_pool, format!("_ddb_{id}"), cols).await? {
+        if let Some(mut w) = dynamic_table_work(data_pool, format!("_ddb_{id}"), cols).await? {
+            w.ddb_name = Some(ddb_table(id));
             work.push((data_pool, w));
         }
     }
-    let indexes: Vec<(String, String, serde_json::Value)> =
-        sqlx::query_as("SELECT index_id, table_id, key_schema FROM indexes ORDER BY index_id")
-            .fetch_all(catalog_pool)
-            .await
-            .map_err(|e| OpError::Internal(format!("Enumerate indexes: {e}")))?;
-    for (id, table_id, ks) in &indexes {
+    let indexes: Vec<(String, String, String, serde_json::Value)> = sqlx::query_as(
+        "SELECT index_id, table_id, index_name, key_schema FROM indexes ORDER BY index_id",
+    )
+    .fetch_all(catalog_pool)
+    .await
+    .map_err(|e| OpError::Internal(format!("Enumerate indexes: {e}")))?;
+    for (id, table_id, name, ks) in &indexes {
         let mut cols: Vec<&str> = Vec::new();
         if composite(ks) {
             cols.push("pk");
@@ -1004,22 +1072,25 @@ async fn escape_legacy_control_chars(catalog_pool: &PgPool, data_pool: &PgPool) 
         if composite_tables.contains(table_id.as_str()) {
             cols.push("base_pk");
         }
-        if let Some(w) = dynamic_table_work(data_pool, format!("_ddb_{id}"), &cols).await? {
+        if let Some(mut w) = dynamic_table_work(data_pool, format!("_ddb_{id}"), &cols).await? {
+            w.ddb_name = Some(format!("index {name:?} of {}", ddb_table(table_id)));
             work.push((data_pool, w));
         }
     }
-    let vectors: Vec<(String, String)> =
-        sqlx::query_as("SELECT index_id, table_id FROM vector_indexes ORDER BY index_id")
-            .fetch_all(catalog_pool)
-            .await
-            .map_err(|e| OpError::Internal(format!("Enumerate vector indexes: {e}")))?;
-    for (id, table_id) in &vectors {
+    let vectors: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT index_id, table_id, index_name FROM vector_indexes ORDER BY index_id",
+    )
+    .fetch_all(catalog_pool)
+    .await
+    .map_err(|e| OpError::Internal(format!("Enumerate vector indexes: {e}")))?;
+    for (id, table_id, name) in &vectors {
         let cols: &[&str] = if composite_tables.contains(table_id.as_str()) {
             &["base_pk"]
         } else {
             &[]
         };
-        if let Some(w) = dynamic_table_work(data_pool, format!("_ddb_vec_{id}"), cols).await? {
+        if let Some(mut w) = dynamic_table_work(data_pool, format!("_ddb_vec_{id}"), cols).await? {
+            w.ddb_name = Some(format!("vector index {name:?} of {}", ddb_table(table_id)));
             work.push((data_pool, w));
         }
     }

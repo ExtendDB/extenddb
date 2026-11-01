@@ -22,6 +22,7 @@ pub(crate) mod gsi_queue;
 mod management_store;
 mod metadata_engine;
 mod migration_004_keys;
+mod migration_004_order;
 mod migrations;
 mod operations;
 mod pg_util;
