@@ -96,7 +96,7 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 | Simultaneous shard readers | 2 (1 for global tables) | Not enforced | No concurrent reader tracking |
 | Max write capacity with streams (provisioned) | 40,000 WCU | Enforced | Same as table WCU limit |
 | GetRecords: max records per call | 1,000 | Enforced | A `Limit` under 1 answers `1 validation error detected: Value at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1`, a `Limit` over 1000 answers `One or more parameter values were invalid: Limit should be less than or equal to 1000` (both measured 2026-10-25) |
-| Shard iterator lifetime | 15 minutes | Not enforced | No shard iterator expiration |
+| Shard iterator lifetime | 15 minutes | Enforced | Iterators older than 15 minutes are rejected with `ExpiredIteratorException` |
 
 ## API-Level Limits
 
@@ -133,7 +133,7 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 | `BackupArn` | 37 to 1024 characters | Maximum enforced; minimum implied | Surrounding ASCII whitespace is trimmed first, then over 1024 bytes, not of the backup ARN shape, a control or non-ASCII character, or a region outside `[a-z0-9-]`, an account that is not digits, or a table name outside `[a-zA-Z0-9_.-]` is `ValidationException` "Invalid Request: BackupArn is not valid"; the right shape with an id that is not a backup id is "Invalid Backup ARN"; a digit-only account that is not the caller's is `AccessDeniedException`. No minimum is checked: the shortest string of the right shape is longer than 37 characters. Another region of the caller's account resolves (the server's region is tried first, then the ARN as written). `ListBackups`'s `ExclusiveStartBackupArn` must also match the account, the region, and `TableName` when given |
 | `ListBackups` page size | 100 | Enforced | `Limit` 1 to 100, default 100; more rows come back through `LastEvaluatedBackupArn` and `ExclusiveStartBackupArn`. Each request reads every backup of the account (or of the table, with `TableName`) and pages in memory, so walking N backups reads about N²/100 rows. `TimeRangeLowerBound`, `TimeRangeUpperBound`, and `BackupType` filter the list before paging; a bound before the epoch, or a lower bound above the upper bound ("Time range lower bound must be less than or equal to upper bound"), is `ValidationException` |
 | Backup contents | Key schema, attribute definitions, items, indexes, billing mode, provisioned throughput, on-demand throughput (table and GSI level), SSE. Table class is not carried (a restore is `STANDARD`) | Partial | ExtendDB restores the same set, except a GSI's on-demand throughput (it records none per index); table class is not restored, as on the service. Streams, TTL, tags, and deletion protection are not restored, as on the service. Backups are stored inside the database the server uses; take database-level backups for off-host copies |
-| Point-in-time recovery | 35-day window | N/A | `RestoreTableToPointInTime` is refused. `UpdateContinuousBackups` accepts enabling point-in-time recovery and reports a 35-day restorable window, but nothing is recorded (see differences-from-dynamodb.md) |
+| Point-in-time recovery | 35-day window | N/A | Not supported: `UpdateContinuousBackups` refuses to enable it (`ContinuousBackupsUnavailableException`) and `RestoreTableToPointInTime` refuses every restore (`PointInTimeRecoveryUnavailableException`); use on-demand backups (see differences-from-dynamodb.md) |
 | `RestoreTableFromBackup` overrides | `BillingModeOverride`, `ProvisionedThroughputOverride`, `GlobalSecondaryIndexOverride`, `LocalSecondaryIndexOverride`, `SSESpecificationOverride`, `OnDemandThroughputOverride`, `VectorIndexOverride` | Partial | All but `VectorIndexOverride` are applied as the service applies them: an index override list replaces the backup's indexes of that kind (empty restores none, a subset restores those, a GSI entry's throughput is the restored index's), `OnDemandThroughputOverride` is the restored table's on-demand throughput on an on-demand restore. Refused with `ValidationException` before the target is created: an index the backup does not have or a changed index definition, a throughput member contradicting the billing mode, `{0, 0}`, a `PROVISIONED` restore of a GSI without throughput ("Invalid Request: Must override ProvisionedThroughput if BillingMode is overridden to PROVISIONED for index <name>"), a GSI entry's `OnDemandThroughput` on a `PROVISIONED` restore (on an on-demand restore it is accepted and not recorded), and `VectorIndexOverride`. See differences-from-dynamodb.md |
 
 ## Global Tables
@@ -162,12 +162,12 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 | Query/Scan | 2 | 0 | 5 | 0 |
 | Batch Operations | 3 | 0 | 2 | 0 |
 | Transactions | 3 | 0 | 1 | 0 |
-| Streams | 2 | 0 | 2 | 0 |
+| Streams | 3 | 0 | 1 | 0 |
 | API-Level | 1 | 0 | 3 | 1 |
 | Import/Export/Backup | 2 | 2 | 0 | 7 |
 | Global Tables | 0 | 0 | 0 | 2 |
 | Contributor Insights | 0 | 0 | 0 | 1 |
-| **Total** | **32** | **3** | **15** | **13** |
+| **Total** | **33** | **3** | **14** | **13** |
 
 ### Unenforced Limits Requiring Tracking
 
@@ -179,9 +179,8 @@ The following unenforced limits are tracked in `docs/technical-debt.md`:
 4. **BatchGetItem response size** (16 MB) — requires aggregate response size tracking
 5. **BatchWriteItem request size** (16 MB) — requires aggregate request size tracking
 6. **Transaction request size** (4 MB) — requires aggregate request size tracking
-7. **Shard iterator lifetime** (15 minutes) — requires timestamp tracking on shard iterators
-8. **Tag count per resource** (50) — requires count validation in TagResource
-9. **Tag key/value length** (128/256 chars) — requires length validation in TagResource
+7. **Tag count per resource** (50): requires count validation in TagResource
+8. **Tag key/value length** (128/256 chars): requires length validation in TagResource
 
 ---
 

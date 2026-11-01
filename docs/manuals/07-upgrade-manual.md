@@ -4,9 +4,9 @@
 
 ## Current Status
 
-Catalog 0.0.4 is current. **Every existing PostgreSQL, SQLite, and Cassandra deployment must run `extenddb migrate`** to reach it. PostgreSQL and SQLite servers refuse to start against a catalog version they were not built for; a Cassandra server starts anyway and serves tables and items, but CreateBackup, RestoreTableFromBackup, and DeleteBackup are refused with a `ValidationException` naming `extenddb migrate --yes` until the catalog is migrated (see [Cassandra](#cassandra)). MongoDB's catalog version does not change in this release.
+Catalog 0.0.5 is current. **Every existing PostgreSQL, SQLite, and Cassandra deployment must run `extenddb migrate`** to reach it. PostgreSQL and SQLite servers refuse to start against a catalog version they were not built for; a Cassandra server starts anyway and serves tables and items, but CreateBackup, RestoreTableFromBackup, and DeleteBackup are refused with a `ValidationException` naming `extenddb migrate --yes` until the catalog is migrated (see [Cassandra](#cassandra)). MongoDB's catalog version does not change in this release; `extenddb migrate --yes` drops its unused `continuous_backups` collection.
 
-See [Catalog 0.0.4](#catalog-004-current) below for what changes and the exact sequence. <!-- version-literal-ok: names the current version and the history below -->
+See [Catalog 0.0.5](#catalog-005-current) below for what changes and the exact sequence. <!-- version-literal-ok: names the current version and the history below -->
 
 ## How Catalog Upgrades Work
 
@@ -18,6 +18,7 @@ Migrations are SQL files in `crates/storage-postgres/migrations/`, applied in fi
 001_schema.sql            ← the complete initial schema
 002_vector_indexes.sql    ← vector index metadata, catalog 0.0.3 <!-- version-literal-ok: history -->
 003_backup_definitions.sql ← backup table definitions, catalog 0.0.4
+004_drop_continuous_backups.sql ← drops the unused PITR table, catalog 0.0.5
 ```
 
 The `schema_history` table tracks which files have been applied. When `extenddb migrate` runs, it:
@@ -202,7 +203,22 @@ To discard data written after the upgrade as well, restore `<data-db>` from its 
 
 ## Version History
 
-### Catalog 0.0.4 (Current)
+### Catalog 0.0.5 (Current)
+
+Removes the per-table point-in-time recovery flag, which drove nothing:
+
+- PostgreSQL: `004_drop_continuous_backups.sql` drops the `continuous_backups` table.
+- SQLite: `extenddb migrate` re-applies the catalog schema, which drops the `continuous_backups` table.
+- Cassandra: `V006__drop_continuous_backups.cql` drops the `continuous_backups` table. Until it runs, CreateBackup, RestoreTableFromBackup, and DeleteBackup are refused as [Cassandra](#cassandra) describes for V005. Stop every server of an earlier build before migrating: an earlier build's DeleteTable, its account deletion, and its removal of `DELETING` tables write to `continuous_backups` and fail once it is gone.
+- MongoDB: the catalog version does not change. `extenddb migrate` reports `catalog: drop the continuous_backups collection` and `extenddb migrate --yes` drops it; a new catalog does not create it.
+
+Point-in-time recovery is reported as unsupported. `DescribeContinuousBackups` always answers `PointInTimeRecoveryStatus: DISABLED`, `UpdateContinuousBackups` with `PointInTimeRecoveryEnabled: true` returns `ContinuousBackupsUnavailableException`, and `RestoreTableToPointInTime` checks the source table (`TableNotFoundException` when it does not exist) and then returns `PointInTimeRecoveryUnavailableException`, the exception the service models on that operation. The engine answers these operations without consulting storage.
+
+**This release changes wire behavior.** Before this upgrade, `UpdateContinuousBackups` accepted an enable request and `DescribeContinuousBackups` then reported `ENABLED` with a 35-day window, although `RestoreTableToPointInTime` could never restore. Any client or infrastructure template that enables point-in-time recovery (for example a Terraform resource with `point_in_time_recovery = true`) now receives `ContinuousBackupsUnavailableException` and must stop requesting it, and a restore attempt now receives `PointInTimeRecoveryUnavailableException` instead of a generic `ValidationException`. Use on-demand backups (`CreateBackup`, `RestoreTableFromBackup`) instead.
+
+The upgrade sequence on each backend is the one under [Catalog 0.0.4](#catalog-004). The upgrade is not reversible in place: an earlier PostgreSQL or SQLite binary refuses to start against a 0.0.5 catalog. Roll back by restoring what you saved before the upgrade; the dropped table held only the enable flag.
+
+### Catalog 0.0.4
 
 Adds the table definition a backup records and the registration of a running restore:
 

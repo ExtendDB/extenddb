@@ -20,6 +20,10 @@ pub(crate) const CATALOG_MIGRATIONS: &[(&str, &str)] = &[
         "003_backup_definitions.sql",
         include_str!("../../storage-postgres/migrations/003_backup_definitions.sql"),
     ),
+    (
+        "004_drop_continuous_backups.sql",
+        include_str!("../../storage-postgres/migrations/004_drop_continuous_backups.sql"),
+    ),
 ];
 
 /// The runner's convergence write, executed after the walk over
@@ -539,10 +543,10 @@ mod tests {
     fn the_migration_count_and_the_catalog_version_agree() {
         assert_eq!(
             CATALOG_MIGRATIONS.len(),
-            3,
+            4,
             "a catalog migration was added or removed; update CATALOG_VERSION and this count"
         );
-        assert_eq!(CATALOG_VERSION.to_string(), "0.0.4");
+        assert_eq!(CATALOG_VERSION.to_string(), "0.0.5");
     }
 
     /// The version the binary expects must be the version the schema writes.

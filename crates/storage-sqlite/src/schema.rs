@@ -27,7 +27,7 @@ use sqlx::SqlitePool;
 /// Compiled-in catalog version. Single source of truth for the SQLite backend;
 /// mirrors the PostgreSQL backend's `CATALOG_VERSION`.
 pub const CATALOG_VERSION: extenddb_core::version::CatalogVersion =
-    extenddb_core::version::CatalogVersion::new(0, 0, 4);
+    extenddb_core::version::CatalogVersion::new(0, 0, 5);
 
 /// Complete catalog schema, applied once on a fresh database.
 ///
@@ -402,15 +402,10 @@ CREATE TABLE IF NOT EXISTS table_restores (
 );
 CREATE INDEX IF NOT EXISTS idx_table_restores_backup ON table_restores (source_backup_arn);
 
--- Continuous backups / PITR status.
-CREATE TABLE IF NOT EXISTS continuous_backups (
-    account_id TEXT NOT NULL,
-    table_name TEXT NOT NULL,
-    pitr_enabled INTEGER NOT NULL DEFAULT 0,
-    earliest_restorable TEXT,
-    latest_restorable TEXT,
-    PRIMARY KEY (account_id, table_name)
-);
+-- Point-in-time recovery is not supported, so no state is stored for it. A
+-- database created before catalog 0.0.5 carried a `continuous_backups` table;
+-- it is dropped here so a migrated database converges on the fresh shape.
+DROP TABLE IF EXISTS continuous_backups;
 
 -- Persistent queue for async GSI propagation. A row is inserted inside the
 -- base write transaction (zero crash window) and consumed by a background
@@ -453,7 +448,7 @@ INSERT OR IGNORE INTO seq_counters (name, value)
 -- never advance, so a migration could add objects and still leave the server
 -- refusing to start on a version mismatch. Must stay in step with
 -- `CATALOG_VERSION` above; they are checked against each other in a test.
-INSERT INTO settings (key, value) VALUES ('catalog_version', '0.0.4')
+INSERT INTO settings (key, value) VALUES ('catalog_version', '0.0.5')
     ON CONFLICT(key) DO UPDATE SET value = excluded.value;
 INSERT OR IGNORE INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0.25');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('index_propagation_delay_ms', '10');
@@ -467,8 +462,8 @@ pub async fn apply(pool: &SqlitePool) -> OpResult<()> {
     refuse_unwritable_catalog(pool).await?;
     // Catalog 0.0.4 originally created backup_items without a stable cursor
     // and table_restores without source_table_arn. Converge both before
-    // SCHEMA_SQL stamps 0.0.4, including databases that an earlier
-    // 0.0.4-in-progress binary already stamped. SQLite cannot add an INTEGER
+    // SCHEMA_SQL stamps the compiled version, including databases that an
+    // earlier 0.0.4-in-progress binary already stamped. SQLite cannot add an INTEGER
     // PRIMARY KEY with ALTER TABLE.
     converge_table_shapes(pool).await?;
     sqlx::raw_sql(SCHEMA_SQL)

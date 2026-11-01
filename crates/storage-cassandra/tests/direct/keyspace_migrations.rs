@@ -21,9 +21,9 @@ use cdrs_tokio::cluster::connection_pool::ConnectionPoolConfigBuilder;
 use cdrs_tokio::cluster::session::{SessionBuilder, TcpSessionBuilder};
 use cdrs_tokio::load_balancing::RoundRobinLoadBalancingStrategy;
 use extenddb_storage::error::StorageError;
-use extenddb_storage_cassandra::CassandraSession;
 use extenddb_storage_cassandra::cassandra_util::{get_column, query_rows};
 use extenddb_storage_cassandra::migrations::{run_catalog_migrations, run_data_migrations};
+use extenddb_storage_cassandra::{CATALOG_VERSION, CassandraSession};
 
 /// Connections per node, the `max_connections` default.
 const POOL_SIZE: usize = 10;
@@ -37,9 +37,13 @@ struct Schema {
     indexes: &'static [&'static str],
     /// `(table, column)` pairs that `ALTER TABLE` statements add.
     added_columns: &'static [(&'static str, &'static str)],
+    /// Tables an earlier file creates and a later one drops, which the run
+    /// must not leave.
+    dropped_tables: &'static [&'static str],
 }
 
-/// Catalog migrations V001 to V005.
+/// Catalog migrations V001 to V006 (V006 drops `continuous_backups`, which
+/// V002 created).
 const CATALOG: Schema = Schema {
     tables: &[
         "access_keys",
@@ -48,7 +52,6 @@ const CATALOG: Schema = Schema {
         "backups_by_account",
         "backups_by_arn",
         "backups_by_table",
-        "continuous_backups",
         "iam_group_members",
         "iam_groups",
         "iam_permissions_boundaries",
@@ -78,6 +81,7 @@ const CATALOG: Schema = Schema {
         ("tables", "restore_source_table_arn"),
         ("tables", "ttl_backfill_cursor"),
     ],
+    dropped_tables: &["continuous_backups"],
 };
 
 /// Data migrations V001 and V002.
@@ -98,6 +102,7 @@ const DATA: Schema = Schema {
     ],
     indexes: &["idx_txn_started_at", "stream_shards_table_id_idx"],
     added_columns: &[],
+    dropped_tables: &[],
 };
 
 /// A session built as the engine builds it, with `POOL_SIZE` connections per node.
@@ -227,7 +232,43 @@ async fn problems_in(
             ));
         }
     }
+    for table in schema
+        .dropped_tables
+        .iter()
+        .filter(|t| tables.contains(**t))
+    {
+        problems.push(format!(
+            "{keyspace}: holds {table}, which a later migration drops"
+        ));
+    }
     problems
+}
+
+/// A line if the catalog in `keyspace` does not hold the compiled
+/// `CATALOG_VERSION` under `settings.catalog_version`. The runner writes no
+/// version of its own, so the stored one is what the last applied file wrote,
+/// and `extenddb migrate` compares it with the compiled constant.
+async fn catalog_version_problem(
+    session: &Arc<CassandraSession>,
+    keyspace: &str,
+) -> Option<String> {
+    let query = format!("SELECT value FROM {keyspace}.settings WHERE key = 'catalog_version'");
+    let rows = query_rows::<StorageError>(
+        session,
+        &query,
+        cdrs_tokio::query_values!(),
+        "catalog version read",
+    )
+    .await
+    .expect("catalog version read");
+    let stored = rows
+        .first()
+        .map(|row| get_column::<String, StorageError>(row, "value", "catalog version read"))
+        .transpose()
+        .expect("catalog_version value");
+    (stored.as_deref() != Some(CATALOG_VERSION)).then(|| {
+        format!("{keyspace}: catalog_version {stored:?}, the binary expects {CATALOG_VERSION}")
+    })
 }
 
 /// Before every migration run the session selects another keyspace with
@@ -277,6 +318,7 @@ async fn migrations_ignore_the_keyspace_another_caller_selected() {
         }
         problems.extend(problems_in(&session, catalog, &CATALOG, &DATA).await);
         problems.extend(problems_in(&session, account, &DATA, &CATALOG).await);
+        problems.extend(catalog_version_problem(&session, catalog).await);
         drop_keyspaces(&session, round).await;
     }
     for table in tables_in(&session, &decoy).await {
@@ -324,6 +366,7 @@ async fn migrations_run_on_a_session_with_no_keyspace_and_leave_none_selected() 
     let data_result = run_data_migrations(&session, &account).await;
     let mut problems = problems_in(&session, &catalog, &CATALOG, &DATA).await;
     problems.extend(problems_in(&session, &account, &DATA, &CATALOG).await);
+    problems.extend(catalog_version_problem(&session, &catalog).await);
     let selected = session.current_keyspace();
     drop_keyspaces(&session, &keyspaces).await;
 
