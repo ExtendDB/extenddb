@@ -125,6 +125,9 @@ pub struct SqliteMigrations {
     owned: bool,
     /// The copy this run took before its first write, if it took one.
     copy: Mutex<Option<PathBuf>>,
+    /// The lines naming the earlier copies this run's copy replaced,
+    /// reported with the run, also when it stops before its first commit.
+    replaced: Mutex<Vec<String>>,
     /// The lines naming the partial copies of stopped runs that opening the
     /// database for writing removed, reported with the run.
     removed: Mutex<Vec<String>>,
@@ -291,6 +294,7 @@ impl SqliteMigrations {
             file,
             owned,
             copy: Mutex::new(None),
+            replaced: Mutex::new(Vec::new()),
             removed: Mutex::new(Vec::new()),
             restore_failed: Mutex::new(None),
             #[cfg(test)]
@@ -337,7 +341,8 @@ impl SqliteMigrations {
 
     /// `result` as the caller reports it: a run that stopped before it
     /// committed anything left the database as it was, so the copy it took
-    /// is removed and the error is returned alone. A run whose last step
+    /// is removed, and the error is returned with the lines naming the files
+    /// the run removed, or alone when it removed none. A run whose last step
     /// committed and whose pragma after it failed stops with that error and
     /// keeps its copy. A report starts with the partial copies of stopped
     /// runs that opening the database removed.
@@ -354,34 +359,40 @@ impl SqliteMigrations {
         };
         let removed =
             std::mem::take(&mut *self.removed.lock().unwrap_or_else(PoisonError::into_inner));
-        let result = match result {
+        let replaced =
+            std::mem::take(&mut *self.replaced.lock().unwrap_or_else(PoisonError::into_inner));
+        match result {
             Ok(mut report) => {
                 report.notes.splice(0..0, removed);
+                report.notes.extend(replaced);
                 Ok(report)
             }
-            Err(MigrationError::Stopped { error, mut report }) => {
-                report.notes.splice(0..0, removed);
-                Err(MigrationError::Stopped { error, report })
-            }
-            other => other,
-        };
-        match result {
             Err(MigrationError::Stopped { error, report }) if report.applied.is_empty() => {
+                // The run's own notes name the copy removed here, so only
+                // the lines naming the other files it removed are kept.
                 let copy = self
                     .copy
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .take();
-                match copy.map(|copy| super::copy::remove_copy(&copy)) {
-                    Some(Err(note)) => Err(MigrationError::Stopped {
-                        error,
-                        report: RunReport {
-                            notes: vec![note],
-                            ..report
-                        },
-                    }),
-                    _ => Err(*error),
+                let mut notes = removed;
+                notes.extend(replaced);
+                if let Some(Err(note)) = copy.map(|copy| super::copy::remove_copy(&copy)) {
+                    notes.push(note);
                 }
+                if notes.is_empty() {
+                    Err(*error)
+                } else {
+                    Err(MigrationError::Stopped {
+                        error,
+                        report: RunReport { notes, ..report },
+                    })
+                }
+            }
+            Err(MigrationError::Stopped { error, mut report }) => {
+                report.notes.splice(0..0, removed);
+                report.notes.extend(replaced);
+                Err(MigrationError::Stopped { error, report })
             }
             other => other,
         }
@@ -571,14 +582,22 @@ impl MigrationBackend for SqliteMigrations {
         }
         let from = from.map_or_else(|| "legacy".to_owned(), |v| v.to_string());
         let copy = super::copy::copy_path(file, &from, to, std::time::SystemTime::now());
-        let mut lines = super::copy::pre_migration_copy(
+        let lines = super::copy::pre_migration_copy(
             &self.stores.pool,
             file,
             &copy,
             super::copy::Hooks::RUN,
         )
         .await?;
-        lines.extend(super::copy::remove_superseded(file, &copy).await);
+        // An earlier copy with the same bytes holds nothing this copy does
+        // not, so it is removed now, before the run's first commit: a crash
+        // loop that kills each run before that commit then leaves one copy,
+        // not one per run.
+        let replaced = super::copy::remove_superseded(file, &copy).await;
+        self.replaced
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(replaced);
         *self.copy.lock().unwrap_or_else(PoisonError::into_inner) = Some(copy);
         Ok(lines)
     }

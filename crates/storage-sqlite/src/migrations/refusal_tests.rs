@@ -380,26 +380,43 @@ async fn a_failed_copy_leaves_no_partial_file() {
     assert!(!copy.exists());
 }
 
-/// Another connection's reader whose snapshot holds frames of the WAL keeps
-/// every checkpoint from moving them into the main file. The copy reads the
-/// committed frames of the WAL with the main file, so it holds the write in
-/// them, and it is owner-only.
+/// A write that is only in the WAL, which no checkpoint has moved into the
+/// main file, is in the copy: the backup reads the committed frames of the
+/// WAL with the main file. The copy is owner-only and in rollback-journal
+/// mode, as `VACUUM INTO` left it, so it can be read without a `-shm` file
+/// beside it, and SQLite leaves no other file beside it.
 #[cfg(unix)]
 #[tokio::test]
-async fn a_copy_holds_the_writes_a_reader_keeps_in_the_wal() {
+async fn a_copy_holds_a_write_that_is_only_in_the_wal() {
+    use sqlx::{ConnectOptions as _, Connection as _};
     use std::os::unix::fs::PermissionsExt;
     let db = temp_db("copy-wal");
     load_dump(&db, DEV_0_1_14).await;
-    let reader = super::tests::plain_pool(&db).await;
-    sqlx::query("INSERT INTO settings (key, value) VALUES ('in_the_wal', '1')")
-        .execute(&reader)
+    // The writer stays open and never checkpoints, so the write stays in
+    // the WAL alone.
+    let writer = super::tests::plain_pool(&db).await;
+    let mut held = writer.acquire().await.expect("connection");
+    sqlx::raw_sql(
+        "PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0; \
+         INSERT INTO settings (key, value) VALUES ('in_the_wal', '1');",
+    )
+    .execute(&mut *held)
+    .await
+    .expect("a write left in the WAL");
+    let mut main_file = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&*db)
+        .read_only(true)
+        .immutable(true)
+        .connect()
         .await
-        .expect("write");
-    let mut held = reader.acquire().await.expect("connection");
-    sqlx::raw_sql("BEGIN; SELECT COUNT(*) FROM settings;")
-        .execute(&mut *held)
-        .await
-        .expect("a read transaction on the WAL");
+        .expect("the main file alone");
+    let (in_main,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM settings WHERE key = 'in_the_wal'")
+            .fetch_one(&mut main_file)
+            .await
+            .expect("count");
+    main_file.close().await.expect("close");
+    assert_eq!(in_main, 0, "the write is in the main file already");
     let migrations = SqliteMigrations::open(&db.to_string_lossy())
         .await
         .expect("open");
@@ -411,18 +428,20 @@ async fn a_copy_holds_the_writes_a_reader_keeps_in_the_wal() {
             .expect("the copy");
     let line = lines.last().expect("the copy's line");
     assert!(line.contains(&copy.display().to_string()), "{line}");
-    let wal = std::fs::metadata(format!("{}-wal", db.display()))
-        .expect("the WAL")
-        .len();
-    assert!(wal > 0, "the write is no longer in the WAL");
     let mode = std::fs::metadata(&copy).expect("copy").permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
-    sqlx::raw_sql("ROLLBACK")
-        .execute(&mut *held)
-        .await
-        .expect("end the read");
+    let header = std::fs::read(&copy).expect("copy");
+    assert_eq!(
+        (header[18], header[19]),
+        (1, 1),
+        "the copy is not in rollback-journal mode"
+    );
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let side = format!("{}{suffix}", copy.display());
+        assert!(!std::path::Path::new(&side).exists(), "{side} is left");
+    }
     drop(held);
-    reader.close().await;
+    writer.close().await;
     migrations.close().await;
     assert_eq!(
         count(
@@ -462,6 +481,55 @@ async fn the_copy_leaves_the_runners_lock_on_the_database() {
         posix_locks(&db),
         held,
         "the copy released the runner's lock"
+    );
+    migrations.close().await;
+}
+
+/// A hard link and a symbolic link to the database under copies' names are
+/// not copies: the search for the earlier copies a run replaces opens
+/// neither, so this process keeps its locks on the database, and removes
+/// neither. A restore with `ln` can leave such a link.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_link_to_the_database_under_a_copys_name_is_not_opened() {
+    let db = temp_db("copy-link");
+    load_dump(&db, DEV_0_1_14).await;
+    let at = |second: u64| {
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_767_225_600 + second)
+    };
+    let hard = super::copy::copy_path(&db, "legacy", LATEST, at(0));
+    std::fs::hard_link(&*db, &hard).expect("a hard link");
+    let soft = super::copy::copy_path(&db, "legacy", LATEST, at(1));
+    std::os::unix::fs::symlink(&*db, &soft).expect("a symbolic link");
+    let migrations = SqliteMigrations::open(&db.to_string_lossy())
+        .await
+        .expect("open");
+    sqlx::query("SELECT COUNT(*) FROM sqlite_master")
+        .execute(migrations.pool())
+        .await
+        .expect("read");
+    let held = posix_locks(&db);
+    assert!(!held.is_empty(), "the runner's connection holds no lock");
+    let copy = super::copy::copy_path(&db, "legacy", LATEST, std::time::SystemTime::now());
+    super::copy::pre_migration_copy(migrations.pool(), &db, &copy, super::copy::Hooks::RUN)
+        .await
+        .expect("the copy");
+    assert_eq!(
+        std::fs::metadata(&hard).expect("the link").len(),
+        std::fs::metadata(&copy).expect("the copy").len(),
+        "the link is no candidate by its size alone"
+    );
+    let lines = super::copy::remove_superseded(&db, &copy).await;
+    assert_eq!(
+        posix_locks(&db),
+        held,
+        "the search released the runner's lock"
+    );
+    assert!(lines.is_empty(), "{lines:?}");
+    assert!(hard.exists(), "the hard link was removed");
+    assert!(
+        soft.symlink_metadata().is_ok(),
+        "the symbolic link was removed"
     );
     migrations.close().await;
 }
@@ -525,13 +593,19 @@ async fn a_short_filesystem_stops_the_run_before_the_copy() {
 }
 
 /// A run with nothing to apply takes no copy, and still removes the partial
-/// copies stopped runs left, with their journals, and names them.
+/// copies stopped runs left, with the files SQLite keeps beside them, and
+/// names them.
 #[tokio::test]
 async fn a_run_with_nothing_to_apply_removes_stopped_partial_copies() {
     let db = temp_db("partials-current");
     run(&db).await.expect("fresh");
     let stem = format!("{}.pre-migration-3-to-4-20260101T000000Z", db.display());
-    let partials = [format!("{stem}.partial"), format!("{stem}.partial-journal")];
+    let partials = [
+        format!("{stem}.partial"),
+        format!("{stem}.partial-journal"),
+        format!("{stem}.partial-wal"),
+        format!("{stem}.partial-shm"),
+    ];
     for p in &partials {
         std::fs::write(p, b"left by a stopped run").expect("plant");
     }
@@ -616,6 +690,75 @@ async fn a_copy_of_the_same_contents_replaces_an_earlier_one() {
     );
     for path in [&other_bytes, &opened, &other_version] {
         assert!(path.exists(), "{} was removed", path.display());
+    }
+}
+
+/// A run that stops before its first commit left the database as it was,
+/// so it removes its own copy, and the earlier copy of the same contents
+/// its copy replaced, and names that one with its error.
+#[tokio::test]
+async fn a_run_that_commits_nothing_names_the_earlier_copy_it_replaced() {
+    let db = temp_db("superseded-stopped");
+    load_dump(&db, DEV_0_1_14).await;
+    exec(&db, "ALTER TABLE tables ADD COLUMN not_in_any_release TEXT").await;
+    let earlier = super::copy::copy_path(
+        &db,
+        "legacy",
+        LATEST,
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_767_225_600),
+    );
+    let migrations = SqliteMigrations::open(&db.to_string_lossy())
+        .await
+        .expect("open");
+    super::copy::pre_migration_copy(migrations.pool(), &db, &earlier, super::copy::Hooks::RUN)
+        .await
+        .expect("a killed run's copy");
+    migrations.close().await;
+    let err = run(&db).await.expect_err("the post-check refuses");
+    let MigrationError::Stopped { error, report } = &err else {
+        panic!("expected the removal named with the error: {err:?}");
+    };
+    assert!(report.applied.is_empty(), "{report:?}");
+    assert!(
+        error.to_string().contains("nothing was committed"),
+        "{error}"
+    );
+    let removed = format!(
+        "removed {}, a copy an earlier run took of the same database contents",
+        earlier.display()
+    );
+    assert!(
+        report.notes.iter().any(|n| n.starts_with(&removed)),
+        "{:?}",
+        report.notes
+    );
+    assert_eq!(
+        super::tests::copies(&db),
+        Vec::<std::path::PathBuf>::new(),
+        "a copy of the unchanged database is left"
+    );
+}
+
+/// A run killed after its copy is complete and before its first commit
+/// leaves its copy, and the next run's copy replaces it as soon as it is
+/// complete: runs killed there one after the other, as in a crash loop,
+/// leave one copy.
+#[tokio::test]
+async fn runs_killed_before_their_first_commit_leave_one_copy() {
+    let db = temp_db("killed-loop");
+    load_dump(&db, DEV_0_1_14).await;
+    let location = db.to_string_lossy().into_owned();
+    for _ in 0..3 {
+        let migrations = SqliteMigrations::open(&location).await.expect("open");
+        migrations
+            .before_first_write(None, LATEST)
+            .await
+            .expect("copy");
+        // Killed here: nothing reports the run or removes its copy.
+        migrations.close().await;
+        let copies = super::tests::copies(&db);
+        assert_eq!(copies.len(), 1, "{copies:?}");
+        super::tests::next_second().await;
     }
 }
 

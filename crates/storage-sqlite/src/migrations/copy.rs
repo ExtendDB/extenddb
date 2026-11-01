@@ -11,7 +11,9 @@
 //! that transaction began, whatever another process writes meanwhile. It
 //! takes time in proportion to the database's size. `VACUUM INTO`, which it
 //! replaces, creates every table and index again, and its time grows faster
-//! than the number of tables.
+//! than the number of tables. The copy is then switched to rollback-journal
+//! mode, as `VACUUM INTO` left it: the backup copies the database's WAL
+//! mark, and a WAL database cannot be read without a `-shm` file beside it.
 //!
 //! Only SQLite opens the database file. POSIX advisory locks belong to a
 //! process and a file, so closing any file descriptor of the database that
@@ -21,7 +23,9 @@
 //! one, checkpoint the WAL and delete it, and the commits the runner made
 //! after that would go to the deleted file and be lost. SQLite keeps its own
 //! descriptors of a file open while a connection of the process holds a lock
-//! on it.
+//! on it. The search for earlier copies below opens files under a copy's
+//! name, so it skips a symbolic link and a hard link to the database, its
+//! WAL or its index, which a restore with `ln` can leave under such a name.
 //!
 //! The copy is created owner-only (0600) before SQLite writes to it,
 //! whatever the database's mode: the database holds the encryption key, and
@@ -34,24 +38,28 @@
 //! A copy is written to `<copy>.partial` first. A run holds the database's
 //! lock before it copies, so a partial file beside the database when a run
 //! starts was left by a run that was stopped while it copied; the run
-//! removes every one, with its journal, and names them.
+//! removes every one, with the files SQLite keeps beside it, and names
+//! them.
 //!
 //! A run that stops before it commits anything removes its copy, since the
 //! database is unchanged; a run that committed a step keeps its copy and
 //! names it in its error. A run that was killed after its copy was complete
-//! and before it committed anything leaves the copy. The next run removes
-//! such a copy, and names it, when the copy has the same bytes as its own:
-//! the same database contents, so its own copy holds everything the earlier
-//! one does. The same `<from>` alone would not show that: a reconverge runs
-//! bodies again without changing the catalog version, and `--forget` brings
-//! a catalog back to a version it had before. A copy with a `-wal` or
-//! `-journal` file beside it, which a process opened, is left as it is.
-//! Nothing else removes a copy.
+//! and before it committed anything leaves the copy. Once the next run's
+//! own copy is complete, the run removes such a copy, and names it, when
+//! the copy has the same bytes as its own: the same database contents, so
+//! its own copy holds everything the earlier one does, and runs killed in
+//! that place one after the other leave one copy. A run that then stops
+//! before its first commit removes its own copy as well and names the
+//! earlier one with its error. The same `<from>` alone would not show that
+//! nothing changed: a reconverge runs bodies again without changing the
+//! catalog version, and `--forget` brings a catalog back to a version it had
+//! before. A copy with a `-wal` or `-journal` file beside it, which a
+//! process opened, is left as it is. Nothing else removes a copy.
 
 use std::fs::File;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use extenddb_storage::migrations::MigrationError;
 use sqlx::SqlitePool;
@@ -64,13 +72,16 @@ use sqlx::SqlitePool;
 /// after the run.
 const SPACE_FACTOR: u64 = 3;
 
-/// What a copy calls that tests replace.
+/// What a copy calls, or waits for, that tests replace.
 #[derive(Clone, Copy)]
 pub(crate) struct Hooks {
     /// The free bytes of a directory's filesystem.
     pub(crate) free_space: fn(&Path) -> Option<u64>,
     /// Runs between the sync and the rename; tests stop the process there.
     pub(crate) before_rename: fn(&Path),
+    /// How long the copy waits while another connection holds a lock the
+    /// backup needs.
+    pub(crate) locked_for: Duration,
 }
 
 impl Hooks {
@@ -78,6 +89,7 @@ impl Hooks {
     pub(crate) const RUN: Self = Self {
         free_space,
         before_rename: no_hook,
+        locked_for: Duration::from_secs(30),
     };
 }
 
@@ -117,7 +129,7 @@ pub(crate) async fn pre_migration_copy(
         copy.display()
     ));
     let started = Instant::now();
-    if let Err(e) = write_partial(db, copy, &partial).await {
+    if let Err(e) = write_partial(db, copy, &partial, hooks.locked_for).await {
         remove_partial(&partial);
         return Err(e);
     }
@@ -130,7 +142,7 @@ pub(crate) async fn pre_migration_copy(
         ));
     }
     // The rename is durable once the directory is synced.
-    let _ = sync_file(&dir).await;
+    let _ = sync_dir(&dir).await;
     let seconds = started.elapsed().as_secs_f64();
     progress(&format!("--- Copied the database in {seconds:.1} s"));
     lines.push(format!(
@@ -144,10 +156,15 @@ pub(crate) async fn pre_migration_copy(
 /// online backup API on a blocking thread, and sync it: a large database
 /// takes a while, and a server that migrates at startup goes on with its
 /// other tasks meanwhile.
-async fn write_partial(db: &Path, copy: &Path, partial: &Path) -> Result<(), MigrationError> {
+async fn write_partial(
+    db: &Path,
+    copy: &Path,
+    partial: &Path,
+    locked_for: Duration,
+) -> Result<(), MigrationError> {
     create_partial(partial).map_err(|e| copy_failed(copy, e))?;
     let (source, target) = (db.to_path_buf(), partial.to_path_buf());
-    tokio::task::spawn_blocking(move || backup::copy(&source, &target))
+    tokio::task::spawn_blocking(move || backup::copy(&source, &target, locked_for))
         .await
         .map_err(|e| copy_failed(copy, e))?
         .map_err(|e| copy_failed(copy, e))?;
@@ -166,10 +183,6 @@ mod backup {
     use std::time::{Duration, Instant};
 
     use libsqlite3_sys as ffi;
-
-    /// How long a copy waits while another connection holds a lock the
-    /// backup needs.
-    const LOCKED_FOR: Duration = Duration::from_secs(30);
 
     /// A connection, closed when dropped.
     struct Connection(*mut ffi::sqlite3);
@@ -206,6 +219,28 @@ mod backup {
             // SAFETY: the connection is open.
             unsafe { ffi::sqlite3_busy_timeout(connection.0, 5_000) };
             Ok(connection)
+        }
+
+        /// Run `sql` on the connection; rows it returns are not read.
+        fn execute(&self, sql: &CStr) -> Result<(), String> {
+            // SAFETY: the connection is open and `sql` is NUL-terminated.
+            // With no callback and no place for an error string, SQLite
+            // allocates nothing for the caller to free, finalizes its own
+            // statements, and leaves an error on the connection.
+            let rc = unsafe {
+                ffi::sqlite3_exec(
+                    self.0,
+                    sql.as_ptr(),
+                    None,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            if rc == ffi::SQLITE_OK {
+                Ok(())
+            } else {
+                Err(self.last_error(rc))
+            }
         }
 
         /// The text of the connection's last error, or of `rc` when SQLite
@@ -245,8 +280,12 @@ mod backup {
     /// Copy the database at `source` into the database file at `target`,
     /// which is empty, in one step: the source is read in one read
     /// transaction, so the target is the database as that transaction saw
-    /// it.
-    pub(super) fn copy(source: &Path, target: &Path) -> Result<(), String> {
+    /// it. Waits up to `locked_for` while another connection holds a lock
+    /// the backup needs. The target is then put in rollback-journal mode:
+    /// the backup copies page 1 with the source's WAL mark, and a WAL
+    /// database cannot be read without a `-shm` file beside it, so a copy
+    /// in a directory its reader may not write could not be opened.
+    pub(super) fn copy(source: &Path, target: &Path, locked_for: Duration) -> Result<(), String> {
         let from = Connection::open(source)?;
         let to = Connection::open(target)?;
         // SAFETY: both connections are open, used by this thread alone, and
@@ -256,7 +295,7 @@ mod backup {
         if backup.is_null() {
             return Err(to.last_error(ffi::SQLITE_ERROR));
         }
-        let deadline = Instant::now() + LOCKED_FOR;
+        let deadline = Instant::now() + locked_for;
         let stepped = loop {
             // SAFETY: the backup is live until it is finished below.
             let rc = unsafe { ffi::sqlite3_backup_step(backup, -1) };
@@ -267,17 +306,21 @@ mod backup {
             break rc;
         };
         // SAFETY: the backup is live and is not used after this call, which
-        // frees it and leaves the error of a failed step on `to`.
+        // frees it. It returns the last step's result unless that was
+        // SQLITE_DONE, and leaves a failed step's error on `to`.
         let finished = unsafe { ffi::sqlite3_backup_finish(backup) };
-        match (stepped, finished) {
-            (ffi::SQLITE_DONE, ffi::SQLITE_OK) => Ok(()),
-            (ffi::SQLITE_BUSY | ffi::SQLITE_LOCKED, ffi::SQLITE_OK) => Err(format!(
-                "another connection held a lock on the database for {} s",
-                LOCKED_FOR.as_secs()
-            )),
-            (_, ffi::SQLITE_OK) => Err(result_text(stepped)),
-            _ => Err(to.last_error(finished)),
+        match stepped {
+            ffi::SQLITE_DONE if finished == ffi::SQLITE_OK => {}
+            ffi::SQLITE_DONE => return Err(to.last_error(finished)),
+            ffi::SQLITE_BUSY | ffi::SQLITE_LOCKED => {
+                return Err(format!(
+                    "another connection held a lock on the database for {} s",
+                    locked_for.as_secs()
+                ));
+            }
+            _ => return Err(to.last_error(stepped)),
         }
+        to.execute(c"PRAGMA journal_mode = DELETE")
     }
 }
 
@@ -307,13 +350,13 @@ fn parent_dir(path: &Path) -> PathBuf {
     }
 }
 
-/// After this run's copy is complete, remove each complete copy an earlier
-/// run took that has the same `<from>`, the same size and the same bytes as
-/// this run's copy, and no `-wal` or `-journal` file beside it. Such a copy
-/// holds the database contents this run's copy holds, so it is a stopped
-/// run's copy that this one replaces. Reads the files on a blocking thread.
-/// Returns one line naming each file removed, and each one that could not
-/// be.
+/// Once this run keeps its copy (its first step committed), remove each
+/// complete copy an earlier run took that has the same `<from>`, the same
+/// size and the same bytes as this run's copy, and no `-wal` or `-journal`
+/// file beside it. Such a copy holds the database contents this run's copy
+/// holds, so it is a stopped run's copy that this one replaces. Reads the
+/// files on a blocking thread. Returns one line naming each file removed,
+/// and each one that could not be.
 pub(crate) async fn remove_superseded(db: &Path, copy: &Path) -> Vec<String> {
     let (db, copy) = (db.to_path_buf(), copy.to_path_buf());
     tokio::task::spawn_blocking(move || superseded(&db, &copy))
@@ -353,6 +396,19 @@ fn superseded(db: &Path, copy: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(parent_dir(db)) else {
         return Vec::new();
     };
+    // A link under a copy's name to the database, its WAL or its index is
+    // not a copy, and it is never opened: closing a descriptor of the
+    // database that this code opened would release every lock the process
+    // holds on it. A symbolic link is skipped by its own metadata, a hard
+    // link by its device and inode.
+    let database: Vec<std::fs::Metadata> = ["", "-wal", "-shm"]
+        .iter()
+        .filter_map(|suffix| {
+            let mut name = db.as_os_str().to_owned();
+            name.push(suffix);
+            std::fs::metadata(PathBuf::from(name)).ok()
+        })
+        .collect();
     let mut found: Vec<PathBuf> = entries
         .filter_map(Result::ok)
         .map(|entry| entry.path())
@@ -360,7 +416,11 @@ fn superseded(db: &Path, copy: &Path) -> Vec<PathBuf> {
             path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
                 n != name && copy_versions(&prefix, n).is_some_and(|(f, _)| f == from)
             }) && !opened(path)
-                && std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() == size)
+                && std::fs::symlink_metadata(path).is_ok_and(|m| {
+                    m.file_type().is_file()
+                        && m.len() == size
+                        && !database.iter().any(|d| same_file(d, &m))
+                })
         })
         .collect();
     found.sort();
@@ -376,6 +436,20 @@ fn opened(copy: &Path) -> bool {
         side.push(suffix);
         std::fs::symlink_metadata(PathBuf::from(side)).is_ok()
     })
+}
+
+/// Whether `a` and `b` are the metadata of one file.
+#[cfg(unix)]
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+/// On Windows a lock belongs to the handle that took it, so closing
+/// another handle of the file releases nothing; no link is told apart.
+#[cfg(not(unix))]
+fn same_file(_: &std::fs::Metadata, _: &std::fs::Metadata) -> bool {
+    false
 }
 
 /// Whether the files at `a` and `b` hold the same bytes; `false` when either
@@ -438,8 +512,9 @@ fn copy_versions<'a>(prefix: &str, name: &'a str) -> Option<(&'a str, u32)> {
     Some((from, to.parse().ok()?))
 }
 
-/// Remove every `<db>.pre-migration-*.partial` beside `db`, with its
-/// journal: the partial copies of runs that were stopped while they copied.
+/// Remove every `<db>.pre-migration-*.partial` beside `db`, with the files
+/// SQLite keeps beside it: the partial copies of runs that were stopped
+/// while they copied.
 /// Every run that holds the database's lock calls it, whether or not it
 /// copies, so a run with nothing to apply removes them too. Returns one
 /// line naming each file removed, and each one that could not be.
@@ -461,7 +536,10 @@ pub(crate) fn remove_stopped_partials(db: &Path) -> Vec<String> {
         .filter(|path| {
             path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
                 n.starts_with(&prefix)
-                    && (n.ends_with(".partial") || n.ends_with(".partial-journal"))
+                    && (n.ends_with(".partial")
+                        || PARTIAL_SIDE_FILES
+                            .iter()
+                            .any(|suffix| n.ends_with(&format!(".partial{suffix}"))))
             })
         })
         .collect();
@@ -501,23 +579,48 @@ fn partial_path(copy: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Remove a partial copy and the rollback journal SQLite keeps beside it
-/// while the backup writes.
+/// The files SQLite may keep beside a partial copy: the rollback journal
+/// while the backup writes, and the WAL and its index while the copy is
+/// switched to rollback-journal mode.
+const PARTIAL_SIDE_FILES: [&str; 3] = ["-journal", "-wal", "-shm"];
+
+/// Remove a partial copy and the files SQLite keeps beside it.
 fn remove_partial(partial: &Path) {
     let _ = std::fs::remove_file(partial);
-    let mut journal = partial.as_os_str().to_owned();
-    journal.push("-journal");
-    let _ = std::fs::remove_file(PathBuf::from(journal));
+    for suffix in PARTIAL_SIDE_FILES {
+        let mut side = partial.as_os_str().to_owned();
+        side.push(suffix);
+        let _ = std::fs::remove_file(PathBuf::from(side));
+    }
 }
 
-/// Sync `path` to disk on a blocking thread, as the backup runs.
+/// Sync the file at `path` to disk on a blocking thread, as the backup
+/// runs. The file is opened for writing: on Windows `sync_all` is
+/// `FlushFileBuffers`, which needs a handle with write access.
 async fn sync_file(path: &Path) -> Result<(), MigrationError> {
+    sync(path, true).await
+}
+
+/// Sync the directory `dir`, so that a rename in it is durable. A
+/// directory is opened for reading, which Windows does not do with these
+/// options; the caller ignores the error.
+async fn sync_dir(dir: &Path) -> Result<(), MigrationError> {
+    sync(dir, false).await
+}
+
+async fn sync(path: &Path, write: bool) -> Result<(), MigrationError> {
     let owned = path.to_path_buf();
-    tokio::task::spawn_blocking(move || File::open(&owned).and_then(|f| f.sync_all()))
-        .await
-        .map_err(std::io::Error::other)
-        .and_then(|synced| synced)
-        .map_err(|e| MigrationError::store(format!("sync {}", path.display()), e))
+    tokio::task::spawn_blocking(move || {
+        std::fs::OpenOptions::new()
+            .read(!write)
+            .write(write)
+            .open(&owned)
+            .and_then(|f| f.sync_all())
+    })
+    .await
+    .map_err(std::io::Error::other)
+    .and_then(|synced| synced)
+    .map_err(|e| MigrationError::store(format!("sync {}", path.display()), e))
 }
 
 /// Stop, with the figures, when `dir` has less than three times the
@@ -591,6 +694,51 @@ mod tests {
     use std::path::Path;
     use std::time::{Duration, SystemTime};
 
+    /// A lock another connection holds past the wait stops the copy, and
+    /// the error says how long it waited: `sqlite3_backup_finish` returns
+    /// the last step's SQLITE_BUSY, which alone reads "database is locked".
+    #[tokio::test]
+    async fn a_lock_held_past_the_wait_stops_the_copy_and_says_so() {
+        let db = crate::migrations::tests::temp_db("copy-busy");
+        let pool = crate::migrations::tests::plain_pool(&db).await;
+        sqlx::raw_sql(
+            "PRAGMA journal_mode = DELETE; CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);",
+        )
+        .execute(&pool)
+        .await
+        .expect("a database");
+        let mut holder = pool.acquire().await.expect("a connection");
+        sqlx::raw_sql("BEGIN EXCLUSIVE")
+            .execute(&mut *holder)
+            .await
+            .expect("an exclusive lock");
+        let target = std::path::PathBuf::from(format!("{}.copy", db.display()));
+        super::create_partial(&target).expect("the target");
+        let source = db.to_path_buf();
+        let started = std::time::Instant::now();
+        let err = tokio::task::spawn_blocking(move || {
+            super::backup::copy(&source, &target, Duration::from_secs(1))
+        })
+        .await
+        .expect("the copy's thread")
+        .expect_err("the lock is held");
+        assert_eq!(
+            err,
+            "another connection held a lock on the database for 1 s"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "{:?}",
+            started.elapsed()
+        );
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut *holder)
+            .await
+            .expect("release");
+        drop(holder);
+        pool.close().await;
+    }
+
     #[test]
     fn a_complete_copy_name_gives_its_versions_and_no_other_name_does() {
         let prefix = "x.sqlite.pre-migration-";
@@ -606,6 +754,8 @@ mod tests {
         for other in [
             "3-to-4-20261029T061706Z.partial",
             "3-to-4-20261029T061706Z.partial-journal",
+            "3-to-4-20261029T061706Z.partial-wal",
+            "3-to-4-20261029T061706Z.partial-shm",
             "3-to-4-20261029T061706Z-wal",
             "3-to-4-2026102",
             "-to-4-20261029T061706Z",
