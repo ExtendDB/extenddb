@@ -617,3 +617,224 @@ async fn create_account_runs_the_account_migrations_through_the_runner() {
             .is_err()
     );
 }
+
+/// The ids recorded in a keyspace's ledger, sorted.
+async fn ledger_ids(session: &CassandraSession, keyspace: &str) -> Vec<i32> {
+    use cdrs_tokio::types::IntoRustByName;
+    let rows = session
+        .query(format!("SELECT id FROM {keyspace}.extenddb_migrations"))
+        .await
+        .expect("read the ledger")
+        .response_body()
+        .expect("body")
+        .into_rows()
+        .unwrap_or_default();
+    let mut ids: Vec<i32> = rows
+        .iter()
+        .map(|row| row.get_r_by_name("id").expect("id"))
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// CreateAccount creates and migrates the account's keyspace before it
+/// writes the `accounts` row, from which the catalog's status reads the
+/// account keyspaces. A call stopped before the row, as a server killed
+/// there stops, leaves a complete keyspace no status counts, so the catalog
+/// is still `Current`; the retried call writes the row. An account keyspace
+/// whose ledger lacks migration 1, beside a catalog keyspace at migration 4,
+/// is named in the status's message.
+#[tokio::test]
+async fn a_create_account_stopped_before_its_row_leaves_a_current_catalog_a_retry_completes() {
+    use extenddb_storage::management_store::OpError;
+    use extenddb_storage::migrations::advice::{Advice, status_message};
+
+    if helpers::skip_without_cassandra() {
+        return;
+    }
+    let session = session().await;
+    let (prefix, _drops) = new_prefix("stopacct");
+    keyspace(&session, &format!("{prefix}_catalog")).await;
+    migrate_catalog_keyspace(session.clone(), &prefix, "test", TIMEOUT)
+        .await
+        .expect("migrate the catalog");
+    let account = format!("{prefix}_account_111111111111");
+    let store =
+        || CassandraCatalogStore::new(session.clone(), prefix.clone(), "datacenter1".to_owned(), 1);
+
+    let error = store()
+        .stopping_after(0)
+        .create_account("111111111111", "one")
+        .await
+        .expect_err("the call stops before the row");
+    assert!(
+        format!("{error:?}").contains("stopped by the test hook before a write"),
+        "{error:?}"
+    );
+    assert_eq!(
+        ledger_ids(&session, &account).await,
+        vec![1],
+        "the keyspace is created and migrated before the row"
+    );
+    assert_eq!(
+        store().list_all_accounts().await.expect("list"),
+        Vec::<(String, String)>::new(),
+        "no accounts row was written"
+    );
+    assert_eq!(
+        catalog_status(session.clone(), &prefix)
+            .await
+            .expect("status"),
+        CatalogStatus::Current { version: 4 },
+        "the keyspace without a row is not counted"
+    );
+
+    store()
+        .create_account("111111111111", "one")
+        .await
+        .expect("the retried call");
+    assert_eq!(
+        store().list_all_accounts().await.expect("list"),
+        vec![("111111111111".to_owned(), "one".to_owned())]
+    );
+    assert_eq!(ledger_ids(&session, &account).await, vec![1]);
+    assert_eq!(
+        catalog_status(session.clone(), &prefix)
+            .await
+            .expect("status"),
+        CatalogStatus::Current { version: 4 }
+    );
+    assert!(
+        matches!(
+            store().create_account("111111111111", "one").await,
+            Err(OpError::AlreadyExists(_))
+        ),
+        "a third call finds the account"
+    );
+
+    // A keyspace a run stopped in before migration 1's row.
+    cql(&session, &format!("TRUNCATE {account}.extenddb_migrations")).await;
+    let status = catalog_status(session.clone(), &prefix)
+        .await
+        .expect("status");
+    assert!(
+        matches!(
+            status,
+            CatalogStatus::Behind {
+                version: Some(0),
+                ..
+            }
+        ),
+        "{status:?}"
+    );
+    let advice = Advice {
+        release: "1.0.0-test",
+        location: "test",
+        backup: "back up the keyspaces",
+        config: None,
+        assignment: None,
+    };
+    let message = status_message(&status, &advice);
+    assert!(
+        message.starts_with(&format!(
+            "account store {account} is at migration 0, behind the catalog store at migration \
+             4, and ExtendDB 1.0.0-test needs migration 4."
+        )),
+        "{message}"
+    );
+    assert!(
+        !message.contains("the catalog is at migration 0"),
+        "{message}"
+    );
+}
+
+/// `init`'s bootstrapper for the deployment of `prefix`, connected as the
+/// test node's superuser, which is also the application role here, so the
+/// grants `init` sends name a role that exists.
+async fn bootstrapper(prefix: &str) -> extenddb_storage_cassandra::CassandraBootstrapper {
+    let mut config = helpers::test_config();
+    config.keyspace_prefix = prefix.to_owned();
+    config.rebuild_cached_connection_string();
+    let (host, port) = helpers::test_contact_point()
+        .split_once(':')
+        .map(|(h, p)| (h.to_owned(), p.parse().expect("a port")))
+        .expect("host:port");
+    let user = config.username.clone().unwrap_or_default();
+    let password = config.password.clone().unwrap_or_default();
+    let bootstrap = extenddb_storage::bootstrapper::BootstrapConfig {
+        host,
+        port,
+        admin_user: user.clone(),
+        admin_password: Some(password.clone()),
+        app_user: user,
+        app_password: password,
+        catalog_db: format!("{prefix}_catalog"),
+        data_db: String::new(),
+    };
+    extenddb_storage_cassandra::CassandraBootstrapper::new(&config, bootstrap)
+        .await
+        .unwrap_or_else(|e| panic!("bootstrapper: {e:?}"))
+}
+
+/// `init`'s default account step creates and migrates the account's
+/// keyspace before it writes the `accounts` row, and a step run again on a
+/// catalog that has an account creates no second account and completes that
+/// account's keyspace: an `init` resumed after the step leaves one account
+/// whose keyspace holds every account migration.
+#[tokio::test]
+async fn the_default_account_step_run_again_keeps_one_account_and_completes_its_keyspace() {
+    use extenddb_storage::bootstrapper::Bootstrapper;
+
+    if helpers::skip_without_cassandra() {
+        return;
+    }
+    let session = session().await;
+    let (prefix, mut drops) = new_prefix("defacct");
+    keyspace(&session, &format!("{prefix}_catalog")).await;
+    migrate_catalog_keyspace(session.clone(), &prefix, "test", TIMEOUT)
+        .await
+        .expect("migrate the catalog");
+    let bootstrapper = bootstrapper(&prefix).await;
+    let store = CassandraCatalogStore::catalog_only(session.clone(), prefix.clone());
+
+    bootstrapper
+        .bootstrap_default_account()
+        .await
+        .expect("the default account");
+    let accounts = store.list_all_accounts().await.expect("list");
+    assert_eq!(accounts.len(), 1, "{accounts:?}");
+    let (id, name) = accounts[0].clone();
+    assert_eq!(name, "default");
+    let account = format!("{prefix}_account_{id}");
+    drops.0.push(account.clone());
+    assert_eq!(ledger_ids(&session, &account).await, vec![1]);
+
+    // The step again, as a resumed `init` runs it.
+    bootstrapper
+        .bootstrap_default_account()
+        .await
+        .expect("the step again");
+    assert_eq!(
+        store.list_all_accounts().await.expect("list"),
+        vec![(id.clone(), "default".to_owned())],
+        "no second account"
+    );
+
+    // A keyspace that lost its migrations is completed by the step.
+    cql(&session, &format!("DROP KEYSPACE {account}")).await;
+    bootstrapper
+        .bootstrap_default_account()
+        .await
+        .expect("the step on a missing keyspace");
+    assert_eq!(ledger_ids(&session, &account).await, vec![1]);
+    assert_eq!(
+        store.list_all_accounts().await.expect("list"),
+        vec![(id, "default".to_owned())]
+    );
+    assert_eq!(
+        catalog_status(session.clone(), &prefix)
+            .await
+            .expect("status"),
+        CatalogStatus::Current { version: 4 }
+    );
+}

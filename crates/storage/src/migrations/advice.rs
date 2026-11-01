@@ -7,7 +7,7 @@
 
 use super::catalog::{CatalogMigrations, Target};
 use super::registry::{MigrationId, RELEASED_THROUGH};
-use super::status::{CatalogStatus, MigrationError, Pending};
+use super::status::{CatalogStatus, MigrationError, Pending, behind_line, stores_behind};
 
 /// What a message needs beyond the status.
 #[derive(Debug, Clone, Copy)]
@@ -156,12 +156,18 @@ pub fn status_message(status: &CatalogStatus, advice: &Advice<'_>) -> String {
     let latest = MigrationId::LATEST.number();
     match status {
         CatalogStatus::Behind { version, pending } => {
-            let (at, stop) = match version {
-                Some(v) => (
+            let behind = stores_behind(pending);
+            let (at, stop) = match (behind, version) {
+                // A run stopped after the catalog store: name the stores it
+                // did not reach, since the catalog store is further on.
+                (Some((catalog_at, behind)), _) => {
+                    (behind_line(catalog_at, &behind), "Stop the server.")
+                }
+                (None, Some(v)) => (
                     format!("the catalog is at migration {v}"),
                     "Stop the server.",
                 ),
-                None => (
+                (None, None) => (
                     "the catalog has no migration ledger (a release before 1.0 created it)"
                         .to_owned(),
                     "Stop every server that uses this catalog: a server of a release before 1.0 \
@@ -426,6 +432,96 @@ mod tests {
         assert!(message.contains("(account, additive), "), "{message}");
         assert!(
             message.contains("(account in 2 stores, breaking)."),
+            "{message}"
+        );
+    }
+
+    /// An account keyspace without migration 1 beside a catalog keyspace at
+    /// the latest migration puts the deployment at migration 0. The message
+    /// names that keyspace and the catalog store's migration instead of
+    /// saying the catalog is at migration 0.
+    #[test]
+    fn a_store_behind_the_catalog_store_is_named() {
+        let latest = MigrationId::LATEST.number();
+        let baseline = MigrationId::ALL[0];
+        let account = |name: &str, id: MigrationId| Pending {
+            id: id.number(),
+            name: id.name(),
+            store: StoreKind::Account,
+            store_name: name.to_owned(),
+            kind: Kind::Breaking,
+        };
+        let status = CatalogStatus::Behind {
+            version: Some(0),
+            pending: vec![account("p_account_111111111111", baseline)],
+        };
+        let message = status_message(&status, &ADVICE);
+        assert_eq!(
+            message.lines().next().unwrap_or_default(),
+            format!(
+                "account store p_account_111111111111 is at migration 0, behind the catalog \
+                 store at migration {latest}, and ExtendDB 1.0.1 needs migration {latest}."
+            ),
+            "{message}"
+        );
+        assert!(
+            !message.contains("the catalog is at migration 0"),
+            "{message}"
+        );
+        assert_eq!(
+            status.to_string(),
+            format!(
+                "account store p_account_111111111111 is at migration 0, behind the catalog \
+                 store at migration {latest}; pending: 1 baseline (account, breaking)"
+            )
+        );
+
+        // Two stores behind, and a data store behind at another migration.
+        let pending = vec![
+            account("p_account_1", baseline),
+            account("p_account_2", baseline),
+            Pending {
+                store: StoreKind::Data,
+                store_name: "extenddb_data".to_owned(),
+                ..account("", MigrationId::LATEST)
+            },
+        ];
+        let message = status_message(
+            &CatalogStatus::Behind {
+                version: Some(0),
+                pending,
+            },
+            &ADVICE,
+        );
+        assert!(
+            message.starts_with(&format!(
+                "account store p_account_1 (at migration 0), account store p_account_2 (at \
+                 migration 0) and data store extenddb_data (at migration {}) are behind the \
+                 catalog store at migration {latest}, and ExtendDB",
+                latest - 1
+            )),
+            "{message}"
+        );
+
+        // An upgrade: every store waits for the same migration, so no store
+        // is behind the catalog store and the version is the catalog's.
+        let upgrade = CatalogStatus::Behind {
+            version: Some(latest - 1),
+            pending: vec![
+                Pending {
+                    store: StoreKind::Catalog,
+                    store_name: "p_catalog".to_owned(),
+                    ..account("", MigrationId::LATEST)
+                },
+                account("p_account_1", MigrationId::LATEST),
+            ],
+        };
+        let message = status_message(&upgrade, &ADVICE);
+        assert!(
+            message.starts_with(&format!(
+                "the catalog is at migration {}, and ExtendDB",
+                latest - 1
+            )),
             "{message}"
         );
     }

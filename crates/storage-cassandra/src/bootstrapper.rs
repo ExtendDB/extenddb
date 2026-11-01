@@ -317,6 +317,86 @@ impl CassandraBootstrapper {
             foreign.join(", ")
         )))
     }
+
+    /// The lowest account id in the catalog's `accounts` table, read through
+    /// the held lease: the default account of an `init` that wrote its row
+    /// and stopped before its admin user.
+    async fn first_account(&self) -> OpResult<Option<String>> {
+        let keyspace = self.engine.catalog_keyspace();
+        let rows = self
+            .held
+            .request(
+                "Read the accounts",
+                crate::cassandra_util::query_rows_quorum::<extenddb_storage::error::StorageError>(
+                    &self.engine.session_arc(),
+                    &format!("SELECT account_id FROM {keyspace}.accounts"),
+                    cdrs_tokio::query_values!(),
+                    "bootstrap_default_account",
+                ),
+            )
+            .await?;
+        let ids = crate::cassandra_util::map_rows(
+            rows,
+            |row| {
+                crate::cassandra_util::get_column::<String, OpError>(
+                    row,
+                    "account_id",
+                    "bootstrap_default_account",
+                )
+            },
+            "bootstrap_default_account",
+        )?;
+        Ok(ids.into_iter().min())
+    }
+
+    /// Create `account_id`'s keyspace when it is missing, run every account
+    /// migration on it through the runner, as CreateAccount does, and grant
+    /// the application role its permissions on it, all under the lease of
+    /// the lock `init` holds: the CREATE KEYSPACE through the held lease with
+    /// the bound of a schema statement under the lock, and the account run
+    /// checking the lease before each write and recording progress on it.
+    /// Each step is safe to send again, so a resumed `init` completes a
+    /// keyspace an earlier one created.
+    async fn complete_account_keyspace(&self, account_id: &str) -> OpResult<()> {
+        let account_keyspace = self.engine.account_keyspace(account_id);
+        println!("--- Creating account keyspace...");
+        self.held
+            .request_within(
+                "Create account keyspace",
+                crate::migrations::LOCKED_DDL_TIMEOUT,
+                self.engine.create_keyspace(&account_keyspace),
+            )
+            .await?;
+        println!("--- Running the account migrations for the default account...");
+        self.held.check("Migrate the default account's keyspace")?;
+        let session = self.engine.session_arc();
+        let release = env!("CARGO_PKG_VERSION");
+        let run = match self.held.handle() {
+            Some(lease) => {
+                crate::migrations::migrate_account_under(
+                    session,
+                    &self.keyspace_prefix,
+                    &account_keyspace,
+                    release,
+                    lease,
+                )
+                .await
+            }
+            None => {
+                crate::migrations::migrate_account(
+                    session,
+                    &self.keyspace_prefix,
+                    &account_keyspace,
+                    release,
+                )
+                .await
+            }
+        };
+        run.map_err(|e| OpError::Internal(format!("Migrate the default account's keyspace: {e}")))?;
+        // `init` created this keyspace as the admin role, so the application
+        // role holds no permission on it yet.
+        self.grant_app_role(&account_keyspace, true).await
+    }
 }
 
 #[async_trait]
@@ -498,17 +578,28 @@ impl Bootstrapper for CassandraBootstrapper {
         Ok(())
     }
 
+    /// Create the default account unless the catalog has an account, whose
+    /// keyspace is completed instead, so an `init` resumed after this step
+    /// creates no second account. The keyspace is created and migrated, and
+    /// the application role granted its permissions on it, before the
+    /// `accounts` row is written: the catalog's status reads the account
+    /// keyspaces from `accounts`, so an `init` stopped before the row leaves
+    /// a catalog whose status is `Current`, which a resumed `init` finishes.
     async fn bootstrap_default_account(&self) -> OpResult<()> {
         let keyspace = self.engine.catalog_keyspace();
+        if let Some(account_id) = self.first_account().await? {
+            println!("--- Default account already exists; completing its keyspace.");
+            return self.complete_account_keyspace(&account_id).await;
+        }
 
         let account_id = generate_account_id();
         let account_name = "default";
+        self.complete_account_keyspace(&account_id).await?;
 
         let insert_cql = format!(
             "INSERT INTO {keyspace}.accounts (account_id, account_name, created_at) \
              VALUES (?, ?, toTimestamp(now())) IF NOT EXISTS"
         );
-
         let applied = self
             .held
             .request(
@@ -521,58 +612,11 @@ impl Bootstrapper for CassandraBootstrapper {
                 ),
             )
             .await?;
-
-        if !applied {
+        if applied {
+            println!("--- Default account created");
+        } else {
             println!("--- Default account already exists, skipping.");
-            return Ok(());
         }
-
-        println!("--- Default account created");
-
-        // The keyspace, then every account migration through the runner,
-        // as CreateAccount does, all under the lease of the lock `init`
-        // holds: the CREATE KEYSPACE through the held lease with the bound of
-        // a schema statement under the lock, and the account run checking
-        // the lease before each write and recording progress on it.
-        let account_keyspace = self.engine.account_keyspace(&account_id);
-        println!("--- Creating account keyspace...");
-        self.held
-            .request_within(
-                "Create account keyspace",
-                crate::migrations::LOCKED_DDL_TIMEOUT,
-                self.engine.create_keyspace(&account_keyspace),
-            )
-            .await?;
-        println!("--- Running the account migrations for the default account...");
-        self.held.check("Migrate the default account's keyspace")?;
-        let session = self.engine.session_arc();
-        let release = env!("CARGO_PKG_VERSION");
-        let run = match self.held.handle() {
-            Some(lease) => {
-                crate::migrations::migrate_account_under(
-                    session,
-                    &self.keyspace_prefix,
-                    &account_keyspace,
-                    release,
-                    lease,
-                )
-                .await
-            }
-            None => {
-                crate::migrations::migrate_account(
-                    session,
-                    &self.keyspace_prefix,
-                    &account_keyspace,
-                    release,
-                )
-                .await
-            }
-        };
-        run.map_err(|e| OpError::Internal(format!("Migrate the default account's keyspace: {e}")))?;
-        // `init` created this keyspace as the admin role, so the application
-        // role holds no permission on it yet.
-        self.grant_app_role(&account_keyspace, true).await?;
-
         Ok(())
     }
 

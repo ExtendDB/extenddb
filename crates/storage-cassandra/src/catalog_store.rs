@@ -101,13 +101,26 @@ impl CassandraCatalogStore {
         self.stop_after = Some(left);
     }
 
-    /// Fail a policy write once the crash-and-rerun tests' budget is spent,
-    /// as a migrator killed before the write stops.
+    /// Stop this store before its write after the first `writes` the test
+    /// hook counts, as a server killed at that point stops: each policy
+    /// write counts, and so does CreateAccount's `accounts` row, which is
+    /// written after the account's keyspace. For the tests of a
+    /// CreateAccount stopped between its keyspace and its row.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn stopping_after(mut self, writes: usize) -> Self {
+        self.stop_after = Some(Arc::new(std::sync::atomic::AtomicUsize::new(writes)));
+        self
+    }
+
+    /// Fail a policy write or CreateAccount's `accounts` row once the
+    /// crash-and-rerun tests' budget is spent, as a process killed before
+    /// the write stops.
     pub(crate) fn test_stop(&self) -> OpResult<()> {
         #[cfg(any(test, feature = "test-util"))]
         if crate::migrations::stopped(self.stop_after.as_deref()) {
             return Err(OpError::Internal(
-                "stopped by the test hook before a policy write".to_owned(),
+                "stopped by the test hook before a write".to_owned(),
             ));
         }
         Ok(())
@@ -168,8 +181,9 @@ impl CassandraCatalogStore {
     /// (idempotent): create it when missing, then run the account
     /// migrations on it through the migration runner, which waits for
     /// schema agreement after each statement and records each one in the
-    /// keyspace's ledger. A retried CreateAccount whose earlier call stopped
-    /// after the `accounts` row repairs the keyspace the same way.
+    /// keyspace's ledger. CreateAccount calls it before it writes the
+    /// `accounts` row, so a retried CreateAccount whose earlier call stopped
+    /// before the row completes the keyspace the same way.
     pub(crate) async fn ensure_account_keyspace(&self, account_id: &str) -> OpResult<()> {
         let keyspace_name = self.account_keyspace(account_id);
         let failed = |e: &dyn std::fmt::Display| {

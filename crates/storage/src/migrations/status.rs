@@ -5,6 +5,7 @@
 //! exit codes.
 
 use super::ledger::Outcome;
+use super::registry::MigrationId;
 use super::table::{Kind, StoreKind};
 
 /// One step a run applied.
@@ -61,6 +62,60 @@ pub struct Pending {
     /// The store instance (the SQLite file, a keyspace name).
     pub store_name: String,
     pub kind: Kind,
+}
+
+/// The stores of a `Behind` status's `pending` list whose ledger lacks a
+/// migration the catalog store's ledger has, which a run stopped between
+/// the catalog store and the others leaves: each with its own migration,
+/// the one before its first pending id, in the order `pending` names them,
+/// after the catalog store's migration. A store whose first pending id the
+/// catalog store lacks too is not behind it, as on an upgrade, where every
+/// store waits for the same migration. `None` when no store is behind.
+#[must_use]
+pub(crate) fn stores_behind(pending: &[Pending]) -> Option<(u32, Vec<(&Pending, u32)>)> {
+    let catalog_at = pending
+        .iter()
+        .filter(|p| p.store == StoreKind::Catalog)
+        .map(|p| p.id)
+        .min()
+        .map_or(MigrationId::LATEST.number(), |id| id.saturating_sub(1));
+    let mut behind: Vec<(&Pending, u32)> = Vec::new();
+    for p in pending.iter().filter(|p| p.store != StoreKind::Catalog) {
+        let at = p.id.saturating_sub(1);
+        match behind
+            .iter_mut()
+            .find(|(b, _)| b.store == p.store && b.store_name == p.store_name)
+        {
+            Some((_, lowest)) => *lowest = (*lowest).min(at),
+            None => behind.push((p, at)),
+        }
+    }
+    behind.retain(|(_, at)| *at < catalog_at);
+    (!behind.is_empty()).then_some((catalog_at, behind))
+}
+
+/// What a `Behind` status says first when [`stores_behind`] names stores:
+/// `account store x is at migration 0, behind the catalog store at
+/// migration 4`, or for several, `account store x (at migration 0) and data
+/// store y (at migration 3) are behind the catalog store at migration 4`.
+#[must_use]
+pub(crate) fn behind_line(catalog_at: u32, behind: &[(&Pending, u32)]) -> String {
+    let named = |p: &Pending| format!("{} store {}", p.store.as_str(), p.store_name);
+    if let [(p, at)] = behind {
+        return format!(
+            "{} is at migration {at}, behind the catalog store at migration {catalog_at}",
+            named(p)
+        );
+    }
+    let mut items: Vec<String> = behind
+        .iter()
+        .map(|(p, at)| format!("{} (at migration {at})", named(p)))
+        .collect();
+    let last = items.pop().unwrap_or_default();
+    format!(
+        "{} and {last} are behind the catalog store at migration {catalog_at}",
+        items.join(", ")
+    )
 }
 
 /// The status `serve`, `migrate` and `verify` act on. When several apply, it
@@ -140,10 +195,13 @@ impl std::fmt::Display for CatalogStatus {
         match self {
             Self::Current { version } => write!(f, "the catalog is at migration {version}"),
             Self::Behind { version, pending } => {
-                let at = version.map_or_else(
-                    || "has no migration ledger (a release before 1.0)".to_owned(),
-                    |v| format!("is at migration {v}"),
-                );
+                let at = match (stores_behind(pending), version) {
+                    (Some((catalog_at, behind)), _) => behind_line(catalog_at, &behind),
+                    (None, Some(v)) => format!("the catalog is at migration {v}"),
+                    (None, None) => {
+                        "the catalog has no migration ledger (a release before 1.0)".to_owned()
+                    }
+                };
                 let list: Vec<String> = pending
                     .iter()
                     .map(|p| {
@@ -156,7 +214,7 @@ impl std::fmt::Display for CatalogStatus {
                         )
                     })
                     .collect();
-                write!(f, "the catalog {at}; pending: {}", list.join(", "))
+                write!(f, "{at}; pending: {}", list.join(", "))
             }
             Self::AheadCompatible { version, unknown } => write!(
                 f,
