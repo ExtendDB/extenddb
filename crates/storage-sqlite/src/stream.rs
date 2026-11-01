@@ -27,7 +27,20 @@ const SHARDS_PER_STREAM: u32 = 4;
 /// Most stream records one retention cleanup statement deletes. Each statement
 /// holds the engine write lock for its own duration only, so this bounds how
 /// long a write waits behind the cleanup.
-pub(crate) const STREAM_CLEANUP_BATCH_ROWS: u32 = 1_000;
+///
+/// Measured with `stream_cleanup_bench`: release build, file database,
+/// 100,000 expired records with a 500-byte payload each, three rounds per
+/// size, on 16 cores with a one-minute load average of 31.1 at the start of
+/// the run and 27.4 at the end. A 250-record statement held the lock for a
+/// median of 7 to 8 ms and at most 234 to 309 ms, and a pass over the
+/// 100,000 records took 10.5 to 14.8 s. A 500-record statement held it for a
+/// median of 8 to 17 ms and at most 236 to 362 ms; a pass took 7.6 to 8.1 s.
+/// A 1,000-record statement held it for a median of 20 to 22 ms and at most
+/// 265 to 849 ms; a pass took 5.1 to 7.7 s. 500 keeps the longest hold under
+/// half a second without the longer pass of 250. The single statement this
+/// replaces deleted 843 to 9,761 records per second in a soak run, which puts
+/// 500 records at 51 to 593 ms and 1,000 at up to 1.19 s.
+pub(crate) const STREAM_CLEANUP_BATCH_ROWS: u32 = 500;
 
 /// One cleanup batch: the oldest `?2` records created before the cutoff `?1`.
 /// The inner select reads `idx_stream_records_created` in index order, and the
