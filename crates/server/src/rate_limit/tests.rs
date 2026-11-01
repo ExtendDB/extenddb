@@ -293,7 +293,7 @@ async fn a_store_error_is_internal_and_holds_no_reservation() {
 }
 
 #[tokio::test]
-async fn the_lockout_log_line_escapes_the_principal() {
+async fn the_refusal_log_line_escapes_the_principal() {
     let store = MemoryStore::default();
     let principal = "admin\nERROR forged line";
     fail_times(&store, principal, "198.51.100.85", 5).await;

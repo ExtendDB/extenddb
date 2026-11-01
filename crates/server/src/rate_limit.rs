@@ -181,7 +181,7 @@ async fn begin_login_from(
         // here. `{:?}` escapes newlines and control characters, so it cannot
         // start a new log line.
         tracing::warn!(
-            "Account lockout: principal {:?} from {} has {recorded_for_pair} failed attempts \
+            "Login refused: principal {:?} from {} has {recorded_for_pair} failed attempts \
              and {} in flight in window",
             attempt.principal,
             attempt.source_ip,
