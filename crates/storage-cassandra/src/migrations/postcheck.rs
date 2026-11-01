@@ -154,9 +154,22 @@ pub fn compare(expected: &Definitions, actual: &Definitions) -> Vec<String> {
     differences
 }
 
+/// The columns of `table` that `expected` has and `actual` lacks, by name.
+#[must_use]
+pub fn columns_missing(expected: &Definitions, actual: &Definitions, table: &str) -> Vec<String> {
+    expected
+        .columns
+        .keys()
+        .filter_map(|key| {
+            let (t, name) = key.split_once('.')?;
+            (t == table && !actual.columns.contains_key(key)).then(|| name.to_owned())
+        })
+        .collect()
+}
+
 /// The columns of `table` in `actual` that `expected` does not have, or
 /// defines otherwise, by name. A column `expected` has and `actual` lacks
-/// is not one of them.
+/// is not one of them ([`columns_missing`] names those).
 #[must_use]
 pub fn columns_not_in(expected: &Definitions, actual: &Definitions, table: &str) -> Vec<String> {
     actual

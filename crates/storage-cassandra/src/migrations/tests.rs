@@ -22,6 +22,35 @@ fn no_migration_is_additive_before_the_old_binary_job() {
     refuse_additive("cassandra", migration).unwrap_or_else(|e| panic!("{e}"));
 }
 
+/// Every `ALTER TABLE ... ADD` of migration 1's catalog body is read as a
+/// column that may be missing from a table an `init` left, and each one is
+/// a column of the v1.0 schema.
+#[test]
+fn the_columns_migration_1_adds_with_alter_are_read_from_its_body() {
+    let added = super::baseline_added_columns();
+    let statements = CATALOG_BASELINE
+        .lines()
+        .filter(|line| line.trim_start().starts_with("ALTER TABLE"))
+        .count();
+    assert_eq!(added.len(), statements, "{added:?}");
+    assert!(
+        added.contains(&("tables", "ttl_backfill_cursor")),
+        "{added:?}"
+    );
+    assert!(
+        added.contains(&("backups_by_arn", "definition")),
+        "{added:?}"
+    );
+    let expected: super::postcheck::Definitions =
+        serde_json::from_str(super::CATALOG_EXPECTED).expect("expected definitions");
+    for (table, column) in &added {
+        assert!(
+            expected.columns.contains_key(&format!("{table}.{column}")),
+            "{table}.{column} is not in the v1.0 schema"
+        );
+    }
+}
+
 #[test]
 fn every_migration_records_a_row_in_the_catalog_and_names_its_stores() {
     for id in MigrationId::ALL {

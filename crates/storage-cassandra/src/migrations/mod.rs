@@ -402,7 +402,8 @@ pub async fn create_lock_table(
 
 /// What an uninitialized `keyspace` holds that makes it another program's:
 /// the tables migration 1 does not create; a table of a catalog table's
-/// name with a column migration 1 does not give it, or defines otherwise;
+/// name with a column migration 1 does not give it, or defines otherwise,
+/// or without a column migration 1 creates it with;
 /// a `settings` table without the catalog's `key` and `value` columns;
 /// `settings` rows other than the migration lock's; `schema_history` rows
 /// other than the ones migration 1 inserts; and a row in any other table.
@@ -441,6 +442,7 @@ pub async fn foreign_contents(
         .map(|t| format!("the table {t}"))
         .collect();
     let actual = postcheck::describe(session, keyspace).await?;
+    let added = baseline_added_columns();
     for table in tables.iter().filter(|t| ours.contains(t.as_str())) {
         let differing = postcheck::columns_not_in(&expected, &actual, table);
         if table == "settings"
@@ -454,6 +456,19 @@ pub async fn foreign_contents(
             foreign.push(format!(
                 "the table {table}, whose column(s) {} migration 1 does not create",
                 differing.join(", ")
+            ));
+            continue;
+        }
+        // Migration 1 creates each table with all its columns but the ones
+        // a later `ALTER TABLE ... ADD` adds, so only those may be missing.
+        let missing: Vec<String> = postcheck::columns_missing(&expected, &actual, table)
+            .into_iter()
+            .filter(|column| !added.contains(&(table.as_str(), column.as_str())))
+            .collect();
+        if !missing.is_empty() {
+            foreign.push(format!(
+                "the table {table}, which lacks the column(s) {} migration 1 creates it with",
+                missing.join(", ")
             ));
             continue;
         }
@@ -514,6 +529,21 @@ pub async fn foreign_contents(
 
 /// The `schema_history` rows migration 1's catalog body inserts, as
 /// `(version, description)`.
+/// The (table, column) pairs migration 1 adds to the catalog keyspace with
+/// `ALTER TABLE ... ADD IF NOT EXISTS`: a table an `init` or a 0.1.x release
+/// created before such a statement lacks them, and migration 1 adds them.
+fn baseline_added_columns() -> std::collections::BTreeSet<(&'static str, &'static str)> {
+    CATALOG_BASELINE
+        .lines()
+        .filter_map(|line| {
+            let rest = line.trim().strip_prefix("ALTER TABLE ")?;
+            let (table, rest) = rest.split_once(' ')?;
+            let (column, _) = rest.strip_prefix("ADD IF NOT EXISTS ")?.split_once(' ')?;
+            Some((table, column))
+        })
+        .collect()
+}
+
 fn baseline_history() -> Vec<(i32, &'static str)> {
     CATALOG_BASELINE
         .lines()

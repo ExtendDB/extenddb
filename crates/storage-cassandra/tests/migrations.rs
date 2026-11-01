@@ -372,6 +372,37 @@ async fn tables_with_catalog_names_and_other_columns_or_rows_are_refused() {
         "nothing was created"
     );
 
+    // Empty tables whose columns are a part of a catalog table's, with the
+    // same names and types: migration 1 creates each of these tables with
+    // the columns they lack, so another program made them.
+    let (subset, _subset_drops) = new_prefix("subset");
+    let catalog = format!("{subset}_catalog");
+    keyspace(&session, &catalog).await;
+    for statement in [
+        format!("CREATE TABLE {catalog}.accounts (account_id text PRIMARY KEY)"),
+        format!(
+            "CREATE TABLE {catalog}.tables (account_id text, table_name text, PRIMARY KEY \
+             ((account_id), table_name))"
+        ),
+    ] {
+        cql(&session, &statement).await;
+    }
+    match migrations.lock(&target_of(&subset), TIMEOUT).await {
+        Err(MigrationError::Refused(message)) => assert!(
+            message.contains("is not an ExtendDB catalog")
+                && message.contains("the table accounts, which lacks the column(s) account_name")
+                && message.contains("the table tables, which lacks the column(s)")
+                && !message.contains("ttl_backfill_cursor"),
+            "{message}"
+        ),
+        other => panic!("{:?}", other.err()),
+    }
+    assert_eq!(
+        helpers_tables(&session, &catalog).await,
+        ["accounts", "tables"],
+        "nothing was created"
+    );
+
     let (history, _history_drops) = new_prefix("history");
     let catalog = format!("{history}_catalog");
     keyspace(&session, &catalog).await;
@@ -411,6 +442,68 @@ async fn tables_with_catalog_names_and_other_columns_or_rows_are_refused() {
         ),
         other => panic!("{:?}", other.err()),
     }
+}
+
+/// `init` refuses another program's keyspace in its first step, before it
+/// creates the application role, so a refused `init` leaves no role behind:
+/// the keyspace of `metrics` and `tags` with a row each, as in
+/// `tables_with_catalog_names_and_other_columns_or_rows_are_refused`.
+#[tokio::test]
+async fn init_refuses_a_foreign_keyspace_before_it_creates_its_role() {
+    use extenddb_storage::bootstrapper::Bootstrapper;
+    use extenddb_storage::management_store::OpError;
+
+    if helpers::skip_without_cassandra() {
+        return;
+    }
+    let session = session().await;
+    let (prefix, _drops) = new_prefix("norole");
+    let catalog = format!("{prefix}_catalog");
+    keyspace(&session, &catalog).await;
+    for statement in [
+        format!("CREATE TABLE {catalog}.metrics (id int PRIMARY KEY, reading double)"),
+        format!("CREATE TABLE {catalog}.tags (name text PRIMARY KEY, color text)"),
+        format!("INSERT INTO {catalog}.metrics (id, reading) VALUES (1, 2.5)"),
+        format!("INSERT INTO {catalog}.tags (name, color) VALUES ('urgent', 'red')"),
+    ] {
+        cql(&session, &statement).await;
+    }
+    let role = format!("{prefix}_app");
+    let bootstrapper = bootstrapper_as(&prefix, &role, "a-new-password").await;
+    let refused = bootstrapper.ensure_app_user().await;
+    let roles = role_rows(&session, &role).await;
+    if roles > 0 {
+        cql(&session, &format!("DROP ROLE IF EXISTS {role}")).await;
+    }
+    match refused {
+        Err(OpError::AlreadyExists(message)) => assert!(
+            message.contains("is not an ExtendDB catalog") && message.contains("the table metrics"),
+            "{message}"
+        ),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(roles, 0, "the refused init created the role {role}");
+    assert_eq!(
+        helpers_tables(&session, &catalog).await,
+        ["metrics", "tags"],
+        "nothing was created"
+    );
+}
+
+/// The rows `system_auth.roles` holds for `role`.
+async fn role_rows(session: &CassandraSession, role: &str) -> usize {
+    session
+        .query_with_values(
+            "SELECT role FROM system_auth.roles WHERE role = ?",
+            cdrs_tokio::query_values!(role),
+        )
+        .await
+        .expect("read system_auth.roles")
+        .response_body()
+        .expect("body")
+        .into_rows()
+        .unwrap_or_default()
+        .len()
 }
 
 /// The tables of `keyspace`, in name order.
@@ -765,6 +858,19 @@ async fn a_create_account_stopped_before_its_row_leaves_a_current_catalog_a_retr
 /// test node's superuser, which is also the application role here, so the
 /// grants `init` sends name a role that exists.
 async fn bootstrapper(prefix: &str) -> extenddb_storage_cassandra::CassandraBootstrapper {
+    let config = helpers::test_config();
+    let user = config.username.clone().unwrap_or_default();
+    let password = config.password.clone().unwrap_or_default();
+    bootstrapper_as(prefix, &user, &password).await
+}
+
+/// `init`'s bootstrapper for the deployment of `prefix`, connected as the
+/// test node's superuser, with `app_user` as the application role.
+async fn bootstrapper_as(
+    prefix: &str,
+    app_user: &str,
+    app_password: &str,
+) -> extenddb_storage_cassandra::CassandraBootstrapper {
     let mut config = helpers::test_config();
     config.keyspace_prefix = prefix.to_owned();
     config.rebuild_cached_connection_string();
@@ -777,10 +883,10 @@ async fn bootstrapper(prefix: &str) -> extenddb_storage_cassandra::CassandraBoot
     let bootstrap = extenddb_storage::bootstrapper::BootstrapConfig {
         host,
         port,
-        admin_user: user.clone(),
-        admin_password: Some(password.clone()),
-        app_user: user,
-        app_password: password,
+        admin_user: user,
+        admin_password: Some(password),
+        app_user: app_user.to_owned(),
+        app_password: app_password.to_owned(),
         catalog_db: format!("{prefix}_catalog"),
         data_db: String::new(),
     };
