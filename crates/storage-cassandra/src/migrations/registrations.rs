@@ -6,12 +6,12 @@
 //! A server registers in `extenddb_servers`: one row, written at `QUORUM`
 //! with a TTL of 45 s and again every 5 s at `LOCAL_QUORUM`. A renewal that
 //! fails is tried again every second. The registration counts as lost only
-//! when no renewal has succeeded for 30 s, after a last attempt at that
-//! deadline. Each attempt is bounded by 5 s, and one sent before the
+//! when no write of the row has succeeded for 30 s, after a last attempt at
+//! that deadline. Each attempt is bounded by 5 s, and one sent before the
 //! deadline also by the time left to it, so the loss is reported at most
-//! 35 s after the last successful renewal was sent, at least 10 s before its
-//! row expires and `migrate --yes`, which waits while a row exists, can see
-//! it gone. The server then stops admitting requests and stops its
+//! 35 s after the last successful write was sent (the INSERT that
+//! registered, then each renewal), at least 10 s before its row expires and
+//! `migrate --yes`, which waits while a row exists, can see it gone. The server then stops admitting requests and stops its
 //! background workers, and registers again with a new row
 //! ([`super::registrar`]).
 
@@ -38,11 +38,12 @@ pub struct RegistrationTimes {
     pub renew_every: Duration,
     /// How soon a renewal that failed is tried again.
     pub retry_every: Duration,
-    /// How long after the last successful renewal was sent the registration
-    /// counts as lost. A renewal sent before then is bounded by the time
-    /// left, and the last attempt, at that deadline, by `renew_every`, so
-    /// the loss is reported by `lost_after + renew_every`, which must stay
-    /// under the TTL.
+    /// How long after the last successful write of the row was sent (the
+    /// INSERT that registered, then each renewal) the registration counts as
+    /// lost. A renewal sent before then is bounded by the time left, and the
+    /// last attempt, at that deadline, by `renew_every`, so the loss is
+    /// reported by `lost_after + renew_every`, which must stay under the
+    /// TTL.
     pub lost_after: Duration,
 }
 
@@ -224,6 +225,10 @@ impl ServingRegistration {
         let values = || {
             cdrs_tokio::query_values!(server_id.as_str(), host, pid, release, started_at.as_str())
         };
+        // The row's TTL can start when a replica applies the INSERT, which
+        // can be as early as its send, so the first deadline counts from
+        // here and not from the answer.
+        let sent = Instant::now();
         send(
             &session,
             &cql,
@@ -239,6 +244,7 @@ impl ServingRegistration {
             cql,
             values(),
             times,
+            sent,
             lost_tx,
         ));
         Ok(Self {
@@ -315,16 +321,18 @@ async fn delete_row(
 
 /// Write the row again every `renew_every`; after a failure try again every
 /// `retry_every`. Report the registration lost once the attempt at the
-/// deadline, `lost_after` after the last successful renewal was sent, fails
-/// too.
+/// deadline, `lost_after` after the last successful write of the row was
+/// sent (`registered`, the send of the INSERT that registered, until a
+/// renewal succeeds), fails too.
 async fn renew_registration(
     session: Arc<CassandraSession>,
     cql: String,
     values: cdrs_tokio::query::QueryValues,
     times: RegistrationTimes,
+    registered: Instant,
     lost: watch::Sender<Option<String>>,
 ) {
-    renew_with(times, lost, || {
+    renew_with(times, registered, lost, || {
         // LOCAL_QUORUM, so a running server stays up while a remote
         // datacenter is unreachable.
         let renewal = send(
@@ -344,17 +352,18 @@ async fn renew_registration(
 /// sent before the deadline is bounded by `renew_every` and by the time left
 /// to the deadline, so the attempt at the deadline is never late; that last
 /// attempt is bounded by `renew_every`. The loss is therefore reported at
-/// most `lost_after + renew_every` after the last successful renewal was
-/// sent.
+/// most `lost_after + renew_every` after the last successful write of the
+/// row was sent, the first of them at `registered`.
 async fn renew_with<F, Fut>(
     times: RegistrationTimes,
+    registered: Instant,
     lost: watch::Sender<Option<String>>,
     mut renew: F,
 ) where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<(), String>>,
 {
-    let mut last_ok = Instant::now();
+    let mut last_ok = registered;
     let mut next = last_ok + times.renew_every;
     loop {
         let deadline = last_ok + times.lost_after;
@@ -430,7 +439,7 @@ mod tests {
                 }
             }
         };
-        tokio::spawn(super::renew_with(times, lost, renew));
+        tokio::spawn(super::renew_with(times, started, lost, renew));
         reported.changed().await.expect("reported");
         let lost_at = started.elapsed();
         // The first renewal, the one that succeeded, was sent one interval
@@ -446,6 +455,31 @@ mod tests {
         );
         let reason = reported.borrow().clone().expect("a reason");
         assert!(reason.contains("not renewed for 30 s"), "{reason}");
+    }
+
+    /// The first deadline counts from when the INSERT that registered was
+    /// sent: with that INSERT answered 10 s after its send and no renewal
+    /// answered, the loss is still reported by `lost_after + renew_every`
+    /// after the send, before a row whose TTL started at the send expires.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_deadline_counts_from_the_registrations_send() {
+        let times = super::RegistrationTimes::DEFAULT;
+        let registered = Instant::now();
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let (lost, mut reported) = watch::channel(None);
+        tokio::spawn(super::renew_with(times, registered, lost, || {
+            std::future::pending::<Result<(), String>>()
+        }));
+        reported.changed().await.expect("reported");
+        let lost_at = registered.elapsed();
+        assert!(
+            lost_at >= times.lost_after,
+            "lost {lost_at:?} after the INSERT was sent"
+        );
+        assert!(
+            lost_at <= times.lost_after + times.renew_every,
+            "lost {lost_at:?} after the INSERT was sent"
+        );
     }
 
     /// The times ADR-0023 (decision 5) and the module documentation give the
