@@ -255,6 +255,7 @@ async fn an_account_run_under_a_lapsed_lease_writes_nothing() {
     if helpers::skip_without_cassandra() {
         return;
     }
+    let _runs = super::ACCOUNT_RUNS.read().await;
     let session = session().await;
     let (prefix, _drops) = new_prefix("lapsed");
     let catalog = format!("{prefix}_catalog");
