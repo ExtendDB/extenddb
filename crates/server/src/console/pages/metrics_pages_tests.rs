@@ -23,6 +23,10 @@ use crate::management::CallerIdentity;
 /// column, so both accounts' rows come back from one store read.
 const TABLES: [&str; 2] = ["orders-account-a", "orders-account-b"];
 
+/// The index every fake row is recorded against, so a test can check that a
+/// response carries no index name.
+const INDEX: &str = "orders-by-status";
+
 /// Metrics store holding one latency row per table in `TABLES`. It counts
 /// reads, so a test can tell whether the handler reached the store.
 #[derive(Default)]
@@ -50,7 +54,7 @@ impl MetricsStore for FakeMetricsStore {
                 bucket,
                 metric: "SuccessfulRequestLatency".to_owned(),
                 table_name: Some((*table).to_owned()),
-                index_name: None,
+                index_name: Some(INDEX.to_owned()),
                 operation: Some("GetItem".to_owned()),
                 sum: 1_500.0,
                 count: 3,
@@ -125,6 +129,7 @@ async fn iam_user_gets_403_and_no_metrics_from_the_data_feed() {
     for table in TABLES {
         assert!(!body.contains(table), "403 body names {table}: {body}");
     }
+    assert!(!body.contains(INDEX), "403 body names an index: {body}");
     assert!(
         !body.contains("GetItem"),
         "403 body names an operation: {body}"
@@ -159,6 +164,18 @@ async fn admin_gets_every_accounts_rows_from_the_data_feed() {
             "admin feed lacks {table}: {tables:?}"
         );
     }
+    let indexes: Vec<&str> = body["metrics"]
+        .as_array()
+        .expect("metrics array")
+        .iter()
+        .filter_map(|m| m["dimensions"].as_array())
+        .flatten()
+        .filter_map(|d| d["GlobalSecondaryIndexName"].as_str())
+        .collect();
+    assert!(
+        indexes.contains(&INDEX),
+        "admin feed lacks {INDEX}: {indexes:?}"
+    );
     assert_eq!(body["segments"][0]["operation"], "GetItem", "{body}");
 }
 

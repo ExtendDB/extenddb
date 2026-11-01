@@ -807,7 +807,7 @@ The management web console is served at `/console/` on the same port as the Dyna
 - **Group management**: Create, delete groups; add/remove members
 - **Role management**: Create, delete roles; view trust policies
 - **Policy management**: Add, delete inline policies with JSON editor
-- **Metrics dashboard**: Operation metrics for every account, with charts (admin only; IAM users are redirected to the dashboard)
+- **Metrics dashboard**: Operation metrics for every account, with charts (admin only; an IAM-user session is redirected to the console home page, `/console`)
 
 ### Authentication
 
