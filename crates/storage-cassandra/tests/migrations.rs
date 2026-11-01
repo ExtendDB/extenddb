@@ -490,6 +490,55 @@ async fn init_refuses_a_foreign_keyspace_before_it_creates_its_role() {
     );
 }
 
+/// `migrate --yes` tells whether the keyspace is a catalog before it takes
+/// the lock from the ledgers and settings alone, so the status's reads for
+/// the pending migrations, which for migration 2 read every principal's
+/// policies, run under the lock and inside `--lock-timeout`: with migration
+/// 2 pending and the policy table gone, the lock is taken, and the status
+/// under the lock is the read that fails.
+#[tokio::test]
+async fn the_check_before_the_lock_reads_no_policy() {
+    if helpers::skip_without_cassandra() {
+        return;
+    }
+    let session = session().await;
+    let (prefix, _drops) = new_prefix("prelock");
+    deployment(&session, &prefix).await;
+    let migrations = CassandraCatalogMigrations;
+    let target = target_of(&prefix);
+    let lock = migrations.lock(&target, TIMEOUT).await.expect("lock");
+    migrations
+        .forget(&lock, 2)
+        .await
+        .expect("forget migration 2");
+    migrations.release(lock).await;
+    // A user, whose policies migration 2's read looks up.
+    cql(
+        &session,
+        &format!(
+            "INSERT INTO {prefix}_catalog.iam_users (account_id, user_name, user_arn, created_at) \
+             VALUES ('111111111111', 'reader', 'arn:aws:iam::111111111111:user/reader', \
+             toTimestamp(now()))"
+        ),
+    )
+    .await;
+    cql(
+        &session,
+        &format!("DROP TABLE {prefix}_catalog.iam_policies"),
+    )
+    .await;
+    let lock = migrations
+        .lock(&target, TIMEOUT)
+        .await
+        .expect("the lock, taken before any policy is read");
+    let status = migrations.status_under_lock(&lock, &target).await;
+    migrations.release(lock).await;
+    match status {
+        Err(e) => assert!(e.to_string().contains("iam_policies"), "{e}"),
+        Ok(status) => panic!("the status under the lock read no policy: {status:?}"),
+    }
+}
+
 /// The rows `system_auth.roles` holds for `role`.
 async fn role_rows(session: &CassandraSession, role: &str) -> usize {
     session

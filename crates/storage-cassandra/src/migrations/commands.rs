@@ -133,15 +133,24 @@ impl CatalogMigrations for CassandraCatalogMigrations {
     /// servers sees the lock and exits 6. An
     /// uninitialized keyspace that holds another program's tables or
     /// `settings` rows is refused before anything is written to it, and
-    /// named, since `init` refuses it too. A keyspace without the catalog's
+    /// named, since `init` refuses it too; whether it is uninitialized is
+    /// read from its ledgers and settings alone, as on MongoDB, so nothing
+    /// before the lock reads the policies. A keyspace without the catalog's
     /// `settings` table is not a catalog; `init` creates it before it takes
     /// the lock.
     async fn lock(&self, target: &Target, timeout: Duration) -> Result<HeldLock, MigrationError> {
         let deployment = Deployment::from_target(target)?;
         let session = deployment.connect().await?;
         let catalog = deployment.catalog_keyspace();
-        let status = catalog_status(session.clone(), &deployment.keyspace_prefix).await?;
-        refuse_foreign(&session, &deployment, &status).await?;
+        // Whether this is a catalog, from its ledgers and settings alone:
+        // the full status runs the pending migrations' `detect`, which for
+        // migration 2 reads every principal's policies, and would run here
+        // outside `timeout`. The status under the lock runs it.
+        let migrations =
+            CassandraMigrations::for_status(session.clone(), &deployment.keyspace_prefix);
+        if !Runner::new(&migrations, "").initialized().await? {
+            refuse_foreign(&session, &deployment, &CatalogStatus::Uninitialized).await?;
+        }
         if !has_columns(&session, &catalog, "settings", &["key", "value"]).await? {
             return Err(MigrationError::Status(CatalogStatus::Uninitialized));
         }
