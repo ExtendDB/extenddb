@@ -482,3 +482,31 @@ fn the_password_variable_is_the_backends_own() {
         role("pg_admin", None)
     );
 }
+
+/// The preview lists a body that runs in several stores of one kind once,
+/// with the number of stores, as the advice does: a deployment with many
+/// account keyspaces gets one line per migration, not one per keyspace.
+#[test]
+fn the_preview_lists_a_body_for_many_stores_once() {
+    let pending_in = |store: StoreKind, store_name: &str| Pending {
+        id: 1,
+        name: "baseline",
+        store,
+        store_name: store_name.to_owned(),
+        kind: Kind::Breaking,
+    };
+    let mut pending = vec![pending_in(StoreKind::Catalog, "acme_catalog")];
+    for n in 0..4 {
+        pending.push(pending_in(StoreKind::Account, &format!("acme_account_{n}")));
+    }
+    let lines = super::pending_lines(&pending);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines[0].starts_with("  1 baseline (catalog, breaking): "),
+        "{lines:?}"
+    );
+    assert!(
+        lines[1].starts_with("  1 baseline (account in 4 stores, breaking): "),
+        "{lines:?}"
+    );
+}

@@ -21,8 +21,8 @@ use std::time::Duration;
 use extenddb_config as config;
 use extenddb_storage::migrations::advice::{self, Advice, AdviceFor};
 use extenddb_storage::migrations::{
-    AdminRole, CatalogMigrations, CatalogStatus, Listed, MigrationError, MigrationId, RunKind,
-    RunReport, Target, before_lock, exit, forget_locked, run_locked,
+    AdminRole, CatalogMigrations, CatalogStatus, Listed, MigrationError, MigrationId, Pending,
+    RunKind, RunReport, Target, before_lock, exit, forget_locked, run_locked,
 };
 
 use crate::cmd_migrate::MigrateArgs;
@@ -231,16 +231,8 @@ async fn preview(
                 ),
             }
             println!("Pending:");
-            for p in pending {
-                let description =
-                    MigrationId::from_number(p.id).map_or("", MigrationId::description);
-                println!(
-                    "  {} {} ({}, {}): {description}",
-                    p.id,
-                    p.name,
-                    p.store.as_str(),
-                    p.kind.as_str()
-                );
+            for line in pending_lines(pending) {
+                println!("{line}");
             }
             println!();
             println!(
@@ -255,6 +247,25 @@ async fn preview(
         }
     }
     Ok(status.exit_code())
+}
+
+/// The preview's lines for `pending`, one per id, kind of store and kind:
+/// a body that runs in several stores of one kind, as in each of
+/// Cassandra's account keyspaces, is one line with the number of stores.
+fn pending_lines(pending: &[Pending]) -> Vec<String> {
+    advice::grouped(pending)
+        .into_iter()
+        .map(|(p, stores)| {
+            let description = MigrationId::from_number(p.id).map_or("", MigrationId::description);
+            format!(
+                "  {} {} ({}, {}): {description}",
+                p.id,
+                p.name,
+                advice::stores_label(p, stores),
+                p.kind.as_str()
+            )
+        })
+        .collect()
 }
 
 /// Take the lock, run, and print what the run did.

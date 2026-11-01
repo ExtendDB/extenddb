@@ -199,12 +199,12 @@ fn capitalized(text: &str) -> String {
     })
 }
 
-/// `Pending (all breaking): 2 name (catalog), ...`, or each kind beside its
-/// migration when the kinds differ.
-fn pending_line(pending: &[Pending]) -> String {
-    // One item per id and kind of store: a body that runs in several stores
-    // of one kind (Cassandra's account keyspaces) is named once, with the
-    // number of stores.
+/// `pending` with one entry per id, kind of store and kind, in their first
+/// order, and the number of stores each entry stands for: a body that runs
+/// in several stores of one kind (Cassandra's account keyspaces) is listed
+/// once.
+#[must_use]
+pub fn grouped(pending: &[Pending]) -> Vec<(&Pending, usize)> {
     let mut groups: Vec<(&Pending, usize)> = Vec::new();
     for p in pending {
         match groups
@@ -215,14 +215,28 @@ fn pending_line(pending: &[Pending]) -> String {
             None => groups.push((p, 1)),
         }
     }
+    groups
+}
+
+/// The kind of store of a [`grouped`] entry, with the number of stores
+/// when it stands for more than one: `account in 4 stores`.
+#[must_use]
+pub fn stores_label(pending: &Pending, stores: usize) -> String {
+    match stores {
+        1 => pending.store.as_str().to_owned(),
+        n => format!("{} in {n} stores", pending.store.as_str()),
+    }
+}
+
+/// `Pending (all breaking): 2 name (catalog), ...`, or each kind beside its
+/// migration when the kinds differ.
+fn pending_line(pending: &[Pending]) -> String {
+    let groups = grouped(pending);
     let same = groups.windows(2).all(|w| w[0].0.kind == w[1].0.kind);
     let items: Vec<String> = groups
         .iter()
         .map(|(p, stores)| {
-            let store = match stores {
-                1 => p.store.as_str().to_owned(),
-                n => format!("{} in {n} stores", p.store.as_str()),
-            };
+            let store = stores_label(p, *stores);
             if same {
                 format!("{} {} ({store})", p.id, p.name)
             } else {
