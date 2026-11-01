@@ -1473,14 +1473,11 @@ impl ManagementStore for MongoCatalogStore {
                 })
                 .with_options(opts)
                 .await
-                .map_err(|e| {
-                    tracing::error!("list_policy_documents: {e}");
-                    OpError::Internal("Database error".to_owned())
-                })?;
-            let docs: Vec<Document> = cursor.try_collect().await.map_err(|e| {
-                tracing::error!("list_policy_documents cursor: {e}");
-                OpError::Internal("Database error".to_owned())
-            })?;
+                .map_err(|e| OpError::Internal(format!("list_policy_documents: {e}")))?;
+            let docs: Vec<Document> = cursor
+                .try_collect()
+                .await
+                .map_err(|e| OpError::Internal(format!("list_policy_documents: {e}")))?;
             Ok(docs
                 .iter()
                 .map(|d| {
@@ -1653,10 +1650,7 @@ impl ManagementStore for MongoCatalogStore {
                     "principal_name": &principal_name,
                 })
                 .await
-                .map_err(|e| {
-                    tracing::error!("boundary_document: {e}");
-                    OpError::Internal("Database error".to_owned())
-                })?;
+                .map_err(|e| OpError::Internal(format!("boundary_document: {e}")))?;
             Ok(doc.as_ref().map(stored_document))
         })
     }
