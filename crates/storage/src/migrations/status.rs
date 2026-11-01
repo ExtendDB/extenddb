@@ -94,10 +94,16 @@ pub fn stores_behind(pending: &[Pending]) -> Option<(u32, Vec<(&Pending, u32)>)>
     (!behind.is_empty()).then_some((catalog_at, behind))
 }
 
+/// How many stores [`behind_line`] names before it counts the others.
+pub const BEHIND_NAMED: usize = 5;
+
 /// What a `Behind` status says first when [`stores_behind`] names stores:
 /// `account store x is at migration 0, behind the catalog store at
 /// migration 4`, or for several, `account store x (at migration 0) and data
 /// store y (at migration 3) are behind the catalog store at migration 4`.
+/// Past [`BEHIND_NAMED`] stores, the others are counted: `account store a
+/// (at migration 0), ..., account store e (at migration 0) and 995 more
+/// stores are behind the catalog store at migration 4`.
 #[must_use]
 pub fn behind_line(catalog_at: u32, behind: &[(&Pending, u32)]) -> String {
     let named = |p: &Pending| format!("{} store {}", p.store.as_str(), p.store_name);
@@ -109,9 +115,15 @@ pub fn behind_line(catalog_at: u32, behind: &[(&Pending, u32)]) -> String {
     }
     let mut items: Vec<String> = behind
         .iter()
+        .take(BEHIND_NAMED)
         .map(|(p, at)| format!("{} (at migration {at})", named(p)))
         .collect();
-    let last = items.pop().unwrap_or_default();
+    let more = behind.len().saturating_sub(BEHIND_NAMED);
+    let last = match more {
+        0 => items.pop().unwrap_or_default(),
+        1 => "1 more store".to_owned(),
+        n => format!("{n} more stores"),
+    };
     format!(
         "{} and {last} are behind the catalog store at migration {catalog_at}",
         items.join(", ")
@@ -342,5 +354,52 @@ impl MigrationError {
             | Self::Locked(_)
             | Self::Blocked(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BEHIND_NAMED, Pending, behind_line};
+    use crate::migrations::table::{Kind, StoreKind};
+
+    fn account(n: usize) -> Pending {
+        Pending {
+            id: 1,
+            name: "baseline",
+            store: StoreKind::Account,
+            store_name: format!("ks_account_{n}"),
+            kind: Kind::Breaking,
+        }
+    }
+
+    /// Two stores are both named; past `BEHIND_NAMED` the others are
+    /// counted, as on a deployment with many account keyspaces behind.
+    #[test]
+    fn the_behind_line_names_a_few_stores_and_counts_the_others() {
+        let two: Vec<Pending> = (1..=2).map(account).collect();
+        let behind: Vec<(&Pending, u32)> = two.iter().map(|p| (p, 0)).collect();
+        assert_eq!(
+            behind_line(4, &behind),
+            "account store ks_account_1 (at migration 0) and account store ks_account_2 (at \
+             migration 0) are behind the catalog store at migration 4"
+        );
+
+        let many: Vec<Pending> = (1..=1000).map(account).collect();
+        let behind: Vec<(&Pending, u32)> = many.iter().map(|p| (p, 0)).collect();
+        let line = behind_line(4, &behind);
+        assert!(
+            line.starts_with("account store ks_account_1 (at migration 0), ")
+                && line.contains("ks_account_5 (at migration 0) and 995 more stores are behind")
+                && !line.contains("ks_account_6"),
+            "{line}"
+        );
+
+        let one_more: Vec<Pending> = (1..=BEHIND_NAMED + 1).map(account).collect();
+        let behind: Vec<(&Pending, u32)> = one_more.iter().map(|p| (p, 0)).collect();
+        assert!(
+            behind_line(4, &behind).contains(" and 1 more store are behind"),
+            "{}",
+            behind_line(4, &behind)
+        );
     }
 }
