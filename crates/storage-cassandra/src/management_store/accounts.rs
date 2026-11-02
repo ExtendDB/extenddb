@@ -136,14 +136,6 @@ impl CassandraCatalogStore {
             "delete_account_backup_index",
         )
         .await?;
-        // continuous_backups uses plain INSERT — plain DELETE is safe
-        crate::cassandra_util::execute::<OpError>(
-            self.session(),
-            &format!("DELETE FROM {catalog_keyspace}.continuous_backups WHERE account_id = ?"),
-            cdrs_tokio::query_values!(account_id),
-            "delete_account_continuous_backups",
-        )
-        .await?;
 
         crate::cassandra_util::apply_lwt(
             self.session(),

@@ -8,9 +8,9 @@
 //!   (`PostgresEngine::prepare_catalog_for_serve`), waiting at most a few
 //!   seconds for the table lock, and keeps the default; `extenddb migrate`
 //!   reports and applies both steps.
-//! - A catalog stamped 0.0.4 by a different `003_*` file: `serve` refuses it
-//!   naming this binary's 003; `extenddb migrate` reports that file as
-//!   pending and applies it.
+//! - A catalog stamped with the current version whose ledger records a
+//!   different `003_*` file: `serve` refuses it naming this binary's 003;
+//!   `extenddb migrate` reports that file as pending and applies it.
 //!
 //! Requires `EXTENDDB_TEST_PG_CONNECTION_STRING` (a base URL
 //! `postgres://user:pass@host:port`, no database); without it every test
@@ -108,8 +108,9 @@ impl Drop for DbGuard {
 
 impl Scratch {
     /// A catalog with 001 and 002 applied and recorded, then `third`
-    /// applied and recorded under `third_name`; and a data database with
-    /// every data migration applied and recorded.
+    /// applied and recorded under `third_name`, then this binary's 004,
+    /// which stamps the current version; and a data database with every
+    /// data migration applied and recorded.
     async fn new(third_name: &str, third: &str) -> Self {
         let base = base_conn().expect("caller checks base_conn() first");
         let stem = format!("eddb_conv_{}", uuid::Uuid::new_v4().simple())[..24].to_owned();
@@ -144,6 +145,10 @@ impl Scratch {
                 include_str!("../migrations/002_vector_indexes.sql"),
             ),
             (third_name, third),
+            (
+                "004_drop_continuous_backups.sql",
+                include_str!("../migrations/004_drop_continuous_backups.sql"),
+            ),
         ] {
             sqlx::raw_sql(sql).execute(&catalog).await.expect(file);
             sqlx::query("INSERT INTO schema_history (filename) VALUES ($1)")
@@ -305,7 +310,10 @@ async fn an_earlier_0_0_4_catalog_converges_at_serve_and_describe_table_works() 
         return;
     }
     let s = Scratch::new("003_backup_definitions.sql", EARLIER_003).await;
-    assert_eq!(s.catalog_version().await, "0.0.4");
+    assert_eq!(
+        s.catalog_version().await,
+        extenddb_storage_postgres::CATALOG_VERSION.to_string()
+    );
     assert_eq!(s.column_default("source_table_arn").await, None);
     assert!(
         matches!(s.column_default("restore_date_time").await, Some(Some(_))),
@@ -509,8 +517,9 @@ async fn migrate_converges_an_earlier_0_0_4_catalog() {
     s.cleanup().await;
 }
 
-/// A catalog stamped 0.0.4 by another branch's `003_*` (recorded under its
-/// own filename). The version matches, but this binary's 003 is unrecorded:
+/// A catalog that ran another branch's `003_*` (recorded under its own
+/// filename) and is stamped with the current version. The version matches,
+/// but this binary's 003 is unrecorded:
 /// `serve` refuses to start, naming the file and `extenddb migrate --yes`,
 /// and changes nothing; `migrate` reports it and applies it; afterwards
 /// nothing is pending, serve starts, and DescribeTable works.
@@ -525,7 +534,10 @@ async fn an_unrecorded_catalog_migration_is_pending_even_at_the_current_version(
         "UPDATE settings SET value = '0.0.4' WHERE key = 'catalog_version';",
     )
     .await;
-    assert_eq!(s.catalog_version().await, "0.0.4");
+    assert_eq!(
+        s.catalog_version().await,
+        extenddb_storage_postgres::CATALOG_VERSION.to_string()
+    );
     let b = s.bootstrapper();
     assert_eq!(
         b.read_catalog_version().await.expect("version").as_deref(),
@@ -591,11 +603,14 @@ async fn serve_refuses_an_unreadable_catalog_version_with_the_shared_refusal() {
         eprintln!("SKIP serve_refuses_an_unreadable_catalog_version: no PostgreSQL");
         return;
     }
-    let s = Scratch::new(
-        "003_tampered_version.sql",
-        "UPDATE settings SET value = 'garbage' WHERE key = 'catalog_version';",
-    )
-    .await;
+    let tamper = "UPDATE settings SET value = 'garbage' WHERE key = 'catalog_version';";
+    let s = Scratch::new("003_tampered_version.sql", tamper).await;
+    // The 004 that Scratch applies after the third file stamps the current
+    // version, so the tampered value is written again last.
+    sqlx::raw_sql(tamper)
+        .execute(&s.catalog)
+        .await
+        .expect("tamper the version");
     assert_eq!(s.catalog_version().await, "garbage");
     let expected = extenddb_storage::util::check_stored_catalog_version(
         Some("garbage"),

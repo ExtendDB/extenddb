@@ -140,19 +140,6 @@ impl CassandraEngine {
             )
             .await?;
 
-            let continuous_backup_delete = format!(
-                "DELETE FROM {catalog_keyspace}.continuous_backups WHERE account_id = ? AND table_name = ?"
-            );
-            self.session
-                .query_with_values(
-                    &continuous_backup_delete,
-                    cdrs_tokio::query_values!(account_id.as_str(), table_name.as_str()),
-                )
-                .await
-                .map_err(|e| {
-                    StorageError::Internal(format!("Failed to delete continuous backup state: {e}"))
-                })?;
-
             // Delete table row — LWT to avoid mixing plain/LWT writes on a row
             // created with IF NOT EXISTS. See ADR-0021.
             let table_delete = format!(

@@ -31,8 +31,9 @@
 //! 3. Add the migration to the `CATALOG_MIGRATIONS` array below
 //! 4. Migrations are embedded at compile time via `include_str!()`
 //! 5. Name tables without a keyspace. The runner writes the keyspace it
-//!    migrates into each `CREATE TABLE`, `CREATE INDEX`, `ALTER TABLE` and
-//!    `INSERT INTO` statement, and rejects any other statement form.
+//!    migrates into each `CREATE TABLE`, `CREATE INDEX`, `ALTER TABLE`,
+//!    `DROP TABLE IF EXISTS` and `INSERT INTO` statement, and rejects any
+//!    other statement form.
 
 use cdrs_tokio::cluster::TcpConnectionManager;
 use cdrs_tokio::cluster::session::Session;
@@ -86,6 +87,10 @@ pub(crate) const CATALOG_MIGRATIONS: &[(&str, &str)] = &[
     (
         "V005__backup_definitions_and_restore_registration.cql",
         include_str!("../migrations/catalog/V005__backup_definitions_and_restore_registration.cql"),
+    ),
+    (
+        "V006__drop_continuous_backups.cql",
+        include_str!("../migrations/catalog/V006__drop_continuous_backups.cql"),
     ),
 ];
 
@@ -256,8 +261,9 @@ pub fn migration_statements(keyspace: &str, filename: &str, sql: &str) -> OpResu
 /// `statement` with the table it names written as `keyspace.table`.
 ///
 /// Recognises `CREATE TABLE [IF NOT EXISTS]`,
-/// `CREATE INDEX [IF NOT EXISTS] [name] ON`, `ALTER TABLE [IF EXISTS]` and
-/// `INSERT INTO`, each naming an unquoted table without a keyspace. Any other
+/// `CREATE INDEX [IF NOT EXISTS] [name] ON`, `ALTER TABLE [IF EXISTS]`,
+/// `DROP TABLE IF EXISTS` and `INSERT INTO`, each naming an unquoted table
+/// without a keyspace. Any other
 /// statement is an error naming `filename`, so no statement runs in whatever
 /// keyspace the session has selected.
 fn qualify_statement(keyspace: &str, filename: &str, statement: &str) -> OpResult<String> {
@@ -322,6 +328,12 @@ fn table_name_offset(body: &str) -> Option<usize> {
             .is_some()
             && !is(words.next(), "EXISTS")
         {
+            return None;
+        }
+    } else if is(first, "DROP") && is(second, "TABLE") {
+        // Only the form a replay can run again: the runner applies a file and
+        // records it as two separate writes, so a file can be applied twice.
+        if !(is(words.next(), "IF") && is(words.next(), "EXISTS")) {
             return None;
         }
     } else if !(is(first, "INSERT") && is(second, "INTO")) {
@@ -441,6 +453,37 @@ mod tests {
         assert!(super::migration_version("005_x.cql").is_err());
     }
 
+    /// The runner writes no catalog version of its own: the version a run
+    /// leaves is the one the last file writes, and `extenddb migrate`
+    /// compares it with `CATALOG_VERSION`. A file left out of
+    /// `CATALOG_MIGRATIONS`, or a bump without its file, leaves a stored
+    /// version every later run reports as pending and none converges.
+    #[test]
+    fn the_last_catalog_migration_writes_the_compiled_catalog_version() {
+        let (filename, sql) = super::CATALOG_MIGRATIONS
+            .last()
+            .expect("at least one catalog migration");
+        let write = format!(
+            "INSERT INTO settings (key, value) VALUES ('catalog_version', '{}')",
+            crate::CATALOG_VERSION
+        );
+        assert!(
+            sql.contains(&write),
+            "{filename} is the last catalog migration and does not write {}",
+            crate::CATALOG_VERSION
+        );
+        let versions: Vec<_> = super::CATALOG_MIGRATIONS
+            .iter()
+            .filter(|(_, sql)| sql.contains("('catalog_version', '"))
+            .map(|(filename, _)| *filename)
+            .collect();
+        assert_eq!(
+            versions.last(),
+            Some(filename),
+            "the last version write is not in the last file: {versions:?}"
+        );
+    }
+
     #[test]
     fn qualifies_each_statement_form_with_the_keyspace() {
         for (statement, qualified) in [
@@ -484,6 +527,14 @@ mod tests {
                 "-- Seed settings\n// two comments\nINSERT INTO settings (key) VALUES ('a')",
                 "-- Seed settings\n// two comments\nINSERT INTO ks_a.settings (key) VALUES ('a')",
             ),
+            (
+                "DROP TABLE IF EXISTS continuous_backups",
+                "DROP TABLE IF EXISTS ks_a.continuous_backups",
+            ),
+            (
+                "drop table if exists continuous_backups",
+                "drop table if exists ks_a.continuous_backups",
+            ),
         ] {
             let got =
                 super::qualify_statement("ks_a", "V999__test.cql", statement).expect(statement);
@@ -496,6 +547,8 @@ mod tests {
         for statement in [
             "UPDATE settings SET value = 'x' WHERE key = 'y'",
             "DROP TABLE settings",
+            "DROP TABLE IF NOT EXISTS settings",
+            "DROP TABLE IF EXISTS other.settings",
             "CREATE TABLE other.settings (key text PRIMARY KEY)",
             "CREATE TABLE \"Settings\" (key text PRIMARY KEY)",
             "CREATE TABLE IF EXISTS settings (key text PRIMARY KEY)",

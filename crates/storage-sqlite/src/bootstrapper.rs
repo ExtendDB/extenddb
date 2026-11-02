@@ -659,13 +659,14 @@ mod migrate_report_tests {
                 .expect("0.0.3 schema");
             // Stamped as an earlier 0.0.4 build left it: version current,
             // backup_items still without its cursor column.
-            sqlx::raw_sql(
+            sqlx::raw_sql(&format!(
                 "INSERT INTO backups (backup_arn, backup_name, table_id, table_name, account_id, \
                  key_schema, attribute_definitions) VALUES ('a', 'b', 't', 't', '0', '[]', '[]'); \
                  INSERT INTO backup_items (backup_arn, pk, sk, item_data) VALUES \
-                     ('a', '', NULL, '{}'), ('a', '', NULL, '{}'); \
-                 UPDATE settings SET value = '0.0.4' WHERE key = 'catalog_version';",
-            )
+                     ('a', '', NULL, '{{}}'), ('a', '', NULL, '{{}}'); \
+                 UPDATE settings SET value = '{}' WHERE key = 'catalog_version';",
+                crate::schema::CATALOG_VERSION
+            ))
             .execute(&pool)
             .await
             .expect("rows");
