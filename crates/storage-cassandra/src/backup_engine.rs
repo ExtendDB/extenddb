@@ -63,10 +63,9 @@ use cdrs_tokio::query::BatchQueryBuilder;
 use cdrs_tokio::types::map::Map;
 use cdrs_tokio::types::{AsRust, IntoRustByName, rows::Row};
 use extenddb_core::types::{
-    AttributeDefinition, BackupDescription, BackupDetails, BackupSummary,
-    ContinuousBackupsDescription, DeleteTableInput, GsiInput, KeySchemaElement, LsiInput,
-    PointInTimeRecoveryDescription, ProvisionedThroughput, SourceTableDetails, TableDescription,
-    TableKeyInfo,
+    AttributeDefinition, BackupDescription, BackupDetails, BackupSummary, DeleteTableInput,
+    GsiInput, KeySchemaElement, LsiInput, ProvisionedThroughput, SourceTableDetails,
+    TableDescription, TableKeyInfo,
 };
 use extenddb_storage::backup_definition::{
     BACKUP_DEFINITION_VERSION, BackupTableDefinition, throughput_from_catalog,
@@ -572,27 +571,6 @@ impl CassandraEngine {
             time_to_live: Some(time_to_live),
             stream_specification: table.stream_specification.clone(),
         })
-    }
-
-    async fn table_exists_for_backup(
-        &self,
-        account_id: &str,
-        table_name: &str,
-    ) -> Result<bool, StorageError> {
-        let query = format!(
-            "SELECT table_name FROM {}.tables WHERE account_id = ? AND table_name = ?",
-            self.catalog_keyspace()
-        );
-        let rows = self
-            .session
-            .query_with_values(&query, cdrs_tokio::query_values!(account_id, table_name))
-            .await
-            .map_err(|e| StorageError::Internal(format!("Query table: {e}")))?
-            .response_body()
-            .map_err(|e| StorageError::Internal(format!("Parse table response: {e}")))?
-            .into_rows()
-            .unwrap_or_default();
-        Ok(!rows.is_empty())
     }
 
     // ── Restore registration ────────────────────────────────────────────────
@@ -1870,100 +1848,6 @@ impl BackupEngine for CassandraEngine {
             registered_rx.await.map_err(|_| {
                 StorageError::Internal("restore task ended before registering".to_owned())
             })?
-        })
-    }
-
-    fn describe_continuous_backups(
-        &self,
-        account_id: &str,
-        table_name: &str,
-    ) -> BoxFuture<'_, Result<ContinuousBackupsDescription, StorageError>> {
-        let account_id = account_id.to_owned();
-        let table_name = table_name.to_owned();
-        Box::pin(async move {
-            if !self
-                .table_exists_for_backup(&account_id, &table_name)
-                .await?
-            {
-                return Err(StorageError::TableNotFound(format!(
-                    "Table not found: {table_name}"
-                )));
-            }
-            let query = format!(
-                "SELECT pitr_enabled FROM {}.continuous_backups WHERE account_id = ? AND table_name = ?",
-                self.catalog_keyspace()
-            );
-            let rows = self
-                .session
-                .query_with_values(
-                    &query,
-                    cdrs_tokio::query_values!(account_id.as_str(), table_name.as_str()),
-                )
-                .await
-                .map_err(|e| StorageError::Internal(format!("Query continuous backups: {e}")))?
-                .response_body()
-                .map_err(|e| StorageError::Internal(format!("Parse continuous backups: {e}")))?
-                .into_rows()
-                .unwrap_or_default();
-            let pitr_enabled = rows
-                .first()
-                .and_then(|row| {
-                    let value: Result<bool, _> = row.get_r_by_name("pitr_enabled");
-                    value.ok()
-                })
-                .unwrap_or(false);
-            let now =
-                crate::cassandra_util::millis_to_seconds_f64(crate::cassandra_util::now_millis());
-            Ok(ContinuousBackupsDescription {
-                continuous_backups_status: "ENABLED".to_owned(),
-                point_in_time_recovery_description: Some(PointInTimeRecoveryDescription {
-                    point_in_time_recovery_status: if pitr_enabled {
-                        "ENABLED".to_owned()
-                    } else {
-                        "DISABLED".to_owned()
-                    },
-                    earliest_restorable_date_time: pitr_enabled
-                        .then_some(now - 35.0 * 24.0 * 3_600.0),
-                    latest_restorable_date_time: pitr_enabled.then_some(now),
-                }),
-            })
-        })
-    }
-
-    fn update_continuous_backups(
-        &self,
-        account_id: &str,
-        table_name: &str,
-        pitr_enabled: bool,
-    ) -> BoxFuture<'_, Result<ContinuousBackupsDescription, StorageError>> {
-        let account_id = account_id.to_owned();
-        let table_name = table_name.to_owned();
-        Box::pin(async move {
-            if !self
-                .table_exists_for_backup(&account_id, &table_name)
-                .await?
-            {
-                return Err(StorageError::TableNotFound(format!(
-                    "Table not found: {table_name}"
-                )));
-            }
-            let query = format!(
-                "INSERT INTO {}.continuous_backups (account_id, table_name, pitr_enabled) VALUES (?, ?, ?)",
-                self.catalog_keyspace()
-            );
-            self.session
-                .query_with_values(
-                    &query,
-                    cdrs_tokio::query_values!(
-                        account_id.as_str(),
-                        table_name.as_str(),
-                        pitr_enabled
-                    ),
-                )
-                .await
-                .map_err(|e| StorageError::Internal(format!("Update continuous backups: {e}")))?;
-            self.describe_continuous_backups(&account_id, &table_name)
-                .await
         })
     }
 }

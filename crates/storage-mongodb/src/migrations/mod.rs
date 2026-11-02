@@ -35,6 +35,9 @@ mod registrations;
 #[rustfmt::skip]
 #[allow(clippy::all, deprecated)]
 mod m0001_baseline;
+#[rustfmt::skip]
+#[allow(clippy::all, deprecated)]
+mod m0005_drop_continuous_backups;
 mod postcheck;
 
 use std::time::Duration;
@@ -125,6 +128,15 @@ pub fn migration(id: MigrationId) -> Migration<MongoStores> {
         MigrationId::IndexTableBaseKey => Migration::NotApplicable(
             "index collections get their compound index when they are created",
         ),
+        MigrationId::DropContinuousBackups => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![StoreBody::code(
+                StoreKind::Catalog,
+                &m0005_drop_continuous_backups::DropContinuousBackups,
+                m0005_drop_continuous_backups::SOURCE,
+            )],
+        },
     }
 }
 

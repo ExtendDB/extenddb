@@ -211,8 +211,8 @@ extenddb uses a dual-database architecture:
 - **Catalog database** (e.g., `extenddb_catalog`): Stores table metadata, account/user/group/role/policy definitions, access keys, settings, stream metadata, and metrics. Shared across all accounts.
 - **Data database** (e.g., `extenddb_catalog_data`): Stores user items, GSI/LSI data, and stream records. Each table gets its own PostgreSQL table.
 
-On PostgreSQL, SQLite, Cassandra and MongoDB the catalog is versioned by its migration ledger, the `extenddb_migrations` table (on MongoDB a collection, in the catalog database and in the data database): the catalog version is the highest migration recorded in every store, migration 4 for this release, and `serve` reads the catalog's status at startup and refuses a catalog that carries a breaking migration it does not know, and one that is behind it unless it runs under `[server] catalog_upgrade = "apply"` or `--migrate`. On Cassandra every account keyspace has a ledger beside the catalog keyspace's.
-A catalog behind the binary stops a server under `refuse`, the default in a production build; run `extenddb migrate --yes` to upgrade it, or start the server with `--migrate`.
+On PostgreSQL, SQLite, Cassandra and MongoDB the catalog is versioned by its migration ledger, the `extenddb_migrations` table (on MongoDB a collection, in the catalog database and in the data database): the catalog version is the highest migration recorded in every store, and `serve` reads the catalog's status at startup and refuses a catalog that carries a breaking migration it does not know, and one that is behind it unless it runs under `[server] catalog_upgrade = "apply"` or `--migrate`. On Cassandra every account keyspace has a ledger beside the catalog keyspace's.
+A server that refuses its catalog prints the status and the command that resolves it. A catalog behind the binary stops a server under `refuse`, the default in a production build; run `extenddb migrate --yes` to upgrade it, or start the server with `--migrate`.
 
 ## Pluggable Architecture
 

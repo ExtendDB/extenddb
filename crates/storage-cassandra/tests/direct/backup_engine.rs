@@ -596,33 +596,6 @@ async fn test_table_name_filter_spans_table_recreation() {
         .expect("delete backup");
 }
 
-#[tokio::test]
-async fn test_continuous_backup_state() {
-    if crate::helpers::skip_without_cassandra() {
-        return;
-    }
-    let engine = setup_engine().await;
-    let table = TestTable::new(&engine, "ContinuousBackupState", false).await;
-
-    let initial = engine
-        .describe_continuous_backups(&table.key_info.account_id, &table.key_info.table_name)
-        .await
-        .expect("describe default continuous backup state");
-    assert_eq!(initial.continuous_backups_status, "ENABLED");
-    let initial_pitr = initial.point_in_time_recovery_description.unwrap();
-    assert_eq!(initial_pitr.point_in_time_recovery_status, "DISABLED");
-    assert!(initial_pitr.earliest_restorable_date_time.is_none());
-
-    let enabled = engine
-        .update_continuous_backups(&table.key_info.account_id, &table.key_info.table_name, true)
-        .await
-        .expect("enable PITR state");
-    let enabled_pitr = enabled.point_in_time_recovery_description.unwrap();
-    assert_eq!(enabled_pitr.point_in_time_recovery_status, "ENABLED");
-    assert!(enabled_pitr.earliest_restorable_date_time.is_some());
-    assert!(enabled_pitr.latest_restorable_date_time.is_some());
-}
-
 /// (a) A table with a GSI (sparse, INCLUDE projection) and an LSI, more than
 /// one backup bucket of items: the restore reaches ACTIVE with every item,
 /// and a Query on each index returns exactly what it returns on the source.

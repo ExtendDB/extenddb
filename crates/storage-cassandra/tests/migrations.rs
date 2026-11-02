@@ -45,7 +45,7 @@ use migrations_support::{TIMEOUT, cql, keyspace, new_prefix, pinned_session, ses
 /// lease's 30 s stall. `init`'s own process runs no other account migration.
 static ACCOUNT_RUNS: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
 
-/// A catalog keyspace at migration 4 and one account keyspace.
+/// A catalog keyspace at the latest migration and one account keyspace.
 async fn deployment(session: &Arc<CassandraSession>, prefix: &str) -> String {
     keyspace(session, &format!("{prefix}_catalog")).await;
     migrate_catalog_keyspace(session.clone(), prefix, "test", TIMEOUT)
@@ -125,7 +125,9 @@ async fn two_migrators_started_together_apply_a_legacy_catalog_once() {
         catalog_status(second_node.clone(), &prefix)
             .await
             .expect("status"),
-        CatalogStatus::Current { version: 4 }
+        CatalogStatus::Current {
+            version: MigrationId::LATEST.number()
+        }
     );
 }
 
@@ -177,8 +179,12 @@ async fn migration_1_creates_the_expected_definitions() {
             std::fs::write(&path, text).expect("write the expected file");
             continue;
         }
-        let expected: postcheck::Definitions =
+        let mut expected: postcheck::Definitions =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+        // Migration 5 drops continuous_backups, which migration 1 creates.
+        expected
+            .columns
+            .retain(|name, _| !name.starts_with("continuous_backups."));
         assert_eq!(
             postcheck::compare(&expected, &actual),
             Vec::<String>::new(),
@@ -651,7 +657,7 @@ async fn migration_1_converges_a_legacy_catalog_and_stops_on_a_table_of_another_
     let store = CassandraCatalogStore::catalog_only(session.clone(), prefix.clone());
     assert_eq!(
         store.get_setting("catalog_version").await.expect("read"),
-        Some("4".to_owned())
+        Some(MigrationId::LATEST.number().to_string())
     );
     assert_eq!(
         store
@@ -762,7 +768,9 @@ async fn create_account_runs_the_account_migrations_through_the_runner() {
         catalog_status(session.clone(), &prefix)
             .await
             .expect("status"),
-        CatalogStatus::Current { version: 4 }
+        CatalogStatus::Current {
+            version: MigrationId::LATEST.number()
+        }
     );
     // A catalog-only store refuses to create a keyspace with a guessed
     // replication.
@@ -843,7 +851,9 @@ async fn a_create_account_stopped_before_its_row_leaves_a_current_catalog_a_retr
         catalog_status(session.clone(), &prefix)
             .await
             .expect("status"),
-        CatalogStatus::Current { version: 4 },
+        CatalogStatus::Current {
+            version: MigrationId::LATEST.number()
+        },
         "the keyspace without a row is not counted"
     );
 
@@ -860,7 +870,9 @@ async fn a_create_account_stopped_before_its_row_leaves_a_current_catalog_a_retr
         catalog_status(session.clone(), &prefix)
             .await
             .expect("status"),
-        CatalogStatus::Current { version: 4 }
+        CatalogStatus::Current {
+            version: MigrationId::LATEST.number()
+        }
     );
     assert!(
         matches!(
@@ -897,7 +909,8 @@ async fn a_create_account_stopped_before_its_row_leaves_a_current_catalog_a_retr
     assert!(
         message.starts_with(&format!(
             "account store {account} is at migration 0, behind the catalog store at migration \
-             4, and ExtendDB 1.0.0-test needs migration 4."
+             {latest}, and ExtendDB 1.0.0-test needs migration {latest}.",
+            latest = MigrationId::LATEST.number()
         )),
         "{message}"
     );
@@ -1008,7 +1021,9 @@ async fn the_default_account_step_run_again_keeps_one_account_and_completes_its_
         catalog_status(session.clone(), &prefix)
             .await
             .expect("status"),
-        CatalogStatus::Current { version: 4 }
+        CatalogStatus::Current {
+            version: MigrationId::LATEST.number()
+        }
     );
 }
 
@@ -1080,7 +1095,12 @@ async fn init_finishes_a_catalog_stopped_before_its_admin_user() {
         .status_under_lock(&lock, &target)
         .await
         .expect("status");
-    assert_eq!(status, CatalogStatus::Current { version: 4 });
+    assert_eq!(
+        status,
+        CatalogStatus::Current {
+            version: MigrationId::LATEST.number()
+        }
+    );
     assert!(
         finishes_a_stopped_init(&next, &status)
             .await

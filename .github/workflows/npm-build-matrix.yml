@@ -87,9 +87,12 @@ jobs:
           ref: ${{ inputs.ref }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.97.0
-        with:
-          targets: ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.97.0 --profile minimal --target ${{ matrix.target }} --no-self-update
+          rustup default 1.97.0
+          rustc --version
 
       - name: Install the musl toolchain (linux legs build static binaries)
         if: contains(matrix.target, 'musl')

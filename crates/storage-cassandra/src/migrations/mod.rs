@@ -118,6 +118,15 @@ pub fn migration(id: MigrationId) -> Migration<CassandraStores> {
             "Cassandra index tables are keyed by their own primary key, so there is no base key \
              index to add",
         ),
+        MigrationId::DropContinuousBackups => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Catalog,
+                "migrations/catalog",
+                "0005_drop_continuous_backups.cql"
+            )],
+        },
     }
 }
 

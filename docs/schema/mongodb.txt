@@ -9,8 +9,6 @@ index extenddb_catalog.admin_users _id_ key {"_id":1} options {}
 collection extenddb_catalog.backups type collection options {}
 index extenddb_catalog.backups _id_ key {"_id":1} options {}
 index extenddb_catalog.backups account_id_1_table_name_1 key {"account_id":1,"table_name":1} options {}
-collection extenddb_catalog.continuous_backups type collection options {}
-index extenddb_catalog.continuous_backups _id_ key {"_id":1} options {}
 collection extenddb_catalog.extenddb_migrations type collection options {}
 index extenddb_catalog.extenddb_migrations _id_ key {"_id":1} options {}
 collection extenddb_catalog.extenddb_servers type collection options {}

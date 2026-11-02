@@ -705,7 +705,11 @@ pub trait WorkerStore: Send + Sync {
     ) -> BoxFuture<'_, Result<Vec<(String, &'static str)>, StorageError>>;
 }
 
-/// Backup and point-in-time recovery operations.
+/// Backup operations.
+///
+/// Point-in-time recovery is deliberately absent: no backend implements it, so
+/// the engine answers `DescribeContinuousBackups`, `UpdateContinuousBackups`,
+/// and `RestoreTableToPointInTime` itself without consulting storage.
 pub trait BackupEngine: Send + Sync {
     /// Create a backup of a table, snapshotting all items.
     fn create_backup(
@@ -798,21 +802,6 @@ pub trait BackupEngine: Send + Sync {
         account_id: &str,
         request: RestoreRequest,
     ) -> BoxFuture<'_, Result<TableDescription, StorageError>>;
-
-    /// Describe continuous backups / PITR status for a table.
-    fn describe_continuous_backups(
-        &self,
-        account_id: &str,
-        table_name: &str,
-    ) -> BoxFuture<'_, Result<extenddb_core::types::ContinuousBackupsDescription, StorageError>>;
-
-    /// Update continuous backups (enable/disable PITR).
-    fn update_continuous_backups(
-        &self,
-        account_id: &str,
-        table_name: &str,
-        pitr_enabled: bool,
-    ) -> BoxFuture<'_, Result<extenddb_core::types::ContinuousBackupsDescription, StorageError>>;
 }
 
 /// Supertrait combining all `DynamoDB` operation traits.

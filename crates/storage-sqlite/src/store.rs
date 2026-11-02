@@ -582,27 +582,6 @@ mod d1_write_lock_tests {
         .await;
     }
 
-    #[tokio::test]
-    async fn update_continuous_backups_waits_for_the_write_lock() {
-        use extenddb_storage::BackupEngine;
-        let engine = engine().await;
-        // The table must exist before the lock window: the pre-lock existence
-        // check returns TableNotFound otherwise, completing without reaching
-        // the write under test.
-        create_table(&engine, "d1-pitr-t").await;
-        let e = engine.clone();
-        assert_serialized(
-            &engine,
-            async move {
-                BackupEngine::update_continuous_backups(&e, "000000000000", "d1-pitr-t", true)
-                    .await
-                    .expect("update continuous backups");
-            },
-            "update_continuous_backups",
-        )
-        .await;
-    }
-
     /// Build a catalog store over the engine's pool and, critically, the
     /// engine's OWN write lock, mirroring the server wiring in `lib.rs`. The
     /// cached key lets access-key creation encrypt without a settings lookup.

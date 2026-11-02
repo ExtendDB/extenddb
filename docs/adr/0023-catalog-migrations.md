@@ -152,10 +152,11 @@ that each backend implements, as follows.
    store their bodies touch, so it is one integer, the same on every backend.
    No file or constant carries a version string. The runner also writes the
    integer to the `catalog_version` settings row with each catalog ledger row,
-   because releases before 1.0 read that row: the v0.1.14 PostgreSQL binary's
-   `serve` refuses the integer with `invalid catalog version '4': expected 3
-   dot-separated components`, its `verify` reports a failed check, and its
-   `migrate --yes` accepts it and prints `4 -> 4`. Two decisions in 1.0 read
+   because releases before 1.0 read that row: measured on a catalog at
+   migration 4, the v0.1.14 PostgreSQL binary's `serve` refuses the integer
+   with `invalid catalog version '4': expected 3 dot-separated components`,
+   its `verify` reports a failed check, and its `migrate --yes` accepts it and
+   prints `4 -> 4`. Two decisions in 1.0 read
    that row: the check for a catalog that an older release wrote to
    (decision 6), and whether a store with no ledger rows is a catalog at all
    (one with neither is `Uninitialized`).
@@ -369,7 +370,7 @@ that each backend implements, as follows.
   to run.
 - Rollback after additive migrations runs the previous 1.x binary. Rollback
   after a breaking migration restores the backup taken before the upgrade.
-  All four v1.0 migrations are breaking, so rolling back from 1.0 is a
+  All five v1.0 migrations are breaking, so rolling back from 1.0 is a
   restore.
 - Releases before 1.0 refuse a 1.0 catalog or leave a trace in it. PostgreSQL
   `serve` refuses the integer version row, and v0.1.14 `serve` on every

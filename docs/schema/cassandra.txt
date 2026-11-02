@@ -5,7 +5,6 @@ table admin_users
 table backups_by_account
 table backups_by_arn
 table backups_by_table
-table continuous_backups
 table extenddb_migrations
 table extenddb_servers
 table iam_group_members
@@ -72,9 +71,6 @@ column backups_by_table.backup_name: text regular
 column backups_by_table.backup_size_bytes: bigint regular
 column backups_by_table.table_arn: text regular
 column backups_by_table.table_id: text regular
-column continuous_backups.account_id: text partition_key 0
-column continuous_backups.table_name: text clustering 0 asc
-column continuous_backups.pitr_enabled: boolean regular
 column extenddb_migrations.id: int partition_key 0
 column extenddb_migrations.applied_at: timestamp regular
 column extenddb_migrations.applied_by: text regular

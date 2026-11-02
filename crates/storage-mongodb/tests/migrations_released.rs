@@ -136,7 +136,9 @@ fn golden(name: &str, value: &Value) {
 #[tokio::test(flavor = "multi_thread")]
 async fn every_released_catalog_upgrades_to_the_definitions_of_a_fresh_install() {
     let Some(uri) = server() else { return };
-    let expected_catalog: Definitions = serde_json::from_str(CATALOG_EXPECTED).unwrap();
+    let mut expected_catalog: Definitions = serde_json::from_str(CATALOG_EXPECTED).unwrap();
+    // Migration 5 drops continuous_backups, which migration 1 creates.
+    expected_catalog.remove("continuous_backups");
     let expected_data: Definitions = serde_json::from_str(DATA_EXPECTED).unwrap();
     let fresh = Deployment::new(&uri, "freshkeys").await;
     fresh.create().await;
@@ -162,12 +164,12 @@ async fn every_released_catalog_upgrades_to_the_definitions_of_a_fresh_install()
             panic!("{state} is not behind");
         };
         assert_eq!(version, None, "{state} has no ledger");
-        assert_eq!(pending.len(), 5, "{state}");
+        assert_eq!(pending.len(), 6, "{state}");
         let report = d.migrate().await.expect("migrate");
-        assert_eq!((report.from, report.to), (None, Some(4)), "{state}");
+        assert_eq!((report.from, report.to), (None, Some(5)), "{state}");
         assert_eq!(
             d.status().await,
-            CatalogStatus::Current { version: 4 },
+            CatalogStatus::Current { version: 5 },
             "{state}"
         );
 
@@ -175,6 +177,10 @@ async fn every_released_catalog_upgrades_to_the_definitions_of_a_fresh_install()
         for (name, want) in &expected_catalog {
             assert_eq!(catalog.get(name), Some(want), "{state}: {name}");
         }
+        assert!(
+            !catalog.contains_key("continuous_backups"),
+            "{state}: continuous_backups"
+        );
         for (name, want) in &expected_data {
             assert_eq!(data.get(name), Some(want), "{state}: {name}");
         }
@@ -395,7 +401,7 @@ async fn a_reconverge_leaves_policies_written_after_migration_2_as_they_are() {
             .any(|n| n.starts_with("Skipped 2 resource_tag_condition_keys:")),
         "{report:?}"
     );
-    assert_eq!(d.status().await, CatalogStatus::Current { version: 4 });
+    assert_eq!(d.status().await, CatalogStatus::Current { version: 5 });
     assert_eq!(
         documents(Deployment::documents(&d.catalog(), "iam_policies").await),
         before
