@@ -39,6 +39,12 @@ pub async fn new_role_form(
         (&account_id, Some(&format!("/console/accounts/{eid}"))),
         ("New Role", None),
     ]);
+    // The default principal is the account's root, which every principal of
+    // the account matches. `create_role` refuses a principal ARN that holds a
+    // wildcard, so the default must not carry one.
+    let root_principal = html::escape(
+        &serde_json::Value::String(format!("arn:aws:iam::{account_id}:root")).to_string(),
+    );
 
     let content = format!(
         r#"{crumbs}<h1>Create Role</h1>
@@ -51,7 +57,7 @@ pub async fn new_role_form(
   "Version": "2012-10-17",
   "Statement": [{{
     "Effect": "Allow",
-    "Principal": {{"AWS": "arn:aws:iam::*:user/*"}},
+    "Principal": {{"AWS": {root_principal}}},
     "Action": "sts:AssumeRole"
   }}]
 }}</textarea>

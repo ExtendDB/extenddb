@@ -23,6 +23,7 @@ REQ-TEST-001
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -411,6 +412,31 @@ class TestConsoleRoles:
             "trust_policy": self._trust_policy(),
         })
         assert resp.status_code == 303
+
+        resp = self.console.get(f"/accounts/{self.account_id}/roles/{role}")
+        assert resp.status_code == 200
+        assert role in resp.text
+
+        self.console.post(f"/accounts/{self.account_id}/roles/{role}/delete")
+
+    def test_create_role_with_the_form_default_trust_policy(self):
+        resp = self.console.get(f"/accounts/{self.account_id}/roles/new")
+        assert resp.status_code == 200
+        m = re.search(
+            r'<textarea id="trust_policy"[^>]*>(.*?)</textarea>', resp.text, re.S
+        )
+        assert m, "the New Role form has a trust policy box"
+        default_policy = html.unescape(m.group(1))
+        assert json.loads(default_policy)["Statement"][0]["Principal"] == {
+            "AWS": f"arn:aws:iam::{self.account_id}:root"
+        }
+
+        role = f"df-{uuid.uuid4().hex[:8]}"
+        resp = self.console.post(f"/accounts/{self.account_id}/roles/new", {
+            "role_name": role,
+            "trust_policy": default_policy,
+        })
+        assert resp.status_code == 303, resp.text
 
         resp = self.console.get(f"/accounts/{self.account_id}/roles/{role}")
         assert resp.status_code == 200
