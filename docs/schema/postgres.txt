@@ -5,7 +5,6 @@ table admin_users
 table backup_definitions
 table backup_items
 table backups
-table continuous_backups
 table extenddb_migrations
 table iam_group_members
 table iam_groups
@@ -62,11 +61,6 @@ column backups.provisioned_throughput: jsonb
 column backups.stream_specification: jsonb
 column backups.created_at: timestamp with time zone NOT NULL DEFAULT now()
 column backups.vector_indexes: jsonb
-column continuous_backups.account_id: text NOT NULL
-column continuous_backups.table_name: text NOT NULL
-column continuous_backups.pitr_enabled: boolean NOT NULL DEFAULT false
-column continuous_backups.earliest_restorable: timestamp with time zone
-column continuous_backups.latest_restorable: timestamp with time zone
 column extenddb_migrations.id: integer NOT NULL
 column extenddb_migrations.name: text NOT NULL
 column extenddb_migrations.kind: text NOT NULL
@@ -209,7 +203,6 @@ index accounts_pkey: CREATE UNIQUE INDEX accounts_pkey ON public.accounts USING 
 index admin_users_pkey: CREATE UNIQUE INDEX admin_users_pkey ON public.admin_users USING btree (admin_name)
 index backup_definitions_pkey: CREATE UNIQUE INDEX backup_definitions_pkey ON public.backup_definitions USING btree (backup_arn)
 index backups_pkey: CREATE UNIQUE INDEX backups_pkey ON public.backups USING btree (backup_arn)
-index continuous_backups_pkey: CREATE UNIQUE INDEX continuous_backups_pkey ON public.continuous_backups USING btree (account_id, table_name)
 index extenddb_migrations_pkey: CREATE UNIQUE INDEX extenddb_migrations_pkey ON public.extenddb_migrations USING btree (id)
 index iam_group_members_pkey: CREATE UNIQUE INDEX iam_group_members_pkey ON public.iam_group_members USING btree (account_id, group_name, user_name)
 index iam_groups_group_arn_key: CREATE UNIQUE INDEX iam_groups_group_arn_key ON public.iam_groups USING btree (group_arn)
@@ -256,7 +249,6 @@ constraint backup_definitions.backup_definitions_backup_arn_fkey: FOREIGN KEY (b
 constraint backup_definitions.backup_definitions_pkey: PRIMARY KEY (backup_arn)
 constraint backup_items.backup_items_backup_arn_fkey: FOREIGN KEY (backup_arn) REFERENCES backups(backup_arn) ON DELETE CASCADE
 constraint backups.backups_pkey: PRIMARY KEY (backup_arn)
-constraint continuous_backups.continuous_backups_pkey: PRIMARY KEY (account_id, table_name)
 constraint extenddb_migrations.extenddb_migrations_pkey: PRIMARY KEY (id)
 constraint iam_group_members.iam_group_members_account_id_group_name_fkey: FOREIGN KEY (account_id, group_name) REFERENCES iam_groups(account_id, group_name) ON DELETE CASCADE
 constraint iam_group_members.iam_group_members_account_id_user_name_fkey: FOREIGN KEY (account_id, user_name) REFERENCES iam_users(account_id, user_name) ON DELETE CASCADE

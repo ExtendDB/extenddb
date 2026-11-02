@@ -44,7 +44,8 @@ struct Schema {
 }
 
 /// Migration 1's catalog body: the tables, index and columns of the 0.1.x
-/// catalog migrations V001 to V005. The runner's ledger and the serving
+/// catalog migrations V001 to V005, apart from `continuous_backups`, which
+/// migration 5 drops (see [`DROPPED`]). The runner's ledger and the serving
 /// registrations are in neither list.
 const CATALOG: Schema = Schema {
     tables: &[
@@ -54,7 +55,6 @@ const CATALOG: Schema = Schema {
         "backups_by_account",
         "backups_by_arn",
         "backups_by_table",
-        "continuous_backups",
         "iam_group_members",
         "iam_groups",
         "iam_permissions_boundaries",
@@ -194,9 +194,13 @@ async fn tables_in(session: &Arc<CassandraSession>, keyspace: &str) -> BTreeSet<
     schema_names(session, query, keyspace, &["table_name"]).await
 }
 
+/// Tables that migration 1 creates and a later migration drops, which no
+/// keyspace holds after a run: migration 5 drops `continuous_backups`.
+const DROPPED: &[&str] = &["continuous_backups"];
+
 /// One line for each table, index or added column of `schema` that `keyspace`
-/// lacks, and for each table of `other` (the other store kind's schema) it
-/// holds.
+/// lacks, for each table of `other` (the other store kind's schema) it
+/// holds, and for each table of [`DROPPED`] it holds.
 async fn problems_in(
     session: &Arc<CassandraSession>,
     keyspace: &str,
@@ -234,6 +238,11 @@ async fn problems_in(
                 "{keyspace}: holds {table}, which the other store kind's body creates"
             ));
         }
+    }
+    for table in DROPPED.iter().filter(|t| tables.contains(**t)) {
+        problems.push(format!(
+            "{keyspace}: holds {table}, which a later migration drops"
+        ));
     }
     problems
 }

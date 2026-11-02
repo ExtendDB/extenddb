@@ -132,6 +132,13 @@ async fn reconverge_skips_a_recorded_id_that_is_not_convergent() {
     };
     let steps_of = |id: MigrationId| steps_after(id.number() - 1) - steps_after(id.number());
     let three = MigrationId::SortKeyDefinitions;
+    // The fake models no id after 4: each later one does not apply, so once
+    // it is recorded a reconverge does not run it again either.
+    let later: usize = MigrationId::ALL
+        .into_iter()
+        .filter(|id| id.number() > MigrationId::IndexTableBaseKey.number())
+        .map(steps_of)
+        .sum();
     an_older_release_writes();
     let report = runner(&fake).reconverge().await.unwrap();
     assert!(
@@ -164,7 +171,7 @@ async fn reconverge_skips_a_recorded_id_that_is_not_convergent() {
     );
     assert_eq!(
         report.applied.len(),
-        steps_after(0) - steps_of(four) - steps_of(three)
+        steps_after(0) - steps_of(four) - steps_of(three) - later
     );
     assert!(
         report.notes.contains(&format!(

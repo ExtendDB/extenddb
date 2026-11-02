@@ -254,16 +254,9 @@ Compound index on `(principal, attempted_at)`.
 Index on `(account_id, table_name)`. The physical backup collection lives in
 `extenddb_data` as `_backup_{backup_id}` — see §4.5.
 
-### 3.17 `continuous_backups`
-```json
-{
-  "account_id": "...",
-  "table_name": "...",
-  "pitr_enabled": false,
-  "earliest_restorable": null,
-  "latest_restorable": null
-}
-```
+### 3.17 `continuous_backups` (removed)
+
+Earlier builds stored each table's point-in-time recovery flag here. The engine answers the point-in-time recovery operations without storage, so a fresh catalog does not create this collection and `extenddb migrate --yes` drops it from a catalog an earlier build created; `extenddb migrate` without `--yes` reports the pending drop as `catalog: drop the continuous_backups collection`. The catalog version does not change for this.
 
 ### 3.18 `schema_history`
 ```json

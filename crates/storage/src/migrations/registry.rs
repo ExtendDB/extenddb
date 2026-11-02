@@ -60,11 +60,18 @@ migration_ids! {
     /// Gives every index table its base key index.
     IndexTableBaseKey = 4, "index_table_base_key",
         "give every secondary index table its base key index";
+    /// Drops the `continuous_backups` table. The engine answers the
+    /// point-in-time recovery operations without storage (#335), so no
+    /// request reads or writes it. A later migration must not create a table
+    /// named `continuous_backups`: `--reconverge` runs this drop again before
+    /// it.
+    DropContinuousBackups = 5, "drop_continuous_backups",
+        "drop the continuous_backups table, which no request reads or writes since #335";
 }
 
 /// Highest id that has shipped in a release. Bodies at or below it are frozen:
 /// each backend pins their checksums, kinds and convergent flags, and
-/// `forget` refuses them. The v1.0 release PR raises it to 4.
+/// `forget` refuses them. The v1.0 release PR raises it to 5.
 pub const RELEASED_THROUGH: u32 = 0;
 
 impl MigrationId {

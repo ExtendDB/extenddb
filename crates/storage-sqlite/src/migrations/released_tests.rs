@@ -132,6 +132,10 @@ async fn settings(db: &Path) -> BTreeMap<String, String> {
     rows.into_iter().collect()
 }
 
+/// Tables that a released catalog has and a migration drops: migration 5
+/// drops `continuous_backups`.
+const DROPPED_TABLES: &[&str] = &["continuous_backups"];
+
 /// Row counts of every table but the ones a migration writes.
 async fn row_counts(db: &Path) -> BTreeMap<String, i64> {
     let pool = plain_pool(db).await;
@@ -268,10 +272,15 @@ async fn every_released_catalog_upgrades_to_the_fresh_schema() {
         );
         assert!(run(&db).await.expect("again").applied.is_empty(), "{name}");
 
-        // Rows: every table keeps its count, and every backup item its
-        // content and its order, with its old rowid as its id.
+        // Rows: every table keeps its count, apart from the dropped ones,
+        // and every backup item its content and its order, with its old
+        // rowid as its id.
         let after = row_counts(&db).await;
         for (table, n) in &before {
+            if DROPPED_TABLES.contains(&table.as_str()) {
+                assert_eq!(after.get(table), None, "{name}: {table} is dropped");
+                continue;
+            }
             assert_eq!(after.get(table), Some(n), "{name}: rows of {table}");
         }
         assert_eq!(
@@ -331,6 +340,14 @@ async fn every_released_catalog_upgrades_to_the_fresh_schema() {
             backup_items(&db).await,
             items_before,
             "{name}: after a reconverge"
+        );
+        // Migration 1 creates continuous_backups again and migration 5 drops
+        // it again, so the objects still match a fresh install.
+        let reconverged = mapped_definitions(&db).await;
+        let actual: BTreeMap<&String, &Vec<String>> = reconverged.iter().collect();
+        assert_eq!(
+            actual, expected,
+            "{name}: objects after a reconverge differ from a fresh install"
         );
     }
 }

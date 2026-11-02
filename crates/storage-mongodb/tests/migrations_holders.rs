@@ -113,7 +113,7 @@ async fn migration_2_keeps_the_lock_through_a_scan_longer_than_the_idle_limit() 
     applied.expect("every migration applies");
     // A shorter run would apply without the progress the scan records.
     assert!(took > timing.idle_limit * 4, "the run took {took:?}");
-    assert_eq!(d.status().await, CatalogStatus::Current { version: 4 });
+    assert_eq!(d.status().await, CatalogStatus::Current { version: 5 });
     assert!(d.catalog_ledger().await.iter().any(|row| row.id == 2));
     d.drop_databases().await;
 }
@@ -151,7 +151,7 @@ async fn the_status_read_under_the_lock_keeps_it_through_a_long_scan() {
         "the status read took {took:?}"
     );
     applied.expect("every migration applies");
-    assert_eq!(d.status().await, CatalogStatus::Current { version: 4 });
+    assert_eq!(d.status().await, CatalogStatus::Current { version: 5 });
     d.drop_databases().await;
 }
 

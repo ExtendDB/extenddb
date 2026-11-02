@@ -246,8 +246,12 @@ async fn assert_finished(session: &Arc<CassandraSession>, prefix: &str, released
             "{}/migrations/{dir}/0001_baseline.expected.json",
             env!("CARGO_MANIFEST_DIR")
         );
-        let expected: postcheck::Definitions =
+        let mut expected: postcheck::Definitions =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+        // Migration 5 drops continuous_backups, which migration 1 creates.
+        expected
+            .columns
+            .retain(|name, _| !name.starts_with("continuous_backups."));
         assert_eq!(expected, actual, "{at}: {dir}");
     }
     let store = CassandraCatalogStore::catalog_only(session.clone(), prefix.to_owned());

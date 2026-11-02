@@ -65,7 +65,10 @@ async fn assert_fresh_definitions(d: &Deployment) {
         .await
         .expect("data");
     migrations.close().await;
-    let expected_catalog: Definitions = serde_json::from_str(CATALOG_EXPECTED).expect("json");
+    let mut expected_catalog: Definitions = serde_json::from_str(CATALOG_EXPECTED).expect("json");
+    // Migration 5 drops continuous_backups, which migration 1 creates.
+    expected_catalog.remove("continuous_backups");
+    assert!(!catalog.contains_key("continuous_backups"));
     let expected_data: Definitions = serde_json::from_str(DATA_EXPECTED).expect("json");
     for (name, want) in &expected_catalog {
         assert_eq!(catalog.get(name), Some(want), "{name}");
@@ -204,7 +207,7 @@ async fn migrate_creates_the_indexes_a_deployment_lacks() {
             .await
             .contains(&"table_id_1".to_owned())
     );
-    assert_eq!(d.status().await, CatalogStatus::Current { version: 4 });
+    assert_eq!(d.status().await, CatalogStatus::Current { version: 5 });
     assert_fresh_definitions(&d).await;
     d.drop_databases().await;
 }
@@ -229,7 +232,7 @@ async fn stop_at_every_request(uri: &str, state: Option<&str>) -> usize {
         }
         assert_eq!(
             d.status().await,
-            CatalogStatus::Current { version: 4 },
+            CatalogStatus::Current { version: 5 },
             "{requests}"
         );
         assert_fresh_definitions(&d).await;

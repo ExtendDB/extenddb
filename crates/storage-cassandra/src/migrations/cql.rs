@@ -18,8 +18,8 @@ use extenddb_storage::migrations::{MigrationError, split_comments};
 pub(crate) struct Statement {
     /// The statement, without comments, with `keyspace.table` in it.
     pub(crate) text: String,
-    /// A `CREATE` or `ALTER`: the runner waits for every live node to agree
-    /// on the schema after it.
+    /// A `CREATE`, `ALTER` or `DROP`: the runner waits for every live node
+    /// to agree on the schema after it.
     pub(crate) ddl: bool,
 }
 
@@ -70,8 +70,9 @@ fn split(code: &str) -> Vec<&str> {
 
 /// `statement` with its table written as `keyspace.table`. Recognises
 /// `CREATE TABLE [IF NOT EXISTS] t`, `CREATE INDEX [IF NOT EXISTS] [name]
-/// ON t`, `ALTER TABLE [IF EXISTS] t`, `INSERT INTO t` and `DELETE FROM t`,
-/// each naming an unquoted table without a keyspace.
+/// ON t`, `ALTER TABLE [IF EXISTS] t`, `DROP TABLE IF EXISTS t`,
+/// `INSERT INTO t` and `DELETE FROM t`, each naming an unquoted table
+/// without a keyspace.
 fn qualify(keyspace: &str, file: &str, statement: &str) -> Result<Statement, MigrationError> {
     let first_line = statement.lines().next().unwrap_or_default();
     let refuse = || {
@@ -144,6 +145,14 @@ fn table_offset(statement: &str) -> Option<(usize, bool)> {
             2
         };
         return at(i).map(|o| (o, true));
+    }
+    if is(0, "DROP") && is(1, "TABLE") {
+        // Only `DROP TABLE IF EXISTS`: a body runs again on a store that
+        // already applied it, where a plain `DROP TABLE` fails.
+        if !(is(2, "IF") && is(3, "EXISTS")) {
+            return None;
+        }
+        return at(4).map(|o| (o, true));
     }
     if (is(0, "INSERT") && is(1, "INTO")) || (is(0, "DELETE") && is(1, "FROM")) {
         return at(2).map(|o| (o, false));
@@ -235,6 +244,11 @@ mod tests {
                 "DELETE FROM ks.settings WHERE key = 'x'",
                 false,
             ),
+            (
+                "DROP TABLE IF EXISTS continuous_backups",
+                "DROP TABLE IF EXISTS ks.continuous_backups",
+                true,
+            ),
         ];
         for (input, want, ddl) in cases {
             assert_eq!(
@@ -262,6 +276,8 @@ mod tests {
             "ALTER TABLE IF tables ADD c text",
             "USE ks",
             "DROP TABLE t",
+            "DROP TABLE IF t",
+            "DROP TABLE IF EXISTS other.t",
         ] {
             let error = one(sql).expect_err(sql);
             assert!(
