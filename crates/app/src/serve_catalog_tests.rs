@@ -131,6 +131,7 @@ fn applied_report() -> RunReport {
                 id: id.number(),
                 name: id.name(),
                 store_name: "db".to_owned(),
+                outcome: extenddb_storage::migrations::Outcome::Applied,
                 notes: vec!["a note\nthat spans two lines".to_owned()],
             })
             .collect(),
