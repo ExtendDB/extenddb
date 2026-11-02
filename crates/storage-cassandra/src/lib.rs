@@ -7,7 +7,7 @@
 //! as the underlying database. It provides a DynamoDB-compatible API backed
 //! by Cassandra's distributed architecture.
 
-pub const CATALOG_VERSION: &str = "0.0.4";
+pub const CATALOG_VERSION: &str = "0.0.5";
 
 /// Default control-plane delay (seconds) when the `control_plane_delay_seconds`
 /// setting is absent or unparseable: CreateTable, the control-plane worker

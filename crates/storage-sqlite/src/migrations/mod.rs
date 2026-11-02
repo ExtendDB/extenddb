@@ -33,6 +33,7 @@ mod postcheck;
 
 use std::time::Duration;
 
+use extenddb_storage::file_body;
 use extenddb_storage::migrations::m0002_resource_tag_condition_keys::{
     self, ResourceTagConditionKeys,
 };
@@ -94,6 +95,15 @@ pub fn migration(id: MigrationId) -> Migration<SqliteStores> {
                 StoreKind::Catalog,
                 &m0004_index_table_base_key::IndexTableBaseKey,
                 m0004_index_table_base_key::SOURCE,
+            )],
+        },
+        MigrationId::DropContinuousBackups => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Catalog,
+                "migrations",
+                "0005_drop_continuous_backups.sql"
             )],
         },
     }

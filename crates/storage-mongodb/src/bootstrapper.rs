@@ -16,6 +16,29 @@ use extenddb_storage::management_store::{OpError, OpResult};
 pub struct MongoBootstrapper {
     client: mongodb::Client,
     connection_string: String,
+    /// The catalog database, `extenddb_catalog` (a test's own in the live
+    /// tests).
+    catalog: mongodb::Database,
+}
+
+/// The catalog collection that stored each table's point-in-time recovery
+/// flag. The engine answers the point-in-time recovery operations without
+/// storage, so a fresh catalog does not create it and `extenddb migrate
+/// --yes` drops it from a catalog an earlier build created. The catalog
+/// version (`0.0.2`) does not change for this.
+const STALE_CONTINUOUS_BACKUPS: &str = "continuous_backups";
+
+impl MongoBootstrapper {
+    /// Whether the catalog still holds [`STALE_CONTINUOUS_BACKUPS`].
+    async fn has_stale_continuous_backups(&self) -> OpResult<bool> {
+        let names = self
+            .catalog_db()
+            .list_collection_names()
+            .filter(doc! { "name": STALE_CONTINUOUS_BACKUPS })
+            .await
+            .map_err(|e| OpError::Internal(format!("list collections: {e}")))?;
+        Ok(!names.is_empty())
+    }
 }
 
 impl MongoBootstrapper {
@@ -45,13 +68,14 @@ impl MongoBootstrapper {
         let client = crate::connect_guarded(&connection_string, None, false).await?;
 
         Ok(Self {
+            catalog: client.database("extenddb_catalog"),
             client,
             connection_string,
         })
     }
 
     fn catalog_db(&self) -> mongodb::Database {
-        self.client.database("extenddb_catalog")
+        self.catalog.clone()
     }
 
     fn data_db(&self) -> mongodb::Database {
@@ -207,7 +231,6 @@ impl Bootstrapper for MongoBootstrapper {
             "metrics",
             "login_attempts",
             "backups",
-            "continuous_backups",
         ];
 
         for coll_name in collections {
@@ -378,15 +401,36 @@ impl Bootstrapper for MongoBootstrapper {
 
     async fn run_data_migrations(&self) -> OpResult<()> {
         // Data database schema is minimal for MongoDB (just idempotency_tokens)
-        // Table collections are created on-demand
+        // Table collections are created on-demand.
+        //
+        // `extenddb migrate --yes` reaches this on every run, whatever the
+        // catalog version, so the one catalog step MongoDB has without a
+        // version of its own runs here: dropping the collection that held the
+        // point-in-time recovery flag, which nothing reads. `serve` never
+        // calls this.
+        if self.has_stale_continuous_backups().await? {
+            println!("--- Dropping the unused {STALE_CONTINUOUS_BACKUPS} collection...");
+            self.catalog_db()
+                .collection::<Document>(STALE_CONTINUOUS_BACKUPS)
+                .drop()
+                .await
+                .map_err(|e| OpError::Internal(format!("drop {STALE_CONTINUOUS_BACKUPS}: {e}")))?;
+        }
         Ok(())
     }
 
     async fn pending_data_migrations(&self) -> OpResult<Vec<String>> {
         // MongoDB has no versioned data-database migrations — table
         // collections are created on-demand, and the idempotency_tokens
-        // collection is created in create_data_db. Nothing to apply.
-        Ok(Vec::new())
+        // collection is created in create_data_db. The one pending step is
+        // the stale catalog collection [`Self::run_data_migrations`] drops.
+        let mut pending = Vec::new();
+        if self.has_stale_continuous_backups().await? {
+            pending.push(format!(
+                "catalog: drop the {STALE_CONTINUOUS_BACKUPS} collection"
+            ));
+        }
+        Ok(pending)
     }
 
     async fn record_data_connection(&self) -> OpResult<()> {
@@ -665,6 +709,10 @@ fn redact_connection_string(uri: &str) -> String {
         &uri[at_idx..]
     )
 }
+
+#[cfg(test)]
+#[path = "bootstrapper_live_tests.rs"]
+mod live_tests;
 
 #[cfg(test)]
 mod tests {

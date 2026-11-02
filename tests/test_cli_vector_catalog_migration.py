@@ -5,10 +5,11 @@
 
 The vector index schema and the backup table definitions are part of
 migration 1, which creates the v1.0 catalog on an empty database and brings a
-released catalog to the same schema. These tests load a deployment of a
-release from before the vector index schema, from its committed fixture, and
-check that the binary refuses to serve it, that `extenddb migrate` upgrades
-it, and that the upgraded deployment then serves. They also check that
+released catalog to the same schema, and migration 5 drops the
+`continuous_backups` table. These tests load a deployment of a release from
+before the vector index schema, from its committed fixture, and check that
+the binary refuses to serve it, that `extenddb migrate` upgrades it, and that
+the upgraded deployment then serves. They also check that
 `--reconverge` runs every convergent migration again on a current catalog,
 and that a catalog ledger row for a migration this binary does not carry
 makes `serve` refuse.
@@ -139,6 +140,12 @@ def _backups_has_vector_column(cli_env):
     )
 
 
+def _continuous_backups_table_exists(cli_env):
+    return _query(
+        cli_env["db_name"], "SELECT to_regclass('public.continuous_backups') IS NOT NULL"
+    )
+
+
 def _ledger_rows(database):
     """`(id, checksum, applied_at)` of every row of a store's ledger."""
     conn = _conn(database)
@@ -247,6 +254,7 @@ class TestVectorCatalogMigration:
         assert _query(
             cli_env["db_name"], "SELECT to_regclass('public.backup_definitions') IS NOT NULL"
         ) is True
+        assert _continuous_backups_table_exists(cli_env) is False
         assert _ledger_ids(cli_env["db_name"]) == list(range(1, _latest() + 1))
         assert _ids_in("catalog") == list(range(1, _latest() + 1))
         data_ids = _ledger_ids(_data_db(cli_env))
@@ -280,6 +288,7 @@ class TestVectorCatalogMigration:
         _patch_config_port(cli_env["config_path"], cli_env["port"])
         _load_released_state(cli_env, PRE_VECTOR_RELEASE)
         assert _vector_table_exists(cli_env) is False
+        assert _continuous_backups_table_exists(cli_env) is True
 
         # The binary refuses a catalog it was not built for (exit 3: migrations
         # pending) rather than starting and failing on the first request that
@@ -310,6 +319,7 @@ class TestVectorCatalogMigration:
         assert _catalog_version(cli_env) == str(_latest())
         assert _vector_table_exists(cli_env) is True
         assert _backups_has_vector_column(cli_env) is True
+        assert _continuous_backups_table_exists(cli_env) is False
         assert _ledger_ids(cli_env["db_name"]) == _ids_in("catalog")
         assert _ledger_ids(_data_db(cli_env)) == _ids_in("data")
 
@@ -364,6 +374,8 @@ class TestVectorCatalogMigration:
                 assert f"Ran again {i} " in output, output
         assert [_ledger_rows(database) for database in stores] == rows_before
         assert _catalog_version(cli_env) == str(_latest())
+        # Migration 1 creates continuous_backups again; migration 5 drops it.
+        assert _continuous_backups_table_exists(cli_env) is False
 
         verify = _run_extenddb("verify", config=cli_env["config_path"], check=False)
         assert verify.returncode == 0, verify.stdout + verify.stderr
