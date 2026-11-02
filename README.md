@@ -259,6 +259,7 @@ docs/
 | [Deployment Guide](docs/manuals/11-deployment-guide.md) | Self-hosted, multi-cloud, air-gapped deployments |
 | [Differences from DynamoDB](docs/differences-from-dynamodb.md) | Behavioral differences and unsupported operations |
 | [Troubleshooting](docs/troubleshooting.md) | Common errors and solutions |
+| [Verifying Container Images](docs/verifying-images.md) | Build provenance and SBOM attestations for the published images |
 
 Build PDFs:
 
