@@ -392,8 +392,9 @@ async fn a_second_run_applies_nothing_and_reconverge_keeps_the_rows() {
     assert_eq!((again.from, again.to), (Some(5), Some(5)));
 
     let reconverged = d.reconverge().await.expect("reconverge");
-    // Migration 1's steps in the catalog and the data database: 2 is not
-    // convergent, and 3 and 4 do not apply on MongoDB.
+    // Migration 1's steps in the catalog and the data database, and migration
+    // 5's in the catalog: 2 is not convergent, and 3 and 4 do not apply on
+    // MongoDB.
     let ran: Vec<(u32, String)> = reconverged
         .applied
         .iter()
@@ -401,7 +402,11 @@ async fn a_second_run_applies_nothing_and_reconverge_keeps_the_rows() {
         .collect();
     assert_eq!(
         ran,
-        [(1, d.target.catalog.clone()), (1, d.target.data.clone())],
+        [
+            (1, d.target.catalog.clone()),
+            (1, d.target.data.clone()),
+            (5, d.target.catalog.clone()),
+        ],
         "{reconverged:?}"
     );
     assert!(
@@ -468,19 +473,19 @@ async fn a_changed_checksum_a_newer_catalog_and_an_older_release_are_reported() 
         doc! { "_id": id, "name": "later", "kind": kind, "checksum": "c", "outcome": "applied",
         "notes": "", "applied_at": bson::DateTime::now(), "applied_by": "9.9.9" }
     };
-    ledger.insert_one(row(5, "breaking")).await.expect("insert");
+    ledger.insert_one(row(6, "breaking")).await.expect("insert");
     let status = d.status().await;
     assert_eq!(status.label(), "AheadIncompatible");
     assert_eq!(status.exit_code(), exit::AHEAD_INCOMPATIBLE);
     ledger
-        .delete_one(doc! { "_id": 5_i64 })
+        .delete_one(doc! { "_id": 6_i64 })
         .await
         .expect("delete");
-    ledger.insert_one(row(5, "additive")).await.expect("insert");
+    ledger.insert_one(row(6, "additive")).await.expect("insert");
     assert_eq!(d.status().await.label(), "AheadCompatible");
     assert!(d.migrate().await.expect("migrate").applied.is_empty());
     ledger
-        .delete_one(doc! { "_id": 5_i64 })
+        .delete_one(doc! { "_id": 6_i64 })
         .await
         .expect("delete");
 

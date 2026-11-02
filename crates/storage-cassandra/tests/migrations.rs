@@ -905,7 +905,8 @@ async fn a_create_account_stopped_before_its_row_leaves_a_current_catalog_a_retr
     assert!(
         message.starts_with(&format!(
             "account store {account} is at migration 0, behind the catalog store at migration \
-             4, and ExtendDB 1.0.0-test needs migration 4."
+             {latest}, and ExtendDB 1.0.0-test needs migration {latest}.",
+            latest = MigrationId::LATEST.number()
         )),
         "{message}"
     );
