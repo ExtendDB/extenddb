@@ -34,6 +34,9 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Only pushes to main save, so other runs restore main's cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Local S3 endpoint for the backup-store conformance suite. moto is a
       # pip package, so it needs no container image; MinIO no longer
