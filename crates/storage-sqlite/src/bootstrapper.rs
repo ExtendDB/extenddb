@@ -179,18 +179,6 @@ impl Bootstrapper for SqliteBootstrapper {
         Ok(()) // Catalog and data share one file.
     }
 
-    async fn run_catalog_migrations(&self) -> OpResult<()> {
-        Err(through_the_runner("run_catalog_migrations"))
-    }
-
-    async fn run_data_migrations(&self) -> OpResult<()> {
-        Err(through_the_runner("run_data_migrations"))
-    }
-
-    async fn pending_data_migrations(&self) -> OpResult<Vec<String>> {
-        Err(through_the_runner("pending_data_migrations"))
-    }
-
     async fn record_data_connection(&self) -> OpResult<()> {
         let pool = self.pool().await?;
         sqlx::query(
@@ -306,8 +294,12 @@ impl Bootstrapper for SqliteBootstrapper {
         })
     }
 
-    async fn is_catalog_initialized(&self) -> OpResult<bool> {
-        Err(through_the_runner("is_catalog_initialized"))
+    async fn has_admin_user(&self) -> OpResult<bool> {
+        let pool = self.pool().await?;
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM admin_users)")
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| OpError::Internal(format!("check admin users: {e}")))
     }
 
     async fn list_table_names(&self) -> OpResult<Vec<String>> {
@@ -353,16 +345,6 @@ impl Bootstrapper for SqliteBootstrapper {
         Ok(())
     }
 
-    async fn read_catalog_version(&self) -> OpResult<Option<String>> {
-        Err(through_the_runner("read_catalog_version"))
-    }
-
-    fn expected_catalog_version(&self) -> String {
-        extenddb_storage::migrations::MigrationId::LATEST
-            .number()
-            .to_string()
-    }
-
     fn catalog_database_name(&self) -> String {
         self.path.clone()
     }
@@ -383,16 +365,6 @@ impl Bootstrapper for SqliteBootstrapper {
             self.path
         )
     }
-}
-
-/// The error of a bootstrapper method the commands do not call on this
-/// backend: its catalog migrates through
-/// [`crate::migrations::SqliteCatalogMigrations`] and the shared runner.
-fn through_the_runner(method: &str) -> OpError {
-    OpError::Internal(format!(
-        "sqlite migrates through its CatalogMigrations; the bootstrapper method {method} is \
-         not used"
-    ))
 }
 
 #[cfg(all(test, unix))]
@@ -431,6 +403,146 @@ mod lock_tests {
 
         bootstrap.drop_databases("unused").await.expect("destroy");
         assert!(!db.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod init_tests {
+    use std::time::Duration;
+
+    use super::SqliteBootstrapper;
+    use extenddb_storage::bootstrapper::{
+        Bootstrapper, finishes_a_stopped_init, write_bootstrap_rows,
+    };
+    use extenddb_storage::migrations::{
+        CatalogMigrations, CatalogStatus, MigrationId, RunKind, run_with_status,
+    };
+
+    use crate::migrations::SqliteCatalogMigrations;
+
+    async fn rows(path: &str, sql: &str) -> Vec<String> {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&crate::sqlite_util::sqlite_url(path))
+            .await
+            .expect("open");
+        let found: Vec<String> = sqlx::query_scalar(sql).fetch_all(&pool).await.expect(sql);
+        pool.close().await;
+        found
+    }
+
+    /// `init` stopped after its migrations, its encryption key and its
+    /// default account leaves a catalog whose status is `Current` and that
+    /// has no admin user. The next `init`'s steps under the lock run no
+    /// migration, keep the key and the account, and write the admin user;
+    /// the `init` after that is refused as initialized.
+    #[tokio::test]
+    async fn init_finishes_a_catalog_stopped_before_its_admin_user_and_refuses_it_after() {
+        let dir = std::env::temp_dir().join(format!(
+            "extenddb-init-finish-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let path = dir.join("extenddb.sqlite").to_string_lossy().into_owned();
+        let bootstrapper = SqliteBootstrapper::new(path.clone());
+        let migrations = SqliteCatalogMigrations;
+        let target = bootstrapper.init_target();
+        let timeout = Duration::from_secs(10);
+
+        // The stopped init.
+        bootstrapper.create_catalog_db().await.expect("file");
+        let lock = migrations.lock(&target, timeout).await.expect("lock");
+        let status = migrations
+            .status_under_lock(&lock, &target)
+            .await
+            .expect("status");
+        assert!(
+            !finishes_a_stopped_init(&bootstrapper, &status)
+                .await
+                .expect("decided")
+        );
+        run_with_status(&migrations, &status, &lock, "1.0.0-test", RunKind::Create)
+            .await
+            .expect("create");
+        bootstrapper.bootstrap_encryption_key().await.expect("key");
+        bootstrapper
+            .bootstrap_default_account()
+            .await
+            .expect("account");
+        migrations.release(lock).await;
+        let key = rows(
+            &path,
+            "SELECT value FROM settings WHERE key = 'encryption_key'",
+        )
+        .await;
+        let accounts = rows(&path, "SELECT account_id FROM accounts").await;
+        assert_eq!((key.len(), accounts.len()), (1, 1));
+        assert!(!bootstrapper.has_admin_user().await.expect("read"));
+
+        // The next init finishes it.
+        let lock = migrations.lock(&target, timeout).await.expect("lock");
+        let status = migrations
+            .status_under_lock(&lock, &target)
+            .await
+            .expect("status");
+        assert_eq!(
+            status,
+            CatalogStatus::Current {
+                version: MigrationId::LATEST.number()
+            }
+        );
+        assert!(
+            finishes_a_stopped_init(&bootstrapper, &status)
+                .await
+                .expect("decided")
+        );
+        bootstrapper.hold(&lock);
+        let admin = write_bootstrap_rows(&bootstrapper, None, None)
+            .await
+            .expect("rows");
+        bootstrapper
+            .record_data_connection()
+            .await
+            .expect("data connection");
+        migrations.release(lock).await;
+        assert_eq!(admin.username, "admin");
+        assert!(!admin.already_existed && admin.generated_password.is_some());
+        assert!(bootstrapper.has_admin_user().await.expect("read"));
+        assert_eq!(
+            rows(
+                &path,
+                "SELECT value FROM settings WHERE key = 'encryption_key'"
+            )
+            .await,
+            key,
+            "the key a server may already have used is kept"
+        );
+        assert_eq!(
+            rows(&path, "SELECT account_id FROM accounts").await,
+            accounts
+        );
+
+        // The init after that is refused.
+        let lock = migrations.lock(&target, timeout).await.expect("lock");
+        let status = migrations
+            .status_under_lock(&lock, &target)
+            .await
+            .expect("status");
+        assert!(
+            !finishes_a_stopped_init(&bootstrapper, &status)
+                .await
+                .expect("decided")
+        );
+        let refused = run_with_status(&migrations, &status, &lock, "1.0.0-test", RunKind::Create)
+            .await
+            .expect_err("refused");
+        migrations.release(lock).await;
+        assert!(
+            refused
+                .to_string()
+                .starts_with("the catalog is already initialized"),
+            "{refused}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

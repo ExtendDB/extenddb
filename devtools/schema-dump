@@ -6,6 +6,7 @@ order, so a fresh install can be compared with docs/schema/<backend>.txt.
 
     devtools/schema-dump sqlite <database file>
     devtools/schema-dump postgres <base URL, no database> <catalog db> <data db>
+    devtools/schema-dump cassandra <node container> <keyspace prefix>
 
 On PostgreSQL the dump lists tables, columns, indexes, constraints,
 sequences, functions, triggers, views and types; the per-table `_ddb_*`
@@ -13,7 +14,13 @@ tables are left out, because no migration creates them, and so are the
 objects an extension owns (pgvector's functions and types), so a server with
 pgvector and one without print the same file. A migration that creates any
 other kind of object adds a query for it here. On SQLite every schema object
-is listed; a fresh install has no per-table objects.
+is listed; a fresh install has no per-table objects. On Cassandra the dump
+reads system_schema through cqlsh in the node's Docker container, as the
+admin role $CASSANDRA_ADMIN_USER with $CASSANDRA_ADMIN_PASSWORD (default
+cassandra and cassandra), and lists the tables, columns and secondary
+indexes of the catalog keyspace and of the one account keyspace a fresh
+install has, init's default account, whose id is left out because it is
+random.
 """
 import sqlite3
 import sys
@@ -144,6 +151,89 @@ def postgres_schema(base: str, database: str) -> list[str]:
     return lines
 
 
+def cassandra_rows(container: str, table: str, columns: str) -> list[list[str]]:
+    """Every row of a system_schema table, read with `cqlsh COPY ... TO
+    STDOUT` in the node's container as the admin role."""
+    import csv
+    import io
+    import os
+    import subprocess
+
+    done = subprocess.run(
+        [
+            "docker", "exec", "-i", container, "cqlsh",
+            "-u", os.environ.get("CASSANDRA_ADMIN_USER", "cassandra"),
+            "-p", os.environ.get("CASSANDRA_ADMIN_PASSWORD", "cassandra"),
+        ],
+        input=f"COPY {table} ({columns}) TO STDOUT;\n",
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    if done.returncode != 0:
+        sys.exit(f"COPY {table}: {done.stdout}{done.stderr}")
+    width = len(columns.split(","))
+    return [
+        row
+        for row in csv.reader(io.StringIO(done.stdout))
+        if len(row) == width and not row[0].startswith("Using ")
+    ]
+
+
+# The order cqlsh's DESCRIBE gives a table's columns.
+CASSANDRA_KINDS = {"partition_key": 0, "clustering": 1, "static": 2, "regular": 3}
+
+
+def cassandra_schema(container: str, keyspace: str) -> list[str]:
+    tables = sorted(
+        name
+        for ks, name in cassandra_rows(container, "system_schema.tables", "keyspace_name, table_name")
+        if ks == keyspace
+    )
+    columns = sorted(
+        (
+            (table, CASSANDRA_KINDS.get(kind, 4), int(position), column, kind, order, kind_type)
+            for ks, table, column, kind, position, order, kind_type in cassandra_rows(
+                container,
+                "system_schema.columns",
+                "keyspace_name, table_name, column_name, kind, position, clustering_order, type",
+            )
+            if ks == keyspace
+        ),
+    )
+    indexes = sorted(
+        (table, index, kind, options)
+        for ks, table, index, kind, options in cassandra_rows(
+            container, "system_schema.indexes", "keyspace_name, table_name, index_name, kind, options"
+        )
+        if ks == keyspace
+    )
+    lines = [f"table {name}" for name in tables]
+    for table, _, position, column, kind, order, kind_type in columns:
+        detail = f"{kind_type} {kind}"
+        if kind in ("partition_key", "clustering"):
+            detail += f" {position}"
+        if kind == "clustering":
+            detail += f" {order}"
+        lines.append(f"column {table}.{column}: {detail}")
+    lines += [f"index {table}.{index}: {kind} {options}" for table, index, kind, options in indexes]
+    return lines
+
+
+def cassandra_account_keyspace(container: str, prefix: str) -> str:
+    """The keyspace of the one account a fresh install has (init's default
+    account), whose id is random."""
+    found = sorted(
+        ks
+        for (ks,) in cassandra_rows(container, "system_schema.keyspaces", "keyspace_name")
+        if ks.startswith(f"{prefix}_account_")
+    )
+    if len(found) != 1:
+        sys.exit(f"expected one account keyspace with the prefix {prefix}, found {found}")
+    return found[0]
+
+
 def main(argv: list[str]) -> None:
     if len(argv) == 2 and argv[0] == "sqlite":
         print("\n".join(sqlite_schema(argv[1])))
@@ -152,6 +242,12 @@ def main(argv: list[str]) -> None:
         for store, database in (("catalog", catalog), ("data", data)):
             print(f"# {store} database")
             print("\n".join(postgres_schema(base, database)))
+    elif len(argv) == 3 and argv[0] == "cassandra":
+        container, prefix = argv[1:]
+        account = cassandra_account_keyspace(container, prefix)
+        for store, keyspace in (("catalog", f"{prefix}_catalog"), ("account", account)):
+            print(f"# {store} keyspace")
+            print("\n".join(cassandra_schema(container, keyspace)))
     else:
         sys.exit(__doc__)
 

@@ -323,6 +323,30 @@ async fn a_fresh_store_gets_every_id_in_order_catalog_first() {
     );
 }
 
+/// A step of a migration that does not apply on the backend recorded its
+/// row and ran nothing, and the report says so; every other step applied.
+#[tokio::test]
+async fn a_step_of_a_migration_that_does_not_apply_is_reported_as_not_applicable() {
+    let fake = Fake::new();
+    let report = runner(&fake).migrate().await.unwrap();
+    for step in &report.applied {
+        let id = MigrationId::from_number(step.id).expect("an id this binary carries");
+        let expected = match table(id) {
+            Migration::NotApplicable(_) => Outcome::NotApplicable,
+            Migration::Applies { .. } => Outcome::Applied,
+        };
+        assert_eq!(step.outcome, expected, "{step:?}");
+    }
+    assert!(
+        report
+            .applied
+            .iter()
+            .any(|s| s.id == MigrationId::SortKeyDefinitions.number()
+                && s.outcome == Outcome::NotApplicable),
+        "{report:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_crash_between_stores_resumes_at_the_first_store_without_a_row() {
     let fake = Fake::new();

@@ -277,9 +277,10 @@ impl<H: HasManagementStore + Send + Sync + 'static> CodeBody<H> for ResourceTagC
 }
 
 /// A pass that could not read or write a policy must not be recorded: the
-/// next run finishes it. The error names the failed lookups and writes and
-/// carries the first failure's database error code, so the runner runs the
-/// body again after a lock timeout.
+/// next run finishes it. The error names the failed lookups and writes,
+/// each with its own text, such as a lapsed migration lock or a node that
+/// did not answer, and carries the first failure's database error code, so
+/// the runner runs the body again after a lock timeout.
 fn refuse_lookup_errors(report: &MigrationReport) -> Result<(), MigrationError> {
     if report.errors == 0 {
         return Ok(());
@@ -292,4 +293,33 @@ fn refuse_lookup_errors(report: &MigrationReport) -> Result<(), MigrationError> 
         },
         _ => MigrationError::Store(message),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MigrationError, MigrationReport, OpError, refuse_lookup_errors};
+
+    /// A failed lookup's own text reaches the operator whatever its kind: a
+    /// store under a lease that lapsed, or a request a node did not answer,
+    /// returns an internal error, and its text says which.
+    #[test]
+    fn a_failed_pass_names_its_failures() {
+        let lapsed = "the migration lock in ks_catalog.settings was not renewed in time";
+        let report = MigrationReport {
+            errors: 1,
+            failures: vec![format!("list the policies of account 1 user/u: {lapsed}")],
+            first_error: Some(OpError::Internal(lapsed.to_owned())),
+            ..MigrationReport::default()
+        };
+        let refused = refuse_lookup_errors(&report);
+        let Err(MigrationError::Store(message)) = refused else {
+            panic!("{refused:?}");
+        };
+        assert!(
+            message.starts_with("resource-tag rewrite: 1 policy lookup(s) or write(s) failed:"),
+            "{message}"
+        );
+        assert!(message.contains(lapsed), "{message}");
+        assert!(refuse_lookup_errors(&MigrationReport::default()).is_ok());
+    }
 }

@@ -52,7 +52,9 @@ The Compose file starts four roles:
 
 1. `postgres`: a separate PostgreSQL 16.10 service.
 2. `extenddb-volume-init`: gives UID 10001 ownership of the named state volume.
-3. `extenddb-bootstrap`: runs `init` once, or `migrate --yes` on later starts.
+3. `extenddb-bootstrap`: runs `init` once. On later starts it runs the
+   `migrate` preview, and `migrate --yes` when the preview exits 3 with
+   migrations pending.
 4. `extenddb`: runs only `serve --foreground` without PostgreSQL admin secrets.
 
 Start the stack:

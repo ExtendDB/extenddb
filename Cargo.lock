@@ -1904,6 +1904,7 @@ dependencies = [
  "extenddb-auth",
  "extenddb-core",
  "extenddb-storage",
+ "extenddb-storage-cassandra",
  "futures",
  "rand 0.9.4",
  "serde",
