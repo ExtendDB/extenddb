@@ -260,6 +260,7 @@ jobs:
           version: ${{ env.VERSION }}
           digest: ${{ env.DIGEST }}
           move-latest: ${{ env.MOVE_LATEST }}
+          signer-workflows: release-image|sign-image
 
       - name: Export wave-1 results for the mirror wave
         id: results
@@ -312,6 +313,7 @@ jobs:
           version: ${{ env.VERSION }}
           digest: ${{ env.DIGEST }}
           move-latest: ${{ env.MOVE_LATEST }}
+          signer-workflows: release-image|sign-image
 
       - name: Assume the ECR publisher role via OIDC
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
@@ -341,6 +343,7 @@ jobs:
           version: ${{ env.VERSION }}
           digest: ${{ env.DIGEST }}
           move-latest: ${{ env.MOVE_LATEST }}
+          signer-workflows: release-image|sign-image
 
       - name: Log out of the mirror registries
         if: always()

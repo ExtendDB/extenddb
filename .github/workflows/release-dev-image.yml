@@ -36,7 +36,7 @@
 #     refuses to overwrite an existing version tag; `latest` only moves
 #     forward, by highest-semver comparison).
 #   * Signing runs in the same job via the shared sign-image composite action
-#     (OIDC to the KMS signing role, Rekor transparency log on). Requires the
+#     (keyless via GitHub OIDC, Rekor transparency log on). Requires the
 #     composite action from PR #279 to be on main.
 #
 # Trigger: manual workflow_dispatch only, same rationale as release-image.yml
@@ -64,7 +64,6 @@ concurrency:
 
 env:
   IMAGE_REPO: extenddb/extenddb-dev
-  KEY_ARN: arn:aws:kms:us-east-1:975306274793:key/654ab7f4-4a11-45e1-a313-3a6989f3721c
   # Pinned AWS CLI for runners that lack it (the smoke test needs `aws`).
   AWSCLI_VERSION: 2.31.6
   AWSCLI_SHA256_X86_64: 45fdcc3003056b3e85c23776636e74208dc2fc16f26278acdbe8eafe3d4e752b
@@ -251,7 +250,7 @@ jobs:
       digest: ${{ steps.push.outputs.digest }}
     permissions:
       contents: read
-      id-token: write            # OIDC for the signing role; no stored AWS secrets
+      id-token: write            # keyless signing (Sigstore/Fulcio) via OIDC
     steps:
       - name: Check out main (for the sign-image composite action)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
@@ -301,7 +300,7 @@ jobs:
           CANDIDATE="sha-${SHA}"
 
           # A released version tag is immutable. If it exists AND its
-          # signature VERIFIES against the committed release key, the
+          # signature VERIFIES as a keyless dev-image signature, the
           # published artifact is authoritative: skip pushing and signing
           # (re-dispatch recovery / mirror backfill). Exists but UNSIGNED:
           # fall through to signing only. Exists with a signature that fails
@@ -318,16 +317,20 @@ jobs:
             EXISTING="$OUT"
             SIG_TAG="sha256-${EXISTING#sha256:}.sig"
             if skopeo inspect --no-creds --format '{{.Digest}}' "docker://${REPO}:${SIG_TAG}" >/dev/null 2>&1; then
-              # The signature must VERIFY, not merely exist: a wrong-key or
-              # garbage manifest at the tag name must abort, not skip.
+              # The signature must VERIFY, not merely exist: a wrong-identity
+              # or garbage manifest at the tag name must abort, not skip.
               if ! command -v cosign >/dev/null || [[ "$(cosign version 2>/dev/null | awk '/GitVersion/{print $2}')" != "$COSIGN_VERSION" ]]; then
                 curl -sSfL -o /tmp/cosign \
                   "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
                 echo "${COSIGN_SHA256}  /tmp/cosign" | sha256sum --check --strict
                 sudo install -m 0755 /tmp/cosign /usr/local/bin/cosign
               fi
-              if ! cosign verify --key extenddb-signing.pub.pem "${REPO}@${EXISTING}" >/dev/null; then
-                echo "::error::${REPO}:${VERSION} carries a signature artifact that does NOT verify against the release key; refusing to skip. Investigate before re-dispatching."
+              if ! cosign verify \
+                   --certificate-identity-regexp '^https://github\.com/ExtendDB/extenddb/\.github/workflows/(release-dev-image|sign-image)\.yml@refs/heads/main$' \
+                   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+                   --certificate-github-workflow-trigger workflow_dispatch \
+                   "${REPO}@${EXISTING}" >/dev/null; then
+                echo "::error::${REPO}:${VERSION} carries a signature artifact that does NOT verify as a keyless ExtendDB dev-image signature; refusing to skip. A key-signed version from before the keyless cutover cannot be re-released through this path; handle it manually. Investigate before re-dispatching."
                 exit 1
               fi
               echo "::notice::${REPO}:${VERSION} already published and its signature verifies; treating published state as authoritative"
@@ -381,13 +384,6 @@ jobs:
           echo "$OUT" | grep -q 'linux/amd64' || { echo "::error::amd64 missing"; exit 1; }
           echo "$OUT" | grep -q 'linux/arm64' || { echo "::error::arm64 missing"; exit 1; }
 
-      - name: Assume the signing role via OIDC (no stored AWS secrets)
-        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
-        with:
-          role-to-assume: arn:aws:iam::975306274793:role/ExtendDBContainerSigningCI
-          role-session-name: extenddb-dev-sign-${{ github.run_id }}
-          aws-region: us-east-1
-
       - name: Does the signature already exist? (re-entry — never double-sign)
         id: sigstate
         env:
@@ -409,7 +405,6 @@ jobs:
           image-repo: docker.io/${{ env.IMAGE_REPO }}
           digest: ${{ steps.push.outputs.digest }}
           release-tag: v${{ needs.gate.outputs.version }}
-          key-arn: ${{ env.KEY_ARN }}
 
       - name: Summarise for the release checklist
         run: |
@@ -483,6 +478,7 @@ jobs:
           version: ${{ env.VERSION }}
           digest: ${{ env.DIGEST }}
           move-latest: ${{ steps.ml.outputs.move-latest }}
+          signer-workflows: release-dev-image|sign-image
 
       - name: Assume the ECR publisher role via OIDC
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
@@ -512,6 +508,7 @@ jobs:
           version: ${{ env.VERSION }}
           digest: ${{ env.DIGEST }}
           move-latest: ${{ steps.ml.outputs.move-latest }}
+          signer-workflows: release-dev-image|sign-image
 
       - name: Log out of the mirror registries
         if: always()

@@ -201,8 +201,10 @@ jobs:
         run: |
           set -euo pipefail
           # This page is a public front door, so a dead link is worse than a
-          # blank page. Loopback URLs are examples inside code blocks, not links.
-          # --retry so a transient blip does not fail the run.
+          # blank page. Fenced code blocks are stripped before extraction: the
+          # cosign verify examples inside them carry URL-shaped regex and
+          # issuer strings that are not links. --retry so a transient blip does
+          # not fail the run.
           FAILED=0
           while read -r url; do
             [[ -z "$url" ]] && continue
@@ -214,7 +216,8 @@ jobs:
             else
               echo "  200 ${url}"
             fi
-          done < <(grep -oE 'https://[^)"[:space:]]+' "$FILE" \
+          done < <(awk '/^```/{fence=!fence; next} !fence' "$FILE" \
+                     | grep -oE 'https://[^)"[:space:]]+' \
                      | sed 's/[),.]*$//' \
                      | grep -v '127\.0\.0\.1' \
                      | sort -u)
