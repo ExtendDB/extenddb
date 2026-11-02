@@ -228,41 +228,44 @@ fn item_operations_default_return_consumed_capacity_to_none() {
 // -- keys an operation does not take -------------------------------------------
 
 #[test]
-fn a_key_the_operation_does_not_take_holds_the_member_as_given() {
+fn a_key_the_operation_does_not_take_is_absent() {
+    // A member an operation does not take must not set its key. Otherwise a
+    // policy that grants a broad action gated only on, say, dynamodb:Select
+    // could be satisfied by a Select member added to a write or a DeleteTable.
     let all = json!({"Select": "COUNT", "ReturnValues": "ALL_OLD"});
     for operation in ["PutItem", "UpdateItem", "DeleteItem"] {
         assert_eq!(select_of(operation, &read()), None, "{operation}");
         assert_eq!(
-            select_of(operation, &with(&read(), &all)).as_deref(),
-            Some("COUNT")
+            select_of(operation, &with(&read(), &all)),
+            None,
+            "{operation} does not read a Select member"
         );
     }
     for operation in ["GetItem", "Query", "Scan"] {
-        assert_eq!(single_table(operation, &read()).return_values, None);
         assert_eq!(
-            single_table(operation, &with(&read(), &all))
-                .return_values
-                .as_deref(),
-            Some("ALL_OLD"),
+            single_table(operation, &read()).return_values,
+            None,
             "{operation}"
+        );
+        assert_eq!(
+            single_table(operation, &with(&read(), &all)).return_values,
+            None,
+            "{operation} does not read a ReturnValues member"
         );
     }
 }
 
 #[test]
-fn other_operations_get_no_default() {
+fn other_operations_read_only_the_keys_they_take() {
     let given = json!({
         "TableName": "t",
         "Select": "COUNT",
         "ReturnValues": "ALL_OLD",
         "ReturnConsumedCapacity": "TOTAL",
     });
-    for operation in [
-        "DescribeTable",
-        "CreateTable",
-        "ListTables",
-        "SearchVectors",
-    ] {
+    // Control-plane operations take none of the three keys, so no member of
+    // those names is read, with or without it in the body.
+    for operation in ["DescribeTable", "CreateTable", "ListTables", "DeleteTable"] {
         assert_eq!(
             single_table(operation, &json!({"TableName": "t"})),
             ParameterKeys::default(),
@@ -270,10 +273,20 @@ fn other_operations_get_no_default() {
         );
         assert_eq!(
             single_table(operation, &given),
-            keys(Some("COUNT"), Some("ALL_OLD"), Some("TOTAL")),
-            "{operation}"
+            ParameterKeys::default(),
+            "{operation} reads no member"
         );
     }
+    // SearchVectors takes ReturnConsumedCapacity, but not Select or ReturnValues.
+    assert_eq!(
+        single_table("SearchVectors", &json!({"TableName": "t"})),
+        ParameterKeys::default()
+    );
+    assert_eq!(
+        single_table("SearchVectors", &given),
+        keys(None, None, Some("TOTAL")),
+        "SearchVectors reads only ReturnConsumedCapacity"
+    );
 }
 
 // -- batch and transaction parts -------------------------------------------------

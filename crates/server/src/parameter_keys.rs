@@ -48,7 +48,8 @@
 //! default the DynamoDB API reference gives for a read of an index; that was not
 //! measured either.
 //!
-//! The batch and transaction targets carry only the keys their operation takes.
+//! On a single table and in a batch or transaction, an operation carries only
+//! the keys it takes; a member an operation does not take is not read.
 
 use serde_json::Value;
 
@@ -73,28 +74,43 @@ pub(crate) struct ParameterKeys {
     pub return_consumed_capacity: Option<String>,
 }
 
-/// The keys of a request authorized once, against one resource.
+/// The keys of a request authorized once, against one resource. Each key is
+/// set only on the operations whose request carries that parameter, the rule
+/// `batch_table` and `transact_item` follow: a member an operation does not
+/// take (a `Select` or `ReturnValues` on a write, any of the three on a
+/// control-plane request) is not read, so a condition on that key cannot be
+/// satisfied by a member added to a request the operation does not model.
 pub(crate) fn single_table(operation: &str, input: &Value) -> ParameterKeys {
-    let mut keys = ParameterKeys {
-        select: given(input, "Select"),
-        return_values: given(input, "ReturnValues"),
-        return_consumed_capacity: given(input, "ReturnConsumedCapacity"),
-    };
     match operation {
-        "GetItem" => keys.select = Some(projection_select(input).to_owned()),
-        "Query" | "Scan" => {
-            keys.select = Some(
-                keys.select
-                    .unwrap_or_else(|| range_read_select(input).to_owned()),
-            );
-        }
-        "PutItem" | "UpdateItem" | "DeleteItem" => {
-            keys.return_values = Some(keys.return_values.unwrap_or_else(|| NONE.to_owned()));
-        }
-        _ => return keys,
+        "GetItem" => ParameterKeys {
+            select: Some(projection_select(input).to_owned()),
+            return_values: None,
+            return_consumed_capacity: Some(consumed_capacity(input)),
+        },
+        "Query" | "Scan" => ParameterKeys {
+            select: Some(
+                given(input, "Select").unwrap_or_else(|| range_read_select(input).to_owned()),
+            ),
+            return_values: None,
+            return_consumed_capacity: Some(consumed_capacity(input)),
+        },
+        "PutItem" | "UpdateItem" | "DeleteItem" => ParameterKeys {
+            select: None,
+            return_values: Some(given(input, "ReturnValues").unwrap_or_else(|| NONE.to_owned())),
+            return_consumed_capacity: Some(consumed_capacity(input)),
+        },
+        // SearchVectors takes ReturnConsumedCapacity but no Select or
+        // ReturnValues. Its value is not measured, so it is read as given and
+        // left absent when the request omits it, as before.
+        "SearchVectors" => ParameterKeys {
+            select: None,
+            return_values: None,
+            return_consumed_capacity: given(input, "ReturnConsumedCapacity"),
+        },
+        // Control-plane and every other single-resource operation take none of
+        // the three.
+        _ => ParameterKeys::default(),
     }
-    keys.return_consumed_capacity = Some(consumed_capacity(input));
-    keys
 }
 
 /// The keys of one table's part of a `BatchGetItem` or `BatchWriteItem`:
