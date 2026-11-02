@@ -52,8 +52,9 @@ import urllib.parse
 import psycopg2
 
 from catalog_checks import (
-    expect_exit, finish, healthy, kill_daemon, pid_file, report, run, run_split, start, stop,
+    expect_exit, finish, healthy, kill_daemon, report, run, run_split, start, stop,
 )
+from catalog_checks import pid_file as pid_file_for
 
 NAMESPACE = 0x0045_4442  # the advisory key namespace of crates/storage-postgres
 MIGRATION_KEY = 1
@@ -150,7 +151,7 @@ def startup_policy(
     # The parent reads the status before it forks, so the code and the
     # message reach the invoking shell.
     code, out, err = run_split(daemon, env)
-    kill_daemon(pid_file(config, env, port), binary)
+    kill_daemon(pid_file_for(config, env, port), binary)
     report(
         code == 3 and MIGRATE_HINT in err,
         f"exit {code}: serve in daemon mode on a catalog behind this binary, the message on stderr",
@@ -347,7 +348,7 @@ def main(binary: str, admin_url: str, port: int) -> int:
     finally:
         for server in servers:
             stop(server)
-        kill_daemon(pid_file(config, env, port), binary)
+        kill_daemon(pid_file_for(config, env, port), binary)
         if holder is not None:
             holder.close()
         cleanup(admin_url, stem)
