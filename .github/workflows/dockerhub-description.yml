@@ -251,6 +251,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: dockerhub
+    permissions:
+      contents: read
+      id-token: write   # OIDC: read the Docker Hub credential from Secrets Manager
     strategy:
       fail-fast: false
       matrix:
@@ -288,13 +291,23 @@ jobs:
           echo "file=$FILE" >> "$GITHUB_OUTPUT"
           echo "short=$SHORT" >> "$GITHUB_OUTPUT"
 
+      - name: Fetch the Docker Hub credential via OIDC (Secrets Manager)
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: arn:aws:iam::975306274793:role/ExtendDBDockerHubPublisher
+          role-session-name: extenddb-dockerhub-overview-${{ github.run_id }}
+          aws-region: us-east-1
+      - name: Read the Docker Hub credential from Secrets Manager
+        uses: aws-actions/aws-secretsmanager-get-secrets@2297f9a879480a9e3af9b293ed15c70caf8e1c88 # v3.0.2
+        with:
+          secret-ids: DOCKERHUB,extenddb/dockerhub-publish
+          parse-json-secrets: true
+
       - name: Publish the Overview
         env:
           IMAGE: ${{ matrix.image }}
           FILE: ${{ steps.src.outputs.file }}
           SHORT: ${{ steps.src.outputs.short }}
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           set -euo pipefail
 

@@ -102,6 +102,7 @@ jobs:
       move_latest: ${{ steps.results.outputs.move_latest }}
     permissions:
       contents: read
+      id-token: write   # OIDC: read the Docker Hub credential from Secrets Manager
     steps:
       - name: Check out main (ancestry and version gates need history)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
@@ -244,10 +245,19 @@ jobs:
             echo "::notice::move_latest is unchecked; latest will not be touched"
           fi
 
+      - name: Fetch the Docker Hub credential via OIDC (Secrets Manager)
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: arn:aws:iam::975306274793:role/ExtendDBDockerHubPublisher
+          role-session-name: extenddb-dockerhub-promote-${{ github.run_id }}
+          aws-region: us-east-1
+      - name: Read the Docker Hub credential from Secrets Manager
+        uses: aws-actions/aws-secretsmanager-get-secrets@2297f9a879480a9e3af9b293ed15c70caf8e1c88 # v3.0.2
+        with:
+          secret-ids: DOCKERHUB,extenddb/dockerhub-publish
+          parse-json-secrets: true
+
       - name: Log in to Docker Hub (the only step chain with the credential)
-        env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           set -euo pipefail
           skopeo login docker.io -u "$DOCKERHUB_USERNAME" --password-stdin <<< "$DOCKERHUB_TOKEN"

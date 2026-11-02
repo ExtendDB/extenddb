@@ -182,7 +182,7 @@ use sqlx::postgres::PgPoolOptions;
 ///
 /// The tuple is the single source of truth. Use `CATALOG_VERSION.to_string()`
 /// wherever a string representation is needed.
-pub const CATALOG_VERSION: CatalogVersion = CatalogVersion::new(0, 0, 4);
+pub const CATALOG_VERSION: CatalogVersion = CatalogVersion::new(0, 0, 5);
 
 /// Minimum number of connections allowed per pool.
 ///
