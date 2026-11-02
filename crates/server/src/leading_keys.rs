@@ -30,7 +30,18 @@
 //!   value from the key condition (an LSI shares the base partition key).
 //! - `Query` on a global secondary index: the index's partition key value from
 //!   the key condition. The service binds LeadingKeys to the queried index's
-//!   partition key, not the base table's.
+//!   partition key, not the base table's. On an index with several HASH
+//!   attributes it binds the first one's value only (measured 2026-10-20). The
+//!   clauses of a key condition on a multi-attribute key schema are assigned
+//!   to key attributes by name, through the same classification the engine
+//!   uses, so any clause order the engine serves binds the first HASH
+//!   attribute. When an equality names the first HASH attribute and the
+//!   classification refuses the condition (a missing HASH attribute, for one),
+//!   the key is left absent, as the service answers `ValidationException` to
+//!   every principal for `g1 = :a` on HASH `g1`, `g2` (measured 2026-10-21). A
+//!   single clause on the partition attribute under an operator the engine
+//!   rejects binds that clause's operand, the rule measured for `pk > :v` on a
+//!   base table.
 //! - `Scan` and `SearchVectors`: no LeadingKeys (neither targets a single
 //!   partition, so the service sets none).
 //! - `BatchGetItem`/`BatchWriteItem`: one authorization per (action, table)
@@ -55,7 +66,7 @@ use extenddb_core::expression::{
     Expr, PathElement, Token, key_condition_clause_operands, parse_key_condition,
     tokenize_with_limit,
 };
-use extenddb_core::types::{KeyType, TableKeyInfo};
+use extenddb_core::types::{KeySchemaElement, KeyType, TableKeyInfo};
 use serde_json::Value;
 
 /// A single `(action, table)` authorization to perform for a batch or
@@ -235,21 +246,22 @@ pub(crate) fn single_table_leading_keys(
 /// schema (base table, or the named index). `None` when the key condition names
 /// no single value for that partition attribute.
 fn query_leading_keys(input: &Value, key_info: &TableKeyInfo, max_tokens: usize) -> Option<String> {
-    // The partition attribute of whatever the query targets: the named index's
-    // partition key, or the base table's. A GSI has its own partition key; an
-    // LSI shares the base table's. An unknown index name is a request the engine
-    // rejects, so leave the key absent.
-    let pk_attr: String = match index_name(input) {
+    // The key schema the query reads: the named index's, or the base table's.
+    // A GSI has its own partition key; an LSI shares the base table's. An
+    // unknown index name is a request the engine rejects, so leave the key
+    // absent.
+    let key_schema: &[KeySchemaElement] = match index_name(input) {
         Some(index) => {
-            let info = key_info
+            &key_info
                 .global_secondary_indexes
                 .iter()
                 .chain(key_info.local_secondary_indexes.iter())
-                .find(|i| i.index_name == index)?;
-            hash_attr(&info.key_schema)?.to_owned()
+                .find(|i| i.index_name == index)?
+                .key_schema
         }
-        None => hash_attr(&key_info.key_schema)?.to_owned(),
+        None => &key_info.key_schema,
     };
+    let pk_attr = hash_attr(key_schema)?;
 
     let names = names_map(input);
     let values = values_map(input);
@@ -260,17 +272,17 @@ fn query_leading_keys(input: &Value, key_info: &TableKeyInfo, max_tokens: usize)
         let pk_clauses: Vec<_> = key_condition_clause_operands(&tokens)
             .ok()?
             .into_iter()
-            .filter(|clause| {
-                resolve_attr_name(&clause.path, &names).as_deref() == Some(pk_attr.as_str())
-            })
+            .filter(|clause| resolve_attr_name(&clause.path, &names).as_deref() == Some(pk_attr))
             .collect();
         // An equality on the partition attribute decides the key, as the
-        // engine reads it. When its value cannot be read here (an `N` that
-        // is not a number, a placeholder with no value), the key stays absent
-        // and no other clause's operand is bound in its place: the equality,
-        // not the other clause, names the partition.
+        // engine reads it. When the engine's classification refuses the
+        // condition (a missing HASH attribute on a multi-attribute key schema,
+        // for one) or the value cannot be read here (an `N` that is not a
+        // number, a placeholder with no value), the key stays absent and no
+        // other clause's operand is bound in its place: the equality, not the
+        // other clause, names the partition.
         if pk_clauses.iter().any(|clause| clause.equality) {
-            return equality_pk_value(&tokens, &pk_attr, &names, &values);
+            return equality_pk_value(&tokens, key_schema, pk_attr, &names, &values);
         }
         // Exactly one clause names the partition key, under an operator the
         // engine rejects, such as `pk > :v`. The service binds LeadingKeys to
@@ -296,7 +308,7 @@ fn query_leading_keys(input: &Value, key_info: &TableKeyInfo, max_tokens: usize)
     // service's comparison operators is not read as one; both leave the key
     // absent.
     if let Some(conds) = input.get("KeyConditions").and_then(Value::as_object) {
-        let cond = conds.get(&pk_attr)?.as_object()?;
+        let cond = conds.get(pk_attr)?.as_object()?;
         let operator = cond.get("ComparisonOperator").and_then(Value::as_str)?;
         if !LEGACY_SINGLE_OPERAND_OPERATORS.contains(&operator) {
             return None;
@@ -325,17 +337,24 @@ const LEGACY_SINGLE_OPERAND_OPERATORS: [&str; 9] = [
 ];
 
 /// The partition key value a `KeyConditionExpression` pins with an equality,
-/// resolved the way the engine resolves it. `None` when the expression does not
-/// parse as a key condition or does not pin `pk_attr` by equality.
+/// resolved against the queried key schema the way the engine resolves it.
+/// `None` when the expression does not parse as a key condition, when the
+/// engine's classification refuses it, or when it does not pin `pk_attr` by
+/// equality.
 fn equality_pk_value(
     tokens: &[Token],
+    key_schema: &[KeySchemaElement],
     pk_attr: &str,
     names: &HashMap<String, String>,
     values: &HashMap<String, Value>,
 ) -> Option<String> {
     let mut kc = parse_key_condition(tokens).ok()?;
-    // Assign PK vs SK using the partition attribute, mirroring the engine.
-    kc.resolve_pk_sk(pk_attr, names).ok()?;
+    // Assign every clause to its key attribute with the engine's own
+    // classification: by name on a multi-attribute key schema, where the
+    // first HASH attribute is the one LeadingKeys names, and by
+    // `resolve_pk_sk` on any other. A condition the classifier refuses is
+    // refused by the engine too.
+    kc.resolve_key_schema(key_schema, names).ok()?;
     // The condition must actually pin the partition key; if it does not, the
     // engine rejects the query.
     if resolve_attr_name(&kc.pk_path, names).as_deref() != Some(pk_attr) {

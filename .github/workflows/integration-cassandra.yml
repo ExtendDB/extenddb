@@ -68,6 +68,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          # Only pushes to main save, so other runs restore main's cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Configure Cassandra authentication
         run: |
           docker exec ${{ job.services.cassandra.id }} sed -i \
@@ -138,6 +140,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          # Only pushes to main save, so other runs restore main's cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Configure Cassandra authentication
         run: |
           docker exec ${{ job.services.cassandra.id }} sed -i \
@@ -189,6 +193,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          # Only pushes to main save, so other runs restore main's cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Configure Cassandra authentication
         run: |
           docker exec ${{ job.services.cassandra.id }} sed -i \
@@ -225,6 +231,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          # Only pushes to main save, so other runs restore main's cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check production Cassandra feature graph
         run: cargo check --release --no-default-features --features cassandra
 
