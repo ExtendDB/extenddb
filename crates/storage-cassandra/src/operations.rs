@@ -93,6 +93,19 @@ impl OperationsEngine for CassandraOperationsEngine {
         crate::CATALOG_VERSION.to_string()
     }
 
+    fn setting_default(&self, key: &str) -> Option<String> {
+        use extenddb_core::settings_keys::INDEX_PROPAGATION_DELAY_MS;
+        match key {
+            // CreateTable's fallback and the control-plane worker's.
+            "control_plane_delay_seconds" => {
+                Some(crate::DEFAULT_CONTROL_PLANE_DELAY_SECONDS.to_string())
+            }
+            // The engine's initial GSI delay, kept while the row is absent.
+            INDEX_PROPAGATION_DELAY_MS => Some("10".to_owned()),
+            _ => None,
+        }
+    }
+
     fn is_sensitive_key(&self, key: &str) -> bool {
         key.contains("password") || key.contains("secret")
     }

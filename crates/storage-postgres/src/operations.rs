@@ -58,8 +58,27 @@ impl OperationsEngine for PostgresOperationsEngine {
         Ok(())
     }
 
+    /// The highest migration this binary carries: the catalog is versioned
+    /// by its ledger, and its `catalog_version` row holds the same integer.
     fn catalog_version(&self) -> String {
-        crate::CATALOG_VERSION.to_string()
+        extenddb_storage::migrations::MigrationId::LATEST
+            .number()
+            .to_string()
+    }
+
+    fn setting_default(&self, key: &str) -> Option<String> {
+        use extenddb_core::settings_keys::INDEX_PROPAGATION_DELAY_MS;
+        match key {
+            // The `COALESCE` fallback of CreateTable and DeleteTable, and the
+            // control-plane worker's.
+            "control_plane_delay_seconds" => {
+                Some(crate::DEFAULT_CONTROL_PLANE_DELAY_SECONDS.to_string())
+            }
+            INDEX_PROPAGATION_DELAY_MS => {
+                Some(crate::DEFAULT_INDEX_PROPAGATION_DELAY_MS.to_string())
+            }
+            _ => None,
+        }
     }
 
     fn is_sensitive_key(&self, key: &str) -> bool {

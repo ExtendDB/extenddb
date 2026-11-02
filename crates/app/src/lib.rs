@@ -28,6 +28,7 @@ mod cmd_healthcheck;
 mod cmd_init;
 mod cmd_manage;
 mod cmd_migrate;
+mod cmd_migrate_runner;
 mod cmd_serve;
 mod cmd_settings;
 mod cmd_status;
@@ -69,7 +70,9 @@ enum Command {
     Destroy(cmd_destroy::DestroyArgs),
     /// Validate a extenddb deployment
     Verify(cmd_verify::VerifyArgs),
-    /// Apply catalog schema migrations (exit 0 up to date or applied, 3 work pending without --yes)
+    /// Apply catalog migrations (exit 0 up to date or applied, 1 error, 3 pending without --yes,
+    /// 4 the catalog has a breaking migration this binary lacks, 5 a person must act, 6 the
+    /// catalog stayed locked)
     Migrate(cmd_migrate::MigrateArgs),
     /// Check if the extenddb server is running
     Status(cmd_status::StatusArgs),
@@ -106,18 +109,25 @@ pub fn run(build: BuildInfo) -> anyhow::Result<()> {
     match cli.command.unwrap_or(Command::Version) {
         Command::Serve(args) => cmd_serve::run(&args, build),
         Command::Init(args) => {
-            let code = run_interactive(cmd_init::run(args))?;
+            let code = run_interactive(cmd_init::run(args, build.version))?;
             if code != 0 {
                 std::process::exit(i32::from(code));
             }
             Ok(())
         }
         Command::Destroy(args) => run_interactive(cmd_destroy::run(args)),
-        Command::Verify(args) => run_interactive(cmd_verify::run(args)),
+        Command::Verify(args) => {
+            let code = run_interactive(cmd_verify::run(args, build.version))?;
+            if code != 0 {
+                std::process::exit(i32::from(code));
+            }
+            Ok(())
+        }
         Command::Migrate(args) => {
             // 0 up to date or applied; cmd_migrate::EXIT_PENDING for a preview
-            // that found work; errors exit 1 through main.
-            let code = run_interactive(cmd_migrate::run(args))?;
+            // that found work; on the migration ledger, the status's code;
+            // errors exit 1 through main.
+            let code = run_interactive(cmd_migrate::run(args, build.version))?;
             if code != 0 {
                 std::process::exit(i32::from(code));
             }
@@ -152,14 +162,14 @@ pub fn run(build: BuildInfo) -> anyhow::Result<()> {
 fn print_version(build: BuildInfo) {
     println!("extenddb {}", build.version);
 
-    // One backend is compiled into this binary; report its catalog version.
-    match (
-        extenddb_storage::backend_name(),
-        extenddb_storage::operations::catalog_version(),
-    ) {
-        (Some(backend), Ok(version)) => println!("catalog {version} ({backend})"),
-        (Some(backend), Err(_)) => println!("catalog unknown ({backend})"),
-        (None, _) => println!("catalog unknown (no backend installed)"),
+    // One backend is compiled into this binary; report the catalog it needs:
+    // the highest migration it carries, or a backend's catalog version.
+    match extenddb_storage::backend_name() {
+        Some(backend) => println!(
+            "catalog {} ({backend})",
+            extenddb_storage::migrations::binary_catalog_label()
+        ),
+        None => println!("catalog unknown (no backend installed)"),
     }
 
     println!("commit {}", build.git_hash);

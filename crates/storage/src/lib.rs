@@ -18,6 +18,7 @@ pub mod error;
 pub mod hooks;
 pub mod management_store;
 pub mod management_store_factory;
+pub mod migrations;
 pub mod operations;
 pub mod policy_migration;
 pub mod server_components;

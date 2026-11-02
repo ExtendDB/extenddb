@@ -241,7 +241,8 @@ impl CassandraBootstrapper {
                 | OpError::AlreadyExists(m)
                 | OpError::NotFound(m)
                 | OpError::HasDependents(m)
-                | OpError::Internal(m) => StorageError::Internal(m),
+                | OpError::Internal(m)
+                | OpError::Database { message: m, .. } => StorageError::Internal(m),
             })
     }
 }

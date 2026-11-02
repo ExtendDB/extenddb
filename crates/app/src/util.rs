@@ -22,6 +22,54 @@ pub fn is_process_alive(_pid: i32) -> bool {
     true
 }
 
+/// The configuration `migrate` and `verify` read: the file `--config`
+/// names, else `extenddb.toml` when it exists, else, in a dev-mode build,
+/// the built-in defaults with the `EXTENDDB__` environment variables, as
+/// `serve` reads them when it starts without a file. Returns the file read,
+/// if any.
+pub(crate) fn command_config(
+    given: Option<&str>,
+) -> anyhow::Result<(extenddb_config::AppConfig, Option<String>)> {
+    let path = given.unwrap_or(crate::cmd_migrate::DEFAULT_CONFIG);
+    if std::path::Path::new(path).exists() {
+        return Ok((extenddb_config::load(path)?, Some(path.to_owned())));
+    }
+    if given.is_none() && cfg!(feature = "dev-mode") {
+        return Ok((extenddb_config::load_builtin_defaults()?, None));
+    }
+    anyhow::bail!(
+        "Config file '{path}' not found. Run 'extenddb init' to set up a deployment, \
+         or use --config <path> to specify a different location."
+    )
+}
+
+/// Print each step a run applied, as `<indent><verb> <id> <name>`, naming
+/// the store only when the run touched more than one, and each step's notes
+/// below it.
+pub(crate) fn print_applied(
+    report: &extenddb_storage::migrations::RunReport,
+    indent: &str,
+    verb: &str,
+) {
+    let several = report
+        .applied
+        .windows(2)
+        .any(|w| w[0].store_name != w[1].store_name);
+    for step in &report.applied {
+        if several {
+            println!(
+                "{indent}{verb} {} {} in {}",
+                step.id, step.name, step.store_name
+            );
+        } else {
+            println!("{indent}{verb} {} {}", step.id, step.name);
+        }
+        for note in &step.notes {
+            println!("{indent}  {note}");
+        }
+    }
+}
+
 /// Append a secret to the backend argument vector when the corresponding CLI
 /// flag was not supplied. The value may come from an environment variable, so
 /// it is added only to this in-process copy and never to the process command

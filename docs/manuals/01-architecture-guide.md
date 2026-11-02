@@ -205,9 +205,9 @@ extenddb uses a dual-database architecture:
 - **Catalog database** (e.g., `extenddb_catalog`): Stores table metadata, account/user/group/role/policy definitions, access keys, settings, stream metadata, and metrics. Shared across all accounts.
 - **Data database** (e.g., `extenddb_catalog_data`): Stores user items, GSI/LSI data, and stream records. Each table gets its own PostgreSQL table.
 
-PostgreSQL, SQLite, and Cassandra store the catalog version in the `settings` table under the key `catalog_version`; PostgreSQL and SQLite check it at startup, and Cassandra has no startup check (see the Upgrade Manual).
-The MongoDB backend tracks its own catalog version, separate from the one the other backends share.
-A mismatch between the compiled-in version and the stored one prevents a PostgreSQL or SQLite server from starting; run `extenddb migrate` to upgrade.
+On PostgreSQL and SQLite the catalog is versioned by its migration ledger, the `extenddb_migrations` table: the catalog version is the highest migration recorded in every store, and `serve` reads the catalog's status at startup and refuses a catalog that is behind it or carries a breaking migration it does not know. Cassandra stores its catalog version in the `settings` table under the key `catalog_version` and has no startup check (see the Upgrade Manual).
+The MongoDB backend tracks its own catalog version, as Cassandra does.
+A PostgreSQL or SQLite server that refuses its catalog prints the status and the command that resolves it; for pending migrations that is `extenddb migrate --yes`.
 
 ## Pluggable Architecture
 
