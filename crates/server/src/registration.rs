@@ -14,8 +14,9 @@
 //! the background, which is a `RestoreTableFromBackup`'s item copy on every
 //! backend, an `UpdateTimeToLive` backfill on Cassandra and PostgreSQL, and
 //! a GSI or vector index build on PostgreSQL. PostgreSQL's GSI propagation
-//! workers, which the engine starts with itself and which write only the
-//! data database, go on too. The server then asks the backend to register
+//! workers, which the engine starts with itself, and MongoDB's startup pass
+//! that rebuilds documents stored without their key (#473) write only the
+//! data database, and go on too. The server then asks the backend to register
 //! again at once and then every second, and when the backend reports a new
 //! registration with the catalog's status unchanged, it starts a new set of
 //! workers and serves again. When the backend refuses (a migration holds the
