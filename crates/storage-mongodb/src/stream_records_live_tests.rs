@@ -12,8 +12,6 @@
 //! Each test uses its own catalog and data databases and drops them at the
 //! end. Rows are inserted directly in the shape the engine writes them.
 
-use std::sync::Arc;
-
 use extenddb_storage::StreamEngine;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::stream_arn;
@@ -42,18 +40,13 @@ impl Fixture {
     async fn new() -> Self {
         let tag = uuid::Uuid::new_v4().simple().to_string();
         let client = mongodb::Client::with_uri_str(uri()).await.expect("client");
-        let slots = crate::backup_engine::restore_server_slot_count(10);
         let engine = MongoEngine {
-            client: client.clone(),
-            catalog_db: client.database(&format!("s{}_cat", &tag[..12])),
-            data_db: client.database(&format!("s{}_data", &tag[..12])),
             region: REGION.to_owned(),
-            gsi_cache: Arc::default(),
-            tx_read_concern: mongodb::options::ReadConcern::snapshot(),
-            backup_liveness: crate::backup_engine::BackupLiveness::default(),
-            restore_server_slot_count: slots,
-            restore_server_slots: Arc::new(tokio::sync::Semaphore::new(slots)),
-            restore_account_slots: crate::backup_engine::RestoreAccountSlots::default(),
+            ..MongoEngine::for_test(
+                &client,
+                client.database(&format!("s{}_cat", &tag[..12])),
+                client.database(&format!("s{}_data", &tag[..12])),
+            )
         };
         Self { engine }
     }

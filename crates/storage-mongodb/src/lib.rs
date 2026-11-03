@@ -636,8 +636,31 @@ impl MongoEngine {
         let catalog_db = catalog_database(&client);
         let data_db = client.database("extenddb_data");
 
+        Ok(Self::from_parts(
+            client,
+            catalog_db,
+            data_db,
+            region,
+            tx_read_concern,
+            pool_size,
+        ))
+    }
+
+    /// The engine on `catalog_db` and `data_db` of `client`, with every other
+    /// field at the value `new` gives it for a pool of `pool_size`
+    /// connections. `new` and [`MongoEngine::for_test`] both build the engine
+    /// here, so a field added to `MongoEngine` is set in this function and in
+    /// no test.
+    fn from_parts(
+        client: mongodb::Client,
+        catalog_db: mongodb::Database,
+        data_db: mongodb::Database,
+        region: &str,
+        tx_read_concern: mongodb::options::ReadConcern,
+        pool_size: u32,
+    ) -> Self {
         let restore_server_slot_count = backup_engine::restore_server_slot_count(pool_size);
-        Ok(Self {
+        Self {
             client,
             catalog_db,
             data_db,
@@ -649,7 +672,28 @@ impl MongoEngine {
             restore_server_slots: Arc::new(tokio::sync::Semaphore::new(restore_server_slot_count)),
             restore_account_slots: backup_engine::RestoreAccountSlots::default(),
             contention_deadline: data_engine::CONTENTION_DEADLINE,
-        })
+        }
+    }
+
+    /// An engine for a test, on `catalog_db` and `data_db` of `client`, in
+    /// region `us-east-1` with snapshot read concern, and every other field
+    /// as `new` sets it for the driver's default pool of 10 connections. A
+    /// test that needs another value for a field sets it with struct update
+    /// syntax on the result.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        client: &mongodb::Client,
+        catalog_db: mongodb::Database,
+        data_db: mongodb::Database,
+    ) -> Self {
+        Self::from_parts(
+            client.clone(),
+            catalog_db,
+            data_db,
+            "us-east-1",
+            mongodb::options::ReadConcern::snapshot(),
+            10,
+        )
     }
 
     /// Read concern to use for a newly-opened multi-document transaction.

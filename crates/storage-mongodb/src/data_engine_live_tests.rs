@@ -41,6 +41,9 @@ mod repair_pass;
 #[path = "data_engine_live_tests_put_race.rs"]
 mod put_race;
 
+#[path = "data_engine_live_tests_contention.rs"]
+mod contention;
+
 fn uri() -> String {
     std::env::var("EXTENDDB_TEST_MONGODB_URI").expect(
         "set EXTENDDB_TEST_MONGODB_URI to a MongoDB replica set, e.g. \
