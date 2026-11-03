@@ -1,0 +1,97 @@
+name: Project status sweep
+# Sets Status on the ExtendDB Roadmap board (org Project 3) from the real
+# state of each open issue and PR. Runs about every 5 minutes (GitHub may
+# delay scheduled runs), right away when an issue is assigned or unassigned,
+# and on demand. The rules are in .github/scripts/project-status-sweep.js.
+#
+# Why a sweep and not PR events: every trigger here runs from the default
+# branch, so no fork can start it, and it needs no pull_request_target (which
+# GitHub turns off by default for public repos from 2026-12-02).
+#
+# Privacy: this repo is public, so this workflow's logs are public; the board
+# is not. The log gets one line of totals. Every detail goes to a "Board
+# sweep: ..." draft card on the board, rewritten each run (see the script).
+# A run goes red, and GitHub emails whoever last edited this file's schedule,
+# when card updates fail or that card cannot be written. Anything else that
+# needs attention shows only in the card's title: NEEDS ATTENTION.
+#
+# Setup (repo admin, once):
+#   1. GitHub App owned by ExtendDB with Organization: Projects read/write;
+#      Repository: Issues, Pull requests, Metadata read. No webhook. Install it
+#      on every repo whose issues or PRs are on the board (today: extenddb).
+#   2. Environment "project-board", deployment branches: main only.
+#      In it: variable PROJECT_APP_CLIENT_ID and secret PROJECT_APP_PRIVATE_KEY.
+#   3. Board workflows: keep "Item closed" and "Pull request merged" (they set
+#      Done). Turn off every other workflow that sets Status; the sweep warns
+#      while any is on.
+#   4. Optional: single-select board field "Auto status" with option "Off".
+#      Cards set to Off are never moved.
+#   5. Run this workflow once with dry_run and read the board's
+#      "Board sweep: DRY RUN ..." card.
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  issues:
+    types: [assigned, unassigned]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Write the planned moves to the board's health card only
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Dry runs get their own group so a scheduled run cannot replace a pending one.
+# Real runs queue: at most one waits, and each reads the whole board anyway.
+concurrency:
+  group: project-status-sweep${{ inputs.dry_run && '-dry' || '' }}
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    # Forks inherit the schedule; only run here.
+    if: github.repository == 'ExtendDB/extenddb'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Secrets live in this environment, which only main can use.
+    # deployment: false keeps that, without a deployment record every run.
+    environment:
+      name: project-board
+      deployment: false
+    steps:
+      - name: Check out sweep script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Mint App token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.PROJECT_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PROJECT_APP_PRIVATE_KEY }}
+          # No repositories list: the token covers the repos the App is
+          # installed on, so cards from a newly added repo work once it is.
+          owner: ExtendDB
+          permission-organization-projects: write
+          permission-issues: read
+          permission-pull-requests: read
+
+      - name: Sweep board
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          DRY_RUN: ${{ inputs.dry_run == true }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const sweep = require(`${process.env.GITHUB_WORKSPACE}/.github/scripts/project-status-sweep.js`);
+            await sweep({
+              github,
+              core,
+              dryRun: process.env.DRY_RUN === 'true',
+              runUrl: process.env.RUN_URL,
+            });

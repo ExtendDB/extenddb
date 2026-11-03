@@ -72,6 +72,35 @@ def _is_real_dynamodb() -> bool:
     return not os.environ.get("EXTENDDB_TEST_ENDPOINT", "").strip()
 
 
+def config_value(section: str, key: str) -> str | None:
+    """`key` of the `[section]` table in the server's config file
+    (`EXTENDDB_CONFIG`, else `extenddb.toml`), unquoted, or None when the file
+    or the key is missing. Reads plain `key = "value"` lines only, which is
+    what `extenddb init` writes."""
+    path = os.environ.get("EXTENDDB_CONFIG", "").strip() or "extenddb.toml"
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return None
+    current = None
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if line.startswith("["):
+            current = line.strip("[]").strip()
+        elif current == section and "=" in line and line.split("=", 1)[0].strip() == key:
+            return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return None
+
+
+def configured_backend() -> str | None:
+    """The backend of the server under test: `EXTENDDB_TEST_BACKEND` (exported
+    by devtools/run-tests), else the `[storage] backend` of its config file,
+    else None (real DynamoDB, or a server started elsewhere)."""
+    explicit = os.environ.get("EXTENDDB_TEST_BACKEND", "").strip()
+    return explicit or config_value("storage", "backend")
+
+
 def _poll_interval() -> float:
     """Return polling interval: 200ms for real DynamoDB, 20ms for ExtendDB."""
     return 0.2 if _is_real_dynamodb() else 0.02

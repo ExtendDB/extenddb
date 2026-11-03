@@ -64,9 +64,22 @@ impl Scratch {
     }
 }
 
+/// The server's base URL, or `None` to skip. With `EXTENDDB_TEST_PG_REQUIRED`
+/// set to any value but `0`, a job that must reach a server fails here
+/// instead.
 fn base_conn() -> Option<String> {
-    let conn = std::env::var("EXTENDDB_TEST_PG_CONNECTION_STRING").ok()?;
-    (!conn.trim().is_empty()).then(|| conn.trim_end_matches('/').to_owned())
+    let conn = std::env::var("EXTENDDB_TEST_PG_CONNECTION_STRING").unwrap_or_default();
+    if conn.trim().is_empty() {
+        let required =
+            std::env::var("EXTENDDB_TEST_PG_REQUIRED").is_ok_and(|v| !v.is_empty() && v != "0");
+        assert!(
+            !required,
+            "EXTENDDB_TEST_PG_CONNECTION_STRING is not set, and EXTENDDB_TEST_PG_REQUIRED says \
+             this job must reach a PostgreSQL server"
+        );
+        return None;
+    }
+    Some(conn.trim_end_matches('/').to_owned())
 }
 
 fn shipped_migrations() -> Vec<String> {
@@ -118,10 +131,13 @@ async fn scratch() -> Scratch {
             .await
             .expect("apply a shipped migration");
     }
-    sqlx::query("UPDATE settings SET value = '0' WHERE key = 'control_plane_delay_seconds'")
-        .execute(&db)
-        .await
-        .expect("pin the control-plane delay to zero");
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0') \
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .execute(&db)
+    .await
+    .expect("pin the control-plane delay to zero");
     sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES ($1, $2)")
         .bind(ACCOUNT)
         .bind(format!("acct-{db_name}"))
@@ -829,15 +845,16 @@ async fn delete_table_waits_for_a_claimed_queue_row_then_drops_everything() {
         early.is_err(),
         "DeleteTable finished while a claim for the table was still held"
     );
-    // With the claim held the queue is stopped and nothing has been dropped.
-    let held: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vector_index_holds WHERE table_id = $1 AND index_id = $1",
-    )
-    .bind(&table_id)
-    .fetch_one(&s.db)
-    .await
-    .expect("count the drop's hold");
-    assert_eq!(held, 1, "the drop stopped the queue for the table first");
+    // With the claim held nothing has been dropped and the catalog row is
+    // still there. On this layout (one database) the drop runs in
+    // DeleteTable's own transaction, its pending-row delete waiting on the
+    // claim, so nothing commits (no queue hold either) until the claim ends.
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM tables WHERE table_id = $1")
+        .bind(&table_id)
+        .fetch_one(&s.db)
+        .await
+        .expect("count the catalog row");
+    assert_eq!(rows, 1, "the catalog row stays until the drop commits");
     let base_exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
         .bind(format!("\"_ddb_{table_id}\""))
         .fetch_one(&s.db)

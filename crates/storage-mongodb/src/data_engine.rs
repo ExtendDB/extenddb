@@ -47,7 +47,7 @@ fn native_attribute_name(path: &[PathElement], maps: &ExpressionMaps) -> Option<
         return None;
     };
     let attr_name = resolve_name_ref(raw_name, maps).ok()?;
-    (!attr_name.contains('.') && !attr_name.starts_with('$')).then(|| attr_name.into_owned())
+    update_create::is_plain_path_name(&attr_name).then(|| attr_name.into_owned())
 }
 
 #[derive(Clone, Copy)]
@@ -800,24 +800,25 @@ impl MongoEngine {
         // indexed attribute is $set to a new value or $unset (RFC-0003
         // §2.2). The GSI cache lets us avoid a catalog query in the
         // common (no-GSI) case; when the cache is stale-or-unknown
-        // we fall through to the slow path which is authoritative.
+        // we fall through to the slow path which is authoritative. Key
+        // attribute names that are not plain path names (a dot, a leading
+        // `$`) also take the slow path, because the upsert writes the key
+        // attributes as `item_data.<name>` (see `update_create`).
         if condition.is_none()
             && !return_old
             && stream.is_none()
             && self.gsi_cache_get_fresh(&key_info.table_id) == Some(false)
-            && let Some(mongo_update) = self.try_build_native_update(actions, maps)
+            && update_create::key_names_are_plain_paths(&key_info.key_schema)
+            && let Some(mongo_update) = Self::try_build_native_update(actions, maps)
         {
             let (fast_filter, took_fast) = match mongo_update {
                 NativeUpdate::Doc(d) => {
-                    let opts = mongodb::options::FindOneAndUpdateOptions::builder()
-                        .upsert(true)
-                        .return_document(ReturnDocument::After)
-                        .build();
-                    let result = coll
-                        .find_one_and_update(key_filter.clone(), d)
-                        .with_options(opts)
-                        .await
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    // The upsert's insert branch must write the document
+                    // `item_to_document` would write (issue #436); see
+                    // `update_create::upsert_native_update`.
+                    let result = self
+                        .upsert_native_update(&coll, &key_filter, d, key, key_info)
+                        .await?;
                     (Some(result), true)
                 }
                 NativeUpdate::Pipeline {
@@ -1123,6 +1124,13 @@ impl MongoEngine {
         };
 
         let mut filter = doc! { "pk": &pk_text };
+
+        extenddb_storage::util::refuse_conditions_beyond_first_range(
+            key_condition,
+            &effective_key_schema,
+            &maps.names,
+            "MongoDB",
+        )?;
 
         // Determine sort key field using effective key schema
         let sk_field = sk_field_name(&effective_key_schema, &key_info.attribute_definitions);
@@ -1631,7 +1639,6 @@ impl MongoEngine {
     /// because mongo serializes doc-scoped write locks around the
     /// pipeline's read + compute + write, no OCC retry needed.
     fn try_build_native_update(
-        &self,
         actions: &[UpdateAction],
         maps: &ExpressionMaps,
     ) -> Option<NativeUpdate> {
@@ -1706,10 +1713,13 @@ impl MongoEngine {
             // Each numeric ADD is `<field> = toString(toDecimal(field
             // or 0) + delta)`; `$unset` is expressed as `<field> =
             // "$$REMOVE"`; SET actions are literal assignments. `_v`
-            // is bumped in the same stage.
+            // is bumped in the same stage. `$literal` makes each SET value a
+            // constant: a `$` string or member name is not read as an
+            // expression, and a document value replaces the attribute instead
+            // of merging into the embedded document it replaces.
             let mut stage: Document = Document::new();
             for (k, v) in &set_doc {
-                stage.insert(k, v.clone());
+                stage.insert(k, doc! { "$literal": v.clone() });
             }
             for k in unset_doc.keys() {
                 stage.insert(k, "$$REMOVE");
@@ -4138,6 +4148,16 @@ fn project_item(
     }
 }
 
+#[path = "data_engine_key_repair.rs"]
+pub(crate) mod key_repair;
+
+#[path = "data_engine_update_create.rs"]
+mod update_create;
+
+#[cfg(test)]
+#[path = "data_engine_live_tests.rs"]
+mod live_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4508,5 +4528,39 @@ transaction_read_concern = "majority""#,
         let path = vec![PathElement::Attribute("name".to_owned())];
 
         assert_eq!(native_attribute_name(&path, &maps), Some("name".to_owned()));
+    }
+
+    #[test]
+    fn native_update_pipeline_sets_each_value_as_a_literal() {
+        let names = std::collections::HashMap::from([
+            ("s".to_owned(), "s".to_owned()),
+            ("p".to_owned(), "p".to_owned()),
+            ("n".to_owned(), "n".to_owned()),
+        ]);
+        let values = std::collections::HashMap::from([
+            ("dollar".to_owned(), AttributeValue::S("$item_data".into())),
+            ("plain".to_owned(), AttributeValue::S("x".into())),
+            ("one".to_owned(), AttributeValue::N("1".into())),
+        ]);
+        let maps = ExpressionMaps::new(names, values);
+        let tokens = expression::tokenize("SET #s = :dollar, #p = :plain ADD #n :one").unwrap();
+        let actions = expression::parse_update(&tokens).unwrap();
+
+        let Some(NativeUpdate::Pipeline { pipeline, .. }) =
+            MongoEngine::try_build_native_update(&actions, &maps)
+        else {
+            panic!("a SET with a numeric ADD builds a pipeline update");
+        };
+        let stage = pipeline[0].get_document("$set").unwrap();
+        // Every SET value is wrapped, not only the ones whose text reads as a
+        // field path: a plain string under a `$literal` stays a string, and
+        // without the wrapper a later read of a non-string attribute fails.
+        let want = doc! { "$literal": { "S": "$item_data" } };
+        assert_eq!(stage.get("item_data.s"), Some(&bson::Bson::Document(want)));
+        let want_plain = doc! { "$literal": { "S": "x" } };
+        assert_eq!(
+            stage.get("item_data.p"),
+            Some(&bson::Bson::Document(want_plain))
+        );
     }
 }
