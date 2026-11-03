@@ -811,6 +811,30 @@ impl MongoEngine {
             && update_create::key_names_are_plain_paths(&key_info.key_schema)
             && let Some(mongo_update) = Self::try_build_native_update(actions, maps)
         {
+            // REMOVE and DELETE on a key that holds no document change
+            // nothing (issue #478), so the native update runs without
+            // upsert: a missing document is the whole answer, and the
+            // service returns no Attributes for it under any ReturnValues.
+            if let NativeUpdate::Doc(d) = &mongo_update
+                && expression::removes_only(actions)
+            {
+                let opts = mongodb::options::FindOneAndUpdateOptions::builder()
+                    .upsert(false)
+                    .return_document(ReturnDocument::After)
+                    .build();
+                let result = coll
+                    .find_one_and_update(key_filter.clone(), d.clone())
+                    .with_options(opts)
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                let new_item = if return_new {
+                    result.as_ref().map(document_to_item).transpose()?
+                } else {
+                    None
+                };
+                return Ok((None, new_item));
+            }
+
             let (fast_filter, took_fast) = match mongo_update {
                 NativeUpdate::Doc(d) => {
                     // The upsert's insert branch must write the document
@@ -898,6 +922,9 @@ impl MongoEngine {
             enum AttemptOk {
                 Committed(Option<Item>, Option<Item>),
                 Stale,
+                /// The key holds no document and the update only removes:
+                /// nothing to write, nothing to return (issue #478).
+                NoWrite,
             }
 
             let attempt_res: Result<AttemptOk, TxErr> = async {
@@ -961,6 +988,13 @@ impl MongoEngine {
                 self.validate_index_keys_for_item(key_info, &new_item)
                     .await
                     .map_err(TxErr::Fatal)?;
+
+                // The actions were applied above so that their validation
+                // errors surface the same way as on an existing document;
+                // with no document to change, the write is skipped.
+                if existing_doc.is_none() && expression::removes_only(actions) {
+                    return Ok(AttemptOk::NoWrite);
+                }
 
                 let mut new_doc = item_to_document(
                     &new_item,
@@ -1049,6 +1083,10 @@ impl MongoEngine {
                     let _ = session.abort_transaction().await;
                     backoff_sleep(attempt).await;
                     continue;
+                }
+                Ok(AttemptOk::NoWrite) => {
+                    let _ = session.abort_transaction().await;
+                    return Ok((None, None));
                 }
                 Err(TxErr::Transient) => {
                     let _ = session.abort_transaction().await;
@@ -2046,6 +2084,9 @@ impl MongoEngine {
             .next_sequence_number_in_session(&shard_id, &mut *session)
             .await?;
 
+        // One wall-clock read feeds both the record's ApproximateCreationDateTime
+        // and the created_at field, so the two never disagree.
+        let created_at = mongodb::bson::DateTime::now();
         let record = StreamRecord {
             event_id: uuid::Uuid::new_v4().to_string(),
             event_name: event,
@@ -2053,13 +2094,7 @@ impl MongoEngine {
             event_source: "aws:dynamodb".to_owned(),
             aws_region: capture.region.to_string(),
             dynamodb: StreamRecordData {
-                approximate_creation_date_time: i64::try_from(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
-                )
-                .unwrap_or(i64::MAX),
+                approximate_creation_date_time: created_at.timestamp_millis().div_euclid(1_000),
                 keys,
                 new_image,
                 old_image,
@@ -2089,7 +2124,7 @@ impl MongoEngine {
                 "table_id": table_id,
                 "event_name": crate::stream_engine::event_name_ddb_str(record.event_name),
                 "record_data": record_bson,
-                "created_at": mongodb::bson::DateTime::now(),
+                "created_at": created_at,
             })
             .session(&mut *session)
             .await
@@ -2950,6 +2985,12 @@ impl MongoEngine {
                         &key_info.attribute_definitions,
                     )
                     .map_err(|e| StorageError::Validation(e.to_string()))?;
+                    // REMOVE and DELETE on a missing key write nothing
+                    // (issue #478); the actions ran above for their
+                    // validation errors only.
+                    if expression::removes_only(actions) {
+                        return Ok((None, None));
+                    }
                     let new_doc = item_to_document(
                         &new_item,
                         &key_info.key_schema,
