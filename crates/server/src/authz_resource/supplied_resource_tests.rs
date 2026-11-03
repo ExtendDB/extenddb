@@ -170,3 +170,21 @@ fn index_query_with_a_non_table_arn_names_the_canonical_index_arn() {
         }
     }
 }
+
+/// The service reads ImportTable's new table name as a name even when it is
+/// an ARN, and authorizes `table/<value as written>` in the caller's account
+/// (measured 2026-11-03 with another account's table ARN as the name).
+#[test]
+fn import_table_name_is_a_name_even_when_it_is_an_arn() {
+    let value = "arn:aws:dynamodb:us-east-1:111122223333:table/x";
+    let t = single(
+        "ImportTable",
+        json!({ "TableCreationParameters": { "TableName": value } }),
+    );
+    let expected = format!("arn:aws:dynamodb:us-east-1:444455556666:table/{value}");
+    assert_eq!(
+        (t.resource.as_str(), t.supplied.as_str()),
+        (expected.as_str(), expected.as_str())
+    );
+    assert_eq!(t.policy_resource(), expected);
+}

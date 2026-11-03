@@ -335,3 +335,22 @@ def test_tag_operations_match_the_arn_as_written(env, table):
                 f"policy allows the dynamodb:{op} action"
             ), (op, spelled, msg)
 
+
+def test_import_table_name_is_read_as_a_name(env, table):
+    # Measured 2026-11-03: the service authorizes ImportTable on
+    # table/<value as written> in the caller's account, also for an ARN.
+    d = _principal(env, NO_POLICY)["dynamodb"]
+    value = f"arn:aws:dynamodb:{env['region']}:{env['known']}:table/{table['name']}"
+    code, msg = _error(lambda: d.import_table(
+        S3BucketSource={"S3Bucket": "b"},
+        InputFormat="DYNAMODB_JSON",
+        TableCreationParameters={
+            "TableName": value,
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "BillingMode": "PAY_PER_REQUEST",
+        },
+    ))
+    expected = f"arn:aws:dynamodb:{env['region']}:{env['caller']}:table/{value}"
+    assert code == "AccessDeniedException", (code, msg)
+    assert f"dynamodb:ImportTable on resource: {expected}" in msg, msg

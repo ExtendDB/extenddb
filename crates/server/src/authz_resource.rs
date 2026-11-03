@@ -645,14 +645,20 @@ pub(crate) fn authz_targets(
             let arn = str_field(input, "TableArn").unwrap_or_default();
             from(canonical_resource(&arn, region, account_id), &arn)
         }
-        // Import creates a table; the resource is the new table.
+        // Import creates a table; the resource is the new table. The service
+        // reads `TableCreationParameters.TableName` as a name even when it is
+        // an ARN, and authorizes `table/<value as written>` in the caller's
+        // account (measured 2026-11-03); the engine creates the table under
+        // the value as written too.
         "ImportTable" => {
             let t = input
                 .get("TableCreationParameters")
                 .and_then(|p| p.get("TableName"))
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            from(table_resource_arn(t, region, account_id), t)
+            one(format!(
+                "arn:{PARTITION}:{SERVICE}:{region}:{account_id}:table/{t}"
+            ))
         }
         // RestoreTableFromBackup requires dynamodb:RestoreTableFromBackup on the
         // source backup ARN and the item actions on the target table it writes
