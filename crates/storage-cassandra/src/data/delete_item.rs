@@ -288,6 +288,25 @@ impl CassandraEngine {
                 // index rows written afterwards carry that order (`data::version`).
                 // Deleting an absent item writes nothing.
                 let Some(old_item) = old_item_opt else {
+                    // The read above is at the driver's default consistency,
+                    // and a replica that missed the latest write reads as
+                    // absent. The fence catches a stale image but not a stale
+                    // absence, so the absence is confirmed at LOCAL_SERIAL
+                    // before the delete answers without writing; a row found
+                    // there is retried from a fresh read, as a lost race is.
+                    if self
+                        .item_present_serial(
+                            &data_keyspace,
+                            &ddb_table,
+                            &pk_text,
+                            Some((&sk, sk_col)),
+                        )
+                        .await?
+                    {
+                        return Err(StorageError::TransactionConflict(
+                            "delete_item read a stale absence (sort key)".to_owned(),
+                        ));
+                    }
                     return Ok(None);
                 };
                 // Taken from the version read above, before the fence, so a
@@ -553,6 +572,20 @@ impl CassandraEngine {
             } else {
                 // Ordinary delete without TTL: see the sort-key variant above.
                 let Some(old_item) = old_item_opt else {
+                    // The read above is at the driver's default consistency,
+                    // and a replica that missed the latest write reads as
+                    // absent. The fence catches a stale image but not a stale
+                    // absence, so the absence is confirmed at LOCAL_SERIAL
+                    // before the delete answers without writing; a row found
+                    // there is retried from a fresh read, as a lost race is.
+                    if self
+                        .item_present_serial(&data_keyspace, &ddb_table, &pk_text, None)
+                        .await?
+                    {
+                        return Err(StorageError::TransactionConflict(
+                            "delete_item read a stale absence (pk only)".to_owned(),
+                        ));
+                    }
                     return Ok(None);
                 };
                 let stamp = super::version::delete_stamp(version)?;
@@ -1472,6 +1505,32 @@ impl CassandraEngine {
         }
 
         Ok(())
+    }
+
+    /// Whether the base row holds an item, read at `LOCAL_SERIAL`.
+    async fn item_present_serial(
+        &self,
+        data_keyspace: &str,
+        ddb_table: &str,
+        pk: &str,
+        sk: Option<(&extenddb_storage::util::SortKeyValue, &str)>,
+    ) -> Result<bool, StorageError> {
+        use cdrs_tokio::types::IntoRustByName as _;
+        let row = super::select_by_pk_at(
+            &self.session,
+            data_keyspace,
+            ddb_table,
+            "item_data",
+            pk,
+            sk.map(|(value, _)| value),
+            sk.map(|(_, col)| col),
+            Some(Consistency::LocalSerial),
+        )
+        .await?;
+        Ok(row.is_some_and(|row| {
+            let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
+            item_data.is_some()
+        }))
     }
 
     /// Issue a conditional `DELETE ... IF version = ? AND prepared_txn_id = null` LWT.

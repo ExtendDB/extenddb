@@ -257,17 +257,47 @@ pub(crate) async fn select_by_pk(
     sk: Option<&SortKeyValue>,
     sk_col: Option<&str>,
 ) -> Result<Option<cdrs_tokio::types::rows::Row>, StorageError> {
-    let result = if let (Some(sk), Some(sk_col)) = (sk, sk_col) {
-        let query =
-            format!("SELECT {columns} FROM {keyspace}.{table} WHERE pk = ? AND {sk_col} = ?");
-        query_with_pk_sk(session, &query, pk, sk).await
+    select_by_pk_at(session, keyspace, table, columns, pk, sk, sk_col, None).await
+}
+
+/// [`select_by_pk`] at `consistency`, or at the driver's default (`ONE`) when
+/// it is `None`. A read at `LOCAL_SERIAL` sees every LWT that has committed,
+/// and completes one still in progress, before it answers.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn select_by_pk_at(
+    session: &CassandraSession,
+    keyspace: &str,
+    table: &str,
+    columns: &str,
+    pk: &str,
+    sk: Option<&SortKeyValue>,
+    sk_col: Option<&str>,
+    consistency: Option<cdrs_tokio::consistency::Consistency>,
+) -> Result<Option<cdrs_tokio::types::rows::Row>, StorageError> {
+    let (query, values) = if let (Some(sk), Some(sk_col)) = (sk, sk_col) {
+        let values = match sk {
+            SortKeyValue::S(s) => cdrs_tokio::query_values!(pk, s.as_str()),
+            SortKeyValue::N(n) => cdrs_tokio::query_values!(pk, decimal_to_value(n)),
+            SortKeyValue::B(b) => cdrs_tokio::query_values!(pk, Blob::new(b.clone())),
+        };
+        (
+            format!("SELECT {columns} FROM {keyspace}.{table} WHERE pk = ? AND {sk_col} = ?"),
+            values,
+        )
     } else {
-        let query = format!("SELECT {columns} FROM {keyspace}.{table} WHERE pk = ?");
-        session
-            .query_with_values(&query, cdrs_tokio::query_values!(pk))
-            .await
-            .map_err(|e| StorageError::Internal(format!("Query failed: {e}")))
-    }?;
+        (
+            format!("SELECT {columns} FROM {keyspace}.{table} WHERE pk = ?"),
+            cdrs_tokio::query_values!(pk),
+        )
+    };
+    let mut params = cdrs_tokio::statement::StatementParamsBuilder::new().with_values(values);
+    if let Some(consistency) = consistency {
+        params = params.with_consistency(consistency);
+    }
+    let result = session
+        .query_with_params(&query, params.build())
+        .await
+        .map_err(|e| StorageError::Internal(format!("Query failed: {e}")))?;
 
     let rows = result
         .response_body()

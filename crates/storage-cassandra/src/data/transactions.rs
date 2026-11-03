@@ -1188,7 +1188,7 @@ impl CassandraEngine {
         skip_txn_id: Option<Uuid>,
     ) -> Result<Option<Item>, StorageError> {
         Ok(self
-            .fetch_row_for_transaction(key_info, key, skip_txn_id)
+            .fetch_row_for_transaction(key_info, key, skip_txn_id, None)
             .await?
             .item)
     }
@@ -1203,18 +1203,25 @@ impl CassandraEngine {
     /// `wait_for_commit_and_read`, which returns another transaction's committed
     /// item and therefore a real old image. The version is `None` in that last
     /// case too: the row belongs to the other transaction until it finishes.
+    ///
+    /// `consistency` is the read's consistency. COMMIT reads its own fenced
+    /// row at `LOCAL_SERIAL`: the read supplies the old image whose index rows
+    /// the commit removes and the version it advances, and the commit's
+    /// `IF prepared_txn_id = ?` checks neither, so a replica that missed the
+    /// latest write must not answer it.
     async fn fetch_row_for_transaction(
         &self,
         key_info: &TableKeyInfo,
         key: &Item,
         skip_txn_id: Option<Uuid>,
+        consistency: Option<Consistency>,
     ) -> Result<TransactionRow, StorageError> {
         let keyspace = self.account_keyspace(&key_info.account_id);
         let table = data_table_name(&key_info.table_id);
         let pk_text = composite_pk_to_text(key, &key_info.key_schema)?;
         let (sk, sk_col) = resolve_sk(key_info, key)?;
 
-        let Some(row) = select_by_pk(
+        let Some(row) = super::select_by_pk_at(
             &self.session,
             &keyspace,
             &table,
@@ -1223,6 +1230,7 @@ impl CassandraEngine {
             pk_text.as_str(),
             sk.as_ref(),
             sk_col.as_deref(),
+            consistency,
         )
         .await?
         else {
@@ -1510,7 +1518,12 @@ impl CassandraEngine {
                 // The item carries the key attributes, so it resolves the row
                 // by itself.
                 let row = self
-                    .fetch_row_for_transaction(key_info, item, Some(txn_id))
+                    .fetch_row_for_transaction(
+                        key_info,
+                        item,
+                        Some(txn_id),
+                        Some(Consistency::LocalSerial),
+                    )
                     .await?;
                 let old_image = commit_old_image(row.item, row.created_to_prepare);
                 let next_version = super::version::next_row_version(row.version)?;
@@ -1549,7 +1562,12 @@ impl CassandraEngine {
             } => {
                 // Re-fetch and re-apply update (idempotent)
                 let row = self
-                    .fetch_row_for_transaction(key_info, key, Some(txn_id))
+                    .fetch_row_for_transaction(
+                        key_info,
+                        key,
+                        Some(txn_id),
+                        Some(Consistency::LocalSerial),
+                    )
                     .await?;
                 let mut final_item = row.item.clone().unwrap_or_else(|| (*key).clone());
                 expression::apply_update_validated(actions, &mut final_item, maps, &[], &[])
@@ -1594,7 +1612,12 @@ impl CassandraEngine {
                 // transaction's fence: the stream record's old image and the
                 // image whose index rows the delete removes.
                 let row = self
-                    .fetch_row_for_transaction(key_info, key, Some(txn_id))
+                    .fetch_row_for_transaction(
+                        key_info,
+                        key,
+                        Some(txn_id),
+                        Some(Consistency::LocalSerial),
+                    )
                     .await?;
                 let old_image = commit_old_image(row.item, row.created_to_prepare);
                 // Taken from the version read under the fence, before the
@@ -2211,8 +2234,9 @@ impl CassandraEngine {
         self.delete_ledger_entry(keyspace, txn_id).await
     }
 
-    /// The `version` of one base row, by its stored key text. Used by recovery,
-    /// which has the ledger's key text rather than an item.
+    /// The `version` of one base row, by its stored key text, read at
+    /// `LOCAL_SERIAL` for the reason COMMIT reads its row there. Used by
+    /// recovery, which has the ledger's key text rather than an item.
     async fn read_version_by_pk(
         &self,
         keyspace: &str,
@@ -2220,7 +2244,7 @@ impl CassandraEngine {
         pk: &str,
         sk: Option<&(extenddb_storage::util::SortKeyValue, String)>,
     ) -> Result<Option<i64>, StorageError> {
-        let row = select_by_pk(
+        let row = super::select_by_pk_at(
             &self.session,
             keyspace,
             table,
@@ -2228,6 +2252,7 @@ impl CassandraEngine {
             pk,
             sk.map(|(value, _)| value),
             sk.map(|(_, col)| col.as_str()),
+            Some(Consistency::LocalSerial),
         )
         .await?;
         Ok(row.and_then(|row| row.get_by_name("version").ok().flatten()))
