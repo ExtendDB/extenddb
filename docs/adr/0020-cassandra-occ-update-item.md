@@ -30,18 +30,27 @@ Version-based OCC via LWT (option 1).
 
 ## Retry policy
 
+`update_item_impl` has its own loop:
+
 - **Max retries:** 20
 - **Base delay:** 2 ms
 - **Backoff:** full jitter — `sleep = random(0, base * 2^min(attempt, 3))`, capped at a 16 ms window to bound tail latency
 - **Retry on:** `[applied] = false` (clean lost race) only
 - **Do not retry on:** Cassandra errors (timeout, unavailable) — propagate immediately
 
+`put_item` and `delete_item` share the loop in `delete_item.rs` (`TTL_CLAIM_MAX_RETRIES`, `ttl_claim_backoff`), which also covers a lost TTL claim:
+
+- **Max retries:** 8, so 9 attempts
+- **Base delay:** 4 ms
+- **Backoff:** full jitter, `sleep = random(0, base * 2^min(attempt, 6))`, so the window grows to 256 ms
+- **Retry on:** a lost OCC race or claim, reported as `TransactionConflict`; after the last attempt the conflict is returned as `TransactionConflictException`
+
 ## Consequences
 
 - A `version bigint` column is added to all data tables via migration.
 - `update_item_impl` and the conditional `put_item_impl` path use an OCC retry loop.
 - `commit_put_or_update` in the transaction system sets `version` in the COMMIT UPDATE (to the value ADR-0027 defines).
-- Under high contention (many concurrent writers to the same item), tail latency increases due to retries. The retry ceiling (20) and bounded backoff (max 16 ms window) prevent unbounded latency growth.
+- Under high contention (many concurrent writers to the same item), tail latency increases due to retries. The retry ceilings (20 for `UpdateItem`, 8 for `PutItem` and `DeleteItem`) and the bounded backoff windows (16 ms and 256 ms) prevent unbounded latency growth.
 
 ---
 
