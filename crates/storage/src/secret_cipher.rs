@@ -284,10 +284,10 @@ mod tests {
         let stored = BASE64.decode(STORED).expect("fixture base64");
         // The tag authenticates the plaintext, so a successful open is the
         // check; the secret has the generated shape, `extenddb` and 32 more
-        // characters.
+        // characters. The assertions do not print the secret.
         let secret = decrypt_secret(&stored, KEY, ACCESS_KEY_ID).expect("decrypt");
         assert_eq!(secret.len(), 40);
-        assert!(secret.starts_with("extenddb"), "{secret}");
+        assert!(secret.starts_with("extenddb"));
         assert_eq!(
             decrypt_secret(&stored, KEY, "AKIAEXTENDDBEAT40RLD").unwrap_err(),
             "decrypt: authentication failed"
