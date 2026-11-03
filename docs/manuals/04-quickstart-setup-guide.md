@@ -130,7 +130,7 @@ Check the version:
 ```bash
 ./target/release/extenddb version
 # extenddb 0.1.14
-# catalog migration 5 (postgres)
+# catalog migration 6 (postgres)
 # commit abc1234
 # built 2026-04-17T12:00:00Z
 ```

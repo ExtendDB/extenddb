@@ -193,15 +193,10 @@ pub async fn handle_update_table(
             )?;
         }
         if bare_update {
-            // The mode the table has after the request: a request that leaves
-            // PAY_PER_REQUEST is not held to the on-demand rule.
-            let pay_per_request = match input.billing_mode {
-                Some(mode) => mode == BillingMode::PayPerRequest,
-                None => existing
-                    .billing_mode_summary
-                    .as_ref()
-                    .is_some_and(|s| s.billing_mode == BillingMode::PayPerRequest),
-            };
+            let pay_per_request = crate::gsi_updates::pay_per_request_after(
+                &input,
+                existing.billing_mode_summary.as_ref(),
+            );
             crate::gsi_updates::refuse_bare_updates(&input, pay_per_request)?;
         }
         if touches_warm {

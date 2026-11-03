@@ -36,7 +36,7 @@
 //! given) a throughput of at least 1 unit each; a `Delete` has a valid name.
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::types::UpdateTableInput;
+use extenddb_core::types::{BillingMode, BillingModeSummary, UpdateTableInput};
 
 /// Row V1a and V1b, whole.
 pub const ONE_ACTION_PER_ELEMENT: &str = "One or more parameter values were invalid: Only one \
@@ -122,6 +122,20 @@ pub(crate) fn refuse_bare_updates(
         ));
     }
     Ok(())
+}
+
+/// Whether the table is PAY_PER_REQUEST after `input`: the request's
+/// `BillingMode` when it carries one, else the stored mode. A request that
+/// leaves PAY_PER_REQUEST is not held to the on-demand rule of
+/// [`refuse_bare_updates`].
+pub(crate) fn pay_per_request_after(
+    input: &UpdateTableInput,
+    stored: Option<&BillingModeSummary>,
+) -> bool {
+    match input.billing_mode {
+        Some(mode) => mode == BillingMode::PayPerRequest,
+        None => stored.is_some_and(|s| s.billing_mode == BillingMode::PayPerRequest),
+    }
 }
 
 /// Apply the element rules to `input`.
@@ -403,6 +417,50 @@ mod tests {
                 "{update} pay_per_request={pay_per_request}"
             );
         }
+    }
+
+    /// The mode an Update without WarmThroughput is answered by is the one the
+    /// table has after the request. On a PAY_PER_REQUEST table the switch to
+    /// PROVISIONED that the service requires (BillingMode PROVISIONED, the
+    /// table's and the index's ProvisionedThroughput 3/3) gets "not yet
+    /// supported"; the same Update without BillingMode gets the on-demand
+    /// sentence.
+    #[test]
+    fn the_billing_mode_after_the_request_decides_a_bare_updates_answer() {
+        let stored = BillingModeSummary {
+            billing_mode: BillingMode::PayPerRequest,
+            last_update_to_pay_per_request_date_time: None,
+        };
+        let update = json!([{ "Update": {
+            "IndexName": "gsi",
+            "ProvisionedThroughput": { "ReadCapacityUnits": 3, "WriteCapacityUnits": 3 },
+        }}]);
+        let switch: UpdateTableInput = serde_json::from_value(json!({
+            "TableName": "t",
+            "BillingMode": "PROVISIONED",
+            "ProvisionedThroughput": { "ReadCapacityUnits": 3, "WriteCapacityUnits": 3 },
+            "GlobalSecondaryIndexUpdates": update,
+        }))
+        .unwrap();
+        assert!(!pay_per_request_after(&switch, Some(&stored)));
+        assert_eq!(
+            message(refuse_bare_updates(
+                &switch,
+                pay_per_request_after(&switch, Some(&stored))
+            )),
+            "UpdateGlobalSecondaryIndex is not yet supported"
+        );
+        let stay = input(update);
+        assert!(pay_per_request_after(&stay, Some(&stored)));
+        assert_eq!(
+            message(refuse_bare_updates(
+                &stay,
+                pay_per_request_after(&stay, Some(&stored))
+            )),
+            "One or more parameter values were invalid: The only Updates for index: gsi when \
+             TableThroughputMode is PAY_PER_REQUEST can be to OnDemandThroughput, WarmThroughput"
+        );
+        assert!(!pay_per_request_after(&stay, None));
     }
 
     /// Rows T3d and T3e: an Update with nothing but the index name on an
