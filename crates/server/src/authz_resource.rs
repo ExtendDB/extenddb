@@ -36,9 +36,12 @@
 //! service, region, and account of a supplied ARN and act within this
 //! deployment's account, so a caller who respells those fields would otherwise
 //! evade a Deny written against the canonical ARN. Canonicalizing here closes
-//! that bypass: a Deny on the real resource always matches. A resource in
-//! another account is refused before the IAM decision for every operation
-//! ([`cross_account`]).
+//! that bypass: a Deny on the real resource always matches. The tag operations
+//! are the one exception: their policies are matched against the `ResourceArn`
+//! as written, as the service matches them, because the engine tag handler
+//! refuses another partition, service or region after the IAM decision (see
+//! [`AuthzTarget`]). A resource in another account is refused before the IAM
+//! decision for every operation ([`cross_account`]).
 //!
 //! Fail-closed: a missing or unparseable resource field never falls back to
 //! `table/*`. It yields the field value verbatim (often empty), which an
@@ -69,21 +72,35 @@ const RESTORE_TARGET_ACTIONS: &[&str] = &[
 
 /// One (IAM action, resource) pair a request is authorized against.
 ///
-/// `resource` is the canonical ARN for this deployment and is what the
-/// policies are matched against, so a Deny on the real resource matches
-/// however the caller spelled the partition, service, region or account.
-/// `supplied` is the resource as the caller wrote it, and is what a denial
-/// message names: the service echoes the caller's ARN with its partition,
-/// service and region intact (measured 2026-10-20 with TagResource on an
-/// `aws-cn` partition, an `s3` service and a `us-west-2` region). It equals
-/// `resource` when the request named the resource by a bare name or by its
-/// canonical ARN.
+/// `resource` is the canonical ARN for this deployment. Resource tags are
+/// read under it, and the policies are matched against it unless
+/// `match_supplied` is set, so a Deny on the real resource matches however
+/// the caller spelled the partition, service or region. `supplied` is the
+/// resource as the caller wrote it, and is what a denial message names: the
+/// service echoes the caller's ARN with its partition, service and region
+/// intact (measured 2026-10-20 with TagResource on an `aws-cn` partition, an
+/// `s3` service and a `us-west-2` region). It equals `resource` when the
+/// request named the resource by a bare name or by its canonical ARN.
+///
+/// `match_supplied` is set on the tag operations only. The service matches
+/// their policies against the `ResourceArn` as written: a caller allowed
+/// `dynamodb:*` on the canonical table ARN alone is denied ListTagsOfResource
+/// on the `aws-cn`, `s3` and `us-west-2` spellings of it (measured
+/// 2026-11-03). The engine tag handler refuses those spellings after the IAM
+/// decision, so no tag is read or written for a resource other than the one
+/// the policies matched. The other ARN fields keep the canonical match: the
+/// engine resolves a `StreamArn`, an export `TableArn` or a restore
+/// `SourceTableArn` with another partition, service or region, and a
+/// `BackupArn` or `CreateBackup` table ARN in another region, to this
+/// deployment's resource, so a Deny on that resource has to match the
+/// respelled ARN.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AuthzTarget {
     /// The bare operation form; `check_authorization` prepends `dynamodb:`.
     pub action: String,
     pub resource: String,
     pub supplied: String,
+    pub match_supplied: bool,
 }
 
 impl AuthzTarget {
@@ -94,6 +111,7 @@ impl AuthzTarget {
             action: action.to_owned(),
             supplied: resource.clone(),
             resource,
+            match_supplied: false,
         }
     }
 
@@ -110,6 +128,16 @@ impl AuthzTarget {
             action: action.to_owned(),
             resource,
             supplied,
+            match_supplied: false,
+        }
+    }
+
+    /// The ARN the policies are matched against.
+    pub(crate) fn policy_resource(&self) -> &str {
+        if self.match_supplied {
+            &self.supplied
+        } else {
+            &self.resource
         }
     }
 }
@@ -541,10 +569,18 @@ pub(crate) fn authz_targets(
 
     match operation {
         // Resource lives in ResourceArn (a table or stream ARN; a foreign ARN
-        // passes the shape check and is denied by authorization).
+        // passes the shape check and is denied by authorization). The policies
+        // are matched against the ARN as written and the resource tags are
+        // read from the canonical table (see `AuthzTarget`).
         "TagResource" | "UntagResource" | "ListTagsOfResource" => {
             let arn = str_field(input, "ResourceArn").unwrap_or_default();
-            from(tag_resource_arn(&arn, region, account_id), &arn)
+            let mut target = AuthzTarget::from_field(
+                operation,
+                tag_resource_arn(&arn, region, account_id),
+                &arn,
+            );
+            target.match_supplied = true;
+            vec![target]
         }
         // Resource lives in StreamArn, validated to a stream before authz.
         "DescribeStream" | "GetShardIterator" => {
@@ -660,6 +696,7 @@ pub(crate) fn authz_targets(
                         action: operation.to_owned(),
                         resource,
                         supplied,
+                        match_supplied: false,
                     }]
                 }
                 _ => from(base, &table_name),

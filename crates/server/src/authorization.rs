@@ -30,9 +30,11 @@ use crate::authz_resource::AuthzTarget;
 /// Evaluate whether the authenticated identity is authorized for the given
 /// `DynamoDB` operation on the given resource.
 ///
-/// Policies are matched against `target.resource`, the canonical ARN for this
-/// deployment; a denial names `target.supplied`, the resource as the caller
-/// wrote it, as the service does.
+/// Policies are matched against `target.policy_resource()`: the canonical ARN
+/// for this deployment, or the ARN as written on the tag operations. Resource
+/// tags are read under the canonical ARN, and a denial names
+/// `target.supplied`, the resource as the caller wrote it, as the service
+/// does.
 ///
 /// For `AuthIdentity::User` and `AuthIdentity::RoleSession`, the full IAM
 /// evaluation algorithm runs: explicit deny → permissions boundary → session
@@ -77,13 +79,14 @@ async fn check_user_authorization(
     params: RequestParams,
 ) -> Result<(), DynamoDbError> {
     let action = format!("dynamodb:{}", target.action);
-    let resource_arn = target.resource.as_str();
+    let resource_arn = target.policy_resource();
 
     // Resource tags apply only to a table, and to an index through its base
     // table (indexes inherit the table's tags). A stream, backup or any other
     // resource has none, so `aws:ResourceTag/*` is absent there, as on the
-    // service (see `resource_tag_lookup_arn`).
-    let tag_arn = crate::authz_resource::resource_tag_lookup_arn(resource_arn);
+    // service (see `resource_tag_lookup_arn`). They are read under the
+    // canonical resource, also when the policies match the ARN as written.
+    let tag_arn = crate::authz_resource::resource_tag_lookup_arn(&target.resource);
 
     // Fetch all authz inputs concurrently; they are independent cache
     // lookups (or DB queries, on cold start). All come back pre-parsed.
@@ -178,10 +181,11 @@ async fn check_role_authorization(
     params: RequestParams,
 ) -> Result<(), DynamoDbError> {
     let action = format!("dynamodb:{}", target.action);
-    let resource_arn = target.resource.as_str();
+    let resource_arn = target.policy_resource();
 
-    // Resource tags for a table or index only (see the user path).
-    let tag_arn = crate::authz_resource::resource_tag_lookup_arn(resource_arn);
+    // Resource tags for a table or index only, read under the canonical
+    // resource (see the user path).
+    let tag_arn = crate::authz_resource::resource_tag_lookup_arn(&target.resource);
 
     let (
         identity_policies,
@@ -530,6 +534,7 @@ mod resource_tag_tests {
             action: "DescribeStream".to_owned(),
             resource: STREAM.to_owned(),
             supplied: supplied.to_owned(),
+            match_supplied: false,
         };
         let err = check_user_authorization(
             &cache,

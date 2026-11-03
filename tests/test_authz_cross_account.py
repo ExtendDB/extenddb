@@ -1,7 +1,7 @@
 # Copyright 2026 ExtendDB contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""A resource ARN in another account.
+"""A resource ARN in another account, and the tag operations' policy match.
 
 ExtendDB has no resource-based policies, so a request that names a resource in
 another account by ARN is refused before the IAM decision. The answer matches
@@ -10,6 +10,10 @@ policy the same answer, chosen by the operation and by whether the account
 exists (measured 2026-11-03 in us-east-1 with an account that exists and with
 999999999999, which does not). Here an account exists when the deployment's
 catalog holds it: the tests create one and use another that is never created.
+
+The tag operations match their policies against the ResourceArn as written,
+as the service does: a caller allowed only on the canonical table ARN is denied
+the aws-cn, s3 and us-west-2 spellings of it (measured 2026-11-03).
 
 Prerequisites:
   - extenddb running with `auth.provider = "builtin"` on EXTENDDB_TEST_ENDPOINT
@@ -302,4 +306,32 @@ def test_shape_checks_run_before_a_known_accounts_denial(env, table):
     assert _error(lambda: streams.describe_stream(StreamArn=known)) == (
         "ValidationException", "Invalid StreamArn")
     assert _error(lambda: streams.describe_stream(StreamArn=unknown)) == ACCESS_IS_DENIED
+
+
+def test_tag_operations_match_the_arn_as_written(env, table):
+    # Measured 2026-11-03 with ListTagsOfResource for a caller allowed
+    # dynamodb:* on the canonical table ARN only: the canonical ARN is
+    # allowed, and each respelling is denied naming the ARN as written.
+    canonical = table["table_arn"]
+    d = _principal(env, {"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "dynamodb:*", "Resource": canonical}]})["dynamodb"]
+    d.list_tags_of_resource(ResourceArn=canonical)
+    region = canonical.split(":")[3]
+    other_region = "us-west-2" if region != "us-west-2" else "us-east-1"
+    for spelled in (
+        canonical.replace("arn:aws:", "arn:aws-cn:", 1),
+        canonical.replace(":dynamodb:", ":s3:", 1),
+        canonical.replace(f":{region}:", f":{other_region}:", 1),
+    ):
+        for op, call in (
+            ("ListTagsOfResource", lambda a=spelled: d.list_tags_of_resource(ResourceArn=a)),
+            ("TagResource", lambda a=spelled: d.tag_resource(
+                ResourceArn=a, Tags=[{"Key": "k", "Value": "v"}])),
+        ):
+            code, msg = _error(call)
+            assert code == "AccessDeniedException", (op, spelled, code, msg)
+            assert msg.endswith(
+                f"dynamodb:{op} on resource: {spelled} because no identity-based "
+                f"policy allows the dynamodb:{op} action"
+            ), (op, spelled, msg)
 

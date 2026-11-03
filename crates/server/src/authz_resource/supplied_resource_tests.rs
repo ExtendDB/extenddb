@@ -16,11 +16,13 @@ fn single(op: &str, input: serde_json::Value) -> AuthzTarget {
     t.remove(0)
 }
 
-/// The three TagResource spellings the service was measured with
-/// (2026-10-20, no-policy caller): the policy match uses the canonical ARN,
-/// the denial names the ARN as written.
+/// The three TagResource spellings the service was measured with: the
+/// policies are matched against the ARN as written (measured 2026-11-03 with
+/// a caller allowed only on the canonical ARN), the resource tags are read
+/// under the canonical ARN, and the denial names the ARN as written
+/// (measured 2026-10-20, no-policy caller).
 #[test]
-fn tag_resource_arn_respelled_fields_are_matched_canonically_and_named_as_written() {
+fn tag_resource_arn_respelled_fields_are_matched_and_named_as_written() {
     for supplied in [
         "arn:aws-cn:dynamodb:us-east-1:444455556666:table/bb-arn-main",
         "arn:aws:s3:us-east-1:444455556666:table/bb-arn-main",
@@ -30,27 +32,38 @@ fn tag_resource_arn_respelled_fields_are_matched_canonically_and_named_as_writte
             let t = single(op, json!({ "ResourceArn": supplied }));
             assert_eq!(t.resource, CANON, "{op} {supplied}");
             assert_eq!(t.supplied, supplied, "{op} {supplied}");
+            assert_eq!(t.policy_resource(), supplied, "{op} {supplied}");
         }
     }
+    let stream =
+        "arn:aws-cn:dynamodb:us-east-1:444455556666:table/T/stream/2026-10-20T16:17:40.188";
+    let t = single("TagResource", json!({ "ResourceArn": stream }));
+    assert_eq!(
+        t.resource,
+        "arn:aws:dynamodb:us-east-1:444455556666:table/T/stream/2026-10-20T16:17:40.188"
+    );
+    assert_eq!(t.policy_resource(), stream);
 }
 
-/// A canonical ARN or a bare name names the canonical ARN in both roles.
+/// A canonical ARN or a bare name names the canonical ARN in every role.
 #[test]
 fn canonical_arn_and_bare_name_name_the_canonical_arn() {
     let t = single("TagResource", json!({ "ResourceArn": CANON }));
     assert_eq!((t.resource.as_str(), t.supplied.as_str()), (CANON, CANON));
+    assert_eq!(t.policy_resource(), CANON);
     let t = single("GetItem", json!({ "TableName": "bb-arn-main" }));
     assert_eq!((t.resource.as_str(), t.supplied.as_str()), (CANON, CANON));
     let t = single("GetItem", json!({ "TableName": CANON }));
     assert_eq!((t.resource.as_str(), t.supplied.as_str()), (CANON, CANON));
     // A foreign-service ARN that is not a table resource is left verbatim
-    // in both roles, so authorization denies it and names it as written.
+    // in every role, so authorization denies it and names it as written.
     let t = single(
         "TagResource",
         json!({ "ResourceArn": "arn:aws:s3:::bucket" }),
     );
     assert_eq!(t.resource, "arn:aws:s3:::bucket");
     assert_eq!(t.supplied, "arn:aws:s3:::bucket");
+    assert_eq!(t.policy_resource(), "arn:aws:s3:::bucket");
 }
 
 /// Every other ARN-bearing field keeps the caller's spelling for the
@@ -70,6 +83,7 @@ fn other_arn_fields_keep_the_supplied_spelling() {
         let t = single(op, json!({ "TableName": respelled_table }));
         assert_eq!(t.resource, CANON, "{op}");
         assert_eq!(t.supplied, respelled_table, "{op}");
+        assert_eq!(t.policy_resource(), CANON, "{op}");
     }
     let t = single(
         "Query",
@@ -77,6 +91,7 @@ fn other_arn_fields_keep_the_supplied_spelling() {
     );
     assert_eq!(t.resource, format!("{CANON}/index/gsi1"));
     assert_eq!(t.supplied, format!("{respelled_table}/index/gsi1"));
+    assert_eq!(t.policy_resource(), format!("{CANON}/index/gsi1"));
 
     let stream =
         "arn:aws-cn:dynamodb:us-east-1:444455556666:table/T/stream/2026-10-20T16:17:40.188";
@@ -86,6 +101,7 @@ fn other_arn_fields_keep_the_supplied_spelling() {
         "arn:aws:dynamodb:us-east-1:444455556666:table/T/stream/2026-10-20T16:17:40.188"
     );
     assert_eq!(t.supplied, stream);
+    assert_eq!(t.policy_resource(), t.resource);
 
     let backup = "arn:aws:dynamodb:eu-west-1:444455556666:table/T/backup/01-ab";
     let t = single(
