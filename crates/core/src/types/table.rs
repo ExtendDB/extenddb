@@ -1141,14 +1141,30 @@ pub struct DeleteGsiAction {
 /// Update an existing GSI.
 ///
 /// `WarmThroughput` is stored and reported (see [`super::WarmThroughputRecord`]).
-/// A provisioned-throughput update is recognized by the deserializer but not
-/// yet implemented: the engine returns a clear "not yet supported" error.
+/// `ProvisionedThroughput` and `OnDemandThroughput` are recognized by the
+/// deserializer but an update of either is not yet implemented: they are read
+/// as opaque values only so that the engine refuses an `Update` carrying
+/// either, with or without `WarmThroughput`, instead of accepting it and
+/// dropping the member.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct UpdateGsiAction {
     #[serde(rename = "IndexName")]
     pub index_name: String,
     #[serde(rename = "WarmThroughput", default)]
     pub warm_throughput: Option<super::WarmThroughput>,
+    #[serde(rename = "ProvisionedThroughput", default)]
+    pub provisioned_throughput: Option<serde_json::Value>,
+    #[serde(rename = "OnDemandThroughput", default)]
+    pub on_demand_throughput: Option<serde_json::Value>,
+}
+
+impl UpdateGsiAction {
+    /// Whether the action carries `ProvisionedThroughput` or
+    /// `OnDemandThroughput`, which ExtendDB does not apply to an index.
+    #[must_use]
+    pub fn carries_throughput(&self) -> bool {
+        self.provisioned_throughput.is_some() || self.on_demand_throughput.is_some()
+    }
 }
 
 /// `UpdateTable` request body.

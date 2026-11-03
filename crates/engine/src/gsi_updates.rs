@@ -15,15 +15,22 @@
 //!   global secondary index update per index is allowed simultaneously.
 //!   Index: <name>" (T3b one element, V3c two). It is checked before the
 //!   one-action rule, so an Update and a Delete of one index answer it.
-//! - An `Update` on an on-demand table that carries anything other than
-//!   `WarmThroughput` (a `ProvisionedThroughput`, or nothing at all): "The
-//!   only Updates for index: <name> when TableThroughputMode is
+//! - An `Update` that carries `WarmThroughput` beside `ProvisionedThroughput`
+//!   or `OnDemandThroughput`: "WarmThroughput must be the only operation in
+//!   the request for index: <name>", on an on-demand table, on a provisioned
+//!   table, and in the request that switches an on-demand table to
+//!   PROVISIONED (measured 2026-11-03). It does not depend on the billing
+//!   mode, so it is checked here, before the table is read.
+//! - An `Update` without `WarmThroughput` on a table that is, or that the
+//!   request makes, on-demand, carrying a `ProvisionedThroughput` or nothing
+//!   at all: "The only Updates for index: <name> when TableThroughputMode is
 //!   PAY_PER_REQUEST can be to OnDemandThroughput, WarmThroughput" (T3d,
-//!   T3e). The billing mode is known only once the table is read, so that
-//!   rule lives in `warm_throughput::validate_warm_throughput_updates`; here
-//!   an `Update` without `WarmThroughput` on a table whose mode is not yet
-//!   known is refused as not yet supported (the service's sentence for a
-//!   provisioned table was not measured).
+//!   T3e). The stored billing mode is known only once the table is read, so
+//!   [`refuse_bare_updates`] runs after the read. ExtendDB does not change an
+//!   index's throughput, so every other `Update` without `WarmThroughput` (one
+//!   carrying only `OnDemandThroughput`, any on a provisioned table, the
+//!   index update of a switch to PROVISIONED) is refused as not yet
+//!   supported, as before this rule existed.
 //!
 //! A `Create` has a valid name, a key schema of defined attributes, and (when
 //! given) a throughput of at least 1 unit each; a `Delete` has a valid name.
@@ -53,10 +60,20 @@ pub fn on_demand_update_members(name: &str) -> String {
     )
 }
 
-/// Whether any `Update` element carries nothing but its index name (a
-/// `ProvisionedThroughput` on it is not a member of ExtendDB's action, so it
-/// reads the same). Such an element needs the table's billing mode for its
-/// sentence, so the caller reads the table first.
+/// Measured 2026-11-03: an `Update` carrying `WarmThroughput` beside
+/// `ProvisionedThroughput` or `OnDemandThroughput`, the sentence for `name`.
+#[must_use]
+pub fn index_warm_throughput_only_operation(name: &str) -> String {
+    format!(
+        "One or more parameter values were invalid: WarmThroughput must be the only operation \
+         in the request for index: {name}"
+    )
+}
+
+/// Whether any `Update` element carries no `WarmThroughput`: nothing but its
+/// index name, or a throughput ExtendDB does not apply to an index. Such an
+/// element needs the table's billing mode for its sentence, so the caller
+/// reads the table first.
 #[must_use]
 pub(crate) fn has_bare_update(input: &UpdateTableInput) -> bool {
     input
@@ -70,10 +87,15 @@ pub(crate) fn has_bare_update(input: &UpdateTableInput) -> bool {
         })
 }
 
-/// Refuse every `Update` element that carries nothing but its index name:
-/// on an on-demand table with the measured sentence (rows T3d, T3e); on a
-/// provisioned table, where the service's sentence was not measured, with
-/// ExtendDB's own "not yet supported".
+/// Refuse every `Update` element that carries no `WarmThroughput`.
+/// `pay_per_request` is the billing mode the table has after the request: the
+/// request's `BillingMode` when it carries one, the stored mode otherwise.
+///
+/// Under PAY_PER_REQUEST an element carrying `ProvisionedThroughput` or
+/// nothing at all answers the measured sentence (rows T3d, T3e). Every other
+/// such element (only `OnDemandThroughput`, which that sentence names as
+/// allowed, or any element under PROVISIONED, where the service changes the
+/// index's throughput) answers ExtendDB's own "not yet supported".
 ///
 /// # Errors
 ///
@@ -89,11 +111,15 @@ pub(crate) fn refuse_bare_updates(
         .filter_map(|u| u.update.as_ref())
         .find(|a| a.warm_throughput.is_none())
     {
-        return Err(DynamoDbError::ValidationException(if pay_per_request {
-            on_demand_update_members(&upd.index_name)
-        } else {
-            "UpdateGlobalSecondaryIndex is not yet supported".to_owned()
-        }));
+        let on_demand_rule =
+            upd.provisioned_throughput.is_some() || upd.on_demand_throughput.is_none();
+        return Err(DynamoDbError::ValidationException(
+            if pay_per_request && on_demand_rule {
+                on_demand_update_members(&upd.index_name)
+            } else {
+                "UpdateGlobalSecondaryIndex is not yet supported".to_owned()
+            },
+        ));
     }
     Ok(())
 }
@@ -148,11 +174,17 @@ pub(crate) fn validate_gsi_updates(input: &UpdateTableInput) -> Result<(), Dynam
             ));
         }
         if let Some(upd) = &update.update {
-            // An Update carrying WarmThroughput is stored (checked against the
-            // index's current values once the table is read). One carrying
-            // nothing else is refused by [`refuse_bare_updates`] once the
+            // An Update carrying only WarmThroughput is stored (checked against
+            // the index's current values once the table is read). One carrying
+            // a throughput beside it is refused here, in every billing mode;
+            // one without it is refused by [`refuse_bare_updates`] once the
             // table's billing mode is known.
             extenddb_core::validation::validate_index_name(&upd.index_name)?;
+            if upd.warm_throughput.is_some() && upd.carries_throughput() {
+                return Err(DynamoDbError::ValidationException(
+                    index_warm_throughput_only_operation(&upd.index_name),
+                ));
+            }
         }
         if let Some(create) = &update.create {
             extenddb_core::validation::validate_index_name(&create.index_name)?;
@@ -287,9 +319,95 @@ mod tests {
         .expect("different indexes");
     }
 
-    /// Rows T3d and T3e: an Update with nothing but the index name (or a
-    /// member ExtendDB's action does not carry) on an on-demand table answers
-    /// the measured sentence; on a provisioned table ExtendDB's own.
+    /// Measured 2026-11-03: an Update carrying WarmThroughput beside
+    /// ProvisionedThroughput, OnDemandThroughput or both answers the
+    /// only-operation sentence before the table is read, so the answer is
+    /// the same under either billing mode and the throughput is never
+    /// dropped with a 200.
+    #[test]
+    fn a_throughput_beside_warm_throughput_is_refused_in_either_billing_mode() {
+        let warm = json!({ "ReadUnitsPerSecond": 12000, "WriteUnitsPerSecond": 4000 });
+        let provisioned = json!({ "ReadCapacityUnits": 9, "WriteCapacityUnits": 9 });
+        let on_demand = json!({ "MaxReadRequestUnits": 100 });
+        for members in [
+            json!({ "ProvisionedThroughput": provisioned }),
+            json!({ "OnDemandThroughput": on_demand }),
+            json!({ "ProvisionedThroughput": provisioned, "OnDemandThroughput": on_demand }),
+        ] {
+            let mut update = json!({ "IndexName": "gsi", "WarmThroughput": warm });
+            update
+                .as_object_mut()
+                .unwrap()
+                .extend(members.as_object().unwrap().clone());
+            for billing in [None, Some("PROVISIONED"), Some("PAY_PER_REQUEST")] {
+                let mut request = input(json!([{ "Update": update }]));
+                request.billing_mode = billing.map(|b| serde_json::from_value(json!(b)).unwrap());
+                assert_eq!(
+                    message(validate_gsi_updates(&request)),
+                    "One or more parameter values were invalid: WarmThroughput must be the only \
+                     operation in the request for index: gsi",
+                    "{update} with BillingMode {billing:?}"
+                );
+            }
+        }
+    }
+
+    /// An Update without WarmThroughput: on an on-demand table one carrying
+    /// ProvisionedThroughput or nothing answers the measured sentence (rows
+    /// T3d, T3e); one carrying only OnDemandThroughput, and every one on a
+    /// provisioned table (the index update of a switch to PROVISIONED
+    /// included), answers ExtendDB's "not yet supported".
+    #[test]
+    fn an_update_without_warm_throughput_answers_by_the_billing_mode_after_the_request() {
+        let provisioned = json!({ "ReadCapacityUnits": 3, "WriteCapacityUnits": 3 });
+        let on_demand = json!({ "MaxReadRequestUnits": 100 });
+        let on_demand_sentence = "One or more parameter values were invalid: The only Updates \
+             for index: gsi when TableThroughputMode is PAY_PER_REQUEST can be to \
+             OnDemandThroughput, WarmThroughput";
+        let not_yet = "UpdateGlobalSecondaryIndex is not yet supported";
+        for (update, pay_per_request, expected) in [
+            (json!({ "IndexName": "gsi" }), true, on_demand_sentence),
+            (
+                json!({ "IndexName": "gsi", "ProvisionedThroughput": provisioned }),
+                true,
+                on_demand_sentence,
+            ),
+            (
+                json!({ "IndexName": "gsi", "ProvisionedThroughput": provisioned, "OnDemandThroughput": on_demand }),
+                true,
+                on_demand_sentence,
+            ),
+            (
+                json!({ "IndexName": "gsi", "OnDemandThroughput": on_demand }),
+                true,
+                not_yet,
+            ),
+            (json!({ "IndexName": "gsi" }), false, not_yet),
+            (
+                json!({ "IndexName": "gsi", "ProvisionedThroughput": provisioned }),
+                false,
+                not_yet,
+            ),
+            (
+                json!({ "IndexName": "gsi", "OnDemandThroughput": on_demand }),
+                false,
+                not_yet,
+            ),
+        ] {
+            let request = input(json!([{ "Update": update }]));
+            validate_gsi_updates(&request).expect("the element rules pass; the mode decides");
+            assert!(has_bare_update(&request));
+            assert_eq!(
+                message(refuse_bare_updates(&request, pay_per_request)),
+                expected,
+                "{update} pay_per_request={pay_per_request}"
+            );
+        }
+    }
+
+    /// Rows T3d and T3e: an Update with nothing but the index name on an
+    /// on-demand table answers the measured sentence; on a provisioned table
+    /// ExtendDB's own.
     #[test]
     fn a_bare_update_is_refused_with_the_billing_mode_sentence() {
         let bare = input(json!([{ "Update": { "IndexName": "gsi" } }]));
