@@ -657,12 +657,17 @@ impl MongoEngine {
     }
 
     /// The steps of a `DeleteTable` after its document is marked `DELETING`:
-    /// drop the data and index collections, remove the tags and the stream
-    /// state, then the document. `DeleteTable` runs them in the request, and
-    /// the control plane runs them for a document a `DeleteTable` left
-    /// `DELETING` (`worker_store.rs`). Each step is idempotent, so running
-    /// them again after a failure, or from both at once, removes what is left
-    /// and changes nothing else.
+    /// drop the data and index collections, remove the stream state, then
+    /// remove the document and the tags together. `DeleteTable` runs them in
+    /// the request, and the control plane runs them for a document a
+    /// `DeleteTable` left `DELETING` (`worker_store.rs`). Two runs of one
+    /// delete can overlap: the request's task, still waiting on a drop when
+    /// the mark's due time passes, and a control-plane pass. Each step is
+    /// idempotent and keyed by the table id, except the tags, which are keyed
+    /// by the ARN and go only with this table id's `DELETING` document. A
+    /// second run, alongside the first or after a table was created into the
+    /// same name, removes what is left of this table and nothing of the new
+    /// one.
     pub(crate) async fn finish_table_delete(
         &self,
         account_id: &str,
@@ -683,15 +688,6 @@ impl MongoEngine {
         // `_ddb_<index_id>` collections.
         self.drop_index_collections_for_table(table_id).await?;
 
-        // Tags are keyed by the table ARN rather than table_id. Remove them
-        // before deleting the table metadata so a table recreated with the
-        // same name cannot inherit the previous table's tags.
-        self.catalog_db
-            .collection::<Document>("tags")
-            .delete_many(doc! { "resource_arn": table_arn })
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-
         self.gsi_cache_invalidate(table_id);
 
         // Delete stream_shards, stream_records, and their sequence counters
@@ -700,18 +696,61 @@ impl MongoEngine {
         // table's stream history. RFC-0003 §8.2 (table-name reuse).
         self.cleanup_stream_state_for_table(table_id).await?;
 
-        // Delete the table metadata: only the DELETING document of this table
-        // id, so a table created into the same name meanwhile is left alone.
-        self.catalog_db
+        // Remove the document and the tags in one transaction, so no tag
+        // outlives the document, and remove the tags only when this call
+        // removed this table id's DELETING document: tags are keyed by the
+        // ARN, which a table created into the same name shares. A write
+        // conflict aborts the transaction with nothing removed. The writer it
+        // met is another run of these steps, claiming or removing the
+        // document, so the document is left to that run, or to the control
+        // plane if it stays DELETING.
+        match self
+            .remove_deleting_document(account_id, table_name, table_id, table_arn)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) if crate::data_engine::is_transient_write_conflict(&e) => Ok(()),
+            Err(e) => Err(StorageError::Internal(e.to_string())),
+        }
+    }
+
+    /// The last step of [`Self::finish_table_delete`]: in one transaction,
+    /// delete this table id's `DELETING` document and, only when that
+    /// removed it, the tags of `table_arn`.
+    async fn remove_deleting_document(
+        &self,
+        account_id: &str,
+        table_name: &str,
+        table_id: &str,
+        table_arn: &str,
+    ) -> mongodb::error::Result<()> {
+        let mut session = self.client.start_session().await?;
+        session
+            .start_transaction()
+            .with_options(
+                mongodb::options::TransactionOptions::builder()
+                    .write_concern(crate::majority_write_concern(self.client.write_concern()))
+                    .build(),
+            )
+            .await?;
+        let removed = self
+            .catalog_db
             .collection::<Document>("tables")
             .delete_one(doc! {
                 "_id": { "account_id": account_id, "table_name": table_name },
                 "table_id": table_id,
                 "table_status": "DELETING",
             })
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-        Ok(())
+            .session(&mut session)
+            .await?;
+        if removed.deleted_count == 1 {
+            self.catalog_db
+                .collection::<Document>("tags")
+                .delete_many(doc! { "resource_arn": table_arn })
+                .session(&mut session)
+                .await?;
+        }
+        session.commit_transaction().await
     }
 
     pub(crate) async fn describe_table_impl(

@@ -460,6 +460,50 @@ async fn the_control_plane_finishes_a_delete_left_deleting() {
     }
 }
 
+/// Two runs of one delete can overlap (the request's task and a control-plane
+/// pass), so one can reach its last steps after the other has removed the
+/// document and the name has been created again. That late run leaves the new
+/// table whole, its tag included: tags are keyed by the ARN, which the new
+/// table shares.
+#[tokio::test]
+async fn a_late_second_run_of_a_delete_leaves_a_new_table_of_the_name_whole() {
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let (old, old_index_ids) = f.create_full_table().await;
+    f.leave_deleting(transition_in(60)).await;
+
+    f.engine
+        .finish_table_delete(ACCOUNT, TABLE, &old.table_id, &old.table_arn)
+        .await
+        .expect("the first run");
+    let left = f.leftovers(&old, &old_index_ids).await;
+    assert!(
+        left.is_empty(),
+        "after the first run these remain: {left:?}"
+    );
+
+    let (new, new_index_ids) = f.create_full_table().await;
+    assert_eq!(
+        new.table_arn, old.table_arn,
+        "precondition: the ARN is shared"
+    );
+    f.engine
+        .finish_table_delete(ACCOUNT, TABLE, &old.table_id, &old.table_arn)
+        .await
+        .expect("the late second run");
+    let left = f.leftovers(&new, &new_index_ids).await;
+    assert_eq!(
+        left.len(),
+        6,
+        "the new table's document, collections, index document, tag and stream shards \
+         stay: {left:?}"
+    );
+    assert_eq!(f.status().await.as_deref(), Some("ACTIVE"));
+
+    f.finish().await;
+}
+
 /// A delete whose transition time is still ahead belongs to a DeleteTable
 /// that may still be running, and the control plane leaves it alone.
 #[tokio::test]
@@ -558,5 +602,57 @@ async fn two_concurrent_delete_tables_have_one_winner() {
     }
 
     drop(engine);
+    f.finish().await;
+}
+
+/// A run whose last step meets another run removing the document (a write
+/// conflict on the transaction) answers `Ok`, not an internal error, and
+/// leaves the document to that run. The other run is held inside its
+/// transaction, with the document and the tag deleted and not yet committed.
+#[tokio::test]
+async fn a_run_that_meets_another_removing_the_document_leaves_it_to_that_run() {
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let (desc, index_ids) = f.create_full_table().await;
+    f.leave_deleting(transition_in(60)).await;
+
+    let mut other = f.engine.client.start_session().await.expect("session");
+    other
+        .start_transaction()
+        .await
+        .expect("start a transaction");
+    f.engine
+        .catalog_db
+        .collection::<Document>("tables")
+        .delete_one(doc! {
+            "_id": { "account_id": ACCOUNT, "table_name": TABLE },
+            "table_id": &desc.table_id,
+            "table_status": "DELETING",
+        })
+        .session(&mut other)
+        .await
+        .expect("the other run deletes the document");
+    f.engine
+        .catalog_db
+        .collection::<Document>("tags")
+        .delete_many(doc! { "resource_arn": &desc.table_arn })
+        .session(&mut other)
+        .await
+        .expect("the other run deletes the tag");
+
+    f.engine
+        .finish_table_delete(ACCOUNT, TABLE, &desc.table_id, &desc.table_arn)
+        .await
+        .expect("a write conflict leaves the document to the other run");
+    assert_eq!(f.status().await.as_deref(), Some("DELETING"));
+
+    other
+        .commit_transaction()
+        .await
+        .expect("the other run commits");
+    let left = f.leftovers(&desc, &index_ids).await;
+    assert!(left.is_empty(), "these remain: {left:?}");
+
     f.finish().await;
 }

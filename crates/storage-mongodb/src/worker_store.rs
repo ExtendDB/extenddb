@@ -83,12 +83,13 @@ impl MongoEngine {
     /// ([`DELETE_FINISH_AFTER`] after its mark, or at once for a document
     /// with no transition time, which a build before this one wrote). Each
     /// document is first claimed by moving its transition time forward,
-    /// conditioned on the value read, so that of several processes sharing
-    /// the catalog one runs the steps at a time, and a step that keeps
-    /// failing is retried once per [`DELETE_FINISH_AFTER`] rather than at
-    /// every poll. A failed step is logged and leaves the document
-    /// `DELETING`; it does not stop the pass. Returns the names of the tables
-    /// removed.
+    /// conditioned on the value read, so that of several control-plane
+    /// passes, in one process or several, one claims a document at a time; a
+    /// `DeleteTable` whose own task is still running then runs the same steps
+    /// alongside it. The claim also makes a step that keeps failing retry
+    /// once per [`DELETE_FINISH_AFTER`] rather than at every poll. A failed
+    /// step is logged and leaves the document `DELETING`; it does not stop
+    /// the pass. Returns the names of the tables removed.
     async fn finish_due_deletes(&self) -> Result<Vec<String>, StorageError> {
         let tables_coll = self.catalog_db.collection::<Document>("tables");
         let due: Vec<Document> = tables_coll
