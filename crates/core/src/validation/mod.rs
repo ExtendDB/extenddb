@@ -1083,8 +1083,9 @@ pub fn validate_put_item(
         ));
     }
 
+    // The attribute-name size check is not here: the service reports it
+    // ahead of the table lookup, so the handler runs it before this.
     validate_item_keys(&input.item, key_schema, attr_defs)?;
-    validate_attribute_name_sizes(&input.item, limits)?;
     validate_item_numbers(&input.item)?;
     validate_item_nesting_depth(&input.item)?;
 
@@ -1214,7 +1215,33 @@ fn validate_expression_attribute_value_numbers(
     Ok(())
 }
 
+/// The request form an attribute name arrived in, which selects the wording
+/// of the size refusal (REQ-LIM-004).
+///
+/// Measured on the service (2026-10-21, us-east-1) with a 65,536-byte name:
+///
+/// | Request form | Refusal |
+/// |---|---|
+/// | `PutItem` item, `UpdateItem` value map key or `AttributeUpdates` name | `1 validation error detected: Attribute name is too large, must be less than 65536 bytes` |
+/// | `PutItem`, `UpdateItem` or `DeleteItem` `ExpressionAttributeNames` value | the same, followed by ` for key #n` |
+/// | `TransactWriteItems` `Put` item, `BatchWriteItem` `PutRequest` item | `Attribute name is too large, must be less than 65536 bytes` |
+/// | `TransactWriteItems` `Put`, `Update`, `Delete` or `ConditionCheck` `ExpressionAttributeNames` value | `ExpressionAttributeNames contains invalid value: Attribute name is too large, must be less than 65536 bytes for key #n` |
+/// | `TransactWriteItems` `Put` or `Update` map key inside an `ExpressionAttributeValues` value | `ExpressionAttributeValues contains invalid value: Attribute name is too large, must be less than 65536 bytes for key :v` |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttributeNameRequestForm {
+    /// A standalone `PutItem`, `UpdateItem` or `DeleteItem` request.
+    SingleItem,
+    /// A member of a `TransactWriteItems` request.
+    TransactionMember,
+    /// A `PutRequest` of a `BatchWriteItem` request. It carries no
+    /// expression maps.
+    BatchRequest,
+}
+
 /// Validate that no attribute name exceeds the maximum allowed size (REQ-LIM-004).
+///
+/// Top-level names and map keys at every depth are measured in UTF-8 bytes.
+/// `form` selects the refusal wording (see [`AttributeNameRequestForm`]).
 ///
 /// # Errors
 ///
@@ -1222,22 +1249,171 @@ fn validate_expression_attribute_value_numbers(
 pub fn validate_attribute_name_sizes(
     item: &Item,
     limits: &LimitsConfig,
+    form: AttributeNameRequestForm,
 ) -> Result<(), DynamoDbError> {
     for (name, value) in item {
-        check_attribute_name_size(name, limits)?;
-        check_nested_attribute_name_sizes(value, limits)?;
+        check_attribute_name_size(name, limits, form)?;
+        check_nested_attribute_name_sizes(value, limits, form)?;
     }
     Ok(())
 }
 
-fn check_attribute_name_size(name: &str, limits: &LimitsConfig) -> Result<(), DynamoDbError> {
+/// Validate the attribute names a request brings in through its expression
+/// maps (REQ-LIM-004): `PutItem`, `UpdateItem`, `DeleteItem` and every
+/// `TransactWriteItems` member.
+///
+/// Every `ExpressionAttributeNames` value is checked, used or not, and the
+/// refusal names the placeholder (`for key #n`). Every map key inside every
+/// `ExpressionAttributeValues` value is checked at every depth; a standalone
+/// request refuses it with the prefixed sentence alone, a transaction member
+/// names the value placeholder (`for key :v`). Each map is visited in sorted
+/// key order so the reported placeholder is deterministic. The order of the
+/// two maps follows the request form, as measured on the service
+/// (2026-10-21) with a long name in each map: a standalone `UpdateItem`
+/// reports the `ExpressionAttributeNames` placeholder, a transacted `Update`
+/// reports the `ExpressionAttributeValues` placeholder. Both checks are input
+/// validation: callers run them ahead of the condition, the index-key checks
+/// and any storage access. `form` selects the wording (see
+/// [`AttributeNameRequestForm`]).
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` for the first name over the limit.
+pub fn validate_expression_attribute_name_sizes(
+    names: Option<&std::collections::HashMap<String, String>>,
+    values: Option<&std::collections::HashMap<String, AttributeValue>>,
+    limits: &LimitsConfig,
+    form: AttributeNameRequestForm,
+) -> Result<(), DynamoDbError> {
+    if form == AttributeNameRequestForm::SingleItem {
+        check_expression_attribute_names(names, limits, form)?;
+        check_expression_attribute_values(values, limits, form)
+    } else {
+        check_expression_attribute_values(values, limits, form)?;
+        check_expression_attribute_names(names, limits, form)
+    }
+}
+
+/// The `ExpressionAttributeNames` half of
+/// [`validate_expression_attribute_name_sizes`].
+fn check_expression_attribute_names(
+    names: Option<&std::collections::HashMap<String, String>>,
+    limits: &LimitsConfig,
+    form: AttributeNameRequestForm,
+) -> Result<(), DynamoDbError> {
+    if let Some(names) = names {
+        let mut placeholders: Vec<&String> = names.keys().collect();
+        placeholders.sort();
+        for placeholder in placeholders {
+            if names[placeholder].len() > limits.max_attribute_name_bytes {
+                return Err(DynamoDbError::ValidationException(
+                    expression_attribute_name_too_large(
+                        limits,
+                        form,
+                        "ExpressionAttributeNames",
+                        placeholder,
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The `ExpressionAttributeValues` half of
+/// [`validate_expression_attribute_name_sizes`].
+fn check_expression_attribute_values(
+    values: Option<&std::collections::HashMap<String, AttributeValue>>,
+    limits: &LimitsConfig,
+    form: AttributeNameRequestForm,
+) -> Result<(), DynamoDbError> {
+    if let Some(values) = values {
+        let mut placeholders: Vec<&String> = values.keys().collect();
+        placeholders.sort();
+        for placeholder in placeholders {
+            if form == AttributeNameRequestForm::SingleItem {
+                check_nested_attribute_name_sizes(&values[placeholder], limits, form)?;
+            } else if nested_attribute_name_too_large(&values[placeholder], limits) {
+                return Err(DynamoDbError::ValidationException(
+                    expression_attribute_name_too_large(
+                        limits,
+                        form,
+                        "ExpressionAttributeValues",
+                        placeholder,
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate the attribute names of a legacy `AttributeUpdates` map: each
+/// attribute it names and the map keys inside each supplied value, with the
+/// standalone `UpdateItem` wording (REQ-LIM-004).
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` for the first name over the limit.
+pub fn validate_attribute_updates_name_sizes(
+    updates: &std::collections::HashMap<String, crate::types::AttributeValueUpdate>,
+    limits: &LimitsConfig,
+) -> Result<(), DynamoDbError> {
+    let form = AttributeNameRequestForm::SingleItem;
+    let mut names: Vec<&String> = updates.keys().collect();
+    names.sort();
+    for name in names {
+        check_attribute_name_size(name, limits, form)?;
+        if let Some(value) = &updates[name].value {
+            check_nested_attribute_name_sizes(value, limits, form)?;
+        }
+    }
+    Ok(())
+}
+
+/// The service's refusal for an attribute name over the limit, worded for
+/// the request form. The figure is the first refused size, one more than the
+/// configured maximum.
+fn attribute_name_too_large(limits: &LimitsConfig, form: AttributeNameRequestForm) -> String {
+    let sentence = format!(
+        "Attribute name is too large, must be less than {} bytes",
+        limits.max_attribute_name_bytes.saturating_add(1)
+    );
+    match form {
+        AttributeNameRequestForm::SingleItem => format!("1 validation error detected: {sentence}"),
+        AttributeNameRequestForm::TransactionMember | AttributeNameRequestForm::BatchRequest => {
+            sentence
+        }
+    }
+}
+
+/// The refusal for an over-limit name that arrived through an expression
+/// map, naming the placeholder. A standalone request uses the prefixed
+/// sentence; a transaction member names the map the placeholder belongs to.
+fn expression_attribute_name_too_large(
+    limits: &LimitsConfig,
+    form: AttributeNameRequestForm,
+    map: &str,
+    placeholder: &str,
+) -> String {
+    let refusal = attribute_name_too_large(limits, form);
+    match form {
+        AttributeNameRequestForm::SingleItem => format!("{refusal} for key {placeholder}"),
+        AttributeNameRequestForm::TransactionMember | AttributeNameRequestForm::BatchRequest => {
+            format!("{map} contains invalid value: {refusal} for key {placeholder}")
+        }
+    }
+}
+
+fn check_attribute_name_size(
+    name: &str,
+    limits: &LimitsConfig,
+    form: AttributeNameRequestForm,
+) -> Result<(), DynamoDbError> {
     if name.len() > limits.max_attribute_name_bytes {
-        return Err(DynamoDbError::ValidationException(format!(
-            "One or more parameter values were invalid: Size of attribute name '{}' \
-             has exceeded the maximum size limit of {} bytes",
-            truncate_for_error(name),
-            limits.max_attribute_name_bytes
-        )));
+        return Err(DynamoDbError::ValidationException(
+            attribute_name_too_large(limits, form),
+        ));
     }
     Ok(())
 }
@@ -1245,28 +1421,28 @@ fn check_attribute_name_size(name: &str, limits: &LimitsConfig) -> Result<(), Dy
 fn check_nested_attribute_name_sizes(
     value: &AttributeValue,
     limits: &LimitsConfig,
+    form: AttributeNameRequestForm,
 ) -> Result<(), DynamoDbError> {
-    match value {
-        AttributeValue::M(map) => {
-            for (name, nested) in map {
-                check_attribute_name_size(name, limits)?;
-                check_nested_attribute_name_sizes(nested, limits)?;
-            }
-        }
-        AttributeValue::L(list) => {
-            for nested in list {
-                check_nested_attribute_name_sizes(nested, limits)?;
-            }
-        }
-        _ => {}
+    if nested_attribute_name_too_large(value, limits) {
+        return Err(DynamoDbError::ValidationException(
+            attribute_name_too_large(limits, form),
+        ));
     }
     Ok(())
 }
 
-/// Truncate a string for inclusion in error messages.
-fn truncate_for_error(s: &str) -> &str {
-    let end = s.char_indices().nth(64).map_or(s.len(), |(idx, _)| idx);
-    &s[..end]
+/// Whether any map key inside `value`, at any depth, exceeds the limit.
+fn nested_attribute_name_too_large(value: &AttributeValue, limits: &LimitsConfig) -> bool {
+    match value {
+        AttributeValue::M(map) => map.iter().any(|(name, nested)| {
+            name.len() > limits.max_attribute_name_bytes
+                || nested_attribute_name_too_large(nested, limits)
+        }),
+        AttributeValue::L(list) => list
+            .iter()
+            .any(|nested| nested_attribute_name_too_large(nested, limits)),
+        _ => false,
+    }
 }
 
 /// Validate that an item contains all required key attributes with correct types.
@@ -2601,7 +2777,7 @@ mod tests {
         let limits = LimitsConfig::default();
         let mut item = Item::new();
         item.insert("ok_name".to_owned(), AttributeValue::S("v".to_owned()));
-        assert!(validate_attribute_name_sizes(&item, &limits).is_ok());
+        assert!(validate_attribute_name_sizes(&item, &limits, SINGLE).is_ok());
     }
 
     #[test]
@@ -2666,10 +2842,10 @@ mod tests {
         };
         let mut item = Item::new();
         item.insert("a".repeat(11), AttributeValue::S("v".to_owned()));
-        let err = validate_attribute_name_sizes(&item, &limits).unwrap_err();
-        assert!(
-            err.to_string().contains("Size of attribute name"),
-            "unexpected error: {err}"
+        let err = validate_attribute_name_sizes(&item, &limits, SINGLE).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "1 validation error detected: Attribute name is too large, must be less than 11 bytes"
         );
     }
 
@@ -2775,18 +2951,124 @@ mod tests {
         }
     }
 
+    /// The refusal under `short_name_limits`: the first refused size is 11.
+    const SHORT_TOO_LARGE: &str =
+        "1 validation error detected: Attribute name is too large, must be less than 11 bytes";
+
+    /// The same refusal without the prefix, as a transaction `Put` member and
+    /// a batch `PutRequest` word it.
+    const SHORT_TOO_LARGE_BARE: &str = "Attribute name is too large, must be less than 11 bytes";
+
+    const SINGLE: AttributeNameRequestForm = AttributeNameRequestForm::SingleItem;
+    const TRANSACTION: AttributeNameRequestForm = AttributeNameRequestForm::TransactionMember;
+    const BATCH: AttributeNameRequestForm = AttributeNameRequestForm::BatchRequest;
+
+    #[test]
+    fn item_name_over_limit_in_transaction_and_batch_uses_the_bare_sentence() {
+        let mut top = Item::new();
+        top.insert("a".repeat(11), AttributeValue::S("v".to_owned()));
+        let mut nested = Item::new();
+        nested.insert("doc".to_owned(), map_with_key("k".repeat(11)));
+        for item in [top, nested] {
+            for form in [TRANSACTION, BATCH] {
+                let err =
+                    validate_attribute_name_sizes(&item, &short_name_limits(), form).unwrap_err();
+                assert!(matches!(err, DynamoDbError::ValidationException(_)));
+                assert_eq!(err.to_string(), SHORT_TOO_LARGE_BARE, "{form:?}");
+            }
+            let err =
+                validate_attribute_name_sizes(&item, &short_name_limits(), SINGLE).unwrap_err();
+            assert_eq!(err.to_string(), SHORT_TOO_LARGE);
+        }
+    }
+
+    #[test]
+    fn transaction_expression_name_over_limit_names_the_map_and_placeholder() {
+        let n = names(&[("#n", "a".repeat(11))]);
+        let err = validate_expression_attribute_name_sizes(
+            Some(&n),
+            None,
+            &short_name_limits(),
+            TRANSACTION,
+        )
+        .unwrap_err();
+        assert!(matches!(err, DynamoDbError::ValidationException(_)));
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "ExpressionAttributeNames contains invalid value: {SHORT_TOO_LARGE_BARE} for key #n"
+            )
+        );
+    }
+
+    #[test]
+    fn transaction_expression_value_map_key_over_limit_names_the_value_placeholder() {
+        let deep = {
+            let mut mid = Item::new();
+            mid.insert("ok".to_owned(), map_with_key("k".repeat(11)));
+            AttributeValue::M(mid)
+        };
+        let in_list = AttributeValue::L(vec![map_with_key("k".repeat(11))]);
+        for value in [map_with_key("k".repeat(11)), deep, in_list] {
+            let v = values(&[(":a", AttributeValue::S("x".to_owned())), (":v", value)]);
+            let err = validate_expression_attribute_name_sizes(
+                None,
+                Some(&v),
+                &short_name_limits(),
+                TRANSACTION,
+            )
+            .unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "ExpressionAttributeValues contains invalid value: {SHORT_TOO_LARGE_BARE} for key :v"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn transaction_expression_values_are_checked_before_names() {
+        let n = names(&[("#n", "a".repeat(11))]);
+        let v = values(&[(":v", map_with_key("k".repeat(11)))]);
+        let err = validate_expression_attribute_name_sizes(
+            Some(&n),
+            Some(&v),
+            &short_name_limits(),
+            TRANSACTION,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "ExpressionAttributeValues contains invalid value: {SHORT_TOO_LARGE_BARE} for key :v"
+            )
+        );
+    }
+
+    #[test]
+    fn transaction_expression_maps_within_limit_pass() {
+        let n = names(&[("#n", "a".repeat(10))]);
+        let v = values(&[(":v", map_with_key("k".repeat(10)))]);
+        assert!(
+            validate_expression_attribute_name_sizes(
+                Some(&n),
+                Some(&v),
+                &short_name_limits(),
+                TRANSACTION
+            )
+            .is_ok()
+        );
+    }
+
     #[test]
     fn nested_map_key_exceeding_limit_rejected() {
         let mut inner = Item::new();
         inner.insert("b".repeat(11), AttributeValue::S("v".to_owned()));
         let mut item = Item::new();
         item.insert("doc".to_owned(), AttributeValue::M(inner));
-        let err = validate_attribute_name_sizes(&item, &short_name_limits()).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains(&format!("Size of attribute name '{}'", "b".repeat(11))),
-            "error should name the nested key: {msg}"
-        );
+        let err = validate_attribute_name_sizes(&item, &short_name_limits(), SINGLE).unwrap_err();
+        assert_eq!(err.to_string(), SHORT_TOO_LARGE);
     }
 
     #[test]
@@ -2801,11 +3083,8 @@ mod tests {
                 AttributeValue::M(inner),
             ]),
         );
-        let err = validate_attribute_name_sizes(&item, &short_name_limits()).unwrap_err();
-        assert!(
-            err.to_string().contains("Size of attribute name"),
-            "unexpected error: {err}"
-        );
+        let err = validate_attribute_name_sizes(&item, &short_name_limits(), SINGLE).unwrap_err();
+        assert_eq!(err.to_string(), SHORT_TOO_LARGE);
     }
 
     #[test]
@@ -2822,7 +3101,7 @@ mod tests {
         );
         let mut item = Item::new();
         item.insert("root".to_owned(), AttributeValue::M(top));
-        assert!(validate_attribute_name_sizes(&item, &short_name_limits()).is_err());
+        assert!(validate_attribute_name_sizes(&item, &short_name_limits(), SINGLE).is_err());
     }
 
     #[test]
@@ -2836,7 +3115,7 @@ mod tests {
             "rows".to_owned(),
             AttributeValue::L(vec![AttributeValue::M(inner)]),
         );
-        assert!(validate_attribute_name_sizes(&item, &short_name_limits()).is_ok());
+        assert!(validate_attribute_name_sizes(&item, &short_name_limits(), SINGLE).is_ok());
     }
 
     #[test]
@@ -2846,13 +3125,229 @@ mod tests {
         at_cap.insert("é".repeat(5), AttributeValue::Null);
         let mut item = Item::new();
         item.insert("doc".to_owned(), AttributeValue::M(at_cap));
-        assert!(validate_attribute_name_sizes(&item, &short_name_limits()).is_ok());
+        assert!(validate_attribute_name_sizes(&item, &short_name_limits(), SINGLE).is_ok());
 
         let mut over = Item::new();
         over.insert("é".repeat(6), AttributeValue::Null);
         let mut item = Item::new();
         item.insert("doc".to_owned(), AttributeValue::M(over));
-        assert!(validate_attribute_name_sizes(&item, &short_name_limits()).is_err());
+        assert!(validate_attribute_name_sizes(&item, &short_name_limits(), SINGLE).is_err());
+    }
+
+    #[test]
+    fn attribute_name_limit_message_at_default_limit() {
+        let limits = LimitsConfig::default();
+        let mut item = Item::new();
+        item.insert("a".repeat(65_535), AttributeValue::Null);
+        assert!(validate_attribute_name_sizes(&item, &limits, SINGLE).is_ok());
+
+        let mut item = Item::new();
+        item.insert("a".repeat(65_536), AttributeValue::Null);
+        let err = validate_attribute_name_sizes(&item, &limits, SINGLE).unwrap_err();
+        assert!(matches!(err, DynamoDbError::ValidationException(_)));
+        assert_eq!(
+            err.to_string(),
+            "1 validation error detected: Attribute name is too large, must be less than 65536 bytes"
+        );
+    }
+
+    fn names(pairs: &[(&str, String)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), v.clone()))
+            .collect()
+    }
+
+    fn values(
+        pairs: &[(&str, AttributeValue)],
+    ) -> std::collections::HashMap<String, AttributeValue> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), v.clone()))
+            .collect()
+    }
+
+    fn map_with_key(key: String) -> AttributeValue {
+        let mut inner = Item::new();
+        inner.insert(key, AttributeValue::S("v".to_owned()));
+        AttributeValue::M(inner)
+    }
+
+    #[test]
+    fn expression_name_over_limit_names_the_placeholder() {
+        let n = names(&[("#n", "a".repeat(11))]);
+        let err =
+            validate_expression_attribute_name_sizes(Some(&n), None, &short_name_limits(), SINGLE)
+                .unwrap_err();
+        assert!(matches!(err, DynamoDbError::ValidationException(_)));
+        assert_eq!(err.to_string(), format!("{SHORT_TOO_LARGE} for key #n"));
+    }
+
+    #[test]
+    fn expression_name_at_limit_passes() {
+        let n = names(&[("#n", "a".repeat(10)), ("#m", "short".to_owned())]);
+        assert!(
+            validate_expression_attribute_name_sizes(Some(&n), None, &short_name_limits(), SINGLE)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn expression_name_limit_counts_utf8_bytes() {
+        // Five two-byte characters is ten bytes: at the cap. Six is over.
+        let at_cap = names(&[("#n", "é".repeat(5))]);
+        assert!(
+            validate_expression_attribute_name_sizes(
+                Some(&at_cap),
+                None,
+                &short_name_limits(),
+                SINGLE
+            )
+            .is_ok()
+        );
+        let over = names(&[("#n", "é".repeat(6))]);
+        assert!(
+            validate_expression_attribute_name_sizes(
+                Some(&over),
+                None,
+                &short_name_limits(),
+                SINGLE
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn expression_names_report_the_first_placeholder_in_sorted_order() {
+        let n = names(&[
+            ("#zz", "z".repeat(11)),
+            ("#b", "b".repeat(11)),
+            ("#ok", "x".to_owned()),
+        ]);
+        let err =
+            validate_expression_attribute_name_sizes(Some(&n), None, &short_name_limits(), SINGLE)
+                .unwrap_err();
+        assert_eq!(err.to_string(), format!("{SHORT_TOO_LARGE} for key #b"));
+    }
+
+    #[test]
+    fn expression_value_map_key_over_limit_uses_the_bare_message() {
+        let v = values(&[(":v", map_with_key("k".repeat(11)))]);
+        let err =
+            validate_expression_attribute_name_sizes(None, Some(&v), &short_name_limits(), SINGLE)
+                .unwrap_err();
+        assert!(matches!(err, DynamoDbError::ValidationException(_)));
+        assert_eq!(err.to_string(), SHORT_TOO_LARGE);
+    }
+
+    #[test]
+    fn expression_value_map_key_inside_list_and_deeper_is_checked() {
+        let in_list = AttributeValue::L(vec![
+            AttributeValue::S("first".to_owned()),
+            map_with_key("k".repeat(11)),
+        ]);
+        let mut mid = Item::new();
+        mid.insert("ok".to_owned(), map_with_key("k".repeat(11)));
+        let deep = AttributeValue::M(mid);
+        for value in [in_list, deep] {
+            let v = values(&[(":v", value)]);
+            let err = validate_expression_attribute_name_sizes(
+                None,
+                Some(&v),
+                &short_name_limits(),
+                SINGLE,
+            )
+            .unwrap_err();
+            assert_eq!(err.to_string(), SHORT_TOO_LARGE);
+        }
+    }
+
+    #[test]
+    fn expression_values_without_long_map_keys_pass() {
+        // A long string VALUE is not a name; only map keys are measured.
+        let v = values(&[
+            (":s", AttributeValue::S("s".repeat(100))),
+            (":m", map_with_key("k".repeat(10))),
+            (
+                ":l",
+                AttributeValue::L(vec![AttributeValue::N("1".to_owned())]),
+            ),
+        ]);
+        assert!(
+            validate_expression_attribute_name_sizes(None, Some(&v), &short_name_limits(), SINGLE)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn expression_names_are_checked_before_values() {
+        let n = names(&[("#n", "a".repeat(11))]);
+        let v = values(&[(":v", map_with_key("k".repeat(11)))]);
+        let err = validate_expression_attribute_name_sizes(
+            Some(&n),
+            Some(&v),
+            &short_name_limits(),
+            SINGLE,
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), format!("{SHORT_TOO_LARGE} for key #n"));
+    }
+
+    #[test]
+    fn expression_maps_absent_pass() {
+        assert!(
+            validate_expression_attribute_name_sizes(None, None, &short_name_limits(), SINGLE)
+                .is_ok()
+        );
+    }
+
+    fn attribute_update(
+        action: &str,
+        value: Option<AttributeValue>,
+    ) -> crate::types::AttributeValueUpdate {
+        crate::types::AttributeValueUpdate {
+            value,
+            action: action.to_owned(),
+        }
+    }
+
+    #[test]
+    fn attribute_updates_name_over_limit_rejected() {
+        let mut updates = std::collections::HashMap::new();
+        updates.insert(
+            "a".repeat(11),
+            attribute_update("PUT", Some(AttributeValue::S("x".to_owned()))),
+        );
+        let err =
+            validate_attribute_updates_name_sizes(&updates, &short_name_limits()).unwrap_err();
+        assert_eq!(err.to_string(), SHORT_TOO_LARGE);
+
+        let mut updates = std::collections::HashMap::new();
+        updates.insert("a".repeat(11), attribute_update("DELETE", None));
+        assert!(validate_attribute_updates_name_sizes(&updates, &short_name_limits()).is_err());
+    }
+
+    #[test]
+    fn attribute_updates_map_key_inside_value_rejected() {
+        let mut updates = std::collections::HashMap::new();
+        updates.insert(
+            "doc".to_owned(),
+            attribute_update("PUT", Some(map_with_key("k".repeat(11)))),
+        );
+        let err =
+            validate_attribute_updates_name_sizes(&updates, &short_name_limits()).unwrap_err();
+        assert_eq!(err.to_string(), SHORT_TOO_LARGE);
+    }
+
+    #[test]
+    fn attribute_updates_within_limit_pass() {
+        let mut updates = std::collections::HashMap::new();
+        updates.insert(
+            "a".repeat(10),
+            attribute_update("PUT", Some(map_with_key("k".repeat(10)))),
+        );
+        updates.insert("b".to_owned(), attribute_update("DELETE", None));
+        assert!(validate_attribute_updates_name_sizes(&updates, &short_name_limits()).is_ok());
     }
 
     #[test]
