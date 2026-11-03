@@ -5,6 +5,7 @@
 
 use extenddb_storage::management_store::{AccessKeyCreated, OpError, OpResult};
 
+use super::database_error;
 use crate::catalog_store::PostgresCatalogStore;
 use crate::pg_util::{is_fk_violation, is_unique_violation};
 
@@ -210,10 +211,7 @@ impl PostgresCatalogStore {
         )
         .fetch_all(self.pool())
         .await
-        .map_err(|e| {
-            tracing::error!("list_session_policies failed: {e}");
-            OpError::Internal("Database error".to_owned())
-        })?;
+        .map_err(|e| database_error("list_session_policies", &e))?;
         Ok(rows
             .into_iter()
             .map(
@@ -241,10 +239,7 @@ impl PostgresCatalogStore {
             .bind(session_token)
             .execute(self.pool())
             .await
-            .map_err(|e| {
-                tracing::error!("update_session_policy failed: {e}");
-                OpError::Internal("Database error".to_owned())
-            })?;
+            .map_err(|e| database_error("update_session_policy", &e))?;
         Ok(())
     }
 

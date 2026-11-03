@@ -298,10 +298,12 @@ async fn execute_transact_write_op(
             // per-item cancellation reason; an empty index key is up-front input
             // validation (a top-level ValidationException).
             let idx_refs = index_key_refs(indexes);
-            validation::validate_index_key_types(item, &idx_refs, &key_info.attribute_definitions)
-                .map_err(|e| {
-                    TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))
-                })?;
+            validation::validate_index_key_types(
+                item,
+                &idx_refs,
+                super::index::fresh_attr_defs(indexes, &key_info.attribute_definitions),
+            )
+            .map_err(|e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())))?;
             validation::validate_index_key_not_empty(
                 item,
                 &idx_refs,
@@ -422,10 +424,12 @@ async fn execute_transact_write_op(
             // mismatch is a cancellation reason; setting an index key to an
             // empty value is a top-level ValidationException.
             let idx_refs = index_key_refs(indexes);
-            validation::validate_index_key_types(&item, &idx_refs, &key_info.attribute_definitions)
-                .map_err(|e| {
-                    TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))
-                })?;
+            validation::validate_index_key_types(
+                &item,
+                &idx_refs,
+                super::index::fresh_attr_defs(indexes, &key_info.attribute_definitions),
+            )
+            .map_err(|e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())))?;
             validation::validate_index_key_not_empty(
                 &item,
                 &idx_refs,

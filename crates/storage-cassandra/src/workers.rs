@@ -9,20 +9,48 @@ use std::time::Duration;
 use std::sync::atomic::AtomicU64;
 
 use extenddb_storage::management_store::SettingsStore;
+use extenddb_storage::{CancellationToken, sleep_or_shutdown};
 
 use crate::CassandraEngine;
 
-/// Poll `index_propagation_delay_ms` from settings every 30 seconds and update
-/// the in-memory atomic used by `put_item/update_item/delete_item`.
+/// Poll `index_propagation_delay_ms` from settings every 5 seconds and update
+/// the in-memory atomic used by `put_item/update_item/delete_item`, until
+/// `shutdown` fires.
+/// How long `spawn_workers` waits for the GSI delay setting before it spawns
+/// the workers. A set starts after every registration again, while the
+/// server admits nothing and acts on no loss, so the read is bounded; the
+/// poller reads the setting again every 5 s.
+pub(crate) const INITIAL_GSI_DELAY_READ: Duration = Duration::from_secs(2);
+
+/// The GSI delay setting, `index_propagation_delay_ms` or else the legacy
+/// `gsi_propagation_delay_ms`, read within `bound`: `None` when neither is
+/// set to a number, a read fails, or the bound passes first.
+pub(crate) async fn read_gsi_delay<S: SettingsStore + ?Sized>(
+    store: &S,
+    bound: Duration,
+) -> Option<u64> {
+    let read = async {
+        let value = match store.get_setting("index_propagation_delay_ms").await {
+            Ok(Some(v)) => Some(v),
+            _ => store
+                .get_setting("gsi_propagation_delay_ms")
+                .await
+                .ok()
+                .flatten(),
+        };
+        value.and_then(|v| v.parse::<u64>().ok())
+    };
+    tokio::time::timeout(bound, read).await.ok().flatten()
+}
+
 pub(crate) async fn poll_gsi_delay<S: SettingsStore + ?Sized>(
     store: Arc<S>,
     gsi_delay: Arc<AtomicU64>,
+    shutdown: CancellationToken,
 ) {
     const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
-    loop {
-        tokio::time::sleep(POLL_INTERVAL).await;
-
+    while sleep_or_shutdown(&shutdown, POLL_INTERVAL).await {
         match store.get_setting("index_propagation_delay_ms").await {
             Ok(Some(val)) => {
                 if let Ok(ms) = val.parse::<u64>() {
@@ -51,6 +79,7 @@ pub(crate) async fn poll_control_plane_transitions<S: SettingsStore + ?Sized>(
     storage: Arc<CassandraEngine>,
     notify: Arc<tokio::sync::Notify>,
     settings: Arc<S>,
+    shutdown: CancellationToken,
 ) {
     const ACTIVE_POLL: Duration = Duration::from_secs(1);
     const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -58,7 +87,10 @@ pub(crate) async fn poll_control_plane_transitions<S: SettingsStore + ?Sized>(
 
     loop {
         // Idle: wait for a wake signal or timeout (defensive sweep)
-        let _ = tokio::time::timeout(IDLE_TIMEOUT, notify.notified()).await;
+        tokio::select! {
+            () = shutdown.cancelled() => return,
+            _ = tokio::time::timeout(IDLE_TIMEOUT, notify.notified()) => {}
+        }
 
         // Read control_plane_delay_seconds from settings to compute active window
         let delay_secs = read_control_plane_delay(&*settings).await;
@@ -82,7 +114,9 @@ pub(crate) async fn poll_control_plane_transitions<S: SettingsStore + ?Sized>(
             if tokio::time::Instant::now() >= deadline {
                 break;
             }
-            tokio::time::sleep(ACTIVE_POLL).await;
+            if !sleep_or_shutdown(&shutdown, ACTIVE_POLL).await {
+                return;
+            }
         }
     }
 }
@@ -91,15 +125,15 @@ pub(crate) async fn poll_control_plane_transitions<S: SettingsStore + ?Sized>(
 ///
 /// Scans every account keyspace for transactions older than `timeout` and
 /// resumes COMMIT or executes ROLLBACK as appropriate.  Runs every
-/// `scan_interval` seconds for the lifetime of the process.
+/// `scan_interval` seconds until `shutdown` fires, and stops before the next
+/// keyspace once it has.
 pub(crate) async fn poll_transaction_recovery(
     engine: Arc<CassandraEngine>,
     timeout: Duration,
     scan_interval: Duration,
+    shutdown: CancellationToken,
 ) {
-    loop {
-        tokio::time::sleep(scan_interval).await;
-
+    while sleep_or_shutdown(&shutdown, scan_interval).await {
         #[allow(clippy::cast_possible_truncation)]
         let cutoff = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -116,6 +150,9 @@ pub(crate) async fn poll_transaction_recovery(
         };
 
         for keyspace in &keyspaces {
+            if shutdown.is_cancelled() {
+                return;
+            }
             let entries = match engine.scan_old_transactions(keyspace, cutoff).await {
                 Ok(e) => e,
                 Err(e) => {
@@ -181,18 +218,17 @@ async fn read_control_plane_delay<S: SettingsStore + ?Sized>(store: &S) -> f64 {
         .flatten()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|&v| v >= 0.0)
-        .unwrap_or(0.25)
+        .unwrap_or(crate::DEFAULT_CONTROL_PLANE_DELAY_SECONDS)
 }
 
 /// Handle that stops GSI workers when dropped.
 pub struct GsiWorkerGuard {
-    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    shutdown: CancellationToken,
 }
 
 impl Drop for GsiWorkerGuard {
     fn drop(&mut self) {
-        self.shutdown
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.shutdown.cancel();
     }
 }
 
@@ -201,28 +237,35 @@ impl Drop for GsiWorkerGuard {
 /// Returns a `GsiWorkerGuard`; workers stop when it is dropped.
 #[must_use]
 pub fn spawn_gsi_workers(engine: Arc<CassandraEngine>) -> GsiWorkerGuard {
-    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    for worker_id in 0..crate::gsi_queue::NUM_WORKERS {
-        let engine = engine.clone();
-        let shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            gsi_worker(worker_id, engine, shutdown).await;
-        });
-    }
+    let shutdown = CancellationToken::new();
+    drop(spawn_gsi_workers_until(engine, &shutdown));
     GsiWorkerGuard { shutdown }
 }
 
-async fn gsi_worker(
-    worker_id: u64,
+/// Spawn GSI propagation workers, one per partition, that return once
+/// `shutdown` fires; their handles, for the server's drain.
+pub(crate) fn spawn_gsi_workers_until(
     engine: Arc<CassandraEngine>,
-    shutdown: Arc<std::sync::atomic::AtomicBool>,
-) {
+    shutdown: &CancellationToken,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    (0..crate::gsi_queue::NUM_WORKERS)
+        .map(|worker_id| {
+            let engine = engine.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                gsi_worker(worker_id, engine, shutdown).await;
+            })
+        })
+        .collect()
+}
+
+async fn gsi_worker(worker_id: u64, engine: Arc<CassandraEngine>, shutdown: CancellationToken) {
     const MAX_IDLE: Duration = Duration::from_secs(1);
 
     tracing::debug!("GSI worker {worker_id} started");
 
     loop {
-        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+        if shutdown.is_cancelled() {
             tracing::debug!("GSI worker {worker_id} shutting down");
             return;
         }
@@ -233,14 +276,15 @@ async fn gsi_worker(
                     .await
                     .unwrap_or(MAX_IDLE)
                     .min(MAX_IDLE);
-                tokio::time::timeout(wait, engine.gsi_queue.notify.notified())
-                    .await
-                    .ok();
+                tokio::select! {
+                    () = shutdown.cancelled() => {}
+                    _ = tokio::time::timeout(wait, engine.gsi_queue.notify.notified()) => {}
+                }
             }
             Ok(_) => continue,
             Err(e) => {
                 tracing::error!("GSI worker {worker_id}: {e}");
-                tokio::time::sleep(MAX_IDLE).await;
+                let _ = sleep_or_shutdown(&shutdown, MAX_IDLE).await;
             }
         }
     }
@@ -450,16 +494,25 @@ async fn gsi_apply_index(
 /// Woken immediately when `apply_table_update` commits a new `CREATING` index,
 /// and also sweeps periodically as a backstop. Treats a NULL `backfill_heartbeat`
 /// (never started) and a heartbeat older than `stale_threshold` (crashed) the
-/// same way: drop+recreate the data table and rerun the backfill.
+/// same way: drop+recreate the data table and rerun the backfill. Once
+/// `shutdown` fires it takes no further index, and it returns only after the
+/// backfills it started have ended, so the server's stop covers them too.
 pub(crate) async fn poll_gsi_backfill_recovery(
     engine: Arc<CassandraEngine>,
     notify: Arc<tokio::sync::Notify>,
     stale_threshold: Duration,
     scan_interval: Duration,
+    shutdown: CancellationToken,
 ) {
-    loop {
+    let mut backfills = tokio::task::JoinSet::new();
+    'scan: loop {
         // Wait for an explicit wake or the periodic backstop timeout.
-        let _ = tokio::time::timeout(scan_interval, notify.notified()).await;
+        tokio::select! {
+            () = shutdown.cancelled() => break,
+            _ = tokio::time::timeout(scan_interval, notify.notified()) => {}
+        }
+        // Collect the backfills that have ended.
+        while backfills.try_join_next().is_some() {}
 
         let keyspaces = match list_account_keyspaces(&engine).await {
             Ok(ks) => ks,
@@ -470,17 +523,56 @@ pub(crate) async fn poll_gsi_backfill_recovery(
         };
 
         for account_ks in &keyspaces {
-            if let Err(e) = recover_stale_backfills(&engine, account_ks, stale_threshold).await {
+            if shutdown.is_cancelled() {
+                break 'scan;
+            }
+            if let Err(e) = recover_stale_backfills(
+                &engine,
+                account_ks,
+                stale_threshold,
+                &shutdown,
+                &mut backfills,
+            )
+            .await
+            {
                 tracing::warn!("gsi_recovery: {account_ks}: {e}");
             }
         }
     }
+    // A backfill stops at its next request once `shutdown` fires; one that
+    // has finished its scan completes the activation and the hold's release.
+    while backfills.join_next().await.is_some() {}
 }
 
+/// The GSI backfill recovery worker `serve` runs, with the stale threshold
+/// and scan interval given, until `shutdown` fires; for tests.
+#[cfg(any(test, feature = "test-util"))]
+#[doc(hidden)]
+#[must_use]
+pub fn spawn_gsi_backfill_recovery_for_tests(
+    engine: Arc<CassandraEngine>,
+    stale_threshold: Duration,
+    scan_interval: Duration,
+    shutdown: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    let notify = engine.gsi_backfill_notify.clone();
+    tokio::spawn(poll_gsi_backfill_recovery(
+        engine,
+        notify,
+        stale_threshold,
+        scan_interval,
+        shutdown,
+    ))
+}
+
+/// Rerun the stale backfills of `account_ks`, each in a task of
+/// `backfills` that stops once `shutdown` fires.
 async fn recover_stale_backfills(
     engine: &Arc<CassandraEngine>,
     account_ks: &str,
     stale_threshold: Duration,
+    shutdown: &CancellationToken,
+    backfills: &mut tokio::task::JoinSet<()>,
 ) -> Result<(), extenddb_storage::error::StorageError> {
     use cdrs_tokio::types::IntoRustByName as _;
 
@@ -506,6 +598,9 @@ async fn recover_stale_backfills(
     .await?;
 
     for row in rows {
+        if shutdown.is_cancelled() {
+            return Ok(());
+        }
         let heartbeat_ms: Option<i64> = row.get_by_name("backfill_heartbeat").ok().flatten();
         let is_stale = heartbeat_ms.is_none_or(|hb| hb < cutoff_ms);
         if !is_stale {
@@ -626,7 +721,8 @@ async fn recover_stale_backfills(
             continue;
         }
 
-        // Spawn the backfill so the recovery loop is not blocked.
+        // Run the backfill in a task of its own so the recovery loop is not
+        // blocked, and in `backfills` so the worker returns only after it.
         let session = engine.session_arc();
         let gsi_queue = Arc::clone(&engine.gsi_queue);
         let account_ks_owned = account_ks.to_owned();
@@ -634,21 +730,33 @@ async fn recover_stale_backfills(
         let table_id_owned = table_id.clone();
         let index_id_owned = index_id.clone();
         let index_name_owned = index_name.clone();
-        tokio::spawn(async move {
-            let result = crate::data::ddl::backfill_gsi(
-                &session,
-                &account_ks_owned,
-                &catalog_ks_owned,
-                &table_id_owned,
-                &index_id_owned,
-                &index_name_owned,
-                &index_key_schema,
-                &base_attr_defs,
-                &base_key_schema,
-                &base_attr_defs,
-                &projection,
-            )
-            .await;
+        let shutdown = shutdown.clone();
+        backfills.spawn(async move {
+            // Once `shutdown` fires the backfill stops at its next request
+            // and the task writes nothing more: the index stays CREATING
+            // under its hold, its heartbeat goes stale, and a later pass runs
+            // the backfill again, as after a crash.
+            let Some(result) = shutdown
+                .run_until_cancelled(crate::data::ddl::backfill_gsi(
+                    &session,
+                    &account_ks_owned,
+                    &catalog_ks_owned,
+                    &table_id_owned,
+                    &index_id_owned,
+                    &index_name_owned,
+                    &index_key_schema,
+                    &base_attr_defs,
+                    &base_key_schema,
+                    &base_attr_defs,
+                    &projection,
+                ))
+                .await
+            else {
+                tracing::info!(
+                    "gsi_recovery: backfill for '{index_name_owned}' stopped by the shutdown"
+                );
+                return;
+            };
 
             if let Err(e) = result {
                 tracing::error!(
@@ -698,5 +806,89 @@ pub(crate) fn is_table_not_found(err: &extenddb_storage::error::StorageError) ->
             msg.contains("unconfigured table") || msg.contains("does not exist")
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use extenddb_storage::management_store::{OpResult, SettingsStore};
+    use futures::future::BoxFuture;
+    use tokio::time::Instant;
+
+    /// A settings store holding `rows`, or one whose reads never answer.
+    struct Settings {
+        rows: Vec<(&'static str, &'static str)>,
+        hang: bool,
+    }
+
+    impl SettingsStore for Settings {
+        fn get_setting(&self, key: &str) -> BoxFuture<'_, OpResult<Option<String>>> {
+            let value = self
+                .rows
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| (*v).to_owned());
+            let hang = self.hang;
+            Box::pin(async move {
+                if hang {
+                    std::future::pending::<()>().await;
+                }
+                Ok(value)
+            })
+        }
+        fn set_setting(&self, _key: &str, _value: &str) -> BoxFuture<'_, OpResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn list_settings(&self) -> BoxFuture<'_, OpResult<Vec<(String, String)>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    /// A read of the GSI delay that gets no answer ends at its bound, so a
+    /// set started after a registration again spawns its workers.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_of_the_gsi_delay_that_gets_no_answer_ends_at_its_bound() {
+        let store = Settings {
+            rows: Vec::new(),
+            hang: true,
+        };
+        let started = Instant::now();
+        let read = tokio::time::timeout(
+            Duration::from_secs(60),
+            super::read_gsi_delay(&store, super::INITIAL_GSI_DELAY_READ),
+        )
+        .await;
+        assert_eq!(read, Ok(None), "the read was not bounded");
+        assert_eq!(started.elapsed(), super::INITIAL_GSI_DELAY_READ);
+    }
+
+    /// The delay is read from `index_propagation_delay_ms`, else from the
+    /// legacy `gsi_propagation_delay_ms`; a value that is not a number reads
+    /// as none.
+    #[tokio::test]
+    async fn the_gsi_delay_is_read_from_the_setting_or_its_legacy_name() {
+        let bound = super::INITIAL_GSI_DELAY_READ;
+        let read = |rows| async move {
+            super::read_gsi_delay(&Settings { rows, hang: false }, bound).await
+        };
+        assert_eq!(
+            read(vec![
+                ("index_propagation_delay_ms", "250"),
+                ("gsi_propagation_delay_ms", "40")
+            ])
+            .await,
+            Some(250)
+        );
+        assert_eq!(
+            read(vec![("gsi_propagation_delay_ms", "40")]).await,
+            Some(40)
+        );
+        assert_eq!(
+            read(vec![("index_propagation_delay_ms", "soon")]).await,
+            None
+        );
+        assert_eq!(read(Vec::new()).await, None);
     }
 }

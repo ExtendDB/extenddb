@@ -7,9 +7,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use extenddb_core::types::{
-    BackupDescription, BackupDetails, BackupSummary, ContinuousBackupsDescription, GsiInput, Item,
-    KeySchemaElement, LsiInput, PointInTimeRecoveryDescription, Projection, RestoreSummary,
-    ScalarAttributeType, SourceTableDetails, StreamSpecification, TableDescription,
+    BackupDescription, BackupDetails, BackupSummary, GsiInput, Item, KeySchemaElement, LsiInput,
+    Projection, RestoreSummary, ScalarAttributeType, SourceTableDetails, StreamSpecification,
+    TableDescription,
 };
 use extenddb_storage::backup_definition::{
     BACKUP_DEFINITION_VERSION, BackupTableDefinition, COPY_BATCH_BYTES, COPY_BATCH_ITEMS,
@@ -1077,15 +1077,23 @@ impl BackupEngine for PostgresEngine {
             // REPEATABLE READ snapshot, so the real relation SELECT must run
             // before meta.commit(). This fixes the data snapshot at the same
             // instant as the captured definition; the lock then keeps a DROP
-            // from removing the relation while its rows are read. The
-            // control-plane drop path uses a short lock timeout and retries a
-            // blocked DeleteTable rather than stalling its worker pass.
+            // from removing the relation while its rows are read. A
+            // DeleteTable that finds this lock leaves its row DELETING, and
+            // the control-plane poller drops the tables under a short lock
+            // timeout, retrying while the lock is held; the guard wakes it
+            // when this transaction ends (commit, error or cancellation), as
+            // the table snapshot's does, and the active poller waits on that
+            // wake as well as on its timer, so the drop follows the backup at
+            // once.
             let ddb_table = data_table_name(&table_id);
-            let mut snapshot = self
-                .data_pool
-                .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-                .await
-                .map_err(db_err)?;
+            let mut held = crate::snapshot_engine::HeldSnapshot::new(
+                self.data_pool
+                    .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                    .await
+                    .map_err(db_err)?,
+                Arc::clone(&self.control_plane_notify),
+            );
+            let snapshot = held.open_conn()?;
             sqlx::query(&format!("LOCK TABLE {ddb_table} IN ACCESS SHARE MODE"))
                 .execute(&mut *snapshot)
                 .await
@@ -1096,29 +1104,32 @@ impl BackupEngine for PostgresEngine {
                 .map_err(db_err)?;
             meta.commit().await.map_err(db_err)?;
 
-            // UpdateTable commits a new index's catalog row before it creates
-            // and fills the index's data table, and removes the row again if
-            // that fails. An index whose data table is not there yet is
-            // therefore not part of the table as of this snapshot; leave it
-            // out rather than record an index that may never exist.
+            // Since #401 UpdateTable creates a new GSI's data table before it
+            // commits the catalog row, so a GSI row without a data table is
+            // not expected: it is what an index whose table was dropped out
+            // from under the catalog, or a crash in a pre-#401 build, leaves.
+            // Such an index is not part of the table as of this snapshot;
+            // leave it out rather than record an index a restore cannot
+            // rebuild. The probe is the table snapshot's
+            // (`snapshot_engine::index_data_table_exists`).
             let gsi_ids_len = gsi_ids.len();
             // The ids were read under the catalog barrier, so this probes
             // exactly the indexes the captured definition describes. The
             // to_regclass lookup reads pg_class rather than the pinned data
             // snapshot and can see later committed DDL; that remains consistent:
-            // UpdateTable creates and fills a GSI in one data transaction, and
-            // restore rebuilds its rows from the captured base items.
+            // a GSI's data table exists from before its catalog row commits
+            // (#401), and restore rebuilds its rows from the captured base
+            // items.
             let mut present = Vec::with_capacity(definition.global_secondary_indexes.len());
             for (gsi, (name, index_id)) in std::mem::take(&mut definition.global_secondary_indexes)
                 .into_iter()
                 .zip(gsi_ids)
             {
                 debug_assert_eq!(gsi.index_name, name);
-                let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
-                    .bind(index_table_name(&index_id))
-                    .fetch_one(&mut *snapshot)
-                    .await
-                    .map_err(db_err)?;
+                let exists =
+                    crate::snapshot_engine::index_data_table_exists(&mut *snapshot, &index_id)
+                        .await
+                        .map_err(db_err)?;
                 if exists {
                     present.push(gsi);
                 }
@@ -1226,7 +1237,7 @@ impl BackupEngine for PostgresEngine {
                     }
                 }
                 count += insert_backup_batch(&mut tx, &backup_arn, &mut pks, &mut datas).await?;
-                snapshot.commit().await.map_err(db_err)?;
+                held.finish().await.map_err(db_err)?;
                 (count, size)
             };
             sqlx::query(
@@ -1640,107 +1651,6 @@ impl BackupEngine for PostgresEngine {
             registered_rx.await.map_err(|_| {
                 StorageError::Internal("the restore task ended before registering".to_owned())
             })?
-        })
-    }
-
-    fn describe_continuous_backups(
-        &self,
-        account_id: &str,
-        table_name: &str,
-    ) -> BoxFuture<'_, Result<ContinuousBackupsDescription, StorageError>> {
-        let account_id = account_id.to_string();
-        let table_name = table_name.to_string();
-        Box::pin(async move {
-            let exists: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM tables WHERE account_id = $1 AND table_name = $2)",
-            )
-            .bind(&account_id)
-            .bind(&table_name)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
-
-            if !exists {
-                return Err(StorageError::TableNotFound(format!(
-                    "Table not found: {table_name}"
-                )));
-            }
-
-            let pitr_row: Option<(bool,)> = sqlx::query_as(
-                "SELECT pitr_enabled FROM continuous_backups \
-             WHERE account_id = $1 AND table_name = $2",
-            )
-            .bind(&account_id)
-            .bind(&table_name)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
-
-            let pitr_enabled = pitr_row.is_some_and(|r| r.0);
-
-            #[allow(clippy::cast_precision_loss)]
-            let now_epoch = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as f64;
-
-            Ok(ContinuousBackupsDescription {
-                continuous_backups_status: "ENABLED".to_owned(),
-                point_in_time_recovery_description: Some(PointInTimeRecoveryDescription {
-                    point_in_time_recovery_status: if pitr_enabled {
-                        "ENABLED".to_owned()
-                    } else {
-                        "DISABLED".to_owned()
-                    },
-                    earliest_restorable_date_time: if pitr_enabled {
-                        Some(now_epoch - 35.0 * 24.0 * 3600.0)
-                    } else {
-                        None
-                    },
-                    latest_restorable_date_time: if pitr_enabled { Some(now_epoch) } else { None },
-                }),
-            })
-        })
-    }
-
-    fn update_continuous_backups(
-        &self,
-        account_id: &str,
-        table_name: &str,
-        pitr_enabled: bool,
-    ) -> BoxFuture<'_, Result<ContinuousBackupsDescription, StorageError>> {
-        let account_id = account_id.to_string();
-        let table_name = table_name.to_string();
-        Box::pin(async move {
-            let exists: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM tables WHERE account_id = $1 AND table_name = $2)",
-            )
-            .bind(&account_id)
-            .bind(&table_name)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
-
-            if !exists {
-                return Err(StorageError::TableNotFound(format!(
-                    "Table not found: {table_name}"
-                )));
-            }
-
-            sqlx::query(
-                "INSERT INTO continuous_backups (account_id, table_name, pitr_enabled) \
-             VALUES ($1, $2, $3) \
-             ON CONFLICT (account_id, table_name) DO UPDATE SET pitr_enabled = $3",
-            )
-            .bind(&account_id)
-            .bind(&table_name)
-            .bind(pitr_enabled)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
-
-            self.describe_continuous_backups(&account_id, &table_name)
-                .await
         })
     }
 }
