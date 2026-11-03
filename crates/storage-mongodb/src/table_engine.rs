@@ -604,7 +604,9 @@ impl MongoEngine {
         // described above and not yet DELETING. Two concurrent DeleteTable
         // calls both read the ACTIVE document; only one update matches. The
         // table id in the filter keeps a stalled call from marking a table
-        // created into the same name after this one was gone.
+        // created into the same name after this one was gone. The mark also
+        // sets the time from which the control plane finishes the delete if
+        // this call stops before it does (`worker_store.rs`).
         let tables_coll = self.catalog_db.collection::<Document>("tables");
         let marked = tables_coll
             .update_one(
@@ -613,7 +615,10 @@ impl MongoEngine {
                     "table_id": &desc.table_id,
                     "table_status": { "$ne": "DELETING" },
                 },
-                doc! { "$set": { "table_status": "DELETING" } },
+                doc! { "$set": {
+                    "table_status": "DELETING",
+                    "status_transition_at": crate::worker_store::delete_finish_due(),
+                } },
             )
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -627,9 +632,47 @@ impl MongoEngine {
             return Err(StorageError::TableBeingDeleted(input.table_name.clone()));
         }
 
+        // The rest of the delete runs in a task of its own, which the request
+        // awaits. A client that gives up on the call (a read timeout, a closed
+        // connection) drops the request future, and dropping it detaches the
+        // task rather than cancelling it, so a delete stalled behind a lock
+        // still finishes once the lock is released. A step that fails, or a
+        // process that dies, leaves the document DELETING for the control
+        // plane to finish.
+        let engine = self.clone();
+        let (account, name) = (account_id.to_owned(), input.table_name.clone());
+        let (table_id, table_arn) = (desc.table_id.clone(), desc.table_arn.clone());
+        tokio::spawn(async move {
+            engine
+                .finish_table_delete(&account, &name, &table_id, &table_arn)
+                .await
+        })
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))??;
+
+        Ok(TableDescription {
+            table_status: TableStatus::Deleting,
+            ..desc
+        })
+    }
+
+    /// The steps of a `DeleteTable` after its document is marked `DELETING`:
+    /// drop the data and index collections, remove the tags and the stream
+    /// state, then the document. `DeleteTable` runs them in the request, and
+    /// the control plane runs them for a document a `DeleteTable` left
+    /// `DELETING` (`worker_store.rs`). Each step is idempotent, so running
+    /// them again after a failure, or from both at once, removes what is left
+    /// and changes nothing else.
+    pub(crate) async fn finish_table_delete(
+        &self,
+        account_id: &str,
+        table_name: &str,
+        table_id: &str,
+        table_arn: &str,
+    ) -> Result<(), StorageError> {
         // Drop the data collection
-        let coll_name = data_collection_name(&desc.table_id);
-        self.drop_collection_if_exists(&coll_name).await?;
+        self.drop_collection_if_exists(&data_collection_name(table_id))
+            .await?;
 
         // The table is already DELETING, so data-plane readers are rejected;
         // unlike individual index deletion, physical cleanup can safely occur
@@ -638,41 +681,37 @@ impl MongoEngine {
         // metadata. The index documents are stored separately from the table
         // document, so dropping the base collection alone does not remove
         // `_ddb_<index_id>` collections.
-        self.drop_index_collections_for_table(&desc.table_id)
-            .await?;
+        self.drop_index_collections_for_table(table_id).await?;
 
         // Tags are keyed by the table ARN rather than table_id. Remove them
         // before deleting the table metadata so a table recreated with the
         // same name cannot inherit the previous table's tags.
         self.catalog_db
             .collection::<Document>("tags")
-            .delete_many(doc! { "resource_arn": &desc.table_arn })
+            .delete_many(doc! { "resource_arn": table_arn })
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        self.gsi_cache_invalidate(&desc.table_id);
+        self.gsi_cache_invalidate(table_id);
 
         // Delete stream_shards, stream_records, and their sequence counters
         // for this table. Prevents a table recreated with the same name
         // (which will get a fresh table_id) from inheriting the deleted
         // table's stream history. RFC-0003 §8.2 (table-name reuse).
-        self.cleanup_stream_state_for_table(&desc.table_id).await?;
+        self.cleanup_stream_state_for_table(table_id).await?;
 
-        // Delete the table metadata: only the document this call marked, so a
-        // table created into the same name meanwhile is left alone.
-        tables_coll
+        // Delete the table metadata: only the DELETING document of this table
+        // id, so a table created into the same name meanwhile is left alone.
+        self.catalog_db
+            .collection::<Document>("tables")
             .delete_one(doc! {
-                "_id": { "account_id": account_id, "table_name": &input.table_name },
-                "table_id": &desc.table_id,
+                "_id": { "account_id": account_id, "table_name": table_name },
+                "table_id": table_id,
                 "table_status": "DELETING",
             })
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-        Ok(TableDescription {
-            table_status: TableStatus::Deleting,
-            ..desc
-        })
+        Ok(())
     }
 
     pub(crate) async fn describe_table_impl(

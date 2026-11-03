@@ -563,9 +563,9 @@ fn build_ttl_condition(
 }
 
 /// Background poller that flips tables out of the transient `CREATING` state
-/// once their scheduled `status_transition_at` has passed. See
-/// [`crate::worker_store`] for how rows enter `CREATING`. Returns once
-/// `shutdown` fires.
+/// once their scheduled `status_transition_at` has passed, and finishes the
+/// deletes a `DeleteTable` left `DELETING`. See [`crate::worker_store`] for how
+/// rows enter either state. Returns once `shutdown` fires.
 pub(crate) async fn control_plane_worker(storage: Arc<MongoEngine>, shutdown: CancellationToken) {
     while sleep_or_shutdown(&shutdown, CONTROL_PLANE_POLL_INTERVAL).await {
         match WorkerStore::process_control_plane_transitions(&*storage).await {

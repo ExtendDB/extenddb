@@ -1036,8 +1036,11 @@ The backend implements every trait in `extenddb-storage`:
   from `CREATING` to `ACTIVE` once their `status_transition_at`
   passes. `create_table_impl` (and restore) write `CREATING` with a
   scheduled transition when `control_plane_delay_seconds` > 0, or
-  `ACTIVE` directly when it is 0. `delete_table_impl` remains inline
-  (no `DELETING` transient state).
+  `ACTIVE` directly when it is 0. `delete_table_impl` marks the
+  document `DELETING` and finishes the delete in the request, in a task
+  of its own that a client's timeout does not cancel; the same pass
+  finishes a delete whose document is still `DELETING` 60 s after the
+  mark (a step that failed, a process that died).
 - `ManagementStore`, `AdminStore`, `SettingsStore`, `MetricsStore`,
   `RateLimitStore` — the catalog trait surface.
 - `AuthorizationStore` — user/group/role/permissions-boundary/session
@@ -1053,7 +1056,8 @@ The backend implements every trait in `extenddb-storage`:
 - `gsi_backfill_worker` — drain `indexes` rows in `CREATING` state,
   scan the base collection with a persistent cursor, flip to ACTIVE.
 - `control_plane_worker` — flip `tables` rows from `CREATING` to
-  `ACTIVE` once their scheduled `status_transition_at` passes.
+  `ACTIVE` once their scheduled `status_transition_at` passes, and
+  finish the deletes left `DELETING` once theirs passes.
 
 ## 13. Testing Strategy
 
