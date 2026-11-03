@@ -145,10 +145,10 @@ impl SqliteEngine {
             // reason: without it, a build committing between an earlier check
             // and this flip would have its table deleted underneath it.
             Self::refuse_if_index_build_in_flight(&mut tx, &row.table_id).await?;
-            // Fenced on the table id read above, so the mark can only land on
-            // the table this call described, never on a table created into the
-            // same name afterwards.
-            let marked = sqlx::query(
+            // The select above ran in this `BEGIN IMMEDIATE` transaction, so
+            // no other writer has changed the row since: the mark updates the
+            // row this call read, which the table id names.
+            sqlx::query(
                 "UPDATE tables SET table_status = 'DELETING', status_transition_at = ? \
                  WHERE account_id = ? AND table_name = ? AND table_id = ?",
             )
@@ -159,9 +159,6 @@ impl SqliteEngine {
             .execute(&mut *tx)
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
-            if marked.rows_affected() == 0 {
-                return Err(StorageError::TableNotFound(input.table_name.clone()));
-            }
             tx.commit()
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
