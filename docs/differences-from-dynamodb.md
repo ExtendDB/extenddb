@@ -4,6 +4,9 @@ This document lists all known behavioral differences between ExtendDB and real
 Amazon DynamoDB. Use it to understand what works identically and what requires
 adaptation when switching between ExtendDB and the real service.
 
+A note such as (measured) or (measured on SQLite) means that the answer comes
+from a request sent to that service or backend.
+
 ## Storage and Infrastructure
 
 | Area | DynamoDB | ExtendDB |
