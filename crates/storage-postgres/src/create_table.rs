@@ -203,7 +203,7 @@ impl PostgresEngine {
         let inserted: Result<(f64, String), sqlx::Error> = sqlx::query_as(
             r"WITH delay AS (
                 SELECT COALESCE(
-                  (SELECT value::FLOAT8 FROM settings WHERE key = 'control_plane_delay_seconds'), 0.25
+                  (SELECT value::FLOAT8 FROM settings WHERE key = 'control_plane_delay_seconds'), $15
                 ) AS secs
               )
               INSERT INTO tables
@@ -222,7 +222,7 @@ impl PostgresEngine {
                      THEN NULL
                      ELSE NOW() + make_interval(secs => (SELECT secs FROM delay))
                 END,
-                $11, $12, $13, $15)
+                $11, $12, $13, $16)
                RETURNING EXTRACT(EPOCH FROM creation_date_time)::FLOAT8, table_status",
         )
         .bind(account_id)
@@ -239,6 +239,7 @@ impl PostgresEngine {
         .bind(&sse_spec_json)
         .bind(&on_demand_json)
         .bind(defer_active)
+        .bind(crate::DEFAULT_CONTROL_PLANE_DELAY_SECONDS)
         .bind(&warm_json)
         .fetch_one(&mut *tx)
         .await;

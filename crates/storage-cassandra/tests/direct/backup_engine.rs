@@ -48,21 +48,21 @@ fn key(id: &str, sort: Option<&str>) -> Item {
     key
 }
 
-pub(crate) fn ks(name: &str, key_type: KeyType) -> KeySchemaElement {
+fn ks(name: &str, key_type: KeyType) -> KeySchemaElement {
     KeySchemaElement {
         attribute_name: name.to_owned(),
         key_type,
     }
 }
 
-pub(crate) fn attr(name: &str, attribute_type: ScalarAttributeType) -> AttributeDefinition {
+fn attr(name: &str, attribute_type: ScalarAttributeType) -> AttributeDefinition {
     AttributeDefinition {
         attribute_name: name.to_owned(),
         attribute_type,
     }
 }
 
-pub(crate) async fn activate_tables(engine: &CassandraEngine) {
+async fn activate_tables(engine: &CassandraEngine) {
     tokio::time::sleep(Duration::from_millis(350)).await;
     engine
         .process_control_plane_transitions()
@@ -113,11 +113,7 @@ async fn put_all(engine: &CassandraEngine, key_info: &TableKeyInfo, items: Vec<I
     }
 }
 
-pub(crate) async fn describe(
-    engine: &CassandraEngine,
-    account_id: &str,
-    name: &str,
-) -> TableDescription {
+async fn describe(engine: &CassandraEngine, account_id: &str, name: &str) -> TableDescription {
     engine
         .describe_table(
             account_id,
@@ -598,33 +594,6 @@ async fn test_table_name_filter_spans_table_recreation() {
         .delete_backup(&account.account_id, &backup.backup_arn)
         .await
         .expect("delete backup");
-}
-
-#[tokio::test]
-async fn test_continuous_backup_state() {
-    if crate::helpers::skip_without_cassandra() {
-        return;
-    }
-    let engine = setup_engine().await;
-    let table = TestTable::new(&engine, "ContinuousBackupState", false).await;
-
-    let initial = engine
-        .describe_continuous_backups(&table.key_info.account_id, &table.key_info.table_name)
-        .await
-        .expect("describe default continuous backup state");
-    assert_eq!(initial.continuous_backups_status, "ENABLED");
-    let initial_pitr = initial.point_in_time_recovery_description.unwrap();
-    assert_eq!(initial_pitr.point_in_time_recovery_status, "DISABLED");
-    assert!(initial_pitr.earliest_restorable_date_time.is_none());
-
-    let enabled = engine
-        .update_continuous_backups(&table.key_info.account_id, &table.key_info.table_name, true)
-        .await
-        .expect("enable PITR state");
-    let enabled_pitr = enabled.point_in_time_recovery_description.unwrap();
-    assert_eq!(enabled_pitr.point_in_time_recovery_status, "ENABLED");
-    assert!(enabled_pitr.earliest_restorable_date_time.is_some());
-    assert!(enabled_pitr.latest_restorable_date_time.is_some());
 }
 
 /// (a) A table with a GSI (sparse, INCLUDE projection) and an LSI, more than
@@ -1577,38 +1546,10 @@ async fn test_restore_of_deleted_backup_is_not_found() {
 
 // ── Isolated catalogs (own keyspace prefix) ────────────────────────────────
 
-/// The catalog migration files in order, so a test can build the catalog
-/// shape of an earlier release by applying the first N statement by
-/// statement, as the runner does.
-pub(crate) const CATALOG_MIGRATION_FILES: &[&str] = &[
-    include_str!("../../migrations/catalog/V001__initial_schema.cql"),
-    include_str!("../../migrations/catalog/V002__backup_restore.cql"),
-    include_str!("../../migrations/catalog/V003__account_scoped_idempotency.cql"),
-    include_str!("../../migrations/catalog/V004__ttl_backfill_cursor.cql"),
-    include_str!("../../migrations/catalog/V005__backup_definitions_and_restore_registration.cql"),
-];
-
 /// An engine on its own keyspace prefix (so its sweeps and workers touch no
-/// other test's tables) with one provisioned account. With `through_v004`
-/// the catalog has run only catalog migrations V001-V004, as a catalog not
-/// yet migrated by `extenddb migrate --yes`; otherwise every migration.
-pub(crate) async fn isolated_engine(
+/// other test's tables) with one provisioned account.
+async fn isolated_engine(
     tag: &str,
-    through_v004: bool,
-) -> (
-    std::sync::Arc<CassandraEngine>,
-    String,
-    crate::helpers::DropKeyspacesOnDrop,
-) {
-    isolated_engine_through(tag, if through_v004 { Some(4) } else { None }).await
-}
-
-/// [`isolated_engine`] with the catalog at the shape after the first
-/// `through` catalog migrations (recorded in `schema_history` as the runner
-/// records them), or fully migrated when `None`.
-pub(crate) async fn isolated_engine_through(
-    tag: &str,
-    through: Option<usize>,
 ) -> (
     std::sync::Arc<CassandraEngine>,
     String,
@@ -1631,38 +1572,22 @@ pub(crate) async fn isolated_engine_through(
             .await
             .unwrap();
     }
-    if let Some(through) = through {
-        // Statement by statement, as the migration runner does, recording
-        // the applied versions in schema_history as the runner did.
-        session.query(format!("USE {catalog_ks}")).await.unwrap();
-        for file in &CATALOG_MIGRATION_FILES[..through] {
-            for statement in file.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-                session
-                    .query(statement)
-                    .await
-                    .expect("earlier catalog statement");
-            }
-        }
-        for version in 1..=i32::try_from(through).expect("small") {
-            session
-                .query_with_values(
-                    format!(
-                        "INSERT INTO {catalog_ks}.schema_history (version, description, applied_at) \
-                         VALUES (?, 'earlier_release', toTimestamp(now()))"
-                    ),
-                    cdrs_tokio::query_values!(version),
-                )
-                .await
-                .expect("record earlier catalog versions");
-        }
-    } else {
-        extenddb_storage_cassandra::migrations::run_catalog_migrations(&session, &catalog_ks)
-            .await
-            .unwrap();
-    }
-    extenddb_storage_cassandra::migrations::run_data_migrations(&session, &account_ks)
-        .await
-        .unwrap();
+    extenddb_storage_cassandra::migrations::migrate_catalog_keyspace(
+        session.clone(),
+        &config.keyspace_prefix,
+        "test",
+        std::time::Duration::from_secs(120),
+    )
+    .await
+    .unwrap();
+    extenddb_storage_cassandra::migrations::migrate_account(
+        session.clone(),
+        &config.keyspace_prefix,
+        &account_ks,
+        "test",
+    )
+    .await
+    .unwrap();
     session
         .query_with_values(
             format!(
@@ -1674,206 +1599,6 @@ pub(crate) async fn isolated_engine_through(
         .await
         .unwrap();
     (engine, account_id, drop_keyspaces)
-}
-
-/// The column names of every table in `keyspace`.
-pub(crate) async fn catalog_columns(engine: &CassandraEngine, keyspace: &str) -> Vec<String> {
-    let rows = extenddb_storage_cassandra::cassandra_util::query_rows::<StorageError>(
-        &engine.session_arc(),
-        "SELECT column_name FROM system_schema.columns WHERE keyspace_name = ?",
-        cdrs_tokio::query_values!(keyspace),
-        "columns",
-    )
-    .await
-    .expect("read schema");
-    let columns: Vec<String> = rows
-        .iter()
-        .map(|row| {
-            extenddb_storage_cassandra::cassandra_util::get_column::<String, StorageError>(
-                row,
-                "column_name",
-                "columns",
-            )
-            .unwrap()
-        })
-        .collect();
-    columns
-}
-
-/// The columns catalog migration V005 adds are absent from `keyspace`.
-async fn assert_catalog_lacks_v005(engine: &CassandraEngine, keyspace: &str) {
-    let columns = catalog_columns(engine, keyspace).await;
-    assert!(columns.iter().any(|c| c == "table_status"), "{columns:?}");
-    for v005 in [
-        "restore_source_backup_arn",
-        "restore_heartbeat",
-        "active_restores",
-        "definition",
-    ] {
-        assert!(!columns.iter().any(|c| c == v005), "{v005} present");
-    }
-}
-
-/// On a catalog that has not run V005, ordinary table and item operations
-/// work; only backup and restore need V005. (CreateTable used to name the
-/// V005 restore columns in its INSERT for every table, which CQL rejects.)
-#[tokio::test]
-async fn test_table_operations_work_on_a_catalog_without_v005() {
-    if crate::helpers::skip_without_cassandra() {
-        return;
-    }
-    let (engine, account_id, _drop_keyspaces) = isolated_engine("v4", true).await;
-    assert_catalog_lacks_v005(&engine, &engine.catalog_keyspace()).await;
-
-    let created = engine
-        .create_table(
-            &account_id,
-            CreateTableInput {
-                table_name: "Unmigrated".to_owned(),
-                key_schema: vec![ks("id", KeyType::Hash)],
-                attribute_definitions: vec![
-                    attr("id", ScalarAttributeType::S),
-                    attr("g", ScalarAttributeType::S),
-                ],
-                billing_mode: Some(BillingMode::PayPerRequest),
-                global_secondary_indexes: Some(vec![GsiInput {
-                    index_name: "ByG".to_owned(),
-                    key_schema: vec![ks("g", KeyType::Hash)],
-                    projection: Projection {
-                        projection_type: ProjectionType::All,
-                        non_key_attributes: None,
-                    },
-                    provisioned_throughput: None,
-                    warm_throughput: None,
-                }]),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("CreateTable on a catalog without V005");
-    assert!(created.restore_summary.is_none());
-    activate_tables(&engine).await;
-    let described = describe(&engine, &account_id, "Unmigrated").await;
-    assert_eq!(described.table_status, TableStatus::Active);
-    assert!(described.restore_summary.is_none());
-
-    let key_info = engine
-        .table_key_info(&account_id, "Unmigrated")
-        .await
-        .expect("key info");
-    engine
-        .put_item(
-            &key_info,
-            item("a", None, "v"),
-            false,
-            None,
-            &Default::default(),
-            None,
-        )
-        .await
-        .expect("PutItem");
-    let got = engine
-        .get_item(&key_info, &key("a", None))
-        .await
-        .expect("GetItem");
-    assert!(got.is_some());
-    assert_eq!(scan_count(&engine, &key_info).await, 1);
-
-    // Backup needs V005. CreateBackup, DeleteBackup and RestoreTableFromBackup
-    // are refused with a message naming the file and `migrate` (they failed
-    // with an internal `Undefined column name ...`); nothing is created.
-    let assert_refused = |what: &str, result: Result<String, StorageError>| match result {
-        Err(StorageError::Unsupported(m)) => {
-            assert!(
-                m.contains("V005__backup_definitions_and_restore_registration.cql")
-                    && m.contains("extenddb migrate --yes")
-                    && !m.contains("V004"),
-                "{what}: {m}"
-            );
-        }
-        other => panic!("{what}: {other:?}"),
-    };
-    assert_refused(
-        "CreateBackup",
-        engine
-            .create_backup(&account_id, "Unmigrated", "needs-v005")
-            .await
-            .map(|d| d.backup_arn),
-    );
-    let some_arn = extenddb_storage::util::backup_arn(
-        "us-east-1",
-        &account_id,
-        "Unmigrated",
-        &extenddb_storage::util::new_backup_id(),
-    );
-    assert_refused(
-        "DeleteBackup",
-        engine
-            .delete_backup(&account_id, &some_arn)
-            .await
-            .map(|d| d.backup_details.backup_arn),
-    );
-    assert_refused(
-        "RestoreTableFromBackup",
-        engine
-            .restore_table_from_backup(
-                &account_id,
-                RestoreRequest {
-                    backup_arn: some_arn.clone(),
-                    source_table_arn: described.table_arn.clone(),
-                    restore_date_time: 0.0,
-                    input: CreateTableInput {
-                        table_name: "UnmigratedTarget".to_owned(),
-                        key_schema: vec![ks("id", KeyType::Hash)],
-                        attribute_definitions: vec![attr("id", ScalarAttributeType::S)],
-                        billing_mode: Some(BillingMode::PayPerRequest),
-                        ..Default::default()
-                    },
-                },
-            )
-            .await
-            .map(|d| d.table_name),
-    );
-    assert!(
-        engine
-            .describe_table(
-                &account_id,
-                DescribeTableInput {
-                    table_name: "UnmigratedTarget".to_owned()
-                }
-            )
-            .await
-            .is_err(),
-        "a refused restore creates no target"
-    );
-
-    // Liveness: once V005 is applied (as `migrate --yes` does, the runner
-    // skipping the recorded files), the same engine backs up without a
-    // restart.
-    extenddb_storage_cassandra::migrations::run_catalog_migrations(
-        &engine.session_arc(),
-        &engine.catalog_keyspace(),
-    )
-    .await
-    .expect("apply V005");
-    let backup = engine
-        .create_backup(&account_id, "Unmigrated", "after-v005")
-        .await
-        .expect("CreateBackup after V005");
-    engine
-        .delete_backup(&account_id, &backup.backup_arn)
-        .await
-        .expect("DeleteBackup after V005");
-
-    engine
-        .delete_table(
-            &account_id,
-            DeleteTableInput {
-                table_name: "Unmigrated".to_owned(),
-            },
-        )
-        .await
-        .expect("DeleteTable on a catalog without V005");
 }
 
 /// Back-date the heartbeat of the CREATING restore target `name` by two
@@ -1911,7 +1636,7 @@ async fn test_restore_sweep_worker_sweeps_at_startup_and_stops_on_shutdown() {
     if crate::helpers::skip_without_cassandra() {
         return;
     }
-    let (engine, account_id, _drop_keyspaces) = isolated_engine("sw", false).await;
+    let (engine, account_id, _drop_keyspaces) = isolated_engine("sw").await;
     let source = create_active_table(
         &engine,
         &account_id,
@@ -1993,7 +1718,7 @@ async fn test_restore_heartbeat_runs_during_target_ddl() {
     if crate::helpers::skip_without_cassandra() {
         return;
     }
-    let (engine, account_id, _drop_keyspaces) = isolated_engine("hb", false).await;
+    let (engine, account_id, _drop_keyspaces) = isolated_engine("hb").await;
     let mut attribute_definitions = vec![
         attr("id", ScalarAttributeType::S),
         attr("sort", ScalarAttributeType::S),

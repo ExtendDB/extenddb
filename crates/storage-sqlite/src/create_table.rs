@@ -121,7 +121,7 @@ impl SqliteEngine {
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?
         .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(0.25);
+        .unwrap_or(crate::DEFAULT_CONTROL_PLANE_DELAY_SECONDS);
 
         // Stored as sent and reported back; nothing acts on it (see the
         // schema comment on `tables.warm_throughput`). UPDATING for the same

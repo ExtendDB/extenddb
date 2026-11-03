@@ -11,8 +11,8 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{
     AttributeDefinition, BackupDescription, BackupDetails, BackupSummary, BillingMode,
-    BillingModeSummary, ContinuousBackupsDescription, GsiDescription, GsiInput, KeySchemaElement,
-    KeyType, LsiInput, OnDemandThroughput, Projection, ProjectionType, ProvisionedThroughput,
+    BillingModeSummary, GsiDescription, GsiInput, KeySchemaElement, KeyType, LsiInput,
+    OnDemandThroughput, Projection, ProjectionType, ProvisionedThroughput,
     ProvisionedThroughputDescription, ScalarAttributeType, SourceTableDetails, StreamSpecification,
     StreamViewType, TableDescription, TableStatus, TimeToLiveDescription, TimeToLiveStatus,
 };
@@ -159,23 +159,6 @@ impl BackupEngine for Fake {
                 None => Ok(desc),
             }
         })
-    }
-
-    fn describe_continuous_backups(
-        &self,
-        _: &str,
-        _: &str,
-    ) -> BoxedFuture<'_, Result<ContinuousBackupsDescription, StorageError>> {
-        unused()
-    }
-
-    fn update_continuous_backups(
-        &self,
-        _: &str,
-        _: &str,
-        _: bool,
-    ) -> BoxedFuture<'_, Result<ContinuousBackupsDescription, StorageError>> {
-        unused()
     }
 }
 

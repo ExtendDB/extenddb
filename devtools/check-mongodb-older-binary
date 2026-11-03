@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+"""Catalogs this binary created and migrated, against the last 0.1.x image:
+
+    devtools/check-mongodb-older-binary <extenddb binary> \\
+        [image] [mongo port] [api port]
+
+Two catalogs, each in a mongo:7 replica set of its own: a fresh one from
+`init`, and the released 0.1.14 fixture upgraded with `migrate --yes`. On
+each, the image (by default extenddb/extenddb-mongodb:0.1.14) runs `serve`,
+which must refuse, then `verify`, `migrate --yes` and `serve` again, and the
+script prints what each run changed, as a diff of the catalog's settings,
+ledgers and indexes before and after. Then this binary must report the catalog as
+written by an older release: `verify` and the migrate preview exit 5 and
+`serve` refuses with 5; `migrate --yes --reconverge` must restore Current
+with the definitions the catalog had before the image ran, and delete the
+marker the image wrote.
+
+The containers publish only on 127.0.0.1, the image runs as the caller's
+uid, and everything is removed at the end with the temporary directory.
+"""
+import difflib
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+from catalog_checks import docker, expect_exit, finish, mongosh, report, run, start_mongo
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+FIXTURES = os.path.join(HERE, "..", "crates", "storage-mongodb", "tests", "fixtures", "released")
+
+DUMP = """
+const out = [];
+for (const name of ["extenddb_catalog", "extenddb_data"]) {
+  const d = db.getSiblingDB(name);
+  for (const c of d.getCollectionNames().sort()) {
+    if (c.startsWith("_ddb_")) continue;
+    for (const i of d.getCollection(c).getIndexes()) {
+      const o = Object.assign({}, i); delete o.v; delete o.ns;
+      out.push(`index ${name}.${c} ${EJSON.stringify(o)}`);
+    }
+  }
+  for (const c of ["settings", "schema_history", "extenddb_migrations"]) {
+    for (const doc of d.getCollection(c).find({}).sort({_id: 1}).toArray()) {
+      const o = Object.assign({}, doc);
+      if (o._id === "encryption_key") o.value = "<key>";
+      delete o.applied_at;
+      out.push(`row ${name}.${c} ${EJSON.stringify(o)}`);
+    }
+  }
+}
+print(out.join("\\n"));
+"""
+
+
+def dump(container: str, port: int) -> list[str]:
+    code, out = mongosh(container, port, DUMP)
+    if code != 0:
+        report(False, "dump the catalog", out)
+    return out.splitlines()
+
+
+def definitions(lines: list[str]) -> list[str]:
+    return [line for line in lines if line.startswith("index ")]
+
+
+def image_run(image: str, container: str, work: str, env: dict, *args: str, timeout: float = 60) -> tuple[int, str]:
+    """Run the image with `args` in `container`'s network, with the work
+    directory at the same path. A run still going after `timeout` is a
+    server that started; it is removed, and its code is -1."""
+    name = f"{container}-image"
+    cmd = ["docker", "run", "--rm", "--name", name, "--network", f"container:{container}",
+           "--user", f"{os.getuid()}:{os.getgid()}", "-v", f"{work}:{work}", "-w", work,
+           "-e", f"HOME={env['HOME']}", "-e", f"EXTENDDB__SERVER__RUN_DIR={env['EXTENDDB__SERVER__RUN_DIR']}",
+           image, *args]
+    try:
+        done = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        return done.returncode, done.stdout + done.stderr
+    except subprocess.TimeoutExpired as e:
+        docker("rm", "-f", name)
+        return -1, f"still running after {timeout:g} s\n{e.stdout or ''}{e.stderr or ''}"
+
+
+def changes(before: list[str], after: list[str]) -> list[str]:
+    return [line for line in difflib.unified_diff(before, after, lineterm="", n=0)
+            if line[:1] in "+-" and not line.startswith(("+++", "---"))]
+
+
+def check(label: str, binary: str, image: str, port: int, api: int, fixture: str | None) -> None:
+    container = f"extenddb-check-older-{port}"
+    work = tempfile.mkdtemp()
+    try:
+        if not start_mongo(container, port, mounts=(f"{FIXTURES}:/fixtures:ro",)):
+            return
+        env = dict(os.environ, HOME=os.path.join(work, "home"),
+                   EXTENDDB__SERVER__RUN_DIR=os.path.join(work, "run"),
+                   EXTENDDB_ADMIN_PASSWORD="CheckAdminPassw0rd1")
+        os.makedirs(env["EXTENDDB__SERVER__RUN_DIR"])
+        # The servers' TLS certificate, where the default config looks for it.
+        tls = os.path.join(env["HOME"], ".extenddb", "tls")
+        os.makedirs(tls)
+        run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=localhost",
+             "-keyout", os.path.join(tls, "key.pem"), "-out", os.path.join(tls, "cert.pem")])
+        config = os.path.join(work, "extenddb.toml")
+        uri = f"mongodb://localhost:{port}/?replicaSet=rs0&directConnection=true"
+        with open(config, "w", encoding="utf-8") as f:
+            f.write(f'[storage]\nbackend = "mongodb"\n\n[storage.mongodb]\nconnection_string = "{uri}"\n')
+        if fixture is None:
+            expect_exit(0, f"{label}: init", [binary, "init", "--backend", "mongodb", "--config", config,
+                                               "--overwrite"], env, timeout=120)
+        else:
+            code, out = mongosh(container, port, f'const FIXTURE = "/fixtures/{fixture}.json"; load("/fixtures/load.js")')
+            report(code == 0 and "loaded" in out, f"{label}: load the {fixture} fixture", out)
+            expect_exit(0, f"{label}: migrate --yes", [binary, "migrate", "--config", config, "--yes"], env)
+        expect_exit(0, f"{label}: verify before the image runs", [binary, "verify", "--config", config], env)
+        before = dump(container, port)
+
+        serve = ["serve", "--config", config, "--foreground", "--port", str(api)]
+        code, out = image_run(image, container, work, env, *serve, timeout=40)
+        report(code > 0 and "resource-tag" in out,
+               f"{label}: the image's serve refuses the catalog for its marker (exit {code})", out)
+        report(changes(before, dump(container, port)) == [], f"{label}: the refused serve changed nothing")
+
+        code, out = image_run(image, container, work, env, "verify", "--config", config)
+        print(f"     {label}: the image's verify exits {code}: {out.strip().splitlines()[-1] if out.strip() else ''}")
+        code, out = image_run(image, container, work, env, "migrate", "--config", config, "--yes")
+        report(code == 0, f"{label}: the image's migrate --yes exits {code}", out)
+        after = dump(container, port)
+        changed = changes(before, after)
+        print(f"     {label}: the image's migrate --yes changed:")
+        for line in changed:
+            print(f"     | {line}")
+        report(any("resource_tag_migration" in line for line in changed),
+               f"{label}: the image's migrate --yes wrote the resource_tag_migration row", "\n".join(changed))
+        # With the marker back, the image's server starts: measured, as the
+        # upgrade manual's table of released binaries records.
+        code, out = image_run(image, container, work, env, *serve, timeout=40)
+        print(f"     {label}: the image's serve after its migrate --yes: "
+              f"{'still serving after 40 s, stopped' if code == -1 else f'exit {code}'}")
+        for line in changes(after, dump(container, port)):
+            print(f"     | {line}")
+
+        for what, cmd in [("verify", [binary, "verify", "--config", config]),
+                          ("migrate preview", [binary, "migrate", "--config", config])]:
+            expect_exit(5, f"{label}: {what} after the image wrote to the catalog", cmd, env,
+                        contains="release before 1.0")
+        expect_exit(5, f"{label}: serve after the image wrote to the catalog",
+                    [binary, *serve], env, contains="--reconverge", timeout=60)
+        expect_exit(0, f"{label}: migrate --yes --reconverge",
+                    [binary, "migrate", "--config", config, "--yes", "--reconverge"], env)
+        expect_exit(0, f"{label}: verify after --reconverge", [binary, "verify", "--config", config], env)
+        restored = dump(container, port)
+        report(definitions(restored) == definitions(before),
+               f"{label}: --reconverge restored the definitions the catalog had",
+               "\n".join(changes(definitions(before), definitions(restored))))
+        report(not any("resource_tag_migration" in line for line in restored),
+               f"{label}: --reconverge deleted the marker")
+    finally:
+        docker("rm", "-f", "-v", container)
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def main(binary: str, image: str, port: int, api: int) -> int:
+    binary = os.path.realpath(binary)
+    code, out = run(["docker", "image", "inspect", image])
+    if not report(code == 0, f"the image {image} is present (pull it first)", out[-500:]):
+        return finish()
+    check("fresh", binary, image, port, api, None)
+    check("upgraded 0.1.14", binary, image, port + 1, api + 1, "0.1.14")
+    return finish()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) not in (2, 3, 4, 5):
+        sys.exit(__doc__)
+    sys.exit(main(
+        sys.argv[1],
+        sys.argv[2] if len(sys.argv) > 2 else "extenddb/extenddb-mongodb:0.1.14",
+        int(sys.argv[3]) if len(sys.argv) > 3 else 27051,
+        int(sys.argv[4]) if len(sys.argv) > 4 else 18470,
+    ))

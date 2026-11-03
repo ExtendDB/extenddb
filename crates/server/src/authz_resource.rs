@@ -113,7 +113,9 @@ fn canonical(region: &str, account_id: &str, rid: &ResourceId) -> String {
         None => base,
         Some(Sub::Index(i)) => format!("{base}/index/{i}"),
         Some(Sub::Stream(s)) => format!("{base}/stream/{s}"),
-        Some(Sub::Backup(b)) => format!("{base}/backup/{b}"),
+        Some(Sub::Backup(b)) => extenddb_core::backup_format::format_backup_arn(
+            PARTITION, region, account_id, &rid.table, b,
+        ),
     }
 }
 
@@ -138,10 +140,7 @@ fn canonical_resource(arn: &str, region: &str, account_id: &str) -> String {
 /// act on `.../backup/<id>`.
 fn backup_arn_field(input: &Value) -> String {
     str_field(input, "BackupArn")
-        .map(|arn| {
-            arn.trim_matches(|c: char| c.is_ascii_whitespace())
-                .to_owned()
-        })
+        .map(|arn| extenddb_core::backup_format::trim_backup_arn(&arn).to_owned())
         .unwrap_or_default()
 }
 
@@ -258,7 +257,7 @@ pub(crate) fn validate_operation_arns(operation: &str, input: &Value) -> Result<
         "DescribeBackup" | "DeleteBackup" => {
             if let Some(arn) = present("BackupArn")
                 && !arn_is_kind(
-                    arn.trim_matches(|c: char| c.is_ascii_whitespace()),
+                    extenddb_core::backup_format::trim_backup_arn(arn),
                     ArnKind::Backup,
                 )
             {
@@ -660,7 +659,7 @@ mod tests {
     use serde_json::json;
 
     const R: &str = "us-east-1";
-    const A: &str = "964157134968";
+    const A: &str = "444455556666";
 
     fn only(op: &str, input: Value) -> String {
         let t = authz_targets(op, &input, R, A);
@@ -767,11 +766,11 @@ mod tests {
     #[test]
     fn respelled_partition_service_region_account_canonicalize_to_same_arn() {
         let canonical =
-            "arn:aws:dynamodb:us-east-1:964157134968:table/T/stream/2026-10-20T16:17:40.188";
+            "arn:aws:dynamodb:us-east-1:444455556666:table/T/stream/2026-10-20T16:17:40.188";
         for respelled in [
-            "arn:aws-cn:dynamodb:us-east-1:964157134968:table/T/stream/2026-10-20T16:17:40.188",
-            "arn:aws:s3:us-east-1:964157134968:table/T/stream/2026-10-20T16:17:40.188",
-            "arn:aws:dynamodb:us-west-2:964157134968:table/T/stream/2026-10-20T16:17:40.188",
+            "arn:aws-cn:dynamodb:us-east-1:444455556666:table/T/stream/2026-10-20T16:17:40.188",
+            "arn:aws:s3:us-east-1:444455556666:table/T/stream/2026-10-20T16:17:40.188",
+            "arn:aws:dynamodb:us-west-2:444455556666:table/T/stream/2026-10-20T16:17:40.188",
             "arn:aws:dynamodb:us-east-1:111122223333:table/T/stream/2026-10-20T16:17:40.188",
         ] {
             assert_eq!(
@@ -786,13 +785,13 @@ mod tests {
 
     #[test]
     fn tag_ops_use_resource_arn() {
-        let table_arn = "arn:aws:dynamodb:us-east-1:964157134968:table/bb";
+        let table_arn = "arn:aws:dynamodb:us-east-1:444455556666:table/bb";
         for op in ["TagResource", "UntagResource", "ListTagsOfResource"] {
             assert_eq!(only(op, json!({ "ResourceArn": table_arn })), table_arn);
         }
         // a stream ARN as the tag target is preserved
         let stream =
-            "arn:aws:dynamodb:us-east-1:964157134968:table/bb/stream/2026-10-20T16:17:40.188";
+            "arn:aws:dynamodb:us-east-1:444455556666:table/bb/stream/2026-10-20T16:17:40.188";
         assert_eq!(
             only("TagResource", json!({ "ResourceArn": stream })),
             stream
@@ -801,7 +800,7 @@ mod tests {
 
     #[test]
     fn stream_reads_use_stream_arn() {
-        let s = "arn:aws:dynamodb:us-east-1:964157134968:table/bb/stream/2026-10-20T16:17:40.188";
+        let s = "arn:aws:dynamodb:us-east-1:444455556666:table/bb/stream/2026-10-20T16:17:40.188";
         assert_eq!(only("DescribeStream", json!({ "StreamArn": s })), s);
         assert_eq!(only("GetShardIterator", json!({ "StreamArn": s })), s);
     }
@@ -810,11 +809,11 @@ mod tests {
     fn list_streams_scopes_to_table_then_account() {
         assert_eq!(
             only("ListStreams", json!({ "TableName": "bb" })),
-            "arn:aws:dynamodb:us-east-1:964157134968:table/bb/stream/*"
+            "arn:aws:dynamodb:us-east-1:444455556666:table/bb/stream/*"
         );
         assert_eq!(
             only("ListStreams", json!({})),
-            "arn:aws:dynamodb:us-east-1:964157134968:table/*/stream/*"
+            "arn:aws:dynamodb:us-east-1:444455556666:table/*/stream/*"
         );
     }
 
@@ -825,25 +824,25 @@ mod tests {
         // table or table/*.
         assert_eq!(
             only("ListBackups", json!({ "TableName": "bb" })),
-            "arn:aws:dynamodb:us-east-1:964157134968:table/bb/backup/*"
+            "arn:aws:dynamodb:us-east-1:444455556666:table/bb/backup/*"
         );
         assert_eq!(
             only("ListBackups", json!({})),
-            "arn:aws:dynamodb:us-east-1:964157134968:table/*/backup/*"
+            "arn:aws:dynamodb:us-east-1:444455556666:table/*/backup/*"
         );
         // A table ARN in TableName is reduced to its table name first.
         assert_eq!(
             only(
                 "ListBackups",
-                json!({ "TableName": "arn:aws:dynamodb:us-east-1:964157134968:table/bb" })
+                json!({ "TableName": "arn:aws:dynamodb:us-east-1:444455556666:table/bb" })
             ),
-            "arn:aws:dynamodb:us-east-1:964157134968:table/bb/backup/*"
+            "arn:aws:dynamodb:us-east-1:444455556666:table/bb/backup/*"
         );
     }
 
     #[test]
     fn backup_ops_use_backup_arn_or_table() {
-        let b = "arn:aws:dynamodb:us-east-1:964157134968:table/bb/backup/01-ab";
+        let b = "arn:aws:dynamodb:us-east-1:444455556666:table/bb/backup/01-ab";
         assert_eq!(only("DescribeBackup", json!({ "BackupArn": b })), b);
         assert_eq!(only("DeleteBackup", json!({ "BackupArn": b })), b);
         assert_eq!(
@@ -851,7 +850,7 @@ mod tests {
                 "CreateBackup",
                 json!({ "TableName": "bb", "BackupName": "x" })
             ),
-            "arn:aws:dynamodb:us-east-1:964157134968:table/bb"
+            "arn:aws:dynamodb:us-east-1:444455556666:table/bb"
         );
     }
 
@@ -859,21 +858,21 @@ mod tests {
     fn query_scan_on_index_use_index_arn() {
         assert_eq!(
             only("Query", json!({ "TableName": "bb", "IndexName": "gsi1" })),
-            "arn:aws:dynamodb:us-east-1:964157134968:table/bb/index/gsi1"
+            "arn:aws:dynamodb:us-east-1:444455556666:table/bb/index/gsi1"
         );
         assert_eq!(
             only("Scan", json!({ "TableName": "bb", "IndexName": "lsi1" })),
-            "arn:aws:dynamodb:us-east-1:964157134968:table/bb/index/lsi1"
+            "arn:aws:dynamodb:us-east-1:444455556666:table/bb/index/lsi1"
         );
         assert_eq!(
             only("Query", json!({ "TableName": "bb" })),
-            "arn:aws:dynamodb:us-east-1:964157134968:table/bb"
+            "arn:aws:dynamodb:us-east-1:444455556666:table/bb"
         );
     }
 
     #[test]
     fn table_name_may_be_an_arn() {
-        let arn = "arn:aws:dynamodb:us-east-1:964157134968:table/bb";
+        let arn = "arn:aws:dynamodb:us-east-1:444455556666:table/bb";
         assert_eq!(only("GetItem", json!({ "TableName": arn })), arn);
         // a respelled table ARN in TableName canonicalizes
         assert_eq!(
@@ -889,14 +888,14 @@ mod tests {
     fn account_level_ops_use_table_wildcard() {
         assert_eq!(
             only("ListTables", json!({})),
-            "arn:aws:dynamodb:us-east-1:964157134968:table/*"
+            "arn:aws:dynamodb:us-east-1:444455556666:table/*"
         );
         assert_eq!(only("DescribeLimits", json!({})), "*");
     }
 
     #[test]
     fn restore_export_import_use_measured_resource() {
-        let backup = "arn:aws:dynamodb:us-east-1:964157134968:table/bb/backup/01-ab";
+        let backup = "arn:aws:dynamodb:us-east-1:444455556666:table/bb/backup/01-ab";
         // RestoreTableFromBackup: the restore action on the backup ARN plus the
         // seven item actions on the target table.
         let rfb = authz_targets(
@@ -906,7 +905,7 @@ mod tests {
             A,
         );
         assert!(rfb.contains(&("RestoreTableFromBackup".to_owned(), backup.to_owned())));
-        let target = "arn:aws:dynamodb:us-east-1:964157134968:table/restored".to_owned();
+        let target = "arn:aws:dynamodb:us-east-1:444455556666:table/restored".to_owned();
         for a in RESTORE_TARGET_ACTIONS {
             assert!(
                 rfb.contains(&((*a).to_owned(), target.clone())),
@@ -925,9 +924,9 @@ mod tests {
         );
         assert!(pitr.contains(&(
             "RestoreTableToPointInTime".to_owned(),
-            "arn:aws:dynamodb:us-east-1:964157134968:table/bb".to_owned()
+            "arn:aws:dynamodb:us-east-1:444455556666:table/bb".to_owned()
         )));
-        let ptarget = "arn:aws:dynamodb:us-east-1:964157134968:table/pitr".to_owned();
+        let ptarget = "arn:aws:dynamodb:us-east-1:444455556666:table/pitr".to_owned();
         for a in RESTORE_TARGET_ACTIONS {
             assert!(
                 pitr.contains(&((*a).to_owned(), ptarget.clone())),
@@ -940,9 +939,9 @@ mod tests {
         assert_eq!(
             only(
                 "ExportTableToPointInTime",
-                json!({ "TableArn": "arn:aws:dynamodb:us-east-1:964157134968:table/bb", "S3Bucket": "x" })
+                json!({ "TableArn": "arn:aws:dynamodb:us-east-1:444455556666:table/bb", "S3Bucket": "x" })
             ),
-            "arn:aws:dynamodb:us-east-1:964157134968:table/bb"
+            "arn:aws:dynamodb:us-east-1:444455556666:table/bb"
         );
         // ImportTable: only the import action on the new table.
         assert_eq!(
@@ -950,7 +949,7 @@ mod tests {
                 "ImportTable",
                 json!({ "TableCreationParameters": { "TableName": "imp" } })
             ),
-            "arn:aws:dynamodb:us-east-1:964157134968:table/imp"
+            "arn:aws:dynamodb:us-east-1:444455556666:table/imp"
         );
     }
 
@@ -967,15 +966,15 @@ mod tests {
         // Tags are accepted only on a table or a stream. An index is rejected
         // as not a table or stream; a backup is not a DynamoDB resource arn.
         // Both measured live.
-        let index = "arn:aws:dynamodb:us-east-1:964157134968:table/bb/index/gsi1";
+        let index = "arn:aws:dynamodb:us-east-1:444455556666:table/bb/index/gsi1";
         assert!(matches!(
             validate_tag_resource_arn_shape(index),
             Err(DynamoDbError::ValidationException(ref m))
                 if m.contains("only table or stream is accepted") && m.contains(index)
         ));
         for backup in [
-            "arn:aws:dynamodb:us-east-1:964157134968:table/bb/backup/01792513080555-82c5bd04",
-            "arn:aws:dynamodb:us-east-1:964157134968:table/bb/backup/01-ab",
+            "arn:aws:dynamodb:us-east-1:444455556666:table/bb/backup/01792513080555-82c5bd04",
+            "arn:aws:dynamodb:us-east-1:444455556666:table/bb/backup/01-ab",
         ] {
             assert!(
                 matches!(
@@ -991,12 +990,12 @@ mod tests {
         }
         // A table ARN and a stream ARN pass the shape check.
         assert!(
-            validate_tag_resource_arn_shape("arn:aws:dynamodb:us-east-1:964157134968:table/bb")
+            validate_tag_resource_arn_shape("arn:aws:dynamodb:us-east-1:444455556666:table/bb")
                 .is_ok()
         );
         assert!(
             validate_tag_resource_arn_shape(
-                "arn:aws:dynamodb:us-east-1:964157134968:table/bb/stream/2026-10-20T16:17:40.188"
+                "arn:aws:dynamodb:us-east-1:444455556666:table/bb/stream/2026-10-20T16:17:40.188"
             )
             .is_ok()
         );
@@ -1013,7 +1012,7 @@ mod tests {
                 if m.contains("ARNs must start with 'arn:': banana")
         ));
         let bad_type =
-            validate_tag_resource_arn_shape("arn:aws:dynamodb:us-east-1:964157134968:banana/x");
+            validate_tag_resource_arn_shape("arn:aws:dynamodb:us-east-1:444455556666:banana/x");
         assert!(matches!(
             bad_type,
             Err(DynamoDbError::ValidationException(ref m))
@@ -1026,11 +1025,11 @@ mod tests {
         // or not passes the shape check; the engine handler validates those
         // fields after authorization.
         assert!(
-            validate_tag_resource_arn_shape("arn:aws-cn:dynamodb:us-east-1:964157134968:table/bb")
+            validate_tag_resource_arn_shape("arn:aws-cn:dynamodb:us-east-1:444455556666:table/bb")
                 .is_ok()
         );
         assert!(
-            validate_tag_resource_arn_shape("arn:aws:s3:us-east-1:964157134968:table/bb").is_ok()
+            validate_tag_resource_arn_shape("arn:aws:s3:us-east-1:444455556666:table/bb").is_ok()
         );
     }
 
@@ -1140,9 +1139,9 @@ mod tests {
             // account, so a Deny on the real resource is always evaluated
             // against the real resource.
             if let Some(rid) = &authz {
-                let c = canonical("us-east-1", "964157134968", rid);
+                let c = canonical("us-east-1", "444455556666", rid);
                 assert!(
-                    c.starts_with("arn:aws:dynamodb:us-east-1:964157134968:table/"),
+                    c.starts_with("arn:aws:dynamodb:us-east-1:444455556666:table/"),
                     "canonical did not pin deployment fields for {input}"
                 );
             }
@@ -1301,7 +1300,7 @@ mod tests {
         match getrecords_resource(&json!({ "ShardIterator": tok }), R, A) {
             GetRecordsResource::Stream(arn) => assert_eq!(
                 arn,
-                "arn:aws:dynamodb:us-east-1:964157134968:table/T/stream/2026-10-20T16:17:40.188"
+                "arn:aws:dynamodb:us-east-1:444455556666:table/T/stream/2026-10-20T16:17:40.188"
             ),
             _ => panic!("expected Stream"),
         }
@@ -1337,19 +1336,19 @@ mod key_lookup_name_tests {
     #[test]
     fn table_arn_for_this_account_and_region_resolves_to_the_table_name() {
         let r = "us-east-1";
-        let a = "964157134968";
+        let a = "444455556666";
         assert_eq!(key_lookup_name("orders", r, a), "orders");
         assert_eq!(
-            key_lookup_name("arn:aws:dynamodb:us-east-1:964157134968:table/orders", r, a),
+            key_lookup_name("arn:aws:dynamodb:us-east-1:444455556666:table/orders", r, a),
             "orders"
         );
         for other in [
             "arn:aws:dynamodb:us-east-1:111111111111:table/orders",
-            "arn:aws:dynamodb:eu-west-1:964157134968:table/orders",
-            "arn:aws-cn:dynamodb:us-east-1:964157134968:table/orders",
-            "arn:aws:s3:us-east-1:964157134968:table/orders",
-            "arn:aws:dynamodb:us-east-1:964157134968:table/orders/index/g1",
-            "arn:aws:dynamodb:us-east-1:964157134968:backup/orders",
+            "arn:aws:dynamodb:eu-west-1:444455556666:table/orders",
+            "arn:aws-cn:dynamodb:us-east-1:444455556666:table/orders",
+            "arn:aws:s3:us-east-1:444455556666:table/orders",
+            "arn:aws:dynamodb:us-east-1:444455556666:table/orders/index/g1",
+            "arn:aws:dynamodb:us-east-1:444455556666:backup/orders",
             "arn:aws:dynamodb",
         ] {
             assert_eq!(key_lookup_name(other, r, a), other, "{other}");

@@ -209,7 +209,10 @@ pub async fn handle_transact_write_items(
         Err(e) => return Err(storage_err_to_dynamo(e)),
     }
 
-    // Stream records are now captured atomically within the storage transaction.
+    // The PostgreSQL, SQLite and MongoDB backends write stream records inside
+    // the storage transaction that writes the items. The Cassandra backend
+    // writes each record in a batch that runs after its item's write, so a
+    // failure there leaves the item without its record.
 
     // Per-item WCU: round each item individually, then sum (M-1).
     let mut per_table_wcu: HashMap<String, f64> = HashMap::new();
