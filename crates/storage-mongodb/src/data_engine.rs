@@ -490,7 +490,8 @@ impl MongoEngine {
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-            // Set when the unconditional upsert below lost a create race.
+            // Set when the unconditional upsert below hit a duplicate key on
+            // `_id`.
             let mut lost_create_race = false;
             let attempt_res: Result<Option<Item>, TxErr> = async {
                 let old_item: Option<Item>;
@@ -570,7 +571,7 @@ impl MongoEngine {
                     // a document in this transaction's snapshot holds the
                     // item's `_id` without matching the key filter. It runs
                     // the transaction again with the backoff of a write
-                    // conflict and counts the lost race against
+                    // conflict and counts the attempt against
                     // `CREATE_RACE_ATTEMPTS`, and the put gives up with the
                     // create race error once that many attempts have met
                     // such a document.
@@ -626,10 +627,12 @@ impl MongoEngine {
                     let _ = session.abort_transaction().await;
                     if lost_create_race {
                         lost_create_races += 1;
-                        // The create race has its own budget: a put that has
-                        // lost it this many times is not waiting out
-                        // contention on an item, so it gives up here rather
-                        // than spending the contention budget.
+                        // A duplicate key on `_id` counts against the create
+                        // race budget: a put that has met a document holding
+                        // the item's `_id` this many times is not waiting out
+                        // contention on an item, so it gives up here with the
+                        // create race error rather than spending the
+                        // contention budget.
                         if lost_create_races >= CREATE_RACE_ATTEMPTS {
                             return Err(create_race_exhausted(lost_create_races));
                         }
@@ -3850,8 +3853,11 @@ fn is_duplicate_key(e: &mongodb::error::Error) -> bool {
 }
 
 /// The error when every attempt of an unconditional PutItem lost the create
-/// race: each attempt found no item, and its insert hit an item another
-/// writer created, which was deleted again before the next attempt read it.
+/// race: on the sessionless path, each attempt found no item, and its insert
+/// hit an item another writer created, which was deleted again before the
+/// next attempt read it; on the transaction path, `CREATE_RACE_ATTEMPTS`
+/// attempts met a document that holds the item's `_id` without matching the
+/// key filter.
 /// `attempt` is the number of attempts made. The message is the internal
 /// error (HTTP 500) the PostgreSQL backend returns when its own retries of
 /// this race run out.

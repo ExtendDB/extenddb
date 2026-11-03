@@ -34,12 +34,7 @@ ROUNDS = 15
 
 @pytest.fixture(scope="module")
 def raw_clients(endpoint_url):
-    """One client per writer thread, none of which retries, so every failure is seen.
-
-    A botocore client shared by several threads can fail a request with a TLS
-    error under concurrent use. With retries off that error would fail the
-    test, so each writer gets a client of its own.
-    """
+    """One client per writer thread, none of which retries, so every failure is seen."""
     kwargs: dict = {
         "service_name": "dynamodb",
         "region_name": os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
