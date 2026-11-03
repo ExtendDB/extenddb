@@ -2026,3 +2026,105 @@ async fn test_a_queue_entry_written_over_a_version_ahead_of_the_clock_is_drained
         1
     );
 }
+
+#[tokio::test]
+async fn test_the_gsi_worker_resolves_two_entries_for_one_item_in_version_order() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    // Two queued entries for one item: v1 inserts the GSI row for a, and v2
+    // deletes a and inserts b. Their payloads are swapped between the two
+    // queue rows, so the worker applies v2 first and v1 last. The worker
+    // stamps each entry's index rows with the version its write stored, so
+    // v1's late insert of a lands under v2's tombstone and only b remains.
+    // Applied at Cassandra's timestamp, the late insert would bring a back.
+    use cdrs_tokio::types::IntoRustByName as _;
+
+    let config = test_config();
+    let engine = Arc::new(CassandraEngine::new(&config, "us-east-1").await.unwrap());
+    let table =
+        crate::helpers::TestTable::with_gsi(&engine, "WorkerOrderTable", "GsiIdx", "gpk").await;
+    set_gsi_delay(&engine, &table.key_info.table_id, "GsiIdx", 50).await;
+    let account_keyspace = engine.account_keyspace(&table.key_info.account_id);
+    let maps = ExpressionMaps::default();
+    for gpk in ["a", "b"] {
+        let mut item = Item::new();
+        item.insert("id".to_string(), AttributeValue::S("X".to_string()));
+        item.insert("gpk".to_string(), AttributeValue::S(gpk.to_string()));
+        engine
+            .put_item(&table.key_info, item, false, None, &maps, None)
+            .await
+            .expect("put");
+    }
+
+    let session = engine.session_arc();
+    let rows = extenddb_storage_cassandra::cassandra_util::query_rows::<
+        extenddb_storage::error::StorageError,
+    >(
+        &session,
+        &format!(
+            "SELECT worker_partition, ready_at, id, old_item, new_item, index_context \
+             FROM {account_keyspace}.gsi_pending"
+        ),
+        cdrs_tokio::query_values!(),
+        "queued entries",
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2, "one entry per write");
+    type Entry = (i32, i64, uuid::Uuid, Option<String>, Option<String>, String);
+    let mut entries: Vec<Entry> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.get_r_by_name("worker_partition").unwrap(),
+                row.get_r_by_name("ready_at").unwrap(),
+                row.get_r_by_name("id").unwrap(),
+                row.get_by_name("old_item").ok().flatten(),
+                row.get_by_name("new_item").ok().flatten(),
+                row.get_r_by_name("index_context").unwrap(),
+            )
+        })
+        .collect();
+    entries.sort_by_key(|entry| (entry.1, entry.2));
+    let swap = format!(
+        "UPDATE {account_keyspace}.gsi_pending SET old_item = ?, new_item = ?, \
+         index_context = ? WHERE worker_partition = ? AND ready_at = ? AND id = ?"
+    );
+    for (target, payload) in [(&entries[0], &entries[1]), (&entries[1], &entries[0])] {
+        extenddb_storage_cassandra::cassandra_util::execute::<extenddb_storage::error::StorageError>(
+            &session,
+            &swap,
+            cdrs_tokio::query_values!(
+                payload.3.clone(),
+                payload.4.clone(),
+                payload.5.clone(),
+                target.0,
+                target.1,
+                target.2
+            ),
+            "swap the payloads",
+        )
+        .await
+        .unwrap();
+    }
+
+    let _worker_guard = extenddb_storage_cassandra::workers::spawn_gsi_workers(engine.clone());
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    while gsi_pending_count(&engine, &account_keyspace).await != 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "gsi_pending did not drain within timeout"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        gsi_query_count(&engine, &table, "GsiIdx", "gpk", "a").await,
+        0,
+        "the earlier version's late insert came back"
+    );
+    assert_eq!(
+        gsi_query_count(&engine, &table, "GsiIdx", "gpk", "b").await,
+        1
+    );
+}
