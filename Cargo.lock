@@ -1728,12 +1728,15 @@ name = "extenddb-auth"
 version = "0.1.14"
 dependencies = [
  "async-trait",
+ "aws-credential-types",
+ "aws-sigv4",
  "axum",
  "extenddb-cache",
  "extenddb-core",
  "futures",
  "hex",
  "hmac 0.12.1",
+ "proptest",
  "serde_json",
  "sha2 0.10.9",
  "thiserror",
