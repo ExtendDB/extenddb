@@ -26,6 +26,7 @@
 #   --external        External Java test suite
 #   --comprehensive   Comprehensive Python suite
 #   --all             all of the above
+#   --terraform       Terraform apply of tests/terraform/warm-throughput (not in --all)
 #   --catalog-check   post-test catalog integrity check
 #
 # Options:
@@ -90,8 +91,9 @@ Suites (at least one required):
   --external        External Java test suite
   --comprehensive   Comprehensive Python suite
   --terraform       Terraform apply of tests/terraform/warm-throughput (installs
-                    the pinned Terraform unless TERRAFORM names a binary)
-  --all             all suites
+                    the pinned linux_amd64 Terraform unless TERRAFORM names a
+                    binary, and downloads the AWS provider; not part of --all)
+  --all             all suites above except --terraform
   --catalog-check   post-test catalog integrity check
 
 Options:
@@ -119,7 +121,7 @@ while [[ $# -gt 0 ]]; do
         --external)       RUN_EXTERNAL=true; shift ;;
         --comprehensive)  RUN_COMPREHENSIVE=true; shift ;;
         --terraform)      RUN_TERRAFORM=true; shift ;;
-        --all)            RUN_RUST=true; RUN_RUST_INTEGRATION=true; RUN_PYTEST=true; RUN_EXTERNAL=true; RUN_COMPREHENSIVE=true; RUN_TERRAFORM=true; shift ;;
+        --all)            RUN_RUST=true; RUN_RUST_INTEGRATION=true; RUN_PYTEST=true; RUN_EXTERNAL=true; RUN_COMPREHENSIVE=true; shift ;;
         --release)        RELEASE=true; shift ;;
         --filter)         FILTER="$2"; shift 2 ;;
         --catalog-check)  RUN_CATALOG_CHECK=true; shift ;;
