@@ -453,7 +453,8 @@ pub enum Refusal {
     /// `InvalidSignatureException`: the signature, the credential scope or a
     /// signed part does not match.
     Signature,
-    /// `UnrecognizedClientException`: the clock check or the session token.
+    /// `UnrecognizedClientException`: the session token is missing or is not
+    /// the key's, or `X-Amz-Date` is outside the skew window (#805).
     Client,
     /// `IncompleteSignature`: a part the check needs is missing.
     Incomplete,
@@ -481,8 +482,6 @@ pub const WRONG_SERVICE: &str = "Credential should be scoped to correct service:
 /// The credential scope's date differs from the date in `X-Amz-Date`.
 pub const SCOPE_DATE_MISMATCH: &str =
     "Date in Credential scope does not match YYYYMMDD from ISO-8601 version of date from HTTP";
-/// `X-Amz-Date` is outside the skew window.
-pub const EXPIRED: &str = "Signature expired:";
 /// The session token is missing or is not the key's.
 pub const INVALID_TOKEN: &str = "The security token included in the request is invalid.";
 /// `X-Amz-Date` is missing.
@@ -557,6 +556,33 @@ pub fn check_refused(wire: &Wire, expected: Refusal, message: &str) -> Result<()
         }
         Err(err) => Err(format!(
             "refused with {err:?}, expected {expected:?} starting {message:?}"
+        )),
+    }
+}
+
+/// Check that the server refuses `wire` with `InvalidSignatureException` or
+/// `UnrecognizedClientException`, with any message but those of the scope
+/// date check and the signature comparison, so neither of those checks
+/// refused it.
+pub fn check_refused_by_the_time_check(wire: &Wire) -> Result<(), String> {
+    let err = match authenticate(wire) {
+        Ok(identity) => {
+            return Err(format!(
+                "verified as {identity:?}, expected a refusal\nheaders: {:?}",
+                wire.headers
+            ));
+        }
+        Err(err) => err,
+    };
+    let message = err.message();
+    let later_check =
+        message.starts_with(SIGNATURE_MISMATCH) || message.starts_with(SCOPE_DATE_MISMATCH);
+    match Refusal::of(&err) {
+        Some(Refusal::Signature | Refusal::Client) if !later_check => Ok(()),
+        _ => Err(format!(
+            "refused with {err:?}, expected InvalidSignatureException or \
+             UnrecognizedClientException from the time check, before the \
+             scope date check and the signature comparison run"
         )),
     }
 }

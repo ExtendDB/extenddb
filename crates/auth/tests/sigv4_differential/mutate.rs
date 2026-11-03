@@ -2,14 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Changes made to a request after `aws-sigv4` signed it, each with the
-//! refusal it must get, and changes the signature does not cover.
+//! refusal it must get; requests signed with credentials the store does not
+//! hold for the key; requests dated outside the skew window; and changes the
+//! signature does not cover.
 
 use std::time::SystemTime;
 
 use crate::harness::{
-    Authorization, EXPIRED, INVALID_TOKEN, Key, MISSING_DATE, OTHER_TOKEN, Refusal,
-    SCOPE_DATE_MISMATCH, SIGNATURE_MISMATCH, Shape, Signed, Tally, WRONG_SERVICE, Wire, amz_date,
-    check_accepted, check_accepted_as, check_refused, shift, sign,
+    Authorization, INVALID_TOKEN, Key, MISSING_DATE, OTHER_TOKEN, Refusal, SCOPE_DATE_MISMATCH,
+    SIGNATURE_MISMATCH, Shape, Signed, Tally, WRONG_SERVICE, Wire, amz_date, check_accepted,
+    check_accepted_as, check_refused, check_refused_by_the_time_check, shift, sign,
 };
 
 /// Seconds the server allows between `X-Amz-Date` and its clock.
@@ -53,9 +55,9 @@ fn first_character_replaced(value: &str) -> String {
 
 /// Changes to `signed` after signing: each signed header's value changed and
 /// each signed header dropped, one more name in `SignedHeaders`, one body
-/// byte changed, `X-Amz-Date` moved, the credential scope's date, region and
-/// service changed, and the signature truncated, extended, upper-cased or
-/// with one digit changed.
+/// byte changed, `X-Amz-Date` moved one second, the credential scope's date,
+/// region and service changed, and the signature truncated, extended,
+/// upper-cased or with one digit changed.
 pub fn mutants(signed: &Signed) -> Vec<Mutant> {
     let mut out = Vec::new();
     header_mutants(signed, &mut out);
@@ -177,8 +179,7 @@ pub fn body_mutants(signed: &Signed) -> Vec<Mutant> {
         .collect()
 }
 
-/// `X-Amz-Date` moved one second either way, and moved past the skew window
-/// either way from the server's clock.
+/// `X-Amz-Date` moved one second either way.
 fn date_mutants(signed: &Signed, out: &mut Vec<Mutant>) {
     let scope_date = signed.wire.authorization().date;
     for seconds in [-1, 1] {
@@ -199,19 +200,6 @@ fn date_mutants(signed: &Signed, out: &mut Vec<Mutant>) {
             }),
             expected: Refusal::Signature,
             message,
-        });
-    }
-    let now = SystemTime::now();
-    for seconds in [-(SKEW_WINDOW + MARGIN), SKEW_WINDOW + MARGIN] {
-        let date = amz_date(shift(now, seconds));
-        out.push(Mutant {
-            category: "x-amz-date moved past the skew window",
-            label: format!("x-amz-date set {seconds} s from now, to {date}"),
-            wire: changed(&signed.wire, |wire| {
-                wire.replace("x-amz-date", date.clone())
-            }),
-            expected: Refusal::Client,
-            message: EXPIRED,
         });
     }
 }
@@ -313,8 +301,7 @@ fn signature_mutants(signed: &Signed, out: &mut Vec<Mutant>) {
     }
 }
 
-/// `shape` signed with credentials the store does not hold for its key, or
-/// at a time outside the skew window.
+/// `shape` signed with credentials the store does not hold for its key.
 pub fn resigned(shape: &Shape) -> Vec<Mutant> {
     let mut variants = Vec::new();
     let mut other_secret = shape.clone();
@@ -326,17 +313,6 @@ pub fn resigned(shape: &Shape) -> Vec<Mutant> {
         Refusal::Signature,
         SIGNATURE_MISMATCH,
     ));
-    for offset in [-(SKEW_WINDOW + MARGIN), SKEW_WINDOW + MARGIN] {
-        let mut outside = shape.clone();
-        outside.clock_offset = offset;
-        variants.push((
-            "signed outside the skew window",
-            "signed with a clock outside the window",
-            outside,
-            Refusal::Client,
-            EXPIRED,
-        ));
-    }
     if shape.key == Key::Session {
         let mut other_token = shape.clone();
         other_token.signing_token = Some(OTHER_TOKEN.to_owned());
@@ -369,6 +345,51 @@ pub fn resigned(shape: &Shape) -> Vec<Mutant> {
         .collect()
 }
 
+/// Requests dated `MARGIN` seconds outside the skew window, before and after
+/// the server's clock: `signed` with `X-Amz-Date` moved there after signing,
+/// and `shape` signed with a clock there.
+///
+/// `DynamoDB` refuses all four with `InvalidSignatureException` and a message
+/// that starts "Signature expired:" before the window or "Signature not yet
+/// current:" after it. It checks the time before it compares the signature,
+/// so a moved `X-Amz-Date`, which also breaks the signature, gets the same
+/// answer. The server answers `UnrecognizedClientException` with its own
+/// message (#805). Each request must be refused by the time check, with
+/// either error and any message.
+///
+/// The credential scope date moves with `X-Amz-Date`, so the scope date
+/// check passes when the move crosses midnight UTC. The order of that check
+/// and the time check was not measured on `DynamoDB`, and these requests do
+/// not test it.
+pub fn outside_the_skew_window(
+    signed: &Signed,
+    shape: &Shape,
+) -> Vec<(&'static str, String, Wire)> {
+    let now = SystemTime::now();
+    let mut out = Vec::new();
+    for seconds in [-(SKEW_WINDOW + MARGIN), SKEW_WINDOW + MARGIN] {
+        let date = amz_date(shift(now, seconds));
+        let mut scope = signed.wire.authorization();
+        date[..8].clone_into(&mut scope.date);
+        out.push((
+            "x-amz-date moved past the skew window",
+            format!("x-amz-date set {seconds} s from now, to {date}"),
+            changed(&signed.wire, |wire| {
+                wire.replace("x-amz-date", date.clone());
+                wire.set_authorization(&scope);
+            }),
+        ));
+        let mut outside = shape.clone();
+        outside.clock_offset = seconds;
+        out.push((
+            "signed outside the skew window",
+            format!("signed with a clock {seconds} s from now"),
+            sign(&outside).wire,
+        ));
+    }
+    out
+}
+
 /// Changes to headers the signature does not cover: each unsigned header
 /// changed and dropped, and one header added.
 pub fn unsigned_changes(signed: &Signed) -> Vec<(&'static str, Wire)> {
@@ -397,8 +418,9 @@ pub fn unsigned_changes(signed: &Signed) -> Vec<(&'static str, Wire)> {
 }
 
 /// Sign `shape` and check that it verifies, that changes to its unsigned
-/// headers still verify, and that each request `mutants` and `resigned` make
-/// from it is refused by the check its message names.
+/// headers still verify, that each request `mutants` and `resigned` make from
+/// it is refused by the check its message names, and that the time check
+/// refuses each request `outside_the_skew_window` makes from it.
 pub fn check_shape(shape: &Shape, tally: &mut Tally, category: &'static str) -> Result<(), String> {
     let signed = sign(shape);
     check_accepted(&signed)?;
@@ -411,6 +433,10 @@ pub fn check_shape(shape: &Shape, tally: &mut Tally, category: &'static str) -> 
         check_refused(&mutant.wire, mutant.expected, mutant.message)
             .map_err(|err| format!("{}: {err}", mutant.label))?;
         tally.add(mutant.category);
+    }
+    for (category, label, wire) in outside_the_skew_window(&signed, shape) {
+        check_refused_by_the_time_check(&wire).map_err(|err| format!("{label}: {err}"))?;
+        tally.add(category);
     }
     Ok(())
 }
