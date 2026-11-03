@@ -366,16 +366,19 @@ issue #533). Four decisions change for stored policies:
    value `${aws:username, 'anon'}` now grants `alice` a table tagged
    `owner=alice`, and a caller with no user name a table tagged `owner=anon`;
    before, it granted neither. In a `2008-10-17` document, in one with no
-   `Version`, and under the numeric, date, IP address, `Bool` and `Null`
-   operators, the text is still compared as written; IAM does not read the
-   default form there either (measured with the IAM policy simulator). A role
-   trust policy follows its own `Version`.
+   `Version`, and under the numeric, date, `Bool` and `Null` operators, the
+   text is still compared as written; IAM does not read the default form
+   there either (measured with the IAM policy simulator). A user, group or
+   role policy or boundary write refuses an `IpAddress` value written as a
+   variable as a malformed CIDR, as before. A role trust policy follows its
+   own `Version`.
 4. Spaces, and the other code points up to U+0020, around the key name of a
    variable are now ignored, in `Resource` and `NotResource` patterns and in the
-   condition values item 3 covers. `Deny table/${ aws:PrincipalTag/team }` now
-   denies a caller tagged `team=blue` the table `blue`. Before, the spaces were
-   part of the key name, so the variable named a key no request carries and the
-   `Deny` denied nothing.
+   condition values item 3 covers. An `Allow` with the condition `StringEquals`
+   on `aws:ResourceTag/owner` and the value `${ aws:username }` now grants
+   `alice` a table tagged `owner=alice`. Before, the spaces were part of the
+   key name, so the variable named a key no request carries, the value was
+   compared as written, and the `Allow` granted nothing.
 
 **Policy writes check `Version`.** Writing a user, group or role policy or a
 permissions boundary, through the management API or the console, now refuses a
@@ -395,8 +398,8 @@ for its `Version` and `Statement` members.
 
 **Who is affected.** Any deployment with a stored policy whose `Resource`,
 `NotResource` or condition values contain `${`: inline user, group and role
-policies, permissions boundaries and session policies, and, for the two condition
-value changes, role trust policies. Search the stored policies for `${`
+policies, permissions boundaries and session policies, and, for the condition
+value changes in items 2 to 4, role trust policies. Search the stored policies for `${`
 (`extenddb manage list-user-policies`, `list-group-policies` and
 `list-role-policies` print inline policies, `get-user-boundary` and
 `get-role-boundary` permissions boundaries, and `list-roles` trust policies) and
