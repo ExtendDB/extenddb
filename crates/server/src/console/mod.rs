@@ -55,6 +55,9 @@ pub struct ConsoleState {
     /// `/console/metrics-data` response with latency segments (same data the
     /// top-level `/metrics` handler adds).
     pub metrics: Arc<extenddb_core::metrics::MetricsCollector>,
+    /// Whether the session cookie carries `Secure`: true when the server
+    /// serves TLS, false in dev mode, which serves plain HTTP.
+    pub secure_cookies: bool,
 }
 
 /// Build the console router.

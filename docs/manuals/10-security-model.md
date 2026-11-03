@@ -169,7 +169,7 @@ Replace the certificate and key files, then restart extenddb. There is no hot-re
 The management web console (`/console/*`) implements:
 
 - **CSRF protection**: Unique tokens generated per session, injected into all forms via JavaScript, validated on every POST handler
-- **Session management**: Server-side sessions with 8-hour expiry, HttpOnly cookies with `SameSite=Strict` and `Path=/console`
+- **Session management**: Server-side sessions with 8-hour expiry, HttpOnly and `Secure` cookies with `SameSite=Strict` and `Path=/console` (a dev-mode build serves plain HTTP and leaves `Secure` off)
 - **Security headers**: X-Content-Type-Options (nosniff), X-Frame-Options (DENY), Referrer-Policy (strict-origin-when-cross-origin)
 - **HSTS**: Sent automatically (TLS is always enabled)
 - **Login rate limiting**: Failed login attempts are tracked per user. Excessive failures trigger account lockout.

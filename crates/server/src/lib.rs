@@ -204,6 +204,7 @@ pub async fn start_server(
             docs_store: docs_store.clone(),
             auth_cache: auth_cache_for_console,
             metrics: metrics_for_console,
+            secure_cookies: tls_enabled,
         });
         let console_router = console::router().with_state(console_state);
         app = app
