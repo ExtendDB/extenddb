@@ -21,3 +21,11 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 tokio = { workspace = true }
+
+[features]
+default = ["partiql"]
+# PartiQL surface (ExecuteStatement, BatchExecuteStatement, ExecuteTransaction),
+# a pure translation over the existing data-plane handlers. Removable: with this
+# off, the three operations are not known and the server answers them with
+# UnknownOperationException exactly as before.
+partiql = ["extenddb-core/partiql"]
