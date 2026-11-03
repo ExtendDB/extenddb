@@ -149,6 +149,27 @@ class TestDeletingWindowControlPlane:
         wait_for_deleted(dynamodb_client, name, timeout=120.0)
 
 
+    def test_tag_changes_are_being_deleted_and_tags_are_listed(self, dynamodb_client, is_extenddb):
+        """TagResource and UntagResource while the table is DELETING are ResourceInUseException
+        with the DELETING sentence, and ListTagsOfResource is served (measured 2026-11-03)."""
+        name = unique_name("del-window")
+        lock = _open_window(dynamodb_client, is_extenddb, name)
+        try:
+            arn = dynamodb_client.describe_table(TableName=name)["Table"]["TableArn"]
+            dynamodb_client.delete_table(TableName=name)
+            with pytest.raises(ClientError) as exc:
+                dynamodb_client.tag_resource(ResourceArn=arn, Tags=[{"Key": "k", "Value": "v"}])
+            _assert_in_use(exc.value, name)
+            with pytest.raises(ClientError) as exc:
+                dynamodb_client.untag_resource(ResourceArn=arn, TagKeys=["k"])
+            _assert_in_use(exc.value, name)
+            assert dynamodb_client.list_tags_of_resource(ResourceArn=arn)["Tags"] == []
+        finally:
+            if lock is not None:
+                lock.release()
+        wait_for_deleted(dynamodb_client, name, timeout=120.0)
+
+
 class TestDeletingWindowDataPlane:
     def test_data_plane_is_served_until_the_table_is_gone(self, dynamodb_client, is_extenddb):
         """PutItem, GetItem, Query and Scan are served while the table is DELETING;
