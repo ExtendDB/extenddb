@@ -444,15 +444,15 @@ mod source_ip_tests {
 mod tests {
     use super::deny_message;
 
-    const P: &str = "arn:aws:iam::964157134968:user/alice";
-    const R: &str = "arn:aws:dynamodb:us-east-1:964157134968:table/bb";
+    const P: &str = "arn:aws:iam::444455556666:user/alice";
+    const R: &str = "arn:aws:dynamodb:us-east-1:444455556666:table/bb";
 
     #[test]
     fn explicit_deny_message_matches_service() {
         assert_eq!(
             deny_message(P, "dynamodb:TagResource", R, true),
-            "User: arn:aws:iam::964157134968:user/alice is not authorized to perform: \
-             dynamodb:TagResource on resource: arn:aws:dynamodb:us-east-1:964157134968:table/bb \
+            "User: arn:aws:iam::444455556666:user/alice is not authorized to perform: \
+             dynamodb:TagResource on resource: arn:aws:dynamodb:us-east-1:444455556666:table/bb \
              with an explicit deny in an identity-based policy"
         );
     }
@@ -461,8 +461,8 @@ mod tests {
     fn implicit_deny_message_matches_service() {
         assert_eq!(
             deny_message(P, "dynamodb:GetItem", R, false),
-            "User: arn:aws:iam::964157134968:user/alice is not authorized to perform: \
-             dynamodb:GetItem on resource: arn:aws:dynamodb:us-east-1:964157134968:table/bb \
+            "User: arn:aws:iam::444455556666:user/alice is not authorized to perform: \
+             dynamodb:GetItem on resource: arn:aws:dynamodb:us-east-1:444455556666:table/bb \
              because no identity-based policy allows the dynamodb:GetItem action"
         );
     }

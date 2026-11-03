@@ -146,5 +146,7 @@ fn op_error_message(e: extenddb_storage::management_store::OpError) -> String {
         | OpError::HasDependents(m)
         | OpError::NotFound(m)
         | OpError::Internal(m) => m,
+        // The driver's text stays out of the page.
+        OpError::Database { .. } => "Database error".to_owned(),
     }
 }

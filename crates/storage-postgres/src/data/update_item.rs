@@ -10,6 +10,7 @@ use extenddb_storage::StreamCapture;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{parse_sk, pk_to_text, sk_column, sk_info};
 
+use super::gsi_build::fix_up_stale_write;
 use super::index::{enqueue_async_indexes, fetch_write_path_indexes, sync_indexes};
 use super::query::check_condition;
 use super::tx_helpers::write_stream_record_in_tx;
@@ -58,12 +59,12 @@ impl PostgresEngine {
         // cached membership gate, and that is gone: an index takes effect the moment
         // its catalog row commits. What remains is a window between this read and
         // the data transaction's commit, in which an index created concurrently is
-        // missed. That window cannot be closed here, because the catalog and the
-        // data tables are different databases and no transaction spans them. It is
-        // also exactly the window the secondary indexes have, for the same reason
-        // and with the same read: parity with a GSI is the bar, and the backfill
-        // that publishes a new index is what covers writes older than it.
-        let (indexes, vector_metas) =
+        // missed. No transaction can close it, because the catalog and the data
+        // tables are different databases. For a GSI it is closed by time instead:
+        // the read's stamp lets a write that was slow to commit queue a repair
+        // for any GSI it did not see (`gsi_build::fix_up_stale_write`), and a fast
+        // write is one the backfill sees. Vector indexes still have the window.
+        let (indexes, vector_metas, stamp) =
             fetch_write_path_indexes(&key_info.table_id, &self.pool).await?;
         // Read whenever anything can propagate, secondary or vector. Gating this on
         // the secondary set alone made a vector-only table ignore the configured
@@ -190,6 +191,26 @@ impl PostgresEngine {
             validation::validate_item_size(&item, self.max_item_size_bytes)
                 .map_err(|e| StorageError::Validation(e.to_string()))?;
 
+            // Secondary-index key validation on the post-update item, as the
+            // TransactWriteItems update path and SQLite already do: a wrong-typed
+            // index key or an index key set to an empty value is a
+            // ValidationException, not an item the index then leaves out.
+            if !indexes.is_empty() {
+                let idx_refs = super::transactions::index_key_refs(&indexes);
+                validation::validate_index_key_types(
+                    &item,
+                    &idx_refs,
+                    super::index::fresh_attr_defs(&indexes, &key_info.attribute_definitions),
+                )
+                .map_err(|e| StorageError::Validation(e.to_string()))?;
+                validation::validate_index_key_not_empty(
+                    &item,
+                    &idx_refs,
+                    validation::SecondaryIndexEmptyContext::UpdateExpression,
+                )
+                .map_err(|e| StorageError::Validation(e.to_string()))?;
+            }
+
             let new_item = if return_new { Some(item.clone()) } else { None };
 
             let item_json =
@@ -263,7 +284,6 @@ impl PostgresEngine {
             sync_indexes(
                 &mut tx,
                 &key_info.key_schema,
-                &key_info.attribute_definitions,
                 &indexes,
                 pre_mutation_item.as_ref(),
                 Some(&item),
@@ -309,6 +329,9 @@ impl PostgresEngine {
             sys_delay,
         )
         .await?;
+
+        async_enqueued +=
+            fix_up_stale_write(&mut tx, &self.pool, stamp, key_info, &indexes, key).await?;
 
         tx.commit()
             .await

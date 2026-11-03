@@ -18,16 +18,25 @@ pub mod error;
 pub mod hooks;
 pub mod management_store;
 pub mod management_store_factory;
+pub mod migrations;
 pub mod operations;
 pub mod policy_migration;
 pub mod server_components;
 pub mod settings_store;
+pub mod snapshot;
+#[doc(hidden)]
+#[cfg(feature = "test-hooks")]
+pub mod snapshot_conformance;
+#[doc(hidden)]
+#[cfg(feature = "test-hooks")]
+pub mod test_pause;
 pub mod transact;
 pub mod vector_catalog;
 pub mod vector_lifecycle;
 
 pub use backend::{Backend, BackendAlreadySet, backend_name, set_backend, try_backend};
 pub use backup_definition::{BackupRestoreSource, RestoreRequest, RestoreTableOverrides};
+pub use snapshot::{SnapshotEngine, SnapshotInfo, TableSnapshot};
 
 pub use transact::{IdempotencyKey, TransactGetOp, TransactWriteOp};
 
@@ -603,13 +612,19 @@ pub trait StreamEngine: Send + Sync {
 
     /// Read stream records from a shard starting after a sequence number.
     ///
-    /// `account_id` is the authenticated caller's account. Implementations MUST
-    /// return records only for shards whose backing table belongs to that
-    /// account; a shard whose table belongs to a different account must yield no
-    /// records, so a shard iterator only reads its owning account's stream data.
+    /// `stream_arn` is the stream the shard iterator was issued for, and the resource
+    /// the request was authorized against. Implementations MUST resolve the shard
+    /// against the table and stream label that ARN names, scoped to `account_id`, as
+    /// part of the read (SQLite in the records statement, PostgreSQL, MongoDB and
+    /// Cassandra after reading the table), and return `StorageError::TableNotFound`
+    /// with the message `Requested resource not found: Stream does not exist` when the
+    /// stream does not exist for that account or the shard is not one of that stream's
+    /// shards. A shard of another table, another account, or an earlier stream label on
+    /// the same table therefore yields no records.
     fn get_stream_records(
         &self,
         account_id: &str,
+        stream_arn: &str,
         shard_id: &str,
         after_sequence: Option<&str>,
         limit: i64,
@@ -690,7 +705,11 @@ pub trait WorkerStore: Send + Sync {
     ) -> BoxFuture<'_, Result<Vec<(String, &'static str)>, StorageError>>;
 }
 
-/// Backup and point-in-time recovery operations.
+/// Backup operations.
+///
+/// Point-in-time recovery is deliberately absent: no backend implements it, so
+/// the engine answers `DescribeContinuousBackups`, `UpdateContinuousBackups`,
+/// and `RestoreTableToPointInTime` itself without consulting storage.
 pub trait BackupEngine: Send + Sync {
     /// Create a backup of a table, snapshotting all items.
     fn create_backup(
@@ -783,21 +802,6 @@ pub trait BackupEngine: Send + Sync {
         account_id: &str,
         request: RestoreRequest,
     ) -> BoxFuture<'_, Result<TableDescription, StorageError>>;
-
-    /// Describe continuous backups / PITR status for a table.
-    fn describe_continuous_backups(
-        &self,
-        account_id: &str,
-        table_name: &str,
-    ) -> BoxFuture<'_, Result<extenddb_core::types::ContinuousBackupsDescription, StorageError>>;
-
-    /// Update continuous backups (enable/disable PITR).
-    fn update_continuous_backups(
-        &self,
-        account_id: &str,
-        table_name: &str,
-        pitr_enabled: bool,
-    ) -> BoxFuture<'_, Result<extenddb_core::types::ContinuousBackupsDescription, StorageError>>;
 }
 
 /// Supertrait combining all `DynamoDB` operation traits.
@@ -806,17 +810,26 @@ pub trait BackupEngine: Send + Sync {
 /// DynamoDB-compatible API. This trait has NO additional methods beyond
 /// the trait bounds — backend-specific concerns belong in `ServerRuntimeHooks`.
 pub trait StorageEngine:
-    TableEngine + DataEngine + MetadataEngine + StreamEngine + BackupEngine + WorkerStore + Send + Sync
+    TableEngine
+    + DataEngine
+    + MetadataEngine
+    + StreamEngine
+    + BackupEngine
+    + SnapshotEngine
+    + WorkerStore
+    + Send
+    + Sync
 {
 }
 
-// Blanket implementation: any type implementing all 6 traits is a StorageEngine
+// Blanket implementation: any type implementing all 7 traits is a StorageEngine
 impl<T> StorageEngine for T where
     T: TableEngine
         + DataEngine
         + MetadataEngine
         + StreamEngine
         + BackupEngine
+        + SnapshotEngine
         + WorkerStore
         + Send
         + Sync
