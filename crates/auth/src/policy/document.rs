@@ -390,12 +390,12 @@ pub fn parse_conditions(value: &Value) -> Result<Vec<Condition>, PolicyParseErro
     };
 
     let mut conditions = Vec::new();
-    for (op_name, keys_obj) in obj {
+    for (op_name, keys_obj) in by_name(obj) {
         let operator = parse_operator(op_name)?;
         let keys = keys_obj
             .as_object()
             .ok_or_else(|| PolicyParseError(format!("condition {op_name} must be an object")))?;
-        for (key, vals) in keys {
+        for (key, vals) in by_name(keys) {
             let values = parse_string_or_array(vals)?;
             conditions.push(Condition {
                 operator: operator.clone(),
@@ -405,6 +405,19 @@ pub fn parse_conditions(value: &Value) -> Result<Vec<Condition>, PolicyParseErro
         }
     }
     Ok(conditions)
+}
+
+/// The entries of `map` in name order. Any build that compiles the MongoDB
+/// backend crate, which includes a build of the whole workspace, gets
+/// serde_json's `preserve_order` feature through `bson`, so there a map keeps
+/// the order it was written in; a build without that crate sorts it by name.
+/// A parse or a check that stops at the first fault reports the same fault on
+/// every build when it reads the entries in name order.
+#[must_use]
+pub fn by_name(map: &serde_json::Map<String, Value>) -> Vec<(&String, &Value)> {
+    let mut entries: Vec<_> = map.iter().collect();
+    entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    entries
 }
 
 /// Parse a condition operator name, handling `ForAllValues:`, `ForAnyValue:` prefixes
@@ -510,6 +523,45 @@ mod tests {
             &doc.statements[0].action_match,
             ActionMatch::Actions(a) if a == &["dynamodb:*"]
         ));
+    }
+
+    /// The fault reported for a Condition with two unknown operators is the
+    /// one whose name sorts first, in either order of the document (#780).
+    /// `cargo test --workspace` builds this crate with `preserve_order`,
+    /// which keeps the written order, so there the test tells the two apart.
+    #[test]
+    fn two_unknown_operators_report_the_first_in_name_order() {
+        for (first, second) in [("BadA", "BadB"), ("BadB", "BadA")] {
+            let json = format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow",
+                "Action":"dynamodb:GetItem","Resource":"*","Condition":{{
+                "{first}":{{"aws:k":"v"}},"{second}":{{"aws:k":"v"}}}}}}]}}"#
+            );
+            let err = PolicyDocument::from_json(&json).unwrap_err();
+            assert_eq!(err.0, "unknown operator: BadA", "{first} before {second}");
+        }
+    }
+
+    /// Conditions come out in name order of operator, then key, in either
+    /// order of the document.
+    #[test]
+    fn conditions_are_read_in_name_order() {
+        for condition in [
+            r#"{"StringLike":{"aws:b":"1","aws:a":"2"},"Bool":{"aws:c":"true"}}"#,
+            r#"{"Bool":{"aws:c":"true"},"StringLike":{"aws:a":"2","aws:b":"1"}}"#,
+        ] {
+            let json = format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow",
+                "Action":"dynamodb:GetItem","Resource":"*","Condition":{condition}}}]}}"#
+            );
+            let doc = PolicyDocument::from_json(&json).unwrap();
+            let keys: Vec<&str> = doc.statements[0]
+                .conditions
+                .iter()
+                .map(|c| c.key.as_str())
+                .collect();
+            assert_eq!(keys, ["aws:c", "aws:a", "aws:b"], "{condition}");
+        }
     }
 
     #[test]
