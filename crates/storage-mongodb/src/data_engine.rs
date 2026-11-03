@@ -483,7 +483,8 @@ impl MongoEngine {
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-            // Set when the unconditional upsert below lost a create race.
+            // Set when the unconditional upsert below hit a duplicate key on
+            // `_id`.
             let mut lost_create_race = false;
             let attempt_res: Result<Option<Item>, TxErr> = async {
                 let old_item: Option<Item>;
@@ -629,8 +630,8 @@ impl MongoEngine {
             }
         }
 
-        // Every attempt lost the create race: give up with the same error
-        // as the sessionless path above.
+        // Every attempt met a document that holds the item's `_id`: give up
+        // with the create race error the sessionless path returns.
         if lost_create_races == TRANSIENT_RETRY_ATTEMPTS {
             return Err(create_race_exhausted(lost_create_races));
         }
@@ -3700,8 +3701,10 @@ fn is_duplicate_key(e: &mongodb::error::Error) -> bool {
 }
 
 /// The error when every attempt of an unconditional PutItem lost the create
-/// race: each attempt found no item, and its insert hit an item another
-/// writer created, which was deleted again before the next attempt read it.
+/// race: on the sessionless path, each attempt found no item, and its insert
+/// hit an item another writer created, which was deleted again before the
+/// next attempt read it; on the transaction path, every attempt met a
+/// document that holds the item's `_id` without matching the key filter.
 /// `attempt` is the number of attempts made. The message is the internal
 /// error (HTTP 500) the PostgreSQL backend returns when its own retries of
 /// this race run out.
