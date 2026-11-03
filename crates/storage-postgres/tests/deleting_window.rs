@@ -541,9 +541,9 @@ async fn a_request_after_the_data_drop_is_table_not_found() {
 
 /// Two concurrent DeleteTable calls on one ACTIVE table: the first locks the
 /// row `FOR UPDATE` and marks it DELETING; the second, blocked on that lock,
-/// re-reads the row after the commit, finds it excluded by the status filter,
-/// and answers TableBeingDeleted from the unfiltered lookup. Ten rounds, a
-/// fresh table each; one row per table, DELETING, and its data table present.
+/// reads the row again after the commit, finds it DELETING, and answers
+/// TableBeingDeleted. Ten rounds, a fresh table each; one row per table,
+/// DELETING, and its data table present.
 #[tokio::test]
 async fn two_concurrent_delete_tables_have_one_winner() {
     if base_conn().is_none() {
