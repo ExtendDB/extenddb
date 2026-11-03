@@ -127,6 +127,15 @@ pub fn migration(id: MigrationId) -> Migration<CassandraStores> {
                 "0005_drop_continuous_backups.cql"
             )],
         },
+        MigrationId::WarmThroughput => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Catalog,
+                "migrations/catalog",
+                "0006_warm_throughput.cql"
+            )],
+        },
     }
 }
 

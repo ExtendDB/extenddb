@@ -4,7 +4,9 @@
 
 ## Current Status
 
-This release versions the PostgreSQL, SQLite, Cassandra and MongoDB catalogs by a migration ledger and carries catalog migrations 1 to 5, which `extenddb migrate --list` prints. **Every deployment created by a 0.1.x release runs `extenddb migrate --yes` once** before a server of this release starts on it: the server refuses a catalog with pending migrations. Migration 1 brings the catalog of every 0.1.x release to the v1.0 schema, and migration 5 drops `continuous_backups`, a table and on MongoDB a collection (see [Catalog 0.0.5](#catalog-005)).
+This release versions the PostgreSQL, SQLite, Cassandra and MongoDB catalogs by a migration ledger and carries catalog migrations 1 to 6, which `extenddb migrate --list` prints. **Every deployment created by a 0.1.x release runs `extenddb migrate --yes` once** before a server of this release starts on it: the server refuses a catalog with pending migrations. Migration 1 brings the catalog of every 0.1.x release to the v1.0 schema, and migration 5 drops `continuous_backups`, a table and on MongoDB a collection (see [Catalog 0.0.5](#catalog-005)).
+
+Migration 6, `warm_throughput`, adds a nullable `warm_throughput` column to the `tables` and `indexes` catalog tables on PostgreSQL, SQLite and Cassandra. It holds the `WarmThroughput` a client sets on a table or a global secondary index, which `DescribeTable` reports; nothing acts on the value (see [Differences from DynamoDB](../differences-from-dynamodb.md)). Tables created before the migration report the defaults for their billing mode. On MongoDB it changes nothing, since the catalog collections have no validator, and the ledger records it as not applicable. Migration 6 is breaking: to go back to a release without it, restore the backup taken before the upgrade (see [Rollback Procedure](#rollback-procedure)).
 
 A backup that a 0.1.x release took can restore without its global and local secondary indexes: a SQLite backup taken by 0.1.14 records only the table's key schema and attribute definitions, and its restore creates the table with its items and no index. Take a new backup of each table after upgrading to v1.0, and keep the 0.1.x backups for their items only.
 
@@ -39,7 +41,7 @@ Exit status 6 means the migration lock, or a running server, was still held when
 
 `verify` also checks the connection to the data database. When that check fails, `verify` exits 1 on a Behind catalog instead of 3, because `migrate --yes` cannot apply the pending migrations while the data database cannot be reached. It still exits 4 or 5 for the statuses that need a person.
 
-A migration is additive when the previous release serves the catalog correctly with it applied, and breaking otherwise. Migrations 1 to 5 are breaking: do not run a 0.1.x server against a migrated catalog. A 0.1.x binary that writes to a migrated catalog (its `migrate --yes`, or a SQLite dev server) leaves it WrittenByOlderRelease. `migrate --yes --reconverge` repairs it by running the convergent migrations again. Migration 2, which rewrites stored policies, is not convergent: the repair skips it and prints a line that says so (see the v0.1.14 notes below).
+A migration is additive when the previous release serves the catalog correctly with it applied, and breaking otherwise. Migrations 1 to 6 are breaking: do not run a 0.1.x server against a migrated catalog. A 0.1.x binary that writes to a migrated catalog (its `migrate --yes`, or a SQLite dev server) leaves it WrittenByOlderRelease. `migrate --yes --reconverge` repairs it by running the convergent migrations again. Migration 2, which rewrites stored policies, is not convergent: the repair skips it and prints a line that says so (see the v0.1.14 notes below).
 
 ## Writing a New Migration
 

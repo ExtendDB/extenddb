@@ -183,8 +183,8 @@ impl PostgresEngine {
         }
 
         // WarmThroughput as sent, reported back and acted on by nothing (see
-        // the shape step on `tables.warm_throughput`). UPDATING for the same
-        // delay the CREATING to ACTIVE flip takes.
+        // catalog migration 6, `0006_warm_throughput.sql`). UPDATING for the
+        // same delay the CREATING to ACTIVE flip takes.
         let delay_secs = Self::control_plane_delay_secs(&mut tx).await?;
         let warm_record =
             warm_throughput_record_for_create(input.warm_throughput.as_ref(), delay_secs);

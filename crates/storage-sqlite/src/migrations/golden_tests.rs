@@ -1,9 +1,9 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Golden tests for SQLite migrations 2 to 4, each run on a released catalog
-//! with the damage or the content its body handles, and migration 1's
-//! accepted and converged pre-release shapes.
+//! Golden tests for SQLite migrations 2 to 4 and 6, each run on a released
+//! catalog with the damage or the content its body handles, and migration
+//! 1's accepted and converged pre-release shapes.
 
 use std::path::Path;
 
@@ -626,4 +626,54 @@ async fn migration_4_adds_the_base_key_index_to_index_tables_created_before_v0_1
     .await;
     text.push_str(&dump(&db, "SELECT notes FROM extenddb_migrations WHERE id = 4").await);
     golden("0004_index_table_base_key", &text);
+}
+
+/// Migration 6 adds `warm_throughput` to `tables` and `indexes` of a released
+/// catalog, leaving every existing row NULL (DescribeTable then reports the
+/// defaults), and running it again changes nothing.
+#[tokio::test]
+async fn migration_6_adds_the_warm_throughput_columns() {
+    let db = temp_db("m6");
+    load_dump(&db, DEV_0_1_14).await;
+    let columns = "SELECT COUNT(*) FROM pragma_table_info('tables') WHERE name = 'warm_throughput'";
+    assert_eq!(
+        count(&db, columns).await,
+        0,
+        "the 0.1.14 catalog predates it"
+    );
+    run(&db).await.expect("migrate");
+    let report = reconverge(&db).await.expect("reconverge");
+    assert!(report.applied.iter().any(|s| s.id == 6), "{report:?}");
+    assert_eq!(
+        status(&db).await,
+        CatalogStatus::Current { version: LATEST }
+    );
+    let mut text = String::new();
+    for table in ["tables", "indexes"] {
+        text.push_str(
+            &dump(
+                &db,
+                &format!(
+                    "SELECT name, type, \"notnull\", dflt_value FROM pragma_table_info('{table}') \
+                     WHERE name = 'warm_throughput'"
+                ),
+            )
+            .await,
+        );
+    }
+    text.push_str(
+        &dump(
+            &db,
+            "SELECT table_name, warm_throughput FROM tables ORDER BY table_name",
+        )
+        .await,
+    );
+    text.push_str(
+        &dump(
+            &db,
+            "SELECT index_name, warm_throughput FROM indexes ORDER BY index_name",
+        )
+        .await,
+    );
+    golden("0006_warm_throughput", &text);
 }

@@ -1030,6 +1030,8 @@ async fn a_backfill_the_recovery_worker_started_ends_before_the_worker_returns()
         .update_table(
             &table.key_info.account_id,
             UpdateTableInput {
+                sse_specification: None,
+                warm_throughput: None,
                 table_name: table.key_info.table_name.clone(),
                 billing_mode: None,
                 table_throughput_mode: None,
@@ -1047,6 +1049,7 @@ async fn a_backfill_the_recovery_worker_started_ends_before_the_worker_returns()
                             non_key_attributes: None,
                         },
                         provisioned_throughput: None,
+                        warm_throughput: None,
                     }),
                     update: None,
                     delete: None,

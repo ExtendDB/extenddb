@@ -266,10 +266,9 @@ impl CassandraEngine {
             Value::from(status_transition_at),
         ];
         // WarmThroughput as sent, reported back and acted on by nothing (see
-        // catalog migration V006). UPDATING for the same delay the CREATING to
-        // ACTIVE flip takes. Named only when sent, for the same reason as the
-        // restore columns: a catalog that has not run V006 still serves an
-        // ordinary CreateTable.
+        // catalog migration 6). UPDATING for the same delay the CREATING to
+        // ACTIVE flip takes. Named only when sent, so a table created without
+        // it writes no null cell.
         let warm_record =
             warm_throughput_record_for_create(input.warm_throughput.as_ref(), delay_seconds);
         if let Some(record) = warm_record.as_ref() {

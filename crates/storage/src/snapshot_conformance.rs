@@ -235,6 +235,7 @@ pub fn table_input(name: &str) -> CreateTableInput {
                 non_key_attributes: None,
             },
             provisioned_throughput: None,
+            warm_throughput: None,
         }]),
         ..Default::default()
     }

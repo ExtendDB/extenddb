@@ -67,6 +67,11 @@ migration_ids! {
     /// it.
     DropContinuousBackups = 5, "drop_continuous_backups",
         "drop the continuous_backups table, which no request reads or writes since #335";
+    /// Adds a nullable `warm_throughput` column to the `tables` and `indexes`
+    /// catalog tables, where the `WarmThroughput` a client set on a table or
+    /// a global secondary index is stored.
+    WarmThroughput = 6, "warm_throughput",
+        "add a nullable warm_throughput column to the tables and indexes catalogs";
 }
 
 /// Highest id that has shipped in a release. Bodies at or below it are frozen:

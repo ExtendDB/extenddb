@@ -123,9 +123,9 @@ impl SqliteEngine {
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(crate::DEFAULT_CONTROL_PLANE_DELAY_SECONDS);
 
-        // Stored as sent and reported back; nothing acts on it (see the
-        // schema comment on `tables.warm_throughput`). UPDATING for the same
-        // delay the CREATING to ACTIVE flip takes.
+        // Stored as sent and reported back; nothing acts on it (see catalog
+        // migration 6, `m0006_warm_throughput`). UPDATING for the same delay
+        // the CREATING to ACTIVE flip takes.
         let warm_record =
             warm_throughput_record_for_create(input.warm_throughput.as_ref(), delay_secs);
         let warm_json = warm_record

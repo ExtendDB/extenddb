@@ -176,12 +176,10 @@ async fn migration_1_creates_the_expected_definitions() {
             std::fs::write(&path, text).expect("write the expected file");
             continue;
         }
-        let mut expected: postcheck::Definitions =
-            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
-        // Migration 5 drops continuous_backups, which migration 1 creates.
-        expected
-            .columns
-            .retain(|name, _| !name.starts_with("continuous_backups."));
+        let expected = migrations_support::after_every_migration(
+            dir,
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json"),
+        );
         assert_eq!(
             postcheck::compare(&expected, &actual),
             Vec::<String>::new(),

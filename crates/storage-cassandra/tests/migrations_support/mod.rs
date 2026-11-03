@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use extenddb_storage_cassandra::cassandra_util::CassandraSession;
 use extenddb_storage_cassandra::engine::CassandraEngine;
-use extenddb_storage_cassandra::migrations::wait_for_schema_agreement;
+use extenddb_storage_cassandra::migrations::{postcheck, wait_for_schema_agreement};
 
 use crate::helpers;
 
@@ -32,6 +32,34 @@ pub fn new_prefix(tag: &str) -> (String, helpers::DropKeyspacesOnDrop) {
         format!("{prefix}_account_111111111111"),
     ]);
     (prefix, drops)
+}
+
+/// The definitions a keyspace of store kind `dir` (`catalog` or `account`)
+/// holds once every migration ran, from migration 1's expected file:
+/// migration 5 drops `continuous_backups`, which migration 1 creates, and
+/// migration 6 adds `warm_throughput` to the catalog's `tables` and
+/// `indexes`.
+pub fn after_every_migration(
+    dir: &str,
+    mut expected: postcheck::Definitions,
+) -> postcheck::Definitions {
+    expected
+        .columns
+        .retain(|name, _| !name.starts_with("continuous_backups."));
+    if dir == "catalog" {
+        for table in ["tables", "indexes"] {
+            expected.columns.insert(
+                format!("{table}.warm_throughput"),
+                postcheck::Column {
+                    kind: "regular".to_owned(),
+                    position: -1,
+                    clustering_order: "none".to_owned(),
+                    data_type: "text".to_owned(),
+                },
+            );
+        }
+    }
+    expected
 }
 
 /// Run `statement`, then wait until every live node agrees on the schema,

@@ -137,6 +137,10 @@ pub fn migration(id: MigrationId) -> Migration<MongoStores> {
                 m0005_drop_continuous_backups::SOURCE,
             )],
         },
+        MigrationId::WarmThroughput => Migration::NotApplicable(
+            "the catalog collections have no validator, so a table or index document carries \
+             a warm_throughput field without a schema change",
+        ),
     }
 }
 

@@ -61,7 +61,7 @@ impl SqliteEngine {
             .fetch_one(&mut **tx)
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
-            let record = warm_throughput_record_for_update(existing.as_deref(), spec, delay_secs)?;
+            let record = warm_throughput_record_for_update(existing.as_deref(), spec, delay_secs);
             sqlx::query(
                 "UPDATE tables SET warm_throughput = ? WHERE account_id = ? AND table_name = ?",
             )
@@ -86,7 +86,7 @@ impl SqliteEngine {
             let Some(existing) = existing else {
                 return Err(StorageError::IndexNotFound(index_name.clone()));
             };
-            let record = warm_throughput_record_for_update(existing.as_deref(), spec, delay_secs)?;
+            let record = warm_throughput_record_for_update(existing.as_deref(), spec, delay_secs);
             sqlx::query(
                 "UPDATE indexes SET warm_throughput = ? WHERE table_id = ? AND index_name = ?",
             )
@@ -112,12 +112,16 @@ mod tests {
         let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
-        sqlx::query("UPDATE settings SET value = ? WHERE key = 'control_plane_delay_seconds'")
-            .bind(delay)
-            .execute(&engine.pool)
-            .await
-            .expect("delay");
+        crate::migrations::apply_for_tests(&engine.pool).await;
+        // No migration seeds the setting, so the row is inserted.
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES ('control_plane_delay_seconds', ?) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(delay)
+        .execute(&engine.pool)
+        .await
+        .expect("delay");
         sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
             .bind(ACCOUNT)
             .execute(&engine.pool)
