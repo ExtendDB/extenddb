@@ -838,6 +838,12 @@ The error log line names the exact relations for one leaked table and gives this
 
 **Fix:** Check PostgreSQL connectivity. The worker retries every hour automatically.
 
+### `Stream record numbering failed: <error>`
+
+**Cause:** The background worker that gives PostgreSQL stream records their sequence numbers encountered a database error. GetRecords numbers the records of the shard it reads before it reads them, so consumers still receive every record. The records of shards that nobody reads stay in the `stream_pending` table, and the retention sweep does not trim them, until the worker succeeds.
+
+**Fix:** Check PostgreSQL connectivity. After a failure the worker tries again a little over a second later.
+
 ## Management Console Errors
 
 ### Console login page shows "Invalid credentials"

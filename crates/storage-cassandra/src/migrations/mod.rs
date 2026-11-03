@@ -127,6 +127,10 @@ pub fn migration(id: MigrationId) -> Migration<CassandraStores> {
                 "0005_drop_continuous_backups.cql"
             )],
         },
+        MigrationId::StreamPending => Migration::NotApplicable(
+            "the stream_pending table belongs to the PostgreSQL backend, and Cassandra numbers its \
+             stream records with the server's clock (#660)",
+        ),
     }
 }
 

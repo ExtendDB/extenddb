@@ -1,0 +1,842 @@
+// Copyright 2026 ExtendDB contributors
+// SPDX-License-Identifier: Apache-2.0
+
+//! A stream consumer on PostgreSQL reads every committed write once, and the
+//! records of one item in the order their writes committed (#808).
+//!
+//! A write stores its stream record in `stream_pending`, inside the write's
+//! own transaction, and the record gets its sequence number only after the
+//! write commits. GetRecords and a LATEST iterator number the shard's
+//! committed records before they read it, and a worker numbers the shards
+//! that nobody reads. Before this, a write drew its number inside its
+//! transaction, and it could commit after a write that drew a higher number.
+//! A consumer that had read the higher number then never read the first
+//! write's record.
+//!
+//! The tests hold a write open at its commit, after it stored its record,
+//! with a deferred constraint trigger that waits on an advisory lock, the
+//! gate.
+//!
+//! Needs `EXTENDDB_TEST_PG_CONNECTION_STRING` (host-only, e.g.
+//! `postgres://user:pass@127.0.0.1:5432`); skips otherwise. Each test builds
+//! its own scratch database and drops it when it passes. A failing test
+//! leaves its database, named `eddb_sord_*`, behind.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use extenddb_core::expression::ExpressionMaps;
+use extenddb_core::types::{
+    AttributeDefinition, AttributeValue, BillingMode, CreateTableInput, Item, KeySchemaElement,
+    KeyType, ScalarAttributeType, StreamRecord, StreamSpecification, StreamViewType, TableKeyInfo,
+};
+use extenddb_storage::util::stream_arn;
+use extenddb_storage::{DataEngine, StreamCapture, StreamEngine, TableEngine};
+use extenddb_storage_postgres::{PostgresConfig, PostgresEngine};
+use sqlx::postgres::PgPoolOptions;
+use sqlx::{Connection, PgConnection, PgPool};
+
+const ACCOUNT: &str = "123456789012";
+const REGION: &str = "us-east-1";
+const TABLE: &str = "t_stream_order";
+const LABEL: &str = "2026-01-01T00:00:00.000";
+
+/// The advisory lock key of the gate.
+const GATE: i64 = 0x5374_4f72;
+
+/// A page size larger than any test writes.
+const PAGE: i64 = 1_000;
+
+struct Scratch {
+    engine: PostgresEngine,
+    db: PgPool,
+    admin: PgPool,
+    db_name: String,
+}
+
+impl Scratch {
+    async fn cleanup(self) {
+        let Scratch {
+            engine,
+            db,
+            admin,
+            db_name,
+        } = self;
+        drop(engine);
+        db.close().await;
+        sqlx::query(&format!(
+            "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
+        ))
+        .execute(&admin)
+        .await
+        .expect("drop the scratch database");
+        admin.close().await;
+    }
+
+    /// The test table, keyed on `pk` and `sk`, with a NEW_AND_OLD_IMAGES
+    /// stream whose label is pinned to [`LABEL`]. Returns its key info, its
+    /// table id and its stream ARN.
+    async fn stream_table(&self) -> (TableKeyInfo, String, String) {
+        let key = |name: &str, key_type| {
+            (
+                KeySchemaElement {
+                    attribute_name: name.to_owned(),
+                    key_type,
+                },
+                AttributeDefinition {
+                    attribute_name: name.to_owned(),
+                    attribute_type: ScalarAttributeType::S,
+                },
+            )
+        };
+        let (key_schema, attribute_definitions) =
+            [key("pk", KeyType::Hash), key("sk", KeyType::Range)]
+                .into_iter()
+                .unzip();
+        let desc = self
+            .engine
+            .create_table(
+                ACCOUNT,
+                CreateTableInput {
+                    table_name: TABLE.to_owned(),
+                    key_schema,
+                    attribute_definitions,
+                    billing_mode: Some(BillingMode::PayPerRequest),
+                    stream_specification: Some(StreamSpecification {
+                        stream_enabled: true,
+                        stream_view_type: Some(StreamViewType::NewAndOldImages),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create the table");
+        sqlx::query("UPDATE tables SET stream_label = $1 WHERE table_id = $2")
+            .bind(LABEL)
+            .bind(&desc.table_id)
+            .execute(&self.db)
+            .await
+            .expect("pin the stream label");
+        let key_info = self
+            .engine
+            .table_key_info(ACCOUNT, TABLE)
+            .await
+            .expect("read the key info");
+        (
+            key_info,
+            desc.table_id,
+            stream_arn(REGION, ACCOUNT, TABLE, LABEL),
+        )
+    }
+
+    /// The shard the records of partition key `pk` go to.
+    async fn shard_of(&self, pk: &str) -> String {
+        self.engine
+            .assign_shard(ACCOUNT, TABLE, pk)
+            .await
+            .expect("assign a shard")
+    }
+
+    /// Store `item("pk", sk, v)`, with its stream record.
+    async fn put(&self, key_info: &TableKeyInfo, pk: &str, sk: &str, v: &str) {
+        self.engine
+            .put_item(
+                key_info,
+                item(pk, sk, v),
+                false,
+                None,
+                &ExpressionMaps::default(),
+                Some(&capture()),
+            )
+            .await
+            .expect("store the item");
+    }
+
+    /// One GetRecords page of `shard`, after `after` or from the start.
+    async fn read(
+        &self,
+        arn: &str,
+        shard: &str,
+        after: Option<&str>,
+    ) -> (Vec<StreamRecord>, Option<String>) {
+        self.engine
+            .get_stream_records(ACCOUNT, arn, shard, after, PAGE)
+            .await
+            .expect("read the shard")
+    }
+
+    /// How many records of `shard` wait in `stream_pending` for a number.
+    async fn pending(&self, shard: &str) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM stream_pending WHERE shard_id = $1")
+            .bind(shard)
+            .fetch_one(&self.db)
+            .await
+            .expect("count the pending records")
+    }
+}
+
+/// The server's base URL, or `None` to skip. With `EXTENDDB_TEST_PG_REQUIRED`
+/// set to any value but `0`, a job that must reach a server fails here
+/// instead.
+fn base_conn() -> Option<String> {
+    let conn = std::env::var("EXTENDDB_TEST_PG_CONNECTION_STRING").unwrap_or_default();
+    if conn.trim().is_empty() {
+        let required =
+            std::env::var("EXTENDDB_TEST_PG_REQUIRED").is_ok_and(|v| !v.is_empty() && v != "0");
+        assert!(
+            !required,
+            "EXTENDDB_TEST_PG_CONNECTION_STRING is not set, and EXTENDDB_TEST_PG_REQUIRED says \
+             this job must reach a PostgreSQL server"
+        );
+        return None;
+    }
+    Some(conn.trim_end_matches('/').to_owned())
+}
+
+/// Every `.sql` file under `migrations/` and `data_migrations/`, each
+/// directory in filename order, so a new migration is picked up here without
+/// editing this file.
+fn shipped_migrations() -> Vec<String> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut out = Vec::new();
+    for dir in ["migrations", "data_migrations"] {
+        let mut files: Vec<_> = std::fs::read_dir(root.join(dir))
+            .expect("read the migrations directory")
+            .map(|e| e.expect("directory entry").path())
+            .filter(|p| p.extension().is_some_and(|e| e == "sql"))
+            .collect();
+        files.sort();
+        for f in files {
+            out.push(std::fs::read_to_string(&f).expect("read a migration file"));
+        }
+    }
+    out
+}
+
+fn skip(test: &str) {
+    eprintln!(
+        "SKIP {test}: EXTENDDB_TEST_PG_CONNECTION_STRING is not set, so there is no PostgreSQL \
+         to build a scratch database in."
+    );
+}
+
+/// A scratch database with every shipped migration applied. With
+/// `default_isolation`, the engine's sessions start their transactions at
+/// that level unless a transaction names its own, as with an operator's
+/// `default_transaction_isolation`.
+async fn scratch(default_isolation: Option<&str>) -> Scratch {
+    let base = base_conn().expect("caller checks base_conn() first");
+    let db_name = format!("eddb_sord_{}", uuid::Uuid::new_v4().simple())[..24].to_owned();
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&format!("{base}/postgres"))
+        .await
+        .expect("connect to the postgres maintenance database");
+    sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
+        .execute(&admin)
+        .await
+        .expect("create the scratch database");
+    let url = format!("{base}/{db_name}");
+    let db = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&url)
+        .await
+        .expect("connect to the scratch database");
+    // One scratch database stands in for both the catalog and the data
+    // database, so every shipped migration file from both directories is
+    // applied to it, in filename order.
+    for sql in shipped_migrations() {
+        sqlx::raw_sql(&sql)
+            .execute(&db)
+            .await
+            .expect("apply a shipped migration");
+    }
+    // The catalog schema's `stream_shards` carries a foreign key to `tables`
+    // that cannot exist in a deployment (the two live in different
+    // databases) and that the engine's insert order violates.
+    sqlx::query("ALTER TABLE stream_shards DROP CONSTRAINT IF EXISTS stream_shards_table_id_fkey")
+        .execute(&db)
+        .await
+        .expect("match the two-database layout");
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0') \
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .execute(&db)
+    .await
+    .expect("pin the control-plane delay to zero");
+    sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES ($1, $2)")
+        .bind(ACCOUNT)
+        .bind(format!("acct-{db_name}"))
+        .execute(&db)
+        .await
+        .expect("seed the account row");
+    if let Some(level) = default_isolation {
+        // Sessions opened from here on, the engine's among them, take it.
+        sqlx::query(&format!(
+            "ALTER DATABASE \"{db_name}\" SET default_transaction_isolation = '{level}'"
+        ))
+        .execute(&admin)
+        .await
+        .expect("set the default isolation level");
+    }
+    let engine = PostgresEngine::new(
+        &PostgresConfig {
+            connection_string: url,
+            pool_size: 12,
+            max_item_size_bytes: 400_000,
+        },
+        REGION,
+    )
+    .await
+    .expect("open a PostgresEngine on the scratch database");
+    Scratch {
+        engine,
+        db,
+        admin,
+        db_name,
+    }
+}
+
+fn item(pk: &str, sk: &str, v: &str) -> Item {
+    BTreeMap::from([
+        ("pk".to_owned(), AttributeValue::S(pk.to_owned())),
+        ("sk".to_owned(), AttributeValue::S(sk.to_owned())),
+        ("v".to_owned(), AttributeValue::S(v.to_owned())),
+    ])
+}
+
+fn capture() -> StreamCapture {
+    StreamCapture {
+        view_type: StreamViewType::NewAndOldImages,
+        user_identity: None,
+        region: Arc::from(REGION),
+    }
+}
+
+/// The `v` of each record's new image, in the order read.
+fn values(records: &[StreamRecord]) -> Vec<String> {
+    records
+        .iter()
+        .map(
+            |r| match r.dynamodb.new_image.as_ref().and_then(|i| i.get("v")) {
+                Some(AttributeValue::S(v)) => v.clone(),
+                other => panic!("a record whose new image has no string v: {other:?}"),
+            },
+        )
+        .collect()
+}
+
+fn string_key(r: &StreamRecord, name: &str) -> String {
+    match r.dynamodb.keys.get(name) {
+        Some(AttributeValue::S(v)) => v.clone(),
+        other => panic!("a record without a string {name} key: {other:?}"),
+    }
+}
+
+/// Open a connection to the scratch database outside its pools. Returns it and
+/// its backend pid.
+async fn connect(s: &Scratch) -> (PgConnection, i32) {
+    let base = base_conn().expect("caller checks base_conn() first");
+    let mut conn = PgConnection::connect(&format!("{base}/{}", s.db_name))
+        .await
+        .expect("connect to the scratch database");
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut conn)
+        .await
+        .expect("read the backend pid");
+    (conn, pid)
+}
+
+/// Make a transaction that writes a row of `relation` for which `condition`
+/// (an expression on `NEW`) holds wait at its commit while the gate is
+/// closed. A deferred constraint trigger runs at commit, after every
+/// statement of the transaction, so the write has stored its stream record
+/// by then.
+async fn install_commit_gate(s: &Scratch, relation: &str, condition: &str) {
+    sqlx::raw_sql(&format!(
+        "CREATE FUNCTION hold_at_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+           IF {condition} THEN PERFORM pg_advisory_xact_lock_shared({GATE}); END IF; \
+           RETURN NULL; \
+         END $$; \
+         CREATE CONSTRAINT TRIGGER hold_at_commit AFTER INSERT OR UPDATE ON {relation} \
+           DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION hold_at_commit();"
+    ))
+    .execute(&s.db)
+    .await
+    .expect("install the gate trigger");
+}
+
+/// Close the gate on a session of its own. Returns the session and its pid.
+async fn close_gate(s: &Scratch) -> (PgConnection, i32) {
+    let (mut gate, pid) = connect(s).await;
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(GATE)
+        .execute(&mut gate)
+        .await
+        .expect("close the gate");
+    (gate, pid)
+}
+
+async fn open_gate(gate: &mut PgConnection) {
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(GATE)
+        .execute(gate)
+        .await
+        .expect("open the gate");
+}
+
+/// The quoted name of the test table's data table.
+fn data_table(table_id: &str) -> String {
+    format!("\"_ddb_{table_id}\"")
+}
+
+/// Wait until a backend waits for a lock of kind `event` that the backend
+/// `blocker` holds. Fails after 10 s, so the caller can report what it saw.
+async fn wait_until_blocked_by(db: &PgPool, blocker: i32, event: &str) -> Result<(), String> {
+    for _ in 0..1_000 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock' \
+             AND wait_event = $2 AND $1 = ANY(pg_blocking_pids(pid))",
+        )
+        .bind(blocker)
+        .bind(event)
+        .fetch_one(db)
+        .await
+        .expect("read pg_stat_activity");
+        if waiting > 0 {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Err(format!(
+        "no backend waited on the {event} lock of backend {blocker}"
+    ))
+}
+
+/// Wait until `n` backends of the scratch database wait on a lock. Fails
+/// after 10 s.
+async fn wait_for_lock_waiters(db: &PgPool, n: i64) -> Result<(), String> {
+    for _ in 0..1_000 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(db)
+        .await
+        .expect("read pg_stat_activity");
+        if waiting >= n {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Err(format!("{n} backends never waited on a lock"))
+}
+
+/// The case #808 names. A write stores its record and then waits at its
+/// commit. A second write to the same shard commits, and a consumer reads
+/// its record. The first write then commits, and the consumer's next read,
+/// after the number it holds, must return the first write's record. With
+/// the number drawn inside the write's transaction, the first write's
+/// number was below the consumer's, and no read after it returned the
+/// record.
+#[tokio::test]
+async fn a_write_that_commits_after_a_read_is_returned_by_the_next_read() {
+    let test = "a_write_that_commits_after_a_read_is_returned_by_the_next_read";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let s = scratch(None).await;
+    let (key_info, table_id, arn) = s.stream_table().await;
+    install_commit_gate(
+        &s,
+        &data_table(&table_id),
+        "NEW.item_data->'v'->>'S' = 'held'",
+    )
+    .await;
+    let shard = s.shard_of("p").await;
+    let (mut gate, gate_pid) = close_gate(&s).await;
+
+    let held = s.put(&key_info, "p", "1", "held");
+    let rest = async {
+        wait_until_blocked_by(&s.db, gate_pid, "advisory").await?;
+        s.put(&key_info, "p", "2", "free").await;
+        let first = s.read(&arn, &shard, None).await;
+        open_gate(&mut gate).await;
+        Ok::<_, String>(first)
+    };
+    let ((), rest) =
+        tokio::time::timeout(Duration::from_secs(30), async { tokio::join!(held, rest) })
+            .await
+            .expect("both writes finished");
+    let (first, cursor) = rest.unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        values(&first),
+        ["free"],
+        "the first read returns the committed write only"
+    );
+    let cursor = cursor.expect("the first read returns a sequence number");
+
+    let (next, _) = s.read(&arn, &shard, Some(&cursor)).await;
+    assert_eq!(
+        values(&next),
+        ["held"],
+        "the read after the consumer's number returns the write that committed late"
+    );
+    assert!(
+        next[0].dynamodb.sequence_number > cursor,
+        "the late write's number {} is above the number {cursor} the consumer read",
+        next[0].dynamodb.sequence_number
+    );
+    let (all, _) = s.read(&arn, &shard, None).await;
+    assert_eq!(
+        values(&all),
+        ["free", "held"],
+        "from the start, the records are in commit order"
+    );
+    assert_eq!(s.pending(&shard).await, 0, "no record is left pending");
+
+    drop(gate);
+    s.cleanup().await;
+}
+
+/// Writers race on four hot items while a consumer pages through every
+/// shard. The consumer must read each write's record exactly once, and each
+/// item's records must chain: the old image of a record is the new image of
+/// the item's record before it. A record out of order breaks the chain.
+#[tokio::test]
+async fn concurrent_writers_lose_no_record_and_keep_each_items_order() {
+    let test = "concurrent_writers_lose_no_record_and_keep_each_items_order";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    const WRITERS: usize = 8;
+    const WRITES: usize = 150;
+    const ITEMS: [&str; 4] = ["h0", "h1", "h2", "h3"];
+    let s = scratch(None).await;
+    let (key_info, table_id, arn) = s.stream_table().await;
+    let shards: Vec<String> =
+        sqlx::query_scalar("SELECT shard_id FROM stream_shards WHERE table_id = $1 ORDER BY 1")
+            .bind(&table_id)
+            .fetch_all(&s.db)
+            .await
+            .expect("list the shards");
+
+    let done = AtomicBool::new(false);
+    let writers = async {
+        futures::future::join_all((0..WRITERS).map(|w| {
+            let (s, key_info) = (&s, &key_info);
+            async move {
+                for i in 0..WRITES {
+                    let pk = ITEMS[(w + i) % ITEMS.len()];
+                    s.put(key_info, pk, "s", &format!("w{w}-{i}")).await;
+                }
+            }
+        }))
+        .await;
+        done.store(true, Ordering::SeqCst);
+    };
+    let consumer = async {
+        let mut cursors: Vec<Option<String>> = vec![None; shards.len()];
+        let mut read: Vec<StreamRecord> = Vec::new();
+        loop {
+            // Read once more after the writers finish, to take the rest.
+            let finished = done.load(Ordering::SeqCst);
+            for (shard, cursor) in shards.iter().zip(cursors.iter_mut()) {
+                loop {
+                    let (page, last) = s.read(&arn, shard, cursor.as_deref()).await;
+                    if page.is_empty() {
+                        break;
+                    }
+                    *cursor = last;
+                    read.extend(page);
+                }
+            }
+            if finished {
+                return read;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    };
+    let ((), read) = tokio::time::timeout(Duration::from_secs(120), async {
+        tokio::join!(writers, consumer)
+    })
+    .await
+    .expect("the writers and the consumer finished");
+
+    let tags = values(&read);
+    let distinct: BTreeSet<&String> = tags.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        tags.len(),
+        "the consumer read a record twice"
+    );
+    assert_eq!(
+        tags.len(),
+        WRITERS * WRITES,
+        "the consumer read {} of the {} writes",
+        tags.len(),
+        WRITERS * WRITES
+    );
+
+    // One item's records are all on one shard, and a shard's records are
+    // read in order, so the item's records keep their order in `read`.
+    let mut last_image: BTreeMap<String, Item> = BTreeMap::new();
+    for r in &read {
+        let pk = string_key(r, "pk");
+        assert_eq!(
+            r.dynamodb.old_image.as_ref(),
+            last_image.get(&pk),
+            "item {pk}: the record {} does not follow the item's record before it",
+            r.dynamodb.sequence_number
+        );
+        let new_image = r.dynamodb.new_image.clone().expect("a put has a new image");
+        last_image.insert(pk, new_image);
+    }
+    for pk in ITEMS {
+        let stored: serde_json::Value = sqlx::query_scalar(&format!(
+            "SELECT item_data FROM {} WHERE pk = $1",
+            data_table(&table_id)
+        ))
+        .bind(pk)
+        .fetch_one(&s.db)
+        .await
+        .expect("read the stored item");
+        let stored: Item = serde_json::from_value(stored).expect("an item");
+        assert_eq!(
+            last_image.get(pk),
+            Some(&stored),
+            "item {pk}: the last record is the last write"
+        );
+    }
+
+    s.cleanup().await;
+}
+
+/// A read returns every write that committed before it, in every round of
+/// a write followed by a read.
+#[tokio::test]
+async fn a_read_returns_the_write_that_committed_before_it() {
+    let test = "a_read_returns_the_write_that_committed_before_it";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let s = scratch(None).await;
+    let (key_info, _, arn) = s.stream_table().await;
+    let shard = s.shard_of("r").await;
+    let mut cursor: Option<String> = None;
+    for i in 0..20 {
+        let v = format!("v{i:02}");
+        s.put(&key_info, "r", &format!("{i:02}"), &v).await;
+        let (page, last) = s.read(&arn, &shard, cursor.as_deref()).await;
+        assert_eq!(values(&page), [v.as_str()], "round {i}");
+        let seq = &page[0].dynamodb.sequence_number;
+        assert_eq!(seq.len(), 21, "round {i}: the number {seq} has 21 digits");
+        assert!(
+            cursor.as_ref().is_none_or(|c| seq > c),
+            "round {i}: the number {seq} is above the one before, {cursor:?}"
+        );
+        cursor = last;
+    }
+
+    s.cleanup().await;
+}
+
+/// A LATEST iterator starts after every write that committed before it, so
+/// those writes are numbered first. Without that, a shard whose records
+/// were all pending had no number to start after, and a LATEST iterator
+/// read the shard from the start. A write still open when the iterator is
+/// taken is numbered after it commits, and the iterator returns it.
+#[tokio::test]
+async fn a_latest_iterator_starts_after_the_committed_writes() {
+    let test = "a_latest_iterator_starts_after_the_committed_writes";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let s = scratch(None).await;
+    let (key_info, table_id, arn) = s.stream_table().await;
+    install_commit_gate(
+        &s,
+        &data_table(&table_id),
+        "NEW.item_data->'v'->>'S' = 'held'",
+    )
+    .await;
+    let shard = s.shard_of("p").await;
+
+    s.put(&key_info, "p", "1", "a").await;
+    let after_a = s
+        .engine
+        .latest_sequence_number(&shard)
+        .await
+        .expect("resolve LATEST")
+        .expect("LATEST resolves to the number of the committed write");
+    let (page, _) = s.read(&arn, &shard, None).await;
+    assert_eq!(values(&page), ["a"]);
+    assert_eq!(page[0].dynamodb.sequence_number, after_a);
+
+    s.put(&key_info, "p", "2", "b").await;
+    let (mut gate, gate_pid) = close_gate(&s).await;
+    let held = s.put(&key_info, "p", "3", "held");
+    let rest = async {
+        wait_until_blocked_by(&s.db, gate_pid, "advisory").await?;
+        let after_b = s
+            .engine
+            .latest_sequence_number(&shard)
+            .await
+            .expect("resolve LATEST");
+        open_gate(&mut gate).await;
+        Ok::<_, String>(after_b)
+    };
+    let ((), rest) =
+        tokio::time::timeout(Duration::from_secs(30), async { tokio::join!(held, rest) })
+            .await
+            .expect("the held write finished");
+    let after_b = rest
+        .unwrap_or_else(|e| panic!("{e}"))
+        .expect("LATEST resolves while a write is open");
+
+    let (page, _) = s.read(&arn, &shard, Some(&after_a)).await;
+    assert_eq!(values(&page), ["b", "held"]);
+    assert_eq!(
+        page[0].dynamodb.sequence_number, after_b,
+        "LATEST taken during the open write starts after b"
+    );
+    let (page, _) = s.read(&arn, &shard, Some(&after_b)).await;
+    assert_eq!(
+        values(&page),
+        ["held"],
+        "the write open when LATEST was taken is returned"
+    );
+
+    drop(gate);
+    s.cleanup().await;
+}
+
+/// The numbering worker numbers the shards that nobody reads, and it skips
+/// a shard that another transaction is numbering instead of waiting. The
+/// number goes in the `sequence_number` column and in the record.
+#[tokio::test]
+async fn the_worker_numbers_unread_shards_and_skips_a_locked_one() {
+    let test = "the_worker_numbers_unread_shards_and_skips_a_locked_one";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let s = scratch(None).await;
+    let (key_info, _, _) = s.stream_table().await;
+    // Two partition keys on two shards.
+    let first = s.shard_of("k0").await;
+    let mut other = None;
+    for i in 1..100 {
+        let pk = format!("k{i}");
+        let shard = s.shard_of(&pk).await;
+        if shard != first {
+            other = Some((pk, shard));
+            break;
+        }
+    }
+    let (other_pk, second) = other.expect("a partition key on another shard");
+    s.put(&key_info, "k0", "s", "one").await;
+    s.put(&key_info, &other_pk, "s", "two").await;
+    assert_eq!((s.pending(&first).await, s.pending(&second).await), (1, 1));
+
+    // An outside transaction holds the first shard's row, as a numbering of
+    // that shard does.
+    let mut holder = s.db.begin().await.expect("begin the outside transaction");
+    sqlx::query("SELECT 1 FROM stream_shards WHERE shard_id = $1 FOR NO KEY UPDATE")
+        .bind(&first)
+        .execute(&mut *holder)
+        .await
+        .expect("lock the first shard");
+    let moved = tokio::time::timeout(
+        Duration::from_secs(10),
+        s.engine.number_pending_stream_records_for_tests(),
+    )
+    .await
+    .expect("the worker does not wait for the locked shard")
+    .expect("number the pending records");
+    assert_eq!(moved, 1, "only the unlocked shard is numbered");
+    assert_eq!((s.pending(&first).await, s.pending(&second).await), (1, 0));
+    holder.rollback().await.expect("release the first shard");
+
+    let moved = s
+        .engine
+        .number_pending_stream_records_for_tests()
+        .await
+        .expect("number the pending records");
+    assert_eq!(moved, 1, "the released shard is numbered");
+    assert_eq!((s.pending(&first).await, s.pending(&second).await), (0, 0));
+
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT sequence_number, record_data->'dynamodb'->>'SequenceNumber' FROM stream_records",
+    )
+    .fetch_all(&s.db)
+    .await
+    .expect("read the numbered records");
+    assert_eq!(rows.len(), 2);
+    for (column, in_record) in &rows {
+        assert_eq!(column, in_record, "the record carries its number");
+        assert_eq!(column.len(), 21, "{column} has 21 digits");
+    }
+
+    s.cleanup().await;
+}
+
+/// Under an operator's REPEATABLE READ default, a read that waits for a
+/// numbering of its shard must not fail. The numbering transaction is READ
+/// COMMITTED whatever the default. At REPEATABLE READ its snapshot would date
+/// from before the wait, it would try to move the records the other
+/// numbering had moved, and the delete would fail with a serialization
+/// error.
+#[tokio::test]
+async fn a_read_that_waits_for_a_numbering_succeeds_under_repeatable_read() {
+    let test = "a_read_that_waits_for_a_numbering_succeeds_under_repeatable_read";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let s = scratch(Some("repeatable read")).await;
+    let (key_info, _, arn) = s.stream_table().await;
+    // The first numbering waits at its commit, holding the shard's row.
+    install_commit_gate(
+        &s,
+        "stream_records",
+        "NEW.record_data->'dynamodb'->'NewImage'->'v'->>'S' = 'held'",
+    )
+    .await;
+    let shard = s.shard_of("p").await;
+    s.put(&key_info, "p", "1", "held").await;
+    let (mut gate, gate_pid) = close_gate(&s).await;
+
+    let numbering = s.engine.number_pending_stream_records_for_tests();
+    let read = async {
+        wait_until_blocked_by(&s.db, gate_pid, "advisory").await?;
+        Ok::<_, String>(
+            s.engine
+                .get_stream_records(ACCOUNT, &arn, &shard, None, PAGE)
+                .await,
+        )
+    };
+    let release = async {
+        // The numbering waits on the gate, and the read on the numbering.
+        let waited = wait_for_lock_waiters(&s.db, 2).await;
+        open_gate(&mut gate).await;
+        waited
+    };
+    let (numbered, read, waited) = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(numbering, read, release)
+    })
+    .await
+    .expect("the numbering and the read finished");
+    let read = read.unwrap_or_else(|e| panic!("{e}"));
+    if let Err(e) = waited {
+        panic!("{e}; the read returned {read:?}");
+    }
+    assert_eq!(numbered.expect("the first numbering commits"), 1);
+    let (records, _) = read.expect("the read that waited succeeds");
+    assert_eq!(values(&records), ["held"]);
+
+    drop(gate);
+    s.cleanup().await;
+}

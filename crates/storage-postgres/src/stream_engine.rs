@@ -19,7 +19,191 @@ use crate::stream_records_sql::{STREAM_RECORDS_AFTER, STREAM_RECORDS_FROM_START}
 /// Number of fixed shards per stream (hash-based assignment).
 const SHARDS_PER_STREAM: u32 = 4;
 
+/// How many pending records one numbering transaction moves. The shard's row
+/// stays locked until the transaction commits, so a reader of the shard waits
+/// for one batch at most.
+const NUMBER_BATCH: i64 = 1_000;
+
+/// How many pending records a read numbers, in batches, before it reads the
+/// shard, and how many the numbering worker numbers on one shard in one pass.
+/// A read right after a write returns the write's record unless the shard
+/// holds more pending records than this. The rest are numbered later, by the
+/// next read or the worker, after every number already visible.
+const NUMBER_LIMIT: u64 = 10_000;
+
+/// Lock a shard's row for a numbering transaction, waiting for another
+/// numbering of the same shard to commit. `$2` is the table the shard must
+/// belong to, or NULL for any.
+const LOCK_SHARD: &str = "SELECT 1 FROM stream_shards \
+     WHERE shard_id = $1 AND ($2::text IS NULL OR table_id = $2) FOR NO KEY UPDATE";
+
+/// [`LOCK_SHARD`] without the wait: no row when the shard is being numbered.
+const LOCK_SHARD_SKIP_LOCKED: &str = "SELECT 1 FROM stream_shards \
+     WHERE shard_id = $1 AND ($2::text IS NULL OR table_id = $2) \
+     FOR NO KEY UPDATE SKIP LOCKED";
+
+/// Move up to `$2` of shard `$1`'s committed records from `stream_pending` to
+/// `stream_records`. The batch is the records with the lowest `id`. It draws
+/// one `stream_seq` value for each, sorts the values, and gives them out in
+/// `id` order, so a record stored later gets a higher number. The number goes
+/// in the `sequence_number` column and in the record's `SequenceNumber`.
+const NUMBER_PENDING: &str = "\
+    WITH batch AS MATERIALIZED ( \
+        SELECT id, table_id, event_name, record_data, created_at FROM stream_pending \
+        WHERE shard_id = $1 ORDER BY id LIMIT $2 \
+    ), ranked AS ( \
+        SELECT batch.*, row_number() OVER (ORDER BY id) AS rn FROM batch \
+    ), numbers AS MATERIALIZED ( \
+        SELECT lpad(n::text, 21, '0') AS seq, row_number() OVER (ORDER BY n) AS rn \
+        FROM (SELECT nextval('stream_seq') AS n FROM batch) drawn \
+    ), moved AS ( \
+        DELETE FROM stream_pending p USING batch WHERE p.shard_id = $1 AND p.id = batch.id \
+    ) \
+    INSERT INTO stream_records \
+        (sequence_number, shard_id, table_id, event_name, record_data, created_at) \
+    SELECT numbers.seq, $1, ranked.table_id, ranked.event_name, \
+        jsonb_set(ranked.record_data, '{dynamodb,SequenceNumber}', to_jsonb(numbers.seq)), \
+        ranked.created_at \
+    FROM ranked JOIN numbers USING (rn)";
+
 impl PostgresEngine {
+    /// Give up to [`NUMBER_BATCH`] of a shard's committed records in
+    /// `stream_pending` their sequence numbers and move them to
+    /// `stream_records`, in one transaction. Returns how many moved, or `None`
+    /// when the shard was not numbered: it is gone, it belongs to another
+    /// table than `table_id`, or, with `wait` false, another transaction is
+    /// numbering it.
+    ///
+    /// A write stores its record in `stream_pending` with no number
+    /// (`write_stream_record_in_tx`), and the record is numbered here once the
+    /// write has committed. That is what keeps a reader from passing a record
+    /// (#808). The transaction holds the shard's row `FOR NO KEY UPDATE` until
+    /// it commits, so the numberings of one shard run one after another, each
+    /// after the previous one committed. `stream_seq` keeps no values cached
+    /// per session (CACHE 1, as the baseline creates it), so it hands out
+    /// values in the order of the calls across all sessions, and every number
+    /// drawn here is higher than every number an earlier numbering of the
+    /// shard committed. The batch holds the records committed when the
+    /// statement starts, after the lock is granted, and a write that commits
+    /// later is numbered by a later call, with a higher number still. Two
+    /// writes to one item take the item's row lock in turn, so the second
+    /// stores its record after the first commits, with a higher `id`, and it
+    /// is numbered after the first.
+    ///
+    /// A writer locks the shard's row only `FOR KEY SHARE`, through the
+    /// foreign key of its insert, and that mode does not conflict with
+    /// `FOR NO KEY UPDATE`: writers never wait for a numbering, and a
+    /// numbering does not wait for writers.
+    ///
+    /// The transaction is READ COMMITTED whatever the database's default, so
+    /// the batch is read with a snapshot taken after the lock is granted.
+    /// Under REPEATABLE READ the snapshot would date from before the wait for
+    /// the lock, the batch would hold records that the numbering waited for
+    /// had already moved, and the delete would fail with a serialization
+    /// error.
+    async fn number_shard_batch(
+        &self,
+        shard_id: &str,
+        table_id: Option<&str>,
+        wait: bool,
+    ) -> Result<Option<u64>, StorageError> {
+        let internal = |e: sqlx::Error| StorageError::Internal(e.to_string());
+        let mut tx = self
+            .data_pool
+            .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
+            .await
+            .map_err(internal)?;
+        let locked: Option<i32> = sqlx::query_scalar(if wait {
+            LOCK_SHARD
+        } else {
+            LOCK_SHARD_SKIP_LOCKED
+        })
+        .bind(shard_id)
+        .bind(table_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(internal)?;
+        if locked.is_none() {
+            return Ok(None);
+        }
+        let moved = sqlx::query(NUMBER_PENDING)
+            .bind(shard_id)
+            .bind(NUMBER_BATCH)
+            .execute(&mut *tx)
+            .await
+            .map_err(internal)?
+            .rows_affected();
+        tx.commit().await.map_err(internal)?;
+        Ok(Some(moved))
+    }
+
+    /// Number the shard's committed pending records before a read of it, up
+    /// to [`NUMBER_LIMIT`], waiting for a numbering already running on the
+    /// shard. A read then returns every record whose write committed before
+    /// it started. With nothing pending this costs one indexed `EXISTS`.
+    async fn number_before_read(
+        &self,
+        shard_id: &str,
+        table_id: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let mut numbered = 0;
+        while numbered < NUMBER_LIMIT {
+            let pending: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM stream_pending WHERE shard_id = $1)",
+            )
+            .bind(shard_id)
+            .fetch_one(&self.data_pool)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            if !pending {
+                break;
+            }
+            match self.number_shard_batch(shard_id, table_id, true).await? {
+                Some(n) if n == NUMBER_BATCH.unsigned_abs() => numbered += n,
+                _ => break,
+            }
+        }
+        Ok(())
+    }
+
+    /// Number the committed pending records of every shard that has some, up
+    /// to [`NUMBER_LIMIT`] per shard, skipping a shard that another
+    /// transaction is numbering. The numbering worker runs this, so a shard
+    /// that nobody reads still has its records numbered, and the retention
+    /// sweep trims them as usual. Returns how many records moved.
+    pub(crate) async fn number_pending_stream_records(&self) -> Result<u64, StorageError> {
+        let shards: Vec<String> =
+            sqlx::query_scalar("SELECT DISTINCT shard_id FROM stream_pending")
+                .fetch_all(&self.data_pool)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let mut total = 0;
+        for shard_id in &shards {
+            let mut numbered = 0;
+            while numbered < NUMBER_LIMIT {
+                match self.number_shard_batch(shard_id, None, false).await? {
+                    Some(n) => {
+                        numbered += n;
+                        if n < NUMBER_BATCH.unsigned_abs() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+            total += numbered;
+        }
+        Ok(total)
+    }
+
+    /// [`Self::number_pending_stream_records`], for tests that stand in for
+    /// the numbering worker.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub async fn number_pending_stream_records_for_tests(&self) -> Result<u64, StorageError> {
+        self.number_pending_stream_records().await
+    }
+
     /// Initialize stream shards for a table and set the `stream_label`.
     ///
     /// Updates the stream label in the catalog (via the provided catalog
@@ -47,10 +231,14 @@ impl PostgresEngine {
         &self,
         retention_hours: i64,
     ) -> Result<u64, StorageError> {
+        // A record still in stream_pending counts as one of the table's
+        // records: deleting the shard would take it with it, through the
+        // foreign key's cascade, before the numbering worker numbers it.
         let candidates: Vec<String> = sqlx::query_scalar(
             "SELECT DISTINCT s.table_id FROM stream_shards s \
              WHERE s.created_at < NOW() - make_interval(hours => $1::integer) \
-               AND NOT EXISTS (SELECT 1 FROM stream_records r WHERE r.table_id = s.table_id)",
+               AND NOT EXISTS (SELECT 1 FROM stream_records r WHERE r.table_id = s.table_id) \
+               AND NOT EXISTS (SELECT 1 FROM stream_pending p WHERE p.table_id = s.table_id)",
         )
         .bind(retention_hours)
         .fetch_all(&self.data_pool)
@@ -77,7 +265,8 @@ impl PostgresEngine {
         // once none of its records remain.
         let result = sqlx::query(
             "DELETE FROM stream_shards s WHERE s.table_id = ANY($1) \
-               AND NOT EXISTS (SELECT 1 FROM stream_records r WHERE r.table_id = s.table_id)",
+               AND NOT EXISTS (SELECT 1 FROM stream_records r WHERE r.table_id = s.table_id) \
+               AND NOT EXISTS (SELECT 1 FROM stream_pending p WHERE p.table_id = s.table_id)",
         )
         .bind(&gone)
         .execute(&self.data_pool)
@@ -186,11 +375,13 @@ impl StreamEngine for PostgresEngine {
                 record.dynamodb.approximate_creation_date_time,
             )
             .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+            // Like a record a write stores in its transaction, this one is
+            // numbered after it commits (`number_shard_batch`), and the
+            // sequence number it carries is replaced then (#808).
             sqlx::query(
-                "INSERT INTO stream_records (sequence_number, shard_id, table_id, event_name, record_data, created_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6)",
+                "INSERT INTO stream_pending (shard_id, table_id, event_name, record_data, created_at) \
+                 VALUES ($1, $2, $3, $4, $5)",
             )
-            .bind(&record.dynamodb.sequence_number)
             .bind(&shard_id)
             .bind(&table_id)
             .bind(format!("{:?}", record.event_name))
@@ -242,6 +433,11 @@ impl StreamEngine for PostgresEngine {
             let Some((table_id, table_label)) = table else {
                 return Err(extenddb_storage::util::stream_does_not_exist());
             };
+
+            // Number the shard's committed records first, so the page holds
+            // every write that committed before this read. Only the named
+            // table's shard is numbered.
+            self.number_before_read(&shard_id, Some(&table_id)).await?;
 
             let rows: Vec<(String, Option<serde_json::Value>)> = if let Some(after) = after_sequence
             {
@@ -605,6 +801,10 @@ impl StreamEngine for PostgresEngine {
     ) -> BoxFuture<'_, Result<Option<String>, StorageError>> {
         let shard_id = shard_id.to_string();
         Box::pin(async move {
+            // A LATEST iterator starts after every record whose write has
+            // committed, so those are numbered first. A write still open is
+            // numbered later with a higher number, and the iterator returns it.
+            self.number_before_read(&shard_id, None).await?;
             let row: Option<(String,)> = sqlx::query_as(
                 "SELECT sequence_number FROM stream_records \
                  WHERE shard_id = $1 ORDER BY sequence_number DESC LIMIT 1",

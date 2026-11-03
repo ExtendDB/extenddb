@@ -402,7 +402,7 @@ The PostgreSQL implementation makes backend-specific choices. These are implemen
 
 2. **Transaction isolation**: the PostgreSQL backend runs `transact_write_items` at `READ COMMITTED` and makes it serializable with locks held until commit: `SELECT ... FOR UPDATE` on every item that exists, and a reserved unique key on every item that a ConditionCheck or Delete finds missing. Your backend needs equivalent isolation guarantees.
 
-3. **Sequence generation** — stream sequence numbers use PostgreSQL sequences (`nextval`). Your backend needs a monotonic counter mechanism.
+3. **Sequence generation**: stream sequence numbers come from a PostgreSQL sequence (`nextval`), drawn after the write commits. A write stores its record in `stream_pending`, and a numbering step moves a shard's committed records to `stream_records` in the order they were stored, one numbering of a shard at a time; GetRecords and a `LATEST` iterator run it on their shard before they read. A number drawn inside the write's transaction could commit after a higher number that a consumer had already read past. Your backend needs numbers that become visible on each shard in increasing order: once a consumer has read a number, no record with a lower number may appear on that shard later ([RFC-0003](../rfcs/0003-backend-acceptance-criteria.md), criterion 5.2).
 
 4. **CASCADE deletes** — account deletion cascades through foreign keys. Your backend needs equivalent cascade logic (can be application-level).
 

@@ -137,6 +137,10 @@ pub fn migration(id: MigrationId) -> Migration<MongoStores> {
                 m0005_drop_continuous_backups::SOURCE,
             )],
         },
+        MigrationId::StreamPending => Migration::NotApplicable(
+            "a MongoDB write draws its stream sequence number from its shard's counter inside its \
+             transaction, so the records of a shard commit in number order",
+        ),
     }
 }
 

@@ -164,12 +164,12 @@ async fn every_released_catalog_upgrades_to_the_definitions_of_a_fresh_install()
             panic!("{state} is not behind");
         };
         assert_eq!(version, None, "{state} has no ledger");
-        assert_eq!(pending.len(), 6, "{state}");
+        assert_eq!(pending.len(), 7, "{state}");
         let report = d.migrate().await.expect("migrate");
-        assert_eq!((report.from, report.to), (None, Some(5)), "{state}");
+        assert_eq!((report.from, report.to), (None, Some(6)), "{state}");
         assert_eq!(
             d.status().await,
-            CatalogStatus::Current { version: 5 },
+            CatalogStatus::Current { version: 6 },
             "{state}"
         );
 
@@ -401,7 +401,7 @@ async fn a_reconverge_leaves_policies_written_after_migration_2_as_they_are() {
             .any(|n| n.starts_with("Skipped 2 resource_tag_condition_keys:")),
         "{report:?}"
     );
-    assert_eq!(d.status().await, CatalogStatus::Current { version: 5 });
+    assert_eq!(d.status().await, CatalogStatus::Current { version: 6 });
     assert_eq!(
         documents(Deployment::documents(&d.catalog(), "iam_policies").await),
         before

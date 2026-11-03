@@ -708,6 +708,13 @@ impl ServerRuntimeHooks for PostgresRuntimeHooks {
             workers::stream_record_cleanup_worker(storage_for_stream, metrics, token).await;
         });
 
+        // 3b. Stream record numbering worker
+        let storage_for_numbering = self.engine.clone();
+        let token = ctx.shutdown.clone();
+        let stream_numbering = tokio::spawn(async move {
+            workers::stream_record_numbering_worker(storage_for_numbering, token).await;
+        });
+
         // 4. Idempotency token cleanup worker
         let storage_for_token = self.engine.clone();
         let metrics = ctx.metrics.clone();
@@ -760,6 +767,7 @@ impl ServerRuntimeHooks for PostgresRuntimeHooks {
             control_plane,
             table_size,
             stream_cleanup,
+            stream_numbering,
             idempotency_cleanup,
             ttl,
             vector_builds,

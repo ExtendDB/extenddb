@@ -106,6 +106,10 @@ pub fn migration(id: MigrationId) -> Migration<SqliteStores> {
                 "0005_drop_continuous_backups.sql"
             )],
         },
+        MigrationId::StreamPending => Migration::NotApplicable(
+            "SQLite runs one writer at a time, so its stream records commit in the order of \
+             their sequence numbers",
+        ),
     }
 }
 

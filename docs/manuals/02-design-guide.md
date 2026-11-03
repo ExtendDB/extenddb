@@ -40,6 +40,7 @@ On PostgreSQL, the data database connection string is stored in the catalog's `s
 | `encryption_keys` | AES-256-GCM key used to encrypt access key secrets. |
 | `stream_shards` | Stream shard metadata (parent shard, sequence range). |
 | `stream_records` | Stream change records with 24-hour retention. |
+| `stream_pending` | Stream records that wait for their sequence number. A write stores its record here, and the record moves to `stream_records` once the write has committed. |
 
 ### Data Tables
 
@@ -135,6 +136,8 @@ Credential lookups (access key ID → decrypted secret) go through each server's
 ### Record Capture
 
 Stream records are captured atomically with data writes. The engine constructs a `StreamCapture` struct with metadata (stream ARN, view type, shard ID, sequence number, keys). The storage backend persists the stream record in the same PostgreSQL transaction as the data write.
+
+On PostgreSQL the record waits in `stream_pending`, with no sequence number, until the write commits. GetRecords and a `LATEST` shard iterator first number the committed records of the shard they read, in the order the writes stored them, and every 250 ms a background worker numbers the committed records of every shard, so the records of a shard that nobody reads are numbered too. A number drawn inside the write's transaction could commit after a higher number that a consumer had already read past, and that consumer would never receive the record.
 
 For UpdateItem, the `new_image` is not known until after `apply_update` runs inside the transaction, so the storage backend constructs the full `StreamRecord` after the update.
 
