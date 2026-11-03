@@ -551,13 +551,21 @@ impl MongoEngine {
                         .upsert(true)
                         .return_document(ReturnDocument::Before)
                         .build();
-                    // Same create race as the fast path above: a
-                    // duplicate-key error means another put created the
-                    // item first. Run the transaction again, so that it
-                    // finds that item, replaces it, and removes its index
-                    // entries and records it as the stream old image. A
-                    // lost create race uses the same retry budget and
-                    // backoff as a write conflict.
+                    // A put that loses the create race to another put does
+                    // not reach the duplicate-key arm here. Inside a
+                    // snapshot transaction MongoDB 7.0 reports that
+                    // collision as WriteConflict (code 112,
+                    // `WiredTigerIdIndex::_insert: index: _id_`) with the
+                    // TransientTransactionError label, whether the other
+                    // put is still open or committed after this
+                    // transaction's snapshot, and `TxErr::from` retries it.
+                    // The arm is a defence: a duplicate-key error here means
+                    // a document in this transaction's snapshot holds the
+                    // item's `_id` without matching the key filter. It runs
+                    // the transaction again with the retry budget and
+                    // backoff of a write conflict, and the put gives up with
+                    // the create race error when every attempt meets that
+                    // document.
                     let old_doc = match coll
                         .find_one_and_replace(key_filter.clone(), new_doc)
                         .with_options(opts)
