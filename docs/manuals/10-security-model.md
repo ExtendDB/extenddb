@@ -56,7 +56,63 @@ extenddb uses SigV4 signature verification with a local credential store and IAM
 - Secret keys encrypted with AES-256-GCM using a per-catalog encryption key
 - Encryption key generated during `extenddb init` and stored in the catalog database
 - Console passwords hashed with bcrypt (cost factor 12)
-- No in-process credential cache — every request reads directly from PostgreSQL
+- Credentials and the inputs to authorization are cached in each server's memory; see Credential and Policy Caching below
+
+#### Credential and Policy Caching
+
+Each server keeps in-memory caches between the request path and the catalog database, so that a request does not read the catalog for every credential and policy lookup. The caches hold decrypted credentials (long-term access keys and AssumeRole session credentials), parsed user, group and role inline policies, permissions boundaries, principal tags, resource tags, role-session data, user and role creation times, and each table's key and index definitions. Authorization decisions themselves are not cached: policies are evaluated on every request. Item data is not cached. This section covers the credentials that sign API requests; web console logins are described under Web Console Security.
+
+The caches are on by default and are configured under `[auth.cache]` in `extenddb.toml` (see the Admin Guide):
+
+| Setting | Default | Effect |
+|---------|---------|--------|
+| `enabled` | `true` | `false` makes every lookup read the catalog |
+| `ttl_seconds` | `60` | The oldest a cached entry can be when it is used. Must be greater than 0 |
+| `soft_ttl_seconds` | `30` | After this age an entry is still used, and a background read replaces it. Must not exceed `ttl_seconds` |
+| `negative_ttl_seconds` | `5` | How long an empty answer is cached: an unknown access key ID, a missing table, or a principal with no policies, boundary or tags. Must not exceed `ttl_seconds` |
+| `max_entries` | `10000` | Entries per cache; beyond this, entries are evicted. Must be greater than 0 |
+
+These settings, whether set in the file or through `EXTENDDB__AUTH__CACHE__*` environment variables, are read at startup; changing them takes a restart. A server whose settings break one of the limits above refuses to start.
+
+**How a change reaches the cache.** A change made on a server through the management API, the web console, or one of the DynamoDB operations named below takes effect on that server immediately. Deleting an access key, user or role, changing an inline policy, permissions boundary, group membership or a user's or role's tags, and calling `TagResource` or `UntagResource` drop the cached entries they affect before the call returns. `CreateTable`, `UpdateTable`, `DeleteTable`, `RestoreTableFromBackup` and `ImportTable` drop the table's key and index definitions, and `CreateTable` and `DeleteTable` also drop its tags. There are two exceptions. If a group change cannot list the group's members, the server logs a warning and those members' entries wait for `ttl_seconds`. The console's Delete user and Delete role do not drop the principal's cached creation time, so a user or role created again with the same name within `ttl_seconds` resolves to the old `aws:userid`, and a condition on `aws:userid` matches the old id in that window (#787). Every other change is seen when the cached entry is next refreshed or expires, within `ttl_seconds`. That covers:
+
+- a change made on one server, as seen by the other servers that serve the same catalog;
+- a change written to the catalog database directly rather than through a server.
+
+On those servers, a change to something that was cached as present (an access key, or a principal's existing policies, boundary or tags) takes up to `ttl_seconds` to arrive. A change to something that was cached as empty (a principal's first policy, boundary or tag) arrives within `negative_ttl_seconds`, because that is how long an empty answer is kept. Running more than one server on a catalog is not supported in this release (see the Deployment Guide); on SQLite, on Unix with the database on a local filesystem, a second server refuses to start. A request that has already been authorized when a credential is revoked is not stopped.
+
+**Revoking access at once.** To make a revocation take effect immediately, for example during incident response, take these steps in order.
+
+*Step 1: change the catalog.* Through the management API or console, delete the access key, the user, or the inline policy that grants the access, or remove the user from the group. The server that handles the call applies the change at once.
+
+AssumeRole session credentials (`ASIAEXTENDDB...`) cannot be deleted one at a time, and a session can last up to 12 hours. A session's permissions come from its role's inline policies, so deleting the role's inline policies stops the role's sessions. This affects every session of that role.
+
+*Step 2: flush the other servers.* On every other server that serves the same catalog, flush that server's cache. Run the command on that server's host with that server's config file, so that the CLI connects to that server and trusts its TLS certificate:
+
+```bash
+read -rs EXTENDDB_PASSWORD && export EXTENDDB_PASSWORD   # the admin password, not echoed
+extenddb manage --config /path/to/extenddb.toml --user ADMIN_NAME cache invalidate SCOPE
+unset EXTENDDB_PASSWORD
+```
+
+Replace `SCOPE` with the scope for what changed:
+
+| Change | Scope |
+|--------|-------|
+| A deleted access key | `credential --access-key-id <id>` |
+| A deleted account | `account --account-id <id>` |
+| A user's keys, inline policies, boundary or tags, or a deleted user | `user --account-id <id> --user-name <name>` |
+| A role's inline policies, boundary or tags, or a deleted role | `role --account-id <id> --role-name <name>` |
+| A group's inline policy or membership | `group-members --account-id <id> --user-names <name>,<name>` (every member), or `all --yes` |
+| A table's tags (`TagResource`, `UntagResource`) | `resource-tags --arn <table ARN>` |
+| A deleted table, a table created again with the same name, or an updated table | `table-key-info --account-id <id> --table-name <name>`, and for a deleted or recreated table also `resource-tags --arn <table ARN>` |
+| Unsure | `all --yes` |
+
+Without `--endpoint`, the CLI connects to `server.bind_addr` and `server.port` from the config file (`127.0.0.1` when `bind_addr` is `0.0.0.0`). With `--endpoint https://<host>:<port>`, it connects to `<host>`. When TLS is on (`server.tls.enabled`, or an `https://` endpoint), it trusts only the certificate at `server.tls.cert_path` in the config file it reads, and that certificate must cover the address the CLI connects to. The certificate `extenddb init` creates covers `localhost`, `127.0.0.1`, `bind_addr` when it is a specific address, and each name given with `--tls-san`. A CA-signed certificate usually covers none of the first three, so with one use `--endpoint https://<name in the certificate>:<port>`, and make `cert_path` a PEM file that also holds the issuing CA's certificate. Do not use a load balancer's address: each call reaches one server behind it and reports success. The same flush is available to admins at `POST /management/cache/invalidate` and on the console's cache page, and each acts only on the server it reaches.
+
+Instead of flushing, you can restart each server, which starts with empty caches. A server started with `auth.cache.enabled = false` (or `EXTENDDB__AUTH__CACHE__ENABLED=false` in its environment) reads the catalog on every request, at the cost of several catalog queries per request.
+
+Flushing a cache does not revoke anything by itself: it only makes the server read the catalog again, so step 1 comes first. If step 2 is not done and the servers are not restarted, a change made in step 1 reaches the other servers within `ttl_seconds` (60 seconds by default). Lowering `ttl_seconds` shortens that window and adds catalog reads; lower `soft_ttl_seconds` and `negative_ttl_seconds` with it so that neither exceeds it.
 
 ## Authorization
 
@@ -81,7 +137,7 @@ Policy sources collected for evaluation:
 
 - **Unparseable policies deny**: A stored policy that cannot be parsed results in access denied, not silent skip. A corrupted Deny policy still denies; a corrupted Allow policy is treated as absent.
 - **Auth before JSON parse**: SigV4 signature verification runs before the request body is parsed. Invalid signatures are rejected with constant-time comparison before any business logic executes.
-- **Concurrent policy fetching**: Identity policies, group policies, and permissions boundaries are fetched concurrently from PostgreSQL. All must succeed for evaluation to proceed.
+- **Concurrent policy fetching**: Identity policies, group policies, and permissions boundaries are fetched concurrently from the catalog when they are not in the server's cache (see Credential and Policy Caching). All must succeed for evaluation to proceed.
 - **Constant-time rejection for inactive keys**: Inactive or expired access keys are rejected without timing differences that could reveal key existence.
 - **Policy document validation on write**: Policy documents are validated for JSON structure and size-capped (6,144 bytes) when attached via the management API. Invalid documents are rejected before storage.
 - **Expression depth and token limits**: Expression parsing enforces configurable depth (default 150) and token limits (default 4,096) to prevent resource exhaustion.
@@ -234,8 +290,9 @@ Import/export file paths are validated:
 ### Logging
 
 - All logging goes to syslog (no log files with sensitive data on disk)
-- Management operations are audit-logged at WARN level
-- Log messages do not contain credentials, access keys, or item data
+- Some management operations are audit-logged at WARN, with target `extenddb::audit::manage` or `extenddb::audit::settings`: DeleteAdmin, user and role tag changes, AssumeRole (granted and denied), and settings changes. Other management changes, such as creating or deleting users, roles, access keys and policies, are not audit-logged
+- Cache flushes (`cache invalidate`) are logged at INFO with the admin name, the scope and its selectors, so they are not recorded when the log level (`logging.level`, or the `log_level` setting, which overrides it) is `warn` or `error`
+- Log messages do not contain secret keys, passwords, or item data. Access key IDs can appear, for example in cache flush records
 
 ### Default Configuration
 
