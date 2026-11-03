@@ -21,7 +21,7 @@ use extenddb_core::types::{
 };
 use extenddb_storage::error::StorageError;
 
-use super::super::{CONTENTION_DEADLINE, OwnedTransactWriteOp, TRANSIENT_RETRY_ATTEMPTS};
+use super::super::{CONTENTION_DEADLINE, OwnedTransactWriteOp};
 use super::{finish, scratch_engine, table};
 use crate::MongoEngine;
 use crate::data::{data_collection_name, document_to_item, item_to_document};
@@ -486,20 +486,30 @@ async fn live_unconditional_put_that_spends_its_attempt_budget_gives_up_with_a_t
 
     match res {
         Err(StorageError::Transient(msg)) => {
+            // The budget is written out rather than read from
+            // `TRANSIENT_RETRY_ATTEMPTS`, so a change to the constant fails
+            // here instead of changing what the test expects.
             assert_eq!(
                 msg,
-                format!(
-                    "PutItem: the write lost {TRANSIENT_RETRY_ATTEMPTS} attempts to concurrent \
-                     writers; retry the request"
-                )
+                "PutItem: the write lost 1000 attempts to concurrent writers; retry the request"
             );
             println!("the put spent its attempt budget in {elapsed:?}: {msg}");
         }
         other => panic!("want the transient spent-budget error, got: {other:?}"),
     }
+    // The loop made those attempts. `backoff_sleep` sleeps a uniform draw
+    // from 0 to 12.8 ms before all but the first eight attempts, so the
+    // sleeps of 1,000 attempts alone come to about 6.4 s (standard deviation
+    // about 0.12 s), before the 1,000 lock waits. A budget of 50 attempts
+    // sleeps about 0.3 s, and the create-race budget is also 50, so a loop
+    // that one of those ended answers well before this floor.
+    assert!(
+        elapsed >= Duration::from_secs(5),
+        "the put gave up in {elapsed:?}, too soon for 1,000 attempts"
+    );
     // The 1,000 attempts take 9.5 to 12.7 s on a shared host, and the sleeps
-    // alone come to 12.8 s at worst, so the bound here is loose: what it rules
-    // out is a budget that no longer ends the loop at all.
+    // alone come to 12.8 s at worst, so the upper bound is loose: what it
+    // rules out is a budget that no longer ends the loop at all.
     assert!(elapsed < Duration::from_secs(120), "took {elapsed:?}");
     assert_eq!(
         stored_item(&engine, &key_info, "k1").await,

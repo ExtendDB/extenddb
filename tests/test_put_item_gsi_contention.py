@@ -17,7 +17,7 @@ backend to is the contract the retry loop gives: every call answers 200 or 503
 ServiceUnavailable, never 400 TransactionConflictException and never 500; the
 stored item is one writer's item, whole; and the index holds exactly one entry
 for it. These tests fail on a server that reports a lost race to the client as
-a 400 or a 500.
+a 400 or a 500, or that sheds more than half of the puts.
 """
 
 from __future__ import annotations
@@ -42,21 +42,23 @@ SHED = "503 ServiceUnavailable"
 
 
 @pytest.fixture(scope="module")
-def raw_client(endpoint_url):
-    """A client that never retries, so every failure is seen."""
+def raw_clients(endpoint_url):
+    """One client per writer thread, none of which retries, so every failure is seen.
+
+    A botocore client shared by several threads can fail a request with a TLS
+    error under concurrent use. With retries off that error would fail the
+    test, so each writer gets a client of its own.
+    """
     kwargs: dict = {
         "service_name": "dynamodb",
         "region_name": os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
-        "config": Config(
-            retries={"total_max_attempts": 1, "mode": "standard"},
-            max_pool_connections=WRITERS * 2,
-        ),
+        "config": Config(retries={"total_max_attempts": 1, "mode": "standard"}),
     }
     if endpoint_url:
         kwargs["endpoint_url"] = endpoint_url
         if endpoint_url.startswith("https://"):
             kwargs["verify"] = False
-    return boto3.client(**kwargs)
+    return [boto3.client(**kwargs) for _ in range(WRITERS)]
 
 
 @pytest.fixture(scope="module")
@@ -78,14 +80,18 @@ def gsi_table(dynamodb_client):
         yield name
 
 
-def _hammer(client, table: str, pk: str) -> list[str]:
-    """WRITERS threads each put PUTS_PER_WRITER items on `pk`; return the failures."""
+def _hammer(clients: list, table: str, pk: str) -> list[str]:
+    """WRITERS threads each put PUTS_PER_WRITER items on `pk`, each with its own client.
+
+    Returns the failures.
+    """
     start = threading.Barrier(WRITERS, timeout=30)
     failures: list[str] = []
     errors: list[BaseException] = []
     lock = threading.Lock()
 
     def run(i: int):
+        client = clients[i]
         try:
             start.wait()
             for n in range(PUTS_PER_WRITER):
@@ -121,19 +127,23 @@ def _gsi_entries(client, table: str, pk: str) -> list[str]:
 
 
 def test_unconditional_puts_on_one_key_of_a_gsi_table_commit_or_are_shed(
-    dynamodb_client, raw_client, gsi_table
+    dynamodb_client, raw_clients, gsi_table
 ):
     pk = f"hot-{uuid.uuid4().hex[:8]}"
-    failures = _hammer(raw_client, gsi_table, pk)
+    failures = _hammer(raw_clients, gsi_table, pk)
     total = WRITERS * PUTS_PER_WRITER
-    # How many of the contended puts were shed. The count depends on the load
-    # the server is under, so it is reported rather than asserted; what is
-    # asserted is that a shed put is the only failure a caller can get.
-    print(f"{len(failures)} of {total} puts were shed, {total - len(failures)} committed")
+    committed = total - len(failures)
+    # How many of the contended puts were shed depends on the load the server
+    # is under, so the count is reported and only bounded loosely: a shed put
+    # is the only failure a caller can get, and at least half of the puts
+    # commit. A server that gives up at the first conflict sheds nearly every
+    # put of this shape and fails the second check.
+    print(f"{len(failures)} of {total} puts were shed, {committed} committed")
     assert set(failures) <= {SHED}, (
         f"{len(failures)} of {total} puts failed with something other than a shed put: "
         f"{sorted(set(failures))}"
     )
+    assert committed >= total // 2, f"only {committed} of {total} puts committed"
     final = dynamodb_client.get_item(
         TableName=gsi_table, Key={"pk": {"S": pk}}, ConsistentRead=True
     )["Item"]
