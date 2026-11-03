@@ -29,9 +29,11 @@ use extenddb_core::types::{
 };
 use extenddb_core::validation::validate_create_table;
 use extenddb_storage::error::StorageError;
+use extenddb_storage::migrations::Runner;
 use extenddb_storage::{
     BackupEngine, DataEngine, RestoreRequest, RestoreTableOverrides, TableEngine,
 };
+use extenddb_storage_postgres::migrations::{PostgresMigrations, PostgresTarget};
 use extenddb_storage_postgres::{PostgresConfig, PostgresEngine};
 use futures::FutureExt;
 use sqlx::PgPool;
@@ -121,9 +123,22 @@ impl Drop for DbGuard {
     }
 }
 
+/// The server's base URL, or `None` to skip. With `EXTENDDB_TEST_PG_REQUIRED`
+/// set to any value but `0`, a job that must reach a server fails here
+/// instead.
 fn base_conn() -> Option<String> {
-    let conn = std::env::var("EXTENDDB_TEST_PG_CONNECTION_STRING").ok()?;
-    (!conn.trim().is_empty()).then(|| conn.trim_end_matches('/').to_owned())
+    let conn = std::env::var("EXTENDDB_TEST_PG_CONNECTION_STRING").unwrap_or_default();
+    if conn.trim().is_empty() {
+        let required =
+            std::env::var("EXTENDDB_TEST_PG_REQUIRED").is_ok_and(|v| !v.is_empty() && v != "0");
+        assert!(
+            !required,
+            "EXTENDDB_TEST_PG_CONNECTION_STRING is not set, and EXTENDDB_TEST_PG_REQUIRED says \
+             this job must reach a PostgreSQL server"
+        );
+        return None;
+    }
+    Some(conn.trim_end_matches('/').to_owned())
 }
 
 async fn connect(url: &str) -> PgPool {
@@ -132,15 +147,6 @@ async fn connect(url: &str) -> PgPool {
         .connect(url)
         .await
         .expect("connect to a scratch database")
-}
-
-async fn apply(pool: &PgPool, migrations: &[&str]) {
-    for sql in migrations {
-        sqlx::raw_sql(sql)
-            .execute(pool)
-            .await
-            .expect("apply a shipped migration");
-    }
 }
 
 async fn scratch() -> Scratch {
@@ -168,35 +174,31 @@ async fn scratch_with_pool(pool_size: u32) -> Scratch {
     }
     let catalog_url = format!("{base}/{catalog_name}");
     let data_url = format!("{base}/{data_name}");
+    // A fresh install, migrated by the runner as `init` does.
+    let target = PostgresTarget::new(catalog_url.parse().expect("a postgres URL"), &data_name)
+        .with_data_connection_row(&data_url);
+    let runner = PostgresMigrations::open_unlocked(&target)
+        .await
+        .expect("open the migration runner");
+    Runner::new(&runner, "test")
+        .migrate()
+        .await
+        .expect("migrate the scratch databases");
+    runner.close().await;
     let catalog = connect(&catalog_url).await;
     let db = connect(&data_url).await;
-    apply(
-        &catalog,
-        &[
-            include_str!("../migrations/001_schema.sql"),
-            include_str!("../migrations/002_vector_indexes.sql"),
-            include_str!("../migrations/003_backup_definitions.sql"),
-        ],
-    )
-    .await;
-    apply(
-        &db,
-        &[
-            include_str!("../data_migrations/001_data_schema.sql"),
-            include_str!("../data_migrations/002_gsi_pending.sql"),
-            include_str!("../data_migrations/003_idempotency_account_scope.sql"),
-            include_str!("../data_migrations/004_vector_index_state.sql"),
-        ],
-    )
-    .await;
-    sqlx::query("UPDATE settings SET value = '0' WHERE key = 'control_plane_delay_seconds'")
+    for key in ["control_plane_delay_seconds", "index_propagation_delay_ms"] {
+        // Zero: no control-plane delay, and synchronous index propagation,
+        // as no queue worker runs here.
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES ($1, '0') \
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(key)
         .execute(&catalog)
         .await
-        .expect("pin the control-plane delay to zero");
-    sqlx::query("UPDATE settings SET value = '0' WHERE key = 'index_propagation_delay_ms'")
-        .execute(&catalog)
-        .await
-        .expect("make index propagation synchronous, as no queue worker runs here");
+        .expect("set a delay to zero");
+    }
     sqlx::query(
         "INSERT INTO settings (key, value) VALUES ('data_database_connection_string', $1) \
          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
@@ -1372,8 +1374,8 @@ async fn simultaneous_restores_of_one_backup_admit_exactly_one() {
 }
 
 /// A backup taken before catalog 0.0.4 has no definition row. Rolling the
-/// catalog back to that shape, replaying migration 003 twice (as an upgrade
-/// interrupted between applying and recording it would), and restoring must
+/// catalog back to that shape, replaying migration 1's catalog file twice
+/// (as a rerun after an interrupted upgrade would), and restoring must
 /// give the table as restores did before: keys and items, no secondary
 /// indexes, and 5/5 throughput for a provisioned table.
 #[tokio::test]
@@ -1393,18 +1395,20 @@ async fn pre_0_0_4_backup_restores_after_migrating() {
         .execute(&s.catalog)
         .await
         .expect("roll the catalog back to 0.0.3");
+    // Migration 1's catalog file, twice, as a rerun after an interrupted
+    // upgrade runs it.
     for _ in 0..2 {
-        sqlx::raw_sql(include_str!("../migrations/003_backup_definitions.sql"))
+        sqlx::raw_sql(include_str!("../migrations/0001_baseline.sql"))
             .execute(&s.catalog)
             .await
-            .expect("apply migration 003");
+            .expect("apply migration 1");
     }
-    let version: String =
-        sqlx::query_scalar("SELECT value FROM settings WHERE key = 'catalog_version'")
+    let recreated: bool =
+        sqlx::query_scalar("SELECT to_regclass('public.backup_definitions') IS NOT NULL")
             .fetch_one(&s.catalog)
             .await
-            .expect("version");
-    assert_eq!(version, "0.0.4");
+            .expect("look up backup_definitions");
+    assert!(recreated);
 
     // A backup taken before 0.0.4 recorded every attribute definition of its
     // table, including those only its GSI and LSI used. It restores with no

@@ -50,7 +50,10 @@
 #     `tag: v*` rule when the tag trigger was removed). A dispatch from any
 #     other ref cannot read the token at all.
 #   Required reviewers: the candidate push must be approved before it happens.
-#   Secrets: DOCKERHUB_USERNAME, DOCKERHUB_TOKEN (Docker Hub PAT, Read/Write).
+#   Secrets: none. The Docker Hub credential is read at run time from AWS
+#     Secrets Manager (extenddb/dockerhub-publish) through the OIDC role
+#     ExtendDBDockerHubPublisher, authorized by the dockerhub environment's
+#     sub claim. No Docker Hub token is stored in GitHub.
 #
 # The backend is a dispatch choice rather than a matrix: a partial failure
 # must not publish one backend's candidate and not the other under the same
@@ -209,6 +212,18 @@ jobs:
           cargo install --locked --version 0.9.0 --features cli cargo-about
           ./devtools/generate-software-license-notices --check \
             --backend '${{ steps.meta.outputs.license_backend }}'
+
+      - name: Gate - the release freezes the catalog migrations it ships
+        # RELEASED_THROUGH must reach the last migration id, so each
+        # backend's checksum test pins every body this tag ships. A tag
+        # before the migration framework has no registry and passes.
+        run: |
+          set -euo pipefail
+          if [[ -e crates/storage/src/migrations/registry.rs ]]; then
+            python3 devtools/check-released-through
+          else
+            echo "the tagged commit has no catalog migration registry"
+          fi
 
   build:
     needs: gate
@@ -372,11 +387,23 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
 
+      - name: Fetch the Docker Hub credential via OIDC (Secrets Manager)
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: arn:aws:iam::975306274793:role/ExtendDBDockerHubPublisher
+          role-session-name: extenddb-dockerhub-release-${{ github.run_id }}
+          aws-region: us-east-1
+      - name: Read the Docker Hub credential from Secrets Manager
+        uses: aws-actions/aws-secretsmanager-get-secrets@2297f9a879480a9e3af9b293ed15c70caf8e1c88 # v3.0.2
+        with:
+          secret-ids: DOCKERHUB,extenddb/dockerhub-publish
+          parse-json-secrets: true
+
       - name: Log in to Docker Hub
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
 
       - name: Push the commit-addressed candidate only
         id: push
