@@ -8,7 +8,7 @@ use super::super::tests::{HASH_ONLY, KEYS, select};
 use super::*;
 
 /// The refusal an ORDER BY gets on a target keyed on `keys`, a table when
-/// `table` is set.
+/// `table` is set: of its terms, then of the WHERE it reads.
 fn refusal(sql: &str, keys: KeyNames<'_>, table: bool) -> Option<String> {
     let s = select(sql);
     let value_of = |op: &Operand| bound_value(op, &[]).cloned();
@@ -16,15 +16,18 @@ fn refusal(sql: &str, keys: KeyNames<'_>, table: bool) -> Option<String> {
         .where_clause
         .as_ref()
         .map(|w| WhereAnalysis::new(w, keys, &value_of));
-    check_order_by(
-        s.order_by.as_ref(),
-        analysis.as_ref(),
-        keys,
-        table,
-        &value_of,
-    )
-    .err()
-    .map(|e| e.message().to_owned())
+    check_order_by_terms(s.order_by.as_ref(), keys)
+        .and_then(|()| {
+            check_order_by_reads(
+                s.order_by.as_ref(),
+                analysis.as_ref(),
+                keys,
+                table,
+                &value_of,
+            )
+        })
+        .err()
+        .map(|e| e.message().to_owned())
 }
 
 const ATTRIBUTE: &str = "in ORDER BY clause must be part of the primary key";

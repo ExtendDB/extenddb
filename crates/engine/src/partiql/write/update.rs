@@ -17,6 +17,7 @@ use super::{
     split_key_where,
 };
 use crate::create_table::storage_err_to_dynamo;
+use crate::partiql::authorize::Gate;
 use crate::partiql::{SingleRequest, common, item_depth};
 use crate::{DispatchResult, OperationContext, handle_update_item};
 
@@ -24,11 +25,14 @@ use crate::{DispatchResult, OperationContext, handle_update_item};
 
 pub(super) async fn run_update(
     ctx: &OperationContext,
-    update: UpdateStatement,
+    update: &UpdateStatement,
     req: &SingleRequest,
+    gate: &mut Gate<'_>,
 ) -> Result<DispatchResult, DynamoDbError> {
-    let parts = build_update_parts(ctx, &update, &req.parameters).await?;
-    if item_depth::sets_a_value_past_the_item_limit(&update, &req.parameters)
+    let parts = build_update_parts(ctx, update, &req.parameters).await?;
+    // The item check below reads the item.
+    gate.pass().await?;
+    if item_depth::sets_a_value_past_the_item_limit(update, &req.parameters)
         && let Some(err) = item_depth::unwritable_update_error(ctx, &parts, req).await
     {
         return Err(crate::partiql::bare_expression_error(err));
@@ -59,7 +63,7 @@ pub(super) async fn run_update(
     let mut result = handle_update_item(body, ctx)
         .await
         .map_err(crate::partiql::bare_expression_error)?;
-    crate::partiql::returning::project_modified(&mut result.body, &update)?;
+    crate::partiql::returning::project_modified(&mut result.body, update)?;
     reshape(result)
 }
 

@@ -14,17 +14,20 @@ use extenddb_core::types::AttributeValue;
 use super::expr_builder::ExprBuilder;
 use super::{key_names, reshape, resolve_av, to_json, validate_insert_keys};
 use crate::create_table::storage_err_to_dynamo;
-use crate::partiql::{SingleRequest, item_depth};
+use crate::partiql::authorize::Gate;
+use crate::partiql::{SingleRequest, common, item_depth};
 use crate::{DispatchResult, OperationContext, handle_put_item};
 
 // --- INSERT ---------------------------------------------------------------
 
 pub(super) async fn run_insert(
     ctx: &OperationContext,
-    insert: InsertStatement,
+    insert: &InsertStatement,
     req: &SingleRequest,
+    gate: &mut Gate<'_>,
 ) -> Result<DispatchResult, DynamoDbError> {
-    let parts = build_insert_parts(ctx, &insert, &req.parameters).await?;
+    let parts = build_insert_parts(ctx, insert, &req.parameters).await?;
+    gate.pass().await?;
     let mut body = json!({
         "TableName": parts.table,
         "Item": parts.item,
@@ -70,10 +73,11 @@ pub(crate) async fn build_insert_parts(
         .map_err(storage_err_to_dynamo)?;
 
     // Build the item from the VALUE map, resolving `?` parameters to their typed
-    // AttributeValues.
+    // AttributeValues. The values are the ones authorization read the key
+    // from (see `common::insert_values`).
     let mut item: BTreeMap<String, AttributeValue> = BTreeMap::new();
-    for (name, operand) in &insert.value {
-        item.insert(name.clone(), resolve_av(operand, params)?);
+    for (name, operand) in common::insert_values(insert) {
+        item.insert(name.to_owned(), resolve_av(operand, params)?);
     }
 
     // PartiQL names the missing or mistyped key attribute with its own message,

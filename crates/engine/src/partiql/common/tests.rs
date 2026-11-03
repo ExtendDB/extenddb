@@ -139,3 +139,40 @@ fn a_wire_key_value_has_the_type_the_table_defines() {
     // An attribute the table defines no type for takes any value.
     assert!(wire_key_value_matches(&key_info, "sk", &json!({"S": "1"})));
 }
+
+/// An INSERT whose VALUE gives `pk` the values `first` then `last`, built by
+/// hand: the parser refuses such a VALUE.
+fn insert_naming_pk_twice(first: &str, last: &str) -> Statement {
+    let s = |v: &str| Operand::Literal(AttributeValue::S(v.to_owned()));
+    Statement::Insert(InsertStatement {
+        table: "t".to_owned(),
+        value: vec![
+            ("pk".to_owned(), s(first)),
+            ("sk".to_owned(), s("x")),
+            ("pk".to_owned(), s(last)),
+        ],
+    })
+}
+
+#[test]
+fn an_insert_has_one_value_for_each_name_the_last_given() {
+    let stmt = insert_naming_pk_twice("a", "b");
+    let Statement::Insert(insert) = &stmt else {
+        unreachable!("built as an INSERT");
+    };
+    let values = insert_values(insert);
+    assert_eq!(values.len(), 2);
+    assert_eq!(
+        values.get("pk"),
+        Some(&&Operand::Literal(AttributeValue::S("b".to_owned())))
+    );
+    // The key the duplicate check reads is the one the item stores.
+    let key = write_key(&stmt, "pk", Some("sk"), &[]).unwrap().unwrap();
+    assert_eq!(
+        key,
+        json!({"pk": {"S": "b"}, "sk": {"S": "x"}})
+            .as_object()
+            .unwrap()
+            .clone()
+    );
+}

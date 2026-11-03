@@ -84,6 +84,7 @@ fn a_transaction_takes_the_item_check_path_only_for_a_value_it_stores() {
         let req = SingleRequest {
             statement: String::new(),
             parameters: vec![deep(levels)],
+            parameter_numbers: vec![None],
             consistent_read: false,
             limit: None,
             next_token: None,

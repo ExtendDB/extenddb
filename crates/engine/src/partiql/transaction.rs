@@ -17,6 +17,15 @@
 //! PartiQL statement into the corresponding transact member, cancels the write
 //! form with positional reasons when a member cannot be translated against its
 //! table, and remaps two error strings the PartiQL surface words differently.
+//!
+//! The members are authorized after the checks of their form (see
+//! `authorize_members`). In an all-read transaction, a member on a table
+//! that exists and that reads an index, or does not name the full primary
+//! key, fails the request before any member is authorized, as the form of
+//! an EXISTS member, an EXISTS on an index and a `BatchExecuteStatement`
+//! read without the full primary key do (measured 2026-11-03 for a caller
+//! that may not run them). For these two refusals of a read transaction the
+//! order against authorization is not measured.
 
 use serde_json::{Map, Value, json};
 
@@ -27,12 +36,12 @@ use extenddb_core::partiql::parser::parse_for_request;
 use extenddb_core::types::CancellationReason;
 
 use super::common;
-use super::{SingleRequest, item_depth, write};
+use super::{SingleRequest, authorize, item_depth, write};
 use crate::{
     DispatchResult, OperationContext, handle_transact_get_items, handle_transact_write_items,
 };
 
-use members::{build_write_member, check_parameter_count, member_reason};
+use members::{build_write_member, check_exists_form, check_parameter_count, member_reason};
 
 mod members;
 
@@ -124,6 +133,11 @@ pub(super) async fn run(
 }
 
 /// Execute an all-read transaction via `TransactGetItems`.
+///
+/// The members are authorized once their form is checked: after the
+/// refusals of a read of an index and of a read without the full primary
+/// key, which fail the request, and ahead of a missing table and a key
+/// value of the wrong type, which cancel it (see `authorize::gate`).
 async fn run_read(
     ctx: &OperationContext,
     parsed: &[(SingleRequest, Statement)],
@@ -153,6 +167,7 @@ async fn run_read(
         }
     }
     if missing {
+        authorize_members(ctx, parsed).await?;
         return Err(cancellation(reasons));
     }
 
@@ -178,7 +193,10 @@ async fn run_read(
 
         // A multi-part base table key (this engine's preview extension) is
         // refused with the service's multi-attribute message.
-        common::ensure_single_attribute_keys(&key_info.key_schema)?;
+        if let Err(e) = common::ensure_single_attribute_keys(&key_info.key_schema) {
+            authorize_members(ctx, parsed).await?;
+            return Err(e);
+        }
 
         let (pk, sk) = common::key_names(&key_info.key_schema);
         let pk = pk.ok_or_else(|| {
@@ -203,6 +221,7 @@ async fn run_read(
         });
         transact_items.push(json!({ "Get": { "TableName": table, "Key": Value::Object(key) } }));
     }
+    authorize_members(ctx, parsed).await?;
     if key_reasons.iter().any(|reason| reason.code != "None") {
         return Err(cancellation(key_reasons));
     }
@@ -235,6 +254,10 @@ async fn run_write(
     for (i, (req, stmt)) in parsed.iter().enumerate() {
         check_parameter_count(stmt, req.parameters.len(), i)?;
     }
+    for (i, (req, stmt)) in parsed.iter().enumerate() {
+        check_exists_form(ctx, i, stmt, req).await?;
+    }
+    authorize_members(ctx, parsed).await?;
 
     let mut transact_items: Vec<Value> = Vec::with_capacity(parsed.len());
     // Positional record of which members are INSERTs, so a condition failure on
@@ -279,6 +302,41 @@ async fn run_write(
         Ok(result) => Ok(reshape_write(result)),
         Err(e) => Err(remap_write_error(e, &is_insert)),
     }
+}
+
+/// Authorize every member, after the checks of the request and of the
+/// members' form, and before a missing table, a key or a condition fails a
+/// member. When the caller may not run one, the request is cancelled with
+/// one reason per member, `AccessDenied` with the refusal for each refused
+/// member and `None` for the others, and nothing is written (measured
+/// 2026-11-03: a condition that fails beside a refused member has the
+/// reason `None`).
+async fn authorize_members(
+    ctx: &OperationContext,
+    parsed: &[(SingleRequest, Statement)],
+) -> Result<(), DynamoDbError> {
+    let mut reasons = Vec::with_capacity(parsed.len());
+    let mut refused = false;
+    for (req, stmt) in parsed {
+        let key_info = ctx.table_key_info(common::statement_table(stmt)).await.ok();
+        let surface = authorize::Surface::Transaction;
+        match authorize::statement(ctx, stmt, key_info.as_ref(), req, surface).await {
+            Ok(_) => reasons.push(CancellationReason::none()),
+            Err(DynamoDbError::AccessDeniedException(message)) => {
+                refused = true;
+                reasons.push(CancellationReason {
+                    code: "AccessDenied".to_owned(),
+                    message: Some(message),
+                    item: None,
+                });
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    if refused {
+        return Err(cancellation(reasons));
+    }
+    Ok(())
 }
 
 /// The reason a member on a missing table reports.

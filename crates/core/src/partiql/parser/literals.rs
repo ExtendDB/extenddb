@@ -24,6 +24,8 @@ impl Parser {
     }
 
     fn map_members(&mut self, path: &str) -> PResult<BTreeMap<String, AttributeValue>> {
+        // A name given twice is refused at the map's opening brace.
+        let open = self.span();
         self.eat(&TokenKind::LBrace);
         let mut map = BTreeMap::new();
         if !matches!(self.peek().kind, TokenKind::RBrace) {
@@ -37,6 +39,9 @@ impl Parser {
                         )));
                     }
                 };
+                if map.contains_key(&key) {
+                    self.refuse_duplicate_key(&key, path, &open);
+                }
                 self.bump();
                 if !self.eat(&TokenKind::Colon) {
                     return Err(ParseError::well_formed("Expected : in map literal"));
@@ -54,10 +59,13 @@ impl Parser {
         Ok(map)
     }
 
-    /// The top-level `VALUE { ... }` item map, returned as ordered pairs.
+    /// The top-level `VALUE { ... }` item map, returned as ordered pairs. A
+    /// name given twice is refused at its second occurrence (see
+    /// [`Parser::refuse_duplicate_key`]), so the pairs name each attribute
+    /// once.
     pub(super) fn item_map(&mut self) -> PResult<Vec<(String, Operand)>> {
         self.eat(&TokenKind::LBrace);
-        let mut pairs = Vec::new();
+        let mut pairs: Vec<(String, Operand)> = Vec::new();
         if !matches!(self.peek().kind, TokenKind::RBrace) {
             loop {
                 let key = match &self.peek().kind {
@@ -69,6 +77,10 @@ impl Parser {
                         )));
                     }
                 };
+                if pairs.iter().any(|(name, _)| *name == key) {
+                    let second = self.span();
+                    self.refuse_duplicate_key(&key, LITERAL_ROOT, &second);
+                }
                 self.bump();
                 if !self.eat(&TokenKind::Colon) {
                     return Err(ParseError::well_formed("Expected : in item value"));
@@ -266,6 +278,29 @@ impl Parser {
                 self.tokens.get(self.pos + 1).map(|t| &t.kind),
                 Some(TokenKind::Dot | TokenKind::LBracket | TokenKind::LParen)
             )
+    }
+
+    /// Refuse `key`, a key of the map at `path` that a member before it
+    /// already names, at the position `at` (measured 2026-11-03, before the
+    /// statement is authorized and with nothing written):
+    ///
+    /// * at the top level of an INSERT VALUE, the position of the second
+    ///   occurrence, its length the quoted key's: `{'pk': 'd1', 'pk': 'd2',
+    ///   'sk': 's'}` is "Duplicate keys in tuple. Key: pk under root at
+    ///   1:47:4", for the partition key, the sort key and another attribute;
+    /// * in any other map (one nested in a value, a map in a list, a SET
+    ///   value, a WHERE literal), the position of that map's opening `{`,
+    ///   length 1: in `'m': {'y': {'x': 1, 'x': 2}}` the inner `{` with
+    ///   "Key: x under root.y".
+    ///
+    /// Names differing in case are different names. Like the other refusals
+    /// of a literal, it is reported once the statement parses, in its place
+    /// among them; of two maps that each repeat a name, the one whose second
+    /// name comes first is reported (not measured).
+    fn refuse_duplicate_key(&mut self, key: &str, path: &str, at: &str) {
+        self.defer(&format!(
+            "Duplicate keys in tuple. Key: {key} under {path} at {at}"
+        ));
     }
 
     /// Read a name inside a literal, at `path` inside the value: it parses

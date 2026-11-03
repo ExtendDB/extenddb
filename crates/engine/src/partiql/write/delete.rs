@@ -12,6 +12,7 @@ use extenddb_core::types::AttributeValue;
 use super::expr_builder::ExprBuilder;
 use super::{build_condition, invalid_delete_returning, key_names, reshape, split_key_where};
 use crate::create_table::storage_err_to_dynamo;
+use crate::partiql::authorize::Gate;
 use crate::partiql::{SingleRequest, common};
 use crate::{DispatchResult, OperationContext, handle_delete_item};
 
@@ -19,8 +20,9 @@ use crate::{DispatchResult, OperationContext, handle_delete_item};
 
 pub(super) async fn run_delete(
     ctx: &OperationContext,
-    delete: DeleteStatement,
+    delete: &DeleteStatement,
     req: &SingleRequest,
+    gate: &mut Gate<'_>,
 ) -> Result<DispatchResult, DynamoDbError> {
     // DELETE allows only `RETURNING ALL OLD *`; any other form is rejected with
     // the clause named verbatim.
@@ -30,7 +32,8 @@ pub(super) async fn run_delete(
         return Err(invalid_delete_returning(returning));
     }
 
-    let parts = build_delete_parts(ctx, &delete, &req.parameters).await?;
+    let parts = build_delete_parts(ctx, delete, &req.parameters).await?;
+    gate.pass().await?;
 
     let mut body = json!({
         "TableName": parts.table,

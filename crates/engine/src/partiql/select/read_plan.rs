@@ -2,12 +2,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The WHERE checks a SELECT gets before anything is read, and the read plan they lead to.
+//!
+//! The disjuncts held back for a refusal made when they are read, the
+//! caller's authorization refusal among them, share one refusal (see
+//! [`check_reads`]): the last refusal of a check in read order, else an
+//! authorization refusal. A request whose page visits only held-back
+//! disjuncts gets it (measured 2026-11-03 when no disjunct is read, and
+//! when every held-back disjunct is refused for authorization). A page that
+//! visits only a disjunct the caller may not read, while another held-back
+//! disjunct fails a check, gets that check's refusal; that is not measured.
 
 use serde_json::{Map, Value};
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::limits::LimitsConfig;
-use extenddb_core::partiql::ast::{CompareOp, Operand, WhereExpr};
+use extenddb_core::partiql::ast::{CompareOp, Operand, OrderBy, WhereExpr};
 use extenddb_core::partiql::plan::{
     Direction, KeyNames, KeyRead, SortCondition, WhereAnalysis, filter_key_refusal, read_order,
     read_order_in, scalar_key_refusal,
@@ -16,6 +25,7 @@ use extenddb_core::types::{AttributeValue, Item, KeySchemaElement, KeyType, Tabl
 use extenddb_core::validation::validate_key_size_limits;
 
 use super::bound_value;
+use super::order::{check_order_by_reads, check_order_by_terms};
 use crate::partiql::common;
 
 /// How a `SELECT` reaches its rows.
@@ -164,41 +174,80 @@ pub(super) struct Checked<'a, 'b> {
 
 /// The most disjuncts a SELECT read by key may split into (measured
 /// 2026-11-03: `pk IN [...]` with 50 values runs and with 51 values is
-/// refused, on a table and on an index).
-const MAX_DECOMPOSED_READS: u64 = 50;
+/// refused, on a table and on an index). It is also the most partition
+/// values the authorization of a read by key asks about
+/// (`authorize::each_disjunct`), which is safe because a statement with
+/// more disjuncts is refused before it is authorized.
+pub(in crate::partiql) const MAX_DECOMPOSED_READS: usize = 50;
 
-/// Check the keys of a WHERE the way the service does, in its order
-/// (measured 2026-11-02): a path into a key attribute in the filter of a
-/// disjunct read by key, the key values of each disjunct read by key, then
-/// overlapping disjuncts. On a table, a path into a key attribute anywhere
-/// in the WHERE has been refused before this check (see [`run`]).
+/// Check the keys of a WHERE and the ORDER BY of a SELECT the way the
+/// service does, in its order, before anything is read (measured 2026-11-03
+/// for a permitted caller):
+///
+/// 1. a path into a key attribute ("Key attributes must be scalars"): on a
+///    table anywhere in the WHERE, on an index in the filter of a disjunct
+///    read by key;
+/// 2. an ORDER BY term that is not a key attribute (see
+///    `order::check_order_by_terms`);
+/// 3. the key values of each disjunct read by key, in statement order;
+/// 4. the WHERE an ORDER BY reads (see `order::check_order_by_reads`),
+///    with the refusal of more than one partition key value without the
+///    partition key in the list;
+/// 5. overlapping disjuncts;
+/// 6. more than [`MAX_DECOMPOSED_READS`] disjuncts (see
+///    [`check_decomposed`]).
+///
+/// Measured: with `pk.x = 1` the scalar refusal whatever the ORDER BY;
+/// `pk = 1`, `pk IN ['a', 1]` and `pk = 'a' AND sk = 1` with `ORDER BY n`
+/// the term refusal, with `ORDER BY sk` the key type refusal; `(pk = 'a' OR
+/// pk = 'a')` with `ORDER BY n` the term refusal, with `ORDER BY sk` the
+/// overlap refusal; `(pk = 'a' OR pk = 'b' OR pk = 'a') ORDER BY sk` the
+/// refusal of more than one partition key value; `pk IN [51 values]` the
+/// ORDER BY refusals. Whether a WHERE that does not read by key is refused
+/// ahead of a key value of the wrong type is not measured.
 ///
 /// A path into a key attribute is refused at once, naming the first such
 /// disjunct in statement order, ahead of the other refusals and when a later
 /// disjunct makes the statement a scan (measured 2026-11-02: `(pk = 'a' AND
 /// sk.x = 1) OR pk = 'b'` gets the scalar refusal on the first request, as
 /// do `(pk = 'a' AND sk.x = 1) OR (pk = 'a' AND sk = 'y')`, `pk = 1 OR (pk =
-/// 'a' AND sk.x = 1)` and `(pk = 'a' AND sk.x = 1) OR x = 1`).
+/// 'a' AND sk.x = 1)` and `(pk = 'a' AND sk.x = 1) OR x = 1`). The
+/// statement is authorized after these checks: 1, 5 and 6 are made before
+/// authorization and 2, 3 and 4 after it (see `authorize::gate`).
 pub(super) fn check_keys(
-    analysis: &WhereAnalysis<'_>,
+    analysis: Option<&WhereAnalysis<'_>>,
+    order: Option<&OrderBy>,
     keys: KeyNames<'_>,
     key_info: &TableKeyInfo,
+    table: bool,
     params: &[AttributeValue],
     value_of: &dyn Fn(&Operand) -> Option<AttributeValue>,
 ) -> Result<(), DynamoDbError> {
-    if let Some(message) = analysis
-        .reads()
-        .iter()
-        .find_map(|read| scalar_key_refusal(&read.filter, keys))
-    {
+    let path_into_key = analysis.and_then(|analysis| {
+        if table {
+            analysis.path_into_key_refusal(keys)
+        } else {
+            analysis
+                .reads()
+                .iter()
+                .find_map(|read| scalar_key_refusal(&read.filter, keys))
+        }
+    });
+    if let Some(message) = path_into_key {
         return Err(DynamoDbError::ValidationException(message));
     }
-    for read in analysis.reads() {
+    check_order_by_terms(order, keys)?;
+    for read in analysis.map(WhereAnalysis::reads).unwrap_or_default() {
         check_key_read(read, keys, key_info, params)?;
     }
+    check_order_by_reads(order, analysis, keys, table, value_of)?;
+    let Some(analysis) = analysis else {
+        return Ok(());
+    };
     analysis
         .check_overlap(value_of)
-        .map_err(|m| DynamoDbError::ValidationException(m.to_owned()))
+        .map_err(|m| DynamoDbError::ValidationException(m.to_owned()))?;
+    check_decomposed(analysis)
 }
 
 /// Refuse a statement read by key whose WHERE splits into more than
@@ -211,18 +260,23 @@ pub(super) fn check_keys(
 /// refusal made when they are read; it does not count the conditions of a
 /// filter (`pk IN [50 values]` beside 99 comparisons runs), and a statement
 /// with a disjunct that is a scan runs as a scan (`pk IN [51 values] OR x =
-/// 1`). The refusal comes after those of [`check_keys`] and the ORDER BY
-/// refusals, and before the checks a disjunct gets when it is read (see
-/// [`check_reads`]): `pk IN [50 values, <2049 bytes>]` and `pk IN [51
-/// values] AND sk = a` get it.
-pub(super) fn check_decomposed(analysis: &WhereAnalysis<'_>) -> Result<(), DynamoDbError> {
-    if analysis.is_keyed() && analysis.disjunct_count() > MAX_DECOMPOSED_READS {
+/// 1`). The refusal comes last of those of [`check_keys`], and before the
+/// checks a disjunct gets when it is read (see [`check_reads`]): `pk IN [50
+/// values, <2049 bytes>]` and `pk IN [51 values] AND sk = a` get it.
+fn check_decomposed(analysis: &WhereAnalysis<'_>) -> Result<(), DynamoDbError> {
+    if analysis.is_keyed() && analysis.disjunct_count() > MAX_DECOMPOSED_READS as u64 {
         return Err(DynamoDbError::ValidationException(
-            "Too many decomposed read operations for a given query.".to_owned(),
+            TOO_MANY_DECOMPOSED_READS.to_owned(),
         ));
     }
     Ok(())
 }
+
+/// The refusal of a statement read by key with more than
+/// [`MAX_DECOMPOSED_READS`] disjuncts, which comes before the statement is
+/// authorized (measured 2026-11-03).
+pub(in crate::partiql) const TOO_MANY_DECOMPOSED_READS: &str =
+    "Too many decomposed read operations for a given query.";
 
 /// The checks each disjunct of a statement read by key gets when it is read
 /// (see [`read_refusal`]), made once the WHERE has passed [`check_keys`] and
@@ -239,6 +293,14 @@ pub(super) fn check_decomposed(analysis: &WhereAnalysis<'_>) -> Result<(), Dynam
 /// (measured 2026-11-02: `pk = <2049 bytes of z> OR (pk = 'a' AND sk = a)
 /// OR pk = 'b'` gets the key size refusal and `(pk = 'b' AND sk = a) OR (pk
 /// = 'a' AND pk = b) OR pk = 'c'` the filter refusal naming sk).
+///
+/// `denied` gives the authorization refusal of a disjunct the caller may not
+/// read (see `authorize`), which is held back the same way, its refusal
+/// taking the place of the checks here (measured 2026-11-03: a disjunct the
+/// policy refuses that is past the key size limit, or has a filter on a key
+/// attribute, gets AccessDenied). Across disjuncts it ranks below the
+/// refusals of the checks.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn check_reads<'a, 'b>(
     analysis: &'b WhereAnalysis<'a>,
     keys: KeyNames<'_>,
@@ -246,6 +308,7 @@ pub(super) fn check_reads<'a, 'b>(
     limits: &LimitsConfig,
     params: &[AttributeValue],
     value_of: &dyn Fn(&Operand) -> Option<AttributeValue>,
+    denied: &dyn Fn(&KeyRead<'a>) -> Option<DynamoDbError>,
 ) -> Result<Checked<'a, 'b>, DynamoDbError> {
     let checked = Checked {
         keyed: analysis.is_keyed(),
@@ -257,21 +320,34 @@ pub(super) fn check_reads<'a, 'b>(
     if !checked.keyed {
         return Ok(checked);
     }
-    let mut failing: Vec<(&'b KeyRead<'a>, DynamoDbError)> = Vec::new();
+    // Each failing disjunct, its refusal, and whether the refusal is the
+    // authorization's.
+    let mut failing: Vec<(&'b KeyRead<'a>, DynamoDbError, bool)> = Vec::new();
     let mut reads = Vec::with_capacity(checked.reads.len());
     for &read in &checked.reads {
-        match read_refusal(read, keys, target_schema, limits, params) {
-            Some(error) => failing.push((read, error)),
-            None => reads.push(read),
+        if let Some(error) = denied(read) {
+            failing.push((read, error, true));
+        } else if let Some(error) = read_refusal(read, keys, target_schema, limits, params) {
+            failing.push((read, error, false));
+        } else {
+            reads.push(read);
         }
     }
-    let refused: Vec<&'b KeyRead<'a>> = failing.iter().map(|(read, _)| *read).collect();
+    let refused: Vec<&'b KeyRead<'a>> = failing.iter().map(|(read, ..)| *read).collect();
+    // An authorization refusal ranks below the others: the one reported is
+    // the last in read order of the refusals made by the checks, and an
+    // authorization refusal only when every failing disjunct has one
+    // (measured 2026-11-03: under `ForAllValues` LeadingKeys ["a"], `(pk =
+    // 'a' AND sk = a) OR pk = 'b'`, either way round, is refused at once
+    // with the filter refusal of the disjunct the policy allows).
+    let by_checks = failing.iter().any(|(_, _, denied)| !denied);
     // `max_by` keeps the last of equal elements, so disjuncts whose order is
     // unknown are taken in statement order.
     let error = failing
         .into_iter()
+        .filter(|(_, _, denied)| !by_checks || !denied)
         .max_by(|a, b| read_order(a.0, b.0, value_of))
-        .map(|(_, error)| error);
+        .map(|(_, error, _)| error);
     match error {
         None => Ok(checked),
         Some(error) if reads.is_empty() => Err(error),

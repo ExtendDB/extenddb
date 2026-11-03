@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::partiql::Statement;
-use extenddb_core::partiql::ast::{InsertStatement, UpdateStatement};
+use extenddb_core::partiql::ast::{InsertStatement, SelectStatement, UpdateStatement};
 use extenddb_core::types::{AttributeValue, CancellationReason, Item, TableKeyInfo};
 use extenddb_core::validation::validate_item_keys;
 
@@ -26,37 +26,7 @@ pub(super) async fn build_write_member(
     req: &SingleRequest,
 ) -> Result<(Value, bool), DynamoDbError> {
     match stmt {
-        // A condition check through an index is refused with its position
-        // (measured 2026-11-02 on an index the table does not have).
-        Statement::Exists(select) if select.from.index.is_some() => {
-            Err(DynamoDbError::ValidationException(format!(
-                "Validation failed in TransactStatements[{index}]: Operations on indices are \
-                 not supported in transactions"
-            )))
-        }
-        Statement::Exists(select) => {
-            let parts = write::build_exists_parts(ctx, select, &req.parameters)
-                .await?
-                .ok_or_else(|| {
-                    DynamoDbError::ValidationException(format!(
-                        "Validation failed in TransactStatements[{index}]: EXISTS() must \
-                         contain a single item read with additional condition"
-                    ))
-                })?;
-            let mut check = json!({
-                "TableName": parts.table,
-                "Key": Value::Object(parts.key),
-                "ConditionExpression": parts.condition,
-                "ExpressionAttributeNames": Value::Object(parts.names),
-            });
-            if !parts.values.is_empty() {
-                check["ExpressionAttributeValues"] = Value::Object(parts.values);
-            }
-            // A failed check returns no item for `ALL_OLD` (measured
-            // 2026-11-02 with one key value and with two: the reason holds
-            // no item though the item exists).
-            Ok((json!({ "ConditionCheck": check }), false))
-        }
+        Statement::Exists(select) => Ok((exists_member(ctx, index, select, req).await?, false)),
         Statement::Insert(insert) => {
             let parts = write::build_insert_parts(ctx, insert, &req.parameters).await?;
             let mut put = json!({
@@ -107,6 +77,74 @@ pub(super) async fn build_write_member(
             "SELECT routed to the transaction write path".to_owned(),
         )),
     }
+}
+
+/// The `ConditionCheck` member of an `EXISTS` statement at position
+/// `index`.
+///
+/// # Errors
+///
+/// The refusal of a check through an index, and of one that is not a read
+/// of one item with a further condition, naming the position.
+async fn exists_member(
+    ctx: &OperationContext,
+    index: usize,
+    select: &SelectStatement,
+    req: &SingleRequest,
+) -> Result<Value, DynamoDbError> {
+    // A condition check through an index is refused with its position
+    // (measured 2026-11-02 on an index the table does not have).
+    if select.from.index.is_some() {
+        return Err(DynamoDbError::ValidationException(format!(
+            "Validation failed in TransactStatements[{index}]: Operations on indices are \
+             not supported in transactions"
+        )));
+    }
+    let parts = write::build_exists_parts(ctx, select, &req.parameters)
+        .await?
+        .ok_or_else(|| {
+            DynamoDbError::ValidationException(format!(
+                "Validation failed in TransactStatements[{index}]: EXISTS() must \
+                 contain a single item read with additional condition"
+            ))
+        })?;
+    let mut check = json!({
+        "TableName": parts.table,
+        "Key": Value::Object(parts.key),
+        "ConditionExpression": parts.condition,
+        "ExpressionAttributeNames": Value::Object(parts.names),
+    });
+    if !parts.values.is_empty() {
+        check["ExpressionAttributeValues"] = Value::Object(parts.values);
+    }
+    // A failed check returns no item for `ALL_OLD` (measured
+    // 2026-11-02 with one key value and with two: the reason holds
+    // no item though the item exists).
+    Ok(json!({ "ConditionCheck": check }))
+}
+
+/// Refuse an `EXISTS` member at position `index` whose form the service
+/// refuses (see [`exists_member`]), before the members are authorized: a
+/// caller that may not read the table gets the refusal of the form
+/// (measured 2026-11-03). A member on a missing table is left to the checks
+/// made after authorization, as before.
+///
+/// # Errors
+///
+/// The refusal of the member's form.
+pub(super) async fn check_exists_form(
+    ctx: &OperationContext,
+    index: usize,
+    stmt: &Statement,
+    req: &SingleRequest,
+) -> Result<(), DynamoDbError> {
+    let Statement::Exists(select) = stmt else {
+        return Ok(());
+    };
+    if ctx.table_key_info(&select.from.table).await.is_err() {
+        return Ok(());
+    }
+    exists_member(ctx, index, select, req).await.map(|_| ())
 }
 
 /// Carry a statement's per-statement `ReturnValuesOnConditionCheckFailure` onto
@@ -237,13 +275,13 @@ fn insert_key_reason(
     params: &[AttributeValue],
 ) -> Result<Option<CancellationReason>, DynamoDbError> {
     let mut keys = Item::new();
-    for (name, operand) in &insert.value {
+    for (name, operand) in common::insert_values(insert) {
         if key_info
             .key_schema
             .iter()
-            .any(|key| &key.attribute_name == name)
+            .any(|key| key.attribute_name == name)
         {
-            keys.insert(name.clone(), write::resolve_av(operand, params)?);
+            keys.insert(name.to_owned(), write::resolve_av(operand, params)?);
         }
     }
     Ok(

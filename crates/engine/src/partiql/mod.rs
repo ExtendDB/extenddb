@@ -18,6 +18,11 @@
 //! uses from `core`'s error enum, and dropping the feature. With the feature
 //! off the three operations are unknown and answered with
 //! `UnknownOperationException`, exactly as before.
+//!
+//! The server does not authorize these operations before dispatch: each
+//! statement is authorized here, through the request's
+//! [`ItemAuthorizer`](crate::ItemAuthorizer), which is not specific to
+//! PartiQL (see `authorize`).
 
 use std::future::Future;
 use std::sync::Arc;
@@ -35,6 +40,9 @@ use extenddb_core::types::AttributeValue;
 
 use crate::{DispatchResult, OperationContext};
 
+use authorize::{Gate, Surface};
+
+mod authorize;
 mod base_join;
 mod batch;
 mod common;
@@ -46,6 +54,8 @@ mod request_checks;
 mod returning;
 mod select;
 mod snapshot;
+#[cfg(test)]
+mod test_context;
 mod transaction;
 mod write;
 
@@ -90,10 +100,22 @@ impl PartiqlExecutor for OperationContext {
             _ => check_statement(&statement, &req.parameters),
         }
         .map_err(DynamoDbError::ValidationException)?;
-        match statement {
-            Statement::Select(s) => select::run(ctx, s, &req).await,
-            other => write::run(ctx, other, &req).await,
-        }
+        // The statement is authorized against one read of its table, at its
+        // place among the checks (see `authorize::gate`).
+        let (ctx, key_info) =
+            snapshot::pinned_context(ctx, common::statement_table(&statement)).await?;
+        let mut gate = Gate::new(
+            &ctx,
+            &statement,
+            key_info.as_ref(),
+            &req,
+            Surface::Statement,
+        );
+        let result = match &statement {
+            Statement::Select(s) => select::run(&ctx, s, &req, &mut gate).await,
+            other => write::run(&ctx, other, &req, &mut gate).await,
+        };
+        gate.settle(result).await?
     }
 
     async fn batch_execute_statement(&self, body: Value) -> Result<DispatchResult, DynamoDbError> {
@@ -159,6 +181,10 @@ fn translation_context(ctx: &OperationContext) -> OperationContext {
 pub(crate) struct SingleRequest {
     pub statement: String,
     pub parameters: Vec<AttributeValue>,
+    /// The text of each parameter that is a number, as the request sends
+    /// it. `parameters` hold numbers normalized (`10.0` is `10`), and
+    /// `dynamodb:LeadingKeys` keeps the text's scale (see `authorize`).
+    pub parameter_numbers: Vec<Option<String>>,
     pub consistent_read: bool,
     pub limit: Option<i64>,
     pub next_token: Option<String>,
@@ -174,9 +200,20 @@ impl SingleRequest {
             .ok_or_else(|| DynamoDbError::ValidationException("Statement is required".to_owned()))?
             .to_owned();
         let parameters = parse_parameters(body.get("Parameters"))?;
+        let parameter_numbers = body
+            .get("Parameters")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .map(|value| value.get("N").and_then(Value::as_str).map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
         Ok(Self {
             statement,
             parameters,
+            parameter_numbers,
             consistent_read: body
                 .get("ConsistentRead")
                 .and_then(Value::as_bool)

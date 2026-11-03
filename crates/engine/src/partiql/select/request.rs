@@ -223,7 +223,8 @@ mod tests {
         let analysis = WhereAnalysis::new(where_clause, keys, &value_of);
         assert_eq!(analysis.disjunct_count(), 50);
         let limits = LimitsConfig::default();
-        let checked = check_reads(&analysis, keys, &schema, &limits, &[], &value_of).unwrap();
+        let checked =
+            check_reads(&analysis, keys, &schema, &limits, &[], &value_of, &|_| None).unwrap();
         let ReadPlan::Steps(steps) =
             ReadPlan::of(Some(&checked), keys, false, Direction::default(), &value_of)
         else {

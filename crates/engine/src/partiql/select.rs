@@ -15,7 +15,8 @@
 //! that names a whole item, takes the disjuncts one after another, the
 //! first page in key order and later pages in the order the visit rules
 //! give (see [`read_steps`]). A disjunct that fails a check made when it is
-//! read is left until the others have been read.
+//! read, or that the caller may not read, is left until the others have been
+//! read.
 
 use serde_json::Value;
 
@@ -26,20 +27,22 @@ use extenddb_core::types::{IndexType, KeySchemaElement};
 use extenddb_storage::error::StorageError;
 
 use super::SingleRequest;
+use super::authorize::Gate;
 use super::base_join::BaseTableJoin;
 use super::common::{self, bound_value};
 use super::expr_bridge::ExprBridge;
 use super::index_read;
-use super::next_token::{decode_next_token, encode_next_token};
+use super::next_token::{TOKEN_MISMATCH, decode_next_token, encode_next_token};
 use crate::create_table::storage_err_to_dynamo;
 use crate::{DispatchResult, OperationContext};
 
-use order::{check_order_by, direction};
-use read_plan::{ReadPlan, check_decomposed, check_keys, check_reads};
+use order::direction;
+use read_plan::{ReadPlan, check_keys, check_reads};
 use request::{Paging, key_condition, query_request, render_filter, scan_request};
 use response::{output_key, shape_response};
 use steps::{StepTarget, read_steps};
 
+pub(super) use read_plan::{MAX_DECOMPOSED_READS, TOO_MANY_DECOMPOSED_READS};
 pub(super) use response::project_item;
 
 mod order;
@@ -49,17 +52,22 @@ mod response;
 mod steps;
 mod visits;
 
-/// Execute a parsed `SELECT`.
+/// Execute a parsed `SELECT`, passing `gate` once the checks the service
+/// makes before authorization are done, ahead of the checks made when a
+/// disjunct is read (see `authorize::gate`). The disjuncts the caller may
+/// not read are held back as the disjuncts that fail such a check are.
 ///
 /// # Errors
 ///
 /// Returns the service's `ValidationException` / `ResourceNotFoundException`
 /// for an invalid target, missing table/index, a GSI strong read, a parameter
-/// count mismatch, or a `NextToken` that does not match the statement.
+/// count mismatch, or a `NextToken` that does not match the statement, and
+/// the statement's refusal.
 pub(super) async fn run(
     ctx: &OperationContext,
-    stmt: SelectStatement,
+    stmt: &SelectStatement,
     req: &SingleRequest,
+    gate: &mut Gate<'_>,
 ) -> Result<DispatchResult, DynamoDbError> {
     // Resolve the target table's key metadata. A missing table surfaces as the
     // service's ResourceNotFoundException ("Requested resource not found"),
@@ -161,67 +169,62 @@ pub(super) async fn run(
     };
 
     // Read the WHERE against the target's keys, and refuse what the service
-    // refuses about it before anything is read.
+    // refuses about it and about the ORDER BY before anything is read, in
+    // its order: a path into a key attribute, the ORDER BY terms, the key
+    // values, the WHERE an ORDER BY reads, overlapping disjuncts and the
+    // number of disjuncts (see `check_keys`). The checks a disjunct gets
+    // when it is read come last (measured 2026-11-03: `pk IN [51 values]
+    // AND sk = a` gets the refusal of too many disjuncts). A read of a
+    // table refuses a path into a key attribute wherever the WHERE has one
+    // (see `WhereAnalysis::path_into_key_refusal`), a read of an index only
+    // in a disjunct read by key; a scan of an index with one is not
+    // measured.
     let value_of = |op: &Operand| bound_value(op, &req.parameters).cloned();
     let analysis = stmt
         .where_clause
         .as_ref()
         .map(|w| WhereAnalysis::new(w, keys, &value_of));
-    // A read of a table refuses a path into a key attribute wherever the
-    // WHERE has one, first of all its checks (see
-    // `WhereAnalysis::path_into_key_refusal`). A read of an index refuses it
-    // only in a disjunct read by key (see `check_keys`); a scan of an index
-    // with one is not measured.
-    if index_info.is_none()
-        && let Some(message) = analysis
-            .as_ref()
-            .and_then(|analysis| analysis.path_into_key_refusal(keys))
-    {
-        return Err(DynamoDbError::ValidationException(message));
-    }
-    // Then the key values and the overlap refusal, the ORDER BY refusals,
-    // the number of disjuncts, and last the checks a disjunct gets when it
-    // is read (measured 2026-11-03: `pk IN [51 values] ORDER BY n` gets the
-    // ORDER BY refusal and `pk IN [51 values] AND sk = a` the refusal of
-    // too many disjuncts).
-    if let Some(analysis) = &analysis {
-        check_keys(analysis, keys, &key_info, &req.parameters, &value_of)?;
-    }
-    check_order_by(
-        stmt.order_by.as_ref(),
+    check_keys(
         analysis.as_ref(),
+        stmt.order_by.as_ref(),
         keys,
+        &key_info,
         index_info.is_none(),
+        &req.parameters,
         &value_of,
     )?;
-    let checked = match &analysis {
-        Some(analysis) => {
-            check_decomposed(analysis)?;
-            Some(check_reads(
-                analysis,
-                keys,
-                &target_schema,
-                &ctx.limits,
-                &req.parameters,
-                &value_of,
-            )?)
-        }
-        None => None,
-    };
 
     // A NextToken is opaque and bound to the exact statement that produced
-    // it.
+    // it. It is checked before the statement is authorized (measured
+    // 2026-11-03), so ahead of the checks a disjunct gets when it is read.
     let start_key = req
         .next_token
         .as_deref()
         .map(|token| decode_next_token(token, &req.statement, &req.parameters))
         .transpose()?;
 
+    // The checks made before authorization are done: authorize, each
+    // disjunct of a read by key by itself, and hold back the ones the caller
+    // may not read.
+    let refused = gate.pass().await?;
+    let checked = match &analysis {
+        Some(analysis) => Some(check_reads(
+            analysis,
+            keys,
+            &target_schema,
+            &ctx.limits,
+            &req.parameters,
+            &value_of,
+            &|read| refused.refusal(read, req),
+        )?),
+        None => None,
+    };
+
     // An index that does not project every attribute refuses some reads and
     // serves others from the base table (see `index_read`).
     if let Some(info) = &index_info {
         let shared_filter = checked.as_ref().and_then(|c| c.shared_filter.as_deref());
-        index_read::check(&stmt, info, &key_info.key_schema, shared_filter)?;
+        index_read::check(stmt, info, &key_info.key_schema, shared_filter)?;
     }
 
     let direction = direction(stmt.order_by.as_ref(), keys);
@@ -259,7 +262,7 @@ pub(super) async fn run(
             BaseTableJoin::for_read(
                 ctx,
                 req,
-                &stmt,
+                stmt,
                 info,
                 &key_info.key_schema,
                 Some(filter_terms),
@@ -285,7 +288,7 @@ pub(super) async fn run(
             } else {
                 render_filter(&mut bridge, &read.filter)?
             };
-            let result = query_request(ctx, &stmt, req, paging, &bridge, kce, filter).await?;
+            let result = query_request(ctx, stmt, req, paging, &bridge, kce, filter).await?;
             if read.returns_nothing() {
                 without_items(result)
             } else {
@@ -299,14 +302,14 @@ pub(super) async fn run(
                 filtered: join.is_none(),
                 refusal: checked.as_ref().and_then(|c| c.deferred.as_ref()),
             };
-            let steps = read_steps(ctx, &stmt, req, &target, steps, paging).await?;
+            let steps = read_steps(ctx, stmt, req, &target, steps, paging).await?;
             resume_after = steps.next;
             last_key = steps.last_key;
             steps.page
         }
         ReadPlan::Scan => {
             let filter = stmt.where_clause.as_ref().filter(|_| join.is_none());
-            scan_request(ctx, &stmt, req, paging, filter).await?
+            scan_request(ctx, stmt, req, paging, filter).await?
         }
     };
     let dispatched = match &join {
@@ -370,15 +373,17 @@ fn without_items(mut result: DispatchResult) -> DispatchResult {
 
 /// The service's refusal of a NextToken that is not one this statement gave.
 fn token_mismatch() -> DynamoDbError {
-    DynamoDbError::ValidationException("NextToken does not match request".to_owned())
+    DynamoDbError::ValidationException(TOKEN_MISMATCH.to_owned())
 }
 
-/// The PartiQL wording for a `ConsistentRead` against a GSI (also returned for
-/// a vector index, measured on the service).
+/// The PartiQL wording for a `ConsistentRead` against a GSI, also returned
+/// for a vector index (measured on the service); it comes before the
+/// statement is authorized (measured 2026-11-03).
+pub(super) const GSI_STRONG_READ: &str =
+    "Strongly consistent read is not supported on Global Secondary Indexes";
+
 fn gsi_strong_read_error() -> DynamoDbError {
-    DynamoDbError::ValidationException(
-        "Strongly consistent read is not supported on Global Secondary Indexes".to_owned(),
-    )
+    DynamoDbError::ValidationException(GSI_STRONG_READ.to_owned())
 }
 
 #[cfg(test)]

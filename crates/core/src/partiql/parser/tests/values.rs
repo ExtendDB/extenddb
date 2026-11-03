@@ -57,6 +57,145 @@ fn a_parameter_inside_a_literal_is_refused_at_its_position() {
 }
 
 #[test]
+fn a_value_that_names_an_attribute_twice_is_refused_at_the_second_name() {
+    // Measured 2026-11-03 with table names of these lengths: the line,
+    // column and length of the second occurrence, the quotes counted.
+    for (sql, key, at) in [
+        (
+            "INSERT INTO \"pqa-abcdef-c\" VALUE {'pk': 'd1', 'pk': 'd2', 'sk': 's'}",
+            "pk",
+            "1:47:4",
+        ),
+        (
+            "INSERT INTO \"pqa-abcdef-c\" VALUE {'pk': 'a', 'pk': 'b', 'sk': 'dup'}",
+            "pk",
+            "1:46:4",
+        ),
+        (
+            "INSERT INTO \"pqa-abcdef-c\" VALUE {'pk': 'd3', 'sk': 's', 'v': '1', 'v': '2'}",
+            "v",
+            "1:68:3",
+        ),
+        (
+            "INSERT INTO \"pqa-abcdef-c\" VALUE {'pk': 'd4', 'sk': 's1', 'sk': 's2'}",
+            "sk",
+            "1:59:4",
+        ),
+        (
+            "INSERT INTO \"rv-0123456789\" VALUE {'pk': 'd1', 'pk': 'd2', 'sk': 's'}",
+            "pk",
+            "1:48:4",
+        ),
+        (
+            "INSERT INTO \"rv-0123456789\" VALUE {'pk': 'd3', 'sk': 's', 'v': '1', 'v': '2'}",
+            "v",
+            "1:69:3",
+        ),
+    ] {
+        assert_eq!(
+            err(sql),
+            format!("Duplicate keys in tuple. Key: {key} under root at {at}"),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn any_other_map_that_names_a_key_twice_is_refused_at_its_opening_brace() {
+    // Measured 2026-11-03 with a table name of this length: the position of
+    // the `{` of the map that names the key twice, length 1, and the path
+    // of that map inside the value.
+    for (sql, path, at) in [
+        (
+            "INSERT INTO \"rv-0123456789\" VALUE {'pk': 'n1', 'sk': 's', 'm': {'x': 1, 'x': 2}}",
+            "root",
+            "1:64:1",
+        ),
+        (
+            "INSERT INTO \"rv-0123456789\" VALUE {'pk': 'n2', 'sk': 's', 'l': [{'x': 1, 'x': 2}]}",
+            "root[0]",
+            "1:65:1",
+        ),
+        (
+            "INSERT INTO \"rv-0123456789\" VALUE {'pk': 'n4', 'sk': 's', 'm': {'y': {'x': 1, 'x': \
+             2}}}",
+            "root.y",
+            "1:70:1",
+        ),
+        (
+            "UPDATE \"rv-0123456789\" SET m = {'x': 1, 'x': 2} WHERE pk = 'a' AND sk = 'x'",
+            "root",
+            "1:32:1",
+        ),
+        (
+            "SELECT * FROM \"rv-0123456789\" WHERE pk = 'a' AND m = {'x': 1, 'x': 2}",
+            "root",
+            "1:54:1",
+        ),
+    ] {
+        assert_eq!(
+            err(sql),
+            format!("Duplicate keys in tuple. Key: x under {path} at {at}"),
+            "{sql}"
+        );
+    }
+    // The same rule elsewhere in a value, and for a name given three times.
+    for (sql, path) in [
+        (
+            "INSERT INTO \"t\" VALUE {'pk':'a','m':{'n':{'x':1,'x':2}}}",
+            "root.n",
+        ),
+        (
+            "INSERT INTO \"t\" VALUE {'pk':'a','l':[1,{'x':1,'x':2}]}",
+            "root[1]",
+        ),
+        (
+            "INSERT INTO \"t\" VALUE {'pk':'a','m':{'x':1,'x':2,'x':3}}",
+            "root",
+        ),
+        (
+            "UPDATE \"t\" SET m = [{'x':1,'x':2}] WHERE pk = 'a'",
+            "root[0]",
+        ),
+    ] {
+        let column = sql.find("{'x'").unwrap() + 1;
+        assert_eq!(
+            err(sql),
+            format!("Duplicate keys in tuple. Key: x under {path} at 1:{column}:1"),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn a_repeated_key_is_one_refusal_among_the_others_of_a_value() {
+    // The first refusal in the value is reported, and a syntax error after
+    // the literal wins.
+    let sql = "INSERT INTO \"t\" VALUE {'pk':'a','w':{'k':?},'pk':'b'}";
+    assert_eq!(err(sql), parameter_in_literal(sql, "root.k"));
+    let sql = "INSERT INTO \"t\" VALUE {'pk':'a','pk':'b','w':{'k':?}}";
+    let column = sql.rfind("'pk'").unwrap() + 1;
+    assert_eq!(
+        err(sql),
+        format!("Duplicate keys in tuple. Key: pk under root at 1:{column}:4")
+    );
+    assert_eq!(
+        err("SELECT * FROM \"t\" WHERE pk = 'p' AND w = {'k':1,'k':2} AND"),
+        wf(MISSING_RHS)
+    );
+    // Measured 2026-11-03.
+    assert_eq!(
+        err("INSERT INTO \"t\" VALUE {'pk': 'n7', 'pk': 'n8', 'sk': 's'} WHERE"),
+        wf("Unexpected token after expression")
+    );
+    // Names are compared as written: a name in another case is another
+    // attribute (measured 2026-11-03 for 'v' and 'V').
+    assert!(parse("INSERT INTO \"t\" VALUE {'pk':'a','PK':'b'}").is_ok());
+    assert!(parse("INSERT INTO \"t\" VALUE {'pk': 'n3', 'sk': 's', 'v': 1, 'V': 2}").is_ok());
+    assert!(parse("UPDATE \"t\" SET m = {'x':1,'X':2} WHERE pk = 'a'").is_ok());
+}
+
+#[test]
 fn a_parameter_in_a_bag_is_refused_at_its_position() {
     let sql = "INSERT INTO \"t\" VALUE {'pk':'m5','w':<<?>>}";
     let column = sql.find('?').unwrap() + 1;

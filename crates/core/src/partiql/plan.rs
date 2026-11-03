@@ -362,12 +362,13 @@ pub fn scalar_key_refusal(filter: &[&WhereExpr], keys: KeyNames<'_>) -> Option<S
     })
 }
 
+/// The refusal of a path into a key attribute, before the key's name.
+pub const SCALAR_KEY_REFUSAL: &str = "Key attributes must be scalars; list random access '[]' and map lookup '.' are not \
+     allowed: Key ";
+
 /// The refusal of a path into the key attribute `key`.
 fn scalar_message(key: &str) -> String {
-    format!(
-        "Key attributes must be scalars; list random access '[]' and map lookup '.' are not \
-         allowed: Key {key}"
-    )
+    format!("{SCALAR_KEY_REFUSAL}{key}")
 }
 
 /// The key attribute of the first condition of a WHERE, in statement order,

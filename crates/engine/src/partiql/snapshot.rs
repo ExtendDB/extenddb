@@ -28,7 +28,32 @@ pub(super) fn context_with_key_info(
         authorized_key_info,
         auth_cache: ctx.auth_cache.clone(),
         table_key_info_lookup: ctx.table_key_info_lookup.clone(),
+        item_authorizer: ctx.item_authorizer.clone(),
     }
+}
+
+/// The context an `ExecuteStatement` runs in: `ctx` with `table` read once,
+/// as a single-table request reads it, and added to its catalog snapshot,
+/// with what the read gave (`None` for a missing table). The statement is
+/// authorized against that read, and every later lookup of the table in the
+/// request resolves from it.
+///
+/// # Errors
+///
+/// Returns a failed catalog read other than a missing table, mapped as the
+/// classic handlers map it.
+pub(super) async fn pinned_context(
+    ctx: &OperationContext,
+    table: &str,
+) -> Result<(OperationContext, Option<TableKeyInfo>), DynamoDbError> {
+    let info = match ctx.table_key_info(table).await {
+        Ok(info) => Some(info),
+        Err(StorageError::TableNotFound(_)) => None,
+        Err(e) => return Err(storage_err_to_dynamo(e)),
+    };
+    let mut snapshot = ctx.authorized_key_info.clone();
+    snapshot.insert(table.to_owned(), info.clone());
+    Ok((context_with_key_info(ctx, snapshot), info))
 }
 
 /// The context the members of a batch or a transaction run in: `ctx` with
@@ -124,6 +149,33 @@ mod tests {
             "authorized"
         );
         assert!(snapshot["missing"].is_none());
+    }
+
+    #[test]
+    fn every_rebuilt_context_keeps_the_item_authorizer() {
+        use crate::ItemAuthorizer;
+        use crate::partiql::test_context::{self, Fixed};
+        test_context::block_on(async {
+            let authorizer: Arc<dyn ItemAuthorizer> = Fixed::allowing();
+            let ctx = test_context::context(Some(Arc::clone(&authorizer))).await;
+            let keeps = |rebuilt: &OperationContext| {
+                rebuilt
+                    .item_authorizer
+                    .as_ref()
+                    .is_some_and(|kept| Arc::ptr_eq(kept, &authorizer))
+            };
+            assert!(keeps(&context_with_key_info(
+                &ctx,
+                AuthorizedKeyInfo::new()
+            )));
+            // "t" is missing in the context's snapshot, so neither of these
+            // reads the catalog.
+            let (pinned, info) = pinned_context(&ctx, "t").await.unwrap();
+            assert!(info.is_none());
+            assert!(keeps(&pinned));
+            assert!(keeps(&snapshot_context(&ctx, &["t"]).await.unwrap()));
+            assert!(keeps(&crate::partiql::translation_context(&ctx)));
+        });
     }
 
     #[test]

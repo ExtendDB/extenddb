@@ -13,6 +13,13 @@
 //! point read `handle_get_item` already serves, a write is `write::run` (each
 //! statement committing independently, which is what makes partial success
 //! real). Nothing here re-implements statement translation.
+//!
+//! Each statement is authorized at its place among its checks (see
+//! `authorize::gate`). Two statements that name one item fail the request
+//! before any statement is authorized, as a read without the full primary
+//! key is refused before it is authorized (measured 2026-11-03 for that
+//! refusal, with a caller that may not run the statement). For two
+//! statements on one item the order against authorization is not measured.
 
 use std::collections::HashMap;
 
@@ -25,6 +32,7 @@ use extenddb_core::partiql::parser::parse_for_request;
 use extenddb_core::types::TableKeyInfo;
 use extenddb_storage::error::StorageError;
 
+use super::authorize::{Gate, Surface};
 use super::common::{self, StatementError};
 use super::{SingleRequest, write};
 use crate::create_table::storage_err_to_dynamo;
@@ -170,39 +178,38 @@ pub(super) async fn run(
         }
         let stmt = p.stmt.expect("non-parse-error statement is Some");
         let table = common::statement_table(&stmt).to_owned();
+        let mut req = p.req;
+        req.return_consumed_capacity = rcc.map(str::to_owned);
 
-        if is_write_batch {
-            let mut req = p.req;
-            req.return_consumed_capacity = rcc.map(str::to_owned);
-            match write::run(ctx, stmt, &req).await {
-                Ok(result) => {
-                    capacity.add(&result.body);
-                    responses.push(write_entry(&table, &result.body));
-                }
-                // A key value past its size limit names the table on every
-                // write (measured 2026-11-02 for INSERT, UPDATE and DELETE).
-                Err(e) => {
-                    let error = StatementError::from_key_error(&e);
-                    responses.push(error.into_entry(Some(&table)));
-                }
-            }
+        // Each statement is authorized at its place among its checks (see
+        // `authorize::gate`). A refused statement's entry carries the
+        // refusal and its table, and the others run (measured 2026-11-03).
+        let mut gate = Gate::new(ctx, &stmt, key_infos[i].as_ref(), &req, Surface::Batch);
+        let answer = if is_write_batch {
+            let result = write::run(ctx, &stmt, &req, &mut gate).await;
+            gate.settle(result).await?.map(|result| {
+                capacity.add(&result.body);
+                write_entry(&table, &result.body)
+            })
         } else {
             let Statement::Select(select) = &stmt else {
                 unreachable!("read batch holds only SELECT statements");
             };
-            responses.push(
-                execute_read(
-                    ctx,
-                    select,
-                    &p.req,
-                    &table,
-                    key_infos[i].as_ref(),
-                    rcc,
-                    &mut capacity,
-                )
-                .await?,
-            );
-        }
+            let read = ReadTarget {
+                select,
+                req: &req,
+                table: &table,
+                key_info: key_infos[i].as_ref(),
+            };
+            let result = execute_read(ctx, &read, &mut capacity, &mut gate).await?;
+            gate.settle(result).await?
+        };
+        // A key value past its size limit names the table, on every write
+        // and on a read (measured 2026-11-02 for SELECT, INSERT, UPDATE and
+        // DELETE).
+        responses.push(
+            answer.unwrap_or_else(|e| StatementError::from_key_error(&e).into_entry(Some(&table))),
+        );
     }
 
     let mut out = Map::new();
@@ -248,32 +255,41 @@ async fn projected_call_error(
     })
 }
 
-/// Execute one read statement, returning its `Responses[i]` entry.
+/// The refusal of a `BatchExecuteStatement` read that is not a read of one
+/// item by its full primary key. It comes before the statement is
+/// authorized (measured 2026-11-03).
+pub(super) const PRIMARY_KEY_REQUIRED: &str = "Select statements within BatchExecuteStatement must specify the primary key in the where \
+     clause.";
+
+/// One read statement of a batch and what it reads.
+struct ReadTarget<'r> {
+    select: &'r SelectStatement,
+    req: &'r SingleRequest,
+    table: &'r str,
+    key_info: Option<&'r TableKeyInfo>,
+}
+
+/// Execute one read statement, passing `gate` before the item is read: its
+/// `Responses[i]` entry, or the refusal its entry carries. The outer error
+/// is a fault that fails the request.
 async fn execute_read(
     ctx: &OperationContext,
-    select: &SelectStatement,
-    req: &SingleRequest,
-    table: &str,
-    key_info: Option<&TableKeyInfo>,
-    rcc: Option<&str>,
+    read: &ReadTarget<'_>,
     capacity: &mut CapacityList,
-) -> Result<Value, DynamoDbError> {
+    gate: &mut Gate<'_>,
+) -> Result<Result<Value, DynamoDbError>, DynamoDbError> {
+    let ReadTarget {
+        select,
+        req,
+        table,
+        key_info,
+    } = *read;
     // An unknown table is a per-statement ResourceNotFound (the call stays 200).
     let Some(key_info) = key_info else {
-        return Ok(
-            StatementError::from_error(&DynamoDbError::ResourceNotFoundException(String::new()))
-                .into_entry(None),
-        );
+        return Ok(Err(DynamoDbError::ResourceNotFoundException(String::new())));
     };
-
-    let batch_key_error = || {
-        json!({
-            "Error": {
-                "Code": "ValidationError",
-                "Message": "Select statements within BatchExecuteStatement must specify the primary key in the where clause."
-            }
-        })
-    };
+    let primary_key_required =
+        || DynamoDbError::ValidationException(PRIMARY_KEY_REQUIRED.to_owned());
 
     // A named index is resolved before the key check. Measured on the service:
     // a missing index is a per-statement ValidationError with the bare index
@@ -293,27 +309,24 @@ async fn execute_read(
             {
                 Ok(info) => {
                     if let Err(e) = common::ensure_single_attribute_keys(&info.key_schema) {
-                        return Ok(StatementError::from_error(&e).into_entry(None));
+                        return Ok(Err(e));
                     }
                 }
                 Err(StorageError::IndexNotFound(_)) => {
-                    return Ok(
-                        StatementError::from_error(&DynamoDbError::ValidationException(
-                            "The table does not have the specified index".to_owned(),
-                        ))
-                        .into_entry(None),
-                    );
+                    return Ok(Err(DynamoDbError::ValidationException(
+                        "The table does not have the specified index".to_owned(),
+                    )));
                 }
                 Err(e) => return Err(storage_err_to_dynamo(e)),
             }
         }
-        return Ok(batch_key_error());
+        return Ok(Err(primary_key_required()));
     }
 
     // A multi-part base table key (this engine's preview extension) is refused
     // per statement with the service's multi-attribute message.
     if let Err(e) = common::ensure_single_attribute_keys(&key_info.key_schema) {
-        return Ok(StatementError::from_error(&e).into_entry(None));
+        return Ok(Err(e));
     }
 
     let (pk, sk) = common::key_names(&key_info.key_schema);
@@ -326,14 +339,17 @@ async fn execute_read(
     // A batch SELECT must be a full-primary-key point read; a partial key is a
     // per-statement ValidationError.
     let Some(key) = common::point_read_key(select, pk, sk, &req.parameters)? else {
-        return Ok(batch_key_error());
+        return Ok(Err(primary_key_required()));
     };
     // A key value of the wrong type gets the message a single SELECT gets,
     // not the GetItem one (measured 2026-11-02).
     if let Err(e) = common::check_key_types(&key, key_info) {
-        return Ok(StatementError::from_error(&e).into_entry(None));
+        return Ok(Err(e));
     }
 
+    if let Err(e) = gate.pass().await {
+        return Ok(Err(e));
+    }
     let mut get_body = json!({ "TableName": table, "Key": Value::Object(key) });
     // ConsistentRead is carried per member: a consistent member is charged a
     // full read unit where an eventual one is charged half (measured
@@ -341,29 +357,28 @@ async fn execute_read(
     if req.consistent_read {
         get_body["ConsistentRead"] = json!(true);
     }
-    if let Some(rcc) = rcc {
+    if let Some(rcc) = &req.return_consumed_capacity {
         get_body["ReturnConsumedCapacity"] = json!(rcc);
     }
-    match handle_get_item(get_body, ctx).await {
-        Ok(result) => {
-            capacity.add(&result.body);
-            let mut entry = Map::new();
-            entry.insert("TableName".to_owned(), Value::String(table.to_owned()));
-            if let Some(item) = result.body.get("Item") {
-                // A batch SELECT with a projection list projects the item, as
-                // the service does; SELECT * returns it whole.
-                let shaped = match &select.projection {
-                    extenddb_core::partiql::ast::Projection::All => item.clone(),
-                    extenddb_core::partiql::ast::Projection::Paths(paths) => {
-                        super::select::project_item(item, paths)
-                    }
-                };
-                entry.insert("Item".to_owned(), shaped);
+    let result = match handle_get_item(get_body, ctx).await {
+        Ok(result) => result,
+        Err(e) => return Ok(Err(e)),
+    };
+    capacity.add(&result.body);
+    let mut entry = Map::new();
+    entry.insert("TableName".to_owned(), Value::String(table.to_owned()));
+    if let Some(item) = result.body.get("Item") {
+        // A batch SELECT with a projection list projects the item, as the
+        // service does; SELECT * returns it whole.
+        let shaped = match &select.projection {
+            extenddb_core::partiql::ast::Projection::All => item.clone(),
+            extenddb_core::partiql::ast::Projection::Paths(paths) => {
+                super::select::project_item(item, paths)
             }
-            Ok(Value::Object(entry))
-        }
-        Err(e) => Ok(StatementError::from_key_error(&e).into_entry(Some(table))),
+        };
+        entry.insert("Item".to_owned(), shaped);
     }
+    Ok(Ok(Value::Object(entry)))
 }
 
 /// Fail the request when two statements address the same item.

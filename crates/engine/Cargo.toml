@@ -22,6 +22,10 @@ sha2 = "0.10"
 hex = "0.4"
 tokio = { workspace = true }
 
+[dev-dependencies]
+# A storage engine for the tests that need an `OperationContext`.
+extenddb-storage-sqlite = { workspace = true }
+
 [features]
 default = ["partiql"]
 # PartiQL surface (ExecuteStatement, BatchExecuteStatement, ExecuteTransaction),

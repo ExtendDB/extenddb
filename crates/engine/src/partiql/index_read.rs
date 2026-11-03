@@ -130,7 +130,7 @@ fn unprojected<'a>(
 }
 
 /// The top-level attribute name of every path a WHERE term references.
-fn where_roots<'a>(expr: &'a WhereExpr, out: &mut Vec<&'a str>) {
+pub(super) fn where_roots<'a>(expr: &'a WhereExpr, out: &mut Vec<&'a str>) {
     match expr {
         WhereExpr::Compare(a, _, b)
         | WhereExpr::BeginsWith(a, b)
@@ -159,7 +159,8 @@ fn where_roots<'a>(expr: &'a WhereExpr, out: &mut Vec<&'a str>) {
     }
 }
 
-fn operand_roots<'a>(op: &'a Operand, out: &mut Vec<&'a str>) {
+/// The top-level attribute name of every path an operand references.
+pub(super) fn operand_roots<'a>(op: &'a Operand, out: &mut Vec<&'a str>) {
     match op {
         Operand::Path(p) => out.push(p.root.as_str()),
         Operand::Arith(a, _, b) => {

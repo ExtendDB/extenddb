@@ -24,6 +24,7 @@ use extenddb_core::partiql::Statement;
 use extenddb_core::partiql::ast::{Operand, Returning, WhereExpr};
 use extenddb_core::types::{AttributeValue, ScalarAttributeType, TableKeyInfo};
 
+use super::authorize::Gate;
 use super::{SingleRequest, bind_parameter, common};
 use crate::{DispatchResult, OperationContext};
 
@@ -43,21 +44,25 @@ mod expr_builder;
 mod insert;
 mod update;
 
-/// Execute a parsed write statement (`INSERT`/`UPDATE`/`DELETE`).
+/// Execute a parsed write statement (`INSERT`/`UPDATE`/`DELETE`), passing
+/// `gate` once its checks made before authorization are done and before it
+/// writes (see `authorize::gate`).
 ///
 /// # Errors
 ///
 /// Returns the service's error for the failure (duplicate key, failed
-/// condition, missing full key, invalid returning clause), as measured.
+/// condition, missing full key, invalid returning clause), as measured, and
+/// the statement's refusal.
 pub(super) async fn run(
     ctx: &OperationContext,
-    stmt: Statement,
+    stmt: &Statement,
     req: &SingleRequest,
+    gate: &mut Gate<'_>,
 ) -> Result<DispatchResult, DynamoDbError> {
     match stmt {
-        Statement::Insert(insert) => run_insert(ctx, insert, req).await,
-        Statement::Update(update) => run_update(ctx, update, req).await,
-        Statement::Delete(delete) => run_delete(ctx, delete, req).await,
+        Statement::Insert(insert) => run_insert(ctx, insert, req, gate).await,
+        Statement::Update(update) => run_update(ctx, update, req, gate).await,
+        Statement::Delete(delete) => run_delete(ctx, delete, req, gate).await,
         Statement::Exists(_) => Err(exists_outside_transaction()),
         // SELECT is dispatched to the read executor by the caller; reaching
         // here is a routing bug, not a client error.
@@ -279,12 +284,15 @@ fn returning_to_return_values(returning: Option<Returning>) -> Option<&'static s
     })
 }
 
+/// The start of the refusal of a `DELETE` returning clause.
+pub(super) const INVALID_RETURNING: &str = "Invalid returning clause: RETURNING ";
+
 /// The refusal of any `DELETE` clause other than `RETURNING ALL OLD *`, with
-/// the clause named verbatim.
+/// the clause named verbatim. It comes before the statement is authorized
+/// (measured 2026-11-03).
 pub(super) fn invalid_delete_returning(returning: Returning) -> DynamoDbError {
     DynamoDbError::ValidationException(format!(
-        "Invalid returning clause: RETURNING {}. \
-         Only RETURNING ALL OLD * is allowed in DELETE statements.",
+        "{INVALID_RETURNING}{}. Only RETURNING ALL OLD * is allowed in DELETE statements.",
         returning_clause_text(returning)
     ))
 }

@@ -7,9 +7,11 @@ use super::super::tests::{HASH_ONLY, KEYS, select};
 use super::*;
 
 mod decomposed;
+mod held_back;
+mod key_order;
 
-/// The checks a WHERE gets before anything is read, in the order `run`
-/// makes them, without the ORDER BY refusals.
+/// The checks a WHERE of a table read without an ORDER BY gets before
+/// anything is read, in the order `run` makes them.
 fn check_where<'a, 'b>(
     analysis: &'b WhereAnalysis<'a>,
     keys: KeyNames<'_>,
@@ -19,9 +21,16 @@ fn check_where<'a, 'b>(
     params: &[AttributeValue],
     value_of: &dyn Fn(&Operand) -> Option<AttributeValue>,
 ) -> Result<Checked<'a, 'b>, DynamoDbError> {
-    check_keys(analysis, keys, key_info, params, value_of)?;
-    check_decomposed(analysis)?;
-    check_reads(analysis, keys, target_schema, limits, params, value_of)
+    check_keys(Some(analysis), None, keys, key_info, true, params, value_of)?;
+    check_reads(
+        analysis,
+        keys,
+        target_schema,
+        limits,
+        params,
+        value_of,
+        &|_| None,
+    )
 }
 
 /// A pk/sk table whose sort key has type `sort`.

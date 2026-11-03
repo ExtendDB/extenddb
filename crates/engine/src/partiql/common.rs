@@ -7,12 +7,16 @@
 //! a batch carries. Every behaviour is justified by a measurement against the
 //! live service, cited where it is implemented.
 
+use std::collections::BTreeMap;
+
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::partiql::Statement;
-use extenddb_core::partiql::ast::{CompareOp, Operand, SelectStatement, WhereExpr};
+use extenddb_core::partiql::ast::{
+    CompareOp, InsertStatement, Operand, SelectStatement, WhereExpr,
+};
 use extenddb_core::partiql::plan::{
     KeyEquality, KeyNames, SortCondition, WhereAnalysis, key_equality, same_value,
 };
@@ -325,10 +329,24 @@ pub(super) fn bound_value<'a>(
     }
 }
 
+/// The value an `INSERT`'s VALUE gives each attribute it names, by name: the
+/// last one given, which is the value the item a write builds holds. The
+/// parser refuses a VALUE that names an attribute twice (measured
+/// 2026-11-03), so each name has one value. The write, the authorization of
+/// the statement and the check for two statements on one item all take the
+/// item's values from here, so they agree on its key.
+pub(super) fn insert_values(insert: &InsertStatement) -> BTreeMap<&str, &Operand> {
+    insert
+        .value
+        .iter()
+        .map(|(name, operand)| (name.as_str(), operand))
+        .collect()
+}
+
 /// The wire-form primary key a write statement targets (`INSERT` from its VALUE
-/// map, `UPDATE`/`DELETE` from the WHERE key equalities), or `None` when the key
-/// is not fully derivable. Used only to detect two statements naming the same
-/// item within one batch/transaction.
+/// map, see [`insert_values`], `UPDATE`/`DELETE` from the WHERE key equalities),
+/// or `None` when the key is not fully derivable. Used only to detect two
+/// statements naming the same item within one batch/transaction.
 pub(super) fn write_key(
     stmt: &Statement,
     pk: &str,
@@ -337,11 +355,9 @@ pub(super) fn write_key(
 ) -> Result<Option<Map<String, Value>>, DynamoDbError> {
     match stmt {
         Statement::Insert(insert) => {
-            let pk_op = insert.value.iter().find(|(n, _)| n == pk).map(|(_, o)| o);
-            let sk_op = match sk {
-                Some(sk) => insert.value.iter().find(|(n, _)| n == sk).map(|(_, o)| o),
-                None => None,
-            };
+            let values = insert_values(insert);
+            let pk_op = values.get(pk).copied();
+            let sk_op = sk.and_then(|sk| values.get(sk).copied());
             build_key(pk, sk, pk_op, sk_op, params)
         }
         Statement::Update(u) => match &u.where_clause {
@@ -405,7 +421,7 @@ fn build_key(
 
 /// Flatten a top-level `AND` chain, treating an `OR`/`NOT` as a single opaque
 /// term. An explicit stack keeps a long chain off the call stack.
-fn flatten_and_lossy<'a>(expr: &'a WhereExpr, out: &mut Vec<&'a WhereExpr>) {
+pub(super) fn flatten_and_lossy<'a>(expr: &'a WhereExpr, out: &mut Vec<&'a WhereExpr>) {
     let mut pending = vec![expr];
     while let Some(expr) = pending.pop() {
         match expr {
@@ -422,10 +438,11 @@ fn flatten_and_lossy<'a>(expr: &'a WhereExpr, out: &mut Vec<&'a WhereExpr>) {
 ///
 /// Per-statement failures inside a batch surface as short Codes without the
 /// `Exception` suffix, and the call itself stays HTTP 200. `TableName` is echoed
-/// only for failures that reached the item layer (`DuplicateItem`,
-/// `ConditionalCheckFailed`, and a key value past its size limit, see
-/// [`StatementError::from_key_error`]); other validation and resource-not-found
-/// errors carry the `Error` object alone, matching the service. A conditional failure on a
+/// only for an authorization refusal and the failures that reached the item
+/// layer (`DuplicateItem`, `ConditionalCheckFailed`, and a key value past its
+/// size limit, see [`StatementError::from_key_error`]); other validation and
+/// resource-not-found errors carry the `Error` object alone, matching the
+/// service. A conditional failure on a
 /// statement that set `ReturnValuesOnConditionCheckFailure` to `ALL_OLD`
 /// carries the existing item on the `Error` itself, never on the entry
 /// (measured 2026-11-02).
@@ -456,6 +473,14 @@ impl StatementError {
                 code: "ResourceNotFound",
                 message: "Requested resource not found".to_owned(),
                 include_table_name: false,
+                item: None,
+            },
+            // A statement the caller may not run carries the refusal and its
+            // table (measured 2026-11-03).
+            DynamoDbError::AccessDeniedException(m) => Self {
+                code: "AccessDenied",
+                message: m.clone(),
+                include_table_name: true,
                 item: None,
             },
             // Everything else a well-formed statement can raise per-statement is

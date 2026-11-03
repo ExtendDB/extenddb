@@ -30,17 +30,26 @@ pub(super) fn encode_next_token(
     BASE64.encode(payload.to_string().as_bytes())
 }
 
+/// The refusal of a `NextToken` that does not decode.
+pub(super) const INVALID_NEXT_TOKEN: &str = "Invalid NextToken";
+
+/// The refusal of a `NextToken` another statement, or other parameter
+/// values, gave.
+pub(super) const TOKEN_MISMATCH: &str = "NextToken does not match request";
+
 /// Decode a pagination token and return its `LastEvaluatedKey`. A token that
 /// does not decode is the service's "Invalid NextToken" (measured 2026-11-02);
 /// one whose embedded statement or parameter values differ from the current
 /// ones is "NextToken does not match request" (measured 2026-11-02: a token
-/// from `pk = ?` with 'p' is refused with 'q' and continues with 'p').
+/// from `pk = ?` with 'p' is refused with 'q' and continues with 'p'). Both
+/// are refused before the statement is authorized (measured 2026-11-03 for a
+/// token that does not decode).
 pub(super) fn decode_next_token(
     token: &str,
     statement: &str,
     parameters: &[AttributeValue],
 ) -> Result<Value, DynamoDbError> {
-    let invalid = || DynamoDbError::ValidationException("Invalid NextToken".to_owned());
+    let invalid = || DynamoDbError::ValidationException(INVALID_NEXT_TOKEN.to_owned());
     let bytes = BASE64.decode(token).map_err(|_| invalid())?;
     let decoded: Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
     let (Some(issued_for), Some(key)) =
@@ -52,7 +61,7 @@ pub(super) fn decode_next_token(
         || decoded.get("p").and_then(Value::as_str) != Some(&parameters_digest(parameters))
     {
         return Err(DynamoDbError::ValidationException(
-            "NextToken does not match request".to_owned(),
+            TOKEN_MISMATCH.to_owned(),
         ));
     }
     Ok(key.clone())
