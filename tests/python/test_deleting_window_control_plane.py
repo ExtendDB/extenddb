@@ -151,19 +151,22 @@ class TestDeletingWindowControlPlane:
 
     def test_tag_changes_are_being_deleted_and_tags_are_listed(self, dynamodb_client, is_extenddb):
         """TagResource and UntagResource while the table is DELETING are ResourceInUseException
-        with the DELETING sentence, and ListTagsOfResource is served (measured 2026-11-03)."""
+        with the DELETING sentence, and ListTagsOfResource lists the tag the table had before
+        DeleteTable (measured 2026-11-03)."""
         name = unique_name("del-window")
         lock = _open_window(dynamodb_client, is_extenddb, name)
         try:
             arn = dynamodb_client.describe_table(TableName=name)["Table"]["TableArn"]
+            dynamodb_client.tag_resource(ResourceArn=arn, Tags=[{"Key": "k1", "Value": "v1"}])
             dynamodb_client.delete_table(TableName=name)
             with pytest.raises(ClientError) as exc:
-                dynamodb_client.tag_resource(ResourceArn=arn, Tags=[{"Key": "k", "Value": "v"}])
+                dynamodb_client.tag_resource(ResourceArn=arn, Tags=[{"Key": "k2", "Value": "v2"}])
             _assert_in_use(exc.value, name)
             with pytest.raises(ClientError) as exc:
-                dynamodb_client.untag_resource(ResourceArn=arn, TagKeys=["k"])
+                dynamodb_client.untag_resource(ResourceArn=arn, TagKeys=["k1"])
             _assert_in_use(exc.value, name)
-            assert dynamodb_client.list_tags_of_resource(ResourceArn=arn)["Tags"] == []
+            listed = dynamodb_client.list_tags_of_resource(ResourceArn=arn)["Tags"]
+            assert listed == [{"Key": "k1", "Value": "v1"}]
         finally:
             if lock is not None:
                 lock.release()
