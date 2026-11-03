@@ -4,7 +4,8 @@
 //! `update_item` for the SQLite backend.
 //!
 //! UpdateItem is an upsert: when the item is absent a new one is created from
-//! the key plus the applied actions. The condition is evaluated against the
+//! the key plus the applied actions, unless every action is a REMOVE or DELETE,
+//! in which case nothing is written. The condition is evaluated against the
 //! pre-update image (or an empty item), then update actions are applied and the
 //! result is validated and written — all under the engine write lock (D1).
 
@@ -115,6 +116,14 @@ impl SqliteEngine {
             .map_err(|e| StorageError::Validation(e.to_string()))?;
         }
 
+        // REMOVE and DELETE on a key that holds no item change nothing: the
+        // service writes no item and emits no stream record (issue #478). The
+        // actions were still applied above so that their validation errors
+        // surface the same way as on an existing item.
+        if old.is_none() && expression::removes_only(actions) {
+            return Ok((None, None));
+        }
+
         upsert_item_in_tx(&mut tx, key_info, &item).await?;
 
         if !indexes.is_empty() {
@@ -180,80 +189,5 @@ impl SqliteEngine {
 }
 
 #[cfg(test)]
-mod tests {
-    use crate::SqliteEngine;
-    use extenddb_core::expression::{ExpressionMaps, parse_update, tokenize};
-    use extenddb_core::types::{AttributeValue, CreateTableInput, Item, UpdateTableInput};
-    use extenddb_storage::error::StorageError;
-    use extenddb_storage::{DataEngine, TableEngine};
-    use serde_json::json;
-
-    /// UpdateItem carrying the key info cached before an UpdateTable added a GSI,
-    /// as a write does that read the cache before the UpdateTable returned and
-    /// took the write lock after the build. A literal of the wrong type for the
-    /// new index key gets the service's per-index wording, the answer once the
-    /// cache lists the index, not the wording for a value computed from the item.
-    #[tokio::test]
-    async fn a_wrong_typed_literal_for_a_gsi_the_cached_key_info_lacks_names_the_index() {
-        let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
-            .await
-            .expect("engine");
-        crate::migrations::apply_for_tests(&engine.pool).await;
-        let account = "000000000000";
-        sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
-            .bind(account)
-            .execute(&engine.pool)
-            .await
-            .expect("account");
-        let input: CreateTableInput = serde_json::from_value(json!({
-            "TableName": "t",
-            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
-            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
-            "BillingMode": "PAY_PER_REQUEST"
-        }))
-        .expect("input");
-        engine
-            .create_table_impl(account, input, false)
-            .await
-            .expect("create table");
-        sqlx::query("UPDATE tables SET table_status = 'ACTIVE' WHERE table_name = 't'")
-            .execute(&engine.pool)
-            .await
-            .expect("activate the table");
-        let cached = engine.table_key_info(account, "t").await.expect("key info");
-        let update: UpdateTableInput = serde_json::from_value(json!({
-            "TableName": "t",
-            "AttributeDefinitions": [{"AttributeName": "g", "AttributeType": "S"}],
-            "GlobalSecondaryIndexUpdates": [{"Create": {
-                "IndexName": "gidx",
-                "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
-                "Projection": {"ProjectionType": "ALL"}
-            }}]
-        }))
-        .expect("update input");
-        engine
-            .update_table_impl(account, update)
-            .await
-            .expect("add the GSI");
-
-        let key: Item = serde_json::from_value(json!({"pk": {"S": "a"}})).expect("key");
-        let actions = parse_update(&tokenize("SET g = :v").expect("tokenize")).expect("parse");
-        let maps = ExpressionMaps::new(
-            std::collections::HashMap::new(),
-            std::collections::HashMap::from([("v".to_owned(), AttributeValue::N("9".to_owned()))]),
-        );
-        let result = engine
-            .update_item(&cached, &key, &actions, false, false, None, &maps, None)
-            .await;
-        let Err(StorageError::Validation(msg)) = result else {
-            panic!("a wrong-typed index key was not a ValidationException: {result:?}");
-        };
-        assert_eq!(
-            msg,
-            "One or more parameter values were invalid: Type mismatch for Index Key g \
-             Expected: S Actual: N IndexName: gidx"
-        );
-        let stored = engine.get_item(&cached, &key).await.expect("get the item");
-        assert!(stored.is_none(), "the refused update wrote nothing");
-    }
-}
+#[path = "update_item_tests.rs"]
+mod tests;
