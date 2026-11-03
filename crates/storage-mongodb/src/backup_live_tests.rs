@@ -121,7 +121,10 @@ async fn engine_on(catalog: &str, data: &str, liveness: BackupLiveness) -> Mongo
 
 fn spawn_worker(engine: &MongoEngine) -> tokio::task::JoinHandle<()> {
     let engine = Arc::new(engine.clone());
-    tokio::spawn(crate::ttl_worker::gsi_backfill_worker(engine))
+    tokio::spawn(crate::ttl_worker::gsi_backfill_worker(
+        engine,
+        extenddb_storage::CancellationToken::new(),
+    ))
 }
 
 fn key(name: &str, key_type: KeyType) -> KeySchemaElement {

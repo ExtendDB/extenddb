@@ -1,11 +1,34 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared helpers for the SQLite backend: connection-URL building, RFC 3339
-//! timestamp conversion, and constraint-violation classification.
+//! Shared helpers for the SQLite backend: connection-URL building, the
+//! connection pragmas, RFC 3339 timestamp conversion, and constraint-violation
+//! classification.
 
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+
+/// The pragmas every connection of every SQLite pool runs with. `wal` sets
+/// the journal mode, which is a property of the file; a connection that only
+/// reads the catalog status leaves it as it is.
+///
+/// # Errors
+///
+/// A pragma failed.
+pub(crate) async fn set_connection_pragmas(
+    conn: &mut sqlx::SqliteConnection,
+    wal: bool,
+) -> Result<(), sqlx::Error> {
+    use sqlx::Executor;
+    if wal {
+        conn.execute("PRAGMA journal_mode = WAL").await?;
+    }
+    conn.execute("PRAGMA foreign_keys = ON").await?;
+    conn.execute("PRAGMA synchronous = NORMAL").await?;
+    conn.execute("PRAGMA busy_timeout = 5000").await?;
+    conn.execute("PRAGMA cache_size = -32000").await?;
+    Ok(())
+}
 
 /// Normalize a configured path or connection string into a sqlx-openable
 /// SQLite URL.

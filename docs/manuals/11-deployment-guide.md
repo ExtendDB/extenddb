@@ -103,9 +103,19 @@ file and never creates `run_dir`, so the root filesystem can be read-only. Use
 #!/bin/sh
 # entrypoint.sh
 set -e
-# Safe to run on every start: already-applied migrations are skipped.
-extenddb migrate --yes --config /etc/extenddb/extenddb.toml
-exec extenddb serve --foreground --config /etc/extenddb/extenddb.toml
+CONFIG=/etc/extenddb/extenddb.toml
+# The preview takes no lock and exits 3 when migrations are pending. Only then
+# does migrate --yes run, which waits for every running server of the catalog
+# to stop, so a start beside another server with nothing to apply does not
+# wait for it.
+rc=0
+extenddb migrate --config "$CONFIG" || rc=$?
+if [ "$rc" -eq 3 ]; then
+  extenddb migrate --yes --config "$CONFIG"
+elif [ "$rc" -ne 0 ]; then
+  exit "$rc"
+fi
+exec extenddb serve --foreground --config "$CONFIG"
 ```
 
 `extenddb stop` cannot stop a foreground server, because there is no PID file to

@@ -44,6 +44,7 @@ REQ-TEST-001, REQ-TEST-004, REQ-AUTH-002
 from __future__ import annotations
 
 import os
+import re
 import time
 import uuid
 from typing import Any
@@ -53,7 +54,7 @@ import pytest
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
 
-from conftest import wait_for_active, wait_for_deleted
+from conftest import configured_backend, wait_for_active, wait_for_deleted
 from management_helpers import ManagementClient
 
 OWN = "alice"
@@ -93,6 +94,28 @@ def _make_client(endpoint_url: str, access_key: str, secret_key: str,
 
 def _denied(exc: ClientError) -> bool:
     return exc.value.response["Error"]["Code"] == "AccessDeniedException"
+
+
+# The values a Query on the multi-attribute key table may name; each query
+# carries only the ones its key condition uses.
+_MK_VALUES = {":v": {"S": OWN}, ":g": {"S": "blue"}, ":x": {"S": "x1"},
+              ":lo": {"S": "a"}, ":a": {"S": "a1"}, ":c": {"S": "b1"},
+              ":p": {"S": "b"}}
+
+
+def _mk_query(index: str, kce: str) -> dict:
+    """Query arguments for `kce` on `index` of the multi-attribute key table,
+    with a `#name` reference for every attribute written as `#<attribute>`."""
+    kwargs: dict = {
+        "IndexName": index,
+        "KeyConditionExpression": kce,
+        "ExpressionAttributeValues": {
+            k: _MK_VALUES[k] for k in sorted(set(re.findall(r":\w+", kce)))},
+    }
+    refs = sorted(set(re.findall(r"#\w+", kce)))
+    if refs:
+        kwargs["ExpressionAttributeNames"] = {r: r[1:] for r in refs}
+    return kwargs
 
 
 @pytest.fixture(scope="module")
@@ -566,6 +589,74 @@ class TestLeadingKeys:
             c.get_item(TableName=mh_table, Key={"pk": {"S": "i3"}})
         assert _denied(e)
 
+    # -- GSIs with multi-attribute keys and three or more conditions ---------
+    #
+    # gsi3 has HASH g1, g2 and RANGE gs; gsi4 has HASH h and RANGE a, b. The
+    # engine assigns every clause of a key condition on such an index to its
+    # key attribute by name, so it serves any clause order. The Query shapes in
+    # QUERY_ACCEPTED below use both indexes.
+
+    def _make_multi_key_gsi_table(self) -> tuple[str, Any]:
+        owner = f"owner-{uuid.uuid4().hex[:8]}"
+        resp = self.mgmt.create_user(self.account_id, owner, "TestPass123!")
+        assert resp.status_code == 201, resp.text
+        self._users.append(owner)
+        resp = self.mgmt.create_access_key(self.account_id, owner)
+        assert resp.status_code == 201, resp.text
+        creds = resp.json()
+        resp = self.mgmt.put_user_policy(self.account_id, owner, "full", ALLOW_ALL)
+        assert resp.status_code == 204, resp.text
+        client = _make_client(self.endpoint, creds["access_key_id"],
+                             creds["secret_access_key"], self.region)
+        table = f"lk-mk-{uuid.uuid4().hex[:8]}"
+        client.create_table(
+            TableName=table,
+            AttributeDefinitions=[
+                {"AttributeName": name, "AttributeType": "S"}
+                for name in ("pk", "g1", "g2", "gs", "h", "a", "b")
+            ],
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            GlobalSecondaryIndexes=[
+                {
+                    "IndexName": "gsi3",
+                    "KeySchema": [
+                        {"AttributeName": "g1", "KeyType": "HASH"},
+                        {"AttributeName": "g2", "KeyType": "HASH"},
+                        {"AttributeName": "gs", "KeyType": "RANGE"},
+                    ],
+                    "Projection": {"ProjectionType": "ALL"},
+                },
+                {
+                    "IndexName": "gsi4",
+                    "KeySchema": [
+                        {"AttributeName": "h", "KeyType": "HASH"},
+                        {"AttributeName": "a", "KeyType": "RANGE"},
+                        {"AttributeName": "b", "KeyType": "RANGE"},
+                    ],
+                    "Projection": {"ProjectionType": "ALL"},
+                },
+            ],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        wait_for_active(client, table)
+        for pk, who, n in [("i1", OWN, "1"), ("i2", OWN, "2"),
+                           ("i3", OTHER, "1"), ("i4", OTHER, "2")]:
+            client.put_item(TableName=table, Item={
+                "pk": {"S": pk}, "g1": {"S": who}, "g2": {"S": "blue"},
+                "gs": {"S": "x" + n}, "h": {"S": who}, "a": {"S": "a1"},
+                "b": {"S": "b" + n}})
+        return table, client
+
+    @pytest.fixture()
+    def mk_table(self):
+        name, owner = self._make_multi_key_gsi_table()
+        yield name
+        try:
+            owner.delete_table(TableName=name)
+            wait_for_deleted(owner, name)
+        except Exception:
+            pass
+
     # -- Numeric (N) partition key rendering --------------------------------
     #
     # The service writes an N partition key into dynamodb:LeadingKeys in one of
@@ -818,9 +909,7 @@ class TestLeadingKeys:
     # other principal. Every rejected shape returned ValidationException to the
     # owner and to the fenced principal. To the other principal the service
     # returned ValidationException, except where QUERY_REJECTED_OTHER_CODE
-    # names a different code. For the shapes in QUERY_REJECTED_CODE_DIVERGES
-    # ExtendDB still answers the other code, so the test asserts only that no
-    # data is returned.
+    # names a different code.
 
     QUERY_ACCEPTED = [
         ("pk eq placeholder", "main", {"KeyConditionExpression": "pk = :v",
@@ -895,7 +984,42 @@ class TestLeadingKeys:
                                           "ExpressionAttributeValues": {":a": {"S": "alice"},
                                                                         ":b": {"S": "blue"}}},
          "g1", "alice"),
+        # Three-clause orders on multi-attribute key GSIs. Each applies two
+        # measured rules, LeadingKeys is the first HASH attribute's value
+        # (2026-10-20, gsi2) and clause order is free (2026-10-21, #429); the
+        # shapes themselves were run against ExtendDB only. Before
+        # authorization assigned the clauses the way the engine does, it found
+        # no partition key in each of them and the other principal read the
+        # rows.
+        ("gsi3 g2 g1 gs", "mk", _mk_query("gsi3", "g2 = :g AND g1 = :v AND gs = :x"),
+         "g1", OWN),
+        ("gsi3 gs g1 g2", "mk", _mk_query("gsi3", "gs = :x AND g1 = :v AND g2 = :g"),
+         "g1", OWN),
+        ("gsi3 g2 g1 gs range", "mk", _mk_query("gsi3", "g2 = :g AND g1 = :v AND gs > :lo"),
+         "g1", OWN),
+        ("gsi3 names g2 g1 gs", "mk",
+         _mk_query("gsi3", "#g2 = :g AND #g1 = :v AND #gs = :x"), "g1", OWN),
+        ("gsi3 names gs g1 g2", "mk",
+         _mk_query("gsi3", "#gs = :x AND #g1 = :v AND #g2 = :g"), "g1", OWN),
+        ("gsi3 names g2 g1 gs range", "mk",
+         _mk_query("gsi3", "#g2 = :g AND #g1 = :v AND #gs > :lo"), "g1", OWN),
+        ("gsi4 a h b", "mk", _mk_query("gsi4", "a = :a AND h = :v AND b = :c"), "h", OWN),
+        ("gsi4 b h a", "mk", _mk_query("gsi4", "b = :c AND h = :v AND a = :a"), "h", OWN),
+        ("gsi4 a h b range", "mk", _mk_query("gsi4", "a = :a AND h = :v AND b > :lo"),
+         "h", OWN),
+        ("gsi4 b range a h", "mk", _mk_query("gsi4", "b > :lo AND a = :a AND h = :v"),
+         "h", OWN),
+        ("gsi4 begins_with b a h", "mk",
+         _mk_query("gsi4", "begins_with(b, :p) AND a = :a AND h = :v"), "h", OWN),
     ]
+
+    # Accepted shapes with a condition on a RANGE attribute after the first.
+    # The MongoDB and Cassandra backends refuse those with ValidationException
+    # (docs/differences-from-dynamodb.md). Authorization runs first, so the
+    # other principal is denied on those backends as well.
+    QUERY_LATER_RANGE = {"gsi4 a h b", "gsi4 b h a", "gsi4 a h b range",
+                         "gsi4 b range a h", "gsi4 begins_with b a h"}
+    FIRST_RANGE_ONLY_BACKENDS = ("mongodb", "cassandra")
 
     QUERY_REJECTED = [
         ("non-eq pk", "main", {"KeyConditionExpression": "pk > :v",
@@ -927,14 +1051,6 @@ class TestLeadingKeys:
         "legacy begins_with pk": "AccessDeniedException",
     }
 
-    # Rejected shapes where ExtendDB still answers a different code than the
-    # service to the principal fenced away from the value. The service returned
-    # ValidationException to all three principals for the GSI shape below, while
-    # ExtendDB binds g1's value and denies. Tracked separately from issue #448.
-    QUERY_REJECTED_CODE_DIVERGES = {
-        "multi hash gsi missing g2": "ValidationException",
-    }
-
     def _fence_policy(self, values: list[str], tables: list[str]) -> dict:
         resources = []
         for t in tables:
@@ -951,8 +1067,9 @@ class TestLeadingKeys:
         }
 
     def test_query_shapes_authorize_the_partition_the_engine_reads(
-            self, table, num_table, mh_table):
-        tables = {"main": table, "num": num_table, "mh": mh_table}
+            self, table, num_table, mh_table, mk_table):
+        tables = {"main": table, "num": num_table, "mh": mh_table, "mk": mk_table}
+        first_range_only = configured_backend() in self.FIRST_RANGE_ONLY_BACKENDS
         owner = self._user_client([("full", ALLOW_ALL)])
         fenced = self._user_client([("lk", self._fence_policy(
             [OWN, G_OWN, "10"], list(tables.values())))])
@@ -979,6 +1096,17 @@ class TestLeadingKeys:
 
         failures = []
         for label, table_key, kwargs, attr, value in self.QUERY_ACCEPTED:
+            if first_range_only and label in self.QUERY_LATER_RANGE:
+                for who, client in (("owner", owner), ("fenced", fenced)):
+                    _, err = call(client, table_key, kwargs)
+                    if err != "ValidationException":
+                        failures.append(f"{label}: {who} got {err or 'rows'}, expected the "
+                                        "backend's ValidationException")
+                _, err_o = call(other, table_key, kwargs)
+                if err_o != "AccessDeniedException":
+                    failures.append(f"{label}: other principal got {err_o or 'rows'}, "
+                                    "expected denial")
+                continue
             got, err = call(owner, table_key, kwargs)
             if err is not None:
                 failures.append(f"{label}: owner got {err}")
@@ -1001,10 +1129,7 @@ class TestLeadingKeys:
                     failures.append(f"{label}: {who} got {err or 'rows'}, expected ValidationException")
             _, err_o = call(other, table_key, kwargs)
             want = self.QUERY_REJECTED_OTHER_CODE.get(label, "ValidationException")
-            if label in self.QUERY_REJECTED_CODE_DIVERGES:
-                if err_o is None:
-                    failures.append(f"{label}: other principal got rows")
-            elif err_o != want:
+            if err_o != want:
                 failures.append(f"{label}: other principal got {err_o or 'rows'}, "
                                 f"expected {want}")
 
