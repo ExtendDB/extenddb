@@ -32,24 +32,16 @@ pub fn warm_throughput_record_for_create(
 }
 
 /// The record an update path stores over the stored JSON (`None` when the
-/// resource never had one).
-///
-/// # Errors
-///
-/// `Internal` when the stored JSON does not parse.
+/// resource never had one, or when it does not parse).
+#[must_use]
 pub fn warm_throughput_record_for_update(
     existing_json: Option<&str>,
     spec: &WarmThroughput,
     delay_secs: f64,
-) -> Result<WarmThroughputRecord, StorageError> {
-    let existing = parse_warm_throughput_record(existing_json)?;
+) -> WarmThroughputRecord {
+    let existing = parse_warm_throughput_record(existing_json);
     let now = epoch_seconds_now();
-    Ok(WarmThroughputRecord::apply_update(
-        existing,
-        spec,
-        now + delay_secs.max(0.0),
-        now,
-    ))
+    WarmThroughputRecord::apply_update(existing, spec, now + delay_secs.max(0.0), now)
 }
 
 /// The stored JSON of a record.
@@ -64,17 +56,23 @@ pub fn warm_throughput_record_json(record: &WarmThroughputRecord) -> Result<Stri
 
 /// A record from its stored JSON; `None` in, `None` out.
 ///
-/// # Errors
-///
-/// `Internal` when the text does not parse as a record.
-pub fn parse_warm_throughput_record(
-    json: Option<&str>,
-) -> Result<Option<WarmThroughputRecord>, StorageError> {
-    json.map(|text| {
-        serde_json::from_str(text)
-            .map_err(|e| StorageError::Internal(format!("warm throughput record: {e}")))
-    })
-    .transpose()
+/// A value that does not parse as a record (a hand edit, or a record shape
+/// this build does not know) is logged and read as never set, so the
+/// resource reports the defaults for its billing mode, as the neighbouring
+/// `on_demand_throughput` column does, and an `UpdateTable` that sets the
+/// member writes a record over it.
+#[must_use]
+pub fn parse_warm_throughput_record(json: Option<&str>) -> Option<WarmThroughputRecord> {
+    let text = json?;
+    match serde_json::from_str(text) {
+        Ok(record) => Some(record),
+        Err(e) => {
+            tracing::warn!(
+                "stored warm_throughput does not parse as a record, reporting the defaults: {e}"
+            );
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -116,14 +114,12 @@ mod tests {
                 write_units_per_second: Some(75),
             },
             0.0,
-        )
-        .expect("merged");
+        );
         assert_eq!(updated.read_units_per_second, Some(100));
         assert_eq!(updated.write_units_per_second, Some(75));
         let again = parse_warm_throughput_record(Some(
             &warm_throughput_record_json(&updated).expect("json"),
         ))
-        .expect("parses")
         .expect("present");
         assert_eq!(
             (again.read_units_per_second, again.write_units_per_second),
@@ -138,11 +134,26 @@ mod tests {
         assert!((again.updating_until - updated.updating_until).abs() < 1e-6);
     }
 
+    /// A value that does not parse reads as never set (the defaults are
+    /// reported), and an update writes a whole record over it.
     #[test]
-    fn garbage_in_the_column_is_an_internal_error_not_a_default() {
-        let err = parse_warm_throughput_record(Some("{\"x\":")).expect_err("refused");
-        assert!(
-            matches!(err, StorageError::Internal(m) if m.starts_with("warm throughput record:"))
-        );
+    fn garbage_in_the_column_reads_as_never_set_and_an_update_replaces_it() {
+        for garbage in ["{\"x\":", "{\"ReadUnitsPerSecond\": \"lots\"}", "\"text\""] {
+            assert_eq!(
+                parse_warm_throughput_record(Some(garbage)),
+                None,
+                "{garbage}"
+            );
+            let updated = warm_throughput_record_for_update(
+                Some(garbage),
+                &WarmThroughput {
+                    read_units_per_second: Some(13_000),
+                    write_units_per_second: None,
+                },
+                0.0,
+            );
+            assert_eq!(updated.read_units_per_second, Some(13_000));
+            assert_eq!(updated.write_units_per_second, None);
+        }
     }
 }

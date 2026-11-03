@@ -247,7 +247,7 @@ impl PostgresEngine {
                         &idx.index_name,
                     ),
                     warm_throughput: None,
-                    warm_throughput_record: parse_warm_throughput_record(warm_json.as_deref())?,
+                    warm_throughput_record: parse_warm_throughput_record(warm_json.as_deref()),
                 });
             } else {
                 lsis.push(LsiDescription {
@@ -367,7 +367,7 @@ impl PostgresEngine {
                 .and_then(|v| serde_json::from_value(v).ok()),
             warm_throughput_record: parse_warm_throughput_record(
                 row.warm_throughput.map(|v| v.to_string()).as_deref(),
-            )?,
+            ),
             // Vector indexes are read separately and applied by the caller: this
             // builder takes `index_rows` only, and the two callers differ in
             // whether they need them. `build_table_description` fills them in;

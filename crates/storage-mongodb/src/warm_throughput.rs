@@ -14,6 +14,7 @@ use extenddb_core::types::{
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::warm_throughput_record_for_create;
+use mongodb::Collection;
 
 use crate::MongoEngine;
 
@@ -28,19 +29,25 @@ pub(crate) fn warm_record_bson(
     }
 }
 
-/// The record on a table or index document, if any.
-///
-/// # Errors
-///
-/// `Internal` when the stored field is present but not a record.
-pub(crate) fn warm_record_from_doc(
-    doc: &Document,
-) -> Result<Option<WarmThroughputRecord>, StorageError> {
-    match doc.get("warm_throughput") {
-        None | Some(Bson::Null) => Ok(None),
-        Some(b) => bson::from_bson(b.clone())
-            .map(Some)
-            .map_err(|e| StorageError::Internal(format!("warm throughput record: {e}"))),
+/// The record on a table or index document, if any. A field that is not a
+/// record is logged and read as never set, so the defaults are reported (see
+/// `extenddb_storage::util::parse_warm_throughput_record`).
+pub(crate) fn warm_record_from_doc(doc: &Document) -> Option<WarmThroughputRecord> {
+    warm_record_from_bson(doc.get("warm_throughput"))
+}
+
+fn warm_record_from_bson(field: Option<&Bson>) -> Option<WarmThroughputRecord> {
+    match field {
+        None | Some(Bson::Null) => None,
+        Some(b) => match bson::from_bson(b.clone()) {
+            Ok(record) => Some(record),
+            Err(e) => {
+                tracing::warn!(
+                    "stored warm_throughput is not a record, reporting the defaults: {e}"
+                );
+                None
+            }
+        },
     }
 }
 
@@ -54,12 +61,61 @@ pub(crate) fn warm_record_bson_for_create(
     Ok((record, bson))
 }
 
+/// How many times a merge reads the record again after another write changed
+/// it between the read and the conditional write.
+const MERGE_ATTEMPTS: usize = 32;
+
+/// Merge `spec` into the `warm_throughput` field of the document `filter`
+/// selects, starting from `current`, the field as read. The write is
+/// conditional on the field still holding what was read; when another
+/// `UpdateTable` wrote it first, the document is read again and the merge
+/// retried, so two requests that set different sides both keep their side.
+async fn merge_warm_throughput(
+    coll: &Collection<Document>,
+    filter: &Document,
+    mut current: Bson,
+    spec: &WarmThroughput,
+    (updating_until, now): (f64, f64),
+    not_found: impl Fn() -> StorageError,
+) -> Result<(), StorageError> {
+    for _ in 0..MERGE_ATTEMPTS {
+        let record = WarmThroughputRecord::apply_update(
+            warm_record_from_bson(Some(&current)),
+            spec,
+            updating_until,
+            now,
+        );
+        let mut guarded = filter.clone();
+        guarded.insert("warm_throughput", current.clone());
+        let result = coll
+            .update_one(
+                guarded,
+                doc! { "$set": { "warm_throughput": warm_record_bson(Some(&record))? } },
+            )
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        if result.matched_count > 0 {
+            return Ok(());
+        }
+        let doc = coll
+            .find_one(filter.clone())
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?
+            .ok_or_else(&not_found)?;
+        current = doc.get("warm_throughput").cloned().unwrap_or(Bson::Null);
+    }
+    Err(StorageError::Internal(
+        "warm throughput: the record changed on every attempt to merge the request".to_owned(),
+    ))
+}
+
 impl MongoEngine {
     /// Store the request's table-level `WarmThroughput` and each
     /// `GlobalSecondaryIndexUpdates.Update.WarmThroughput`, merged over what
-    /// is stored. Read-modify-write without a transaction, like the rest of
-    /// this backend's UpdateTable. The engine has already validated the
-    /// values against the current ones.
+    /// is stored. Each merge is a conditional write on the value it read,
+    /// retried when another request wrote first (see
+    /// `merge_warm_throughput`). The engine has already validated the values
+    /// against the current ones.
     pub(crate) async fn store_warm_throughput_updates(
         &self,
         account_id: &str,
@@ -87,19 +143,18 @@ impl MongoEngine {
             .ok_or_else(|| StorageError::TableNotFound(input.table_name.clone()))?;
 
         if let Some(spec) = &input.warm_throughput {
-            let record = WarmThroughputRecord::apply_update(
-                warm_record_from_doc(&table_doc)?,
+            merge_warm_throughput(
+                &tables_coll,
+                &table_filter,
+                table_doc
+                    .get("warm_throughput")
+                    .cloned()
+                    .unwrap_or(Bson::Null),
                 spec,
-                updating_until,
-                now,
-            );
-            tables_coll
-                .update_one(
-                    table_filter,
-                    doc! { "$set": { "warm_throughput": warm_record_bson(Some(&record))? } },
-                )
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+                (updating_until, now),
+                || StorageError::TableNotFound(input.table_name.clone()),
+            )
+            .await?;
         }
 
         if gsi_updates.is_empty() {
@@ -119,19 +174,18 @@ impl MongoEngine {
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?
                 .ok_or_else(|| StorageError::IndexNotFound(index_name.clone()))?;
-            let record = WarmThroughputRecord::apply_update(
-                warm_record_from_doc(&index_doc)?,
+            merge_warm_throughput(
+                &indexes_coll,
+                &filter,
+                index_doc
+                    .get("warm_throughput")
+                    .cloned()
+                    .unwrap_or(Bson::Null),
                 spec,
-                updating_until,
-                now,
-            );
-            indexes_coll
-                .update_one(
-                    filter,
-                    doc! { "$set": { "warm_throughput": warm_record_bson(Some(&record))? } },
-                )
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+                (updating_until, now),
+                || StorageError::IndexNotFound(index_name.clone()),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -151,19 +205,20 @@ mod tests {
             updating_until: 1.5,
         };
         let doc = doc! { "warm_throughput": warm_record_bson(Some(&record)).expect("bson") };
-        assert_eq!(warm_record_from_doc(&doc).expect("parses"), Some(record));
+        assert_eq!(warm_record_from_doc(&doc), Some(record));
         let null = doc! { "warm_throughput": Bson::Null };
-        assert_eq!(warm_record_from_doc(&null).expect("parses"), None);
-        assert_eq!(warm_record_from_doc(&doc! {}).expect("parses"), None);
+        assert_eq!(warm_record_from_doc(&null), None);
+        assert_eq!(warm_record_from_doc(&doc! {}), None);
         assert_eq!(warm_record_bson(None).expect("bson"), Bson::Null);
     }
 
     #[test]
-    fn garbage_in_the_field_is_an_internal_error() {
-        let bad = doc! { "warm_throughput": "not a record" };
-        assert!(matches!(
-            warm_record_from_doc(&bad),
-            Err(StorageError::Internal(m)) if m.starts_with("warm throughput record:")
-        ));
+    fn garbage_in_the_field_reads_as_never_set() {
+        for bad in [
+            doc! { "warm_throughput": "not a record" },
+            doc! { "warm_throughput": { "ReadUnitsPerSecond": "lots" } },
+        ] {
+            assert_eq!(warm_record_from_doc(&bad), None, "{bad}");
+        }
     }
 }

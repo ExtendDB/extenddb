@@ -1611,7 +1611,7 @@ impl MongoEngine {
                         warm_throughput: None,
                         warm_throughput_record: crate::warm_throughput::warm_record_from_doc(
                             idx_doc,
-                        )?,
+                        ),
                     });
                 }
                 "LSI" => {
@@ -1708,7 +1708,7 @@ impl MongoEngine {
             table_class_summary,
             on_demand_throughput,
             restore_summary,
-            warm_throughput_record: crate::warm_throughput::warm_record_from_doc(doc)?,
+            warm_throughput_record: crate::warm_throughput::warm_record_from_doc(doc),
             // Fields for features this backend does not implement, vector
             // indexes today, take their defaults. Adding one to
             // TableDescription then does not break this build.

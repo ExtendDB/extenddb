@@ -8,11 +8,9 @@
 //! pre-warms or scales on it, and it has no effect on throughput, throttling
 //! or storage. See `extenddb_core::types::WarmThroughputRecord`.
 
-use extenddb_core::types::UpdateTableInput;
+use extenddb_core::types::{UpdateTableInput, WarmThroughputRecord};
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{
-    warm_throughput_record_for_create, warm_throughput_record_for_update,
-};
+use extenddb_storage::util::{warm_throughput_record_for_update, warm_throughput_updating_until};
 
 use crate::PostgresEngine;
 
@@ -74,7 +72,7 @@ impl PostgresEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
             let existing = existing.map(|v| v.to_string());
-            let record = warm_throughput_record_for_update(existing.as_deref(), spec, delay_secs)?;
+            let record = warm_throughput_record_for_update(existing.as_deref(), spec, delay_secs);
             sqlx::query(
                 "UPDATE tables SET warm_throughput = $1 WHERE account_id = $2 AND table_name = $3",
             )
@@ -100,7 +98,7 @@ impl PostgresEngine {
                 return Err(StorageError::IndexNotFound(index_name.clone()));
             };
             let existing = existing.map(|v| v.to_string());
-            let record = warm_throughput_record_for_update(existing.as_deref(), spec, delay_secs)?;
+            let record = warm_throughput_record_for_update(existing.as_deref(), spec, delay_secs);
             sqlx::query(
                 "UPDATE indexes SET warm_throughput = $1 WHERE table_id = $2 AND index_name = $3",
             )
@@ -123,19 +121,16 @@ impl PostgresEngine {
     /// default 0.25 s window. Without this the response, which is described
     /// after the build, would report the new index's `WarmThroughput` `ACTIVE`
     /// where the service reports it `UPDATING`.
+    ///
+    /// `created` holds each index's name and the record it was inserted with.
+    /// The write is conditional on that record, so a `WarmThroughput` Update
+    /// of the index accepted while the build ran keeps its value.
     pub(crate) async fn restart_created_gsi_warm_throughput(
         &self,
         table_id: &str,
-        input: &UpdateTableInput,
+        created: &[(String, serde_json::Value)],
     ) -> Result<(), StorageError> {
-        let creates: Vec<_> = input
-            .global_secondary_index_updates
-            .iter()
-            .flatten()
-            .filter_map(|u| u.create.as_ref())
-            .filter(|c| c.warm_throughput.is_some())
-            .collect();
-        if creates.is_empty() {
+        if created.is_empty() {
             return Ok(());
         }
         let mut conn = self
@@ -144,21 +139,23 @@ impl PostgresEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
         let delay_secs = Self::control_plane_delay_secs(&mut conn).await?;
-        for create in creates {
-            let Some(record) =
-                warm_throughput_record_for_create(create.warm_throughput.as_ref(), delay_secs)
+        for (index_name, inserted) in created {
+            let Ok(mut record) = serde_json::from_value::<WarmThroughputRecord>(inserted.clone())
             else {
                 continue;
             };
+            record.updating_until = warm_throughput_updating_until(delay_secs);
             let json =
                 serde_json::to_value(record).map_err(|e| StorageError::Internal(e.to_string()))?;
             sqlx::query(
                 "UPDATE indexes SET warm_throughput = $1 \
-                 WHERE table_id = $2 AND index_name = $3 AND index_type = 'GSI'",
+                 WHERE table_id = $2 AND index_name = $3 AND index_type = 'GSI' \
+                 AND warm_throughput = $4",
             )
             .bind(json)
             .bind(table_id)
-            .bind(&create.index_name)
+            .bind(index_name)
+            .bind(inserted)
             .execute(&mut *conn)
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;

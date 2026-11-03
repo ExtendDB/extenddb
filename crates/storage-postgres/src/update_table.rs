@@ -437,6 +437,9 @@ impl PostgresEngine {
         Self::store_warm_throughput_updates(&mut tx, account_id, &table_id, &input).await?;
 
         // Apply GSI updates (create/delete).
+        // The WarmThroughput record each created GSI was inserted with, so the
+        // restart after the build leaves a later Update's record alone.
+        let mut created_warm: Vec<(String, serde_json::Value)> = Vec::new();
         let mut created_index_ids: Vec<String> = Vec::new();
         let mut deleted_index_ids: Vec<String> = Vec::new();
         // The merged and pruned attribute definitions persisted by this
@@ -496,6 +499,9 @@ impl PostgresEngine {
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    if let Some(warm) = gsi_warm {
+                        created_warm.push((create.index_name.clone(), warm));
+                    }
                     created_index_ids.push(index_id);
                     // The data table is created before this transaction commits, and
                     // the index is published CREATING; see the block before the
@@ -1104,7 +1110,7 @@ impl PostgresEngine {
 
         // The build outlasts a new GSI's WarmThroughput UPDATING window; start
         // it again so the response reports it as the service does.
-        self.restart_created_gsi_warm_throughput(&table_id, &input)
+        self.restart_created_gsi_warm_throughput(&table_id, &created_warm)
             .await?;
 
         self.build_table_description(account_id, &input.table_name)

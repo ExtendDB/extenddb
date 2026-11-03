@@ -165,9 +165,9 @@ impl CassandraEngine {
             .ok()
             .flatten()
             .and_then(|s: String| serde_json::from_str(&s).ok());
-        // Absent on a catalog that has not run V006 (SELECT * tolerates it).
+        // Added by catalog migration 6; null when the client never set it.
         let warm_json: Option<String> = table_row.get_by_name("warm_throughput").ok().flatten();
-        let warm_throughput_record = parse_warm_throughput_record(warm_json.as_deref())?;
+        let warm_throughput_record = parse_warm_throughput_record(warm_json.as_deref());
 
         // A restore target reports its registration for as long as the row
         // carries it; the engine shows it only while the table is CREATING.
@@ -233,7 +233,7 @@ impl CassandraEngine {
                     item_count: 0,
                     index_arn: index_arn(&self.region, account_id, &table_name, &index_name),
                     warm_throughput: None,
-                    warm_throughput_record: parse_warm_throughput_record(warm_json.as_deref())?,
+                    warm_throughput_record: parse_warm_throughput_record(warm_json.as_deref()),
                 });
             } else {
                 lsis.push(LsiDescription {

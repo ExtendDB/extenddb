@@ -5,7 +5,7 @@
 //! the `UPDATING` window takes, and the `UpdateTable` merges.
 //!
 //! The record is written as sent (one JSON text per table and per index, see
-//! catalog migration V006) and read back by DescribeTable; nothing pre-warms
+//! catalog migration 6) and read back by DescribeTable; nothing pre-warms
 //! or scales on it, and it has no effect on throughput, throttling or
 //! storage. See `extenddb_core::types::WarmThroughputRecord`.
 
@@ -14,8 +14,29 @@ use extenddb_core::types::WarmThroughput;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{warm_throughput_record_for_update, warm_throughput_record_json};
 
+use cdrs_tokio::query::QueryValues;
+use cdrs_tokio::types::value::Value;
+
 use crate::CassandraEngine;
-use crate::cassandra_util::query_optional;
+use crate::cassandra_util::{lwt_applied, query_lwt, query_optional};
+
+/// How many times a conditional warm throughput write reads the record again
+/// after another `UpdateTable` changed it between the read and the write.
+pub(crate) const MERGE_ATTEMPTS: usize = 32;
+
+/// A stored record as read (`None` when the column is null) and the JSON to
+/// write over it. The write is conditional on `read`, so a merge that another
+/// request overtook is retried instead of overwriting that request's side.
+pub(crate) struct WarmMerge {
+    pub(crate) read: Option<String>,
+    pub(crate) merged: String,
+}
+
+/// The bind value of a lightweight transaction condition on a text column
+/// that may be null.
+pub(crate) fn condition_value(read: Option<&str>) -> Value {
+    read.map_or(Value::Null, Value::from)
+}
 
 impl CassandraEngine {
     /// `control_plane_delay_seconds` from the settings table (0.25 when
@@ -41,15 +62,13 @@ impl CassandraEngine {
     }
 
     /// The JSON an `UpdateTable` stores in `tables.warm_throughput`: the
-    /// request merged over the current record. Read as its own statement so
-    /// a catalog that has not run V006 only fails a request that names the
-    /// member.
+    /// request merged over the current record, with the record as read.
     pub(crate) async fn merged_table_warm_throughput(
         &self,
         account_id: &str,
         table_name: &str,
         spec: &WarmThroughput,
-    ) -> Result<String, StorageError> {
+    ) -> Result<WarmMerge, StorageError> {
         let catalog_ks = self.catalog_keyspace();
         let row = query_optional::<StorageError>(
             &self.session,
@@ -67,19 +86,23 @@ impl CassandraEngine {
             existing.as_deref(),
             spec,
             self.control_plane_delay_secs().await,
-        )?;
-        warm_throughput_record_json(&record)
+        );
+        Ok(WarmMerge {
+            merged: warm_throughput_record_json(&record)?,
+            read: existing,
+        })
     }
 
     /// The JSON an `UpdateTable` stores in `indexes.warm_throughput` for a
     /// `GlobalSecondaryIndexUpdates.Update`: the request merged over the
-    /// index's current record. `IndexNotFound` when the table has no such GSI.
+    /// index's current record, with the record as read. `IndexNotFound` when
+    /// the table has no such GSI.
     pub(crate) async fn merged_index_warm_throughput(
         &self,
         table_id: &str,
         index_name: &str,
         spec: &WarmThroughput,
-    ) -> Result<String, StorageError> {
+    ) -> Result<WarmMerge, StorageError> {
         let catalog_ks = self.catalog_keyspace();
         let row = query_optional::<StorageError>(
             &self.session,
@@ -101,7 +124,52 @@ impl CassandraEngine {
             existing.as_deref(),
             spec,
             self.control_plane_delay_secs().await,
-        )?;
-        warm_throughput_record_json(&record)
+        );
+        Ok(WarmMerge {
+            merged: warm_throughput_record_json(&record)?,
+            read: existing,
+        })
+    }
+
+    /// Store a `GlobalSecondaryIndexUpdates.Update.WarmThroughput` merged over
+    /// the index's record, as a lightweight transaction conditional on the
+    /// record read; when another `UpdateTable` wrote the record first it is
+    /// read again and merged again, so two requests that set different sides
+    /// both keep their side.
+    pub(crate) async fn store_index_warm_throughput(
+        &self,
+        table_id: &str,
+        index_name: &str,
+        spec: &WarmThroughput,
+    ) -> Result<(), StorageError> {
+        let catalog_ks = self.catalog_keyspace();
+        let cql = format!(
+            "UPDATE {catalog_ks}.indexes SET warm_throughput = ? \
+             WHERE table_id = ? AND index_name = ? \
+             IF index_type = 'GSI' AND warm_throughput = ?"
+        );
+        for _ in 0..MERGE_ATTEMPTS {
+            let merge = self
+                .merged_index_warm_throughput(table_id, index_name, spec)
+                .await?;
+            let result = query_lwt(
+                &self.session,
+                &cql,
+                QueryValues::SimpleValues(vec![
+                    Value::from(merge.merged.as_str()),
+                    Value::from(table_id),
+                    Value::from(index_name),
+                    condition_value(merge.read.as_deref()),
+                ]),
+            )
+            .await?;
+            if lwt_applied(&result)? {
+                return Ok(());
+            }
+        }
+        Err(StorageError::Internal(format!(
+            "warm throughput of index {index_name}: the record changed on every attempt to \
+             merge the request"
+        )))
     }
 }

@@ -12,6 +12,8 @@ pre-existing IndexStatus divergence are gated on `is_extenddb`.
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 from botocore.exceptions import ClientError
 
@@ -418,3 +420,67 @@ class TestWarmThroughputAcrossBillingChanges:
         _wait_all_active(dynamodb_client, name)
         active = _wait_warm_active(dynamodb_client, name, timeout=900)
         assert active["WarmThroughput"] == {**ON_DEMAND_DEFAULTS, "Status": "ACTIVE"}
+
+
+class TestWarmThroughputConcurrentUpdates:
+    def test_two_updates_that_set_different_sides_both_keep_their_side(
+        self, dynamodb_client, tables, is_extenddb
+    ):
+        """Two UpdateTables sent together, one raising ReadUnitsPerSecond and one
+        WriteUnitsPerSecond, both answer 200, and the settled value carries both
+        sides, on the table and on a GSI, in each of ten rounds. ExtendDB only: an
+        increase on the service is billed and settles after minutes. Each backend
+        merges the request over the stored record; a merge that another request
+        overtook is retried instead of writing over that request's side."""
+        if not is_extenddb:
+            pytest.skip("raises warm throughput twenty times; the service bills each increase")
+        name, _ = _create(
+            dynamodb_client,
+            tables,
+            BillingMode="PAY_PER_REQUEST",
+            GlobalSecondaryIndexes=[GSI],
+        )
+        _wait_all_active(dynamodb_client, name)
+        index = GSI["IndexName"]
+
+        def on_table(member, value):
+            return {"WarmThroughput": {member: value}}
+
+        def on_index(member, value):
+            return {
+                "GlobalSecondaryIndexUpdates": [
+                    {"Update": {"IndexName": index, "WarmThroughput": {member: value}}}
+                ]
+            }
+
+        for shape, reported in (
+            (on_table, lambda t: t["WarmThroughput"]),
+            (on_index, lambda t: t["GlobalSecondaryIndexes"][0]["WarmThroughput"]),
+        ):
+            for i in range(1, 11):
+                read, write = 12000 + 100 * i, 4000 + 100 * i
+                barrier = threading.Barrier(2)
+                errors = []
+
+                def send(member, value, shape=shape, barrier=barrier, errors=errors):
+                    barrier.wait()
+                    try:
+                        dynamodb_client.update_table(TableName=name, **shape(member, value))
+                    except ClientError as e:
+                        errors.append(e.response["Error"])
+
+                senders = [
+                    threading.Thread(target=send, args=("ReadUnitsPerSecond", read)),
+                    threading.Thread(target=send, args=("WriteUnitsPerSecond", write)),
+                ]
+                for sender in senders:
+                    sender.start()
+                for sender in senders:
+                    sender.join()
+                assert errors == [], (shape.__name__, i, errors)
+                settled = _wait_warm_active(dynamodb_client, name)
+                assert reported(settled) == {
+                    "ReadUnitsPerSecond": read,
+                    "WriteUnitsPerSecond": write,
+                    "Status": "ACTIVE",
+                }, (shape.__name__, i)

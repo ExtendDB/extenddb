@@ -236,7 +236,7 @@ impl SqliteEngine {
                     warm_throughput: None,
                     warm_throughput_record: parse_warm_throughput_record(
                         idx.warm_throughput.as_deref(),
-                    )?,
+                    ),
                 });
             } else {
                 lsis.push(LsiDescription {
@@ -350,7 +350,7 @@ impl SqliteEngine {
                 .on_demand_throughput
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok()),
-            warm_throughput_record: parse_warm_throughput_record(row.warm_throughput.as_deref())?,
+            warm_throughput_record: parse_warm_throughput_record(row.warm_throughput.as_deref()),
             // Any core field this backend does not populate takes its default, so
             // adding one does not break this build.
             ..Default::default()
