@@ -71,3 +71,15 @@ def wait_for_deleted(client, table_name: str, timeout: float = 60.0) -> None:
 def unique_name(prefix: str = "test") -> str:
     """Generate a unique name for test isolation."""
     return f"{prefix}-{uuid.uuid4().hex[:12]}"
+
+
+# What GetShardIterator answers for a stream ARN that names no stream of the
+# caller's account (measured 2026-10-24). GetRecords answers the same for such
+# an ARN and for a shard that is not one of that stream's shards.
+STREAM_DOES_NOT_EXIST = "Requested resource not found: Stream does not exist"
+
+
+def describe_stream_not_found_message(stream_arn: str) -> str:
+    """What DescribeStream answers for a stream ARN that names no stream of the
+    caller's account (measured 2026-10-24): the ARN, and no trailing period."""
+    return f"Requested resource not found: Stream: {stream_arn} not found"
