@@ -353,14 +353,14 @@ mod tests {
                 .as_object_mut()
                 .unwrap()
                 .extend(members.as_object().unwrap().clone());
-            for billing in [None, Some("PROVISIONED"), Some("PAY_PER_REQUEST")] {
+            for mode in [None, Some("PROVISIONED"), Some("PAY_PER_REQUEST")] {
                 let mut request = input(json!([{ "Update": update }]));
-                request.billing_mode = billing.map(|b| serde_json::from_value(json!(b)).unwrap());
+                request.billing_mode = mode.map(|m| serde_json::from_value(json!(m)).unwrap());
                 assert_eq!(
                     message(validate_gsi_updates(&request)),
                     "One or more parameter values were invalid: WarmThroughput must be the only \
                      operation in the request for index: gsi",
-                    "{update} with BillingMode {billing:?}"
+                    "{update} with BillingMode {mode:?}"
                 );
             }
         }
