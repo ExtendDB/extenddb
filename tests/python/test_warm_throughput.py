@@ -144,13 +144,17 @@ class TestWarmThroughputLifecycle:
     def test_update_warm_throughput_goes_updating_then_active(
         self, dynamodb_client, tables, is_extenddb
     ):
-        """Rows U1, U2, U3, U5, U6, S2a, S2b and S2c: UpdateTable with WarmThroughput
-        is accepted and the response reports the PREVIOUS values with Status
-        UPDATING while TableStatus and IndexStatus stay ACTIVE; inside the window a
-        request carrying those previous values is accepted (U3); once settled the new
-        values read ACTIVE and the same request is a decrease (S2b). Only the waits
-        are gated: ExtendDB returns to ACTIVE within the control plane delay, the
-        service after minutes, so the settled assertions run on ExtendDB only."""
+        """Rows U1, U2, U3, U3b, U5, U6, S2a, S2b and S2c: UpdateTable with
+        WarmThroughput is accepted and the response reports the PREVIOUS values with
+        Status UPDATING while TableStatus and IndexStatus stay ACTIVE; inside the
+        window a request carrying those previous values is accepted (U3) and does not
+        lower the change in progress: the table settles at the higher values (U3b,
+        measured 2026-11-03: 12200/4200 and then 12000/4000 about 50 ms later both
+        answered 200, and the table and a GSI each read 12200/4200 ACTIVE once
+        settled, about ten minutes later); once settled the same request is a
+        decrease (S2b). Only the waits are gated: ExtendDB returns to ACTIVE within
+        the control plane delay, the service after minutes, so the settled
+        assertions run on ExtendDB only."""
         name, _ = _create(
             dynamodb_client,
             tables,
@@ -180,9 +184,7 @@ class TestWarmThroughputLifecycle:
                 "TableDescription"
             ]
             assert t["WarmThroughput"] == {**ON_DEMAND_DEFAULTS, "Status": "UPDATING"}
-            if is_extenddb:
-                _wait_warm_active(dynamodb_client, name)
-                dynamodb_client.update_table(TableName=name, WarmThroughput=higher)
+        # U3b: the table settles at the higher values, whether or not U3 ran.
         if is_extenddb:
             active = _wait_warm_active(dynamodb_client, name)
             assert active["WarmThroughput"] == {**higher, "Status": "ACTIVE"}

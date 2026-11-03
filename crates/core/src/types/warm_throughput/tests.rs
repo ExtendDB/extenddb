@@ -108,7 +108,10 @@ fn the_previous_pair_is_reported_and_compared_while_updating() {
     );
     assert_eq!(raised.reported(on_demand(), 10.0), (24_000, 8_000));
     // U3: inside the window a request carrying the previous values validates
-    // against 12000/4000 and, applied, keeps reporting 12000/4000.
+    // against 12000/4000, keeps reporting 12000/4000 while UPDATING, and
+    // settles at the higher pair still in progress, as the service does
+    // (measured 2026-11-03: 12200/4200, then 12000/4000 inside the window,
+    // settled at 12200/4200 on a table and on a GSI).
     let inside = WarmThroughputRecord::apply_update(
         Some(raised),
         &WarmThroughput {
@@ -119,7 +122,19 @@ fn the_previous_pair_is_reported_and_compared_while_updating() {
         5.0,
     );
     assert_eq!(inside.reported(on_demand(), 6.0), (12_000, 4_000));
-    assert_eq!(inside.reported(on_demand(), 15.0), (12_000, 4_000));
+    assert_eq!(inside.reported(on_demand(), 15.0), (24_000, 8_000));
+    // One side lower and one higher than the change in progress: each side
+    // keeps the larger value.
+    let mixed = WarmThroughputRecord::apply_update(
+        Some(raised),
+        &WarmThroughput {
+            read_units_per_second: Some(12_000),
+            write_units_per_second: Some(9_000),
+        },
+        15.0,
+        5.0,
+    );
+    assert_eq!(mixed.reported(on_demand(), 15.0), (24_000, 9_000));
     // S2c: the same values re-sent on a settled table report themselves UPDATING.
     let same = WarmThroughputRecord::apply_update(
         Some(raised),

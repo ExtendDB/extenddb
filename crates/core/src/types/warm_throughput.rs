@@ -192,12 +192,22 @@ impl WarmThroughputRecord {
     }
 
     /// The record an `UpdateTable` writes over `existing` at `now`: each side
-    /// the request names replaces the stored side, a side it leaves out keeps
-    /// the stored value (or stays unset and keeps reporting the default), the
-    /// `UPDATING` deadline restarts, and the previous pair becomes what
-    /// `existing` reported at `now` (its own previous pair while it was still
-    /// `UPDATING`, its stored sides otherwise), so a request inside the window
-    /// keeps reporting the values the window started from.
+    /// the request names becomes the larger of the requested and the stored
+    /// side, a side it leaves out keeps the stored value (or stays unset and
+    /// keeps reporting the default), the `UPDATING` deadline restarts, and the
+    /// previous pair becomes what `existing` reported at `now` (its own
+    /// previous pair while it was still `UPDATING`, its stored sides
+    /// otherwise), so a request inside the window keeps reporting the values
+    /// the window started from.
+    ///
+    /// The larger side is kept because a request validated against the
+    /// previous pair can be lower than the change still in progress. Measured
+    /// on 2026-11-03 on an on-demand table and on a GSI: 12200/4200 and then
+    /// 12000/4000 about 50 ms later both answered 200, and each settled at
+    /// 12200/4200 `ACTIVE`. Outside the window a lower request is refused as a
+    /// decrease before it gets here, so the rule changes nothing there; it
+    /// also keeps two concurrent `UpdateTable`s, each validated against the
+    /// description read before either wrote, from lowering the value.
     ///
     /// A `spec` with neither side (`WarmThroughput: {}`) changes no value and
     /// restarts the window. The service answers `InternalFailure` with an empty
@@ -222,13 +232,16 @@ impl WarmThroughputRecord {
                 existing.write_units_per_second,
             )
         };
+        let side = |requested: Option<i64>, stored: Option<i64>| match (requested, stored) {
+            (Some(r), Some(s)) => Some(r.max(s)),
+            (requested, stored) => requested.or(stored),
+        };
         Self {
-            read_units_per_second: spec
-                .read_units_per_second
-                .or(existing.read_units_per_second),
-            write_units_per_second: spec
-                .write_units_per_second
-                .or(existing.write_units_per_second),
+            read_units_per_second: side(spec.read_units_per_second, existing.read_units_per_second),
+            write_units_per_second: side(
+                spec.write_units_per_second,
+                existing.write_units_per_second,
+            ),
             previous_read_units_per_second: previous_read,
             previous_write_units_per_second: previous_write,
             updating_until,
