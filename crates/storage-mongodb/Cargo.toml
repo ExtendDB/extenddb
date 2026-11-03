@@ -10,8 +10,18 @@ license.workspace = true
 
 [features]
 # Enables deterministic coordination hooks used only by the MongoDB integration
-# test binary. Production builds do not compile these hooks.
+# test binary (the mongodb-test-hooks server build). Production builds do not
+# compile these hooks.
 test-hooks = []
+# Compiles the snapshot page-size setter, the open pause and the shared
+# snapshot conformance check the crate's snapshot tests use. Separate from
+# `test-hooks` so the crate's own tests build the production commit and
+# backfill paths, not the coordination hooks.
+snapshot-test-hooks = ["extenddb-storage/test-hooks"]
+# Test hooks for the migration tests: databases of other names on a shared
+# server, a lock that stops renewing as a killed holder does, and the
+# post-check's definitions.
+test-util = ["extenddb-storage/test-util"]
 
 [dependencies]
 # Internal crates
@@ -61,3 +71,12 @@ dashmap.workspace = true
 # Property-based testing for the filter-pushdown parity harness
 # (crates/storage-mongodb/tests/pushdown_parity.rs).
 proptest = "1"
+# The migration tests run on a runtime with the test macro.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# The checksum test checks this backend's migration table with the framework's
+# test helper.
+extenddb-storage = { workspace = true, features = ["test-util"] }
+# The crate's snapshot tests need `snapshot-test-hooks` and its migration tests
+# need `test-util`; a dev-dependency on itself turns both on for test builds
+# only.
+extenddb-storage-mongodb = { path = ".", features = ["snapshot-test-hooks", "test-util"] }

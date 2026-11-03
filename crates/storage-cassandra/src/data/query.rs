@@ -122,6 +122,13 @@ impl CassandraEngine {
             )
         };
 
+        extenddb_storage::util::refuse_conditions_beyond_first_range(
+            key_condition,
+            &query_key_schema,
+            &expression_maps.names,
+            "Cassandra",
+        )?;
+
         // Step 1: Resolve partition key value — composite for multi-part HASH keys.
         let pk_av = resolve_expr_to_av(&key_condition.pk_value, expression_maps)?;
         let pk_text = if key_condition.extra_pk_conditions.is_empty() {
@@ -225,6 +232,29 @@ impl CassandraEngine {
             && exclusive_start_key.is_some()
             && (base_sk_info_val.is_some() || sk_info_opt.is_some());
 
+        // Every RANGE attribute of the index is a clustering column, in key-schema
+        // order, ahead of base_pk. CQL accepts an ORDER BY only over a prefix of
+        // the clustering columns in declared order, so an index with several
+        // RANGE attributes must name all of them.
+        let index_sk_columns: Vec<String> = if index_name.is_some() {
+            super::ddl::all_sort_key_info(&query_key_schema, &key_info.attribute_definitions)
+                .iter()
+                .enumerate()
+                .map(|(i, &(_, sk_type))| extenddb_storage::util::sk_column_n(i, sk_type))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if index_sk_columns.len() > 1 && exclusive_start_key.is_some() {
+            // The cursor compares the first RANGE attribute and the base key
+            // only, which is not the clustering order of such an index.
+            return Err(StorageError::Validation(format!(
+                "ExclusiveStartKey on index {}: the Cassandra backend pages a Query over \
+                 an index with one RANGE attribute only",
+                index_name.unwrap_or_default()
+            )));
+        }
+
         // Special case: hash-only index needs base_pk pagination but uses single query
         let is_hash_only_index = index_name.is_some() && sk_info_opt.is_none();
 
@@ -273,8 +303,12 @@ impl CassandraEngine {
                 let direction = if forward { "ASC" } else { "DESC" };
                 query.push_str(&format!(" ORDER BY {sk_col} {direction}"));
                 if index_name.is_some() {
-                    // base_pk is a clustering key after the index SK; include it
-                    // so ties are broken consistently and the cursor is stable.
+                    // The remaining index RANGE columns, then base_pk: all are
+                    // clustering keys after the first index SK, so ties are
+                    // broken consistently and the cursor is stable.
+                    for col in index_sk_columns.iter().skip(1) {
+                        query.push_str(&format!(", {col} {direction}"));
+                    }
                     query.push_str(&format!(", base_pk {direction}"));
                     if let Some((_, base_sk_type)) = &base_sk_info_val {
                         let base_sk_col = format!("base_{}", sk_column(*base_sk_type));
