@@ -17,13 +17,10 @@ outside transaction keeps ``ACCESS SHARE`` on the table's data table, so the
 drop waits and the catalog row stays ``DELETING``. That needs
 ``EXTENDDB_TEST_PG_ADMIN_CONNECTION_STRING`` (a base URL with no database
 component) and the catalog database name (``EXTENDDB_TEST_PG_CATALOG_DB``,
-default ``extenddb_catalog``), and a server whose ``DeleteTable`` marks the row
-``DELETING`` before the data drop. Before #504 that is the asynchronous path
-only, taken when ``control_plane_delay_seconds`` is 1 or more; on the
-immediate path the catalog row is removed first and the drop waits on the held
-lock inside the request, so the tests read the server's delay from the
-``settings`` table and skip when it is under 1. #504 marks the row on both
-paths and removes that condition. Without the connection string, or on a
+default ``extenddb_catalog``). A ``DeleteTable`` that finds another session
+holding the data table marks the row ``DELETING`` and leaves the drop to the
+control plane, whatever ``control_plane_delay_seconds`` is, so the row stays
+``DELETING`` until the lock is released. Without the connection string, or on a
 backend other than PostgreSQL (``EXTENDDB_TEST_BACKEND``, exported by
 ``devtools/run-tests --backend``), these tests skip on ExtendDB; the
 storage-level tests in each backend crate carry the rows there.
@@ -79,18 +76,6 @@ def _skip_unless_window_can_be_held(dynamodb_client, name: str) -> None:
         reason = f"the window is held through PostgreSQL only (EXTENDDB_TEST_BACKEND={BACKEND})"
     elif not PG_ADMIN:
         reason = "EXTENDDB_TEST_PG_ADMIN_CONNECTION_STRING is not set; cannot hold the table DELETING"
-    else:
-        delay = _catalog_setting("control_plane_delay_seconds")
-        try:
-            delay_secs = float(delay) if delay is not None else 0.25
-        except ValueError:
-            delay_secs = 0.25
-        if delay_secs < 1.0:
-            reason = (
-                f"control_plane_delay_seconds is {delay}: DeleteTable removes the catalog row "
-                "before the drop, so a held lock blocks the request rather than holding the row "
-                "DELETING (#504 removes this condition)"
-            )
     if reason is not None:
         dynamodb_client.delete_table(TableName=name)
         pytest.skip(reason)
