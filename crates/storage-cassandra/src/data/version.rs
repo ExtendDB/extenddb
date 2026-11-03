@@ -31,6 +31,23 @@
 //! A row that a transaction created under the earlier scheme carries a null
 //! `version`. Readers keep that as `None`, the fence binds a null (which
 //! `IF version = null` matches), and the next write gives the row a value.
+//!
+//! `previous + 1` carries a version written from a host whose clock runs
+//! ahead forward for the rest of the row's history, so the ExtendDB hosts'
+//! clocks must agree. A write that finds a version more than
+//! [`AHEAD_WARNING_MICROS`] ahead of its own clock logs a warning, at most
+//! once a minute. Only index rows carry the version as their write timestamp:
+//! the queue rows and stream records written beside them keep Cassandra's,
+//! so the GSI worker's delete of an applied queue entry, which carries
+//! Cassandra's timestamp, always lands above the entry.
+
+use std::sync::atomic::{AtomicI64, Ordering};
+
+use extenddb_storage::error::StorageError;
+
+/// How far ahead of the writer's clock a stored version may be before the
+/// write logs a warning: one second, in microseconds.
+pub const AHEAD_WARNING_MICROS: i64 = 1_000_000;
 
 /// Microseconds since the Unix epoch, the domain of Cassandra write timestamps.
 pub fn now_micros() -> i64 {
@@ -40,17 +57,52 @@ pub fn now_micros() -> i64 {
 /// The version a write stores for a row whose current version is `previous`
 /// (`None` when the row is absent or has never been versioned), and the
 /// write timestamp of the index rows that write produces.
-pub fn next_row_version(previous: Option<i64>) -> i64 {
+///
+/// # Errors
+/// [`StorageError::Internal`] when `previous` is the largest `bigint`: the
+/// next version would equal it, and the fence could not tell the two writes
+/// apart.
+pub fn next_row_version(previous: Option<i64>) -> Result<i64, StorageError> {
     next_row_version_at(previous, now_micros())
 }
 
 /// [`next_row_version`] with the clock reading supplied, for tests and for
 /// callers that pinned a timestamp earlier in the same request.
-pub fn next_row_version_at(previous: Option<i64>, now: i64) -> i64 {
-    match previous {
-        Some(previous) => previous.saturating_add(1).max(now),
-        None => now,
+///
+/// # Errors
+/// As [`next_row_version`].
+pub fn next_row_version_at(previous: Option<i64>, now: i64) -> Result<i64, StorageError> {
+    let Some(previous) = previous else {
+        return Ok(now);
+    };
+    let next = previous.checked_add(1).ok_or_else(version_exhausted)?;
+    if next > now.saturating_add(AHEAD_WARNING_MICROS) {
+        warn_version_ahead(next, now);
     }
+    Ok(next.max(now))
+}
+
+fn version_exhausted() -> StorageError {
+    StorageError::Internal("the item's version has reached the largest bigint".to_owned())
+}
+
+/// Log that a row's version is ahead of this host's clock, at most once a
+/// minute.
+fn warn_version_ahead(next: i64, now: i64) {
+    static LAST_WARNED: AtomicI64 = AtomicI64::new(i64::MIN);
+    let last = LAST_WARNED.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < 60_000_000
+        || LAST_WARNED
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    tracing::warn!(
+        ahead_micros = next.saturating_sub(now),
+        "an item's version is ahead of this host's clock; the ExtendDB hosts' clocks \
+         disagree, or one ran ahead when it wrote the item"
+    );
 }
 
 /// Versions at or above this value are clock readings this scheme stored. A
@@ -77,10 +129,15 @@ pub const CLOCK_VERSION_FLOOR: i64 = 1_000_000_000_000_000;
 /// A row with a null or counter version has index rows stamped with
 /// coordinator time, which `previous + 1` does not exceed, so its delete takes
 /// the clock.
-pub fn delete_stamp(previous: Option<i64>) -> i64 {
+///
+/// # Errors
+/// As [`next_row_version`], when `previous` is the largest `bigint`.
+pub fn delete_stamp(previous: Option<i64>) -> Result<i64, StorageError> {
     match previous {
-        Some(previous) if previous >= CLOCK_VERSION_FLOOR => previous.saturating_add(1),
-        _ => now_micros(),
+        Some(previous) if previous >= CLOCK_VERSION_FLOOR => {
+            previous.checked_add(1).ok_or_else(version_exhausted)
+        }
+        _ => Ok(now_micros()),
     }
 }
 
@@ -97,17 +154,17 @@ mod tests {
 
     #[test]
     fn a_fresh_row_takes_the_clock() {
-        assert_eq!(next_row_version_at(None, 1_000), 1_000);
+        assert_eq!(next_row_version_at(None, 1_000).unwrap(), 1_000);
     }
 
     #[test]
     fn a_later_write_exceeds_the_previous_version_even_when_the_clock_is_behind() {
-        assert_eq!(next_row_version_at(Some(5_000), 1_000), 5_001);
+        assert_eq!(next_row_version_at(Some(5_000), 1_000).unwrap(), 5_001);
     }
 
     #[test]
     fn a_later_write_takes_the_clock_when_it_is_ahead() {
-        assert_eq!(next_row_version_at(Some(1_000), 5_000), 5_000);
+        assert_eq!(next_row_version_at(Some(1_000), 5_000).unwrap(), 5_000);
     }
 
     #[test]
@@ -115,7 +172,7 @@ mod tests {
         let clock = [100, 50, 50, 200, 199, 1_000, 999];
         let mut previous = None;
         for now in clock {
-            let next = next_row_version_at(previous, now);
+            let next = next_row_version_at(previous, now).unwrap();
             if let Some(previous) = previous {
                 assert!(next > previous, "{next} must exceed {previous}");
             }
@@ -124,16 +181,21 @@ mod tests {
     }
 
     #[test]
-    fn the_largest_version_does_not_wrap() {
-        assert_eq!(next_row_version_at(Some(i64::MAX), 1), i64::MAX);
+    fn a_write_or_delete_of_a_row_at_the_largest_version_is_refused() {
+        assert!(next_row_version_at(Some(i64::MAX), 1).is_err());
+        assert!(delete_stamp(Some(i64::MAX)).is_err());
+        assert_eq!(
+            next_row_version_at(Some(i64::MAX - 1), 1).unwrap(),
+            i64::MAX
+        );
     }
 
     #[test]
     fn a_row_this_scheme_wrote_is_deleted_one_above_its_version() {
         let version = 1_762_000_000_000_000;
-        assert_eq!(delete_stamp(Some(version)), version + 1);
+        assert_eq!(delete_stamp(Some(version)).unwrap(), version + 1);
         assert_eq!(
-            delete_stamp(Some(CLOCK_VERSION_FLOOR)),
+            delete_stamp(Some(CLOCK_VERSION_FLOOR)).unwrap(),
             CLOCK_VERSION_FLOOR + 1
         );
     }
@@ -141,9 +203,9 @@ mod tests {
     #[test]
     fn a_row_with_a_counter_or_null_version_is_deleted_at_the_clock() {
         let before = now_micros();
-        assert!(delete_stamp(Some(7)) >= before);
-        assert!(delete_stamp(Some(CLOCK_VERSION_FLOOR - 1)) >= before);
-        assert!(delete_stamp(None) >= before);
+        assert!(delete_stamp(Some(7)).unwrap() >= before);
+        assert!(delete_stamp(Some(CLOCK_VERSION_FLOOR - 1)).unwrap() >= before);
+        assert!(delete_stamp(None).unwrap() >= before);
     }
 
     #[test]

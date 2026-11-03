@@ -1116,8 +1116,9 @@ async fn test_version_stamps_order_index_mutations_whatever_their_arrival_order(
     let f = SyncIndexFixture::new().await;
     let v1 = SyncIndexFixture::item("a", "v1");
     let v2 = SyncIndexFixture::item("b", "v2");
-    let stamp_v1 = extenddb_storage_cassandra::data::version::next_row_version(None);
-    let stamp_v2 = extenddb_storage_cassandra::data::version::next_row_version(Some(stamp_v1));
+    let stamp_v1 = extenddb_storage_cassandra::data::version::next_row_version(None).unwrap();
+    let stamp_v2 =
+        extenddb_storage_cassandra::data::version::next_row_version(Some(stamp_v1)).unwrap();
     assert!(stamp_v2 > stamp_v1);
 
     f.apply(f.batch(Some(&v1), Some(&v2), Some(stamp_v2))).await;
@@ -1917,7 +1918,9 @@ async fn test_a_delete_removes_the_index_row_a_backfill_wrote() {
         .expect("add the index");
 
     let table_id = table.key_info.table_id.clone();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    // The backfill recreates the index table first, and its schema change
+    // can take a minute on a loaded node.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
     let index_id = loop {
         engine.process_control_plane_transitions().await.unwrap();
         let (status, _, index_id) = index_state(&engine, &table_id, "StatusIndex").await;
@@ -1963,4 +1966,63 @@ async fn test_a_delete_removes_the_index_row_a_backfill_wrote() {
         "the backfilled index row outlived the deleted item"
     );
     shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_a_queue_entry_written_over_a_version_ahead_of_the_clock_is_drained() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    // A version ahead of Cassandra's clock, written from a host whose clock
+    // ran ahead, is carried forward by the next write. The queue row that
+    // write gives an asynchronous GSI keeps Cassandra's timestamp, so the
+    // worker's delete of the applied entry, which carries Cassandra's
+    // timestamp, lands above it and the queue drains. Stamped with the
+    // version, the entry outlived that delete and was applied on every poll.
+    let config = test_config();
+    let engine = Arc::new(CassandraEngine::new(&config, "us-east-1").await.unwrap());
+    let table =
+        crate::helpers::TestTable::with_gsi(&engine, "AheadVersionTable", "GsiIdx", "gpk").await;
+    set_gsi_delay(&engine, &table.key_info.table_id, "GsiIdx", 50).await;
+    let account_keyspace = engine.account_keyspace(&table.key_info.account_id);
+    let maps = ExpressionMaps::default();
+
+    let mut item = Item::new();
+    item.insert("id".to_string(), AttributeValue::S("X".to_string()));
+    item.insert("gpk".to_string(), AttributeValue::S("g".to_string()));
+    item.insert("data".to_string(), AttributeValue::S("v1".to_string()));
+    engine
+        .put_item(&table.key_info, item.clone(), false, None, &maps, None)
+        .await
+        .expect("put v1");
+    let ahead = extenddb_storage_cassandra::data::version::now_micros() + 3_600_000_000;
+    let data_table = format!("items_{}", table.key_info.table_id.replace('-', "_"));
+    extenddb_storage_cassandra::cassandra_util::execute::<extenddb_storage::error::StorageError>(
+        &engine.session_arc(),
+        &format!("UPDATE {account_keyspace}.{data_table} SET version = ? WHERE pk = ?"),
+        cdrs_tokio::query_values!(ahead, "X"),
+        "version ahead of the clock",
+    )
+    .await
+    .unwrap();
+    item.insert("data".to_string(), AttributeValue::S("v2".to_string()));
+    engine
+        .put_item(&table.key_info, item, false, None, &maps, None)
+        .await
+        .expect("put v2");
+    assert_eq!(gsi_pending_count(&engine, &account_keyspace).await, 2);
+
+    let _worker_guard = extenddb_storage_cassandra::workers::spawn_gsi_workers(engine.clone());
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    while gsi_pending_count(&engine, &account_keyspace).await != 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the queue entry written over a version ahead of the clock was never removed"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        gsi_query_count(&engine, &table, "GsiIdx", "gpk", "g").await,
+        1
+    );
 }

@@ -478,7 +478,7 @@ impl CassandraEngine {
 
         // A fresh row: its version is the clock, and the index rows written
         // below carry it as their write timestamp (see `data::version`).
-        let version = super::version::next_row_version(None);
+        let version = super::version::next_row_version(None)?;
 
         let (insert_cql, insert_qv) = if let Some((sk_name, sk_type)) =
             sk_info(&key_info.key_schema, &key_info.attribute_definitions)
@@ -560,12 +560,12 @@ impl CassandraEngine {
         if indexes.is_empty() && stream_stmt.is_none() {
             return Ok(None);
         }
-        let mut batch = BatchQueryBuilder::new()
-            .with_consistency(Consistency::LocalQuorum)
-            .with_timestamp(version);
+        // The index statements carry the version; the queue rows and the
+        // stream record keep Cassandra's timestamp (`data::version`).
+        let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
 
         if !indexes.is_empty() {
-            super::index::sync_indexes(
+            super::index::sync_indexes_at(
                 &mut batch,
                 data_keyspace,
                 &key_info.key_schema,
@@ -574,6 +574,7 @@ impl CassandraEngine {
                 None,
                 Some(&item),
                 sys_delay,
+                Some(version),
             )?;
         }
 

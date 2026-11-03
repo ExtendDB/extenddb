@@ -261,7 +261,8 @@ pub(crate) fn effective_delay(idx: &IndexMeta, system_default: u64) -> u64 {
 /// Only processes indexes where `effective_delay == 0`. Async indexes are
 /// handled by async queue (Phase 2).
 ///
-/// Adds parameterized statements to the batch builder.
+/// Adds parameterized statements to the batch builder. The statements take
+/// the batch's write timestamp; [`sync_indexes_at`] gives them one of their own.
 #[allow(clippy::too_many_arguments)]
 pub fn sync_indexes(
     batch: &mut BatchQueryBuilder,
@@ -272,6 +273,35 @@ pub fn sync_indexes(
     old_item: Option<&Item>,
     new_item: Option<&Item>,
     system_default_delay: u64,
+) -> Result<(), StorageError> {
+    sync_indexes_at(
+        batch,
+        account_keyspace,
+        base_key_schema,
+        attr_defs,
+        indexes,
+        old_item,
+        new_item,
+        system_default_delay,
+        None,
+    )
+}
+
+/// [`sync_indexes`] with `stamp`, when set, as the write timestamp of each
+/// index statement (`USING TIMESTAMP`). The other statements of the batch,
+/// such as queue rows and stream records, then keep Cassandra's timestamp. A
+/// batch with a timestamp of its own must pass `None`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sync_indexes_at(
+    batch: &mut BatchQueryBuilder,
+    account_keyspace: &str,
+    base_key_schema: &[KeySchemaElement],
+    attr_defs: &[AttributeDefinition],
+    indexes: &[IndexMeta],
+    old_item: Option<&Item>,
+    new_item: Option<&Item>,
+    system_default_delay: u64,
+    stamp: Option<i64>,
 ) -> Result<(), StorageError> {
     for idx in indexes {
         if idx.index_type != "LSI" && effective_delay(idx, system_default_delay) != 0 {
@@ -307,7 +337,7 @@ pub fn sync_indexes(
                 base_key_schema,
                 &idx_sks,
                 &base_sks,
-                None,
+                stamp,
             )?;
         }
 
@@ -325,7 +355,7 @@ pub fn sync_indexes(
                 base_key_schema,
                 &idx_sks,
                 &base_sks,
-                None,
+                stamp,
             )?;
         }
     }

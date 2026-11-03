@@ -339,7 +339,7 @@ impl CassandraEngine {
         let next_version = super::version::next_row_version_at(
             version,
             mutation_timestamp.unwrap_or_else(super::version::now_micros),
-        );
+        )?;
 
         // Build the LWT statement used when no TTL claim owns the existing row.
         let (lwt_cql, lwt_qv) = if item_existed {
@@ -417,12 +417,15 @@ impl CassandraEngine {
         // clears must not land above a later claim's Paxos timestamp, so the
         // batch stays on the wall clock and the claim serializes the writers.
         // For an unclaimed row, the LWT above commits first and this batch
-        // durably records all secondary effects and reconciliation work, stamped
-        // with the version that LWT stored so index rows resolve in base-row
-        // commit order (`data::version`).
-        let mut batch = BatchQueryBuilder::new()
-            .with_consistency(Consistency::LocalQuorum)
-            .with_timestamp(mutation_timestamp.unwrap_or(next_version));
+        // durably records all secondary effects and reconciliation work. Its
+        // index statements carry the version that LWT stored, so index rows
+        // resolve in base-row commit order, and its queue rows and stream
+        // record keep Cassandra's timestamp (`data::version`).
+        let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
+        if let Some(timestamp) = mutation_timestamp {
+            batch = batch.with_timestamp(timestamp);
+        }
+        let index_stamp = mutation_timestamp.is_none().then_some(next_version);
 
         if ttl_claim.is_some() {
             let (update_cql, update_qv) = if let (Some(sk), Some(sk_col)) = (sk, sk_col) {
@@ -454,7 +457,7 @@ impl CassandraEngine {
         }
 
         if !indexes.is_empty() {
-            super::index::sync_indexes(
+            super::index::sync_indexes_at(
                 &mut batch,
                 data_keyspace,
                 &key_info.key_schema,
@@ -463,6 +466,7 @@ impl CassandraEngine {
                 pre_mutation_item,
                 Some(new_item),
                 sys_delay,
+                index_stamp,
             )?;
         }
 

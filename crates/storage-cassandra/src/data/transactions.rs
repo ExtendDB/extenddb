@@ -1513,7 +1513,7 @@ impl CassandraEngine {
                     .fetch_row_for_transaction(key_info, item, Some(txn_id))
                     .await?;
                 let old_image = commit_old_image(row.item, row.created_to_prepare);
-                let next_version = super::version::next_row_version(row.version);
+                let next_version = super::version::next_row_version(row.version)?;
                 let indexes = self.indexes_for_commit(key_info).await?;
                 self.commit_put_or_update(
                     key_info,
@@ -1558,7 +1558,7 @@ impl CassandraEngine {
                 // The row was read before the base write, so it is still the
                 // old image.
                 let old_image = commit_old_image(row.item, row.created_to_prepare);
-                let next_version = super::version::next_row_version(row.version);
+                let next_version = super::version::next_row_version(row.version)?;
                 let indexes = self.indexes_for_commit(key_info).await?;
                 self.commit_put_or_update(
                     key_info,
@@ -1600,7 +1600,7 @@ impl CassandraEngine {
                 // Taken from the version read under the fence, before the
                 // commit's LWT, as the single-item delete takes its stamp
                 // (`version::delete_stamp`).
-                let delete_stamp = super::version::delete_stamp(row.version);
+                let delete_stamp = super::version::delete_stamp(row.version)?;
                 let indexes = if old_image.is_some() {
                     self.indexes_for_commit(key_info).await?
                 } else {
@@ -1932,9 +1932,10 @@ impl CassandraEngine {
     /// `new_item`, so the batch removes the old image's rows. The stream
     /// record's own images are already baked into `stream_stmt`.
     ///
-    /// The batch is stamped with `stamp`, the version the commit stored (for a
-    /// delete, the stamp above the deleted row's version), so its rows resolve
-    /// in base-row commit order against any other writer's index batch
+    /// The index statements carry `stamp`, the version the commit stored (for
+    /// a delete, the stamp above the deleted row's version), so its rows
+    /// resolve in base-row commit order against any other writer's index
+    /// batch; the queue rows and the stream record keep Cassandra's timestamp
     /// (`data::version`).
     ///
     /// The statements run as `secondary_effect_batches` groups them: one batch
@@ -1957,16 +1958,14 @@ impl CassandraEngine {
             return Ok(());
         }
 
-        let mut batch = BatchQueryBuilder::new()
-            .with_consistency(Consistency::LocalQuorum)
-            .with_timestamp(stamp);
+        let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
         let mut async_enqueued = 0;
 
         if !indexes.is_empty() {
             let sys_delay = self
                 .gsi_default_delay_ms
                 .load(std::sync::atomic::Ordering::Relaxed);
-            super::index::sync_indexes(
+            super::index::sync_indexes_at(
                 &mut batch,
                 &data_keyspace,
                 &key_info.key_schema,
@@ -1975,6 +1974,7 @@ impl CassandraEngine {
                 index_old_item,
                 new_item,
                 sys_delay,
+                Some(stamp),
             )?;
 
             async_enqueued = super::index::enqueue_async_indexes(
@@ -2360,7 +2360,7 @@ impl CassandraEngine {
                 let next_version = super::version::next_row_version(
                     self.read_version_by_pk(keyspace, &table, &op.pk, sk.as_ref())
                         .await?,
-                );
+                )?;
 
                 let result = if let Some((sk_val, sk_col)) = &sk {
                     let query = format!(
@@ -2422,7 +2422,7 @@ impl CassandraEngine {
                 let delete_stamp = super::version::delete_stamp(
                     self.read_version_by_pk(keyspace, &table, &op.pk, sk.as_ref())
                         .await?,
-                );
+                )?;
                 // Step 1: update partition_max_delete_timestamp
                 let update_null = format!(
                     "UPDATE {keyspace}.{table} SET partition_max_delete_timestamp = ? \
