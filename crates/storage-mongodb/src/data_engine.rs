@@ -3687,8 +3687,10 @@ const TRANSIENT_RETRY_ATTEMPTS: u32 = 1000;
 /// The cost of the longer retry is CPU on the MongoDB server: the losers of a
 /// hot key retry with a backoff capped at 12.8 ms for up to the deadline, so
 /// the server stays busy committing and aborting transactions on that key for
-/// as long as the contention lasts, about 2 cores at 1,800 to 1,900
-/// transactions a second with 64 and 256 writers on one key.
+/// as long as the contention lasts. With 64 and 256 writers putting one key of
+/// a GSI table for 20 s, on a 16-core host at a load average of about 20,
+/// mongod used about 1.3 cores and ran 1,670 and 1,810 transactions a second,
+/// of which 98.7 and 99.6 percent aborted.
 ///
 /// The engine carries the deadline in
 /// [`MongoEngine::contention_deadline`](crate::MongoEngine) so that a test can
