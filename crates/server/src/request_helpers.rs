@@ -186,23 +186,24 @@ pub(crate) async fn authorize_request(
         return Ok(authorized_key_info);
     }
 
-    // Tag operations refuse a table or stream ARN in another account with
-    // "Access is denied" for every principal, before the IAM decision and
-    // before the shape check, as the service does: an index or backup ARN in
-    // another account is refused that way too (measured 2026-10-20 with an
-    // admin and a no-policy caller, and 2026-10-24 for the index and backup
-    // ARNs). The ResourceArn shape is then validated before the IAM decision:
-    // an index ARN in this account (tags are accepted only on a table or
-    // stream) is rejected with ValidationException for every principal. A
-    // table or stream ARN passes; its region and existence are checked after
-    // authorization by the engine tag handler.
+    // A request that names a resource in another account by ARN is refused
+    // before the IAM decision, for every principal, with the service's answer
+    // for the operation and for whether this deployment knows the account
+    // (measured 2026-11-03 for an admin and a no-policy caller; see
+    // `authz_resource::cross_account`).
+    authz_resource::cross_account::refuse(state, identity, operation, input, account_id).await?;
+
+    // The tag operations' ResourceArn shape is validated before the IAM
+    // decision: an index ARN in this account (tags are accepted only on a
+    // table or stream) is rejected with ValidationException for every
+    // principal. A table or stream ARN passes; its region and existence are
+    // checked after authorization by the engine tag handler.
     if matches!(
         operation,
         "TagResource" | "UntagResource" | "ListTagsOfResource"
     ) && let Some(arn) = input.get("ResourceArn").and_then(Value::as_str)
         && !arn.is_empty()
     {
-        authz_resource::check_resource_account(arn, account_id)?;
         authz_resource::validate_tag_resource_arn_shape(arn)?;
     }
 

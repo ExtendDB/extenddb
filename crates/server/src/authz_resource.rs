@@ -36,7 +36,9 @@
 //! service, region, and account of a supplied ARN and act within this
 //! deployment's account, so a caller who respells those fields would otherwise
 //! evade a Deny written against the canonical ARN. Canonicalizing here closes
-//! that bypass: a Deny on the real resource always matches.
+//! that bypass: a Deny on the real resource always matches. A resource in
+//! another account is refused before the IAM decision for every operation
+//! ([`cross_account`]).
 //!
 //! Fail-closed: a missing or unparseable resource field never falls back to
 //! `table/*`. It yields the field value verbatim (often empty), which an
@@ -45,6 +47,8 @@
 
 use extenddb_core::error::DynamoDbError;
 use serde_json::Value;
+
+pub(crate) mod cross_account;
 
 /// Partition and service are fixed to this deployment's; see module docs.
 const PARTITION: &str = "aws";
@@ -108,29 +112,6 @@ impl AuthzTarget {
             supplied,
         }
     }
-}
-
-/// Refuse a request whose resource ARN names another account.
-///
-/// Every `DynamoDB` resource ARN (`table/...`) whose account field differs
-/// from the caller's account is refused with `AccessDeniedException`
-/// "Access is denied" before the IAM decision, for every principal: the
-/// service answers an admin and a no-policy caller the same way (measured
-/// 2026-10-20, TagResource on `arn:aws:dynamodb:us-east-1:<other>:table/T`).
-/// The engine tag and backup handlers make the same check for the authorized
-/// caller; running it here first keeps a no-policy caller from receiving the
-/// long denial naming the other account's resource instead. A value that is
-/// not a `table/...` resource ARN (a bare name, a foreign-service ARN) passes
-/// to authorization unchanged.
-pub(crate) fn check_resource_account(arn: &str, account_id: &str) -> Result<(), DynamoDbError> {
-    if let Some(r) = extenddb_core::arn::parse(arn)
-        && r.account != account_id
-    {
-        return Err(DynamoDbError::AccessDeniedException(
-            "Access is denied".to_owned(),
-        ));
-    }
-    Ok(())
 }
 
 /// A `DynamoDB` resource identity: a table and an optional sub-resource.

@@ -3,13 +3,12 @@
 
 //! The denial names the resource as the caller supplied it (issue #447).
 
-use super::{AuthzTarget, authz_targets, check_resource_account, table_target};
-use extenddb_core::error::DynamoDbError;
+use super::{AuthzTarget, authz_targets, table_target};
 use serde_json::json;
 
 const R: &str = "us-east-1";
-const A: &str = "964157134968";
-const CANON: &str = "arn:aws:dynamodb:us-east-1:964157134968:table/bb-arn-main";
+const A: &str = "444455556666";
+const CANON: &str = "arn:aws:dynamodb:us-east-1:444455556666:table/bb-arn-main";
 
 fn single(op: &str, input: serde_json::Value) -> AuthzTarget {
     let mut t = authz_targets(op, &input, R, A);
@@ -23,9 +22,9 @@ fn single(op: &str, input: serde_json::Value) -> AuthzTarget {
 #[test]
 fn tag_resource_arn_respelled_fields_are_matched_canonically_and_named_as_written() {
     for supplied in [
-        "arn:aws-cn:dynamodb:us-east-1:964157134968:table/bb-arn-main",
-        "arn:aws:s3:us-east-1:964157134968:table/bb-arn-main",
-        "arn:aws:dynamodb:us-west-2:964157134968:table/bb-arn-main",
+        "arn:aws-cn:dynamodb:us-east-1:444455556666:table/bb-arn-main",
+        "arn:aws:s3:us-east-1:444455556666:table/bb-arn-main",
+        "arn:aws:dynamodb:us-west-2:444455556666:table/bb-arn-main",
     ] {
         for op in ["TagResource", "UntagResource", "ListTagsOfResource"] {
             let t = single(op, json!({ "ResourceArn": supplied }));
@@ -58,7 +57,7 @@ fn canonical_arn_and_bare_name_name_the_canonical_arn() {
 /// denial while matching the canonical resource.
 #[test]
 fn other_arn_fields_keep_the_supplied_spelling() {
-    let respelled_table = "arn:aws:dynamodb:us-west-2:964157134968:table/bb-arn-main";
+    let respelled_table = "arn:aws:dynamodb:us-west-2:444455556666:table/bb-arn-main";
     for op in [
         "GetItem",
         "PutItem",
@@ -80,22 +79,22 @@ fn other_arn_fields_keep_the_supplied_spelling() {
     assert_eq!(t.supplied, format!("{respelled_table}/index/gsi1"));
 
     let stream =
-        "arn:aws-cn:dynamodb:us-east-1:964157134968:table/T/stream/2026-10-20T16:17:40.188";
+        "arn:aws-cn:dynamodb:us-east-1:444455556666:table/T/stream/2026-10-20T16:17:40.188";
     let t = single("DescribeStream", json!({ "StreamArn": stream }));
     assert_eq!(
         t.resource,
-        "arn:aws:dynamodb:us-east-1:964157134968:table/T/stream/2026-10-20T16:17:40.188"
+        "arn:aws:dynamodb:us-east-1:444455556666:table/T/stream/2026-10-20T16:17:40.188"
     );
     assert_eq!(t.supplied, stream);
 
-    let backup = "arn:aws:dynamodb:eu-west-1:964157134968:table/T/backup/01-ab";
+    let backup = "arn:aws:dynamodb:eu-west-1:444455556666:table/T/backup/01-ab";
     let t = single(
         "DescribeBackup",
         json!({ "BackupArn": format!("{backup}\n") }),
     );
     assert_eq!(
         t.resource,
-        "arn:aws:dynamodb:us-east-1:964157134968:table/T/backup/01-ab"
+        "arn:aws:dynamodb:us-east-1:444455556666:table/T/backup/01-ab"
     );
     assert_eq!(
         t.supplied, backup,
@@ -117,7 +116,7 @@ fn other_arn_fields_keep_the_supplied_spelling() {
     );
     assert_eq!(v[0].resource, CANON);
     assert_eq!(v[0].supplied, respelled_table);
-    let ptarget = "arn:aws:dynamodb:us-east-1:964157134968:table/pitr";
+    let ptarget = "arn:aws:dynamodb:us-east-1:444455556666:table/pitr";
     assert!(
         v[1..]
             .iter()
@@ -139,10 +138,10 @@ fn other_arn_fields_keep_the_supplied_spelling() {
 #[test]
 fn index_query_with_a_non_table_arn_names_the_canonical_index_arn() {
     for table_name in [
-        "arn:aws:dynamodb:us-east-1:964157134968:table/bb-arn-main/index/gsi1",
-        "arn:aws:dynamodb:us-east-1:964157134968:TABLE/bb-arn-main",
-        "arn:aws:dynamodb:us-east-1:964157134968:table/x/table/bb-arn-main",
-        "arn:aws:dynamodb:us-east-1:964157134968:banana/x",
+        "arn:aws:dynamodb:us-east-1:444455556666:table/bb-arn-main/index/gsi1",
+        "arn:aws:dynamodb:us-east-1:444455556666:TABLE/bb-arn-main",
+        "arn:aws:dynamodb:us-east-1:444455556666:table/x/table/bb-arn-main",
+        "arn:aws:dynamodb:us-east-1:444455556666:banana/x",
     ] {
         for op in ["Query", "Scan"] {
             let t = single(op, json!({ "TableName": table_name, "IndexName": "gsi1" }));
@@ -153,33 +152,5 @@ fn index_query_with_a_non_table_arn_names_the_canonical_index_arn() {
             );
             assert_eq!(t.supplied, t.resource, "{op} {table_name}");
         }
-    }
-}
-
-/// A table or stream ARN in another account is "Access is denied" for every
-/// principal (measured 2026-10-20 with an admin and a no-policy caller);
-/// anything else passes to authorization.
-#[test]
-fn other_account_resource_is_access_denied_before_authorization() {
-    for arn in [
-        "arn:aws:dynamodb:us-east-1:111122223333:table/bb-arn-main",
-        "arn:aws:dynamodb:us-east-1:111122223333:table/bb-arn-main/stream/2026-10-20T16:17:40.188",
-        "arn:aws-cn:dynamodb:us-west-2:111122223333:table/bb-arn-main",
-    ] {
-        let err = check_resource_account(arn, A).unwrap_err();
-        assert!(
-            matches!(&err, DynamoDbError::AccessDeniedException(m) if m == "Access is denied"),
-            "{arn}: {err:?}"
-        );
-    }
-    for value in [
-        CANON,
-        "arn:aws-cn:dynamodb:us-west-2:964157134968:table/bb-arn-main",
-        "bb-arn-main",
-        "arn:aws:s3:::bucket",
-        "arn:aws:dynamodb:us-east-1:111122223333:banana/x",
-        "banana",
-    ] {
-        assert!(check_resource_account(value, A).is_ok(), "{value}");
     }
 }
