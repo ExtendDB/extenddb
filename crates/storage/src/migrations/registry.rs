@@ -67,6 +67,10 @@ migration_ids! {
     /// it.
     DropContinuousBackups = 5, "drop_continuous_backups",
         "drop the continuous_backups table, which no request reads or writes since #335";
+    /// Re-encodes the strings a PostgreSQL store holds from an earlier
+    /// release into the escape that stores U+0000 (#364).
+    EscapeControlChars = 6, "escape_control_chars",
+        "re-encode the strings PostgreSQL stores so that they can hold U+0000";
 }
 
 /// Highest id that has shipped in a release. Bodies at or below it are frozen:

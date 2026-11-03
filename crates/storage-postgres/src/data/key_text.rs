@@ -70,7 +70,7 @@ pub(crate) fn composite_pk_to_text(
 /// is that of the escaped part.
 ///
 /// [`composite_pk_to_text`] builds every composite key column through this
-/// function, and migration `004_escape_control_chars` rebuilds legacy
+/// function, and catalog migration 6, `escape_control_chars`, rebuilds legacy
 /// composite key columns through it ([`reescape_legacy_composite`]).
 pub(crate) fn join_escaped_parts<S: AsRef<str>>(raw_parts: &[S]) -> String {
     let parts: Vec<String> = raw_parts

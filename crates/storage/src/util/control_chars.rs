@@ -35,8 +35,9 @@
 //! it is returned as a literal U+0001. Rows written before this escape existed
 //! can hold such a character, and a lenient decoder reads them unchanged. A
 //! legacy string that contained U+0001 immediately followed by U+0001 or U+0002
-//! would decode differently; the operator migration `004_escape_control_chars`
-//! re-encodes such rows so that case cannot arise after it has run.
+//! would decode differently; on PostgreSQL, catalog migration 6,
+//! `escape_control_chars`, re-encodes such rows so that case cannot arise after
+//! it has run.
 
 use std::borrow::Cow;
 

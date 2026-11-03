@@ -170,8 +170,8 @@ pub(crate) fn partition_for(base_pk_text: &str) -> i32 {
 /// which `new_item` carries for puts and updates and `old_item` for deletes
 /// (the base key is immutable over an item's lifetime). The key text is the
 /// stored (escaped) form, so a key holding U+0001 hashes differently from the
-/// raw text a build without the escape hashed; migration
-/// `004_escape_control_chars` recomputes the column of such rows through this
+/// raw text a build without the escape hashed; catalog migration 6,
+/// `escape_control_chars`, recomputes the column of such rows through this
 /// function.
 pub(crate) fn worker_partition(
     old_item: Option<&Item>,

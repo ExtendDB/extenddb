@@ -137,6 +137,11 @@ pub fn migration(id: MigrationId) -> Migration<MongoStores> {
                 m0005_drop_continuous_backups::SOURCE,
             )],
         },
+        MigrationId::EscapeControlChars => Migration::NotApplicable(
+            "string values already held U+0000; field names an earlier release stored are read \
+             back as written unless they hold U+0001 followed by U+0001 or U+0002, and are not \
+             rewritten (see the upgrade manual)",
+        ),
     }
 }
 

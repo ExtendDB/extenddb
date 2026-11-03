@@ -214,7 +214,17 @@ impl Scratch {
     }
 
     /// The runner's target, which writes the data connection rows as `init`.
+    /// The tests hold sessions of their own on the scratch databases (lock
+    /// holders, observers), so the target leaves out migration 6's check for
+    /// other sessions; [`Scratch::target_checking_sessions`] keeps it.
     pub fn target(&self) -> PostgresTarget {
+        self.target_checking_sessions()
+            .with_other_sessions_allowed()
+    }
+
+    /// [`Scratch::target`] with migration 6's check for other sessions, as
+    /// `extenddb migrate --yes` runs it.
+    pub fn target_checking_sessions(&self) -> PostgresTarget {
         PostgresTarget::new(self.options(), &self.data_name)
             .with_data_connection_row(self.data_url())
     }

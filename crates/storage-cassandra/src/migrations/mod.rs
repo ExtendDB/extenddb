@@ -127,6 +127,10 @@ pub fn migration(id: MigrationId) -> Migration<CassandraStores> {
                 "0005_drop_continuous_backups.cql"
             )],
         },
+        MigrationId::EscapeControlChars => Migration::NotApplicable(
+            "Cassandra stores U+0000 in strings as written, so its stored form of strings does \
+             not change",
+        ),
     }
 }
 

@@ -4,7 +4,7 @@
 
 ## Current Status
 
-This release versions the PostgreSQL, SQLite, Cassandra and MongoDB catalogs by a migration ledger and carries catalog migrations 1 to 5, which `extenddb migrate --list` prints. **Every deployment created by a 0.1.x release runs `extenddb migrate --yes` once** before a server of this release starts on it: the server refuses a catalog with pending migrations. Migration 1 brings the catalog of every 0.1.x release to the v1.0 schema, and migration 5 drops `continuous_backups`, a table and on MongoDB a collection (see [Catalog 0.0.5](#catalog-005)).
+This release versions the PostgreSQL, SQLite, Cassandra and MongoDB catalogs by a migration ledger and carries catalog migrations 1 to 6, which `extenddb migrate --list` prints. **Every deployment created by a 0.1.x release runs `extenddb migrate --yes` once** before a server of this release starts on it: the server refuses a catalog with pending migrations. Migration 1 brings the catalog of every 0.1.x release to the v1.0 schema, and migration 5 drops `continuous_backups`, a table and on MongoDB a collection (see [Catalog 0.0.5](#catalog-005)). On PostgreSQL, migration 6 re-encodes the strings an earlier release stored and runs only with every server of an earlier release stopped (see [U+0000 in strings on PostgreSQL and MongoDB](#u0000-in-strings-on-postgresql-and-mongodb-catalog-migration-6)).
 
 A backup that a 0.1.x release took can restore without its global and local secondary indexes: a SQLite backup taken by 0.1.14 records only the table's key schema and attribute definitions, and its restore creates the table with its items and no index. Take a new backup of each table after upgrading to v1.0, and keep the 0.1.x backups for their items only.
 
@@ -39,7 +39,7 @@ Exit status 6 means the migration lock, or a running server, was still held when
 
 `verify` also checks the connection to the data database. When that check fails, `verify` exits 1 on a Behind catalog instead of 3, because `migrate --yes` cannot apply the pending migrations while the data database cannot be reached. It still exits 4 or 5 for the statuses that need a person.
 
-A migration is additive when the previous release serves the catalog correctly with it applied, and breaking otherwise. Migrations 1 to 5 are breaking: do not run a 0.1.x server against a migrated catalog. A 0.1.x binary that writes to a migrated catalog (its `migrate --yes`, or a SQLite dev server) leaves it WrittenByOlderRelease. `migrate --yes --reconverge` repairs it by running the convergent migrations again. Migration 2, which rewrites stored policies, is not convergent: the repair skips it and prints a line that says so (see the v0.1.14 notes below).
+A migration is additive when the previous release serves the catalog correctly with it applied, and breaking otherwise. Migrations 1 to 6 are breaking: do not run a 0.1.x server against a migrated catalog. A 0.1.x binary that writes to a migrated catalog (its `migrate --yes`, or a SQLite dev server) leaves it WrittenByOlderRelease. `migrate --yes --reconverge` repairs it by running the convergent migrations again. Migration 2, which rewrites stored policies, and migration 6, which re-encodes stored strings on PostgreSQL, are not convergent: the repair skips them and prints a line for each that says so (see the v0.1.14 notes below).
 
 ## Writing a New Migration
 
@@ -310,6 +310,24 @@ The first release, so all 0.0.2 deployments were fresh installs.
 Catalog upgrades change the schema; behavior changes alter how the running server
 interprets existing data or configuration. Review these before upgrading a live
 deployment, even when no catalog migration is required.
+
+### U+0000 in strings on PostgreSQL and MongoDB (catalog migration 6)
+
+DynamoDB accepts U+0000 anywhere a string appears. The PostgreSQL backend now stores every string through an order-preserving escape: U+0000 as U+0001 U+0001, U+0001 as U+0001 U+0002, and every other character as it is, so a string that holds neither character is stored as before. The MongoDB backend applies the same escape to BSON field names (attribute names and map keys); BSON string values already held U+0000. SQLite and Cassandra store the character as written, and their stored data does not change.
+
+**Migration 6, `escape_control_chars`, PostgreSQL.** Rows an earlier release wrote hold their strings raw, and a raw U+0001 immediately followed by U+0001 or U+0002 reads back differently under the new decoder; a lone U+0001 reads back unchanged. Migration 6 re-encodes those rows: in the data database, every data table, index table and vector index table (the text key columns and `item_data`), `gsi_pending` and `stream_records`; in the catalog database, `backup_items`. Only rows that contain U+0001 change. A partition key column of a key schema with more than one HASH attribute holds the netstring join of the parts, so it is rebuilt part by part, and `gsi_pending.worker_partition` is recomputed for the queued rows the migration changes. The migration reads every row of every table once, so on a large deployment it takes time proportional to the size of the data. Each database's rewrite runs in one transaction with its ledger row: a run that stops leaves that database as it was, and the next `migrate --yes` runs it again. The ledger notes, which `migrate` and `verify` print, name each table the migration changed with its number of row updates.
+
+Upgrade in this order:
+
+1. Stop every ExtendDB server that uses the deployment, including the servers of earlier releases.
+2. Run `extenddb migrate --yes` with the new binary.
+3. Start the new servers.
+
+The migration cannot tell a row a running server writes from a legacy row, so it runs only while no server writes. `migrate --yes` waits for the servers that hold the serving key, and a server of a 0.1.x release does not hold it. While the catalog lists a table or `gsi_pending` or `stream_records` holds a row, migration 6 therefore stops the run before its first write when any other session is connected to the data database, and while `backup_items` holds a row it does the same for the catalog database: `migrate` names each such session by role, client address and application name, and exits 5. The migrator's own sessions and read-only status sessions are not counted. Stop those sessions and run again. If the only other sessions are idle connections that a connection pooler holds, set `EXTENDDB_MIGRATE_IGNORE_CONNECTIONS=1` to skip the check. The preview, `extenddb migrate` without `--yes`, does not look for sessions, so it runs beside a server and reports migration 6 as pending.
+
+A server of this release refuses a deployment where migration 6 is pending, and `extenddb init` applies it to a new deployment, which has nothing to rewrite. The migration is breaking and not convergent: a server of an earlier release refuses the migrated catalog, `migrate --yes --reconverge` skips migration 6, and going back to an earlier release means restoring both databases from the backups taken before the upgrade. A 0.1.x binary given a restored catalog and a migrated data database would read escaped strings as data.
+
+**MongoDB.** The MongoDB backend has no migration for this change; its ledger records migration 6 as not applicable. Field names an earlier release wrote are stored raw. A name that holds a lone U+0001 reads back unchanged, as do all string values and all key strings; a name that holds U+0001 immediately followed by U+0001 or U+0002 reads back with that pair decoded as U+0000 or U+0001. Deployments whose attribute names never contain U+0001 are not affected.
 
 ### v0.1.15: Point-in-time recovery is reported as unsupported (catalog migration required)
 

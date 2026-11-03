@@ -422,8 +422,8 @@ The PostgreSQL backend uses two categories of tables:
   index and sweep, vector search filters) uses the escaped name. The MongoDB
   backend applies the same escape to BSON field names only, since BSON string
   values are length-prefixed and hold the byte as is. Rows written before the
-  escape existed are re-encoded once by the operator migration
-  `004_escape_control_chars` (see the upgrade manual).
+  escape existed are re-encoded once on PostgreSQL by catalog migration 6,
+  `escape_control_chars` (see the upgrade manual).
 
 - **GSI tables**: GSI tables include base table primary key columns (`base_pk`,
   `base_sk_*`) as actual SQL columns (not just inside `item_data` JSONB). This
