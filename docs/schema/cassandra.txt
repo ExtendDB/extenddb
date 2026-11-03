@@ -144,6 +144,7 @@ column indexes.key_schema: text regular
 column indexes.projection: text regular
 column indexes.propagation_delay_ms: int regular
 column indexes.provisioned_throughput: text regular
+column indexes.warm_throughput: text regular
 column login_attempts.principal: text partition_key 0
 column login_attempts.attempted_at: timestamp clustering 0 desc
 column login_attempts.source_ip: text regular
@@ -192,6 +193,7 @@ column tables.ttl_cleanup_generation: uuid regular
 column tables.ttl_generation: uuid regular
 column tables.ttl_index_ready: boolean regular
 column tables.ttl_sweep_owner: uuid regular
+column tables.warm_throughput: text regular
 column tags.resource_arn: text partition_key 0
 column tags.tag_key: text clustering 0 asc
 column tags.tag_value: text regular
