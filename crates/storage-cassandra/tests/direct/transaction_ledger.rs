@@ -562,3 +562,80 @@ async fn test_committing_recovery_repairs_the_index_rows_of_a_row_it_commits() {
         Some(AttributeValue::S("K2".to_string()))
     );
 }
+
+#[tokio::test]
+async fn test_committing_recovery_repairs_the_index_rows_of_a_commit_that_landed_before_the_crash()
+{
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    // The live commit's LWT landed: the row holds K2, unfenced, with this
+    // transaction's commit timestamp. The crash came before its index batch,
+    // so the GSI still holds K1's row. Recovery's commit fence does not apply;
+    // it re-syncs the row from the ledger's two images at the row's version.
+    let engine = Arc::new(setup_engine().await);
+    let table =
+        crate::helpers::TestTable::with_gsi(&engine, "RecoveryLandedTable", "GsiIdx", "gpk").await;
+    let keyspace = engine.account_keyspace(&table.key_info.account_id);
+    let table_id = table.key_info.table_id.clone();
+    activate_with_sync_gsi(&engine, &table_id, "GsiIdx").await;
+    let maps = ExpressionMaps::default();
+
+    let k1 = gsi_item("landed", "K1", "1");
+    let k2 = gsi_item("landed", "K2", "2");
+    engine
+        .put_item(&table.key_info, k1.clone(), false, None, &maps, None)
+        .await
+        .unwrap();
+    let (version_before, _) = base_row_state(&engine, &keyspace, &table_id, "landed").await;
+    let committed_version = version_before.unwrap() + 10;
+    let txn_timestamp = 1_700_000_000_000_i64;
+    let data_table = format!("items_{}", table_id.replace('-', "_"));
+    extenddb_storage_cassandra::cassandra_util::execute::<StorageError>(
+        &engine.session_arc(),
+        &format!(
+            "UPDATE {keyspace}.{data_table} SET item_data = ?, version = ?, \
+             last_committed_txn_timestamp = ? WHERE pk = ?"
+        ),
+        cdrs_tokio::query_values!(
+            serde_json::to_string(&k2).unwrap(),
+            committed_version,
+            txn_timestamp,
+            "landed"
+        ),
+        "the live commit's base write",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        gsi_rows_for(&engine, &keyspace, &table_id, "GsiIdx", "landed").await,
+        vec!["K1"]
+    );
+
+    let txn_id = Uuid::new_v4();
+    engine
+        .write_ledger_entry(
+            &keyspace,
+            txn_id,
+            TransactionState::Committing,
+            txn_timestamp,
+            None,
+            None,
+            &ledger_put_op(&table_id, "landed", &k1, &k2),
+        )
+        .await
+        .unwrap();
+    engine.recover_transaction(&keyspace, txn_id).await.unwrap();
+
+    assert_eq!(
+        gsi_rows_for(&engine, &keyspace, &table_id, "GsiIdx", "landed").await,
+        vec!["K2"],
+        "recovery left the index rows of the landed commit unrepaired"
+    );
+    let (version_after, _) = base_row_state(&engine, &keyspace, &table_id, "landed").await;
+    assert_eq!(
+        version_after,
+        Some(committed_version),
+        "recovery rewrote the row"
+    );
+}

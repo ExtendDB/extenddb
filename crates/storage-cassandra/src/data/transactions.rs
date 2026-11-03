@@ -2175,12 +2175,12 @@ impl CassandraEngine {
                     // and recovery for it stays insert-only (the worker
                     // revalidates before deleting anything, so the stale entry
                     // is inert garbage, not a hazard).
-                    // Index rows are synced only for a row this recovery pass
-                    // committed itself (`stamp` is the version it stored). When
-                    // the commit fence did not apply, the row was committed
-                    // earlier or has since been rewritten by a later writer,
-                    // whose own index batch carries a higher stamp; re-syncing
-                    // the ledger's image would put stale rows above it.
+                    // Index rows are synced for a row this recovery pass
+                    // committed itself (`stamp` is the version it stored), and
+                    // for a Put or Update whose live commit landed and whose row
+                    // still holds the ledger's image (`stamp` is its current
+                    // version). A row a later writer has rewritten is left to
+                    // that writer, whose index batch carries a higher stamp.
                     match (op.op.as_str(), stamp) {
                         ("PUT" | "UPDATE", stamp) => {
                             self.reconcile_ttl_transition_by_table_id(
@@ -2258,13 +2258,63 @@ impl CassandraEngine {
         Ok(row.and_then(|row| row.get_by_name("version").ok().flatten()))
     }
 
+    /// The version of a row the live COMMIT of this transaction wrote and
+    /// nothing has rewritten since: no fence on it, `last_committed_txn_timestamp`
+    /// equal to `txn_timestamp`, and `item_data` equal to the ledger's
+    /// committed image. `None` for any other row. Read at `LOCAL_SERIAL`.
+    async fn landed_commit_version(
+        &self,
+        keyspace: &str,
+        table: &str,
+        pk: &str,
+        sk: Option<&(extenddb_storage::util::SortKeyValue, String)>,
+        txn_timestamp: i64,
+        item_data: &str,
+    ) -> Result<Option<i64>, StorageError> {
+        let Some(row) = super::select_by_pk_at(
+            &self.session,
+            keyspace,
+            table,
+            "item_data, version, prepared_txn_id, last_committed_txn_timestamp",
+            pk,
+            sk.map(|(value, _)| value),
+            sk.map(|(_, col)| col.as_str()),
+            Some(Consistency::LocalSerial),
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        let prepared: Option<Uuid> = row.get_by_name("prepared_txn_id").ok().flatten();
+        let committed_at: Option<i64> = row
+            .get_by_name("last_committed_txn_timestamp")
+            .ok()
+            .flatten();
+        if prepared.is_some() || committed_at != Some(txn_timestamp) {
+            return Ok(None);
+        }
+        let stored: Option<String> = row.get_by_name("item_data").ok().flatten();
+        let parse = |data: &str| serde_json::from_str::<Item>(data).ok();
+        let same_image = match (stored.as_deref().and_then(parse), parse(item_data)) {
+            (Some(stored), Some(ledger)) => stored == ledger,
+            _ => false,
+        };
+        Ok(if same_image {
+            row.get_by_name("version").ok().flatten()
+        } else {
+            None
+        })
+    }
+
     /// Re-run the index-row sync a committed operation would have performed
     /// had the process survived, from the two images the ledger kept: the
     /// pre-commit image recorded at PREPARE and the committed image. `stamp`
     /// is the version this recovery pass stored on the base row, so the batch
     /// is ordered against other writers' index batches exactly as the live
-    /// commit's would have been. Callers only reach here when the recovery
-    /// commit fence applied; a row a later writer owns is left to that writer.
+    /// commit's would have been. Callers reach here when the recovery commit
+    /// fence applied, or for a Put or Update whose live commit landed and whose
+    /// row nothing has rewritten since (`landed_commit_version`); a row a later
+    /// writer owns is left to that writer.
     /// A ledger written before the pre-image field exists has no old image and
     /// the sync is insert-only: a key the transaction moved leaves its old row
     /// behind, the same class of leftover as before this sync existed.
@@ -2321,9 +2371,11 @@ impl CassandraEngine {
     /// CHECK: delete the `created_to_prepare` marker if PREPARE planted one for an
     /// absent item; no-op if the checked item already existed.
     ///
-    /// Returns the version stamp this call committed the row under, or `None`
-    /// when its fence did not apply (the row was committed before the crash, or
-    /// a later writer has since taken it) and for CHECK, which writes no item.
+    /// Returns the version stamp this call committed the row under; for a Put
+    /// or Update whose fence did not apply, the row's version when the live
+    /// commit landed and nothing has rewritten the row since; otherwise `None`
+    /// (a later writer has taken the row, a Delete the live commit already
+    /// applied, and CHECK, which writes no item).
     async fn recover_commit_op(
         &self,
         keyspace: &str,
@@ -2434,12 +2486,25 @@ impl CassandraEngine {
                     StorageError::Internal("Database error".to_owned())
                 })?;
 
-                // The fence does not apply when the row was already committed
-                // (idempotent replay) or a later writer owns it; either way
-                // this pass did not write the row and reports no stamp.
-                Ok(check_lwt_applied(&result, "recover_commit PUT/UPDATE")
-                    .is_ok()
-                    .then_some(next_version))
+                if check_lwt_applied(&result, "recover_commit PUT/UPDATE").is_ok() {
+                    return Ok(Some(next_version));
+                }
+                // The fence does not apply when the live commit landed before
+                // the crash or a later writer has taken the row. A row that
+                // holds this transaction's commit timestamp and the ledger's
+                // image is the live commit's, whose index batch may be what
+                // the crash cut off, so it is re-synced at its current
+                // version; a later writer's batch carries a higher stamp and
+                // still wins. Any other row is left to its owner.
+                self.landed_commit_version(
+                    keyspace,
+                    &table,
+                    &op.pk,
+                    sk.as_ref(),
+                    txn_timestamp,
+                    item_data,
+                )
+                .await
             }
             "DELETE" => {
                 // The stamp the index tombstones carry if this pass deletes the
