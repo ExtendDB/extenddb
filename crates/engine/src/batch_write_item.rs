@@ -4,6 +4,7 @@
 //! `BatchWriteItem` operation handler.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use serde_json::Value;
 
@@ -17,6 +18,7 @@ use extenddb_core::validation::{
     validate_attribute_name_sizes, validate_batch_item_keys, validate_batch_key_only,
     validate_item_nesting_depth, validate_item_size, validate_key_sizes,
 };
+use extenddb_storage::error::StorageError;
 
 use crate::OperationContext;
 use crate::capacity_helpers;
@@ -32,13 +34,28 @@ use crate::{DispatchMetrics, DispatchResult};
 /// executed individually — no cross-item conditions. `DynamoDB` limits: max 25
 /// items total, max 16 MB request size, max 400 KB per item.
 ///
+/// A write the backend cannot apply now (see `is_deferrable`) does not stop
+/// the batch: its request is returned in UnprocessedItems and the requests
+/// after it are still tried.
+///
 /// # Errors
 ///
 /// Returns `DynamoDbError` for validation failures, missing tables, or storage errors.
+/// A write the backend cannot apply now fails the batch only when no request
+/// of the batch was applied.
 pub async fn handle_batch_write_item(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
+    // The storage calls of the batch run in one request clock scope, so a
+    // backend that bounds how long a contended write keeps retrying measures
+    // one bound for the whole batch instead of one per write request.
+    extenddb_storage::request_clock::scope(Instant::now(), write_batch(body, ctx)).await
+}
+
+/// The body of [`handle_batch_write_item`], which runs it inside the batch's
+/// request clock scope.
+async fn write_batch(body: Value, ctx: &OperationContext) -> Result<DispatchResult, DynamoDbError> {
     let input: BatchWriteItemInput =
         serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
@@ -78,6 +95,12 @@ pub async fn handle_batch_write_item(
         input.return_consumed_capacity == extenddb_core::types::ReturnConsumedCapacity::Indexes;
     let mut per_table_gsi: HashMap<String, HashMap<String, f64>> = HashMap::new();
     let mut per_table_lsi: HashMap<String, HashMap<String, f64>> = HashMap::new();
+    // The write requests the backend could not apply now (see `is_deferrable`),
+    // returned to the client in UnprocessedItems, and the first such error,
+    // which the batch answers when none of its requests was applied.
+    let mut unprocessed: HashMap<String, Vec<WriteRequest>> = HashMap::new();
+    let mut first_deferral: Option<StorageError> = None;
+    let mut applied = 0usize;
 
     for (table_name, reqs) in &input.request_items {
         let key_info = ctx
@@ -124,7 +147,7 @@ pub async fn handle_batch_write_item(
                 let item_wcu = capacity_helpers::write_capacity_units(item_size_bytes(&put.item));
                 total_wcu += item_wcu;
                 *per_table_wcu.entry(table_name.clone()).or_default() += item_wcu;
-                let old_item = ctx
+                let written = ctx
                     .storage
                     .put_item(
                         &key_info,
@@ -134,8 +157,25 @@ pub async fn handle_batch_write_item(
                         &empty_maps,
                         stream.as_ref(),
                     )
-                    .await
-                    .map_err(storage_err_to_dynamo)?;
+                    .await;
+                let old_item = match written {
+                    Ok(old_item) => old_item,
+                    Err(e) if is_deferrable(&e) => {
+                        tracing::warn!(
+                            table = %table_name,
+                            error = %e,
+                            "BatchWriteItem: a put request was not applied; it is returned in UnprocessedItems"
+                        );
+                        unprocessed
+                            .entry(table_name.clone())
+                            .or_default()
+                            .push(wr.clone());
+                        first_deferral.get_or_insert(e);
+                        continue;
+                    }
+                    Err(e) => return Err(storage_err_to_dynamo(e)),
+                };
+                applied += 1;
                 if want_index_cc {
                     let (gsi, lsi) = capacity_helpers::index_write_units(
                         old_item.as_ref(),
@@ -178,7 +218,7 @@ pub async fn handle_batch_write_item(
                 let item_wcu = capacity_helpers::write_capacity_units(item_size_bytes(&del.key));
                 total_wcu += item_wcu;
                 *per_table_wcu.entry(table_name.clone()).or_default() += item_wcu;
-                let old_item = ctx
+                let written = ctx
                     .storage
                     .delete_item(
                         &key_info,
@@ -188,8 +228,25 @@ pub async fn handle_batch_write_item(
                         &empty_maps,
                         stream.as_ref(),
                     )
-                    .await
-                    .map_err(storage_err_to_dynamo)?;
+                    .await;
+                let old_item = match written {
+                    Ok(old_item) => old_item,
+                    Err(e) if is_deferrable(&e) => {
+                        tracing::warn!(
+                            table = %table_name,
+                            error = %e,
+                            "BatchWriteItem: a delete request was not applied; it is returned in UnprocessedItems"
+                        );
+                        unprocessed
+                            .entry(table_name.clone())
+                            .or_default()
+                            .push(wr.clone());
+                        first_deferral.get_or_insert(e);
+                        continue;
+                    }
+                    Err(e) => return Err(storage_err_to_dynamo(e)),
+                };
+                applied += 1;
                 if want_index_cc {
                     let (gsi, lsi) = capacity_helpers::index_write_units(
                         old_item.as_ref(),
@@ -208,6 +265,14 @@ pub async fn handle_batch_write_item(
                 }
             }
         }
+    }
+
+    // No request of the batch was applied, so answering an error is safe: a
+    // client that retries it resends requests none of which took effect.
+    if applied == 0
+        && let Some(e) = first_deferral
+    {
+        return Err(storage_err_to_dynamo(e));
     }
 
     // With INDEXES, each per-table entry carries the arms the batch actually
@@ -241,7 +306,7 @@ pub async fn handle_batch_write_item(
     let wcu = total_wcu;
 
     let output = BatchWriteItemOutput {
-        unprocessed_items: HashMap::new(),
+        unprocessed_items: unprocessed,
         consumed_capacity,
         item_collection_metrics: if all_icm.is_empty() {
             None
@@ -257,6 +322,38 @@ pub async fn handle_batch_write_item(
             ..Default::default()
         },
     })
+}
+
+/// Whether a failed write leaves its request for the client to retry, in
+/// UnprocessedItems, instead of failing the batch.
+///
+/// Neither error applied the write. `Transient` is a write the backend could
+/// not apply now and expects to apply on a retry; on MongoDB a write that kept
+/// losing to concurrent writers until its contention deadline or its attempt
+/// budget ran out answers it. `TransactionConflict` is a write that lost to a
+/// transaction holding the item. Every other error still fails the batch.
+///
+/// Amazon DynamoDB answers a request it cannot apply this way. Measured in
+/// us-east-1 on 2026-11-03 with client retries off, while TransactWriteItems
+/// calls kept updating one item: of 80 batches that put the held item and then
+/// a free item, 46 answered 200 with the held item's request in
+/// UnprocessedItems and the free item written, and 53 of 80 batches with the
+/// two requests the other way round did the same. Each of those 99 batches
+/// reported 2 write capacity units, the units of both requests, which is why
+/// the capacity of a request returned unprocessed is still counted here. A
+/// batch whose only request was on the held item answered 500
+/// InternalServerError in 54 of 80 calls, never 200 with its request
+/// unprocessed.
+///
+/// Failing the batch after an earlier request was applied is what this
+/// avoids: an SDK that retries the error resends the whole batch, so the
+/// requests already applied are applied again, after any write another
+/// client made to the same items in between.
+fn is_deferrable(e: &StorageError) -> bool {
+    matches!(
+        e,
+        StorageError::Transient(_) | StorageError::TransactionConflict(_)
+    )
 }
 
 /// Validate that no two write requests in the same table target the same key.

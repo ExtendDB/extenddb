@@ -306,6 +306,77 @@ async fn live_a_single_item_write_that_reaches_the_deadline_answers_a_transient_
     finish(engine).await;
 }
 
+/// A write inside a request clock scope measures the deadline from the
+/// scope's start, which is how the write requests of one `BatchWriteItem`
+/// share one deadline.
+///
+/// The scope here started 5 s ago and the deadline is 2 s, so a put of the
+/// held item makes its first attempt and gives up before a second one,
+/// instead of retrying for 2 s from its own start. A put of a free item in the
+/// same scope commits, because the first attempt of a write always runs.
+#[tokio::test]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_a_write_in_a_request_scope_measures_the_deadline_from_the_scope_start() {
+    let deadline = Duration::from_secs(2);
+    let engine = engine_with_deadline(deadline).await;
+    let maps = ExpressionMaps::default();
+    let key_info = gsi_path_table(&engine, "deadline-scope");
+    let mut holder = hold_item_in_a_transaction(&engine, &key_info, "k1").await;
+    let request_started = Instant::now()
+        .checked_sub(Duration::from_secs(5))
+        .expect("the process clock reaches five seconds back");
+
+    let started = Instant::now();
+    let (held, free) = extenddb_storage::request_clock::scope(request_started, async {
+        let held = engine
+            .put_item_impl(
+                &key_info,
+                item_with("k1", "this-put"),
+                false,
+                None,
+                &maps,
+                None,
+            )
+            .await;
+        let free = engine
+            .put_item_impl(
+                &key_info,
+                item_with("k2", "this-put"),
+                false,
+                None,
+                &maps,
+                None,
+            )
+            .await;
+        (held, free)
+    })
+    .await;
+    let elapsed = started.elapsed();
+    let _ = holder.abort_transaction().await;
+
+    match held {
+        Err(StorageError::Transient(msg)) => assert_eq!(
+            msg,
+            "PutItem: the write lost to concurrent writers for 2 seconds; retry the request"
+        ),
+        other => panic!("want the transient deadline error, got: {other:?}"),
+    }
+    assert!(free.is_ok(), "the put of the free item: {free:?}");
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "the two puts took {elapsed:?}, so the held put measured a deadline of its own"
+    );
+    assert_eq!(
+        stored_item(&engine, &key_info, "k1").await,
+        Some(item_with("k1", "held"))
+    );
+    assert_eq!(
+        stored_item(&engine, &key_info, "k2").await,
+        Some(item_with("k2", "this-put"))
+    );
+    finish(engine).await;
+}
+
 /// A `TransactWriteItems` that reaches the deadline answers a canceled
 /// transaction with a `TransactionConflict` reason per item, which is what
 /// live DynamoDB answers a transaction that loses to contention (107 of 160

@@ -468,7 +468,7 @@ impl MongoEngine {
 
         let tx_options = self.write_transaction_options();
         let mut lost_create_races = 0;
-        let contention_started = std::time::Instant::now();
+        let contention_started = contention_clock_start();
 
         for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
             if contention_deadline_passed(attempt, contention_started, self.contention_deadline) {
@@ -726,7 +726,7 @@ impl MongoEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let tx_options = self.write_transaction_options();
-        let contention_started = std::time::Instant::now();
+        let contention_started = contention_clock_start();
 
         for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
             if contention_deadline_passed(attempt, contention_started, self.contention_deadline) {
@@ -959,7 +959,7 @@ impl MongoEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let tx_options = self.write_transaction_options();
-        let contention_started = std::time::Instant::now();
+        let contention_started = contention_clock_start();
 
         for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
             if contention_deadline_passed(attempt, contention_started, self.contention_deadline) {
@@ -2291,7 +2291,7 @@ impl MongoEngine {
             )
         });
 
-        let contention_started = std::time::Instant::now();
+        let contention_started = contention_clock_start();
 
         for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
             // A transaction that reaches the deadline stops retrying and
@@ -3856,6 +3856,18 @@ fn contention_deadline_passed(
     attempt > 0 && started.elapsed() >= deadline
 }
 
+/// The instant a contention retry loop measures the engine's deadline from.
+///
+/// A caller that makes several storage calls for one API request runs them
+/// inside [`extenddb_storage::request_clock::scope`], as `BatchWriteItem`
+/// does, and then every loop of that request measures from the start the
+/// scope carries, so the request's writes share one deadline. Outside a
+/// scope, which is where a single-item request and the TTL worker call from,
+/// a loop measures from the start of its own call.
+fn contention_clock_start() -> std::time::Instant {
+    extenddb_storage::request_clock::started().unwrap_or_else(std::time::Instant::now)
+}
+
 /// The error for a write that stopped retrying because the engine's
 /// contention deadline passed while it was losing to concurrent writers.
 /// `operation` names the API operation and `deadline` is the deadline that
@@ -4431,6 +4443,24 @@ mod tests {
             spent,
             CONTENTION_DEADLINE * 60
         ));
+    }
+
+    /// A loop measures the deadline from the start its request clock scope
+    /// carries, so the writes of one batch share one deadline, and from its
+    /// own start outside a scope.
+    #[tokio::test]
+    async fn the_contention_clock_starts_with_the_request_scope() {
+        let before = std::time::Instant::now();
+        let outside = contention_clock_start();
+        assert!(outside >= before, "outside a scope the clock starts now");
+        let batch_started = before
+            .checked_sub(std::time::Duration::from_secs(30))
+            .expect("the process clock reaches 30 seconds back");
+        let inside = extenddb_storage::request_clock::scope(batch_started, async {
+            (contention_clock_start(), contention_clock_start())
+        })
+        .await;
+        assert_eq!(inside, (batch_started, batch_started));
     }
 
     /// The give-up on the deadline is the transient error the engine answers
