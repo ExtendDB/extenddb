@@ -298,6 +298,66 @@ fn field_count_rule_holds_after_expansion() {
     ));
 }
 
+// --- `?` and `*` count UTF-16 code units, as `matcher::wildcard_match` does
+// (#581) ---
+
+const TABLE: &str = "arn:aws:dynamodb:us-east-1:123456789012:table/";
+
+/// Whether `table/<pattern>` followed by a variable that expands to nothing
+/// matches `table/<name>`. The variable puts the pattern on the token path;
+/// the answer must be the one `arn_match` gives for `table/<pattern>`.
+fn matches_beside_an_empty_variable(pattern: &str, name: &str) -> bool {
+    let arn = format!("{TABLE}{name}");
+    let with_variable = format!("{TABLE}{pattern}${{aws:PrincipalTag/none, ''}}");
+    let answer = resource_pattern_matches(&with_variable, &arn, true, &Ctx::empty());
+    assert_eq!(
+        answer,
+        arn_match(&format!("{TABLE}{pattern}"), &arn),
+        "{pattern} against {name}"
+    );
+    answer
+}
+
+/// The `Resource` rows of `matcher/utf16_tests.rs`, measured with the IAM
+/// policy simulator: `?` takes the one-unit `\u{e9}` and `\u{65e5}`, and the
+/// two-unit `\u{1f600}` takes `??`. The `?zz` cases follow from them.
+#[test]
+fn question_mark_takes_one_utf16_unit_beside_a_variable() {
+    assert!(matches_beside_an_empty_variable("?", "\u{e9}"));
+    assert!(!matches_beside_an_empty_variable("??", "\u{e9}"));
+    assert!(matches_beside_an_empty_variable("?", "\u{65e5}"));
+    assert!(!matches_beside_an_empty_variable("??", "\u{65e5}"));
+    assert!(!matches_beside_an_empty_variable("?", "\u{1f600}"));
+    assert!(matches_beside_an_empty_variable("??", "\u{1f600}"));
+    assert!(!matches_beside_an_empty_variable("????", "\u{1f600}"));
+    assert!(matches_beside_an_empty_variable("?zz", "\u{e9}zz"));
+    assert!(matches_beside_an_empty_variable("?zz", "\u{65e5}zz"));
+}
+
+/// Measured with the IAM policy simulator: `*??bc` does not match
+/// `\u{65e5}bc` and matches `\u{1f600}bc`, and `*?bc` matches `\u{1f600}bc`.
+#[test]
+fn star_backtracks_by_utf16_units_beside_a_variable() {
+    assert!(!matches_beside_an_empty_variable("*??bc", "\u{65e5}bc"));
+    assert!(matches_beside_an_empty_variable("*??bc", "\u{1f600}bc"));
+    assert!(matches_beside_an_empty_variable("*?bc", "\u{1f600}bc"));
+}
+
+#[test]
+fn a_substituted_value_is_matched_by_utf16_units() {
+    // The value is literal, and a `?` written after it takes one unit.
+    let ctx = Ctx::empty().with(TEAM, &["\u{65e5}"]);
+    let matches = |suffix: &str, name: &str| {
+        let pattern = format!("{TABLE}${{aws:PrincipalTag/team}}{suffix}");
+        resource_pattern_matches(&pattern, &format!("{TABLE}{name}"), true, &ctx)
+    };
+    assert!(matches("?", "\u{65e5}\u{e9}"));
+    assert!(!matches("?", "\u{65e5}\u{1f600}"));
+    assert!(matches("??", "\u{65e5}\u{1f600}"));
+    assert!(!matches("?", "\u{65e5}"));
+    assert!(!matches("?", "\u{65e6}x"));
+}
+
 #[test]
 fn unclosed_brace_is_literal_text() {
     let pattern = "arn:aws:dynamodb:us-east-1:123456789012:table/${aws";

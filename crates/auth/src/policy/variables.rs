@@ -34,8 +34,10 @@
 //! [`super::matcher::arn_match`]: the first five `:` separate fields, the
 //! resource field keeps its own `:` and `/`, and both sides need the same
 //! number of fields. Only a `:` written in the policy text separates fields;
-//! a `:` inside a variable value is matched as a byte of its field (measured:
-//! a region-field value `us-east-1:123456789012` matches no table ARN).
+//! a `:` inside a variable value is matched as a character of its field
+//! (measured: a region-field value `us-east-1:123456789012` matches no table
+//! ARN). `*` and `?` count UTF-16 code units, as in
+//! [`super::matcher::wildcard_match`] (#581).
 
 use super::context::ConditionContext;
 use super::document::{PolicyDocument, PolicyParseError};
@@ -76,18 +78,38 @@ pub(super) fn validate_version(json: &str) -> Result<(), PolicyParseError> {
     }
 }
 
+/// `*` in UTF-16.
+const STAR: u16 = 0x2A;
+/// `?` in UTF-16.
+const QUESTION: u16 = 0x3F;
+/// `:` in UTF-16.
+const COLON: u16 = 0x3A;
+
 /// One unit of an expanded pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Token {
-    /// `*` written in the policy text: matches zero or more bytes.
+    /// `*` written in the policy text: matches zero or more UTF-16 code units.
     Star,
-    /// `?` written in the policy text: matches exactly one byte.
+    /// `?` written in the policy text: matches exactly one UTF-16 code unit.
     Question,
     /// `:` written in the policy text: a field separator among the first five,
     /// a literal `:` in the resource field.
     Colon,
-    /// One byte matched literally.
-    Byte(u8),
+    /// One UTF-16 code unit matched literally.
+    Unit(u16),
+}
+
+impl Token {
+    /// The token for a UTF-16 code unit of the policy text, where `*`, `?`
+    /// and `:` keep their meaning.
+    fn written(unit: u16) -> Self {
+        match unit {
+            STAR => Self::Star,
+            QUESTION => Self::Question,
+            COLON => Self::Colon,
+            other => Self::Unit(other),
+        }
+    }
 }
 
 /// A `${...}` reference as written in a policy.
@@ -214,16 +236,11 @@ fn expand_tokens(pattern: &str, context: &impl ConditionContext) -> Result<Vec<T
     let mut unresolvable = false;
     for part in parts(pattern) {
         match part {
-            Part::Text(text) => tokens.extend(text.bytes().map(|b| match b {
-                b'*' => Token::Star,
-                b'?' => Token::Question,
-                b':' => Token::Colon,
-                other => Token::Byte(other),
-            })),
-            Part::Ref(_, Reference::Escape(byte)) => tokens.push(Token::Byte(byte)),
+            Part::Text(text) => tokens.extend(text.encode_utf16().map(Token::written)),
+            Part::Ref(_, Reference::Escape(byte)) => tokens.push(Token::Unit(u16::from(byte))),
             Part::Ref(_, Reference::Key { name, default }) => {
                 match resolve(name, default, context) {
-                    Ok(value) => tokens.extend(value.bytes().map(Token::Byte)),
+                    Ok(value) => tokens.extend(value.encode_utf16().map(Token::Unit)),
                     Err(Missing::Unresolvable) => unresolvable = true,
                     Err(Missing::Absent) => return Err(Missing::Absent),
                 }
@@ -328,10 +345,10 @@ fn arn_match_tokens(pattern: &[Token], value: &str) -> bool {
     if p_fields.len() != v_fields.len() {
         return false;
     }
-    p_fields
-        .iter()
-        .zip(v_fields.iter())
-        .all(|(p, v)| match_tokens(p, v.as_bytes()))
+    p_fields.iter().zip(v_fields.iter()).all(|(p, v)| {
+        let units: Vec<u16> = v.encode_utf16().collect();
+        match_tokens(p, &units)
+    })
 }
 
 /// Split at the first five `:` written in the policy text, so the resource
@@ -352,9 +369,11 @@ fn split_fields(pattern: &[Token]) -> Vec<&[Token]> {
     fields
 }
 
-/// Greedy wildcard match over tokens, the same algorithm as
-/// `matcher::wildcard_match` with `Star` and `Question` as the wildcards.
-fn match_tokens(p: &[Token], v: &[u8]) -> bool {
+/// Greedy wildcard match over tokens against the UTF-16 code units of a
+/// value: the algorithm of `matcher::wildcard_match`, which counts what `?`
+/// and `*` match in UTF-16 code units (#581), with `Star` and `Question` as
+/// the wildcards.
+fn match_tokens(p: &[Token], v: &[u16]) -> bool {
     let (plen, vlen) = (p.len(), v.len());
     let mut pi = 0;
     let mut vi = 0;
@@ -368,8 +387,8 @@ fn match_tokens(p: &[Token], v: &[u8]) -> bool {
             pi += 1;
         } else if pi < plen
             && (p[pi] == Token::Question
-                || p[pi] == Token::Byte(v[vi])
-                || (p[pi] == Token::Colon && v[vi] == b':'))
+                || p[pi] == Token::Unit(v[vi])
+                || (p[pi] == Token::Colon && v[vi] == COLON))
         {
             pi += 1;
             vi += 1;
