@@ -53,10 +53,10 @@ async fn two_migrators_started_together_apply_once_and_the_other_finds_nothing()
     applied.sort_unstable();
     assert_eq!(
         applied,
-        [0, 6],
+        [0, 7],
         "one applies every step and the other finds nothing"
     );
-    assert_eq!(d.status().await, CatalogStatus::Current { version: 5 });
+    assert_eq!(d.status().await, CatalogStatus::Current { version: 6 });
     d.drop_databases().await;
 }
 
@@ -204,7 +204,7 @@ async fn migrate_waits_for_a_running_server_and_a_server_refuses_while_a_migrati
             .is_none()
     );
     // The preview and verify read the status beside the server.
-    assert_eq!(d.status().await, CatalogStatus::Current { version: 5 });
+    assert_eq!(d.status().await, CatalogStatus::Current { version: 6 });
     serving.release().await;
     let (held, _) = lock(&d.target, false, Duration::from_secs(2), Timing::PRODUCTION)
         .await

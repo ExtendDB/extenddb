@@ -207,7 +207,7 @@ async fn migrate_creates_the_indexes_a_deployment_lacks() {
             .await
             .contains(&"table_id_1".to_owned())
     );
-    assert_eq!(d.status().await, CatalogStatus::Current { version: 5 });
+    assert_eq!(d.status().await, CatalogStatus::Current { version: 6 });
     assert_fresh_definitions(&d).await;
     d.drop_databases().await;
 }
@@ -232,7 +232,7 @@ async fn stop_at_every_request(uri: &str, state: Option<&str>) -> usize {
         }
         assert_eq!(
             d.status().await,
-            CatalogStatus::Current { version: 5 },
+            CatalogStatus::Current { version: 6 },
             "{requests}"
         );
         assert_fresh_definitions(&d).await;
