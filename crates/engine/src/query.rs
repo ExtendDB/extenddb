@@ -22,7 +22,7 @@ use crate::create_table::storage_err_to_dynamo;
 use crate::expression_helpers::{build_expression_maps, parse_optional_filter};
 use crate::index_helpers::{
     VectorIndexReadRefusal, classify_unresolved_index_read, combined_lek_key_schema,
-    validate_query_select_index_support,
+    unresolved_index_error, validate_query_select_index_support,
 };
 use crate::legacy_filter::{desugar_filter, desugar_key_conditions};
 use crate::read_helpers::{PostRead, read_page};
@@ -101,7 +101,7 @@ pub async fn handle_query(
                 Err(err @ StorageError::IndexNotFound(_)) => {
                     match classify_unresolved_index_read(ctx, &key_info, idx_name).await? {
                         VectorIndexReadRefusal::NotFound => {
-                            return Err(storage_err_to_dynamo(err));
+                            return Err(unresolved_index_error(ctx, &key_info, err).await);
                         }
                         // Query refuses a backfilling vector index with the same
                         // message as an active one (measured 2026-08-20; Scan

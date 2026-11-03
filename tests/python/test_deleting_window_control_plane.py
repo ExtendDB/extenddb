@@ -81,13 +81,28 @@ def _skip_unless_window_can_be_held(dynamodb_client, name: str) -> None:
         pytest.skip(reason)
 
 
-def _open_window(dynamodb_client, is_extenddb: bool, name: str) -> _HeldLock | None:
-    """Create the table and, on ExtendDB, hold the lock that keeps it DELETING."""
+def _open_window(
+    dynamodb_client, is_extenddb: bool, name: str, with_index: bool = False
+) -> _HeldLock | None:
+    """Create the table (with a GSI ``gsi1`` on ``gk`` when ``with_index``) and, on
+    ExtendDB, hold the lock that keeps it DELETING."""
+    attributes = [{"AttributeName": "pk", "AttributeType": "S"}]
+    extra = {}
+    if with_index:
+        attributes.append({"AttributeName": "gk", "AttributeType": "S"})
+        extra["GlobalSecondaryIndexes"] = [
+            {
+                "IndexName": "gsi1",
+                "KeySchema": [{"AttributeName": "gk", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        ]
     dynamodb_client.create_table(
         TableName=name,
-        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        AttributeDefinitions=attributes,
         KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
         BillingMode="PAY_PER_REQUEST",
+        **extra,
     )
     wait_for_active(dynamodb_client, name)
     if not is_extenddb:
@@ -171,4 +186,34 @@ class TestDeletingWindowDataPlane:
 
         with pytest.raises(ClientError) as exc:
             dynamodb_client.get_item(TableName=name, Key={"pk": {"S": "w1"}}, ConsistentRead=True)
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    def test_index_reads_after_the_table_is_gone_are_not_found(self, dynamodb_client, is_extenddb):
+        """Query and Scan on an index of a table that is gone are ResourceNotFoundException,
+        as GetItem is, after a GetItem during the window: on ExtendDB that read stores the
+        DELETING table's key info in the key-info cache, and the entry outlives the table."""
+        name = unique_name("del-window")
+        lock = _open_window(dynamodb_client, is_extenddb, name, with_index=True)
+        try:
+            resp = dynamodb_client.delete_table(TableName=name)
+            assert resp["TableDescription"]["TableStatus"] == "DELETING"
+            got = dynamodb_client.get_item(
+                TableName=name, Key={"pk": {"S": "absent"}}, ConsistentRead=True
+            )
+            assert "Item" not in got
+        finally:
+            if lock is not None:
+                lock.release()
+        wait_for_deleted(dynamodb_client, name, timeout=120.0)
+
+        with pytest.raises(ClientError) as exc:
+            dynamodb_client.query(
+                TableName=name,
+                IndexName="gsi1",
+                KeyConditionExpression="gk = :gk",
+                ExpressionAttributeValues={":gk": {"S": "x"}},
+            )
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        with pytest.raises(ClientError) as exc:
+            dynamodb_client.scan(TableName=name, IndexName="gsi1")
         assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
