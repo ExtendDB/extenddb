@@ -94,7 +94,7 @@ impl SqliteEngine {
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?
         .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(0.25);
+        .unwrap_or(crate::DEFAULT_CONTROL_PLANE_DELAY_SECONDS);
 
         let index_ids: Vec<String> = index_rows.iter().map(|r| r.index_id.clone()).collect();
         let table_id = row.table_id.clone();
@@ -222,11 +222,14 @@ mod deleting_window_tests {
         let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
-        sqlx::query("UPDATE settings SET value = '0' WHERE key = 'control_plane_delay_seconds'")
-            .execute(&engine.pool)
-            .await
-            .expect("delay");
+        crate::migrations::apply_for_tests(&engine.pool).await;
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0') \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .execute(&engine.pool)
+        .await
+        .expect("delay");
         sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
             .bind(ACCOUNT)
             .execute(&engine.pool)

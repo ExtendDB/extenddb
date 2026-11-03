@@ -1308,8 +1308,8 @@ mod gsi_throughput_tests {
         let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
-        sqlx::query("UPDATE settings SET value = '0' WHERE key = 'control_plane_delay_seconds'")
+        crate::migrations::apply_for_tests(&engine.pool).await;
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0') ON CONFLICT(key) DO UPDATE SET value = excluded.value")
             .execute(&engine.pool)
             .await
             .expect("delay");
@@ -1432,7 +1432,7 @@ mod reconciler_tests {
         let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
+        crate::migrations::apply_for_tests(&engine.pool).await;
 
         let account = "000000000000";
         sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
@@ -1518,7 +1518,7 @@ mod reconciler_tests {
         let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
+        crate::migrations::apply_for_tests(&engine.pool).await;
         let account = "000000000000";
         sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
             .bind(account)
@@ -1618,7 +1618,7 @@ mod reconciler_tests {
         let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
+        crate::migrations::apply_for_tests(&engine.pool).await;
         let account = "000000000000";
         sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
             .bind(account)
@@ -1735,7 +1735,7 @@ mod reconciler_tests {
         let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
+        crate::migrations::apply_for_tests(&engine.pool).await;
 
         let account = "000000000000";
         sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
@@ -1853,7 +1853,7 @@ mod reconciler_tests {
         let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
+        crate::migrations::apply_for_tests(&engine.pool).await;
         sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
             .bind("000000000000")
             .execute(&engine.pool)
@@ -1979,7 +1979,7 @@ mod reconciler_tests {
         let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
+        crate::migrations::apply_for_tests(&engine.pool).await;
         sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
             .bind("000000000000")
             .execute(&engine.pool)
@@ -2066,7 +2066,7 @@ mod reconciler_tests {
         let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
+        crate::migrations::apply_for_tests(&engine.pool).await;
         sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
             .bind("000000000000")
             .execute(&engine.pool)
@@ -2150,7 +2150,7 @@ mod reconciler_tests {
         let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
+        crate::migrations::apply_for_tests(&engine.pool).await;
         let account = "000000000000";
         sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
             .bind(account)
@@ -2251,7 +2251,7 @@ mod reconciler_tests {
         let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
+        crate::migrations::apply_for_tests(&engine.pool).await;
         let account = "000000000000";
         sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
             .bind(account)
@@ -2402,7 +2402,7 @@ mod reconciler_tests {
         let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
+        crate::migrations::apply_for_tests(&engine.pool).await;
         let account = "000000000000";
         sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
             .bind(account)

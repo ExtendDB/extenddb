@@ -134,10 +134,13 @@ async fn scratch() -> Scratch {
             .expect("apply a shipped migration");
     }
     set_delay(&catalog, "0").await;
-    sqlx::query("UPDATE settings SET value = '0' WHERE key = 'index_propagation_delay_ms'")
-        .execute(&catalog)
-        .await
-        .expect("pin the propagation delay to zero");
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ('index_propagation_delay_ms', '0') \
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .execute(&catalog)
+    .await
+    .expect("pin the propagation delay to zero");
     sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES ($1, $2)")
         .bind(ACCOUNT)
         .bind(format!("acct-{db_name}"))
@@ -164,12 +167,17 @@ async fn scratch() -> Scratch {
     }
 }
 
+/// Write the control-plane delay. The row is written, not only updated:
+/// migration 1 seeds no setting.
 async fn set_delay(catalog: &PgPool, seconds: &str) {
-    sqlx::query("UPDATE settings SET value = $1 WHERE key = 'control_plane_delay_seconds'")
-        .bind(seconds)
-        .execute(catalog)
-        .await
-        .expect("set the control-plane delay");
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ('control_plane_delay_seconds', $1) \
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .bind(seconds)
+    .execute(catalog)
+    .await
+    .expect("set the control-plane delay");
 }
 
 async fn status_of(catalog: &PgPool, table: &str) -> Option<String> {

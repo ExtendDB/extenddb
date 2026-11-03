@@ -259,9 +259,9 @@ async fn create_databases(base: &str, names: &[String; 2], pgvector: bool) -> bo
 
 /// Apply every catalog and data migration the crate ships, as `extenddb
 /// migrate --yes` does (the data ones on `data_url`, which is the catalog
-/// database on the shared layout), and pgvector if asked. The lists live in
-/// the crate (`migrations.rs`), so a migration added there is applied here
-/// without this file knowing.
+/// database on the shared layout), and pgvector if asked. The table lives in
+/// the crate (`migrations/mod.rs`), so a migration added there is applied
+/// here without this file knowing.
 async fn migrate(catalog: &PgPool, data_url: &str, pgvector: bool) {
     let data = PgPoolOptions::new()
         .max_connections(2)
@@ -281,14 +281,19 @@ async fn migrate(catalog: &PgPool, data_url: &str, pgvector: bool) {
 }
 
 /// Zero the control-plane and propagation delays, and point the engine at
-/// `separate_data_url` when there is one.
+/// `separate_data_url` when there is one. The rows are written, not only
+/// updated: migration 1 seeds no setting, and the tests below that change a
+/// delay update the row written here.
 async fn configure_catalog(catalog: &PgPool, separate_data_url: Option<&String>) {
     for key in ["control_plane_delay_seconds", "index_propagation_delay_ms"] {
-        sqlx::query("UPDATE settings SET value = '0' WHERE key = $1")
-            .bind(key)
-            .execute(catalog)
-            .await
-            .expect("setting");
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES ($1, '0') \
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(key)
+        .execute(catalog)
+        .await
+        .expect("setting");
     }
     if let Some(data_url) = separate_data_url {
         sqlx::query(

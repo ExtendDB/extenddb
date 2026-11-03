@@ -35,6 +35,8 @@ mod deleting_window;
 mod groups;
 #[path = "direct/index.rs"]
 mod index;
+#[path = "direct/keyspace_migrations.rs"]
+mod keyspace_migrations;
 #[path = "direct/metadata_engine.rs"]
 mod metadata_engine;
 #[path = "direct/policies.rs"]
