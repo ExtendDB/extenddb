@@ -330,8 +330,10 @@ async fn write_batch(body: Value, ctx: &OperationContext) -> Result<DispatchResu
 /// Neither error applied the write. `Transient` is a write the backend could
 /// not apply now and expects to apply on a retry; on MongoDB a write that kept
 /// losing to concurrent writers until its contention deadline or its attempt
-/// budget ran out answers it. `TransactionConflict` is a write that lost to a
-/// transaction holding the item. Every other error still fails the batch.
+/// budget ran out answers it. `TransactionConflict` is a write that kept
+/// losing to concurrent writers, or to a transaction holding the item, until
+/// its retries ran out; on MongoDB it is DeleteItem's spent attempt budget.
+/// Every other error still fails the batch.
 ///
 /// Amazon DynamoDB answers a request it cannot apply this way. Measured in
 /// us-east-1 on 2026-11-03 with client retries off, while TransactWriteItems

@@ -30,6 +30,7 @@ import uuid
 import boto3
 import pytest
 from botocore.config import Config
+from botocore.exceptions import ClientError
 
 from conftest import scoped_table
 
@@ -205,3 +206,25 @@ def test_the_requests_of_a_batch_share_one_contention_deadline(
     assert elapsed < DEADLINE + SLACK, f"the batch answered in {elapsed:.2f} s"
     assert _w(dynamodb_client, gsi_table, b1) == "v1"
     assert _w(dynamodb_client, gsi_table, b2) == "v0"
+
+
+def test_a_batch_none_of_whose_requests_was_applied_answers_the_error(
+    dynamodb_client, endpoint_url, mongodb_container, gsi_table
+):
+    """A batch whose only request reaches the deadline answers 503 and applies nothing."""
+    b = f"b-{uuid.uuid4().hex[:8]}"
+    dynamodb_client.put_item(TableName=gsi_table, Item=_item(b, "v0"))
+    client = _client(endpoint_url, retries=False)
+
+    hold = Hold(mongodb_container, gsi_table, b, HOLD)
+    started = time.monotonic()
+    with pytest.raises(ClientError) as err:
+        client.batch_write_item(
+            RequestItems={gsi_table: [{"PutRequest": {"Item": _item(b, "v1")}}]}
+        )
+    elapsed = time.monotonic() - started
+    hold.wait()
+
+    assert err.value.response["ResponseMetadata"]["HTTPStatusCode"] == 503
+    assert elapsed < DEADLINE + SLACK, f"the batch answered in {elapsed:.2f} s"
+    assert _w(dynamodb_client, gsi_table, b) == "v0", "the put of B was applied"
