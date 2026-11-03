@@ -50,3 +50,4 @@ decision, write a new ADR.
 | [0021](0021-cassandra-lwt-delete-atomicity-gap.md) | Cassandra: LWT delete atomicity gap and required worker/saga pattern | Accepted |
 | [0022](0022-trust-policy-deny-over-allow.md) | Role trust-policy evaluation follows IAM Deny-over-Allow order | Accepted |
 | [0023](0023-catalog-migrations.md) | One list of catalog migrations for every backend, with a ledger in every store | Accepted |
+| [0026](0026-credential-crypto-on-aws-lc.md) | Credential cryptography uses AWS-LC through aws-lc-rs | Accepted |
