@@ -133,6 +133,12 @@ fn a_condition_value_naming_a_multivalued_key_with_a_default_uses_it_only_when_a
 // --- Variables before the fifth colon expand (`aws:RequestedRegion` in the
 // region field, `aws:PrincipalAccount` in the account field, PR #535 body
 // table) ---
+//
+// These two simulator rows contradict IAM's policy variables page, which
+// says a variable cannot replace parts of the ARN before the fifth colon.
+// The tests follow the measurement. A variable in the service field goes
+// through the same code and was not measured, so change neither rule
+// without measuring both.
 
 #[test]
 fn a_variable_in_the_region_field_expands() {
