@@ -15,7 +15,8 @@ mod transaction;
 pub use attribute_value::AttributeValue;
 pub use backup::{
     BackupDescription, BackupDetails, BackupSummary, ContinuousBackupsDescription,
-    PointInTimeRecoveryDescription, SourceTableDetails,
+    GlobalSecondaryIndexInfo, LocalSecondaryIndexInfo, PointInTimeRecoveryDescription,
+    SourceTableDetails, SourceTableFeatureDetails,
 };
 pub use batch::{
     BatchGetItemInput, BatchGetItemOutput, BatchWriteItemInput, BatchWriteItemOutput,
@@ -55,7 +56,7 @@ pub use table::{
     DescribeTimeToLiveOutput, DistanceFunction, GlobalSecondaryIndexUpdate, GsiDescription,
     GsiInput, IndexStatus, ListTablesInput, ListTablesOutput, ListTagsOfResourceInput,
     ListTagsOfResourceOutput, LsiDescription, LsiInput, MAX_VECTOR_INDEXES_PER_TABLE,
-    OnDemandThroughput, Projection, ProjectionType, ProvisionedThroughput,
+    ONLINE_INDEX_LIMIT, OnDemandThroughput, Projection, ProjectionType, ProvisionedThroughput,
     ProvisionedThroughputDescription, RestoreSummary, SearchSchemaElement, SearchSchemaElementType,
     SseDescription, SseType, StreamSpecification, StreamViewType, TableDescription, TableStatus,
     Tag, TagResourceInput, TimeToLiveDescription, TimeToLiveSpecification,

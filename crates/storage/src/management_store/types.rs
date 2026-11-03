@@ -6,7 +6,7 @@
 // ── Error types ────────────────────────────────────────────────────────
 
 /// Error from a management or operational storage operation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpError {
     /// Input validation failed (caller should have caught this).
     Validation(String),
@@ -18,10 +18,57 @@ pub enum OpError {
     HasDependents(String),
     /// Internal storage error.
     Internal(String),
+    /// A database statement failed with this error code (PostgreSQL's
+    /// SQLSTATE). `message` is the driver's text, for logs and the
+    /// operator's commands; API responses never carry it.
+    Database { message: String, sqlstate: String },
+}
+
+impl OpError {
+    /// The database error code of the statement that failed, when the error
+    /// carries one.
+    #[must_use]
+    pub fn sqlstate(&self) -> Option<&str> {
+        match self {
+            Self::Database { sqlstate, .. } => Some(sqlstate),
+            Self::Validation(_)
+            | Self::AlreadyExists(_)
+            | Self::NotFound(_)
+            | Self::HasDependents(_)
+            | Self::Internal(_) => None,
+        }
+    }
+
+    /// The error's text, without the variant name that `{:?}` prints.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Validation(m)
+            | Self::AlreadyExists(m)
+            | Self::NotFound(m)
+            | Self::HasDependents(m)
+            | Self::Internal(m)
+            | Self::Database { message: m, .. } => m,
+        }
+    }
 }
 
 /// Result alias for management operations.
 pub type OpResult<T> = Result<T, OpError>;
+
+/// A stored session's policy, returned by
+/// [`super::ManagementStore::list_session_policies`] for the policy migration.
+///
+/// Only sessions that carry a session policy are returned. Carries the identity
+/// needed to rewrite the policy and report it, keyed by `session_token`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionPolicyEntry {
+    pub session_token: String,
+    pub account_id: String,
+    pub role_name: String,
+    pub session_name: String,
+    pub policy: serde_json::Value,
+}
 
 // ── Detail structs ─────────────────────────────────────────────────────
 

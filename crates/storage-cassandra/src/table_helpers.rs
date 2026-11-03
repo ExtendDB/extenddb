@@ -6,7 +6,8 @@
 use cdrs_tokio::types::{IntoRustByName, rows::Row};
 use extenddb_core::types::{
     BillingMode, BillingModeSummary, GsiDescription, LsiDescription,
-    ProvisionedThroughputDescription, SseDescription, SseType, TableDescription, TableStatus,
+    ProvisionedThroughputDescription, RestoreSummary, SseDescription, SseType, TableDescription,
+    TableStatus,
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{index_arn, stream_arn};
@@ -165,6 +166,28 @@ impl CassandraEngine {
             .flatten()
             .and_then(|s: String| serde_json::from_str(&s).ok());
 
+        // A restore target reports its registration for as long as the row
+        // carries it; the engine shows it only while the table is CREATING.
+        let restore_source_backup_arn: Option<String> = table_row
+            .get_by_name("restore_source_backup_arn")
+            .ok()
+            .flatten();
+        let restore_summary = restore_source_backup_arn.map(|arn| {
+            let source_table_arn: Option<String> = table_row
+                .get_by_name("restore_source_table_arn")
+                .ok()
+                .flatten();
+            let restore_date_time_ms: Option<i64> =
+                table_row.get_by_name("restore_date_time").ok().flatten();
+            RestoreSummary {
+                source_backup_arn: Some(arn),
+                source_table_arn,
+                restore_date_time: restore_date_time_ms
+                    .map_or(0.0, crate::cassandra_util::millis_to_seconds_f64),
+                restore_in_progress: table_status == TableStatus::Creating,
+            }
+        });
+
         // Build GSI/LSI descriptions
         let mut gsis: Vec<GsiDescription> = Vec::new();
         let mut lsis: Vec<LsiDescription> = Vec::new();
@@ -195,14 +218,13 @@ impl CassandraEngine {
 
             if index_type == "GSI" {
                 let pt_str: Option<String> = row.get_r_by_name("provisioned_throughput").ok();
-                let pt = pt_str.as_ref().and_then(|s| serde_json::from_str(s).ok());
 
                 gsis.push(GsiDescription {
                     index_name: index_name.clone(),
                     key_schema: ks,
                     projection: proj,
                     index_status,
-                    provisioned_throughput: pt,
+                    provisioned_throughput: gsi_throughput_description(pt_str.as_deref()),
                     index_size_bytes: 0,
                     item_count: 0,
                     index_arn: index_arn(&self.region, account_id, &table_name, &index_name),
@@ -277,8 +299,72 @@ impl CassandraEngine {
             }),
             table_class_summary: table_class.map(|tc| serde_json::json!({"TableClass": tc})),
             on_demand_throughput,
-            restore_summary: None,
+            restore_summary,
             vector_indexes: None,
         })
+    }
+}
+
+/// The ProvisionedThroughput a GSI reports in DescribeTable.
+///
+/// Every GSI carries one, as on the service and the other backends: an
+/// on-demand GSI (no throughput recorded in its catalog row) reports {0, 0}
+/// rather than omitting the member. The column holds either shape:
+/// create_table writes a `ProvisionedThroughputDescription`, update_table's
+/// GSI create writes the input `ProvisionedThroughput`, so it is read as the
+/// latter (which ignores `NumberOfDecreasesToday`).
+fn gsi_throughput_description(stored: Option<&str>) -> Option<ProvisionedThroughputDescription> {
+    let recorded = stored
+        .and_then(|s| serde_json::from_str::<extenddb_core::types::ProvisionedThroughput>(s).ok());
+    Some(ProvisionedThroughputDescription {
+        read_capacity_units: recorded.as_ref().map_or(0, |pt| pt.read_capacity_units),
+        write_capacity_units: recorded.as_ref().map_or(0, |pt| pt.write_capacity_units),
+        number_of_decreases_today: 0,
+        last_increase_date_time: None,
+        last_decrease_date_time: None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gsi_throughput_description;
+    use extenddb_core::types::{ProvisionedThroughput, ProvisionedThroughputDescription};
+
+    #[test]
+    fn an_on_demand_gsi_reports_zero_throughput() {
+        // None: the column is null (create_table on a PAY_PER_REQUEST table);
+        // "": update_table's GSI create without throughput.
+        for stored in [None, Some(""), Some("null")] {
+            let pt = gsi_throughput_description(stored)
+                .unwrap_or_else(|| panic!("{stored:?}: GSI ProvisionedThroughput omitted"));
+            assert_eq!(
+                (pt.read_capacity_units, pt.write_capacity_units),
+                (0, 0),
+                "{stored:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_provisioned_gsi_reports_its_recorded_throughput_in_either_stored_shape() {
+        let from_create_table = serde_json::to_string(&ProvisionedThroughputDescription {
+            read_capacity_units: 3,
+            write_capacity_units: 4,
+            ..Default::default()
+        })
+        .unwrap();
+        let from_update_table = serde_json::to_string(&ProvisionedThroughput {
+            read_capacity_units: 5,
+            write_capacity_units: 6,
+        })
+        .unwrap();
+        for (stored, want) in [(from_create_table, (3, 4)), (from_update_table, (5, 6))] {
+            let pt = gsi_throughput_description(Some(&stored)).unwrap();
+            assert_eq!(
+                (pt.read_capacity_units, pt.write_capacity_units),
+                want,
+                "{stored}"
+            );
+        }
     }
 }

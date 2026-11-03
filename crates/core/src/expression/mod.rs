@@ -24,7 +24,10 @@ mod update_parser;
 
 pub use ast::{ArithOp, CompareOp, Expr, PathElement, UpdateAction};
 pub use evaluator::evaluate_condition;
-pub use key_condition::{KeyCondition, SortKeyCondition, parse_key_condition};
+pub use key_condition::{
+    KeyClauseOperand, KeyCondition, SortKeyCondition, key_condition_clause_operands,
+    parse_key_condition,
+};
 pub use kind::ExpressionKind;
 pub use parser::{parse_condition, parse_condition_with_depth_limit};
 pub use projection::{Projection, parse_projection};

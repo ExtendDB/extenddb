@@ -5,6 +5,7 @@
 
 use extenddb_storage::management_store::{AccessKeyCreated, OpError, OpResult};
 
+use super::database_error;
 use crate::catalog_store::PostgresCatalogStore;
 use crate::pg_util::{is_fk_violation, is_unique_violation};
 
@@ -197,6 +198,48 @@ impl PostgresCatalogStore {
             tracing::error!("store_session failed: {e}");
             OpError::Internal("Database error".to_owned())
         })?;
+        Ok(())
+    }
+
+    /// List stored session policies for the resource-tag migration.
+    pub(crate) async fn list_session_policies_impl(
+        &self,
+    ) -> OpResult<Vec<extenddb_storage::management_store::SessionPolicyEntry>> {
+        let rows: Vec<(String, String, String, String, serde_json::Value)> = sqlx::query_as(
+            "SELECT session_token, account_id, role_name, session_name, session_policy \
+             FROM iam_sessions WHERE session_policy IS NOT NULL",
+        )
+        .fetch_all(self.pool())
+        .await
+        .map_err(|e| database_error("list_session_policies", &e))?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(session_token, account_id, role_name, session_name, policy)| {
+                    extenddb_storage::management_store::SessionPolicyEntry {
+                        session_token,
+                        account_id,
+                        role_name,
+                        session_name,
+                        policy,
+                    }
+                },
+            )
+            .collect())
+    }
+
+    /// Replace a stored session's policy for the resource-tag migration.
+    pub(crate) async fn update_session_policy_impl(
+        &self,
+        session_token: &str,
+        document: &serde_json::Value,
+    ) -> OpResult<()> {
+        sqlx::query("UPDATE iam_sessions SET session_policy = $1 WHERE session_token = $2")
+            .bind(document)
+            .bind(session_token)
+            .execute(self.pool())
+            .await
+            .map_err(|e| database_error("update_session_policy", &e))?;
         Ok(())
     }
 

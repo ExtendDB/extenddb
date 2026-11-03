@@ -24,7 +24,28 @@ pub enum DynamoDbError {
     #[error("{0}")]
     BackupNotFoundException(String),
     #[error("{0}")]
+    BackupInUseException(String),
+    #[error("{0}")]
     ResourceInUseException(String),
+    /// HTTP 400. `RestoreTableFromBackup` into a table name that is already
+    /// taken. Listed in the operation's errors in the 2012-08-10 service model
+    /// (botocore 1.33.13 `service-2.json`, shape `TableAlreadyExistsException`)
+    /// and measured on DynamoDB. `CreateTable` keeps
+    /// `ResourceInUseException`, which is what the service returns there.
+    #[error("{0}")]
+    TableAlreadyExistsException(String),
+    /// HTTP 400. `RestoreTableFromBackup` into a name that is itself a
+    /// `CREATING` restore target. Measured on DynamoDB: `Table: <name> is
+    /// already being restored from backup: <arn>`.
+    #[error("{0}")]
+    TableInUseException(String),
+    /// HTTP 400. `CreateBackup` on a table that does not exist or is not yet
+    /// `ACTIVE`, and `DescribeContinuousBackups`, `UpdateContinuousBackups`
+    /// and `RestoreTableToPointInTime` on a table that does not exist.
+    /// Measured on DynamoDB: `Table not found: <name>`. Distinct from
+    /// `ResourceNotFoundException`, which the data plane returns.
+    #[error("{0}")]
+    TableNotFoundException(String),
     /// A per-table or per-account limit was exceeded.
     ///
     /// Distinct from `ValidationException` on purpose: the service uses this
@@ -70,6 +91,21 @@ pub enum DynamoDbError {
     /// Returned when a shard iterator has expired (older than 15 minutes).
     #[error("{0}")]
     ExpiredIteratorException(String),
+    /// SP-ERR-002: HTTP 400. Returned when continuous backups (point-in-time
+    /// recovery) cannot be enabled. The service models this exception on
+    /// `UpdateContinuousBackups`; ExtendDB returns it there for
+    /// `PointInTimeRecoveryEnabled: true`, because no storage backend
+    /// implements point-in-time recovery.
+    #[error("{0}")]
+    ContinuousBackupsUnavailableException(String),
+    /// SP-ERR-002: HTTP 400. Returned by `RestoreTableToPointInTime` when
+    /// point-in-time recovery is not enabled for the source table, which in
+    /// ExtendDB is always: no storage backend implements point-in-time
+    /// recovery. The service models this exception on the restore operation,
+    /// distinct from `ContinuousBackupsUnavailableException`, which it models
+    /// on `UpdateContinuousBackups`.
+    #[error("{0}")]
+    PointInTimeRecoveryUnavailableException(String),
     #[error("{0}")]
     ServiceUnavailable(String),
     /// SP-ERR-002: Concurrent modification of the same item in a transaction.
@@ -114,7 +150,11 @@ impl DynamoDbError {
             Self::ValidationException(_)
             | Self::ResourceNotFoundException(_)
             | Self::BackupNotFoundException(_)
+            | Self::BackupInUseException(_)
             | Self::ResourceInUseException(_)
+            | Self::TableAlreadyExistsException(_)
+            | Self::TableInUseException(_)
+            | Self::TableNotFoundException(_)
             | Self::LimitExceededException(_)
             | Self::ConditionalCheckFailedException(..)
             | Self::TransactionCanceledException { .. }
@@ -123,6 +163,8 @@ impl DynamoDbError {
             | Self::AccessDeniedException(_)
             | Self::ExpiredTokenException(_)
             | Self::ExpiredIteratorException(_)
+            | Self::ContinuousBackupsUnavailableException(_)
+            | Self::PointInTimeRecoveryUnavailableException(_)
             | Self::TransactionConflictException(_)
             | Self::ProvisionedThroughputExceededException(_)
             | Self::ThrottlingException(_)
@@ -155,7 +197,11 @@ impl DynamoDbError {
             Self::ValidationException(_) => "ValidationException",
             Self::ResourceNotFoundException(_) => "ResourceNotFoundException",
             Self::BackupNotFoundException(_) => "BackupNotFoundException",
+            Self::BackupInUseException(_) => "BackupInUseException",
             Self::ResourceInUseException(_) => "ResourceInUseException",
+            Self::TableAlreadyExistsException(_) => "TableAlreadyExistsException",
+            Self::TableInUseException(_) => "TableInUseException",
+            Self::TableNotFoundException(_) => "TableNotFoundException",
             Self::LimitExceededException(_) => "LimitExceededException",
             Self::ConditionalCheckFailedException(..) => "ConditionalCheckFailedException",
             Self::TransactionCanceledException { .. } => "TransactionCanceledException",
@@ -169,6 +215,12 @@ impl DynamoDbError {
             Self::UnrecognizedClientException(_) => "UnrecognizedClientException",
             Self::ExpiredTokenException(_) => "ExpiredTokenException",
             Self::ExpiredIteratorException(_) => "ExpiredIteratorException",
+            Self::ContinuousBackupsUnavailableException(_) => {
+                "ContinuousBackupsUnavailableException"
+            }
+            Self::PointInTimeRecoveryUnavailableException(_) => {
+                "PointInTimeRecoveryUnavailableException"
+            }
             Self::ServiceUnavailable(_) => "ServiceUnavailable",
             Self::TransactionConflictException(_) => "TransactionConflictException",
             Self::ProvisionedThroughputExceededException(_) => {
@@ -221,7 +273,11 @@ impl DynamoDbError {
             Self::ValidationException(m)
             | Self::ResourceNotFoundException(m)
             | Self::BackupNotFoundException(m)
+            | Self::BackupInUseException(m)
             | Self::ResourceInUseException(m)
+            | Self::TableAlreadyExistsException(m)
+            | Self::TableInUseException(m)
+            | Self::TableNotFoundException(m)
             | Self::LimitExceededException(m)
             | Self::ConditionalCheckFailedException(m, _)
             | Self::IdempotentParameterMismatchException(m)
@@ -234,6 +290,8 @@ impl DynamoDbError {
             | Self::UnrecognizedClientException(m)
             | Self::ExpiredTokenException(m)
             | Self::ExpiredIteratorException(m)
+            | Self::ContinuousBackupsUnavailableException(m)
+            | Self::PointInTimeRecoveryUnavailableException(m)
             | Self::ServiceUnavailable(m)
             | Self::TransactionConflictException(m)
             | Self::ProvisionedThroughputExceededException(m)
@@ -315,8 +373,13 @@ mod tests {
             (DynamoDbError::RequestLimitExceeded(String::new()), 400),
             (DynamoDbError::RequestTimeoutException(String::new()), 408),
             (DynamoDbError::ResourceInUseException(String::new()), 400),
+            (
+                DynamoDbError::TableAlreadyExistsException(String::new()),
+                400,
+            ),
             (DynamoDbError::ResourceNotFoundException(String::new()), 400),
             (DynamoDbError::BackupNotFoundException(String::new()), 400),
+            (DynamoDbError::BackupInUseException(String::new()), 400),
             (DynamoDbError::SerializationException(String::new()), 400),
             (DynamoDbError::ServiceUnavailable(String::new()), 503),
             (DynamoDbError::ThrottlingException(String::new()), 400),
@@ -343,6 +406,15 @@ mod tests {
             (DynamoDbError::ValidationException(String::new()), 400),
             (DynamoDbError::ExpiredTokenException(String::new()), 400),
             (DynamoDbError::ExpiredIteratorException(String::new()), 400),
+            (
+                DynamoDbError::ContinuousBackupsUnavailableException(String::new()),
+                400,
+            ),
+            (
+                DynamoDbError::PointInTimeRecoveryUnavailableException(String::new()),
+                400,
+            ),
+            (DynamoDbError::TableNotFoundException(String::new()), 400),
             (DynamoDbError::InvalidSignatureException(String::new()), 400),
         ];
         for (err, expected) in cases {
@@ -354,5 +426,15 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn table_already_exists_uses_the_dynamodb_namespace() {
+        let err = DynamoDbError::TableAlreadyExistsException("Table already exists: t".to_owned());
+        assert_eq!(
+            err.full_error_type(),
+            "com.amazonaws.dynamodb.v20120810#TableAlreadyExistsException"
+        );
+        assert_eq!(err.message(), "Table already exists: t");
     }
 }

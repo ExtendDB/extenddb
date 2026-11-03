@@ -10,7 +10,10 @@ use bson::{Document, doc};
 use extenddb_core::metrics::MetricsCollector;
 use extenddb_core::types::{KeySchemaElement, Projection, ProjectionType, UserIdentity};
 use extenddb_storage::error::StorageError;
-use extenddb_storage::{DataEngine, MetadataEngine, StreamEngine, TableEngine, WorkerStore};
+use extenddb_storage::{
+    CancellationToken, DataEngine, MetadataEngine, StreamEngine, TableEngine, WorkerStore,
+    sleep_or_shutdown,
+};
 use futures::TryStreamExt;
 
 use crate::MongoEngine;
@@ -27,11 +30,16 @@ const GSI_BACKFILL_BATCH: i64 = 500;
 /// without busy-spinning.
 const CONTROL_PLANE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-pub(crate) async fn ttl_cleanup_worker(storage: Arc<MongoEngine>, metrics: Arc<MetricsCollector>) {
+/// Retry pending TTL indexes and delete expired items every
+/// [`SCAN_INTERVAL`], until `shutdown` fires.
+pub(crate) async fn ttl_cleanup_worker(
+    storage: Arc<MongoEngine>,
+    metrics: Arc<MetricsCollector>,
+    shutdown: CancellationToken,
+) {
     let region_arc: Arc<str> = Arc::from(storage.region.as_str());
 
-    loop {
-        tokio::time::sleep(SCAN_INTERVAL).await;
+    while sleep_or_shutdown(&shutdown, SCAN_INTERVAL).await {
         retry_pending_indexes(&storage).await;
         sweep_expired_items(&storage, &metrics, &region_arc).await;
     }
@@ -40,10 +48,13 @@ pub(crate) async fn ttl_cleanup_worker(storage: Arc<MongoEngine>, metrics: Arc<M
 /// Defense-in-depth stream-record deletion. A MongoDB TTL index on
 /// `stream_records.created_at` already deletes records ~1 minute after
 /// created_at + 24h; this loop covers the case where that index is
-/// missing (init predates the schema change) or lagging.
-pub(crate) async fn stream_record_cleanup_worker(storage: Arc<MongoEngine>) {
-    loop {
-        tokio::time::sleep(STREAM_CLEANUP_INTERVAL).await;
+/// missing (init predates the schema change) or lagging. Returns once
+/// `shutdown` fires.
+pub(crate) async fn stream_record_cleanup_worker(
+    storage: Arc<MongoEngine>,
+    shutdown: CancellationToken,
+) {
+    while sleep_or_shutdown(&shutdown, STREAM_CLEANUP_INTERVAL).await {
         match StreamEngine::cleanup_expired_stream_records(&*storage, STREAM_RETENTION_HOURS).await
         {
             Ok(0) => {}
@@ -75,9 +86,25 @@ pub(crate) async fn stream_record_cleanup_worker(storage: Arc<MongoEngine>) {
 /// use a sessionless fast path only when the generation-checked cache
 /// says the table has no indexes; an invalidated in-flight observation
 /// cannot publish that stale no-index result.
-pub(crate) async fn gsi_backfill_worker(storage: Arc<MongoEngine>) {
-    loop {
-        tokio::time::sleep(GSI_BACKFILL_INTERVAL).await;
+///
+/// Every `heartbeat_interval` the loop also runs the backup sweep
+/// ([`MongoEngine::sweep_stale_backup_claims`]), so a claim or restore target
+/// left by a process that died is removed within about
+/// `stale_after + heartbeat_interval + GSI_BACKFILL_INTERVAL` without a restart
+/// of this one. The sweep removes only state whose heartbeat stopped, so it is
+/// safe while other processes share the catalog. Returns once `shutdown`
+/// fires, at its next pause between cycles.
+pub(crate) async fn gsi_backfill_worker(storage: Arc<MongoEngine>, shutdown: CancellationToken) {
+    let mut last_backup_sweep = std::time::Instant::now();
+    while sleep_or_shutdown(&shutdown, GSI_BACKFILL_INTERVAL).await {
+        if last_backup_sweep.elapsed() >= storage.backup_liveness.heartbeat_interval {
+            last_backup_sweep = std::time::Instant::now();
+            match storage.sweep_stale_backup_claims().await {
+                Ok(sweep) if sweep.is_empty() => {}
+                Ok(sweep) => tracing::warn!("periodic backup sweep: {sweep}"),
+                Err(e) => tracing::warn!("periodic backup sweep failed: {e}"),
+            }
+        }
 
         let indexes_coll = storage.catalog_db.collection::<Document>("indexes");
         let cursor = match indexes_coll
@@ -102,6 +129,9 @@ pub(crate) async fn gsi_backfill_worker(storage: Arc<MongoEngine>) {
         };
 
         for job in jobs {
+            if shutdown.is_cancelled() {
+                return;
+            }
             if let Err(e) = run_gsi_backfill_job(&storage, &job).await {
                 tracing::warn!(
                     "GSI backfill worker: job failed for index_id={}: {e}",
@@ -534,10 +564,10 @@ fn build_ttl_condition(
 
 /// Background poller that flips tables out of the transient `CREATING` state
 /// once their scheduled `status_transition_at` has passed. See
-/// [`crate::worker_store`] for how rows enter `CREATING`.
-pub(crate) async fn control_plane_worker(storage: Arc<MongoEngine>) {
-    loop {
-        tokio::time::sleep(CONTROL_PLANE_POLL_INTERVAL).await;
+/// [`crate::worker_store`] for how rows enter `CREATING`. Returns once
+/// `shutdown` fires.
+pub(crate) async fn control_plane_worker(storage: Arc<MongoEngine>, shutdown: CancellationToken) {
+    while sleep_or_shutdown(&shutdown, CONTROL_PLANE_POLL_INTERVAL).await {
         match WorkerStore::process_control_plane_transitions(&*storage).await {
             Ok(t) if t.is_empty() => {}
             Ok(transitions) => {

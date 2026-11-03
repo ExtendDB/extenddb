@@ -307,7 +307,7 @@ extenddb implements a local IAM identity model that mirrors the structure of AWS
 
 ### 4.4 Authorization — Tag-Based Access Control (ABAC)
 
-- REQ-ABAC-001: Support **resource tag conditions** in policies via `dynamodb:ResourceTag/{key}`. The policy engine resolves resource tags by querying the tag store for the target table's ARN.
+- REQ-ABAC-001: Support **resource tag conditions** in policies via `aws:ResourceTag/{key}`. The policy engine resolves resource tags by querying the tag store for the target table's ARN.
 - REQ-ABAC-002: Support **principal tag conditions** via `aws:PrincipalTag/{key}`. Principal tags come from the authenticated identity (user tags, role tags, or session tags).
 - REQ-ABAC-003: Support the following condition operators for ABAC:
   - String operators: `StringEquals`, `StringNotEquals`, `StringLike`, `StringNotLike`, `StringEqualsIgnoreCase`

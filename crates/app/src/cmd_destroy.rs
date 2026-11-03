@@ -112,12 +112,17 @@ pub async fn run(args: DestroyArgs) -> anyhow::Result<()> {
     drop(bootstrap);
     let bootstrap = extenddb_storage::bootstrapper::create_bootstrapper(&args.config, &cli_args)
         .await
-        .map_err(|e| anyhow::anyhow!("Cannot connect as admin: {e:?}"))?;
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Cannot connect as admin: {}",
+                crate::cmd_migrate::storage_err(e)
+            )
+        })?;
 
     bootstrap
         .drop_databases(&data_db)
         .await
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        .map_err(crate::cmd_migrate::op_err)?;
 
     println!();
     println!("=== extenddb destroy complete ===");

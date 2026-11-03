@@ -5,10 +5,19 @@
 
 use crate::error::StorageError;
 
+/// The partition of every ARN this server issues, and of the `DynamoDB` ARNs
+/// these helpers and `backup_arn` format. A backup ARN in another
+/// partition can name nothing here, so the engine refuses one as malformed.
+/// Other sites still spell `aws` out themselves (the tagging ARN parser, the
+/// PostgreSQL backup queries, the IAM and KMS ARN formats).
+pub const ARN_PARTITION: &str = "aws";
+
 /// Returns an ARN for the specified `DynamoDB` index.
 #[must_use]
 pub fn index_arn(region: &str, account_id: &str, table_name: &str, index_name: &str) -> String {
-    format!("arn:aws:dynamodb:{region}:{account_id}:table/{table_name}/index/{index_name}")
+    format!(
+        "arn:{ARN_PARTITION}:dynamodb:{region}:{account_id}:table/{table_name}/index/{index_name}"
+    )
 }
 
 /// The label that tells one stream on a table name from the next, in the
@@ -48,33 +57,118 @@ pub fn new_stream_label() -> String {
 /// Returns an ARN for the specified `DynamoDB` stream.
 #[must_use]
 pub fn stream_arn(region: &str, account_id: &str, table_name: &str, stream_label: &str) -> String {
-    format!("arn:aws:dynamodb:{region}:{account_id}:table/{table_name}/stream/{stream_label}")
+    format!(
+        "arn:{ARN_PARTITION}:dynamodb:{region}:{account_id}:table/{table_name}/stream/{stream_label}"
+    )
 }
 
 /// Returns an ARN for the specified `DynamoDB` table.
 #[must_use]
 pub fn table_arn(region: &str, account_id: &str, table_name: &str) -> String {
-    format!("arn:aws:dynamodb:{region}:{account_id}:table/{table_name}")
+    format!("arn:{ARN_PARTITION}:dynamodb:{region}:{account_id}:table/{table_name}")
 }
 
 /// Parse a stream ARN into (`table_name`, `stream_label`).
 ///
 /// Stream ARNs contain ISO 8601 timestamps with colons in the stream label,
 /// e.g. `arn:aws:dynamodb:us-east-1:<account-id>:table/T/stream/2026-04-08T08:40:22`.
-/// We use `splitn(6, ':')` so the 6th element preserves everything after the 5th
-/// colon delimiter, including colons within the stream label.
+/// Parsing goes through [`extenddb_core::arn::parse`], the one parser shared
+/// with request validation and authorization, so a string the engine resolves
+/// to a stream is exactly a string authorization canonicalizes to the same
+/// stream. A missing `arn:` prefix, fewer than five fields, or a resource that
+/// is not `table/<name>/stream/<label>` is rejected.
 pub fn parse_stream_arn(arn: &str) -> Result<(String, String), StorageError> {
-    let segments: Vec<&str> = arn.splitn(6, ':').collect();
-    let resource = segments
-        .get(5)
-        .ok_or_else(|| StorageError::Validation(format!("Invalid stream ARN: {arn}")))?;
-    let parts: Vec<&str> = resource.splitn(4, '/').collect();
-    if parts.len() == 4 && parts[0] == "table" && parts[2] == "stream" {
-        Ok((parts[1].to_owned(), parts[3].to_owned()))
-    } else {
-        Err(StorageError::Validation(format!(
+    match extenddb_core::arn::parse(arn) {
+        Some(extenddb_core::arn::TableResource {
+            table,
+            sub: Some(extenddb_core::arn::SubResource::Stream(label)),
+            ..
+        }) => Ok((table, label)),
+        _ => Err(StorageError::Validation(format!(
             "Invalid stream ARN format: {arn}"
-        )))
+        ))),
+    }
+}
+
+/// What `DescribeStream` answers for a stream ARN that names no stream of the
+/// caller's account. Measured 2026-10-24 on an existing table with its stream
+/// label changed: the sentence names the ARN and has no trailing period.
+#[must_use]
+pub fn stream_not_found(stream_arn: &str) -> StorageError {
+    StorageError::TableNotFound(format!(
+        "Requested resource not found: Stream: {stream_arn} not found"
+    ))
+}
+
+/// What `GetShardIterator` answers for a stream ARN that names no stream of the
+/// caller's account. Measured 2026-10-24 with a real shard id and a stream
+/// label three digits off.
+///
+/// `GetRecords` answers with the same sentence, both for such an ARN and for a
+/// shard that is not one of the named stream's shards. The service's iterator
+/// tokens are opaque, so a token that names such a stream or pairs a stream
+/// with another stream's shard cannot be built against it and the answer was
+/// not measured.
+pub const STREAM_DOES_NOT_EXIST: &str = "Requested resource not found: Stream does not exist";
+
+/// [`STREAM_DOES_NOT_EXIST`] as the storage error the engine maps to a
+/// `ResourceNotFoundException`.
+#[must_use]
+pub fn stream_does_not_exist() -> StorageError {
+    StorageError::TableNotFound(STREAM_DOES_NOT_EXIST.to_owned())
+}
+
+/// What `GetShardIterator` answers for a shard that is not one of the named
+/// stream's shards: the stream-not-found sentence with a trailing period. The
+/// service answers "Requested resource not found: Shard does not exist"
+/// (measured 2026-10-24), so this text differs from it.
+#[must_use]
+pub fn shard_not_in_stream(stream_arn: &str) -> StorageError {
+    StorageError::TableNotFound(format!(
+        "Requested resource not found: Stream: {stream_arn} not found."
+    ))
+}
+
+#[cfg(test)]
+mod stream_not_found_tests {
+    use super::{
+        STREAM_DOES_NOT_EXIST, shard_not_in_stream, stream_does_not_exist, stream_not_found,
+    };
+    use crate::error::StorageError;
+
+    const ARN: &str =
+        "arn:aws:dynamodb:us-east-1:111111111111:table/T/stream/2026-01-01T00:00:00.000";
+
+    fn message(error: StorageError) -> String {
+        match error {
+            StorageError::TableNotFound(msg) => msg,
+            other => panic!("expected TableNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn describe_stream_names_the_arn_and_has_no_trailing_period() {
+        assert_eq!(
+            message(stream_not_found(ARN)),
+            format!("Requested resource not found: Stream: {ARN} not found")
+        );
+    }
+
+    #[test]
+    fn get_shard_iterator_and_get_records_say_the_stream_does_not_exist() {
+        assert_eq!(
+            STREAM_DOES_NOT_EXIST,
+            "Requested resource not found: Stream does not exist"
+        );
+        assert_eq!(message(stream_does_not_exist()), STREAM_DOES_NOT_EXIST);
+    }
+
+    #[test]
+    fn a_shard_of_no_stream_of_the_table_keeps_the_sentence_with_the_period() {
+        assert_eq!(
+            message(shard_not_in_stream(ARN)),
+            format!("Requested resource not found: Stream: {ARN} not found.")
+        );
     }
 }
 

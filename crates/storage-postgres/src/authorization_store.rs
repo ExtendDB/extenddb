@@ -144,23 +144,26 @@ impl AuthorizationStore for PostgresCatalogStore {
         let role_name = role_name.to_owned();
         let session_name = session_name.to_owned();
         Box::pin(async move {
-            let row: Option<(Option<serde_json::Value>, Option<serde_json::Value>)> =
-                sqlx::query_as(
-                    "SELECT session_policy, session_tags FROM iam_sessions \
+            let row: Option<(
+                Option<serde_json::Value>,
+                Option<serde_json::Value>,
+                time::OffsetDateTime,
+            )> = sqlx::query_as(
+                "SELECT session_policy, session_tags, created_at FROM iam_sessions \
                      WHERE account_id = $1 AND role_name = $2 AND session_name = $3 \
                      AND expires_at > now()",
-                )
-                .bind(&account_id)
-                .bind(&role_name)
-                .bind(&session_name)
-                .fetch_optional(self.pool())
-                .await
-                .map_err(|e| {
-                    tracing::error!("fetch_session_data: {e}");
-                    OpError::Internal("Database error".to_owned())
-                })?;
+            )
+            .bind(&account_id)
+            .bind(&role_name)
+            .bind(&session_name)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(|e| {
+                tracing::error!("fetch_session_data: {e}");
+                OpError::Internal("Database error".to_owned())
+            })?;
 
-            let Some((policy_value, tags_value)) = row else {
+            let Some((policy_value, tags_value, created_at)) = row else {
                 return Ok(None);
             };
 
@@ -189,6 +192,9 @@ impl AuthorizationStore for PostgresCatalogStore {
             Ok(Some(SessionData {
                 session_policy,
                 session_tags,
+                created_at: created_at
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .ok(),
             }))
         })
     }
@@ -250,6 +256,58 @@ impl AuthorizationStore for PostgresCatalogStore {
                     tracing::error!("fetch_resource_tags: {e}");
                     OpError::Internal("Database error".to_owned())
                 })
+        })
+    }
+
+    fn fetch_user_created_at(
+        &self,
+        account_id: &str,
+        user_name: &str,
+    ) -> BoxFuture<'_, OpResult<Option<String>>> {
+        let account_id = account_id.to_owned();
+        let user_name = user_name.to_owned();
+        Box::pin(async move {
+            let row: Option<(time::OffsetDateTime,)> = sqlx::query_as(
+                "SELECT created_at FROM iam_users WHERE account_id = $1 AND user_name = $2",
+            )
+            .bind(&account_id)
+            .bind(&user_name)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(|e| {
+                tracing::error!("fetch_user_created_at: {e}");
+                OpError::Internal("Database error".to_owned())
+            })?;
+            Ok(row.and_then(|(ts,)| {
+                ts.format(&time::format_description::well_known::Rfc3339)
+                    .ok()
+            }))
+        })
+    }
+
+    fn fetch_role_created_at(
+        &self,
+        account_id: &str,
+        role_name: &str,
+    ) -> BoxFuture<'_, OpResult<Option<String>>> {
+        let account_id = account_id.to_owned();
+        let role_name = role_name.to_owned();
+        Box::pin(async move {
+            let row: Option<(time::OffsetDateTime,)> = sqlx::query_as(
+                "SELECT created_at FROM iam_roles WHERE account_id = $1 AND role_name = $2",
+            )
+            .bind(&account_id)
+            .bind(&role_name)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(|e| {
+                tracing::error!("fetch_role_created_at: {e}");
+                OpError::Internal("Database error".to_owned())
+            })?;
+            Ok(row.and_then(|(ts,)| {
+                ts.format(&time::format_description::well_known::Rfc3339)
+                    .ok()
+            }))
         })
     }
 }

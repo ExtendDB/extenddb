@@ -98,6 +98,24 @@ pub async fn create_role(
         return r;
     }
 
+    // Same name rule as the management API (`management::iam_role::create_role`).
+    if !crate::management::is_valid_iam_name(&form.role_name) {
+        let nav = html::nav_bar(&identity_label(&session.identity));
+        let content = format!(
+            "<h1>Create Role</h1>{}",
+            html::alert_error(
+                "role_name must be 1-128 characters: alphanumeric, hyphens, underscores, dots, plus, equals, at"
+            )
+        );
+        return Html(html::layout_csrf(
+            "New Role",
+            &nav,
+            &content,
+            &session.csrf_token,
+        ))
+        .into_response();
+    }
+
     // Validate trust policy is valid JSON.
     let tp: Result<serde_json::Value, _> = serde_json::from_str(&form.trust_policy);
     let Ok(tp) = tp else {
@@ -114,6 +132,28 @@ pub async fn create_role(
         ))
         .into_response();
     };
+
+    // Apply the same trust-policy validation as the management API, so the
+    // console cannot store a trust policy that the service, and the
+    // management API, refuse.
+    let invalid = if tp.get("Statement").is_none() {
+        Some("Trust policy must contain a Statement".to_owned())
+    } else {
+        crate::management::validate_trust_policy(&tp)
+            .err()
+            .map(|msg| format!("Invalid trust policy: {msg}"))
+    };
+    if let Some(msg) = invalid {
+        let nav = html::nav_bar(&identity_label(&session.identity));
+        let content = format!("<h1>Create Role</h1>{}", html::alert_error(&msg));
+        return Html(html::layout_csrf(
+            "New Role",
+            &nav,
+            &content,
+            &session.csrf_token,
+        ))
+        .into_response();
+    }
 
     match state
         .catalog_store

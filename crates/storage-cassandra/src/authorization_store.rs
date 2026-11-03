@@ -261,7 +261,7 @@ impl AuthorizationStore for CassandraCatalogStore {
 
         Box::pin(async move {
             let query = format!(
-                "SELECT session_policy, session_tags FROM {catalog_keyspace}.iam_sessions \
+                "SELECT session_policy, session_tags, created_at FROM {catalog_keyspace}.iam_sessions \
                  WHERE account_id = ? AND role_name = ? AND session_name = ? ALLOW FILTERING"
             );
 
@@ -323,6 +323,16 @@ impl AuthorizationStore for CassandraCatalogStore {
             Ok(Some(SessionData {
                 session_policy,
                 session_tags,
+                created_at: crate::cassandra_util::get_timestamp::<OpError>(
+                    row,
+                    "created_at",
+                    "fetch_session_data",
+                )
+                .ok()
+                .and_then(|dt| {
+                    dt.format(&time::format_description::well_known::Rfc3339)
+                        .ok()
+                }),
             }))
         })
     }
@@ -477,6 +487,78 @@ impl AuthorizationStore for CassandraCatalogStore {
             }
 
             Ok(tags)
+        })
+    }
+
+    fn fetch_user_created_at(
+        &self,
+        account_id: &str,
+        user_name: &str,
+    ) -> BoxFuture<'_, OpResult<Option<String>>> {
+        let account_id = account_id.to_owned();
+        let user_name = user_name.to_owned();
+        let catalog_keyspace = self.catalog_keyspace();
+        let session = self.session().clone();
+        Box::pin(async move {
+            let query = format!(
+                "SELECT created_at FROM {catalog_keyspace}.iam_users \
+                 WHERE account_id = ? AND user_name = ?"
+            );
+            let rows = crate::cassandra_util::query_rows::<OpError>(
+                &session,
+                &query,
+                cdrs_tokio::query_values!(account_id.as_str(), user_name.as_str()),
+                "fetch_user_created_at",
+            )
+            .await?;
+            Ok(rows.first().and_then(|row| {
+                crate::cassandra_util::get_timestamp::<OpError>(
+                    row,
+                    "created_at",
+                    "fetch_user_created_at",
+                )
+                .ok()
+                .and_then(|dt| {
+                    dt.format(&time::format_description::well_known::Rfc3339)
+                        .ok()
+                })
+            }))
+        })
+    }
+
+    fn fetch_role_created_at(
+        &self,
+        account_id: &str,
+        role_name: &str,
+    ) -> BoxFuture<'_, OpResult<Option<String>>> {
+        let account_id = account_id.to_owned();
+        let role_name = role_name.to_owned();
+        let catalog_keyspace = self.catalog_keyspace();
+        let session = self.session().clone();
+        Box::pin(async move {
+            let query = format!(
+                "SELECT created_at FROM {catalog_keyspace}.iam_roles \
+                 WHERE account_id = ? AND role_name = ?"
+            );
+            let rows = crate::cassandra_util::query_rows::<OpError>(
+                &session,
+                &query,
+                cdrs_tokio::query_values!(account_id.as_str(), role_name.as_str()),
+                "fetch_role_created_at",
+            )
+            .await?;
+            Ok(rows.first().and_then(|row| {
+                crate::cassandra_util::get_timestamp::<OpError>(
+                    row,
+                    "created_at",
+                    "fetch_role_created_at",
+                )
+                .ok()
+                .and_then(|dt| {
+                    dt.format(&time::format_description::well_known::Rfc3339)
+                        .ok()
+                })
+            }))
         })
     }
 }

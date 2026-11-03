@@ -9,17 +9,12 @@
 //! user. Destruction removes the database file and its WAL/SHM sidecars.
 
 use async_trait::async_trait;
-use extenddb_core::types::{AttributeDefinition, KeySchemaElement, KeyType};
-use extenddb_storage::bootstrapper::{
-    AdminBootstrapResult, Bootstrapper, KeyDefinitionRepair, helpers,
-};
+use extenddb_storage::bootstrapper::{AdminBootstrapResult, Bootstrapper, helpers};
 use extenddb_storage::error::StorageError;
 use extenddb_storage::management_store::{OpError, OpResult};
-use extenddb_storage::util::recover_sort_key_definitions;
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqlitePoolOptions;
 
-use crate::schema::{self, CATALOG_VERSION};
 use crate::serve_lock::ServeLock;
 use crate::sqlite_util::sqlite_url;
 
@@ -30,17 +25,11 @@ use crate::sqlite_util::sqlite_url;
 /// paths, not the hot serving path.
 pub struct SqliteBootstrapper {
     path: String,
-    /// The database-file lock held between [`Bootstrapper::acquire_migration_lock`]
-    /// and [`Bootstrapper::release_migration_lock`]; see `serve_lock`.
-    held_lock: std::sync::Mutex<Option<ServeLock>>,
 }
 
 impl SqliteBootstrapper {
     pub fn new(path: impl Into<String>) -> Self {
-        Self {
-            path: path.into(),
-            held_lock: std::sync::Mutex::new(None),
-        }
+        Self { path: path.into() }
     }
 
     /// Take the exclusive lock a running `extenddb serve` holds on this
@@ -121,14 +110,9 @@ impl SqliteBootstrapper {
         SqlitePoolOptions::new()
             .max_connections(1)
             .after_connect(|conn, _| {
-                Box::pin(async move {
-                    use sqlx::Executor;
-                    conn.execute("PRAGMA journal_mode = WAL").await?;
-                    conn.execute("PRAGMA foreign_keys = ON").await?;
-                    conn.execute("PRAGMA synchronous = NORMAL").await?;
-                    conn.execute("PRAGMA busy_timeout = 5000").await?;
-                    Ok(())
-                })
+                Box::pin(
+                    async move { crate::sqlite_util::set_connection_pragmas(conn, true).await },
+                )
             })
             .connect(&sqlite_url(&self.path))
             .await
@@ -146,36 +130,53 @@ impl Bootstrapper for SqliteBootstrapper {
         Ok(()) // SQLite has no role concept.
     }
 
+    /// Create the database file, empty and with mode 0600, and its directory.
+    /// An existing file is refused so `init` is not silently destructive.
+    /// The commands' migration lock opens only an existing file, so the file
+    /// exists before `init` takes it.
     async fn create_catalog_db(&self) -> OpResult<()> {
-        // Connecting with mode=rwc creates the file; refuse to clobber an
-        // existing database so `init` is not silently destructive.
-        if !self.is_memory() && std::path::Path::new(&self.path).exists() {
-            return Err(OpError::AlreadyExists(format!(
+        if self.is_memory() {
+            return Ok(());
+        }
+        let exists = || {
+            OpError::AlreadyExists(format!(
                 "SQLite database '{}' already exists. Run 'destroy' first, then 'init'.",
                 self.path
-            )));
+            ))
+        };
+        let path = std::path::Path::new(&self.path);
+        if path.exists() {
+            return Err(exists());
         }
-        Ok(())
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                OpError::Internal(format!(
+                    "create parent directory for SQLite database '{}': {e}",
+                    self.path
+                ))
+            })?;
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(path) {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(exists()),
+            Err(e) => Err(OpError::Internal(format!(
+                "create SQLite database '{}': {e}",
+                self.path
+            ))),
+        }
     }
 
     async fn create_data_db(&self) -> OpResult<()> {
         Ok(()) // Catalog and data share one file.
-    }
-
-    async fn run_catalog_migrations(&self) -> OpResult<()> {
-        let pool = self.pool().await?;
-        schema::apply(&pool).await
-    }
-
-    async fn run_data_migrations(&self) -> OpResult<()> {
-        Ok(()) // Single file — schema applied in run_catalog_migrations.
-    }
-
-    async fn pending_data_migrations(&self) -> OpResult<Vec<String>> {
-        // SQLite applies its complete schema in run_catalog_migrations (a single
-        // file), so there are no separately-tracked data migrations that can be
-        // pending.
-        Ok(Vec::new())
     }
 
     async fn record_data_connection(&self) -> OpResult<()> {
@@ -293,162 +294,12 @@ impl Bootstrapper for SqliteBootstrapper {
         })
     }
 
-    async fn is_catalog_initialized(&self) -> OpResult<bool> {
-        if !self.is_memory() && !std::path::Path::new(&self.path).exists() {
-            return Ok(false);
-        }
-        let Ok(pool) = self.pool().await else {
-            return Ok(false);
-        };
-        schema::table_exists(&pool, "settings").await
-    }
-
-    /// Repair table metadata damaged by the pre-fix `UpdateTable` (#259).
-    ///
-    /// SQLite keeps the catalog and the data tables in one file, so the physical
-    /// sort key columns are read with `PRAGMA table_info`. Otherwise identical to
-    /// the PostgreSQL implementation: for any base sort key with no attribute
-    /// definition, recover the type from its column name.
-    async fn repair_lost_sort_key_definitions(&self, apply: bool) -> OpResult<KeyDefinitionRepair> {
-        let mut report = KeyDefinitionRepair::default();
-        let Ok(pool) = self.pool().await else {
-            return Ok(report);
-        };
-        // A never-initialised catalog has no `tables` table, and `pool()` opens
-        // with mode=rwc, which silently creates an empty database file, so the
-        // SELECT below would hard-error rather than find nothing. PostgreSQL
-        // degrades gracefully through its get_data_db_name() guard; this is the
-        // SQLite equivalent.
-        if !schema::table_exists(&pool, "tables").await? {
-            return Ok(report);
-        }
-
-        let rows: Vec<(String, String, String, String, String)> = sqlx::query_as(
-            "SELECT account_id, table_name, table_id, key_schema, attribute_definitions \
-             FROM tables ORDER BY table_name",
-        )
-        .fetch_all(&pool)
-        .await
-        .map_err(|e| OpError::Internal(format!("Cannot read tables: {e}")))?;
-
-        for (account_id, table_name, table_id, ks_json, ad_json) in rows {
-            let key_schema: Vec<KeySchemaElement> = match serde_json::from_str(&ks_json) {
-                Ok(v) => v,
-                Err(e) => {
-                    report
-                        .needs_attention
-                        .push(format!("{table_name}: unreadable key_schema ({e})"));
-                    continue;
-                }
-            };
-            let attr_defs: Vec<AttributeDefinition> =
-                serde_json::from_str(&ad_json).unwrap_or_default();
-
-            // Reported for every table on every run, not only when a sort key is
-            // repaired: the partition key definition is dropped by the same write and
-            // is not recoverable from the schema, because the pk column is always TEXT.
-            // It is not needed for correctness either, since partition key values are
-            // encoded from the key schema alone, so it is reported rather than guessed
-            // and keeps being reported until a human restores it.
-            let pk_missing: Vec<&str> = key_schema
-                .iter()
-                .filter(|ks| ks.key_type == KeyType::Hash)
-                .filter(|ks| {
-                    !attr_defs
-                        .iter()
-                        .any(|ad| ad.attribute_name == ks.attribute_name)
-                })
-                .map(|ks| ks.attribute_name.as_str())
-                .collect();
-            if !pk_missing.is_empty() {
-                report.needs_attention.push(format!(
-                    "{table_name}: partition key definition(s) [{}] are absent; reads and \
-                     writes are unaffected, but index key type validation cannot check them",
-                    pk_missing.join(", ")
-                ));
-            }
-
-            let missing: Vec<&KeySchemaElement> = key_schema
-                .iter()
-                .filter(|ks| ks.key_type == KeyType::Range)
-                .filter(|ks| {
-                    !attr_defs
-                        .iter()
-                        .any(|ad| ad.attribute_name == ks.attribute_name)
-                })
-                .collect();
-            if missing.is_empty() {
-                continue;
-            }
-
-            // PRIMARY KEY columns only, in key order. Every data table carries all
-            // three typed columns for each sort key position (sk_s, sk_n, sk_b), so
-            // column existence says nothing about the declared type: only the pk
-            // position reported by table_info does. `table_id` is interpolated
-            // because PRAGMA takes no bind parameters; it is checked as a UUID first
-            // so a malformed catalog row cannot reach the statement.
-            if uuid::Uuid::parse_str(&table_id).is_err() {
-                report
-                    .needs_attention
-                    .push(format!("{table_name}: table_id {table_id:?} is not a UUID"));
-                continue;
-            }
-            let mut key_columns: Vec<(i64, String)> = sqlx::query_as::<
-                _,
-                (i64, String, String, i64, Option<String>, i64),
-            >(&format!(
-                "PRAGMA table_info(\"_ddb_{table_id}\")"
-            ))
-            .fetch_all(&pool)
+    async fn has_admin_user(&self) -> OpResult<bool> {
+        let pool = self.pool().await?;
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM admin_users)")
+            .fetch_one(&pool)
             .await
-            .map_err(|e| OpError::Internal(format!("Cannot read columns of {table_name}: {e}")))?
-            .into_iter()
-            .filter(|(.., pk_pos)| *pk_pos > 0)
-            .map(|(_, name, _, _, _, pk_pos)| (pk_pos, name))
-            .collect();
-            key_columns.sort_unstable();
-            let columns: Vec<String> = key_columns.into_iter().map(|(_, name)| name).collect();
-
-            let recovered = recover_sort_key_definitions(&key_schema, &attr_defs, &columns);
-            if recovered.is_empty() {
-                report.needs_attention.push(format!(
-                    "{table_name}: sort key(s) [{}] have no attribute definition and no \
-                     matching PRIMARY KEY column was found to recover the type from",
-                    missing
-                        .iter()
-                        .map(|ks| ks.attribute_name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-                continue;
-            }
-
-            let mut merged = attr_defs;
-            merged.extend(recovered.iter().cloned());
-            let merged_json = serde_json::to_string(&merged)
-                .map_err(|e| OpError::Internal(format!("Cannot serialize definitions: {e}")))?;
-            if apply {
-                sqlx::query(
-                    "UPDATE tables SET attribute_definitions = ?1 \
-                     WHERE account_id = ?2 AND table_name = ?3",
-                )
-                .bind(&merged_json)
-                .bind(&account_id)
-                .bind(&table_name)
-                .execute(&pool)
-                .await
-                .map_err(|e| OpError::Internal(format!("Cannot repair {table_name}: {e}")))?;
-            }
-
-            for def in &recovered {
-                report.repaired.push(format!(
-                    "{table_name}: {} ({:?})",
-                    def.attribute_name, def.attribute_type
-                ));
-            }
-        }
-
-        Ok(report)
+            .map_err(|e| OpError::Internal(format!("check admin users: {e}")))
     }
 
     async fn list_table_names(&self) -> OpResult<Vec<String>> {
@@ -475,28 +326,6 @@ impl Bootstrapper for SqliteBootstrapper {
         Ok(row.map(|(v,)| v))
     }
 
-    /// `init` and `migrate` rewrite the schema, so they take the same
-    /// exclusive lock `extenddb serve` holds on the database file. Unlike the
-    /// trait's default contract this does not wait for the lock: the holder is
-    /// a server that runs until stopped, so waiting would hang, and the
-    /// operator is told to stop it instead.
-    async fn acquire_migration_lock(&self) -> OpResult<()> {
-        let lock = self.exclusive_lock("this command")?;
-        *self
-            .held_lock
-            .lock()
-            .map_err(|_| OpError::Internal("lock state poisoned".to_owned()))? = lock;
-        Ok(())
-    }
-
-    async fn release_migration_lock(&self) -> OpResult<()> {
-        self.held_lock
-            .lock()
-            .map_err(|_| OpError::Internal("lock state poisoned".to_owned()))?
-            .take();
-        Ok(())
-    }
-
     async fn drop_databases(&self, _data_db: &str) -> OpResult<()> {
         if self.is_memory() {
             return Ok(());
@@ -514,25 +343,6 @@ impl Bootstrapper for SqliteBootstrapper {
         let _ = std::fs::remove_file(format!("{}-wal", self.path));
         let _ = std::fs::remove_file(format!("{}-shm", self.path));
         Ok(())
-    }
-
-    async fn read_catalog_version(&self) -> OpResult<Option<String>> {
-        let Ok(pool) = self.pool().await else {
-            return Ok(None);
-        };
-        if !schema::table_exists(&pool, "settings").await? {
-            return Ok(None);
-        }
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT value FROM settings WHERE key = 'catalog_version'")
-                .fetch_optional(&pool)
-                .await
-                .map_err(|e| OpError::Internal(format!("read catalog version: {e}")))?;
-        Ok(row.map(|(v,)| v))
-    }
-
-    fn expected_catalog_version(&self) -> String {
-        CATALOG_VERSION.to_string()
     }
 
     fn catalog_database_name(&self) -> String {
@@ -563,10 +373,10 @@ mod lock_tests {
     use crate::serve_lock::ServeLock;
     use extenddb_storage::bootstrapper::Bootstrapper;
 
-    /// `destroy` and `migrate` are refused while a server holds the database,
-    /// and a server is refused while `migrate` holds it.
+    /// `destroy` is refused while a server holds the database, and runs once
+    /// the server has gone.
     #[tokio::test]
-    async fn destroy_and_migrate_are_refused_while_a_server_holds_the_file() {
+    async fn destroy_is_refused_while_a_server_holds_the_file() {
         let dir = std::env::temp_dir().join(format!(
             "extenddb-bootstrap-lock-{}",
             uuid::Uuid::new_v4().simple()
@@ -589,23 +399,150 @@ mod lock_tests {
             db.exists(),
             "destroy must not unlink a file a server has open"
         );
-        let err = bootstrap
-            .acquire_migration_lock()
-            .await
-            .expect_err("migrate under a server");
-        assert!(
-            format!("{err:?}").contains("another extenddb process"),
-            "{err:?}"
-        );
         drop(server);
-
-        bootstrap.acquire_migration_lock().await.expect("free now");
-        assert!(ServeLock::acquire(&db).is_err(), "serve during migrate");
-        bootstrap.release_migration_lock().await.expect("release");
-        ServeLock::acquire(&db).expect("free after release");
 
         bootstrap.drop_databases("unused").await.expect("destroy");
         assert!(!db.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod init_tests {
+    use std::time::Duration;
+
+    use super::SqliteBootstrapper;
+    use extenddb_storage::bootstrapper::{
+        Bootstrapper, finishes_a_stopped_init, write_bootstrap_rows,
+    };
+    use extenddb_storage::migrations::{
+        CatalogMigrations, CatalogStatus, MigrationId, RunKind, run_with_status,
+    };
+
+    use crate::migrations::SqliteCatalogMigrations;
+
+    async fn rows(path: &str, sql: &str) -> Vec<String> {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&crate::sqlite_util::sqlite_url(path))
+            .await
+            .expect("open");
+        let found: Vec<String> = sqlx::query_scalar(sql).fetch_all(&pool).await.expect(sql);
+        pool.close().await;
+        found
+    }
+
+    /// `init` stopped after its migrations, its encryption key and its
+    /// default account leaves a catalog whose status is `Current` and that
+    /// has no admin user. The next `init`'s steps under the lock run no
+    /// migration, keep the key and the account, and write the admin user;
+    /// the `init` after that is refused as initialized.
+    #[tokio::test]
+    async fn init_finishes_a_catalog_stopped_before_its_admin_user_and_refuses_it_after() {
+        let dir = std::env::temp_dir().join(format!(
+            "extenddb-init-finish-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let path = dir.join("extenddb.sqlite").to_string_lossy().into_owned();
+        let bootstrapper = SqliteBootstrapper::new(path.clone());
+        let migrations = SqliteCatalogMigrations;
+        let target = bootstrapper.init_target();
+        let timeout = Duration::from_secs(10);
+
+        // The stopped init.
+        bootstrapper.create_catalog_db().await.expect("file");
+        let lock = migrations.lock(&target, timeout).await.expect("lock");
+        let status = migrations
+            .status_under_lock(&lock, &target)
+            .await
+            .expect("status");
+        assert!(
+            !finishes_a_stopped_init(&bootstrapper, &status)
+                .await
+                .expect("decided")
+        );
+        run_with_status(&migrations, &status, &lock, "1.0.0-test", RunKind::Create)
+            .await
+            .expect("create");
+        bootstrapper.bootstrap_encryption_key().await.expect("key");
+        bootstrapper
+            .bootstrap_default_account()
+            .await
+            .expect("account");
+        migrations.release(lock).await;
+        let key = rows(
+            &path,
+            "SELECT value FROM settings WHERE key = 'encryption_key'",
+        )
+        .await;
+        let accounts = rows(&path, "SELECT account_id FROM accounts").await;
+        assert_eq!((key.len(), accounts.len()), (1, 1));
+        assert!(!bootstrapper.has_admin_user().await.expect("read"));
+
+        // The next init finishes it.
+        let lock = migrations.lock(&target, timeout).await.expect("lock");
+        let status = migrations
+            .status_under_lock(&lock, &target)
+            .await
+            .expect("status");
+        assert_eq!(
+            status,
+            CatalogStatus::Current {
+                version: MigrationId::LATEST.number()
+            }
+        );
+        assert!(
+            finishes_a_stopped_init(&bootstrapper, &status)
+                .await
+                .expect("decided")
+        );
+        bootstrapper.hold(&lock);
+        let admin = write_bootstrap_rows(&bootstrapper, None, None)
+            .await
+            .expect("rows");
+        bootstrapper
+            .record_data_connection()
+            .await
+            .expect("data connection");
+        migrations.release(lock).await;
+        assert_eq!(admin.username, "admin");
+        assert!(!admin.already_existed && admin.generated_password.is_some());
+        assert!(bootstrapper.has_admin_user().await.expect("read"));
+        assert_eq!(
+            rows(
+                &path,
+                "SELECT value FROM settings WHERE key = 'encryption_key'"
+            )
+            .await,
+            key,
+            "the key a server may already have used is kept"
+        );
+        assert_eq!(
+            rows(&path, "SELECT account_id FROM accounts").await,
+            accounts
+        );
+
+        // The init after that is refused.
+        let lock = migrations.lock(&target, timeout).await.expect("lock");
+        let status = migrations
+            .status_under_lock(&lock, &target)
+            .await
+            .expect("status");
+        assert!(
+            !finishes_a_stopped_init(&bootstrapper, &status)
+                .await
+                .expect("decided")
+        );
+        let refused = run_with_status(&migrations, &status, &lock, "1.0.0-test", RunKind::Create)
+            .await
+            .expect_err("refused");
+        migrations.release(lock).await;
+        assert!(
+            refused
+                .to_string()
+                .starts_with("the catalog is already initialized"),
+            "{refused}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

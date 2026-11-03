@@ -136,8 +136,8 @@ impl AuthorizationStore for SqliteCatalogStore {
         let role_name = role_name.to_owned();
         let session_name = session_name.to_owned();
         Box::pin(async move {
-            let row: Option<(Option<String>, Option<String>, String)> = sqlx::query_as(
-                "SELECT session_policy, session_tags, expires_at FROM iam_sessions \
+            let row: Option<(Option<String>, Option<String>, String, String)> = sqlx::query_as(
+                "SELECT session_policy, session_tags, expires_at, created_at FROM iam_sessions \
                  WHERE account_id = ? AND role_name = ? AND session_name = ?",
             )
             .bind(&account_id)
@@ -147,7 +147,7 @@ impl AuthorizationStore for SqliteCatalogStore {
             .await
             .map_err(|e| db_err("fetch_session_data", e))?;
 
-            let Some((session_policy, tags_json, expires_at)) = row else {
+            let Some((session_policy, tags_json, expires_at, created_at)) = row else {
                 return Ok(None);
             };
 
@@ -193,6 +193,10 @@ impl AuthorizationStore for SqliteCatalogStore {
             Ok(Some(SessionData {
                 session_policy,
                 session_tags,
+                created_at: parse_timestamp(&created_at).ok().and_then(|dt| {
+                    dt.format(&time::format_description::well_known::Rfc3339)
+                        .ok()
+                }),
             }))
         })
     }
@@ -247,6 +251,56 @@ impl AuthorizationStore for SqliteCatalogStore {
             .fetch_all(self.pool())
             .await
             .map_err(|e| db_err("fetch_resource_tags", e))
+        })
+    }
+
+    fn fetch_user_created_at(
+        &self,
+        account_id: &str,
+        user_name: &str,
+    ) -> BoxFuture<'_, OpResult<Option<String>>> {
+        let account_id = account_id.to_owned();
+        let user_name = user_name.to_owned();
+        Box::pin(async move {
+            let row: Option<(String,)> = sqlx::query_as(
+                "SELECT created_at FROM iam_users WHERE account_id = ? AND user_name = ?",
+            )
+            .bind(&account_id)
+            .bind(&user_name)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(|e| db_err("fetch_user_created_at", e))?;
+            Ok(row.and_then(|(ts,)| {
+                parse_timestamp(&ts).ok().and_then(|dt| {
+                    dt.format(&time::format_description::well_known::Rfc3339)
+                        .ok()
+                })
+            }))
+        })
+    }
+
+    fn fetch_role_created_at(
+        &self,
+        account_id: &str,
+        role_name: &str,
+    ) -> BoxFuture<'_, OpResult<Option<String>>> {
+        let account_id = account_id.to_owned();
+        let role_name = role_name.to_owned();
+        Box::pin(async move {
+            let row: Option<(String,)> = sqlx::query_as(
+                "SELECT created_at FROM iam_roles WHERE account_id = ? AND role_name = ?",
+            )
+            .bind(&account_id)
+            .bind(&role_name)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(|e| db_err("fetch_role_created_at", e))?;
+            Ok(row.and_then(|(ts,)| {
+                parse_timestamp(&ts).ok().and_then(|dt| {
+                    dt.format(&time::format_description::well_known::Rfc3339)
+                        .ok()
+                })
+            }))
         })
     }
 }

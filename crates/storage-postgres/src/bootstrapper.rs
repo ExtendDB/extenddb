@@ -7,42 +7,19 @@
 //! teardown using PostgreSQL-specific DDL. Connection pools are created
 //! lazily as needed during the bootstrap sequence.
 
-use std::time::Duration;
-
 use async_trait::async_trait;
-use extenddb_core::types::{AttributeDefinition, KeySchemaElement};
 use extenddb_storage::bootstrapper::{
-    AdminBootstrapResult, BootstrapConfig, Bootstrapper, KeyDefinitionRepair,
+    AdminBootstrapResult, BootstrapConfig, Bootstrapper,
     helpers::{
         check_conflict, check_conflict_redacted, extract_arg, generate_account_id,
         generate_encryption_key, generate_random_password, hash_password_async,
     },
 };
 use extenddb_storage::management_store::{OpError, OpResult};
-use extenddb_storage::util::recover_sort_key_definitions;
+use extenddb_storage::migrations::{AdminRole, Target};
 use sqlx::PgPool;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-use tokio::sync::{Mutex, OnceCell};
-
-use crate::CATALOG_VERSION;
-use crate::migrations;
-
-/// ExtendDB's advisory-lock namespace. PostgreSQL's two-argument form,
-/// `pg_advisory_xact_lock(classid, objid)`, lets ExtendDB reserve one stable
-/// `classid` by convention and assign a distinct `objid` to each internal lock.
-/// Other applications in the same database must avoid choosing the same keys.
-///
-/// The value itself is arbitrary. It only has to stay stable across releases and
-/// differ from any other namespace we add later.
-const ADVISORY_LOCK_NAMESPACE: i32 = 0x0045_4442; // 'E', 'D', 'B'
-/// `objid` for the schema-migration lock, which serializes concurrent `migrate`
-/// runs (for example several replicas starting at once).
-const MIGRATION_LOCK_OBJID: i32 = 1;
-
-/// Maximum time to wait for another migrator. Normal contention should clear
-/// well within this window; expiry indicates a peer that is likely wedged and
-/// needs operator attention rather than an indefinitely stuck init Job.
-const MIGRATION_LOCK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+use tokio::sync::OnceCell;
 
 /// Utilities for bootstrapping a `PostgreSQL` backend store.
 ///
@@ -53,9 +30,6 @@ const MIGRATION_LOCK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 pub struct PostgresBootstrapper {
     config: BootstrapConfig,
     admin_pool: OnceCell<PgPool>,
-    /// Dedicated connection whose open transaction holds the migration advisory
-    /// lock. `None` when no migration lock is held.
-    lock_conn: Mutex<Option<sqlx::PgConnection>>,
 }
 
 impl PostgresBootstrapper {
@@ -66,7 +40,6 @@ impl PostgresBootstrapper {
         Self {
             config,
             admin_pool: OnceCell::new(),
-            lock_conn: Mutex::new(None),
         }
     }
 
@@ -97,7 +70,7 @@ impl PostgresBootstrapper {
                     .max_connections(1)
                     .connect_with(opts)
                     .await
-                    .map_err(|e| OpError::Internal(format!("Cannot connect as admin: {e}")))
+                    .map_err(|e| OpError::Internal(admin_connect_error(&self.config, &e)))
             })
             .await
     }
@@ -144,68 +117,6 @@ impl PostgresBootstrapper {
     /// Return the catalog connection URL (for config file generation).
     pub fn catalog_connection_url(&self) -> String {
         self.app_connection_url(&self.config.catalog_db)
-    }
-
-    /// Try to install pgvector on the data database, tolerating refusal.
-    ///
-    /// The attempt runs as the admin role first: pgvector's control file does
-    /// not mark the extension trusted, so a stock server refuses `CREATE
-    /// EXTENSION` from any non-superuser, even on a database its role owns
-    /// ("Must be superuser", measured on a stock install). The application role
-    /// can therefore never succeed there, and the admin credentials this command
-    /// already holds are exactly the ones that can. The application role is
-    /// still tried on admin failure, which is the shape managed platforms
-    /// allowlisting pgvector for the database owner need. Serve-time code never
-    /// attempts this, because a request path must not carry data-definition
-    /// privileges it only needs once.
-    ///
-    /// Failure is a notice, not an error. A deployment that does not want vector
-    /// indexes, or a managed PostgreSQL that does not offer pgvector, must still
-    /// initialise and upgrade normally; the server then refuses vector
-    /// operations, which is the fail-closed half of the same decision.
-    async fn try_create_vector_extension(&self, pool: &PgPool) {
-        use sqlx::Connection as _;
-
-        println!("--- Checking pgvector extension on the data database...");
-        let admin_opts = PgConnectOptions::new()
-            .host(&self.config.host)
-            .port(self.config.port)
-            .username(&self.config.admin_user)
-            .database(&self.config.data_db);
-        let admin_opts = if let Some(ref pass) = self.config.admin_password {
-            admin_opts.password(pass)
-        } else {
-            admin_opts
-        };
-        let admin_error = match sqlx::PgConnection::connect_with(&admin_opts).await {
-            Ok(mut conn) => {
-                let created = sqlx::query("CREATE EXTENSION IF NOT EXISTS vector")
-                    .execute(&mut conn)
-                    .await;
-                let _ = conn.close().await;
-                match created {
-                    Ok(_) => {
-                        println!("    pgvector available; vector indexes are supported.");
-                        return;
-                    }
-                    Err(e) => e.to_string(),
-                }
-            }
-            Err(e) => e.to_string(),
-        };
-        match sqlx::query("CREATE EXTENSION IF NOT EXISTS vector")
-            .execute(pool)
-            .await
-        {
-            Ok(_) => println!("    pgvector available; vector indexes are supported."),
-            Err(e) => {
-                let hint = crate::vector::create_extension_hint(&e);
-                println!(
-                    "    NOTICE: could not create the pgvector extension (as the admin role: \
-                     {admin_error}; as the application role: {e}). {hint}."
-                );
-            }
-        }
     }
 }
 
@@ -284,156 +195,6 @@ impl Bootstrapper for PostgresBootstrapper {
             &self.config.app_user,
         )
         .await
-    }
-
-    async fn run_catalog_migrations(&self) -> OpResult<()> {
-        let pool = self.app_pool(&self.config.catalog_db).await?;
-        migrations::run_catalog_migrations(&pool).await
-    }
-
-    async fn run_data_migrations(&self) -> OpResult<()> {
-        let pool = self.app_pool(&self.config.data_db).await?;
-        self.try_create_vector_extension(&pool).await;
-        migrations::run_data_migrations(&pool).await?;
-        // Programmatic migrations need the catalog pool (to enumerate index
-        // tables) plus the data pool (where the `_ddb_*` tables live).
-        let catalog_pool = self.app_pool(&self.config.catalog_db).await?;
-        migrations::run_data_code_migrations(&catalog_pool, &pool).await
-    }
-
-    async fn acquire_migration_lock(&self) -> OpResult<()> {
-        use std::io::Write as _;
-
-        use sqlx::Connection;
-
-        // This is not re-entrant. A second call would open a second transaction
-        // and block on the lock the first one holds, deadlocking against itself.
-        let mut held = self.lock_conn.lock().await;
-        if held.is_some() {
-            return Err(OpError::Internal(
-                "Migration lock is already held by this process".to_owned(),
-            ));
-        }
-
-        // Keep an explicit transaction open on a dedicated catalog connection
-        // for the whole migration. Transaction-level advisory locks are released
-        // automatically when that transaction ends or the connection dies.
-        //
-        // The explicit transaction is important for transaction-pooling proxies:
-        // they must retain one PostgreSQL backend until COMMIT/ROLLBACK, so the
-        // lock cannot silently move between backends as separate autocommit
-        // statements can. RDS Proxy also supports this path without session
-        // pinning. The migration statements can use separate connections because
-        // advisory locks coordinate globally within the catalog database.
-        //
-        // Advisory locks are scoped to a database, so migrators only serialize
-        // if they share this catalog database. ExtendDB replicas normally do,
-        // because they use the same catalog connection string.
-        let mut conn =
-            sqlx::PgConnection::connect_with(&self.app_connect_opts(&self.config.catalog_db))
-                .await
-                .map_err(|e| {
-                    OpError::Internal(format!("Cannot connect to take migration lock: {e}"))
-                })?;
-        sqlx::query("BEGIN")
-            .execute(&mut conn)
-            .await
-            .map_err(|e| OpError::Internal(format!("Cannot begin migration lock: {e}")))?;
-
-        // Equivalent to SET LOCAL lock_timeout, but parameterized so the Rust
-        // duration remains the single source of truth. This applies only to the
-        // dedicated transaction and is discarded by rollback on release.
-        let lock_timeout = format!("{}ms", MIGRATION_LOCK_TIMEOUT.as_millis());
-        let _: String = sqlx::query_scalar("SELECT set_config('lock_timeout', $1, true)")
-            .bind(&lock_timeout)
-            .fetch_one(&mut conn)
-            .await
-            .map_err(|e| {
-                OpError::Internal(format!("Cannot configure migration lock timeout: {e}"))
-            })?;
-
-        // Try first so that a migrator which has to wait can say so, rather
-        // than sitting silent for as long as the other migration takes.
-        let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1, $2)")
-            .bind(ADVISORY_LOCK_NAMESPACE)
-            .bind(MIGRATION_LOCK_OBJID)
-            .fetch_one(&mut conn)
-            .await
-            .map_err(|e| OpError::Internal(format!("Cannot acquire migration lock: {e}")))?;
-        if !acquired {
-            println!("--- Another migrator holds the migration lock; waiting for it to finish...");
-            std::io::stdout()
-                .flush()
-                .map_err(|e| OpError::Internal(format!("Cannot report migration wait: {e}")))?;
-            sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
-                .bind(ADVISORY_LOCK_NAMESPACE)
-                .bind(MIGRATION_LOCK_OBJID)
-                .execute(&mut conn)
-                .await
-                .map_err(|e| {
-                    if let sqlx::Error::Database(db_err) = &e
-                        && db_err.code().as_deref() == Some("55P03")
-                    {
-                        return OpError::Internal(format!(
-                            "Timed out after {}s waiting for the migration advisory lock; \
-                             another migrator may be wedged. Check the holder's logs or \
-                             terminate it before retrying: {e}",
-                            MIGRATION_LOCK_TIMEOUT.as_secs(),
-                        ));
-                    }
-                    OpError::Internal(format!("Cannot acquire migration lock: {e}"))
-                })?;
-            println!("--- Migration lock acquired.");
-            std::io::stdout()
-                .flush()
-                .map_err(|e| OpError::Internal(format!("Cannot report migration lock: {e}")))?;
-        }
-
-        // Guard against a key or lock-mode mismatch in the acquisition queries.
-        // `objsubid = 2` distinguishes the two-i32 advisory-lock keyspace from
-        // the one-i64 form, and `granted` excludes a merely waiting request.
-        let held_by_this_transaction: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM pg_locks \
-             WHERE locktype = 'advisory' AND classid = $1 AND objid = $2 \
-               AND objsubid = 2 AND mode = 'ExclusiveLock' AND granted \
-               AND pid = pg_backend_pid())",
-        )
-        .bind(ADVISORY_LOCK_NAMESPACE)
-        .bind(MIGRATION_LOCK_OBJID)
-        .fetch_one(&mut conn)
-        .await
-        .map_err(|e| OpError::Internal(format!("Cannot verify migration lock: {e}")))?;
-        if !held_by_this_transaction {
-            return Err(OpError::Internal(
-                "PostgreSQL did not report the migration transaction's advisory lock after \
-                 acquisition; refusing to run migrations without verified serialization"
-                    .to_owned(),
-            ));
-        }
-
-        *held = Some(conn);
-        Ok(())
-    }
-
-    async fn release_migration_lock(&self) -> OpResult<()> {
-        use sqlx::Connection;
-
-        let Some(mut conn) = self.lock_conn.lock().await.take() else {
-            return Ok(());
-        };
-        // This transaction contains only the advisory lock, so rollback is the
-        // safest release: it cannot accidentally commit future work added to the
-        // dedicated connection. Closing is a backstop if rollback fails.
-        let release = sqlx::query("ROLLBACK").execute(&mut conn).await;
-        let _ = conn.close().await;
-        release
-            .map(|_| ())
-            .map_err(|e| OpError::Internal(format!("Cannot release migration lock: {e}")))
-    }
-
-    async fn pending_data_migrations(&self) -> OpResult<Vec<String>> {
-        let pool = self.app_pool(&self.config.data_db).await?;
-        migrations::pending_data_migrations(&pool).await
     }
 
     async fn record_data_connection(&self) -> OpResult<()> {
@@ -586,150 +347,12 @@ impl Bootstrapper for PostgresBootstrapper {
         })
     }
 
-    async fn is_catalog_initialized(&self) -> OpResult<bool> {
+    async fn has_admin_user(&self) -> OpResult<bool> {
         let pool = self.app_pool(&self.config.catalog_db).await?;
-        migrations::table_exists(&pool, "settings").await
-    }
-
-    /// Repair table metadata damaged by the pre-fix `UpdateTable` (#259).
-    ///
-    /// Reads the catalog's key schemas and attribute definitions, and for any base
-    /// sort key with no definition recovers the type from the data table's
-    /// physical sort key column (`sk_s`/`sk_n`/`sk_b`, or the numbered variants for
-    /// multiple sort keys). Runs under the migration lock the caller holds.
-    async fn repair_lost_sort_key_definitions(&self, apply: bool) -> OpResult<KeyDefinitionRepair> {
-        let mut report = KeyDefinitionRepair::default();
-        let Ok(catalog) = self.app_pool(&self.config.catalog_db).await else {
-            return Ok(report);
-        };
-        let Some(data_db) = self.get_data_db_name().await? else {
-            return Ok(report);
-        };
-        let data = self.app_pool(&data_db).await?;
-
-        let rows: Vec<(String, String, String, serde_json::Value, serde_json::Value)> =
-            sqlx::query_as(
-                "SELECT account_id, table_name, table_id, key_schema, attribute_definitions \
-                 FROM tables ORDER BY table_name",
-            )
-            .fetch_all(&catalog)
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM admin_users)")
+            .fetch_one(&pool)
             .await
-            .map_err(|e| OpError::Internal(format!("Cannot read tables: {e}")))?;
-
-        for (account_id, table_name, table_id, ks_json, ad_json) in rows {
-            let key_schema: Vec<KeySchemaElement> = match serde_json::from_value(ks_json) {
-                Ok(v) => v,
-                Err(e) => {
-                    report
-                        .needs_attention
-                        .push(format!("{table_name}: unreadable key_schema ({e})"));
-                    continue;
-                }
-            };
-            let attr_defs: Vec<AttributeDefinition> =
-                serde_json::from_value(ad_json).unwrap_or_default();
-
-            // Nothing to do unless a sort key has lost its definition.
-            // Reported for every table on every run, not only when a sort key is
-            // repaired: the partition key definition is dropped by the same write and
-            // is not recoverable from the schema, because the pk column is always TEXT.
-            // It is not needed for correctness either, since partition key values are
-            // encoded from the key schema alone, so it is reported rather than guessed
-            // and keeps being reported until a human restores it.
-            let pk_missing: Vec<&str> = key_schema
-                .iter()
-                .filter(|ks| ks.key_type == extenddb_core::types::KeyType::Hash)
-                .filter(|ks| {
-                    !attr_defs
-                        .iter()
-                        .any(|ad| ad.attribute_name == ks.attribute_name)
-                })
-                .map(|ks| ks.attribute_name.as_str())
-                .collect();
-            if !pk_missing.is_empty() {
-                report.needs_attention.push(format!(
-                    "{table_name}: partition key definition(s) [{}] are absent; reads and \
-                     writes are unaffected, but index key type validation cannot check them",
-                    pk_missing.join(", ")
-                ));
-            }
-
-            let missing: Vec<&KeySchemaElement> = key_schema
-                .iter()
-                .filter(|ks| ks.key_type == extenddb_core::types::KeyType::Range)
-                .filter(|ks| {
-                    !attr_defs
-                        .iter()
-                        .any(|ad| ad.attribute_name == ks.attribute_name)
-                })
-                .collect();
-            if missing.is_empty() {
-                continue;
-            }
-
-            // PRIMARY KEY columns only, in key order. Every data table carries all
-            // three typed columns for each sort key position (sk_s, sk_n, sk_b), so
-            // column existence says nothing about the declared type: only PRIMARY KEY
-            // membership does. `to_regclass` resolves the name through the current
-            // search_path, so this cannot match a same-named table in another schema,
-            // and returns NULL (no rows) rather than raising when the data table is
-            // absent.
-            let columns: Vec<String> = sqlx::query_as::<_, (String,)>(
-                "SELECT a.attname \
-                 FROM pg_index i \
-                 JOIN unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON TRUE \
-                 JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum \
-                 WHERE i.indrelid = to_regclass($1) AND i.indisprimary \
-                 ORDER BY k.ord",
-            )
-            .bind(format!("\"_ddb_{table_id}\""))
-            .fetch_all(&data)
-            .await
-            .map_err(|e| OpError::Internal(format!("Cannot read columns of {table_name}: {e}")))?
-            .into_iter()
-            .map(|(c,)| c)
-            .collect();
-
-            let recovered = recover_sort_key_definitions(&key_schema, &attr_defs, &columns);
-            if recovered.is_empty() {
-                report.needs_attention.push(format!(
-                    "{table_name}: sort key(s) [{}] have no attribute definition and no \
-                     matching PRIMARY KEY column was found to recover the type from",
-                    missing
-                        .iter()
-                        .map(|ks| ks.attribute_name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-                continue;
-            }
-
-            let mut merged = attr_defs;
-            merged.extend(recovered.iter().cloned());
-            let merged_json = serde_json::to_value(&merged)
-                .map_err(|e| OpError::Internal(format!("Cannot serialize definitions: {e}")))?;
-            if apply {
-                sqlx::query(
-                    "UPDATE tables SET attribute_definitions = $1 \
-                     WHERE account_id = $2 AND table_name = $3",
-                )
-                .bind(&merged_json)
-                .bind(&account_id)
-                .bind(&table_name)
-                .execute(&catalog)
-                .await
-                .map_err(|e| OpError::Internal(format!("Cannot repair {table_name}: {e}")))?;
-            }
-
-            for def in &recovered {
-                report.repaired.push(format!(
-                    "{table_name}: {} ({:?})",
-                    def.attribute_name, def.attribute_type
-                ));
-            }
-        }
-
-        Ok(report)
+            .map_err(|e| OpError::Internal(format!("Check admin users: {e}")))
     }
 
     async fn list_table_names(&self) -> OpResult<Vec<String>> {
@@ -779,27 +402,6 @@ impl Bootstrapper for PostgresBootstrapper {
         Ok(())
     }
 
-    async fn read_catalog_version(&self) -> OpResult<Option<String>> {
-        let pool = self.app_pool(&self.config.catalog_db).await?;
-
-        if !migrations::table_exists(&pool, "settings").await? {
-            return Ok(None);
-        }
-
-        let row = sqlx::query_as::<_, (String,)>(
-            "SELECT value FROM settings WHERE key = 'catalog_version'",
-        )
-        .fetch_optional(&pool)
-        .await
-        .map_err(|e| OpError::Internal(format!("Read catalog version: {e}")))?;
-
-        Ok(row.map(|(v,)| v))
-    }
-
-    fn expected_catalog_version(&self) -> String {
-        CATALOG_VERSION.to_string()
-    }
-
     fn catalog_database_name(&self) -> String {
         self.config.catalog_db.clone()
     }
@@ -810,6 +412,21 @@ impl Bootstrapper for PostgresBootstrapper {
 
     fn catalog_connection_url(&self) -> String {
         self.app_connection_url(&self.config.catalog_db)
+    }
+
+    /// The catalog's and the data database's connection strings, the data
+    /// database's name and the admin role, as this bootstrapper resolved
+    /// them; migration 1 records the data database's rows.
+    fn init_target(&self) -> Target {
+        Target {
+            location: self.catalog_connection_url(),
+            data_store: Some(self.config.data_db.clone()),
+            admin: Some(AdminRole {
+                user: self.config.admin_user.clone(),
+                password: self.config.admin_password.clone(),
+            }),
+            data_connection: Some(self.app_connection_url(&self.config.data_db)),
+        }
     }
 
     fn generate_backend_config_section(&self) -> String {
@@ -933,12 +550,8 @@ impl PostgresBootstrapper {
         let resolved_admin_user = pg_user
             .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "postgres".to_owned()));
         let resolved_catalog_db = catalog_db.unwrap_or(catalog_db_name);
-        let final_data_db = data_db.unwrap_or_else(|| {
-            resolved_catalog_db
-                .strip_suffix("_catalog")
-                .unwrap_or(&resolved_catalog_db)
-                .to_owned()
-        });
+        let explicit_data_db = data_db.is_some();
+        let final_data_db = data_db.unwrap_or_else(|| derive_data_db_name(&resolved_catalog_db));
         let resolved_app_user = extenddb_user.unwrap_or(user);
         let resolved_app_password = extenddb_pass.unwrap_or(password);
 
@@ -953,10 +566,62 @@ impl PostgresBootstrapper {
             data_db: final_data_db,
         };
 
-        Self::connect(config)
+        // The message alone: `{e:?}` here nested the variant name into the text
+        // (`Internal("Cannot connect as admin: ...")`), and the CLI wrapped it again.
+        let op_message = |e: OpError| match e {
+            OpError::Validation(m)
+            | OpError::AlreadyExists(m)
+            | OpError::NotFound(m)
+            | OpError::HasDependents(m)
+            | OpError::Internal(m)
+            | OpError::Database { message: m, .. } => m,
+        };
+        let mut store = Self::connect(config)
             .await
-            .map_err(|e| StorageError::Internal(format!("{e:?}")))
+            .map_err(|e| StorageError::Internal(op_message(e)))?;
+        // An existing catalog knows its data database: `init` stores the name
+        // in its settings. Without `--data-db`, that name wins over the
+        // `<catalog-db>` minus `_catalog` derivation, so `migrate` and the
+        // other commands reach the data database of a deployment that was
+        // initialised with another name. A catalog without the setting (or no
+        // catalog yet, as during `init`) keeps the derivation.
+        if !explicit_data_db
+            && let Some(stored) = store
+                .get_data_db_name()
+                .await
+                .map_err(|e| StorageError::Internal(op_message(e)))?
+            && stored != store.config.data_db
+        {
+            println!(
+                "--- Data database '{stored}' (recorded in the catalog's settings; the derived \
+                 name would have been '{}')",
+                store.config.data_db
+            );
+            store.config.data_db = stored;
+        }
+        Ok(store)
     }
+}
+
+/// The data database name `init` uses when `--data-db` is not given:
+/// `<catalog-db>` without its `_catalog` suffix.
+pub(crate) fn derive_data_db_name(catalog_db: &str) -> String {
+    catalog_db
+        .strip_suffix("_catalog")
+        .unwrap_or(catalog_db)
+        .to_owned()
+}
+
+/// One line naming the role and server the admin connection tried, and what
+/// to pass instead. When `--pg-user` is absent the role defaults to `$USER`,
+/// which is rarely a PostgreSQL role with a password, so the hint matters.
+fn admin_connect_error(config: &BootstrapConfig, e: &sqlx::Error) -> String {
+    format!(
+        "Cannot connect to PostgreSQL at {}:{} as admin user \"{}\": {e}. Pass the admin role \
+         with --pg-user <role> and its password in the EXTENDDB_PG_PASSWORD environment \
+         variable.",
+        config.host, config.port, config.admin_user
+    )
 }
 
 #[cfg(test)]
@@ -964,6 +629,43 @@ mod tests {
     use super::*;
     use extenddb_storage::bootstrapper::BootstrapConfig;
 
+    /// `extenddb migrate`/`init`/`destroy` print this error as the whole
+    /// reason they stopped (it used to read
+    /// `Internal("Internal(\"Cannot connect as admin: ...\")")`).
+    #[tokio::test]
+    async fn an_admin_connection_failure_is_one_plain_line_naming_the_user() {
+        // Port 1 on loopback: nothing listens, so the connect fails at once.
+        let args: Vec<String> = [
+            "extenddb",
+            "migrate",
+            "--pg-host",
+            "127.0.0.1",
+            "--pg-port",
+            "1",
+            "--pg-user",
+            "someadmin",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        let Err(err) = PostgresBootstrapper::from_config("/nonexistent/extenddb.toml", &args).await
+        else {
+            panic!("connecting to 127.0.0.1:1 succeeded");
+        };
+        let extenddb_storage::error::StorageError::Internal(msg) = &err else {
+            panic!("unexpected error variant: {err:?}");
+        };
+        assert!(!msg.contains("Internal("), "{msg}");
+        assert!(!msg.contains('\n'), "{msg}");
+        assert!(
+            msg.starts_with(
+                "Cannot connect to PostgreSQL at 127.0.0.1:1 as admin user \"someadmin\": "
+            ),
+            "{msg}"
+        );
+        assert!(msg.contains("--pg-user"), "{msg}");
+        assert!(msg.contains("EXTENDDB_PG_PASSWORD"), "{msg}");
+    }
     #[test]
     fn test_connection_url_tcp_host() {
         let config = BootstrapConfig {

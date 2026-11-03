@@ -269,6 +269,102 @@ impl CassandraCatalogStore {
         .await
     }
 
+    /// List stored session policies for the resource-tag migration.
+    pub(crate) async fn list_session_policies_impl(
+        &self,
+    ) -> OpResult<Vec<extenddb_storage::management_store::SessionPolicyEntry>> {
+        let query = format!(
+            "SELECT session_token, account_id, role_name, session_name, session_policy \
+             FROM {}.iam_sessions",
+            self.catalog_keyspace()
+        );
+        let rows = crate::cassandra_util::query_rows(
+            self.session(),
+            &query,
+            cdrs_tokio::query_values!(),
+            "list_session_policies",
+        )
+        .await?;
+        let raw: Vec<(String, String, String, String, Option<String>)> =
+            crate::cassandra_util::map_rows(
+                rows,
+                |row| {
+                    let session_token = crate::cassandra_util::get_column(
+                        row,
+                        "session_token",
+                        "list_session_policies",
+                    )?;
+                    let account_id = crate::cassandra_util::get_column(
+                        row,
+                        "account_id",
+                        "list_session_policies",
+                    )?;
+                    let role_name = crate::cassandra_util::get_column(
+                        row,
+                        "role_name",
+                        "list_session_policies",
+                    )?;
+                    let session_name = crate::cassandra_util::get_column(
+                        row,
+                        "session_name",
+                        "list_session_policies",
+                    )?;
+                    let session_policy: Option<String> = row.get_r_by_name("session_policy").ok();
+                    Ok((
+                        session_token,
+                        account_id,
+                        role_name,
+                        session_name,
+                        session_policy,
+                    ))
+                },
+                "list_session_policies",
+            )?;
+        let mut out = Vec::new();
+        for (session_token, account_id, role_name, session_name, policy) in raw {
+            let Some(text) = policy else { continue };
+            // A session policy that does not parse is a corrupt row. It
+            // cannot be evaluated under either key form, so no decision
+            // depends on the migration; report it and carry on.
+            match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(policy) => out.push(extenddb_storage::management_store::SessionPolicyEntry {
+                    session_token,
+                    account_id,
+                    role_name,
+                    session_name,
+                    policy,
+                }),
+                Err(_) => tracing::warn!(
+                    account_id = %account_id,
+                    role_name = %role_name,
+                    session_name = %session_name,
+                    "stored session policy does not parse; skipped by the resource-tag migration"
+                ),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Replace a stored session's policy for the resource-tag migration.
+    pub(crate) async fn update_session_policy_impl(
+        &self,
+        session_token: &str,
+        document: &serde_json::Value,
+    ) -> OpResult<()> {
+        let query = format!(
+            "UPDATE {}.iam_sessions SET session_policy = ? WHERE session_token = ?",
+            self.catalog_keyspace()
+        );
+        let document = document.to_string();
+        crate::cassandra_util::execute(
+            self.session(),
+            &query,
+            cdrs_tokio::query_values!(document.as_str(), session_token),
+            "update_session_policy",
+        )
+        .await
+    }
+
     // ── Caller tags ────────────────────────────────────────────────
 
     pub(crate) async fn fetch_caller_tags_impl(

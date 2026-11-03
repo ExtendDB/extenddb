@@ -846,3 +846,278 @@ async fn test_async_gsi_worker_skips_dropped_index() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
+
+/// UpdateTimeToLive enabling TTL on a table whose GSI propagates
+/// asynchronously is a `Validation` refusal (the engine answers it with
+/// ValidationException, not a 5xx), naming the table, the index and its
+/// delay, and changes nothing. With the same GSI synchronous, TTL is enabled
+/// (liveness: the refusal is about the asynchronous GSI, not TTL itself).
+#[tokio::test]
+async fn test_ttl_on_a_table_with_an_async_gsi_is_refused_as_a_validation_error() {
+    use extenddb_core::types::TimeToLiveStatus;
+    use extenddb_storage::MetadataEngine as _;
+    use extenddb_storage::error::StorageError;
+
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let config = test_config();
+    let engine = CassandraEngine::new(&config, "us-east-1").await.unwrap();
+    let table = crate::helpers::TestTable::with_gsi(&engine, "TtlAsyncGsi", "GsiIdx", "gpk").await;
+    set_gsi_delay(&engine, &table.key_info.table_id, "GsiIdx", 50).await;
+    let account = table.key_info.account_id.clone();
+    let name = table.key_info.table_name.clone();
+    for _ in 0..50 {
+        engine.process_control_plane_transitions().await.unwrap();
+        let desc = engine.describe_ttl(&account, &name).await;
+        if desc.is_ok() {
+            match engine.update_ttl(&account, &name, "expires_at", true).await {
+                Err(StorageError::TableNotActive(_)) => {}
+                Err(StorageError::Validation(msg)) => {
+                    assert!(
+                        msg.contains(&name) && msg.contains("GsiIdx") && msg.contains("50 ms"),
+                        "{msg}"
+                    );
+                    let after = engine.describe_ttl(&account, &name).await.unwrap();
+                    assert_eq!(after.time_to_live_status, TimeToLiveStatus::Disabled);
+
+                    set_gsi_delay(&engine, &table.key_info.table_id, "GsiIdx", 0).await;
+                    engine
+                        .update_ttl(&account, &name, "expires_at", true)
+                        .await
+                        .expect("TTL with a synchronous GSI is enabled");
+                    let enabled = engine.describe_ttl(&account, &name).await.unwrap();
+                    assert_ne!(enabled.time_to_live_status, TimeToLiveStatus::Disabled);
+                    return;
+                }
+                other => panic!("expected a Validation refusal, got {other:?}"),
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("table {name} never became ACTIVE");
+}
+
+/// The index's status, backfill heartbeat and id in the catalog.
+async fn index_state(
+    engine: &CassandraEngine,
+    table_id: &str,
+    index_name: &str,
+) -> (String, Option<i64>, String) {
+    use cdrs_tokio::types::IntoRustByName as _;
+
+    let catalog_keyspace = engine.catalog_keyspace();
+    let rows = extenddb_storage_cassandra::cassandra_util::query_rows::<
+        extenddb_storage::error::StorageError,
+    >(
+        &engine.session_arc(),
+        &format!(
+            "SELECT index_status, backfill_heartbeat, index_id FROM {catalog_keyspace}.indexes \
+             WHERE table_id = ? AND index_name = ?"
+        ),
+        cdrs_tokio::query_values!(table_id, index_name),
+        "index_state",
+    )
+    .await
+    .expect("read the index row");
+    let row = rows.first().expect("the index row");
+    let status: String = row
+        .get_by_name("index_status")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let heartbeat: Option<i64> = row.get_by_name("backfill_heartbeat").ok().flatten();
+    let index_id: String = row
+        .get_by_name("index_id")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    (status, heartbeat, index_id)
+}
+
+/// The rows of an index's data table.
+async fn index_rows(engine: &CassandraEngine, account_keyspace: &str, index_id: &str) -> i64 {
+    use cdrs_tokio::types::IntoRustByName as _;
+
+    let rows = extenddb_storage_cassandra::cassandra_util::query_rows::<
+        extenddb_storage::error::StorageError,
+    >(
+        &engine.session_arc(),
+        &format!(
+            "SELECT COUNT(*) FROM {account_keyspace}.{}",
+            extenddb_storage_cassandra::data::ddl::index_table_name(index_id)
+        ),
+        cdrs_tokio::query_values!(),
+        "index_rows",
+    )
+    .await
+    .expect("count the index rows");
+    let count: Option<i64> = rows
+        .first()
+        .and_then(|row| row.get_by_name("count").ok().flatten());
+    count.expect("a count")
+}
+
+/// A backfill the GSI recovery worker started ends before the worker
+/// returns: once the worker's token fires, the backfill writes no more index
+/// rows and does not mark the index ACTIVE, so the server's stop at a lost
+/// registration, which waits for its workers, covers it. The table holds 40
+/// pages, so the backfill is still running when the token fires after its
+/// first page; the test fails, rather than passing, if it is not.
+#[tokio::test]
+async fn a_backfill_the_recovery_worker_started_ends_before_the_worker_returns() {
+    use extenddb_core::types::{CreateGsiAction, GlobalSecondaryIndexUpdate, UpdateTableInput};
+    use extenddb_storage::TableEngine as _;
+    use std::time::Duration;
+
+    const ITEMS: usize = 20_000;
+
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let config = test_config();
+    let engine = Arc::new(CassandraEngine::new(&config, "us-east-1").await.unwrap());
+    let table = crate::helpers::TestTable::new(&engine, "BackfillStopTable", false).await;
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    engine
+        .process_control_plane_transitions()
+        .await
+        .expect("activate the table");
+
+    let mut writes = tokio::task::JoinSet::new();
+    for i in 0..ITEMS {
+        if writes.len() >= 64 {
+            writes
+                .join_next()
+                .await
+                .expect("a write")
+                .expect("put_item");
+        }
+        let engine = engine.clone();
+        let key_info = table.key_info.clone();
+        writes.spawn(async move {
+            let mut item = Item::new();
+            item.insert("id".to_owned(), AttributeValue::S(format!("item-{i}")));
+            item.insert(
+                "status".to_owned(),
+                AttributeValue::S(format!("s{}", i % 64)),
+            );
+            engine
+                .put_item(
+                    &key_info,
+                    item,
+                    false,
+                    None,
+                    &ExpressionMaps::default(),
+                    None,
+                )
+                .await
+                .expect("put_item");
+        });
+    }
+    while let Some(write) = writes.join_next().await {
+        write.expect("put_item");
+    }
+
+    let shutdown = extenddb_storage::CancellationToken::new();
+    let worker = extenddb_storage_cassandra::workers::spawn_gsi_backfill_recovery_for_tests(
+        engine.clone(),
+        Duration::from_secs(120),
+        Duration::from_secs(60),
+        shutdown.clone(),
+    );
+    engine
+        .update_table(
+            &table.key_info.account_id,
+            UpdateTableInput {
+                table_name: table.key_info.table_name.clone(),
+                billing_mode: None,
+                table_throughput_mode: None,
+                provisioned_throughput: None,
+                deletion_protection_enabled: None,
+                global_secondary_index_updates: Some(vec![GlobalSecondaryIndexUpdate {
+                    create: Some(CreateGsiAction {
+                        index_name: "StatusIndex".to_owned(),
+                        key_schema: vec![KeySchemaElement {
+                            attribute_name: "status".to_owned(),
+                            key_type: KeyType::Hash,
+                        }],
+                        projection: Projection {
+                            projection_type: ProjectionType::All,
+                            non_key_attributes: None,
+                        },
+                        provisioned_throughput: None,
+                    }),
+                    update: None,
+                    delete: None,
+                }]),
+                attribute_definitions: Some(vec![
+                    AttributeDefinition {
+                        attribute_name: "id".to_owned(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                    AttributeDefinition {
+                        attribute_name: "status".to_owned(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                ]),
+                stream_specification: None,
+                table_class: None,
+                on_demand_throughput: None,
+                vector_index_updates: None,
+            },
+        )
+        .await
+        .expect("add the index");
+
+    // The backfill writes its heartbeat after its first page.
+    let table_id = table.key_info.table_id.clone();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let index_id = loop {
+        let (status, heartbeat, index_id) = index_state(&engine, &table_id, "StatusIndex").await;
+        if heartbeat.is_some() {
+            assert_eq!(
+                status, "CREATING",
+                "the backfill of {ITEMS} items ended before its first heartbeat was read"
+            );
+            break index_id;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the backfill wrote no heartbeat within 120 s"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(30), worker)
+        .await
+        .expect("the worker returns within 30 s of its token")
+        .expect("the worker does not panic");
+
+    // A batch sent before the token fired can land after the task ended;
+    // give it time before the first count.
+    let account_keyspace = engine.account_keyspace(&table.key_info.account_id);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let (status, _, _) = index_state(&engine, &table_id, "StatusIndex").await;
+    let written = index_rows(&engine, &account_keyspace, &index_id).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let (status_later, _, _) = index_state(&engine, &table_id, "StatusIndex").await;
+    let written_later = index_rows(&engine, &account_keyspace, &index_id).await;
+    println!(
+        "index rows 2 s after the worker returned: {written} ({status}); 2 s later: \
+         {written_later} ({status_later})"
+    );
+    assert_eq!(
+        status, "CREATING",
+        "the index is {status} 2 s after the worker returned, with {written} rows"
+    );
+    assert!(
+        usize::try_from(written).expect("a count") < ITEMS,
+        "the backfill wrote all {ITEMS} index rows: the token did not stop it"
+    );
+    assert_eq!(
+        (status_later.as_str(), written_later),
+        ("CREATING", written),
+        "the backfill went on after the worker returned"
+    );
+}

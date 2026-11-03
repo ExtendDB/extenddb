@@ -1,11 +1,34 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared helpers for the SQLite backend: connection-URL building, RFC 3339
-//! timestamp conversion, and constraint-violation classification.
+//! Shared helpers for the SQLite backend: connection-URL building, the
+//! connection pragmas, RFC 3339 timestamp conversion, and constraint-violation
+//! classification.
 
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+
+/// The pragmas every connection of every SQLite pool runs with. `wal` sets
+/// the journal mode, which is a property of the file; a connection that only
+/// reads the catalog status leaves it as it is.
+///
+/// # Errors
+///
+/// A pragma failed.
+pub(crate) async fn set_connection_pragmas(
+    conn: &mut sqlx::SqliteConnection,
+    wal: bool,
+) -> Result<(), sqlx::Error> {
+    use sqlx::Executor;
+    if wal {
+        conn.execute("PRAGMA journal_mode = WAL").await?;
+    }
+    conn.execute("PRAGMA foreign_keys = ON").await?;
+    conn.execute("PRAGMA synchronous = NORMAL").await?;
+    conn.execute("PRAGMA busy_timeout = 5000").await?;
+    conn.execute("PRAGMA cache_size = -32000").await?;
+    Ok(())
+}
 
 /// Normalize a configured path or connection string into a sqlx-openable
 /// SQLite URL.
@@ -28,6 +51,38 @@ pub(crate) fn format_timestamp(ts: OffsetDateTime) -> String {
     ts.to_offset(time::UtcOffset::UTC)
         .format(&Rfc3339)
         .unwrap_or_else(|_| ts.to_string())
+}
+
+/// Format epoch seconds as a catalog timestamp with microsecond precision
+/// (`2026-10-15T12:00:00.438000Z`). Fixed width, so stored values sort as
+/// text in time order.
+///
+/// Rounded to the microsecond before conversion: epoch seconds near 1.8e9
+/// carry about 0.24 us of f64 precision, so finer digits would be noise.
+pub(crate) fn format_epoch_seconds(secs: f64) -> String {
+    #[allow(clippy::cast_possible_truncation)] // saturating; out of range falls back below
+    let micros = (secs * 1e6).round() as i128;
+    let dt = OffsetDateTime::from_unix_timestamp_nanos(micros * 1000)
+        .unwrap_or(OffsetDateTime::UNIX_EPOCH);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}Z",
+        dt.year(),
+        u8::from(dt.month()),
+        dt.day(),
+        dt.hour(),
+        dt.minute(),
+        dt.second(),
+        dt.microsecond()
+    )
+}
+
+/// Epoch seconds, sub-second precision, of a catalog timestamp; 0 if it does
+/// not parse.
+#[allow(clippy::cast_precision_loss)] // epoch seconds fit f64's mantissa
+pub(crate) fn timestamp_epoch_seconds(s: &str) -> f64 {
+    parse_timestamp(s).map_or(0.0, |dt| {
+        dt.unix_timestamp() as f64 + f64::from(dt.nanosecond()) / 1e9
+    })
 }
 
 /// Parse a catalog timestamp string into an `OffsetDateTime`.

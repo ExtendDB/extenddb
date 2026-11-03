@@ -189,6 +189,7 @@ class ManagementClient:
         session_tags: dict | None = None,
         session_policy: dict | None = None,
         duration_seconds: int = 3600,
+        external_id: str | None = None,
     ) -> requests.Response:
         body: dict[str, Any] = {
             "caller_arn": caller_arn,
@@ -199,6 +200,8 @@ class ManagementClient:
             body["session_tags"] = session_tags
         if session_policy is not None:
             body["session_policy"] = session_policy
+        if external_id is not None:
+            body["external_id"] = external_id
         return requests.post(
             f"{self.base_url}/accounts/{account_id}/roles/{role_name}/assume",
             json=body,

@@ -31,7 +31,7 @@
 #   - A Cassandra node reachable at the contact point (default 127.0.0.1:9042)
 #     with PasswordAuthenticator enabled. The official cassandra:4.1 image does
 #     not honour CASSANDRA_AUTHENTICATOR, so patch it after starting:
-#       docker run -d --name cassandra -p 9042:9042 \
+#       docker run -d --name cassandra -p 127.0.0.1:9042:9042 \
 #         -e CASSANDRA_CLUSTER_NAME=extenddb-ci \
 #         -e HEAP_NEWSIZE=128M -e MAX_HEAP_SIZE=1024M \
 #         cassandra:4.1
@@ -216,6 +216,13 @@ export EXTENDDB_ADMIN_USER=admin
 export EXTENDDB_ADMIN_PASSWORD="$ADMIN_PASSWORD"
 export EXTENDDB_CONFIG="$CONFIG"
 export TMPDIR="$TMP_CANON"
+# The backup/restore fidelity tests' large backup (60,000 items by default)
+# drives enough requests through one driver connection that cdrs-tokio's
+# stream ids wrap while a slow request (a DROP TABLE under load) is still
+# outstanding; the driver then closes the connection on "Unmatched stream id"
+# and does not reconnect to the single node, and every later request fails.
+# 10,000 items still keep the restore copy running past the response.
+export EXTENDDB_TEST_BACKUP_ITEMS="${EXTENDDB_TEST_BACKUP_ITEMS:-10000}"
 
 RC=0
 devtools/run-tests --extenddb --backend cassandra --config "$CONFIG" "${RUN_TESTS_ARGS[@]}" || RC=$?

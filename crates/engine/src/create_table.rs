@@ -103,14 +103,23 @@ pub async fn handle_create_table(
     );
     ctx.auth_cache.invalidate_resource_tags(&arn).await;
 
-    table_desc.populate_table_throughput_mode_summary();
+    table_desc.prepare_for_response();
     let output = CreateTableOutput {
         table_description: table_desc,
     };
     serialize_output(&output)
 }
 
-pub(crate) fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> DynamoDbError {
+/// Map a storage-layer error to its `DynamoDB` wire error.
+///
+/// Exposed so the server's authorization path classifies a key-info lookup
+/// fault the same way the engine classifies the identical fault on the data
+/// path: a transient or connection error becomes `ServiceUnavailable`, the
+/// catalog and backend-internal errors become `InternalServerError`, and a
+/// not-active table becomes `ResourceInUseException`. Without a single mapper
+/// the same database hiccup returned different wire errors depending on which
+/// layer hit it first.
+pub fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> DynamoDbError {
     use extenddb_storage::error::StorageError;
     match e {
         StorageError::TableNotFound(name) => DynamoDbError::ResourceNotFoundException(
@@ -123,6 +132,18 @@ pub(crate) fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) ->
             ErrorMessageKey::TableInUse,
             &[&name],
         )),
+        // Only RestoreTableFromBackup raises this; its own mapping makes it
+        // TableInUseException. Elsewhere (a plain CreateTable into a name
+        // that is a CREATING restore target) the service's text is the one
+        // for a taken name, "Table already exists: <name>" (measured on
+        // DynamoDB), and the backup ARN is not disclosed to a caller
+        // authorized on the table alone.
+        StorageError::TableBeingRestored { table_name, .. } => {
+            DynamoDbError::ResourceInUseException(error_message(
+                ErrorMessageKey::TableAlreadyExists,
+                &[&table_name],
+            ))
+        }
         StorageError::IndexNotFound(name) => DynamoDbError::ValidationException(format!(
             "The table does not have the specified index: {name}"
         )),
@@ -134,10 +155,18 @@ pub(crate) fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) ->
         // state: the documented delete-table sentence and the measured
         // phase-dependent vector refusal both arrive through this one arm.
         StorageError::IndexesInUse(msg) => DynamoDbError::ResourceInUseException(msg),
+        StorageError::BackupInUse(msg) => DynamoDbError::BackupInUseException(msg),
         StorageError::LimitExceeded(msg) => DynamoDbError::LimitExceededException(msg), // Retryable by definition, so it maps like Connection: a 503 the SDKs
         // retry, rather than a 500 they surface.
         StorageError::Transient(msg) => {
             tracing::warn!(transient_error = %msg, "transient storage error");
+            DynamoDbError::ServiceUnavailable("Service is temporarily unavailable".to_owned())
+        }
+        // Only backup and export jobs hold snapshots; a request that reaches
+        // this arm lost one mid-operation. The job owner restarts it; the
+        // client sees the same retryable 503 as a transient fault.
+        StorageError::SnapshotExpired(msg) => {
+            tracing::warn!(snapshot_error = %msg, "storage snapshot expired");
             DynamoDbError::ServiceUnavailable("Service is temporarily unavailable".to_owned())
         }
         StorageError::DeletionProtected(arn) => DynamoDbError::ValidationException(format!(
@@ -152,14 +181,6 @@ pub(crate) fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) ->
         // "unsupported" error class, and the request is invalid against this
         // deployment rather than a server failure.
         StorageError::Unsupported(msg) => DynamoDbError::ValidationException(msg),
-        StorageError::CatalogVersionMismatch { expected, found } => {
-            tracing::error!("Catalog version mismatch: expected {expected}, found {found}");
-            DynamoDbError::InternalServerError("Internal server error".to_owned())
-        }
-        StorageError::CatalogNotInitialized => {
-            tracing::error!("Catalog not initialized");
-            DynamoDbError::InternalServerError("Internal server error".to_owned())
-        }
         // Generic path: discard the old item (callers that need it use
         // `storage_err_to_dynamo_with_ccf` instead).
         StorageError::ConditionFailed(_) => DynamoDbError::ConditionalCheckFailedException(
@@ -223,5 +244,23 @@ pub(crate) fn storage_err_to_dynamo_with_ccf(
             )
         }
         other => storage_err_to_dynamo(other),
+    }
+}
+
+#[cfg(test)]
+mod storage_error_mapping_tests {
+    use extenddb_core::error::DynamoDbError;
+    use extenddb_storage::error::StorageError;
+
+    use super::storage_err_to_dynamo;
+
+    /// A snapshot the backend discarded is retryable, like a transient error.
+    #[test]
+    fn snapshot_expired_is_service_unavailable() {
+        let err = storage_err_to_dynamo(StorageError::SnapshotExpired("gone".to_owned()));
+        assert!(
+            matches!(err, DynamoDbError::ServiceUnavailable(_)),
+            "{err:?}"
+        );
     }
 }

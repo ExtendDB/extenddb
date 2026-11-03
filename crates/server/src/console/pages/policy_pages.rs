@@ -267,6 +267,24 @@ async fn put_policy(
         return r;
     }
 
+    // Same name rule as the management API (`management::iam_policy::put_policy`).
+    if !crate::management::is_valid_iam_name(&form.policy_name) {
+        let nav = html::nav_bar(&identity_label(&session.identity));
+        let content = format!(
+            "<h1>Add Policy</h1>{}",
+            html::alert_error(
+                "policy_name must be 1-128 characters: alphanumeric, hyphens, underscores, dots, plus, equals, at"
+            )
+        );
+        return Html(html::layout_csrf(
+            "New Policy",
+            &nav,
+            &content,
+            &session.csrf_token,
+        ))
+        .into_response();
+    }
+
     // Validate JSON.
     let doc: serde_json::Value = if let Ok(v) = serde_json::from_str(&form.policy_document) {
         v
@@ -284,6 +302,28 @@ async fn put_policy(
         ))
         .into_response();
     };
+
+    // Apply the same identity-policy validation as the management API, so
+    // the console cannot store a document the service, and the management
+    // API, refuse.
+    let invalid = if doc.get("Version").is_none() || doc.get("Statement").is_none() {
+        Some("Policy document must contain Version and Statement".to_owned())
+    } else {
+        extenddb_auth::policy::document::PolicyDocument::from_json_for_write(&doc.to_string())
+            .err()
+            .map(|e| format!("Invalid policy document: {e}"))
+    };
+    if let Some(msg) = invalid {
+        let nav = html::nav_bar(&identity_label(&session.identity));
+        let content = format!("<h1>Add Policy</h1>{}", html::alert_error(&msg));
+        return Html(html::layout_csrf(
+            "New Policy",
+            &nav,
+            &content,
+            &session.csrf_token,
+        ))
+        .into_response();
+    }
 
     match state
         .catalog_store

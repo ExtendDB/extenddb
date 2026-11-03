@@ -109,6 +109,18 @@ jobs:
 
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
+      - name: Fetch the Docker Hub credential via OIDC (Secrets Manager)
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: arn:aws:iam::975306274793:role/ExtendDBDockerHubPublisher
+          role-session-name: extenddb-dockerhub-sign-${{ github.run_id }}
+          aws-region: us-east-1
+      - name: Read the Docker Hub credential from Secrets Manager
+        uses: aws-actions/aws-secretsmanager-get-secrets@2297f9a879480a9e3af9b293ed15c70caf8e1c88 # v3.0.2
+        with:
+          secret-ids: DOCKERHUB,extenddb/dockerhub-publish
+          parse-json-secrets: true
+
       - name: Assume the signing role via OIDC (no stored AWS secrets)
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
         with:
@@ -117,9 +129,6 @@ jobs:
           aws-region: us-east-1
 
       - name: Log in to Docker Hub (environment credential)
-        env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           set -euo pipefail
           docker login docker.io -u "$DOCKERHUB_USERNAME" --password-stdin <<< "$DOCKERHUB_TOKEN"

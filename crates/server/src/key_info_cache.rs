@@ -1,16 +1,18 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! `CachedTableKeyInfoStore` — stale-while-revalidate cache for
+//! `CachedTableKeyInfoStore`, a stale-while-revalidate cache for
 //! `TableKeyInfo` lookups.
 //!
-//! `TableKeyInfo` is fetched per request by the auth path
-//! (`request_helpers.rs::authorize_request` for `LeadingKeys` extraction)
-//! and by engine handlers that operate on multiple tables (batch / transact
-//! operations). Caching it eliminates a catalog roundtrip per request on the
-//! steady-state hot path.
+//! `TableKeyInfo` is fetched through this cache by the auth path for the
+//! single-table operations (`request_helpers.rs::authorize_request`, for
+//! `LeadingKeys` extraction) and by single-table engine handlers for a table
+//! the auth path did not read. The batch and transaction operations do not use
+//! it: authorization reads their tables from storage and the engine resolves
+//! them from what authorization read. Caching it eliminates a catalog
+//! roundtrip per request on the steady-state hot path.
 //!
-//! Negative results — `Err(TableNotFound)` or table missing — are stored as
+//! Negative results (`Err(TableNotFound)` or table missing) are stored as
 //! `None` and capped at the configured `negative_ttl` (defaults to 5s) so
 //! newly-created tables become available quickly without restart.
 //!
@@ -68,14 +70,19 @@ impl CachedTableKeyInfoStore {
                   -> BoxFuture<'static, Result<Option<TableKeyInfo>, StorageError>> {
                 let inner = inner.clone();
                 async move {
-                    match inner.table_key_info(&account_id, &table_name).await {
-                        Ok(info) => Ok(Some(info)),
-                        // Map "not found" to negative cache.
-                        Err(StorageError::TableNotFound(_)) => Ok(None),
-                        // Other errors (TableNotActive, Connection, Internal, etc.)
-                        // are not cached.
-                        Err(e) => Err(e),
-                    }
+                    let key_info = inner.table_key_info(&account_id, &table_name).await;
+                    load_key_info(key_info, || async {
+                        inner
+                            .describe_table(
+                                &account_id,
+                                extenddb_core::types::DescribeTableInput {
+                                    table_name: table_name.clone(),
+                                },
+                            )
+                            .await
+                            .map(|desc| desc.table_status)
+                    })
+                    .await
                 }
                 .boxed()
             },
@@ -107,16 +114,6 @@ impl CachedTableKeyInfoStore {
             Ok(None) => Err(StorageError::TableNotFound(table_name.to_owned())),
             Err(e) => Err(e),
         }
-    }
-
-    /// Same as `get`, but returns `Ok(None)` for missing tables — matches the
-    /// `.ok()` semantic used by the auth path's `LeadingKeys` extraction.
-    pub async fn get_optional(&self, account_id: &str, table_name: &str) -> Option<TableKeyInfo> {
-        self.cache
-            .get((account_id.to_owned(), table_name.to_owned()))
-            .await
-            .ok()
-            .flatten()
     }
 
     /// Drop the cached entry for `(account_id, table_name)`.
@@ -156,6 +153,57 @@ impl CachedTableKeyInfoStore {
     }
 }
 
+/// What the loader caches for one `table_key_info` answer.
+///
+/// `Ok(Some)` is the key info. `Ok(None)` is a negative entry, cached for
+/// `negative_ttl`: the table is not in the catalog at all. `Err` is not
+/// cached and is what the caller sees.
+///
+/// Every backend's `table_key_info` answers `TableNotFound` both for a name
+/// the catalog does not have and for one it has in a state other than
+/// `ACTIVE` (a `CreateTable` or `RestoreTableFromBackup` target that is still
+/// `CREATING`; the data plane reports both as `ResourceNotFoundException`, as
+/// the service does). Caching the second as a negative entry made reads on a
+/// restored table fail for up to `negative_ttl` after `DescribeTable` reported
+/// it `ACTIVE`: a probe during the copy stored the entry, and nothing
+/// invalidated it at the transition (the service's first
+/// read after `ACTIVE` succeeds). So on `TableNotFound` the catalog is asked
+/// once more, with `describe_table`, which answers for a table in any state:
+/// a table it finds is reported not found to the caller but not cached, so
+/// the next read asks the catalog again; a table it does not find is cached
+/// negatively as before. An error from the probe is treated as "found" (not
+/// cached): a miss is rare, and a negative entry stored on a database error
+/// would be the wrong answer for 5 s. The cost: a request against a name
+/// that is not `ACTIVE` loads once, uncached, which is one `table_key_info`
+/// and one `describe_table` on the auth path; the engine does not load
+/// again, because authorization records the table as missing in the
+/// snapshot it hands the engine (`OperationContext::authorized_key_info`). On
+/// PostgreSQL
+/// `describe_table` is itself two queries. Measured on SQLite with a
+/// `GetItem` loop on a `CREATING` restore target: see
+/// `docs/differences-from-dynamodb.md`, "Reads on a restore target".
+async fn load_key_info<P, F>(
+    key_info: Result<TableKeyInfo, StorageError>,
+    probe: P,
+) -> Result<Option<TableKeyInfo>, StorageError>
+where
+    P: FnOnce() -> F,
+    F: std::future::Future<Output = Result<extenddb_core::types::TableStatus, StorageError>>,
+{
+    match key_info {
+        Ok(info) => Ok(Some(info)),
+        Err(StorageError::TableNotFound(name)) => match probe().await {
+            Err(StorageError::TableNotFound(_)) => Ok(None),
+            // In the catalog but not ACTIVE (or the probe failed): not found
+            // to this caller, and not remembered.
+            Ok(_) | Err(_) => Err(StorageError::TableNotFound(name)),
+        },
+        // Other errors (TableNotActive, Connection, Internal, etc.)
+        // are not cached.
+        Err(e) => Err(e),
+    }
+}
+
 impl extenddb_storage::TableKeyInfoLookup for CachedTableKeyInfoStore {
     fn lookup<'a>(
         &'a self,
@@ -176,7 +224,103 @@ impl extenddb_auth::TableKeyInfoCacheInvalidator for CachedTableKeyInfoStore {
     }
 }
 
-// No unit tests in this module: the SWR mechanics are covered by the
-// extenddb-cache crate's tests (same `Loader<K, V, E>` shape), and the
-// table_key_info round-trip is exercised end-to-end by tests/test_cache_coherence.py
-// against a live Postgres backend.
+// The SWR mechanics are covered by the extenddb-cache crate's tests (same
+// `Loader<K, V, E>` shape), and the table_key_info round-trip is exercised
+// end-to-end by tests/test_cache_coherence.py against a live Postgres backend
+// and by tests/test_backup_restore_fidelity.py (a read on a restore target
+// while CREATING, then the first read after ACTIVE).
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use extenddb_core::types::TableStatus;
+    use std::cell::Cell;
+
+    fn info() -> TableKeyInfo {
+        TableKeyInfo::default()
+    }
+
+    /// A probe that records whether it ran and answers `status`.
+    fn probe(
+        ran: &Cell<bool>,
+        status: Result<TableStatus, StorageError>,
+    ) -> impl FnOnce() -> std::future::Ready<Result<TableStatus, StorageError>> + '_ {
+        move || {
+            ran.set(true);
+            std::future::ready(status)
+        }
+    }
+
+    #[tokio::test]
+    async fn an_active_table_is_cached_without_a_probe() {
+        let ran = Cell::new(false);
+        let got = load_key_info(Ok(info()), probe(&ran, Ok(TableStatus::Active))).await;
+        assert!(matches!(got, Ok(Some(_))));
+        assert!(!ran.get(), "no probe on a hit");
+    }
+
+    #[tokio::test]
+    async fn a_name_the_catalog_does_not_have_is_cached_negatively() {
+        let ran = Cell::new(false);
+        let got = load_key_info(
+            Err(StorageError::TableNotFound("t".to_owned())),
+            probe(&ran, Err(StorageError::TableNotFound("t".to_owned()))),
+        )
+        .await;
+        assert!(matches!(got, Ok(None)), "{got:?}");
+        assert!(ran.get());
+    }
+
+    /// Measured on DynamoDB: a name the catalog has in a non-ACTIVE state is not
+    /// found to the caller, and not cached, so the first read after the
+    /// table becomes ACTIVE asks the catalog again.
+    #[tokio::test]
+    async fn a_creating_table_is_not_found_but_not_cached() {
+        for status in [
+            TableStatus::Creating,
+            TableStatus::Updating,
+            TableStatus::Deleting,
+            TableStatus::Active,
+        ] {
+            let ran = Cell::new(false);
+            let got = load_key_info(
+                Err(StorageError::TableNotFound("t".to_owned())),
+                probe(&ran, Ok(status)),
+            )
+            .await;
+            assert!(
+                matches!(&got, Err(StorageError::TableNotFound(n)) if n == "t"),
+                "{status:?}: {got:?}"
+            );
+            assert!(ran.get());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_probe_is_not_cached_either() {
+        let ran = Cell::new(false);
+        let got = load_key_info(
+            Err(StorageError::TableNotFound("t".to_owned())),
+            probe(&ran, Err(StorageError::Connection("down".to_owned()))),
+        )
+        .await;
+        assert!(
+            matches!(got, Err(StorageError::TableNotFound(_))),
+            "{got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn other_errors_pass_through_without_a_probe() {
+        let ran = Cell::new(false);
+        let got = load_key_info(
+            Err(StorageError::TableNotActive("t".to_owned())),
+            probe(&ran, Ok(TableStatus::Active)),
+        )
+        .await;
+        assert!(
+            matches!(got, Err(StorageError::TableNotActive(_))),
+            "{got:?}"
+        );
+        assert!(!ran.get());
+    }
+}

@@ -10,21 +10,27 @@
 
 pub(crate) mod authorization;
 pub mod authz_cache;
+pub(crate) mod authz_resource;
 pub mod console;
 pub mod dev_credentials;
 mod handler;
 mod import_export_paths;
 pub mod key_info_cache;
+mod leading_keys;
 pub mod management;
 mod metrics_endpoint;
 pub mod rate_limit;
+mod registration;
 mod request_helpers;
+mod request_tags;
 mod response;
 mod serve;
 mod throttle_helpers;
 mod workers;
 
-pub use serve::{BuildInfo, LogTarget, ServeParams, log_to_syslog_raw, serve};
+pub use serve::{
+    BuildInfo, CatalogRefusal, LogTarget, RegistrationLost, ServeParams, log_to_syslog_raw, serve,
+};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -91,6 +97,10 @@ pub struct AppState {
     pub config_entries: Vec<(String, String)>,
     /// Runtime documentation store. `None` if `docs_dir` is not configured.
     pub docs_store: Option<console::docs_embed::DocsStore>,
+    /// Whether new requests are admitted, and whether the server must stop:
+    /// set while the backend's serving registration is lost
+    /// ([`registration`]).
+    pub(crate) admission: registration::Admission,
 }
 
 /// TLS configuration passed from the binary crate.
@@ -110,6 +120,10 @@ pub struct ServerTlsConfig {
 ///
 /// When `tls` is `Some`, the server serves HTTPS using `axum-server` with rustls.
 /// When `tls` is `None`, the server serves plaintext HTTP.
+///
+/// It stops on SIGINT or SIGTERM, or when `state`'s admission asks for a
+/// stop after the serving registration was lost; both drain the listener
+/// the same way and remove the PID file.
 pub async fn start_server(
     listener: tokio::net::TcpListener,
     state: AppState,
@@ -126,6 +140,7 @@ pub async fn start_server(
     let metrics_for_console = state.metrics.clone();
     let authz_cache_for_mgmt = state.authz_cache.clone();
     let table_key_info_cache_for_mgmt = state.table_key_info_cache.clone();
+    let mgmt_region = state.region.clone();
     let version_info = state.version_info.clone();
     let docs_store = state.docs_store.clone();
     let listen_url = {
@@ -134,6 +149,7 @@ pub async fn start_server(
         format!("{scheme}://{addr}")
     };
     let config_entries = state.config_entries.clone();
+    let admission = state.admission.clone();
     let shared = Arc::new(state);
 
     // Security headers applied to all responses.
@@ -173,6 +189,8 @@ pub async fn start_server(
             auth_cache: auth_cache_for_mgmt,
             authz_cache: authz_cache_for_mgmt,
             table_key_info_cache: table_key_info_cache_for_mgmt,
+            region: mgmt_region,
+            secure_transport: tls_enabled,
         });
         let mgmt_router = management::router().with_state(mgmt_state);
         app = app.nest("/management", mgmt_router);
@@ -197,6 +215,13 @@ pub async fn start_server(
                 get(|| async { Redirect::permanent("/console") }),
             );
     }
+
+    // While the serving registration is lost, every route answers
+    // ServiceUnavailable before its handler runs.
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        admission.clone(),
+        registration::refuse_while_unregistered,
+    ));
 
     // Apply security headers to all routes.
     let app = app.layer(security_layers);
@@ -233,8 +258,9 @@ pub async fn start_server(
         let handle = axum_server::Handle::new();
         let shutdown_handle = handle.clone();
         let shutdown_pid = pid_file.clone();
+        let stop = admission.clone();
         tokio::spawn(async move {
-            shutdown_signal().await;
+            signal_or_stop(&stop).await;
             shutdown_handle.graceful_shutdown(Some(Duration::from_secs(5)));
             // P50: Log timeout but don't call std::process::exit — let the
             // runtime shut down normally so destructors (including ZeroizeOnDrop) run.
@@ -262,7 +288,7 @@ pub async fn start_server(
             nodelay_listener(listener),
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
-        .with_graceful_shutdown(graceful_shutdown(pid_file.clone()))
+        .with_graceful_shutdown(graceful_shutdown(pid_file.clone(), admission))
         .await?;
     }
 
@@ -277,8 +303,8 @@ async fn health_check() -> impl IntoResponse {
     (StatusCode::OK, axum::Json(json!({"status": "healthy"})))
 }
 
-async fn graceful_shutdown(pid_file: Option<PathBuf>) {
-    shutdown_signal().await;
+async fn graceful_shutdown(pid_file: Option<PathBuf>, admission: registration::Admission) {
+    signal_or_stop(&admission).await;
     // P50: Spawn a timeout task that cleans up the PID file if connections
     // don't drain. Does NOT call std::process::exit — the runtime shuts down
     // normally so destructors (including ZeroizeOnDrop) run.
@@ -404,6 +430,20 @@ fn send_https_redirect(stream: &tokio::net::TcpStream, addr: std::net::SocketAdd
     let _ = stream.try_write(response.as_bytes());
 }
 
+/// Resolves on a shutdown signal, or once `admission` asks for a stop
+/// because the serving registration could not be taken again.
+async fn signal_or_stop(admission: &registration::Admission) {
+    tokio::select! {
+        () = shutdown_signal() => admission.mark_signalled(),
+        () = admission.stop_requested() => {
+            tracing::info!(
+                "Stopping because the serving registration could not be taken again, draining \
+                 connections..."
+            );
+        }
+    }
+}
+
 #[cfg(unix)]
 async fn shutdown_signal() {
     let ctrl_c = tokio::signal::ctrl_c();
@@ -491,5 +531,35 @@ mod tests {
         let (accepted, peer) = listener.accept().await;
         assert_eq!(peer, client.local_addr().expect("client addr"));
         assert!(accepted.nodelay().expect("read TCP_NODELAY"));
+    }
+
+    /// A stop that the registration supervisor asks for ends the plaintext
+    /// server through the graceful shutdown a signal starts.
+    #[tokio::test]
+    async fn a_stop_after_a_lost_registration_ends_the_server_as_a_signal_does() {
+        use std::future::IntoFuture;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let admission = registration::Admission::default();
+        let app = Router::new().route("/", get(|| async { "served" }));
+        let server = tokio::spawn(
+            axum::serve(listener, app)
+                .with_graceful_shutdown(graceful_shutdown(None, admission.clone()))
+                .into_future(),
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!server.is_finished(), "the server stopped by itself");
+        admission.stop("the registration could not be taken again".to_owned());
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("the server stops within 10 s of the stop")
+            .expect("the server task")
+            .expect("the server");
+        assert_eq!(
+            admission.stop_reason(),
+            Some("the registration could not be taken again")
+        );
     }
 }

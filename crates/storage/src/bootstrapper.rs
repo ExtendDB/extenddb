@@ -41,19 +41,6 @@ pub struct AdminBootstrapResult {
     pub from_env: bool,
 }
 
-/// Outcome of [`Bootstrapper::repair_lost_sort_key_definitions`].
-#[derive(Debug, Default, Clone)]
-pub struct KeyDefinitionRepair {
-    /// Tables whose sort key definitions were restored, as
-    /// `table_name: attribute (TYPE)` lines. When the caller passed `apply =
-    /// false` these are the repairs that WOULD be made.
-    pub repaired: Vec<String>,
-    /// Tables that are damaged but could not be repaired automatically, because
-    /// no physical sort key column was found to read the type back from. These
-    /// need a human: guessing a type would resolve the key to the wrong column.
-    pub needs_attention: Vec<String>,
-}
-
 /// High-level bootstrap operations for storage backends.
 ///
 /// Covers the init, destroy, and migrate command paths. Implementations
@@ -73,68 +60,6 @@ pub trait Bootstrapper: Send + Sync {
     /// Create the data database. Returns error if it already exists.
     async fn create_data_db(&self) -> OpResult<()>;
 
-    /// Run catalog schema migrations (creates tables, indexes, etc.).
-    async fn run_catalog_migrations(&self) -> OpResult<()>;
-
-    /// Run data schema migrations (stream tables, sequences, etc.).
-    async fn run_data_migrations(&self) -> OpResult<()>;
-
-    /// Restore sort key attribute definitions that issue #259 deleted from table
-    /// metadata, reading each type back from the physical sort key column.
-    ///
-    /// Before the fix, `UpdateTable` replaced a table's stored attribute
-    /// definitions with the request's subset, so adding a GSI dropped the base
-    /// table's own key definitions and keyed reads silently returned another item
-    /// in the same partition. The write path no longer does that, but a table
-    /// damaged by an older build stays damaged, and it now fails its reads loudly
-    /// instead (see `TableKeyInfo::validate_sort_key_definitions`). This repairs
-    /// such tables so they serve correct reads again.
-    ///
-    /// With `apply` false this only detects and reports, writing nothing, so a
-    /// `migrate` run that has not been confirmed with `--yes` never mutates the
-    /// catalog. With `apply` true the repair is written.
-    ///
-    /// Idempotent: a table whose definitions are intact is left untouched, so
-    /// running it on a healthy deployment reports nothing and changes nothing.
-    ///
-    /// The default implementation repairs nothing, which is correct for a backend
-    /// that never wrote the definitions in the first place.
-    async fn repair_lost_sort_key_definitions(&self, apply: bool) -> OpResult<KeyDefinitionRepair> {
-        let _ = apply;
-        Ok(KeyDefinitionRepair::default())
-    }
-
-    /// Acquire a cross-process lock so that concurrent `migrate` runs, such as
-    /// several replicas starting at once, don't race each other applying schema
-    /// changes. Blocks until the lock is available.
-    ///
-    /// The default is a no-op, which means a backend that does not override this
-    /// gets no serialization at all. Implement it if concurrent bootstrap is a
-    /// supported deployment for your backend.
-    ///
-    /// Implementations need not be re-entrant, and callers must not acquire
-    /// twice without releasing. Every acquire must be paired with
-    /// [`Bootstrapper::release_migration_lock`], and the backend must also
-    /// release the lock if the process dies without doing so.
-    async fn acquire_migration_lock(&self) -> OpResult<()> {
-        Ok(())
-    }
-
-    /// Release the lock taken by [`Bootstrapper::acquire_migration_lock`], and
-    /// do nothing if no lock is held. Defaults to a no-op.
-    async fn release_migration_lock(&self) -> OpResult<()> {
-        Ok(())
-    }
-
-    /// Filenames of data-database migrations that have not yet been applied.
-    ///
-    /// Excludes a pre-tracking baseline migration that already exists and will
-    /// be adopted (recorded without re-running) rather than applied. Data
-    /// migrations are tracked in the data database's own ledger, independent of
-    /// the catalog version, so `migrate` uses this to report accurately and to
-    /// decide whether confirmation is required — without running anything.
-    async fn pending_data_migrations(&self) -> OpResult<Vec<String>>;
-
     /// Record the data database connection string in the catalog.
     async fn record_data_connection(&self) -> OpResult<()>;
 
@@ -152,8 +77,15 @@ pub trait Bootstrapper: Send + Sync {
         env_password: Option<&str>,
     ) -> OpResult<AdminBootstrapResult>;
 
-    /// Check if the catalog is already initialized (has schema).
-    async fn is_catalog_initialized(&self) -> OpResult<bool>;
+    /// Whether the catalog's `admin_users` table or collection holds a user.
+    /// `init` writes the admin user last, so a catalog whose migrations are
+    /// all applied and that has none is one an `init` stopped in, which
+    /// [`finishes_a_stopped_init`] has `init` finish. The default answers
+    /// `true`, so on a backend that does not read the table `init` refuses
+    /// such a catalog as an initialized one.
+    async fn has_admin_user(&self) -> OpResult<bool> {
+        Ok(true)
+    }
 
     /// List table names in the catalog (for destroy confirmation display).
     async fn list_table_names(&self) -> OpResult<Vec<String>>;
@@ -164,12 +96,6 @@ pub trait Bootstrapper: Send + Sync {
     /// Drop both catalog and data databases. Destructive and irreversible.
     async fn drop_databases(&self, data_db: &str) -> OpResult<()>;
 
-    /// Read the current catalog schema version.
-    async fn read_catalog_version(&self) -> OpResult<Option<String>>;
-
-    /// Get the expected catalog version for this binary.
-    fn expected_catalog_version(&self) -> String;
-
     /// Return the catalog database name for display.
     fn catalog_database_name(&self) -> String;
 
@@ -179,9 +105,68 @@ pub trait Bootstrapper: Send + Sync {
     /// Return the catalog connection URL for config file generation.
     fn catalog_connection_url(&self) -> String;
 
+    /// The deployment `init` runs the catalog migrations on, with the values
+    /// this bootstrapper resolved from the command line and the config file,
+    /// so the backend derives none of them again. The default names the
+    /// catalog's connection URL alone.
+    fn init_target(&self) -> crate::migrations::Target {
+        crate::migrations::Target::at(self.catalog_connection_url())
+    }
+
+    /// The migration lock `init` holds while it writes the encryption key,
+    /// the default account, the admin user and the data connection. A
+    /// backend whose lock has a lease checks it before each of those writes,
+    /// as its runner does before each migration request; the default keeps
+    /// nothing.
+    fn hold(&self, _lock: &crate::migrations::HeldLock) {}
+
     /// Generate the backend-specific configuration subsection for extenddb.toml.
     /// Returns only the [`storage.backend_name`] section content, not the [storage] header.
     fn generate_backend_config_section(&self) -> String;
+}
+
+/// Whether `init`, holding the migration lock on a catalog whose status it
+/// read under the lock as `status`, finishes that catalog instead of
+/// refusing it as initialized: every migration is applied (`Current`) and
+/// the catalog has no admin user, the last of the rows `init` writes, which
+/// is what an `init` that stopped after its migrations leaves. `init` then
+/// runs no migration and writes the bootstrap rows the catalog lacks
+/// ([`write_bootstrap_rows`]). A catalog with an admin user is refused.
+///
+/// # Errors
+///
+/// The admin users cannot be read.
+pub async fn finishes_a_stopped_init(
+    bootstrapper: &dyn Bootstrapper,
+    status: &crate::migrations::CatalogStatus,
+) -> OpResult<bool> {
+    if !matches!(status, crate::migrations::CatalogStatus::Current { .. }) {
+        return Ok(false);
+    }
+    Ok(!bootstrapper.has_admin_user().await?)
+}
+
+/// The rows a server needs before it can start, in the order `init` writes
+/// them: the encryption key, the default account, the admin user. Each step
+/// writes its row only when the catalog lacks it, so on a catalog an earlier
+/// `init` stopped in this writes the rows that `init` did not.
+/// `admin_user` and `admin_password` come from `EXTENDDB_ADMIN_USER` and
+/// `EXTENDDB_ADMIN_PASSWORD`.
+///
+/// # Errors
+///
+/// As the backend's bootstrap steps.
+pub async fn write_bootstrap_rows(
+    bootstrapper: &dyn Bootstrapper,
+    admin_user: Option<&str>,
+    admin_password: Option<&str>,
+) -> OpResult<AdminBootstrapResult> {
+    bootstrapper.bootstrap_encryption_key().await?; // REQ-AUTH-010
+    bootstrapper.bootstrap_default_account().await?;
+    // REQ-AUTH-003
+    bootstrapper
+        .bootstrap_admin_user(admin_user, admin_password)
+        .await
 }
 
 use std::future::Future;
@@ -311,10 +296,21 @@ pub mod helpers {
         Ok(())
     }
 
-    /// Extract a CLI argument value by flag name.
+    /// Extract a CLI argument value by flag name, given as `--flag value` or
+    /// `--flag=value`, as clap accepts both. The first occurrence wins; clap
+    /// refuses a flag given twice before a bootstrapper reads the arguments.
     #[must_use]
     pub fn extract_arg(args: &[String], flag: &str) -> Option<String> {
-        args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
+        let mut iter = args.iter();
+        while let Some(arg) = iter.next() {
+            if arg == flag {
+                return iter.next().cloned();
+            }
+            if let Some(value) = arg.strip_prefix(flag).and_then(|r| r.strip_prefix('=')) {
+                return Some(value.to_owned());
+            }
+        }
+        None
     }
 
     #[cfg(test)]
@@ -568,6 +564,19 @@ pub mod helpers {
             // Should return first occurrence
             assert_eq!(extract_arg(&args, "--host"), Some("first".to_string()));
         }
+
+        /// clap accepts `--data-db=items`, so the bootstrapper reads it too;
+        /// a longer flag that starts with the name is not a match.
+        #[test]
+        fn test_extract_arg_equals_form() {
+            let args: Vec<String> = ["init", "--data-db=items", "--pg-user", "admin"]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect();
+            assert_eq!(extract_arg(&args, "--data-db"), Some("items".to_owned()));
+            assert_eq!(extract_arg(&args, "--pg-user"), Some("admin".to_owned()));
+            assert_eq!(extract_arg(&args, "--data"), None);
+        }
     }
 }
 
@@ -577,7 +586,8 @@ pub mod helpers {
 /// new required method is added, or a defaulted one loses its default, this
 /// stops compiling, which is the same breakage an out-of-tree backend crate
 /// would hit. It also pins object safety by boxing as `dyn Bootstrapper`, and
-/// checks that the defaulted migration-lock methods are usable no-ops.
+/// checks that the defaulted `hold` is a usable no-op and that the defaulted
+/// `has_admin_user` keeps `init` refusing an initialized catalog.
 #[cfg(test)]
 mod out_of_tree_compat_tests {
     use super::*;
@@ -598,15 +608,6 @@ mod out_of_tree_compat_tests {
         }
         async fn create_data_db(&self) -> OpResult<()> {
             Ok(())
-        }
-        async fn run_catalog_migrations(&self) -> OpResult<()> {
-            Ok(())
-        }
-        async fn run_data_migrations(&self) -> OpResult<()> {
-            Ok(())
-        }
-        async fn pending_data_migrations(&self) -> OpResult<Vec<String>> {
-            Ok(Vec::new())
         }
         async fn record_data_connection(&self) -> OpResult<()> {
             Ok(())
@@ -629,9 +630,6 @@ mod out_of_tree_compat_tests {
                 from_env: false,
             })
         }
-        async fn is_catalog_initialized(&self) -> OpResult<bool> {
-            Ok(true)
-        }
         async fn list_table_names(&self) -> OpResult<Vec<String>> {
             Ok(Vec::new())
         }
@@ -640,12 +638,6 @@ mod out_of_tree_compat_tests {
         }
         async fn drop_databases(&self, _data_db: &str) -> OpResult<()> {
             Ok(())
-        }
-        async fn read_catalog_version(&self) -> OpResult<Option<String>> {
-            Ok(None)
-        }
-        fn expected_catalog_version(&self) -> String {
-            "0.0.0".to_owned()
         }
         fn catalog_database_name(&self) -> String {
             "minimal".to_owned()
@@ -661,14 +653,29 @@ mod out_of_tree_compat_tests {
         }
     }
 
-    /// A backend that does not implement the migration lock still works, and
-    /// the defaults are no-ops rather than errors.
+    /// A backend that does not read its admin users takes the default
+    /// `has_admin_user`, under which `init` refuses a catalog whose
+    /// migrations are applied instead of finishing it.
     #[tokio::test]
-    async fn migration_lock_defaults_to_a_usable_no_op() {
+    async fn has_admin_user_defaults_to_true_so_init_refuses_a_current_catalog() {
+        let bootstrapper = MinimalBootstrapper;
+        assert!(bootstrapper.has_admin_user().await.expect("answered"));
+        let current = crate::migrations::CatalogStatus::Current { version: 4 };
+        assert!(
+            !finishes_a_stopped_init(&bootstrapper, &current)
+                .await
+                .expect("decided")
+        );
+    }
+
+    /// A backend that keeps no lease takes the default `hold`, which keeps
+    /// nothing and needs no lock of its own kind.
+    #[test]
+    fn hold_defaults_to_a_no_op() {
         let bootstrapper: Box<dyn Bootstrapper> = Box::new(MinimalBootstrapper);
-        assert!(bootstrapper.acquire_migration_lock().await.is_ok());
-        assert!(bootstrapper.release_migration_lock().await.is_ok());
-        // Releasing without acquiring must also be harmless.
-        assert!(bootstrapper.release_migration_lock().await.is_ok());
+        bootstrapper.hold(&crate::migrations::HeldLock::new(
+            "minimal://".to_owned(),
+            (),
+        ));
     }
 }

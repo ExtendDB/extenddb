@@ -710,9 +710,11 @@ impl extenddb_storage::vector_lifecycle::VectorIndexBuild for PostgresVectorBuil
         // the advisory lock, and no decision reads this column. What it answers at
         // three in the morning is "which process is building this index", which the
         // lock cannot be asked from another session.
-        sqlx::query(
-            "UPDATE vector_indexes SET backfilling = true, build_owner = $3, \
-             build_heartbeat_at = NOW() WHERE table_id = $1 AND index_id = $2",
+        let updated = sqlx::query(
+            "UPDATE vector_indexes v SET backfilling = true, build_owner = $3, \
+             build_heartbeat_at = NOW() WHERE v.table_id = $1 AND v.index_id = $2 \
+             AND EXISTS (SELECT 1 FROM tables t WHERE t.table_id = v.table_id \
+                         AND t.table_status <> 'DELETING')",
         )
         .bind(&self.table_id)
         .bind(&self.index_id)
@@ -720,6 +722,26 @@ impl extenddb_storage::vector_lifecycle::VectorIndexBuild for PostgresVectorBuil
         .execute(&self.catalog)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
+        if updated.rows_affected() == 0 {
+            // Recovery may have recreated the physical table after DeleteTable's
+            // worker collected its ids or dropped the old table. No catalog row
+            // (or a DELETING parent) means the rebuild must stop and remove the
+            // table it just created rather than publish an orphan.
+            let mut tx = self
+                .data
+                .begin()
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            crate::PostgresEngine::drop_vector_data_table(&mut tx, &self.index_id).await?;
+            tx.commit()
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            release_hold(&self.data, &self.table_id, &self.index_id).await?;
+            return Err(StorageError::Internal(format!(
+                "vector index {} or its parent table vanished while recovery reset its data table",
+                self.index_id
+            )));
+        }
         Ok(())
     }
 
@@ -775,8 +797,13 @@ impl extenddb_storage::vector_lifecycle::VectorIndexBuild for PostgresVectorBuil
 
     async fn reset_data_table(&mut self) -> Result<(), StorageError> {
         // Reload first: a rebuild has no request to read the definition from, and
-        // the index may have been altered since the build that died.
-        self.load_meta().await?;
+        // the index may have been altered since the build that died. If deletion
+        // won after candidate selection, give back the hold recovery just took;
+        // no later phase exists to release it.
+        if let Err(e) = self.load_meta().await {
+            release_hold(&self.data, &self.table_id, &self.index_id).await?;
+            return Err(e);
+        }
         let mut tx = self
             .data
             .begin()
@@ -838,9 +865,18 @@ async fn sweep_orphan_holds(
     engine: &crate::PostgresEngine,
     live: &[String],
 ) -> Result<(), StorageError> {
+    // A hold whose index_id is its own table_id is the control plane stopping
+    // the queue while it drops a DELETING table (`drop_table_storage`). The
+    // drop runs within a one-second budget, so a hold that is still there
+    // after one was left by a process that died mid-drop; it gets the longer
+    // age all the same, since sweeping a live one only makes workers claim
+    // rows they then time out on.
     let swept = sqlx::query(
         "DELETE FROM vector_index_holds \
-         WHERE NOT (index_id = ANY($1)) AND created_at < NOW() - INTERVAL '1 minute'",
+         WHERE NOT (index_id = ANY($1)) \
+           AND created_at < NOW() - CASE WHEN index_id = table_id \
+                                         THEN INTERVAL '10 minutes' \
+                                         ELSE INTERVAL '1 minute' END",
     )
     .bind(live)
     .execute(&engine.data_pool)
@@ -955,7 +991,7 @@ pub async fn build_ownership(data: &sqlx::PgPool, index_id: &str) -> Option<Buil
     let mut conn = match <sqlx::PgConnection as sqlx::Connection>::connect_with(&options).await {
         Ok(conn) => conn,
         Err(e) => {
-            tracing::warn!("could not open a session for vector build ownership: {e}");
+            tracing::warn!("could not open a session for index build ownership: {e}");
             return None;
         }
     };
@@ -971,7 +1007,7 @@ pub async fn build_ownership(data: &sqlx::PgPool, index_id: &str) -> Option<Buil
         Ok(true) => Some(BuildOwner { _conn: conn }),
         Ok(false) => None,
         Err(e) => {
-            tracing::warn!("vector build ownership probe failed: {e}");
+            tracing::warn!("index build ownership probe failed: {e}");
             None
         }
     }
@@ -1010,6 +1046,14 @@ pub async fn reconcile_incomplete_vector_indexes(
 /// Without this, a build that dies after its first batch leaves its index
 /// `CREATING` and its queue hold in place, so the table's whole index propagation
 /// stops, and the only exit is a restart.
+const REBUILD_CANDIDATES_SQL: &str = "SELECT v.index_id, v.table_id, v.dimensions, t.key_schema, t.attribute_definitions \
+     FROM vector_indexes v JOIN tables t ON t.table_id = v.table_id \
+     WHERE v.index_status = 'CREATING' AND t.table_status <> 'DELETING' \
+     AND ($1::float8 IS NULL \
+          OR v.build_heartbeat_at IS NULL \
+          OR v.build_heartbeat_at < NOW() - make_interval(secs => $1)) \
+     ORDER BY v.index_name";
+
 pub async fn rebuild_stuck_vector_indexes(
     engine: &crate::PostgresEngine,
     stale_after: Option<std::time::Duration>,
@@ -1017,19 +1061,12 @@ pub async fn rebuild_stuck_vector_indexes(
     // A null heartbeat counts as stale: it means the build never reached its first
     // batch, so nothing is renewing it.
     let stale_seconds = stale_after.map(|d| d.as_secs_f64());
-    let rows: Vec<(String, String, i32, serde_json::Value, serde_json::Value)> = sqlx::query_as(
-        "SELECT v.index_id, v.table_id, v.dimensions, t.key_schema, t.attribute_definitions \
-         FROM vector_indexes v JOIN tables t ON t.table_id = v.table_id \
-         WHERE v.index_status = 'CREATING' \
-         AND ($1::float8 IS NULL \
-              OR v.build_heartbeat_at IS NULL \
-              OR v.build_heartbeat_at < NOW() - make_interval(secs => $1)) \
-         ORDER BY v.index_name",
-    )
-    .bind(stale_seconds)
-    .fetch_all(&engine.pool)
-    .await
-    .map_err(|e| StorageError::Internal(e.to_string()))?;
+    let rows: Vec<(String, String, i32, serde_json::Value, serde_json::Value)> =
+        sqlx::query_as(REBUILD_CANDIDATES_SQL)
+            .bind(stale_seconds)
+            .fetch_all(&engine.pool)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
 
     // Swept against the UNFILTERED set of building indexes, not against the rows
     // selected above. Mid-run those rows are filtered by staleness, so they are not
@@ -1102,4 +1139,15 @@ pub async fn rebuild_stuck_vector_indexes(
         }
     }
     Ok(rebuilt)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::REBUILD_CANDIDATES_SQL;
+
+    #[test]
+    fn stale_recovery_candidates_exclude_deleting_parents() {
+        assert!(REBUILD_CANDIDATES_SQL.contains("JOIN tables t ON t.table_id = v.table_id"));
+        assert!(REBUILD_CANDIDATES_SQL.contains("t.table_status <> 'DELETING'"));
+    }
 }

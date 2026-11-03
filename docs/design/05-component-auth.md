@@ -144,7 +144,7 @@ pub enum AuthzDecision {
 pub struct RequestContext {
     /// aws:PrincipalTag/* — from the authenticated identity's tags.
     pub principal_tags: HashMap<String, String>,
-    /// dynamodb:ResourceTag/* — from the target table's tags.
+    /// aws:ResourceTag/*, from the target table's tags.
     pub resource_tags: HashMap<String, String>,
     /// dynamodb:LeadingKeys — partition key values being accessed.
     /// `None` for table-level operations (CreateTable, DeleteTable, etc.)
@@ -541,17 +541,19 @@ pub trait ConditionContext {
 
     /// Returns `true` if `key` is a multivalued (set-valued) condition key.
     /// Arity is a property of the key, not the number of values present.
-    /// `RequestContext` reports `dynamodb:Attributes` and `dynamodb:LeadingKeys`
-    /// as multivalued; all other keys (and all trust-policy keys) are single-valued.
+    /// `RequestContext` reports `dynamodb:Attributes`, `dynamodb:LeadingKeys` and
+    /// `aws:TagKeys` as multivalued; all other keys are single-valued, except
+    /// that `AssumeRoleContext` also reports `aws:TagKeys` as multivalued.
     fn is_multivalued_key(&self, key: &str) -> bool;
 }
 ```
 
 **Condition-key arity (single-valued vs multivalued).** AWS classifies each
 condition key as single-valued or multivalued (`ArrayOfString`) in the service
-authorization reference. For DynamoDB, `dynamodb:Attributes` and
-`dynamodb:LeadingKeys` are multivalued; everything else extenddb resolves
-(`dynamodb:Select`, `dynamodb:ReturnValues`, tag keys, etc.) is single-valued.
+authorization reference. For DynamoDB, `dynamodb:Attributes`,
+`dynamodb:LeadingKeys` and `aws:TagKeys` are multivalued; everything else
+extenddb resolves (`dynamodb:Select`, `dynamodb:ReturnValues`,
+`aws:RequestTag/<key>`, etc.) is single-valued.
 A **bare** operator (one without a `ForAllValues:`/`ForAnyValue:` qualifier)
 applied to a multivalued key **never matches** — verified against real AWS IAM
 (BR-7085), and independent of how many values are present. Only the set-operator
@@ -600,7 +602,7 @@ impl RequestContext {
     fn resolve_key_inner(&self, key: &str) -> Option<Vec<&str>> {
         if let Some(tag_key) = key.strip_prefix("aws:PrincipalTag/") {
             self.principal_tags.get(tag_key).map(|v| vec![v.as_str()])
-        } else if let Some(tag_key) = key.strip_prefix("dynamodb:ResourceTag/") {
+        } else if let Some(tag_key) = key.strip_prefix("aws:ResourceTag/") {
             self.resource_tags.get(tag_key).map(|v| vec![v.as_str()])
         } else {
             match key {
@@ -727,6 +729,8 @@ pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext
             match context_values {
                 None => true,  // ForAllValues with absent key is vacuously true
                                // (same result whether or not IfExists is present)
+                // No Arn set check: a value that is not an ARN fails
+                // compare_single for every Arn operator, so `all` is false
                 Some(vals) => vals.iter().all(|cv| {
                     condition.values.iter().any(|pv| compare_single(base_op, cv, pv))
                 })
@@ -737,6 +741,7 @@ pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext
             let (absent_passes, base_op) = unwrap_if_exists(inner);
             match context_values {
                 None => absent_passes,  // false normally, true if IfExists
+                Some(vals) if arn_operator_sees_non_arn(base_op, &vals) => false,
                 Some(vals) => vals.iter().any(|cv| {
                     condition.values.iter().any(|pv| compare_single(base_op, cv, pv))
                 })
@@ -768,6 +773,20 @@ fn unwrap_if_exists(op: &ConditionOperator) -> (bool, &ConditionOperator) {
         ConditionOperator::IfExists(base) => (true, base),
         other => (false, other),
     }
+}
+
+/// Helper: true when `op` is an Arn operator and any context value is not an
+/// ARN (`is_arn`). IAM evaluates the condition as false for the whole set in
+/// that case, in the bare, ForAnyValue and ForAllValues forms (measured with
+/// simulate-custom-policy on the values [V, "notanarn"]). ForAnyValue checks
+/// it before comparing per value. ForAllValues needs no check, because a
+/// value that is not an ARN fails compare_single against every policy value
+/// (so `all` is false for a non-empty policy value list), and neither does
+/// the bare form, which is false on a multivalued key. With an empty policy
+/// value list, which the write paths accept, ForAllValues with a negative
+/// Arn operator is true and ForAnyValue is false, as IAM evaluates them.
+fn arn_operator_sees_non_arn(op: &ConditionOperator, context_values: &[&str]) -> bool {
+    is_arn_operator(op) && !context_values.iter().all(|cv| is_arn(cv))
 }
 
 /// Evaluate a non-set, non-IfExists condition operator against a single-valued key.
@@ -815,10 +834,14 @@ fn compare_single(op: &ConditionOperator, context_value: &str, policy_value: &st
             compare_dates(op, context_value, policy_value),
         ConditionOperator::Bool =>
             context_value.eq_ignore_ascii_case(policy_value),
-        ConditionOperator::ArnEquals => context_value == policy_value,
-        ConditionOperator::ArnNotEquals => context_value != policy_value,
-        ConditionOperator::ArnLike => arn_match(policy_value, context_value),
-        ConditionOperator::ArnNotLike => !arn_match(policy_value, context_value),
+        // IAM evaluates ArnEquals as ArnLike and ArnNotEquals as ArnNotLike:
+        // `*` and `?` match in every ARN field, and a context value that is
+        // not an ARN matches neither operator (measured with
+        // simulate-custom-policy).
+        ConditionOperator::ArnEquals | ConditionOperator::ArnLike =>
+            is_arn(context_value) && arn_match(policy_value, context_value),
+        ConditionOperator::ArnNotEquals | ConditionOperator::ArnNotLike =>
+            is_arn(context_value) && !arn_match(policy_value, context_value),
         // Null, ForAllValues, ForAnyValue, IfExists are handled by the caller
         _ => false,
     }
@@ -867,9 +890,14 @@ extenddb provides a local AssumeRole mechanism for testing role-based access pat
 
 5. Build AssumeRoleContext from caller tags + SessionTags + ExternalId.
 
-6. Evaluate trust policy: caller ARN must match a Principal in an Allow
-   statement, and all Condition blocks must pass against AssumeRoleContext.
-   If denied, return 403 AccessDenied.
+6. Evaluate the trust policy in IAM order. The call exercises `sts:AssumeRole`,
+   and `sts:TagSession` as well when session tags are passed. For each
+   exercised action a matching explicit `Deny` blocks the call, and otherwise a
+   matching `Allow` grants it; with neither, assumption is implicitly denied. A
+   statement matches when its `Principal` matches the caller, its `Action` (or
+   `NotAction`) covers the action, and all `Condition` blocks pass against
+   AssumeRoleContext. A `Deny` whose `Condition` fails to parse fails closed (it
+   blocks). If the call is not granted, return 403 AccessDenied.
 
 7. Generate temporary credentials:
    - New access_key_id (prefixed "ASIA" to match AWS convention)
@@ -904,7 +932,23 @@ A role's trust policy controls who can assume it:
 }
 ```
 
-The trust policy is evaluated when AssumeRole is called. Only the `Principal` and `Condition` fields are checked — `Action` must be `sts:AssumeRole` and `Resource` is implicit (the role itself).
+The trust policy is evaluated when AssumeRole is called, following IAM order: a
+matching explicit `Deny` blocks assumption before any `Allow` is considered, and
+the decision is made per exercised STS action (`sts:AssumeRole`, plus
+`sts:TagSession` when session tags are passed). A statement matches on
+`Principal`, on `Action`/`NotAction`, and on its `Condition` block. `Effect` is
+compared case-insensitively. The `Resource` field is not used (the role itself
+is implicit) and is rejected at write.
+
+`Principal` matching covers a single ARN, a list of ARNs, `{"AWS": "*"}`, a bare
+account id, and an account root ARN (`arn:aws:iam::<account>:root`); the last
+two match any caller in that account. `NotPrincipal` is rejected at write. A
+`Deny` whose `Condition` references an operator or key the evaluator does not
+resolve fails closed, so it blocks rather than being silently dropped. Trust
+documents are validated when the role is created: the documents IAM rejects for
+a trust policy are rejected, and those it accepts (a missing `Version`, a
+single-object `Statement`, numeric condition values, unknown condition keys) are
+accepted.
 
 > **Note:** Trust policies use `"Action": "sts:AssumeRole"` for compatibility with real IAM policy documents, even though extenddb exposes AssumeRole via `/management/assume-role` rather than an STS endpoint. The policy engine matches this action string during trust policy evaluation regardless of the actual HTTP endpoint used.
 

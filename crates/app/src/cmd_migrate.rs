@@ -3,210 +3,109 @@
 
 //! `extenddb migrate` — apply catalog schema migrations (REQ-CAT-014).
 //!
-//! Reads current catalog version, runs pending migrations, and reports the result.
+//! The command's arguments and the error helpers the other commands share.
+//! Every backend migrates through `cmd_migrate_runner`, whose exit statuses
+//! are 0, 1, 3 (work pending and `--yes` not given), 4, 5 and 6 (see that
+//! module).
 
 use clap::Args;
 
-use extenddb_config as config;
+use extenddb_storage::error::StorageError;
+use extenddb_storage::management_store::OpError;
+
+/// The config file `migrate` and `verify` read when `--config` is not given.
+pub(crate) const DEFAULT_CONFIG: &str = "extenddb.toml";
+
+/// Seconds `--yes` and `--forget` wait for the migration lock by default.
+pub(crate) const DEFAULT_LOCK_TIMEOUT_SECS: u64 = 60;
 
 #[derive(Args)]
 pub struct MigrateArgs {
-    /// Path to configuration file
-    #[arg(short, long, default_value = "extenddb.toml")]
-    config: String,
+    /// Path to configuration file (default: extenddb.toml; a dev-mode build
+    /// without one reads the EXTENDDB__ environment variables, as serve does)
+    #[arg(short, long)]
+    pub(crate) config: Option<String>,
 
-    /// `PostgreSQL` admin user (for catalog migrations)
+    /// `PostgreSQL` admin role for the pgvector extension attempt; schema
+    /// work runs as the application role in the config file
     #[arg(long)]
-    pg_user: Option<String>,
+    pub(crate) pg_user: Option<String>,
 
     /// `PostgreSQL` admin password.
     /// Prefer `EXTENDDB_PG_PASSWORD` to keep the value out of process arguments.
     #[arg(long)]
-    pg_pass: Option<String>,
+    pub(crate) pg_pass: Option<String>,
 
-    /// Confirm migration (required, no interactive prompt)
+    /// `PostgreSQL` data database to migrate (PostgreSQL only; ignored on
+    /// other backends). Normally not needed: the name `init` recorded in the
+    /// catalog's settings is used, else the catalog database name without its
+    /// `_catalog` suffix. Pass it for a catalog that has no recorded name and
+    /// a data database named otherwise.
     #[arg(long)]
-    yes: bool,
+    pub(crate) data_db: Option<String>,
+
+    /// Cassandra role to connect as instead of the role the config file
+    /// names (for example the role `init` used)
+    #[arg(long)]
+    pub(crate) cassandra_user: Option<String>,
+
+    /// Password of the `--cassandra-user` role.
+    /// Prefer `EXTENDDB_CASSANDRA_PASSWORD` to keep the value out of process arguments.
+    #[arg(long)]
+    pub(crate) cassandra_pass: Option<String>,
+
+    /// Apply the pending migrations. Without it, migrate only reports what is
+    /// pending and exits 3 if there is any (0 if everything is up to date)
+    #[arg(long)]
+    pub(crate) yes: bool,
+
+    /// Print every migration this binary carries, with its kind on this
+    /// backend, and exit without opening the catalog
+    #[arg(long, conflicts_with_all = ["yes", "forget", "reconverge"])]
+    pub(crate) list: bool,
+
+    /// With --yes: run every convergent migration again, to repair a catalog
+    /// a release before 1.0 wrote to after it was migrated
+    #[arg(long, requires = "yes", conflicts_with = "forget")]
+    pub(crate) reconverge: bool,
+
+    /// Delete the ledger rows of an unreleased migration whose body changed on
+    /// a development database, so the next `migrate --yes` runs it again
+    #[arg(long, value_name = "ID", conflicts_with = "yes")]
+    pub(crate) forget: Option<u32>,
+
+    /// Seconds --yes and --forget wait for a server or another migration to
+    /// release the catalog before exiting 6 (default 60, at most 86400)
+    #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(0..=86_400))]
+    pub(crate) lock_timeout: Option<u64>,
 }
 
-pub async fn run(args: MigrateArgs) -> anyhow::Result<()> {
-    if !std::path::Path::new(&args.config).exists() {
-        anyhow::bail!(
-            "Config file '{}' not found. Run 'extenddb init' to set up a deployment, \
-             or use --config <path> to specify a different location.",
-            args.config,
-        );
+/// The message of a bootstrapper error, without the variant name that `{e:?}`
+/// adds (which printed `Internal("Internal(\"Cannot connect ...\")")`).
+pub(crate) fn op_err(e: OpError) -> anyhow::Error {
+    match e {
+        OpError::Validation(m)
+        | OpError::AlreadyExists(m)
+        | OpError::NotFound(m)
+        | OpError::HasDependents(m)
+        | OpError::Internal(m)
+        | OpError::Database { message: m, .. } => anyhow::anyhow!(m),
     }
-    // Load the config for validation only: migrate drives the bootstrapper from
-    // the config path directly, but a malformed config should fail here rather
-    // than midway through a migration.
-    config::load(&args.config)?;
-
-    println!("=== extenddb migrate ===");
-    println!("Config:           {}", args.config);
-    println!();
-
-    // Collect CLI args for backend-specific parsing. The environment-sourced
-    // secret is appended only to this in-process copy, not OS-visible argv.
-    let mut cli_args: Vec<String> = std::env::args().collect();
-    crate::util::append_secret_arg(
-        &mut cli_args,
-        "--pg-pass",
-        std::env::var_os("EXTENDDB_PG_PASSWORD"),
-        "EXTENDDB_PG_PASSWORD",
-    )?;
-
-    // Create bootstrapper via registry
-    let bootstrap = extenddb_storage::bootstrapper::create_bootstrapper(&args.config, &cli_args)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-
-    // Serialize concurrent migrators, such as several replicas starting at
-    // once, so they don't race each other applying schema changes.
-    bootstrap
-        .acquire_migration_lock()
-        .await
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    let result = apply_migrations(bootstrap.as_ref(), &args).await;
-    if let Err(e) = bootstrap.release_migration_lock().await {
-        tracing::warn!("Failed to release migration lock: {e:?}");
-    }
-    result
 }
 
-/// Run the version checks and apply pending migrations while the migration lock
-/// is held. Split out of `run` so that the lock is always released afterwards.
-async fn apply_migrations(
-    bootstrap: &dyn extenddb_storage::bootstrapper::Bootstrapper,
-    args: &MigrateArgs,
-) -> anyhow::Result<()> {
-    // Show current catalog version.
-    println!("--- Checking current catalog version...");
-    let current = bootstrap
-        .read_catalog_version()
-        .await
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    let current_display = current.as_deref().unwrap_or("none");
-    println!("  Current version: {current_display}");
-
-    let expected = bootstrap.expected_catalog_version();
-    let catalog_pending = current.as_deref() != Some(expected.as_str());
-
-    // Data migrations are tracked in the data database's own ledger, separate
-    // from and independent of the catalog version, so they must be checked (and
-    // applied) on their own — a release that only changes the data schema does
-    // not bump the catalog version.
-    println!("--- Checking data migrations...");
-    let data_pending = bootstrap
-        .pending_data_migrations()
-        .await
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    if data_pending.is_empty() {
-        println!("  Data migrations up to date.");
-    } else {
-        println!("  Pending: {}", data_pending.join(", "));
+/// The message of a storage error; `Internal` carries a complete sentence
+/// already, so its "Internal error: " prefix is dropped.
+pub(crate) fn storage_err(e: StorageError) -> anyhow::Error {
+    match e {
+        StorageError::Internal(m) => anyhow::anyhow!(m),
+        other => anyhow::anyhow!(other.to_string()),
     }
+}
 
-    // Detect table metadata damaged by the pre-fix UpdateTable (#259), which
-    // deleted a table's own key attribute definitions when a GSI was added.
-    //
-    // Detection is read-only and runs even when the catalog version is already
-    // current: the damage is in a row's contents, not in the schema, so an
-    // up-to-date deployment is exactly the case that needs checking. Nothing is
-    // written until --yes has been given, below.
-    println!("--- Checking table key metadata...");
-    let detected = bootstrap
-        .repair_lost_sort_key_definitions(false)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    let repair_pending = !detected.repaired.is_empty();
-    if !repair_pending && detected.needs_attention.is_empty() {
-        println!("  Table key metadata intact.");
-    } else {
-        for line in &detected.repaired {
-            println!("  Repairable: {line}");
-        }
-        for line in &detected.needs_attention {
-            println!("  NEEDS ATTENTION: {line}");
-        }
-    }
-
-    if !catalog_pending && data_pending.is_empty() && !repair_pending {
-        println!();
-        if detected.needs_attention.is_empty() {
-            println!(
-                "Everything is up to date (catalog version {expected}). No migrations needed."
-            );
-        } else {
-            // Nothing is automatically applicable, but saying "everything is up
-            // to date" straight after a NEEDS ATTENTION line would be
-            // contradictory: those tables require a human.
-            println!(
-                "No migrations needed (catalog version {expected}), but {} item(s) above \
-                 need manual attention.",
-                detected.needs_attention.len()
-            );
-        }
-        return Ok(());
-    }
-
-    if !args.yes {
-        let mut what = Vec::new();
-        if catalog_pending {
-            what.push(format!("catalog {current_display} -> {expected}"));
-        }
-        if !data_pending.is_empty() {
-            what.push(format!("data migrations [{}]", data_pending.join(", ")));
-        }
-        if repair_pending {
-            what.push(format!(
-                "table key metadata repairs [{}]",
-                detected.repaired.join("; ")
-            ));
-        }
-        anyhow::bail!(
-            "--yes is required to apply migrations. Pending: {}.",
-            what.join("; ")
-        );
-    }
-
-    if catalog_pending {
-        bootstrap
-            .run_catalog_migrations()
-            .await
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    }
-
-    // Always run data migrations: the data-database ledger is idempotent
-    // (already-applied migrations are skipped) and independent of the catalog
-    // version, so an upgrade that only touched the data schema is still applied.
-    bootstrap
-        .run_data_migrations()
-        .await
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-
-    // Apply the table key metadata repair after the schema migrations, so it never
-    // reads or writes a pre-migration catalog shape.
-    if repair_pending {
-        let applied = bootstrap
-            .repair_lost_sort_key_definitions(true)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        for line in &applied.repaired {
-            println!("  Restored sort key definition: {line}");
-        }
-    }
-
-    // Read new catalog version.
-    let new = bootstrap
-        .read_catalog_version()
-        .await
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    let new_display = new.as_deref().unwrap_or("none");
-
-    println!();
-    println!("=== extenddb migrate complete ===");
-    println!("Catalog version: {current_display} -> {new_display}");
-
-    Ok(())
+/// Run `extenddb migrate`; returns the process exit status (see
+/// `cmd_migrate_runner`).
+pub async fn run(args: MigrateArgs, release: &str) -> anyhow::Result<u8> {
+    let migrations = extenddb_storage::migrations::installed()
+        .ok_or_else(|| anyhow::anyhow!("no storage backend is installed"))?;
+    crate::cmd_migrate_runner::run(&args, migrations, release).await
 }

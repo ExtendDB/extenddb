@@ -492,27 +492,48 @@ class TestStreamAccountScoping:
             + str(drained)[:600]
         )
 
-        # Construct a shard-iterator token for the shard holding account A's
-        # record and call GetRecords with account B's own credentials. The
-        # token is "<shard_id>|AFTER_SEQUENCE_NUMBER|<seq>|<ts>" in plain base64.
-        other_iterator = base64.b64encode(
-            f"{target_shard}|AFTER_SEQUENCE_NUMBER||{int(time.time())}".encode()
-        ).decode()
-        # Real DynamoDB rejects a GetRecords iterator it did not issue with
-        # ValidationException("Invalid ShardIterator") -- and does not
-        # distinguish "exists but not yours" from "does not exist", so the
-        # response cannot be used to probe another account's shard existence.
-        with pytest.raises(ClientError) as exc:
-            other["streams"].get_records(ShardIterator=other_iterator, Limit=100)
-        err = exc.value.response["Error"]
-        assert err["Code"] == "ValidationException", (
-            "a shard iterator for another account's shard must be rejected as "
-            f"ValidationException, got {err}"
-        )
-        assert err["Message"] == "Invalid ShardIterator", (
-            "expected DynamoDB-verbatim 'Invalid ShardIterator', got "
-            f"{err['Message']!r}"
-        )
+        # Account B calls GetRecords with iterators that name account A's shard.
+        # None of them may return A's records, and the answer must not depend on
+        # whether the shard exists, so it cannot be used to probe another
+        # account's streams. A made-up shard id is the control.
+        missing_shard = "shardId-00000000-0000-0000-0000-000000000000-0000000000000000"
+
+        def get_records_error(token: str) -> dict:
+            with pytest.raises(ClientError) as exc:
+                other["streams"].get_records(ShardIterator=token, Limit=100)
+            return exc.value.response["Error"]
+
+        # A token in the format issued before iterators carried their stream
+        # ARN ("<shard>|<type>|<seq>|<ts>"). It is answered by its shape alone,
+        # before any lookup, with ExpiredIteratorException, which is what
+        # DynamoDB returns for an expired iterator; the client asks for a new
+        # one.
+        def old_format(shard_id: str) -> str:
+            return base64.b64encode(
+                f"{shard_id}|AFTER_SEQUENCE_NUMBER||{int(time.time())}".encode()
+            ).decode()
+
+        err = get_records_error(old_format(target_shard))
+        assert err["Code"] == "ExpiredIteratorException", err
+        assert err["Message"] == "Shard iterator has expired", err
+        assert get_records_error(old_format(missing_shard)) == err
+
+        # A token in the current format that names account A's stream ARN.
+        # Authorization pins the stream ARN to account B, and the engine looks
+        # the stream up in account B, where it does not exist, so the request
+        # fails the same way for a real and a made-up shard.
+        def current_format(shard_id: str) -> str:
+            return base64.b64encode(
+                f"{shard_id}|AFTER_SEQUENCE_NUMBER||{int(time.time())}|{arn}".encode()
+            ).decode()
+
+        err = get_records_error(current_format(target_shard))
+        assert err["Code"] == "ResourceNotFoundException", err
+        assert get_records_error(current_format(missing_shard)) == err
+
+        # An iterator that does not decode gets DynamoDB's verbatim answer.
+        err = get_records_error("bm90LWFuLWl0ZXJhdG9y")
+        assert err == {"Code": "ValidationException", "Message": "Invalid ShardIterator"}, err
 
     def test_metrics_endpoint_requires_admin_auth(self, auth_env):
         endpoint, admin_user, admin_pass = auth_env
