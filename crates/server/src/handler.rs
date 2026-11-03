@@ -88,6 +88,16 @@ pub(crate) async fn handle_request(
             );
         }
     };
+    // Any build that compiles the MongoDB backend crate (the MongoDB binary,
+    // or a build of the whole workspace) gets serde_json's `preserve_order`
+    // feature through `bson`, so there a parsed object keeps the order the
+    // client wrote its members in; other builds sort them by name. The typed
+    // input deserializers stop at the first member that fails, so on such a
+    // build a body with two faults got an error chosen by the client's member
+    // order. DynamoDB answered each two-fault Query and Scan body measured on
+    // 2026-11-03 alike in both orders. Sorting gives every build the sorted
+    // order; without `preserve_order` the call does nothing.
+    input.sort_all_objects();
 
     // --- Auth segment ---
     let auth_start = std::time::Instant::now();
@@ -97,18 +107,6 @@ pub(crate) async fn handle_request(
     };
     #[allow(clippy::cast_precision_loss)]
     let auth_us = auth_start.elapsed().as_micros() as f64;
-
-    // A build with the MongoDB backend gets serde_json's `preserve_order`
-    // feature through `bson`, so there a parsed object keeps the order the
-    // client wrote its members in; every other build sorts them by name. The
-    // typed input deserializers stop at the first member that fails, so on the
-    // MongoDB build a body with two faults got an error chosen by the client's
-    // member order. DynamoDB answered each two-fault Query and Scan body
-    // measured on 2026-11-03 alike in both orders. Sorting gives every build
-    // the sorted order; without `preserve_order` the call does nothing. It runs
-    // after authentication, which reads the raw bytes, so an unauthenticated
-    // caller pays only for the parse.
-    input.sort_all_objects();
 
     let account_id: Arc<str> = match &identity {
         extenddb_auth::AuthIdentity::User { account_id, .. }
