@@ -186,6 +186,9 @@ impl CassandraEngine {
         allowed_prepared_txn_id: Option<uuid::Uuid>,
         expected_claimed_item: Option<&Item>,
     ) -> Result<Option<Item>, StorageError> {
+        // Taken before the read: a write whose version is at or above it began
+        // after this delete did (`item_present_serial`).
+        let started = super::version::now_micros();
         let data_keyspace = self.account_keyspace(&key_info.account_id);
         let ddb_table = data_table_name(&key_info.table_id);
 
@@ -292,14 +295,18 @@ impl CassandraEngine {
                     // and a replica that missed the latest write reads as
                     // absent. The fence catches a stale image but not a stale
                     // absence, so the absence is confirmed at LOCAL_SERIAL
-                    // before the delete answers without writing; a row found
-                    // there is retried from a fresh read, as a lost race is.
+                    // before the delete answers without writing. An item found
+                    // there that a write stored before this delete began is
+                    // retried from a fresh read, as a lost race is; one whose
+                    // version was read after it began is a concurrent write,
+                    // which the delete is ordered before.
                     if self
                         .item_present_serial(
                             &data_keyspace,
                             &ddb_table,
                             &pk_text,
                             Some((&sk, sk_col)),
+                            started,
                         )
                         .await?
                     {
@@ -576,10 +583,13 @@ impl CassandraEngine {
                     // and a replica that missed the latest write reads as
                     // absent. The fence catches a stale image but not a stale
                     // absence, so the absence is confirmed at LOCAL_SERIAL
-                    // before the delete answers without writing; a row found
-                    // there is retried from a fresh read, as a lost race is.
+                    // before the delete answers without writing. An item found
+                    // there that a write stored before this delete began is
+                    // retried from a fresh read, as a lost race is; one whose
+                    // version was read after it began is a concurrent write,
+                    // which the delete is ordered before.
                     if self
-                        .item_present_serial(&data_keyspace, &ddb_table, &pk_text, None)
+                        .item_present_serial(&data_keyspace, &ddb_table, &pk_text, None, started)
                         .await?
                     {
                         return Err(StorageError::TransactionConflict(
@@ -1507,20 +1517,25 @@ impl CassandraEngine {
         Ok(())
     }
 
-    /// Whether the base row holds an item, read at `LOCAL_SERIAL`.
+    /// Whether the base row, read at `LOCAL_SERIAL`, holds an item that a
+    /// write stored before this delete began. A version at or above `started`
+    /// was read from the clock after the delete began, so that write is
+    /// concurrent with the delete, which is ordered before it and answers
+    /// without writing. A null or counter version counts as stored before.
     async fn item_present_serial(
         &self,
         data_keyspace: &str,
         ddb_table: &str,
         pk: &str,
         sk: Option<(&extenddb_storage::util::SortKeyValue, &str)>,
+        started: i64,
     ) -> Result<bool, StorageError> {
         use cdrs_tokio::types::IntoRustByName as _;
         let row = super::select_by_pk_at(
             &self.session,
             data_keyspace,
             ddb_table,
-            "item_data",
+            "item_data, version",
             pk,
             sk.map(|(value, _)| value),
             sk.map(|(_, col)| col),
@@ -1529,7 +1544,10 @@ impl CassandraEngine {
         .await?;
         Ok(row.is_some_and(|row| {
             let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
-            item_data.is_some()
+            let version: Option<i64> = row.get_by_name("version").ok().flatten();
+            let concurrent =
+                version.is_some_and(|v| v >= super::version::CLOCK_VERSION_FLOOR && v >= started);
+            item_data.is_some() && !concurrent
         }))
     }
 

@@ -75,7 +75,8 @@ version.
 The transaction commit reads the row it holds under its PREPARE fence at
 `LOCAL_SERIAL`, binds a concrete version, and syncs index rows for Put, Update
 and Delete. An unconditional delete whose read finds no item reads again at
-`LOCAL_SERIAL` before it answers without writing.
+`LOCAL_SERIAL` before it answers without writing, and retries if that read
+finds an item a write stored before the delete began.
 
 Recovery of a COMMITTING transaction syncs index rows from the ledger's two
 images, stamped with the row's version, for each Put, Update or Delete whose
@@ -127,7 +128,10 @@ the ledger's image.
   rows it removes and as the version it advances, and its own fence does not
   check either, so it reads at `LOCAL_SERIAL`. The unconditional delete's fence
   catches a stale image but not a stale absence, so the delete confirms an
-  absence at `LOCAL_SERIAL`.
+  absence at `LOCAL_SERIAL`. An item that read finds with a version taken
+  after the delete began belongs to a write that started after the delete,
+  which the delete is ordered before. Retrying into it deleted a concurrent
+  create's item and widened the three-writer case below.
 - The TTL-claimed write path keeps the mutation timestamp it pins after taking
   the claim as its batch timestamp, because the claim cells that batch clears
   must not land above a later claim's Paxos timestamp; its version is computed
@@ -163,9 +167,7 @@ the ledger's image.
   below the tombstone. The item is then in the base table and missing from the
   index row it shares with the deleted image until its next write. On one node,
   a conditional create, an unconditional create and a delete released together
-  on an absent key produced this in 41 of 300 rounds; before this change the
-  same shape produced it in 4 of 300, because a delete that read the key as
-  absent wrote nothing, and the delete now confirms that absence and retries.
+  on an absent key produced this in 22 of 900 rounds.
   Closing it needs the delete to leave a version that the next create fences on.
 - The ExtendDB hosts' clocks must be synchronized with each other. A version
   written from a host whose clock runs ahead stays ahead for that row, since
