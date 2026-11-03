@@ -435,6 +435,116 @@ fn query_on_multi_hash_gsi_is_clause_order_independent() {
     assert_eq!(r, Some(vec!["alice".to_owned()]));
 }
 
+/// A table carrying a GSI with HASH `g1`, `g2` and RANGE `gs`, and a GSI with
+/// HASH `h` and RANGE `a`, `b`.
+fn multi_attribute_gsi_table() -> TableKeyInfo {
+    let gsi = |name: &str, key_schema: Vec<KeySchemaElement>| IndexInfo {
+        index_name: name.to_owned(),
+        index_id: name.to_owned(),
+        index_type: IndexType::Gsi,
+        key_schema,
+        projection: proj(),
+    };
+    TableKeyInfo {
+        table_name: "mk".to_owned(),
+        key_schema: vec![ks("pk", KeyType::Hash)],
+        base_key_schema: vec![ks("pk", KeyType::Hash)],
+        global_secondary_indexes: vec![
+            gsi(
+                "gsi3",
+                vec![
+                    ks("g1", KeyType::Hash),
+                    ks("g2", KeyType::Hash),
+                    ks("gs", KeyType::Range),
+                ],
+            ),
+            gsi(
+                "gsi4",
+                vec![
+                    ks("h", KeyType::Hash),
+                    ks("a", KeyType::Range),
+                    ks("b", KeyType::Range),
+                ],
+            ),
+        ],
+        ..Default::default()
+    }
+}
+
+/// A Query on `index` of the multi-attribute table naming `alice` as the
+/// first HASH attribute's value.
+fn multi_attribute_query(index: &str, kce: &str, names: &[(&str, &str)]) -> Value {
+    let names: serde_json::Map<String, Value> = names
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), json!(v)))
+        .collect();
+    json!({
+        "TableName": "mk",
+        "IndexName": index,
+        "KeyConditionExpression": kce,
+        "ExpressionAttributeNames": names,
+        "ExpressionAttributeValues": {
+            ":v": {"S": "alice"}, ":g": {"S": "blue"}, ":x": {"S": "x1"},
+            ":lo": {"S": "a"}, ":a": {"S": "a1"}, ":c": {"S": "b1"}, ":p": {"S": "b"},
+        },
+    })
+}
+
+/// One Query shape: the index, the key condition and its `#name` references.
+type MultiAttributeCase<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
+
+#[test]
+fn query_on_multi_attribute_gsi_binds_the_first_hash_attribute_in_any_clause_order() {
+    // The engine assigns the clauses of a multi-attribute key schema by name
+    // and serves each of these orders. Authorization used to read them with
+    // `resolve_pk_sk`, found no partition clause and left the key absent, so
+    // a ForAllValues fence let the query through.
+    let hash_names = [("#g1", "g1"), ("#g2", "g2"), ("#gs", "gs")];
+    let cases: &[MultiAttributeCase] = &[
+        ("gsi3", "g2 = :g AND g1 = :v AND gs = :x", &[]),
+        ("gsi3", "gs = :x AND g1 = :v AND g2 = :g", &[]),
+        ("gsi3", "g2 = :g AND g1 = :v AND gs > :lo", &[]),
+        ("gsi3", "#g2 = :g AND #g1 = :v AND #gs = :x", &hash_names),
+        ("gsi3", "#gs = :x AND #g1 = :v AND #g2 = :g", &hash_names),
+        ("gsi3", "#g2 = :g AND #g1 = :v AND #gs > :lo", &hash_names),
+        ("gsi4", "a = :a AND h = :v AND b = :c", &[]),
+        ("gsi4", "b = :c AND h = :v AND a = :a", &[]),
+        ("gsi4", "a = :a AND h = :v AND b > :lo", &[]),
+        ("gsi4", "b > :lo AND a = :a AND h = :v", &[]),
+        ("gsi4", "begins_with(b, :p) AND a = :a AND h = :v", &[]),
+        // Orders authorization already read correctly.
+        ("gsi3", "g1 = :v AND g2 = :g AND gs = :x", &[]),
+        ("gsi4", "h = :v AND a = :a AND b = :c", &[]),
+    ];
+    for (index, kce, names) in cases {
+        let input = multi_attribute_query(index, kce, names);
+        let r = single_table_leading_keys(
+            &input,
+            "Query",
+            Some(&multi_attribute_gsi_table()),
+            MAX_TOKENS,
+        );
+        assert_eq!(r, Some(vec!["alice".to_owned()]), "{index}: {kce}");
+    }
+}
+
+#[test]
+fn query_on_multi_hash_gsi_missing_a_hash_attribute_is_absent() {
+    // The engine refuses `g1 = :a` on HASH `g1`, `g2` (`HASH key attributes g2
+    // must have equality conditions specified in the query`). Measured
+    // 2026-10-21: the service answers ValidationException to every principal
+    // for this shape, a principal fenced away from `alice` included, so the key
+    // is not bound.
+    let input = json!({
+        "TableName": "m",
+        "IndexName": "gsi2",
+        "KeyConditionExpression": "g1 = :a",
+        "ExpressionAttributeValues": {":a": {"S": "alice"}},
+    });
+    let r = single_table_leading_keys(&input, "Query", Some(&multi_hash_gsi_table()), MAX_TOKENS);
+    assert_eq!(r, None);
+}
+
 // ---- query: shapes the engine rejects (key left absent) -----------------
 
 #[test]
