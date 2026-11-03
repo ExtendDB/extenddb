@@ -124,6 +124,75 @@ fn parse_default_form_with_and_without_space() {
     }
 }
 
+/// Both forms trim the key name, and the default form trims before and after
+/// the comma and before the closing brace; the text inside the quotes keeps
+/// its spaces. Rows W1 to W8 and T4 of `evaluator/tests/variable_spelling.rs`.
+#[test]
+fn parse_trims_spaces_around_the_key_in_both_forms() {
+    let plain = Reference::Key {
+        name: "aws:username",
+        default: None,
+    };
+    for inner in [" aws:username ", "aws:username ", " aws:username"] {
+        assert_eq!(parse_reference(inner), plain, "{inner:?}");
+    }
+    let defaulted = Reference::Key {
+        name: "aws:username",
+        default: Some("anon"),
+    };
+    for inner in [
+        " aws:username , 'anon'",
+        "aws:username ,'anon'",
+        "aws:username,  'anon'",
+        "aws:username, 'anon' ",
+    ] {
+        assert_eq!(parse_reference(inner), defaulted, "{inner:?}");
+    }
+    assert_eq!(
+        parse_reference("aws:username, ' anon '"),
+        Reference::Key {
+            name: "aws:username",
+            default: Some(" anon ")
+        }
+    );
+}
+
+/// The code points up to U+0020 are trimmed and no others (rows T1 to T11
+/// of `evaluator/tests/variable_spelling.rs`).
+#[test]
+fn parse_trims_code_points_up_to_space_and_no_others() {
+    for c in [' ', '\t', '\n', '\u{b}', '\u{c}', '\r', '\u{1}', '\u{1f}'] {
+        let inner = format!("{c}aws:username{c}");
+        assert_eq!(
+            parse_reference(&inner),
+            Reference::Key {
+                name: "aws:username",
+                default: None
+            },
+            "{c:?}"
+        );
+    }
+    for c in ['\u{85}', '\u{a0}', '\u{3000}'] {
+        let inner = format!("{c}aws:username{c}");
+        assert_eq!(
+            parse_reference(&inner),
+            Reference::Key {
+                name: &inner,
+                default: None
+            },
+            "{c:?}"
+        );
+    }
+}
+
+/// `${ * }` and `${ $ }` are the escapes (rows X1 and X2); `${ ? }` follows.
+#[test]
+fn parse_trims_the_escapes() {
+    assert_eq!(parse_reference(" * "), Reference::Escape(b'*'));
+    assert_eq!(parse_reference(" ? "), Reference::Escape(b'?'));
+    assert_eq!(parse_reference("\t$\t"), Reference::Escape(b'$'));
+}
+
 #[test]
 fn parse_comma_without_quotes_is_key_text() {
     assert_eq!(

@@ -124,13 +124,27 @@ enum Reference<'a> {
     Escape(u8),
 }
 
+/// Trim the code points up to U+0020 from both ends of `text`, the set Java's
+/// `String.trim` removes.
+///
+/// IAM trims this set around a variable's key name and its quoted default,
+/// in both forms and in the escapes (measured with the IAM policy simulator:
+/// space, tab, newline, U+000B, U+000C, U+000D, U+0001 and U+001F are
+/// trimmed; U+0085, U+00A0 and U+3000 are not, so a key name written with
+/// one of them names a key the request does not carry).
+fn trim_up_to_space(text: &str) -> &str {
+    text.trim_matches(|c: char| c <= ' ')
+}
+
 /// Parse the text between `${` and `}`.
 ///
-/// `*`, `?` and `$` are escapes. `name, 'default'` (whitespace around either
-/// part ignored) is the default form. Anything else, including a `,` whose
-/// right side is not single-quoted, is taken as the key name as written, which
-/// is what the condition path did before the default form was read.
+/// The text is trimmed with [`trim_up_to_space`] first. Then `*`, `?` and
+/// `$` are the escapes, and `name, 'default'` is the default form, where the
+/// name and the quoted default are trimmed again and the text inside the
+/// quotes is kept as written. Anything else, including a `,` whose right
+/// side is not single-quoted, is taken as the key name.
 fn parse_reference(inner: &str) -> Reference<'_> {
+    let inner = trim_up_to_space(inner);
     match inner {
         "*" => return Reference::Escape(b'*'),
         "?" => return Reference::Escape(b'?'),
@@ -138,10 +152,10 @@ fn parse_reference(inner: &str) -> Reference<'_> {
         _ => {}
     }
     if let Some((name, default)) = inner.split_once(',') {
-        let default = default.trim();
+        let default = trim_up_to_space(default);
         if default.len() >= 2 && default.starts_with('\'') && default.ends_with('\'') {
             return Reference::Key {
-                name: name.trim(),
+                name: trim_up_to_space(name),
                 default: Some(&default[1..default.len() - 1]),
             };
         }
