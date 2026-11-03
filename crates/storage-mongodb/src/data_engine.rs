@@ -428,9 +428,9 @@ impl MongoEngine {
         // this loop does. The error means another put's item is already in
         // the collection, so the next attempt finds that item, replaces it
         // and returns it as the old image; if a delete removed that item
-        // first, the next attempt inserts. Attempts share the transient
-        // retry budget and back off between them, as the transaction path
-        // below does.
+        // first, the next attempt inserts. This path makes at most
+        // `CREATE_RACE_ATTEMPTS` attempts and backs off between them, the
+        // budget a lost create race has on the transaction path below.
         if condition.is_none()
             && stream.is_none()
             && self.gsi_cache_get_fresh(&key_info.table_id) == Some(false)
@@ -569,10 +569,11 @@ impl MongoEngine {
                     // The arm is a defence: a duplicate-key error here means
                     // a document in this transaction's snapshot holds the
                     // item's `_id` without matching the key filter. It runs
-                    // the transaction again with the retry budget and
-                    // backoff of a write conflict, and the put gives up with
-                    // the create race error when every attempt meets that
-                    // document.
+                    // the transaction again with the backoff of a write
+                    // conflict and counts the lost race against
+                    // `CREATE_RACE_ATTEMPTS`, and the put gives up with the
+                    // create race error once that many attempts have met
+                    // such a document.
                     let old_doc = match coll
                         .find_one_and_replace(key_filter.clone(), new_doc)
                         .with_options(opts)
@@ -3654,18 +3655,37 @@ const TRANSIENT_RETRY_ATTEMPTS: u32 = 1000;
 /// UpdateItem answer HTTP 503 on the deadline and 400
 /// `TransactionConflictException` when their attempt budget runs out first
 /// (measured in 2 of 4 rounds against a held document, where the 1,000
-/// attempts and the deadline both land near 10 s). The 400 of those two
-/// paths is what #437 replaces, after which every single-item write answers
-/// 503 whichever bound it reaches.
+/// attempts and the deadline both land near 10 s). #475, the fix for #437,
+/// replaces the 400 of those two paths, after which every single-item write
+/// answers 503 whichever bound it reaches.
 ///
 /// The deadline is read before an attempt starts, so a request answers within
-/// the deadline plus one attempt. It governs the loops that serve a request:
-/// put, delete, update and transact. The single-item writes answer it with
-/// HTTP 503; a transaction answers it as it answers a spent attempt budget,
-/// with `TransactionCanceledException`. The GSI backfill loop shares the attempt
-/// budget and takes no deadline: it runs in the background worker in
-/// `ttl_worker.rs`, where no caller is waiting for a reply and giving up
-/// leaves the index CREATING.
+/// the deadline plus the attempt already running. That attempt has no bound
+/// of its own: under many writers on one key it waits for a connection from
+/// the pool (`pool_size`, 50 by default) and for the commit's own retries,
+/// which can take a couple of seconds. At 256 writers on one key of a GSI table the
+/// longest call measured 11.7 s.
+///
+/// It governs the put, delete, update and transact loops. The single-item
+/// writes answer it with HTTP 503; a transaction answers it as it answers a
+/// spent attempt budget, with `TransactionCanceledException`. A loop measures
+/// the deadline from the start of its request (see `contention_clock_start`):
+/// the write requests of one `BatchWriteItem` share one deadline, and the
+/// handler returns a request that reaches it in UnprocessedItems. The TTL
+/// worker's conditional delete runs the delete loop too, outside any request,
+/// so an expired item that stays contended holds the sweep until the deadline
+/// or the attempt budget ends that loop, where 50 attempts ended it before
+/// the budget was raised. The worker then logs the failure and moves to the
+/// next item.
+/// The GSI backfill loop shares the attempt budget and takes no deadline: it
+/// runs in the background worker in `ttl_worker.rs`, where no caller is
+/// waiting for a reply and giving up leaves the index CREATING.
+///
+/// The cost of the longer retry is CPU on the MongoDB server: the losers of a
+/// hot key retry with a backoff capped at 12.8 ms for up to the deadline, so
+/// the server stays busy committing and aborting transactions on that key for
+/// as long as the contention lasts, about 2 cores at 1,800 to 1,900
+/// transactions a second with 64 and 256 writers on one key.
 ///
 /// The engine carries the deadline in
 /// [`MongoEngine::contention_deadline`](crate::MongoEngine) so that a test can
@@ -3871,7 +3891,8 @@ fn contention_clock_start() -> std::time::Instant {
 /// The error for a write that stopped retrying because the engine's
 /// contention deadline passed while it was losing to concurrent writers.
 /// `operation` names the API operation and `deadline` is the deadline that
-/// passed.
+/// passed, in seconds with any fraction, so a deadline a test sets below one
+/// second does not read as 0 seconds.
 ///
 /// Like the attempt-budget give-up of PutItem this is a
 /// [`StorageError::Transient`], which the engine answers as HTTP 503
@@ -3881,7 +3902,7 @@ fn contention_clock_start() -> std::time::Instant {
 fn contention_deadline_exhausted(operation: &str, deadline: std::time::Duration) -> StorageError {
     StorageError::Transient(format!(
         "{operation}: the write lost to concurrent writers for {} seconds; retry the request",
-        deadline.as_secs()
+        deadline.as_secs_f64()
     ))
 }
 
@@ -4480,13 +4501,20 @@ mod tests {
                 other => panic!("want Transient, got {other:?}"),
             }
         }
-        // The message carries the deadline that passed, not the default.
-        match contention_deadline_exhausted("PutItem", std::time::Duration::from_secs(2)) {
-            StorageError::Transient(msg) => assert!(
-                msg.contains("lost to concurrent writers for 2 seconds"),
-                "{msg}"
-            ),
-            other => panic!("want Transient, got {other:?}"),
+        // The message carries the deadline that passed, not the default, and
+        // a deadline below one second keeps its fraction.
+        for (deadline, wait) in [
+            (std::time::Duration::from_secs(2), "2 seconds"),
+            (std::time::Duration::from_millis(250), "0.25 seconds"),
+            (std::time::Duration::from_millis(1500), "1.5 seconds"),
+        ] {
+            match contention_deadline_exhausted("PutItem", deadline) {
+                StorageError::Transient(msg) => assert!(
+                    msg.contains(&format!("lost to concurrent writers for {wait};")),
+                    "{msg}"
+                ),
+                other => panic!("want Transient, got {other:?}"),
+            }
         }
     }
 
