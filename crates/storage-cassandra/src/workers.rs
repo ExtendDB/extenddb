@@ -469,6 +469,7 @@ async fn gsi_apply_index(
             &context.base_key_schema,
             &idx_sks,
             &base_sks,
+            None,
         )?;
     }
 
@@ -489,6 +490,7 @@ async fn gsi_apply_index(
             &context.base_key_schema,
             &idx_sks,
             &base_sks,
+            None,
         )?;
     }
 

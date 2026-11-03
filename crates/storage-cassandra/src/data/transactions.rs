@@ -1597,7 +1597,10 @@ impl CassandraEngine {
                     .fetch_row_for_transaction(key_info, key, Some(txn_id))
                     .await?;
                 let old_image = commit_old_image(row.item, row.created_to_prepare);
-                let version = row.version;
+                // Taken from the version read under the fence, before the
+                // commit's LWT, as the single-item delete takes its stamp
+                // (`version::delete_stamp`).
+                let delete_stamp = super::version::delete_stamp(row.version);
                 let indexes = if old_image.is_some() {
                     self.indexes_for_commit(key_info).await?
                 } else {
@@ -1711,7 +1714,7 @@ impl CassandraEngine {
                     None,
                     &indexes,
                     stream_stmt,
-                    super::version::next_row_version(version),
+                    delete_stamp,
                 )
                 .await
             }
@@ -2415,8 +2418,8 @@ impl CassandraEngine {
             }
             "DELETE" => {
                 // The stamp the index tombstones carry if this pass deletes the
-                // row: above the row's current version, as the live path's is.
-                let delete_stamp = super::version::next_row_version(
+                // row, taken from its current version as the live path's is.
+                let delete_stamp = super::version::delete_stamp(
                     self.read_version_by_pk(keyspace, &table, &op.pk, sk.as_ref())
                         .await?,
                 );

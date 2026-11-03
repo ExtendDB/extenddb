@@ -307,6 +307,7 @@ pub fn sync_indexes(
                 base_key_schema,
                 &idx_sks,
                 &base_sks,
+                None,
             )?;
         }
 
@@ -324,6 +325,7 @@ pub fn sync_indexes(
                 base_key_schema,
                 &idx_sks,
                 &base_sks,
+                None,
             )?;
         }
     }
@@ -458,8 +460,10 @@ pub(crate) async fn enqueue_async_indexes(
 
 /// Delete a row from an index table using index keys and base table keys.
 ///
-/// Adds a parameterized DELETE statement to the batch.
-/// Cassandra requires ALL PRIMARY KEY columns for DELETE.
+/// Adds a parameterized DELETE statement to the batch. Cassandra requires ALL
+/// PRIMARY KEY columns for DELETE. `stamp`, when set, is the statement's own
+/// write timestamp (`USING TIMESTAMP`); a batch that carries a timestamp of
+/// its own must pass `None`, since Cassandra refuses a batch with both.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn delete_index_row_multi(
     batch: &mut BatchQueryBuilder,
@@ -470,6 +474,7 @@ pub(crate) fn delete_index_row_multi(
     base_ks: &[KeySchemaElement],
     idx_sks: &[(&str, ScalarAttributeType)],
     base_sks: &[(&str, ScalarAttributeType)],
+    stamp: Option<i64>,
 ) -> Result<(), StorageError> {
     let idx_pk_text = composite_pk_to_text(item, index_ks)?;
     let base_pk_text = composite_pk_to_text(item, base_ks)?;
@@ -514,10 +519,17 @@ pub(crate) fn delete_index_row_multi(
         }
     }
 
+    let using = if let Some(stamp) = stamp {
+        values.insert(0, cdrs_tokio::types::value::Value::from(stamp));
+        " USING TIMESTAMP ?"
+    } else {
+        ""
+    };
     let cql = format!(
-        "DELETE FROM {}.{} WHERE {}",
+        "DELETE FROM {}.{}{} WHERE {}",
         account_keyspace,
         idx_table,
+        using,
         where_cols.join(" AND ")
     );
     let qv = cdrs_tokio::query::QueryValues::SimpleValues(values);
@@ -528,7 +540,8 @@ pub(crate) fn delete_index_row_multi(
 
 /// Insert a row into an index table with multi-part key support.
 ///
-/// Adds a parameterized INSERT statement to the batch.
+/// Adds a parameterized INSERT statement to the batch. `stamp` is the
+/// statement's own write timestamp, as for [`delete_index_row_multi`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn insert_index_row_multi(
     batch: &mut BatchQueryBuilder,
@@ -540,6 +553,7 @@ pub(crate) fn insert_index_row_multi(
     base_ks: &[KeySchemaElement],
     idx_sks: &[(&str, ScalarAttributeType)],
     base_sks: &[(&str, ScalarAttributeType)],
+    stamp: Option<i64>,
 ) -> Result<(), StorageError> {
     let idx_pk_text = composite_pk_to_text(item, index_ks)?;
     let base_pk_text = composite_pk_to_text(item, base_ks)?;
@@ -583,12 +597,19 @@ pub(crate) fn insert_index_row_multi(
     values.push(item_json.as_str().into());
 
     let placeholders = vec!["?"; cols.len()].join(", ");
+    let using = if let Some(stamp) = stamp {
+        values.push(cdrs_tokio::types::value::Value::from(stamp));
+        " USING TIMESTAMP ?"
+    } else {
+        ""
+    };
     let cql = format!(
-        "INSERT INTO {}.{} ({}) VALUES ({})",
+        "INSERT INTO {}.{} ({}) VALUES ({}){}",
         account_keyspace,
         idx_table,
         cols.join(", "),
-        placeholders
+        placeholders,
+        using
     );
     let qv = cdrs_tokio::query::QueryValues::SimpleValues(values);
     let old = std::mem::replace(batch, BatchQueryBuilder::new());

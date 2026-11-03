@@ -1709,3 +1709,258 @@ async fn a_backfill_the_recovery_worker_started_ends_before_the_worker_returns()
         "the backfill went on after the worker returned"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A delete's index tombstones are stamped from the deleted row's version.
+// ---------------------------------------------------------------------------
+
+/// The data table of the LSI `lsi_name` on `table`.
+async fn lsi_index_table(
+    engine: &CassandraEngine,
+    table: &crate::helpers::TestTable,
+    lsi_name: &str,
+) -> String {
+    use cdrs_tokio::types::IntoRustByName as _;
+    let catalog = engine.catalog_keyspace();
+    let rows = extenddb_storage_cassandra::cassandra_util::query_rows::<
+        extenddb_storage::error::StorageError,
+    >(
+        &engine.session_arc(),
+        &format!("SELECT index_id FROM {catalog}.indexes WHERE table_id = ? AND index_name = ?"),
+        cdrs_tokio::query_values!(table.key_info.table_id.as_str(), lsi_name),
+        "lsi index id",
+    )
+    .await
+    .unwrap();
+    let index_id: String = rows[0].get_r_by_name("index_id").unwrap();
+    extenddb_storage_cassandra::data::ddl::index_table_name(&index_id)
+}
+
+#[tokio::test]
+async fn test_a_delete_stamps_its_tombstones_one_above_the_deleted_version() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    // A create of the same key that commits after a delete stamps its index
+    // rows with a clock reading taken before its own LWT, and that reading can
+    // precede the delete's. The delete's tombstones therefore carry the
+    // deleted row's version + 1 rather than the clock, so an index row
+    // written at version + 2 after the delete survives it. A tombstone taken
+    // from the clock after the fence shadows that row.
+    use extenddb_core::types::ReturnValuesOnConditionCheckFailure;
+    use extenddb_storage::TransactWriteOp;
+
+    let engine = Arc::new(setup_engine().await);
+    let table =
+        crate::helpers::TestTable::with_lsi(&engine, "DeleteStampTable", "LsiPriority", "priority")
+            .await;
+    tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+    engine.process_control_plane_transitions().await.unwrap();
+    let maps = ExpressionMaps::default();
+    let keyspace = engine.account_keyspace(&table.key_info.account_id);
+    let idx_table = lsi_index_table(&engine, &table, "LsiPriority").await;
+
+    for (id, transactional) in [("by-delete-item", false), ("by-transaction", true)] {
+        engine
+            .put_item(
+                &table.key_info,
+                lsi_item(id, 1, 10, "v1"),
+                false,
+                None,
+                &maps,
+                None,
+            )
+            .await
+            .unwrap();
+        let (version, index_wt) = stamps(&engine, &table, "LsiPriority", id, 1, 10).await;
+        let version = version.expect("the put stored a version");
+        assert_eq!(index_wt, Some(version));
+
+        let mut key = Item::new();
+        key.insert("id".to_string(), AttributeValue::S(id.to_string()));
+        key.insert("sort".to_string(), AttributeValue::N("1".to_string()));
+        if transactional {
+            let ops = vec![TransactWriteOp::Delete {
+                key_info: &table.key_info,
+                key: &key,
+                condition: None,
+                maps: &maps,
+                return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+                stream: None,
+            }];
+            engine.transact_write_items(&ops, None).await.unwrap();
+        } else {
+            engine
+                .delete_item(&table.key_info, &key, false, None, &maps, None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            stamps(&engine, &table, "LsiPriority", id, 1, 10).await,
+            (None, None),
+            "{id}: the delete left the index row"
+        );
+
+        // The index row a create stamped just above the deleted version writes.
+        let cql = format!(
+            "INSERT INTO {keyspace}.{idx_table} (pk, sk_n, base_pk, base_sk_n, item_data) \
+             VALUES (?, ?, ?, ?, ?) USING TIMESTAMP ?"
+        );
+        extenddb_storage_cassandra::cassandra_util::execute::<
+            extenddb_storage::error::StorageError,
+        >(
+            &engine.session_arc(),
+            &cql,
+            cdrs_tokio::query_values!(id, 10_i64, id, 1_i64, "{}", version + 2),
+            "insert stamped index row",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stamps(&engine, &table, "LsiPriority", id, 1, 10).await.1,
+            Some(version + 2),
+            "{id}: the delete's tombstone shadows an index row stamped version + 2"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_a_delete_removes_the_index_row_a_backfill_wrote() {
+    // A backfill stamps each index row it writes with the base row's version,
+    // so the delete's version + 1 tombstone removes it. Written at coordinator
+    // time, the backfilled row would sit above that tombstone and outlive the
+    // item.
+    use cdrs_tokio::types::IntoRustByName as _;
+    use extenddb_core::types::{CreateGsiAction, GlobalSecondaryIndexUpdate, UpdateTableInput};
+    use extenddb_storage::TableEngine as _;
+    use std::time::Duration;
+
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let config = test_config();
+    let engine = Arc::new(CassandraEngine::new(&config, "us-east-1").await.unwrap());
+    let table = crate::helpers::TestTable::new(&engine, "BackfillStampTable", false).await;
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    engine.process_control_plane_transitions().await.unwrap();
+    let maps = ExpressionMaps::default();
+    let mut item = Item::new();
+    item.insert("id".to_owned(), AttributeValue::S("x".to_owned()));
+    item.insert("status".to_owned(), AttributeValue::S("s".to_owned()));
+    engine
+        .put_item(&table.key_info, item, false, None, &maps, None)
+        .await
+        .unwrap();
+    let keyspace = engine.account_keyspace(&table.key_info.account_id);
+    let data_table = format!("items_{}", table.key_info.table_id.replace('-', "_"));
+    let rows = extenddb_storage_cassandra::cassandra_util::query_rows::<
+        extenddb_storage::error::StorageError,
+    >(
+        &engine.session_arc(),
+        &format!("SELECT version FROM {keyspace}.{data_table} WHERE pk = ?"),
+        cdrs_tokio::query_values!("x"),
+        "base version",
+    )
+    .await
+    .unwrap();
+    let version: Option<i64> = rows[0].get_by_name("version").ok().flatten();
+
+    let shutdown = extenddb_storage::CancellationToken::new();
+    let _worker = extenddb_storage_cassandra::workers::spawn_gsi_backfill_recovery_for_tests(
+        engine.clone(),
+        Duration::from_secs(120),
+        Duration::from_secs(60),
+        shutdown.clone(),
+    );
+    engine
+        .update_table(
+            &table.key_info.account_id,
+            UpdateTableInput {
+                table_name: table.key_info.table_name.clone(),
+                billing_mode: None,
+                table_throughput_mode: None,
+                provisioned_throughput: None,
+                deletion_protection_enabled: None,
+                global_secondary_index_updates: Some(vec![GlobalSecondaryIndexUpdate {
+                    create: Some(CreateGsiAction {
+                        index_name: "StatusIndex".to_owned(),
+                        key_schema: vec![KeySchemaElement {
+                            attribute_name: "status".to_owned(),
+                            key_type: KeyType::Hash,
+                        }],
+                        projection: Projection {
+                            projection_type: ProjectionType::All,
+                            non_key_attributes: None,
+                        },
+                        provisioned_throughput: None,
+                    }),
+                    update: None,
+                    delete: None,
+                }]),
+                attribute_definitions: Some(vec![
+                    AttributeDefinition {
+                        attribute_name: "id".to_owned(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                    AttributeDefinition {
+                        attribute_name: "status".to_owned(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                ]),
+                stream_specification: None,
+                table_class: None,
+                on_demand_throughput: None,
+                vector_index_updates: None,
+            },
+        )
+        .await
+        .expect("add the index");
+
+    let table_id = table.key_info.table_id.clone();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let index_id = loop {
+        engine.process_control_plane_transitions().await.unwrap();
+        let (status, _, index_id) = index_state(&engine, &table_id, "StatusIndex").await;
+        if status == "ACTIVE" {
+            break index_id;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the index is still {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    // Synchronous, so the delete writes its tombstone instead of queueing it.
+    set_gsi_delay(&engine, &table_id, "StatusIndex", 0).await;
+    let idx_table = extenddb_storage_cassandra::data::ddl::index_table_name(&index_id);
+    let rows = extenddb_storage_cassandra::cassandra_util::query_rows::<
+        extenddb_storage::error::StorageError,
+    >(
+        &engine.session_arc(),
+        &format!("SELECT WRITETIME(item_data) AS wt FROM {keyspace}.{idx_table}"),
+        cdrs_tokio::query_values!(),
+        "backfilled row stamp",
+    )
+    .await
+    .unwrap();
+    let backfilled: Option<i64> = rows
+        .first()
+        .and_then(|row| row.get_by_name("wt").ok().flatten());
+    assert_eq!(
+        backfilled, version,
+        "the backfilled row is not stamped with the version"
+    );
+
+    let mut key = Item::new();
+    key.insert("id".to_owned(), AttributeValue::S("x".to_owned()));
+    engine
+        .delete_item(&table.key_info, &key, false, None, &maps, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        index_rows(&engine, &keyspace, &index_id).await,
+        0,
+        "the backfilled index row outlived the deleted item"
+    );
+    shutdown.cancel();
+}

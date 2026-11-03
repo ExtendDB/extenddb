@@ -20,8 +20,13 @@
 //! The value is therefore `max(previous + 1, now)` in microseconds since the
 //! epoch. It is strictly increasing across the row's history by the `+ 1`,
 //! and it stays in the same domain as the wall-clock timestamps Cassandra
-//! assigns to writes that carry none (index backfill, legacy rows, TTL
-//! expiration), so those writes keep their relative order against it.
+//! assigns to writes that carry none (legacy rows, TTL expiration), so those
+//! writes keep their relative order against it.
+//!
+//! A delete leaves no version behind, so the create that follows it has no
+//! `previous` and stamps its index rows with its own clock reading, taken
+//! before its LWT. The delete's index tombstones are therefore stamped from
+//! the deleted row's version rather than from the clock ([`delete_stamp`]).
 //!
 //! A row that a transaction created under the earlier scheme carries a null
 //! `version`. Readers keep that as `None`, the fence binds a null (which
@@ -45,6 +50,37 @@ pub fn next_row_version_at(previous: Option<i64>, now: i64) -> i64 {
     match previous {
         Some(previous) => previous.saturating_add(1).max(now),
         None => now,
+    }
+}
+
+/// Versions at or above this value are clock readings this scheme stored. A
+/// row last written before the scheme carries a null or a write counter, and a
+/// counter starts at 1 and does not reach 10^15 (September 2001 in
+/// microseconds since the epoch).
+pub const CLOCK_VERSION_FLOOR: i64 = 1_000_000_000_000_000;
+
+/// The write timestamp of the index tombstones that a delete of a row whose
+/// version was read as `previous` writes. The delete takes it before its fence.
+///
+/// Every index row of a row this scheme wrote carries a stamp no greater than
+/// `previous`, so `previous + 1` removes all of them whenever the delete runs.
+/// A create of the same key that commits after the delete stamps its index
+/// rows with a clock reading taken before its own LWT. When the create was
+/// sent after the write that stored `previous`, that reading exceeds
+/// `previous + 1` and the create's rows land above the tombstones, even when
+/// the create read its clock before the delete did. A stamp read from the
+/// clock after the fence ordered the two by their clock readings instead, and
+/// a create that read its clock first and committed second lost its index
+/// rows. A create that read its clock before the write that stored `previous`
+/// can still land under the tombstones; ADR-0027 records that case.
+///
+/// A row with a null or counter version has index rows stamped with
+/// coordinator time, which `previous + 1` does not exceed, so its delete takes
+/// the clock.
+pub fn delete_stamp(previous: Option<i64>) -> i64 {
+    match previous {
+        Some(previous) if previous >= CLOCK_VERSION_FLOOR => previous.saturating_add(1),
+        _ => now_micros(),
     }
 }
 
@@ -90,6 +126,24 @@ mod tests {
     #[test]
     fn the_largest_version_does_not_wrap() {
         assert_eq!(next_row_version_at(Some(i64::MAX), 1), i64::MAX);
+    }
+
+    #[test]
+    fn a_row_this_scheme_wrote_is_deleted_one_above_its_version() {
+        let version = 1_762_000_000_000_000;
+        assert_eq!(delete_stamp(Some(version)), version + 1);
+        assert_eq!(
+            delete_stamp(Some(CLOCK_VERSION_FLOOR)),
+            CLOCK_VERSION_FLOOR + 1
+        );
+    }
+
+    #[test]
+    fn a_row_with_a_counter_or_null_version_is_deleted_at_the_clock() {
+        let before = now_micros();
+        assert!(delete_stamp(Some(7)) >= before);
+        assert!(delete_stamp(Some(CLOCK_VERSION_FLOOR - 1)) >= before);
+        assert!(delete_stamp(None) >= before);
     }
 
     #[test]

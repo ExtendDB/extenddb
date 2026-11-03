@@ -7,9 +7,10 @@ On Amazon DynamoDB an index never reports an item the base table does not
 hold, and never misses one it does, once the index has caught up. The tests
 here pin that for each way an item can change: a write that keeps the index
 key, a write that moves it, a transactional Put, Update and Delete, a
-concurrent delete and put of one key, and ordinary writes on an item that a
-transaction created. The LSI is read with ConsistentRead; the GSI is polled
-because it is eventually consistent on Amazon DynamoDB.
+concurrent delete and put of one key, a delete racing a conditional create of
+the same key and index row, and ordinary writes on an item that a transaction
+created. The LSI is read with ConsistentRead; the GSI is polled because it is
+eventually consistent on Amazon DynamoDB.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from botocore.exceptions import ClientError
 
 from conftest import scoped_table
 
-RACE_ROUNDS = 25
+RACE_ROUNDS = 40
 WRITERS = 2
 
 
@@ -37,22 +38,25 @@ def _k(name: str, kind: str) -> dict:
     return {"AttributeName": name, "KeyType": kind}
 
 
-@pytest.fixture(scope="module")
-def raw_client(endpoint_url):
+def _raw_client(endpoint_url):
     """A client that never retries, so every failure is seen."""
     kwargs: dict = {
         "service_name": "dynamodb",
         "region_name": os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
-        "config": Config(
-            retries={"total_max_attempts": 1, "mode": "standard"},
-            max_pool_connections=WRITERS * 2,
-        ),
+        "config": Config(retries={"total_max_attempts": 1, "mode": "standard"}),
     }
     if endpoint_url:
         kwargs["endpoint_url"] = endpoint_url
         if endpoint_url.startswith("https://"):
             kwargs["verify"] = False
     return boto3.client(**kwargs)
+
+
+@pytest.fixture(scope="module")
+def raw_clients(endpoint_url):
+    """One non-retrying client per racing writer, so the writers share no
+    connection pool."""
+    return [_raw_client(endpoint_url) for _ in range(WRITERS)]
 
 
 @pytest.fixture(scope="module")
@@ -260,12 +264,35 @@ class TestOrdinaryWritesOnATransactionCreatedItem:
         )
 
 
+def _race(round_number: int, delete, write) -> None:
+    """Run `delete` and `write` on two threads released together. Odd rounds
+    hold the delete back a little and even rounds the write, so both orders
+    of arrival occur over a run."""
+    barrier = threading.Barrier(WRITERS)
+    lead = 0.002 if round_number % 2 else 0.0
+
+    def run(call, wait):
+        barrier.wait()
+        time.sleep(wait)
+        call()
+
+    threads = [
+        threading.Thread(target=run, args=(delete, lead)),
+        threading.Thread(target=run, args=(write, 0.002 - lead)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+
 def test_a_delete_racing_a_put_leaves_the_index_agreeing_with_the_base_item(
-    dynamodb_client, raw_client, indexed_table
+    dynamodb_client, raw_clients, indexed_table
 ):
     """Whichever of a DeleteItem and a PutItem on one key lands last, the LSI
     reports the item exactly when the base table holds it, with its lk."""
     disagreements = []
+    put_last = delete_last = 0
     for n in range(RACE_ROUNDS):
         pk = f"race-{n}"
         dynamodb_client.put_item(TableName=indexed_table, Item=_item(pk, "1", "old", f"g-{pk}", "v1"))
@@ -273,26 +300,113 @@ def test_a_delete_racing_a_put_leaves_the_index_agreeing_with_the_base_item(
 
         def put():
             try:
-                raw_client.put_item(TableName=indexed_table, Item=_item(pk, "1", "new", f"g-{pk}", "v2"))
+                raw_clients[0].put_item(TableName=indexed_table, Item=_item(pk, "1", "new", f"g-{pk}", "v2"))
             except ClientError as e:  # pragma: no cover - reported below
                 errors.append(e)
 
         def delete():
             try:
-                raw_client.delete_item(TableName=indexed_table, Key={"pk": {"S": pk}, "sk": {"S": "1"}})
+                raw_clients[1].delete_item(TableName=indexed_table, Key={"pk": {"S": pk}, "sk": {"S": "1"}})
             except ClientError as e:  # pragma: no cover - reported below
                 errors.append(e)
 
-        threads = [threading.Thread(target=put), threading.Thread(target=delete)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+        _race(n, delete, put)
         assert not errors, [e.response["Error"] for e in errors]
 
         base = _base(dynamodb_client, indexed_table, pk, "1")
+        if base:
+            put_last += 1
+        else:
+            delete_last += 1
         want = [(base["lk"]["S"], base["data"]["S"])] if base else []
         got = _lsi(dynamodb_client, indexed_table, pk)
         if got != want:
             disagreements.append((pk, want, got))
     assert not disagreements, f"LSI disagrees with the base table (pk, base, lsi): {disagreements}"
+    assert put_last and delete_last, f"one order never happened: put last {put_last}, delete last {delete_last}"
+
+
+@pytest.mark.parametrize("delete_with", ["DeleteItem", "TransactWriteItems"])
+def test_a_delete_racing_a_create_of_the_same_index_row_leaves_the_indexes_agreeing(
+    dynamodb_client, raw_clients, indexed_table, delete_with
+):
+    """A delete races a PutItem that creates the same key under
+    attribute_not_exists(pk), with the same lk and gk as the deleted item, so
+    both writers address the same LSI and GSI rows. When the create lands
+    after the delete, both indexes report the new item; when it lands first,
+    its condition fails, the delete removes the item, and both indexes are
+    empty.
+
+    A transaction answers later than a DeleteItem, so a create sent once next
+    to it lands while the item still exists. Against a transaction the create
+    is resent until it succeeds or the delete has answered, with one last
+    attempt after the answer, so the rounds reach the create that commits
+    after the delete."""
+    disagreements = []
+    created = refused = 0
+    resend = delete_with == "TransactWriteItems"
+    for n in range(RACE_ROUNDS):
+        pk = f"same-row-{delete_with}-{n}"
+        gk = f"g-{pk}"
+        dynamodb_client.put_item(TableName=indexed_table, Item=_item(pk, "1", "same", gk, "v1"))
+        outcome: dict[str, str] = {}
+        key = {"pk": {"S": pk}, "sk": {"S": "1"}}
+        answered = threading.Event()
+
+        def create():
+            last = False
+            while True:
+                try:
+                    raw_clients[0].put_item(
+                        TableName=indexed_table,
+                        Item=_item(pk, "1", "same", gk, "v2"),
+                        ConditionExpression="attribute_not_exists(pk)",
+                    )
+                    outcome["create"] = "ok"
+                    return
+                except ClientError as e:
+                    outcome["create"] = e.response["Error"]["Code"]
+                if not resend or last:
+                    return
+                last = answered.is_set()
+
+        def delete():
+            try:
+                if delete_with == "DeleteItem":
+                    raw_clients[1].delete_item(TableName=indexed_table, Key=key)
+                else:
+                    raw_clients[1].transact_write_items(
+                        TransactItems=[{"Delete": {"TableName": indexed_table, "Key": key}}]
+                    )
+                outcome["delete"] = "ok"
+            except ClientError as e:
+                outcome["delete"] = e.response["Error"]["Code"]
+            finally:
+                answered.set()
+
+        _race(n, delete, create)
+        # A request that meets the other one in flight on the item can be
+        # refused with a conflict; the indexes must agree with the base table
+        # whatever each request answered.
+        assert outcome["delete"] in ("ok", "TransactionCanceledException"), outcome
+        assert outcome["create"] in (
+            "ok",
+            "ConditionalCheckFailedException",
+            "TransactionConflictException",
+        ), outcome
+        if outcome["create"] == "ok":
+            created += 1
+        else:
+            refused += 1
+
+        base = _base(dynamodb_client, indexed_table, pk, "1")
+        want_lsi = [("same", base["data"]["S"])] if base else []
+        want_gsi = [("1", base["data"]["S"])] if base else []
+        got_lsi = _lsi(dynamodb_client, indexed_table, pk)
+        got_gsi = _gsi(dynamodb_client, indexed_table, gk, want_gsi)
+        if (got_lsi, got_gsi) != (want_lsi, want_gsi):
+            disagreements.append((pk, outcome, want_lsi, got_lsi, got_gsi))
+    assert not disagreements, f"an index disagrees with the base table: {disagreements}"
+    assert created, f"no create landed after the delete in {RACE_ROUNDS} rounds"
+    if not resend:
+        assert refused, f"no create landed before the delete in {RACE_ROUNDS} rounds"

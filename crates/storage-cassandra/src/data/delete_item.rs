@@ -290,6 +290,10 @@ impl CassandraEngine {
                 let Some(old_item) = old_item_opt else {
                     return Ok(None);
                 };
+                // Taken from the version read above, before the fence, so a
+                // create of this key that commits after the delete stamps its
+                // index rows above these tombstones (`version::delete_stamp`).
+                let stamp = super::version::delete_stamp(version);
                 self.update_partition_max_delete_timestamp_at(
                     &data_keyspace,
                     &ddb_table,
@@ -320,7 +324,7 @@ impl CassandraEngine {
                         Some(&old_item),
                         stream,
                         sys_delay,
-                        super::version::next_row_version(version),
+                        stamp,
                     )
                     .await?;
                 }
@@ -543,6 +547,7 @@ impl CassandraEngine {
                 let Some(old_item) = old_item_opt else {
                     return Ok(None);
                 };
+                let stamp = super::version::delete_stamp(version);
                 self.update_partition_max_delete_timestamp_at(
                     &data_keyspace,
                     &ddb_table,
@@ -570,7 +575,7 @@ impl CassandraEngine {
                         Some(&old_item),
                         stream,
                         sys_delay,
-                        super::version::next_row_version(version),
+                        stamp,
                     )
                     .await?;
                 }
@@ -1487,9 +1492,10 @@ impl CassandraEngine {
     /// Run the secondary-effects LOGGED BATCH (index removals + stream record)
     /// after an OCC LWT has already deleted the base row.
     ///
-    /// `stamp` is the write timestamp of the batch: the version domain value
-    /// for this deletion (`data::version`), above every index row the deleted
-    /// item ever wrote, so the tombstones win however late they arrive.
+    /// `stamp` is the write timestamp of the batch, from
+    /// [`super::version::delete_stamp`]: above every index row the deleted
+    /// item wrote, so the tombstones win however late they arrive, and below
+    /// the index rows of a create that commits after the delete.
     ///
     /// Only called when `!indexes.is_empty() || stream.is_some()`.
     #[allow(clippy::too_many_arguments)]
