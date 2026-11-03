@@ -277,6 +277,15 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
     }
     let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        // A deeply nested but valid request body is parsed, converted to typed
+        // AttributeValues, and dropped on a worker thread, each step recursing
+        // to the body's depth. The request parser caps nesting at 5200
+        // structural levels (about 2600 document wrappers; extenddb-server's
+        // request_parse). Measured 2026-11-02 (debug): an 8 MiB stack overflows
+        // past about 1500 wrappers, while 32 MiB handles the ceiling and a 5500
+        // wrapper body besides. Give each worker 32 MiB, well above the 2 MiB
+        // default.
+        .thread_stack_size(32 * 1024 * 1024)
         .build()?
         .block_on(extenddb_server::serve(params));
     // `serve` has printed the refusal; end with its code, which `migrate`
