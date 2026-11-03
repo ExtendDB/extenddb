@@ -90,7 +90,7 @@ pub use layout::{
     trim_backup_arn,
 };
 pub use manifest::{
-    CURRENT_FORMAT_VERSION, DataFileEntry, DataFileReader, ExtenddbManifest, ItemOrder, KeyRange,
-    KeyRangeCheck, KeyRangeTracker, SnapshotDescriptor, SourceTableSchema, check_format_version,
-    verify_manifest_checksum,
+    BackupGsi, BackupLsi, CURRENT_FORMAT_VERSION, DataFileEntry, DataFileReader, ExtenddbManifest,
+    ItemOrder, KeyRange, KeyRangeCheck, KeyRangeTracker, SnapshotDescriptor, SourceTableSchema,
+    check_format_version, verify_manifest_checksum,
 };
