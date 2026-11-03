@@ -110,6 +110,8 @@ mod ttl;
 #[cfg(test)]
 mod unicode;
 #[cfg(test)]
+mod update_arithmetic_result;
+#[cfg(test)]
 mod update_expressions;
 #[cfg(test)]
 mod update_expressions_more;
