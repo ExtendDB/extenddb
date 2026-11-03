@@ -280,7 +280,7 @@ impl CassandraEngine {
         sk: Option<&extenddb_storage::util::SortKeyValue>,
         sk_col: Option<&'static str>,
         ttl_enabled: bool,
-    ) -> Result<(Option<Item>, i64), StorageError> {
+    ) -> Result<(Option<Item>, Option<i64>), StorageError> {
         use cdrs_tokio::types::IntoRustByName as _;
 
         let row_opt = if let (Some(sk), Some(sk_col)) = (sk, sk_col) {
@@ -309,7 +309,7 @@ impl CassandraEngine {
         };
 
         let Some(row) = row_opt else {
-            return Ok((None, 0));
+            return Ok((None, None));
         };
 
         let prepared_txn_id: Option<uuid::Uuid> = row.get_by_name("prepared_txn_id").ok().flatten();
@@ -319,7 +319,7 @@ impl CassandraEngine {
 
         // Static partition metadata can produce a physical row with no logical item.
         let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
-        let version: i64 = row.get_by_name("version").ok().flatten().unwrap_or(0);
+        let version: Option<i64> = row.get_by_name("version").ok().flatten();
 
         Ok((item_data.map(json_to_item).transpose()?, version))
     }
@@ -337,7 +337,7 @@ impl CassandraEngine {
         sk: Option<&extenddb_storage::util::SortKeyValue>,
         sk_col: Option<&'static str>,
         item_json_str: &str,
-        version: i64,
+        version: Option<i64>,
         item_existed: bool,
         indexes: &[super::index::IndexMeta],
         key_info: &TableKeyInfo,
@@ -363,7 +363,13 @@ impl CassandraEngine {
             )
         });
 
-        let next_version = version + 1;
+        // The version this write stores, and the write timestamp of the index
+        // rows it produces (see `data::version`). On the claimed path the clock
+        // reading is the mutation timestamp pinned right after the claim.
+        let next_version = super::version::next_row_version_at(
+            version,
+            mutation_timestamp.unwrap_or_else(super::version::now_micros),
+        )?;
 
         // Build the LWT statement used when no TTL claim owns the existing row.
         let (lwt_cql, lwt_qv) = if item_existed {
@@ -378,7 +384,7 @@ impl CassandraEngine {
                     next_version.into(),
                     cdrs_tokio::types::value::Value::from(pk_text),
                     super::index::sk_to_value(sk),
-                    version.into(),
+                    super::version::fence_value(version),
                 ];
                 (cql, cdrs_tokio::query::QueryValues::SimpleValues(vals))
             } else {
@@ -390,29 +396,31 @@ impl CassandraEngine {
                     item_json_str.into(),
                     next_version.into(),
                     cdrs_tokio::types::value::Value::from(pk_text),
-                    version.into(),
+                    super::version::fence_value(version),
                 ];
                 (cql, cdrs_tokio::query::QueryValues::SimpleValues(vals))
             }
         } else if let (Some(sk), Some(sk_col)) = (sk, sk_col) {
             let cql = format!(
-                "UPDATE {data_keyspace}.{ddb_table} SET item_data = ?, version = 1 \
+                "UPDATE {data_keyspace}.{ddb_table} SET item_data = ?, version = ? \
                  WHERE pk = ? AND {sk_col} = ? \
                  IF item_data = null AND prepared_txn_id = null"
             );
             let vals = vec![
                 item_json_str.into(),
+                next_version.into(),
                 cdrs_tokio::types::value::Value::from(pk_text),
                 super::index::sk_to_value(sk),
             ];
             (cql, cdrs_tokio::query::QueryValues::SimpleValues(vals))
         } else {
             let cql = format!(
-                "UPDATE {data_keyspace}.{ddb_table} SET item_data = ?, version = 1 \
+                "UPDATE {data_keyspace}.{ddb_table} SET item_data = ?, version = ? \
                  WHERE pk = ? IF item_data = null AND prepared_txn_id = null"
             );
             let vals = vec![
                 item_json_str.into(),
+                next_version.into(),
                 cdrs_tokio::types::value::Value::from(pk_text),
             ];
             (cql, cdrs_tokio::query::QueryValues::SimpleValues(vals))
@@ -435,12 +443,19 @@ impl CassandraEngine {
 
         // Cassandra cannot mix an LWT with non-LWT statements in one batch. For a
         // claimed row, the exact claim is the fence and the base write joins this
-        // LOGGED BATCH. For an unclaimed row, the LWT above commits first and this
-        // batch durably records all secondary effects and reconciliation work.
+        // LOGGED BATCH at the pinned mutation timestamp: the claim cells it
+        // clears must not land above a later claim's Paxos timestamp, so the
+        // batch stays on the wall clock and the claim serializes the writers.
+        // For an unclaimed row, the LWT above commits first and this batch
+        // durably records all secondary effects and reconciliation work. Its
+        // index statements carry the version that LWT stored, so index rows
+        // resolve in base-row commit order, and its queue rows and stream
+        // record keep Cassandra's timestamp (`data::version`).
         let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
         if let Some(timestamp) = mutation_timestamp {
             batch = batch.with_timestamp(timestamp);
         }
+        let index_stamp = mutation_timestamp.is_none().then_some(next_version);
 
         if ttl_claim.is_some() {
             let (update_cql, update_qv) = if let (Some(sk), Some(sk_col)) = (sk, sk_col) {
@@ -472,7 +487,7 @@ impl CassandraEngine {
         }
 
         if !indexes.is_empty() {
-            super::index::sync_indexes(
+            super::index::sync_indexes_at(
                 &mut batch,
                 data_keyspace,
                 &key_info.key_schema,
@@ -481,6 +496,7 @@ impl CassandraEngine {
                 pre_mutation_item,
                 Some(new_item),
                 sys_delay,
+                index_stamp,
             )?;
         }
 
@@ -496,6 +512,7 @@ impl CassandraEngine {
                 pre_mutation_item,
                 Some(new_item),
                 sys_delay,
+                next_version,
             )
             .await?
         };
