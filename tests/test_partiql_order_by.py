@@ -13,6 +13,11 @@ DESC. Within a partition the items follow the path that names the sort key,
 and descend when no path names it: `ORDER BY pk` reads the items of a
 partition in descending order.
 
+Among the checks of the WHERE, a path into a key attribute comes first, then
+a path in the list that is not a key attribute, then the key values, then
+more than one partition key value without the partition key in the list,
+then overlapping disjuncts and the number of disjuncts.
+
 Dual-target: EXTENDDB_TEST_ENDPOINT selects an extenddb server; unset, the
 tests run against the live service with the default credential chain. The
 assertions are identical on both. Every expected value was measured on the
@@ -39,6 +44,15 @@ HASH_KEY = (
     "WHERE clause."
 )
 OVERLAP = "Overlapping conditions with range keys are not supported in where clause"
+SCALAR = (
+    "Key attributes must be scalars; list random access '[]' and map lookup '.' are not "
+    "allowed: Key pk"
+)
+VALUES_51 = ", ".join(f"'v{i:03}'" for i in range(51))
+
+
+def _key_type(name):
+    return f"Key attribute's data type should match its data type in table's schema: Key {name}"
 
 
 def _attribute(name):
@@ -237,6 +251,54 @@ def test_partitions_follow_the_partition_key(dynamodb_client, five, order, keys)
 def test_each_path_takes_a_direction_one_item_a_page(dynamodb_client, four, order, keys):
     statement = f"SELECT * FROM \"{four}\" WHERE pk IN ['a', 'b'] ORDER BY {order}"
     assert _read(dynamodb_client, statement, Limit=1) == keys
+
+
+@pytest.mark.parametrize(
+    ("where", "by_n", "by_sk"),
+    [
+        ("pk.x = 1", SCALAR, SCALAR),
+        ("pk = 1", _attribute("n"), _key_type("pk")),
+        ("(pk = 'a' OR pk = 'a')", _attribute("n"), OVERLAP),
+        ("(pk = 'a' OR pk = 'b' OR pk = 'a')", _attribute("n"), HASH_KEY),
+        (f"pk IN [{VALUES_51}]", _attribute("n"), HASH_KEY),
+        ("pk IN ['a', 1]", _attribute("n"), _key_type("pk")),
+        ("pk = 'a' AND sk = 1", _attribute("n"), _key_type("sk")),
+        ("pk = 'a' AND (sk = 'x' OR sk > 'a')", _attribute("n"), OVERLAP),
+    ],
+    ids=[
+        "key-path",
+        "key-type",
+        "overlap",
+        "overlap-two-keys",
+        "51-disjuncts",
+        "key-type-in-an-in",
+        "sort-key-type",
+        "sort-key-overlap",
+    ],
+)
+def test_the_order_by_refusals_sit_among_the_key_checks(dynamodb_client, five, where, by_n, by_sk):
+    # A path into a key comes first, then a term that is not a key
+    # attribute, then the key values, then more than one partition key value
+    # without the partition key in the list, then overlapping disjuncts and
+    # the number of disjuncts.
+    for order, result in (("n", by_n), ("sk", by_sk)):
+        statement = f'SELECT * FROM "{five}" WHERE {where} ORDER BY {order}'
+        assert _read(dynamodb_client, statement) == result, order
+
+
+@pytest.mark.parametrize(
+    ("clause", "result"),
+    [
+        ("ORDER BY pk.x", NO_WHERE),
+        ("WHERE n = 1 ORDER BY n", _attribute("n")),
+        ("WHERE pk = 1 OR pk = 1", _key_type("pk")),
+        ("WHERE pk.x = 1 AND pk = 1", SCALAR),
+    ],
+)
+def test_the_key_checks_keep_their_order_with_and_without_an_order_by(
+    dynamodb_client, five, clause, result
+):
+    assert _read(dynamodb_client, f'SELECT * FROM "{five}" {clause}') == result
 
 
 def test_a_list_that_ends_in_a_comma_is_an_unexpected_term(dynamodb_client, four):
