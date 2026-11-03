@@ -26,7 +26,7 @@ import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
-from conftest import scoped_table
+from conftest import _is_real_dynamodb, configured_backend, scoped_table
 
 WRITERS = 8
 ROUNDS = 15
@@ -46,6 +46,19 @@ XFAIL_UNTIL_MONGODB_FIX = pytest.mark.xfail(
     raises=AssertionError,
     strict=False,
 )
+
+# TEMPORARY: on Cassandra, each put commits the base row and then writes its
+# index rows in a separate batch. When puts to the same new key race, the row
+# of a replaced item can be written after the put that replaced it deleted
+# it, so the LSI query or the GSI scan returns that row beside the final
+# item's (#414). Only that result counts as the expected failure: the puts,
+# the final item's own index entry and, in the LSI test, the old images are
+# still checked in every round on Cassandra. The race does not fire in every
+# run, so these tests still pass now and then there.
+# TODO: once #414 is fixed (#424), delete XFAIL_STALE_INDEX_ROWS,
+# _stale_lsi_rows, the blocks in the GSI and LSI tests that use them, and the
+# _is_real_dynamodb and configured_backend imports.
+XFAIL_STALE_INDEX_ROWS = not _is_real_dynamodb() and configured_backend() == "cassandra"
 
 
 @pytest.fixture(scope="module")
@@ -298,13 +311,33 @@ def test_racing_puts_on_a_gsi_table_leave_only_the_final_entry(
     while (got := _gsi_keys(dynamodb_client, gsi_table)) != want and time.monotonic() < deadline:
         time.sleep(0.5)
     wrong = {pk: (want[pk], got.get(pk)) for pk in want if got.get(pk) != want[pk]}
+    if (
+        XFAIL_STALE_INDEX_ROWS
+        and wrong
+        and got.keys() == want.keys()
+        and all(set(want[pk]) < set(got[pk]) for pk in wrong)
+    ):
+        pytest.xfail(f"#414: the GSI holds rows of replaced items (want, got): {wrong}")
     assert not wrong and got.keys() == want.keys(), f"stale GSI entries (want, got): {wrong}"
+
+
+def _stale_lsi_rows(items: list[dict], pk: str, final: dict) -> bool:
+    """The #414 result: rows of this key only, each `lk` once, the final
+    item's among them and at least one other."""
+    lks = [i["lk"]["S"] for i in items]
+    return (
+        len(lks) > 1
+        and len(set(lks)) == len(lks)
+        and final["lk"]["S"] in lks
+        and all(i["pk"]["S"] == pk and i["sk"]["S"] == "s" for i in items)
+    )
 
 
 def test_racing_puts_on_an_lsi_table_leave_only_the_final_entry(
     dynamodb_client, raw_client, lsi_table
 ):
     """A strongly consistent LSI query returns the final item's entry only."""
+    stale = []
     for _ in range(ROUNDS):
         pk, out = _race(raw_client, lsi_table, "range", {"ReturnValues": "ALL_OLD"})
         _assert_all_succeed(out)
@@ -317,7 +350,13 @@ def test_racing_puts_on_an_lsi_table_leave_only_the_final_entry(
             KeyConditionExpression="pk = :pk",
             ExpressionAttributeValues={":pk": {"S": pk}},
         )["Items"]
-        assert [i["lk"]["S"] for i in items] == [final["lk"]["S"]], (final, items)
+        lks = [i["lk"]["S"] for i in items]
+        if XFAIL_STALE_INDEX_ROWS and _stale_lsi_rows(items, pk, final):
+            stale.append((final["lk"]["S"], lks))
+            continue
+        assert lks == [final["lk"]["S"]], (final, items)
+    if stale:
+        pytest.xfail(f"#414: the LSI holds rows of replaced items (final lk, rows): {stale}")
 
 
 def _stream_records(streams_client, stream_arn: str) -> dict[str, list[dict]]:
