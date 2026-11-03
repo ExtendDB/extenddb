@@ -44,6 +44,9 @@ pub type RoleListEntry = (
     serde_json::Value,
     time::OffsetDateTime,
 );
+/// A stored policy document as the resource-tag migration reads it: the
+/// decoded document, or the text of the error the store met decoding it.
+pub type StoredDocument = Result<serde_json::Value, String>;
 
 // ── Settings store ─────────────────────────────────────────────────────
 
@@ -350,6 +353,36 @@ pub trait ManagementStore: Send + Sync {
         principal_name: &str,
     ) -> BoxFuture<'_, OpResult<Vec<(String, serde_json::Value, time::OffsetDateTime)>>>;
 
+    /// List a principal's policies for the resource-tag migration as
+    /// `(policy_name, document)`, decoding each document on its own: a
+    /// document the store cannot decode comes back as its decode error, and
+    /// the principal's other policies are still read.
+    ///
+    /// The default reads [`list_policies`](Self::list_policies), which fails
+    /// the whole list on a document it cannot decode. A backend that stores
+    /// documents as text overrides this.
+    fn list_policy_documents(
+        &self,
+        account_id: &str,
+        principal_type: &str,
+        principal_name: &str,
+    ) -> BoxFuture<'_, OpResult<Vec<(String, StoredDocument)>>> {
+        let (account_id, principal_type, principal_name) = (
+            account_id.to_owned(),
+            principal_type.to_owned(),
+            principal_name.to_owned(),
+        );
+        Box::pin(async move {
+            let policies = self
+                .list_policies(&account_id, &principal_type, &principal_name)
+                .await?;
+            Ok(policies
+                .into_iter()
+                .map(|(name, document, _created)| (name, Ok(document)))
+                .collect())
+        })
+    }
+
     // ── Permissions boundaries ─────────────────────────────────────
 
     /// Set (upsert) a permissions boundary on a user.
@@ -395,6 +428,38 @@ pub trait ManagementStore: Send + Sync {
         account_id: &str,
         role_name: &str,
     ) -> BoxFuture<'_, OpResult<()>>;
+
+    /// The permissions boundary of a user or a role (`principal_type`
+    /// `user` or `role`) for the resource-tag migration: `None` when it has
+    /// none, else the decoded document or the text of the error the store
+    /// met decoding it.
+    ///
+    /// The default reads [`get_user_boundary`](Self::get_user_boundary) or
+    /// [`get_role_boundary`](Self::get_role_boundary), which fail on a
+    /// document they cannot decode. A backend that stores documents as text
+    /// overrides this.
+    fn boundary_document(
+        &self,
+        account_id: &str,
+        principal_type: &str,
+        principal_name: &str,
+    ) -> BoxFuture<'_, OpResult<Option<StoredDocument>>> {
+        let (account_id, principal_type, principal_name) = (
+            account_id.to_owned(),
+            principal_type.to_owned(),
+            principal_name.to_owned(),
+        );
+        Box::pin(async move {
+            let boundary = match principal_type.as_str() {
+                "user" => self.get_user_boundary(&account_id, &principal_name).await,
+                "role" => self.get_role_boundary(&account_id, &principal_name).await,
+                other => Err(OpError::Validation(format!(
+                    "a permissions boundary belongs to a user or a role, not a {other}"
+                ))),
+            }?;
+            Ok(boundary.map(Ok))
+        })
+    }
 
     // ── Access keys ────────────────────────────────────────────────
 
