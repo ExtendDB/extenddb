@@ -63,6 +63,8 @@ mod visits;
 /// for an invalid target, missing table/index, a GSI strong read, a parameter
 /// count mismatch, or a `NextToken` that does not match the statement, and
 /// the statement's refusal.
+// The checks follow the service's order; helpers would split that order across functions.
+#[allow(clippy::too_many_lines)]
 pub(super) async fn run(
     ctx: &OperationContext,
     stmt: &SelectStatement,
@@ -320,7 +322,7 @@ pub(super) async fn run(
         None => dispatched,
     };
 
-    let mut response = shape_response(dispatched, req, &stmt.projection)?;
+    let mut response = shape_response(dispatched, req, &stmt.projection);
     if let (Some(key), Value::Object(body)) = (last_key, &mut response.body) {
         body.insert("LastEvaluatedKey".to_owned(), key);
     }

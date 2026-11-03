@@ -156,9 +156,8 @@ fn parse_attempt(
     inline: bool,
 ) -> Option<PResult<Statement>> {
     // A lexing failure carries nothing after the prefix (see the lexer).
-    let tokens = match lex(input) {
-        Ok(tokens) => tokens,
-        Err(_) => return Some(Err(ParseError::well_formed(""))),
+    let Ok(tokens) = lex(input) else {
+        return Some(Err(ParseError::well_formed("")));
     };
     let mut p = Parser {
         tokens,
@@ -199,6 +198,8 @@ fn parse_attempt(
     Some(p.resolve(result))
 }
 
+// Each flag records one independent fact about the request or the parse so far.
+#[allow(clippy::struct_excessive_bools)]
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,

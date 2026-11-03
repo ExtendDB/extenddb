@@ -210,22 +210,8 @@ pub(super) fn split<'a>(
             let complete = left.complete
                 && right.complete
                 && left.branches.len().saturating_mul(right.branches.len()) <= MAX_BRANCHES;
-            let mut branches = Vec::new();
-            'product: for l in &left.branches {
-                for r in &right.branches {
-                    if branches.len() == MAX_BRANCHES {
-                        break 'product;
-                    }
-                    let mut conjuncts = l.conjuncts.clone();
-                    conjuncts.extend(r.conjuncts.iter().copied());
-                    branches.push(Branch {
-                        conjuncts,
-                        has_key: l.has_key || r.has_key,
-                    });
-                }
-            }
             Split {
-                branches,
+                branches: product(&left.branches, &right.branches),
                 complete,
                 tally: left.tally.and(right.tally, value_of),
             }
@@ -289,6 +275,26 @@ pub(super) fn split<'a>(
     }
 }
 
+/// The disjuncts of an AND: each disjunct of one side with each disjunct of
+/// the other, in statement order, the first [`MAX_BRANCHES`] of them.
+fn product<'a>(left: &[Branch<'a>], right: &[Branch<'a>]) -> Vec<Branch<'a>> {
+    let mut branches = Vec::new();
+    'product: for l in left {
+        for r in right {
+            if branches.len() == MAX_BRANCHES {
+                break 'product;
+            }
+            let mut conjuncts = l.conjuncts.clone();
+            conjuncts.extend(r.conjuncts.iter().copied());
+            branches.push(Branch {
+                conjuncts,
+                has_key: l.has_key || r.has_key,
+            });
+        }
+    }
+    branches
+}
+
 /// The key read of one disjunct, or `None` when the disjunct is a scan.
 pub(super) fn key_read<'a>(
     conjuncts: &[Conjunct<'a>],
@@ -331,8 +337,8 @@ fn same_condition(
     value_of: &dyn Fn(&Operand) -> Option<AttributeValue>,
 ) -> bool {
     match (a, b) {
-        (SortCondition::Compare(x, v), SortCondition::Compare(y, w)) => {
-            x == y && same_value(v, w, value_of)
+        (SortCondition::Compare(op1, v1), SortCondition::Compare(op2, v2)) => {
+            op1 == op2 && same_value(v1, v2, value_of)
         }
         (SortCondition::Between(l1, h1), SortCondition::Between(l2, h2)) => {
             same_value(l1, l2, value_of) && same_value(h1, h2, value_of)

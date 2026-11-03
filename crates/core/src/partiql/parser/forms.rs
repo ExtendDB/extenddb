@@ -107,23 +107,20 @@ impl Parser {
         if !self.eat(&TokenKind::Eq) {
             return Err(ParseError::well_formed("Expected = in SET clause"));
         }
-        match self.set_function_ahead() {
-            Some(op) => {
-                let action = self.set_members_call(path, op)?;
-                clauses.set_members.push(action);
+        if let Some(op) = self.set_function_ahead() {
+            let action = self.set_members_call(path, op)?;
+            clauses.set_members.push(action);
+        } else {
+            let value = self.operand()?;
+            self.note_set_number(&value);
+            // An IS test as the value parses and is refused (measured
+            // 2026-11-02 with `SET a = b IS NULL`).
+            if self.eat_keyword("IS") {
+                self.eat_keyword("NOT");
+                self.type_name()?;
+                self.defer("IS operator is not supported in update expressions");
             }
-            None => {
-                let value = self.operand()?;
-                self.note_set_number(&value);
-                // An IS test as the value parses and is refused (measured
-                // 2026-11-02 with `SET a = b IS NULL`).
-                if self.eat_keyword("IS") {
-                    self.eat_keyword("NOT");
-                    self.type_name()?;
-                    self.defer("IS operator is not supported in update expressions");
-                }
-                clauses.sets.push(SetAction { path, value });
-            }
+            clauses.sets.push(SetAction { path, value });
         }
         Ok(())
     }

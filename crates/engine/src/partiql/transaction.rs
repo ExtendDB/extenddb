@@ -154,16 +154,13 @@ async fn run_read(
         let Statement::Select(select) = stmt else {
             unreachable!("read transaction holds only SELECT statements");
         };
-        match ctx.table_key_info(&select.from.table).await {
-            Ok(info) => {
-                key_infos.push(Some(info));
-                reasons.push(CancellationReason::none());
-            }
-            Err(_) => {
-                missing = true;
-                key_infos.push(None);
-                reasons.push(not_found_reason());
-            }
+        if let Ok(info) = ctx.table_key_info(&select.from.table).await {
+            key_infos.push(Some(info));
+            reasons.push(CancellationReason::none());
+        } else {
+            missing = true;
+            key_infos.push(None);
+            reasons.push(not_found_reason());
         }
     }
     if missing {

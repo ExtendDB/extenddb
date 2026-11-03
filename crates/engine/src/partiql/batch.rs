@@ -21,7 +21,7 @@
 //! refusal, with a caller that may not run the statement). For two
 //! statements on one item the order against authorization is not measured.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value, json};
 
@@ -51,6 +51,8 @@ struct Parsed {
 ///
 /// Returns the service's request-level errors (read/write mix, duplicate key,
 /// size limit); per-statement failures are carried inside `Responses`.
+// The steps follow the service's order; helpers would split that order across functions.
+#[allow(clippy::too_many_lines)]
 pub(super) async fn run(
     ctx: &OperationContext,
     body: &Value,
@@ -387,7 +389,7 @@ fn detect_duplicate_keys(
     key_infos: &[Option<TableKeyInfo>],
     is_write_batch: bool,
 ) -> Result<(), DynamoDbError> {
-    let mut seen: HashMap<String, ()> = HashMap::with_capacity(parsed.len());
+    let mut seen: HashSet<String> = HashSet::with_capacity(parsed.len());
     for (i, p) in parsed.iter().enumerate() {
         let (Some(stmt), Some(key_info)) = (&p.stmt, &key_infos[i]) else {
             continue;
@@ -405,7 +407,7 @@ fn detect_duplicate_keys(
         };
         if let Some(key) = key {
             let id = common::canonical_identity(common::statement_table(stmt), &key);
-            if seen.insert(id, ()).is_some() {
+            if !seen.insert(id) {
                 return Err(DynamoDbError::ValidationException(
                     "Provided list of item keys contains duplicates".to_owned(),
                 ));

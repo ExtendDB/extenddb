@@ -86,7 +86,7 @@ pub(super) fn exists_outside_transaction() -> DynamoDbError {
 /// Reshape a classic put/update/delete response into the PartiQL write shape:
 /// a `RETURNING` item becomes the single element of `Items`, an absent one
 /// leaves `Items` empty, and `ConsumedCapacity` passes through when present.
-fn reshape(result: DispatchResult) -> Result<DispatchResult, DynamoDbError> {
+fn reshape(result: DispatchResult) -> DispatchResult {
     let mut items: Vec<Value> = Vec::new();
     if let Some(attributes) = result.body.get("Attributes") {
         items.push(attributes.clone());
@@ -95,10 +95,10 @@ fn reshape(result: DispatchResult) -> Result<DispatchResult, DynamoDbError> {
     if let Some(cc) = result.body.get("ConsumedCapacity") {
         body["ConsumedCapacity"] = cc.clone();
     }
-    Ok(DispatchResult {
+    DispatchResult {
         body,
         metrics: result.metrics,
-    })
+    }
 }
 
 // --- key / condition translation -----------------------------------------

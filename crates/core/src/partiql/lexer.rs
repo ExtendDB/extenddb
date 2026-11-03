@@ -97,6 +97,8 @@ pub struct LexError {
 ///
 /// Returns a [`LexError`] on an unterminated string or identifier or an
 /// unrecognized character.
+// Each arm of the loop updates `i`, `line` and `col`, which a helper per arm would need passed in.
+#[allow(clippy::too_many_lines)]
 pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
     let chars: Vec<char> = input.chars().collect();
     let mut tokens = Vec::new();
@@ -300,8 +302,7 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
                     ">>" => (TokenKind::RDoubleAngle, 2),
                     "<=" => (TokenKind::Le, 2),
                     ">=" => (TokenKind::Ge, 2),
-                    "<>" => (TokenKind::Ne, 2),
-                    "!=" => (TokenKind::Ne, 2),
+                    "<>" | "!=" => (TokenKind::Ne, 2),
                     "||" => (TokenKind::Concat, 2),
                     _ => {
                         let k = match c {

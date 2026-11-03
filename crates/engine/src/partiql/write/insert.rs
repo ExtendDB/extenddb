@@ -41,7 +41,7 @@ pub(super) async fn run_insert(
     let result = handle_put_item(body, ctx).await.map_err(|e| {
         crate::partiql::bare_expression_error(item_depth::item_nesting_error(map_insert_error(e)))
     });
-    reshape(result?)
+    Ok(reshape(result?))
 }
 
 /// The translated classic `PutItem` pieces for an `INSERT`: the item, the

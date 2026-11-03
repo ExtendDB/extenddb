@@ -39,7 +39,12 @@ pub(super) fn interval(
         // prefix with its last byte raised by one.
         SortCondition::BeginsWith(prefix) => {
             let low = bound(prefix)?;
-            let high = low.next_prefix()?;
+            let high = match &low {
+                Bound::S(bytes) => next_prefix(bytes).map(Bound::S),
+                Bound::B(bytes) => next_prefix(bytes).map(Bound::B),
+                // A number has no prefix.
+                Bound::N(_) => return None,
+            };
             Interval::new(Some(low), true, high, false)
         }
     })
@@ -77,26 +82,20 @@ impl Bound {
     pub(super) fn same(&self, other: &Self) -> bool {
         self.compare(other) == Some(Ordering::Equal)
     }
+}
 
-    /// The least byte string greater than every string with this prefix:
-    /// the prefix with its last byte raised by one (carrying), or `None` when
-    /// there is none. `None` for a number, which has no prefix.
-    fn next_prefix(&self) -> Option<Option<Self>> {
-        let mut next = match self {
-            Self::S(b) | Self::B(b) => b.clone(),
-            Self::N(_) => return None,
-        };
-        while let Some(last) = next.pop() {
-            if last < u8::MAX {
-                next.push(last + 1);
-                return Some(Some(match self {
-                    Self::S(_) => Self::S(next),
-                    _ => Self::B(next),
-                }));
-            }
+/// The least byte string greater than every string with this prefix: the
+/// prefix with its last byte raised by one (carrying), or `None` when there
+/// is none.
+fn next_prefix(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut next = prefix.to_vec();
+    while let Some(last) = next.pop() {
+        if last < u8::MAX {
+            next.push(last + 1);
+            return Some(next);
         }
-        Some(None)
     }
+    None
 }
 
 /// A sort-key range; a missing bound is unbounded.

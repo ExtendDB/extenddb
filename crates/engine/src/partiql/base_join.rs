@@ -124,7 +124,7 @@ impl BaseTableJoin {
         let mut kept = Vec::new();
         let mut table_units = 0.0;
         for row in rows {
-            let index_row: Item = serde_json::from_value(row).map_err(internal)?;
+            let index_row: Item = serde_json::from_value(row).map_err(|e| internal(&e))?;
             let key = extract_key(&index_row, &key_info.key_schema);
             let base = ctx
                 .storage
@@ -139,7 +139,7 @@ impl BaseTableJoin {
             // row it left behind.
             let item = base.unwrap_or(index_row);
             if self.passes(&item)? {
-                kept.push(serde_json::to_value(&item).map_err(internal)?);
+                kept.push(serde_json::to_value(&item).map_err(|e| internal(&e))?);
             }
         }
         metrics.returned_item_count = kept.len() as u64;
@@ -180,7 +180,7 @@ fn add_units(capacity: &mut Map<String, Value>, units: f64) {
     capacity.insert("CapacityUnits".to_owned(), Value::from(current + units));
 }
 
-fn internal(e: serde_json::Error) -> DynamoDbError {
+fn internal(e: &serde_json::Error) -> DynamoDbError {
     DynamoDbError::InternalServerError(format!("failed to convert an index row: {e}"))
 }
 

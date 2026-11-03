@@ -153,16 +153,15 @@ pub(super) async fn authorize_access(
     authorizer: Option<&dyn ItemAuthorizer>,
     access: &ItemAccess,
 ) -> Result<(), DynamoDbError> {
-    match authorizer {
-        Some(authorizer) => authorizer.authorize(access).await,
-        None => {
-            tracing::error!(
-                action = access.action,
-                table = %access.table,
-                "no item authorizer in the request context; refusing the statement"
-            );
-            Err(unauthorized())
-        }
+    if let Some(authorizer) = authorizer {
+        authorizer.authorize(access).await
+    } else {
+        tracing::error!(
+            action = access.action,
+            table = %access.table,
+            "no item authorizer in the request context; refusing the statement"
+        );
+        Err(unauthorized())
     }
 }
 

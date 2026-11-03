@@ -171,10 +171,10 @@ impl ExprBuilder {
             }
             WhereExpr::IsMissing(path, missing) => {
                 let rendered = self.path(path);
-                return Ok(if *missing != negated {
-                    format!("attribute_not_exists({rendered})")
-                } else {
+                return Ok(if *missing == negated {
                     format!("attribute_exists({rendered})")
+                } else {
+                    format!("attribute_not_exists({rendered})")
                 });
             }
             // As on a read: `IS NULL` is an equality with NULL, `IS <type>`
@@ -191,10 +191,10 @@ impl ExprBuilder {
                     let code = self.value(&AttributeValue::S(code.to_owned()))?;
                     format!("attribute_type({value}, {code})")
                 };
-                return Ok(if *is_not != negated {
-                    format!("NOT {test}")
-                } else {
+                return Ok(if *is_not == negated {
                     test
+                } else {
+                    format!("NOT {test}")
                 });
             }
             WhereExpr::And(..)

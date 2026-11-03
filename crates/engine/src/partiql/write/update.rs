@@ -64,7 +64,7 @@ pub(super) async fn run_update(
         .await
         .map_err(crate::partiql::bare_expression_error)?;
     crate::partiql::returning::project_modified(&mut result.body, update)?;
-    reshape(result)
+    Ok(reshape(result))
 }
 
 /// The translated classic `UpdateItem` pieces for an `UPDATE`: the key, the

@@ -146,7 +146,9 @@ pub(super) fn where_roots<'a>(expr: &'a WhereExpr, out: &mut Vec<&'a str>) {
         }
         WhereExpr::In(a, items) => {
             operand_roots(a, out);
-            items.iter().for_each(|i| operand_roots(i, out));
+            for item in items {
+                operand_roots(item, out);
+            }
         }
         WhereExpr::Function(_, args) => args.iter().for_each(|a| operand_roots(a, out)),
         WhereExpr::IsMissing(p, _) => out.push(p.root.as_str()),

@@ -181,10 +181,10 @@ impl<'p> ExprBridge<'p> {
             // attribute_exists, and each is the negation of the other.
             WhereExpr::IsMissing(path, is_missing) => {
                 let p = self.path(path);
-                return Ok(if *is_missing != negated {
-                    format!("attribute_not_exists({p})")
-                } else {
+                return Ok(if *is_missing == negated {
                     format!("attribute_exists({p})")
+                } else {
+                    format!("attribute_not_exists({p})")
                 });
             }
             // `IS NULL` is an equality with NULL and `IS <type>` an
@@ -203,10 +203,10 @@ impl<'p> ExprBridge<'p> {
                     let code = self.value_ref(AttributeValue::S(code.to_owned()));
                     format!("attribute_type({value}, {code})")
                 };
-                return Ok(if *is_not != negated {
-                    format!("NOT {test}")
-                } else {
+                return Ok(if *is_not == negated {
                     test
+                } else {
+                    format!("NOT {test}")
                 });
             }
             WhereExpr::And(..)

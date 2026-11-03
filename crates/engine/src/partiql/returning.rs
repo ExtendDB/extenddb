@@ -48,12 +48,12 @@ pub(super) fn project_modified(
     let Some(attributes) = fields.remove("Attributes") else {
         return Ok(());
     };
-    let item: Item = serde_json::from_value(attributes).map_err(internal)?;
+    let item: Item = serde_json::from_value(attributes).map_err(|e| internal(&e))?;
     let projected = modified_paths(&item, update)?;
     if !projected.is_empty() {
         fields.insert(
             "Attributes".to_owned(),
-            serde_json::to_value(projected).map_err(internal)?,
+            serde_json::to_value(projected).map_err(|e| internal(&e))?,
         );
     }
     Ok(())
@@ -97,7 +97,7 @@ fn placeholder(name: &str, names: &mut HashMap<String, String>) -> PathElement {
     PathElement::Attribute(format!("#{key}"))
 }
 
-fn internal(e: serde_json::Error) -> DynamoDbError {
+fn internal(e: &serde_json::Error) -> DynamoDbError {
     tracing::error!(internal_error = %e, "failed to shape a PartiQL RETURNING item");
     DynamoDbError::InternalServerError("Internal server error".to_owned())
 }

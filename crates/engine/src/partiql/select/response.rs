@@ -5,7 +5,6 @@
 
 use serde_json::{Map, Value};
 
-use extenddb_core::error::DynamoDbError;
 use extenddb_core::partiql::ast::{Path, PathStep, Projection};
 
 use crate::DispatchResult;
@@ -20,7 +19,7 @@ pub(super) fn shape_response(
     result: DispatchResult,
     req: &SingleRequest,
     projection: &Projection,
-) -> Result<DispatchResult, DynamoDbError> {
+) -> DispatchResult {
     let DispatchResult { body, metrics } = result;
     let mut source = match body {
         Value::Object(m) => m,
@@ -52,10 +51,10 @@ pub(super) fn shape_response(
         out.insert("LastEvaluatedKey".to_owned(), lek);
     }
 
-    Ok(DispatchResult {
+    DispatchResult {
         body: Value::Object(out),
         metrics,
-    })
+    }
 }
 
 /// Project one wire-form item (`{"attr": {typed value}}`) down to the selected

@@ -58,11 +58,11 @@ pub(super) async fn run_delete(
         body["ReturnValuesOnConditionCheckFailure"] = json!(rvoccf);
     }
 
-    reshape(
+    Ok(reshape(
         handle_delete_item(body, ctx)
             .await
             .map_err(crate::partiql::bare_expression_error)?,
-    )
+    ))
 }
 
 /// The translated classic `DeleteItem` pieces for a `DELETE`: the key, an

@@ -79,13 +79,13 @@ impl ItemAuthorizer for PolicyAuthorizer {
                 user_agent: self.user_agent.clone(),
                 ..item_params(access)
             };
-            authorization::check_authorization(
+            Box::pin(authorization::check_authorization(
                 self.state.authz_cache.as_ref(),
                 &self.identity,
                 &target,
                 false,
                 params,
-            )
+            ))
             .await
         })
     }
