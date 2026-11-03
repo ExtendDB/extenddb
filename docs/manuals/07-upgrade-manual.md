@@ -341,7 +341,7 @@ default, makes the pattern match nothing, and a `2008-10-17` document, or one
 with no `Version`, still matches the pattern as written. With a default, the
 default is used: `table/${aws:PrincipalTag/team, 'none'}` matches `table/none`
 when the request has no `team` tag (measured with the IAM policy simulator,
-issue #533). Three decisions change for stored policies:
+issue #533). Four decisions change for stored policies:
 
 1. A pattern with a variable now matches the table it names. `Allow
    table/${aws:username}` now grants the caller's own table, where it granted
@@ -358,13 +358,24 @@ issue #533). Three decisions change for stored policies:
    `${dynamodb:LeadingKeys}` now grants a caller tagged `team=blue` whose request
    has the leading key `blue`, where it did not, and a `Deny` with that condition
    now applies to the same request.
-3. A condition value written as `${key, 'default'}` now expands to the request's
-   value for `key`, or to `default` when the request does not carry `key`.
-   Before, the whole text was compared as written. For example, an `Allow` with
-   the condition `StringEquals` on `aws:ResourceTag/owner` and the value
-   `${aws:username, 'anon'}` now grants `alice` a table tagged `owner=alice`, and
-   a caller with no user name a table tagged `owner=anon`; before, it granted
-   neither.
+3. In a `2012-10-17` document, a condition value written as
+   `${key, 'default'}` under a string or ARN operator now expands to the
+   request's value for `key`, or to `default` when the request does not carry
+   `key`. Before, the whole text was compared as written. For example, an
+   `Allow` with the condition `StringEquals` on `aws:ResourceTag/owner` and the
+   value `${aws:username, 'anon'}` now grants `alice` a table tagged
+   `owner=alice`, and a caller with no user name a table tagged `owner=anon`;
+   before, it granted neither. In a `2008-10-17` document, in one with no
+   `Version`, and under the numeric, date, IP address, `Bool` and `Null`
+   operators, the text is still compared as written; IAM does not read the
+   default form there either (measured with the IAM policy simulator). A role
+   trust policy follows its own `Version`.
+4. Spaces, and the other code points up to U+0020, around the key name of a
+   variable are now ignored, in `Resource` and `NotResource` patterns and in the
+   condition values item 3 covers. `Deny table/${ aws:PrincipalTag/team }` now
+   denies a caller tagged `team=blue` the table `blue`. Before, the spaces were
+   part of the key name, so the variable named a key no request carries and the
+   `Deny` denied nothing.
 
 **Policy writes check `Version`.** Writing a user, group or role policy or a
 permissions boundary, through the management API or the console, now refuses a
@@ -373,8 +384,14 @@ example `"2012-10-18"` or the number `20121017`, with `Invalid policy document:
 policy parse error: invalid Version ...`, or for a permissions boundary `Invalid
 permissions boundary document: policy parse error: invalid Version ...`. A
 document already stored with such a value keeps evaluating, with its `Resource`
-patterns matched as written. A session policy passed to `AssumeRole` is checked
-only for its `Version` and `Statement` members.
+patterns matched as written, but sending it again unchanged is refused with the
+same message. A stored `Deny` whose `Resource` or `NotResource` holds a variable
+in such a document keeps denying what the pattern as written matches, which for
+`table/${aws:PrincipalTag/team}` is nothing, until its `Version` is changed to
+`2012-10-17`. To find such documents before upgrading, list the stored policies
+and boundaries with the commands under **Who is affected** below and check each
+document's `Version`. A session policy passed to `AssumeRole` is checked only
+for its `Version` and `Statement` members.
 
 **Who is affected.** Any deployment with a stored policy whose `Resource`,
 `NotResource` or condition values contain `${`: inline user, group and role
