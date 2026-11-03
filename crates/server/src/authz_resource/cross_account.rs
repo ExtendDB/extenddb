@@ -20,10 +20,16 @@
 //! `DeleteTable`, `DeleteItem` and `DeleteBackup` were not sent to the
 //! service; they take the answers of `UpdateTable`, `UpdateItem` and
 //! `DescribeBackup`. `SearchVectors` has no service counterpart and takes the
-//! answers of `DescribeTable`. The ARN shape checks sit between the two
-//! answers: an index or backup ARN in `ResourceArn`, or a `StreamArn` in
-//! another partition, is "Access is denied" in an account that does not exist
-//! and gets the shape ValidationException in one that does. A batch or transaction whose tables are
+//! answers of `DescribeTable`. On the service the ARN shape checks sit
+//! between the two answers: an index or backup ARN in `ResourceArn`, or a
+//! `StreamArn` in another partition or region, is "Access is denied" in an
+//! account that does not exist and gets the shape ValidationException in one
+//! that does. ExtendDB runs its own shape checks at that point. They do not
+//! check a `StreamArn`'s partition or region (#451), so such a `StreamArn` in
+//! an account the catalog holds gets the denial. A table ARN in `TableName`
+//! with another partition, service or region, or naming an index or backup,
+//! gets the answers above, where the service answers a ValidationException
+//! (#794). A batch or transaction whose tables are
 //! in more than one account, the caller's included, is refused with
 //! [`MIXED_ACCOUNTS`] whichever accounts they are.
 //!
@@ -222,12 +228,13 @@ fn principal_arn(identity: &AuthIdentity) -> String {
     }
 }
 
-/// The error for `operation` naming `resource` in another account, with the
-/// ARN shape checks placed as the service places them: an account that exists
-/// gets them first, and one that does not is refused before them. Measured
-/// 2026-11-03: an index or backup ARN in `ResourceArn`, and a `StreamArn` in
-/// another partition or region, get the shape ValidationException when the
-/// account exists and "Access is denied" when it does not.
+/// The error for `operation` naming `resource` in another account. For an
+/// account that exists ExtendDB's ARN shape checks run first, and one that
+/// does not is refused before them, as on the service (measured 2026-11-03
+/// with an index or backup ARN in `ResourceArn`). The service also answers a
+/// `StreamArn` in another partition or region with its shape
+/// ValidationException there; ExtendDB's `StreamArn` check does not cover
+/// those (#451).
 fn answer(
     operation: &str,
     input: &Value,

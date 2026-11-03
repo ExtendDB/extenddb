@@ -287,9 +287,13 @@ def test_tables_in_more_than_one_account_are_refused(env, table, policy):
 
 
 def test_shape_checks_run_before_a_known_accounts_denial(env, table):
-    # Measured 2026-11-03: an index or backup ARN in ResourceArn, and a
-    # StreamArn in another partition, get the shape ValidationException in an
-    # account that exists and "Access is denied" in one that does not.
+    # Measured 2026-11-03: an index or backup ARN in ResourceArn gets the
+    # shape ValidationException in an account that exists and "Access is
+    # denied" in one that does not. The service answers a StreamArn in another
+    # partition or region the same way; ExtendDB does not check that yet
+    # (#451), so the StreamArn case below uses a table ARN, which its
+    # StreamArn check refuses. That input was not sent to the service with
+    # another account's ARN.
     clients = _principal(env, NO_POLICY)
     d, streams = clients["dynamodb"], clients["dynamodbstreams"]
     region = env["region"]
