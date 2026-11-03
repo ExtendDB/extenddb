@@ -32,15 +32,33 @@ use super::matcher::wildcard_match;
 ///   Absent key is vacuously true.
 /// - `ForAnyValue`: at least one context value must match some policy value.
 ///   Absent key is false (unless wrapped in `IfExists`).
+///
+/// Policy variables in the values are read as in a `2012-10-17` document;
+/// [`evaluate_condition_with`] takes the document's choice.
 pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext) -> bool {
+    evaluate_condition_with(condition, true, context)
+}
+
+/// [`evaluate_condition`] for a statement of a document whose `Version` is
+/// `2012-10-17` when `version_2012` is true
+/// ([`super::document::PolicyDocument::expands_policy_variables`]).
+///
+/// The value says how the text between `${` and `}` in a condition value is
+/// read ([`reads_iam_variable_syntax`]); `${key}` expands whatever it is.
+pub fn evaluate_condition_with(
+    condition: &Condition,
+    version_2012: bool,
+    context: &impl ConditionContext,
+) -> bool {
     let context_values = context.resolve_key(&condition.key);
     let is_multivalued = context.is_multivalued_key(&condition.key);
+    let iam_syntax = reads_iam_variable_syntax(&condition.operator, version_2012);
 
     // Expand policy variables (e.g. `${aws:PrincipalTag/Team}`) in condition values.
     let expanded_values: Vec<String> = condition
         .values
         .iter()
-        .map(|v| expand_policy_variables(v, context))
+        .map(|v| expand_policy_variables(v, iam_syntax, context))
         .collect();
 
     match &condition.operator {
@@ -179,18 +197,24 @@ pub enum ConditionMatch {
 ///
 /// Returns [`ConditionMatch::Unresolvable`] when the key is unresolved and the
 /// context reports it as service-populated (case 3), and when a condition value
-/// reads such a key through a `${name}` or `${name, 'default'}` policy
-/// variable, since the variable has no value to expand to and the service,
-/// which has one, would not use the default. Otherwise returns `Match` or
-/// `NoMatch` from the ordinary evaluation, so cases 1 and 2 are unchanged.
+/// reads such a key through a `${name}` policy variable, or through a
+/// `${name, 'default'}` one where [`reads_iam_variable_syntax`] holds, since
+/// the variable has no value to expand to and the service, which has one,
+/// would not use the default. Otherwise returns `Match` or `NoMatch` from the
+/// ordinary evaluation, so cases 1 and 2 are unchanged. `version_2012` is as
+/// in [`evaluate_condition_with`].
 pub fn evaluate_condition_match(
     condition: &Condition,
+    version_2012: bool,
     context: &impl ConditionContext,
 ) -> ConditionMatch {
-    if is_unresolvable(&condition.key, context) || reads_unresolvable_variable(condition, context) {
+    let iam_syntax = reads_iam_variable_syntax(&condition.operator, version_2012);
+    if is_unresolvable(&condition.key, context)
+        || reads_unresolvable_variable(condition, iam_syntax, context)
+    {
         return ConditionMatch::Unresolvable;
     }
-    if evaluate_condition(condition, context) {
+    if evaluate_condition_with(condition, version_2012, context) {
         ConditionMatch::Match
     } else {
         ConditionMatch::NoMatch
@@ -207,12 +231,54 @@ fn is_unresolvable(key: &str, context: &impl ConditionContext) -> bool {
 /// policy variable, a key [`is_unresolvable`] reports.
 ///
 /// The names come from [`super::variables::variable_key_names`], which reads
-/// the default form the way [`expand_policy_variables`] expands it, so a
-/// default written beside such a key does not hide the key from this check.
-fn reads_unresolvable_variable(condition: &Condition, context: &impl ConditionContext) -> bool {
+/// the text between the braces the way [`expand_policy_variables`] expands
+/// it with the same `iam_syntax`, so with it a default written beside such a
+/// key does not hide the key from this check.
+fn reads_unresolvable_variable(
+    condition: &Condition,
+    iam_syntax: bool,
+    context: &impl ConditionContext,
+) -> bool {
     condition.values.iter().any(|value| {
-        super::variables::variable_key_names(value).any(|name| is_unresolvable(name, context))
+        super::variables::variable_key_names(value, iam_syntax)
+            .any(|name| is_unresolvable(name, context))
     })
+}
+
+/// Whether the values of a condition under `operator`, in a document whose
+/// `Version` is `2012-10-17` when `version_2012` is true, are read with IAM's
+/// variable syntax: the `${key, 'default'}` form, and a key name trimmed of
+/// the code points up to U+0020.
+///
+/// IAM reads that syntax only in a `2012-10-17` document and under the string
+/// and ARN operators, with or without a set qualifier or `IfExists` (IAM
+/// policy simulator, 2026-11-03, two samples per row). In a `2008-10-17`
+/// document and in one with no `Version`, `${aws:username, 'x'}` is compared
+/// as written under `StringEquals` and `StringNotEquals`. In a `2012-10-17`
+/// document a default does not take part under `NumericEquals`,
+/// `DateGreaterThan`, `IpAddress`, `Bool` or `Null`, while it does under
+/// `StringEquals` and `ArnLike`. Elsewhere the text between the braces is the
+/// key name as written, which is how condition values were read before the
+/// default form: `${key}` still expands there, as it did.
+fn reads_iam_variable_syntax(operator: &ConditionOperator, version_2012: bool) -> bool {
+    version_2012 && operator_reads_variables(operator)
+}
+
+/// Whether `operator`, unwrapped from its set qualifier and `IfExists`, is a
+/// string or ARN operator.
+fn operator_reads_variables(operator: &ConditionOperator) -> bool {
+    match operator {
+        ConditionOperator::ForAllValues(inner)
+        | ConditionOperator::ForAnyValue(inner)
+        | ConditionOperator::IfExists(inner) => operator_reads_variables(inner),
+        ConditionOperator::StringEquals
+        | ConditionOperator::StringNotEquals
+        | ConditionOperator::StringEqualsIgnoreCase
+        | ConditionOperator::StringNotEqualsIgnoreCase
+        | ConditionOperator::StringLike
+        | ConditionOperator::StringNotLike => true,
+        other => is_arn_operator(other),
+    }
 }
 
 /// Evaluate a statement's whole condition block (all conditions are ANDed).
@@ -220,14 +286,17 @@ fn reads_unresolvable_variable(condition: &Condition, context: &impl ConditionCo
 /// `NoMatch` dominates: if any condition is definitely not satisfied the
 /// statement does not apply, even if another condition is unresolvable. Failing
 /// that, any unresolvable condition makes the block `Unresolvable` (fail
-/// closed). Otherwise every condition matched.
+/// closed). Otherwise every condition matched. `version_2012` is whether the
+/// statement's document has `Version` `2012-10-17`, as in
+/// [`evaluate_condition_with`].
 pub fn evaluate_statement_conditions(
     conditions: &[Condition],
+    version_2012: bool,
     context: &impl ConditionContext,
 ) -> ConditionMatch {
     let mut any_unresolvable = false;
     for condition in conditions {
-        match evaluate_condition_match(condition, context) {
+        match evaluate_condition_match(condition, version_2012, context) {
             ConditionMatch::Match => {}
             ConditionMatch::NoMatch => return ConditionMatch::NoMatch,
             ConditionMatch::Unresolvable => any_unresolvable = true,
@@ -256,9 +325,15 @@ pub fn evaluate_statement_conditions(
 /// applies to every request). A variable naming a key the context reports
 /// unresolvable also stays literal here, with or without a default; the
 /// condition fails closed on it before this expansion is compared
-/// ([`evaluate_condition_match`]).
-fn expand_policy_variables(value: &str, context: &impl ConditionContext) -> String {
-    super::variables::expand_condition_value(value, context)
+/// ([`evaluate_condition_match`]). Without `iam_syntax`
+/// ([`reads_iam_variable_syntax`]) the default form is not read, so
+/// `${key, 'default'}` stays literal too.
+fn expand_policy_variables(
+    value: &str,
+    iam_syntax: bool,
+    context: &impl ConditionContext,
+) -> String {
+    super::variables::expand_condition_value(value, iam_syntax, context)
 }
 
 /// Unwrap an `IfExists` wrapper if present.

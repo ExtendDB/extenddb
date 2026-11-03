@@ -4,14 +4,16 @@
 //! Text that comes from a variable value or a default: it is not expanded a
 //! second time, and a `*` or `?` in it is not a wildcard. Also the two
 //! condition-value rules, the `${key, 'default'}` form and no expansion for a
-//! multivalued key, under the set operators, `IfExists` and `Null`.
+//! multivalued key, under the set operators and `IfExists`, and the default
+//! form under `Null`, which does not read it.
 //!
-//! None of these expectations was measured on its own. Each follows from a
-//! rule the PR #535 body table measured with the IAM policy simulator on
-//! 2026-10-24: text from a value is matched literally (`team=bl*` matches only
-//! `table/bl*`), and a condition value naming `dynamodb:LeadingKeys` is not
-//! expanded under `StringEquals`. The default form in a condition value was
-//! not measured.
+//! Except for the `Null` row, none of these expectations was measured on its
+//! own. Each follows from a rule the PR #535 body table measured with the IAM
+//! policy simulator on 2026-10-24: text from a value is matched literally
+//! (`team=bl*` matches only `table/bl*`), and a condition value naming
+//! `dynamodb:LeadingKeys` is not expanded under `StringEquals`. The default
+//! form in a condition value was measured on 2026-11-03 under `StringEquals`,
+//! `ArnLike` and `Null` (`condition_variable_scope.rs`).
 
 use super::*;
 
@@ -145,16 +147,16 @@ fn the_default_form_expands_under_set_operators_and_if_exists() {
 }
 
 #[test]
-fn the_default_form_expands_in_a_null_condition() {
-    // With no `flag` tag the value is `false`, so the Allow needs `team`.
-    let p = allow_get_if(
+fn the_default_form_is_not_read_in_a_null_condition() {
+    // Row N5 of `condition_variable_scope.rs`: the Deny does not apply to a
+    // caller with neither tag. Read with its default, the value would be
+    // `true` and the Deny would apply.
+    let p = deny_get_if(
         "Null",
         "aws:PrincipalTag/team",
-        "${aws:PrincipalTag/flag, 'false'}",
+        "${aws:PrincipalTag/f, 'true'}",
     );
-    let with_team = Ctx::empty().with("aws:PrincipalTag/team", vec!["blue"]);
-    assert_eq!(get(&p, "T", &with_team), AuthzDecision::Allow);
-    assert_eq!(get(&p, "T", &Ctx::empty()), AuthzDecision::Deny);
+    assert_eq!(get(&p, "T", &Ctx::empty()), AuthzDecision::Allow);
 }
 
 // --- A multivalued key in a condition value, under every operator form ---

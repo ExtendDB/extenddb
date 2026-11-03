@@ -176,7 +176,13 @@ enum Part<'a> {
 
 /// Split `value` into plain text and `${...}` references. A `${` with no
 /// closing `}` is plain text, as before.
-fn parts(value: &str) -> Vec<Part<'_>> {
+///
+/// With `iam_syntax` the text between the braces is read by
+/// [`parse_reference`]. Without it the whole text, as written, is the key
+/// name, which is how a condition value was read before the default form:
+/// nothing is trimmed, and `${key, 'default'}` names the key
+/// `key, 'default'`, which no request carries.
+fn parts(value: &str, iam_syntax: bool) -> Vec<Part<'_>> {
     let mut out = Vec::new();
     let mut rest = value;
     while let Some(start) = rest.find("${") {
@@ -185,7 +191,16 @@ fn parts(value: &str) -> Vec<Part<'_>> {
         match after_start.find('}') {
             Some(end) => {
                 let raw = &rest[start..start + 3 + end];
-                out.push(Part::Ref(raw, parse_reference(&after_start[..end])));
+                let inner = &after_start[..end];
+                let reference = if iam_syntax {
+                    parse_reference(inner)
+                } else {
+                    Reference::Key {
+                        name: inner,
+                        default: None,
+                    }
+                };
+                out.push(Part::Ref(raw, reference));
                 rest = &after_start[end + 1..];
             }
             None => {
@@ -248,7 +263,7 @@ fn resolve<'a>(
 fn expand_tokens(pattern: &str, context: &impl ConditionContext) -> Result<Vec<Token>, Missing> {
     let mut tokens = Vec::with_capacity(pattern.len());
     let mut unresolvable = false;
-    for part in parts(pattern) {
+    for part in parts(pattern, true) {
         match part {
             Part::Text(text) => tokens.extend(text.encode_utf16().map(Token::written)),
             Part::Ref(_, Reference::Escape(byte)) => tokens.push(Token::Unit(u16::from(byte))),
@@ -307,37 +322,52 @@ pub fn resource_pattern_is_unresolvable(
 }
 
 /// The key names the `${key}` and `${key, 'default'}` variables in `value`
-/// read, in the order [`expand_condition_value`] reads them.
+/// read, in the order [`expand_condition_value`] reads them with the same
+/// `iam_syntax`.
 ///
-/// The default is not part of the name, so a caller that asks the context
-/// about each name sees the key behind `${aws:RequestTag/env, 'x'}` as it
-/// sees the one behind `${aws:RequestTag/env}`. The `${*}`, `${?}` and `${$}`
-/// escapes name no key, and neither does a `${` with no closing brace, as
-/// both expand to themselves.
-pub fn variable_key_names(value: &str) -> impl Iterator<Item = &str> {
-    parts(value).into_iter().filter_map(|part| match part {
-        Part::Ref(_, Reference::Key { name, .. }) => Some(name),
-        Part::Text(_) | Part::Ref(_, Reference::Escape(_)) => None,
-    })
+/// With `iam_syntax` the default is not part of the name, so a caller that
+/// asks the context about each name sees the key behind
+/// `${aws:RequestTag/env, 'x'}` as it sees the one behind
+/// `${aws:RequestTag/env}`. Without it the name is the text between the
+/// braces as written. The `${*}`, `${?}` and `${$}` escapes name no key, and
+/// neither does a `${` with no closing brace, as both expand to themselves.
+pub fn variable_key_names(value: &str, iam_syntax: bool) -> impl Iterator<Item = &str> {
+    parts(value, iam_syntax)
+        .into_iter()
+        .filter_map(|part| match part {
+            Part::Ref(_, Reference::Key { name, .. }) => Some(name),
+            Part::Text(_) | Part::Ref(_, Reference::Escape(_)) => None,
+        })
 }
 
 /// Expand variables in a condition value.
 ///
-/// `${key}` and `${key, 'default'}` are replaced by their value; a variable
-/// whose key the request does not carry, with no default, is left as written,
-/// and so are the `${*}`, `${?}` and `${$}` escapes, as before. A variable
-/// whose key the context reports unresolvable is also left as written, with
-/// or without a default: the service would have a value for the key, so the
-/// default is not used, and the caller fails the condition closed instead of
-/// comparing the text (`condition::evaluate_condition_match`, which finds the
-/// key through [`variable_key_names`]).
+/// `${key}` is replaced by its value, and with `iam_syntax` so is
+/// `${key, 'default'}`; a variable whose key the request does not carry,
+/// with no default, is left as written, and so are the `${*}`, `${?}` and
+/// `${$}` escapes, as before. A variable whose key the context reports
+/// unresolvable is also left as written, with or without a default: the
+/// service would have a value for the key, so the default is not used, and
+/// the caller fails the condition closed instead of comparing the text
+/// (`condition::evaluate_condition_match`, which finds the key through
+/// [`variable_key_names`]).
+///
+/// The caller passes `iam_syntax` only where IAM reads the default form: in
+/// a `2012-10-17` document and under a string or ARN operator. Elsewhere the
+/// text between the braces is the key name as written ([`parts`]), so
+/// `${key, 'default'}` stays as written, and `${key}` expands as it did
+/// before the default form was read.
 #[must_use]
-pub fn expand_condition_value(value: &str, context: &impl ConditionContext) -> String {
+pub fn expand_condition_value(
+    value: &str,
+    iam_syntax: bool,
+    context: &impl ConditionContext,
+) -> String {
     if !value.contains("${") {
         return value.to_owned();
     }
     let mut result = String::with_capacity(value.len());
-    for part in parts(value) {
+    for part in parts(value, iam_syntax) {
         match part {
             Part::Text(text) | Part::Ref(text, Reference::Escape(_)) => result.push_str(text),
             Part::Ref(raw, Reference::Key { name, default }) => {

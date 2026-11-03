@@ -450,15 +450,15 @@ fn unclosed_brace_is_literal_text() {
 fn condition_value_expands_variable_and_default() {
     let ctx = team_blue();
     assert_eq!(
-        expand_condition_value("team-${aws:PrincipalTag/team}", &ctx),
+        expand_condition_value("team-${aws:PrincipalTag/team}", true, &ctx),
         "team-blue"
     );
     assert_eq!(
-        expand_condition_value("${aws:username, 'anon'}", &ctx),
+        expand_condition_value("${aws:username, 'anon'}", true, &ctx),
         "anon"
     );
     assert_eq!(
-        expand_condition_value("${aws:PrincipalTag/team, 'none'}", &ctx),
+        expand_condition_value("${aws:PrincipalTag/team, 'none'}", true, &ctx),
         "blue"
     );
 }
@@ -467,21 +467,22 @@ fn condition_value_expands_variable_and_default() {
 fn condition_value_leaves_unresolved_and_escapes_literal() {
     let ctx = Ctx::empty();
     assert_eq!(
-        expand_condition_value("${aws:username}", &ctx),
+        expand_condition_value("${aws:username}", true, &ctx),
         "${aws:username}"
     );
     assert_eq!(
-        expand_condition_value("a${*}b${?}c${$}", &ctx),
+        expand_condition_value("a${*}b${?}c${$}", true, &ctx),
         "a${*}b${?}c${$}"
     );
-    assert_eq!(expand_condition_value("plain", &ctx), "plain");
-    assert_eq!(expand_condition_value("${open", &ctx), "${open");
+    assert_eq!(expand_condition_value("plain", true, &ctx), "plain");
+    assert_eq!(expand_condition_value("${open", true, &ctx), "${open");
 }
 
 #[test]
 fn variable_key_names_strip_the_default_and_skip_escapes() {
     let names: Vec<&str> = variable_key_names(
         "${aws:PrincipalTag/team}-${aws:RequestTag/env, 'x'}${*}${aws:username,'y'}${open",
+        true,
     )
     .collect();
     assert_eq!(
@@ -494,16 +495,39 @@ fn variable_key_names_strip_the_default_and_skip_escapes() {
     );
     // A comma whose right side is not single-quoted is part of the name, as
     // `expand_condition_value` reads it.
-    let names: Vec<&str> = variable_key_names("${a, b}").collect();
+    let names: Vec<&str> = variable_key_names("${a, b}", true).collect();
     assert_eq!(names, ["a, b"]);
-    assert_eq!(variable_key_names("plain").count(), 0);
+    assert_eq!(variable_key_names("plain", true).count(), 0);
+}
+
+/// Without `iam_syntax`, as in a `2008-10-17` document or under an operator
+/// other than a string or ARN one, the text between the braces is the key
+/// name as written: the default form and a trimmed key are not read, and
+/// `${key}` expands as it did before the default form was read.
+#[test]
+fn without_iam_syntax_the_text_between_the_braces_is_the_key_name() {
+    let ctx = Ctx::empty().with("aws:username", &["alice"]);
+    for value in [
+        "${aws:username, 'anon'}",
+        "${aws:PrincipalTag/team, 'none'}",
+        "${ aws:username }",
+    ] {
+        assert_eq!(expand_condition_value(value, false, &ctx), value);
+    }
+    assert_eq!(
+        expand_condition_value("u-${aws:username}", false, &ctx),
+        "u-alice"
+    );
+    let names: Vec<&str> =
+        variable_key_names("${aws:RequestTag/env, 'x'}${ aws:username }", false).collect();
+    assert_eq!(names, ["aws:RequestTag/env, 'x'", " aws:username "]);
 }
 
 #[test]
 fn condition_value_present_key_without_values_is_empty() {
     let ctx = Ctx::empty().with(TEAM, &[]);
     assert_eq!(
-        expand_condition_value("x${aws:PrincipalTag/team}y", &ctx),
+        expand_condition_value("x${aws:PrincipalTag/team}y", true, &ctx),
         "xy"
     );
 }
