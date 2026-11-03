@@ -238,11 +238,15 @@ async fn a_request_after_the_data_drop_is_table_not_found() {
 /// here to finish the deletion).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_concurrent_delete_tables_have_one_winner() {
-    let target = std::env::var_os("CARGO_TARGET_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target")
-        });
+    // The cargo target directory, found from this test binary's own path
+    // (`<target>/<profile>/deps/<binary>`) as `snapshot_engine`'s file engine
+    // finds it, so a relative `CARGO_TARGET_DIR` or a `--target-dir` is
+    // honoured too.
+    let exe = std::env::current_exe().expect("the test binary's path");
+    let target = exe
+        .ancestors()
+        .nth(3)
+        .unwrap_or_else(|| panic!("{} is not <target>/<profile>/deps/<binary>", exe.display()));
     assert!(target.is_dir(), "cargo target directory must exist");
     let path = target.join(format!("deleting-pair-{}.sqlite", uuid::Uuid::new_v4()));
     let engine = Arc::new(
