@@ -221,7 +221,12 @@ pub async fn serve(params: ServeParams) -> anyhow::Result<()> {
     let log_target = params.log_target;
     let result = serve_inner(params, port).await;
     if let Err(ref e) = result {
-        if let Some(ref path) = pid_path {
+        // Only this process's own file: another running server may hold the
+        // path when the two share a port number on different addresses.
+        if let Some(ref path) = pid_path
+            && std::fs::read_to_string(path)
+                .is_ok_and(|s| s.trim() == std::process::id().to_string())
+        {
             let _ = std::fs::remove_file(path);
         }
         // P57 Bug 7: Log fatal errors where the operator will see them. After
@@ -235,6 +240,63 @@ pub async fn serve(params: ServeParams) -> anyhow::Result<()> {
         }
     }
     result
+}
+
+/// The PID file a server writes and the lock it keeps on it.
+struct PidFileGuard {
+    /// The file this server owns, which `start_server` removes at shutdown.
+    path: Option<PathBuf>,
+    /// Keeps the lock on the file this process wrote; `None` when there is no
+    /// file, or when `daemonize` holds the lock.
+    lock: Option<std::fs::File>,
+    /// The path and PID of a file another running process holds instead.
+    held_by_other: Option<String>,
+}
+
+#[cfg(unix)]
+fn take_pid_file(pid_file: Option<PathBuf>) -> anyhow::Result<PidFileGuard> {
+    use crate::pid_file::Hold;
+
+    let Some(path) = pid_file else {
+        return Ok(PidFileGuard {
+            path: None,
+            lock: None,
+            held_by_other: None,
+        });
+    };
+    let hold = crate::pid_file::hold(&path)
+        .map_err(|e| anyhow::anyhow!("Failed to write PID file {}: {e}", path.display()))?;
+    Ok(match hold {
+        Hold::Taken(file) => PidFileGuard {
+            path: Some(path),
+            lock: Some(file),
+            held_by_other: None,
+        },
+        Hold::Daemonized => PidFileGuard {
+            path: Some(path),
+            lock: None,
+            held_by_other: None,
+        },
+        Hold::HeldByOther(pid) => PidFileGuard {
+            held_by_other: Some(format!("{} (pid {pid})", path.display())),
+            path: None,
+            lock: None,
+        },
+    })
+}
+
+/// Non-unix: no locks, and `stop` and `status` do not read PID files.
+#[cfg(not(unix))]
+fn take_pid_file(pid_file: Option<PathBuf>) -> anyhow::Result<PidFileGuard> {
+    if let Some(ref path) = pid_file {
+        std::fs::write(path, format!("{}\n", std::process::id()))
+            .map_err(|e| anyhow::anyhow!("Failed to write PID file {}: {e}", path.display()))?;
+    }
+    Ok(PidFileGuard {
+        path: pid_file,
+        lock: None,
+        held_by_other: None,
+    })
 }
 
 /// Inner serve function — separated so [`serve`] can clean up the PID file on
@@ -252,15 +314,16 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     let catalog_version = extenddb_storage::migrations::binary_catalog_label();
 
     // Write the PID file, when the caller asked for one, so `extenddb status`,
-    // `extenddb stop`, and `start_server`'s graceful shutdown cleanup work. When
-    // the caller daemonized, the grandchild PID that `daemonize` wrote is the
-    // same value as `std::process::id()` post-fork, so this is a consistent
-    // rewrite rather than a conflicting one. A supervised deployment passes
-    // `None` and needs no writable run directory at all.
-    if let Some(ref path) = pid_file {
-        std::fs::write(path, format!("{}\n", std::process::id()))
-            .map_err(|e| anyhow::anyhow!("Failed to write PID file {}: {e}", path.display()))?;
-    }
+    // `extenddb stop`, and `start_server`'s graceful shutdown cleanup work. A
+    // supervised deployment passes `None` and needs no writable run directory
+    // at all. On unix the server holds a lock on the file until it exits, which
+    // is how `status` and `stop` tell its PID from a stale one; in daemon mode
+    // `daemonize` has already written the same PID and holds that lock.
+    let PidFileGuard {
+        path: pid_file,
+        lock: _pid_file_lock,
+        held_by_other,
+    } = take_pid_file(pid_file)?;
 
     // Init logging (REQ-LOG-003, REQ-LOG-006) — the caller chose the target via
     // [`LogTarget`]; a supervised/container deployment picks stderr so the
@@ -328,6 +391,13 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         .with(fmt_layer)
         .try_init()
         .map_err(|e| anyhow::anyhow!("Failed to initialize tracing: {e}"))?;
+
+    if let Some(other) = held_by_other {
+        tracing::warn!(
+            "PID file {other} belongs to another running server; serving without a PID file, \
+             so `extenddb status` and `extenddb stop` find that server, not this one"
+        );
+    }
 
     for warning in app_config.storage.startup_warnings() {
         tracing::warn!("{}", warning.log_message());
