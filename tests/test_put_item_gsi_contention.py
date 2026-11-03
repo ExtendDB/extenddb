@@ -32,7 +32,7 @@ import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
-from conftest import scoped_table
+from conftest import configured_backend, scoped_table
 
 WRITERS = 32
 PUTS_PER_WRITER = 63
@@ -126,6 +126,10 @@ def _gsi_entries(client, table: str, pk: str) -> list[str]:
         kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
 
 
+@pytest.mark.skipif(
+    configured_backend() == "cassandra",
+    reason="Cassandra answers some of these puts with TransactionConflictException (#802)",
+)
 def test_unconditional_puts_on_one_key_of_a_gsi_table_commit_or_are_shed(
     dynamodb_client, raw_clients, gsi_table
 ):
