@@ -404,11 +404,14 @@ mod stream_clock_tests {
         let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
-        sqlx::query("UPDATE settings SET value = '0' WHERE key = 'control_plane_delay_seconds'")
-            .execute(&engine.pool)
-            .await
-            .expect("delay");
+        crate::migrations::apply_for_tests(&engine.pool).await;
+        // The migrations seed no settings, so the row is written, not updated.
+        sqlx::query(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0')",
+        )
+        .execute(&engine.pool)
+        .await
+        .expect("delay");
         sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
             .bind(ACCOUNT)
             .execute(&engine.pool)
