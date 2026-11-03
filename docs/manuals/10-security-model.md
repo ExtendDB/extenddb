@@ -19,7 +19,8 @@ This document describes the security architecture of extenddb, including the thr
 1. **Client ↔ extenddb**: Untrusted. All input is validated. SigV4 signatures are verified. IAM policies are evaluated.
 2. **extenddb ↔ PostgreSQL**: Trusted network. The PostgreSQL connection string contains credentials. Use TLS for the PostgreSQL connection in production (`sslmode=require` in the connection string).
 3. **Admin ↔ Management API/Console**: Authenticated via admin credentials or IAM user credentials. CSRF tokens protect the web console.
-4. **Catalog database contents**: Credential-equivalent. The AES-256-GCM key that encrypts access key secrets lives in the catalog `settings` table alongside the ciphertext it protects, so read access to the catalog database yields every stored access key secret. Treat catalog read access, and any catalog backup, as equivalent to holding those credentials. See [Credential Storage](#credential-storage).
+4. **Catalog database contents**: Credential-equivalent. The AES-256-GCM key that encrypts access key secrets lives in the catalog `settings` table alongside the ciphertext it protects, so read access to the catalog database yields every stored access key secret. On PostgreSQL the same table holds `data_database_connection_string`, the login for the data database; the console, the management API and the `settings` CLI mask it, but a reader of the catalog database gets it in full. Treat catalog read access, and any catalog backup, as equivalent to holding those credentials. See [Credential Storage](#credential-storage).
+5. **Server host**: Credential-equivalent as well. `extenddb.toml` holds the catalog connection string, and a running server keeps the encryption key and recently used decrypted secrets in process memory, so read access to the config file, a core dump of the server, or a read of its memory yields the same credentials.
 
 ### Out of Scope
 
@@ -58,7 +59,7 @@ extenddb uses SigV4 signature verification with a local credential store and IAM
 - Encryption key generated during `extenddb init` and stored unwrapped in the catalog `settings` table, under the key `encryption_key`
 - The encryption key and the ciphertext it protects therefore share one trust domain: anyone who can read the catalog database can decrypt every stored access key secret. Restrict catalog database access to the extenddb service account, and protect catalog backups to the same standard as the credentials themselves.
 - The management API and web console redact `encryption_key` from settings responses. The key is readable only with catalog database access: a database client, or `extenddb settings get encryption_key --show-secret` on a host that holds the catalog connection string.
-- extenddb provides no key rotation path. Re-keying requires re-creating the affected access keys.
+- extenddb has no command to rotate the encryption key. Rotating it by hand makes every stored access key secret and session credential unreadable: re-create all access keys under the new key, then restart the server, which keeps the old key and decrypted secrets in memory.
 - Console passwords hashed with bcrypt (cost factor 12)
 - No in-process credential cache — every request reads directly from PostgreSQL
 
@@ -233,7 +234,7 @@ Import/export file paths are validated:
 
 - `extenddb init` prints admin credentials once; they are not stored in plaintext
 - The `--password` flag accepts passwords via environment variable (`EXTENDDB_ADMIN_PASSWORD`) to avoid process listing exposure
-- Access key secrets are shown once on creation and cannot be retrieved afterward
+- Access key secrets are shown once on creation, and no API or console page returns them again; a reader of the catalog database can still decrypt them (see [Credential Storage](#credential-storage))
 
 ### Logging
 

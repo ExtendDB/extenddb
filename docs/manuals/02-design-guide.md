@@ -23,7 +23,7 @@ On PostgreSQL, the data database connection string is stored in the catalog's `s
 | `tables` | DynamoDB table metadata. Composite PK: `(account_id, table_name)`. Stores key schema, attribute definitions, billing mode, stream spec, status, ARN, and TTL config. |
 | `indexes` | GSI/LSI metadata. FK on `table_id` (UUID) with CASCADE delete. |
 | `tags` | Resource tags. PK: `(resource_arn, tag_key)`. |
-| `settings` | Key-value store for catalog version, data DB URL, and runtime settings. |
+| `settings` | Key-value store for catalog version, data DB URL, the AES-256-GCM key that encrypts access key secrets (`encryption_key`), and runtime settings. |
 | `schema_history` | Migration tracking. Records which SQL files have been applied. |
 | `admin_users` | Admin credentials (bcrypt-hashed passwords). |
 | `iam_users` | IAM users scoped to accounts. Optional console password. |
@@ -37,7 +37,6 @@ On PostgreSQL, the data database connection string is stored in the catalog's `s
 | `iam_user_tags` | Tags on IAM users. |
 | `iam_role_tags` | Tags on IAM roles. |
 | `permissions_boundaries` | Permissions boundaries for users and roles. |
-| `encryption_keys` | AES-256-GCM key used to encrypt access key secrets. |
 | `stream_shards` | Stream shard metadata (parent shard, sequence range). |
 | `stream_records` | Stream change records with 24-hour retention. |
 
@@ -126,7 +125,7 @@ Policy conditions support all IAM condition operators: `StringEquals`, `StringNo
 
 ### Credential Storage
 
-Access key secrets are encrypted at rest using AES-256-GCM. The encryption key is generated during `extenddb init` and stored in the `encryption_keys` table. Each access key record stores the encrypted secret and a unique nonce.
+Access key secrets are encrypted at rest using AES-256-GCM. The encryption key is generated during `extenddb init` and stored in the `settings` table under the key `encryption_key`. Each access key record stores the encrypted secret and a unique nonce.
 
 Credential lookups (access key → encrypted secret) read directly from the database on every request — there is no in-process cache for credentials. The encryption key used to decrypt secrets is cached at startup because it is immutable after `extenddb init` (see Caching Design below).
 
