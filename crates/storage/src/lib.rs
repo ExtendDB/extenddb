@@ -20,6 +20,7 @@ pub mod management_store;
 pub mod management_store_factory;
 pub mod migrations;
 pub mod operations;
+pub mod password;
 pub mod policy_migration;
 pub mod server_components;
 pub mod settings_store;

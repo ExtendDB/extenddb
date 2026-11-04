@@ -281,7 +281,7 @@ The console uses the `ManagementStore` trait for all data access — it never qu
 - Sessions stored in-memory with random tokens in HttpOnly cookies (`SameSite=Strict`, `Path=/console`)
 - CSRF tokens on all state-changing POST handlers
 - Security headers: X-Content-Type-Options (nosniff), X-Frame-Options (DENY), Referrer-Policy (strict-origin-when-cross-origin)
-- Login rate limiting with account lockout on excessive failures
+- Login rate limiting per user and source address, shared with the management API (see the security model manual)
 
 ### Unauthenticated Routes
 

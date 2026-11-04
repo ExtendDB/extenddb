@@ -228,7 +228,30 @@ The management web console (`/console/*`) implements:
 - **Session management**: Server-side sessions with 8-hour expiry, HttpOnly cookies with `SameSite=Strict` and `Path=/console`
 - **Security headers**: X-Content-Type-Options (nosniff), X-Frame-Options (DENY), Referrer-Policy (strict-origin-when-cross-origin)
 - **HSTS**: Sent automatically (TLS is always enabled)
-- **Login rate limiting**: Failed login attempts are tracked per user. Excessive failures trigger account lockout.
+- **Login rate limiting**: Failed login attempts are counted per user and source address, and per source address, as described under [Login Rate Limiting](#login-rate-limiting).
+
+## Login Rate Limiting
+
+The console login form, the management API (HTTP Basic auth) and the `/metrics` endpoint share one set of limits on failed logins. Attempts are stored in the catalog's `login_attempts` table, so every surface sees the same history.
+
+- **5 failures per user and source address in 15 minutes.** After the fifth wrong password for a user from one address, further attempts for that user from that address are answered `429 Too Many Requests` until the oldest failure is 15 minutes old. Attempts for the same user from other addresses are not affected, so a third party who knows an admin's name cannot lock the admin out.
+- **20 failures per source address in 15 minutes**, counted over all users. This caps guessing from one address at 20 passwords per 15 minutes however many names it tries.
+- **Attempts are reserved before the password is checked.** An attempt counts against both limits from the moment it is admitted until its failure is recorded, so a burst of concurrent wrong passwords is admitted up to the cap and the rest are refused without a password check.
+- **Bounded verification.** At most 4 bcrypt operations (password checks and password hashes) run at once per process. A login that waits more than 10 seconds for a slot is answered `500` and is not counted as a failure, since no password was checked.
+
+A successful login is not recorded. A storage error before or during the password check is answered `500` and is not counted against the caller.
+
+The source address is the peer address of the TCP connection, with an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) counted as the IPv4 address. Any other IPv6 address is counted by its /64 prefix, because a /64 is the block usually assigned to one host or site and a client can send from any address in it; all addresses in one /64 share one set of limits. ExtendDB does not read `X-Forwarded-For` or any other forwarded-address header (they are caller-supplied).
+
+Callers that reach ExtendDB from one address share one set of limits. Five failures for a user from any of them refuse that user to all of them, and 20 failures in total refuse every user, until the oldest failure is 15 minutes old. Callers share an address in these cases:
+
+- **A reverse proxy or load balancer** that opens its own connections to ExtendDB, so every request arrives from the proxy's address. Put a proxy or load balancer in front of ExtendDB only when it preserves the client address, or when callers behind it are trusted not to lock each other out.
+- **The server host itself.** `extenddb manage` and a `/metrics` scraper running on the server host connect from the same address. A scraper with a stale password for an admin refuses that admin on the host after 5 failures, `extenddb manage` included.
+- **A NAT gateway**, whose egress address is shared by every client behind it.
+
+To recover an address that is refused, wait until its oldest failure is 15 minutes old, or delete the address's rows from the catalog's `login_attempts` table.
+
+A password can be guessed against one user from many addresses at 5 attempts per address per 15 minutes; only the source-address limit and the strength of the password bound that. Use long passwords for admin users and restrict which networks can reach the management and console ports.
 
 ## Provisioned Throughput Throttling
 
