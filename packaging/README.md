@@ -98,7 +98,12 @@ deliberate second step):
 1. Land the release state on `main` with the workspace version bumped and
    `npm/package.json` bumped to match, then tag that commit `vX.Y.Z` and push
    the tag. This is the same tag the container release consumes; the two
-   publish workflows are dispatched independently against it.
+   publish workflows are dispatched independently against it. When the
+   release ships a catalog migration, the same state raises
+   `RELEASED_THROUGH` to the last migration and pastes the checksum lines the
+   checksum test prints (CONTRIBUTING.md, "Adding a catalog migration"); the
+   gate jobs of the two container release workflows run
+   `devtools/check-released-through` on the tag and refuse it otherwise.
 2. Dispatch the `npm-publish` workflow from `main` with the tag as input.
    The gate validates shape, existence, ancestry against `main`, and the
    version match. Five native runners build, smoke test, and run the full
