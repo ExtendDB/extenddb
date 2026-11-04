@@ -150,6 +150,20 @@ devtools/run-tests --extenddb --pytest --filter test_put_item
 1. A running extenddb server: `./target/debug/extenddb serve --config extenddb.toml`
 2. `EXTENDDB_TEST_ENDPOINT=https://localhost:18443`
 3. `EXTENDDB_ADMIN_PASSWORD=<password from extenddb init>`
+4. `EXTENDDB_TEST_BACKUP_STORE=<filesystem|s3|none>`, required for `--pytest`
+   (and so for `--all`) and read by the Rust integration suite's backup
+   tests: where the server under test writes its backups. `filesystem` for a
+   server with a `[backup.store]` filesystem root, which a file-backed SQLite
+   server without the section has by default (`backups/` beside its database
+   file); `s3` for an S3 store; `none` for a server without a store
+   (`kind = "disabled"`, or PostgreSQL, MongoDB and Cassandra without the
+   section). With a configured store CreateBackup is asynchronous and this
+   release refuses to restore its backups, so the backup tests derive their
+   expected outcome from the variable and fail rather than guess when it is
+   unset; `run-tests --pytest` refuses before any test runs with
+   `error: --extenddb --pytest requires EXTENDDB_TEST_BACKUP_STORE to be set.`
+   The suites check the value against the server's `/health` `backup_store`
+   component, so a wrong value fails too.
 
 The `run-tests` script automatically:
 - Performs health check on the target endpoint
@@ -185,8 +199,8 @@ The `run-tests` script automatically:
 The primary test suite is in Python, testing extenddb through the same AWS SDK interface that customers use.
 
 ```bash
-# Via run-tests script (recommended)
-devtools/run-tests --extenddb --pytest
+# Via run-tests script (recommended; EXTENDDB_TEST_BACKUP_STORE as above)
+EXTENDDB_TEST_BACKUP_STORE=filesystem devtools/run-tests --extenddb --pytest
 
 # Run in parallel (uses 1/3 of CPU cores by default)
 devtools/run-tests --extenddb --pytest --parallel

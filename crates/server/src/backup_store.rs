@@ -79,7 +79,9 @@ use std::sync::Arc;
 use extenddb_backup_store::{BackupStore, BackupStoreKind, StoreError};
 use extenddb_config::backup::{BackupConfig, EffectiveStore, Unconfigured};
 pub use extenddb_engine::LOCAL_CHECK_TIMEOUT;
-use extenddb_engine::{BackupRuntime, ConfiguredStore, Spool, StoreProblem, store_identity};
+use extenddb_engine::{
+    BackupRuntime, ConfiguredStore, JobSettings, Spool, StoreProblem, store_identity,
+};
 use extenddb_storage::backup_catalog::{StoreIdentity, StoreKind};
 use extenddb_storage::{BackupCatalog, StorageEngine};
 
@@ -200,6 +202,26 @@ impl StoreSetup {
     }
 }
 
+/// Why CreateBackup is bound to the in-catalog path on `backend`, whatever
+/// the store configuration, or `None` where the store-backed job runs.
+/// Cassandra cannot pin a table snapshot. SQLite's job claim is an
+/// in-process slot, sound only with one process per database file, and the
+/// serve lock that enforces that is `flock`, taken on Unix only
+/// (`serve_lock.rs`): two servers on one file on another platform would
+/// each take the other's rows for dead, so there the create stays
+/// in-catalog and the store serves restores and deletes.
+#[must_use]
+pub fn in_catalog_create_only(backend: &str) -> Option<&'static str> {
+    match backend {
+        "cassandra" => Some("this backend cannot pin a table snapshot"),
+        "sqlite" if !cfg!(unix) => Some(
+            "the serve lock that keeps one process per SQLite database file is taken on Unix \
+             only, and the job's claim is sound only with one process per file",
+        ),
+        _ => None,
+    }
+}
+
 /// Build the backup runtime for this process: the job slots and, when the
 /// configuration and the backend select one, the store with its health
 /// ([`configure_described`] without the reason for an absent store).
@@ -218,10 +240,28 @@ pub async fn configure(
     Ok((setup.runtime, setup.spool_lock))
 }
 
-/// Build the backup runtime for this process: the job slots and, when the
-/// configuration and the backend select one, the store with its health;
-/// otherwise why there is none. `catalog` is the catalog the identity check
-/// reads and the rows rule of the module doc consults.
+/// The `[backup]` settings the jobs and the reconciler read, as the
+/// configuration resolves them: the heartbeat period is
+/// [`BackupConfig::effective_heartbeat_interval_secs`].
+#[must_use]
+pub fn job_settings(backup: &BackupConfig) -> JobSettings {
+    JobSettings {
+        data_file_target_bytes: backup.data_file_target_bytes,
+        heartbeat_interval: std::time::Duration::from_secs(
+            backup.effective_heartbeat_interval_secs(),
+        ),
+        stale_job_after: std::time::Duration::from_secs(backup.stale_job_after_secs),
+        failed_row_retention: std::time::Duration::from_secs(backup.failed_row_retention_secs),
+    }
+}
+
+/// Build the backup runtime for this process: the job slots, the job
+/// settings and, when the configuration and the backend select one, the
+/// store with its health and the names the DynamoDB-shaped manifests carry
+/// for it; otherwise why there is none. `catalog` is the catalog the
+/// identity check reads and the rows rule of the module doc consults. The
+/// server adds the metrics collector, the shutdown token and the source
+/// names to the runtime it gets back.
 ///
 /// # Errors
 ///
@@ -233,9 +273,16 @@ pub async fn configure_described<C: BackupCatalog + ?Sized>(
     catalog: &C,
     caller: Caller,
 ) -> anyhow::Result<StoreSetup> {
+    let in_catalog_only = in_catalog_create_only(backend);
+    if let Some(why) = in_catalog_only {
+        tracing::info!(
+            "CreateBackup on this server writes the in-catalog format whatever [backup.store] \
+             says: {why}"
+        );
+    }
     let runtime = BackupRuntime::new(backup.max_concurrent_jobs)
-        .with_legacy_create_only(backend == "cassandra")
-        .with_stale_job_after(std::time::Duration::from_secs(backup.stale_job_after_secs));
+        .with_legacy_create_only(in_catalog_only.is_some())
+        .with_job_settings(job_settings(backup));
     let resolved = backup
         .resolve_store(database_file)
         .map_err(|e| anyhow::anyhow!("[backup] configuration: {e}"))?;
@@ -328,6 +375,15 @@ pub async fn configure_described<C: BackupCatalog + ?Sized>(
         BackupStoreKind::S3 => StoreKind::S3,
         BackupStoreKind::Disabled => unreachable!("open_described never returns Disabled"),
     };
+    // `manifest-summary.json`'s `s3Bucket` and the key prefix every key of
+    // the DynamoDB-shaped manifests starts with: the bucket and the
+    // configured prefix on S3, the root path and no prefix on a filesystem
+    // store.
+    let (bucket, key_prefix) = match (kind, &config.s3) {
+        (StoreKind::S3, Some(s3)) => (s3.bucket.clone(), s3.prefix.clone()),
+        _ => (opened.root.clone(), String::new()),
+    };
+    let configured = |store: ConfiguredStore| store.with_manifest_names(bucket, key_prefix);
 
     // The spool and its lock: configuration errors on every backend.
     let (spool, spool_lock) = match (resolved.spool_path, caller) {
@@ -346,19 +402,28 @@ pub async fn configure_described<C: BackupCatalog + ?Sized>(
     // listener is up, in the reconciler's first cycle. A read-only command
     // runs no check at all.
     if caller == Caller::ReadOnlyCommand {
-        let configured = ConfiguredStore::checking(kind, opened.root, opened.store, spool);
+        let configured = configured(ConfiguredStore::checking(
+            kind,
+            opened.root,
+            opened.store,
+            spool,
+        ));
         return Ok(StoreSetup::with_store(runtime, configured, spool_lock));
     }
     if kind == StoreKind::S3 {
         if caller == Caller::Server {
             tracing::info!(
                 "backup store: {kind} {}{spool_line}; its validation and identity check run \
-                 after the listener is up, and CreateBackup writes in-catalog backups in this \
-                 release",
+                 after the listener is up, and CreateBackup writes to it once a check passes",
                 opened.root
             );
         }
-        let configured = ConfiguredStore::checking(kind, opened.root, opened.store, spool);
+        let configured = configured(ConfiguredStore::checking(
+            kind,
+            opened.root,
+            opened.store,
+            spool,
+        ));
         return Ok(StoreSetup::with_store(runtime, configured, spool_lock));
     }
 
@@ -404,16 +469,17 @@ pub async fn configure_described<C: BackupCatalog + ?Sized>(
             );
             // `defaulted` travels with the store, so the reconciler applies
             // the rows rule to the first check's outcome.
-            let configured = ConfiguredStore::checking(kind, opened.root, opened.store, spool)
-                .defaulted(defaulted);
+            let configured = configured(
+                ConfiguredStore::checking(kind, opened.root, opened.store, spool)
+                    .defaulted(defaulted),
+            );
             return Ok(StoreSetup::with_store(runtime, configured, spool_lock));
         }
     };
     match &outcome {
         Ok(identity) => tracing::info!(
-            "backup store: {kind} {} (store id {}){spool_line}; CreateBackup writes in-catalog \
-             backups in this release, and the store serves restores and deletes of the backups \
-             it holds",
+            "backup store: {kind} {} (store id {}){spool_line}; CreateBackup writes to it, and \
+             it serves restores and deletes of the backups it holds",
             opened.root,
             identity.store_id
         ),
@@ -436,7 +502,13 @@ pub async fn configure_described<C: BackupCatalog + ?Sized>(
             rows_note(defaulted)
         ),
     }
-    let configured = ConfiguredStore::new(kind, opened.root, opened.store, spool, outcome);
+    let configured = configured(ConfiguredStore::new(
+        kind,
+        opened.root,
+        opened.store,
+        spool,
+        outcome,
+    ));
     Ok(StoreSetup::with_store(runtime, configured, spool_lock))
 }
 
@@ -863,7 +935,7 @@ mod tests {
     use extenddb_storage::BoxedFuture;
     use extenddb_storage::backup_catalog::{
         BackupKey, BackupRow, BackupStatus, DeleteStart, JobClaim, MaintenanceClaim, RestoreJobRow,
-        RestoreTargetKey, TimeBounds,
+        RestoreTargetKey, StoreIdentity, TimeBounds,
     };
     use extenddb_storage::error::StorageError;
     use futures::stream::BoxStream;
@@ -893,6 +965,13 @@ mod tests {
             &'a self,
             _row: &'a BackupRow,
         ) -> BoxedFuture<'a, Result<Box<dyn JobClaim>, StorageError>> {
+            unused()
+        }
+        fn claim_dead_backup<'a>(
+            &'a self,
+            _key: &'a BackupKey,
+            _stale_after: std::time::Duration,
+        ) -> BoxedFuture<'a, Result<Option<Box<dyn JobClaim>>, StorageError>> {
             unused()
         }
         fn list_backup_rows<'a>(

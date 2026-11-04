@@ -851,6 +851,24 @@ async fn resolve_dead_owners(opened: &Opened) {
             for arn in &report.deletions_finished {
                 println!("finished the deletion of {arn}");
             }
+            for (arn, status) in &report.creating_resolved {
+                println!(
+                    "resolved the CREATING backup {arn} to {status}: its owner is dead{}",
+                    match status {
+                        extenddb_storage::backup_catalog::BackupStatus::Available =>
+                            " and the store holds its complete manifest",
+                        _ =>
+                            " and the store holds no complete manifest; its objects are \
+                              deleted once the row's heartbeat is stale",
+                    }
+                );
+            }
+            for arn in &report.creating_left_to_owner {
+                println!(
+                    "left the CREATING backup {arn}: another owner took it over before this \
+                     command's write"
+                );
+            }
         }
         Err(e) => println!("could not resolve the jobs the stopped server left: {e}"),
     }

@@ -1772,6 +1772,7 @@ name = "extenddb-engine"
 version = "0.1.14"
 dependencies = [
  "base64 0.22.1",
+ "bytes",
  "crc32fast",
  "extenddb-auth",
  "extenddb-backup-store",
@@ -1784,6 +1785,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]
@@ -1952,7 +1954,9 @@ dependencies = [
  "bigdecimal",
  "crc32fast",
  "extenddb-auth",
+ "extenddb-backup-store",
  "extenddb-core",
+ "extenddb-engine",
  "extenddb-storage",
  "extenddb-storage-sqlite",
  "futures",

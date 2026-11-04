@@ -11,7 +11,11 @@
 //! "$$NOW"`, so no row ever exists unowned and a second claim of the same
 //! backup trips the unique index on (`account_id`, `backup_id`). Every write
 //! the job makes carries its generation in the filter; a heartbeat that
-//! matches other than exactly one document means the claim is lost.
+//! matches other than exactly one document means the claim is lost. The
+//! heartbeat is also the liveness test: the reconciler takes over a CREATING
+//! row whose heartbeat is older than the stale window on the server's clock
+//! with one conditional update that sets a fresh generation and leaves
+//! `heartbeat_at` as the dead owner wrote it.
 //!
 //! The lock on a row for DeleteBackup is a session transaction that `$inc`s
 //! `lock_seq` on the row before it reads the status and the in-use rule, so
@@ -204,6 +208,21 @@ fn key_filter(key: &BackupKey) -> Document {
     doc! { "account_id": &key.account_id, "backup_id": &key.backup_id }
 }
 
+/// `set` as the `$set` stage of a pipeline update: `$$NOW` stays the server's
+/// clock and every other value is wrapped in `$literal`, so a string, or a
+/// key inside the source table object, is never read as a field path.
+fn literal_set(set: Document) -> Document {
+    set.into_iter()
+        .map(|(k, v)| {
+            let v = match v {
+                Bson::String(s) if s == "$$NOW" => Bson::String(s),
+                other => doc! { "$literal": other }.into(),
+            };
+            (k, v)
+        })
+        .collect()
+}
+
 /// The filter for the rows of `store`.
 fn store_filter(store: &StoreIdentity) -> Document {
     doc! {
@@ -357,22 +376,19 @@ impl JobClaim for MongoBackupClaim {
             if let Some(reason) = &fields.failure_reason {
                 set.insert("failure_reason", reason.as_str());
             }
+            if let Some(source) = &fields.source_table_details_json {
+                let source = bson::to_bson(source).map_err(|e| {
+                    StorageError::Internal(format!("serialize source_table_details_json: {e}"))
+                })?;
+                set.insert("source_table_details_json", source);
+            }
             if fields.completed {
                 set.insert("completed_at", "$$NOW");
             }
-            // A pipeline update, so `$$NOW` is the server's clock; the
-            // literal strings are wrapped so the pipeline does not read them
-            // as field paths.
-            let set: Document = set
-                .into_iter()
-                .map(|(k, v)| {
-                    let v = match v {
-                        Bson::String(s) if s == "$$NOW" => Bson::String(s),
-                        other => doc! { "$literal": other }.into(),
-                    };
-                    (k, v)
-                })
-                .collect();
+            // A pipeline update, so `$$NOW` is the server's clock; every other
+            // value is wrapped in `$literal` so the pipeline does not read a
+            // string, or a key of the source table object, as a field path.
+            let set = literal_set(set);
             match self
                 .index
                 .update_one(filter, vec![doc! { "$set": set }])
@@ -540,16 +556,7 @@ impl BackupCatalog for MongoEngine {
             let mut set = row_fields(row)?;
             set.insert("owner_generation", generation_field(generation));
             set.insert("heartbeat_at", "$$NOW");
-            let set: Document = set
-                .into_iter()
-                .map(|(k, v)| {
-                    let v = match v {
-                        Bson::String(s) if s == "$$NOW" => Bson::String(s),
-                        other => doc! { "$literal": other }.into(),
-                    };
-                    (k, v)
-                })
-                .collect();
+            let set = literal_set(set);
             match self
                 .backup_index()
                 .update_one(filter, vec![doc! { "$set": set }])
@@ -732,6 +739,45 @@ impl BackupCatalog for MongoEngine {
                 .await
                 .map_err(internal)?;
             Ok(result.deleted_count == 1)
+        })
+    }
+
+    fn claim_dead_backup<'a>(
+        &'a self,
+        key: &'a BackupKey,
+        stale_after: Duration,
+    ) -> BoxFuture<'a, Result<Option<Box<dyn JobClaim>>, StorageError>> {
+        Box::pin(async move {
+            // The heartbeat is the liveness test: a live owner refreshes it
+            // every period, so a CREATING row whose heartbeat is older than
+            // the window on the server's clock has no owner, and the one
+            // write below both tests that and takes the row. The filter
+            // binds no generation, so the write takes a row whatever
+            // generation it carries; `heartbeat_at` is left as the dead
+            // owner wrote it. A second taker before this one resolves the
+            // row (another process's reconciler; one process runs one
+            // reconciler) finds the same stale heartbeat and takes the row
+            // again under its own generation, which fences this claim's
+            // status write as any takeover fences the dead owner's.
+            let generation = new_generation();
+            let mut filter = key_filter(key);
+            filter.insert("status", BackupStatus::Creating.as_str());
+            filter.insert("$expr", age_is_stale(&["heartbeat_at"], stale_after));
+            let update = vec![doc! { "$set": literal_set(doc! {
+                "owner_generation": generation_field(generation),
+            }) }];
+            let taken = self
+                .backup_index()
+                .find_one_and_update(filter, update)
+                .await
+                .map_err(internal)?;
+            Ok(taken.map(|_| {
+                Box::new(MongoBackupClaim {
+                    index: self.backup_index(),
+                    key: key.clone(),
+                    generation,
+                }) as Box<dyn JobClaim>
+            }))
         })
     }
 
@@ -1237,5 +1283,32 @@ mod tests {
         let doc = doc! { "owner_generation": generation_field(g) };
         assert_eq!(generation_from_field(&doc, "owner_generation"), g);
         assert_eq!(generation_from_field(&doc! {}, "owner_generation"), 0);
+    }
+
+    /// A pipeline `$set` keeps `$$NOW` as the server's clock and wraps every
+    /// other value, the source table object included, so none is read as a
+    /// field path.
+    #[test]
+    fn a_pipeline_set_wraps_every_value_but_now_in_a_literal() {
+        let source = bson::to_bson(&fixture_source_table()).unwrap();
+        let set = literal_set(doc! {
+            "status": "AVAILABLE",
+            "completed_at": "$$NOW",
+            "owner_generation": 7_i64,
+            "source_table_details_json": source.clone(),
+        });
+        assert_eq!(set.get_str("completed_at"), Ok("$$NOW"));
+        assert_eq!(
+            set.get_document("status").unwrap(),
+            &doc! { "$literal": "AVAILABLE" }
+        );
+        assert_eq!(
+            set.get_document("owner_generation").unwrap(),
+            &doc! { "$literal": 7_i64 }
+        );
+        assert_eq!(
+            set.get_document("source_table_details_json").unwrap(),
+            &doc! { "$literal": source }
+        );
     }
 }

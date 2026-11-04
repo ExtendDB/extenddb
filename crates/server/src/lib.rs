@@ -30,8 +30,8 @@ mod throttle_helpers;
 mod workers;
 
 pub use serve::{
-    BuildInfo, CatalogRefusal, LogTarget, RegistrationLost, ServeParams, catalog_refusal,
-    log_to_syslog_raw, serve,
+    BuildInfo, CatalogRefusal, JOB_DRAIN_TIMEOUT, LogTarget, RegistrationLost, ServeParams,
+    WORKER_STOP_TIMEOUT, catalog_refusal, log_to_syslog_raw, serve,
 };
 
 use std::path::PathBuf;
@@ -114,6 +114,11 @@ pub struct ServerTlsConfig {
     /// Path to the PEM private key file.
     pub key_path: PathBuf,
 }
+
+/// How long the listener drains active connections after a stop: the bound
+/// on HTTPS, and on plain HTTP the time after which the PID file is removed.
+/// `extenddb stop` waits for the sum of the shutdown bounds.
+pub const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Build and start the HTTP server on a pre-bound listener.
 ///
@@ -266,7 +271,7 @@ pub async fn start_server(
         let stop = admission.clone();
         tokio::spawn(async move {
             signal_or_stop(&stop).await;
-            shutdown_handle.graceful_shutdown(Some(Duration::from_secs(5)));
+            shutdown_handle.graceful_shutdown(Some(CONNECTION_DRAIN_TIMEOUT));
             // P50: Log timeout but don't call std::process::exit — let the
             // runtime shut down normally so destructors (including ZeroizeOnDrop) run.
             tokio::time::sleep(Duration::from_secs(10)).await;
@@ -289,12 +294,34 @@ pub async fn start_server(
             .await?;
     } else {
         tracing::info!("extenddb listening on {local_addr}");
-        axum::serve(
+        // The plain-HTTP listener's drain is bounded as the TLS listener's
+        // is: axum's graceful shutdown waits for every open connection with
+        // no bound of its own, and `extenddb stop` waits for the sum of the
+        // server's bounds, which counts this drain as `CONNECTION_DRAIN_TIMEOUT`.
+        let stopping = extenddb_storage::CancellationToken::new();
+        let serve = axum::serve(
             nodelay_listener(listener),
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
-        .with_graceful_shutdown(graceful_shutdown(pid_file.clone(), admission))
-        .await?;
+        .with_graceful_shutdown({
+            let stopping = stopping.clone();
+            let pid_file = pid_file.clone();
+            async move {
+                graceful_shutdown(pid_file, admission).await;
+                stopping.cancel();
+            }
+        });
+        let drain_bound = async {
+            stopping.cancelled().await;
+            tokio::time::sleep(CONNECTION_DRAIN_TIMEOUT).await;
+        };
+        tokio::select! {
+            served = serve => served?,
+            () = drain_bound => tracing::warn!(
+                "connections still open {} s after the stop; the listener is closed with them",
+                CONNECTION_DRAIN_TIMEOUT.as_secs()
+            ),
+        }
     }
 
     // Normal shutdown path — clean up PID file after connections drain.
@@ -344,8 +371,11 @@ async fn graceful_shutdown(pid_file: Option<PathBuf>, admission: registration::A
     // don't drain. Does NOT call std::process::exit — the runtime shuts down
     // normally so destructors (including ZeroizeOnDrop) run.
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        tracing::warn!("Graceful shutdown timed out after 5s, forcing PID file cleanup");
+        tokio::time::sleep(CONNECTION_DRAIN_TIMEOUT).await;
+        tracing::warn!(
+            "Graceful shutdown timed out after {}s, forcing PID file cleanup",
+            CONNECTION_DRAIN_TIMEOUT.as_secs()
+        );
         cleanup_pid_file(pid_file.as_deref());
     });
 }

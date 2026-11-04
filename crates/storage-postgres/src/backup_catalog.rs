@@ -251,7 +251,8 @@ impl JobClaim for PostgresBackupClaim {
                  size_bytes = COALESCE($5, size_bytes), \
                  item_count = COALESCE($6, item_count), \
                  failure_reason = COALESCE($7, failure_reason), \
-                 completed_at = CASE WHEN $8 THEN now() ELSE completed_at END \
+                 completed_at = CASE WHEN $8 THEN now() ELSE completed_at END, \
+                 source_table_details_json = COALESCE($10, source_table_details_json) \
                  WHERE account_id = $1 AND backup_id = $2 AND owner_generation = $3 \
                  AND status = $9",
             )
@@ -264,6 +265,7 @@ impl JobClaim for PostgresBackupClaim {
             .bind(fields.failure_reason.as_deref())
             .bind(fields.completed)
             .bind(from.as_str())
+            .bind(fields.source_table_details_json.as_ref())
             .execute(session.connection())
             .await;
             match written {
@@ -553,6 +555,47 @@ impl BackupCatalog for PostgresEngine {
             .map_err(db_err)?
             .rows_affected();
             Ok(affected == 1)
+        })
+    }
+
+    fn claim_dead_backup<'a>(
+        &'a self,
+        key: &'a BackupKey,
+        stale_after: Duration,
+    ) -> BoxFuture<'a, Result<Option<Box<dyn JobClaim>>, StorageError>> {
+        Box::pin(async move {
+            // The same advisory lock the owner took: a session that still
+            // holds it is alive whatever its heartbeat says (the lock goes
+            // with the session), and a second taker is refused here.
+            let Some(mut session) =
+                try_claim(&self.pool, &backup_lock_key(&key.backup_id), None).await?
+            else {
+                return Ok(None);
+            };
+            let generation = session.generation();
+            let taken = sqlx::query(
+                "UPDATE backup_index SET owner_generation = $3 \
+                 WHERE account_id = $1 AND backup_id = $2 AND status = 'CREATING' \
+                 AND heartbeat_at < now() - make_interval(secs => $4)",
+            )
+            .bind(&key.account_id)
+            .bind(&key.backup_id)
+            .bind(generation_column(generation))
+            .bind(stale_after.as_secs_f64())
+            .execute(session.connection())
+            .await
+            .map_err(db_err)?
+            .rows_affected();
+            if taken != 1 {
+                session.close().await;
+                return Ok(None);
+            }
+            Ok(Some(Box::new(PostgresBackupClaim {
+                session: Mutex::new(session),
+                generation,
+                key: key.clone(),
+                pool: self.pool.clone(),
+            }) as Box<dyn JobClaim>))
         })
     }
 
