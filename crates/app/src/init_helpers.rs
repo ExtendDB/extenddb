@@ -328,46 +328,43 @@ key_path = "{tls_key}"
     Ok(())
 }
 
-/// Write `contents` to `path` with mode 0600 throughout: a new file is created
-/// 0600, and an existing one is narrowed to 0600 before it is truncated and
-/// rewritten. Narrowing does not close a descriptor another user opened while
-/// the file was wider, so callers remove an existing file first, as init does
-/// for the config and the TLS key. The config can carry the PostgreSQL
-/// connection string's password and the Cassandra application password, and
-/// the TLS key file holds the server's private key.
+/// Write `contents` to a new file at `path` with mode 0600 throughout. The
+/// write fails if `path` exists, so callers remove an existing file first, as
+/// init does for the config and the TLS key. The config can carry the
+/// `PostgreSQL` connection string's password and the Cassandra application
+/// password, and the TLS key file holds the server's private key.
 fn write_owner_only(path: &str, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     open_owner_only(path)?.write_all(contents)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        // `mode` applies only when the file is created, and the umask can only
-        // narrow it; this pins the result for both paths.
+        // The umask can narrow `mode` further; this pins the result at 0600.
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(())
 }
 
-/// Open `path` truncated for writing, with no access for other users before
-/// any byte is written: a new file is created 0600, and an existing one is
-/// narrowed to 0600 first.
+/// Create `path` for writing with mode 0600, so other users have no access
+/// before any byte is written. The open fails if `path` exists, also when it
+/// is a symlink: a file that existed may be open in another user's process,
+/// and a symlink would put the contents where it points.
 fn open_owner_only(path: &str) -> std::io::Result<std::fs::File> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        if std::path::Path::new(path).exists() {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        }
+        use std::os::unix::fs::OpenOptionsExt;
         std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
             .open(path)
     }
     #[cfg(not(unix))]
     {
-        std::fs::File::create(path)
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
     }
 }
 
@@ -403,12 +400,14 @@ mod write_owner_only_tests {
         let dir = scratch_dir("open");
         let control = dir.join("control");
         std::fs::File::create(&control).expect("control file");
-        assert_ne!(
-            mode(&control) & 0o077,
-            0,
-            "the umask removes group and other bits, so this test cannot tell a \
-             0600 create from a default one"
-        );
+        let group_and_other_bits = mode(&control) & 0o077;
+        if group_and_other_bits == 0 {
+            // The umask removes every group and other bit (umask 077 does), so
+            // a plain create is 0600 too and this test cannot tell them apart.
+            eprintln!("skipped: under this umask a plain create has no group or other bits");
+            std::fs::remove_dir_all(&dir).expect("cleanup");
+            return;
+        }
         let path = dir.join("key.pem");
 
         let file = super::open_owner_only(path.to_str().expect("utf-8 path")).expect("create");
@@ -447,8 +446,9 @@ mod write_owner_only_tests {
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
-    /// The config is 0600 from creation, and an existing world-readable one
-    /// is narrowed before the new contents (with a password) are written.
+    /// The config is 0600 from creation. A write to a path that exists fails
+    /// and leaves that file as it was, so the new contents (with a password)
+    /// never go into a file that was readable by others.
     #[test]
     fn the_config_is_never_readable_by_others() {
         let dir = scratch_dir("config");
@@ -460,9 +460,30 @@ mod write_owner_only_tests {
         assert_eq!(std::fs::read(&path).expect("read"), b"first");
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
-        super::write_owner_only(p, b"password = \"s\"").expect("overwrite");
-        assert_eq!(mode(&path), 0o600);
-        assert_eq!(std::fs::read(&path).expect("read"), b"password = \"s\"");
+        let err = super::write_owner_only(p, b"password = \"s\"").expect_err("existing file");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(mode(&path), 0o644);
+        assert_eq!(std::fs::read(&path).expect("read"), b"first");
+
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// A symlink at the path is not followed: the write fails, and the file
+    /// the symlink points to keeps its contents and its mode.
+    #[test]
+    fn a_symlink_at_the_path_is_not_followed() {
+        let dir = scratch_dir("symlink");
+        let target = dir.join("target");
+        std::fs::write(&target, b"other").expect("target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let link = dir.join("key.pem");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        let err = super::write_owner_only(link.to_str().expect("utf-8 path"), b"secret")
+            .expect_err("symlink");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&target).expect("read"), b"other");
+        assert_eq!(mode(&target), 0o644);
 
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
