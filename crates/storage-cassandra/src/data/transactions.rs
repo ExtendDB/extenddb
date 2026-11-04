@@ -236,7 +236,7 @@ impl CassandraEngine {
         let mut reasons: Vec<CancellationReason> = Vec::with_capacity(ops.len());
         let mut any_failed = false;
         for op in ops {
-            match validation::validate_key_only(
+            match validation::validate_batch_key_only(
                 op.key,
                 &op.key_info.key_schema,
                 &op.key_info.attribute_definitions,
