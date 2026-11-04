@@ -2204,6 +2204,7 @@ async fn test_claim_backup_excludes_a_second_owner_and_fences_its_writes() {
         size_bytes: Some(1234),
         item_count: Some(5),
         failure_reason: None,
+        source_table_details_json: None,
         completed: true,
     };
     assert_eq!(
@@ -5466,4 +5467,404 @@ async fn test_the_newest_available_row_and_the_running_restores_are_read_by_stat
             .any(|job| job.target.account_id == account_id),
         "the age-based listing misses a heartbeat ahead of the clock"
     );
+}
+/// The index row of `row`, read back through the catalog.
+async fn stored_index_row(engine: &CassandraEngine, row: &BackupRow) -> BackupRow {
+    engine
+        .read_backup_row(&arn_of(row))
+        .await
+        .expect("read")
+        .expect("the row exists")
+}
+
+/// `claim_dead_backup`: refused while the owner's heartbeat is within the
+/// window, on the coordinator's clock; once the window has passed (waited
+/// out, not hand-dated) the row is taken over under a fresh generation with
+/// its heartbeat left as the dead owner wrote it, the old claim finds its
+/// heartbeat lost and its writes unmatched, and the successor's AVAILABLE
+/// write carries the source table and a completion time and moves the status
+/// index. A successor that heartbeats is a live owner to a third taker; a row
+/// that is not CREATING, and a missing row, answer `None`.
+#[tokio::test]
+async fn test_claim_dead_backup_takes_over_a_stale_row_and_refuses_a_live_one() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, "extenddb_ttl_test").await;
+    let account_id = account.account_id.clone();
+    let store = unique_store();
+    let row = index_row(&account_id, "Music", "dead-owner", &store);
+    let key = row.key();
+    let window = Duration::from_secs(1);
+    assert!(
+        engine
+            .claim_dead_backup(&key, window)
+            .await
+            .expect("claim")
+            .is_none(),
+        "a missing row"
+    );
+    let owner = engine.claim_backup(&row).await.expect("claim");
+    let before = stored_index_row(&engine, &row).await;
+    assert!(
+        engine
+            .claim_dead_backup(&key, Duration::from_secs(300))
+            .await
+            .expect("claim")
+            .is_none(),
+        "a live owner within a long window"
+    );
+    assert!(
+        engine
+            .claim_dead_backup(&key, window)
+            .await
+            .expect("claim")
+            .is_none(),
+        "a heartbeat written an instant ago is within a one-second window"
+    );
+    tokio::time::sleep(Duration::from_millis(1_300)).await;
+    let successor = engine
+        .claim_dead_backup(&key, window)
+        .await
+        .expect("claim")
+        .expect("the window passed on the coordinator's clock: taken over");
+    assert_ne!(successor.generation(), owner.generation());
+    assert_ne!(successor.generation(), UNOWNED_GENERATION);
+    let after = stored_index_row(&engine, &row).await;
+    assert_eq!(after.owner_generation, successor.generation());
+    assert_eq!(after.status, BackupStatus::Creating);
+    assert_eq!(
+        after.heartbeat_at, before.heartbeat_at,
+        "the takeover left the heartbeat as the dead owner wrote it"
+    );
+    assert_eq!(
+        owner.heartbeat().await.expect("heartbeat"),
+        Heartbeat::Lost,
+        "the old owner's heartbeat finds another generation"
+    );
+    assert_eq!(
+        owner
+            .set_status(
+                JobStatus::Creating,
+                JobStatus::Failed,
+                &StatusFields::default()
+            )
+            .await
+            .expect("write"),
+        WriteOutcome::NotMatched,
+        "the old generation's write is fenced"
+    );
+
+    // The successor heartbeats: a third taker finds a live owner.
+    assert_eq!(
+        successor.heartbeat().await.expect("heartbeat"),
+        Heartbeat::Confirmed
+    );
+    assert!(
+        engine
+            .claim_dead_backup(&key, window)
+            .await
+            .expect("claim")
+            .is_none(),
+        "the successor's heartbeat is fresh"
+    );
+
+    // The successor's AVAILABLE write carries the manifest's source table.
+    let mut source_table = row.source_table_details_json.clone();
+    source_table["item_count"] = serde_json::json!(41);
+    let fields = StatusFields {
+        size_bytes: Some(4_096),
+        item_count: Some(41),
+        failure_reason: None,
+        source_table_details_json: Some(source_table.clone()),
+        completed: true,
+    };
+    assert_eq!(
+        successor
+            .set_status(JobStatus::Creating, JobStatus::Available, &fields)
+            .await
+            .expect("write"),
+        WriteOutcome::Matched
+    );
+    let available = stored_index_row(&engine, &row).await;
+    assert_eq!(available.status, BackupStatus::Available);
+    assert_eq!(available.size_bytes, 4_096);
+    assert_eq!(available.item_count, 41);
+    assert_eq!(
+        available.source_table_details_json, source_table,
+        "the write applied the source table"
+    );
+    assert!(available.completed_at.is_some(), "completed is stamped");
+    let listed: Vec<BackupRow> = engine
+        .list_backup_rows(Some(BackupStatus::Available), &store)
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1, "the status index followed: {listed:?}");
+    assert!(
+        engine
+            .claim_dead_backup(&key, Duration::ZERO)
+            .await
+            .expect("claim")
+            .is_none(),
+        "an AVAILABLE row is not taken over, whatever its heartbeat's age"
+    );
+
+    // A FAILED write without the member leaves the stored source table.
+    let failed = index_row(&account_id, "Music", "dead-owner-failed", &store);
+    let claim = engine.claim_backup(&failed).await.expect("claim");
+    assert_eq!(
+        claim
+            .set_status(
+                JobStatus::Creating,
+                JobStatus::Failed,
+                &StatusFields {
+                    failure_reason: Some("owner dead".to_owned()),
+                    completed: true,
+                    ..StatusFields::default()
+                }
+            )
+            .await
+            .expect("write"),
+        WriteOutcome::Matched
+    );
+    let stored = stored_index_row(&engine, &failed).await;
+    assert_eq!(
+        stored.source_table_details_json,
+        failed.source_table_details_json
+    );
+    assert_eq!(stored.failure_reason.as_deref(), Some("owner dead"));
+}
+
+/// The `active_restores` of a `backups_by_arn` row, as the map's entries.
+async fn registrations(
+    engine: &CassandraEngine,
+    account_id: &str,
+    backup_arn: &str,
+) -> std::collections::HashMap<String, String> {
+    use cdrs_tokio::types::AsRust;
+    use cdrs_tokio::types::IntoRustByName;
+    let rows = extenddb_storage_cassandra::cassandra_util::query_rows_quorum::<StorageError>(
+        &engine.session_arc(),
+        &format!(
+            "SELECT active_restores FROM {}.backups_by_arn \
+             WHERE account_id = ? AND backup_arn = ?",
+            engine.catalog_keyspace()
+        ),
+        cdrs_tokio::query_values!(account_id, backup_arn),
+        "registrations",
+    )
+    .await
+    .expect("read the row");
+    let map: Option<cdrs_tokio::types::map::Map> = rows
+        .first()
+        .expect("the row exists")
+        .get_by_name("active_restores")
+        .ok()
+        .flatten();
+    map.map(|map| map.as_rust().expect("map").unwrap_or_default())
+        .unwrap_or_default()
+}
+
+/// `sweep_restore_registrations`: an entry whose target is a CREATING
+/// restore target of the backup with the registered table id is kept; one
+/// whose target is ACTIVE, one whose target restores from another backup and
+/// one whose target has no row are removed, and the swept backup's ARN is
+/// returned once. A second sweep finds nothing to do.
+#[tokio::test]
+async fn test_the_registrations_sweep_removes_stale_entries_and_keeps_a_live_one() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let (engine, account_id, _drop_keyspaces) = isolated_engine("sw", false).await;
+    let store = unique_store();
+    let catalog = engine.catalog_keyspace();
+    let row = index_row(&account_id, "Music", "registered", &store);
+    let claim = engine.claim_backup(&row).await.expect("claim");
+    assert_eq!(
+        claim
+            .set_status(
+                JobStatus::Creating,
+                JobStatus::Available,
+                &StatusFields::default()
+            )
+            .await
+            .expect("write"),
+        WriteOutcome::Matched
+    );
+    let other = index_row(&account_id, "Music", "other", &store);
+    let other_claim = engine.claim_backup(&other).await.expect("claim");
+    assert_eq!(
+        other_claim
+            .set_status(
+                JobStatus::Creating,
+                JobStatus::Available,
+                &StatusFields::default()
+            )
+            .await
+            .expect("write"),
+        WriteOutcome::Matched
+    );
+    let mut targets = Vec::new();
+    for name in ["SwLive", "SwActive", "SwForeign"] {
+        targets.push(
+            create_active_table(
+                &engine,
+                &account_id,
+                CreateTableInput {
+                    table_name: name.to_owned(),
+                    key_schema: vec![ks("id", KeyType::Hash)],
+                    attribute_definitions: vec![attr("id", ScalarAttributeType::S)],
+                    billing_mode: Some(BillingMode::PayPerRequest),
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+    let (live, active, foreign) = (&targets[0], &targets[1], &targets[2]);
+    // A CREATING target restoring from the backup; a CREATING target
+    // restoring from the other backup; an ACTIVE table; a name with no row.
+    for (target, source) in [(live, &row), (foreign, &other)] {
+        apply(
+            &engine,
+            &format!(
+                "UPDATE {catalog}.tables SET table_status = 'CREATING', \
+                 status_transition_at = null, restore_source_backup_arn = ? \
+                 WHERE account_id = ? AND table_name = ? IF table_id = ?"
+            ),
+            cdrs_tokio::query_values!(
+                source.backup_arn.as_str(),
+                account_id.as_str(),
+                target.table_name.as_str(),
+                target.table_id.as_str()
+            ),
+        )
+        .await;
+    }
+    let missing_id = uuid::Uuid::new_v4().to_string();
+    for (table_id, name) in [
+        (live.table_id.as_str(), "SwLive"),
+        (active.table_id.as_str(), "SwActive"),
+        (foreign.table_id.as_str(), "SwForeign"),
+        (missing_id.as_str(), "SwMissing"),
+    ] {
+        apply(
+            &engine,
+            &format!(
+                "UPDATE {catalog}.backups_by_arn SET active_restores[?] = ? \
+                 WHERE account_id = ? AND backup_arn = ? IF EXISTS"
+            ),
+            cdrs_tokio::query_values!(table_id, name, account_id.as_str(), row.backup_arn.as_str()),
+        )
+        .await;
+    }
+    // The other backup registers its own live restore: nothing to sweep.
+    apply(
+        &engine,
+        &format!(
+            "UPDATE {catalog}.backups_by_arn SET active_restores[?] = ? \
+             WHERE account_id = ? AND backup_arn = ? IF EXISTS"
+        ),
+        cdrs_tokio::query_values!(
+            foreign.table_id.as_str(),
+            "SwForeign",
+            account_id.as_str(),
+            other.backup_arn.as_str()
+        ),
+    )
+    .await;
+    assert_eq!(
+        registrations(&engine, &account_id, &row.backup_arn)
+            .await
+            .len(),
+        4
+    );
+
+    let swept = engine.sweep_restore_registrations().await.expect("sweep");
+    assert_eq!(swept, std::slice::from_ref(&row.backup_arn));
+    let left = registrations(&engine, &account_id, &row.backup_arn).await;
+    assert_eq!(
+        left,
+        std::collections::HashMap::from([(live.table_id.clone(), "SwLive".to_owned())]),
+        "the live entry is kept and the three stale ones are removed"
+    );
+    assert_eq!(
+        registrations(&engine, &account_id, &other.backup_arn).await,
+        std::collections::HashMap::from([(foreign.table_id.clone(), "SwForeign".to_owned())]),
+        "the other backup's live entry is untouched"
+    );
+    assert!(
+        engine
+            .sweep_restore_registrations()
+            .await
+            .expect("sweep")
+            .is_empty(),
+        "a second sweep finds nothing"
+    );
+    assert_eq!(
+        engine.backup_in_use(&row.key()).await.expect("in use"),
+        Some("SwLive".to_owned()),
+        "the kept entry is the in-use rule's"
+    );
+}
+
+/// The liveness test inside the takeover write: with the owner's beat
+/// landing between `claim_dead_backup`'s `LOCAL_SERIAL` read (which found
+/// the heartbeat stale) and its LWT, the LWT's `heartbeat_at = <read>`
+/// condition fails and the takeover answers `None`; the row keeps the
+/// owner's generation and the owner's next beat confirms. Without that
+/// condition the staleness comparison alone would decide, and a live owner's
+/// job would be failed by the reconciler.
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn test_a_beat_between_the_takeovers_read_and_its_write_refuses_the_takeover() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, "extenddb_ttl_test").await;
+    let account_id = account.account_id.clone();
+    let store = unique_store();
+    let row = index_row(&account_id, "Music", "beat-in-the-gap", &store);
+    let key = row.key();
+    let window = Duration::from_secs(1);
+    let owner = engine.claim_backup(&row).await.expect("claim");
+    tokio::time::sleep(Duration::from_millis(1_300)).await;
+    let pause =
+        extenddb_storage_cassandra::test_hooks::pause_before_takeover_write(&row.backup_arn);
+    let taker = {
+        let engine = engine.clone();
+        let key = key.clone();
+        tokio::spawn(async move { engine.claim_dead_backup(&key, window).await })
+    };
+    pause.reached().await;
+    // The read found the beat stale; the owner beats now.
+    assert_eq!(
+        owner.heartbeat().await.expect("heartbeat"),
+        Heartbeat::Confirmed
+    );
+    pause.release();
+    let taken = taker.await.expect("the taker's task").expect("claim");
+    assert!(
+        taken.is_none(),
+        "the LWT's heartbeat condition refuses a row whose owner beat in the gap"
+    );
+    let after = stored_index_row(&engine, &row).await;
+    assert_eq!(after.owner_generation, owner.generation());
+    assert_eq!(after.status, BackupStatus::Creating);
+    assert_eq!(
+        owner.heartbeat().await.expect("heartbeat"),
+        Heartbeat::Confirmed,
+        "the owner's claim is intact"
+    );
+    // Without the beat, the same stale row is taken over.
+    tokio::time::sleep(Duration::from_millis(1_300)).await;
+    let successor = engine
+        .claim_dead_backup(&key, window)
+        .await
+        .expect("claim")
+        .expect("taken over once no beat lands in the gap");
+    assert_ne!(successor.generation(), owner.generation());
 }

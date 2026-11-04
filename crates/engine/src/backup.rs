@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use extenddb_core::backup_format::{BackupArn, is_region};
+use extenddb_core::backup_format::{BackupArn, check_store_prefix_table_name, is_region};
 use extenddb_core::error::{DynamoDbError, ErrorMessageKey, error_message};
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{
@@ -29,16 +29,17 @@ use extenddb_storage::backup_catalog::{
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::{
-    BackupCatalog, BackupRestoreSource, LegacyBackupReader, RestoreRequest, RestoreTableOverrides,
-    TableEngine,
+    BackupCatalog, BackupRestoreSource, LegacyBackupReader, MetadataEngine, RestoreRequest,
+    RestoreTableOverrides, SnapshotEngine, TableEngine,
 };
 use futures::TryStreamExt;
 use serde_json::{Value, json};
 
+pub use job::KillPoint;
 pub use maintenance::HeldClaim;
 pub use runtime::{
-    BackupRuntime, ConfiguredStore, LOCAL_CHECK_TIMEOUT, S3_CHECK_TIMEOUT, Spool, StoreHealth,
-    StoreHealthReport, check_configured_store, read_identity_bounded,
+    BackupRuntime, ConfiguredStore, JobSettings, LOCAL_CHECK_TIMEOUT, S3_CHECK_TIMEOUT, Spool,
+    StoreHealth, StoreHealthReport, check_configured_store, read_identity_bounded,
 };
 pub use store_identity::{STORE_IDENTITY_KEY, StoreIdentityFile, StoreProblem};
 
@@ -418,10 +419,11 @@ pub(crate) async fn handle_create_backup(
         )
         .await;
     let details = create_backup(
-        &*ctx.storage,
+        &ctx.storage,
         &ctx.backup,
         &ctx.account_id,
         &ctx.region,
+        &ctx.limits,
         table_name,
         backup_name,
         probe,
@@ -435,23 +437,53 @@ pub(crate) async fn handle_create_backup(
 /// account (`TableNotFoundException`, "Table not found: <name>", otherwise,
 /// whether or not a permit is free); the server's region fits a backup ARN
 /// (`check_backup_arn_fits`: a `server.region` outside `[a-z0-9-]` is a
-/// `ValidationException` naming the setting); the table has no vector index
-/// (the in-catalog format cannot restore one); then the job permit
+/// `ValidationException` naming the setting); on the store-backed path, the
+/// table name fits a store prefix (`check_store_prefix_fits`: a name over 255
+/// bytes or made only of dots is a `ValidationException` naming the rule; the
+/// in-catalog path writes no prefix and backs such a table up, as the service
+/// does); on the in-catalog path, the table has no vector index (the
+/// in-catalog format cannot restore one); then the job permit
 /// (`LimitExceededException` when none is freed within the runtime's wait).
 /// `probe` is the `DescribeTable` of the table, which the handler ran.
 ///
-/// This is the in-catalog create, the path while no `[backup.store]` is
-/// configured; each call logs that the format is deprecated. Last before the
-/// permit, the maintenance claim ([`refuse_while_maintenance_held`]).
-async fn create_backup<S: BackupCatalog + LegacyBackupReader + ?Sized>(
-    storage: &S,
+/// With a store configured and the backend not bound to the in-catalog
+/// create, the create is store-backed: the store must be healthy
+/// ([`BackupRuntime::require_healthy_store`], refused before a slot is
+/// taken as every operation that touches the store is), the maintenance
+/// claim must not be held ([`refuse_while_maintenance_held`], before the
+/// permit as on the in-catalog path, so a refusal inserts no row), then the
+/// permit (`LimitExceededException` when none is free), then the detached
+/// task of [`job::start`] (the snapshot's open, the row under the job's
+/// claim, the response CREATING) whose answer the request awaits. A vector
+/// table is backed up on this path (the manifest records its indexes).
+///
+/// Otherwise the in-catalog create: the table has no vector index (the
+/// in-catalog format cannot restore one), the maintenance claim is not held
+/// ([`refuse_while_maintenance_held`], last before the permit), the permit,
+/// then `LegacyBackupReader::create`; each call logs that the format is
+/// deprecated. `probe` is the `DescribeTable` of the table, which the
+/// handler ran.
+#[allow(clippy::too_many_arguments)]
+async fn create_backup<S>(
+    storage: &Arc<S>,
     runtime: &BackupRuntime,
     account_id: &str,
     region: &str,
+    limits: &LimitsConfig,
     table_name: &str,
     backup_name: &str,
     probe: Result<TableDescription, StorageError>,
-) -> Result<extenddb_core::types::BackupDetails, DynamoDbError> {
+) -> Result<extenddb_core::types::BackupDetails, DynamoDbError>
+where
+    S: BackupCatalog
+        + LegacyBackupReader
+        + SnapshotEngine
+        + MetadataEngine
+        + ?Sized
+        + Send
+        + Sync
+        + 'static,
+{
     let desc = match probe {
         Ok(desc) if desc.table_status == TableStatus::Active => desc,
         Ok(_) => {
@@ -463,20 +495,34 @@ async fn create_backup<S: BackupCatalog + LegacyBackupReader + ?Sized>(
         Err(e) => return Err(create_backup_storage_err_to_dynamo(e, table_name)),
     };
     check_backup_arn_fits(region)?;
-    refuse_backup_of_vector_table(&desc)?;
-    // A create that writes to the configured store needs it healthy, and is
-    // refused before a slot is taken when it is not, as every operation that
-    // touches the store is; the in-catalog create touches no store, so the
-    // store's health does not gate it (a backend bound to the in-catalog
-    // create, or a server with an unhealthy store, creates as a server
-    // without a store does).
-    let store_backed = runtime.configured_store().is_some()
-        && !runtime.legacy_create_only()
-        && STORE_BACKED_CREATE;
+    let store_backed = runtime.configured_store().is_some() && !runtime.legacy_create_only();
     if store_backed {
-        runtime.require_healthy_store()?;
+        check_store_prefix_fits(region, account_id, table_name)?;
+        let store = runtime.require_healthy_store()?;
+        let env = job::JobEnv::new(runtime, store)?;
+        refuse_while_maintenance_held(&**storage, runtime).await?;
+        let permit = runtime.take_permit().await?;
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let request = job::CreateRequest {
+            account_id: account_id.to_owned(),
+            region: region.to_owned(),
+            table_name: table_name.to_owned(),
+            backup_name: backup_name.to_owned(),
+            limits: limits.into(),
+        };
+        runtime.spawn_job(job::start(Arc::clone(storage), env, permit, request, reply));
+        return answer.await.unwrap_or_else(|_| {
+            tracing::error!(
+                "CreateBackup of {table_name} (account {account_id}): the job task ended \
+                 without answering"
+            );
+            Err(DynamoDbError::InternalServerError(
+                "Internal server error".to_owned(),
+            ))
+        });
     }
-    refuse_while_maintenance_held(storage, runtime).await?;
+    refuse_backup_of_vector_table(&desc)?;
+    refuse_while_maintenance_held(&**storage, runtime).await?;
     let permit = runtime.take_permit().await?;
     match runtime.configured_store() {
         None => tracing::warn!(
@@ -486,8 +532,8 @@ async fn create_backup<S: BackupCatalog + LegacyBackupReader + ?Sized>(
         ),
         Some(store) => tracing::info!(
             "CreateBackup of {table_name} (account {account_id}) is writing the in-catalog \
-             backup format; the configured {} backup store serves restores and deletes of the \
-             backups it holds, and a later release's CreateBackup writes to it",
+             backup format: this backend is bound to it; the configured {} backup store serves \
+             restores and deletes of the backups it holds",
             store.kind
         ),
     }
@@ -498,19 +544,21 @@ async fn create_backup<S: BackupCatalog + LegacyBackupReader + ?Sized>(
 }
 
 /// The jobs' side of the catalog-level maintenance claim: a backup or
-/// restore job is refused with `LimitExceededException` while a maintenance
-/// command (`extenddb backup purge`) holds the claim, read with
-/// `stale_job_after_secs` so a dead command's claim expires. The check runs
-/// after every other refusal and before the permit, which on this head is
-/// before the job's row exists: the in-catalog create and restore commit
-/// their row inside the backend and detach, so the engine has no point
-/// between the row and the copy to check at. A claim taken between this
-/// check and the row's insert is therefore not seen by the job; the command
-/// create that slips through writes no object of the store the command
-/// deletes from, and a restore that slips through is a RUNNING record the
-/// command's wait lists, so the window costs nothing in this release. The
-/// store-backed job of a later release owns its row from the
-/// engine and checks after the row exists, as the design's 5.1 step 2 says.
+/// restore job is refused with `LimitExceededException`
+/// ([`maintenance_held`]) while a maintenance command (`extenddb backup
+/// purge`) holds the claim, read with `stale_job_after_secs` so a dead
+/// command's claim expires. The check runs after every other refusal and
+/// before the permit, which is before the job's row exists: the in-catalog
+/// create and restore commit their row inside the backend and detach, so the
+/// engine has no point between the row and the copy to check at, and the
+/// store-backed create checks here too rather than after its insert, since
+/// a row written FAILED for the refusal carried the insert's heartbeat and
+/// `backup purge`'s wait counted it as a live job for the stale window. A
+/// claim taken between this check and the row's insert is therefore not
+/// seen by the job; the in-catalog create that slips through writes no
+/// object of the store the command deletes from, and a restore or a
+/// store-backed create that slips through is a RUNNING record or a CREATING
+/// row the command's wait lists, so the window costs nothing.
 async fn refuse_while_maintenance_held<S: BackupCatalog + ?Sized>(
     storage: &S,
     runtime: &BackupRuntime,
@@ -520,21 +568,19 @@ async fn refuse_while_maintenance_held<S: BackupCatalog + ?Sized>(
         .await
         .map_err(storage_err_to_dynamo)?;
     if held {
-        return Err(DynamoDbError::LimitExceededException(
-            "A backup maintenance command holds this catalog's maintenance claim; backup and \
-             restore jobs are refused until it finishes"
-                .to_owned(),
-        ));
+        return Err(maintenance_held());
     }
     Ok(())
 }
 
-/// Whether CreateBackup writes to the configured store. No store-backed
-/// create exists on this head: every create writes the in-catalog format,
-/// whatever the store configuration, and the release that adds the
-/// store-backed job turns this on for a server with a store configured and
-/// not bound to the in-catalog create.
-const STORE_BACKED_CREATE: bool = false;
+/// The refusal every job answers while the maintenance claim is held.
+fn maintenance_held() -> DynamoDbError {
+    DynamoDbError::LimitExceededException(
+        "A backup maintenance command holds this catalog's maintenance claim; backup and \
+         restore jobs are refused until it finishes"
+            .to_owned(),
+    )
+}
 
 /// The one backup ARN rule CreateBackup applies on this path: the server's
 /// own region (`server.region` outside `[a-z0-9-]` forms no backup ARN
@@ -557,6 +603,39 @@ fn check_backup_arn_fits(region: &str) -> Result<(), DynamoDbError> {
     Ok(())
 }
 
+/// The store-backed create's name rules, applied before the job's row exists:
+/// the table name has to fit a store prefix
+/// (`extenddb_core::backup_format::check_store_prefix_table_name`: over 255
+/// bytes, or made only of dots, fits none) and the backup ARN has to form
+/// (checked with a placeholder id, so the message names the limit whatever
+/// the length). The in-catalog create applies neither: it writes no prefix,
+/// and the service backs up any table it can create.
+fn check_store_prefix_fits(
+    region: &str,
+    account_id: &str,
+    table_name: &str,
+) -> Result<(), DynamoDbError> {
+    check_store_prefix_table_name(table_name).map_err(|e| {
+        DynamoDbError::ValidationException(format!(
+            "TableName cannot be backed up: a backup ARN cannot be formed for it: {e}"
+        ))
+    })?;
+    let placeholder = extenddb_core::backup_format::format_backup_id(0, 0);
+    BackupArn::new(
+        extenddb_storage::util::ARN_PARTITION,
+        region,
+        account_id,
+        table_name,
+        &placeholder,
+    )
+    .map(drop)
+    .map_err(|e| {
+        DynamoDbError::ValidationException(format!(
+            "TableName cannot be backed up: a backup ARN cannot be formed for it: {e}"
+        ))
+    })
+}
+
 /// [`storage_err_to_dynamo`] for CreateBackup, where a table that does not
 /// exist or is not yet `ACTIVE` is `TableNotFoundException` with the
 /// service's text (`Table not found: <name>`, measured on DynamoDB for both
@@ -571,7 +650,8 @@ fn create_backup_storage_err_to_dynamo(e: StorageError, table_name: &str) -> Dyn
     }
 }
 
-/// The CreateBackup refusal for a table with vector indexes.
+/// The in-catalog create's refusal for a table with vector indexes (the
+/// in-catalog format cannot restore one); the store-backed path has none.
 fn refuse_backup_of_vector_table(desc: &TableDescription) -> Result<(), DynamoDbError> {
     let count = desc.vector_indexes.as_ref().map_or(0, Vec::len);
     if count == 0 {
@@ -1451,8 +1531,8 @@ where
 /// index's row first ([`check_catalog_row_status`]: a CREATING row is
 /// `BackupInUseException`, a DELETING, DELETED or FAILED row
 /// `BackupNotFoundException`), else the legacy reader's restore source, a
-/// missing backup being `BackupNotFoundException` whatever the target name's
-/// state; (5) check the target name under the account through
+/// missing backup being `BackupNotFoundException` whatever the target
+/// name's state; (5) check the target name under the account through
 /// `describe_table` ([`check_restore_target_name`]: a table of that name is
 /// `TableAlreadyExistsException`, a CREATING restore target
 /// `TableInUseException` naming its source backup), after the backup is
@@ -1461,14 +1541,14 @@ where
 /// of a missing backup into an existing table, into a table CreateTable is
 /// still creating and into a CREATING restore target all answer
 /// `BackupNotFoundException`; an in-use backup into an existing table
-/// answers `TableAlreadyExistsException`); then, for a row, the rest of its
-/// checks ([`check_catalog_row_for_restore`]: a backup in use is
+/// answers `TableAlreadyExistsException`, and a restore of a backup into
+/// its own CREATING target `TableInUseException`); then, for a row, the
+/// rest of its checks ([`check_catalog_row_for_restore`]: a backup in use is
 /// `BackupInUseException`, a row of another store a `ValidationException`,
 /// a row of the configured store while it is unhealthy one naming the
 /// store's kind, and an AVAILABLE row of the healthy store the
 /// `ValidationException` naming the store, since this release restores
-/// in-catalog backups only);
-/// (6) refuse what no
+/// in-catalog backups only); (6) refuse what no
 /// backend restores faithfully (multi-part key, vector indexes); (7) check
 /// the throughput override against the backup's billing mode, build the
 /// target's `CreateTableInput`, and apply the index and on-demand throughput
@@ -1516,7 +1596,8 @@ async fn restore_table_from_backup<S: BackupCatalog + LegacyBackupReader + Table
         // 5, for a row: the target name once the backup is known to exist,
         // before the backup's in-use rule (measured on DynamoDB: an in-use
         // backup into an existing table is TableAlreadyExistsException, a
-        // backup into its own CREATING target TableInUseException).
+        // backup into its own CREATING target TableInUseException, not
+        // BackupInUseException).
         check_restore_target_name(storage, account_id, target_table_name).await?;
         check_catalog_row_for_restore(storage, runtime, &arn, &row).await?;
     }
@@ -1782,6 +1863,7 @@ fn storage_err_to_dynamo(e: StorageError) -> DynamoDbError {
     }
 }
 
+mod job;
 pub mod maintenance;
 mod overrides;
 mod pitr;

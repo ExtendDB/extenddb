@@ -196,7 +196,7 @@ still reports it as running, with the PID shown as unknown. Pass
 `serve --foreground --write-pid-file` to write one anyway, which restores both
 commands at the cost of needing a writable `run_dir`.
 8. Spawn background tasks (log level polling, throttling polling, GSI delay polling, stream cleanup, TTL expiry, metrics persistence)
-9. On SIGTERM/SIGINT: drain connections (5s timeout), exit
+9. On SIGTERM/SIGINT: drain connections (5s timeout), end the running backup jobs through their failure path (30s), stop the background tasks (5s, then abort) and give up the serving registration, exit
 
 ## Catalog Model
 

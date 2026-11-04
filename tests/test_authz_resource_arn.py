@@ -38,6 +38,7 @@ from botocore.exceptions import ClientError
 
 from conftest import wait_for_active
 from management_helpers import ManagementClient
+from test_backup_restore_fidelity import _delete_backup_when_available
 
 
 def _require_auth_env() -> tuple[str, str, str]:
@@ -122,7 +123,13 @@ def _user_with_policy(mgmt: ManagementClient, account_id: str, policy: dict) -> 
 @pytest.fixture(scope="module")
 def table(auth_env, mgmt, account_id, region):
     """A table with a GSI, a stream, one item, and a backup. Returns the
-    canonical table, index, stream, and backup ARNs."""
+    canonical table, index, stream, and backup ARNs. The cells deny
+    DeleteBackup and DeleteTable to other users, so the backup and the table
+    are deleted here once the module is done: on a server with a configured
+    `[backup.store]` the backup is a complete set of objects under the store,
+    and one that is left behind stays until someone deletes it (CI runners
+    die with theirs; a developer's server keeps them). The backup is deleted
+    once AVAILABLE, since a backup still CREATING refuses DeleteBackup."""
     endpoint = auth_env[0]
     ak, sk = _user_with_policy(mgmt, account_id, ALLOW_ALL)
     admin = _client(endpoint, ak, sk, region)
@@ -147,13 +154,18 @@ def table(auth_env, mgmt, account_id, region):
     desc = admin.describe_table(TableName=name)["Table"]
     table_arn = desc["TableArn"]
     backup_arn = admin.create_backup(TableName=name, BackupName="arnbk")["BackupDetails"]["BackupArn"]
-    return {
+    yield {
         "name": name,
         "table_arn": table_arn,
         "index_arn": table_arn + "/index/gsi1",
         "stream_arn": desc.get("LatestStreamArn"),
         "backup_arn": backup_arn,
     }
+    _delete_backup_when_available(admin, backup_arn)
+    try:
+        admin.delete_table(TableName=name)
+    except ClientError:
+        pass
 
 
 class TestExplicitDenyOnResourceArn:

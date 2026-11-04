@@ -10,11 +10,11 @@ deployment and reads `/health`, the server's log and the API's answers:
   with a filesystem store, `checking` while an S3 store's first check is in
   flight, unhealthy (status `degraded`) while an S3 endpoint refuses
   connections or stalls, and healthy again once it answers, without a restart;
-- the restore and delete of a store-backed backup refused with a
-  ValidationException naming the store's kind and the problem's category and
-  not its root while the store is checking or unhealthy; CreateBackup served
-  throughout (this release's create writes the in-catalog format, which
-  touches no store);
+- the restore and delete of a store-backed backup, and CreateBackup (which
+  writes to the store), refused with a ValidationException naming the
+  store's kind and the problem's category and not its root while the store
+  is checking or unhealthy, and CreateBackup writing a backup under the
+  store's root once it is healthy;
 - a stalled S3 endpoint holding the listener for no longer than the server's
   own startup, and each reconciler cycle for no longer than the check's bound;
 - the configuration errors that stop startup with the key, path or bucket in
@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -182,6 +183,18 @@ def _client(port: int, creds: dict):
         aws_secret_access_key=creds["AWS_SECRET_ACCESS_KEY"],
         verify=False,
     )
+
+
+def _wait_backup_available(ddb, arn: str, timeout: float = 60.0) -> None:
+    """Poll DescribeBackup to AVAILABLE; any other status fails."""
+    deadline = time.monotonic() + timeout
+    while True:
+        status = ddb.describe_backup(BackupArn=arn)["BackupDescription"]["BackupDetails"]["BackupStatus"]
+        if status == "AVAILABLE":
+            return
+        assert status == "CREATING", f"backup {arn} is {status}"
+        assert time.monotonic() < deadline, f"backup {arn} not AVAILABLE in {timeout} s"
+        time.sleep(0.1)
 
 
 def _create_table(ddb, name: str) -> None:
@@ -441,14 +454,38 @@ class TestSqlite:
             configured = f" (configured as {root})" if canonical != root else ""
             assert f"  backup store: filesystem {canonical}{configured} (the default beside the database file)" in log, log
             assert f"backup store: filesystem {canonical} (store id" in log, log
-            # CreateBackup takes the in-catalog path and says the store is configured.
+            # CreateBackup writes to the store: CREATING answered, the job's
+            # objects under the root, the row AVAILABLE once the manifest is
+            # written, and no deprecation warning.
             creds = _provision(d.port, d.cert, ADMIN_PASSWORD)
             ddb = _client(d.port, creds)
             _create_table(ddb, "Music")
+            ddb.put_item(TableName="Music", Item={"pk": {"S": "a"}, "n": {"N": "1"}})
             details = ddb.create_backup(TableName="Music", BackupName="nightly")["BackupDetails"]
-            assert details["BackupStatus"] in ("CREATING", "AVAILABLE")
-            assert "writing the in-catalog backup format; the configured filesystem backup store" in server.log_text()
-            assert "configure [backup.store]" not in server.log_text()
+            assert details["BackupStatus"] == "CREATING", details
+            arn = details["BackupArn"]
+            _wait_backup_available(ddb, arn)
+            backup_id = arn.rsplit("/", 1)[1]
+            prefix = os.path.join(root, "123456789012", "Music", backup_id)
+            assert sorted(os.listdir(prefix)) == [
+                "data", "extenddb-manifest.json", "extenddb-manifest.sha256",
+                "manifest-files.json", "manifest-summary.json",
+            ], os.listdir(prefix)
+            assert (os.stat(os.path.join(prefix, "extenddb-manifest.json")).st_mode & 0o777) == 0o600
+            with open(os.path.join(prefix, "extenddb-manifest.json")) as f:
+                manifest = json.load(f)
+            assert manifest["backup_arn"] == arn and manifest["source_backend"] == "sqlite", manifest
+            described = ddb.describe_backup(BackupArn=arn)["BackupDescription"]["BackupDetails"]
+            assert described["BackupSizeBytes"] == manifest["backup_size_bytes"] > 0, described
+            log = server.log_text()
+            assert f"backup {arn}: started, " in log and "in the table as last counted by the stats pass, key-ordered" in log, log
+            # The completion line carries the backup's own count, and its
+            # bytes count the documents beside the data files.
+            written = re.search(rf"backup {re.escape(arn)}: AVAILABLE, (\d+) items, (\d+) bytes written in", log)
+            assert written and int(written.group(1)) == 1, log
+            assert int(written.group(2)) > manifest["backup_size_bytes"], log
+            assert "in-catalog backup format" not in log, log
+            assert "configure [backup.store]" not in log, log
         finally:
             server.stop()
 
@@ -474,8 +511,9 @@ class TestSqlite:
         """`sqlite-memory`'s shape (`[storage.sqlite] path = ":memory:"`, the
         default of that build) on the SQLite build: with `[backup.store.filesystem]
         path` set the store is configured and healthy, its identity file is
-        written, and a backup created there (in-catalog in this release, the
-        log naming the configured store) restores with its item; without
+        written, and a backup created there is written to the store (CREATING,
+        then AVAILABLE with its manifest under the root; its restore is
+        refused naming the store until the restore job lands); without
         `[backup.store]` there is no default root (no database file to put it
         beside), no component, and CreateBackup writes a legacy backup with the
         warning naming `[backup.store]`."""
@@ -499,19 +537,17 @@ class TestSqlite:
             ddb = _client(d.port, creds)
             _create_table(ddb, "Music")
             ddb.put_item(TableName="Music", Item={"pk": {"S": "a"}, "v": {"N": "1"}})
-            arn = ddb.create_backup(TableName="Music", BackupName="nightly")["BackupDetails"]["BackupArn"]
-            deadline = time.monotonic() + 60
-            while ddb.describe_backup(BackupArn=arn)["BackupDescription"]["BackupDetails"]["BackupStatus"] != "AVAILABLE":
-                assert time.monotonic() < deadline, "the backup did not become AVAILABLE"
-                time.sleep(0.1)
-            assert "the configured filesystem backup store" in server.log_text(), server.log_text()
-            ddb.restore_table_from_backup(TargetTableName="Restored", BackupArn=arn)
-            deadline = time.monotonic() + 60
-            while ddb.describe_table(TableName="Restored")["Table"]["TableStatus"] != "ACTIVE":
-                assert time.monotonic() < deadline, "the restore did not finish"
-                time.sleep(0.1)
-            item = ddb.get_item(TableName="Restored", Key={"pk": {"S": "a"}})["Item"]
-            assert item == {"pk": {"S": "a"}, "v": {"N": "1"}}, item
+            details = ddb.create_backup(TableName="Music", BackupName="nightly")["BackupDetails"]
+            assert details["BackupStatus"] == "CREATING", details
+            arn = details["BackupArn"]
+            _wait_backup_available(ddb, arn)
+            prefix = os.path.join(root, "123456789012", "Music", arn.rsplit("/", 1)[1])
+            assert os.path.isfile(os.path.join(prefix, "extenddb-manifest.json")), os.listdir(root)
+            with pytest.raises(ClientError) as refused:
+                ddb.restore_table_from_backup(TargetTableName="Restored", BackupArn=arn)
+            assert refused.value.response["Error"]["Code"] == "ValidationException", refused.value.response
+            assert "is in a backup store" in refused.value.response["Error"]["Message"], refused.value.response
+            assert "configure [backup.store]" not in server.log_text(), server.log_text()
         finally:
             server.stop()
 
@@ -626,10 +662,13 @@ class TestSqlite:
             creds = _provision(d.port, d.cert, ADMIN_PASSWORD)
             ddb = _client(d.port, creds)
             _create_table(ddb, "Music")
-            # The in-catalog create touches no store: it runs on an unhealthy
-            # one, as it does on a server with none.
-            details = ddb.create_backup(TableName="Music", BackupName="nightly")["BackupDetails"]
-            assert details["BackupStatus"] in ("CREATING", "AVAILABLE")
+            # CreateBackup writes to the store, so it is refused while the
+            # store is unhealthy, naming the kind and the category, not the
+            # bucket; no row is created.
+            with pytest.raises(ClientError) as refused:
+                ddb.create_backup(TableName="Music", BackupName="nightly")
+            _assert_store_refusal(refused.value, "s3", bucket, category="unreachable")
+            assert ddb.list_backups(TableName="Music")["BackupSummaries"] == []
             log = server.log_text()
             assert "is unhealthy: the store could not be reached" in log, log
             assert bucket in log, "the operator's line names the bucket"
@@ -641,11 +680,25 @@ class TestSqlite:
             )
             assert health["status"] == "healthy"
             assert "is healthy again" in server.log_text()
-            details = ddb.create_backup(TableName="Music", BackupName="nightly2")["BackupDetails"]
-            assert details["BackupStatus"] in ("CREATING", "AVAILABLE")
-            # The identity file was created on the first passing check.
+            # The identity file was created on the first passing check, and
+            # CreateBackup now writes a backup into the bucket.
             body = _s3_client().get_object(Bucket=bucket, Key="extenddb-store.json")["Body"].read()
             assert json.loads(body)["backend"] == "sqlite"
+            ddb.put_item(TableName="Music", Item={"pk": {"S": "a"}, "n": {"N": "1"}})
+            details = ddb.create_backup(TableName="Music", BackupName="nightly2")["BackupDetails"]
+            assert details["BackupStatus"] == "CREATING", details
+            arn = details["BackupArn"]
+            _wait_backup_available(ddb, arn)
+            keys = sorted(
+                o["Key"].rsplit("/", 1)[1]
+                for o in _s3_client().list_objects_v2(
+                    Bucket=bucket, Prefix=f"123456789012/Music/{arn.rsplit('/', 1)[1]}/"
+                )["Contents"]
+            )
+            assert keys == [
+                "000001.json.gz", "extenddb-manifest.json", "extenddb-manifest.sha256",
+                "manifest-files.json", "manifest-summary.json",
+            ], keys
 
             # And degrades again once the endpoint is gone.
             forwarder.stop()
@@ -654,8 +707,9 @@ class TestSqlite:
                 d.port, lambda h: h["components"]["backup_store"]["status"] == "unhealthy", timeout=30, server=server
             )
             assert health["status"] == "degraded"
-            details = ddb.create_backup(TableName="Music", BackupName="again")["BackupDetails"]
-            assert details["BackupStatus"] in ("CREATING", "AVAILABLE"), "the in-catalog create is not gated"
+            with pytest.raises(ClientError) as refused:
+                ddb.create_backup(TableName="Music", BackupName="again")
+            _assert_store_refusal(refused.value, "s3", bucket, category="unreachable")
         finally:
             if forwarder is not None:
                 forwarder.stop()
@@ -665,9 +719,9 @@ class TestSqlite:
         """An endpoint that accepts connections and never answers. Checked:
         the server binds and serves before the store's first check, which runs
         after the listener is up (`/health` answers well within the SDK's
-        attempt timeout with the component `checking`); the in-catalog
-        CreateBackup is served meanwhile; the restore of a seeded store-backed
-        row is refused naming the pending check; the check is abandoned at its
+        attempt timeout with the component `checking`); CreateBackup and the
+        restore of a seeded store-backed row are refused naming the pending
+        check; the check is abandoned at its
         30 s bound, the component turns `unhealthy` (`unreachable`) without a
         restart and the refusal names that; and the reconciler keeps cycling
         while the endpoint stalls (the next cycle's check opens a new
@@ -720,14 +774,16 @@ class TestSqlite:
             log = server.log_text()
             assert "listening on" in log and "run after the listener is up" in log, log
             assert "backup store: s3" in log and "tarpit-bucket" in log, log
-            # Requests are served while the check hangs: the in-catalog create
-            # runs, and the seeded row's restore is refused naming the pending
-            # check and the store's kind, not the bucket.
+            # Requests are served while the check hangs: the table is
+            # created, and CreateBackup and the seeded row's restore are
+            # refused naming the pending check and the store's kind, not the
+            # bucket.
             creds = _provision(d.port, d.cert, ADMIN_PASSWORD)
             ddb = _client(d.port, creds)
             _create_table(ddb, "Music")
-            details = ddb.create_backup(TableName="Music", BackupName="nightly")["BackupDetails"]
-            assert details["BackupStatus"] in ("CREATING", "AVAILABLE")
+            with pytest.raises(ClientError) as refused:
+                ddb.create_backup(TableName="Music", BackupName="nightly")
+            _assert_store_refusal(refused.value, "s3", "tarpit-bucket", category="first check is pending")
             with pytest.raises(ClientError) as refused:
                 ddb.restore_table_from_backup(TargetTableName="Restored", BackupArn=arn)
             _assert_store_refusal(refused.value, "s3", "tarpit-bucket", category="first check is pending")
@@ -759,8 +815,9 @@ class TestSqlite:
             assert accepted_at[1] - first < 45.0, f"the second connection came {accepted_at[1] - first:.1f} s after the first"
             assert "is unhealthy" in log and log.count("is unhealthy: the store could not be reached") == 1, \
                 "the transition is logged once"
-            details = ddb.create_backup(TableName="Music", BackupName="nightly2")["BackupDetails"]
-            assert details["BackupStatus"] in ("CREATING", "AVAILABLE")
+            with pytest.raises(ClientError) as refused:
+                ddb.create_backup(TableName="Music", BackupName="nightly2")
+            _assert_store_refusal(refused.value, "s3", "tarpit-bucket", category="unreachable")
         finally:
             server.stop()
             tarpit.close()
@@ -814,10 +871,11 @@ class TestSqlite:
             with pytest.raises(ClientError) as refused:
                 ddb.delete_backup(BackupArn=arn)
             _assert_store_refusal(refused.value, "filesystem", root, category="manifest probe failed")
-            # The in-catalog create is served on the unhealthy store.
+            # CreateBackup is refused on the unhealthy store too.
             _create_table(ddb, "Music")
-            details = ddb.create_backup(TableName="Music", BackupName="nightly")["BackupDetails"]
-            assert details["BackupStatus"] in ("CREATING", "AVAILABLE")
+            with pytest.raises(ClientError) as refused:
+                ddb.create_backup(TableName="Music", BackupName="nightly")
+            _assert_store_refusal(refused.value, "filesystem", root, category="manifest probe failed")
             # The manifest put back: the next cycle recovers the store.
             for level in (os.path.dirname(os.path.dirname(manifest_dir)), os.path.dirname(manifest_dir), manifest_dir):
                 if not os.path.isdir(level):
@@ -900,8 +958,8 @@ class TestSqlite:
         """`destroy` then `init --overwrite` on the same directory: the default
         root's identity file names the old catalog. The server starts with the
         store unconfigured and a warning naming the file (not degraded, not a
-        startup error), CreateBackup keeps the in-catalog path, and `destroy`'s
-        output said to remove the file."""
+        startup error), CreateBackup takes the in-catalog path with its
+        deprecation warning, and `destroy`'s output said to remove the file."""
         d = sqlite_deployment
         server = _Server(d.config, str(tmp_path / "serve.log"))
         try:

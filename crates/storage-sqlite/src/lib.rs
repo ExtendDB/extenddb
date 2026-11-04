@@ -253,13 +253,18 @@ fn sqlite_server_components_factory(
                 .await
                 .map_err(BackendError::Catalog)?;
         }
-        let mut engine =
-            SqliteEngine::new(&db_path, pool_size, &region, options.max_item_size_bytes)
-                .await
-                .map_err(|e| BackendError::ConnectionFailed {
-                    backend: "sqlite".to_owned(),
-                    details: e.to_string(),
-                })?;
+        let mut engine = SqliteEngine::new_for_server(
+            &db_path,
+            pool_size,
+            options.max_concurrent_jobs,
+            &region,
+            options.max_item_size_bytes,
+        )
+        .await
+        .map_err(|e| BackendError::ConnectionFailed {
+            backend: "sqlite".to_owned(),
+            details: e.to_string(),
+        })?;
         if options.beside_server {
             return components_of(engine, &db_path).await;
         }
