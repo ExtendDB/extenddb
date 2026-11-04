@@ -48,11 +48,16 @@ async fn a_gsi_added_by_update_table_walks_both_creating_phases() {
     let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
         .await
         .expect("engine");
-    crate::schema::apply(&engine.pool).await.expect("schema");
-    sqlx::query("UPDATE settings SET value = '0' WHERE key = 'control_plane_delay_seconds'")
-        .execute(&engine.pool)
-        .await
-        .expect("delay");
+    crate::migrations::apply_for_tests(&engine.pool).await;
+    // Zero control-plane delay: the table is ACTIVE at create time, since no
+    // transition poller runs inside a unit test. The migrations write no
+    // settings row for the delay, so the row is inserted here.
+    sqlx::query(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0')",
+    )
+    .execute(&engine.pool)
+    .await
+    .expect("delay");
     sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
         .bind(ACCOUNT)
         .execute(&engine.pool)

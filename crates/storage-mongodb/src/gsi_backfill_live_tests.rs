@@ -174,9 +174,10 @@ async fn phase(engine: &MongoEngine, key_info: &TableKeyInfo) -> Option<u8> {
 #[ignore = "needs EXTENDDB_TEST_MONGODB_URI"]
 async fn live_gsi_added_by_update_table_walks_both_creating_phases() {
     let engine = engine().await;
-    let worker = tokio::spawn(crate::ttl_worker::gsi_backfill_worker(Arc::new(
-        engine.clone(),
-    )));
+    let worker = tokio::spawn(crate::ttl_worker::gsi_backfill_worker(
+        Arc::new(engine.clone()),
+        extenddb_storage::CancellationToken::new(),
+    ));
     let key_info = table_with_a_new_gsi(&engine, 2000).await;
 
     let mut seen: Vec<u8> = Vec::new();
@@ -239,9 +240,10 @@ async fn live_gsi_job_resumed_after_a_restart_keeps_its_second_phase() {
     );
 
     let started = Instant::now();
-    let worker = tokio::spawn(crate::ttl_worker::gsi_backfill_worker(Arc::new(
-        engine.clone(),
-    )));
+    let worker = tokio::spawn(crate::ttl_worker::gsi_backfill_worker(
+        Arc::new(engine.clone()),
+        extenddb_storage::CancellationToken::new(),
+    ));
     loop {
         match phase(&engine, &key_info).await {
             Some(3) => break,

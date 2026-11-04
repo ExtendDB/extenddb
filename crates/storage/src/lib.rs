@@ -19,8 +19,11 @@ pub mod gsi_backfill;
 pub mod hooks;
 pub mod management_store;
 pub mod management_store_factory;
+pub mod migrations;
 pub mod operations;
+pub mod password;
 pub mod policy_migration;
+pub mod secret_cipher;
 pub mod server_components;
 pub mod settings_store;
 pub mod snapshot;
@@ -325,7 +328,11 @@ pub trait DataEngine: Send + Sync {
     /// Update an item by primary key using update actions.
     ///
     /// `UpdateItem` is an upsert: if the item doesn't exist, a new item is created
-    /// containing the key attributes plus the SET values.
+    /// containing the key attributes plus the SET values. The exception is an
+    /// update whose actions all remove data (`REMOVE`, `DELETE`): on a missing
+    /// item it writes nothing, emits no stream record, and returns
+    /// `(None, None)` whatever `return_old` and `return_new` say
+    /// (`extenddb_core::expression::removes_only`).
     ///
     /// If `condition` is `Some`, evaluates the condition against the existing item
     /// (or empty item for new) inside a transaction.
@@ -705,7 +712,11 @@ pub trait WorkerStore: Send + Sync {
     ) -> BoxFuture<'_, Result<Vec<(String, &'static str)>, StorageError>>;
 }
 
-/// Backup and point-in-time recovery operations.
+/// Backup operations.
+///
+/// Point-in-time recovery is deliberately absent: no backend implements it, so
+/// the engine answers `DescribeContinuousBackups`, `UpdateContinuousBackups`,
+/// and `RestoreTableToPointInTime` itself without consulting storage.
 pub trait BackupEngine: Send + Sync {
     /// Create a backup of a table, snapshotting all items.
     fn create_backup(
@@ -798,21 +809,6 @@ pub trait BackupEngine: Send + Sync {
         account_id: &str,
         request: RestoreRequest,
     ) -> BoxFuture<'_, Result<TableDescription, StorageError>>;
-
-    /// Describe continuous backups / PITR status for a table.
-    fn describe_continuous_backups(
-        &self,
-        account_id: &str,
-        table_name: &str,
-    ) -> BoxFuture<'_, Result<extenddb_core::types::ContinuousBackupsDescription, StorageError>>;
-
-    /// Update continuous backups (enable/disable PITR).
-    fn update_continuous_backups(
-        &self,
-        account_id: &str,
-        table_name: &str,
-        pitr_enabled: bool,
-    ) -> BoxFuture<'_, Result<extenddb_core::types::ContinuousBackupsDescription, StorageError>>;
 }
 
 /// Supertrait combining all `DynamoDB` operation traits.

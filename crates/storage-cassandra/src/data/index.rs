@@ -35,6 +35,20 @@ pub struct IndexMeta {
     pub propagation_delay_ms: Option<i32>,
 }
 
+/// Build [`validation::IndexKeyRef`] views over the table's indexes for
+/// secondary-index key validation on a written or updated item.
+pub(crate) fn index_key_refs(
+    indexes: &[IndexMeta],
+) -> Vec<extenddb_core::validation::IndexKeyRef<'_>> {
+    indexes
+        .iter()
+        .map(|idx| extenddb_core::validation::IndexKeyRef {
+            index_name: &idx.index_name,
+            key_schema: &idx.key_schema,
+        })
+        .collect()
+}
+
 /// Fetch all index metadata for a table from the catalog.
 pub async fn fetch_indexes_for_table(
     table_id: &str,
@@ -154,7 +168,7 @@ pub async fn fetch_index_by_name(
     let row = rows
         .into_iter()
         .next()
-        .ok_or_else(|| StorageError::IndexNotFound(format!("Index {index_name} not found")))?;
+        .ok_or_else(|| StorageError::IndexNotFound(index_name.to_owned()))?;
 
     let index_status: Option<String> = row.get_by_name("index_status").ok().flatten();
     if index_status.as_deref() == Some("CREATING") {
@@ -241,6 +255,23 @@ pub(crate) fn item_has_index_keys(item: &Item, index_ks: &[KeySchemaElement]) ->
         .all(|ks| item.contains_key(&ks.attribute_name))
 }
 
+/// Whether two images of one base item map to the same index-table row.
+///
+/// The index row's primary key is the index key attributes followed by the
+/// base key attributes, so the rows coincide exactly when every one of those
+/// attributes has the same value in both images.
+pub(crate) fn same_index_row(
+    old: &Item,
+    new: &Item,
+    index_ks: &[KeySchemaElement],
+    base_ks: &[KeySchemaElement],
+) -> bool {
+    index_ks
+        .iter()
+        .chain(base_ks.iter())
+        .all(|ks| old.get(&ks.attribute_name) == new.get(&ks.attribute_name))
+}
+
 /// Compute the effective propagation delay for an index.
 ///
 /// Per-GSI setting overrides the system default. `Some(0)` = sync, `None` = use default.
@@ -260,7 +291,8 @@ pub(crate) fn effective_delay(idx: &IndexMeta, system_default: u64) -> u64 {
 /// Only processes indexes where `effective_delay == 0`. Async indexes are
 /// handled by async queue (Phase 2).
 ///
-/// Adds parameterized statements to the batch builder.
+/// Adds parameterized statements to the batch builder. The statements take
+/// the batch's write timestamp; [`sync_indexes_at`] gives them one of their own.
 #[allow(clippy::too_many_arguments)]
 pub fn sync_indexes(
     batch: &mut BatchQueryBuilder,
@@ -272,6 +304,35 @@ pub fn sync_indexes(
     new_item: Option<&Item>,
     system_default_delay: u64,
 ) -> Result<(), StorageError> {
+    sync_indexes_at(
+        batch,
+        account_keyspace,
+        base_key_schema,
+        attr_defs,
+        indexes,
+        old_item,
+        new_item,
+        system_default_delay,
+        None,
+    )
+}
+
+/// [`sync_indexes`] with `stamp`, when set, as the write timestamp of each
+/// index statement (`USING TIMESTAMP`). The other statements of the batch,
+/// such as queue rows and stream records, then keep Cassandra's timestamp. A
+/// batch with a timestamp of its own must pass `None`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sync_indexes_at(
+    batch: &mut BatchQueryBuilder,
+    account_keyspace: &str,
+    base_key_schema: &[KeySchemaElement],
+    attr_defs: &[AttributeDefinition],
+    indexes: &[IndexMeta],
+    old_item: Option<&Item>,
+    new_item: Option<&Item>,
+    system_default_delay: u64,
+    stamp: Option<i64>,
+) -> Result<(), StorageError> {
     for idx in indexes {
         if idx.index_type != "LSI" && effective_delay(idx, system_default_delay) != 0 {
             continue; // Async — handled after commit. LSIs are always synchronous.
@@ -280,9 +341,22 @@ pub fn sync_indexes(
         let idx_sks = all_sort_key_info(&idx.key_schema, attr_defs);
         let base_sks = all_sort_key_info(base_key_schema, attr_defs);
 
+        let old_indexed = old_item.filter(|old| item_has_index_keys(old, &idx.key_schema));
+        let new_indexed = new_item.filter(|new| item_has_index_keys(new, &idx.key_schema));
+
+        // Every statement in a batch shares the batch's write timestamp, and
+        // a tombstone wins over a cell at the same timestamp, so deleting and
+        // re-inserting one index row in the same batch leaves the row deleted.
+        // When the old and new images address the same index row, the INSERT
+        // alone rewrites every column of that row.
+        let same_row = match (old_indexed, new_indexed) {
+            (Some(old), Some(new)) => same_index_row(old, new, &idx.key_schema, base_key_schema),
+            _ => false,
+        };
+
         // Delete old index row if the old item had index keys
-        if let Some(old) = old_item
-            && item_has_index_keys(old, &idx.key_schema)
+        if let Some(old) = old_indexed
+            && !same_row
         {
             delete_index_row_multi(
                 batch,
@@ -293,13 +367,12 @@ pub fn sync_indexes(
                 base_key_schema,
                 &idx_sks,
                 &base_sks,
+                stamp,
             )?;
         }
 
         // Insert new index row if the new item has index keys
-        if let Some(new) = new_item
-            && item_has_index_keys(new, &idx.key_schema)
-        {
+        if let Some(new) = new_indexed {
             let projected =
                 project_item_for_index(new, &idx.key_schema, base_key_schema, &idx.projection);
             insert_index_row_multi(
@@ -312,6 +385,7 @@ pub fn sync_indexes(
                 base_key_schema,
                 &idx_sks,
                 &base_sks,
+                stamp,
             )?;
         }
     }
@@ -324,6 +398,11 @@ pub fn sync_indexes(
 /// Must be called before the batch is executed so the pending rows commit
 /// atomically with the base write. LSIs and delay=0 GSIs are skipped (they are
 /// handled synchronously by `sync_indexes`).
+///
+/// `index_stamp` is the write timestamp the worker gives the index rows when
+/// it applies the entry: the base-row version this mutation produced (see
+/// `data::version`), so entries for one item resolve in version order on the
+/// index table whatever order the worker meets them in.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn enqueue_async_indexes(
     session: &std::sync::Arc<crate::cassandra_util::CassandraSession>,
@@ -334,6 +413,7 @@ pub(crate) async fn enqueue_async_indexes(
     old_item: Option<&extenddb_core::types::Item>,
     new_item: Option<&extenddb_core::types::Item>,
     system_default_delay: u64,
+    index_stamp: i64,
 ) -> Result<usize, StorageError> {
     use crate::gsi_queue::{GsiApplyContext, GsiIndexDef, jitter_delay_ms, partition_for};
     use extenddb_storage::util::composite_pk_to_text;
@@ -357,6 +437,7 @@ pub(crate) async fn enqueue_async_indexes(
                 key_schema: idx.key_schema.clone(),
                 projection: idx.projection.clone(),
             },
+            index_stamp: Some(index_stamp),
         };
 
         let context_json =
@@ -439,8 +520,10 @@ pub(crate) async fn enqueue_async_indexes(
 
 /// Delete a row from an index table using index keys and base table keys.
 ///
-/// Adds a parameterized DELETE statement to the batch.
-/// Cassandra requires ALL PRIMARY KEY columns for DELETE.
+/// Adds a parameterized DELETE statement to the batch. Cassandra requires ALL
+/// PRIMARY KEY columns for DELETE. `stamp`, when set, is the statement's own
+/// write timestamp (`USING TIMESTAMP`); a batch that carries a timestamp of
+/// its own must pass `None`, since Cassandra refuses a batch with both.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn delete_index_row_multi(
     batch: &mut BatchQueryBuilder,
@@ -451,6 +534,7 @@ pub(crate) fn delete_index_row_multi(
     base_ks: &[KeySchemaElement],
     idx_sks: &[(&str, ScalarAttributeType)],
     base_sks: &[(&str, ScalarAttributeType)],
+    stamp: Option<i64>,
 ) -> Result<(), StorageError> {
     let idx_pk_text = composite_pk_to_text(item, index_ks)?;
     let base_pk_text = composite_pk_to_text(item, base_ks)?;
@@ -495,10 +579,17 @@ pub(crate) fn delete_index_row_multi(
         }
     }
 
+    let using = if let Some(stamp) = stamp {
+        values.insert(0, cdrs_tokio::types::value::Value::from(stamp));
+        " USING TIMESTAMP ?"
+    } else {
+        ""
+    };
     let cql = format!(
-        "DELETE FROM {}.{} WHERE {}",
+        "DELETE FROM {}.{}{} WHERE {}",
         account_keyspace,
         idx_table,
+        using,
         where_cols.join(" AND ")
     );
     let qv = cdrs_tokio::query::QueryValues::SimpleValues(values);
@@ -509,7 +600,8 @@ pub(crate) fn delete_index_row_multi(
 
 /// Insert a row into an index table with multi-part key support.
 ///
-/// Adds a parameterized INSERT statement to the batch.
+/// Adds a parameterized INSERT statement to the batch. `stamp` is the
+/// statement's own write timestamp, as for [`delete_index_row_multi`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn insert_index_row_multi(
     batch: &mut BatchQueryBuilder,
@@ -521,6 +613,7 @@ pub(crate) fn insert_index_row_multi(
     base_ks: &[KeySchemaElement],
     idx_sks: &[(&str, ScalarAttributeType)],
     base_sks: &[(&str, ScalarAttributeType)],
+    stamp: Option<i64>,
 ) -> Result<(), StorageError> {
     let idx_pk_text = composite_pk_to_text(item, index_ks)?;
     let base_pk_text = composite_pk_to_text(item, base_ks)?;
@@ -564,12 +657,19 @@ pub(crate) fn insert_index_row_multi(
     values.push(item_json.as_str().into());
 
     let placeholders = vec!["?"; cols.len()].join(", ");
+    let using = if let Some(stamp) = stamp {
+        values.push(cdrs_tokio::types::value::Value::from(stamp));
+        " USING TIMESTAMP ?"
+    } else {
+        ""
+    };
     let cql = format!(
-        "INSERT INTO {}.{} ({}) VALUES ({})",
+        "INSERT INTO {}.{} ({}) VALUES ({}){}",
         account_keyspace,
         idx_table,
         cols.join(", "),
-        placeholders
+        placeholders,
+        using
     );
     let qv = cdrs_tokio::query::QueryValues::SimpleValues(values);
     let old = std::mem::replace(batch, BatchQueryBuilder::new());
