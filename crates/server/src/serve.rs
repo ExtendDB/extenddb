@@ -339,6 +339,7 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         extenddb_storage::server_components::ServerComponentsOptions::default();
 
     component_options.bootstrap_if_uninitialized = dev_mode;
+    component_options.max_item_size_bytes = app_config.limits.max_item_size_bytes;
     component_options.release = build.version;
 
     // Wire the node's own bind address as the instance ID so each ExtendDB node

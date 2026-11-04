@@ -643,11 +643,7 @@ impl ManagementStore for MongoCatalogStore {
             };
 
             let hash = hash.to_owned();
-            Ok(tokio::task::spawn_blocking(move || {
-                bcrypt::verify(password, &hash).unwrap_or(false)
-            })
-            .await
-            .unwrap_or(false))
+            extenddb_storage::password::verify_password(password, hash).await
         })
     }
 
@@ -2276,9 +2272,11 @@ impl extenddb_storage::management_store::RateLimitStore for MongoCatalogStore {
     fn count_principal_failures(
         &self,
         principal: &str,
+        source_ip: &str,
         window_seconds: i64,
     ) -> BoxFuture<'_, OpResult<i64>> {
         let principal = principal.to_owned();
+        let source_ip = source_ip.to_owned();
         Box::pin(async move {
             let coll = self.catalog_db().collection::<Document>("failed_logins");
             let cutoff = time::OffsetDateTime::now_utc()
@@ -2287,6 +2285,7 @@ impl extenddb_storage::management_store::RateLimitStore for MongoCatalogStore {
             let count = coll
                 .count_documents(doc! {
                     "principal": &principal,
+                    "source_ip": &source_ip,
                     "attempted_at": { "$gte": cutoff_bson },
                 })
                 .await
@@ -2476,13 +2475,8 @@ impl extenddb_storage::management_store::AdminStore for MongoCatalogStore {
                 return Ok(None);
             };
             let hash = hash.to_owned();
-            Ok(Some(
-                tokio::task::spawn_blocking(move || {
-                    bcrypt::verify(password, &hash).unwrap_or(false)
-                })
-                .await
-                .unwrap_or(false),
-            ))
+            let verified = extenddb_storage::password::verify_password(password, hash).await?;
+            Ok(Some(verified))
         })
     }
 }

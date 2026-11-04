@@ -21,10 +21,15 @@ These steps start a single-node Cassandra 4.1 container for local development.
 1. Start the container:
 
    ```bash
-   docker run -d --name cassandra -p 9042:9042 \
+   docker run -d --name cassandra -p 127.0.0.1:9042:9042 \
        -e CASSANDRA_CLUSTER_NAME=extenddb-dev \
        cassandra:4.1
    ```
+
+   The port is published on the loopback interface only. Until step 3 the
+   node accepts any login, and after it the superuser is on Apache
+   Cassandra's documented default password; neither should be reachable from
+   other hosts.
 
 2. Wait for the node to accept CQL. The port opens before the database is
    ready, so poll with `cqlsh` until it succeeds:
@@ -91,6 +96,17 @@ cargo build --release --no-default-features --features cassandra
 The binary is single-backend. To run Cassandra and another backend side by
 side, build one binary per backend.
 
+## Container Image
+
+Starting with ExtendDB 1.0, the `extenddb/extenddb-cassandra` image is
+published to Docker Hub, GHCR and ECR Public. It contains this build of
+ExtendDB and no Cassandra server, client or Java runtime; Cassandra stays a
+separate service. [`docker/README-cassandra.md`](../docker/README-cassandra.md) covers
+running `init`, `serve` and `migrate` with the image, and a local reference
+stack, `docker-compose.cassandra.yml`, that starts a password-authenticated
+Cassandra node next to ExtendDB. The cluster requirements below apply to the
+image unchanged.
+
 ## Initializing ExtendDB with Cassandra
 
 Initialize against the authenticated local node from above. Pass the contact
@@ -98,13 +114,15 @@ point and the superuser credentials used to create the keyspaces and the
 application role:
 
 ```bash
-./target/release/extenddb init \
+EXTENDDB_CASSANDRA_PASSWORD=cassandra ./target/release/extenddb init \
     --backend cassandra \
     --cassandra-contact-points 127.0.0.1:9042 \
     --cassandra-user cassandra \
-    --cassandra-pass cassandra \
     --config extenddb.toml
 ```
+
+`init` reads the superuser password from `EXTENDDB_CASSANDRA_PASSWORD` when
+`--cassandra-pass` is not given, which keeps it out of the process list.
 
 The node must run `PasswordAuthenticator` (step 3). `init` always creates its
 application role with a password, so it fails against an unauthenticated
@@ -171,12 +189,9 @@ Fields:
   time. Required against any authenticated node (which `init` requires anyway).
 - `keyspace_prefix` — prefix for this deployment's keyspaces (default
   `extenddb`).
-- `replication_factor` — keyspace replication factor. `init` always writes `1`,
-  regardless of the cluster. For a multi-node cluster, edit this to 3 or more
-  **after** `init`; keyspaces created later (per account) use the config value,
-  except an account keyspace that `migrate --yes` creates for an account whose
-  CreateAccount stopped before its keyspace: that one takes the catalog
-  keyspace's replication. Existing keyspaces are not altered retroactively.
+- `replication_factor` — keyspace replication factor. `init` always writes `1`
+  and creates its own keyspaces with it; see [Keyspace replication](#keyspace-replication)
+  for a multi-node cluster.
 - `datacenter` — the local datacenter name for `NetworkTopologyStrategy`. Currently,
   `init` always writes `datacenter1` and has no flag to change it, and the keyspaces
   it creates reference `datacenter1`, so the cluster's local datacenter must be
@@ -247,12 +262,40 @@ section covers only what is specific to Cassandra.
 
 ### Keyspace replication
 
-Set `replication_factor` to 3 or more for a multi-node cluster. `init` always
-writes `1`, so edit the config after `init`; keyspaces created afterward (per
-account) use the value in the config, except an account keyspace that
-`migrate --yes` creates for an account whose CreateAccount stopped before its
-keyspace, which takes the catalog keyspace's replication. The `datacenter` must
-be `datacenter1`:
+Set `replication_factor` to 3 or more for a multi-node cluster. `init` has no
+flag for it: it creates the catalog keyspace and the default account's
+keyspace with replication factor 1 and writes `replication_factor = 1` to the
+config. Keyspaces created later (one per new account) take the value from the
+config when `serve` starts, except an account keyspace that `migrate --yes`
+creates for an account whose CreateAccount stopped before its keyspace, which
+takes the catalog keyspace's replication. On a multi-node cluster, after
+`init`:
+
+1. Set `replication_factor = 3` in `extenddb.toml` (example below), before you
+   start `serve` or, if it is already running, restart it before you create
+   accounts.
+2. Raise the replication of the keyspaces that already exist: Cassandra's own
+   `system_auth` keyspace, which holds the roles ExtendDB logs in with and
+   starts at `SimpleStrategy` with replication factor 1, and every keyspace
+   whose name starts with the keyspace prefix (`DESCRIBE KEYSPACES` lists
+   them):
+
+   ```sql
+   ALTER KEYSPACE system_auth
+     WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': 3};
+   ALTER KEYSPACE extenddb_catalog
+     WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': 3};
+   -- and the same for each extenddb_account_<id> keyspace
+   ```
+
+3. Run `nodetool repair -full` on each node.
+
+Use a replication factor no larger than the number of nodes in `datacenter1`.
+Logins read `system_auth` at `QUORUM` for the default superuser, so a
+`system_auth` replication factor above the node count makes those logins fail
+with `Cannot achieve consistency level QUORUM`.
+
+The `datacenter` must be `datacenter1`:
 `init` hardcodes that name into the keyspace definitions and provides no flag to
 change it, so your cluster's local datacenter has to be named `datacenter1`
 until that is configurable. ExtendDB creates its keyspaces with
