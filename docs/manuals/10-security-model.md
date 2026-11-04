@@ -139,7 +139,7 @@ Policy sources collected for evaluation:
 - **Auth before JSON parse**: SigV4 signature verification runs before the request body is parsed. Invalid signatures are rejected with constant-time comparison before any business logic executes.
 - **Concurrent policy fetching**: Identity policies, group policies, and permissions boundaries are fetched concurrently from the catalog when they are not in the server's cache (see Credential and Policy Caching). All must succeed for evaluation to proceed.
 - **Constant-time rejection for inactive keys**: Inactive or expired access keys are rejected without timing differences that could reveal key existence.
-- **Policy document validation on write**: Policy documents are validated for JSON structure and size-capped (6,144 bytes) when attached via the management API. Invalid documents are rejected before storage. A `Version` other than the string `2012-10-17` or `2008-10-17` is refused; only a `2012-10-17` document expands policy variables.
+- **Policy document validation on write**: Policy documents are validated for JSON structure and size-capped at `max_policy_document_bytes` (6,144 bytes by default) when attached via the management API or the console. Invalid documents are rejected before storage. A `Version` other than the string `2012-10-17` or `2008-10-17` is refused; only a `2012-10-17` document expands policy variables. A stored policy is parsed with the same cap, so a policy stored before the cap was lowered no longer parses, and its principal is denied.
 - **Expression depth and token limits**: Expression parsing enforces configurable depth (default 150) and token limits (default 4,096) to prevent resource exhaustion.
 
 ### Supported Condition Operators
@@ -277,7 +277,7 @@ Input validation is layered:
 |-------|---------|-------------|
 | Max expression tokens | 4,096 | Maximum tokens in a parsed expression |
 | Max expression depth | 150 | Maximum nesting depth in expressions |
-| Max policy document size | 6,144 bytes | Maximum size of an IAM policy document |
+| Max policy document size | 6,144 bytes | Maximum size of an IAM policy document (`max_policy_document_bytes`) |
 
 ### Path Traversal Protection
 

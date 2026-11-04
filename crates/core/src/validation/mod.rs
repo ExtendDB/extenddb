@@ -1,6 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 pub mod number;
+pub mod provisioned_limits;
 pub mod vector_item;
 
 pub use vector_item::{

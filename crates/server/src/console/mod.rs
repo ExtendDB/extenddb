@@ -55,6 +55,9 @@ pub struct ConsoleState {
     /// `/console/metrics-data` response with latency segments (same data the
     /// top-level `/metrics` handler adds).
     pub metrics: Arc<extenddb_core::metrics::MetricsCollector>,
+    /// The configured `max_policy_document_bytes`: a policy over it is
+    /// refused on write.
+    pub max_policy_document_bytes: usize,
 }
 
 /// Build the console router.
