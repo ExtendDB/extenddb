@@ -25,6 +25,7 @@ mod import_export_io;
 mod index_helpers;
 mod legacy_filter;
 mod list_tables;
+pub mod private_fs;
 mod put_item;
 mod query;
 mod read_helpers;
