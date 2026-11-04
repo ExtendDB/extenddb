@@ -19,14 +19,16 @@ use std::sync::Arc;
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::response::{Html, IntoResponse, Response};
 use extenddb_storage::management_store::MetricsStore;
 
 use crate::console::ConsoleState;
 use crate::console::html;
 use crate::management::CallerIdentity;
 
-use super::{SessionData, identity_label, is_admin, metrics_content, require_session};
+use super::{
+    SessionData, identity_label, is_admin, metrics_content, require_admin, require_session,
+};
 
 /// Data plane operations (reads + writes on items).
 const DATA_OPS: &[&str] = &[
@@ -56,8 +58,8 @@ pub async fn metrics_page(State(state): State<Arc<ConsoleState>>, headers: Heade
 /// The dashboard page for `session`, or a redirect to the console dashboard
 /// when the session is not an admin's.
 fn render_metrics_page(session: &SessionData, version_info: &str) -> Response {
-    if !is_admin(&session.identity) {
-        return Redirect::to("/console").into_response();
+    if let Err(redirect) = require_admin(session) {
+        return redirect;
     }
 
     let nav = html::nav_bar(&identity_label(&session.identity));

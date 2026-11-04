@@ -77,10 +77,11 @@ pub fn router() -> Router<Arc<ConsoleState>> {
         // browser fetch of the top-level `/metrics` (now Basic-auth only, for
         // Prometheus).
         .route("/metrics-data", get(pages::metrics_data))
-        // Settings (read-only, admin-only)
+        // Settings (read-only, admin-only; an IAM-user session is redirected
+        // to /console)
         .route("/settings", get(pages::settings_page))
-        // Cache (admin-only break-glass invalidation).
-        // See docs/design/12-auth-authz-cache.md §6.1.
+        // Cache (admin-only break-glass invalidation; an IAM-user session is
+        // redirected to /console). See docs/design/12-auth-authz-cache.md §6.1.
         .route("/cache", get(pages::cache_page))
         .route("/cache/invalidate", post(pages::invalidate_cache))
         // Accounts

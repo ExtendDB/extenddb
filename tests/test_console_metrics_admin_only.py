@@ -8,6 +8,10 @@ carries the table names and traffic of every account. An IAM user who logs in
 to the console gets neither the page nor the feed. An admin gets both, with
 every account's tables.
 
+The Settings and Cache pages are admin only too. Each of the three pages
+redirects an IAM-user session to the console dashboard, and the navigation bar
+links them for admins only.
+
 Two accounts each create a table and send it traffic. The tests wait until
 the metrics flush has written both tables' rows, as seen through the admin's
 feed, and then check what an IAM user of the second account receives.
@@ -20,6 +24,7 @@ Prerequisites match tests/test_console_integration.py:
 from __future__ import annotations
 
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -41,6 +46,11 @@ POLL_SECONDS = 5
 
 # The module fixture waits for the metrics flush.
 pytestmark = pytest.mark.slow
+
+# The console pages for admins only, relative to /console.
+ADMIN_PAGES = ("/metrics", "/settings", "/cache")
+
+_CSRF_RE = re.compile(r'<meta name="csrf-token" content="([^"]+)"')
 
 
 def _require_auth_env() -> tuple[str, str, str]:
@@ -84,6 +94,23 @@ class Console:
         return self.http.get(
             f"{self.base_url}/console{path}",
             params=params,
+            allow_redirects=False,
+            timeout=30,
+            verify=self.verify,
+        )
+
+    def post(self, path: str, *, csrf: str | None = None, **form: str) -> requests.Response:
+        """Submit a console form. The CSRF token is ``csrf`` when given, else
+        this session's own token, which the console dashboard carries in a
+        meta tag."""
+        if csrf is None:
+            dashboard = self.get("")
+            match = _CSRF_RE.search(dashboard.text)
+            assert match, f"no CSRF token on /console: {dashboard.status_code}"
+            csrf = match.group(1)
+        return self.http.post(
+            f"{self.base_url}/console{path}",
+            data={**form, "_csrf": csrf},
             allow_redirects=False,
             timeout=30,
             verify=self.verify,
@@ -233,20 +260,45 @@ def test_iam_user_gets_403_and_no_metrics_from_the_feed(flushed: Flushed, query:
         assert table not in resp.text, resp.text
 
 
-def test_iam_user_is_redirected_from_the_metrics_page(flushed: Flushed) -> None:
-    resp = flushed.user_b.get("/metrics")
+@pytest.mark.parametrize("page", ADMIN_PAGES)
+def test_iam_user_is_redirected_from_admin_only_pages(flushed: Flushed, page: str) -> None:
+    resp = flushed.user_b.get(page)
     assert resp.status_code == 303, f"{resp.status_code} {resp.text[:300]}"
     assert resp.headers.get("location") == "/console"
 
 
-def test_navigation_links_the_metrics_page_for_admins_only(flushed: Flushed) -> None:
-    link = 'href="/console/metrics"'
+@pytest.mark.parametrize(
+    "csrf", [None, "not-this-sessions-token"], ids=["own-token", "wrong-token"]
+)
+def test_iam_user_is_redirected_from_the_cache_form(flushed: Flushed, csrf: str | None) -> None:
+    # The form checks for an admin before it checks the CSRF token, so a
+    # wrong token gets the same redirect as the session's own token.
+    resp = flushed.user_b.post(
+        "/cache/invalidate",
+        csrf=csrf,
+        scope="credential",
+        access_key_id="AKIAEXTENDDBCONSOLE0",
+    )
+    assert resp.status_code == 303, f"{resp.status_code} {resp.text[:300]}"
+    assert resp.headers.get("location") == "/console"
+
+
+def test_navigation_links_admin_only_pages_for_admins_only(flushed: Flushed) -> None:
     user_dashboard = flushed.user_b.get("")
     assert user_dashboard.status_code == 200, user_dashboard.status_code
-    assert link not in user_dashboard.text
     admin_dashboard = flushed.admin.get("")
     assert admin_dashboard.status_code == 200, admin_dashboard.status_code
-    assert link in admin_dashboard.text
+    for page in ADMIN_PAGES:
+        link = f'href="/console{page}"'
+        assert link not in user_dashboard.text, link
+        assert link in admin_dashboard.text, link
+
+
+@pytest.mark.parametrize("page,heading", [("/settings", "Settings"), ("/cache", "Cache")])
+def test_admin_gets_the_settings_and_cache_pages(flushed: Flushed, page: str, heading: str) -> None:
+    resp = flushed.admin.get(page)
+    assert resp.status_code == 200, f"{resp.status_code} {resp.text[:300]}"
+    assert f"<h1>{heading}</h1>" in resp.text
 
 
 def test_admin_gets_the_page_and_every_accounts_tables(flushed: Flushed) -> None:

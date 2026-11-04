@@ -143,6 +143,17 @@ fn is_admin(identity: &CallerIdentity) -> bool {
     matches!(identity, CallerIdentity::Admin(_))
 }
 
+/// Let an admin session through to an admin-only page: Metrics, Settings and
+/// Cache. An IAM-user session gets a redirect to the console dashboard.
+#[allow(clippy::result_large_err)]
+fn require_admin(session: &SessionData) -> Result<(), Response> {
+    if is_admin(&session.identity) {
+        Ok(())
+    } else {
+        Err(Redirect::to("/console").into_response())
+    }
+}
+
 /// Extract the user-facing message from a storage `OpError`.
 fn op_error_message(e: extenddb_storage::management_store::OpError) -> String {
     use extenddb_storage::management_store::OpError;

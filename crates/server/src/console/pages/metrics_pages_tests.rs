@@ -1,7 +1,8 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tests for the admin-only console metrics dashboard and its data feed.
+//! Tests for the admin-only console metrics dashboard and its data feed, and
+//! for the navigation bar's links to the admin-only pages.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -203,11 +204,28 @@ async fn admin_gets_the_metrics_page() {
 }
 
 #[test]
-fn nav_bar_links_the_metrics_page_for_admins_only() {
-    let link = r#"<a href="/console/metrics">Metrics</a>"#;
+fn nav_bar_links_the_admin_only_pages_for_admins_only() {
+    let accounts = r#"<a href="/console/accounts">Accounts</a>"#;
+    let admin_links = [
+        r#"<a href="/console/metrics">Metrics</a>"#,
+        r#"<a href="/console/settings">Settings</a>"#,
+        r#"<a href="/console/cache">Cache</a>"#,
+    ];
+    let spacer = r#"<span class="spacer"></span>"#;
 
-    assert!(html::nav_bar(&identity_label(&admin())).contains(link));
+    // An admin's bar lists the three links after Accounts, in this order,
+    // and before the spacer.
+    let admin_nav = html::nav_bar(&identity_label(&admin()));
+    let admin_row = format!("{accounts}\n{}\n{spacer}", admin_links.join("\n"));
+    assert!(admin_nav.contains(&admin_row), "{admin_nav}");
+
     let user_nav = html::nav_bar(&identity_label(&iam_user()));
-    assert!(!user_nav.contains(link), "{user_nav}");
+    for link in admin_links {
+        assert!(!user_nav.contains(link), "{user_nav}");
+    }
+    assert!(
+        user_nav.contains(&format!("{accounts}\n{spacer}")),
+        "{user_nav}"
+    );
     assert!(user_nav.contains("444455556666/bob"), "{user_nav}");
 }

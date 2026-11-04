@@ -170,21 +170,24 @@ pub struct NavIdentity {
     pub is_admin: bool,
 }
 
-/// Build the navigation bar for an authenticated session. The Metrics link
-/// is left out for IAM users, because the metrics dashboard is admin only.
+/// The navigation links to the admin-only pages. Each of these pages
+/// redirects an IAM-user session to the console dashboard.
+const ADMIN_LINKS: &str = concat!(
+    "\n<a href=\"/console/metrics\">Metrics</a>",
+    "\n<a href=\"/console/settings\">Settings</a>",
+    "\n<a href=\"/console/cache\">Cache</a>",
+);
+
+/// Build the navigation bar for an authenticated session. The Metrics,
+/// Settings and Cache links are left out for IAM users, because those pages
+/// are admin only.
 pub fn nav_bar(identity: &NavIdentity) -> String {
-    let metrics_link = if identity.is_admin {
-        "\n<a href=\"/console/metrics\">Metrics</a>"
-    } else {
-        ""
-    };
+    let admin_links = if identity.is_admin { ADMIN_LINKS } else { "" };
     format!(
         r#"<nav>
 <span class="brand">extenddb Console</span>
 <a href="/console">Dashboard</a>
-<a href="/console/accounts">Accounts</a>{metrics_link}
-<a href="/console/settings">Settings</a>
-<a href="/console/cache">Cache</a>
+<a href="/console/accounts">Accounts</a>{admin_links}
 <span class="spacer"></span>
 <span>{identity}</span>
 <form class="inline" method="post" action="/console/logout">

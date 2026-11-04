@@ -11,7 +11,7 @@ use std::fmt::Write;
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::HeaderMap;
 use axum::response::{Html, IntoResponse, Response};
 
 use crate::console::ConsoleState;
@@ -20,7 +20,7 @@ use crate::console::html;
 // the static config display cannot drift apart.
 use extenddb_config::{MASK, should_redact};
 
-use super::{identity_label, is_admin, require_session};
+use super::{identity_label, require_admin, require_session};
 
 /// Known runtime settings with their default values.
 /// These are the settings that can be changed via `extenddb settings set`.
@@ -46,12 +46,8 @@ pub async fn settings_page(State(state): State<Arc<ConsoleState>>, headers: Head
         Err(redirect) => return redirect,
     };
 
-    if !is_admin(&session.identity) {
-        return (
-            StatusCode::FORBIDDEN,
-            "Settings are visible to admin users only",
-        )
-            .into_response();
+    if let Err(redirect) = require_admin(&session) {
+        return redirect;
     }
 
     let nav = html::nav_bar(&identity_label(&session.identity));
