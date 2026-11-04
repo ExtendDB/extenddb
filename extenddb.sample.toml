@@ -188,7 +188,30 @@
 # failed_row_retention_secs = 604800   # FAILED tombstones kept for the operator (7 days)
 # reconcile_interval_secs = 60         # Reconciler cycle
 # max_concurrent_jobs = 4              # Backup and restore jobs running at once on this instance
-# spool_path = "/var/lib/extenddb/spool" # Restore download area for an S3 store
+# spool_path = "/var/lib/extenddb/spool" # Restore download area for an S3 store; required
+#                                        # with an S3 store except on file-backed SQLite, where
+#                                        # it defaults to backup-spool/ beside the database file
+
+# [backup.store]
+# Where CreateBackup's backups will live, from a later release (this release's
+# CreateBackup writes in-catalog backups with any store, and the store serves
+# restores and deletes of the backups it holds). Absent on file-backed SQLite: a filesystem
+# store at backups/ beside the database file. Absent on PostgreSQL, MongoDB,
+# Cassandra and an in-memory SQLite database: no store, and CreateBackup
+# writes in-catalog backups with a deprecation warning. kind = "disabled"
+# opts out on any backend. Instances that share a catalog must share one
+# store root (an S3 bucket and prefix, or a shared mount).
+# kind = "filesystem"                  # "filesystem" | "s3" | "disabled"
+# [backup.store.filesystem]
+# path = "/var/lib/extenddb/backups"   # Must exist, owned by the extenddb user, mode 0700
+# [backup.store.s3]
+# bucket = "my-extenddb-backups"
+# prefix = "extenddb/"                 # Optional key prefix
+# region = "us-east-1"                 # Optional; the AWS SDK's chain otherwise
+# endpoint = "http://127.0.0.1:9000"   # Optional, for an S3-compatible server
+# force_path_style = true              # Required with an http:// endpoint
+# upload_part_size_bytes = 8388608     # 5 MiB to 5 GiB
+# max_concurrent_uploads = 4
 
 # Import/Export file operations are disabled by default (secure default).
 # Configure allowed directories separately for imports and exports.
