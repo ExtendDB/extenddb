@@ -122,6 +122,10 @@ pub fn migration(id: MigrationId) -> Migration<SqliteStores> {
             "SQLite runs one writer at a time, so its stream records commit in the order of \
              their sequence numbers",
         ),
+        MigrationId::RestoreProgress => Migration::NotApplicable(
+            "the restore progress of a store-backed restore is on table_restores (file_index, \
+             items_applied) on SQLite; the table is PostgreSQL's data database's",
+        ),
     }
 }
 

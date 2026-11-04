@@ -588,6 +588,13 @@ impl<R: std::io::Read> DataFileReader<R> {
         }
         checked
     }
+
+    /// The uncompressed bytes decoded so far
+    /// ([`DataFileDecoder::bytes_decoded`]).
+    #[must_use]
+    pub fn bytes_decoded(&self) -> u64 {
+        self.decoder.bytes_decoded()
+    }
 }
 
 impl<R: std::io::Read> Iterator for DataFileReader<R> {

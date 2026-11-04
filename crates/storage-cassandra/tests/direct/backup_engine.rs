@@ -20,14 +20,15 @@ use extenddb_core::types::{
     TimeToLiveStatus,
 };
 use extenddb_storage::backup_catalog::{
-    BackupRow, BackupStatus, DeleteStart, Heartbeat, JobStatus, RestoreTargetKey, StaleClock,
-    StatusFields, StoreIdentity, StoreKind, TimeBounds, UNOWNED_GENERATION, WriteOutcome,
+    BackupRow, BackupStatus, DeleteStart, Heartbeat, JobStatus, RestoreKind,
+    RestoreRegistrationRow, RestoreTargetKey, StaleClock, StatusFields, StoreIdentity, StoreKind,
+    TimeBounds, UNOWNED_GENERATION, WriteOutcome, backup_in_use_message,
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::migrations::{CatalogStatus, MigrationError, MigrationId};
 use extenddb_storage::{
-    BackupCatalog, DataEngine, JobPermit, LegacyBackupReader, RestoreRequest,
-    RestoreTableOverrides, TableEngine,
+    BackupCatalog, BulkLoadFile, DataEngine, Finished, JobPermit, LegacyBackupReader,
+    RestoreEngine, RestoreRequest, RestoreTableOverrides, TableEngine,
 };
 use extenddb_storage_cassandra::CassandraEngine;
 use futures::{StreamExt, TryStreamExt};
@@ -5815,6 +5816,1967 @@ async fn test_the_registrations_sweep_removes_stale_entries_and_keeps_a_live_one
     );
 }
 
+// ── Store-backed (manifest) restore ──────────────────────────────────────────
+
+/// An AVAILABLE catalog-index backup row (`store_kind` set) for `table`, the
+/// row a store-backed restore registers against.
+async fn available_index_backup(
+    engine: &CassandraEngine,
+    account_id: &str,
+    table: &str,
+    name: &str,
+    store: &StoreIdentity,
+) -> BackupRow {
+    let row = index_row(account_id, table, name, store);
+    let claim = engine.claim_backup(&row).await.expect("claim backup");
+    assert_eq!(
+        claim
+            .set_status(
+                JobStatus::Creating,
+                JobStatus::Available,
+                &StatusFields {
+                    completed: true,
+                    ..StatusFields::default()
+                }
+            )
+            .await
+            .expect("make the backup AVAILABLE"),
+        WriteOutcome::Matched
+    );
+    row
+}
+
+/// A hash-only `CreateTableInput` for a restore target.
+fn manifest_target_input(name: &str) -> CreateTableInput {
+    CreateTableInput {
+        table_name: name.to_owned(),
+        key_schema: vec![ks("id", KeyType::Hash)],
+        attribute_definitions: vec![attr("id", ScalarAttributeType::S)],
+        billing_mode: Some(BillingMode::PayPerRequest),
+        ..Default::default()
+    }
+}
+
+/// The registration a store-backed restore of `row` writes, with `spool_host`.
+fn manifest_registration(row: &BackupRow, spool_host: Option<&str>) -> RestoreRegistrationRow {
+    RestoreRegistrationRow {
+        backup: row.key(),
+        source_table_arn: format!(
+            "arn:aws:dynamodb:us-east-1:{}:table/{}",
+            row.account_id, row.table_name
+        ),
+        restore_date_time: row.created_at,
+        store: row.store.clone(),
+        spool_host: spool_host.map(str::to_owned),
+        owner_generation: UNOWNED_GENERATION,
+    }
+}
+
+/// A hash-keyed item with key `k{i:05}`.
+fn id_item(i: usize) -> Item {
+    let mut it = BTreeMap::new();
+    it.insert("id".to_owned(), AttributeValue::S(format!("k{i:05}")));
+    it.insert("v".to_owned(), AttributeValue::S(format!("val{i}")));
+    it
+}
+
+/// The items `lo..hi` as a `bulk_load` stream.
+fn item_stream(
+    lo: usize,
+    hi: usize,
+) -> futures::stream::BoxStream<'static, Result<Item, StorageError>> {
+    let items: Vec<Item> = (lo..hi).map(id_item).collect();
+    futures::stream::iter(items.into_iter().map(Ok)).boxed()
+}
+
+/// `claim_restore` registers a CREATING target with a RUNNING `manifest`
+/// record carrying the store, the spool host and the claim's generation, the
+/// `active_restores` entry on the backup, and a `RestoreSummary` on the
+/// description; the claim heartbeats and reads the record.
+#[tokio::test]
+async fn test_claim_restore_registers_a_manifest_target_with_its_record() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, "extenddb_ttl_test").await;
+    let account_id = account.account_id.clone();
+    let store = unique_store();
+    let row = available_index_backup(&engine, &account_id, "Music", "nightly", &store).await;
+    let registration = manifest_registration(&row, Some("host-a:/var/spool"));
+
+    let (desc, claim) = engine
+        .claim_restore(
+            &account_id,
+            manifest_target_input("RManifest"),
+            &registration,
+        )
+        .await
+        .expect("the registration creates the target and the record");
+    assert_eq!(desc.table_status, TableStatus::Creating);
+    let summary = desc.restore_summary.as_ref().expect("a RestoreSummary");
+    assert_eq!(
+        summary.source_backup_arn.as_deref(),
+        Some(row.backup_arn.as_str())
+    );
+    assert!(summary.restore_in_progress);
+    assert_ne!(claim.generation(), UNOWNED_GENERATION);
+
+    let key = RestoreTargetKey {
+        account_id: account_id.clone(),
+        table_name: desc.table_name.clone(),
+        table_id: desc.table_id.clone(),
+    };
+    let record = engine
+        .read_restore_job(&key)
+        .await
+        .expect("read")
+        .expect("the record exists");
+    assert_eq!(record.kind, RestoreKind::Manifest);
+    assert_eq!(record.status, JobStatus::Running);
+    assert_eq!(record.owner_generation, claim.generation());
+    assert_eq!(record.store.as_ref(), Some(&store));
+    assert_eq!(record.spool_host.as_deref(), Some("host-a:/var/spool"));
+    assert_eq!(record.source_backup_arn, row.backup_arn);
+
+    // The backup is in use by the target, and the heartbeat confirms and the
+    // read returns RUNNING.
+    assert_eq!(
+        engine.backup_in_use(&row.key()).await.unwrap().as_deref(),
+        Some("RManifest")
+    );
+    assert_eq!(
+        claim.heartbeat().await.expect("heartbeat"),
+        Heartbeat::Confirmed
+    );
+    assert_eq!(claim.read().await.expect("read").status, JobStatus::Running);
+}
+
+/// The two orderings against `start_backup_delete` on the backup's
+/// `backup_index` row: a registration that lands first leaves the backup in
+/// use; a DeleteBackup that lands first leaves the registration with no
+/// backup to read.
+#[tokio::test]
+async fn test_claim_restore_and_start_backup_delete_order_on_the_backup_index_row() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, "extenddb_ttl_test").await;
+    let account_id = account.account_id.clone();
+
+    // Registration wins: DeleteBackup finds the backup in use by the target.
+    let store = unique_store();
+    let won = available_index_backup(&engine, &account_id, "Music", "a", &store).await;
+    let (desc, _claim) = engine
+        .claim_restore(
+            &account_id,
+            manifest_target_input("WonTarget"),
+            &manifest_registration(&won, None),
+        )
+        .await
+        .expect("register");
+    assert_eq!(desc.table_status, TableStatus::Creating);
+    assert_eq!(
+        engine.start_backup_delete(&won.key()).await.unwrap(),
+        DeleteStart::InUse("WonTarget".to_owned())
+    );
+
+    // DeleteBackup wins: the registration finds the backup gone.
+    let lost = available_index_backup(&engine, &account_id, "Music", "b", &store).await;
+    assert_eq!(
+        engine.start_backup_delete(&lost.key()).await.unwrap(),
+        DeleteStart::Deleting
+    );
+    let refused = engine
+        .claim_restore(
+            &account_id,
+            manifest_target_input("LostTarget"),
+            &manifest_registration(&lost, None),
+        )
+        .await
+        .err()
+        .expect("a registration against a DELETING backup is Backup not found");
+    assert!(
+        matches!(refused, StorageError::Validation(ref m) if m.contains("Backup not found")),
+        "{refused}"
+    );
+    // The lost registration left no target behind.
+    assert!(
+        engine
+            .describe_table(
+                &account_id,
+                DescribeTableInput {
+                    table_name: "LostTarget".to_owned()
+                }
+            )
+            .await
+            .is_err()
+    );
+}
+
+/// A second restore of a backup whose target is CREATING is `BackupInUse`,
+/// and a restore into a taken name is `TableAlreadyExists`.
+#[tokio::test]
+async fn test_a_second_restore_is_in_use_and_a_taken_name_is_refused() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, "extenddb_ttl_test").await;
+    let account_id = account.account_id.clone();
+    let store = unique_store();
+    let row = available_index_backup(&engine, &account_id, "Music", "nightly", &store).await;
+
+    let (_desc, _claim) = engine
+        .claim_restore(
+            &account_id,
+            manifest_target_input("FirstTarget"),
+            &manifest_registration(&row, None),
+        )
+        .await
+        .expect("the first restore registers");
+
+    // A second restore of the same backup, into a different name, is in use.
+    let in_use = engine
+        .claim_restore(
+            &account_id,
+            manifest_target_input("SecondTarget"),
+            &manifest_registration(&row, None),
+        )
+        .await
+        .err()
+        .expect("the backup is in use by the first restore");
+    // The service's text names the backup, not the target.
+    assert!(
+        matches!(in_use, StorageError::BackupInUse(ref m) if *m == backup_in_use_message(&row.backup_arn)),
+        "{in_use}"
+    );
+
+    // A restore into an existing table's name is TableAlreadyExists.
+    create_active_table(
+        &engine,
+        &account_id,
+        CreateTableInput {
+            table_name: "Taken".to_owned(),
+            key_schema: vec![ks("id", KeyType::Hash)],
+            attribute_definitions: vec![attr("id", ScalarAttributeType::S)],
+            billing_mode: Some(BillingMode::PayPerRequest),
+            ..Default::default()
+        },
+    )
+    .await;
+    let other = available_index_backup(&engine, &account_id, "Music", "other", &store).await;
+    let taken = engine
+        .claim_restore(
+            &account_id,
+            manifest_target_input("Taken"),
+            &manifest_registration(&other, None),
+        )
+        .await
+        .err()
+        .expect("the name is taken");
+    assert!(
+        matches!(taken, StorageError::TableAlreadyExists(ref name) if name == "Taken"),
+        "{taken}"
+    );
+}
+
+/// `claim_restore_dead`: a live owner, and a legacy record, are not taken
+/// over; a stale manifest record is, under a fresh generation, with the
+/// claimant's `restore_spool_host` written and `restore_heartbeat_at`
+/// refreshed to the coordinator's clock in the same lightweight transaction,
+/// so a second taker right after the first (before the successor's first
+/// beat) finds the record live and is refused while the first taker's beat
+/// confirms; the old claim's writes are then fenced.
+#[tokio::test]
+async fn test_claim_restore_dead_takes_over_a_stale_manifest_record() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, "extenddb_ttl_test").await;
+    let account_id = account.account_id.clone();
+    let store = unique_store();
+    let row = available_index_backup(&engine, &account_id, "Music", "nightly", &store).await;
+    let (desc, owner) = engine
+        .claim_restore(
+            &account_id,
+            manifest_target_input("Takeover"),
+            &manifest_registration(&row, Some("owner:/s")),
+        )
+        .await
+        .expect("register");
+    let key = RestoreTargetKey {
+        account_id: account_id.clone(),
+        table_name: desc.table_name.clone(),
+        table_id: desc.table_id.clone(),
+    };
+    let window = Duration::from_secs(1);
+    let before = engine
+        .read_restore_job(&key)
+        .await
+        .unwrap()
+        .unwrap()
+        .heartbeat_at;
+    assert!(
+        engine
+            .claim_restore_dead(&key, Duration::from_secs(300), Some("other:/s"))
+            .await
+            .expect("claim")
+            .is_none(),
+        "a live owner within a long window is not taken over"
+    );
+
+    tokio::time::sleep(Duration::from_millis(1_300)).await;
+    let successor = engine
+        .claim_restore_dead(&key, window, Some("successor:/spool"))
+        .await
+        .expect("claim")
+        .expect("the window passed: taken over");
+    assert_ne!(successor.generation(), owner.generation());
+    let after = engine.read_restore_job(&key).await.unwrap().unwrap();
+    assert_eq!(after.owner_generation, successor.generation());
+    assert_eq!(after.status, JobStatus::Running);
+    assert_eq!(
+        after.spool_host.as_deref(),
+        Some("successor:/spool"),
+        "the takeover wrote the claimant's spool host"
+    );
+    // A second taker right after the first, before the successor's first
+    // beat: its serial read finds the fresh heartbeat and it is refused; the
+    // first taker's beat confirms.
+    let second = engine
+        .claim_restore_dead(&key, window, Some("second:/s"))
+        .await
+        .expect("a second takeover attempt");
+    assert!(
+        second.is_none(),
+        "a second taker right after the first is refused: {:?}",
+        second.as_ref().map(|c| c.generation())
+    );
+    assert_eq!(
+        successor.heartbeat().await.expect("heartbeat"),
+        Heartbeat::Confirmed,
+        "the first taker keeps the record"
+    );
+    assert!(
+        after.heartbeat_at > before + 1.0,
+        "the takeover refreshed the heartbeat: {} was {before}",
+        after.heartbeat_at
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("epoch")
+        .as_secs_f64();
+    assert!(
+        (now - after.heartbeat_at).abs() < 5.0,
+        "the refreshed heartbeat is the coordinator's now: {} vs {now}",
+        after.heartbeat_at
+    );
+    assert_eq!(owner.heartbeat().await.expect("heartbeat"), Heartbeat::Lost);
+    assert_eq!(
+        owner
+            .set_status(
+                JobStatus::Running,
+                JobStatus::Failed,
+                &StatusFields::default()
+            )
+            .await
+            .expect("write"),
+        WriteOutcome::NotMatched,
+        "the old generation's write is fenced"
+    );
+
+    // The successor heartbeats again: a third taker finds it live.
+    assert_eq!(
+        successor.heartbeat().await.expect("heartbeat"),
+        Heartbeat::Confirmed
+    );
+    assert!(
+        engine
+            .claim_restore_dead(&key, window, Some("third:/s"))
+            .await
+            .expect("claim")
+            .is_none(),
+        "the successor's heartbeat is fresh"
+    );
+
+    // A legacy record is not a manifest restore's to take, whatever its age.
+    apply(
+        &engine,
+        &format!(
+            "UPDATE {}.tables SET restore_kind = 'legacy' \
+             WHERE account_id = ? AND table_name = ? IF table_id = ?",
+            engine.catalog_keyspace()
+        ),
+        cdrs_tokio::query_values!(
+            account_id.as_str(),
+            key.table_name.as_str(),
+            key.table_id.as_str()
+        ),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(1_300)).await;
+    assert!(
+        engine
+            .claim_restore_dead(&key, window, Some("x:/s"))
+            .await
+            .expect("claim")
+            .is_none(),
+        "a legacy record is not taken over by the manifest takeover"
+    );
+}
+
+/// `claim_restore_dead` refuses the takeover when a heartbeat lands between
+/// its serial read and its lightweight transaction: the LWT conditions on the
+/// heartbeat it read, which the beat has moved.
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn test_claim_restore_dead_refuses_a_beat_between_the_read_and_the_write() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, "extenddb_ttl_test").await;
+    let account_id = account.account_id.clone();
+    let store = unique_store();
+    let row = available_index_backup(&engine, &account_id, "Music", "nightly", &store).await;
+    let (desc, owner) = engine
+        .claim_restore(
+            &account_id,
+            manifest_target_input("BeatRace"),
+            &manifest_registration(&row, Some("owner:/s")),
+        )
+        .await
+        .expect("register");
+    let key = RestoreTargetKey {
+        account_id: account_id.clone(),
+        table_name: desc.table_name.clone(),
+        table_id: desc.table_id.clone(),
+    };
+    tokio::time::sleep(Duration::from_millis(1_300)).await;
+
+    let pause =
+        extenddb_storage_cassandra::test_hooks::pause_before_restore_takeover(&key.table_id);
+    let takeover = {
+        let engine = engine.clone();
+        let key = key.clone();
+        tokio::spawn(async move {
+            engine
+                .claim_restore_dead(&key, Duration::from_secs(1), Some("successor:/s"))
+                .await
+        })
+    };
+    pause.reached().await;
+    // A beat lands after the takeover read its stale heartbeat.
+    apply(
+        &engine,
+        &format!(
+            "UPDATE {}.tables SET restore_heartbeat_at = toTimestamp(now()) \
+             WHERE account_id = ? AND table_name = ? IF table_id = ?",
+            engine.catalog_keyspace()
+        ),
+        cdrs_tokio::query_values!(
+            account_id.as_str(),
+            key.table_name.as_str(),
+            key.table_id.as_str()
+        ),
+    )
+    .await;
+    pause.release();
+    assert!(
+        takeover
+            .await
+            .expect("takeover task")
+            .expect("claim")
+            .is_none(),
+        "the beat between the read and the write refuses the takeover"
+    );
+    let record = engine.read_restore_job(&key).await.unwrap().unwrap();
+    assert_eq!(
+        record.owner_generation,
+        owner.generation(),
+        "the record is still the original owner's"
+    );
+    assert_eq!(
+        record.spool_host.as_deref(),
+        Some("owner:/s"),
+        "the refused takeover did not rewrite the spool host"
+    );
+}
+
+/// A record whose backup does not list its target (the owner died between
+/// the target's creation and the `active_restores` registration): the
+/// takeover re-applies the entry, so the backup is in use for the resumed
+/// load and `start_backup_delete` is refused.
+#[tokio::test]
+async fn test_claim_restore_dead_reapplies_a_missing_active_restores_entry() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, "extenddb_ttl_test").await;
+    let account_id = account.account_id.clone();
+    let store = unique_store();
+    let row = available_index_backup(&engine, &account_id, "Music", "nightly", &store).await;
+    let (desc, owner) = engine
+        .claim_restore(
+            &account_id,
+            manifest_target_input("Unlisted"),
+            &manifest_registration(&row, Some("owner:/s")),
+        )
+        .await
+        .expect("register");
+    let key = RestoreTargetKey {
+        account_id: account_id.clone(),
+        table_name: desc.table_name.clone(),
+        table_id: desc.table_id.clone(),
+    };
+    // The crash's shape: the target and its RUNNING record exist, the
+    // backup's entry does not.
+    apply(
+        &engine,
+        &format!(
+            "DELETE active_restores[?] FROM {}.backups_by_arn \
+             WHERE account_id = ? AND backup_arn = ? IF EXISTS",
+            engine.catalog_keyspace()
+        ),
+        cdrs_tokio::query_values!(
+            key.table_id.as_str(),
+            account_id.as_str(),
+            row.backup_arn.as_str()
+        ),
+    )
+    .await;
+    assert!(
+        registrations(&engine, &account_id, &row.backup_arn)
+            .await
+            .is_empty(),
+        "the entry is gone"
+    );
+    drop(owner);
+    tokio::time::sleep(Duration::from_millis(1_300)).await;
+    let successor = engine
+        .claim_restore_dead(&key, Duration::from_secs(1), Some("successor:/s"))
+        .await
+        .expect("claim")
+        .expect("the stale record is taken over");
+    let entries = registrations(&engine, &account_id, &row.backup_arn).await;
+    assert_eq!(
+        entries.get(&key.table_id).map(String::as_str),
+        Some("Unlisted"),
+        "the takeover re-applied the backup's entry for the target: {entries:?}"
+    );
+    assert_eq!(
+        engine.start_backup_delete(&row.key()).await.unwrap(),
+        DeleteStart::InUse("Unlisted".to_owned()),
+        "the backup is in use for the resumed load"
+    );
+    assert_eq!(
+        engine.backup_in_use(&row.key()).await.unwrap().as_deref(),
+        Some("Unlisted")
+    );
+    drop(successor);
+}
+
+/// A DeleteBackup that lands between a registration's unfenced pre-read and
+/// its `active_restores` lightweight transaction: the transaction's own
+/// `backup_status = 'AVAILABLE'` condition refuses the registration, which
+/// answers `Backup not found` and leaves no target and no entry.
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn test_a_delete_between_the_registrations_pre_read_and_its_fence_leaves_no_target() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, "extenddb_ttl_test").await;
+    let account_id = account.account_id.clone();
+    let store = unique_store();
+    let row = available_index_backup(&engine, &account_id, "Music", "raced", &store).await;
+    let pause =
+        extenddb_storage_cassandra::test_hooks::pause_before_restore_registration(&row.backup_arn);
+    let registration = {
+        let engine = engine.clone();
+        let account_id = account_id.clone();
+        let registration = manifest_registration(&row, None);
+        tokio::spawn(async move {
+            engine
+                .claim_restore(
+                    &account_id,
+                    manifest_target_input("RacedTarget"),
+                    &registration,
+                )
+                .await
+        })
+    };
+    // The registration has read the backup AVAILABLE and created the target;
+    // the delete lands before its fence.
+    pause.reached().await;
+    assert_eq!(
+        engine.start_backup_delete(&row.key()).await.unwrap(),
+        DeleteStart::Deleting,
+        "nothing holds the backup before the registration's fence"
+    );
+    pause.release();
+    let refused = registration
+        .await
+        .expect("registration task")
+        .err()
+        .expect("the fence refuses the registration");
+    assert!(
+        matches!(refused, StorageError::Validation(ref m) if m.contains("Backup not found")),
+        "{refused}"
+    );
+    assert!(
+        matches!(
+            engine
+                .describe_table(
+                    &account_id,
+                    DescribeTableInput {
+                        table_name: "RacedTarget".to_owned()
+                    }
+                )
+                .await,
+            Err(StorageError::TableNotFound(_))
+        ),
+        "the refused registration left no target"
+    );
+    assert!(
+        registrations(&engine, &account_id, &row.backup_arn)
+            .await
+            .is_empty(),
+        "no entry on the DELETING backup"
+    );
+}
+
+/// Two concurrent registrations of one backup leave one target: the in-use
+/// pre-read is not atomic with the `active_restores` lightweight
+/// transaction, so both can pass it (the first held before its fence while
+/// the second runs whole), but the fence's `active_restores = null` admits
+/// one; the other finds the registered target in its re-read, is
+/// `BackupInUse` naming it, and removes its own target.
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn test_two_concurrent_registrations_of_one_backup_leave_one_target() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, "extenddb_ttl_test").await;
+    let account_id = account.account_id.clone();
+    let store = unique_store();
+    let row = available_index_backup(&engine, &account_id, "Music", "twice", &store).await;
+    let pause =
+        extenddb_storage_cassandra::test_hooks::pause_before_restore_registration(&row.backup_arn);
+    let first = {
+        let engine = engine.clone();
+        let account_id = account_id.clone();
+        let registration = manifest_registration(&row, None);
+        tokio::spawn(async move {
+            engine
+                .claim_restore(
+                    &account_id,
+                    manifest_target_input("FirstOfTwo"),
+                    &registration,
+                )
+                .await
+        })
+    };
+    // The first registration has passed the pre-read (no restore registered)
+    // and created its target; the second runs whole before the first's fence.
+    pause.reached().await;
+    let (second_desc, second_claim) = engine
+        .claim_restore(
+            &account_id,
+            manifest_target_input("SecondOfTwo"),
+            &manifest_registration(&row, None),
+        )
+        .await
+        .expect("the second registration, whole before the first's fence");
+    pause.release();
+    let refused = first
+        .await
+        .expect("registration task")
+        .err()
+        .expect("the first's fence finds the second registered");
+    assert!(
+        matches!(refused, StorageError::BackupInUse(ref m) if *m == backup_in_use_message(&row.backup_arn)),
+        "{refused}"
+    );
+    assert!(
+        matches!(
+            engine
+                .describe_table(
+                    &account_id,
+                    DescribeTableInput {
+                        table_name: "FirstOfTwo".to_owned()
+                    }
+                )
+                .await,
+            Err(StorageError::TableNotFound(_))
+        ),
+        "the refused registration left no target"
+    );
+    assert_eq!(
+        registrations(&engine, &account_id, &row.backup_arn).await,
+        std::collections::HashMap::from([(second_desc.table_id.clone(), "SecondOfTwo".to_owned())]),
+        "one entry on the backup, the second's"
+    );
+    assert_eq!(
+        engine
+            .backup_in_use(&row.key())
+            .await
+            .expect("in use")
+            .as_deref(),
+        Some("SecondOfTwo")
+    );
+    assert_eq!(
+        second_claim.heartbeat().await.expect("beat"),
+        Heartbeat::Confirmed,
+        "the second registration's claim is live"
+    );
+}
+
+/// A registration whose record a reconciler took over during its target's
+/// DDL (no heartbeat runs there, so a DDL that outlasts the stale window
+/// leaves the record dead) removes nothing: its `active_restores` transaction
+/// finds the successor's entry, and its removal of the target is conditioned
+/// on its own generation, which the takeover moved. The target stays, the
+/// record is the successor's, and the registration answers an error naming
+/// the lost claim rather than the refusal.
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn test_a_registration_taken_over_during_its_ddl_leaves_the_successors_target() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, "extenddb_ttl_test").await;
+    let account_id = account.account_id.clone();
+    let store = unique_store();
+    let row = available_index_backup(&engine, &account_id, "Music", "slowddl", &store).await;
+    let pause =
+        extenddb_storage_cassandra::test_hooks::pause_before_restore_registration(&row.backup_arn);
+    let registration = {
+        let engine = engine.clone();
+        let account_id = account_id.clone();
+        let registration = manifest_registration(&row, Some("registrant:/s"));
+        tokio::spawn(async move {
+            engine
+                .claim_restore(
+                    &account_id,
+                    composite_target_input("SlowDdl"),
+                    &registration,
+                )
+                .await
+        })
+    };
+    // The target's row and DDL exist; the registration is held before its
+    // `active_restores` transaction, as a DDL past the stale window would
+    // hold it. The record's heartbeat is the row insert's.
+    pause.reached().await;
+    let desc = describe(&engine, &account_id, "SlowDdl").await;
+    assert_eq!(desc.table_status, TableStatus::Creating);
+    let key = RestoreTargetKey {
+        account_id: account_id.clone(),
+        table_name: desc.table_name.clone(),
+        table_id: desc.table_id.clone(),
+    };
+    let registrant_generation = engine
+        .read_restore_job(&key)
+        .await
+        .unwrap()
+        .unwrap()
+        .owner_generation;
+    tokio::time::sleep(Duration::from_millis(1_300)).await;
+    let successor = engine
+        .claim_restore_dead(&key, Duration::from_secs(1), Some("successor:/s"))
+        .await
+        .expect("claim")
+        .expect("the registration's record is stale and taken over");
+    assert_ne!(successor.generation(), registrant_generation);
+    assert_eq!(
+        registrations(&engine, &account_id, &row.backup_arn).await,
+        std::collections::HashMap::from([(key.table_id.clone(), "SlowDdl".to_owned())]),
+        "the takeover re-applied the target's entry"
+    );
+
+    pause.release();
+    let outcome = registration.await.expect("registration task");
+
+    // The successor's target, record and registration stand.
+    let target = engine
+        .describe_table(
+            &account_id,
+            DescribeTableInput {
+                table_name: "SlowDdl".to_owned(),
+            },
+        )
+        .await;
+    assert!(
+        matches!(&target, Ok(desc) if desc.table_status == TableStatus::Creating),
+        "the registrant's refusal path left the successor's target in place: {target:?}"
+    );
+    let lost = outcome
+        .err()
+        .expect("the registration does not return a claim on a record another owns");
+    assert!(
+        matches!(&lost, StorageError::Internal(m) if m.contains("lost its record to a takeover")),
+        "the registration names the lost claim, not the refusal: {lost}"
+    );
+    let record = engine
+        .read_restore_job(&key)
+        .await
+        .expect("read")
+        .expect("the record stands");
+    assert_eq!(record.status, JobStatus::Running);
+    assert_eq!(record.owner_generation, successor.generation());
+    assert_eq!(record.spool_host.as_deref(), Some("successor:/s"));
+    assert_eq!(
+        registrations(&engine, &account_id, &row.backup_arn).await,
+        std::collections::HashMap::from([(key.table_id.clone(), "SlowDdl".to_owned())]),
+        "the successor's entry on the backup stands"
+    );
+    assert_eq!(
+        successor.heartbeat().await.expect("beat"),
+        Heartbeat::Confirmed
+    );
+    // The successor loads into the target the registrant left: its data and
+    // index tables are there.
+    assert_eq!(
+        engine
+            .bulk_load(
+                &key,
+                &*successor,
+                BulkLoadFile {
+                    file_index: 0,
+                    start_at: 0,
+                    reapplying: false,
+                },
+                futures::stream::iter((0..6).map(composite_item).map(Ok)).boxed(),
+            )
+            .await
+            .expect("the successor's load"),
+        6
+    );
+    assert_eq!(engine.count_restore_target(&key).await.expect("count"), 6);
+    assert_eq!(
+        index_rows(&engine, &account_id, &key.table_id, "gix").await,
+        3
+    );
+}
+
+/// A composite-key restore target with a GSI and an LSI.
+fn composite_target_input(name: &str) -> CreateTableInput {
+    CreateTableInput {
+        table_name: name.to_owned(),
+        key_schema: vec![ks("id", KeyType::Hash), ks("sk", KeyType::Range)],
+        attribute_definitions: vec![
+            attr("id", ScalarAttributeType::S),
+            attr("sk", ScalarAttributeType::N),
+            attr("g", ScalarAttributeType::S),
+            attr("l", ScalarAttributeType::S),
+        ],
+        billing_mode: Some(BillingMode::PayPerRequest),
+        global_secondary_indexes: Some(vec![GsiInput {
+            index_name: "gix".to_owned(),
+            key_schema: vec![ks("g", KeyType::Hash)],
+            projection: Projection {
+                projection_type: ProjectionType::KeysOnly,
+                non_key_attributes: None,
+            },
+            provisioned_throughput: None,
+        }]),
+        local_secondary_indexes: Some(vec![LsiInput {
+            index_name: "lix".to_owned(),
+            key_schema: vec![ks("id", KeyType::Hash), ks("l", KeyType::Range)],
+            projection: Projection {
+                projection_type: ProjectionType::All,
+                non_key_attributes: None,
+            },
+        }]),
+        ..Default::default()
+    }
+}
+
+/// Item `i` of the composite fixture: `id` one of five, `sk` the index,
+/// every second item carrying the GSI's key `g`, every third the LSI's `l`.
+fn composite_item(i: usize) -> Item {
+    let mut it = BTreeMap::new();
+    it.insert("id".to_owned(), AttributeValue::S(format!("p{}", i % 5)));
+    it.insert("sk".to_owned(), AttributeValue::N(i.to_string()));
+    if i.is_multiple_of(2) {
+        it.insert("g".to_owned(), AttributeValue::S(format!("g{}", i % 4)));
+    }
+    if i.is_multiple_of(3) {
+        it.insert("l".to_owned(), AttributeValue::S(format!("l{i}")));
+    }
+    it
+}
+
+/// The rows of the target's secondary index `index_name`.
+async fn index_rows(
+    engine: &CassandraEngine,
+    account_id: &str,
+    table_id: &str,
+    index_name: &str,
+) -> i64 {
+    use cdrs_tokio::types::IntoRustByName;
+    let rows = extenddb_storage_cassandra::cassandra_util::query_rows_quorum::<StorageError>(
+        &engine.session_arc(),
+        &format!(
+            "SELECT index_id FROM {}.indexes WHERE table_id = ? AND index_name = ?",
+            engine.catalog_keyspace()
+        ),
+        cdrs_tokio::query_values!(table_id, index_name),
+        "index id",
+    )
+    .await
+    .expect("read the index");
+    let index_id: String = rows
+        .first()
+        .expect("the index exists")
+        .get_by_name("index_id")
+        .ok()
+        .flatten()
+        .expect("index_id");
+    let rows = extenddb_storage_cassandra::cassandra_util::query_rows_quorum::<StorageError>(
+        &engine.session_arc(),
+        &format!(
+            "SELECT COUNT(*) AS c FROM {}.{}",
+            engine.account_keyspace(account_id),
+            extenddb_storage_cassandra::data::ddl::index_table_name(&index_id)
+        ),
+        cdrs_tokio::query_values!(),
+        "index rows",
+    )
+    .await
+    .expect("count the index rows");
+    rows.first()
+        .expect("a count")
+        .get_by_name("c")
+        .ok()
+        .flatten()
+        .expect("c")
+}
+
+/// Per item of the composite fixture (keyed by its `sk`), the base row's
+/// `version` when `index_name` is `None`, otherwise the write timestamp of
+/// the item's row in that secondary index (`WRITETIME(item_data)`).
+#[cfg(feature = "test-hooks")]
+async fn stamps_by_sk(
+    engine: &CassandraEngine,
+    account_id: &str,
+    table_id: &str,
+    index_name: Option<&str>,
+) -> BTreeMap<String, i64> {
+    use cdrs_tokio::types::IntoRustByName;
+    let keyspace = engine.account_keyspace(account_id);
+    let cql = match index_name {
+        None => format!(
+            "SELECT item_data, version AS stamp FROM {keyspace}.items_{}",
+            table_id.replace('-', "_")
+        ),
+        Some(index_name) => {
+            let rows =
+                extenddb_storage_cassandra::cassandra_util::query_rows_quorum::<StorageError>(
+                    &engine.session_arc(),
+                    &format!(
+                        "SELECT index_id FROM {}.indexes WHERE table_id = ? AND index_name = ?",
+                        engine.catalog_keyspace()
+                    ),
+                    cdrs_tokio::query_values!(table_id, index_name),
+                    "index id",
+                )
+                .await
+                .expect("read the index");
+            let index_id: String = rows
+                .first()
+                .expect("the index exists")
+                .get_by_name("index_id")
+                .ok()
+                .flatten()
+                .expect("index_id");
+            format!(
+                "SELECT item_data, WRITETIME(item_data) AS stamp FROM {keyspace}.{}",
+                extenddb_storage_cassandra::data::ddl::index_table_name(&index_id)
+            )
+        }
+    };
+    let rows = extenddb_storage_cassandra::cassandra_util::query_rows_quorum::<StorageError>(
+        &engine.session_arc(),
+        &cql,
+        cdrs_tokio::query_values!(),
+        "stamps",
+    )
+    .await
+    .expect("read the stamps");
+    rows.into_iter()
+        .map(|row| {
+            let json: String = row.get_r_by_name("item_data").expect("item_data");
+            let image: Item = serde_json::from_str(&json).expect("an item image");
+            let Some(AttributeValue::N(sk)) = image.get("sk") else {
+                panic!("no sk in {image:?}");
+            };
+            let stamp: i64 = row.get_r_by_name("stamp").expect("a stamp");
+            (sk.clone(), stamp)
+        })
+        .collect()
+}
+
+/// Every GSI and LSI row of the composite target carries its base row's
+/// `version` as its write timestamp, the stamp the write path gives the
+/// index rows of each version it stores (ADR-0027); returns the base
+/// versions.
+#[cfg(feature = "test-hooks")]
+async fn assert_index_rows_carry_the_base_versions(
+    engine: &CassandraEngine,
+    account_id: &str,
+    table_id: &str,
+) -> BTreeMap<String, i64> {
+    let versions = stamps_by_sk(engine, account_id, table_id, None).await;
+    for index_name in ["gix", "lix"] {
+        let stamps = stamps_by_sk(engine, account_id, table_id, Some(index_name)).await;
+        assert!(!stamps.is_empty(), "{index_name} has rows");
+        for (sk, stamp) in &stamps {
+            assert_eq!(
+                Some(stamp),
+                versions.get(sk),
+                "the {index_name} row of item {sk} carries its base row's version"
+            );
+        }
+    }
+    versions
+}
+
+/// `bulk_load` into a composite-key target with a GSI and an LSI: a file
+/// resumed after its first three items (`start_at: 3`) applies exactly the
+/// rest and records `start_at` plus the items applied as the file's total;
+/// the GSI and LSI rows are written with the base rows; an empty file, and a
+/// file resumed at its end, record their progress.
+#[tokio::test]
+async fn test_bulk_load_resumes_mid_file_with_its_index_rows_and_records_an_empty_file() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, "extenddb_ttl_test").await;
+    let account_id = account.account_id.clone();
+    let store = unique_store();
+    let row = available_index_backup(&engine, &account_id, "Music", "nightly", &store).await;
+    let (desc, claim) = engine
+        .claim_restore(
+            &account_id,
+            composite_target_input("Composite"),
+            &manifest_registration(&row, None),
+        )
+        .await
+        .expect("register a composite target");
+    let key = RestoreTargetKey {
+        account_id: account_id.clone(),
+        table_name: desc.table_name.clone(),
+        table_id: desc.table_id.clone(),
+    };
+    // File 0 resumed after three of its ten items.
+    let rest: Vec<Item> = (3..10).map(composite_item).collect();
+    let applied = engine
+        .bulk_load(
+            &key,
+            &*claim,
+            BulkLoadFile {
+                file_index: 0,
+                start_at: 3,
+                reapplying: false,
+            },
+            futures::stream::iter(rest.into_iter().map(Ok)).boxed(),
+        )
+        .await
+        .expect("the rest of file 0");
+    assert_eq!(applied, 7, "exactly the rest");
+    let record = engine.read_restore_job(&key).await.unwrap().unwrap();
+    assert_eq!(record.file_index, Some(0));
+    assert_eq!(
+        record.items_applied,
+        Some(10),
+        "the running total is start_at plus the items applied"
+    );
+    assert_eq!(engine.count_restore_target(&key).await.expect("count"), 7);
+    assert_eq!(
+        index_rows(&engine, &account_id, &key.table_id, "gix").await,
+        3,
+        "the GSI rows of items 4, 6 and 8"
+    );
+    assert_eq!(
+        index_rows(&engine, &account_id, &key.table_id, "lix").await,
+        3,
+        "the LSI rows of items 3, 6 and 9"
+    );
+
+    // An empty file records its progress as complete.
+    let applied = engine
+        .bulk_load(
+            &key,
+            &*claim,
+            BulkLoadFile {
+                file_index: 1,
+                start_at: 0,
+                reapplying: false,
+            },
+            futures::stream::iter(Vec::<Result<Item, StorageError>>::new()).boxed(),
+        )
+        .await
+        .expect("an empty file");
+    assert_eq!(applied, 0);
+    let record = engine.read_restore_job(&key).await.unwrap().unwrap();
+    assert_eq!(
+        (record.file_index, record.items_applied),
+        (Some(1), Some(0)),
+        "an empty file's progress is recorded"
+    );
+    // A file resumed at its end: `start_at` is the recorded total.
+    let applied = engine
+        .bulk_load(
+            &key,
+            &*claim,
+            BulkLoadFile {
+                file_index: 2,
+                start_at: 4,
+                reapplying: false,
+            },
+            futures::stream::iter(Vec::<Result<Item, StorageError>>::new()).boxed(),
+        )
+        .await
+        .expect("a file resumed at its end");
+    assert_eq!(applied, 0);
+    let record = engine.read_restore_job(&key).await.unwrap().unwrap();
+    assert_eq!(
+        (record.file_index, record.items_applied),
+        (Some(2), Some(4))
+    );
+
+    // Another account's key, and the target once ACTIVE, name no CREATING
+    // restore target: `count_restore_target` is `TableNotFound`.
+    let foreign = RestoreTargetKey {
+        account_id: "111111111111".to_owned(),
+        ..key.clone()
+    };
+    assert!(matches!(
+        engine.count_restore_target(&foreign).await,
+        Err(StorageError::TableNotFound(_))
+    ));
+    assert_eq!(
+        engine
+            .finish_restore(&key, &*claim, 7, 4_096)
+            .await
+            .expect("finish"),
+        Finished::Active
+    );
+    assert!(
+        matches!(
+            engine.count_restore_target(&key).await,
+            Err(StorageError::TableNotFound(_))
+        ),
+        "an ACTIVE table is not a CREATING restore target"
+    );
+}
+
+/// A file resumed mid-way (`start_at: 3`) with more than one batch left:
+/// the progress written after each batch inside the loop is `start_at` plus
+/// the items applied so far, as the write after the tail is, so a second
+/// crash between two of the resumed file's batches resumes from a running
+/// total that counts the items the first run applied. Three items per batch,
+/// seven items: the record reads 6 after the first batch, 9 after the
+/// second, 10 at the end.
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn test_a_mid_file_resume_records_start_at_in_every_batch_progress() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, "extenddb_ttl_test").await;
+    let account_id = account.account_id.clone();
+    extenddb_storage_cassandra::test_hooks::set_restore_batch_size(&account_id, 3);
+    let store = unique_store();
+    let row = available_index_backup(&engine, &account_id, "Music", "nightly", &store).await;
+    let (desc, claim) = engine
+        .claim_restore(
+            &account_id,
+            manifest_target_input("ResumedBatches"),
+            &manifest_registration(&row, None),
+        )
+        .await
+        .expect("register");
+    let key = RestoreTargetKey {
+        account_id: account_id.clone(),
+        table_name: desc.table_name.clone(),
+        table_id: desc.table_id.clone(),
+    };
+    // The stream reads the record when asked for the first item of the
+    // second and of the third batch: by then the previous batch's progress
+    // is written.
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_by_stream = std::sync::Arc::clone(&seen);
+    let reader = engine.clone();
+    let read_key = key.clone();
+    let rest: futures::stream::BoxStream<'static, Result<Item, StorageError>> =
+        Box::pin(futures::stream::unfold(3usize, move |i| {
+            let reader = reader.clone();
+            let key = read_key.clone();
+            let seen = std::sync::Arc::clone(&seen_by_stream);
+            async move {
+                if i >= 10 {
+                    return None;
+                }
+                if i == 6 || i == 9 {
+                    let record = reader.read_restore_job(&key).await.unwrap().unwrap();
+                    seen.lock()
+                        .expect("seen")
+                        .push((record.file_index, record.items_applied));
+                }
+                Some((Ok(id_item(i)), i + 1))
+            }
+        }));
+    let applied = engine
+        .bulk_load(
+            &key,
+            &*claim,
+            BulkLoadFile {
+                file_index: 0,
+                start_at: 3,
+                reapplying: false,
+            },
+            rest,
+        )
+        .await
+        .expect("the rest of file 0");
+    assert_eq!(applied, 7, "exactly the rest");
+    assert_eq!(
+        *seen.lock().expect("seen"),
+        vec![(Some(0), Some(6)), (Some(0), Some(9))],
+        "each batch's progress is start_at plus the items applied so far"
+    );
+    let record = engine.read_restore_job(&key).await.unwrap().unwrap();
+    assert_eq!(
+        (record.file_index, record.items_applied),
+        (Some(0), Some(10)),
+        "the tail's progress is the file's total"
+    );
+    assert_eq!(engine.count_restore_target(&key).await.expect("count"), 7);
+}
+
+/// A progress lightweight transaction whose outcome is unknown (a write
+/// timeout, a lost connection) does not fail the file: the record is re-read
+/// at LOCAL_SERIAL. One whose transaction committed (the answer alone was
+/// lost) is found applied and the file goes on; one whose transaction never
+/// ran is found carrying the earlier progress and is written once more; a
+/// second unknown outcome the record does not carry fails the file with an
+/// error naming it, and the batches before it stand with their progress.
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn test_an_unknown_progress_write_outcome_is_decided_by_a_re_read() {
+    use extenddb_storage_cassandra::test_hooks::ProgressWriteFault;
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, "extenddb_ttl_test").await;
+    let account_id = account.account_id.clone();
+    extenddb_storage_cassandra::test_hooks::set_restore_batch_size(&account_id, 3);
+    let store = unique_store();
+    let row = available_index_backup(&engine, &account_id, "Music", "nightly", &store).await;
+    let (desc, claim) = engine
+        .claim_restore(
+            &account_id,
+            manifest_target_input("UnknownProgress"),
+            &manifest_registration(&row, None),
+        )
+        .await
+        .expect("register");
+    let key = RestoreTargetKey {
+        account_id: account_id.clone(),
+        table_name: desc.table_name.clone(),
+        table_id: desc.table_id.clone(),
+    };
+
+    // File 0, three batches: the first batch's write lands but its answer is
+    // lost (the re-read finds the values written), the second's never runs
+    // (the re-read finds the first batch's values; written once more), the
+    // tail's runs as usual. The file completes with every item and its
+    // progress.
+    extenddb_storage_cassandra::test_hooks::fail_progress_writes(
+        &account_id,
+        &[ProgressWriteFault::Landed, ProgressWriteFault::Lost],
+    );
+    let applied = engine
+        .bulk_load(
+            &key,
+            &*claim,
+            BulkLoadFile {
+                file_index: 0,
+                start_at: 0,
+                reapplying: false,
+            },
+            item_stream(0, 7),
+        )
+        .await
+        .expect("an unknown outcome the record decides does not fail the file");
+    assert_eq!(applied, 7);
+    let record = engine.read_restore_job(&key).await.unwrap().unwrap();
+    assert_eq!(
+        (record.file_index, record.items_applied),
+        (Some(0), Some(7)),
+        "the file's progress is recorded"
+    );
+    assert_eq!(engine.count_restore_target(&key).await.expect("count"), 7);
+
+    // File 1: the first batch's write is lost twice over; the second unknown
+    // outcome fails the file. The batch's items landed (the writes are
+    // idempotent upserts a resume rewrites) and the record carries file 0's
+    // progress, so a resume re-applies file 1 from its start.
+    extenddb_storage_cassandra::test_hooks::fail_progress_writes(
+        &account_id,
+        &[ProgressWriteFault::Lost, ProgressWriteFault::Lost],
+    );
+    let failed = engine
+        .bulk_load(
+            &key,
+            &*claim,
+            BulkLoadFile {
+                file_index: 1,
+                start_at: 0,
+                reapplying: false,
+            },
+            item_stream(7, 14),
+        )
+        .await
+        .expect_err("two unknown outcomes the record does not carry fail the file");
+    assert!(
+        matches!(&failed, StorageError::Internal(m) if m.contains("had no known outcome twice")),
+        "{failed}"
+    );
+    let record = engine.read_restore_job(&key).await.unwrap().unwrap();
+    assert_eq!(
+        (record.file_index, record.items_applied),
+        (Some(0), Some(7)),
+        "file 1 recorded no progress"
+    );
+    assert_eq!(
+        engine.count_restore_target(&key).await.expect("count"),
+        10,
+        "the first batch of file 1 landed before its progress write"
+    );
+    assert_eq!(
+        claim.heartbeat().await.expect("beat"),
+        Heartbeat::Confirmed,
+        "the claim is this job's throughout"
+    );
+}
+
+/// A batch closes at the first item whose text takes it past
+/// `RESTORE_BATCH_BYTES`, long before the count cap: a file of 100 items of
+/// about 350 KB each (35 MB of text against the 32 MiB bound) is written in
+/// two batches, the first's progress recorded before the stream hands over
+/// its last item.
+#[tokio::test]
+async fn test_a_batch_closes_at_the_byte_bound_before_the_count_cap() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    const N: usize = 100;
+    const TEXT: usize = 350_000;
+    const {
+        assert!(N < extenddb_storage::restore_engine::RESTORE_BATCH_ITEMS);
+        // 100 items cross the byte bound once.
+        assert!(
+            N * TEXT > extenddb_storage::restore_engine::RESTORE_BATCH_BYTES
+                && (N - 2) * TEXT < 2 * extenddb_storage::restore_engine::RESTORE_BATCH_BYTES
+        );
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, "extenddb_ttl_test").await;
+    let account_id = account.account_id.clone();
+    let store = unique_store();
+    let row = available_index_backup(&engine, &account_id, "Music", "nightly", &store).await;
+    let (desc, claim) = engine
+        .claim_restore(
+            &account_id,
+            manifest_target_input("BigItems"),
+            &manifest_registration(&row, None),
+        )
+        .await
+        .expect("register");
+    let key = RestoreTargetKey {
+        account_id: account_id.clone(),
+        table_name: desc.table_name.clone(),
+        table_id: desc.table_id.clone(),
+    };
+    // The stream reads the record when asked for the last item: by then the
+    // byte bound has closed the first batch and recorded its progress.
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let seen_by_stream = std::sync::Arc::clone(&seen);
+    let reader = engine.clone();
+    let read_key = key.clone();
+    let big: futures::stream::BoxStream<'static, Result<Item, StorageError>> =
+        Box::pin(futures::stream::unfold(0usize, move |i| {
+            let reader = reader.clone();
+            let key = read_key.clone();
+            let seen = std::sync::Arc::clone(&seen_by_stream);
+            async move {
+                if i >= N {
+                    return None;
+                }
+                if i == N - 1 {
+                    let record = reader.read_restore_job(&key).await.unwrap().unwrap();
+                    *seen.lock().expect("seen") = Some((record.file_index, record.items_applied));
+                }
+                let mut item = id_item(i);
+                item.insert("v".to_owned(), AttributeValue::S("x".repeat(TEXT)));
+                Some((Ok(item), i + 1))
+            }
+        }));
+    let applied = engine
+        .bulk_load(
+            &key,
+            &*claim,
+            BulkLoadFile {
+                file_index: 0,
+                start_at: 0,
+                reapplying: false,
+            },
+            big,
+        )
+        .await
+        .expect("bulk_load");
+    assert_eq!(applied as usize, N);
+    let (file_index, items_applied) = seen
+        .lock()
+        .expect("seen")
+        .expect("the stream read the record at its last item");
+    assert_eq!(file_index, Some(0), "the first batch recorded its progress");
+    let first_batch = items_applied.expect("the first batch's total") as usize;
+    assert!(
+        0 < first_batch && first_batch < N,
+        "the first batch closed at the byte bound with {first_batch} of {N} items"
+    );
+    assert!(
+        first_batch * TEXT
+            < extenddb_storage::restore_engine::RESTORE_BATCH_BYTES + TEXT + 1_000 * N,
+        "the batch closed at the first item past the bound: {first_batch} items"
+    );
+    let record = engine.read_restore_job(&key).await.unwrap().unwrap();
+    assert_eq!(
+        (record.file_index, record.items_applied),
+        (Some(0), Some(N as u64))
+    );
+    assert_eq!(
+        engine.count_restore_target(&key).await.expect("count") as usize,
+        N
+    );
+}
+
+/// A claim lost between two batches of one file (the record's generation
+/// moved by a takeover while the load ran): the read before the next batch
+/// finds the record no longer this claim's, the file ends as a lost claim,
+/// and the second batch's items never land.
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn test_bulk_load_stops_at_a_lost_claim_between_two_batches() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, "extenddb_ttl_test").await;
+    let account_id = account.account_id.clone();
+    extenddb_storage_cassandra::test_hooks::set_restore_batch_size(&account_id, 3);
+    let store = unique_store();
+    let row = available_index_backup(&engine, &account_id, "Music", "nightly", &store).await;
+    let (desc, claim) = engine
+        .claim_restore(
+            &account_id,
+            manifest_target_input("LostMidFile"),
+            &manifest_registration(&row, None),
+        )
+        .await
+        .expect("register");
+    let key = RestoreTargetKey {
+        account_id: account_id.clone(),
+        table_name: desc.table_name.clone(),
+        table_id: desc.table_id.clone(),
+    };
+    // The stream hands the first batch's three items, then moves the
+    // record's generation when asked for the first item of the second.
+    let mover = engine.clone();
+    let moved_key = key.clone();
+    let generation = i64::try_from(claim.generation()).unwrap();
+    let stream: futures::stream::BoxStream<'static, Result<Item, StorageError>> =
+        Box::pin(futures::stream::unfold(0usize, move |i| {
+            let mover = mover.clone();
+            let key = moved_key.clone();
+            async move {
+                if i >= 7 {
+                    return None;
+                }
+                if i == 3 {
+                    apply(
+                        &mover,
+                        &format!(
+                            "UPDATE {}.tables SET restore_owner_generation = ? \
+                             WHERE account_id = ? AND table_name = ? \
+                             IF table_id = ? AND restore_owner_generation = ?",
+                            mover.catalog_keyspace()
+                        ),
+                        cdrs_tokio::query_values!(
+                            generation + 1,
+                            key.account_id.as_str(),
+                            key.table_name.as_str(),
+                            key.table_id.as_str(),
+                            generation
+                        ),
+                    )
+                    .await;
+                }
+                Some((Ok(id_item(i)), i + 1))
+            }
+        }));
+    let out = engine
+        .bulk_load(
+            &key,
+            &*claim,
+            BulkLoadFile {
+                file_index: 0,
+                start_at: 0,
+                reapplying: false,
+            },
+            stream,
+        )
+        .await;
+    assert!(
+        matches!(&out, Err(StorageError::Internal(m)) if m.contains("claim on the target was lost")),
+        "the read before the second batch finds another owner: {out:?}"
+    );
+    assert_eq!(
+        engine.count_restore_target(&key).await.expect("count"),
+        3,
+        "the first batch's items alone landed"
+    );
+    let record = engine.read_restore_job(&key).await.unwrap().unwrap();
+    assert_eq!(
+        (record.file_index, record.items_applied),
+        (Some(0), Some(3)),
+        "the first batch's progress stands"
+    );
+}
+
+/// `bulk_load` crosses a batch boundary, recording the file's running total
+/// after each batch, and a re-applied batch changes nothing observable: the
+/// writes are idempotent upserts of the base rows and of each GSI and LSI row
+/// through the ordinary put path (an index row whose key did not change is
+/// rewritten by its `INSERT` alone, and each index row carries its base row's
+/// `version` as its write timestamp, ADR-0027), so the base count and both
+/// index row counts equal those of the first load, after the last batch alone
+/// is re-applied (`start_at: 8`, a resume's shape) and after the whole file
+/// is, and every index row's stamp follows its base row's version.
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn test_bulk_load_crosses_a_batch_boundary_and_a_reapply_changes_nothing() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, "extenddb_ttl_test").await;
+    let account_id = account.account_id.clone();
+    // Four items per batch, so twelve items cross two boundaries.
+    extenddb_storage_cassandra::test_hooks::set_restore_batch_size(&account_id, 4);
+    let store = unique_store();
+    let row = available_index_backup(&engine, &account_id, "Music", "nightly", &store).await;
+    let (desc, claim) = engine
+        .claim_restore(
+            &account_id,
+            composite_target_input("BulkTarget"),
+            &manifest_registration(&row, None),
+        )
+        .await
+        .expect("register");
+    let key = RestoreTargetKey {
+        account_id: account_id.clone(),
+        table_name: desc.table_name.clone(),
+        table_id: desc.table_id.clone(),
+    };
+    let composite_items = |range: std::ops::Range<usize>| {
+        futures::stream::iter(range.map(composite_item).map(Ok)).boxed()
+    };
+    // Items 0, 2, 4, 6, 8 and 10 carry the GSI's key; 0, 3, 6 and 9 the LSI's.
+    let (gsi_rows, lsi_rows) = (6, 4);
+
+    let applied = engine
+        .bulk_load(
+            &key,
+            &*claim,
+            BulkLoadFile {
+                file_index: 0,
+                start_at: 0,
+                reapplying: false,
+            },
+            composite_items(0..12),
+        )
+        .await
+        .expect("bulk_load");
+    assert_eq!(applied, 12);
+    let record = engine.read_restore_job(&key).await.unwrap().unwrap();
+    assert_eq!(record.file_index, Some(0));
+    assert_eq!(record.items_applied, Some(12));
+    assert_eq!(engine.count_restore_target(&key).await.expect("count"), 12);
+    assert_eq!(
+        index_rows(&engine, &account_id, &key.table_id, "gix").await,
+        gsi_rows
+    );
+    assert_eq!(
+        index_rows(&engine, &account_id, &key.table_id, "lix").await,
+        lsi_rows
+    );
+    let loaded =
+        assert_index_rows_carry_the_base_versions(&engine, &account_id, &key.table_id).await;
+    assert_eq!(loaded.len(), 12);
+
+    // The last batch re-applied (a resume whose progress write was lost):
+    // the same base and index rows.
+    let reapplied = engine
+        .bulk_load(
+            &key,
+            &*claim,
+            BulkLoadFile {
+                file_index: 0,
+                start_at: 8,
+                reapplying: true,
+            },
+            composite_items(8..12),
+        )
+        .await
+        .expect("bulk_load re-apply of the last batch");
+    assert_eq!(reapplied, 4);
+    assert_eq!(engine.count_restore_target(&key).await.expect("count"), 12);
+    assert_eq!(
+        index_rows(&engine, &account_id, &key.table_id, "gix").await,
+        gsi_rows,
+        "a re-applied batch keeps every GSI row"
+    );
+    assert_eq!(
+        index_rows(&engine, &account_id, &key.table_id, "lix").await,
+        lsi_rows,
+        "a re-applied batch keeps every LSI row"
+    );
+    // The re-applied items' base rows moved to a later version and their
+    // index rows with them; the others kept both.
+    let reapplied_versions =
+        assert_index_rows_carry_the_base_versions(&engine, &account_id, &key.table_id).await;
+    for (sk, version) in &reapplied_versions {
+        if sk.parse::<usize>().expect("an integer sk") >= 8 {
+            assert!(version > &loaded[sk], "item {sk} was written again");
+        } else {
+            assert_eq!(version, &loaded[sk], "item {sk} was not written again");
+        }
+    }
+
+    // The whole file re-applied: the count stays 12 and the index rows stand.
+    let reapplied = engine
+        .bulk_load(
+            &key,
+            &*claim,
+            BulkLoadFile {
+                file_index: 0,
+                start_at: 0,
+                reapplying: true,
+            },
+            composite_items(0..12),
+        )
+        .await
+        .expect("bulk_load re-apply");
+    assert_eq!(reapplied, 12);
+    assert_eq!(
+        engine.count_restore_target(&key).await.expect("count"),
+        12,
+        "a re-applied file changes nothing"
+    );
+    assert_eq!(
+        (
+            index_rows(&engine, &account_id, &key.table_id, "gix").await,
+            index_rows(&engine, &account_id, &key.table_id, "lix").await
+        ),
+        (gsi_rows, lsi_rows),
+        "a re-applied file keeps every index row"
+    );
+    assert_index_rows_carry_the_base_versions(&engine, &account_id, &key.table_id).await;
+}
+
+/// An unordered backup carrying one key in two data files applies both items
+/// (the second overwrites the first), so `count_restore_target` is one short
+/// of the manifest's total: the shortfall is the duplicate, which the
+/// engine's count check turns into a FAILED restore.
+#[tokio::test]
+async fn test_an_unordered_duplicate_key_is_caught_by_the_count_alone() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, "extenddb_ttl_test").await;
+    let account_id = account.account_id.clone();
+    let store = unique_store();
+    let row = available_index_backup(&engine, &account_id, "Music", "nightly", &store).await;
+    let (desc, claim) = engine
+        .claim_restore(
+            &account_id,
+            manifest_target_input("DupTarget"),
+            &manifest_registration(&row, None),
+        )
+        .await
+        .expect("register");
+    let key = RestoreTargetKey {
+        account_id: account_id.clone(),
+        table_name: desc.table_name.clone(),
+        table_id: desc.table_id.clone(),
+    };
+    // File 0: items 0..6. File 1: items 6..12 and item 0 again (the backup
+    // holds k00000 twice). The manifest's total is 13 items.
+    engine
+        .bulk_load(
+            &key,
+            &*claim,
+            BulkLoadFile {
+                file_index: 0,
+                start_at: 0,
+                reapplying: false,
+            },
+            item_stream(0, 6),
+        )
+        .await
+        .expect("file 0");
+    let file_one: Vec<Item> = (6..12)
+        .map(id_item)
+        .chain(std::iter::once(id_item(0)))
+        .collect();
+    engine
+        .bulk_load(
+            &key,
+            &*claim,
+            BulkLoadFile {
+                file_index: 1,
+                start_at: 0,
+                reapplying: false,
+            },
+            futures::stream::iter(file_one.into_iter().map(Ok)).boxed(),
+        )
+        .await
+        .expect("file 1");
+    let count = engine.count_restore_target(&key).await.expect("count");
+    assert_eq!(count, 12, "the duplicated key collapsed into one row");
+    assert!(count < 13, "the count is one short of the manifest's 13");
+}
+
+/// `bulk_load` stops with a lost-claim error when the record's generation has
+/// moved (the reconciler took it over): the progress lightweight transaction
+/// matches no RUNNING record under the claim's generation.
+#[tokio::test]
+async fn test_bulk_load_is_refused_when_the_claim_was_lost() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, "extenddb_ttl_test").await;
+    let account_id = account.account_id.clone();
+    let store = unique_store();
+    let row = available_index_backup(&engine, &account_id, "Music", "nightly", &store).await;
+    let (desc, claim) = engine
+        .claim_restore(
+            &account_id,
+            manifest_target_input("LostTarget"),
+            &manifest_registration(&row, None),
+        )
+        .await
+        .expect("register");
+    let key = RestoreTargetKey {
+        account_id: account_id.clone(),
+        table_name: desc.table_name.clone(),
+        table_id: desc.table_id.clone(),
+    };
+    // Another owner bumps the generation.
+    apply(
+        &engine,
+        &format!(
+            "UPDATE {}.tables SET restore_owner_generation = ? \
+             WHERE account_id = ? AND table_name = ? \
+             IF table_id = ? AND restore_owner_generation = ?",
+            engine.catalog_keyspace()
+        ),
+        cdrs_tokio::query_values!(
+            i64::try_from(claim.generation()).unwrap() + 1,
+            account_id.as_str(),
+            key.table_name.as_str(),
+            key.table_id.as_str(),
+            i64::try_from(claim.generation()).unwrap()
+        ),
+    )
+    .await;
+    let error = engine
+        .bulk_load(
+            &key,
+            &*claim,
+            BulkLoadFile {
+                file_index: 0,
+                start_at: 0,
+                reapplying: false,
+            },
+            item_stream(0, 3),
+        )
+        .await
+        .expect_err("the progress write finds another owner");
+    assert!(
+        error.to_string().contains("claim on the target was lost"),
+        "{error}"
+    );
+}
+
+/// `finish_restore` flips the target ACTIVE and marks the record DONE, and a
+/// stale generation's `finish_restore` is `NotMatched`.
+#[tokio::test]
+async fn test_finish_restore_flips_the_target_and_refuses_a_stale_generation() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, "extenddb_ttl_test").await;
+    let account_id = account.account_id.clone();
+    let store = unique_store();
+    let row = available_index_backup(&engine, &account_id, "Music", "nightly", &store).await;
+    let (desc, claim) = engine
+        .claim_restore(
+            &account_id,
+            manifest_target_input("FinishTarget"),
+            &manifest_registration(&row, None),
+        )
+        .await
+        .expect("register");
+    let key = RestoreTargetKey {
+        account_id: account_id.clone(),
+        table_name: desc.table_name.clone(),
+        table_id: desc.table_id.clone(),
+    };
+    engine
+        .bulk_load(
+            &key,
+            &*claim,
+            BulkLoadFile {
+                file_index: 0,
+                start_at: 0,
+                reapplying: false,
+            },
+            item_stream(0, 5),
+        )
+        .await
+        .expect("bulk_load");
+    let count = engine.count_restore_target(&key).await.expect("count");
+    assert_eq!(count, 5);
+
+    assert_eq!(
+        engine
+            .finish_restore(&key, &*claim, count, 4_096)
+            .await
+            .expect("finish"),
+        Finished::Active
+    );
+    let described = describe(&engine, &account_id, "FinishTarget").await;
+    assert_eq!(described.table_status, TableStatus::Active);
+    assert_eq!(described.item_count, 5);
+
+    // A second flip, the record no longer RUNNING, matches nothing.
+    assert!(matches!(
+        engine
+            .finish_restore(&key, &*claim, count, 4_096)
+            .await
+            .expect("finish again"),
+        Finished::NotMatched(_)
+    ));
+}
+
+/// After a claim writes the record FAILED (leaving `table_status` alone),
+/// `remove_restore_target` performs the two-write removal (CREATING to
+/// DELETING, then the drop) and the target is gone.
+#[tokio::test]
+async fn test_remove_restore_target_after_a_failed_write() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, "extenddb_ttl_test").await;
+    let account_id = account.account_id.clone();
+    let store = unique_store();
+    let row = available_index_backup(&engine, &account_id, "Music", "nightly", &store).await;
+    let (desc, claim) = engine
+        .claim_restore(
+            &account_id,
+            manifest_target_input("FailTarget"),
+            &manifest_registration(&row, None),
+        )
+        .await
+        .expect("register");
+    let key = RestoreTargetKey {
+        account_id: account_id.clone(),
+        table_name: desc.table_name.clone(),
+        table_id: desc.table_id.clone(),
+    };
+    assert_eq!(
+        claim
+            .set_status(
+                JobStatus::Running,
+                JobStatus::Failed,
+                &StatusFields {
+                    failure_reason: Some("a data file failed".to_owned()),
+                    completed: true,
+                    ..StatusFields::default()
+                }
+            )
+            .await
+            .expect("fail the record"),
+        WriteOutcome::Matched
+    );
+    // The FAILED write left the table CREATING; the record carries the reason.
+    assert_eq!(
+        describe(&engine, &account_id, "FailTarget")
+            .await
+            .table_status,
+        TableStatus::Creating,
+        "the FAILED write leaves table_status alone for the removal's two-write step"
+    );
+    let record = engine.read_restore_job(&key).await.unwrap().unwrap();
+    assert_eq!(record.status, JobStatus::Failed);
+    assert_eq!(record.failure_reason.as_deref(), Some("a data file failed"));
+
+    assert!(
+        engine.remove_restore_target(&key).await.expect("remove"),
+        "the two-write removal of a FAILED target succeeds"
+    );
+    assert!(
+        matches!(
+            engine
+                .describe_table(
+                    &account_id,
+                    DescribeTableInput {
+                        table_name: "FailTarget".to_owned()
+                    }
+                )
+                .await,
+            Err(StorageError::TableNotFound(_))
+        ),
+        "the target is gone"
+    );
+    assert!(
+        engine.read_restore_job(&key).await.expect("read").is_none(),
+        "the record went with the target"
+    );
+}
+
 /// The liveness test inside the takeover write: with the owner's beat
 /// landing between `claim_dead_backup`'s `LOCAL_SERIAL` read (which found
 /// the heartbeat stale) and its LWT, the LWT's `heartbeat_at = <read>`
@@ -5872,4 +7834,524 @@ async fn test_a_beat_between_the_takeovers_read_and_its_write_refuses_the_takeov
         .expect("claim")
         .expect("taken over once no beat lands in the gap");
     assert_ne!(successor.generation(), owner.generation());
+}
+
+// ── The batch's timestamp fence, the first batch resumed without progress, the
+// ── readiness check's index tables, the in-use rule of a running restore ───────
+
+/// The items of a target's data table (rows with an `item_data`: a delete
+/// leaves the partition's static delete stamp behind, so `COUNT(*)` would
+/// count a deleted item's partition), counted whatever the table's status
+/// (`count_restore_target` refuses a target no longer CREATING).
+#[cfg(feature = "test-hooks")]
+async fn base_rows(engine: &CassandraEngine, account_id: &str, table_id: &str) -> i64 {
+    use cdrs_tokio::types::IntoRustByName;
+    let rows = extenddb_storage_cassandra::cassandra_util::query_rows_quorum::<StorageError>(
+        &engine.session_arc(),
+        &format!(
+            "SELECT COUNT(item_data) AS c FROM {}.items_{}",
+            engine.account_keyspace(account_id),
+            table_id.replace('-', "_")
+        ),
+        cdrs_tokio::query_values!(),
+        "base rows",
+    )
+    .await
+    .expect("count the base rows");
+    rows.first()
+        .expect("a count")
+        .get_by_name("c")
+        .ok()
+        .flatten()
+        .expect("c")
+}
+
+/// Microseconds since the epoch on this host's clock, the domain of the
+/// restore's write timestamps.
+#[cfg(feature = "test-hooks")]
+fn micros_now() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_micros(),
+    )
+    .expect("fits")
+}
+
+/// The batch fence (the module doc of `restore_engine`): a writer paused
+/// between a batch's claim check and the batch's writes, taken over, whose
+/// successor re-applies the batch, flips the target ACTIVE and deletes two
+/// of its items, lands its batch when released at the timestamp it read
+/// before the check, below every write and delete the successor made: the
+/// deleted items stay deleted, their GSI and LSI rows stay gone, and the
+/// surviving rows carry the successor's versions, not the stalled writer's.
+/// Without the timestamp (the writes stamped when they land) the stalled
+/// batch would resurrect the deleted items and their index rows.
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn test_a_batch_landed_after_a_takeover_loses_to_the_successors_writes_and_deletes() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, "extenddb_ttl_test").await;
+    let account_id = account.account_id.clone();
+    extenddb_storage_cassandra::test_hooks::set_restore_batch_size(&account_id, 4);
+    let store = unique_store();
+    let row = available_index_backup(&engine, &account_id, "Music", "nightly", &store).await;
+    let (desc, owner) = engine
+        .claim_restore(
+            &account_id,
+            composite_target_input("Fenced"),
+            &manifest_registration(&row, Some("owner:/s")),
+        )
+        .await
+        .expect("register");
+    let key = RestoreTargetKey {
+        account_id: account_id.clone(),
+        table_name: desc.table_name.clone(),
+        table_id: desc.table_id.clone(),
+    };
+    let composite_items = |range: std::ops::Range<usize>| {
+        futures::stream::iter(range.map(composite_item).map(Ok)).boxed()
+    };
+
+    // The owner's one batch of four, held after its claim check.
+    let pause =
+        extenddb_storage_cassandra::test_hooks::pause_after_restore_claim_check(&key.table_id);
+    let stalled = {
+        let engine = engine.clone();
+        let key = key.clone();
+        tokio::spawn(async move {
+            engine
+                .bulk_load(
+                    &key,
+                    &*owner,
+                    BulkLoadFile {
+                        file_index: 0,
+                        start_at: 0,
+                        reapplying: false,
+                    },
+                    composite_items(0..4),
+                )
+                .await
+        })
+    };
+    pause.reached().await;
+    assert_eq!(
+        base_rows(&engine, &account_id, &key.table_id).await,
+        0,
+        "nothing is written before the check"
+    );
+
+    // The owner's heartbeat (the check refreshed it) goes stale; the
+    // successor takes the record over, writes the batch itself at later
+    // timestamps, finishes, and two items are deleted through the ACTIVE
+    // table.
+    tokio::time::sleep(Duration::from_millis(1_300)).await;
+    let successor_from = micros_now();
+    let successor = engine
+        .claim_restore_dead(&key, Duration::from_secs(1), Some("successor:/s"))
+        .await
+        .expect("claim")
+        .expect("the stale record is taken over");
+    let applied = engine
+        .bulk_load(
+            &key,
+            &*successor,
+            BulkLoadFile {
+                file_index: 0,
+                start_at: 0,
+                reapplying: true,
+            },
+            composite_items(0..4),
+        )
+        .await
+        .expect("the successor's load");
+    assert_eq!(applied, 4);
+    assert_eq!(
+        engine
+            .finish_restore(&key, &*successor, 4, 1_024)
+            .await
+            .expect("finish"),
+        Finished::Active
+    );
+    let key_info = engine
+        .table_key_info(&account_id, "Fenced")
+        .await
+        .expect("the ACTIVE target's key info");
+    // The deletes' GSI tombstones are written in the delete's own batch (no
+    // propagation worker runs in these tests).
+    make_gsis_synchronous(&engine, &key.table_id, &["gix"]).await;
+    // Items 0 and 2 carry the GSI's key `g`; item 0 the LSI's `l` as well.
+    for i in [0usize, 2] {
+        let mut k = BTreeMap::new();
+        k.insert("id".to_owned(), AttributeValue::S(format!("p{}", i % 5)));
+        k.insert("sk".to_owned(), AttributeValue::N(i.to_string()));
+        engine
+            .delete_item(&key_info, &k, false, None, &ExpressionMaps::default(), None)
+            .await
+            .expect("delete through the ACTIVE table");
+    }
+    assert_eq!(base_rows(&engine, &account_id, &key.table_id).await, 2);
+    assert_eq!(
+        index_rows(&engine, &account_id, &key.table_id, "gix").await,
+        0
+    );
+    assert_eq!(
+        index_rows(&engine, &account_id, &key.table_id, "lix").await,
+        1
+    );
+
+    // The stalled writer lands its batch now. Its progress write then finds
+    // the record no longer its own (the lost claim); its writes carry the
+    // timestamp read before its check, so they change nothing.
+    pause.release();
+    let out = stalled.await.expect("the owner's task");
+    assert!(
+        matches!(&out, Err(StorageError::Internal(m)) if m.contains("claim on the target was lost")),
+        "the stalled writer's progress write reports the lost claim: {out:?}"
+    );
+    assert_eq!(
+        base_rows(&engine, &account_id, &key.table_id).await,
+        2,
+        "the deleted items stay deleted"
+    );
+    assert_eq!(
+        index_rows(&engine, &account_id, &key.table_id, "gix").await,
+        0,
+        "the deleted items' GSI rows stay gone"
+    );
+    assert_eq!(
+        index_rows(&engine, &account_id, &key.table_id, "lix").await,
+        1,
+        "the deleted item's LSI row stays gone"
+    );
+    for i in [0usize, 2] {
+        let mut k = BTreeMap::new();
+        k.insert("id".to_owned(), AttributeValue::S(format!("p{}", i % 5)));
+        k.insert("sk".to_owned(), AttributeValue::N(i.to_string()));
+        assert!(
+            engine.get_item(&key_info, &k).await.expect("get").is_none(),
+            "item {i} was not resurrected"
+        );
+    }
+    let versions = live_versions_by_sk(&engine, &account_id, &key.table_id).await;
+    assert_eq!(versions.keys().collect::<Vec<_>>(), ["1", "3"]);
+    for (sk, version) in &versions {
+        assert!(
+            *version >= successor_from,
+            "item {sk} carries the successor's version ({version}), not the stalled writer's \
+             (before {successor_from})"
+        );
+    }
+    // The surviving LSI row (item 3's) carries its base row's version.
+    assert_eq!(
+        stamps_by_sk(&engine, &account_id, &key.table_id, Some("lix")).await,
+        BTreeMap::from([("3".to_owned(), versions["3"])])
+    );
+}
+
+/// Per live item of the composite fixture (keyed by its `sk`), the base
+/// row's `version`; a deleted item's partition, left with its static delete
+/// stamp alone, is skipped.
+#[cfg(feature = "test-hooks")]
+async fn live_versions_by_sk(
+    engine: &CassandraEngine,
+    account_id: &str,
+    table_id: &str,
+) -> BTreeMap<String, i64> {
+    use cdrs_tokio::types::IntoRustByName;
+    let rows = extenddb_storage_cassandra::cassandra_util::query_rows_quorum::<StorageError>(
+        &engine.session_arc(),
+        &format!(
+            "SELECT item_data, version FROM {}.items_{}",
+            engine.account_keyspace(account_id),
+            table_id.replace('-', "_")
+        ),
+        cdrs_tokio::query_values!(),
+        "versions",
+    )
+    .await
+    .expect("read the versions");
+    rows.into_iter()
+        .filter_map(|row| {
+            let json: Option<String> = row.get_by_name("item_data").ok().flatten();
+            let image: Item = serde_json::from_str(&json?).expect("an item image");
+            let Some(AttributeValue::N(sk)) = image.get("sk") else {
+                panic!("no sk in {image:?}");
+            };
+            let version: i64 = row.get_r_by_name("version").expect("a version");
+            Some((sk.clone(), version))
+        })
+        .collect()
+}
+
+/// A first batch whose writes landed and whose progress was never recorded
+/// (here the progress lightweight transaction's outcome is unknown twice and
+/// the load fails, the state a crash before the first progress record
+/// leaves) is resumed with the first file re-applied (`reapplying`, from
+/// `start_at: 0`): the upserts rewrite the landed rows and write the rest,
+/// and the base count and both index-row counts are exact. The engine
+/// takes this path for a target holding no more than the backup's total
+/// (`a_half_applied_first_file_with_no_progress_is_resumed_with_upserts`).
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn test_a_first_batch_applied_without_progress_resumes_to_the_exact_count() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, "extenddb_ttl_test").await;
+    let account_id = account.account_id.clone();
+    extenddb_storage_cassandra::test_hooks::set_restore_batch_size(&account_id, 3);
+    let store = unique_store();
+    let row = available_index_backup(&engine, &account_id, "Music", "nightly", &store).await;
+    let (desc, claim) = engine
+        .claim_restore(
+            &account_id,
+            composite_target_input("HalfFirst"),
+            &manifest_registration(&row, None),
+        )
+        .await
+        .expect("register");
+    let key = RestoreTargetKey {
+        account_id: account_id.clone(),
+        table_name: desc.table_name.clone(),
+        table_id: desc.table_id.clone(),
+    };
+    let composite_items = |range: std::ops::Range<usize>| {
+        futures::stream::iter(range.map(composite_item).map(Ok)).boxed()
+    };
+    // The first batch's writes land; its progress write is lost twice and the
+    // load fails with no progress recorded.
+    extenddb_storage_cassandra::test_hooks::fail_progress_writes(
+        &account_id,
+        &[
+            extenddb_storage_cassandra::test_hooks::ProgressWriteFault::Lost,
+            extenddb_storage_cassandra::test_hooks::ProgressWriteFault::Lost,
+        ],
+    );
+    let out = engine
+        .bulk_load(
+            &key,
+            &*claim,
+            BulkLoadFile {
+                file_index: 0,
+                start_at: 0,
+                reapplying: false,
+            },
+            composite_items(0..7),
+        )
+        .await;
+    assert!(
+        matches!(&out, Err(StorageError::Internal(m)) if m.contains("no known outcome twice")),
+        "{out:?}"
+    );
+    let record = engine.read_restore_job(&key).await.unwrap().unwrap();
+    assert_eq!(
+        (record.file_index, record.items_applied),
+        (None, None),
+        "no progress is recorded"
+    );
+    assert_eq!(
+        engine.count_restore_target(&key).await.expect("count"),
+        3,
+        "the first batch's items landed"
+    );
+
+    // The resume: the whole first file re-applied with upserts.
+    let applied = engine
+        .bulk_load(
+            &key,
+            &*claim,
+            BulkLoadFile {
+                file_index: 0,
+                start_at: 0,
+                reapplying: true,
+            },
+            composite_items(0..7),
+        )
+        .await
+        .expect("the resume's load");
+    assert_eq!(applied, 7);
+    assert_eq!(engine.count_restore_target(&key).await.expect("count"), 7);
+    // Items 0, 2, 4 and 6 carry `g`; 0, 3 and 6 carry `l`.
+    assert_eq!(
+        index_rows(&engine, &account_id, &key.table_id, "gix").await,
+        4
+    );
+    assert_eq!(
+        index_rows(&engine, &account_id, &key.table_id, "lix").await,
+        3
+    );
+    let record = engine.read_restore_job(&key).await.unwrap().unwrap();
+    assert_eq!(
+        (record.file_index, record.items_applied),
+        (Some(0), Some(7))
+    );
+    assert_index_rows_carry_the_base_versions(&engine, &account_id, &key.table_id).await;
+}
+
+/// `restore_target_ready` reads the index tables as well as the data table:
+/// a target whose GSI table is missing (the registration creates the data
+/// table and then each index table in its own statement, so a crash between
+/// them leaves this) is not ready, where the data table alone would pass.
+#[tokio::test]
+async fn test_restore_target_ready_requires_every_index_table() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, "extenddb_ttl_test").await;
+    let account_id = account.account_id.clone();
+    let store = unique_store();
+    let row = available_index_backup(&engine, &account_id, "Music", "nightly", &store).await;
+    let (desc, _claim) = engine
+        .claim_restore(
+            &account_id,
+            composite_target_input("NoGsiTable"),
+            &manifest_registration(&row, None),
+        )
+        .await
+        .expect("register");
+    let key = RestoreTargetKey {
+        account_id: account_id.clone(),
+        table_name: desc.table_name.clone(),
+        table_id: desc.table_id.clone(),
+    };
+    assert!(
+        engine.restore_target_ready(&key).await.expect("ready"),
+        "the registration created every table"
+    );
+    // The GSI's table is dropped, as a crash between the data table's DDL
+    // and the index table's would leave it.
+    use cdrs_tokio::types::IntoRustByName;
+    let rows = extenddb_storage_cassandra::cassandra_util::query_rows_quorum::<StorageError>(
+        &engine.session_arc(),
+        &format!(
+            "SELECT index_id FROM {}.indexes WHERE table_id = ? AND index_name = ?",
+            engine.catalog_keyspace()
+        ),
+        cdrs_tokio::query_values!(key.table_id.as_str(), "gix"),
+        "index id",
+    )
+    .await
+    .expect("read the index");
+    let index_id: String = rows
+        .first()
+        .expect("the GSI exists")
+        .get_by_name("index_id")
+        .ok()
+        .flatten()
+        .expect("index_id");
+    engine
+        .session()
+        .query(format!(
+            "DROP TABLE {}.{}",
+            engine.account_keyspace(&account_id),
+            extenddb_storage_cassandra::data::ddl::index_table_name(&index_id)
+        ))
+        .await
+        .expect("drop the GSI's table");
+    assert!(
+        !engine.restore_target_ready(&key).await.expect("ready"),
+        "a target missing its GSI table is not ready"
+    );
+}
+
+/// The in-use rule's input on Cassandra while a store-backed restore of the
+/// backup runs: `backup_in_use` names the CREATING target, twice (the
+/// engine reads it before it validates a second restore's overrides, so an
+/// unknown GSI override, a throughput override and a plain restore are each
+/// `BackupInUseException`, as on the other backends); it names the target
+/// still when the backup's `active_restores` entry has not landed (the
+/// registration writes the target row first), through the target rows; and
+/// it names nothing once the target is ACTIVE.
+#[tokio::test]
+async fn test_a_running_store_backed_restore_keeps_its_backup_in_use_until_active() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, "extenddb_ttl_test").await;
+    let account_id = account.account_id.clone();
+    let store = unique_store();
+    let row = available_index_backup(&engine, &account_id, "Music", "nightly", &store).await;
+    assert_eq!(
+        engine.backup_in_use(&row.key()).await.expect("in use"),
+        None
+    );
+    let (desc, claim) = engine
+        .claim_restore(
+            &account_id,
+            manifest_target_input("InUseTarget"),
+            &manifest_registration(&row, None),
+        )
+        .await
+        .expect("register");
+    let key = RestoreTargetKey {
+        account_id: account_id.clone(),
+        table_name: desc.table_name.clone(),
+        table_id: desc.table_id.clone(),
+    };
+    for _ in 0..2 {
+        assert_eq!(
+            engine.backup_in_use(&row.key()).await.expect("in use"),
+            Some("InUseTarget".to_owned()),
+            "a running store-backed restore keeps the backup in use"
+        );
+        let second = engine
+            .claim_restore(
+                &account_id,
+                manifest_target_input("SecondTarget"),
+                &manifest_registration(&row, None),
+            )
+            .await
+            .err()
+            .expect("a second restore is refused");
+        assert!(
+            matches!(second, StorageError::BackupInUse(ref m) if *m == backup_in_use_message(&row.backup_arn)),
+            "{second}"
+        );
+    }
+    // The registration's `active_restores` entry removed: the target row
+    // alone keeps the backup in use.
+    apply(
+        &engine,
+        &format!(
+            "DELETE active_restores[?] FROM {}.backups_by_arn \
+             WHERE account_id = ? AND backup_arn = ? IF EXISTS",
+            engine.catalog_keyspace()
+        ),
+        cdrs_tokio::query_values!(
+            key.table_id.as_str(),
+            account_id.as_str(),
+            row.backup_arn.as_str()
+        ),
+    )
+    .await;
+    assert!(
+        registrations(&engine, &account_id, &row.backup_arn)
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        engine.backup_in_use(&row.key()).await.expect("in use"),
+        Some("InUseTarget".to_owned()),
+        "the CREATING target row keeps the backup in use before the map entry lands"
+    );
+    // ACTIVE: the backup is free.
+    assert_eq!(
+        engine
+            .finish_restore(&key, &*claim, 0, 0)
+            .await
+            .expect("finish"),
+        Finished::Active
+    );
+    assert_eq!(
+        engine.backup_in_use(&row.key()).await.expect("in use"),
+        None
+    );
 }

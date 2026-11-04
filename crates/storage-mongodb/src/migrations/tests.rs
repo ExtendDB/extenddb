@@ -39,7 +39,7 @@ fn every_migration_records_a_row_in_the_catalog_and_names_its_stores() {
 }
 
 #[test]
-fn every_body_is_code_and_three_and_four_do_not_apply() {
+fn every_body_is_code_and_three_four_seven_and_eight_do_not_apply() {
     for id in MigrationId::ALL {
         for body in migration(id).bodies() {
             assert!(matches!(body.body, Body::Code { .. }), "{id}");
@@ -48,6 +48,8 @@ fn every_body_is_code_and_three_and_four_do_not_apply() {
     for id in [
         MigrationId::SortKeyDefinitions,
         MigrationId::IndexTableBaseKey,
+        MigrationId::StreamPending,
+        MigrationId::RestoreProgress,
     ] {
         let Migration::NotApplicable(reason) = migration(id) else {
             panic!("{id} applies on MongoDB");
