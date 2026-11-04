@@ -41,6 +41,7 @@ adaptation when switching between ExtendDB and the real service.
 | Export formats | DYNAMODB_JSON, ION | DYNAMODB_JSON, ION |
 | Import execution | Asynchronous (background job) | Synchronous (completes before returning) |
 | Export execution | Point-in-time snapshot | Current snapshot, synchronous |
+| Imported rows holding a number the service cannot store | A row holding a value that is not a number ends the import of the file: it and the rows after it are not imported. A row holding a number out of range or with more than 38 digits is skipped, and the rows after it are imported. Each refused row counts as one error and is logged to CloudWatch, and an import with any error is `FAILED` with `ItemValidationError`, keeping the rows it imported (measured 2026-11-03) | The same, with three differences. A zero whose exponent fits in 32 bits but is out of range, such as `0E126`, is imported as `0`, where the service skips the row (`Number overflow` for `0E126`). A Unicode decimal digit (`\uff15`), which the service imports as the digit (`5`), is not a number to ExtendDB, so the row ends the import of the file. Each refused row is logged to the server log, and the `FailureMessage` names the server log instead of CloudWatch |
 
 ## Control Plane
 

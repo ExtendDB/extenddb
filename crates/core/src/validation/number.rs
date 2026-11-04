@@ -80,9 +80,9 @@ pub fn validate_and_normalize_number(s: &str) -> Result<String, DynamoDbError> {
         // digits (`0E126` is an overflow, `0.0E-130` an underflow). Only a zero
         // whose exponent does not fit in an i32 is checked here. A refused
         // zero keeps its raw spelling in `AttributeValue`, as every refused
-        // number does, and Query, Scan (#544, #562) and ImportTable do not
-        // validate numbers yet: refusing `0E126` here would make them look it
-        // up and store it as a key of its own instead of `0` (#618).
+        // number does, and Query and Scan (#544, #562) do not validate
+        // numbers yet: refusing `0E126` here would make them look it up as a
+        // key of its own instead of `0` (#618).
         if i32::try_from(explicit_exp).is_err() {
             check_zero_magnitude(explicit_exp, frac_part)?;
         }
@@ -548,13 +548,12 @@ mod tests {
 
     // DynamoDB refuses each of these zeros: `0E126` and the next four are a
     // `Number overflow`, `0.0E-130` and the rest a `Number underflow`. They
-    // stay accepted as 0 until Query and Scan (#544, #562) and ImportTable
-    // validate numbers, which #618 still tracks: a zero refused by this
-    // function keeps its raw spelling, and those paths would then look up and
-    // store `0E126` as a key of its own. Move these rows to the refused lists
-    // above when they do.
+    // stay accepted as 0 until Query and Scan (#544, #562) validate numbers,
+    // which #618 still tracks: a zero refused by this function keeps its raw
+    // spelling, and those operations would then look up `0E126` as a key of
+    // its own. Move these rows to the refused lists above when they do.
     #[test]
-    fn zero_with_i32_exponent_stays_accepted_until_query_scan_and_import_validate() {
+    fn zero_with_i32_exponent_stays_accepted_until_query_and_scan_validate() {
         for n in [
             "0E126",
             "00E126",

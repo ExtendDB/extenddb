@@ -16,6 +16,9 @@
 //!   a 32-bit exponent and scale; see [`validate_number_i32_scale`]. An empty
 //!   value answers the message without the colon.
 //!
+//! `ImportTable` reads the numbers of a row the second way (measured
+//! 2026-11-03; see [`import_row`]).
+//!
 //! `PutItem`, `UpdateItem` and `DeleteItem` start the message with
 //! `1 validation error detected: `, and the other operations do not.
 //! `TransactWriteItems` reports a value in `ExpressionAttributeValues` as
@@ -212,6 +215,90 @@ pub fn transact_write_item(item: &TransactWriteItem) -> Result<(), DynamoDbError
         ))
     })?;
     item_numbers(Rules::I32Scale, key_or_item).map_err(bare)
+}
+
+/// Why `ImportTable` refuses a row holding a number the service cannot read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportRowFault {
+    /// A value that is not a number. The service refuses the row and does not
+    /// process the rows after it ("Expected a valid numeric. Remainder of the
+    /// file will not be processed.").
+    Malformed,
+    /// A number outside the supported range or with more than 38 digits, with
+    /// the service's message for it. The service refuses the row and imports
+    /// the rows after it.
+    OutOfRange(String),
+}
+
+/// Refuse an `ImportTable` row holding a number the service cannot read.
+///
+/// Measured 2026-11-03 (us-east-1), one import from S3 per value, each file a
+/// row with a valid number, the row under test, and another valid row:
+///
+/// - The service reads a row's numbers as `BatchWriteItem` does, with a
+///   32-bit exponent and scale; see [`validate_number_i32_scale`]. `abc`,
+///   ` 5`, an empty value, `12e`, `1E2147483648` and `1E-2147483648` are not
+///   numbers, and `1E2147483647` is a `Number underflow`.
+/// - A row holding a value that is not a number stops the import of the
+///   file: the row and the rows after it are not imported, and the row is
+///   the last one counted as processed. This holds whatever else the row
+///   holds: a number out of range ahead of it in the row, or no key.
+/// - A row holding a number out of range, or with more than 38 digits, is
+///   not imported and the rows after it are.
+///
+/// Either way the row counts as one error, and numbers in an `NS`, `L` or `M`
+/// count as the row's numbers. A row with no key and the number `1E126` was
+/// logged as `Number overflow`, and a row whose key has the wrong type and
+/// the number `1E126` as the type mismatch; the caller checks numbers before
+/// keys, so only the second row's log line differs.
+///
+/// Two values are read differently from the service:
+///
+/// - A zero whose exponent fits in 32 bits reaches this check as `0` (see
+///   [`validate_number_i32_scale`]), so a row holding `0E126`, which the
+///   service refuses as `Number overflow`, is imported with `0`.
+/// - The service reads a Unicode decimal digit as the digit (a row holding
+///   `\u{ff15}` was imported with `5`). This check does not, as no other
+///   number check does, so such a row ends the import of the file.
+///
+/// # Errors
+///
+/// Returns the row's [`ImportRowFault`]: `Malformed` when any value is not a
+/// number, and otherwise the first number out of range, in the order of the
+/// item's map.
+pub fn import_row(item: &Item) -> Result<(), ImportRowFault> {
+    let mut numbers = Vec::new();
+    for value in item.values() {
+        collect_numbers(value, &mut numbers);
+    }
+    let mut out_of_range = None;
+    for n in numbers {
+        match validate_number_i32_scale(n) {
+            Ok(()) => {}
+            // Every message that check gives for a value that is not a number
+            // starts with this text, and none of its range messages does; the
+            // tests pin the split for every measured value.
+            Err(message) if message.starts_with(NUMERIC_VALUE) => {
+                return Err(ImportRowFault::Malformed);
+            }
+            Err(message) => {
+                out_of_range.get_or_insert(message);
+            }
+        }
+    }
+    out_of_range.map_or(Ok(()), |message| Err(ImportRowFault::OutOfRange(message)))
+}
+
+/// Every number in `value`: an `N`, the members of an `NS`, and the numbers
+/// nested in an `L` or `M`.
+fn collect_numbers<'a>(value: &'a AttributeValue, numbers: &mut Vec<&'a str>) {
+    match value {
+        AttributeValue::N(n) => numbers.push(n),
+        AttributeValue::NS(set) => numbers.extend(set.iter().map(String::as_str)),
+        AttributeValue::L(list) => list.iter().for_each(|v| collect_numbers(v, numbers)),
+        AttributeValue::M(map) => map.values().for_each(|v| collect_numbers(v, numbers)),
+        _ => {}
+    }
 }
 
 /// The first fault in an `ExpressionAttributeValues` map: a value nested too

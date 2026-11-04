@@ -587,3 +587,104 @@ fn batch_write_item_visits_tables_in_name_order() {
     .unwrap();
     assert_eq!(refused(batch_write_item(&input)), format!("{NUMERIC}: abc"));
 }
+
+// `ImportTable` rows: measured 2026-11-03 (us-east-1), one import from S3 per
+// row. A row is read through `Item`'s deserializer, as the import file
+// reader reads it, so a valid number arrives normalized and any other
+// keeps its text.
+
+fn import_item(row: &Value) -> Item {
+    serde_json::from_value(row.clone()).unwrap()
+}
+
+#[test]
+fn import_row_stops_at_a_value_that_is_not_a_number() {
+    for row in [
+        json!({"pk": {"S": "a"}, "n": {"N": "abc"}}),
+        json!({"pk": {"S": "a"}, "n": {"N": ""}}),
+        json!({"pk": {"S": "a"}, "n": {"N": " 5"}}),
+        json!({"pk": {"S": "a"}, "n": {"N": "12e"}}),
+        json!({"pk": {"S": "a"}, "n": {"N": "1E2147483648"}}),
+        json!({"pk": {"S": "a"}, "n": {"N": "1E9223372036854775808"}}),
+        json!({"pk": {"S": "a"}, "n": {"N": "1E-2147483648"}}),
+        json!({"pk": {"S": "a"}, "n": {"N": "1.5E-2147483647"}}),
+        json!({"pk": {"S": "a"}, "s": {"NS": ["1", "abc"]}}),
+        json!({"pk": {"N": "abc"}}),
+        // A number out of range ahead of it in the row does not change the
+        // answer, nor does a missing key.
+        json!({"pk": {"S": "a"}, "a": {"N": "1E126"}, "b": {"N": "abc"}}),
+        json!({"other": {"S": "x"}, "n": {"N": "abc"}}),
+        // The service imports a row holding a Unicode decimal digit with the
+        // digit (`5` here); this check refuses it, as every number check does.
+        json!({"pk": {"S": "a"}, "n": {"N": "\u{ff15}"}}),
+    ] {
+        assert_eq!(
+            import_row(&import_item(&row)),
+            Err(ImportRowFault::Malformed),
+            "{row}"
+        );
+    }
+}
+
+#[test]
+fn import_row_refuses_a_number_out_of_range() {
+    let ones = "1".repeat(39);
+    for (row, message) in [
+        (json!({"pk": {"S": "a"}, "n": {"N": "1E126"}}), OVERFLOW),
+        (
+            json!({"pk": {"S": "a"}, "n": {"N": "1E999999999"}}),
+            OVERFLOW,
+        ),
+        (json!({"pk": {"S": "a"}, "n": {"N": "1E-131"}}), UNDERFLOW),
+        (json!({"pk": {"S": "a"}, "n": {"N": "-1E-131"}}), UNDERFLOW),
+        // The magnitude passes the 32-bit maximum and wraps to a negative.
+        (
+            json!({"pk": {"S": "a"}, "n": {"N": "1E2147483647"}}),
+            UNDERFLOW,
+        ),
+        (json!({"pk": {"S": "a"}, "n": {"N": ones}}), DIGITS),
+        (
+            json!({"pk": {"S": "a"}, "s": {"NS": ["1", "1E126"]}}),
+            OVERFLOW,
+        ),
+        (
+            json!({"pk": {"S": "a"}, "m": {"M": {"x": {"N": "1E126"}}}}),
+            OVERFLOW,
+        ),
+        (
+            json!({"pk": {"S": "a"}, "l": {"L": [{"N": "1E-131"}]}}),
+            UNDERFLOW,
+        ),
+        (json!({"pk": {"N": "1E126"}}), OVERFLOW),
+        (json!({"other": {"S": "x"}, "n": {"N": "1E126"}}), OVERFLOW),
+    ] {
+        assert_eq!(
+            import_row(&import_item(&row)),
+            Err(ImportRowFault::OutOfRange(message.to_owned())),
+            "{row}"
+        );
+    }
+}
+
+#[test]
+fn import_row_accepts_what_the_service_imports() {
+    for row in [
+        json!({"pk": {"S": "a"}, "n": {"N": "5"}}),
+        json!({"pk": {"S": "a"}, "n": {"N": "1.50"}}),
+        json!({"pk": {"S": "a"}, "n": {"N": "-0.0"}}),
+        json!({"pk": {"S": "a"}, "n": {"N": "+5"}}),
+        json!({"pk": {"S": "a"}, "n": {"N": "1.5E2"}}),
+        json!({"pk": {"S": "a"}, "n": {"N": "0E125"}}),
+        json!({"pk": {"S": "a"}, "n": {"N": "9.9999999999999999999999999999999999999E125"}}),
+        json!({"pk": {"S": "a"}, "n": {"N": "1E-130"}}),
+        json!({"pk": {"S": "a"}, "s": {"NS": ["1.0", "2"]}}),
+        json!({"pk": {"N": "2.50"}}),
+        json!({"pk": {"S": "a"}, "b": {"BOOL": true}, "s": {"S": "abc"}}),
+    ] {
+        assert_eq!(import_row(&import_item(&row)), Ok(()), "{row}");
+    }
+    // The service refuses `0E126` as `Number overflow`; the row's value is
+    // `0` until the 64-bit reader range checks every zero (#618).
+    let zero = json!({"pk": {"S": "a"}, "n": {"N": "0E126"}});
+    assert_eq!(import_row(&import_item(&zero)), Ok(()));
+}
