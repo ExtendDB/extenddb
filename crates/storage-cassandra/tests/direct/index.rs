@@ -1880,6 +1880,8 @@ async fn test_a_delete_removes_the_index_row_a_backfill_wrote() {
         .update_table(
             &table.key_info.account_id,
             UpdateTableInput {
+                sse_specification: None,
+                warm_throughput: None,
                 table_name: table.key_info.table_name.clone(),
                 billing_mode: None,
                 table_throughput_mode: None,
@@ -1897,6 +1899,7 @@ async fn test_a_delete_removes_the_index_row_a_backfill_wrote() {
                             non_key_attributes: None,
                         },
                         provisioned_throughput: None,
+                        warm_throughput: None,
                     }),
                     update: None,
                     delete: None,
