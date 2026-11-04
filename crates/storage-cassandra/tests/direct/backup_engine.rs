@@ -8,7 +8,7 @@
 //! `restore_table_from_backup`), because the backend now receives the
 //! resolved `CreateTableInput` rather than the backup ARN alone.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use extenddb_core::expression::{Expr, ExpressionMaps, KeyCondition, PathElement};
@@ -1706,11 +1706,34 @@ async fn test_restore_sweep_worker_sweeps_at_startup_and_stops_on_shutdown() {
         .expect("sweep worker panicked");
 }
 
+/// The names of the tables in `keyspace`, read from `system_schema`.
+async fn table_names_in(engine: &CassandraEngine, keyspace: &str) -> BTreeSet<String> {
+    use cdrs_tokio::types::IntoRustByName;
+    let rows = extenddb_storage_cassandra::cassandra_util::query_rows::<StorageError>(
+        &engine.session_arc(),
+        "SELECT table_name FROM system_schema.tables WHERE keyspace_name = ?",
+        cdrs_tokio::query_values!(keyspace),
+        "list tables",
+    )
+    .await
+    .expect("list tables");
+    rows.iter()
+        .map(|row| {
+            let name: Option<String> = row.get_by_name("table_name").ok().flatten();
+            name.expect("table_name")
+        })
+        .collect()
+}
+
 /// The restore heartbeat runs while the target's data and index tables are
 /// created, not only once the copy starts: with many indexes that DDL (each
 /// statement waiting for schema agreement) can outlast RESTORE_STALE_AFTER on
 /// a slow cluster, and a heartbeat still at its insert value would let a
 /// sweep remove the live target.
+///
+/// The check is on order, not time, so it holds at any DDL speed: when the
+/// heartbeat first moves past its insert value, not all of the target's
+/// tables exist yet.
 #[tokio::test]
 async fn test_restore_heartbeat_runs_during_target_ddl() {
     if crate::helpers::skip_without_cassandra() {
@@ -1766,12 +1789,20 @@ async fn test_restore_heartbeat_runs_during_target_ddl() {
         .await
         .expect("create backup");
 
-    // Watch the target row while the restore request runs: when it first
-    // appears, and when its heartbeat first moves past its insert value.
+    // The source table's data and index tables share the account keyspace
+    // with the target's; any table not among these is the target's.
+    let account_keyspace = engine.account_keyspace(&account_id);
+    let source_tables = std::sync::Arc::new(table_names_in(&engine, &account_keyspace).await);
+
+    // Watch the target row while the restore request runs: whether it
+    // appears, and how many target tables exist when its heartbeat first
+    // moves past its insert value.
     let watching = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let watcher = {
         let engine = std::sync::Arc::clone(&engine);
         let account_id = account_id.clone();
+        let account_keyspace = account_keyspace.clone();
+        let source_tables = std::sync::Arc::clone(&source_tables);
         let watching = std::sync::Arc::clone(&watching);
         tokio::spawn(async move {
             let query = format!(
@@ -1779,8 +1810,11 @@ async fn test_restore_heartbeat_runs_during_target_ddl() {
                  WHERE account_id = ? AND table_name = ?",
                 engine.catalog_keyspace()
             );
-            let (mut row_seen, mut refreshed) = (None, None);
-            while watching.load(std::sync::atomic::Ordering::Acquire) && refreshed.is_none() {
+            let mut row_seen = false;
+            let mut target_tables_at_first_beat = None;
+            while watching.load(std::sync::atomic::Ordering::Acquire)
+                && target_tables_at_first_beat.is_none()
+            {
                 let rows = extenddb_storage_cassandra::cassandra_util::query_rows::<StorageError>(
                     &engine.session_arc(),
                     &query,
@@ -1791,18 +1825,19 @@ async fn test_restore_heartbeat_runs_during_target_ddl() {
                 .expect("watch target");
                 if let Some(row) = rows.first() {
                     use cdrs_tokio::types::IntoRustByName;
-                    let observed = Instant::now();
-                    row_seen.get_or_insert(observed);
+                    row_seen = true;
                     let created: Option<i64> = row.get_by_name("created_at").ok().flatten();
                     let heartbeat: Option<i64> =
                         row.get_by_name("restore_heartbeat").ok().flatten();
                     if heartbeat > created {
-                        refreshed = Some(observed);
+                        let tables = table_names_in(&engine, &account_keyspace).await;
+                        target_tables_at_first_beat =
+                            Some(tables.difference(&source_tables).count());
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            (row_seen, refreshed)
+            (row_seen, target_tables_at_first_beat)
         })
     };
     let started = restore(
@@ -1814,27 +1849,33 @@ async fn test_restore_heartbeat_runs_during_target_ddl() {
     )
     .await
     .expect("restore");
-    let returned = Instant::now();
     watching.store(false, std::sync::atomic::Ordering::Release);
-    let (row_seen, refreshed) = watcher.await.expect("watcher");
+    let (row_seen, target_tables_at_first_beat) = watcher.await.expect("watcher");
     assert_eq!(started.table_status, TableStatus::Creating);
-    let row_seen = row_seen.expect("the target row was never observed before the restore returned");
-    // Precondition: the DDL after the insert took long enough to tell a
-    // heartbeat started at the insert from one started after registration.
-    let ddl = returned - row_seen;
     assert!(
-        ddl >= Duration::from_millis(800),
-        "target DDL took only {ddl:?}; too short for this test to discriminate"
+        row_seen,
+        "the target row was never observed before the restore returned"
     );
-    let refreshed = refreshed.expect("the heartbeat was not refreshed before the restore returned");
+    // The restore returns once the target's DDL is done: its data table and
+    // one table per index (5 GSIs + 5 LSIs).
+    let target_table_count = table_names_in(&engine, &account_keyspace)
+        .await
+        .difference(&source_tables)
+        .count();
+    assert_eq!(
+        target_table_count, 11,
+        "the target should have a data table and 10 index tables"
+    );
+    let target_tables_at_first_beat = target_tables_at_first_beat
+        .expect("the heartbeat was not refreshed before the restore returned");
     eprintln!(
-        "target DDL {ddl:?}; heartbeat first refreshed {:?} before the restore returned",
-        returned - refreshed
+        "heartbeat first refreshed when {target_tables_at_first_beat} of \
+         {target_table_count} target tables existed"
     );
     assert!(
-        returned - refreshed >= Duration::from_millis(500),
-        "the heartbeat was first refreshed only {:?} before the restore returned (DDL {ddl:?})",
-        returned - refreshed
+        target_tables_at_first_beat < target_table_count,
+        "the heartbeat was first refreshed only after all {target_table_count} target \
+         tables existed"
     );
     wait_active(
         &engine,
