@@ -425,6 +425,45 @@ impl CassandraEngine {
 
         let account_keyspace = self.account_keyspace(first_account);
 
+        // Key checks first, for every member in request order, before the
+        // token is checked and before the ledger entry and PREPARE. They need
+        // only the request and the table metadata, and a fault among them
+        // decides the request under the service's precedence (the first such
+        // fault in request order) and leaves the token unused, before any
+        // item is read or any marker is written, as on the other backends.
+        extenddb_storage::transact_key_check_pass(ops.iter().map(|op| {
+            let key_info = transact_write_op_key_info(op);
+            extenddb_storage::transact_op_key_checks(
+                op,
+                &Self::transact_index_key_refs(key_info),
+                &key_info.attribute_definitions,
+            )
+        }))?;
+        // The first Update member with an empty index-key literal. Only the
+        // members before it are prepared: an empty value one of them writes
+        // from the item answers ahead of the literal, and no member after it
+        // is read or marked.
+        let empty_literal = extenddb_storage::transact_first_empty_literal(ops.iter().map(|op| {
+            extenddb_storage::transact_op_empty_literal_checks(
+                op,
+                &Self::transact_index_key_refs(transact_write_op_key_info(op)),
+            )
+        }));
+        let run_ops = &ops[..empty_literal.as_ref().map_or(ops.len(), |(p, _)| *p)];
+        // The reasons of the members that ran, the empty literal at its
+        // position, `None` after it, resolved as the service ranks them.
+        let decide = |mut reasons: Vec<CancellationReason>| {
+            if let Some((_, reason)) = &empty_literal {
+                reasons.truncate(run_ops.len());
+                reasons.push(reason.clone());
+                reasons.resize(ops.len(), CancellationReason::none());
+            }
+            match CancellationReason::resolve_key_faults(reasons) {
+                Ok(reasons) => StorageError::TransactionCanceled(reasons),
+                Err(message) => StorageError::Validation(message),
+            }
+        };
+
         // Check the account-scoped idempotency token before creating the ledger.
         if let Some((idempotency_account, token, fingerprint)) = idempotency {
             if idempotency_account != first_account {
@@ -441,37 +480,10 @@ impl CassandraEngine {
             .await?;
         }
 
-        // Key checks first, for every member in request order, before the
-        // ledger entry and PREPARE. They need only the request and the table
-        // metadata, and a fault among them decides the request under the
-        // service's precedence (the first such fault in request order) before
-        // any item is read or any marker is written, as on the other
-        // backends. The token reserved above is released on this path, as on
-        // the PREPARE cancellation path below, so a retry can proceed.
-        let key_check = extenddb_storage::transact_key_check_pass(ops.iter().map(|op| {
-            let key_info = transact_write_op_key_info(op);
-            extenddb_storage::transact_op_key_checks(
-                op,
-                &Self::transact_index_key_refs(key_info),
-                &key_info.attribute_definitions,
-            )
-        }))
-        // Then every Update member's empty index-key literal, which ranks
-        // below those faults and above everything PREPARE finds.
-        .and_then(|()| {
-            extenddb_storage::transact_key_check_pass(ops.iter().map(|op| {
-                extenddb_storage::transact_op_empty_literal_checks(
-                    op,
-                    &Self::transact_index_key_refs(transact_write_op_key_info(op)),
-                )
-            }))
-        });
-        if let Err(answer) = key_check {
-            if let Some((idempotency_account, token, _)) = idempotency {
-                self.delete_idempotency_token(&self.catalog_keyspace(), idempotency_account, token)
-                    .await;
-            }
-            return Err(answer);
+        if run_ops.is_empty() {
+            // The first member's empty literal decides: nothing to prepare.
+            self.record_cancelled_token(idempotency).await;
+            return Err(decide(Vec::new()));
         }
 
         // Generate unique transaction ID
@@ -479,7 +491,7 @@ impl CassandraEngine {
         let started_at = crate::cassandra_util::now_millis();
 
         // Build initial ledger ops (pk/sk known; item_data for UPDATE filled in after PREPARE)
-        let mut ledger_ops = Self::initial_ledger_ops(ops)?;
+        let mut ledger_ops = Self::initial_ledger_ops(run_ops)?;
         let initial_blob = serde_json::to_string(&ledger_ops)
             .map_err(|e| StorageError::Internal(format!("serialize ledger ops: {e}")))?;
 
@@ -496,9 +508,23 @@ impl CassandraEngine {
         .await?;
 
         // T4.2: PREPARE phase - returns computed item_data for UPDATE ops
-        let prepare_result = self.execute_prepare_phase(ops, txn_id, started_at).await;
+        let prepare_result = self
+            .execute_prepare_phase(run_ops, txn_id, started_at)
+            .await;
 
         match prepare_result {
+            Ok(_) if empty_literal.is_some() => {
+                // The members before the empty literal prepared cleanly, so
+                // the literal decides: roll them back.
+                if let Err(e) = self
+                    .execute_rollback_phase(&account_keyspace, run_ops, txn_id)
+                    .await
+                {
+                    tracing::error!("transact_write: rollback failed for txn {txn_id}: {e}");
+                }
+                self.record_cancelled_token(idempotency).await;
+                Err(decide(vec![CancellationReason::none(); run_ops.len()]))
+            }
             Ok(computed_items) => {
                 // Fill in the UPDATE post-images and every op's pre-commit
                 // image now that PREPARE has read them.
@@ -532,30 +558,21 @@ impl CassandraEngine {
                     reasons.len()
                 );
                 if let Err(e) = self
-                    .execute_rollback_phase(&account_keyspace, ops, txn_id)
+                    .execute_rollback_phase(&account_keyspace, run_ops, txn_id)
                     .await
                 {
                     // Rollback failures are recoverable by the background worker.
                     // Do not replace the original cancellation error.
                     tracing::error!("transact_write: rollback failed for txn {txn_id}: {e}");
                 }
-                // B5: release the token so a retry with the same token can proceed.
-                if let Some((idempotency_account, token, _)) = idempotency {
-                    self.delete_idempotency_token(
-                        &self.catalog_keyspace(),
-                        idempotency_account,
-                        token,
-                    )
-                    .await;
-                }
+                // The request passed the key checks, so its token stays used,
+                // as the service keeps it; the same request runs again (B5).
+                self.record_cancelled_token(idempotency).await;
                 // Key faults leave PREPARE under internal reason codes; the
                 // shared resolver applies the service's precedence across
                 // members and decides between a cancellation and a top-level
                 // ValidationException.
-                match CancellationReason::resolve_key_faults(reasons) {
-                    Ok(reasons) => Err(StorageError::TransactionCanceled(reasons)),
-                    Err(message) => Err(StorageError::Validation(message)),
-                }
+                Err(decide(reasons))
             }
         }
     }
@@ -1294,10 +1311,32 @@ impl CassandraEngine {
         .await?
         {
             let stored_fp: String = get_column(&row, "fingerprint", "check_idempotency_token")?;
-            return if stored_fp == fingerprint {
-                Err(StorageError::IdempotentReplay)
-            } else {
-                Err(StorageError::IdempotentMismatch)
+            return match extenddb_storage::StoredToken::of(&stored_fp, fingerprint) {
+                extenddb_storage::StoredToken::Replay => Err(StorageError::IdempotentReplay),
+                extenddb_storage::StoredToken::Mismatch => Err(StorageError::IdempotentMismatch),
+                extenddb_storage::StoredToken::Rerun => {
+                    // The same request left the token cancelled: take it for
+                    // this run, so only one rerun proceeds.
+                    let take_query = format!(
+                        "UPDATE {keyspace}.idempotency_tokens_by_account \
+                         SET fingerprint = ?, created_at = ? \
+                         WHERE account_id = ? AND \"token\" = ? IF fingerprint = ?"
+                    );
+                    let now = crate::cassandra_util::now_millis();
+                    let taken = crate::cassandra_util::apply_lwt(
+                        &self.session,
+                        &take_query,
+                        cdrs_tokio::query_values!(fingerprint, now, account_id, token, stored_fp),
+                        "check_idempotency_token rerun",
+                    )
+                    .await?;
+                    if taken {
+                        Ok(())
+                    } else {
+                        // A concurrent rerun of the same request took it.
+                        Err(StorageError::IdempotentReplay)
+                    }
+                }
             };
         }
 
@@ -1338,27 +1377,36 @@ impl CassandraEngine {
         Ok(())
     }
 
-    /// Delete a previously reserved idempotency token.
-    ///
-    /// Called on every cancellation path to prevent token poisoning (B5): a
-    /// token reserved before the ledger is committed must be released if the
-    /// transaction is cancelled, so a retry with the same token can proceed.
-    async fn delete_idempotency_token(&self, keyspace: &str, account_id: &str, token: &str) {
-        let delete_query = format!(
-            "DELETE FROM {keyspace}.idempotency_tokens_by_account \
-             WHERE account_id = ? AND \"token\" = ?"
+    /// Keep a reserved token used after its request was cancelled past the
+    /// request-level key checks, as the service keeps it: store it with
+    /// [`extenddb_storage::cancelled_token_fingerprint`], so a different
+    /// request with the token answers `IdempotentParameterMismatchException`
+    /// and the same request runs again (B5: a retry is not answered as a
+    /// replay of a write that never happened).
+    async fn record_cancelled_token(&self, idempotency: Option<(&str, &str, &str)>) {
+        let Some((account_id, token, fingerprint)) = idempotency else {
+            return;
+        };
+        let keyspace = self.catalog_keyspace();
+        let upsert_query = format!(
+            "INSERT INTO {keyspace}.idempotency_tokens_by_account \
+             (account_id, \"token\", fingerprint, created_at) VALUES (?, ?, ?, ?)"
         );
+        let cancelled = extenddb_storage::cancelled_token_fingerprint(fingerprint);
+        let now = crate::cassandra_util::now_millis();
         if let Err(e) = crate::cassandra_util::execute::<StorageError>(
             &self.session,
-            &delete_query,
-            cdrs_tokio::query_values!(account_id, token),
-            "delete_idempotency_token",
+            &upsert_query,
+            cdrs_tokio::query_values!(account_id, token, cancelled, now),
+            "record_cancelled_token",
         )
         .await
         {
-            // Non-fatal: the token will eventually expire via Cassandra TTL.
-            // Log so it is visible in ops, but do not replace the original error.
-            tracing::warn!("delete_idempotency_token failed (token will expire): {e}");
+            // Non-fatal: the reserved token stays, so a different request
+            // still answers the mismatch; the same request is then answered
+            // as a replay until the token expires via Cassandra TTL. Log so
+            // it is visible in ops, but do not replace the original error.
+            tracing::warn!("record_cancelled_token failed (token will expire): {e}");
         }
     }
 

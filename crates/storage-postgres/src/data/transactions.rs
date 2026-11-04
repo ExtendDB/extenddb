@@ -14,8 +14,8 @@ use extenddb_core::validation;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::pk_to_text;
 use extenddb_storage::{
-    IdempotencyKey, TransactGetOp, TransactWriteOp, transact_key_check_pass,
-    transact_op_empty_literal_checks, transact_op_key_checks,
+    IdempotencyKey, TransactGetOp, TransactWriteOp, transact_first_empty_literal,
+    transact_key_check_pass, transact_op_empty_literal_checks, transact_op_key_checks,
 };
 
 use super::index::{
@@ -24,7 +24,8 @@ use super::index::{
 };
 use super::tx_helpers::{
     check_idempotency_token_in_tx, delete_item_in_tx, fetch_item_for_update, fetch_item_in_tx,
-    insert_item_if_absent_in_tx, upsert_item_in_tx, write_stream_record_in_tx,
+    insert_item_if_absent_in_tx, record_cancelled_token, upsert_item_in_tx,
+    write_stream_record_in_tx,
 };
 use crate::PostgresEngine;
 use crate::pg_util::is_conflict_abort;
@@ -131,6 +132,33 @@ impl PostgresEngine {
         // applies to this transaction rather than up to 30 s later.
         let sys_delay = self.index_propagation_delay().await;
 
+        // Key checks first, for every member, before the token is checked and
+        // before any row is locked. They need only the request and the table
+        // metadata, and a fault among them decides the request under the
+        // service's precedence (the first such fault in request order) and
+        // leaves the token unused, so a request that is already decided never
+        // waits on a row another transaction holds.
+        transact_key_check_pass(ops.iter().map(|op| {
+            let indexes = &table_indexes[transact_op_table_name(op)];
+            transact_op_key_checks(
+                op,
+                &index_key_refs(indexes),
+                fresh_attr_defs(indexes, &transact_op_key_info(op).attribute_definitions),
+            )
+        }))?;
+        // The first Update member with an empty index-key literal. Only the
+        // members before it run: an empty value one of them writes from the
+        // item answers ahead of the literal, and no member after it is locked.
+        // A member before it waits on a row another transaction holds as any
+        // member does.
+        let empty_literal = transact_first_empty_literal(ops.iter().map(|op| {
+            transact_op_empty_literal_checks(
+                op,
+                &index_key_refs(&table_indexes[transact_op_table_name(op)]),
+            )
+        }));
+        let run = empty_literal.as_ref().map_or(ops.len(), |(p, _)| *p);
+
         let mut tx = self
             .data_pool
             .begin()
@@ -155,34 +183,15 @@ impl PostgresEngine {
         let mut op_items: Vec<(Option<Item>, Option<Item>)> = vec![(None, None); ops.len()];
         let mut any_failed = false;
         let mut failed_op: Option<(usize, StorageError)> = None;
-
-        // Key checks first, for every member, before any row is locked. They
-        // need only the request and the table metadata, and a fault among them
-        // decides the request under the service's precedence (the first such
-        // fault in request order), so a request that is already decided never
-        // waits on a row another transaction holds. Then every Update member's
-        // empty index-key literal, which ranks below those faults and above
-        // everything the members find once they run. Returning drops `tx`,
-        // which rolls back the idempotency token checked above.
-        transact_key_check_pass(ops.iter().map(|op| {
-            let indexes = &table_indexes[transact_op_table_name(op)];
-            transact_op_key_checks(
-                op,
-                &index_key_refs(indexes),
-                fresh_attr_defs(indexes, &transact_op_key_info(op).attribute_definitions),
-            )
-        }))?;
-        transact_key_check_pass(ops.iter().map(|op| {
-            transact_op_empty_literal_checks(
-                op,
-                &index_key_refs(&table_indexes[transact_op_table_name(op)]),
-            )
-        }))?;
+        if let Some((p, reason)) = &empty_literal {
+            any_failed = true;
+            reasons[*p] = reason.clone();
+        }
 
         // Run the ops in key order, not request order, so every transaction
         // locks its items in one global order and two cannot deadlock on each
         // other. Results keep their request positions.
-        for i in execution_order(ops) {
+        for i in execution_order(ops).into_iter().filter(|&i| i < run) {
             let op = &ops[i];
             let indexes = &table_indexes[transact_op_table_name(op)];
             let reason = execute_transact_write_op(
@@ -215,8 +224,21 @@ impl PostgresEngine {
                 // A member that ran earlier in execution order may have left an
                 // internal key fault (an Update's empty index key); the shared
                 // resolver ranks it as it does without the conflict, so no
-                // internal code reaches the client.
+                // internal code reaches the client. The request passed the
+                // key checks, so its token stays used.
                 reasons[i] = CancellationReason::transaction_conflict();
+                // End the aborted transaction first: its uncommitted token row
+                // would block the record below.
+                tx.rollback().await.map_err(db_error)?;
+                if let Some(key) = idempotency {
+                    record_cancelled_token(
+                        &self.data_pool,
+                        key.account_id,
+                        key.token,
+                        key.fingerprint,
+                    )
+                    .await?;
+                }
                 return Err(match CancellationReason::resolve_key_faults(reasons) {
                     Ok(reasons) => StorageError::TransactionCanceled(reasons),
                     Err(message) => StorageError::Validation(message),
@@ -231,8 +253,14 @@ impl PostgresEngine {
             // Key faults left the members as internal reasons; the shared
             // resolver applies the service's cross-member precedence and
             // decides between a cancellation and a top-level
-            // ValidationException. Every member has run, so the first
-            // wrong-typed key in request order is the one named.
+            // ValidationException. The request passed the key checks, so
+            // its token stays used, as the service keeps it: roll back the
+            // writes, then record the token as cancelled.
+            tx.rollback().await.map_err(db_error)?;
+            if let Some(key) = idempotency {
+                record_cancelled_token(&self.data_pool, key.account_id, key.token, key.fingerprint)
+                    .await?;
+            }
             return Err(match CancellationReason::resolve_key_faults(reasons) {
                 Ok(reasons) => StorageError::TransactionCanceled(reasons),
                 Err(message) => StorageError::Validation(message),

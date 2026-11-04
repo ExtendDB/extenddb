@@ -14,8 +14,8 @@ use extenddb_core::types::{CancellationReason, Item, ReturnValuesOnConditionChec
 use extenddb_core::validation;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::{
-    IdempotencyKey, TransactGetOp, TransactWriteOp, transact_key_check_pass,
-    transact_op_empty_literal_checks, transact_op_key_checks,
+    IdempotencyKey, TransactGetOp, TransactWriteOp, transact_first_empty_literal,
+    transact_key_check_pass, transact_op_empty_literal_checks, transact_op_key_checks,
 };
 
 use super::index::{
@@ -23,7 +23,7 @@ use super::index::{
 };
 use super::tx_helpers::{
     check_idempotency_token_in_tx, delete_item_in_tx, fetch_item_for_update, fetch_item_in_tx,
-    upsert_item_in_tx, write_stream_record_in_tx,
+    record_cancelled_token, upsert_item_in_tx, write_stream_record_in_tx,
 };
 use crate::sqlite_util::format_timestamp;
 use crate::store::SqliteEngine;
@@ -91,6 +91,27 @@ impl SqliteEngine {
             }
         }
 
+        // Key checks first, for every member, before the token is checked and
+        // before any row is read. They need only the request and the table
+        // metadata, and a fault among them decides the request under the
+        // service's precedence (the first such fault in request order) and
+        // leaves the token unused.
+        transact_key_check_pass(ops.iter().map(|op| {
+            let indexes = &table_indexes[op_table_name(op)];
+            transact_op_key_checks(
+                op,
+                &index_key_refs(indexes),
+                fresh_attr_defs(indexes, &op_key_info(op).attribute_definitions),
+            )
+        }))?;
+        // The first Update member with an empty index-key literal. Only the
+        // members before it run: an empty value one of them writes from the
+        // item answers ahead of the literal.
+        let empty_literal = transact_first_empty_literal(ops.iter().map(|op| {
+            transact_op_empty_literal_checks(op, &index_key_refs(&table_indexes[op_table_name(op)]))
+        }));
+        let run = empty_literal.as_ref().map_or(ops.len(), |(p, _)| *p);
+
         let mut tx = self
             .pool
             .begin_with("BEGIN IMMEDIATE")
@@ -105,31 +126,11 @@ impl SqliteEngine {
                 .await?;
         }
 
-        // Key checks first, for every member, before any row is read or
-        // locked. They need only the request and the table metadata, and a
-        // fault among them decides the request under the service's precedence
-        // (the first such fault in request order), so a decided request never
-        // waits on a later member's row. Then every Update member's empty
-        // index-key literal, which ranks below those faults and above
-        // everything the members find once they run. Dropping `tx` rolls back
-        // the idempotency token checked above.
-        transact_key_check_pass(ops.iter().map(|op| {
-            let indexes = &table_indexes[op_table_name(op)];
-            transact_op_key_checks(
-                op,
-                &index_key_refs(indexes),
-                fresh_attr_defs(indexes, &op_key_info(op).attribute_definitions),
-            )
-        }))?;
-        transact_key_check_pass(ops.iter().map(|op| {
-            transact_op_empty_literal_checks(op, &index_key_refs(&table_indexes[op_table_name(op)]))
-        }))?;
-
         let mut reasons: Vec<CancellationReason> = Vec::with_capacity(ops.len());
         let mut op_items: Vec<(Option<Item>, Option<Item>)> = Vec::with_capacity(ops.len());
         let mut any_failed = false;
 
-        for op in ops {
+        for op in &ops[..run] {
             let indexes = &table_indexes[op_table_name(op)];
             match execute_transact_write_op(
                 &mut tx,
@@ -152,11 +153,24 @@ impl SqliteEngine {
                 Err(TxnOpError::Storage(e)) => return Err(e),
             }
         }
+        if let Some((_, reason)) = empty_literal {
+            any_failed = true;
+            reasons.push(reason);
+            reasons.resize(ops.len(), CancellationReason::none());
+        }
 
         if any_failed {
-            // Dropping `tx` without commit rolls back all writes. Key faults
-            // left the members as internal reasons; the shared resolver applies
-            // the service's cross-member precedence.
+            // Roll back every write. Key faults left the members as internal
+            // reasons; the shared resolver applies the service's cross-member
+            // precedence. The request passed the key checks, so its token
+            // stays used, as the service keeps it.
+            tx.rollback()
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            if let Some(key) = idempotency {
+                record_cancelled_token(&self.pool, key.account_id, key.token, key.fingerprint)
+                    .await?;
+            }
             return Err(match CancellationReason::resolve_key_faults(reasons) {
                 Ok(reasons) => StorageError::TransactionCanceled(reasons),
                 Err(message) => StorageError::Validation(message),

@@ -15,9 +15,9 @@ use extenddb_core::types::{
     AttributeValue, Item, StreamEventName, StreamRecord, StreamRecordData, StreamViewType,
     TableKeyInfo, item_size_bytes,
 };
-use extenddb_storage::StreamCapture;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{pk_to_text, sk_column, sk_info};
+use extenddb_storage::{StoredToken, StreamCapture, cancelled_token_fingerprint};
 
 use super::{
     bind_sk_execute, bind_sk_fetch_optional, bind_sk_only_execute, data_table_name, json_to_item,
@@ -279,7 +279,9 @@ pub(super) async fn write_stream_record_in_tx(
 
 /// Check (and record) an idempotency token within a transaction. Tokens are
 /// valid for 10 minutes; the cutoff is computed in Rust as RFC 3339 so it
-/// compares correctly against the stored RFC 3339 `created_at`.
+/// compares correctly against the stored RFC 3339 `created_at`. A token the
+/// same request left cancelled is taken again for this run; see
+/// [`StoredToken::of`].
 pub(super) async fn check_idempotency_token_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     account_id: &str,
@@ -299,11 +301,11 @@ pub(super) async fn check_idempotency_token_in_tx(
     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
     if let Some((stored_fp,)) = existing {
-        return if stored_fp == fingerprint {
-            Err(StorageError::IdempotentReplay)
-        } else {
-            Err(StorageError::IdempotentMismatch)
-        };
+        match StoredToken::of(&stored_fp, fingerprint) {
+            StoredToken::Replay => return Err(StorageError::IdempotentReplay),
+            StoredToken::Mismatch => return Err(StorageError::IdempotentMismatch),
+            StoredToken::Rerun => {}
+        }
     }
 
     let now = format_timestamp(time::OffsetDateTime::now_utc());
@@ -318,6 +320,36 @@ pub(super) async fn check_idempotency_token_in_tx(
     .bind(fingerprint)
     .bind(&now)
     .execute(&mut **tx)
+    .await
+    .map_err(|e| StorageError::Internal(e.to_string()))?;
+    Ok(())
+}
+
+/// Keep a token used after its request was cancelled past the request-level
+/// key checks, once the request's transaction has rolled back: store it with
+/// [`cancelled_token_fingerprint`], unless a token younger than 10 minutes is
+/// already stored (the same request's earlier cancellation). Runs under the
+/// engine write lock, after the rollback released the database.
+pub(super) async fn record_cancelled_token(
+    pool: &sqlx::SqlitePool,
+    account_id: &str,
+    token: &str,
+    fingerprint: &str,
+) -> Result<(), StorageError> {
+    let now = time::OffsetDateTime::now_utc();
+    let cutoff = format_timestamp(now - time::Duration::minutes(10));
+    sqlx::query(
+        "INSERT INTO idempotency_tokens (account_id, token, fingerprint, created_at) \
+         VALUES (?, ?, ?, ?) \
+         ON CONFLICT (account_id, token) DO UPDATE SET fingerprint = excluded.fingerprint, \
+         created_at = excluded.created_at WHERE idempotency_tokens.created_at <= ?",
+    )
+    .bind(account_id)
+    .bind(token)
+    .bind(cancelled_token_fingerprint(fingerprint))
+    .bind(format_timestamp(now))
+    .bind(&cutoff)
+    .execute(pool)
     .await
     .map_err(|e| StorageError::Internal(e.to_string()))?;
     Ok(())

@@ -584,6 +584,70 @@ async fn an_invalid_first_op_answers_without_waiting_on_later_locks() {
     s.cleanup().await;
 }
 
+#[tokio::test]
+async fn an_empty_literal_first_answers_without_waiting_on_later_locks() {
+    // An Update member's empty index-key literal decides the request when no
+    // member before it writes an empty value from the item. With it first no
+    // member runs, so the request must not wait on the next op's row, held
+    // here by an outside transaction.
+    let test = "an_empty_literal_first_answers_without_waiting_on_later_locks";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let s = scratch().await;
+    let maps = ExpressionMaps::default();
+    let key_info = gsi_table(&s).await;
+    let b = item("b", "seed");
+    s.engine
+        .put_item(&key_info, b.clone(), false, None, &maps, None)
+        .await
+        .expect("seed b");
+    let table = data_table(&s.db).await;
+    let mut holder = s.db.begin().await.expect("begin the outside transaction");
+    sqlx::query(&format!("SELECT 1 FROM {table} WHERE pk = 'b' FOR UPDATE"))
+        .execute(&mut *holder)
+        .await
+        .expect("lock b");
+
+    let empty = ExpressionMaps::new(
+        std::collections::HashMap::new(),
+        std::collections::HashMap::from([("e".to_owned(), AttributeValue::S(String::new()))]),
+    );
+    let tokens = expression::tokenize("SET a1 = :e").expect("tokenize");
+    let actions = expression::parse_update(&tokens).expect("parse");
+    let key_a = key("a");
+    let ops = [
+        TransactWriteOp::Update {
+            key_info: &key_info,
+            key: &key_a,
+            actions: &actions,
+            condition: None,
+            maps: &empty,
+            return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+            stream: None,
+        },
+        put(&key_info, &b, &maps),
+    ];
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        s.engine.transact_write_items(&ops, None),
+    )
+    .await
+    .expect("the transaction answered without waiting on b");
+    holder.rollback().await.expect("release b");
+    match result {
+        Err(StorageError::Validation(msg)) => assert_eq!(
+            msg,
+            "One or more parameter values are not valid. The update expression attempted to \
+             update a secondary index key to a value that is not supported. The AttributeValue \
+             for a key attribute cannot contain an empty string value."
+        ),
+        other => panic!("expected the empty literal's ValidationException, got {other:?}"),
+    }
+
+    s.cleanup().await;
+}
+
 /// The condition `attribute_not_exists(pk)`.
 fn not_exists() -> Expr {
     let tokens = expression::tokenize("attribute_not_exists(pk)").expect("tokenize");

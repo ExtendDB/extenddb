@@ -45,7 +45,16 @@ sent twice) found an Update's empty index-key literal reported on the
 statement, ahead of the member's own failing condition and of a wrong type
 computed from the item in the same statement, on UpdateItem (s1 to s9) and
 in TransactWriteItems (t1 to t6); between two such members the first in
-request order decides (K1, K1r).
+request order decides (K1, K1r). The rows with the list_append member second
+(L4r, L9r, L10r) answer the first member's fault.
+
+A fourth measurement on 2026-11-01 (each request sent twice) put an Update's
+empty literal against an empty value another member writes from the item:
+the first empty value in request order decides, literal or not (U3a, U3b,
+U3c); within one statement the literal comes first (U3f); and a member whose
+own condition fails writes nothing, so its empty if_not_exists fallback is
+never reported (U1a to U1c). Two empty literals of different kinds in one
+statement had no fixed order on the service, so no row here has that shape.
 
 Run with EXTENDDB_TEST_ENDPOINT unset to assert the same against the service.
 """
@@ -252,6 +261,20 @@ def members(table: str) -> dict:
             table, "r", "SET #s = :e, #b = #p", {"#s": "sidx", "#b": "bidx", "#p": "pk"}, {":e": {"S": ""}}
         ),
         "plain_a": _update(table, "a", "SET #v = :v", {"#v": "v"}, {":v": {"S": "x"}}),
+        # The 2026-11-01 rows: Update r SET sidx = e, bidx = :eb, the stored
+        # empty string and an empty binary literal in one statement; and the
+        # empty if_not_exists fallback with the failing condition.
+        "set_sidx_e_bidx_empty": _update(
+            table, "r", "SET #s = #e, #b = :eb", {"#s": "sidx", "#e": "e", "#b": "bidx"}, {":eb": {"B": b""}}
+        ),
+        "r_fallback_empty_failing": _update(
+            table,
+            "r",
+            "SET #s = if_not_exists(#x, :e)",
+            {"#s": "sidx", "#x": "nope", "#p": "pk"},
+            {":e": {"S": ""}},
+            "attribute_not_exists(#p)",
+        ),
     }
 
 
@@ -316,6 +339,7 @@ ROWS = [
     ("L3", ["set_sidx_list_ref", "set_sidx_empty"], (VE_TYPE_L, NONE)),
     ("L3r", ["set_sidx_empty", "set_sidx_list_ref"], (NONE, VE_TYPE_L)),
     ("L4", ["set_sidx_list_ref", "set_d0_lit_n"], (VE_TYPE_L, NONE)),
+    ("L4r", ["set_d0_lit_n", "set_sidx_list_ref"], (VE_TYPE, NONE)),
     ("L5", ["set_sidx_list_ref", "set_sidx_n"], (VE_TYPE_L, NONE)),
     ("L5r", ["set_sidx_n", "set_sidx_list_ref"], (NONE, VE_TYPE_L)),
     ("L6", ["set_sidx_list_ref", "cannot_apply"], (VE_TYPE_L, NONE)),
@@ -325,7 +349,9 @@ ROWS = [
     ("L8", ["set_sidx_list_ref", "delete_present"], (VE_TYPE_L, NONE)),
     ("L8r", ["delete_present", "set_sidx_list_ref"], (NONE, VE_TYPE_L)),
     ("L9", ["set_sidx_list_ref", "put_empty"], (VE_TYPE_L, NONE)),
+    ("L9r", ["put_empty", "set_sidx_list_ref"], EMPTY_ITEM_WORDING),
     ("L10", ["set_sidx_list_ref", "put_wrong"], (VE_TYPE_L, NONE)),
+    ("L10r", ["put_wrong", "set_sidx_list_ref"], (VE_TYPE, NONE)),
     # An Update member's empty literal is checked before any member runs,
     # below the faults above: ahead of the member's own failing condition
     # (t1, t2, t5, t6) and of a wrong type computed from the item in the same
@@ -339,6 +365,18 @@ ROWS = [
     ("t6", ["r_bidx_empty_failing"], EMPTY_UPDATE_WORDING_B),
     ("K1", ["set_sidx_n_bidx_empty", "set_sidx_empty"], EMPTY_UPDATE_WORDING_B),
     ("K1r", ["set_sidx_empty", "set_sidx_n_bidx_empty"], EMPTY_UPDATE_WORDING),
+    # 2026-11-01. Across members the first empty value in request order
+    # decides, an empty literal or an empty value written from the item
+    # (U3a, U3b, U3c); within one statement the literal comes first (U3f). A
+    # member whose own condition fails writes nothing, so its empty
+    # if_not_exists fallback is never reported (U1a to U1c).
+    ("U3a", ["set_sidx_stored_empty", "set_bidx_empty"], EMPTY_UPDATE_WORDING),
+    ("U3b", ["set_sidx_fallback_empty", "set_bidx_empty"], EMPTY_UPDATE_WORDING),
+    ("U3c", ["set_bidx_empty", "set_sidx_stored_empty"], EMPTY_UPDATE_WORDING_B),
+    ("U3f", ["set_sidx_e_bidx_empty"], EMPTY_UPDATE_WORDING_B),
+    ("U1a", ["r_fallback_empty_failing"], (CCF,)),
+    ("U1b", ["r_fallback_empty_failing", "plain_a"], (CCF, NONE)),
+    ("U1c", ["plain_a", "r_fallback_empty_failing"], (NONE, CCF)),
 ]
 
 

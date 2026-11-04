@@ -583,3 +583,190 @@ async fn test_idempotency_token_is_scoped_to_account() {
         .await
         .expect("the same token in another account must not replay");
 }
+
+/// A Put of `{id}` with `token`, whose fingerprint differs from every other
+/// request in `test_idempotency_token_after_a_key_fault`.
+async fn put_with_token(
+    engine: &extenddb_storage_cassandra::CassandraEngine,
+    key_info: &extenddb_core::types::TableKeyInfo,
+    id: &str,
+    token: &str,
+) -> Result<(), extenddb_storage::error::StorageError> {
+    let mut item = Item::new();
+    item.insert("id".to_owned(), AttributeValue::S(id.to_owned()));
+    let maps = ExpressionMaps::default();
+    let ops = [TransactWriteOp::Put {
+        key_info,
+        item: &item,
+        condition: None,
+        maps: &maps,
+        return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+        stream: None,
+    }];
+    let fingerprint = format!("fp-put-{id}");
+    engine
+        .transact_write_items(
+            &ops,
+            Some(IdempotencyKey {
+                account_id: &key_info.account_id,
+                token,
+                fingerprint: &fingerprint,
+            }),
+        )
+        .await
+}
+
+/// A token beside a key fault, as the service keeps it (measured
+/// 2026-11-01): a fault of the request-level checks (a wrong-typed table key)
+/// leaves the token unused, so another request with it commits. A fault found
+/// after them (an empty index-key literal, a failed condition) leaves it used:
+/// the same request with it answers that fault again, and another request
+/// with it answers the mismatch and writes nothing.
+#[tokio::test]
+async fn test_idempotency_token_after_a_key_fault() {
+    use extenddb_core::expression::{self, Expr, PathElement};
+    use extenddb_storage::TableEngine;
+    use extenddb_storage::error::StorageError;
+    use std::collections::HashMap;
+
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let table = TestTable::with_gsi(&engine, "TxnTokenKeyFault", "GkIndex", "gk").await;
+    // The index is in the key info only once the table is active.
+    tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+    engine
+        .process_control_plane_transitions()
+        .await
+        .expect("process table transitions");
+    let key_info = engine
+        .table_key_info(&table.key_info.account_id, "TxnTokenKeyFault")
+        .await
+        .expect("key info");
+    assert_eq!(key_info.global_secondary_indexes.len(), 1, "{key_info:?}");
+    let present = |id: &'static str| {
+        let engine = &engine;
+        let key_info = &key_info;
+        async move {
+            let key = Item::from([("id".to_owned(), AttributeValue::S(id.to_owned()))]);
+            engine
+                .get_item(key_info, &key)
+                .await
+                .expect("get_item")
+                .is_some()
+        }
+    };
+    let token = |name: &str| format!("tok-{name}-{}", uuid::Uuid::new_v4().simple());
+    let plain = ExpressionMaps::default();
+
+    // A wrong-typed table key: answered by the request-level checks, and the
+    // token stays unused.
+    let bad_key = Item::from([("id".to_owned(), AttributeValue::N("1".to_owned()))]);
+    let t1 = token("key");
+    let ops = [TransactWriteOp::Put {
+        key_info: &key_info,
+        item: &bad_key,
+        condition: None,
+        maps: &plain,
+        return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+        stream: None,
+    }];
+    let key_fault = IdempotencyKey {
+        account_id: &key_info.account_id,
+        token: &t1,
+        fingerprint: "fp-key",
+    };
+    let result = engine.transact_write_items(&ops, Some(key_fault)).await;
+    assert!(
+        matches!(&result, Err(StorageError::TransactionCanceled(r)) if r[0].code == "ValidationError"),
+        "{result:?}"
+    );
+    put_with_token(&engine, &key_info, "after-key", &t1)
+        .await
+        .expect("the token is unused after a request-level fault");
+    assert!(present("after-key").await);
+
+    // An empty index-key literal: found after the token is checked, so the
+    // token stays used.
+    let empty = ExpressionMaps::new(
+        HashMap::new(),
+        HashMap::from([("e".to_owned(), AttributeValue::S(String::new()))]),
+    );
+    let tokens = expression::tokenize("SET gk = :e").expect("tokenize");
+    let actions = expression::parse_update(&tokens).expect("parse");
+    let key_u = Item::from([("id".to_owned(), AttributeValue::S("u".to_owned()))]);
+    let t2 = token("empty");
+    let ops = [TransactWriteOp::Update {
+        key_info: &key_info,
+        key: &key_u,
+        actions: &actions,
+        condition: None,
+        maps: &empty,
+        return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+        stream: None,
+    }];
+    let empty_fault = IdempotencyKey {
+        account_id: &key_info.account_id,
+        token: &t2,
+        fingerprint: "fp-empty",
+    };
+    for send in ["first", "again"] {
+        let result = engine.transact_write_items(&ops, Some(empty_fault)).await;
+        assert!(
+            matches!(&result, Err(StorageError::Validation(m)) if m.ends_with("cannot contain an empty string value.")),
+            "{send}: {result:?}"
+        );
+    }
+    let result = put_with_token(&engine, &key_info, "after-empty", &t2).await;
+    assert!(
+        matches!(result, Err(StorageError::IdempotentMismatch)),
+        "{result:?}"
+    );
+    assert!(!present("after-empty").await);
+
+    // A failed condition: the same.
+    engine
+        .put_item(
+            &key_info,
+            Item::from([("id".to_owned(), AttributeValue::S("c1".to_owned()))]),
+            false,
+            None,
+            &plain,
+            None,
+        )
+        .await
+        .expect("seed c1");
+    let c1 = Item::from([("id".to_owned(), AttributeValue::S("c1".to_owned()))]);
+    let not_exists = Expr::Function {
+        name: "attribute_not_exists".to_owned(),
+        args: vec![Expr::Path(vec![PathElement::Attribute("id".to_owned())])],
+    };
+    let t3 = token("ccf");
+    let ops = [TransactWriteOp::Put {
+        key_info: &key_info,
+        item: &c1,
+        condition: Some(&not_exists),
+        maps: &plain,
+        return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+        stream: None,
+    }];
+    let ccf = IdempotencyKey {
+        account_id: &key_info.account_id,
+        token: &t3,
+        fingerprint: "fp-ccf",
+    };
+    for send in ["first", "again"] {
+        let result = engine.transact_write_items(&ops, Some(ccf)).await;
+        assert!(
+            matches!(&result, Err(StorageError::TransactionCanceled(r)) if r[0].code == "ConditionalCheckFailed"),
+            "{send}: {result:?}"
+        );
+    }
+    let result = put_with_token(&engine, &key_info, "after-ccf", &t3).await;
+    assert!(
+        matches!(result, Err(StorageError::IdempotentMismatch)),
+        "{result:?}"
+    );
+    assert!(!present("after-ccf").await);
+}

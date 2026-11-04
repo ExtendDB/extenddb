@@ -41,8 +41,9 @@ pub use backup_definition::{BackupRestoreSource, RestoreRequest, RestoreTableOve
 pub use snapshot::{SnapshotEngine, SnapshotInfo, TableSnapshot};
 
 pub use transact::{
-    IdempotencyKey, TransactGetOp, TransactWriteOp, transact_key_check_pass,
-    transact_op_empty_literal_checks, transact_op_key_checks,
+    IdempotencyKey, StoredToken, TransactGetOp, TransactWriteOp, cancelled_token_fingerprint,
+    transact_first_empty_literal, transact_key_check_pass, transact_op_empty_literal_checks,
+    transact_op_key_checks,
 };
 
 pub use server_components::{

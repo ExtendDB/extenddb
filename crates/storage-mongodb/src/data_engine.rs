@@ -2253,22 +2253,18 @@ impl MongoEngine {
         // Outcome of one attempt at running the whole idempotency check
         // + op fan-out + commit. `Retry` means MongoDB aborted the txn
         // as a transient conflict; the caller should re-run from the top.
-        // `KeyFaults` means the key-check pass below decided the request.
         enum AttemptOutcome {
             Committed,
             CanceledReasons(Vec<CancellationReason>),
-            KeyFaults,
             Retry,
         }
 
         // Key checks first, for every member in request order, before the
-        // session transaction starts. They need only the request and the
-        // table's indexes, and a fault among them decides the request under
-        // the service's precedence (the first such fault in request order)
-        // before any member is applied, as on the other backends. The
-        // decision is answered inside the attempt once the idempotency token
-        // is checked, so a reused token is answered first, and the abort
-        // discards the token insert.
+        // session transaction starts and before the token is checked. They
+        // need only the request and the table's indexes, and a fault among
+        // them decides the request under the service's precedence (the first
+        // such fault in request order) and leaves the token unused, as on the
+        // other backends.
         let mut index_schemas: std::collections::HashMap<
             &str,
             Vec<(String, Vec<KeySchemaElement>)>,
@@ -2280,7 +2276,7 @@ impl MongoEngine {
                 index_schemas.insert(table_id, schemas);
             }
         }
-        let key_check = extenddb_storage::transact_key_check_pass(ops.iter().map(|op| {
+        extenddb_storage::transact_key_check_pass(ops.iter().map(|op| {
             let idx_refs: Vec<extenddb_core::validation::IndexKeyRef<'_>> = index_schemas
                 [op.table_id()]
             .iter()
@@ -2294,23 +2290,22 @@ impl MongoEngine {
                 &idx_refs,
                 &op.key_info().attribute_definitions,
             )
-        }))
-        // Then every Update member's empty index-key literal, which ranks
-        // below those faults and above everything the members find once they
-        // run.
-        .and_then(|()| {
-            extenddb_storage::transact_key_check_pass(ops.iter().map(|op| {
-                let idx_refs: Vec<extenddb_core::validation::IndexKeyRef<'_>> = index_schemas
-                    [op.table_id()]
-                .iter()
-                .map(|(n, ks)| extenddb_core::validation::IndexKeyRef {
-                    index_name: n.as_str(),
-                    key_schema: ks.as_slice(),
-                })
-                .collect();
-                extenddb_storage::transact_op_empty_literal_checks(&op.as_op(), &idx_refs)
-            }))
-        });
+        }))?;
+        // The first Update member with an empty index-key literal. Only the
+        // members before it run: an empty value one of them writes from the
+        // item answers ahead of the literal.
+        let empty_literal = extenddb_storage::transact_first_empty_literal(ops.iter().map(|op| {
+            let idx_refs: Vec<extenddb_core::validation::IndexKeyRef<'_>> = index_schemas
+                [op.table_id()]
+            .iter()
+            .map(|(n, ks)| extenddb_core::validation::IndexKeyRef {
+                index_name: n.as_str(),
+                key_schema: ks.as_slice(),
+            })
+            .collect();
+            extenddb_storage::transact_op_empty_literal_checks(&op.as_op(), &idx_refs)
+        }));
+        let run = empty_literal.as_ref().map_or(ops.len(), |(p, _)| *p);
 
         // Rehydrate the `IdempotencyKey` per attempt from owned strings.
         // The input struct holds `&str`s, so it cannot be moved across
@@ -2378,13 +2373,44 @@ impl MongoEngine {
                         })
                     });
 
+                    let mut rerun = false;
                     if let Some(existing_doc) = existing {
                         let stored_fp = existing_doc.get_str("fingerprint").unwrap_or_default();
-                        return Err(if stored_fp == key.fingerprint {
-                            StorageError::IdempotentReplay
-                        } else {
-                            StorageError::IdempotentMismatch
-                        });
+                        match extenddb_storage::StoredToken::of(stored_fp, key.fingerprint) {
+                            extenddb_storage::StoredToken::Replay => {
+                                return Err(StorageError::IdempotentReplay);
+                            }
+                            extenddb_storage::StoredToken::Mismatch => {
+                                return Err(StorageError::IdempotentMismatch);
+                            }
+                            extenddb_storage::StoredToken::Rerun => {
+                                // The same request left the token cancelled:
+                                // take it for this run inside the session. A
+                                // concurrent rerun conflicts and retries.
+                                let taken = idem_coll
+                                    .update_one(
+                                        doc! {
+                                            "account_id": key.account_id,
+                                            "token": key.token,
+                                            "fingerprint": stored_fp,
+                                        },
+                                        doc! { "$set": {
+                                            "fingerprint": key.fingerprint,
+                                            "created_at": mongodb::bson::DateTime::now(),
+                                        } },
+                                    )
+                                    .session(&mut session)
+                                    .await;
+                                match taken {
+                                    Ok(res) if res.modified_count == 1 => rerun = true,
+                                    Ok(_) => return Ok(AttemptOutcome::Retry),
+                                    Err(e) if is_transient_write_conflict(&e) => {
+                                        return Ok(AttemptOutcome::Retry);
+                                    }
+                                    Err(e) => return Err(StorageError::Internal(e.to_string())),
+                                }
+                            }
+                        }
                     }
 
                     // Store the token. A unique index on (account_id, token)
@@ -2393,15 +2419,20 @@ impl MongoEngine {
                     // us to the insert. On E11000, resolve the winner by
                     // re-reading outside the session — same replay/mismatch
                     // logic as the pre-check path.
-                    let insert_res = idem_coll
-                        .insert_one(doc! {
-                            "account_id": key.account_id,
-                            "token": key.token,
-                            "fingerprint": key.fingerprint,
-                            "created_at": mongodb::bson::DateTime::now(),
-                        })
-                        .session(&mut session)
-                        .await;
+                    let insert_res = if rerun {
+                        Ok(())
+                    } else {
+                        idem_coll
+                            .insert_one(doc! {
+                                "account_id": key.account_id,
+                                "token": key.token,
+                                "fingerprint": key.fingerprint,
+                                "created_at": mongodb::bson::DateTime::now(),
+                            })
+                            .session(&mut session)
+                            .await
+                            .map(|_| ())
+                    };
                     if let Err(e) = insert_res {
                         if is_duplicate_key(&e) {
                             let winner = idem_coll
@@ -2430,14 +2461,21 @@ impl MongoEngine {
                             if winner.is_none() {
                                 return Ok(AttemptOutcome::Retry);
                             }
-                            return Err(
-                                match winner.as_ref().and_then(|d| d.get_str("fingerprint").ok()) {
-                                    Some(fp) if fp == key.fingerprint => {
-                                        StorageError::IdempotentReplay
-                                    }
-                                    _ => StorageError::IdempotentMismatch,
-                                },
-                            );
+                            // A winner the same request left cancelled is
+                            // taken on the next attempt.
+                            return match winner
+                                .as_ref()
+                                .and_then(|d| d.get_str("fingerprint").ok())
+                                .map(|fp| extenddb_storage::StoredToken::of(fp, key.fingerprint))
+                            {
+                                Some(extenddb_storage::StoredToken::Replay) => {
+                                    Err(StorageError::IdempotentReplay)
+                                }
+                                Some(extenddb_storage::StoredToken::Rerun) => {
+                                    Ok(AttemptOutcome::Retry)
+                                }
+                                _ => Err(StorageError::IdempotentMismatch),
+                            };
                         }
                         if is_transient_write_conflict(&e) {
                             return Ok(AttemptOutcome::Retry);
@@ -2446,14 +2484,12 @@ impl MongoEngine {
                     }
                 }
 
-                if key_check.is_err() {
-                    return Ok(AttemptOutcome::KeyFaults);
-                }
-
                 let mut reasons: Vec<CancellationReason> = Vec::with_capacity(ops.len());
                 let mut any_failed = false;
 
-                for (op, cache_generation) in ops.iter().zip(cache_generations.iter().copied()) {
+                for (op, cache_generation) in
+                    ops.iter().zip(cache_generations.iter().copied()).take(run)
+                {
                     match self
                         .execute_transact_write_op_in_session(op, cache_generation, &mut session)
                         .await
@@ -2468,6 +2504,11 @@ impl MongoEngine {
                         }
                         Err(TransactOpError::Storage(e)) => return Err(e),
                     }
+                }
+                if let Some((_, reason)) = &empty_literal {
+                    any_failed = true;
+                    reasons.push(reason.clone());
+                    reasons.resize(ops.len(), CancellationReason::none());
                 }
 
                 if any_failed {
@@ -2489,6 +2530,12 @@ impl MongoEngine {
                 }
                 Ok(AttemptOutcome::CanceledReasons(reasons)) => {
                     let _ = session.abort_transaction().await;
+                    // The request passed the key checks, so its token stays
+                    // used, as the service keeps it.
+                    if let Some((account_id, token, fingerprint)) = idem_owned.as_ref() {
+                        self.record_cancelled_token(account_id, token, fingerprint)
+                            .await?;
+                    }
                     // Key faults left the members as internal reasons; the
                     // shared resolver applies the service's cross-member
                     // precedence and decides between a cancellation and a
@@ -2497,10 +2544,6 @@ impl MongoEngine {
                         Ok(reasons) => StorageError::TransactionCanceled(reasons),
                         Err(message) => StorageError::Validation(message),
                     });
-                }
-                Ok(AttemptOutcome::KeyFaults) => {
-                    let _ = session.abort_transaction().await;
-                    return key_check;
                 }
                 Ok(AttemptOutcome::Retry) => {
                     let _ = session.abort_transaction().await;
@@ -2529,6 +2572,35 @@ impl MongoEngine {
             })
             .collect();
         Err(StorageError::TransactionCanceled(reasons))
+    }
+
+    /// Keep a token used after its request was cancelled past the
+    /// request-level key checks, once the session transaction has aborted:
+    /// store it with [`extenddb_storage::cancelled_token_fingerprint`] unless
+    /// a token is already stored (the same request's earlier cancellation, or
+    /// a request that took the token meanwhile).
+    async fn record_cancelled_token(
+        &self,
+        account_id: &str,
+        token: &str,
+        fingerprint: &str,
+    ) -> Result<(), StorageError> {
+        let idem_coll = self.data_db.collection::<Document>("idempotency_tokens");
+        let stored = idem_coll
+            .update_one(
+                doc! { "account_id": account_id, "token": token },
+                doc! { "$setOnInsert": {
+                    "fingerprint": extenddb_storage::cancelled_token_fingerprint(fingerprint),
+                    "created_at": mongodb::bson::DateTime::now(),
+                } },
+            )
+            .upsert(true)
+            .await;
+        match stored {
+            // A concurrent upsert of the same token inserted it first.
+            Err(e) if !is_duplicate_key(&e) => Err(StorageError::Internal(e.to_string())),
+            _ => Ok(()),
+        }
     }
 
     async fn execute_transact_write_op_in_session(

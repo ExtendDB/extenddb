@@ -10,9 +10,9 @@ use extenddb_core::types::{
     AttributeValue, Item, StreamEventName, StreamRecord, StreamRecordData, StreamViewType,
     TableKeyInfo, item_size_bytes,
 };
-use extenddb_storage::StreamCapture;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{SortKeyValue, parse_sk, pk_to_text, sk_column, sk_info};
+use extenddb_storage::{StoredToken, StreamCapture, cancelled_token_fingerprint};
 
 use super::index::db_error;
 use super::{data_table_name, json_to_item};
@@ -403,6 +403,8 @@ pub(super) async fn check_idempotency_token_in_tx(
     token: &str,
     fingerprint: &str,
 ) -> Result<(), StorageError> {
+    // A token older than 10 minutes, or one the same request left cancelled
+    // (see `StoredToken::of`), is taken for this run.
     let row: Option<(String, bool)> = sqlx::query_as(
         r"WITH ins AS (
             INSERT INTO idempotency_tokens (account_id, token, fingerprint)
@@ -410,6 +412,7 @@ pub(super) async fn check_idempotency_token_in_tx(
             ON CONFLICT (account_id, token) DO UPDATE
                 SET fingerprint = $3, created_at = NOW()
                 WHERE idempotency_tokens.created_at <= NOW() - INTERVAL '10 minutes'
+                   OR idempotency_tokens.fingerprint = $4
             RETURNING fingerprint, TRUE AS inserted
           )
           SELECT fingerprint, inserted FROM ins
@@ -425,13 +428,43 @@ pub(super) async fn check_idempotency_token_in_tx(
     .bind(account_id)
     .bind(token)
     .bind(fingerprint)
+    .bind(cancelled_token_fingerprint(fingerprint))
     .fetch_optional(&mut **tx)
     .await
     .map_err(db_error)?;
 
     match row {
         Some((_, true)) | None => Ok(()),
-        Some((stored, false)) if stored == fingerprint => Err(StorageError::IdempotentReplay),
-        Some((_, false)) => Err(StorageError::IdempotentMismatch),
+        Some((stored, false)) => match StoredToken::of(&stored, fingerprint) {
+            StoredToken::Replay => Err(StorageError::IdempotentReplay),
+            StoredToken::Rerun | StoredToken::Mismatch => Err(StorageError::IdempotentMismatch),
+        },
     }
+}
+
+/// Keep a token used after its request was cancelled past the request-level
+/// key checks, once the request's transaction has rolled back: store it with
+/// [`cancelled_token_fingerprint`], unless a token younger than 10 minutes is
+/// already stored (the same request's earlier cancellation, or a request that
+/// took the token meanwhile).
+pub(super) async fn record_cancelled_token(
+    pool: &sqlx::PgPool,
+    account_id: &str,
+    token: &str,
+    fingerprint: &str,
+) -> Result<(), StorageError> {
+    sqlx::query(
+        r"INSERT INTO idempotency_tokens (account_id, token, fingerprint)
+          VALUES ($1, $2, $3)
+          ON CONFLICT (account_id, token) DO UPDATE
+              SET fingerprint = $3, created_at = NOW()
+              WHERE idempotency_tokens.created_at <= NOW() - INTERVAL '10 minutes'",
+    )
+    .bind(account_id)
+    .bind(token)
+    .bind(cancelled_token_fingerprint(fingerprint))
+    .execute(pool)
+    .await
+    .map_err(db_error)?;
+    Ok(())
 }
