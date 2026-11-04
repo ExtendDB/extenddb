@@ -73,6 +73,15 @@ migration_ids! {
     BackupCatalogIndex = 6, "backup_catalog_index",
         "create the backup catalog index, the restore job fields, the maintenance claim \
          record and the catalog id";
+    /// Creates `restore_progress` in the PostgreSQL data database, where a
+    /// store-backed restore records each data file it applied; the other
+    /// backends keep that progress on the job record and have nothing to do.
+    /// Declared `Kind::Breaking` on PostgreSQL although a new table is
+    /// additive by CONTRIBUTING's step 4: declaring `Kind::Additive` needs
+    /// the old-binary job, which does not exist yet.
+    RestoreProgress = 7, "restore_progress",
+        "create the restore progress table of store-backed restores in the PostgreSQL data \
+         database";
 }
 
 /// Highest id that has shipped in a release. Bodies at or below it are frozen:

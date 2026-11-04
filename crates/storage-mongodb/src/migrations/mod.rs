@@ -160,6 +160,11 @@ pub fn migration(id: MigrationId) -> Migration<MongoStores> {
                 m0006_backup_catalog_index::SOURCE,
             )],
         },
+        MigrationId::RestoreProgress => Migration::NotApplicable(
+            "a store-backed restore records its progress on the target's restore job record \
+             (restore_job.file_index); the restore_progress table is PostgreSQL's data \
+             database's",
+        ),
     }
 }
 

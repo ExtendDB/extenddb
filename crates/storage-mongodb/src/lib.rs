@@ -22,6 +22,7 @@ mod metadata_engine;
 pub mod migrations;
 mod operations;
 pub mod pushdown;
+mod restore_engine;
 mod snapshot_engine;
 mod stream_engine;
 mod table_engine;

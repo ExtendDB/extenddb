@@ -270,7 +270,14 @@ async fn a_fresh_database_is_current_after_one_run_and_seeds_nothing() {
             "SELECT COUNT(*) FROM extenddb_migrations WHERE outcome = 'applied'"
         )
         .await,
-        i64::from(LATEST)
+        i64::from(LATEST) - 1,
+        "every id but 7 (the PostgreSQL progress table) applies on SQLite"
+    );
+    assert_eq!(
+        scalar(&db, "SELECT outcome FROM extenddb_migrations WHERE id = 7")
+            .await
+            .as_deref(),
+        Some("not_applicable")
     );
     assert_eq!(version_row(&db).await, Some(LATEST.to_string()));
     assert_eq!(

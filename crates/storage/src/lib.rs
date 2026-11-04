@@ -23,6 +23,7 @@ pub mod migrations;
 pub mod operations;
 pub mod password;
 pub mod policy_migration;
+pub mod restore_engine;
 pub mod secret_cipher;
 pub mod server_components;
 pub mod settings_store;
@@ -41,7 +42,10 @@ pub use backend::{Backend, BackendAlreadySet, backend_name, set_backend, try_bac
 pub use backup_catalog::{
     BackupCatalog, JobClaim, JobPermit, LegacyBackupReader, MaintenanceClaim,
 };
-pub use backup_definition::{BackupRestoreSource, RestoreRequest, RestoreTableOverrides};
+pub use backup_definition::{
+    BackupRestoreSource, RestoreRequest, RestoreSource, RestoreTableOverrides,
+};
+pub use restore_engine::{BulkLoadFile, Finished, RestoreEngine};
 pub use snapshot::{SnapshotEngine, SnapshotInfo, TableSnapshot};
 
 pub use transact::{IdempotencyKey, TransactGetOp, TransactWriteOp};
@@ -727,6 +731,7 @@ pub trait StorageEngine:
     + StreamEngine
     + BackupCatalog
     + LegacyBackupReader
+    + RestoreEngine
     + SnapshotEngine
     + WorkerStore
     + Send
@@ -734,7 +739,7 @@ pub trait StorageEngine:
 {
 }
 
-// Blanket implementation: any type implementing all 8 traits is a StorageEngine
+// Blanket implementation: any type implementing all 9 traits is a StorageEngine
 impl<T> StorageEngine for T where
     T: TableEngine
         + DataEngine
@@ -742,6 +747,7 @@ impl<T> StorageEngine for T where
         + StreamEngine
         + BackupCatalog
         + LegacyBackupReader
+        + RestoreEngine
         + SnapshotEngine
         + WorkerStore
         + Send

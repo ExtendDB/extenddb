@@ -31,6 +31,7 @@ mod metadata_engine;
 pub mod migrations;
 pub mod operations;
 pub(crate) mod propagation_hold;
+mod restore_engine;
 mod snapshot_engine;
 mod stream_engine;
 pub mod stream_util;

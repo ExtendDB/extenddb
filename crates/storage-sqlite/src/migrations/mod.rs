@@ -118,6 +118,10 @@ pub fn migration(id: MigrationId) -> Migration<SqliteStores> {
                 m0006_backup_catalog_index::SOURCE,
             )],
         },
+        MigrationId::RestoreProgress => Migration::NotApplicable(
+            "the restore progress of a store-backed restore is on table_restores (file_index, \
+             items_applied) on SQLite; the table is PostgreSQL's data database's",
+        ),
     }
 }
 

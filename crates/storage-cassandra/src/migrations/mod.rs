@@ -150,6 +150,11 @@ pub fn migration(id: MigrationId) -> Migration<CassandraStores> {
                 m0006_backup_catalog_index::SOURCE,
             )],
         },
+        MigrationId::RestoreProgress => Migration::NotApplicable(
+            "a store-backed restore records its progress on the target's catalog tables row \
+             (restore_file_index, restore_items_applied, which migration 6 adds); the \
+             restore_progress table is PostgreSQL's data database's",
+        ),
     }
 }
 
