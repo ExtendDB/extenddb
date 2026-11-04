@@ -2092,6 +2092,7 @@ impl CassandraEngine {
     /// followed by the record as a batch of its own when the two are too large
     /// to share one. The queue row that `enqueue_async_indexes` adds for an
     /// asynchronous GSI goes into the index batch with the index rows.
+    #[allow(clippy::too_many_arguments)]
     async fn commit_secondary_effects(
         &self,
         key_info: &TableKeyInfo,
@@ -2112,7 +2113,6 @@ impl CassandraEngine {
         let mut async_enqueued = 0;
 
         if !indexes.is_empty() {
-        {
             // Read live once for the transaction: the first item whose table
             // has a GSI following the system setting fills `sys_delay`, and
             // later items reuse it. An item with none reads nothing.
@@ -2493,10 +2493,24 @@ impl CassandraEngine {
         let old = parse(old_item_data)?;
         let new = parse(new_item_data)?;
         let indexes = self.indexes_for_commit(&key_info).await?;
+        // Background recovery: the cached delay, not a live read, as the TTL
+        // sweep does.
+        let sys_delay = tokio::sync::OnceCell::new_with(Some(
+            self.gsi_default_delay_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ));
         // Recovery writes no stream record (issue #579), so the batch carries
         // the index rows alone.
-        self.commit_secondary_effects(&key_info, old.as_ref(), new.as_ref(), &indexes, None, stamp)
-            .await
+        self.commit_secondary_effects(
+            &key_info,
+            old.as_ref(),
+            new.as_ref(),
+            &indexes,
+            None,
+            stamp,
+            &sys_delay,
+        )
+        .await
     }
 
     /// Commit a single operation during recovery.
