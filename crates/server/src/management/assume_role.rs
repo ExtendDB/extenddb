@@ -369,7 +369,22 @@ async fn evaluate_trust_policy(
         epoch_time,
     };
 
-    trust_decision(&statements, caller_arn, &context, has_session_tags)
+    trust_decision_for(
+        &statements,
+        caller_arn,
+        &context,
+        has_session_tags,
+        trust_policy_is_version_2012(trust_policy),
+    )
+}
+
+/// Whether a trust policy's `Version` is `2012-10-17`. Its condition values
+/// then read the `${key, 'default'}` form and trim the key name, as an
+/// identity policy's do (`condition::evaluate_condition_with`); in a
+/// `2008-10-17` trust policy, or one with no `Version`, the text between the
+/// braces is the key name as written.
+fn trust_policy_is_version_2012(trust_policy: &Value) -> bool {
+    trust_policy.get("Version").and_then(Value::as_str) == Some("2012-10-17")
 }
 
 /// The `aws:PrincipalType` for a caller ARN: `User` for an IAM user ARN,
@@ -404,17 +419,31 @@ fn statements_vec(trust_policy: &Value) -> Option<Vec<Value>> {
     }
 }
 
-/// Decide assumption from resolved statements and context. Split out so the
-/// per-action Deny-over-Allow ordering is unit-testable without a store.
+/// [`trust_decision_for`] for a `2012-10-17` trust policy. The unit tests'
+/// statements stand for such a document.
+#[cfg(test)]
 fn trust_decision(
     statements: &[Value],
     caller_arn: &str,
     context: &AssumeRoleContext,
     has_session_tags: bool,
 ) -> bool {
+    trust_decision_for(statements, caller_arn, context, has_session_tags, true)
+}
+
+/// Decide assumption from resolved statements and context. Split out so the
+/// per-action Deny-over-Allow ordering is unit-testable without a store.
+/// `version_2012` is [`trust_policy_is_version_2012`] for the trust policy.
+fn trust_decision_for(
+    statements: &[Value],
+    caller_arn: &str,
+    context: &AssumeRoleContext,
+    has_session_tags: bool,
+    version_2012: bool,
+) -> bool {
     requested_actions(has_session_tags)
         .iter()
-        .all(|action| action_permitted(statements, caller_arn, context, action))
+        .all(|action| action_permitted(statements, caller_arn, context, action, version_2012))
 }
 
 /// The STS actions an `AssumeRole` request exercises.
@@ -434,17 +463,18 @@ fn action_permitted(
     caller_arn: &str,
     context: &AssumeRoleContext,
     action: &str,
+    version_2012: bool,
 ) -> bool {
     for stmt in statements {
         if effect_of(stmt).eq_ignore_ascii_case("Deny")
-            && deny_statement_blocks(stmt, caller_arn, context, action)
+            && deny_statement_blocks(stmt, caller_arn, context, action, version_2012)
         {
             return false;
         }
     }
     for stmt in statements {
         if effect_of(stmt).eq_ignore_ascii_case("Allow")
-            && allow_statement_grants(stmt, caller_arn, context, action)
+            && allow_statement_grants(stmt, caller_arn, context, action, version_2012)
         {
             return true;
         }
@@ -465,12 +495,13 @@ fn deny_statement_blocks(
     caller_arn: &str,
     context: &AssumeRoleContext,
     action: &str,
+    version_2012: bool,
 ) -> bool {
     if !principal_matches(&stmt["Principal"], caller_arn) || !action_matches(stmt, action) {
         return false;
     }
     matches!(
-        evaluate_conditions(stmt, context),
+        evaluate_conditions(stmt, context, version_2012),
         ConditionOutcome::Pass | ConditionOutcome::Unparseable
     )
 }
@@ -482,11 +513,15 @@ fn allow_statement_grants(
     caller_arn: &str,
     context: &AssumeRoleContext,
     action: &str,
+    version_2012: bool,
 ) -> bool {
     if !principal_matches(&stmt["Principal"], caller_arn) || !action_matches(stmt, action) {
         return false;
     }
-    matches!(evaluate_conditions(stmt, context), ConditionOutcome::Pass)
+    matches!(
+        evaluate_conditions(stmt, context, version_2012),
+        ConditionOutcome::Pass
+    )
 }
 
 /// Outcome of a statement's `Condition` block for a given context.
@@ -498,11 +533,16 @@ enum ConditionOutcome {
 
 /// Evaluate a statement's `Condition` block. Scalar condition values (numbers,
 /// booleans) are coerced to strings, matching IAM. An unknown operator or a
-/// structurally invalid block is reported as `Unparseable`.
-fn evaluate_conditions(stmt: &Value, context: &AssumeRoleContext) -> ConditionOutcome {
+/// structurally invalid block is reported as `Unparseable`. `version_2012` is
+/// whether the trust policy's `Version` is `2012-10-17`.
+fn evaluate_conditions(
+    stmt: &Value,
+    context: &AssumeRoleContext,
+    version_2012: bool,
+) -> ConditionOutcome {
     let normalized = normalize_condition_scalars(&stmt["Condition"]);
     match parse_conditions(&normalized) {
-        Ok(conds) => match evaluate_statement_conditions(&conds, context) {
+        Ok(conds) => match evaluate_statement_conditions(&conds, version_2012, context) {
             ConditionMatch::Match => ConditionOutcome::Pass,
             ConditionMatch::NoMatch => ConditionOutcome::Fail,
             // A condition on a key STS populates but ExtendDB cannot resolve
@@ -1904,5 +1944,52 @@ mod tests {
         let root = "arn:aws:iam::123456789012:root";
         assert_eq!(caller_principal_type(root), None);
         assert_eq!(caller_username(root), None);
+    }
+
+    /// Decide `sts:AssumeRole` for alice under the whole trust policy `doc`,
+    /// with the `Version` it carries.
+    fn trust_document_allows(doc: &Value, context: &AssumeRoleContext) -> bool {
+        let statements = statements_vec(doc).unwrap();
+        trust_decision_for(
+            &statements,
+            CALLER,
+            context,
+            false,
+            trust_policy_is_version_2012(doc),
+        )
+    }
+
+    fn trust_document(version: Option<&str>, statements: &[Value]) -> Value {
+        let mut doc = json!({"Statement": statements});
+        if let Some(version) = version {
+            doc["Version"] = json!(version);
+        }
+        doc
+    }
+
+    #[test]
+    fn trust_policy_reads_the_default_form_only_with_version_2012() {
+        // The identity policy rows V1 to V4 (IAM policy simulator,
+        // 2026-11-03) applied to a trust policy: outside a 2012-10-17
+        // document `${aws:username, 'x'}` is compared as written.
+        let gate = |effect: &str, operator: &str| {
+            json!({"Effect": effect, "Principal": {"AWS": CALLER},
+                "Action": "sts:AssumeRole",
+                "Condition": {operator: {"aws:PrincipalTag/team": "${aws:username, 'x'}"}}})
+        };
+        let alice = ctx_with_tags(&[("team", "alice")]);
+        for version in [None, Some("2008-10-17")] {
+            let allow = trust_document(version, &[gate("Allow", "StringEquals")]);
+            assert!(!trust_document_allows(&allow, &alice), "{version:?}");
+            let deny = trust_document(version, &[allow_alice(), gate("Deny", "StringNotEquals")]);
+            assert!(!trust_document_allows(&deny, &alice), "{version:?}");
+        }
+        let allow = trust_document(Some("2012-10-17"), &[gate("Allow", "StringEquals")]);
+        assert!(trust_document_allows(&allow, &alice));
+        let deny = trust_document(
+            Some("2012-10-17"),
+            &[allow_alice(), gate("Deny", "StringNotEquals")],
+        );
+        assert!(trust_document_allows(&deny, &alice));
     }
 }
