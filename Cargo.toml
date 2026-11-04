@@ -130,7 +130,9 @@ uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
 bigdecimal = { version = "0.4", features = ["serde"] }
 bcrypt = "0.17"
-aes-gcm = "0.10"
+# Already in the graph through rustls; named directly so the credential secret
+# cipher and SigV4 call AWS-LC. These are the features rustls already enables.
+aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
 rand = "0.9"
 
 # Time

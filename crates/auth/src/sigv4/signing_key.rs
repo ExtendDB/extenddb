@@ -11,10 +11,7 @@
 //! kSigning = HMAC(kService, "aws4_request")
 //! ```
 
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
-
-type HmacSha256 = Hmac<Sha256>;
+use aws_lc_rs::hmac;
 
 /// Derive the `SigV4` signing key from a secret access key.
 ///
@@ -38,14 +35,11 @@ pub fn compute_signature(signing_key: &[u8], string_to_sign: &str) -> String {
 }
 
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    // HMAC-SHA256 accepts any key length per RFC 2104. `new_from_slice` only
-    // fails for `InvalidLength`, which cannot occur for HMAC (it hashes
-    // oversized keys). Using `expect` is safe here — an empty fallback would
-    // risk producing a predictable signing key.
-    #[allow(clippy::expect_used)]
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(data);
-    mac.finalize().into_bytes().to_vec()
+    // HMAC-SHA256 accepts a key of any length (RFC 2104). `Key::new` panics
+    // only if AWS-LC cannot set up the HMAC context, which does not depend on
+    // the key.
+    let key = hmac::Key::new(hmac::HMAC_SHA256, key);
+    hmac::sign(&key, data).as_ref().to_vec()
 }
 
 #[cfg(test)]

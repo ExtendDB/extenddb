@@ -40,7 +40,7 @@ A new backend must implement **13 storage traits** plus the `CredentialStore` tr
 7. `AdminStore` — admin user management
 8. `SettingsStore` — runtime settings
 9. `MetricsStore` — historical metrics persistence and query
-10. `RateLimitStore` — login rate limiting and account lockout
+10. `RateLimitStore`: login rate limiting per user and source address
 11. `AuthorizationStore` — policy lookups for authorization decisions
 12. `BackupEngine` — backup and restore operations
 13. `Bootstrapper` — database initialization, destruction, migration, verification
@@ -218,9 +218,12 @@ Defined in `crates/storage/src/management_store/mod.rs`. Login rate limiting:
 
 | Method | Purpose |
 |--------|---------|
-| `record_login_attempt` | Record a login attempt (success or failure) |
-| `recent_failed_attempts` | Count recent failed attempts for lockout decisions |
+| `count_principal_failures` | Count recent failed attempts for one principal from one source address |
+| `count_ip_failures` | Count recent failed attempts from one source address, over all principals |
+| `record_failed_login` | Record a failed login attempt with its source address |
 | `cleanup_old_attempts` | Garbage-collect old login attempt records |
+
+Password verification in a backend's `AdminStore` and `ManagementStore` must go through `extenddb_storage::password::verify_password`, which bounds concurrent bcrypt work per process.
 
 ### AuthorizationStore
 

@@ -69,14 +69,8 @@ pub async fn assume_role(
     body: axum::body::Bytes,
 ) -> Response {
     // Authenticate via Basic auth — admin only.
-    let source_ip = crate::authorization::condition_source_ip(&addr);
-    if let Err(e) = authenticate_admin(
-        &headers,
-        &*state.catalog_store,
-        &*state.catalog_store,
-        Some(&source_ip),
-    )
-    .await
+    if let Err(e) =
+        authenticate_admin(&headers, &*state.catalog_store, &*state.catalog_store, addr).await
     {
         return e;
     }
@@ -182,7 +176,7 @@ pub async fn assume_role(
         request_tags,
         &state.region,
         state.secure_transport,
-        Some(source_ip.as_str()),
+        Some(crate::authorization::condition_source_ip(&addr).as_str()),
         user_agent.as_deref(),
         &account_id,
         &*state.catalog_store,

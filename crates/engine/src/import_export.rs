@@ -139,7 +139,11 @@ pub async fn handle_import_table(
             error_count += 1;
             continue;
         }
-        if let Err(e) = validate_attribute_name_sizes(&item, &ctx.limits) {
+        if let Err(e) = validate_attribute_name_sizes(
+            &item,
+            &ctx.limits,
+            extenddb_core::validation::AttributeNameRequestForm::SingleItem,
+        ) {
             tracing::warn!(error = %e, "import: skipping item with oversized attribute name");
             error_count += 1;
             continue;

@@ -664,6 +664,16 @@ A policy whose Arn values are literal ARNs, applied to a context value that is a
 
 ---
 
+### v0.1.15: console account pages serve an IAM user its own account only
+
+**What changed.** Every console page and form under `/console/accounts/{account_id}` now redirects an IAM-user session to `/console` when `{account_id}` is not the session's own account, and the answer is the same whether or not an account has that ID. Before this release the account, user, group and role pages checked only that a console session existed. An IAM user who requested another account's ID read that account's name, the names of its users, groups and roles, each user's access key IDs, inline policy names, groups and tags, and each role's trust policy. The forms under that path already refused IAM users, except the access key forms, which accept an IAM user's own keys. A refused form for another account now redirects to `/console`. Before this release 8 of the 17 forms redirected to a page of that account (the forms that create and delete users, groups and roles, and that add and remove group members), the delete account form redirected to `/console/accounts`, and the 2 access key forms and 6 policy forms redirected to `/console`. The console home page now shows the deployment's account count and admin count to admin sessions only, and shows an IAM-user session a link to its own account.
+
+**Who is affected.** IAM users who opened another account's pages in the console. They are redirected to `/console`. The pages of an IAM user's own account and every page an admin session sees are unchanged.
+
+No catalog migration is required.
+
+---
+
 ### v0.1.15: IAM tag condition keys apply to TagResource, UntagResource and CreateTable
 
 **What changed.** `aws:TagKeys` and `aws:RequestTag/<key>` now resolve on the three operations that carry a tag set, as the AWS service authorization reference lists them. `TagResource` and `CreateTable` populate both keys from `Tags`: `aws:RequestTag/<key>` holds the value of the tag named `<key>`, and `aws:TagKeys` lists the tag keys in request order. `UntagResource` populates `aws:TagKeys` from `TagKeys` and leaves `aws:RequestTag/<key>` absent. Every other operation leaves both keys absent, `ListTagsOfResource` included, and so does a request whose tag list is empty. Before this release both keys were absent on every data-plane request, so a statement that named either key did not depend on the tags of a tag operation.

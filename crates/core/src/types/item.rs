@@ -388,35 +388,75 @@ pub fn attribute_value_size(value: &AttributeValue) -> usize {
 
 /// Calculate the `DynamoDB` size of a number in bytes.
 ///
-/// `DynamoDB` number sizing: approximately 1 byte per 2 significant digits + 1 byte.
-/// Zero is 1 byte. Negative numbers add 1 byte. Max 21 bytes.
+/// Measured against the service (us-east-1, 2026-10-19) by accept/refuse pairs
+/// either side of the 409,600-byte item limit:
+///
+/// ```text
+/// 1 + ceil(integer significant digits / 2) + ceil(fraction significant digits / 2)
+///   + 1 if negative
+/// ```
+///
+/// The two halves are rounded up separately, so digits that straddle the
+/// decimal point cost one byte more than the same digits without a point:
+/// `1.5` is 3 bytes where `15` is 2, and `3.14159` is 5 where `123456` is 4.
+/// Leading zeros of the integer half and trailing zeros of the fraction half
+/// are not significant; trailing zeros of the integer half are significant
+/// when a fraction follows them (`100` is 2, `100.5` is 4) and a zero between
+/// two significant digits always is (`1010` is 3). The exponent is not
+/// counted (`1E125` is 2). Zero is 1 byte however it is spelled, and is never
+/// negative (`-0` is 1).
 fn dynamodb_number_size(n: &str) -> usize {
-    let s = n.trim_start_matches('-');
-    let is_zero = s.chars().all(|c| c == '0' || c == '.');
-    if is_zero {
+    let (negative, body) = match n.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, n.strip_prefix('+').unwrap_or(n)),
+    };
+    let (mantissa, exponent) = match body.find(['e', 'E']) {
+        Some(pos) => (&body[..pos], body[pos + 1..].parse::<i64>().unwrap_or(0)),
+        None => (body, 0),
+    };
+    let (int_text, frac_text) = match mantissa.find('.') {
+        Some(pos) => (&mantissa[..pos], &mantissa[pos + 1..]),
+        None => (mantissa, ""),
+    };
+    let digits: String = int_text.chars().chain(frac_text.chars()).collect();
+    if !digits.bytes().any(|b| (b'1'..=b'9').contains(&b)) {
         return 1;
     }
-
-    let significant = if let Some(dot_pos) = s.find('.') {
-        let (int_part, frac_part) = s.split_at(dot_pos);
-        let frac = &frac_part[1..];
-        let int_trimmed = int_part.trim_start_matches('0');
-        let frac_trimmed = frac.trim_end_matches('0');
-        if int_trimmed.is_empty() {
-            let frac_sig = frac.trim_start_matches('0');
-            frac_sig.trim_end_matches('0').len()
-        } else {
-            format!("{int_trimmed}{frac_trimmed}").len()
-        }
+    // Where the decimal point sits in `digits` once the exponent is applied.
+    let point = i64::try_from(int_text.len())
+        .unwrap_or(i64::MAX)
+        .saturating_add(exponent);
+    let len = i64::try_from(digits.len()).unwrap_or(i64::MAX);
+    let (int_part, frac_part): (String, String) = if point <= 0 {
+        (
+            String::new(),
+            "0".repeat(usize::try_from(-point).unwrap_or(0)) + &digits,
+        )
+    } else if point >= len {
+        (
+            digits.clone() + &"0".repeat(usize::try_from(point - len).unwrap_or(0)),
+            String::new(),
+        )
     } else {
-        let trimmed = s.trim_start_matches('0').trim_end_matches('0');
-        if trimmed.is_empty() { 1 } else { trimmed.len() }
+        let split = usize::try_from(point).unwrap_or(0);
+        (digits[..split].to_owned(), digits[split..].to_owned())
     };
-
-    let mut size = significant.div_ceil(2) + 1;
-    if n.starts_with('-') {
-        size += 1;
-    }
+    let int_part = int_part.trim_start_matches('0');
+    let frac_part = frac_part.trim_end_matches('0');
+    // Trailing zeros of the integer half fall away only when no fraction follows.
+    let int_significant = if frac_part.is_empty() {
+        int_part.trim_end_matches('0').len()
+    } else {
+        int_part.len()
+    };
+    // Leading zeros of the fraction half fall away only when no integer precedes.
+    let frac_significant = if int_part.is_empty() {
+        frac_part.trim_start_matches('0').len()
+    } else {
+        frac_part.len()
+    };
+    let size =
+        1 + int_significant.div_ceil(2) + frac_significant.div_ceil(2) + usize::from(negative);
     size.min(21)
 }
 
@@ -426,6 +466,32 @@ mod tests {
 
     fn s(v: &str) -> AttributeValue {
         AttributeValue::S(v.to_owned())
+    }
+
+    #[test]
+    fn number_size_matches_the_service_for_measured_literals() {
+        // Each figure measured against the service (us-east-1, 2026-10-19) by an
+        // accept/refuse pair either side of the 409,600-byte item limit.
+        for (literal, bytes) in [
+            ("0", 1),
+            ("-0", 1),
+            ("1", 2),
+            ("15", 2),
+            ("100", 2),
+            ("1E125", 2),
+            ("0.15", 2),
+            ("1.5", 3),
+            ("1.2", 3),
+            ("1.200", 3),
+            ("1010", 3),
+            ("-42", 3),
+            ("1.234", 4),
+            ("100.5", 4),
+            ("123456", 4),
+            ("3.14159", 5),
+        ] {
+            assert_eq!(dynamodb_number_size(literal), bytes, "literal {literal}");
+        }
     }
 
     #[test]

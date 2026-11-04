@@ -211,9 +211,10 @@ async fn build_components(
         })?;
 
     // Load encryption key from settings collection. A missing key must be
-    // a hard failure: an empty key would base64-decode to zero bytes and
-    // panic in aes_gcm (`Key::from_slice` requires 32 bytes). Refuse to
-    // start instead, matching the postgres backend.
+    // a hard failure: an empty key would base64-decode to zero bytes, and
+    // the secret cipher refuses any key that is not 32 bytes, so every
+    // credential lookup would fail. Refuse to start instead, matching the
+    // postgres backend.
     let catalog_db = catalog_client.database("extenddb_catalog");
     let settings_coll = catalog_db.collection::<mongodb::bson::Document>("settings");
     let enc_key = settings_coll
