@@ -212,7 +212,7 @@ impl SqliteEngine {
         .await
         .map_err(|e| internal(format!("check encryption key: {e}")))?;
         if !key_exists {
-            let key = helpers::generate_encryption_key();
+            let key = helpers::generate_encryption_key().map_err(internal)?;
             sqlx::query("INSERT OR IGNORE INTO settings (key, value) VALUES ('encryption_key', ?)")
                 .bind(&key)
                 .execute(&self.pool)

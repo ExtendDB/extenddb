@@ -13,6 +13,7 @@ use extenddb_storage::management_store::{
     MetricsRow, OpError, OpResult, RoleDetail, RoleListEntry, SessionPolicyEntry, StoredDocument,
     UserDetail, UserListEntry,
 };
+use extenddb_storage::secret_cipher::encrypt_secret;
 
 use crate::catalog_store::MongoCatalogStore;
 
@@ -2518,37 +2519,6 @@ fn generate_secret_key() -> String {
         .map(|_| CHARSET[rand::Rng::random_range(&mut rng, 0..CHARSET.len())] as char)
         .collect();
     format!("extenddb{suffix}")
-}
-
-fn encrypt_secret(plaintext: &str, key_b64: &str, aad: &str) -> Result<Vec<u8>, String> {
-    use aes_gcm::Aes256Gcm;
-    use aes_gcm::KeyInit;
-    use aes_gcm::aead::Aead;
-    use aes_gcm::aead::Payload;
-    use base64::Engine;
-
-    let key_bytes = base64::engine::general_purpose::STANDARD
-        .decode(key_b64)
-        .map_err(|e| format!("decode encryption key: {e}"))?;
-
-    let key = aes_gcm::Key::<Aes256Gcm>::from_slice(&key_bytes);
-    let cipher = Aes256Gcm::new(key);
-
-    let nonce_bytes: [u8; 12] = rand::random();
-    let nonce = aes_gcm::Nonce::from_slice(&nonce_bytes);
-
-    let payload = Payload {
-        msg: plaintext.as_bytes(),
-        aad: aad.as_bytes(),
-    };
-    let ciphertext = cipher
-        .encrypt(nonce, payload)
-        .map_err(|e| format!("encrypt: {e}"))?;
-
-    let mut result = Vec::with_capacity(12 + ciphertext.len());
-    result.extend_from_slice(&nonce_bytes);
-    result.extend_from_slice(&ciphertext);
-    Ok(result)
 }
 
 /// A stored policy or boundary as the resource-tag migration reads it: its

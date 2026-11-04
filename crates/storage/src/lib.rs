@@ -22,6 +22,7 @@ pub mod migrations;
 pub mod operations;
 pub mod password;
 pub mod policy_migration;
+pub mod secret_cipher;
 pub mod server_components;
 pub mod settings_store;
 pub mod snapshot;
