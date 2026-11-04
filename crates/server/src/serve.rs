@@ -176,6 +176,43 @@ impl std::fmt::Display for CatalogRefusal {
 
 impl std::error::Error for CatalogRefusal {}
 
+/// The refusal for a catalog error the backend's factory returned, for
+/// `serve` and for every command that opens the catalog through the factory
+/// (`extenddb backup list` and `purge`): the message, with the command that
+/// resolves the status, and the exit code `migrate` and `verify` use for it
+/// (3 for a catalog behind this binary, 6 while a migration runs).
+pub async fn catalog_refusal(
+    error: &extenddb_storage::migrations::MigrationError,
+    release: &'static str,
+    app_config: &config::AppConfig,
+    config_path: Option<&str>,
+) -> CatalogRefusal {
+    use extenddb_storage::migrations::{Target, advice, installed};
+    // A server started without a config file (a dev server configured
+    // by `EXTENDDB__` variables) advises `migrate` without one, which
+    // reads the same variables. The backup clause names the data
+    // store the catalog records.
+    let target = Target::at(app_config.storage.connection_config());
+    let named = match installed() {
+        Some(migrations) => Target {
+            data_store: migrations.data_store_name(&target).await,
+            ..target
+        },
+        None => target,
+    };
+    let advice = advice::AdviceFor::new(
+        release,
+        config::redact_password(app_config.storage.connection_config()),
+        installed(),
+        &named,
+        config_path,
+    );
+    CatalogRefusal {
+        exit_code: error.exit_code(),
+        message: advice::error_message(error, &advice.advice()),
+    }
+}
+
 /// `serve` stopped because the backend's serving registration was lost and
 /// could not be taken again. It stopped through the shutdown path a signal
 /// takes: the listener drained, the workers stopped and the PID file was
@@ -358,30 +395,13 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     {
         Ok(components) => components,
         Err(extenddb_storage::server_components::BackendError::Catalog(error)) => {
-            use extenddb_storage::migrations::{Target, advice, installed};
-            // A server started without a config file (a dev server configured
-            // by `EXTENDDB__` variables) advises `migrate` without one, which
-            // reads the same variables. The backup clause names the data
-            // store the catalog records.
-            let target = Target::at(app_config.storage.connection_config());
-            let named = match installed() {
-                Some(migrations) => Target {
-                    data_store: migrations.data_store_name(&target).await,
-                    ..target
-                },
-                None => target,
-            };
-            let advice = advice::AdviceFor::new(
+            return Err(catalog_refusal(
+                &error,
                 build.version,
-                config::redact_password(app_config.storage.connection_config()),
-                installed(),
-                &named,
+                &app_config,
                 config_path.as_deref(),
-            );
-            return Err(CatalogRefusal {
-                exit_code: error.exit_code(),
-                message: advice::error_message(&error, &advice.advice()),
-            }
+            )
+            .await
             .into());
         }
         Err(other) => return Err(other.into()),
@@ -641,9 +661,21 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         initial_throttling,
     ));
 
-    let backup_runtime = Arc::new(extenddb_engine::BackupRuntime::new(
-        app_config.backup.max_concurrent_jobs,
-    ));
+    // The backup store: resolved per backend, opened, validated, its identity
+    // checked. A configuration error stops startup here; a transport or
+    // identity failure starts the server with the store unhealthy
+    // (`backup_store` module doc). The spool lock lives until shutdown.
+    let backend_name = app_config.storage.backend.clone();
+    let (backup_runtime, _spool_lock) = crate::backup_store::configure(
+        &app_config.backup,
+        app_config.storage.database_file().as_deref(),
+        &backend_name,
+        &storage,
+        crate::backup_store::Caller::Server,
+    )
+    .await?;
+    let backup_runtime = Arc::new(backup_runtime);
+    let backup_runtime_for_reconciler = Arc::clone(&backup_runtime);
     let state = AppState {
         storage: storage.clone(),
         backup_runtime,
@@ -698,6 +730,7 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         let config_log_level = app_config.logging.level.clone();
         let metrics = metrics.clone();
         let storage = storage.clone();
+        let backup_runtime = backup_runtime_for_reconciler;
         Box::new(move |token: CancellationToken| {
             let catalog_store = catalog_store.clone();
             let reload_handle = reload_handle.clone();
@@ -707,6 +740,8 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
             let hooks = hooks.clone();
             let storage = storage.clone();
             let reconciler_state = reconciler_state.clone();
+            let backup_runtime = Arc::clone(&backup_runtime);
+            let backend_name = backend_name.clone();
             futures::FutureExt::boxed(async move {
                 let mut handles = vec![
                     // D-22: Poll log_level from the settings table.
@@ -746,7 +781,9 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
                     // them.
                     tokio::spawn(extenddb_engine::reconciler::run(
                         storage,
+                        backup_runtime,
                         reconciler_settings,
+                        backend_name,
                         metrics.clone(),
                         reconciler_state,
                         token.clone(),

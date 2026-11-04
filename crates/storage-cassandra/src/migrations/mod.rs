@@ -57,7 +57,7 @@ pub(crate) use connect::{LOCKED_DDL_TIMEOUT, REQUEST_TIMEOUT};
 pub(crate) use locks::LeaseHandle;
 pub use locks::{LeaseTimes, MigrationLock};
 pub use registrar::ServerRegistration;
-pub use registrations::{RegistrationTimes, ServingRegistration};
+pub use registrations::{RegistrationTimes, SERVE_COMMAND, ServingRegistration};
 
 use crate::cassandra_util::CassandraSession;
 
@@ -720,11 +720,31 @@ pub async fn register_server(
     host: &str,
     release: &str,
 ) -> Result<ServerRegistration, MigrationError> {
-    register_server_timed(
+    register_server_as(session, keyspace_prefix, host, release, SERVE_COMMAND).await
+}
+
+/// [`register_server`] for the process `command` names: `extenddb serve`
+/// ([`SERVE_COMMAND`]) or a command that opens the catalog as a server does
+/// (`extenddb backup list`), whose row carries its name (the registrations
+/// module doc says where) and whose refusal while a migration holds the
+/// lock names the holder without the server's advice to start the server.
+///
+/// # Errors
+///
+/// As [`register_server`].
+pub async fn register_server_as(
+    session: Arc<CassandraSession>,
+    keyspace_prefix: &str,
+    host: &str,
+    release: &str,
+    command: &str,
+) -> Result<ServerRegistration, MigrationError> {
+    register_server_with(
         session,
         keyspace_prefix,
         host,
         release,
+        command,
         RegistrationTimes::DEFAULT,
     )
     .await
@@ -742,6 +762,26 @@ pub async fn register_server_timed(
     release: &str,
     times: RegistrationTimes,
 ) -> Result<ServerRegistration, MigrationError> {
+    register_server_with(
+        session,
+        keyspace_prefix,
+        host,
+        release,
+        SERVE_COMMAND,
+        times,
+    )
+    .await
+}
+
+async fn register_server_with(
+    session: Arc<CassandraSession>,
+    keyspace_prefix: &str,
+    host: &str,
+    release: &str,
+    command: &str,
+    times: RegistrationTimes,
+) -> Result<ServerRegistration, MigrationError> {
+    let release = &registrations::release_cell(release, command);
     let catalog = format!("{keyspace_prefix}_catalog");
     agreement::wait_for_agreement(&session, AGREEMENT_TIMEOUT).await?;
     if !connect::table_exists(&session, &catalog, "extenddb_servers").await? {
@@ -760,9 +800,15 @@ pub async fn register_server_timed(
             .await?;
     let checked = async {
         if let Some(holder) = locks::lock_holder(&session, &catalog).await? {
+            // A command's refusal ends at the holder; the command's caller
+            // adds that it is retried once the migration has finished.
+            let then = if command == SERVE_COMMAND {
+                "; start the server again when it finishes"
+            } else {
+                ""
+            };
             return Err(MigrationError::Locked(format!(
-                "a migration holds the catalog's migration lock (holder {holder}); start the \
-                 server again when it finishes"
+                "a migration holds the catalog's migration lock (holder {holder}){then}"
             )));
         }
         match catalog_status(session.clone(), keyspace_prefix).await? {
