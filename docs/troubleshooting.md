@@ -170,9 +170,18 @@ use. Do not use symlinks that point outside the allowed directories.
 
 **Cause:** Export refuses to overwrite. Something already exists at the
 requested `FilePath`, so the export stopped rather than truncating it. A symlink
-at that path produces the same error rather than being followed.
+at that path produces the same error rather than being followed. A failed export
+removes its file, so what is there is a completed export, an export to that
+`FilePath` that is still running, a file from somewhere else, a partial file
+from a server that stopped during an export, an empty file from a request
+cancelled while the file was being created, or the file of a failed export that
+the server could not remove (the server logs a warning when that happens).
 
-**Fix:** Export to a new filename, or remove the existing file first.
+**Fix:** Export to a new filename. If an export to that `FilePath` may still be
+running, for example from a client that retried or from a second client, wait
+for it to answer or use another `FilePath` before you remove anything: removing
+its file makes it answer `COMPLETED` with no file at its `FilePath`. Otherwise
+remove the existing file first.
 
 ### `Failed to daemonize: <error>`
 
@@ -860,35 +869,60 @@ The error log line names the exact relations for one leaked table and gives this
 
 ## Import/Export Errors
 
-### `Source path does not exist: <path>`
+An export that fails removes its file, so it can be retried with the same
+`FilePath`. A server that stops during an export can still leave a partial file
+there, a request cancelled while the file is being created can leave an empty
+one, and a file the server could not remove stays where it is; the server logs a
+warning with the path and the error when that happens.
 
-**Cause:** The `FileSource.Path` in an `ImportTable` request points to a file or directory that does not exist on the server's filesystem.
+An export syncs its file and the directory that holds it before it answers
+`COMPLETED`. When the server cannot open that directory (for example, it can
+write to the directory but not read it) or the filesystem cannot sync a
+directory, the export completes without the directory sync and the server logs
+a warning. Without that sync, a crash of the host soon after the answer can lose
+the file's directory entry.
+
+### `Path does not exist or is not accessible`
+
+**Cause:** The `FileSource.Path` in an `ImportTable` request points to a file or directory that does not exist on the server's filesystem, or that the extenddb process cannot reach.
 
 **Fix:** Verify the path is correct and accessible to the extenddb process. Paths are relative to the server's working directory.
 
-### `Cannot open source file: <error>`
+### `Cannot open source file`
 
 **Cause:** The import source file exists but cannot be opened (permission denied, is a directory, etc.).
 
 **Fix:** Check file permissions. The extenddb process must have read access to the file.
 
-### `Invalid JSON at line N: <error>`
+### `Invalid JSON at line N`
 
 **Cause:** A line in the DYNAMODB_JSON import file is not valid JSON.
 
 **Fix:** Each line must be a valid JSON object. The format is one item per line: `{"Item": {"pk": {"S": "val"}, ...}}` or bare `{"pk": {"S": "val"}, ...}`.
 
-### `Cannot write export file: <error>`
+### `Cannot create export file`
 
-**Cause:** The export destination path is not writable (permission denied, disk full, etc.).
+**Cause:** The parent directory exists, but the server could not create the file in it: no write permission on the directory, a read-only filesystem, or a full disk.
 
-**Fix:** Check that the extenddb process has write access to the destination directory. Parent directories are created automatically.
+**Fix:** Give the extenddb process write access to the destination directory, or free disk space, then export again.
 
-### `Invalid table ARN: <arn>`
+### `Cannot write export file`
 
-**Cause:** The `TableArn` in an `ExportTableToPointInTime` request is not a valid DynamoDB table ARN.
+**Cause:** The server created the export file but could not write, flush or sync it, or sync the directory that holds it: a full disk, the file size limit, an I/O error, or the server's limit on open files. On macOS the server syncs the file with `F_FULLFSYNC`, which some network volumes, such as SMB mounts, refuse with `ENOTSUP`, so an export to such a volume gets this error. The export removes the file before it answers. If the server cannot remove it, the file stays and the server logs a warning with the path and the error.
+
+**Fix:** Check that the disk has room and that the extenddb process can write to the destination directory, then export again. On macOS, export to a local volume rather than a network volume that refuses `F_FULLFSYNC`. The same `FilePath` can be used, unless the server logged that it could not remove the file; remove that file first. Only the account directory, `<root>/<account id>/`, is created for you. An export whose parent directory does not exist is refused with `Parent directory does not exist or is not accessible`, so create any other directory in the path first.
+
+### `One or more parameter values were invalid: tableArn is not a valid ARN`
+
+**Cause:** The `TableArn` in an `ExportTableToPointInTime` request is not a well-formed DynamoDB table ARN. The server refuses it before authorization.
 
 **Fix:** Use the full ARN format: `arn:aws:dynamodb:<region>:<account>:table/<name>`. You can get the ARN from `DescribeTable`.
+
+### `Invalid Request: Table ARN is invalid.`
+
+**Cause:** The `TableArn` in an `ExportTableToPointInTime` request is the ARN of an index, a stream or a backup of a table rather than the ARN of the table.
+
+**Fix:** Use the table's own ARN, `arn:aws:dynamodb:<region>:<account>:table/<name>`, which `DescribeTable` returns.
 
 ## GSI Async Update Behavior
 

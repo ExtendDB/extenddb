@@ -21,3 +21,8 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 tokio = { workspace = true }
+
+# The export file's directory sync reads the error number of a failure, and
+# its tests lower the file size limit and check the effective uid.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
