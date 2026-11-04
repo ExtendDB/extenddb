@@ -38,7 +38,7 @@ use extenddb_core::types::{Item, KeySchemaElement, TableKeyInfo};
 use extenddb_storage::error::StorageError;
 use mongodb::options::{FindOneAndUpdateOptions, ReturnDocument};
 
-use super::{TRANSIENT_RETRY_ATTEMPTS, backoff_sleep};
+use super::{CREATE_RACE_ATTEMPTS, backoff_sleep};
 use crate::MongoEngine;
 use crate::data::key_fields::insert_only_key_fields;
 
@@ -70,9 +70,10 @@ impl MongoEngine {
     ///
     /// `key` and `key_info` supply the `$setOnInsert` fields that make a
     /// created document match what PutItem writes. Attempts that lose the
-    /// create race share the transient retry budget and back off between
-    /// them; when every attempt loses, the error is the same
-    /// `TransactionConflict` the transaction path returns.
+    /// create race count against `CREATE_RACE_ATTEMPTS`, the budget a lost
+    /// create race has on the PutItem paths, and back off between them; when
+    /// every attempt loses, the error is the same `TransactionConflict` the
+    /// transaction path returns.
     pub(crate) async fn upsert_native_update(
         &self,
         coll: &mongodb::Collection<Document>,
@@ -89,7 +90,7 @@ impl MongoEngine {
             .upsert(true)
             .return_document(ReturnDocument::After)
             .build();
-        for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
+        for attempt in 0..CREATE_RACE_ATTEMPTS {
             match coll
                 .find_one_and_update(key_filter.clone(), update.clone())
                 .with_options(opts.clone())

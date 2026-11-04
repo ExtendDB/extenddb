@@ -102,20 +102,12 @@ impl Fixture {
 
 async fn engine_on(catalog: &str, data: &str, liveness: BackupLiveness) -> MongoEngine {
     let client = mongodb::Client::with_uri_str(uri()).await.expect("client");
-    // The driver default pool (10) and the slot count production derives
-    // from it, so the tests see the same admission bound as `serve`.
-    let slots = super::restore_server_slot_count(10);
+    // `for_test` derives the restore slot count from the driver default pool
+    // (10), as production does, so the tests see the same admission bound as
+    // `serve`.
     MongoEngine {
-        client: client.clone(),
-        catalog_db: client.database(catalog),
-        data_db: client.database(data),
-        region: "us-east-1".to_owned(),
-        gsi_cache: Arc::default(),
-        tx_read_concern: mongodb::options::ReadConcern::snapshot(),
         backup_liveness: liveness,
-        restore_server_slot_count: slots,
-        restore_server_slots: Arc::new(tokio::sync::Semaphore::new(slots)),
-        restore_account_slots: super::RestoreAccountSlots::default(),
+        ..MongoEngine::for_test(&client, client.database(catalog), client.database(data))
     }
 }
 
