@@ -14,8 +14,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use extenddb_storage::migrations::{
-    Body, CatalogStatus, CodeBody, Done, LedgerRow, MigrationBackend, MigrationError, MigrationId,
-    Outcome, RELEASED_THROUGH, Runner, Step, StoreBody, StoreKind, StoreRef, check_released,
+    Body, CatalogStatus, CodeBody, Done, LedgerRow, Migration, MigrationBackend, MigrationError,
+    MigrationId, Outcome, RELEASED_THROUGH, Runner, Step, StoreBody, StoreKind, StoreRef,
+    check_released,
 };
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqlitePoolOptions;
@@ -264,12 +265,22 @@ async fn a_fresh_database_is_current_after_one_run_and_seeds_nothing() {
         status(&db).await,
         CatalogStatus::Current { version: LATEST }
     );
+    // A row for every id: `applied` for the ids with a body on this backend,
+    // `not_applicable` for the others.
+    let applies = MigrationId::ALL
+        .into_iter()
+        .filter(|id| matches!(migration(*id), Migration::Applies { .. }))
+        .count();
     assert_eq!(
         count(
             &db,
             "SELECT COUNT(*) FROM extenddb_migrations WHERE outcome = 'applied'"
         )
         .await,
+        i64::try_from(applies).expect("a count fits i64")
+    );
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM extenddb_migrations").await,
         i64::from(LATEST)
     );
     assert_eq!(version_row(&db).await, Some(LATEST.to_string()));

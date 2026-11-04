@@ -52,6 +52,7 @@ from a request sent to that service or backend.
 |------|----------|------|
 | Table creation delay | Returns `CREATING` immediately; transitions to `ACTIVE` typically within seconds. Same behavior for on-demand and provisioned | Configurable via `control_plane_delay_seconds` runtime setting (default: 5s) |
 | DeletionProtectionEnabled | Enforced | Enforced (accepted and stored, DeleteTable rejects when enabled) |
+| U+0000 in a key attribute name, an index key attribute name or a projected attribute name | Accepted; `DescribeTable` returns each name byte for byte (measured 2026-09-18 and 2026-10-24, and again on 2026-11-04) | The same on all four backends. PostgreSQL `jsonb` cannot hold U+0000, so a PostgreSQL deployment stores these names through an escape, U+0000 as U+0001 U+0001 and U+0001 as U+0001 U+0002. Catalog migration 6 applies the escape to the names an earlier release stored (see the [Upgrade Manual](manuals/07-upgrade-manual.md#general-upgrade-procedure)) |
 
 ## Time to Live (TTL)
 

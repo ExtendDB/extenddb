@@ -127,6 +127,11 @@ pub fn migration(id: MigrationId) -> Migration<CassandraStores> {
                 "0005_drop_continuous_backups.cql"
             )],
         },
+        MigrationId::AttributeNameEscape => Migration::NotApplicable(
+            "Cassandra stores the documents that carry attribute names as JSON text in text \
+             columns, where U+0000 is the six-character escape \\u0000, so every name reads back \
+             as it was written",
+        ),
     }
 }
 

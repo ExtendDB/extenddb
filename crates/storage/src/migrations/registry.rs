@@ -67,11 +67,15 @@ migration_ids! {
     /// it.
     DropContinuousBackups = 5, "drop_continuous_backups",
         "drop the continuous_backups table, which no request reads or writes since #335";
+    /// Rewrites the stored documents that carry attribute names through the
+    /// escape that lets a PostgreSQL catalog hold U+0000 in a name (#367).
+    AttributeNameEscape = 6, "attribute_name_escape",
+        "store attribute names through the escape that lets PostgreSQL jsonb hold U+0000";
 }
 
 /// Highest id that has shipped in a release. Bodies at or below it are frozen:
 /// each backend pins their checksums, kinds and convergent flags, and
-/// `forget` refuses them. The v1.0 release PR raises it to 5.
+/// `forget` refuses them. The v1.0 release PR raises it to 6.
 pub const RELEASED_THROUGH: u32 = 0;
 
 impl MigrationId {

@@ -137,6 +137,10 @@ pub fn migration(id: MigrationId) -> Migration<MongoStores> {
                 m0005_drop_continuous_backups::SOURCE,
             )],
         },
+        MigrationId::AttributeNameEscape => Migration::NotApplicable(
+            "MongoDB stores the catalog's attribute names as BSON string values, which carry their \
+             length and so can hold U+0000, and every name reads back as it was written",
+        ),
     }
 }
 
