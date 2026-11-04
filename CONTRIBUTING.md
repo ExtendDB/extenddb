@@ -341,7 +341,7 @@ SQLite, PostgreSQL, Cassandra and MongoDB migrate through this framework.
 
 ### Example: a nullable column on `tables`
 
-Migration 6, `table_note`, adds a nullable `note TEXT` column to the catalog's
+Migration 7, `table_note`, adds a nullable `note TEXT` column to the catalog's
 `tables` table on SQLite and PostgreSQL.
 
 In `crates/storage/src/migrations/registry.rs`, at the end of the
@@ -349,18 +349,18 @@ In `crates/storage/src/migrations/registry.rs`, at the end of the
 
 ```rust
     /// Adds a nullable `note` column to the `tables` catalog table.
-    TableNote = 6, "table_note",
+    TableNote = 7, "table_note",
         "add a nullable note column to the tables catalog";
 ```
 
 PostgreSQL has `ADD COLUMN IF NOT EXISTS`, so its body is a file,
-`crates/storage-postgres/migrations/0006_table_note.sql`:
+`crates/storage-postgres/migrations/0007_table_note.sql`:
 
 ```sql
 -- Copyright 2026 ExtendDB contributors
 -- SPDX-License-Identifier: Apache-2.0
 --
--- Migration 6, table_note, PostgreSQL catalog database: a nullable note
+-- Migration 7, table_note, PostgreSQL catalog database: a nullable note
 -- column on tables. IF NOT EXISTS makes a second run change nothing.
 
 ALTER TABLE tables ADD COLUMN IF NOT EXISTS note TEXT;
@@ -375,7 +375,7 @@ In `crates/storage-postgres/src/migrations/mod.rs`, the arm in `migration()`:
             bodies: vec![file_body!(
                 StoreKind::Catalog,
                 "migrations",
-                "0006_table_note.sql"
+                "0007_table_note.sql"
             )],
         },
 ```
@@ -393,13 +393,13 @@ and the id in the transactional arm of `runs_in()`:
 SQLite has no `ADD COLUMN IF NOT EXISTS`, and a file with a plain
 `ADD COLUMN` fails when it runs a second time, so the SQLite body is code
 that checks for the column first.
-`crates/storage-sqlite/src/migrations/m0006_table_note.rs`:
+`crates/storage-sqlite/src/migrations/m0007_table_note.rs`:
 
 ```rust
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Migration 6, `table_note`, SQLite: a nullable `note` column on `tables`.
+//! Migration 7, `table_note`, SQLite: a nullable `note` column on `tables`.
 //!
 //! SQLite has no `ADD COLUMN IF NOT EXISTS`, so the body reads the table's
 //! columns first and adds the column only when it is missing. A second run
@@ -411,10 +411,10 @@ use extenddb_storage::migrations::{CodeBody, Done, MigrationError};
 use super::SqliteStores;
 
 /// This file, whose SHA-256 the checksum test pins.
-pub(crate) const SOURCE: &str = include_str!("m0006_table_note.rs");
+pub(crate) const SOURCE: &str = include_str!("m0007_table_note.rs");
 
 /// Recorded as this migration's checksum. Changes only with a new migration.
-const FINGERPRINT: &str = "0006_table_note/sqlite/1";
+const FINGERPRINT: &str = "0007_table_note/sqlite/1";
 
 pub(crate) struct TableNote;
 
@@ -453,7 +453,7 @@ beside the others:
 ```rust
 #[rustfmt::skip]
 #[allow(clippy::all, deprecated)]
-mod m0006_table_note;
+mod m0007_table_note;
 ```
 
 and the arm in `migration()`:
@@ -464,8 +464,8 @@ and the arm in `migration()`:
             convergent: true,
             bodies: vec![StoreBody::code(
                 StoreKind::Catalog,
-                &m0006_table_note::TableNote,
-                m0006_table_note::SOURCE,
+                &m0007_table_note::TableNote,
+                m0007_table_note::SOURCE,
             )],
         },
 ```
@@ -477,7 +477,7 @@ rows of `tables`:
 
 ```rust
 #[tokio::test]
-async fn migration_6_adds_the_note_column_to_tables() {
+async fn migration_7_adds_the_note_column_to_tables() {
     let db = temp_db("m6");
     load_dump(&db, DEV_0_1_14).await;
     run(&db).await.expect("migrate");
@@ -488,12 +488,12 @@ async fn migration_6_adds_the_note_column_to_tables() {
     )
     .await;
     text.push_str(&dump(&db, "SELECT table_name, note FROM tables ORDER BY table_name").await);
-    golden("0006_table_note", &text);
+    golden("0007_table_note", &text);
 }
 ```
 
-`EXTENDDB_BLESS_EXPECTED=1 cargo test -p extenddb-storage-sqlite --lib migration_6`
-writes `crates/storage-sqlite/tests/fixtures/golden/0006_table_note.txt`, one
+`EXTENDDB_BLESS_EXPECTED=1 cargo test -p extenddb-storage-sqlite --lib migration_7`
+writes `crates/storage-sqlite/tests/fixtures/golden/0007_table_note.txt`, one
 tab-separated line per row under each query:
 
 ```
@@ -508,15 +508,15 @@ The PostgreSQL body is a file, so it has no golden test.
 The example declares `Kind::Breaking`. A nullable column can be additive by
 the rule in step 4, but declaring it additive needs the old-binary job, which
 this example does not add. As a breaking migration it makes a 1.x binary
-without migration 6 refuse a catalog that has it, and a rollback restores the
+without migration 7 refuse a catalog that has it, and a rollback restores the
 backup.
 
 The same PR changes the code that reads and writes `tables.note` in each
 backend's catalog store, and commits the `docs/schema/sqlite.txt` and
 `docs/schema/postgres.txt` that the integration jobs regenerate. It changes
 no per-table DDL, because `tables` is a catalog table, and adds no `RELEASED`
-entry. `extenddb migrate --list` then shows migration 6, and on a catalog at
-migration 5 `extenddb migrate` lists migration 6 as pending and exits 3.
+entry. `extenddb migrate --list` then shows migration 7, and on a catalog at
+migration 6 `extenddb migrate` lists migration 7 as pending and exits 3.
 
 ### Running the migration tests
 

@@ -820,18 +820,6 @@ The error log line names the exact relations for one leaked table and gives this
 
 **Fix:** Check PostgreSQL connectivity. Verify the table's stream shards exist in the `stream_shards` table. If the table was created before streams were enabled, the shards may not have been initialized.
 
-### `Stream capture: failed to write record for <table>: <error>`
-
-**Cause:** A stream record was constructed but could not be persisted to the `stream_records` table. The data write succeeded — only the stream record is missing.
-
-**Fix:** Check PostgreSQL connectivity and disk space. If the error mentions a unique constraint violation, two writes to the same shard may have occurred in the same microsecond — retry the operation.
-
-### `Stream capture: failed to get sequence number: <error>`
-
-**Cause:** extenddb could not generate a sequence number for a stream record. The data write succeeded — only the stream record is missing.
-
-**Fix:** Check PostgreSQL connectivity.
-
 ### `Stream cleanup worker: <error>`
 
 **Cause:** The background worker that deletes stream records older than 24 hours encountered a database error. Expired records will accumulate until the worker succeeds.
@@ -843,6 +831,12 @@ The error log line names the exact relations for one leaked table and gives this
 **Cause:** The background worker that gives PostgreSQL stream records their sequence numbers encountered a database error. GetRecords numbers the records of the shard it reads before it reads them, so consumers still receive every record. The records of shards that nobody reads stay in the `stream_pending` table, and the retention sweep does not trim them, until the worker succeeds.
 
 **Fix:** Check PostgreSQL connectivity. After a failure the worker tries again a little over a second later.
+
+### GetRecords is slow on PostgreSQL while a long transaction runs
+
+**Cause:** Every stream record passes through the `stream_pending` table, and the numbering step deletes it there. A transaction that stays open on the data database, such as the one a backup of a large table reads from, keeps autovacuum from removing those deleted rows. Until it ends, each GetRecords on a busy shard and each numbering read past them.
+
+**Fix:** Find the long transaction in `pg_stat_activity` (`xact_start`). Once it ends, autovacuum removes the rows; `VACUUM stream_pending` removes them at once.
 
 ## Management Console Errors
 

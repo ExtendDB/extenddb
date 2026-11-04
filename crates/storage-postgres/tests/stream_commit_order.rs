@@ -30,10 +30,11 @@ use std::time::Duration;
 use extenddb_core::expression::ExpressionMaps;
 use extenddb_core::types::{
     AttributeDefinition, AttributeValue, BillingMode, CreateTableInput, Item, KeySchemaElement,
-    KeyType, ScalarAttributeType, StreamRecord, StreamSpecification, StreamViewType, TableKeyInfo,
+    KeyType, ReturnValuesOnConditionCheckFailure, ScalarAttributeType, StreamRecord,
+    StreamSpecification, StreamViewType, TableKeyInfo,
 };
 use extenddb_storage::util::stream_arn;
-use extenddb_storage::{DataEngine, StreamCapture, StreamEngine, TableEngine};
+use extenddb_storage::{DataEngine, StreamCapture, StreamEngine, TableEngine, TransactWriteOp};
 use extenddb_storage_postgres::{PostgresConfig, PostgresEngine};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Connection, PgConnection, PgPool};
@@ -222,11 +223,12 @@ fn skip(test: &str) {
     );
 }
 
-/// A scratch database with every shipped migration applied. With
-/// `default_isolation`, the engine's sessions start their transactions at
-/// that level unless a transaction names its own, as with an operator's
+/// A scratch database with every shipped migration applied, and an engine
+/// whose pool holds `pool_size` connections. With `default_isolation`, the
+/// engine's sessions start their transactions at that level unless a
+/// transaction names its own, as with an operator's
 /// `default_transaction_isolation`.
-async fn scratch(default_isolation: Option<&str>) -> Scratch {
+async fn scratch(default_isolation: Option<&str>, pool_size: u32) -> Scratch {
     let base = base_conn().expect("caller checks base_conn() first");
     let db_name = format!("eddb_sord_{}", uuid::Uuid::new_v4().simple())[..24].to_owned();
     let admin = PgPoolOptions::new()
@@ -285,7 +287,7 @@ async fn scratch(default_isolation: Option<&str>) -> Scratch {
     let engine = PostgresEngine::new(
         &PostgresConfig {
             connection_string: url,
-            pool_size: 12,
+            pool_size,
             max_item_size_bytes: 400_000,
         },
         REGION,
@@ -417,25 +419,6 @@ async fn wait_until_blocked_by(db: &PgPool, blocker: i32, event: &str) -> Result
     ))
 }
 
-/// Wait until `n` backends of the scratch database wait on a lock. Fails
-/// after 10 s.
-async fn wait_for_lock_waiters(db: &PgPool, n: i64) -> Result<(), String> {
-    for _ in 0..1_000 {
-        let waiting: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM pg_stat_activity \
-             WHERE datname = current_database() AND wait_event_type = 'Lock'",
-        )
-        .fetch_one(db)
-        .await
-        .expect("read pg_stat_activity");
-        if waiting >= n {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    Err(format!("{n} backends never waited on a lock"))
-}
-
 /// The case #808 names. A write stores its record and then waits at its
 /// commit. A second write to the same shard commits, and a consumer reads
 /// its record. The first write then commits, and the consumer's next read,
@@ -449,7 +432,7 @@ async fn a_write_that_commits_after_a_read_is_returned_by_the_next_read() {
     if base_conn().is_none() {
         return skip(test);
     }
-    let s = scratch(None).await;
+    let s = scratch(None, 12).await;
     let (key_info, table_id, arn) = s.stream_table().await;
     install_commit_gate(
         &s,
@@ -516,7 +499,7 @@ async fn concurrent_writers_lose_no_record_and_keep_each_items_order() {
     const WRITERS: usize = 8;
     const WRITES: usize = 150;
     const ITEMS: [&str; 4] = ["h0", "h1", "h2", "h3"];
-    let s = scratch(None).await;
+    let s = scratch(None, 12).await;
     let (key_info, table_id, arn) = s.stream_table().await;
     let shards: Vec<String> =
         sqlx::query_scalar("SELECT shard_id FROM stream_shards WHERE table_id = $1 ORDER BY 1")
@@ -624,7 +607,7 @@ async fn a_read_returns_the_write_that_committed_before_it() {
     if base_conn().is_none() {
         return skip(test);
     }
-    let s = scratch(None).await;
+    let s = scratch(None, 12).await;
     let (key_info, _, arn) = s.stream_table().await;
     let shard = s.shard_of("r").await;
     let mut cursor: Option<String> = None;
@@ -656,7 +639,7 @@ async fn a_latest_iterator_starts_after_the_committed_writes() {
     if base_conn().is_none() {
         return skip(test);
     }
-    let s = scratch(None).await;
+    let s = scratch(None, 12).await;
     let (key_info, table_id, arn) = s.stream_table().await;
     install_commit_gate(
         &s,
@@ -724,7 +707,7 @@ async fn the_worker_numbers_unread_shards_and_skips_a_locked_one() {
     if base_conn().is_none() {
         return skip(test);
     }
-    let s = scratch(None).await;
+    let s = scratch(None, 12).await;
     let (key_info, _, _) = s.stream_table().await;
     // Two partition keys on two shards.
     let first = s.shard_of("k0").await;
@@ -784,19 +767,17 @@ async fn the_worker_numbers_unread_shards_and_skips_a_locked_one() {
     s.cleanup().await;
 }
 
-/// Under an operator's REPEATABLE READ default, a read that waits for a
-/// numbering of its shard must not fail. The numbering transaction is READ
-/// COMMITTED whatever the default. At REPEATABLE READ its snapshot would date
-/// from before the wait, it would try to move the records the other
-/// numbering had moved, and the delete would fail with a serialization
-/// error.
+/// Under an operator's REPEATABLE READ default, a read of a shard that
+/// another transaction numbers must succeed and return what that numbering
+/// commits. The read waits for the numbering with no connection held, and its
+/// own numbering transaction is READ COMMITTED whatever the default.
 #[tokio::test]
-async fn a_read_that_waits_for_a_numbering_succeeds_under_repeatable_read() {
-    let test = "a_read_that_waits_for_a_numbering_succeeds_under_repeatable_read";
+async fn a_read_during_a_numbering_succeeds_under_repeatable_read() {
+    let test = "a_read_during_a_numbering_succeeds_under_repeatable_read";
     if base_conn().is_none() {
         return skip(test);
     }
-    let s = scratch(Some("repeatable read")).await;
+    let s = scratch(Some("repeatable read"), 12).await;
     let (key_info, _, arn) = s.stream_table().await;
     // The first numbering waits at its commit, holding the shard's row.
     install_commit_gate(
@@ -812,31 +793,345 @@ async fn a_read_that_waits_for_a_numbering_succeeds_under_repeatable_read() {
     let numbering = s.engine.number_pending_stream_records_for_tests();
     let read = async {
         wait_until_blocked_by(&s.db, gate_pid, "advisory").await?;
-        Ok::<_, String>(
-            s.engine
-                .get_stream_records(ACCOUNT, &arn, &shard, None, PAGE)
-                .await,
-        )
+        let started = std::time::Instant::now();
+        let read = s
+            .engine
+            .get_stream_records(ACCOUNT, &arn, &shard, None, PAGE)
+            .await;
+        Ok::<_, String>((read, started.elapsed()))
     };
     let release = async {
-        // The numbering waits on the gate, and the read on the numbering.
-        let waited = wait_for_lock_waiters(&s.db, 2).await;
+        let parked = wait_until_blocked_by(&s.db, gate_pid, "advisory").await;
+        // The read looks at the shard while the numbering holds it.
+        tokio::time::sleep(Duration::from_millis(200)).await;
         open_gate(&mut gate).await;
-        waited
+        parked
     };
-    let (numbered, read, waited) = tokio::time::timeout(Duration::from_secs(30), async {
+    let (numbered, read, parked) = tokio::time::timeout(Duration::from_secs(30), async {
         tokio::join!(numbering, read, release)
     })
     .await
     .expect("the numbering and the read finished");
-    let read = read.unwrap_or_else(|e| panic!("{e}"));
-    if let Err(e) = waited {
+    let (read, waited) = read.unwrap_or_else(|e| panic!("{e}"));
+    if let Err(e) = parked {
         panic!("{e}; the read returned {read:?}");
     }
     assert_eq!(numbered.expect("the first numbering commits"), 1);
-    let (records, _) = read.expect("the read that waited succeeds");
+    let (records, _) = read.expect("the read during the numbering succeeds");
     assert_eq!(values(&records), ["held"]);
+    assert!(
+        waited >= Duration::from_millis(150),
+        "the read returned after {waited:?}, before the numbering committed"
+    );
 
     drop(gate);
+    s.cleanup().await;
+}
+
+/// Readers of a shard that another transaction numbers wait for it with no
+/// pool connection held. Twice as many readers as the pool has connections
+/// wait on a held shard, and a write must still get a connection at once.
+/// When each waiting reader held a connection, the write waited until the
+/// shard was released.
+#[tokio::test]
+async fn readers_waiting_for_a_numbering_leave_the_pool_to_writes() {
+    let test = "readers_waiting_for_a_numbering_leave_the_pool_to_writes";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    const POOL: u32 = 10;
+    let s = scratch(None, POOL).await;
+    let (key_info, _, arn) = s.stream_table().await;
+    let shard = s.shard_of("p").await;
+    s.put(&key_info, "p", "1", "pending").await;
+
+    // An outside transaction holds the shard's row, as a running numbering
+    // does.
+    let mut holder = s.db.begin().await.expect("begin the outside transaction");
+    sqlx::query("SELECT 1 FROM stream_shards WHERE shard_id = $1 FOR NO KEY UPDATE")
+        .bind(&shard)
+        .execute(&mut *holder)
+        .await
+        .expect("hold the shard");
+    let readers = futures::future::join_all((0..2 * POOL).map(|_| s.read(&arn, &shard, None)));
+    let write = async {
+        // The readers reach the held shard first.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let started = std::time::Instant::now();
+        let put = tokio::time::timeout(
+            Duration::from_secs(5),
+            s.put(&key_info, "q", "1", "unrelated"),
+        )
+        .await;
+        let took = started.elapsed();
+        holder.rollback().await.expect("release the shard");
+        (put.is_ok(), took)
+    };
+    let (reads, (put_done, took)) = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(readers, write)
+    })
+    .await
+    .expect("the readers and the write finished");
+    assert!(
+        put_done && took < Duration::from_secs(1),
+        "the write took {took:?} while {} readers waited on the held shard",
+        2 * POOL
+    );
+    for (records, _) in &reads {
+        assert_eq!(values(records), ["pending"], "each reader gets the record");
+    }
+
+    s.cleanup().await;
+}
+
+/// About 100 KB of text that compresses poorly, from a fixed seed.
+fn noise(len: usize, seed: u64) -> String {
+    let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            char::from(b"0123456789abcdef"[(x % 16) as usize])
+        })
+        .collect()
+}
+
+/// A numbering transaction stops adding records to its batch once the
+/// records before the next one hold a mebibyte, so the shard's row is held
+/// for a bounded copy. Records of about 100 KB go about ten to a
+/// transaction, and one pass of the worker still numbers them all.
+#[tokio::test]
+async fn a_numbering_batch_stops_at_a_mebibyte_of_records() {
+    let test = "a_numbering_batch_stops_at_a_mebibyte_of_records";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    const RECORDS: u64 = 30;
+    let s = scratch(None, 12).await;
+    let (key_info, _, _) = s.stream_table().await;
+    let shard = s.shard_of("big").await;
+    for i in 0..RECORDS {
+        s.put(&key_info, "big", &format!("{i:02}"), &noise(100_000, i))
+            .await;
+    }
+    let moved = s
+        .engine
+        .number_pending_stream_records_for_tests()
+        .await
+        .expect("number the pending records");
+    assert_eq!(moved, RECORDS, "one pass numbers every record");
+
+    // The records one numbering transaction moved share its xmin.
+    let rows: Vec<(String, String, i32)> = sqlx::query_as(
+        "SELECT xmin::text, sequence_number, pg_column_size(record_data) FROM stream_records \
+         WHERE shard_id = $1 ORDER BY sequence_number",
+    )
+    .bind(&shard)
+    .fetch_all(&s.db)
+    .await
+    .expect("read the numbered records");
+    let mut batches: Vec<(String, Vec<i64>)> = Vec::new();
+    for (xmin, _, size) in rows {
+        match batches.last_mut() {
+            Some((x, sizes)) if *x == xmin => sizes.push(i64::from(size)),
+            _ => batches.push((xmin, vec![i64::from(size)])),
+        }
+    }
+    assert!(
+        batches.len() >= 3,
+        "{RECORDS} records of about 100 KB took {} transaction(s)",
+        batches.len()
+    );
+    for (xmin, sizes) in &batches {
+        let before_last: i64 = sizes[..sizes.len() - 1].iter().sum();
+        assert!(
+            before_last < 1 << 20,
+            "transaction {xmin} took {} records, {before_last} bytes before its last",
+            sizes.len()
+        );
+    }
+
+    s.cleanup().await;
+}
+
+/// Writers put, delete, and put two items on two shards in one
+/// TransactWriteItems, on eight hot items, while the numbering worker runs in
+/// a loop and two consumers page every shard. Each consumer must read every
+/// record once, both must read each shard in the same order, and each item's
+/// records must chain: the old image of a record is the new image of the
+/// item's record before it, or none after a delete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writes_of_every_kind_beside_the_worker_reach_two_consumers_in_order() {
+    let test = "writes_of_every_kind_beside_the_worker_reach_two_consumers_in_order";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    const WRITERS: usize = 8;
+    const OPS: usize = 120;
+    let s = scratch(None, 20).await;
+    let (key_info, table_id, arn) = s.stream_table().await;
+    let shards: Vec<String> =
+        sqlx::query_scalar("SELECT shard_id FROM stream_shards WHERE table_id = $1 ORDER BY 1")
+            .bind(&table_id)
+            .fetch_all(&s.db)
+            .await
+            .expect("list the shards");
+    // Four hot items on one shard and four on another.
+    let (mut left, mut right) = (Vec::new(), Vec::new());
+    for i in 0..200 {
+        let pk = format!("h{i}");
+        let shard = s.shard_of(&pk).await;
+        if shard == shards[0] && left.len() < 4 {
+            left.push(pk);
+        } else if shard == shards[1] && right.len() < 4 {
+            right.push(pk);
+        }
+    }
+    assert_eq!((left.len(), right.len()), (4, 4), "hot items on two shards");
+
+    let maps = ExpressionMaps::default();
+    let cap = capture();
+    let expected = std::sync::atomic::AtomicUsize::new(0);
+    let done = AtomicBool::new(false);
+    let writers = async {
+        futures::future::join_all((0..WRITERS).map(|w| {
+            let (s, key_info, maps, cap, left, right, expected) =
+                (&s, &key_info, &maps, &cap, &left, &right, &expected);
+            async move {
+                for i in 0..OPS {
+                    let tag = format!("w{w}-{i}");
+                    let (a, b) = (&left[(w + i) % 4], &right[(w * 3 + i) % 4]);
+                    match i % 10 {
+                        7 => {
+                            let key = BTreeMap::from([
+                                ("pk".to_owned(), AttributeValue::S(a.clone())),
+                                ("sk".to_owned(), AttributeValue::S("s".to_owned())),
+                            ]);
+                            let old = s
+                                .engine
+                                .delete_item(key_info, &key, true, None, maps, Some(cap))
+                                .await
+                                .expect("a delete");
+                            if old.is_some() {
+                                expected.fetch_add(1, Ordering::SeqCst);
+                            }
+                        }
+                        8 | 9 => {
+                            let (x, y) = (item(a, "s", &tag), item(b, "s", &format!("{tag}b")));
+                            let put = |item| TransactWriteOp::Put {
+                                key_info,
+                                item,
+                                condition: None,
+                                maps,
+                                return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+                                stream: Some(cap.clone()),
+                            };
+                            let ops = [put(&x), put(&y)];
+                            if s.engine.transact_write_items(&ops, None).await.is_ok() {
+                                expected.fetch_add(2, Ordering::SeqCst);
+                            }
+                        }
+                        _ => {
+                            s.put(key_info, a, "s", &tag).await;
+                            expected.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                }
+            }
+        }))
+        .await;
+        done.store(true, Ordering::SeqCst);
+    };
+    let worker = async {
+        while !done.load(Ordering::SeqCst) {
+            s.engine
+                .number_pending_stream_records_for_tests()
+                .await
+                .expect("a worker pass");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    let consumer = || async {
+        let mut cursors: Vec<Option<String>> = vec![None; shards.len()];
+        let mut read: Vec<Vec<StreamRecord>> = vec![Vec::new(); shards.len()];
+        loop {
+            let finished = done.load(Ordering::SeqCst);
+            for ((shard, cursor), got) in shards.iter().zip(cursors.iter_mut()).zip(read.iter_mut())
+            {
+                loop {
+                    let (page, last) = s.read(&arn, shard, cursor.as_deref()).await;
+                    if page.is_empty() {
+                        break;
+                    }
+                    *cursor = last;
+                    got.extend(page);
+                }
+            }
+            if finished {
+                return read;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    };
+    let ((), (), first, second) = tokio::time::timeout(Duration::from_secs(120), async {
+        tokio::join!(writers, worker, consumer(), consumer())
+    })
+    .await
+    .expect("the writers, the worker and the consumers finished");
+
+    let expected = expected.load(Ordering::SeqCst);
+    for (name, read) in [("first", &first), ("second", &second)] {
+        let all: Vec<&StreamRecord> = read.iter().flatten().collect();
+        assert_eq!(all.len(), expected, "the {name} consumer's record count");
+        let tags: Vec<String> = all
+            .iter()
+            .filter_map(|r| match r.dynamodb.new_image.as_ref()?.get("v") {
+                Some(AttributeValue::S(v)) => Some(v.clone()),
+                _ => None,
+            })
+            .collect();
+        let distinct: BTreeSet<&String> = tags.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            tags.len(),
+            "the {name} consumer read a write twice"
+        );
+        for shard in read {
+            for pair in shard.windows(2) {
+                assert!(
+                    pair[0].dynamodb.sequence_number < pair[1].dynamodb.sequence_number,
+                    "the {name} consumer's numbers go back on a shard"
+                );
+            }
+        }
+        let mut last_image: BTreeMap<String, Option<Item>> = BTreeMap::new();
+        for r in &all {
+            let pk = string_key(r, "pk");
+            let before = last_image.get(&pk).cloned().flatten();
+            assert_eq!(
+                r.dynamodb.old_image, before,
+                "the {name} consumer: item {pk}'s record {} does not follow its record before",
+                r.dynamodb.sequence_number
+            );
+            last_image.insert(pk, r.dynamodb.new_image.clone());
+        }
+    }
+    let numbers = |read: &Vec<Vec<StreamRecord>>| -> Vec<Vec<String>> {
+        read.iter()
+            .map(|shard| {
+                shard
+                    .iter()
+                    .map(|r| r.dynamodb.sequence_number.clone())
+                    .collect()
+            })
+            .collect()
+    };
+    assert_eq!(
+        numbers(&first),
+        numbers(&second),
+        "both consumers read the same records"
+    );
+
     s.cleanup().await;
 }

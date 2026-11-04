@@ -12,6 +12,10 @@
 -- `id` orders the records of a shard. Two writes to one item take the item's
 -- row lock in turn, so the second inserts its record after the first commits
 -- and gets the higher `id`. IF NOT EXISTS makes a second run change nothing.
+--
+-- Every record is inserted here and deleted by its numbering, so the table
+-- holds few live rows and many dead ones. Autovacuum takes it once 1,000 rows
+-- are dead, whatever its size.
 
 CREATE TABLE IF NOT EXISTS stream_pending (
     shard_id TEXT NOT NULL REFERENCES stream_shards(shard_id) ON DELETE CASCADE,
@@ -21,4 +25,11 @@ CREATE TABLE IF NOT EXISTS stream_pending (
     record_data JSONB NOT NULL,
     created_at TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (shard_id, id)
-);
+) WITH (autovacuum_vacuum_scale_factor = 0, autovacuum_vacuum_threshold = 1000);
+
+-- The order of a shard's records needs both sequences to hand out values in
+-- the order of the calls across sessions, which a cache of more than one
+-- value per session breaks. Both have a cache of 1 when they are created;
+-- these statements set it again on a database where it was changed.
+ALTER SEQUENCE stream_seq CACHE 1;
+ALTER SEQUENCE stream_pending_id_seq CACHE 1;
