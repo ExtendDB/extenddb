@@ -11,9 +11,8 @@ The storage layer provides a trait-based abstraction for all persistent data ope
 `storage` crate with no database-specific dependencies. Backend implementations live in separate crates (e.g.,
 `storage-postgres`) and are installed once from a thin `main` via `set_backend`, one backend per binary.
 
-The trait-based design allows new storage backends to be added by implementing the storage traits and registering a
-factory function, with no changes needed to the `engine` or `server` crates. The factory pattern enables runtime
-backend selection based on configuration.
+A new storage backend implements the storage traits in its own crate and needs no change to the `engine` or `server`
+crates.
 
 **Current status**: four backends implement the storage traits, in `storage-postgres`, `storage-sqlite`, `storage-mongodb`
 and `storage-cassandra`. Each binary is built with one of them.
