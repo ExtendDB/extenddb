@@ -130,11 +130,14 @@ fn other_arn_fields_keep_the_supplied_spelling() {
         R,
         A,
     );
-    assert_eq!(v[0].resource, CANON);
-    assert_eq!(v[0].supplied, respelled_table);
+    // The item actions on the target come first and the restore action on
+    // the source last (issue #446).
+    let (source, target) = v.split_last().expect("restore targets");
+    assert_eq!(source.resource, CANON);
+    assert_eq!(source.supplied, respelled_table);
     let ptarget = "arn:aws:dynamodb:us-east-1:444455556666:table/pitr";
     assert!(
-        v[1..]
+        target
             .iter()
             .all(|t| t.resource == ptarget && t.supplied == ptarget)
     );
