@@ -158,8 +158,10 @@ fn qualify(keyspace: &str, file: &str, statement: &str) -> Result<Statement, Mig
     let first_line = statement.lines().next().unwrap_or_default();
     let refuse = || {
         MigrationError::Store(format!(
-            "migration file {file} has a statement that names no table the runner can qualify \
-             with a keyspace: {first_line}"
+            "Migration file {file} has a statement the runner cannot qualify with a keyspace: \
+             {first_line}. The runner supports CREATE TABLE, CREATE INDEX, ALTER TABLE, \
+             DROP TABLE IF EXISTS, INSERT INTO and DELETE FROM, each naming an unquoted table \
+             without a keyspace."
         ))
     };
     let (at, ddl) = table_offset(statement).ok_or_else(refuse)?;
@@ -364,6 +366,35 @@ mod tests {
             assert!(
                 error.contains("f.cql") && error.contains("qualify"),
                 "{error}"
+            );
+        }
+        // The message names both causes (#676): a form the runner does not
+        // handle, here an UPDATE, and a form it handles whose table it still
+        // cannot qualify, here one with a keyspace and one in quotes. It
+        // quotes the statement's first line.
+        for (sql, first_line) in [
+            (
+                "UPDATE settings\nSET value = 'x' WHERE key = 'y'",
+                "UPDATE settings",
+            ),
+            (
+                "CREATE TABLE other.t (a int PRIMARY KEY)",
+                "CREATE TABLE other.t (a int PRIMARY KEY)",
+            ),
+            (
+                "CREATE TABLE \"T\" (a int PRIMARY KEY)",
+                "CREATE TABLE \"T\" (a int PRIMARY KEY)",
+            ),
+        ] {
+            assert_eq!(
+                one(sql),
+                Err(format!(
+                    "Migration file f.cql has a statement the runner cannot qualify with a \
+                     keyspace: {first_line}. The runner supports CREATE TABLE, CREATE INDEX, \
+                     ALTER TABLE, DROP TABLE IF EXISTS, INSERT INTO and DELETE FROM, each \
+                     naming an unquoted table without a keyspace."
+                )),
+                "{sql}"
             );
         }
         // One bad statement refuses the whole file, before anything runs.
