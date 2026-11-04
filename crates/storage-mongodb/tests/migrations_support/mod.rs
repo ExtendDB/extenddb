@@ -22,9 +22,36 @@ use extenddb_storage::migrations::{
     CatalogStatus, LedgerRow, MigrationError, MigrationId, RunReport, Runner,
 };
 use extenddb_storage_mongodb::migrations::{
-    MigrationLock, MongoMigrations, MongoTarget, Timing, catalog_status, lock, migrate_holding,
+    Definitions, Index, MigrationLock, MongoMigrations, MongoTarget, Timing, catalog_status, lock,
+    migrate_holding,
 };
 use futures::TryStreamExt;
+
+/// The catalog definitions migration 1 creates in an empty store.
+pub const CATALOG_EXPECTED: &str =
+    include_str!("../../migrations/catalog/0001_baseline.expected.json");
+
+/// The name of the index migration 6 creates on `access_keys`.
+pub const ACCESS_KEY_ID_INDEX: &str = "access_key_id_1";
+
+/// The catalog definitions after every migration: migration 1's, without
+/// the collection migration 5 drops, with the index migration 6 creates.
+pub fn catalog_after_every_migration() -> Definitions {
+    let mut catalog: Definitions = serde_json::from_str(CATALOG_EXPECTED).expect("catalog");
+    catalog.remove("continuous_backups");
+    catalog
+        .get_mut("access_keys")
+        .expect("access_keys")
+        .indexes
+        .insert(
+            ACCESS_KEY_ID_INDEX.to_owned(),
+            Index {
+                key: vec![("access_key_id".to_owned(), serde_json::json!(1))],
+                options: [("unique".to_owned(), serde_json::json!(true))].into(),
+            },
+        );
+    catalog
+}
 
 /// The server the tests run against, or `None` to skip.
 ///

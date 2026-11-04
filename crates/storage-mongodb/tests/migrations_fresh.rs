@@ -16,7 +16,7 @@ use extenddb_storage::migrations::{
 use extenddb_storage_mongodb::migrations::{
     Definitions, MigrationLock, MongoMigrations, Timing, describe_store, lock,
 };
-use migrations_support::{Deployment, server};
+use migrations_support::{ACCESS_KEY_ID_INDEX, Deployment, catalog_after_every_migration, server};
 
 const CATALOG_EXPECTED: &str = include_str!("../migrations/catalog/0001_baseline.expected.json");
 const DATA_EXPECTED: &str = include_str!("../migrations/data/0001_baseline.expected.json");
@@ -303,7 +303,7 @@ async fn a_fresh_store_gets_every_migration_and_the_expected_definitions() {
     let Some(uri) = server() else { return };
     let d = Deployment::new(&uri, "fresh").await;
     let report = d.create().await;
-    assert_eq!((report.from, report.to), (None, Some(5)));
+    assert_eq!((report.from, report.to), (None, Some(6)));
     let applied: Vec<(u32, String)> = report
         .applied
         .iter()
@@ -318,6 +318,7 @@ async fn a_fresh_store_gets_every_migration_and_the_expected_definitions() {
             (3, d.target.catalog.clone()),
             (4, d.target.catalog.clone()),
             (5, d.target.catalog.clone()),
+            (6, d.target.catalog.clone()),
         ]
     );
     let not_applicable: Vec<u32> = report
@@ -327,7 +328,7 @@ async fn a_fresh_store_gets_every_migration_and_the_expected_definitions() {
         .map(|s| s.id)
         .collect();
     assert_eq!(not_applicable, [3, 4], "{report:?}");
-    assert_eq!(d.status().await, CatalogStatus::Current { version: 5 });
+    assert_eq!(d.status().await, CatalogStatus::Current { version: 6 });
     let rows = d.catalog_ledger().await;
     let outcomes: Vec<(u32, Outcome)> = rows.iter().map(|r| (r.id, r.outcome)).collect();
     assert_eq!(
@@ -338,6 +339,7 @@ async fn a_fresh_store_gets_every_migration_and_the_expected_definitions() {
             (3, Outcome::NotApplicable),
             (4, Outcome::NotApplicable),
             (5, Outcome::Applied),
+            (6, Outcome::Applied),
         ]
     );
     assert!(
@@ -347,7 +349,7 @@ async fn a_fresh_store_gets_every_migration_and_the_expected_definitions() {
     let data_rows = Deployment::documents(&d.data(), "extenddb_migrations").await;
     assert_eq!(data_rows.len(), 1);
     assert_eq!(data_rows[0].get_i64("_id"), Ok(1));
-    assert_eq!(d.setting("catalog_version").await.as_deref(), Some("5"));
+    assert_eq!(d.setting("catalog_version").await.as_deref(), Some("6"));
     assert_eq!(d.setting("resource_tag_migration").await, None);
     let history = Deployment::documents(&d.catalog(), "schema_history").await;
     assert_eq!(history.len(), 1);
@@ -356,11 +358,15 @@ async fn a_fresh_store_gets_every_migration_and_the_expected_definitions() {
     let (catalog, data) = definitions(&d).await;
     if std::env::var("EXTENDDB_BLESS_EXPECTED").as_deref() == Ok("1") {
         let dir = env!("CARGO_MANIFEST_DIR");
-        // Migration 1's file keeps the collection migration 5 drops.
+        // Migration 1's file keeps the collection migration 5 drops and
+        // lacks the index migration 6 creates.
         let committed: Definitions = serde_json::from_str(CATALOG_EXPECTED).expect("catalog");
         let mut catalog_at_1 = catalog.clone();
         if let Some(dropped) = committed.get("continuous_backups") {
             catalog_at_1.insert("continuous_backups".to_owned(), dropped.clone());
+        }
+        if let Some(access_keys) = catalog_at_1.get_mut("access_keys") {
+            access_keys.indexes.remove(ACCESS_KEY_ID_INDEX);
         }
         for (path, defs) in [("catalog", &catalog_at_1), ("data", &data)] {
             let text = serde_json::to_string_pretty(defs).expect("json") + "\n";
@@ -371,12 +377,8 @@ async fn a_fresh_store_gets_every_migration_and_the_expected_definitions() {
             .expect("write");
         }
     }
-    let mut expected_catalog: Definitions =
-        serde_json::from_str(CATALOG_EXPECTED).expect("catalog");
-    // Migration 5 drops continuous_backups, which migration 1 creates.
-    expected_catalog.remove("continuous_backups");
     let expected_data: Definitions = serde_json::from_str(DATA_EXPECTED).expect("data");
-    assert_eq!(catalog, expected_catalog);
+    assert_eq!(catalog, catalog_after_every_migration());
     assert_eq!(data, expected_data);
     d.drop_databases().await;
 }
@@ -389,12 +391,12 @@ async fn a_second_run_applies_nothing_and_reconverge_keeps_the_rows() {
     let before = d.catalog_ledger().await;
     let again = d.migrate().await.expect("migrate");
     assert!(again.applied.is_empty());
-    assert_eq!((again.from, again.to), (Some(5), Some(5)));
+    assert_eq!((again.from, again.to), (Some(6), Some(6)));
 
     let reconverged = d.reconverge().await.expect("reconverge");
-    // Migration 1's steps in the catalog and the data database, and migration
-    // 5's in the catalog: 2 is not convergent, and 3 and 4 do not apply on
-    // MongoDB.
+    // Migration 1's steps in the catalog and the data database, and the
+    // steps of migrations 5 and 6 in the catalog: 2 is not convergent, and 3
+    // and 4 do not apply on MongoDB.
     let ran: Vec<(u32, String)> = reconverged
         .applied
         .iter()
@@ -406,6 +408,7 @@ async fn a_second_run_applies_nothing_and_reconverge_keeps_the_rows() {
             (1, d.target.catalog.clone()),
             (1, d.target.data.clone()),
             (5, d.target.catalog.clone()),
+            (6, d.target.catalog.clone()),
         ],
         "{reconverged:?}"
     );
@@ -421,7 +424,7 @@ async fn a_second_run_applies_nothing_and_reconverge_keeps_the_rows() {
         before,
         "reconverge leaves the rows as they are"
     );
-    assert_eq!(d.status().await, CatalogStatus::Current { version: 5 });
+    assert_eq!(d.status().await, CatalogStatus::Current { version: 6 });
     d.drop_databases().await;
 }
 
@@ -456,7 +459,7 @@ async fn forget_clears_an_unreleased_id_and_migrate_applies_it_again() {
     assert_eq!(pending.iter().map(|p| p.id).collect::<Vec<_>>(), [1, 1]);
     let report = d.migrate().await.expect("migrate");
     assert_eq!(report.applied.len(), 2);
-    assert_eq!(d.status().await, CatalogStatus::Current { version: 5 });
+    assert_eq!(d.status().await, CatalogStatus::Current { version: 6 });
     d.drop_databases().await;
 }
 
@@ -473,19 +476,19 @@ async fn a_changed_checksum_a_newer_catalog_and_an_older_release_are_reported() 
         doc! { "_id": id, "name": "later", "kind": kind, "checksum": "c", "outcome": "applied",
         "notes": "", "applied_at": bson::DateTime::now(), "applied_by": "9.9.9" }
     };
-    ledger.insert_one(row(6, "breaking")).await.expect("insert");
+    ledger.insert_one(row(7, "breaking")).await.expect("insert");
     let status = d.status().await;
     assert_eq!(status.label(), "AheadIncompatible");
     assert_eq!(status.exit_code(), exit::AHEAD_INCOMPATIBLE);
     ledger
-        .delete_one(doc! { "_id": 6_i64 })
+        .delete_one(doc! { "_id": 7_i64 })
         .await
         .expect("delete");
-    ledger.insert_one(row(6, "additive")).await.expect("insert");
+    ledger.insert_one(row(7, "additive")).await.expect("insert");
     assert_eq!(d.status().await.label(), "AheadCompatible");
     assert!(d.migrate().await.expect("migrate").applied.is_empty());
     ledger
-        .delete_one(doc! { "_id": 6_i64 })
+        .delete_one(doc! { "_id": 7_i64 })
         .await
         .expect("delete");
 
@@ -500,7 +503,7 @@ async fn a_changed_checksum_a_newer_catalog_and_an_older_release_are_reported() 
     assert_eq!(refused.exit_code(), exit::ATTENTION);
     d.reconverge().await.expect("reconverge");
     assert_eq!(d.setting("resource_tag_migration").await, None);
-    assert_eq!(d.status().await, CatalogStatus::Current { version: 5 });
+    assert_eq!(d.status().await, CatalogStatus::Current { version: 6 });
     settings
         .update_one(
             doc! { "_id": "catalog_version" },
@@ -510,7 +513,7 @@ async fn a_changed_checksum_a_newer_catalog_and_an_older_release_are_reported() 
         .expect("version");
     assert_eq!(d.status().await.label(), "WrittenByOlderRelease");
     d.reconverge().await.expect("reconverge");
-    assert_eq!(d.setting("catalog_version").await.as_deref(), Some("5"));
+    assert_eq!(d.setting("catalog_version").await.as_deref(), Some("6"));
 
     // A recorded checksum this binary's body does not have.
     ledger
@@ -558,6 +561,6 @@ async fn a_ledger_document_this_binary_cannot_read_stops_the_status() {
         .expect_err("an error");
     migrations.close().await;
     assert!(error.to_string().contains("\"sideways\""), "{error}");
-    assert_eq!(MigrationId::LATEST.number(), 5);
+    assert_eq!(MigrationId::LATEST.number(), 6);
     d.drop_databases().await;
 }

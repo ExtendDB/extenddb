@@ -67,11 +67,16 @@ migration_ids! {
     /// it.
     DropContinuousBackups = 5, "drop_continuous_backups",
         "drop the continuous_backups table, which no request reads or writes since #335";
+    /// Makes every access key ID unique. PostgreSQL, SQLite and Cassandra key
+    /// `access_keys` by the ID; MongoDB had no unique index on it, so an
+    /// import stored a second key under an ID that a key already had.
+    UniqueAccessKeyIds = 6, "unique_access_key_ids",
+        "make every access key ID unique, which the MongoDB catalog did not enforce";
 }
 
 /// Highest id that has shipped in a release. Bodies at or below it are frozen:
 /// each backend pins their checksums, kinds and convergent flags, and
-/// `forget` refuses them. The v1.0 release PR raises it to 5.
+/// `forget` refuses them. The v1.0 release PR raises it to 6.
 pub const RELEASED_THROUGH: u32 = 0;
 
 impl MigrationId {

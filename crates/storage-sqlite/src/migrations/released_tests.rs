@@ -390,11 +390,14 @@ async fn a_catalog_an_older_release_wrote_to_is_reported_and_reconverged() {
 
         next_second().await;
         let report = reconverge(&db).await.expect("reconverge");
-        // Every convergent migration ran again; migration 2, which is not
-        // convergent, is named as skipped.
+        // Every convergent migration with a body on SQLite ran again;
+        // migration 2, which is not convergent, is named as skipped.
         let convergent = MigrationId::ALL
             .into_iter()
-            .filter(|id| super::migration(*id).convergent())
+            .filter(|id| {
+                let migration = super::migration(*id);
+                migration.convergent() && !migration.bodies().is_empty()
+            })
             .count();
         assert_eq!(report.applied.len(), convergent, "{trace}: {report:?}");
         let skipped = format!("Skipped {}:", MigrationId::ResourceTagConditionKeys);
