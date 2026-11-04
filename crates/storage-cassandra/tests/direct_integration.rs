@@ -33,6 +33,8 @@ mod delete_item;
 mod groups;
 #[path = "direct/index.rs"]
 mod index;
+#[path = "direct/index_propagation_setting.rs"]
+mod index_propagation_setting;
 #[path = "direct/keyspace_migrations.rs"]
 mod keyspace_migrations;
 #[path = "direct/metadata_engine.rs"]

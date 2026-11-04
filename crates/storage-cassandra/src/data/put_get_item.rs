@@ -172,12 +172,10 @@ impl CassandraEngine {
                 index.propagation_delay_ms = Some(0);
             }
         }
-        let sys_delay = if indexes.is_empty() || index_writes == IndexWrites::AllSynchronous {
-            0
-        } else {
-            self.gsi_default_delay_ms
-                .load(std::sync::atomic::Ordering::Relaxed)
-        };
+        // Read live, once per request, and only when some GSI follows the
+        // system setting. `AllSynchronous` set every index's delay to 0
+        // above, so it reads nothing.
+        let sys_delay = self.system_index_delay(&indexes).await;
 
         // Always use read-then-write path to check prepared_txn_id for transaction safety.
         // This ensures non-transactional writes cannot corrupt in-flight transactions.

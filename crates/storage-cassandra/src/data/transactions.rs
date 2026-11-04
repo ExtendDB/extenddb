@@ -1021,10 +1021,15 @@ impl CassandraEngine {
             pre_commit_images.push(image);
         }
 
+        // The system GSI delay, read live at most once for the whole
+        // transaction, and only if some item's table has a GSI that follows
+        // the system setting (see `commit_secondary_effects`).
+        let sys_delay = tokio::sync::OnceCell::new();
+
         // TODO: Execute COMMIT operations for each item in parallel
         // For now, sequential execution
         for op in ops {
-            self.commit_single_operation(op, txn_id, txn_timestamp)
+            self.commit_single_operation(op, txn_id, txn_timestamp, &sys_delay)
                 .await?;
         }
 
@@ -1593,6 +1598,7 @@ impl CassandraEngine {
         op: &TransactWriteOp<'_>,
         txn_id: Uuid,
         txn_timestamp: i64,
+        sys_delay: &tokio::sync::OnceCell<u64>,
     ) -> Result<(), StorageError> {
         let txn_id_bytes = Bytes::new(txn_id.as_bytes().to_vec());
 
@@ -1623,8 +1629,15 @@ impl CassandraEngine {
                     old_image.as_ref(),
                     Some(item),
                 );
-                self.commit_secondary_effects(key_info, None, Some(item), &indexes, stream_stmt)
-                    .await
+                self.commit_secondary_effects(
+                    key_info,
+                    None,
+                    Some(item),
+                    &indexes,
+                    stream_stmt,
+                    sys_delay,
+                )
+                .await
             }
             TransactWriteOp::Update {
                 key_info,
@@ -1664,6 +1677,7 @@ impl CassandraEngine {
                     Some(&final_item),
                     &indexes,
                     stream_stmt,
+                    sys_delay,
                 )
                 .await
             }
@@ -1783,7 +1797,7 @@ impl CassandraEngine {
                     old_image.as_ref(),
                     None,
                 );
-                self.commit_secondary_effects(key_info, None, None, &[], stream_stmt)
+                self.commit_secondary_effects(key_info, None, None, &[], stream_stmt, sys_delay)
                     .await
             }
             TransactWriteOp::ConditionCheck { key_info, key, .. } => {
@@ -1992,6 +2006,7 @@ impl CassandraEngine {
         new_item: Option<&Item>,
         indexes: &[super::index::IndexMeta],
         stream_stmt: Option<String>,
+        sys_delay: &tokio::sync::OnceCell<u64>,
     ) -> Result<(), StorageError> {
         let data_keyspace = self.account_keyspace(&key_info.account_id);
 
@@ -2005,9 +2020,16 @@ impl CassandraEngine {
         if let Some(new_item) = new_item
             && !indexes.is_empty()
         {
-            let sys_delay = self
-                .gsi_default_delay_ms
-                .load(std::sync::atomic::Ordering::Relaxed);
+            // Read live once for the transaction: the first item whose table
+            // has a GSI following the system setting fills `sys_delay`, and
+            // later items reuse it. An item with none reads nothing.
+            let sys_delay = if indexes.iter().any(crate::engine::follows_system_delay) {
+                *sys_delay
+                    .get_or_init(|| self.index_propagation_delay())
+                    .await
+            } else {
+                0
+            };
             super::index::sync_indexes(
                 &mut batch,
                 &data_keyspace,

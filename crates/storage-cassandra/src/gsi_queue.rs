@@ -60,20 +60,80 @@ pub(crate) fn jitter_delay_ms(delay_ms: u64) -> u64 {
 }
 
 /// Handle for waking GSI workers after a write enqueues rows.
+///
+/// One `Notify` per worker partition, each with exactly one waiter: the
+/// partition's worker. A wake uses `notify_one`, which stores a permit when
+/// the worker is not waiting (busy applying rows), so the worker's next wait
+/// returns at once instead of sleeping a full idle period with a due row in
+/// the queue (#407).
 pub struct GsiQueue {
-    pub(crate) notify: Arc<Notify>,
+    notify: [Notify; NUM_WORKERS as usize],
 }
 
 impl GsiQueue {
     #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            notify: Arc::new(Notify::new()),
+            notify: std::array::from_fn(|_| Notify::new()),
         })
     }
 
-    /// Wake all workers after a write inserts into `gsi_pending`.
+    /// Wake all workers after a write inserts into `gsi_pending`. A worker
+    /// that is not waiting gets the wake on its next wait.
     pub fn notify_workers(&self) {
-        self.notify.notify_waiters();
+        for notify in &self.notify {
+            notify.notify_one();
+        }
+    }
+
+    /// Resolves when a write wakes `worker_id`, or at once if one already
+    /// did since its last wait.
+    pub(crate) async fn notified(&self, worker_id: u64) {
+        // `worker_id` is always below NUM_WORKERS: the workers are spawned
+        // for `0..NUM_WORKERS`.
+        #[allow(clippy::cast_possible_truncation)]
+        self.notify[worker_id as usize].notified().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GsiQueue;
+    use std::time::Duration;
+
+    /// What a worker does when it finds no due row: wait for a wake, at most
+    /// `bound`. `true` when woken.
+    async fn worker_wait(queue: &GsiQueue, worker_id: u64, bound: Duration) -> bool {
+        tokio::time::timeout(bound, queue.notified(worker_id))
+            .await
+            .is_ok()
+    }
+
+    /// A write can land while a worker is busy applying rows, not parked. Its
+    /// wake must be kept for the worker's next wait, or the worker sleeps a
+    /// full idle period with a due row in the queue (#407). Every partition's
+    /// worker gets it.
+    #[tokio::test]
+    async fn a_wake_sent_while_no_worker_waits_is_kept() {
+        let queue = GsiQueue::new();
+        queue.notify_workers();
+        for worker_id in 0..super::NUM_WORKERS {
+            assert!(
+                worker_wait(&queue, worker_id, Duration::from_millis(10)).await,
+                "the wake sent before worker {worker_id} waited was lost"
+            );
+        }
+    }
+
+    /// A kept wake is used once: the worker's next wait after it sleeps.
+    #[tokio::test]
+    async fn a_kept_wake_is_used_once() {
+        let queue = GsiQueue::new();
+        queue.notify_workers();
+        assert!(worker_wait(&queue, 0, Duration::from_millis(10)).await);
+        assert!(
+            !worker_wait(&queue, 0, Duration::from_millis(10)).await,
+            "one wake woke the worker twice"
+        );
     }
 }

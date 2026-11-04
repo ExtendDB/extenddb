@@ -49,7 +49,10 @@ pub struct CassandraEngine {
     /// Wakes the control plane poller when a table enters CREATING or DELETING state
     pub(crate) control_plane_notify: Arc<tokio::sync::Notify>,
 
-    /// Default GSI propagation delay in milliseconds (for async indexes)
+    /// Last-known system GSI propagation delay in milliseconds. Writes read
+    /// the setting live through [`Self::index_propagation_delay`]; this is
+    /// its fallback when that read fails, re-warmed by every successful read
+    /// and by the background poller.
     pub(crate) gsi_default_delay_ms: Arc<std::sync::atomic::AtomicU64>,
 
     /// Short-lived cache of per-table TTL configuration for the write path.
@@ -129,7 +132,9 @@ impl CassandraEngine {
             replication_factor: config.replication_factor,
             datacenter: config.datacenter.clone(),
             control_plane_notify: Arc::new(tokio::sync::Notify::new()),
-            gsi_default_delay_ms: Arc::new(std::sync::atomic::AtomicU64::new(10)), // Default 10ms
+            gsi_default_delay_ms: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::DEFAULT_INDEX_PROPAGATION_DELAY_MS,
+            )),
             ttl_config_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             ttl_config_cache_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             gsi_queue: crate::gsi_queue::GsiQueue::new(),
@@ -232,6 +237,81 @@ impl CassandraEngine {
         format!("{}_account_{}", self.keyspace_prefix, account_id)
     }
 
+    /// Current system GSI propagation delay (ms); `0` means synchronous.
+    ///
+    /// Reads the `index_propagation_delay_ms` setting live from the catalog,
+    /// as SQLite and PostgreSQL do, so a change made with `extenddb settings
+    /// set` from another process applies to the next write rather than up to
+    /// 5 s later, when the poller refreshes the cached value (#407). Callers
+    /// call this only for a table with an index that can be asynchronous, so
+    /// a table without one pays nothing.
+    ///
+    /// On a read error the cached value is used and the error is logged, so a
+    /// degraded catalog serves a stale delay loudly rather than silently. On
+    /// success the cache is re-warmed.
+    pub(crate) async fn index_propagation_delay(&self) -> u64 {
+        use cdrs_tokio::types::IntoRustByName as _;
+        use std::sync::atomic::Ordering;
+
+        let query = format!(
+            "SELECT key, value FROM {}.settings \
+             WHERE key IN ('index_propagation_delay_ms', 'gsi_propagation_delay_ms')",
+            self.catalog_keyspace()
+        );
+        let rows = crate::cassandra_util::query_rows::<StorageError>(
+            &self.session,
+            &query,
+            cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
+            "index_propagation_delay",
+        )
+        .await;
+        match rows {
+            Ok(rows) => {
+                let (mut canonical, mut legacy) = (None, None);
+                for row in &rows {
+                    let key: Option<String> = row.get_by_name("key").ok().flatten();
+                    let value: Option<String> = row.get_by_name("value").ok().flatten();
+                    match key.as_deref() {
+                        Some("index_propagation_delay_ms") => canonical = value,
+                        Some("gsi_propagation_delay_ms") => legacy = value,
+                        _ => {}
+                    }
+                }
+                let ms = propagation_delay_from_settings(canonical.as_deref(), legacy.as_deref());
+                self.gsi_default_delay_ms.store(ms, Ordering::Relaxed);
+                ms
+            }
+            Err(e) => {
+                let ms = self.gsi_default_delay_ms.load(Ordering::Relaxed);
+                tracing::warn!(
+                    "Failed to read index_propagation_delay_ms, using the last known value \
+                     {ms} ms: {e}"
+                );
+                ms
+            }
+        }
+    }
+
+    /// The system delay a write to a table with `indexes` needs: the live
+    /// [`Self::index_propagation_delay`] when some GSI follows the system
+    /// setting, else `0` with no catalog read.
+    ///
+    /// `0` is safe to return in the second case because nothing reads it: an
+    /// LSI is always synchronous, and a GSI with a delay of its own uses that
+    /// (see [`crate::data::index::effective_delay`]). Callers on the request
+    /// path call this once per request, and once per transaction, not once
+    /// per index or per item.
+    pub(crate) async fn system_index_delay(
+        &self,
+        indexes: &[crate::data::index::IndexMeta],
+    ) -> u64 {
+        if indexes.iter().any(follows_system_delay) {
+            self.index_propagation_delay().await
+        } else {
+            0
+        }
+    }
+
     /// Create a keyspace with `NetworkTopologyStrategy`.
     pub async fn create_keyspace(&self, keyspace_name: &str) -> Result<(), StorageError> {
         let cql = format!(
@@ -287,6 +367,76 @@ impl CassandraEngine {
             ));
         }
         Ok(())
+    }
+}
+
+/// The propagation delay a catalog's settings give, matching SQLite and
+/// PostgreSQL: the canonical `index_propagation_delay_ms` wins when its row
+/// exists, else the pre-rename `gsi_propagation_delay_ms`; a missing or
+/// unparseable value is [`crate::DEFAULT_INDEX_PROPAGATION_DELAY_MS`].
+pub(crate) fn propagation_delay_from_settings(
+    canonical: Option<&str>,
+    legacy: Option<&str>,
+) -> u64 {
+    canonical
+        .or(legacy)
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(crate::DEFAULT_INDEX_PROPAGATION_DELAY_MS)
+}
+
+/// Whether `index` takes its delay from the system setting: a GSI that sets
+/// no delay of its own (or a negative one, which
+/// [`crate::data::index::effective_delay`] reads the same way). An LSI never
+/// does: it is always written synchronously.
+pub(crate) fn follows_system_delay(index: &crate::data::index::IndexMeta) -> bool {
+    index.index_type != "LSI" && index.propagation_delay_ms.is_none_or(|ms| ms < 0)
+}
+
+#[cfg(test)]
+mod propagation_delay_tests {
+    use super::follows_system_delay;
+    use super::propagation_delay_from_settings as delay;
+    use crate::DEFAULT_INDEX_PROPAGATION_DELAY_MS as DEFAULT;
+
+    fn index(index_type: &str, propagation_delay_ms: Option<i32>) -> crate::data::index::IndexMeta {
+        crate::data::index::IndexMeta {
+            index_name: "i".to_owned(),
+            index_id: "i".to_owned(),
+            index_type: index_type.to_owned(),
+            key_schema: Vec::new(),
+            projection: extenddb_core::types::Projection {
+                projection_type: extenddb_core::types::ProjectionType::All,
+                non_key_attributes: None,
+            },
+            propagation_delay_ms,
+        }
+    }
+
+    #[test]
+    fn only_a_gsi_without_its_own_delay_follows_the_setting() {
+        assert!(follows_system_delay(&index("GSI", None)));
+        assert!(follows_system_delay(&index("GSI", Some(-1))));
+        assert!(!follows_system_delay(&index("GSI", Some(0))));
+        assert!(!follows_system_delay(&index("GSI", Some(500))));
+        assert!(!follows_system_delay(&index("LSI", None)));
+    }
+
+    #[test]
+    fn canonical_key_wins() {
+        assert_eq!(delay(Some("0"), Some("999")), 0);
+        assert_eq!(delay(Some("250"), None), 250);
+    }
+
+    #[test]
+    fn legacy_key_is_read_when_canonical_is_absent() {
+        assert_eq!(delay(None, Some("0")), 0);
+    }
+
+    #[test]
+    fn missing_or_unparseable_is_the_default() {
+        assert_eq!(delay(None, None), DEFAULT);
+        assert_eq!(delay(Some("soon"), Some("0")), DEFAULT);
+        assert_eq!(delay(None, Some("-1")), DEFAULT);
     }
 }
 

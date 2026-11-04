@@ -197,12 +197,9 @@ impl CassandraEngine {
             fetch_indexes_for_table(&key_info.table_id, &self.session, &catalog_keyspace),
             self.ttl_config_for_table(&key_info.account_id, &key_info.table_name),
         )?;
-        let sys_delay = if indexes.is_empty() {
-            0
-        } else {
-            self.gsi_default_delay_ms
-                .load(std::sync::atomic::Ordering::Relaxed)
-        };
+        // Read live, once per request, and only when some GSI follows the
+        // system setting.
+        let sys_delay = self.system_index_delay(&indexes).await;
 
         if let Some((sk_name, sk_type)) =
             sk_info(&key_info.key_schema, &key_info.attribute_definitions)
@@ -922,6 +919,10 @@ impl CassandraEngine {
         if indexes.is_empty() {
             return Ok(());
         }
+        // The cached value, refreshed every 5 s by `poll_gsi_delay`, not a
+        // live read: only the background TTL sweep calls this, once per
+        // expired item, so a live read would add a catalog read per item for
+        // no client-visible gain.
         let default_delay = self
             .gsi_default_delay_ms
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -989,6 +990,8 @@ impl CassandraEngine {
         let indexes =
             fetch_indexes_for_table(&key_info.table_id, &self.session, &self.catalog_keyspace())
                 .await?;
+        // The cached value, not a live read: only the background TTL sweep
+        // calls this (see `restore_sync_indexes_for_item`).
         let default_delay = self
             .gsi_default_delay_ms
             .load(std::sync::atomic::Ordering::Relaxed);

@@ -60,12 +60,9 @@ impl CassandraEngine {
             ),
             self.ttl_config_for_table(&key_info.account_id, &key_info.table_name),
         )?;
-        let sys_delay = if indexes.is_empty() {
-            0
-        } else {
-            self.gsi_default_delay_ms
-                .load(std::sync::atomic::Ordering::Relaxed)
-        };
+        // Read live, once per request (not per OCC attempt), and only when
+        // some GSI follows the system setting.
+        let sys_delay = self.system_index_delay(&indexes).await;
         // Resolve sort key once — used in every iteration of the OCC loop.
         let (sk_opt, sk_col_opt) = if let Some(sk_elem) = key_info
             .key_schema

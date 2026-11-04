@@ -972,9 +972,10 @@ impl MetadataEngine for CassandraEngine {
                     &self.catalog_keyspace(),
                 )
                 .await?;
-                let default_delay = self
-                    .gsi_default_delay_ms
-                    .load(std::sync::atomic::Ordering::Relaxed);
+                // Live, so a `settings set` made just before this request
+                // decides the refusal; no read when no GSI follows the
+                // system setting.
+                let default_delay = self.system_index_delay(&indexes).await;
                 if let Some((index_name, delay)) = indexes.iter().find_map(|index| {
                     let delay = crate::data::index::effective_delay(index, default_delay);
                     (index.index_type == "GSI" && delay != 0)

@@ -12,6 +12,13 @@
 /// and the console's default all read this one value.
 pub(crate) const DEFAULT_CONTROL_PLANE_DELAY_SECONDS: f64 = 0.25;
 
+/// Default secondary-index propagation delay (milliseconds) when the
+/// `index_propagation_delay_ms` setting is absent or unparseable, as it is on
+/// a catalog the migrations created. The same value as SQLite and PostgreSQL,
+/// and the single definition used by the live read on the write path, the
+/// background refresh worker, and the engine's starting value.
+pub(crate) const DEFAULT_INDEX_PROPAGATION_DELAY_MS: u64 = 10;
+
 mod admin_store;
 mod authorization_store;
 mod backup_engine;

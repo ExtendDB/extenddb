@@ -13,9 +13,6 @@ use extenddb_storage::{CancellationToken, sleep_or_shutdown};
 
 use crate::CassandraEngine;
 
-/// Poll `index_propagation_delay_ms` from settings every 5 seconds and update
-/// the in-memory atomic used by `put_item/update_item/delete_item`, until
-/// `shutdown` fires.
 /// How long `spawn_workers` waits for the GSI delay setting before it spawns
 /// the workers. A set starts after every registration again, while the
 /// server admits nothing and acts on no loss, so the read is bounded; the
@@ -43,6 +40,15 @@ pub(crate) async fn read_gsi_delay<S: SettingsStore + ?Sized>(
     tokio::time::timeout(bound, read).await.ok().flatten()
 }
 
+/// Read `index_propagation_delay_ms` from settings every 5 seconds into
+/// `gsi_delay`, until `shutdown` fires.
+///
+/// Client writes read the setting live
+/// ([`CassandraEngine::index_propagation_delay`]); this keeps the cached
+/// value current for the background TTL sweep, which uses it, and as the
+/// fallback when a live read fails. The value is chosen the same way as the
+/// live read: the canonical key, else the pre-rename one, else
+/// [`crate::DEFAULT_INDEX_PROPAGATION_DELAY_MS`] when missing or unparseable.
 pub(crate) async fn poll_gsi_delay<S: SettingsStore + ?Sized>(
     store: Arc<S>,
     gsi_delay: Arc<AtomicU64>,
@@ -51,27 +57,27 @@ pub(crate) async fn poll_gsi_delay<S: SettingsStore + ?Sized>(
     const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
     while sleep_or_shutdown(&shutdown, POLL_INTERVAL).await {
-        match store.get_setting("index_propagation_delay_ms").await {
-            Ok(Some(val)) => {
-                if let Ok(ms) = val.parse::<u64>() {
-                    gsi_delay.store(ms, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
-            Ok(None) => {
-                // Fall back to legacy key name, then to the canonical default.
-                let ms = store
-                    .get_setting("gsi_propagation_delay_ms")
-                    .await
-                    .ok()
-                    .flatten()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(10);
-                gsi_delay.store(ms, std::sync::atomic::Ordering::Relaxed);
-            }
+        let canonical = match store.get_setting("index_propagation_delay_ms").await {
+            Ok(value) => value,
             Err(e) => {
                 tracing::debug!("Failed to query index_propagation_delay_ms: {e:?}");
+                continue;
             }
-        }
+        };
+        let legacy = if canonical.is_none() {
+            match store.get_setting("gsi_propagation_delay_ms").await {
+                Ok(value) => value,
+                Err(e) => {
+                    tracing::debug!("Failed to query gsi_propagation_delay_ms: {e:?}");
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let ms =
+            crate::engine::propagation_delay_from_settings(canonical.as_deref(), legacy.as_deref());
+        gsi_delay.store(ms, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -270,18 +276,23 @@ async fn gsi_worker(worker_id: u64, engine: Arc<CassandraEngine>, shutdown: Canc
             return;
         }
         match gsi_process_batch(worker_id, &engine).await {
-            Ok(0) => {
-                // Nothing ready. Sleep until the next row is due or a write wakes us.
-                let wait = gsi_next_ready_wait(worker_id, &engine)
-                    .await
-                    .unwrap_or(MAX_IDLE)
-                    .min(MAX_IDLE);
+            Ok(batch) if batch.applied > 0 => continue,
+            Ok(batch) => {
+                // Nothing applied. Sleep until the earliest row not yet due
+                // becomes due, or a write wakes us, at most MAX_IDLE (#407).
+                let wait = batch.next_due_ms.map_or(MAX_IDLE, |due| {
+                    let ms = due.saturating_sub(crate::cassandra_util::now_millis());
+                    #[allow(clippy::cast_sign_loss)]
+                    Duration::from_millis(ms.max(0) as u64)
+                });
                 tokio::select! {
                     () = shutdown.cancelled() => {}
-                    _ = tokio::time::timeout(wait, engine.gsi_queue.notify.notified()) => {}
+                    _ = tokio::time::timeout(
+                        wait.min(MAX_IDLE),
+                        engine.gsi_queue.notified(worker_id),
+                    ) => {}
                 }
             }
-            Ok(_) => continue,
             Err(e) => {
                 tracing::error!("GSI worker {worker_id}: {e}");
                 let _ = sleep_or_shutdown(&shutdown, MAX_IDLE).await;
@@ -290,28 +301,35 @@ async fn gsi_worker(worker_id: u64, engine: Arc<CassandraEngine>, shutdown: Canc
     }
 }
 
-/// Time until the earliest not-yet-due row in this partition becomes eligible.
-async fn gsi_next_ready_wait(worker_id: u64, engine: &CassandraEngine) -> Option<Duration> {
-    // We need to find the minimum ready_at across all account keyspaces.
-    // For simplicity, use MAX_IDLE as the wait — the worker will re-check
-    // promptly. A more precise implementation would query each keyspace.
-    // TODO: query MIN(ready_at) per keyspace and return the smallest delta.
-    let _ = (worker_id, engine);
-    None
+/// What one pass of a worker over its partition found.
+struct GsiBatch {
+    /// Rows applied (and deleted from the queue).
+    applied: usize,
+    /// `ready_at` (ms) of the earliest row seen that was not yet due, across
+    /// all account keyspaces: when the worker has work again.
+    next_due_ms: Option<i64>,
 }
 
-/// Claim and process up to 100 ready rows from this worker's partition across
-/// all account keyspaces. Returns the total number applied.
+/// Apply the due rows of this worker's partition, up to 100 per account
+/// keyspace, and find when the next row is due.
+///
+/// Each keyspace's partition is read in `(ready_at, id)` order without a
+/// `ready_at` filter. Rows are applied until the first one not yet due; that
+/// row's `ready_at` is the keyspace's next due time. One query per keyspace
+/// gives both, where a separate `MIN(ready_at)` read would double the
+/// worker's reads. "Due" is judged with this server's clock, the one
+/// `enqueue_async_indexes` used to set `ready_at`.
 async fn gsi_process_batch(
     worker_id: u64,
     engine: &CassandraEngine,
-) -> Result<usize, extenddb_storage::error::StorageError> {
+) -> Result<GsiBatch, extenddb_storage::error::StorageError> {
     use cdrs_tokio::query_values;
     use cdrs_tokio::types::IntoRustByName as _;
     use extenddb_core::types::Item;
 
     let keyspaces = list_account_keyspaces(engine).await?;
     let mut total = 0usize;
+    let mut next_due_ms: Option<i64> = None;
     #[allow(clippy::cast_possible_truncation)]
     let worker_id_i32 = worker_id as i32;
 
@@ -319,7 +337,7 @@ async fn gsi_process_batch(
         let query = format!(
             "SELECT worker_partition, ready_at, id, table_id, old_item, new_item, index_context \
              FROM {keyspace}.gsi_pending \
-             WHERE worker_partition = ? AND ready_at <= toTimestamp(now()) \
+             WHERE worker_partition = ? \
              ORDER BY ready_at ASC, id ASC \
              LIMIT 100"
         );
@@ -342,8 +360,19 @@ async fn gsi_process_batch(
             Err(e) => return Err(e),
         };
 
+        let now_ms = crate::cassandra_util::now_millis();
         for row in rows {
-            let ready_at: i64 = crate::cassandra_util::get_column(&row, "ready_at", "gsi_worker")?;
+            // A partition whose queued rows are all deleted still returns its
+            // static `last_ready_at` as a row with no clustering key: no work.
+            let ready_at: Option<i64> = row.get_by_name("ready_at").ok().flatten();
+            let Some(ready_at) = ready_at else {
+                continue;
+            };
+            if ready_at > now_ms {
+                // Rows come in ready_at order: none after this one is due.
+                next_due_ms = Some(next_due_ms.map_or(ready_at, |due| due.min(ready_at)));
+                break;
+            }
             let id: uuid::Uuid = crate::cassandra_util::get_column(&row, "id", "gsi_worker")?;
             let table_id: String =
                 crate::cassandra_util::get_column(&row, "table_id", "gsi_worker")?;
@@ -413,7 +442,10 @@ async fn gsi_process_batch(
         }
     }
 
-    Ok(total)
+    Ok(GsiBatch {
+        applied: total,
+        next_due_ms,
+    })
 }
 
 /// Apply a single GSI update (delete old row, insert new row) for one pending entry.
