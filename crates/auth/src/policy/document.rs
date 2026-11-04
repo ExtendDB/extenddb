@@ -7,6 +7,7 @@
 //! `ActionMatch` and `ResourceMatch` enums prevent invalid states where both
 //! `Action` and `NotAction` (or `Resource` and `NotResource`) are present.
 
+use extenddb_core::limits::DEFAULT_MAX_POLICY_DOCUMENT_BYTES;
 use serde_json::Value;
 use std::fmt;
 
@@ -142,22 +143,26 @@ impl fmt::Display for PolicyParseError {
 impl std::error::Error for PolicyParseError {}
 
 impl PolicyDocument {
-    /// Parse a policy document from a JSON string.
+    /// Parse a policy document from a JSON string, with the default size
+    /// limit ([`DEFAULT_MAX_POLICY_DOCUMENT_BYTES`]).
     ///
-    /// Enforces the default 6,144-byte size limit (matching AWS IAM inline
-    /// policy limit). This applies to both write-path validation and read-path
-    /// parsing of stored policies — a stored policy exceeding this limit will
-    /// fail to parse, triggering fail-closed denial (defense in depth).
+    /// The server parses with the configured `max_policy_document_bytes`
+    /// instead, through [`Self::from_json_with_size_limit`] on the read path
+    /// and [`Self::from_json_for_write`] on the write path.
     ///
     /// # Errors
     ///
     /// Returns `PolicyParseError` if the JSON is malformed or contains
     /// invalid policy constructs (e.g., both Action and `NotAction`).
     pub fn from_json(json: &str) -> Result<Self, PolicyParseError> {
-        Self::from_json_with_size_limit(json, 6_144)
+        Self::from_json_with_size_limit(json, DEFAULT_MAX_POLICY_DOCUMENT_BYTES)
     }
 
     /// Parse a policy document with an explicit size limit.
+    ///
+    /// The read path parses a stored policy this way, with the same limit the
+    /// write path applies: a stored policy over the limit does not parse, and
+    /// its principal is denied (fail closed).
     ///
     /// # Errors
     ///
@@ -185,17 +190,18 @@ impl PolicyDocument {
     /// a managed or boundary policy) and apply the checks the service applies
     /// only when a policy is written.
     ///
-    /// Everything `from_json` checks, plus the `Sid` charset. The `Sid` check
-    /// runs at write only: a `Sid` is a statement label that does not affect
-    /// evaluation, so a policy stored before this check existed must keep
-    /// parsing on the request path rather than fail the principal closed.
+    /// Everything [`Self::from_json_with_size_limit`] checks with `max_bytes`,
+    /// the configured `max_policy_document_bytes`, plus the `Sid` charset. The
+    /// `Sid` check runs at write only: a `Sid` is a statement label that does
+    /// not affect evaluation, so a policy stored before this check existed must
+    /// keep parsing on the request path rather than fail the principal closed.
     ///
     /// # Errors
     ///
-    /// Returns `PolicyParseError` if `from_json` rejects the document or a
-    /// statement `Sid` is outside the service's charset.
-    pub fn from_json_for_write(json: &str) -> Result<Self, PolicyParseError> {
-        let doc = Self::from_json(json)?;
+    /// Returns `PolicyParseError` if the document exceeds `max_bytes`, does
+    /// not parse, or has a statement `Sid` outside the service's charset.
+    pub fn from_json_for_write(json: &str, max_bytes: usize) -> Result<Self, PolicyParseError> {
+        let doc = Self::from_json_with_size_limit(json, max_bytes)?;
         validate_statement_sids(&doc.statements)?;
         Ok(doc)
     }
@@ -681,7 +687,8 @@ mod tests {
                 r#"{{"Version":"2012-10-17","Statement":[{{"Sid":"{sid}","Effect":"Allow","Action":"dynamodb:GetItem","Resource":"*"}}]}}"#
             );
             assert!(
-                PolicyDocument::from_json_for_write(&json).is_err(),
+                PolicyDocument::from_json_for_write(&json, DEFAULT_MAX_POLICY_DOCUMENT_BYTES)
+                    .is_err(),
                 "should reject Sid {sid:?} at write"
             );
             // A policy stored before the check existed still parses on the
@@ -700,10 +707,30 @@ mod tests {
                 r#"{{"Version":"2012-10-17","Statement":[{{"Sid":"{sid}","Effect":"Allow","Action":"dynamodb:GetItem","Resource":"*"}}]}}"#
             );
             assert!(
-                PolicyDocument::from_json_for_write(&json).is_ok(),
+                PolicyDocument::from_json_for_write(&json, DEFAULT_MAX_POLICY_DOCUMENT_BYTES)
+                    .is_ok(),
                 "should accept Sid {sid:?}"
             );
         }
+    }
+
+    /// Both paths take the limit from the caller: a document of exactly
+    /// `max_bytes` parses, and one byte over does not.
+    #[test]
+    fn the_size_limit_is_the_one_the_caller_passes() {
+        let json = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"dynamodb:GetItem","Resource":"*"}]}"#;
+        let at = json.len();
+        assert!(PolicyDocument::from_json_with_size_limit(json, at).is_ok());
+        assert!(PolicyDocument::from_json_for_write(json, at).is_ok());
+        let over = PolicyDocument::from_json_for_write(json, at - 1).expect_err("one byte over");
+        assert_eq!(
+            over.to_string(),
+            format!(
+                "policy parse error: policy document exceeds maximum size ({} bytes)",
+                at - 1
+            )
+        );
+        assert!(PolicyDocument::from_json_with_size_limit(json, at - 1).is_err());
     }
 
     #[test]

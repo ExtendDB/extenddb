@@ -200,9 +200,10 @@ async fn put_policy(
     // Strict parse-on-write: reject documents the policy evaluator cannot parse.
     {
         let json_str = document.to_string();
-        if let Err(e) =
-            extenddb_auth::policy::document::PolicyDocument::from_json_for_write(&json_str)
-        {
+        if let Err(e) = extenddb_auth::policy::document::PolicyDocument::from_json_for_write(
+            &json_str,
+            state.max_policy_document_bytes,
+        ) {
             return (
                 StatusCode::BAD_REQUEST,
                 format!("Invalid policy document: {e}"),
