@@ -50,6 +50,85 @@ fn native_attribute_name(path: &[PathElement], maps: &ExpressionMaps) -> Option<
     (!attr_name.contains('.') && !attr_name.starts_with('$')).then(|| attr_name.into_owned())
 }
 
+/// The most digits each operand of a numeric `ADD` can have on the native
+/// `MongoDB` fast path when both operands are integers. The sum then has at
+/// most 34 digits, which a BSON `Decimal128` holds exactly.
+const NATIVE_ADD_INTEGER_DIGITS: usize = 33;
+
+/// The most digits before the decimal point that each operand can have on the
+/// native fast path when either operand has a fraction. Twenty digits hold
+/// every 64-bit integer.
+const NATIVE_ADD_DECIMAL_INTEGER_DIGITS: usize = 20;
+
+/// The most digits after the decimal point that each operand can have on the
+/// native fast path. With [`NATIVE_ADD_DECIMAL_INTEGER_DIGITS`], the aligned
+/// sum has at most 21 + 13 = 34 digits.
+const NATIVE_ADD_DECIMAL_FRACTION_DIGITS: usize = 13;
+
+/// A numeric `ADD` delta the native fast path can add, with the stored values
+/// it can be added to.
+struct NativeAddDelta {
+    /// The `Decimal128` of the delta's normalized text.
+    value: bson::Decimal128,
+    /// The pattern the stored `.N` text must match: a number written without
+    /// an exponent, within the digit limits that keep the sum exact.
+    stored: String,
+}
+
+/// The delta of a numeric `ADD` as the native fast path adds it. An integer
+/// of at most [`NATIVE_ADD_INTEGER_DIGITS`] digits can be added to a stored
+/// integer of at most as many digits. A delta within
+/// [`NATIVE_ADD_DECIMAL_INTEGER_DIGITS`] and
+/// [`NATIVE_ADD_DECIMAL_FRACTION_DIGITS`] can be added to a stored number
+/// within the same limits. Either way the sum is exact, and a nonzero sum is
+/// at least 1E-13 and below 2E33 in magnitude, so `DynamoDB` can store it.
+/// `None` sends the update to the session path, where the update evaluator
+/// range checks both operands and the sum.
+///
+/// A `Decimal128` keeps 34 digits and holds magnitudes the service refuses.
+/// Without these limits, `GetItem` on `MongoDB` 7 returned
+/// `99999999999999999999999999999999990000` after
+/// `99999999999999999999999999999999999999 + 1` and
+/// `1.000000000000000000000000000000000E+126` after `5E125 + 5E125`, where
+/// the service answers `100000000000000000000000000000000000000` and
+/// `Number overflow` (measured 2026-11-03).
+///
+/// The pipeline writes the sum as `Decimal128` text, which reads normalize:
+/// `2.25 + -0.25` is written `2.00`, and a sum below 1E-6 in magnitude can be
+/// written with an exponent, such as `1E-7` or `0E-13`. The pattern refuses
+/// an exponent, so the next `ADD` to such a value takes the session path,
+/// which writes the normalized text.
+fn native_add_delta(n: &str) -> Option<NativeAddDelta> {
+    let normalized = extenddb_core::validation::number::validate_and_normalize_number(n).ok()?;
+    let unsigned = normalized.strip_prefix('-').unwrap_or(&normalized);
+    let (integer, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    let digits_only = integer
+        .bytes()
+        .chain(fraction.bytes())
+        .all(|b| b.is_ascii_digit());
+    if !digits_only {
+        return None;
+    }
+    let integers = format!("[0-9]{{1,{NATIVE_ADD_INTEGER_DIGITS}}}");
+    let decimals = format!(
+        r"[0-9]{{1,{NATIVE_ADD_DECIMAL_INTEGER_DIGITS}}}(\.[0-9]{{1,{NATIVE_ADD_DECIMAL_FRACTION_DIGITS}}})?"
+    );
+    let fits_decimals = integer.len() <= NATIVE_ADD_DECIMAL_INTEGER_DIGITS
+        && fraction.len() <= NATIVE_ADD_DECIMAL_FRACTION_DIGITS;
+    let stored = match (fraction.is_empty(), fits_decimals) {
+        (true, true) => format!(r"\A-?({integers}|{decimals})\z"),
+        (true, false) if integer.len() <= NATIVE_ADD_INTEGER_DIGITS => {
+            format!(r"\A-?{integers}\z")
+        }
+        (false, true) => format!(r"\A-?{decimals}\z"),
+        _ => return None,
+    };
+    Some(NativeAddDelta {
+        value: normalized.parse().ok()?,
+        stored,
+    })
+}
+
 #[derive(Clone, Copy)]
 enum TransactionKind {
     ReadOnly,
@@ -827,7 +906,9 @@ impl MongoEngine {
                     // Compose the key filter with the type guard. If
                     // the doc exists but fails the guard, findAndModify
                     // returns None and we fall through to the slow
-                    // path (which raises ValidationException).
+                    // path, which raises ValidationException for a
+                    // value that is not a number and adds a number
+                    // outside the native digit limits.
                     // Upsert is disabled here because a missing-doc
                     // "no match" is indistinguishable from a
                     // type-mismatch "no match"; the slow path handles
@@ -1614,15 +1695,16 @@ impl MongoEngine {
     /// - `Some(NativeUpdate::Doc(...))` for a plain operator update
     ///   (`$set`/`$unset`/`$inc`), served by
     ///   `find_one_and_update(filter, doc)`.
-    /// - `Some(NativeUpdate::Pipeline(...))` for numeric `ADD`, which
+    /// - `Some(NativeUpdate::Pipeline(...))` for a numeric `ADD` of a delta
+    ///   that `native_add_delta` accepts, which
     ///   requires an aggregation-pipeline update (`$set` with computed
     ///   expressions) to convert the string-stored `.N` value to a
     ///   `Decimal128`, add the delta, and convert back — all
     ///   server-side.
-    /// - `None` on anything else — set-typed `ADD`, `DELETE`,
-    ///   `list_append`, `if_not_exists`, arithmetic, multi-component
-    ///   paths. Those fall through to the session-scoped
-    ///   read-modify-write path.
+    /// - `None` on anything else: set-typed `ADD`, a numeric `ADD` of a
+    ///   delta that `native_add_delta` refuses, `DELETE`, `list_append`,
+    ///   `if_not_exists`, arithmetic, multi-component paths. Those fall
+    ///   through to the session-scoped read-modify-write path.
     ///
     /// The pipeline form is what makes RFC-0003 §4.4 achievable
     /// without a numeric shadow field: 50+ concurrent
@@ -1635,7 +1717,7 @@ impl MongoEngine {
     ) -> Option<NativeUpdate> {
         let mut set_doc = Document::new();
         let mut unset_doc = Document::new();
-        let mut num_adds: Vec<(String, String)> = Vec::new();
+        let mut num_adds: Vec<(String, NativeAddDelta)> = Vec::new();
 
         for action in actions {
             match action {
@@ -1650,13 +1732,11 @@ impl MongoEngine {
                     };
                     match val {
                         AttributeValue::N(n) => {
-                            // Validate the delta parses as Decimal128
-                            // up-front so a bad number fails fast
-                            // rather than mid-pipeline on mongo.
-                            if n.parse::<bson::Decimal128>().is_err() {
-                                return None;
-                            }
-                            num_adds.push((attr_name, n.clone()));
+                            // Only a delta `native_add_delta` accepts takes
+                            // this path, and the filter below admits only
+                            // the stored values that keep the sum exact and
+                            // in range.
+                            num_adds.push((attr_name, native_add_delta(n)?));
                         }
                         AttributeValue::SS(_) | AttributeValue::NS(_) | AttributeValue::BS(_) => {
                             // Set ADD — $addToSet would work in theory
@@ -1715,27 +1795,28 @@ impl MongoEngine {
             for k in unset_doc.keys() {
                 stage.insert(k, "$$REMOVE");
             }
-            // Guard: the fast path never reads the pre-image, so we
-            // can't detect an existing non-numeric attribute (e.g.
-            // ADD to a string). Require every ADD target to be
-            // absent or already hold `.N` — else return no match and
-            // let the caller fall back to the slow path, which reads
-            // the pre-image and returns a proper ValidationException.
+            // Guard: the fast path never reads the pre-image, so it cannot
+            // see an attribute that is not a number (ADD to a string), or a
+            // stored number the sum would round or take out of range.
+            // Require every ADD target to be absent or to hold a number
+            // written without an exponent, within the digit limits that
+            // keep the sum with its delta exact (`NativeAddDelta::stored`).
+            // Otherwise the filter matches nothing and the caller falls back
+            // to the slow path, which reads the pre-image and applies the
+            // update with the update evaluator: the sum, a type mismatch, or
+            // the number check's ValidationException.
             let mut guard_clauses: Vec<Document> = Vec::with_capacity(num_adds.len());
-            for (attr, delta_s) in &num_adds {
+            for (attr, delta) in &num_adds {
                 let field = format!("item_data.{attr}.N");
                 let field_ref = format!("${field}");
                 let attr_path = format!("item_data.{attr}");
-                let delta_dec = delta_s
-                    .parse::<bson::Decimal128>()
-                    .expect("validated above");
                 stage.insert(
                     &field,
                     doc! {
                         "$toString": {
                             "$add": [
                                 { "$toDecimal": { "$ifNull": [ &field_ref, "0" ] } },
-                                { "$toDecimal": bson::Bson::Decimal128(delta_dec) },
+                                { "$toDecimal": bson::Bson::Decimal128(delta.value) },
                             ]
                         }
                     },
@@ -1743,7 +1824,7 @@ impl MongoEngine {
                 guard_clauses.push(doc! {
                     "$or": [
                         { &attr_path: { "$exists": false } },
-                        { &field: { "$exists": true } },
+                        { &field: { "$regex": delta.stored.as_str() } },
                     ]
                 });
             }
@@ -3505,12 +3586,14 @@ const TRANSIENT_RETRY_ATTEMPTS: u32 = 50;
 /// converts a string-stored `.N` value to Decimal128, applies the
 /// delta, and converts back).
 ///
-/// `Pipeline` carries an optional `type_guard` filter — for numeric
-/// ADD we require the target attribute to be absent or already an
-/// `.N` so we don't clobber a string with a number. When the guard
-/// rejects the match, `find_one_and_update` returns `None`, and the
-/// caller falls back to the slow (session-scoped) path which reads
-/// the pre-image and surfaces a proper `ValidationException`.
+/// `Pipeline` carries an optional `type_guard` filter: for numeric
+/// ADD the target attribute must be absent or hold a number within
+/// the native digit limits (`NativeAddDelta::stored`), so a string is
+/// not clobbered with a number and the sum stays exact. When the
+/// guard rejects the match, `find_one_and_update` returns `None`, and
+/// the caller falls back to the slow (session-scoped) path, which
+/// reads the pre-image and either applies the update with the update
+/// evaluator or surfaces a `ValidationException`.
 enum NativeUpdate {
     Doc(Document),
     Pipeline {
@@ -4463,5 +4546,111 @@ transaction_read_concern = "majority""#,
             stage.get("item_data.p"),
             Some(&bson::Bson::Document(want_plain))
         );
+    }
+
+    /// `ADD n :v` with `:v` set to `delta`, built for the native path.
+    fn native_add(delta: &str) -> Option<NativeUpdate> {
+        let values = std::collections::HashMap::from([(
+            "v".to_owned(),
+            AttributeValue::N(delta.to_owned()),
+        )]);
+        let maps = ExpressionMaps::new(std::collections::HashMap::new(), values);
+        let tokens = expression::tokenize("ADD n :v").unwrap();
+        let actions = expression::parse_update(&tokens).unwrap();
+        MongoEngine::try_build_native_update(&actions, &maps)
+    }
+
+    /// A delta takes the native path when its normalized text is an integer
+    /// of at most 33 digits, or has at most 20 digits before the decimal
+    /// point and 13 after it. With the filter on the stored value (see the
+    /// next test), the `Decimal128` sum is then exact and in range. A longer
+    /// number, a number out of range and a value that is not a number go to
+    /// the session path, where the update evaluator checks the operands and
+    /// the sum (see `native_add_delta` for what `GetItem` returned without
+    /// these limits).
+    #[test]
+    fn native_add_takes_only_a_delta_that_can_keep_the_sum_exact() {
+        let integer = "9".repeat(33);
+        let widest = format!("{}.{}", "9".repeat(20), "9".repeat(13));
+        for delta in [
+            "1",
+            "-1",
+            "0",
+            "1E3",
+            "+7",
+            "0.5",
+            "-0.25",
+            "2.50",
+            "1E-13",
+            "1E20",
+            integer.as_str(),
+            widest.as_str(),
+        ] {
+            assert!(
+                matches!(native_add(delta), Some(NativeUpdate::Pipeline { .. })),
+                "{delta}"
+            );
+        }
+        let long_integer = "1".repeat(34);
+        let long_whole = format!("{}.5", "1".repeat(21));
+        for delta in [
+            "5E125",
+            "1E33",
+            long_integer.as_str(),
+            long_whole.as_str(),
+            "1E-14",
+            "0.12345678901234",
+            "1E126",
+            "abc",
+            "",
+        ] {
+            assert!(native_add(delta).is_none(), "{delta}");
+        }
+    }
+
+    /// The filter of the native pipeline for `delta`.
+    fn native_add_guard(delta: &str) -> bson::Bson {
+        let Some(NativeUpdate::Pipeline { type_guard, .. }) = native_add(delta) else {
+            panic!("{delta} builds a pipeline update");
+        };
+        let guard = type_guard.expect("an ADD target has a guard");
+        guard.get_array("$or").unwrap()[1].clone()
+    }
+
+    /// The pipeline adds the delta's normalized text. Its filter matches only
+    /// an absent attribute or a stored number written without an exponent,
+    /// within the limits that keep the sum with this delta exact: up to 33
+    /// integer digits when both operands are integers, and up to 20 digits
+    /// before the decimal point and 13 after it when either has a fraction.
+    #[test]
+    fn native_add_adds_the_normalized_delta_and_guards_the_stored_number() {
+        let Some(NativeUpdate::Pipeline { pipeline, .. }) = native_add("1E3") else {
+            panic!("a delta within the limits builds a pipeline update");
+        };
+        let stage = pipeline[0].get_document("$set").unwrap();
+        let add = stage
+            .get_document("item_data.n.N")
+            .and_then(|d| d.get_document("$toString"))
+            .and_then(|d| d.get_array("$add"))
+            .unwrap();
+        let want: bson::Decimal128 = "1000".parse().unwrap();
+        assert_eq!(
+            add[1],
+            bson::Bson::Document(doc! { "$toDecimal": bson::Bson::Decimal128(want) })
+        );
+        let integers = r"[0-9]{1,33}";
+        let decimals = r"[0-9]{1,20}(\.[0-9]{1,13})?";
+        let long_integer = "1".repeat(21);
+        for (delta, stored) in [
+            ("1E3", format!(r"\A-?({integers}|{decimals})\z")),
+            (long_integer.as_str(), format!(r"\A-?{integers}\z")),
+            ("0.5", format!(r"\A-?{decimals}\z")),
+        ] {
+            assert_eq!(
+                native_add_guard(delta),
+                bson::Bson::Document(doc! { "item_data.n.N": { "$regex": stored } }),
+                "{delta}"
+            );
+        }
     }
 }

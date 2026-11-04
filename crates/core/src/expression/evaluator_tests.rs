@@ -438,3 +438,116 @@ fn size_of_null_attribute_yields_no_value() {
     values.insert("zero".into(), AttributeValue::N("0".into()));
     assert!(!eval("size(nu) > :zero", &item, HashMap::new(), values).unwrap());
 }
+
+/// Evaluate `expr_str` on another thread and return its answer, or fail the
+/// test after 10 seconds.
+fn eval_within_10_s(
+    expr_str: &'static str,
+    item: BTreeMap<String, AttributeValue>,
+    values: HashMap<String, AttributeValue>,
+) -> Result<bool, DynamoDbError> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let _ = tx.send(eval(expr_str, &item, HashMap::new(), values));
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok(answer) => answer,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            std::panic::resume_unwind(worker.join().expect_err("no answer and no panic"))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("`{expr_str}` ran for 10 s"),
+    }
+}
+
+/// A number with millions of digits, in a placeholder or in the item, is not
+/// parsed as written: bigdecimal's parse is quadratic in the digit count, and
+/// neither the placeholders nor a stored item are checked for numbers on
+/// every path before a comparison. Such a number is not one the service can
+/// store, and only `<>` is true for it.
+#[test]
+fn a_number_with_millions_of_digits_is_not_parsed() {
+    let long = format!("1{}", "0".repeat(2_000_000));
+    let item = BTreeMap::from([("n".to_owned(), AttributeValue::N("1".to_owned()))]);
+    let values = HashMap::from([("v".to_owned(), AttributeValue::N(long.clone()))]);
+    assert!(!eval_within_10_s("n < :v", item.clone(), values.clone()).unwrap());
+    assert!(eval_within_10_s("n <> :v", item, values).unwrap());
+
+    let item = BTreeMap::from([("n".to_owned(), AttributeValue::N(long))]);
+    let values = HashMap::from([("v".to_owned(), AttributeValue::N("1".to_owned()))]);
+    assert!(!eval_within_10_s("n > :v", item, values).unwrap());
+}
+
+/// A placeholder refused when the maps are built stays refused: a filter
+/// does not read its text again for each item it compares.
+#[test]
+fn a_refused_placeholder_is_read_once_per_request() {
+    let long = format!("1{}", "0".repeat(2_000_000));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let tokens = tokenize("n < :v").unwrap();
+        let expr = parse_condition(&tokens).unwrap();
+        let values = HashMap::from([("v".to_owned(), AttributeValue::N(long))]);
+        let maps = ExpressionMaps::new(HashMap::new(), values);
+        // The refusal is recorded, whatever the build's speed.
+        assert_eq!(maps.get_parsed_numeric("v"), Some(ParsedNumber::Refused));
+        let matched = (0..100)
+            .map(|i| BTreeMap::from([("n".to_owned(), AttributeValue::N(i.to_string()))]))
+            .filter(|item| evaluate_condition(&expr, item, &maps).unwrap())
+            .count();
+        let _ = tx.send(matched);
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok(matched) => assert_eq!(matched, 0),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            std::panic::resume_unwind(worker.join().expect_err("no answer and no panic"))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("100 items against one refused placeholder ran for 10 s")
+        }
+    }
+}
+
+/// A stored number the service cannot store, as an older release could
+/// store it, compares as a value of another type does: only `<>` is true, so
+/// `<>` and `NOT (... = ...)` agree.
+#[test]
+fn a_stored_number_out_of_range_compares_only_as_not_equal() {
+    for stored in ["1E126", "12345678901234567890123456789012345678901", "abc"] {
+        let item = BTreeMap::from([("n".to_owned(), AttributeValue::N(stored.to_owned()))]);
+        for (expr, expected) in [
+            ("n = :v", false),
+            ("n <> :v", true),
+            ("NOT (n = :v)", true),
+            ("n > :v", false),
+            ("n < :v", false),
+            ("n IN (:v)", false),
+            ("n BETWEEN :v AND :v", false),
+        ] {
+            let values = HashMap::from([("v".to_owned(), AttributeValue::N("0".to_owned()))]);
+            assert_eq!(
+                eval(expr, &item, HashMap::new(), values).unwrap(),
+                expected,
+                "{expr}, n = {stored}"
+            );
+        }
+    }
+}
+
+/// A number the service can store still compares numerically, in any
+/// spelling.
+#[test]
+fn numbers_in_any_spelling_compare_by_value() {
+    let item = BTreeMap::from([("n".to_owned(), AttributeValue::N("150".to_owned()))]);
+    for (expr, v) in [
+        ("n = :v", "1.5E2"),
+        ("n = :v", "+150.00"),
+        ("n < :v", "1E125"),
+        ("n > :v", "1E-130"),
+    ] {
+        let values = HashMap::from([("v".to_owned(), AttributeValue::N(v.to_owned()))]);
+        assert!(
+            eval(expr, &item, HashMap::new(), values).unwrap(),
+            "{expr} with :v = {v}"
+        );
+    }
+}

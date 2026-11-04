@@ -21,6 +21,7 @@ use extenddb_core::types::{
     CreateTableInput, ExportFormat, ImportStatus, ImportTableDescription, ImportTableInput,
     ImportTableOutput, Item, TableCreationParameters,
 };
+use extenddb_core::validation::number::operations::{ImportRowFault, import_row};
 use extenddb_core::validation::{
     validate_attribute_name_sizes, validate_item_keys, validate_item_nesting_depth,
     validate_item_size, validate_key_sizes,
@@ -119,33 +120,96 @@ pub async fn handle_import_table(
 
     let mut imported_count: i64 = 0;
     let mut error_count: i64 = 0;
-    let processed_count = i64::try_from(items.len()).unwrap_or(i64::MAX);
+    let mut processed_count: i64 = 0;
+    // Created before the rows are read so that each row's log line names the
+    // import it belongs to; `item_number` counts items, not file lines.
+    let import_arn = format!("{}:import/{}", table_arn, uuid::Uuid::new_v4());
+    let table_name = tcp.table_name.as_str();
 
     for item in items {
+        processed_count += 1;
+        // Numbers before the other checks: a row holding a value that is not
+        // a number ends the import of the file whatever else the row holds,
+        // and a row holding a number out of range is skipped (see
+        // `import_row`).
+        match import_row(&item) {
+            Ok(()) => {}
+            Err(ImportRowFault::OutOfRange(message)) => {
+                tracing::warn!(
+                    import_arn = ?import_arn,
+                    table_name = ?table_name,
+                    item_number = processed_count,
+                    error = %message,
+                    "import: skipping item with a number out of range"
+                );
+                error_count += 1;
+                continue;
+            }
+            Err(ImportRowFault::Malformed) => {
+                tracing::warn!(
+                    import_arn = ?import_arn,
+                    table_name = ?table_name,
+                    item_number = processed_count,
+                    "import: item holds a value that is not a number; the rest of the file is not imported"
+                );
+                error_count += 1;
+                break;
+            }
+        }
         if let Err(e) =
             validate_item_keys(&item, &key_info.key_schema, &key_info.attribute_definitions)
         {
-            tracing::warn!(error = %e, "import: skipping item with invalid keys");
+            tracing::warn!(
+                import_arn = ?import_arn,
+                table_name = ?table_name,
+                item_number = processed_count,
+                error = ?e.to_string(),
+                "import: skipping item with invalid keys"
+            );
             error_count += 1;
             continue;
         }
         if let Err(e) = validate_item_nesting_depth(&item) {
-            tracing::warn!(error = %e, "import: skipping item with excessive nesting");
+            tracing::warn!(
+                import_arn = ?import_arn,
+                table_name = ?table_name,
+                item_number = processed_count,
+                error = ?e.to_string(),
+                "import: skipping item with excessive nesting"
+            );
             error_count += 1;
             continue;
         }
         if let Err(e) = validate_item_size(&item, ctx.limits.max_item_size_bytes) {
-            tracing::warn!(error = %e, "import: skipping oversized item");
+            tracing::warn!(
+                import_arn = ?import_arn,
+                table_name = ?table_name,
+                item_number = processed_count,
+                error = ?e.to_string(),
+                "import: skipping oversized item"
+            );
             error_count += 1;
             continue;
         }
         if let Err(e) = validate_attribute_name_sizes(&item, &ctx.limits) {
-            tracing::warn!(error = %e, "import: skipping item with oversized attribute name");
+            tracing::warn!(
+                import_arn = ?import_arn,
+                table_name = ?table_name,
+                item_number = processed_count,
+                error = ?e.to_string(),
+                "import: skipping item with oversized attribute name"
+            );
             error_count += 1;
             continue;
         }
         if let Err(e) = validate_key_sizes(&item, &key_info.key_schema, &ctx.limits) {
-            tracing::warn!(error = %e, "import: skipping item with oversized key");
+            tracing::warn!(
+                import_arn = ?import_arn,
+                table_name = ?table_name,
+                item_number = processed_count,
+                error = ?e.to_string(),
+                "import: skipping item with oversized key"
+            );
             error_count += 1;
             continue;
         }
@@ -159,11 +223,28 @@ pub async fn handle_import_table(
     }
 
     let end_time = epoch_seconds();
-    let import_arn = format!("{}:import/{}", table_arn, uuid::Uuid::new_v4());
+
+    // An import that refused any row is FAILED with `ItemValidationError`,
+    // and the rows it accepted stay in the table (measured 2026-11-03). The
+    // service's message sends the reader to its error log in CloudWatch;
+    // ExtendDB writes each refused row to the server log instead.
+    let (import_status, failure_code, failure_message) = if error_count > 0 {
+        (
+            ImportStatus::Failed,
+            Some("ItemValidationError".to_owned()),
+            Some(
+                "Some of the items failed validation checks and were not imported. \
+                 Please check the server log for more details."
+                    .to_owned(),
+            ),
+        )
+    } else {
+        (ImportStatus::Completed, None, None)
+    };
 
     let description = ImportTableDescription {
         import_arn,
-        import_status: ImportStatus::Completed,
+        import_status,
         table_arn,
         table_id: Some(table_id),
         file_source: input.file_source,
@@ -174,8 +255,8 @@ pub async fn handle_import_table(
         imported_item_count: imported_count,
         start_time: Some(start_time),
         end_time: Some(end_time),
-        failure_code: None,
-        failure_message: None,
+        failure_code,
+        failure_message,
     };
 
     serialize_output(&ImportTableOutput {

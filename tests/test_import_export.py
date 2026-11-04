@@ -500,3 +500,185 @@ class TestCrossTenantIsolation:
                 })
         finally:
             discard(target)
+
+
+# ---------------------------------------------------------------------------
+# ImportTable rows holding numbers the service cannot store
+#
+# Measured against DynamoDB ImportTable from S3 on 2026-11-03 (us-east-1), one
+# import per file. Unless a test says otherwise, each file held a row with a
+# valid number, the row under test, and another valid row. A row holding a
+# value that is not a number ends the import of the file there; a row holding
+# a number out of range is skipped and the rows after it are imported. Either
+# way the row counts as one error, and an import with any error is FAILED with
+# ItemValidationError, keeping the rows it imported.
+# ---------------------------------------------------------------------------
+
+OUT_OF_RANGE = [
+    pytest.param({"n": {"N": "1E126"}}, id="overflow"),
+    pytest.param({"n": {"N": "1E-131"}}, id="underflow"),
+    pytest.param({"n": {"N": "1" * 39}}, id="39-digits"),
+    pytest.param({"n": {"N": "1E999999999"}}, id="large-exponent"),
+    pytest.param({"n": {"N": "1E2147483647"}}, id="magnitude-wraps"),
+    pytest.param({"s": {"NS": ["1", "1E126"]}}, id="number-set"),
+    pytest.param({"m": {"M": {"x": {"N": "1E126"}}}}, id="in-a-map"),
+    pytest.param({"l": {"L": [{"N": "1E-131"}]}}, id="in-a-list"),
+]
+
+NOT_A_NUMBER = [
+    pytest.param({"n": {"N": "abc"}}, id="letters"),
+    pytest.param({"n": {"N": ""}}, id="empty"),
+    pytest.param({"n": {"N": " 5"}}, id="leading-space"),
+    pytest.param({"n": {"N": "12e"}}, id="no-exponent-digits"),
+    pytest.param({"n": {"N": "1E2147483648"}}, id="exponent-over-32-bits"),
+    pytest.param({"n": {"N": "1E-2147483648"}}, id="scale-over-32-bits"),
+    pytest.param({"s": {"NS": ["1", "abc"]}}, id="number-set"),
+    pytest.param({"a": {"N": "1E126"}, "b": {"N": "abc"}}, id="after-a-number-out-of-range"),
+    # The service imports this row with `5`. ExtendDB does not read a Unicode
+    # decimal digit as the digit in any number (docs/differences-from-dynamodb.md).
+    pytest.param({"n": {"N": "\uff15"}}, id="fullwidth-digit"),
+]
+
+
+class TestImportTableNumbers:
+    """ImportTable refuses rows holding numbers the service cannot store."""
+
+    @staticmethod
+    def _import(table: str, rows: list[dict], key_type: str = "S") -> dict:
+        path = import_source("".join(json.dumps({"Item": row}) + "\n" for row in rows))
+        try:
+            return extenddb_request("ImportTable", {
+                "FileSource": {"Path": path},
+                "InputFormat": "DYNAMODB_JSON",
+                "TableCreationParameters": {
+                    "TableName": table,
+                    "AttributeDefinitions": [
+                        {"AttributeName": "pk", "AttributeType": key_type},
+                    ],
+                    "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                    "BillingMode": "PAY_PER_REQUEST",
+                },
+            })["ImportTableDescription"]
+        finally:
+            discard(path)
+
+    @staticmethod
+    def _counts(desc: dict) -> tuple[int, int, int]:
+        return desc["ProcessedItemCount"], desc["ImportedItemCount"], desc["ErrorCount"]
+
+    @staticmethod
+    def _assert_failed(desc: dict) -> None:
+        assert (desc["ImportStatus"], desc.get("FailureCode")) == ("FAILED", "ItemValidationError")
+        assert desc["FailureMessage"].startswith(
+            "Some of the items failed validation checks and were not imported."
+        )
+
+    @staticmethod
+    def _items(dynamodb_client, table: str) -> dict:
+        items = dynamodb_client.scan(TableName=table, ConsistentRead=True)["Items"]
+        return {next(iter(item["pk"].values())): item for item in items}
+
+    @pytest.mark.parametrize("attrs", OUT_OF_RANGE)
+    def test_a_row_holding_a_number_out_of_range_is_skipped(
+        self, dynamodb_client, unique_table_name, cleanup_table, attrs
+    ):
+        cleanup_table(unique_table_name)
+        desc = self._import(unique_table_name, [
+            {"pk": {"S": "before"}, "n": {"N": "1"}},
+            {"pk": {"S": "under-test"}, **attrs},
+            {"pk": {"S": "after"}, "n": {"N": "2"}},
+        ])
+        assert self._counts(desc) == (3, 2, 1)
+        self._assert_failed(desc)
+        assert sorted(self._items(dynamodb_client, unique_table_name)) == ["after", "before"]
+
+    @pytest.mark.parametrize("attrs", NOT_A_NUMBER)
+    def test_a_row_holding_a_value_that_is_not_a_number_ends_the_import(
+        self, dynamodb_client, unique_table_name, cleanup_table, attrs
+    ):
+        cleanup_table(unique_table_name)
+        desc = self._import(unique_table_name, [
+            {"pk": {"S": "before"}, "n": {"N": "1"}},
+            {"pk": {"S": "under-test"}, **attrs},
+            {"pk": {"S": "after"}, "n": {"N": "2"}},
+        ])
+        assert self._counts(desc) == (2, 1, 1)
+        self._assert_failed(desc)
+        assert sorted(self._items(dynamodb_client, unique_table_name)) == ["before"]
+
+    def test_a_row_with_no_key_and_a_value_that_is_not_a_number_ends_the_import(
+        self, dynamodb_client, unique_table_name, cleanup_table
+    ):
+        cleanup_table(unique_table_name)
+        desc = self._import(unique_table_name, [
+            {"pk": {"S": "before"}, "n": {"N": "1"}},
+            {"other": {"S": "x"}, "n": {"N": "abc"}},
+            {"pk": {"S": "after"}, "n": {"N": "2"}},
+        ])
+        assert self._counts(desc) == (2, 1, 1)
+        self._assert_failed(desc)
+        assert sorted(self._items(dynamodb_client, unique_table_name)) == ["before"]
+
+    @pytest.mark.parametrize("key,counts,imported", [
+        pytest.param("1E126", (3, 2, 1), ["1", "3"], id="out-of-range"),
+        pytest.param("abc", (2, 1, 1), ["1"], id="not-a-number"),
+    ])
+    def test_a_number_key_is_checked_as_any_number(
+        self, dynamodb_client, unique_table_name, cleanup_table, key, counts, imported
+    ):
+        cleanup_table(unique_table_name)
+        desc = self._import(
+            unique_table_name,
+            [{"pk": {"N": "1"}}, {"pk": {"N": key}}, {"pk": {"N": "3"}}],
+            key_type="N",
+        )
+        assert self._counts(desc) == counts
+        self._assert_failed(desc)
+        assert sorted(self._items(dynamodb_client, unique_table_name)) == imported
+
+    def test_rows_after_a_skipped_row_are_imported_until_one_ends_the_import(
+        self, dynamodb_client, unique_table_name, cleanup_table
+    ):
+        """The measured five-row file had these values in this order."""
+        cleanup_table(unique_table_name)
+        desc = self._import(unique_table_name, [
+            {"pk": {"S": "before"}, "n": {"N": "1"}},
+            {"pk": {"S": "out-of-range"}, "n": {"N": "1E126"}},
+            {"pk": {"S": "middle"}, "n": {"N": "3"}},
+            {"pk": {"S": "not-a-number"}, "n": {"N": "abc"}},
+            {"pk": {"S": "after"}, "n": {"N": "2"}},
+        ])
+        assert self._counts(desc) == (4, 2, 2)
+        self._assert_failed(desc)
+        assert sorted(self._items(dynamodb_client, unique_table_name)) == ["before", "middle"]
+
+    def test_numbers_are_stored_as_the_service_spells_them(
+        self, dynamodb_client, unique_table_name, cleanup_table
+    ):
+        """Every row valid; each case was a row of one measured file."""
+        cleanup_table(unique_table_name)
+        cases = {
+            "frac": ({"N": "1.50"}, {"N": "1.5"}),
+            "negative-zero": ({"N": "-0.0"}, {"N": "0"}),
+            "plus": ({"N": "+5"}, {"N": "5"}),
+            "exponent": ({"N": "1.5E2"}, {"N": "150"}),
+            "zero-exponent": ({"N": "0E125"}, {"N": "0"}),
+            "max": (
+                {"N": "9.9999999999999999999999999999999999999E125"},
+                {"N": "9" * 38 + "0" * 88},
+            ),
+            "min": ({"N": "1E-130"}, {"N": "0." + "0" * 129 + "1"}),
+            "number-set": ({"NS": ["1.0", "2"]}, {"NS": ["1", "2"]}),
+        }
+        desc = self._import(
+            unique_table_name,
+            [{"pk": {"S": name}, "n": given} for name, (given, _) in cases.items()],
+        )
+        assert self._counts(desc) == (len(cases), len(cases), 0)
+        assert (desc["ImportStatus"], desc.get("FailureCode")) == ("COMPLETED", None)
+        items = self._items(dynamodb_client, unique_table_name)
+        for name, (_, stored) in cases.items():
+            got = items[name]["n"]
+            if "NS" in got:
+                got = {"NS": sorted(got["NS"])}
+            assert got == stored, name

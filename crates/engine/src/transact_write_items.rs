@@ -75,6 +75,13 @@ pub async fn handle_transact_write_items(
         }
     }
 
+    // The client request token's length and pattern are checked ahead of the
+    // actions (measured 2026-10-27: a 37-character token is reported ahead of
+    // a missing table, a condition syntax error and a malformed key number).
+    if let Some(ref token) = input.client_request_token {
+        validate_client_request_token(token)?;
+    }
+
     // Resolve table key info, validate inputs, parse expressions, and check
     // for duplicate targets — all in a single pass to avoid redundant
     // `table_key_info` lookups.
@@ -82,6 +89,13 @@ pub async fn handle_transact_write_items(
     let mut seen_targets: HashSet<String> = HashSet::with_capacity(input.transact_items.len());
     for twi in &input.transact_items {
         let op = prepare_write_op(twi, ctx).await?;
+        // A number the service cannot read is checked after this action is
+        // prepared and before the next one is. Where the action also holds
+        // another fault, that fault is answered, as before this check; the
+        // service answers the number there (12 rows measured 2026-10-27). An
+        // earlier action's condition syntax error or unused value is answered
+        // ahead of a later action's number, as on the service.
+        extenddb_core::validation::number::operations::transact_write_item(twi)?;
         let target_key = op.canonical_target();
         if !seen_targets.insert(target_key) {
             return Err(DynamoDbError::ValidationException(
@@ -148,10 +162,6 @@ pub async fn handle_transact_write_items(
     // The token is passed to the storage layer and checked atomically within
     // the write transaction, guaranteeing that token storage and data writes
     // commit together.
-    if let Some(ref token) = input.client_request_token {
-        validate_client_request_token(token)?;
-    }
-
     let idempotency =
         input
             .client_request_token
