@@ -170,6 +170,21 @@ pub async fn handle_update_table(
         )?;
     }
 
+    // The provisioned-capacity maxima, checked against what the table holds now.
+    if extenddb_core::validation::provisioned_limits::changes_provisioned_capacity(&input) {
+        let existing = ctx
+            .storage
+            .describe_table(
+                &ctx.account_id,
+                extenddb_core::types::DescribeTableInput {
+                    table_name: input.table_name.clone(),
+                },
+            )
+            .await
+            .map_err(|e| update_table_err_to_dynamo(e, &input.table_name))?;
+        crate::table_limits::enforce_update_table(ctx, &input, &existing).await?;
+    }
+
     let table_name = input.table_name.clone();
     // Kept for the post-condition check below, since `input` is moved into the
     // backend call.
