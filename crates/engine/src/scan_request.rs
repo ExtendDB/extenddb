@@ -35,10 +35,7 @@
 //! 4. every number in `ExpressionAttributeValues`, `NS` members and values
 //!    nested in `L` and `M` included, whether a `FilterExpression` reads the
 //!    value, nothing reads it, or the request carries no expression at all; a
-//!    Unicode decimal digit counts as the digit it stands for; then every
-//!    number in the `ExclusiveStartKey` values, which answers the same text as
-//!    a malformed number in a value, with no filter and on an index scan too,
-//!    and after the `ReturnConsumedCapacity` enum;
+//!    Unicode decimal digit counts as the digit it stands for;
 //! 5. the nesting depth of `ExpressionAttributeValues`: a value nested 32
 //!    levels deep in `L` answers `Nesting Levels have exceeded supported
 //!    limits: Attributes in the item have nested levels beyond supported
@@ -49,14 +46,38 @@
 //!    "BAD"` answers the nesting text). Both enums invalid answers the
 //!    `ReturnConsumedCapacity` error alone, so the two are not aggregated.
 //!
+//! The numbers in `ExclusiveStartKey` are checked by the handler at the key's
+//! own stage, after the checks the service makes ahead of them (measured
+//! 2026-10-31 between 23:54 and 23:56 UTC with `{"pk": {"N": "bob"}, "sk":
+//! {"S": "x"}}` as the key): each of the six checks above, the `Select` rule
+//! for `SPECIFIC_ATTRIBUTES`, the `FilterExpression` syntax and the
+//! unused-value check answers its own text ahead of the number text, and a
+//! malformed number in `ExpressionAttributeValues` is reported ahead of one in
+//! the key. The number text is the value check's, with no filter and on an
+//! index scan too (measured 2026-10-30). Inside the key a number fault
+//! anywhere, an `NS` member or a value nested in the `L` of a non-key
+//! attribute included, comes ahead of a value that is empty or has an unknown
+//! type descriptor, in either member order; with two number faults the first
+//! member is named (`{"pk": {"N": "bob"}, "sk": {"N": "fred"}}` names `bob`).
+//! See [`StartKeyBody`].
+//!
 //! Not measured, and checked in the order listed above: the `AttributesToGet`
 //! length clause beside a `Segment` or `TotalSegments` fault without a `Limit`
 //! fault (listed first, as beside `Limit`), the older form of the length
 //! clause (the empty list echoed, `Value '[]' at 'attributesToGet' ...`, and
 //! listed last, as the older form reverses the newer one), the length clause
-//! against the enums, the `ExclusiveStartKey` number check against the
-//! `ExpressionAttributeValues` one, `M` levels in the nesting count, and the
-//! nesting of a value an expression reads or of a request with no expression.
+//! against the enums, `M` levels in the nesting count, and the nesting of a
+//! value an expression reads or of a request with no expression. Not measured
+//! at the key's stage: the key's checks against the table lookup, the index
+//! resolution, the `ConsistentRead` and `Select` index rules and the `Segment`
+//! pairing, which the handler makes ahead of them; a key whose only fault is
+//! an empty or unknown-descriptor value against the filter syntax and
+//! unused-value checks (the handler reports it after them, with the service's
+//! prefix `The provided starting key is invalid: ` on the deserializer's
+//! text, measured for the empty value alone); and which of two number faults
+//! is named when
+//! the request lists the members the other way round (the check reads members
+//! in sorted order, which names `bob` either way).
 //!
 //! The JSON parser accepts 128 levels of nesting, which is 62 `L` levels; a
 //! body nested deeper is a `SerializationException` from the parser, ahead of
@@ -77,20 +98,20 @@
 use std::collections::HashMap;
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::types::{AttributeValue, ScanInput, saturated_int32};
+use extenddb_core::types::{AttributeValue, Item, ScanInput, saturated_int32};
 use serde_json::Value;
 
 use crate::query_key_values::{
-    SCAN_CONDITIONS, has_unreadable_attribute_value, non_empty, present, shape_fault_first,
-    validate_expression_attribute_value_numbers,
+    SCAN_CONDITIONS, has_unreadable_attribute_value, is_shape_fault, non_empty, present,
+    shape_fault_first, validate_expression_attribute_value_numbers, validate_number_text,
 };
 
 /// The `Scan` checks that run on the raw request body, in the service's order:
 /// the `AttributesToGet` length and the `Limit`, `Segment` and `TotalSegments`
 /// ranges in one message, the expression and non-expression parameter mix, the
-/// `ReturnConsumedCapacity` enum, every number in `ExpressionAttributeValues`
-/// and `ExclusiveStartKey`, the nesting depth of `ExpressionAttributeValues`,
-/// then the `Select` enum.
+/// `ReturnConsumedCapacity` enum, every number in `ExpressionAttributeValues`,
+/// the nesting depth of `ExpressionAttributeValues`, then the `Select` enum.
+/// The numbers in `ExclusiveStartKey` are checked later, by [`StartKeyBody`].
 ///
 /// The checks read the raw body, so a field that does not deserialize (an
 /// invalid `Select`, for one) does not stop the ones before it. When a check
@@ -139,15 +160,8 @@ fn scan_request_checks(body: &Value) -> Result<(), DynamoDbError> {
         }],
     )?;
 
-    let values = attribute_value_map(body, "ExpressionAttributeValues");
-    if let Some(values) = &values {
-        validate_expression_attribute_value_numbers(values)?;
-    }
-    // The key's values are numbers checked with the same rules and text.
-    if let Some(key) = attribute_value_map(body, "ExclusiveStartKey") {
-        validate_expression_attribute_value_numbers(&key)?;
-    }
-    if let Some(values) = &values {
+    if let Some(values) = attribute_value_map(body, "ExpressionAttributeValues") {
+        validate_expression_attribute_value_numbers(&values)?;
         extenddb_core::validation::validate_attribute_values_nesting_depth(values.values())?;
     }
 
@@ -170,6 +184,120 @@ fn scan_request_checks(body: &Value) -> Result<(), DynamoDbError> {
 /// field is absent or is not one; [`shape_fault_first`] reports the shape.
 fn attribute_value_map(body: &Value, field: &str) -> Option<HashMap<String, AttributeValue>> {
     serde_json::from_value(body.get(field)?.clone()).ok()
+}
+
+/// The service's prefix on a fault in an `ExclusiveStartKey` value (measured
+/// 2026-10-31 between 23:54 and 23:56 UTC: `{"pk": {}, "sk": {"S": "x"}}`
+/// answers `The provided starting key is invalid: Supplied AttributeValue is
+/// empty, must contain exactly one of the supported datatypes`).
+const START_KEY_PREFIX: &str = "The provided starting key is invalid: ";
+
+/// The `ExclusiveStartKey` of a `Scan` body as the request wrote it, with the
+/// checks the service makes on the key at the key's own stage: after the
+/// request-time checks of [`validate_scan_request_body`], the `Select` rule for
+/// `SPECIFIC_ATTRIBUTES`, the `FilterExpression` syntax and the unused-value
+/// check, and ahead of the key schema (measured 2026-10-31 between 23:54 and
+/// 23:56 UTC; see the module doc).
+///
+/// A key whose value is empty, carries an unknown type descriptor or more than
+/// one, or is a set that is empty or has duplicates does not deserialize as a
+/// map of attribute values. [`StartKeyBody::take`] takes such a key out of the
+/// body, so that the typed deserialization of the body does not report it
+/// ahead of the checks the service makes first, and [`StartKeyBody::validate`]
+/// reports it at the key's stage, after the key's numbers: `{"pk": {}, "sk":
+/// {"N": "bob"}}` and `{"sk": {"N": "bob"}, "pk": {}}` answer the number text
+/// for `bob`. A key of the wrong JSON shape (not an object, a value that is
+/// not an object, an `N` that is not a string) stays in the body, as the
+/// service reports a shape fault ahead of every check; see
+/// [`shape_fault_first`].
+pub(crate) struct StartKeyBody {
+    /// The key as the request wrote it; `None` when the body has none.
+    raw: Option<Value>,
+    /// The deserializer's fault in a key taken out of the body, to report
+    /// after the key's numbers. A `ValidationException` carries the service's
+    /// prefix for the key (measured for an empty value; the texts for more
+    /// than one descriptor and for an empty or duplicate set follow it,
+    /// unmeasured). The `SerializationException` for an unknown type
+    /// descriptor keeps the deserializer's text (unmeasured on its own; beside
+    /// a `Limit` fault or a number fault the service reports those).
+    deferred: Option<DynamoDbError>,
+}
+
+impl StartKeyBody {
+    /// Reads the key from `body` and takes it out of the body when it does not
+    /// deserialize for a reason that is not a shape fault.
+    pub(crate) fn take(body: &mut Value) -> Self {
+        let raw = body.get("ExclusiveStartKey").cloned();
+        let deferred = match raw
+            .as_ref()
+            .map(|key| serde_json::from_value::<Item>(key.clone()))
+        {
+            Some(Err(e)) => match crate::deserialize_error(e) {
+                shape if is_shape_fault(&shape) => None,
+                DynamoDbError::ValidationException(msg) => Some(
+                    DynamoDbError::ValidationException(format!("{START_KEY_PREFIX}{msg}")),
+                ),
+                other => Some(other),
+            },
+            Some(Ok(_)) | None => None,
+        };
+        if deferred.is_some()
+            && let Some(fields) = body.as_object_mut()
+        {
+            fields.remove("ExclusiveStartKey");
+        }
+        Self { raw, deferred }
+    }
+
+    /// The key's checks at its own stage: every number in the key with the
+    /// value check's rules and text (an `N`, the members of an `NS`, and the
+    /// values nested in `L` and `M`, in the sorted order of the key's members,
+    /// so that two faults name the same one on every backend), then the
+    /// deserializer's fault in a key [`StartKeyBody::take`] took out of the
+    /// body.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DynamoDbError::ValidationException` with the service's text, or
+    /// the deserializer's `SerializationException` for an unknown type
+    /// descriptor.
+    pub(crate) fn validate(&self) -> Result<(), DynamoDbError> {
+        if let Some(members) = self.raw.as_ref().and_then(Value::as_object) {
+            let mut names: Vec<&String> = members.keys().collect();
+            names.sort();
+            for name in names {
+                validate_raw_value_numbers(&members[name])?;
+            }
+        }
+        match &self.deferred {
+            Some(fault) => Err(fault.clone()),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Every number in one raw attribute value: an `N` text, the members of an
+/// `NS`, and the values nested in `L` and `M`. A value that is not one
+/// attribute value, or whose inner JSON is not of the descriptor's shape, holds
+/// no number to check here; the deserializer reports it.
+fn validate_raw_value_numbers(value: &Value) -> Result<(), DynamoDbError> {
+    let Some(fields) = value.as_object() else {
+        return Ok(());
+    };
+    let mut fields = fields.iter();
+    let (Some((descriptor, inner)), None) = (fields.next(), fields.next()) else {
+        return Ok(());
+    };
+    match (descriptor.as_str(), inner) {
+        ("N", Value::String(text)) => validate_number_text(text),
+        ("NS", Value::Array(texts)) => texts
+            .iter()
+            .filter_map(Value::as_str)
+            .try_for_each(validate_number_text),
+        ("L", Value::Array(members)) => members.iter().try_for_each(validate_raw_value_numbers),
+        ("M", Value::Object(members)) => members.values().try_for_each(validate_raw_value_numbers),
+        _ => Ok(()),
+    }
 }
 
 /// The constraints the service aggregates into one message: the length of

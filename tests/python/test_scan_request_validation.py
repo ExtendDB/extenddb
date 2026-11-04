@@ -7,14 +7,19 @@ nesting depth of ``ExpressionAttributeValues``.
 
 Every request below is sent as raw signed JSON. Each is a row of the table
 measured against DynamoDB (us-east-1) on 2026-10-25 at 10:38 and 10:55 UTC on
-a Scan of an existing table of 29 items, or of the one measured on 2026-10-30
-at 12:40 UTC where a row says so, each sent twice, and each expected answer is
-the service's. The table here holds 12 items, so the count the accepted
-request returns is 12.
+a Scan of an existing table of 29 items, or of the ones measured on 2026-10-30
+at 12:40 UTC and on 2026-10-31 between 23:54 and 23:56 UTC where a row says
+so, each sent twice, and each expected answer is the service's. The table here
+holds 12 items, so the count the accepted request returns is 12.
 
 Depth is the number of ``L`` wrappers around the leaf: 32 or more answers the
 nesting text, 31 reaches the unused-value check. A malformed number at the
 bottom is reported first, at the depths 31 to 60 that were measured.
+
+The numbers in ``ExclusiveStartKey`` are checked after every other check in
+this file and after the filter syntax and unused-value checks, and inside the
+key a number fault comes ahead of an empty value or an unknown type
+descriptor (2026-10-31).
 """
 
 from __future__ import annotations
@@ -53,11 +58,34 @@ NESTING = (
     "Attributes in the item have nested levels beyond supported limit"
 )
 UNUSED = "Value provided in ExpressionAttributeValues unused in expressions: keys: {:d}"
+LIMIT = (
+    "1 validation error detected: Value at 'Limit' failed to satisfy constraint: "
+    "Member must have value greater than or equal to 1"
+)
+SEGMENT = (
+    "1 validation error detected: Value at 'Segment' failed to satisfy constraint: "
+    "Member must have value greater than or equal to 0"
+)
+SELECT_ENUM = (
+    "1 validation error detected: Value 'BAD' at 'select' failed to satisfy constraint: "
+    "Member must satisfy enum value set: "
+    "[SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]"
+)
+SELECT_SPECIFIC = (
+    "Must specify the AttributesToGet or ProjectionExpression when choosing to get "
+    "SPECIFIC_ATTRIBUTES"
+)
+UNUSED_U = "Value provided in ExpressionAttributeValues unused in expressions: keys: {:u}"
+EMPTY_KEY_VALUE = (
+    "The provided starting key is invalid: Supplied AttributeValue is empty, "
+    "must contain exactly one of the supported datatypes"
+)
 
 VALID_FILTER = '"FilterExpression": "a = :n", "ExpressionAttributeValues": {":n": {"N": "1"}}'
 BOB_FILTER = '"FilterExpression": "a = :n", "ExpressionAttributeValues": {":n": {"N": "bob"}}'
 ONE = {"N": "1"}
 BOB = {"N": "bob"}
+BOB_KEY = '"ExclusiveStartKey": {"pk": {"N": "bob"}, "sk": {"S": "x"}}'
 
 # (id, the fields after TableName as JSON text, the expected message)
 REFUSED = [
@@ -85,6 +113,57 @@ REFUSED = [
     ("ExclusiveStartKey-bob-with-ReturnConsumedCapacity-BAD",
      '"ExclusiveStartKey": {"pk": {"N": "bob"}, "sk": {"S": "x"}}, '
      '"ReturnConsumedCapacity": "BAD"', RCC_ENUM),
+]
+
+# Measured 2026-10-31 between 23:54 and 23:56 UTC: every other check comes
+# ahead of the number in ExclusiveStartKey.
+KEY_AFTER_THE_OTHER_CHECKS = [
+    ("Limit-0", BOB_KEY + ', "Limit": 0', LIMIT),
+    ("Segment-minus-1", BOB_KEY + ', "Segment": -1, "TotalSegments": 2', SEGMENT),
+    ("Select-BAD", BOB_KEY + ', "Select": "BAD"', SELECT_ENUM),
+    ("ScanFilter-empty-with-FilterExpression", BOB_KEY + ', "ScanFilter": {}, ' + VALID_FILTER,
+     MIX),
+    ("AttributesToGet-empty", BOB_KEY + ', "AttributesToGet": []', LENGTH),
+    ("unused-value",
+     BOB_KEY + ', "FilterExpression": "a = :p", '
+     '"ExpressionAttributeValues": {":p": {"S": "x"}, ":u": {"S": "y"}}', UNUSED_U),
+    ("bob-in-the-values-and-fred-in-the-key",
+     '"ExclusiveStartKey": {"pk": {"N": "fred"}, "sk": {"S": "x"}}, ' + BOB_FILTER, NUMERIC_BOB),
+]
+
+# Measured 2026-10-31 between 23:54 and 23:56 UTC: inside the key a number
+# fault anywhere comes ahead of an empty value or an unknown type descriptor,
+# in either member order; two number faults name the first member; a key
+# whose only fault is an empty value answers the service's key text.
+KEY_FAULTS = [
+    ("empty-pk-then-bob", '"ExclusiveStartKey": {"pk": {}, "sk": {"N": "bob"}}', NUMERIC_BOB),
+    ("bob-then-empty-pk", '"ExclusiveStartKey": {"sk": {"N": "bob"}, "pk": {}}', NUMERIC_BOB),
+    ("type-X-pk-then-bob", '"ExclusiveStartKey": {"pk": {"X": "1"}, "sk": {"N": "bob"}}',
+     NUMERIC_BOB),
+    ("bob-then-fred", '"ExclusiveStartKey": {"pk": {"N": "bob"}, "sk": {"N": "fred"}}',
+     NUMERIC_BOB),
+    ("bob-in-an-NS", '"ExclusiveStartKey": {"pk": {"NS": ["bob"]}, "sk": {"S": "x"}}',
+     NUMERIC_BOB),
+    ("bob-in-an-L", '"ExclusiveStartKey": {"pk": {"L": [{"N": "bob"}]}, "sk": {"S": "x"}}',
+     NUMERIC_BOB),
+    ("bob-in-the-L-of-a-non-key-attribute",
+     '"ExclusiveStartKey": {"pk": {"S": "p0"}, "sk": {"S": "x"}, "z": {"L": [{"N": "bob"}]}}',
+     NUMERIC_BOB),
+    ("bob-in-the-index-key-of-an-LSI-scan",
+     '"IndexName": "lsi", "ExclusiveStartKey": {"pk": {"S": "p0"}, "sk": {"S": "x"}, '
+     '"ln": {"N": "bob"}}', NUMERIC_BOB),
+    ("empty-pk-alone", '"ExclusiveStartKey": {"pk": {}, "sk": {"S": "x"}}', EMPTY_KEY_VALUE),
+]
+
+# Measured 2026-10-31 between 23:54 and 23:56 UTC on a table with an N hash
+# key: the number texts for a leading space, an empty text and 39 digits.
+N_KEY_FAULTS = [
+    ("leading-space", '"ExclusiveStartKey": {"pk": {"N": " 1"}}',
+     "The parameter cannot be converted to a numeric value:  1"),
+    ("empty-text", '"ExclusiveStartKey": {"pk": {"N": ""}}',
+     "The parameter cannot be converted to a numeric value: "),
+    ("39-digits", '"ExclusiveStartKey": {"pk": {"N": "111111111111111111111111111111111111111"}}',
+     "Attempting to store more than 38 significant digits in a Number"),
 ]
 
 
@@ -124,7 +203,7 @@ def _validation_message(status: int, payload: dict) -> str:
 
 @pytest.fixture(scope="module")
 def table(dynamodb_client):
-    """pk S, sk S, a GSI ``gsi`` on gpk S, with ITEMS items."""
+    """pk S, sk S, a GSI ``gsi`` on gpk S, an LSI ``lsi`` on ln N, with ITEMS items."""
     name = unique_name("scanreq")
     dynamodb_client.create_table(
         TableName=name,
@@ -132,6 +211,7 @@ def table(dynamodb_client):
             {"AttributeName": "pk", "AttributeType": "S"},
             {"AttributeName": "sk", "AttributeType": "S"},
             {"AttributeName": "gpk", "AttributeType": "S"},
+            {"AttributeName": "ln", "AttributeType": "N"},
         ],
         KeySchema=[
             {"AttributeName": "pk", "KeyType": "HASH"},
@@ -142,12 +222,38 @@ def table(dynamodb_client):
             "KeySchema": [{"AttributeName": "gpk", "KeyType": "HASH"}],
             "Projection": {"ProjectionType": "ALL"},
         }],
+        LocalSecondaryIndexes=[{
+            "IndexName": "lsi",
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "ln", "KeyType": "RANGE"},
+            ],
+            "Projection": {"ProjectionType": "ALL"},
+        }],
         BillingMode="PAY_PER_REQUEST",
     )
     wait_for_active(dynamodb_client, name)
     for i in range(ITEMS):
         dynamodb_client.put_item(TableName=name, Item={
             "pk": {"S": f"p{i}"}, "sk": {"S": "s"}, "a": {"N": str(i)}})
+    yield name
+    dynamodb_client.delete_table(TableName=name)
+    wait_for_deleted(dynamodb_client, name)
+
+
+@pytest.fixture(scope="module")
+def n_table(dynamodb_client):
+    """pk N, with items 1 to 6."""
+    name = unique_name("scanreqn")
+    dynamodb_client.create_table(
+        TableName=name,
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "N"}],
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    wait_for_active(dynamodb_client, name)
+    for i in range(1, 7):
+        dynamodb_client.put_item(TableName=name, Item={"pk": {"N": str(i)}})
     yield name
     dynamodb_client.delete_table(TableName=name)
     wait_for_deleted(dynamodb_client, name)
@@ -166,6 +272,48 @@ class TestRequestChecks:
                                 '"ScanFilter": {}, "ConsistentRead": true')
         assert status == 200, payload
         assert (payload["Count"], payload["ScannedCount"]) == (ITEMS, ITEMS)
+
+
+class TestExclusiveStartKey:
+    """The numbers in the key, after every other check and ahead of the key's
+    other faults (measured 2026-10-31 between 23:54 and 23:56 UTC)."""
+
+    @pytest.mark.parametrize("fields, expected", [r[1:] for r in KEY_AFTER_THE_OTHER_CHECKS],
+                             ids=[r[0] for r in KEY_AFTER_THE_OTHER_CHECKS])
+    def test_the_other_checks_come_first(self, dynamodb_client, table, fields, expected):
+        assert _validation_message(*_scan(dynamodb_client, table, fields)) == expected
+
+    def test_32_levels_are_refused_ahead_of_the_key(self, dynamodb_client, table):
+        fields = BOB_KEY + ", " + unused_value(nest(ONE, 32))
+        assert _validation_message(*_scan(dynamodb_client, table, fields)) == NESTING
+
+    def test_the_select_rule_is_checked_ahead_of_the_key(self, dynamodb_client, table):
+        # The service answers '1 validation error detected: ' and then this
+        # text. The Scan text here has no prefix, so only the check's place
+        # is asserted.
+        fields = BOB_KEY + ', "Select": "SPECIFIC_ATTRIBUTES"'
+        message = _validation_message(*_scan(dynamodb_client, table, fields))
+        assert message.endswith(SELECT_SPECIFIC), message
+
+    def test_the_filter_syntax_is_checked_ahead_of_the_key(self, dynamodb_client, table):
+        # The service answers 'Invalid FilterExpression: Syntax error; token:
+        # "=", near: "= = :p"'. The parser here words the syntax error
+        # differently, so only the check's place is asserted.
+        fields = (BOB_KEY + ', "FilterExpression": "a = = :p", '
+                  '"ExpressionAttributeValues": {":p": {"S": "x"}}')
+        message = _validation_message(*_scan(dynamodb_client, table, fields))
+        assert message.startswith("Invalid FilterExpression:"), message
+
+    @pytest.mark.parametrize("fields, expected", [r[1:] for r in KEY_FAULTS],
+                             ids=[r[0] for r in KEY_FAULTS])
+    def test_a_number_fault_comes_ahead_of_the_other_faults_in_the_key(
+            self, dynamodb_client, table, fields, expected):
+        assert _validation_message(*_scan(dynamodb_client, table, fields)) == expected
+
+    @pytest.mark.parametrize("fields, expected", [r[1:] for r in N_KEY_FAULTS],
+                             ids=[r[0] for r in N_KEY_FAULTS])
+    def test_the_number_texts_on_an_n_hash_key(self, dynamodb_client, n_table, fields, expected):
+        assert _validation_message(*_scan(dynamodb_client, n_table, fields)) == expected
 
 
 class TestNestingDepth:

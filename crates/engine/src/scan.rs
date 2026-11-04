@@ -38,19 +38,23 @@ use crate::{DispatchMetrics, DispatchResult};
 /// Returns `DynamoDbError` for validation failures, missing tables, or storage errors.
 #[allow(clippy::cast_possible_wrap)] // item counts won't exceed i64::MAX
 pub async fn handle_scan(
-    body: Value,
+    mut body: Value,
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
     // Request-time checks on the raw body, in the service's order: the
     // AttributesToGet length and the Limit, Segment and TotalSegments ranges
     // in one message, the expression and non-expression parameter mix, the
-    // ReturnConsumedCapacity enum, every number in ExpressionAttributeValues
-    // and ExclusiveStartKey, the nesting depth of ExpressionAttributeValues,
-    // the Select enum. They run before typed deserialization so a field that
-    // does not deserialize does not stop the ones before it; a field of the
-    // wrong JSON type anywhere in the body is reported ahead of them; see
-    // `scan_request`.
+    // ReturnConsumedCapacity enum, every number in ExpressionAttributeValues,
+    // the nesting depth of ExpressionAttributeValues, the Select enum. They
+    // run before typed deserialization so a field that does not deserialize
+    // does not stop the ones before it; a field of the wrong JSON type
+    // anywhere in the body is reported ahead of them; see `scan_request`.
     crate::scan_request::validate_scan_request_body(&body)?;
+    // The ExclusiveStartKey is checked at its own stage, below, after the
+    // filter syntax, Select and unused-value checks; a key whose value does
+    // not deserialize is held back here so that typed deserialization does
+    // not report it first.
+    let start_key = crate::scan_request::StartKeyBody::take(&mut body);
     let input: ScanInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
     // Validate Filter/Projection expressions before the existence
@@ -349,6 +353,12 @@ pub async fn handle_scan(
         }
         ExpressionMaps::new(names, values)
     };
+
+    // The ExclusiveStartKey's own checks: every number in it with the value
+    // check's text, then a value that is empty or has an unknown type
+    // descriptor, ahead of the key schema (measured 2026-10-31; see
+    // `scan_request::StartKeyBody`).
+    start_key.validate()?;
 
     // Validate ExclusiveStartKey matches the key schema
     if let Some(ref start_key) = input.exclusive_start_key {

@@ -5,24 +5,37 @@
 //! numbers in `ExclusiveStartKey` and the nesting depth of
 //! `ExpressionAttributeValues`.
 //!
-//! The rows in every test but the last are requests sent to the service
-//! (us-east-1, each request twice, a Scan of an existing table) with the
-//! answers it gave: on 2026-10-25 at 10:38 and 10:55 UTC, and on 2026-10-30 at
-//! 12:40 UTC where a test says so. The last test applies the same rules to
-//! requests that were not sent.
+//! Every row is a request sent to the service (us-east-1, each request twice,
+//! a Scan of an existing table) with the answer it gave: on 2026-10-25 at
+//! 10:38 and 10:55 UTC, on 2026-10-30 at 12:40 UTC, and on 2026-10-31 between
+//! 23:54 and 23:56 UTC where a test says so.
 
 use extenddb_core::error::DynamoDbError;
 use serde_json::{Value, json};
 
-use super::validate_scan_request_body;
+use super::{StartKeyBody, validate_scan_request_body};
 
 const MIX: &str = "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {ScanFilter} Expression parameters: {FilterExpression}";
 const LENGTH: &str = "1 validation error detected: Value at 'AttributesToGet' failed to satisfy constraint: Member must have length greater than or equal to 1";
 const NUMERIC_BOB: &str = "The parameter cannot be converted to a numeric value: bob";
 const NESTING: &str = "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit";
+const EMPTY_KEY_VALUE: &str = "The provided starting key is invalid: Supplied AttributeValue is empty, must contain exactly one of the supported datatypes";
 
 fn check(body: &Value) -> Option<String> {
     match validate_scan_request_body(body) {
+        Ok(()) => None,
+        Err(DynamoDbError::ValidationException(msg)) => Some(msg),
+        Err(other) => panic!("unexpected error {other:?}"),
+    }
+}
+
+/// The key's own checks on `body`, as the handler makes them after the
+/// request-time checks: `StartKeyBody::take` on a copy of the body, then
+/// `validate`. Panics on a `SerializationException`, which no row here
+/// expects.
+fn check_key(body: &Value) -> Option<String> {
+    let mut body = body.clone();
+    match StartKeyBody::take(&mut body).validate() {
         Ok(()) => None,
         Err(DynamoDbError::ValidationException(msg)) => Some(msg),
         Err(other) => panic!("unexpected error {other:?}"),
@@ -108,22 +121,174 @@ fn an_empty_attributes_to_get_joins_the_range_faults() {
     );
 }
 
+/// A Scan body with `key` as its `ExclusiveStartKey`.
+fn with_key(key: Value) -> Value {
+    scan(json!({"ExclusiveStartKey": key}))
+}
+
 #[test]
 fn a_malformed_number_in_the_exclusive_start_key_is_reported_with_the_number_text() {
-    let key = |number: &str| json!({"ExclusiveStartKey": {"pk": {"N": number}, "sk": {"S": "x"}}});
-    let bad = with(scan(filter("1")), key("bob"));
-    assert_eq!(check(&bad).as_deref(), Some(NUMERIC_BOB));
-    assert_eq!(check(&with(scan(filter("1")), key("1"))), None);
-    // Measured 2026-10-30 12:40 UTC: with no filter, the same text; the
-    // ReturnConsumedCapacity enum is checked first.
-    assert_eq!(check(&scan(key("bob"))).as_deref(), Some(NUMERIC_BOB));
-    let enum_first = with(scan(key("bob")), json!({"ReturnConsumedCapacity": "BAD"}));
+    let key = |number: &str| json!({"pk": {"N": number}, "sk": {"S": "x"}});
+    let bad = with(with_key(key("bob")), filter("1"));
+    // The request-time checks leave the key to its own stage.
+    assert_eq!(check(&bad), None);
+    assert_eq!(check_key(&bad).as_deref(), Some(NUMERIC_BOB));
+    assert_eq!(check_key(&with(with_key(key("1")), filter("1"))), None);
+    // Measured 2026-10-30 12:40 UTC: with no filter, the same text.
     assert_eq!(
-        check(&enum_first).as_deref(),
+        check_key(&with_key(key("bob"))).as_deref(),
+        Some(NUMERIC_BOB)
+    );
+    // Measured 2026-10-31 between 23:54 and 23:56 UTC: a number as an NS
+    // member, as an L member, and in the L of an attribute that is not a key
+    // attribute; the number texts for a leading space, an empty text and 39
+    // digits (on an N hash key).
+    for key in [
+        json!({"pk": {"NS": ["bob"]}, "sk": {"S": "x"}}),
+        json!({"pk": {"L": [{"N": "bob"}]}, "sk": {"S": "x"}}),
+        json!({"pk": {"S": "p0"}, "sk": {"S": "x"}, "z": {"L": [{"N": "bob"}]}}),
+    ] {
+        assert_eq!(
+            check_key(&with_key(key.clone())).as_deref(),
+            Some(NUMERIC_BOB),
+            "{key}"
+        );
+    }
+    for (number, text) in [
+        (
+            " 1",
+            "The parameter cannot be converted to a numeric value:  1",
+        ),
+        ("", "The parameter cannot be converted to a numeric value: "),
+        (
+            "111111111111111111111111111111111111111",
+            "Attempting to store more than 38 significant digits in a Number",
+        ),
+    ] {
+        let key = with_key(json!({"pk": {"N": number}}));
+        assert_eq!(check_key(&key).as_deref(), Some(text), "{number:?}");
+    }
+}
+
+/// Measured 2026-10-31 between 23:54 and 23:56 UTC with `{"pk": {"N": "bob"},
+/// "sk": {"S": "x"}}` as the key: each request-time check answers its own text
+/// ahead of the key's number (the `Select` rule for `SPECIFIC_ATTRIBUTES`, the
+/// filter syntax and the unused-value check, which the handler makes after
+/// deserializing, do too; the wire tests send those rows). Measured
+/// 2026-10-30 12:40 UTC: the `ReturnConsumedCapacity` enum ahead of the key.
+#[test]
+fn every_request_time_check_comes_ahead_of_the_number_in_the_exclusive_start_key() {
+    let bob = json!({"pk": {"N": "bob"}, "sk": {"S": "x"}});
+    for (extra, text) in [
+        (
+            json!({"Limit": 0}),
+            "1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1",
+        ),
+        (
+            json!({"ReturnConsumedCapacity": "BAD"}),
+            "1 validation error detected: Value 'BAD' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]",
+        ),
+        (
+            json!({"Segment": -1, "TotalSegments": 2}),
+            "1 validation error detected: Value at 'Segment' failed to satisfy constraint: Member must have value greater than or equal to 0",
+        ),
+        (
+            json!({"Select": "BAD"}),
+            "1 validation error detected: Value 'BAD' at 'select' failed to satisfy constraint: Member must satisfy enum value set: [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]",
+        ),
+        (with(filter("1"), json!({"ScanFilter": {}})), MIX),
+        (json!({"AttributesToGet": []}), LENGTH),
+        (
+            json!({
+                "FilterExpression": "a = :p",
+                "ExpressionAttributeValues": {":p": {"S": "x"}, ":d": nested(&json!({"N": "1"}), 32)},
+            }),
+            NESTING,
+        ),
+        // The values ahead of the key, with `fred` in the key.
+        (
+            json!({
+                "FilterExpression": "a = :n",
+                "ExpressionAttributeValues": {":n": {"N": "bob"}},
+                "ExclusiveStartKey": {"pk": {"N": "fred"}, "sk": {"S": "x"}},
+            }),
+            NUMERIC_BOB,
+        ),
+    ] {
+        let body = with(with_key(bob.clone()), extra);
+        assert_eq!(check(&body).as_deref(), Some(text), "{body}");
+    }
+}
+
+/// Measured 2026-10-31 between 23:54 and 23:56 UTC: inside the key a number
+/// fault comes ahead of a value that is empty or has an unknown type
+/// descriptor, in either member order; with two number faults the first
+/// member is named; a key whose only fault is an empty value answers the
+/// service's key text.
+#[test]
+fn a_number_fault_in_the_key_comes_ahead_of_an_empty_or_unknown_descriptor_value() {
+    for key in [
+        json!({"pk": {}, "sk": {"N": "bob"}}),
+        json!({"sk": {"N": "bob"}, "pk": {}}),
+        json!({"pk": {"X": "1"}, "sk": {"N": "bob"}}),
+        json!({"pk": {"N": "bob"}, "sk": {"N": "fred"}}),
+    ] {
+        let body = with_key(key.clone());
+        // The request-time checks leave the key to its own stage.
+        assert_eq!(check(&body), None, "{key}");
+        assert_eq!(check_key(&body).as_deref(), Some(NUMERIC_BOB), "{key}");
+    }
+    let empty = with_key(json!({"pk": {}, "sk": {"S": "x"}}));
+    assert_eq!(check_key(&empty).as_deref(), Some(EMPTY_KEY_VALUE));
+    // Measured 2026-10-31 between 23:54 and 23:56 UTC too: a Limit fault
+    // beside the empty value answers the Limit clause, in the older form.
+    assert_eq!(
+        check(&with(empty, json!({"Limit": 0}))).as_deref(),
         Some(
-            "1 validation error detected: Value 'BAD' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"
+            "1 validation error detected: Value '0' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"
         )
     );
+}
+
+/// `StartKeyBody::take` holds back a key the deserializer refuses for its
+/// value and leaves one of the wrong JSON shape in the body, where the typed
+/// deserialization reports it ahead of every check.
+#[test]
+fn a_key_of_the_wrong_shape_stays_in_the_body_and_an_unreadable_value_is_held_back() {
+    for key in [json!("x"), json!({"pk": "x"}), json!({"pk": {"N": 5}})] {
+        let mut body = with_key(key.clone());
+        let start_key = StartKeyBody::take(&mut body);
+        assert!(body.get("ExclusiveStartKey").is_some(), "{key}");
+        assert!(start_key.validate().is_ok(), "{key}");
+        let shape = serde_json::from_value::<extenddb_core::types::ScanInput>(body)
+            .map_err(crate::deserialize_error);
+        assert!(
+            matches!(shape, Err(DynamoDbError::SerializationException(_))),
+            "{key}: {shape:?}"
+        );
+    }
+    for key in [
+        json!({"pk": {}}),
+        json!({"pk": {"X": "1"}}),
+        json!({"pk": {"S": "x", "N": "1"}}),
+    ] {
+        let mut body = with_key(key.clone());
+        let start_key = StartKeyBody::take(&mut body);
+        assert!(body.get("ExclusiveStartKey").is_none(), "{key}");
+        assert!(start_key.validate().is_err(), "{key}");
+        assert!(
+            serde_json::from_value::<extenddb_core::types::ScanInput>(body).is_ok(),
+            "{key}"
+        );
+    }
+    // A readable key stays in the body and passes.
+    let mut body = with_key(json!({"pk": {"S": "p0"}, "sk": {"S": "x"}}));
+    let start_key = StartKeyBody::take(&mut body);
+    assert!(body.get("ExclusiveStartKey").is_some());
+    assert!(start_key.validate().is_ok());
+    // No key at all.
+    let mut body = scan(json!({}));
+    assert!(StartKeyBody::take(&mut body).validate().is_ok());
 }
 
 #[test]
@@ -159,10 +324,11 @@ fn the_number_check_runs_before_the_nesting_check() {
     assert_eq!(check(&body).as_deref(), Some(NUMERIC_BOB));
 }
 
-/// Requests the service was not sent. The answers follow from the measured
-/// rows and from the order the checks are made in.
+/// Combinations the other tests do not send, each measured 2026-10-31 between
+/// 23:54 and 23:56 UTC with the answer asserted here (the key row with `{"pk":
+/// {"N": "fred"}}` and with `"sk": {"S": "x"}` added to it).
 #[test]
-fn combinations_the_service_was_not_sent_follow_the_order_of_the_checks() {
+fn combinations_measured_on_2026_10_31_follow_the_order_of_the_checks() {
     // The mix names whichever expression parameter is present.
     let projection = scan(json!({"ScanFilter": {}, "ProjectionExpression": "a"}));
     assert_eq!(
