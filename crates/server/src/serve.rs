@@ -13,6 +13,7 @@
 
 use std::net::TcpListener;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use std::path::PathBuf;
@@ -27,6 +28,7 @@ use tracing_subscriber::{
 };
 
 use crate::AppState;
+use crate::registration::WorkerControl;
 use crate::workers;
 
 /// Build provenance of the deployed binary.
@@ -337,6 +339,7 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         extenddb_storage::server_components::ServerComponentsOptions::default();
 
     component_options.bootstrap_if_uninitialized = dev_mode;
+    component_options.max_item_size_bytes = app_config.limits.max_item_size_bytes;
     component_options.release = build.version;
 
     // Wire the node's own bind address as the instance ID so each ExtendDB node
@@ -390,30 +393,9 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     let registrar = runtime_hooks
         .as_ref()
         .and_then(|hooks| hooks.serving_registrar());
+    // Released after the drain, once no worker writes to the catalog.
+    let held = registrar.clone();
     let admission = crate::registration::Admission::default();
-
-    // Resource-tag migration guard. ExtendDB evaluates resource tags only as
-    // aws:ResourceTag/* and leaves dynamodb:ResourceTag/* absent, so a catalog
-    // whose stored policies still name the dynamodb: form must be rewritten by
-    // `extenddb migrate --yes` before this binary serves it. `migrate`, `init`
-    // and every fresh-catalog bootstrap record a settings marker; refuse to
-    // start when it is missing. One settings-row read, no policy scan. A
-    // backend on the migration runner read the catalog's status in its
-    // factory instead, and migration 1 deletes the marker.
-    if extenddb_storage::migrations::installed().is_none()
-        && catalog_store
-            .get_setting(extenddb_core::settings_keys::RESOURCE_TAG_MIGRATION)
-            .await
-            .map_err(|e| anyhow::anyhow!("reading the resource-tag migration marker: {e:?}"))?
-            .is_none()
-    {
-        anyhow::bail!(
-            "this catalog has not had the resource-tag condition-key migration applied. \
-             Run `extenddb migrate --yes` before starting the server. It rewrites stored \
-             policies from dynamodb:ResourceTag to aws:ResourceTag, which this build \
-             evaluates, and records a marker the server checks at startup."
-        );
-    }
 
     // Dev mode: seed the credentials the SDK may sign with and verify against
     // them (see `dev_credentials` for the vending contract). Seeded here so it
@@ -686,66 +668,89 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         admission: admission.clone(),
     };
 
-    // Workers run until `shutdown` is cancelled, which happens after the HTTP
-    // server stops accepting. Handles are collected so shutdown can drain them
-    // (the metrics flush worker persists its final bucket on the way out)
-    // instead of leaving the work to a runtime drop.
+    // The server's own workers and the backend's run as one set, each set on
+    // a child token of `shutdown`, which is cancelled after the HTTP server
+    // stops accepting. The registration supervisor stops the set while the
+    // server holds no registration and starts a new one once it holds one.
+    // Handles are kept so a stop can drain them (the metrics flush worker
+    // persists its final bucket on the way out) instead of leaving the work
+    // to a runtime drop.
     let shutdown = CancellationToken::new();
-    let mut worker_handles = vec![
-        // D-22: Poll log_level from the settings table.
-        tokio::spawn(workers::poll_log_level(
-            catalog_store.clone(),
-            reload_handle.clone(),
-            app_config.logging.level.clone(),
-            shutdown.clone(),
-        )),
-        // Poll the throttling_enabled runtime setting.
-        tokio::spawn(workers::poll_throttling_enabled(
-            catalog_store.clone(),
-            throttle,
-            config_throttling,
-            shutdown.clone(),
-        )),
-        // Metrics pruning and flushing.
-        tokio::spawn(workers::metrics_prune_worker(
-            metrics.clone(),
-            shutdown.clone(),
-        )),
-        tokio::spawn(workers::metrics_flush_worker(
-            metrics.clone(),
-            catalog_store.clone(),
-            shutdown.clone(),
-        )),
-        // Clean up old login attempt records.
-        tokio::spawn(workers::login_attempt_cleanup_worker(
-            catalog_store.clone(),
-            shutdown.clone(),
-        )),
-        // Phase 11a: Warn about approximate consumed capacity.
-        tokio::spawn(workers::capacity_warning_worker(shutdown.clone())),
-    ];
-
-    // Spawn backend-specific workers via runtime hooks
-    if let Some(hooks) = runtime_hooks {
-        let worker_ctx = extenddb_storage::WorkerContext {
-            metrics: metrics.clone(),
-            catalog_store: catalog_store.clone(),
-            reload_handle: reload_handle.clone(),
-            config_log_level: app_config.logging.level.clone(),
-            shutdown: shutdown.clone(),
-        };
-        worker_handles.extend(hooks.spawn_workers(&worker_ctx).await);
-    }
+    let hooks: Option<Arc<dyn extenddb_storage::ServerRuntimeHooks>> = runtime_hooks.map(Arc::from);
+    let spawn: SpawnWorkers = {
+        let catalog_store = catalog_store.clone();
+        let reload_handle = reload_handle.clone();
+        let config_log_level = app_config.logging.level.clone();
+        let metrics = metrics.clone();
+        Box::new(move |token: CancellationToken| {
+            let catalog_store = catalog_store.clone();
+            let reload_handle = reload_handle.clone();
+            let config_log_level = config_log_level.clone();
+            let throttle = throttle.clone();
+            let metrics = metrics.clone();
+            let hooks = hooks.clone();
+            futures::FutureExt::boxed(async move {
+                let mut handles = vec![
+                    // D-22: Poll log_level from the settings table.
+                    tokio::spawn(workers::poll_log_level(
+                        catalog_store.clone(),
+                        reload_handle.clone(),
+                        config_log_level.clone(),
+                        token.clone(),
+                    )),
+                    // Poll the throttling_enabled runtime setting.
+                    tokio::spawn(workers::poll_throttling_enabled(
+                        catalog_store.clone(),
+                        throttle,
+                        config_throttling,
+                        token.clone(),
+                    )),
+                    // Metrics pruning and flushing.
+                    tokio::spawn(workers::metrics_prune_worker(
+                        metrics.clone(),
+                        token.clone(),
+                    )),
+                    tokio::spawn(workers::metrics_flush_worker(
+                        metrics.clone(),
+                        catalog_store.clone(),
+                        token.clone(),
+                    )),
+                    // Clean up old login attempt records.
+                    tokio::spawn(workers::login_attempt_cleanup_worker(
+                        catalog_store.clone(),
+                        token.clone(),
+                    )),
+                    // Phase 11a: Warn about approximate consumed capacity.
+                    tokio::spawn(workers::capacity_warning_worker(token.clone())),
+                ];
+                // Backend-specific workers via runtime hooks.
+                if let Some(hooks) = hooks {
+                    let worker_ctx = extenddb_storage::WorkerContext {
+                        metrics,
+                        catalog_store,
+                        reload_handle,
+                        config_log_level,
+                        shutdown: token,
+                    };
+                    handles.extend(hooks.spawn_workers(&worker_ctx).await);
+                }
+                handles
+            })
+        })
+    };
+    let background = Arc::new(BackgroundWorkers::new(spawn, &shutdown));
+    background.start().await;
     // A backend whose registration the database can end: the supervisor
-    // refuses requests while it is lost, and asks for a stop when it cannot
-    // be taken again. It is drained with the other workers.
-    if let Some(registrar) = registrar {
-        worker_handles.push(tokio::spawn(crate::registration::supervise(
+    // refuses requests and stops the workers while it is lost, and asks for
+    // a stop when it cannot be taken again.
+    let supervisor = registrar.map(|registrar| {
+        tokio::spawn(crate::registration::supervise(
             registrar,
             admission.clone(),
             shutdown.clone(),
-        )));
-    }
+            Arc::clone(&background) as Arc<dyn WorkerControl>,
+        ))
+    });
 
     let tls_config = if tls_enabled {
         let cert_path = config::expand_tilde(&app_config.server.tls.cert_path);
@@ -760,9 +765,22 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
 
     let server_result = crate::start_server(listener, state, pid_file, tls_config).await;
 
-    // The HTTP server has stopped accepting; drain the workers so in-flight
-    // cycles finish and the metrics flush worker writes its final bucket.
-    drain_workers(&shutdown, worker_handles).await;
+    // The HTTP server has stopped accepting. The supervisor returns once the
+    // token fires; then the workers stop, so in-flight cycles finish and the
+    // metrics flush worker writes its final bucket, and the serving
+    // registration is given up once every one of them has ended.
+    shutdown.cancel();
+    if let Some(supervisor) = supervisor
+        && tokio::time::timeout(SUPERVISOR_TIMEOUT, supervisor)
+            .await
+            .is_err()
+    {
+        tracing::warn!(
+            "The registration supervisor did not return within {}s",
+            SUPERVISOR_TIMEOUT.as_secs()
+        );
+    }
+    stop_then_release(&background, held.as_deref()).await;
 
     server_result?;
 
@@ -778,30 +796,173 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Cancel the shutdown token and wait for every worker to return.
-///
-/// Bounded by `DRAIN_TIMEOUT` so a worker stuck inside a backend call cannot
-/// hold the process open; a timeout is logged and the remaining tasks are
-/// dropped, which is the pre-drain behavior.
-async fn drain_workers(shutdown: &CancellationToken, handles: Vec<tokio::task::JoinHandle<()>>) {
-    const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long `serve` waits for the registration supervisor once the shutdown
+/// token fires: longer than a stop of the workers, which the supervisor may
+/// be running then.
+const SUPERVISOR_TIMEOUT: Duration = Duration::from_secs(10);
 
-    shutdown.cancel();
-    let count = handles.len();
-    let drain = futures::future::join_all(handles);
-    match tokio::time::timeout(DRAIN_TIMEOUT, drain).await {
-        Ok(results) => {
-            let panicked = results.iter().filter(|r| r.is_err()).count();
-            if panicked > 0 {
-                tracing::warn!("{panicked} of {count} background worker(s) ended abnormally");
-            } else {
-                tracing::info!("{count} background worker(s) drained");
-            }
+/// How long a stop waits for the workers after their token fires before it
+/// aborts the ones still running.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a stop waits for the aborted workers to end.
+const ABORT_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Starts one set of background workers on the token it is given, and
+/// returns their handles.
+type SpawnWorkers = Box<
+    dyn Fn(
+            CancellationToken,
+        ) -> futures::future::BoxFuture<'static, Vec<tokio::task::JoinHandle<()>>>
+        + Send
+        + Sync,
+>;
+
+/// The set of workers that runs now, with its token.
+struct WorkerSet {
+    token: CancellationToken,
+    handles: Vec<tokio::task::JoinHandle<()>>,
+}
+
+/// The server's background workers, its own and the backend's, which start
+/// and stop as one set. `serve` starts the first set and stops the one that
+/// runs at shutdown; the registration supervisor stops the set while the
+/// server holds no registration and starts a new one once it holds one.
+/// Each set runs on a child token of the server's shutdown token.
+struct BackgroundWorkers {
+    spawn: SpawnWorkers,
+    shutdown: CancellationToken,
+    running: tokio::sync::Mutex<Option<WorkerSet>>,
+    /// A stop could not end every worker of its set.
+    left_running: AtomicBool,
+    drain: Duration,
+    abort: Duration,
+}
+
+impl BackgroundWorkers {
+    fn new(spawn: SpawnWorkers, shutdown: &CancellationToken) -> Self {
+        Self::with_bounds(spawn, shutdown, DRAIN_TIMEOUT, ABORT_TIMEOUT)
+    }
+
+    fn with_bounds(
+        spawn: SpawnWorkers,
+        shutdown: &CancellationToken,
+        drain: Duration,
+        abort: Duration,
+    ) -> Self {
+        Self {
+            spawn,
+            shutdown: shutdown.clone(),
+            running: tokio::sync::Mutex::new(None),
+            left_running: AtomicBool::new(false),
+            drain,
+            abort,
         }
-        Err(_) => tracing::warn!(
-            "Background workers did not drain within {}s; shutting down anyway",
-            DRAIN_TIMEOUT.as_secs()
-        ),
+    }
+}
+
+#[async_trait::async_trait]
+impl WorkerControl for BackgroundWorkers {
+    /// Cancel the running set's token and wait for its workers, abort those
+    /// still running after the drain bound, and wait for them to end.
+    /// Reports whether every worker of every set has ended; a worker that
+    /// outlives its abort (one that blocks its thread) is reported once and
+    /// for the rest of the process.
+    async fn stop(&self) -> bool {
+        let mut running = self.running.lock().await;
+        if let Some(set) = running.take()
+            && !stop_set(set, self.drain, self.abort).await
+        {
+            self.left_running.store(true, Ordering::Release);
+        }
+        !self.left_running.load(Ordering::Acquire)
+    }
+
+    async fn start(&self) {
+        let mut running = self.running.lock().await;
+        if running.is_some() {
+            return;
+        }
+        let token = self.shutdown.child_token();
+        let handles = (self.spawn)(token.clone()).await;
+        *running = Some(WorkerSet { token, handles });
+    }
+}
+
+/// Stop one set of workers; whether every one of them ended.
+async fn stop_set(set: WorkerSet, drain: Duration, abort: Duration) -> bool {
+    set.token.cancel();
+    let count = set.handles.len();
+    let aborts: Vec<_> = set
+        .handles
+        .iter()
+        .map(tokio::task::JoinHandle::abort_handle)
+        .collect();
+    let mut joined = futures::future::join_all(set.handles);
+    if let Ok(results) = tokio::time::timeout(drain, &mut joined).await {
+        let panicked = results.iter().filter(|r| r.is_err()).count();
+        if panicked > 0 {
+            tracing::warn!("{panicked} of {count} background worker(s) ended abnormally");
+        } else {
+            tracing::info!("{count} background worker(s) drained");
+        }
+        return true;
+    }
+    let left = aborts.iter().filter(|handle| !handle.is_finished()).count();
+    for handle in &aborts {
+        handle.abort();
+    }
+    if tokio::time::timeout(abort, joined).await.is_ok() {
+        tracing::warn!(
+            "{left} of {count} background worker(s) did not stop within {}s and were aborted",
+            drain.as_secs()
+        );
+        true
+    } else {
+        tracing::error!(
+            "{left} of {count} background worker(s) did not stop within {}s, and some still ran \
+             {}s after they were aborted",
+            drain.as_secs(),
+            abort.as_secs()
+        );
+        false
+    }
+}
+
+/// Stop the workers, then release the serving registration: a migration
+/// that waits for the servers starts once the registration is gone, so
+/// releasing it while a worker runs would let the migration run beside a
+/// worker that still writes to the catalog. When a worker could not be
+/// stopped, the registration is not released and expires by itself. The
+/// stop and the release are bounded.
+async fn stop_then_release(
+    workers: &BackgroundWorkers,
+    registrar: Option<&dyn extenddb_storage::hooks::ServingRegistrar>,
+) {
+    const RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
+
+    let bound = workers.drain + workers.abort + SUPERVISOR_TIMEOUT;
+    let ended = tokio::time::timeout(bound, workers.stop())
+        .await
+        .unwrap_or(false);
+    let Some(registrar) = registrar else {
+        return;
+    };
+    if !ended {
+        tracing::warn!(
+            "A background worker may still run, so the serving registration is not released; it \
+             expires by itself"
+        );
+        return;
+    }
+    if tokio::time::timeout(RELEASE_TIMEOUT, registrar.release())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            "The serving registration was not released within {}s; it expires by itself",
+            RELEASE_TIMEOUT.as_secs()
+        );
     }
 }
 
@@ -832,4 +993,170 @@ pub fn log_to_syslog_raw(msg: &str) {
 #[cfg(not(unix))]
 pub fn log_to_syslog_raw(msg: &str) {
     eprintln!("{msg}");
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use extenddb_storage::CancellationToken;
+    use extenddb_storage::hooks::{Reregistration, ServingRegistrar};
+
+    use super::{BackgroundWorkers, SpawnWorkers, WorkerControl};
+
+    type Events = Arc<Mutex<Vec<&'static str>>>;
+
+    /// A registrar that records when it is released.
+    struct Recorder(Events);
+
+    #[async_trait::async_trait]
+    impl ServingRegistrar for Recorder {
+        async fn lost(&self) -> String {
+            std::future::pending().await
+        }
+
+        async fn register_again(&self) -> Reregistration {
+            Reregistration::Unavailable(String::new())
+        }
+
+        async fn release(&self) {
+            self.0.lock().unwrap().push("released");
+        }
+    }
+
+    /// Workers whose sets each run `worker` once, with short stop bounds.
+    fn workers<F, Fut>(shutdown: &CancellationToken, worker: F) -> BackgroundWorkers
+    where
+        F: Fn(CancellationToken) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let spawn: SpawnWorkers = Box::new(move |token| {
+            let handle = tokio::spawn(worker(token));
+            futures::FutureExt::boxed(async move { vec![handle] })
+        });
+        BackgroundWorkers::with_bounds(
+            spawn,
+            shutdown,
+            Duration::from_millis(200),
+            Duration::from_millis(300),
+        )
+    }
+
+    /// The registration is released after every worker has returned, so a
+    /// migration that waits for the servers cannot start while a worker
+    /// still writes to the catalog.
+    #[tokio::test]
+    async fn the_registration_is_released_after_the_workers_stop() {
+        let events: Events = Arc::new(Mutex::new(Vec::new()));
+        let shutdown = CancellationToken::new();
+        let workers = {
+            let events = events.clone();
+            workers(&shutdown, move |token| {
+                let events = events.clone();
+                async move {
+                    token.cancelled().await;
+                    // A last write after the token fired.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    events.lock().unwrap().push("worker stopped");
+                }
+            })
+        };
+        workers.start().await;
+        let registrar = Recorder(events.clone());
+        shutdown.cancel();
+        super::stop_then_release(&workers, Some(&registrar)).await;
+        assert_eq!(*events.lock().unwrap(), ["worker stopped", "released"]);
+    }
+
+    /// A worker that does not return when its token fires is aborted at the
+    /// drain bound, and the registration is released only after that.
+    #[tokio::test]
+    async fn a_worker_that_ignores_its_token_is_aborted_before_the_release() {
+        let events: Events = Arc::new(Mutex::new(Vec::new()));
+        let ticks = Arc::new(AtomicU32::new(0));
+        let shutdown = CancellationToken::new();
+        let workers = {
+            let ticks = ticks.clone();
+            workers(&shutdown, move |_token| {
+                let ticks = ticks.clone();
+                async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        ticks.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            })
+        };
+        workers.start().await;
+        let registrar = Recorder(events.clone());
+        shutdown.cancel();
+        super::stop_then_release(&workers, Some(&registrar)).await;
+        assert_eq!(*events.lock().unwrap(), ["released"]);
+        let at_release = ticks.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            ticks.load(Ordering::SeqCst),
+            at_release,
+            "the worker ran on after the release"
+        );
+    }
+
+    /// A worker that an abort cannot end, one that blocks its thread, keeps
+    /// the registration: it is left to expire, and every later stop reports
+    /// that a worker may still run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_worker_that_blocks_its_thread_keeps_the_registration() {
+        let events: Events = Arc::new(Mutex::new(Vec::new()));
+        let shutdown = CancellationToken::new();
+        let workers = workers(&shutdown, |_token| async {
+            std::thread::sleep(Duration::from_millis(1500));
+        });
+        workers.start().await;
+        // Let the worker reach its blocking call before the stop.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let registrar = Recorder(events.clone());
+        shutdown.cancel();
+        super::stop_then_release(&workers, Some(&registrar)).await;
+        assert!(events.lock().unwrap().is_empty(), "released");
+        assert!(!workers.stop().await, "a later stop forgot the worker");
+    }
+
+    /// A stopped set starts again on a new token: the supervisor stops the
+    /// workers at a loss and starts them after a new registration.
+    #[tokio::test]
+    async fn the_workers_start_again_after_a_stop() {
+        let started = Arc::new(AtomicU32::new(0));
+        let stopped = Arc::new(AtomicU32::new(0));
+        let shutdown = CancellationToken::new();
+        let workers = {
+            let (started, stopped) = (started.clone(), stopped.clone());
+            workers(&shutdown, move |token| {
+                let (started, stopped) = (started.clone(), stopped.clone());
+                async move {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    token.cancelled().await;
+                    stopped.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+        workers.start().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(workers.stop().await);
+        assert_eq!(
+            (
+                started.load(Ordering::SeqCst),
+                stopped.load(Ordering::SeqCst)
+            ),
+            (1, 1)
+        );
+        assert!(!shutdown.is_cancelled(), "a stop cancelled the server");
+        workers.start().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(started.load(Ordering::SeqCst), 2, "no new set started");
+        shutdown.cancel();
+        assert!(workers.stop().await);
+        assert_eq!(stopped.load(Ordering::SeqCst), 2);
+    }
 }

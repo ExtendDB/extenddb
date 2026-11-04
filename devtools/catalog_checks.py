@@ -5,7 +5,10 @@ checking its exit code, reporting each check, and starting and stopping a
 server.
 
 devtools/check-sqlite-catalog-lock, check-sqlite-older-binary,
-check-postgres-catalog-lock and check-postgres-older-binary import it. Each
+check-postgres-catalog-lock, check-postgres-older-binary,
+check-cassandra-catalog-lock, check-cassandra-older-binary,
+check-cassandra-authorizer and the check-mongodb-* scripts import it; the
+MongoDB ones start their replica sets with `start_mongo`. Each
 check prints one line, `ok` or `FAIL` and what was checked, with the
 command's output indented under a FAIL; `finish` prints the count of failed
 checks or `all checks passed` and returns the script's exit code.
@@ -83,6 +86,28 @@ def healthy(url: str, proc: subprocess.Popen | None = None, seconds: float = 60)
     return False
 
 
+def watch_lost_registration(
+    proc: subprocess.Popen, url: str, seconds: float
+) -> tuple[float | None, int | None, float]:
+    """Poll `url` (a server's /health) every 0.5 s, while the server's
+    database does not answer, until `proc` exits or `seconds` pass. Returns
+    the seconds to the first 503 (None without one), the exit code (None
+    while the server runs) and the seconds waited."""
+    started = time.monotonic()
+    first_503 = None
+    while time.monotonic() - started < seconds and proc.poll() is None:
+        probe = subprocess.run(
+            ["curl", "-sk", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "2", url],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if first_503 is None and probe.stdout.strip() == "503":
+            first_503 = time.monotonic() - started
+        time.sleep(0.5)
+    return first_503, proc.poll(), time.monotonic() - started
+
+
 def start(cmd: list[str], env: dict | None, log: str, cwd: str | None = None) -> subprocess.Popen:
     """Start `cmd` in the background with its output in the file `log`."""
     with open(log, "w", encoding="utf-8") as out:
@@ -107,3 +132,42 @@ def finish() -> int:
         return 1
     print("all checks passed")
     return 0
+
+
+def docker(*args: str, timeout: float = 120) -> subprocess.CompletedProcess:
+    """Run `docker` with `args`, capturing its output."""
+    return subprocess.run(["docker", *args], capture_output=True, text=True, check=False, timeout=timeout)
+
+
+def mongosh(container: str, port: int, script: str, timeout: float = 60) -> tuple[int, str]:
+    """Run `script` with mongosh in a container `start_mongo` started."""
+    done = docker("exec", container, "mongosh", "--quiet", "--port", str(port), "--eval", script, timeout=timeout)
+    return done.returncode, done.stdout + done.stderr
+
+
+def start_mongo(container: str, port: int, mongod_args: tuple[str, ...] = (), mounts: tuple[str, ...] = ()) -> bool:
+    """Start mongo:7 as a one-node replica set named rs0 in `container`,
+    listening on `port` inside the container and published on 127.0.0.1
+    only, so the same connection string works from the host and from a
+    container that shares its network. Waits for the member to be primary.
+    `mongod_args` are added to mongod's command line, `mounts` are `-v`
+    arguments; a set started with `--keyFile` initiates through the
+    localhost exception."""
+    docker("rm", "-f", container)
+    volumes = [arg for mount in mounts for arg in ("-v", mount)]
+    started = docker(
+        "run", "-d", "--name", container, "-p", f"127.0.0.1:{port}:{port}", *volumes,
+        "mongo:7", "mongod", "--replSet", "rs0", "--bind_ip_all", "--port", str(port), *mongod_args,
+    )
+    if started.returncode != 0:
+        return report(False, f"start {container}", started.stderr)
+    for _ in range(60):
+        if mongosh(container, port, "db.runCommand({ping: 1}).ok")[1].strip().endswith("1"):
+            break
+        time.sleep(1)
+    mongosh(container, port, f"rs.initiate({{_id: 'rs0', members: [{{_id: 0, host: 'localhost:{port}'}}]}})")
+    for _ in range(60):
+        if mongosh(container, port, "db.hello().isWritablePrimary")[1].strip().endswith("true"):
+            return True
+        time.sleep(1)
+    return report(False, f"{container} did not become primary", docker("logs", container).stdout[-2000:])

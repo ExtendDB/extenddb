@@ -21,8 +21,9 @@ use std::time::Duration;
 use extenddb_config as config;
 use extenddb_storage::migrations::advice::{self, Advice, AdviceFor};
 use extenddb_storage::migrations::{
-    AdminRole, CatalogMigrations, CatalogStatus, Listed, MigrationError, MigrationId, RunKind,
-    RunReport, Target, before_lock, exit, forget_locked, run_locked,
+    AdminRole, CatalogMigrations, CatalogStatus, Listed, MigrationError, MigrationId, Pending,
+    RunKind, RunReport, Target, before_lock, behind_line, exit, forget_locked, run_locked,
+    stores_behind,
 };
 
 use crate::cmd_migrate::MigrateArgs;
@@ -49,10 +50,11 @@ pub(crate) async fn run(
     let target = Target {
         location,
         data_store: args.data_db.clone(),
-        admin: admin_role(
-            args.pg_user.as_deref(),
-            args.pg_pass.as_deref(),
+        admin: admin_role_for(
+            extenddb_storage::backend_name(),
+            args,
             std::env::var_os("EXTENDDB_PG_PASSWORD"),
+            std::env::var_os("EXTENDDB_CASSANDRA_PASSWORD"),
         )?,
         data_connection: None,
     };
@@ -106,12 +108,41 @@ pub(crate) async fn run(
     }))
 }
 
-/// The admin role `--pg-user` names, with `--pg-pass` or else the
-/// `EXTENDDB_PG_PASSWORD` variable; `None` without `--pg-user`.
+/// The admin role of the backend this binary serves: on Cassandra the role
+/// the runner connects as instead of the config file's (`--cassandra-user`,
+/// `--cassandra-pass` or `EXTENDDB_CASSANDRA_PASSWORD`); on every other
+/// backend the PostgreSQL role of the pgvector attempt (`--pg-user`,
+/// `--pg-pass` or `EXTENDDB_PG_PASSWORD`), which only PostgreSQL reads. The
+/// other backend's flags are ignored, as they were before Cassandra moved
+/// onto the runner.
+fn admin_role_for(
+    backend: Option<&str>,
+    args: &MigrateArgs,
+    pg_password_env: Option<std::ffi::OsString>,
+    cassandra_password_env: Option<std::ffi::OsString>,
+) -> anyhow::Result<Option<AdminRole>> {
+    if backend == Some("cassandra") {
+        admin_role(
+            args.cassandra_user.as_deref(),
+            args.cassandra_pass.as_deref(),
+            ("EXTENDDB_CASSANDRA_PASSWORD", cassandra_password_env),
+        )
+    } else {
+        admin_role(
+            args.pg_user.as_deref(),
+            args.pg_pass.as_deref(),
+            ("EXTENDDB_PG_PASSWORD", pg_password_env),
+        )
+    }
+}
+
+/// The admin role a user flag names (`--pg-user` or `--cassandra-user`),
+/// with its password flag or else the password variable `env_name` names;
+/// `None` without the user flag.
 fn admin_role(
     user: Option<&str>,
     password: Option<&str>,
-    password_env: Option<std::ffi::OsString>,
+    (env_name, password_env): (&str, Option<std::ffi::OsString>),
 ) -> anyhow::Result<Option<AdminRole>> {
     let Some(user) = user else {
         return Ok(None);
@@ -120,7 +151,7 @@ fn admin_role(
         (Some(password), _) => Some(password.to_owned()),
         (None, Some(env)) => Some(
             env.into_string()
-                .map_err(|_| anyhow::anyhow!("EXTENDDB_PG_PASSWORD must contain valid UTF-8"))?,
+                .map_err(|_| anyhow::anyhow!("{env_name} must contain valid UTF-8"))?,
         ),
         (None, None) => None,
     };
@@ -197,26 +228,10 @@ async fn preview(
                      release before 1.0 is not detected while it runs."
                 );
             }
-            match version {
-                Some(v) => {
-                    println!("The catalog is at migration {v}; this binary carries {latest}.")
-                }
-                None => println!(
-                    "The catalog has no migration ledger (a release before 1.0 created it); this \
-                     binary carries migrations 1 to {latest}."
-                ),
-            }
+            println!("{}", behind_summary(*version, pending, latest));
             println!("Pending:");
-            for p in pending {
-                let description =
-                    MigrationId::from_number(p.id).map_or("", MigrationId::description);
-                println!(
-                    "  {} {} ({}, {}): {description}",
-                    p.id,
-                    p.name,
-                    p.store.as_str(),
-                    p.kind.as_str()
-                );
+            for line in pending_lines(pending) {
+                println!("{line}");
             }
             match migrations.pending_changes(target, &status).await {
                 Ok(lines) => {
@@ -241,6 +256,47 @@ async fn preview(
     Ok(status.exit_code())
 }
 
+/// The preview's first line for a `Behind` status: the stores a stopped run
+/// left behind the catalog store, when there are any, else the catalog's
+/// migration, then the latest migration this binary carries.
+fn behind_summary(version: Option<u32>, pending: &[Pending], latest: u32) -> String {
+    match (stores_behind(pending), version) {
+        (Some((catalog_at, behind)), _) => {
+            let mut line = behind_line(catalog_at, &behind);
+            if let Some(first) = line.get(..1).map(str::to_uppercase) {
+                line.replace_range(..1, &first);
+            }
+            format!("{line}; this binary carries {latest}.")
+        }
+        (None, Some(v)) => {
+            format!("The catalog is at migration {v}; this binary carries {latest}.")
+        }
+        (None, None) => format!(
+            "The catalog has no migration ledger (a release before 1.0 created it); this binary \
+             carries migrations 1 to {latest}."
+        ),
+    }
+}
+
+/// The preview's lines for `pending`, one per id, kind of store and kind:
+/// a body that runs in several stores of one kind, as in each of
+/// Cassandra's account keyspaces, is one line with the number of stores.
+fn pending_lines(pending: &[Pending]) -> Vec<String> {
+    advice::grouped(pending)
+        .into_iter()
+        .map(|(p, stores)| {
+            let description = MigrationId::from_number(p.id).map_or("", MigrationId::description);
+            format!(
+                "  {} {} ({}, {}): {description}",
+                p.id,
+                p.name,
+                advice::stores_label(p, stores),
+                p.kind.as_str()
+            )
+        })
+        .collect()
+}
+
 /// Take the lock, run, and print what the run did.
 async fn apply(
     migrations: &dyn CatalogMigrations,
@@ -257,8 +313,9 @@ async fn apply(
         lock_timeout.as_secs()
     );
     let lock = migrations.lock(target, lock_timeout).await?;
-    let report = run_locked(migrations, target, &lock, release, kind).await?;
-    drop(lock);
+    let report = run_locked(migrations, target, &lock, release, kind).await;
+    migrations.release(lock).await;
+    let report = report?;
     print_report(&report, kind);
     if report.applied.is_empty() && kind == RunKind::Migrate {
         // A catalog ahead by additive migrations has nothing to apply and
@@ -279,7 +336,7 @@ fn print_report(report: &RunReport, kind: RunKind) {
         RunKind::Create | RunKind::Migrate => "Applied",
         RunKind::Reconverge => "Ran again",
     };
-    crate::util::print_applied(report, "  ", verb);
+    crate::util::print_applied(report, "  ", verb, "");
     let show =
         |v: Option<u32>| v.map_or_else(|| "no ledger".to_owned(), |v| format!("migration {v}"));
     println!();
@@ -303,7 +360,9 @@ async fn forget(
     lock_timeout: Duration,
 ) -> Result<u8, MigrationError> {
     let lock = migrations.lock(target, lock_timeout).await?;
-    forget_locked(migrations, target, &lock, id).await?;
+    let forgotten = forget_locked(migrations, target, &lock, id).await;
+    migrations.release(lock).await;
+    forgotten?;
     println!(
         "Forgot migration {id}: its ledger rows are deleted, and the next \
          `extenddb migrate --yes` runs it again."

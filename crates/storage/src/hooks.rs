@@ -52,9 +52,15 @@ pub trait ServerRuntimeHooks: Send + Sync {
     /// state (connection pools, notify handles, etc.).
     ///
     /// Return the spawned tasks' join handles so the server can await them
-    /// during shutdown after cancelling [`WorkerContext::shutdown`]. Returning
-    /// an empty vector opts out of the drain (the tasks are then dropped when
-    /// the runtime shuts down).
+    /// after cancelling [`WorkerContext::shutdown`]; the server aborts the
+    /// ones still running 5 s later. Every worker this spawns must be among
+    /// the handles and return once that token fires, and a task a worker
+    /// starts must end before the worker returns, so the stop covers it too.
+    ///
+    /// Called again for each new set of workers: a server whose serving
+    /// registration is lost stops its workers, and starts a new set with a
+    /// new token once it registers again (see
+    /// [`ServerRuntimeHooks::serving_registrar`]).
     async fn spawn_workers(&self, ctx: &WorkerContext) -> Vec<tokio::task::JoinHandle<()>>;
 
     /// Get backend-specific info for logging (optional).
@@ -73,13 +79,15 @@ pub trait ServerRuntimeHooks: Send + Sync {
     ///
     /// `serve` calls this once, before [`ServerRuntimeHooks::spawn_workers`].
     /// When [`ServingRegistrar::lost`] returns, the server answers every new
-    /// request with `ServiceUnavailable` and calls
-    /// [`ServingRegistrar::register_again`] at once and then every second.
-    /// It serves again on [`Reregistration::Registered`]. On
-    /// [`Reregistration::Refused`], or when 30 s pass without a
-    /// registration, it stops as a shutdown signal stops it (the listener
-    /// drains, [`WorkerContext::shutdown`] fires, the PID file is removed)
-    /// and exits 1.
+    /// request with `ServiceUnavailable`, stops its background workers, and
+    /// then calls [`ServingRegistrar::register_again`] at once and every
+    /// second after. On [`Reregistration::Registered`] it starts a new set of
+    /// workers and serves again. On [`Reregistration::Refused`], when 30 s
+    /// pass without a registration, or when a worker could not be stopped, it
+    /// stops as a shutdown signal stops it (the listener drains, the PID file
+    /// is removed) and exits 1. On every shutdown it calls
+    /// [`ServingRegistrar::release`] once every background worker has ended,
+    /// and not at all when one could not be stopped.
     fn serving_registrar(&self) -> Option<Arc<dyn ServingRegistrar>> {
         None
     }
@@ -110,6 +118,15 @@ pub trait ServingRegistrar: Send + Sync {
     /// the timeout passes, so a dropped attempt must leave no registration
     /// behind.
     async fn register_again(&self) -> Reregistration;
+
+    /// Give up the registration the server holds, so a migration need not
+    /// wait for it to expire. `serve` calls it at most once, after every
+    /// background worker has ended, so a migration cannot start while one of
+    /// them still writes to the catalog; when a worker could not be stopped
+    /// it does not call it, and the registration expires. The default does
+    /// nothing, for a registration that ends with the process, such as
+    /// PostgreSQL's key, which the database frees when the session closes.
+    async fn release(&self) {}
 }
 
 /// The outcome of one [`ServingRegistrar::register_again`].

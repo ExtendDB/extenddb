@@ -830,7 +830,7 @@ async fn migrate_yes_refuses_a_store_that_is_not_a_catalog() {
 /// it in the error; one that committed nothing removes it.
 #[tokio::test]
 async fn a_stopped_run_keeps_its_copy_only_after_a_commit() {
-    use extenddb_storage::migrations::{AppliedStep, RunReport};
+    use extenddb_storage::migrations::{AppliedStep, Outcome, RunReport};
 
     let db = temp_db("stopped-copy");
     load_dump(&db, DEV_0_1_14).await;
@@ -850,6 +850,7 @@ async fn a_stopped_run_keeps_its_copy_only_after_a_commit() {
         id: 1,
         name: "baseline",
         store_name: location.clone(),
+        outcome: Outcome::Applied,
         notes: Vec::new(),
     }];
 

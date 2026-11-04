@@ -101,6 +101,18 @@ impl<'a, B: MigrationBackend> Runner<'a, B> {
         self.status_of(&snap).await
     }
 
+    /// Whether the store is a catalog, from its ledgers and settings alone:
+    /// the first of the status's tests, without the reads of the pending
+    /// migrations' `detect`, so a command can refuse a store that is not a
+    /// catalog before it takes the lock without reading every policy.
+    ///
+    /// # Errors
+    ///
+    /// A ledger or the settings could not be read.
+    pub async fn initialized(&self) -> Result<bool, MigrationError> {
+        Ok(self.read().await?.initialized())
+    }
+
     /// Apply every pending migration this binary carries.
     ///
     /// # Errors
@@ -259,12 +271,15 @@ impl<'a, B: MigrationBackend> Runner<'a, B> {
 
     /// Every store without a row for an id up to `target`, in order: by id,
     /// then catalog first. With `rerun`, also every store with a row for a
-    /// convergent id.
+    /// convergent id that applies on this backend: one that does not has no
+    /// body to run again.
     fn planned(&self, snap: &Snapshot, target: MigrationId, rerun: bool) -> Vec<Planned> {
         let mut steps = Vec::new();
         for id in MigrationId::ALL.into_iter().filter(|id| *id <= target) {
             let migration = self.backend.migration(id);
-            let rerun = rerun && migration.convergent();
+            let rerun = rerun
+                && migration.convergent()
+                && !matches!(migration, Migration::NotApplicable(_));
             for kind in migration.store_kinds() {
                 for store in snap.instances(kind) {
                     let recorded = snap.has_row(store, id.number());
@@ -496,11 +511,12 @@ impl<'a, B: MigrationBackend> Runner<'a, B> {
         applied: &mut Vec<AppliedStep>,
     ) -> Result<(), MigrationError> {
         for (i, step) in steps.iter().enumerate() {
-            let done = self.apply_step(snap, step).await?;
+            let (done, outcome) = self.apply_step(snap, step).await?;
             applied.push(AppliedStep {
                 id: step.id.number(),
                 name: step.id.name(),
                 store_name: step.store.name.clone(),
+                outcome,
                 notes: done.notes,
             });
             let last_of_id = steps.get(i + 1).is_none_or(|next| next.id != step.id);
@@ -555,11 +571,13 @@ impl<'a, B: MigrationBackend> Runner<'a, B> {
             .collect()
     }
 
+    /// Apply `step` and return the backend's result with the outcome its
+    /// row records.
     async fn apply_step(
         &self,
         snap: &mut Snapshot,
         step: &Planned,
-    ) -> Result<Done, MigrationError> {
+    ) -> Result<(Done, Outcome), MigrationError> {
         let migration = self.backend.migration(step.id);
         let checksum = record_checksum(
             self.backend.released(),
@@ -610,6 +628,6 @@ impl<'a, B: MigrationBackend> Runner<'a, B> {
             .apply(&step.store, step.id, action, row, catalog_version)
             .await?;
         *snap = after;
-        Ok(done)
+        Ok((done, outcome))
     }
 }

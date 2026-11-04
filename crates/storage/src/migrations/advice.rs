@@ -7,8 +7,7 @@
 
 use super::catalog::{CatalogMigrations, Target};
 use super::registry::{MigrationId, RELEASED_THROUGH};
-use super::status::{CatalogStatus, MigrationError, Pending};
-use super::table::Kind;
+use super::status::{CatalogStatus, MigrationError, Pending, behind_line, stores_behind};
 
 /// What a message needs beyond the status.
 #[derive(Debug, Clone, Copy)]
@@ -157,12 +156,18 @@ pub fn status_message(status: &CatalogStatus, advice: &Advice<'_>) -> String {
     let latest = MigrationId::LATEST.number();
     match status {
         CatalogStatus::Behind { version, pending } => {
-            let (at, stop) = match version {
-                Some(v) => (
+            let behind = stores_behind(pending);
+            let (at, stop) = match (behind, version) {
+                // A run stopped after the catalog store: name the stores it
+                // did not reach, since the catalog store is further on.
+                (Some((catalog_at, behind)), _) => {
+                    (behind_line(catalog_at, &behind), "Stop the server.")
+                }
+                (None, Some(v)) => (
                     format!("the catalog is at migration {v}"),
                     "Stop the server.",
                 ),
-                None => (
+                (None, None) => (
                     "the catalog has no migration ledger (a release before 1.0 created it)"
                         .to_owned(),
                     "Stop every server that uses this catalog: a server of a release before 1.0 \
@@ -255,29 +260,53 @@ fn capitalized(text: &str) -> String {
     })
 }
 
+/// `pending` with one entry per id, kind of store and kind, in their first
+/// order, and the number of stores each entry stands for: a body that runs
+/// in several stores of one kind (Cassandra's account keyspaces) is listed
+/// once.
+#[must_use]
+pub fn grouped(pending: &[Pending]) -> Vec<(&Pending, usize)> {
+    let mut groups: Vec<(&Pending, usize)> = Vec::new();
+    for p in pending {
+        match groups
+            .iter_mut()
+            .find(|(g, _)| g.id == p.id && g.store == p.store && g.kind == p.kind)
+        {
+            Some((_, stores)) => *stores += 1,
+            None => groups.push((p, 1)),
+        }
+    }
+    groups
+}
+
+/// The kind of store of a [`grouped`] entry, with the number of stores
+/// when it stands for more than one: `account in 4 stores`.
+#[must_use]
+pub fn stores_label(pending: &Pending, stores: usize) -> String {
+    match stores {
+        1 => pending.store.as_str().to_owned(),
+        n => format!("{} in {n} stores", pending.store.as_str()),
+    }
+}
+
 /// `Pending (all breaking): 2 name (catalog), ...`, or each kind beside its
 /// migration when the kinds differ.
 fn pending_line(pending: &[Pending]) -> String {
-    let kinds: Vec<Kind> = pending.iter().map(|p| p.kind).collect();
-    let same = kinds.windows(2).all(|w| w[0] == w[1]);
-    let items: Vec<String> = pending
+    let groups = grouped(pending);
+    let same = groups.windows(2).all(|w| w[0].0.kind == w[1].0.kind);
+    let items: Vec<String> = groups
         .iter()
-        .map(|p| {
+        .map(|(p, stores)| {
+            let store = stores_label(p, *stores);
             if same {
-                format!("{} {} ({})", p.id, p.name, p.store.as_str())
+                format!("{} {} ({store})", p.id, p.name)
             } else {
-                format!(
-                    "{} {} ({}, {})",
-                    p.id,
-                    p.name,
-                    p.store.as_str(),
-                    p.kind.as_str()
-                )
+                format!("{} {} ({store}, {})", p.id, p.name, p.kind.as_str())
             }
         })
         .collect();
-    match kinds.first() {
-        Some(kind) if same => format!("Pending (all {}): {}.", kind.as_str(), items.join(", ")),
+    match groups.first() {
+        Some((p, _)) if same => format!("Pending (all {}): {}.", p.kind.as_str(), items.join(", ")),
         _ => format!("Pending: {}.", items.join(", ")),
     }
 }
@@ -290,7 +319,7 @@ mod quoting_tests;
 mod tests {
     use super::{Advice, error_message, status_message};
     use crate::migrations::{
-        AppliedStep, CatalogStatus, Kind, MigrationError, MigrationId, Pending, RunReport,
+        AppliedStep, CatalogStatus, Kind, MigrationError, MigrationId, Outcome, Pending, RunReport,
         StoreKind,
     };
 
@@ -356,6 +385,145 @@ mod tests {
         );
         assert!(message.starts_with("the catalog has no migration ledger"));
         assert!(message.contains("Stop every server that uses this catalog"));
+    }
+
+    /// A body that runs in every account keyspace is named once per id with
+    /// the number of keyspaces, not once per keyspace.
+    #[test]
+    fn a_body_in_many_stores_of_one_kind_is_named_once() {
+        let baseline = MigrationId::ALL[0];
+        let entry = |store, store_name: &str, kind| Pending {
+            id: baseline.number(),
+            name: baseline.name(),
+            store,
+            store_name: store_name.to_owned(),
+            kind,
+        };
+        let mut list = vec![entry(
+            StoreKind::Catalog,
+            "extenddb_catalog",
+            Kind::Breaking,
+        )];
+        for keyspace in ["acct_a", "acct_b", "acct_c"] {
+            list.push(entry(StoreKind::Account, keyspace, Kind::Breaking));
+        }
+        let message = status_message(
+            &CatalogStatus::Behind {
+                version: None,
+                pending: list.clone(),
+            },
+            &ADVICE,
+        );
+        let line = format!(
+            "Pending (all breaking): {id} {name} (catalog), {id} {name} (account in 3 stores).",
+            id = baseline.number(),
+            name = baseline.name()
+        );
+        assert!(message.contains(&line), "{message}");
+
+        list[1].kind = Kind::Additive;
+        let message = status_message(
+            &CatalogStatus::Behind {
+                version: None,
+                pending: list,
+            },
+            &ADVICE,
+        );
+        assert!(message.contains("(account, additive), "), "{message}");
+        assert!(
+            message.contains("(account in 2 stores, breaking)."),
+            "{message}"
+        );
+    }
+
+    /// An account keyspace without migration 1 beside a catalog keyspace at
+    /// the latest migration puts the deployment at migration 0. The message
+    /// names that keyspace and the catalog store's migration instead of
+    /// saying the catalog is at migration 0.
+    #[test]
+    fn a_store_behind_the_catalog_store_is_named() {
+        let latest = MigrationId::LATEST.number();
+        let baseline = MigrationId::ALL[0];
+        let account = |name: &str, id: MigrationId| Pending {
+            id: id.number(),
+            name: id.name(),
+            store: StoreKind::Account,
+            store_name: name.to_owned(),
+            kind: Kind::Breaking,
+        };
+        let status = CatalogStatus::Behind {
+            version: Some(0),
+            pending: vec![account("p_account_111111111111", baseline)],
+        };
+        let message = status_message(&status, &ADVICE);
+        assert_eq!(
+            message.lines().next().unwrap_or_default(),
+            format!(
+                "account store p_account_111111111111 is at migration 0, behind the catalog \
+                 store at migration {latest}, and ExtendDB 1.0.1 needs migration {latest}."
+            ),
+            "{message}"
+        );
+        assert!(
+            !message.contains("the catalog is at migration 0"),
+            "{message}"
+        );
+        assert_eq!(
+            status.to_string(),
+            format!(
+                "account store p_account_111111111111 is at migration 0, behind the catalog \
+                 store at migration {latest}; pending: 1 baseline (account, breaking)"
+            )
+        );
+
+        // Two stores behind, and a data store behind at another migration.
+        let pending = vec![
+            account("p_account_1", baseline),
+            account("p_account_2", baseline),
+            Pending {
+                store: StoreKind::Data,
+                store_name: "extenddb_data".to_owned(),
+                ..account("", MigrationId::LATEST)
+            },
+        ];
+        let message = status_message(
+            &CatalogStatus::Behind {
+                version: Some(0),
+                pending,
+            },
+            &ADVICE,
+        );
+        assert!(
+            message.starts_with(&format!(
+                "account store p_account_1 (at migration 0), account store p_account_2 (at \
+                 migration 0) and data store extenddb_data (at migration {}) are behind the \
+                 catalog store at migration {latest}, and ExtendDB",
+                latest - 1
+            )),
+            "{message}"
+        );
+
+        // An upgrade: every store waits for the same migration, so no store
+        // is behind the catalog store and the version is the catalog's.
+        let upgrade = CatalogStatus::Behind {
+            version: Some(latest - 1),
+            pending: vec![
+                Pending {
+                    store: StoreKind::Catalog,
+                    store_name: "p_catalog".to_owned(),
+                    ..account("", MigrationId::LATEST)
+                },
+                account("p_account_1", MigrationId::LATEST),
+            ],
+        };
+        let message = status_message(&upgrade, &ADVICE);
+        assert!(
+            message.starts_with(&format!(
+                "the catalog is at migration {}, and ExtendDB",
+                latest - 1
+            )),
+            "{message}"
+        );
     }
 
     #[test]
@@ -501,6 +669,7 @@ mod tests {
                     id: 1,
                     name: "baseline",
                     store_name: "db".to_owned(),
+                    outcome: Outcome::Applied,
                     notes: Vec::new(),
                 }],
                 notes: vec!["copied the database to db.pre-migration-legacy-to-4-x".to_owned()],

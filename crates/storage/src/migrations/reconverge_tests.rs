@@ -115,7 +115,8 @@ async fn a_ledger_without_migration_1_is_at_migration_0() {
 /// Id 4 is not convergent on the fake. While no store has a row for it, a
 /// reconverge applies it like any pending id. Once it is recorded, a
 /// reconverge leaves it as it is and names it in the report's notes, runs
-/// the convergent ids again, and repairs the catalog.
+/// the convergent ids again, and repairs the catalog. Id 3 does not apply on
+/// the fake: a reconverge does not run its recorded row again.
 #[tokio::test]
 async fn reconverge_skips_a_recorded_id_that_is_not_convergent() {
     let fake = Fake::new();
@@ -129,12 +130,25 @@ async fn reconverge_skips_a_recorded_id_that_is_not_convergent() {
             s.traces.resource_tag_marker = true;
         });
     };
+    let steps_of = |id: MigrationId| steps_after(id.number() - 1) - steps_after(id.number());
+    let three = MigrationId::SortKeyDefinitions;
+    // The fake models no id after 4: each later one does not apply, so once
+    // it is recorded a reconverge does not run it again either.
+    let later: usize = MigrationId::ALL
+        .into_iter()
+        .filter(|id| id.number() > MigrationId::IndexTableBaseKey.number())
+        .map(steps_of)
+        .sum();
     an_older_release_writes();
     let report = runner(&fake).reconverge().await.unwrap();
+    assert!(
+        report.applied.iter().all(|s| s.id != three.number()),
+        "{report:?}"
+    );
     assert_eq!(
         report.applied.len(),
-        steps_after(0),
-        "every id ran: {report:?}"
+        steps_after(0) - steps_of(three),
+        "every id that applies ran: {report:?}"
     );
     assert!(
         report.notes.iter().all(|n| !n.starts_with("Skipped")),
@@ -147,13 +161,18 @@ async fn reconverge_skips_a_recorded_id_that_is_not_convergent() {
 
     an_older_release_writes();
     let four = MigrationId::IndexTableBaseKey;
-    let steps_of_four = steps_after(four.number() - 1) - steps_after(four.number());
     let report = runner(&fake).reconverge().await.unwrap();
     assert!(
-        report.applied.iter().all(|s| s.id != four.number()),
+        report
+            .applied
+            .iter()
+            .all(|s| s.id != four.number() && s.id != three.number()),
         "{report:?}"
     );
-    assert_eq!(report.applied.len(), steps_after(0) - steps_of_four);
+    assert_eq!(
+        report.applied.len(),
+        steps_after(0) - steps_of(four) - steps_of(three) - later
+    );
     assert!(
         report.notes.contains(&format!(
             "Skipped {four}: it is not convergent on fake, so it does not run again over \

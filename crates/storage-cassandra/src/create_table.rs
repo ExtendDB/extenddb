@@ -219,11 +219,10 @@ impl CassandraEngine {
             )));
         }
 
-        // Insert table metadata with LWT (IF NOT EXISTS). Only a restore
-        // target names the restore columns (added by catalog migration V005),
-        // so an ordinary CreateTable also works on a catalog that has not run
-        // V005; CQL rejects a statement naming an undefined column even when
-        // no value is bound to it.
+        // Insert table metadata with LWT (IF NOT EXISTS). Every catalog this
+        // release serves has the restore columns (catalog migration 1 creates
+        // them). Only a restore target has values for them, so only its insert
+        // names them, and an ordinary table's row leaves them null.
         let mut columns = String::from(
             "account_id, table_name, table_id, table_arn, key_schema, \
              attribute_definitions, billing_mode, provisioned_throughput, stream_specification, \
@@ -311,8 +310,8 @@ impl CassandraEngine {
                 // A restore into a name that is a CREATING restore target is
                 // refused as such, naming that target's source backup (the
                 // service answers TableInUseException); any other taken name
-                // is TableAlreadyExists. The restore column is absent on a
-                // catalog without V005, which reads as "not a restore target".
+                // is TableAlreadyExists. An ordinary table's row has a null
+                // restore column, which reads as "not a restore target".
                 if restore.is_some() {
                     let status: Option<String> = row.get_by_name("table_status").ok().flatten();
                     let source: Option<String> =

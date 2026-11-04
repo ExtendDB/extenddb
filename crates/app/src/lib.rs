@@ -124,9 +124,8 @@ pub fn run(build: BuildInfo) -> anyhow::Result<()> {
             Ok(())
         }
         Command::Migrate(args) => {
-            // 0 up to date or applied; cmd_migrate::EXIT_PENDING for a preview
-            // that found work; on the migration ledger, the status's code;
-            // errors exit 1 through main.
+            // 0 up to date or applied, else the catalog status's code (3 for
+            // a preview that found work); errors exit 1 through main.
             let code = run_interactive(cmd_migrate::run(args, build.version))?;
             if code != 0 {
                 std::process::exit(i32::from(code));

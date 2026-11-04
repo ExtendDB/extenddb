@@ -133,14 +133,14 @@ In-memory stale-while-revalidate caches eliminate the per-request catalog roundt
 | `ttl_seconds` | `60` | Hard TTL — entries older than this trigger a fresh, request-blocking load. |
 | `soft_ttl_seconds` | `30` | Stale-but-usable threshold; older entries still serve immediately while a background task refreshes them. |
 | `negative_ttl_seconds` | `5` | Negative-cache TTL for "not found" results. |
-| `max_entries` | `10000` | Per-cache LRU cap. |
+| `max_entries` | `10000` | Maximum entries per cache. |
 
 Statistics are exposed at `/management/auth-cache-metrics` (JSON, admin-authenticated). The per-cache `pass_through` flag distinguishes "cache disabled" from "cache cold." The report includes every authorization sub-cache, among them the two principal creation-time caches (`user_created_at`, `role_created_at`) consulted on each user and role-session request to derive `aws:userid` and `aws:TokenIssueTime`.
 
 **Invalidation timing**:
 
 - **Single-key invalidations** (e.g. `DeleteAccessKey`, `PutUserPolicy`) drop the cached entry immediately; the next request sees the post-mutation state.
-- **Fanout invalidations** (e.g. `DeleteAccount`, `DeleteRole` session sweep, `DeleteGroup` member fanout) are **asynchronous** — there is a small window (~ms) between the API returning success and the matching entries being evicted. For hard cutover (e.g. revoking a compromised key), prefer the single-key path (`DeleteAccessKey`) over the cascade.
+- **Fanout invalidations** (e.g. `DeleteAccount`, `DeleteRole` session sweep, `DeleteGroup` member fanout) also take effect when the API returns. The account and role sweeps register a predicate with moka, and moka's `get` applies it, so matching entries are not served once the call returns; moka removes them from its map during later cache operations. The group fanout drops each member's entries in turn. If a group change cannot list the group's members, the server logs a warning and those members' entries wait for `ttl_seconds`.
 - **Off-instance changes** (multi-node deployments, or direct catalog writes) wait up to `ttl_seconds` to be observed locally.
 
 #### [server.tls]
@@ -800,8 +800,8 @@ The management web console is served at `/console/` on the same port as the Dyna
 
 ### Features
 
-- **Dashboard**: Account and admin user counts, version info
-- **Account management**: Create, view, delete accounts
+- **Dashboard**: Account and admin user counts (admin sessions only; an IAM-user session gets a link to its own account), version info
+- **Account management**: Create, view, delete accounts (an IAM-user session views its own account only and is redirected to `/console` from the pages of any other account)
 - **User management**: Create, delete users; view access keys, policies, tags, group memberships
 - **Access key management**: Create and delete access keys (secret shown once)
 - **Group management**: Create, delete groups; add/remove members
@@ -925,7 +925,7 @@ Check that PostgreSQL is running and the connection string in `extenddb.toml` is
 
 **The catalog has pending migrations, or is ahead of the binary:**
 
-On PostgreSQL and SQLite, `serve` reads the catalog's migration status before it opens the engine and refuses a catalog it cannot serve, printing the status and the command that resolves it. A catalog with pending migrations exits 3, for example `the catalog is at migration 4, and ExtendDB <release> needs migration 5`, followed by the pending migrations and `extenddb migrate --config extenddb.toml --yes`. A catalog that a newer release migrated with a breaking migration exits 4 and names that release's migrations; upgrade the binary rather than the catalog. The [Upgrade Manual](07-upgrade-manual.md#the-catalog-status) lists every status with its exit code and the stop / migrate / start sequence. On Cassandra and MongoDB the catalog checks are those of the 0.1.x releases; their sections of the Upgrade Manual describe them.
+On PostgreSQL, SQLite, Cassandra and MongoDB, `serve` reads the catalog's migration status before it opens the engine and refuses a catalog it cannot serve, printing the status and the command that resolves it. A catalog with pending migrations exits 3, for example `the catalog is at migration 4, and ExtendDB <release> needs migration 5`, followed by the pending migrations and `extenddb migrate --config extenddb.toml --yes`. A catalog that a newer release migrated with a breaking migration exits 4 and names that release's migrations; upgrade the binary rather than the catalog. The [Upgrade Manual](07-upgrade-manual.md#the-catalog-status) lists every status with its exit code and the stop / migrate / start sequence.
 
 ### Authentication Errors
 

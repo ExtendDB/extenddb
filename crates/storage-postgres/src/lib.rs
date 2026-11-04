@@ -168,7 +168,7 @@ pub fn backend() -> extenddb_storage::Backend {
             })
         },
         server_components: server_components_factory,
-        catalog_migrations: Some(&migrations::PostgresCatalogMigrations),
+        catalog_migrations: &migrations::PostgresCatalogMigrations,
     }
 }
 
@@ -791,7 +791,7 @@ fn server_components_factory(
     // PostgreSQL bootstrap needs operator input (databases, roles, admin
     // credentials), so `bootstrap_if_uninitialized` is not honored here:
     // an uninitialized catalog fails with the explicit-`init` guidance.
-    _options: extenddb_storage::server_components::ServerComponentsOptions,
+    options: extenddb_storage::server_components::ServerComponentsOptions,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<ServerComponents, BackendError>> + Send>,
 > {
@@ -808,7 +808,7 @@ fn server_components_factory(
         let pg_config = PostgresConfig {
             connection_string: connection_string.clone(),
             pool_size: max_connections,
-            max_item_size_bytes: 400_000,
+            max_item_size_bytes: options.max_item_size_bytes,
         };
 
         // Create PostgresEngine

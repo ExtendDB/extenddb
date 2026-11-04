@@ -394,3 +394,182 @@ async fn the_preview_refuses_a_lock_timeout() {
     );
     assert!(fake.calls().is_empty());
 }
+
+fn role(user: &str, password: Option<&str>) -> Option<extenddb_storage::migrations::AdminRole> {
+    Some(extenddb_storage::migrations::AdminRole {
+        user: user.to_owned(),
+        password: password.map(str::to_owned),
+    })
+}
+
+/// The admin role is the backend's own: a Cassandra binary reads
+/// `--cassandra-user` with `--cassandra-pass` or
+/// `EXTENDDB_CASSANDRA_PASSWORD` and ignores `--pg-user`; every other
+/// binary reads `--pg-user` with `--pg-pass` or `EXTENDDB_PG_PASSWORD` and
+/// ignores `--cassandra-user`.
+#[test]
+fn the_admin_role_is_chosen_by_the_backend() {
+    let both = parse(&[
+        "--yes",
+        "--pg-user",
+        "pg_admin",
+        "--pg-pass",
+        "pg_secret",
+        "--cassandra-user",
+        "cass_admin",
+        "--cassandra-pass",
+        "cass_secret",
+    ])
+    .expect("parse");
+    let pick = |backend: Option<&str>, args| {
+        super::admin_role_for(backend, args, None, None).expect("admin role")
+    };
+    assert_eq!(
+        pick(Some("cassandra"), &both),
+        role("cass_admin", Some("cass_secret"))
+    );
+    assert_eq!(
+        pick(Some("postgres"), &both),
+        role("pg_admin", Some("pg_secret"))
+    );
+    assert_eq!(
+        pick(Some("sqlite"), &both),
+        role("pg_admin", Some("pg_secret"))
+    );
+    assert_eq!(
+        pick(Some("mongodb"), &both),
+        role("pg_admin", Some("pg_secret"))
+    );
+    assert_eq!(pick(None, &both), role("pg_admin", Some("pg_secret")));
+
+    let cassandra_only = parse(&["--yes", "--cassandra-user", "cass_admin"]).expect("parse");
+    assert_eq!(pick(Some("postgres"), &cassandra_only), None);
+    assert_eq!(
+        pick(Some("cassandra"), &cassandra_only),
+        role("cass_admin", None)
+    );
+
+    let pg_only = parse(&["--yes", "--pg-user", "pg_admin"]).expect("parse");
+    assert_eq!(pick(Some("cassandra"), &pg_only), None);
+    assert_eq!(pick(Some("postgres"), &pg_only), role("pg_admin", None));
+}
+
+/// Each backend's password variable fills in for its password flag, and the
+/// flag wins over the variable; the other backend's variable is ignored.
+#[test]
+fn the_password_variable_is_the_backends_own() {
+    let env = |value: &str| Some(std::ffi::OsString::from(value));
+    let cassandra = parse(&["--yes", "--cassandra-user", "cass_admin"]).expect("parse");
+    assert_eq!(
+        super::admin_role_for(
+            Some("cassandra"),
+            &cassandra,
+            env("pg_env"),
+            env("cass_env")
+        )
+        .expect("admin role"),
+        role("cass_admin", Some("cass_env"))
+    );
+    assert_eq!(
+        super::admin_role_for(Some("cassandra"), &cassandra, env("pg_env"), None)
+            .expect("admin role"),
+        role("cass_admin", None)
+    );
+    let with_flag = parse(&[
+        "--yes",
+        "--cassandra-user",
+        "cass_admin",
+        "--cassandra-pass",
+        "flag",
+    ])
+    .expect("parse");
+    assert_eq!(
+        super::admin_role_for(Some("cassandra"), &with_flag, None, env("cass_env"))
+            .expect("admin role"),
+        role("cass_admin", Some("flag"))
+    );
+
+    let postgres = parse(&["--yes", "--pg-user", "pg_admin"]).expect("parse");
+    assert_eq!(
+        super::admin_role_for(Some("postgres"), &postgres, env("pg_env"), env("cass_env"))
+            .expect("admin role"),
+        role("pg_admin", Some("pg_env"))
+    );
+    assert_eq!(
+        super::admin_role_for(Some("postgres"), &postgres, None, env("cass_env"))
+            .expect("admin role"),
+        role("pg_admin", None)
+    );
+}
+
+/// The preview lists a body that runs in several stores of one kind once,
+/// with the number of stores, as the advice does: a deployment with many
+/// account keyspaces gets one line per migration, not one per keyspace.
+#[test]
+fn the_preview_lists_a_body_for_many_stores_once() {
+    let pending_in = |store: StoreKind, store_name: &str| Pending {
+        id: 1,
+        name: "baseline",
+        store,
+        store_name: store_name.to_owned(),
+        kind: Kind::Breaking,
+    };
+    let mut pending = vec![pending_in(StoreKind::Catalog, "acme_catalog")];
+    for n in 0..4 {
+        pending.push(pending_in(StoreKind::Account, &format!("acme_account_{n}")));
+    }
+    let lines = super::pending_lines(&pending);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines[0].starts_with("  1 baseline (catalog, breaking): "),
+        "{lines:?}"
+    );
+    assert!(
+        lines[1].starts_with("  1 baseline (account in 4 stores, breaking): "),
+        "{lines:?}"
+    );
+}
+
+/// A run stopped after the catalog store leaves stores behind it, and the
+/// preview's first line names them with the catalog store's migration,
+/// where the catalog's own migration (0 here) would read as nothing
+/// applied. An upgrade, where every store waits for the same migration,
+/// keeps the catalog's migration.
+#[test]
+fn the_preview_names_the_stores_behind_the_catalog_store() {
+    let pending_in = |id: MigrationId, store: StoreKind, store_name: &str| Pending {
+        id: id.number(),
+        name: id.name(),
+        store,
+        store_name: store_name.to_owned(),
+        kind: Kind::Breaking,
+    };
+    let latest = MigrationId::LATEST.number();
+    let stopped = [pending_in(
+        MigrationId::Baseline,
+        StoreKind::Account,
+        "ks_account_1",
+    )];
+    assert_eq!(
+        super::behind_summary(Some(0), &stopped, latest),
+        format!(
+            "Account store ks_account_1 is at migration 0, behind the catalog store at \
+             migration {latest}; this binary carries {latest}."
+        )
+    );
+    let upgrade = [
+        pending_in(MigrationId::LATEST, StoreKind::Catalog, "ks_catalog"),
+        pending_in(MigrationId::LATEST, StoreKind::Account, "ks_account_1"),
+    ];
+    assert_eq!(
+        super::behind_summary(Some(latest - 1), &upgrade, latest),
+        format!(
+            "The catalog is at migration {}; this binary carries {latest}.",
+            latest - 1
+        )
+    );
+    assert!(
+        super::behind_summary(None, &upgrade, latest)
+            .starts_with("The catalog has no migration ledger"),
+    );
+}
