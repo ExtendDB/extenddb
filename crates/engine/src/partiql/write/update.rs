@@ -19,7 +19,8 @@ use super::{
 use crate::create_table::storage_err_to_dynamo;
 use crate::partiql::authorize::Gate;
 use crate::partiql::{SingleRequest, common, item_depth};
-use crate::{DispatchResult, OperationContext, handle_update_item};
+use crate::update_item::handle_update_item_with;
+use crate::{DispatchResult, OperationContext};
 
 // --- UPDATE ---------------------------------------------------------------
 
@@ -60,7 +61,10 @@ pub(super) async fn run_update(
         body["ReturnValuesOnConditionCheckFailure"] = json!(rvoccf);
     }
 
-    let mut result = handle_update_item(body, ctx)
+    // The service sizes an UPDATE by its finished item alone, not by the
+    // statement as it sizes UpdateItem (measured 2026-11-04).
+    let finished_item_sizing = true;
+    let mut result = handle_update_item_with(body, ctx, finished_item_sizing)
         .await
         .map_err(crate::partiql::bare_expression_error)?;
     crate::partiql::returning::project_modified(&mut result.body, update)?;

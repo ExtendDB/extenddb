@@ -174,9 +174,14 @@ remains. The key and untouched attributes are left out. Both the statement figur
 and the finished item are checked against the limit, and a breach refuses with
 `Item size to update has exceeded the maximum allowed size`.
 
+A transacted `Update` and a PartiQL `UPDATE` are sized by the finished item
+alone, with the same wording. For PartiQL this holds in `ExecuteStatement`,
+`BatchExecuteStatement` and `ExecuteTransaction` (measured in us-east-1 on
+2026-11-04).
+
 | Area | DynamoDB | ExtendDB |
 |------|----------|------|
-| `UpdateItem` item-size accounting | In 31 of 33 commercial regions a standalone `UpdateItem` is sized by the statement (the rule above). At a one-byte key the largest finished item it can produce is 409,581 bytes. Two regions (`eu-south-2`, `me-central-1`) size an `UpdateItem` on the finished item, like a `PutItem`. | PostgreSQL and SQLite follow the 31-region statement rule. A transacted `Update` is sized on the finished item on both, as on the service. Cassandra sizes every update on the finished item against a fixed 409,600 bytes; MongoDB applies no item-size limit on updates. |
+| `UpdateItem` item-size accounting | In 31 of 33 commercial regions a standalone `UpdateItem` is sized by the statement (the rule above). At a one-byte key the largest finished item it can produce is 409,581 bytes. Two regions (`eu-south-2`, `me-central-1`) size an `UpdateItem` on the finished item, like a `PutItem`. | PostgreSQL and SQLite follow the 31-region statement rule. A transacted `Update` and a PartiQL `UPDATE` are sized on the finished item on both, as on the service. Cassandra sizes every update on the finished item against a fixed 409,600 bytes; MongoDB applies no item-size limit on updates. |
 
 ## Capacity and Throttling
 
