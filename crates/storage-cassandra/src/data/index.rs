@@ -599,6 +599,34 @@ pub(crate) fn insert_index_row_multi(
     base_sks: &[(&str, ScalarAttributeType)],
     stamp: Option<i64>,
 ) -> Result<(), StorageError> {
+    let (cql, qv) = index_row_insert(
+        account_keyspace,
+        idx_table,
+        item,
+        projected,
+        index_ks,
+        base_ks,
+        idx_sks,
+        base_sks,
+    )?;
+    let old = std::mem::replace(batch, BatchQueryBuilder::new());
+    *batch = old.add_query(cql, qv);
+    Ok(())
+}
+
+/// The parameterized INSERT of `item`'s row in the index table `idx_table`,
+/// as a statement and its bound values.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn index_row_insert(
+    account_keyspace: &str,
+    idx_table: &str,
+    item: &Item,
+    projected: &Item,
+    index_ks: &[KeySchemaElement],
+    base_ks: &[KeySchemaElement],
+    idx_sks: &[(&str, ScalarAttributeType)],
+    base_sks: &[(&str, ScalarAttributeType)],
+) -> Result<(String, cdrs_tokio::query::QueryValues), StorageError> {
     let idx_pk_text = composite_pk_to_text(item, index_ks)?;
     let base_pk_text = composite_pk_to_text(item, base_ks)?;
 
@@ -655,10 +683,7 @@ pub(crate) fn insert_index_row_multi(
         placeholders,
         using
     );
-    let qv = cdrs_tokio::query::QueryValues::SimpleValues(values);
-    let old = std::mem::replace(batch, BatchQueryBuilder::new());
-    *batch = old.add_query(cql, qv);
-    Ok(())
+    Ok((cql, cdrs_tokio::query::QueryValues::SimpleValues(values)))
 }
 
 /// Convert a `SortKeyValue` to a `cdrs_tokio` bound `Value`.

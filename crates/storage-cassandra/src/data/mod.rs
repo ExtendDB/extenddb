@@ -21,6 +21,7 @@ pub mod index;
 mod put_get_item;
 mod query;
 mod query_helpers;
+mod restore_copy;
 mod scan;
 mod sk_range;
 mod transact_stream;
