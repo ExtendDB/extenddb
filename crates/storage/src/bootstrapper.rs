@@ -247,14 +247,20 @@ pub mod helpers {
 
     /// Generate a 256-bit AES-GCM encryption key and return it as base64.
     ///
-    /// Uses `aes_gcm::Aes256Gcm::generate_key` with `OsRng` for cryptographically
-    /// secure random key generation.
-    pub fn generate_encryption_key() -> String {
-        use aes_gcm::KeyInit;
+    /// The key bytes come from AWS-LC's random number generator through
+    /// `aws_lc_rs::rand::fill`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the random number generator fails. No key is
+    /// produced in that case.
+    pub fn generate_encryption_key() -> Result<String, String> {
         use base64::Engine;
 
-        let key = aes_gcm::Aes256Gcm::generate_key(&mut aes_gcm::aead::OsRng);
-        base64::engine::general_purpose::STANDARD.encode(key)
+        let mut key = zeroize::Zeroizing::new([0u8; 32]);
+        aws_lc_rs::rand::fill(&mut key[..])
+            .map_err(|_| "generate encryption key: random number generator failed".to_owned())?;
+        Ok(base64::engine::general_purpose::STANDARD.encode(&key[..]))
     }
 
     /// Check that a CLI arg, if provided, matches the config value.
@@ -426,7 +432,7 @@ pub mod helpers {
 
         #[test]
         fn test_generate_encryption_key_length() {
-            let key_b64 = generate_encryption_key();
+            let key_b64 = generate_encryption_key().expect("generate key");
 
             // Decode to verify it's valid base64 and correct length
             use base64::Engine;
@@ -443,8 +449,8 @@ pub mod helpers {
 
         #[test]
         fn test_generate_encryption_key_uniqueness() {
-            let key1 = generate_encryption_key();
-            let key2 = generate_encryption_key();
+            let key1 = generate_encryption_key().expect("generate key");
+            let key2 = generate_encryption_key().expect("generate key");
 
             // Multiple calls should produce different keys
             assert_ne!(key1, key2, "Encryption keys should be unique");

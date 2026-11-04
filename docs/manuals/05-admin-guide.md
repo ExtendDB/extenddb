@@ -800,8 +800,8 @@ The management web console is served at `/console/` on the same port as the Dyna
 
 ### Features
 
-- **Dashboard**: Account and admin user counts, version info
-- **Account management**: Create, view, delete accounts
+- **Dashboard**: Account and admin user counts (admin sessions only; an IAM-user session gets a link to its own account), version info
+- **Account management**: Create, view, delete accounts (an IAM-user session views its own account only and is redirected to `/console` from the pages of any other account)
 - **User management**: Create, delete users; view access keys, policies, tags, group memberships
 - **Access key management**: Create and delete access keys (secret shown once)
 - **Group management**: Create, delete groups; add/remove members
