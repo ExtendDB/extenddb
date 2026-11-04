@@ -140,17 +140,23 @@ async fn scratch_with_delay(delay_ms: &str) -> Scratch {
             .expect("apply a shipped migration");
     }
     // CreateTable completes inline with no control-plane worker.
-    sqlx::query("UPDATE settings SET value = '0' WHERE key = 'control_plane_delay_seconds'")
-        .execute(&db)
-        .await
-        .expect("pin the control-plane delay to zero");
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0') \
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .execute(&db)
+    .await
+    .expect("pin the control-plane delay to zero");
     // The propagation delay the caller chose. A non-zero delay keeps writes on
     // the asynchronous queue; zero returns an ACTIVE index to inline maintenance.
-    sqlx::query("UPDATE settings SET value = $1 WHERE key = 'index_propagation_delay_ms'")
-        .bind(delay_ms)
-        .execute(&db)
-        .await
-        .expect("set the propagation delay");
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ('index_propagation_delay_ms', $1) \
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .bind(delay_ms)
+    .execute(&db)
+    .await
+    .expect("set the propagation delay");
     sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES ($1, $2)")
         .bind(ACCOUNT)
         .bind(format!("acct-{db_name}"))
