@@ -683,8 +683,9 @@ pub(crate) fn authz_targets(
             let source = str_field(input, "SourceTableArn")
                 .or_else(|| str_field(input, "SourceTableName"))
                 .unwrap_or_default();
+            let restore = from(table_resource_arn(&source, region, account_id), &source);
             let mut v = restore_target_actions(input, region, account_id);
-            v.extend(from(table_resource_arn(&source, region, account_id), &source));
+            v.extend(restore);
             v
         }
         // Query and Scan on an index authorize the index ARN. With a table ARN
