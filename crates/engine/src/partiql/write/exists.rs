@@ -7,6 +7,7 @@ use serde_json::{Map, Value};
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::partiql::ast::SelectStatement;
+use extenddb_core::partiql::plan::SCALAR_KEY_REFUSAL;
 use extenddb_core::types::AttributeValue;
 
 use super::expr_builder::ExprBuilder;
@@ -41,12 +42,19 @@ pub(crate) struct ConditionCheckParts {
 /// 'a' AND pk = 'b' AND a = 1` and `pk = 'a' AND pk = 'b'` cancel the
 /// transaction with `ConditionalCheckFailed` for the member).
 ///
+/// A condition that tests a path into a key attribute against values (see
+/// `common::where_key`) fails the request, naming the member at position
+/// `index` (measured 2026-11-05: `EXISTS(SELECT * FROM t WHERE pk = 'k' AND
+/// sk = 'b' AND pk.c = 1)`).
+///
 /// # Errors
 ///
-/// Returns `ResourceNotFoundException` for a missing table and the
-/// multi-attribute refusal for a multi-part key.
+/// Returns `ResourceNotFoundException` for a missing table, the
+/// multi-attribute refusal for a multi-part key, and the refusal of a path
+/// into a key attribute tested against values.
 pub(crate) async fn build_exists_parts(
     ctx: &OperationContext,
+    index: usize,
     select: &SelectStatement,
     params: &[AttributeValue],
 ) -> Result<Option<ConditionCheckParts>, DynamoDbError> {
@@ -74,6 +82,11 @@ pub(crate) async fn build_exists_parts(
             wire_key(pk_name, sk_name, partition, sort, params)?,
             vec![where_clause],
         ),
+        common::WhereKey::IntoKey { name } => {
+            return Err(DynamoDbError::ValidationException(format!(
+                "Validation failed in TransactStatements[{index}]: {SCALAR_KEY_REFUSAL}{name}"
+            )));
+        }
         common::WhereKey::Partial | common::WhereKey::Conflict { .. } => return Ok(None),
     };
     let mut builder = ExprBuilder::default();

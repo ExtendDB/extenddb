@@ -22,6 +22,7 @@ use serde_json::{Map, Value, json};
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::partiql::Statement;
 use extenddb_core::partiql::ast::{Operand, Returning, WhereExpr};
+use extenddb_core::partiql::plan::SCALAR_KEY_REFUSAL;
 use extenddb_core::types::{AttributeValue, ScalarAttributeType, TableKeyInfo};
 
 use super::authorize::Gate;
@@ -123,8 +124,9 @@ fn key_names(key_info: &TableKeyInfo) -> Result<(&str, Option<&str>), DynamoDbEr
 /// # Errors
 ///
 /// The service's refusal of a key attribute with two different values
-/// (measured 2026-11-02: `pk = 'a' AND 1 = pk`), and its full-key message
-/// when the key is not pinned by equality.
+/// (measured 2026-11-02: `pk = 'a' AND 1 = pk`) and of a path into a key
+/// attribute tested against values (see `common::where_key`), and its
+/// full-key message when the key is not pinned by equality.
 fn split_key_where<'a>(
     where_clause: &'a WhereExpr,
     pk_name: &str,
@@ -136,6 +138,9 @@ fn split_key_where<'a>(
         FullKey::Conflict(name) => Err(DynamoDbError::ValidationException(format!(
             "Multiple conditions on same key {name}. Only single item Update/Insert/Delete are \
              supported"
+        ))),
+        FullKey::IntoKey(name) => Err(DynamoDbError::ValidationException(format!(
+            "{SCALAR_KEY_REFUSAL}{name}"
         ))),
         FullKey::Partial => Err(full_key_error()),
     }
@@ -157,6 +162,8 @@ enum FullKey<'a> {
     Partial,
     /// A key attribute with two different values, named.
     Conflict(String),
+    /// A path into a key attribute tested against values, named.
+    IntoKey(String),
 }
 
 /// Read a write's WHERE for its full primary key.
@@ -175,6 +182,7 @@ fn split_full_key<'a>(
             } => (partition, sort, residual),
             common::WhereKey::Partial => return Ok(FullKey::Partial),
             common::WhereKey::Conflict { name, .. } => return Ok(FullKey::Conflict(name)),
+            common::WhereKey::IntoKey { name } => return Ok(FullKey::IntoKey(name)),
         };
     let key = wire_key(pk_name, sk_name, partition, sort, params)?;
     Ok(FullKey::Pinned(key, residual))

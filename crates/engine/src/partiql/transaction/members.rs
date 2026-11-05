@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::partiql::Statement;
-use extenddb_core::partiql::ast::{InsertStatement, SelectStatement, UpdateStatement};
+use extenddb_core::partiql::ast::{InsertStatement, SelectStatement, UpdateStatement, WhereExpr};
 use extenddb_core::types::{AttributeValue, CancellationReason, Item, TableKeyInfo};
 use extenddb_core::validation::validate_item_keys;
 
@@ -100,7 +100,7 @@ async fn exists_member(
              not supported in transactions"
         )));
     }
-    let parts = write::build_exists_parts(ctx, select, &req.parameters)
+    let parts = write::build_exists_parts(ctx, index, select, &req.parameters)
         .await?
         .ok_or_else(|| {
             DynamoDbError::ValidationException(format!(
@@ -177,7 +177,11 @@ pub(super) fn check_parameter_count(
 ///
 /// A missing table is `ResourceNotFound`. A WHERE that does not give the full
 /// key by equality, or an `UPDATE` key value of the wrong type, is a
-/// `ValidationError` saying the key does not match the schema; a `SET` of a
+/// `ValidationError` saying the key does not match the schema, and so is a
+/// WHERE that tests a path into a key attribute against values (measured
+/// 2026-11-05 on UPDATE and DELETE); a path into a key attribute among the
+/// other conditions of an `UPDATE`, a `DELETE` or an `EXISTS` is a
+/// `ValidationError` with its refusal (see [`condition_key_reason`]); a `SET` of a
 /// key attribute and an `INSERT` without one are `ValidationError`s naming
 /// the attribute (measured 2026-11-02). A `DELETE` key value of the wrong type
 /// is treated like an `UPDATE` one, a `REMOVE` of a key attribute like a
@@ -203,15 +207,36 @@ pub(super) async fn member_reason(
     };
     common::ensure_single_attribute_keys(&key_info.key_schema)?;
     let params = &req.parameters;
+    let condition_key = |where_clause: Option<&WhereExpr>| {
+        condition_key_reason(where_clause, &key_info, params)
+    };
     match stmt {
         Statement::Insert(insert) => insert_key_reason(insert, &key_info, params),
-        Statement::Update(update) => {
-            Ok(key_reason(stmt, &key_info, params)?
-                .or_else(|| key_update_reason(update, &key_info)))
-        }
-        Statement::Delete(_) => key_reason(stmt, &key_info, params),
-        Statement::Select(_) | Statement::Exists(_) => Ok(None),
+        Statement::Update(update) => Ok(key_reason(stmt, &key_info, params)?
+            .or_else(|| key_update_reason(update, &key_info))
+            .or_else(|| condition_key(update.where_clause.as_ref()))),
+        Statement::Delete(delete) => Ok(key_reason(stmt, &key_info, params)?
+            .or_else(|| condition_key(Some(&delete.where_clause)))),
+        Statement::Exists(select) => Ok(condition_key(select.where_clause.as_ref())),
+        Statement::Select(_) => Ok(None),
     }
+}
+
+/// The reason a member reports when its WHERE pins its item and reads a
+/// path into a key attribute among its other conditions (see
+/// `common::condition_key_refusal`), after the reasons of its key and of a
+/// SET of a key attribute (measured 2026-11-05 on UPDATE, DELETE and
+/// EXISTS).
+fn condition_key_reason(
+    where_clause: Option<&WhereExpr>,
+    key_info: &TableKeyInfo,
+    params: &[AttributeValue],
+) -> Option<CancellationReason> {
+    let (Some(pk), sk) = common::key_names(&key_info.key_schema) else {
+        return None;
+    };
+    common::condition_key_refusal(where_clause?, pk, sk, params)
+        .map(CancellationReason::validation_error)
 }
 
 /// The reason an `UPDATE` or `DELETE` reports when its WHERE does not give the

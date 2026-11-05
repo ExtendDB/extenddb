@@ -334,6 +334,73 @@ fn key_roots<'a>(op: &'a Operand, keys: KeyNames<'_>, out: &mut Vec<&'a str>) {
     }
 }
 
+/// The key attribute of a condition that tests a path into one against
+/// values alone (see `plan::path_tested_against_values`).
+pub(super) fn value_test_of_path_into_key<'a>(
+    expr: &'a WhereExpr,
+    keys: KeyNames<'_>,
+) -> Option<&'a str> {
+    let into_key = |op: &'a Operand| match op {
+        Operand::Path(path) if !path.steps.is_empty() && keys.is_key(&path.root) => {
+            Some(path.root.as_str())
+        }
+        _ => None,
+    };
+    match expr {
+        WhereExpr::Compare(l, _, r) => into_key(l)
+            .filter(|_| is_value(r))
+            .or_else(|| into_key(r).filter(|_| is_value(l))),
+        WhereExpr::Between(v, low, high) => into_key(v).filter(|_| is_value(low) && is_value(high)),
+        WhereExpr::In(v, items) => into_key(v).filter(|_| items.iter().all(is_value)),
+        WhereExpr::BeginsWith(a, b) | WhereExpr::Contains(a, b) | WhereExpr::AttributeType(a, b) => {
+            into_key(a).filter(|_| is_value(b))
+        }
+        WhereExpr::IsType(operand, _, false) => into_key(operand),
+        WhereExpr::ComparedWithBoolean(inner, _) => value_test_of_path_into_key(inner, keys),
+        _ => None,
+    }
+}
+
+/// Every key attribute a condition reads a path into, in statement order.
+pub(super) fn keys_with_paths_into_them<'a>(
+    expr: &'a WhereExpr,
+    keys: KeyNames<'_>,
+    out: &mut Vec<&'a str>,
+) {
+    for leaf in leaves(expr) {
+        let path = match leaf {
+            Leaf::Operand(op) => {
+                paths_into_keys(op, keys, out);
+                continue;
+            }
+            Leaf::Missing(path) => path,
+        };
+        if !path.steps.is_empty() && keys.is_key(&path.root) {
+            out.push(path.root.as_str());
+        }
+    }
+}
+
+/// Every key attribute an operand reads a path into, itself or as a
+/// function's argument or an arithmetic operand.
+fn paths_into_keys<'a>(op: &'a Operand, keys: KeyNames<'_>, out: &mut Vec<&'a str>) {
+    match op {
+        Operand::Path(path) if !path.steps.is_empty() && keys.is_key(&path.root) => {
+            out.push(path.root.as_str());
+        }
+        Operand::Function(_, args) => {
+            for arg in args {
+                paths_into_keys(arg, keys, out);
+            }
+        }
+        Operand::Arith(l, _, r) => {
+            paths_into_keys(l, keys, out);
+            paths_into_keys(r, keys, out);
+        }
+        Operand::Path(_) | Operand::Literal(_) | Operand::Parameter(_) => {}
+    }
+}
+
 /// The key attribute of the first path into one in a condition.
 fn path_into_key<'a>(expr: &'a WhereExpr, keys: KeyNames<'_>) -> Option<&'a str> {
     leaves(expr).into_iter().find_map(|leaf| match leaf {

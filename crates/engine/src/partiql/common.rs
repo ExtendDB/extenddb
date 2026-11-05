@@ -18,7 +18,8 @@ use extenddb_core::partiql::ast::{
     CompareOp, InsertStatement, Operand, SelectStatement, WhereExpr,
 };
 use extenddb_core::partiql::plan::{
-    KeyEquality, KeyNames, SortCondition, WhereAnalysis, key_equality, same_value,
+    CONDITION_KEY_REFUSAL, KeyEquality, KeyNames, SortCondition, WhereAnalysis,
+    condition_key_path, key_equality, path_tested_against_values, same_value,
 };
 use extenddb_core::types::{
     AttributeValue, CancellationReason, KeySchemaElement, KeyType, ScalarAttributeType,
@@ -257,11 +258,23 @@ pub(super) enum WhereKey<'a> {
         name: String,
         first: Option<(&'a Operand, Option<&'a Operand>)>,
     },
+    /// A condition tests a path into the key attribute `name` against values
+    /// (see `plan::path_tested_against_values`), ahead of any second value
+    /// for a key attribute.
+    IntoKey { name: String },
 }
 
 /// Read a write's WHERE for the item it pins (see [`WhereKey`]). Two
 /// equalities with one value are one (measured 2026-11-02: `pk = 'a' AND
 /// pk = 'a'` and `sk = 'x' AND 'x' = sk` update the item).
+///
+/// A condition that tests a path into a key attribute against values and a
+/// second value for a key attribute are refused in statement order, ahead
+/// of a key attribute with no equality and of the key's types (measured
+/// 2026-11-05 on UPDATE and DELETE: `pk = 'k' AND pk = 'zz' AND sk = 'b' AND
+/// sk.c = 1` names the second value, `pk = 'k' AND sk = 'b' AND pk.c = 1 AND
+/// pk = 'zz'` the path, and `pk = 'k' AND pk.c = 1` and `pk = 1 AND sk = 'b'
+/// AND pk.c = 1` the path).
 pub(super) fn where_key<'a>(
     where_clause: &'a WhereExpr,
     pk: &str,
@@ -279,23 +292,33 @@ pub(super) fn where_key<'a>(
     let mut sk_value: Option<&Operand> = None;
     let mut residual = Vec::new();
     let mut conflict: Option<&str> = None;
+    let mut into_key: Option<&str> = None;
     for term in terms {
         let (existing, value, name) = match key_equality(term, keys) {
             Some(KeyEquality::Partition(value)) => (&mut pk_value, value, pk),
             Some(KeyEquality::Sort(value)) => (&mut sk_value, value, sk.unwrap_or_default()),
             None => {
+                if conflict.is_none() && into_key.is_none() {
+                    into_key = path_tested_against_values(term, keys);
+                }
                 residual.push(term);
                 continue;
             }
         };
         match *existing {
             Some(seen) => {
-                if conflict.is_none() && !same_value(seen, value, &value_of) {
+                if conflict.is_none() && into_key.is_none() && !same_value(seen, value, &value_of)
+                {
                     conflict = Some(name);
                 }
             }
             None => *existing = Some(value),
         }
+    }
+    if let Some(name) = into_key {
+        return WhereKey::IntoKey {
+            name: name.to_owned(),
+        };
     }
     let first = match (pk_value, sk_value, sk) {
         (Some(partition), sort, None) | (Some(partition), sort @ Some(_), Some(_)) => {
@@ -381,8 +404,32 @@ fn pinned_key(
         WhereKey::Pinned {
             partition, sort, ..
         } => build_key(pk, sk, Some(partition), sort, params),
-        WhereKey::Partial | WhereKey::Conflict { .. } => Ok(None),
+        WhereKey::Partial | WhereKey::Conflict { .. } | WhereKey::IntoKey { .. } => Ok(None),
     }
+}
+
+/// The refusal of a write, or of an `EXISTS` check, whose WHERE pins its
+/// item and whose other conditions read a path into a key attribute in a
+/// way [`where_key`] does not refuse, naming the attribute
+/// `plan::condition_key_path` gives; `None` otherwise. The service makes
+/// this check after the key's types and after the refusal of a SET of a key
+/// attribute, whether or not the item exists, and reports it as a failure
+/// of the item: a batch member's error names its table and a transaction
+/// member has it as its cancellation reason (measured 2026-11-05).
+pub(super) fn condition_key_refusal(
+    where_clause: &WhereExpr,
+    pk: &str,
+    sk: Option<&str>,
+    params: &[AttributeValue],
+) -> Option<String> {
+    let WhereKey::Pinned { residual, .. } = where_key(where_clause, pk, sk, params) else {
+        return None;
+    };
+    let keys = KeyNames {
+        partition: pk,
+        sort: sk,
+    };
+    condition_key_path(&residual, keys).map(|key| format!("{CONDITION_KEY_REFUSAL}{key}"))
 }
 
 /// A canonical string identity for an item: its table and wire-form key. Two
@@ -498,10 +545,13 @@ impl StatementError {
     /// [`Self::from_error`], except that a key value past its size limit
     /// carries the statement's `TableName` (measured 2026-11-02 for SELECT,
     /// INSERT, UPDATE and DELETE; a key value of the wrong type carries
-    /// none).
+    /// none), and so does the refusal of [`condition_key_refusal`]
+    /// (measured 2026-11-05 on UPDATE and DELETE).
     pub(super) fn from_key_error(err: &DynamoDbError) -> Self {
         let mut error = Self::from_error(err);
-        error.include_table_name |= is_key_size_error(err);
+        error.include_table_name |= is_key_size_error(err)
+            || matches!(err, DynamoDbError::ValidationException(message)
+                if message.starts_with(CONDITION_KEY_REFUSAL));
         error
     }
 

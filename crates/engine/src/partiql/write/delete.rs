@@ -34,6 +34,9 @@ pub(super) async fn run_delete(
 
     let parts = build_delete_parts(ctx, delete, &req.parameters).await?;
     gate.pass().await?;
+    if let Some(refusal) = parts.condition_key_refusal {
+        return Err(DynamoDbError::ValidationException(refusal));
+    }
 
     let mut body = json!({
         "TableName": parts.table,
@@ -74,6 +77,10 @@ pub(crate) struct DeleteParts {
     pub condition: Option<String>,
     pub names: Map<String, Value>,
     pub values: Map<String, Value>,
+    /// The refusal of a path into a key attribute among the WHERE's other
+    /// conditions (see `common::condition_key_refusal`), which the
+    /// statement gets once it is authorized, whether or not the item exists.
+    pub condition_key_refusal: Option<String>,
 }
 
 /// Translate a `DELETE` into its `DeleteItem` pieces. Does not validate the
@@ -97,6 +104,8 @@ pub(crate) async fn build_delete_parts(
 
     let (key, residual) = split_key_where(&delete.where_clause, pk_name, sk_name, params)?;
     common::check_key_types(&key, &key_info)?;
+    let condition_key_refusal =
+        common::condition_key_refusal(&delete.where_clause, pk_name, sk_name, params);
 
     let mut builder = ExprBuilder::default();
     let condition = delete_condition(&mut builder, pk_name, &residual, params)?;
@@ -107,6 +116,7 @@ pub(crate) async fn build_delete_parts(
         condition,
         names: builder.names,
         values: builder.values,
+        condition_key_refusal,
     })
 }
 
