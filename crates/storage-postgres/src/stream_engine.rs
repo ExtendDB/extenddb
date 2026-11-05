@@ -28,14 +28,15 @@ const NUMBER_BATCH: i64 = 1_000;
 /// record past this. The shard's row stays locked until the batch commits, and
 /// the time a batch takes grows with its bytes, because each record is copied
 /// to `stream_records`: on PostgreSQL 16, a batch of 1,000 records took 26 ms
-/// at about 1 KB a record and 2.4 s at 100 KB.
+/// at about 1 KB a record and 2.4 s at 100 KB. The bytes are the
+/// `record_bytes` column, the length of each record's JSON text as the write
+/// sent it. The copy decompresses and rewrites each record, so its time
+/// follows that length, which TOAST compression does not shrink.
 const NUMBER_BATCH_BYTES: i64 = 1 << 20;
 
-/// How many pending records a read numbers, in batches, before it reads the
-/// shard, and how many the numbering worker numbers on one shard in one pass.
-/// A read right after a write returns the write's record unless the shard
-/// holds more pending records than this. The rest are numbered later, by the
-/// next read or the worker, after every number already visible.
+/// How many pending records the numbering worker numbers on one shard in one
+/// pass, in batches. A read numbers one batch at most before it reads the
+/// shard (`number_before_read`).
 const NUMBER_LIMIT: u64 = 10_000;
 
 /// How long a read waits in all for other transactions that number its shard.
@@ -82,7 +83,7 @@ const PENDING_SHARDS: &str = "\
 /// first `$2` it looked at.
 const NUMBER_PENDING: &str = "\
     WITH first AS ( \
-        SELECT id, pg_column_size(record_data) AS size FROM stream_pending \
+        SELECT id, record_bytes AS size FROM stream_pending \
         WHERE shard_id = $1 ORDER BY id LIMIT $2 \
     ), sized AS ( \
         SELECT id, sum(size) OVER (ORDER BY id) - size AS before FROM first \
@@ -200,12 +201,22 @@ impl PostgresEngine {
         })
     }
 
-    /// Number the shard's committed pending records before a read of it, up
-    /// to [`NUMBER_LIMIT`]. A read then returns every record whose write
-    /// committed before it started. When another transaction numbers the
-    /// shard, the read waits for it with no connection held, looking again
-    /// after a pause, for [`NUMBER_WAIT`] at most. With nothing pending this
-    /// costs one indexed `EXISTS`.
+    /// Number one batch of the shard's committed pending records before a
+    /// read of it: [`NUMBER_BATCH`] records, or fewer once they hold
+    /// [`NUMBER_BATCH_BYTES`]. One batch bounds the time a read spends here
+    /// to about one batch's copy (26 ms for 1,000 records of about 1 KB on
+    /// PostgreSQL 16).
+    ///
+    /// A read then returns the records whose writes committed before it
+    /// started, except in three cases: the shard holds more pending records
+    /// than one batch takes, another transaction numbers the shard for longer
+    /// than [`NUMBER_WAIT`], or this numbering fails. The records left
+    /// pending get higher numbers than any the read returns, from the next
+    /// read or the numbering worker, and a later read returns them.
+    ///
+    /// When another transaction numbers the shard, the read waits for it with
+    /// no connection held, looking again after a pause, for [`NUMBER_WAIT`]
+    /// at most. With nothing pending this costs one indexed `EXISTS`.
     async fn number_before_read(
         &self,
         shard_id: &str,
@@ -213,8 +224,7 @@ impl PostgresEngine {
     ) -> Result<(), StorageError> {
         let deadline = tokio::time::Instant::now() + NUMBER_WAIT;
         let mut pause = Duration::from_millis(1);
-        let mut numbered = 0;
-        while numbered < NUMBER_LIMIT {
+        loop {
             // A record that a running numbering moves still counts as
             // pending here until that numbering commits.
             let pending: bool = sqlx::query_scalar(
@@ -225,26 +235,29 @@ impl PostgresEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
             if !pending {
-                break;
+                return Ok(());
             }
             match self.number_shard_batch(shard_id, table_id).await? {
-                Numbered::Moved { moved, more } => {
-                    numbered += moved;
-                    if !more {
-                        break;
-                    }
-                }
+                Numbered::Moved { .. } | Numbered::Missing => return Ok(()),
                 Numbered::Busy => {
                     if tokio::time::Instant::now() + pause > deadline {
-                        break;
+                        return Ok(());
                     }
                     tokio::time::sleep(pause).await;
                     pause = (pause * 2).min(NUMBER_PAUSE);
                 }
-                Numbered::Missing => break,
             }
         }
-        Ok(())
+    }
+
+    /// [`Self::number_before_read`], with a failure logged instead of
+    /// returned: the read goes on and returns the records numbered so far.
+    /// The records left pending are numbered by the next read or the
+    /// numbering worker, with higher numbers than any this read returns.
+    async fn number_before_read_or_log(&self, shard_id: &str, table_id: Option<&str>) {
+        if let Err(e) = self.number_before_read(shard_id, table_id).await {
+            tracing::warn!("Stream record numbering before a read of shard {shard_id} failed: {e}");
+        }
     }
 
     /// Number up to [`NUMBER_LIMIT`] of one shard's committed pending
@@ -501,10 +514,13 @@ impl StreamEngine for PostgresEngine {
                 return Err(extenddb_storage::util::stream_does_not_exist());
             };
 
-            // Number the shard's committed records first, so the page holds
-            // every write that committed before this read. Only the named
-            // table's shard is numbered.
-            self.number_before_read(&shard_id, Some(&table_id)).await?;
+            // Number a batch of the shard's committed records first, so the
+            // page holds the writes that committed before this read, within
+            // the bounds `number_before_read` names. Only the named table's
+            // shard is numbered. A numbering failure is logged, and the page
+            // holds the records numbered so far.
+            self.number_before_read_or_log(&shard_id, Some(&table_id))
+                .await;
 
             let rows: Vec<(String, Option<serde_json::Value>)> = if let Some(after) = after_sequence
             {
@@ -871,15 +887,15 @@ impl StreamEngine for PostgresEngine {
     ) -> BoxFuture<'_, Result<Option<String>, StorageError>> {
         let shard_id = shard_id.to_string();
         Box::pin(async move {
-            // A LATEST iterator starts after every record whose write has
-            // committed, so those are numbered first, up to NUMBER_LIMIT of
-            // them. A write still open is numbered later with a higher
-            // number, and the iterator returns it. When more than
-            // NUMBER_LIMIT records of the shard wait for their numbers, the
-            // rest are numbered later too, above the number returned here,
-            // and the iterator returns them although their writes committed
-            // before it was taken.
-            self.number_before_read(&shard_id, None).await?;
+            // A LATEST iterator starts after the records whose writes have
+            // committed, so a batch of them is numbered first. A write still
+            // open is numbered later with a higher number, and the iterator
+            // returns it. When more records of the shard wait for their
+            // numbers than one batch takes, or the numbering fails (it is
+            // logged), the rest are numbered later too, above the number
+            // returned here, and the iterator returns them although their
+            // writes committed before it was taken.
+            self.number_before_read_or_log(&shard_id, None).await;
             let row: Option<(String,)> = sqlx::query_as(
                 "SELECT sequence_number FROM stream_records \
                  WHERE shard_id = $1 ORDER BY sequence_number DESC LIMIT 1",

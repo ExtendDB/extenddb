@@ -370,8 +370,15 @@ pub(super) async fn write_stream_record_in_tx(
         user_identity: capture.user_identity.clone(),
     };
 
-    let record_json =
-        serde_json::to_value(&record).map_err(|e| StorageError::Internal(e.to_string()))?;
+    // The record's JSON text, sent once: the database parses it into the
+    // jsonb column, and its length in bytes is stored beside it. A numbering
+    // batch adds up that length (`NUMBER_BATCH_BYTES` in stream_engine.rs).
+    // It is the record's size before TOAST compresses it, which is what the
+    // numbering copies and rewrites; `pg_column_size` would give the
+    // compressed size.
+    let record_text =
+        serde_json::to_string(&record).map_err(|e| StorageError::Internal(e.to_string()))?;
+    let record_bytes = i64::try_from(record_text.len()).unwrap_or(i64::MAX);
 
     // The record waits in stream_pending, with no sequence number, until this
     // transaction commits. A reader of the shard, or the numbering worker,
@@ -382,13 +389,15 @@ pub(super) async fn write_stream_record_in_tx(
     // already read the higher number would then never return this record
     // (#808).
     sqlx::query(
-        "INSERT INTO stream_pending (shard_id, table_id, event_name, record_data, created_at) \
-         VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO stream_pending \
+         (shard_id, table_id, event_name, record_data, record_bytes, created_at) \
+         VALUES ($1, $2, $3, $4::jsonb, $5, $6)",
     )
     .bind(shard_id)
     .bind(&key_info.table_id)
     .bind(format!("{:?}", record.event_name))
-    .bind(&record_json)
+    .bind(&record_text)
+    .bind(record_bytes)
     .bind(created_at)
     .execute(&mut **tx)
     .await

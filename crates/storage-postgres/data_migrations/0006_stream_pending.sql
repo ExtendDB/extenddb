@@ -23,6 +23,10 @@ CREATE TABLE IF NOT EXISTS stream_pending (
     table_id TEXT NOT NULL,
     event_name TEXT NOT NULL,
     record_data JSONB NOT NULL,
+    -- The byte length of the record's JSON text as the write sent it. A
+    -- numbering batch adds it up to bound the bytes it copies; it is the size
+    -- before TOAST compression, which pg_column_size does not give.
+    record_bytes BIGINT NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (shard_id, id)
 ) WITH (autovacuum_vacuum_scale_factor = 0, autovacuum_vacuum_threshold = 1000);

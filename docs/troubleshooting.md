@@ -828,9 +828,15 @@ The error log line names the exact relations for one leaked table and gives this
 
 ### `Stream record numbering failed: <error>`
 
-**Cause:** The background worker that gives PostgreSQL stream records their sequence numbers encountered a database error. GetRecords numbers the records of the shard it reads before it reads them, so consumers still receive every record. The records of shards that nobody reads stay in the `stream_pending` table, and the retention sweep does not trim them, until the worker succeeds.
+**Cause:** The background worker that gives PostgreSQL stream records their sequence numbers encountered a database error. GetRecords numbers one batch of the records of the shard it reads before it reads them, so a consumer that keeps reading a shard still receives its records, unless the same error stops that numbering too (see the next entry). The records of shards that nobody reads stay in the `stream_pending` table, and the retention sweep does not trim them, until the worker succeeds.
 
 **Fix:** Check PostgreSQL connectivity. After a failure the worker tries again a little over a second later.
+
+### `Stream record numbering before a read of shard <shard> failed: <error>`
+
+**Cause:** GetRecords, or GetShardIterator with `LATEST`, could not number the shard's committed stream records before it read the shard, because of a database error. The call went on and answered from the records numbered before. The records left in `stream_pending` get higher sequence numbers from a later read or the background worker, and a later GetRecords call returns them.
+
+**Fix:** Check PostgreSQL connectivity and the error in the message. While the error repeats on every read of the shard and in the worker, consumers of that shard receive no new records.
 
 ### GetRecords is slow on PostgreSQL while a long transaction runs
 

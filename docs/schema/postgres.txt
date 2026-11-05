@@ -332,6 +332,7 @@ column stream_pending.id: bigint NOT NULL DEFAULT nextval('stream_pending_id_seq
 column stream_pending.table_id: text NOT NULL
 column stream_pending.event_name: text NOT NULL
 column stream_pending.record_data: jsonb NOT NULL
+column stream_pending.record_bytes: bigint NOT NULL DEFAULT 0
 column stream_pending.created_at: timestamp with time zone NOT NULL
 column stream_records.shard_id: text NOT NULL
 column stream_records.sequence_number: text NOT NULL

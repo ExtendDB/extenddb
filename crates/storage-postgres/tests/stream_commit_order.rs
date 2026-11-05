@@ -6,9 +6,9 @@
 //!
 //! A write stores its stream record in `stream_pending`, inside the write's
 //! own transaction, and the record gets its sequence number only after the
-//! write commits. GetRecords and a LATEST iterator number the shard's
-//! committed records before they read it, and a worker numbers the shards
-//! that nobody reads. Before this, a write drew its number inside its
+//! write commits. GetRecords and a LATEST iterator number a batch of the
+//! shard's committed records before they read it, and a worker numbers the
+//! shards that nobody reads. Before this, a write drew its number inside its
 //! transaction, and it could commit after a write that drew a higher number.
 //! A consumer that had read the higher number then never read the first
 //! write's record.
@@ -884,6 +884,118 @@ async fn readers_waiting_for_a_numbering_leave_the_pool_to_writes() {
     s.cleanup().await;
 }
 
+/// A read numbers one batch of the shard's pending records before it reads
+/// the shard, so the time GetRecords spends numbering is bounded by one
+/// batch. Of a backlog of 1,500 records, the first read numbers and returns
+/// the first 1,000, and the rest wait. The next read numbers and returns the
+/// rest, after the first read's numbers. When a read numbered up to 10,000
+/// records, the first read numbered all 1,500.
+#[tokio::test]
+async fn a_read_numbers_one_batch_of_a_backlog() {
+    let test = "a_read_numbers_one_batch_of_a_backlog";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    const BACKLOG: usize = 1_500;
+    let s = scratch(None, 12).await;
+    let (key_info, _, arn) = s.stream_table().await;
+    let shard = s.shard_of("b").await;
+    let written: Vec<String> = (0..BACKLOG).map(|i| format!("v{i:04}")).collect();
+    for (i, v) in written.iter().enumerate() {
+        s.put(&key_info, "b", &format!("{i:04}"), v).await;
+    }
+    assert_eq!(s.pending(&shard).await, 1_500);
+
+    let (first, cursor) = s.read(&arn, &shard, None).await;
+    assert_eq!(
+        values(&first),
+        &written[..1_000],
+        "the first read returns the first batch"
+    );
+    assert_eq!(
+        s.pending(&shard).await,
+        500,
+        "the first read numbers one batch"
+    );
+
+    let (rest, _) = s.read(&arn, &shard, cursor.as_deref()).await;
+    assert_eq!(
+        values(&rest),
+        &written[1_000..],
+        "the next read returns the rest in order"
+    );
+    assert_eq!(s.pending(&shard).await, 0);
+    assert!(
+        rest[0].dynamodb.sequence_number > first[999].dynamodb.sequence_number,
+        "the rest are numbered after the first batch"
+    );
+
+    s.cleanup().await;
+}
+
+/// A read whose numbering fails returns the records numbered before it,
+/// and logs the failure, where it failed GetRecords before. A LATEST
+/// iterator taken then starts after the numbered records. Once the cause is
+/// gone, the next read numbers and returns the record that waited.
+#[tokio::test]
+async fn a_read_whose_numbering_fails_returns_the_numbered_records() {
+    let test = "a_read_whose_numbering_fails_returns_the_numbered_records";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let s = scratch(None, 12).await;
+    let (key_info, _, arn) = s.stream_table().await;
+    let shard = s.shard_of("f").await;
+    s.put(&key_info, "f", "1", "a").await;
+    let (page, after_a) = s.read(&arn, &shard, None).await;
+    assert_eq!(values(&page), ["a"]);
+    let after_a = after_a.expect("the read returns the number of a");
+
+    // A numbering that copies the record whose v is "refused" fails.
+    sqlx::raw_sql(
+        "CREATE FUNCTION refuse_numbering() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+           IF NEW.record_data->'dynamodb'->'NewImage'->'v'->>'S' = 'refused' THEN \
+             RAISE EXCEPTION 'the test refuses this numbering'; \
+           END IF; \
+           RETURN NEW; \
+         END $$; \
+         CREATE TRIGGER refuse_numbering BEFORE INSERT ON stream_records \
+           FOR EACH ROW EXECUTE FUNCTION refuse_numbering();",
+    )
+    .execute(&s.db)
+    .await
+    .expect("install the failing trigger");
+    s.put(&key_info, "f", "2", "refused").await;
+
+    let (page, _) = s.read(&arn, &shard, None).await;
+    assert_eq!(
+        values(&page),
+        ["a"],
+        "the read returns the records numbered before"
+    );
+    assert_eq!(s.pending(&shard).await, 1, "the refused record waits");
+    let latest = s
+        .engine
+        .latest_sequence_number(&shard)
+        .await
+        .expect("LATEST resolves while the numbering fails");
+    assert_eq!(latest.as_deref(), Some(after_a.as_str()));
+
+    sqlx::raw_sql("DROP TRIGGER refuse_numbering ON stream_records")
+        .execute(&s.db)
+        .await
+        .expect("remove the failing trigger");
+    let (page, _) = s.read(&arn, &shard, Some(&after_a)).await;
+    assert_eq!(
+        values(&page),
+        ["refused"],
+        "the next read returns the record that waited"
+    );
+    assert_eq!(s.pending(&shard).await, 0);
+
+    s.cleanup().await;
+}
+
 /// About 100 KB of text that compresses poorly, from a fixed seed.
 fn noise(len: usize, seed: u64) -> String {
     let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
@@ -895,6 +1007,67 @@ fn noise(len: usize, seed: u64) -> String {
             char::from(b"0123456789abcdef"[(x % 16) as usize])
         })
         .collect()
+}
+
+/// About 100 KB of text that compresses to a small part of its length.
+fn compressible(len: usize, seed: u64) -> String {
+    format!("{seed:04}").repeat(len / 4)
+}
+
+/// Number every pending record of `shard` in one pass of the worker. Returns
+/// the `record_bytes` of the records each numbering transaction moved, one
+/// list per transaction, in the order the records were stored.
+async fn number_in_batches(s: &Scratch, shard: &str) -> Vec<Vec<i64>> {
+    let sizes: Vec<i64> = sqlx::query_scalar(
+        "SELECT record_bytes FROM stream_pending WHERE shard_id = $1 ORDER BY id",
+    )
+    .bind(shard)
+    .fetch_all(&s.db)
+    .await
+    .expect("read the sizes of the pending records");
+    let moved = s
+        .engine
+        .number_pending_stream_records_for_tests()
+        .await
+        .expect("number the pending records");
+    assert_eq!(moved, sizes.len() as u64, "one pass numbers every record");
+    // The records one numbering transaction moved share its xmin, and the
+    // numbering gives them numbers in the order they were stored.
+    let xmins: Vec<String> = sqlx::query_scalar(
+        "SELECT xmin::text FROM stream_records WHERE shard_id = $1 ORDER BY sequence_number",
+    )
+    .bind(shard)
+    .fetch_all(&s.db)
+    .await
+    .expect("read the numbered records");
+    assert_eq!(xmins.len(), sizes.len());
+    let mut batches: Vec<(String, Vec<i64>)> = Vec::new();
+    for (xmin, size) in xmins.into_iter().zip(sizes) {
+        match batches.last_mut() {
+            Some((x, sizes)) if *x == xmin => sizes.push(size),
+            _ => batches.push((xmin, vec![size])),
+        }
+    }
+    batches.into_iter().map(|(_, sizes)| sizes).collect()
+}
+
+/// `records` records of about 100 KB took three or more numbering
+/// transactions, and in each the records before the last hold less than a
+/// mebibyte of JSON text.
+fn assert_batches_stop_at_a_mebibyte(batches: &[Vec<i64>], records: u64) {
+    assert!(
+        batches.len() >= 3,
+        "{records} records of about 100 KB took {} transaction(s)",
+        batches.len()
+    );
+    for (i, sizes) in batches.iter().enumerate() {
+        let before_last: i64 = sizes[..sizes.len() - 1].iter().sum();
+        assert!(
+            before_last < 1 << 20,
+            "transaction {i} took {} records, {before_last} bytes before its last",
+            sizes.len()
+        );
+    }
 }
 
 /// A numbering transaction stops adding records to its batch once the
@@ -915,42 +1088,49 @@ async fn a_numbering_batch_stops_at_a_mebibyte_of_records() {
         s.put(&key_info, "big", &format!("{i:02}"), &noise(100_000, i))
             .await;
     }
-    let moved = s
-        .engine
-        .number_pending_stream_records_for_tests()
-        .await
-        .expect("number the pending records");
-    assert_eq!(moved, RECORDS, "one pass numbers every record");
+    let batches = number_in_batches(&s, &shard).await;
+    assert_batches_stop_at_a_mebibyte(&batches, RECORDS);
 
-    // The records one numbering transaction moved share its xmin.
-    let rows: Vec<(String, String, i32)> = sqlx::query_as(
-        "SELECT xmin::text, sequence_number, pg_column_size(record_data) FROM stream_records \
-         WHERE shard_id = $1 ORDER BY sequence_number",
+    s.cleanup().await;
+}
+
+/// A batch counts each record at the length of its JSON text, not at the
+/// size PostgreSQL stores after compression, because the copy decompresses
+/// and writes the whole record. Records of about 100 KB that compress to a
+/// few kilobytes still go about ten to a transaction. Counted at their
+/// stored size, all 30 went into one transaction.
+#[tokio::test]
+async fn a_numbering_batch_counts_compressible_records_at_their_text_length() {
+    let test = "a_numbering_batch_counts_compressible_records_at_their_text_length";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    const RECORDS: u64 = 30;
+    let s = scratch(None, 12).await;
+    let (key_info, _, _) = s.stream_table().await;
+    let shard = s.shard_of("big").await;
+    for i in 0..RECORDS {
+        s.put(
+            &key_info,
+            "big",
+            &format!("{i:02}"),
+            &compressible(100_000, i),
+        )
+        .await;
+    }
+    let stored: i64 = sqlx::query_scalar(
+        "SELECT max(pg_column_size(record_data))::bigint FROM stream_pending WHERE shard_id = $1",
     )
     .bind(&shard)
-    .fetch_all(&s.db)
+    .fetch_one(&s.db)
     .await
-    .expect("read the numbered records");
-    let mut batches: Vec<(String, Vec<i64>)> = Vec::new();
-    for (xmin, _, size) in rows {
-        match batches.last_mut() {
-            Some((x, sizes)) if *x == xmin => sizes.push(i64::from(size)),
-            _ => batches.push((xmin, vec![i64::from(size)])),
-        }
-    }
+    .expect("read the stored sizes");
     assert!(
-        batches.len() >= 3,
-        "{RECORDS} records of about 100 KB took {} transaction(s)",
-        batches.len()
+        stored < 10_000,
+        "a record of about 100 KB is stored in {stored} bytes, so it is compressed"
     );
-    for (xmin, sizes) in &batches {
-        let before_last: i64 = sizes[..sizes.len() - 1].iter().sum();
-        assert!(
-            before_last < 1 << 20,
-            "transaction {xmin} took {} records, {before_last} bytes before its last",
-            sizes.len()
-        );
-    }
+    let batches = number_in_batches(&s, &shard).await;
+    assert_batches_stop_at_a_mebibyte(&batches, RECORDS);
 
     s.cleanup().await;
 }
