@@ -413,7 +413,24 @@ impl MongoEngine {
         // single-document atomicity instead. Two concurrent writes
         // serialize at the storage engine level; one wins the last-
         // writer-wins race and the other's version is overwritten.
-        // No txn, no retry loop, no possible 500 from contention.
+        //
+        // The one exception is two puts that both create the item: each
+        // finds no document and each inserts, and the second insert fails
+        // with a duplicate-key error. The collection has two unique
+        // indexes: `_id_`, and one on the key fields (`pk`, plus the sort
+        // key field on a table with a sort key). MongoDB retries such an
+        // upsert itself only when the filter is an equality on the fields
+        // of the index that raised the error. This filter names `pk` and,
+        // on a table with a sort key, the sort key field, so the server
+        // would retry a collision on the key-field index. Every
+        // duplicate-key error measured on MongoDB 7.0 names `_id_`, which
+        // the filter does not name, so the server does not retry it and
+        // this loop does. The error means another put's item is already in
+        // the collection, so the next attempt finds that item, replaces it
+        // and returns it as the old image; if a delete removed that item
+        // first, the next attempt inserts. Attempts share the transient
+        // retry budget and back off between them, as the transaction path
+        // below does.
         if condition.is_none()
             && stream.is_none()
             && self.gsi_cache_get_fresh(&key_info.table_id) == Some(false)
@@ -424,13 +441,23 @@ impl MongoEngine {
                 .upsert(true)
                 .return_document(ReturnDocument::Before)
                 .build();
-            let old_doc = coll
-                .find_one_and_replace(key_filter, new_doc)
-                .with_options(opts)
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            let old_item = old_doc.as_ref().map(document_to_item).transpose()?;
-            return Ok(if return_old { old_item } else { None });
+            for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
+                match coll
+                    .find_one_and_replace(key_filter.clone(), &new_doc)
+                    .with_options(opts.clone())
+                    .await
+                {
+                    Ok(old_doc) => {
+                        let old_item = old_doc.as_ref().map(document_to_item).transpose()?;
+                        return Ok(if return_old { old_item } else { None });
+                    }
+                    Err(e) if is_duplicate_key(&e) => {
+                        backoff_sleep(attempt).await;
+                    }
+                    Err(e) => return Err(StorageError::Internal(e.to_string())),
+                }
+            }
+            return Err(create_race_exhausted(TRANSIENT_RETRY_ATTEMPTS));
         }
 
         let mut session = self
@@ -440,6 +467,7 @@ impl MongoEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let tx_options = self.write_transaction_options();
+        let mut lost_create_races = 0;
 
         for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
             let new_doc =
@@ -455,6 +483,9 @@ impl MongoEngine {
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
 
+            // Set when the unconditional upsert below hit a duplicate key on
+            // `_id`.
+            let mut lost_create_race = false;
             let attempt_res: Result<Option<Item>, TxErr> = async {
                 let old_item: Option<Item>;
 
@@ -521,12 +552,34 @@ impl MongoEngine {
                         .upsert(true)
                         .return_document(ReturnDocument::Before)
                         .build();
-                    let old_doc = coll
+                    // A put that loses the create race to another put does
+                    // not reach the duplicate-key arm here. Inside a
+                    // snapshot transaction MongoDB 7.0 reports that
+                    // collision as WriteConflict (code 112,
+                    // `WiredTigerIdIndex::_insert: index: _id_`) with the
+                    // TransientTransactionError label, whether the other
+                    // put is still open or committed after this
+                    // transaction's snapshot, and `TxErr::from` retries it.
+                    // The arm is a defence: a duplicate-key error here means
+                    // a document in this transaction's snapshot holds the
+                    // item's `_id` without matching the key filter. It runs
+                    // the transaction again with the retry budget and
+                    // backoff of a write conflict, and the put gives up with
+                    // the create race error when every attempt meets that
+                    // document.
+                    let old_doc = match coll
                         .find_one_and_replace(key_filter.clone(), new_doc)
                         .with_options(opts)
                         .session(&mut session)
                         .await
-                        .map_err(TxErr::from)?;
+                    {
+                        Ok(old_doc) => old_doc,
+                        Err(e) if is_duplicate_key(&e) => {
+                            lost_create_race = true;
+                            return Err(TxErr::Transient);
+                        }
+                        Err(e) => return Err(TxErr::from(e)),
+                    };
                     old_item = old_doc.as_ref().map(document_to_item).transpose()?;
                 }
 
@@ -564,6 +617,9 @@ impl MongoEngine {
                 },
                 Err(TxErr::Transient) => {
                     let _ = session.abort_transaction().await;
+                    if lost_create_race {
+                        lost_create_races += 1;
+                    }
                     backoff_sleep(attempt).await;
                     continue;
                 }
@@ -572,6 +628,12 @@ impl MongoEngine {
                     return Err(e);
                 }
             }
+        }
+
+        // Every attempt met a document that holds the item's `_id`: give up
+        // with the create race error the sessionless path returns.
+        if lost_create_races == TRANSIENT_RETRY_ATTEMPTS {
+            return Err(create_race_exhausted(lost_create_races));
         }
 
         // Retry ceiling exhausted. RFC-0003 §4.3 requires
@@ -3751,17 +3813,38 @@ enum CommitOutcome {
     RerunBody,
 }
 
-/// Detect a duplicate-key error (E11000, code 11000). Used at
-/// conditional-insert sites — a duplicate is the manifestation of a
-/// conditional-put race, so it must be surfaced as
-/// `ConditionalCheckFailedException` rather than a 500.
+/// Detect a duplicate-key error (E11000, code 11000).
+///
+/// The driver reports it in two forms: `insert_one` returns it as a write
+/// error, and `findAndModify` (`find_one_and_replace` with upsert) returns
+/// it as a command error. At conditional-insert sites a duplicate is the
+/// manifestation of a conditional-put race, so it must be surfaced as
+/// `ConditionalCheckFailedException` rather than a 500. At unconditional
+/// upsert sites it means another put created the item first, and the put
+/// is retried so that it replaces that item.
 fn is_duplicate_key(e: &mongodb::error::Error) -> bool {
-    matches!(
-        *e.kind,
-        mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(
-            mongodb::error::WriteError { code: 11000, .. }
-        ))
-    )
+    matches!(*e.kind, mongodb::error::ErrorKind::Command(ref c) if c.code == 11000)
+        || matches!(
+            *e.kind,
+            mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(
+                mongodb::error::WriteError { code: 11000, .. }
+            ))
+        )
+}
+
+/// The error when every attempt of an unconditional PutItem lost the create
+/// race: on the sessionless path, each attempt found no item, and its insert
+/// hit an item another writer created, which was deleted again before the
+/// next attempt read it; on the transaction path, every attempt met a
+/// document that holds the item's `_id` without matching the key filter.
+/// `attempt` is the number of attempts made. The message is the internal
+/// error (HTTP 500) the PostgreSQL backend returns when its own retries of
+/// this race run out.
+fn create_race_exhausted(attempt: u32) -> StorageError {
+    StorageError::Internal(format!(
+        "PutItem could not create the item after {attempt} attempts: each insert lost the \
+         create race to a concurrent writer"
+    ))
 }
 
 /// Build a `mongodb::error::Error` carrying the given error labels.
@@ -4286,6 +4369,31 @@ mod tests {
         let e = command_error(11600);
         assert!(matches!(classify_commit_error(&e), CommitErrorClass::Fatal));
         assert!(!is_transient_write_conflict(&e));
+    }
+
+    /// Build a write error with the given code, the form `insert_one`
+    /// returns.
+    fn write_error(code: i32) -> mongodb::error::Error {
+        let write_error: mongodb::error::WriteError = bson::from_document(doc! {
+            "code": code,
+            "codeName": "SyntheticTestError",
+            "errmsg": "synthetic write error",
+        })
+        .expect("static WriteError document deserializes");
+        mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(write_error))
+            .into()
+    }
+
+    #[test]
+    fn duplicate_key_is_recognized_as_a_command_error_and_as_a_write_error() {
+        // findAndModify, which an upserting find_one_and_replace sends,
+        // reports E11000 as a command error.
+        assert!(is_duplicate_key(&command_error(11000)));
+        // insert_one reports it as a write error.
+        assert!(is_duplicate_key(&write_error(11000)));
+        assert!(!is_duplicate_key(&command_error(112)));
+        assert!(!is_duplicate_key(&write_error(112)));
+        assert!(!is_transient_write_conflict(&command_error(11000)));
     }
 
     #[derive(Default)]
