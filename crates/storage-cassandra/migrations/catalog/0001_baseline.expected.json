@@ -1,0 +1,1007 @@
+{
+  "columns": {
+    "access_keys.access_key_id": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "access_keys.account_id": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "access_keys.created_at": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "timestamp"
+    },
+    "access_keys.is_active": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "boolean"
+    },
+    "access_keys.secret_key_encrypted": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "blob"
+    },
+    "access_keys.user_name": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "accounts.account_id": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "accounts.account_name": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "accounts.created_at": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "timestamp"
+    },
+    "admin_users.admin_name": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "admin_users.created_at": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "timestamp"
+    },
+    "admin_users.password_hash": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backups_by_account.account_id": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backups_by_account.backup_arn": {
+      "kind": "clustering",
+      "position": 1,
+      "clustering_order": "asc",
+      "type": "text"
+    },
+    "backups_by_account.backup_name": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backups_by_account.backup_size_bytes": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "bigint"
+    },
+    "backups_by_account.created_at": {
+      "kind": "clustering",
+      "position": 0,
+      "clustering_order": "desc",
+      "type": "timestamp"
+    },
+    "backups_by_account.table_arn": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backups_by_account.table_id": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backups_by_account.table_name": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backups_by_arn.account_id": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backups_by_arn.active_restores": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "map<text, text>"
+    },
+    "backups_by_arn.attribute_definitions": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backups_by_arn.backup_arn": {
+      "kind": "partition_key",
+      "position": 1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backups_by_arn.backup_name": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backups_by_arn.backup_size_bytes": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "bigint"
+    },
+    "backups_by_arn.backup_status": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backups_by_arn.backup_type": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backups_by_arn.billing_mode": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backups_by_arn.created_at": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "timestamp"
+    },
+    "backups_by_arn.definition": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backups_by_arn.item_count": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "bigint"
+    },
+    "backups_by_arn.key_schema": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backups_by_arn.provisioned_throughput": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backups_by_arn.stream_specification": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backups_by_arn.table_arn": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backups_by_arn.table_created_at": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "timestamp"
+    },
+    "backups_by_arn.table_id": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backups_by_arn.table_name": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backups_by_table.account_id": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backups_by_table.backup_arn": {
+      "kind": "clustering",
+      "position": 1,
+      "clustering_order": "asc",
+      "type": "text"
+    },
+    "backups_by_table.backup_name": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backups_by_table.backup_size_bytes": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "bigint"
+    },
+    "backups_by_table.created_at": {
+      "kind": "clustering",
+      "position": 0,
+      "clustering_order": "desc",
+      "type": "timestamp"
+    },
+    "backups_by_table.table_arn": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backups_by_table.table_id": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "backups_by_table.table_name": {
+      "kind": "partition_key",
+      "position": 1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "continuous_backups.account_id": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "continuous_backups.pitr_enabled": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "boolean"
+    },
+    "continuous_backups.table_name": {
+      "kind": "clustering",
+      "position": 0,
+      "clustering_order": "asc",
+      "type": "text"
+    },
+    "extenddb_servers.host": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "extenddb_servers.pid": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "int"
+    },
+    "extenddb_servers.release": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "extenddb_servers.server_id": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "extenddb_servers.started_at": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "iam_group_members.account_id": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "iam_group_members.group_name": {
+      "kind": "partition_key",
+      "position": 1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "iam_group_members.user_name": {
+      "kind": "clustering",
+      "position": 0,
+      "clustering_order": "asc",
+      "type": "text"
+    },
+    "iam_groups.account_id": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "iam_groups.created_at": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "timestamp"
+    },
+    "iam_groups.group_arn": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "iam_groups.group_name": {
+      "kind": "clustering",
+      "position": 0,
+      "clustering_order": "asc",
+      "type": "text"
+    },
+    "iam_permissions_boundaries.account_id": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "iam_permissions_boundaries.policy_document": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "iam_permissions_boundaries.principal_name": {
+      "kind": "clustering",
+      "position": 1,
+      "clustering_order": "asc",
+      "type": "text"
+    },
+    "iam_permissions_boundaries.principal_type": {
+      "kind": "clustering",
+      "position": 0,
+      "clustering_order": "asc",
+      "type": "text"
+    },
+    "iam_policies.account_id": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "iam_policies.created_at": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "timestamp"
+    },
+    "iam_policies.policy_document": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "iam_policies.policy_name": {
+      "kind": "clustering",
+      "position": 2,
+      "clustering_order": "asc",
+      "type": "text"
+    },
+    "iam_policies.principal_name": {
+      "kind": "clustering",
+      "position": 1,
+      "clustering_order": "asc",
+      "type": "text"
+    },
+    "iam_policies.principal_type": {
+      "kind": "clustering",
+      "position": 0,
+      "clustering_order": "asc",
+      "type": "text"
+    },
+    "iam_role_tags.account_id": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "iam_role_tags.role_name": {
+      "kind": "partition_key",
+      "position": 1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "iam_role_tags.tag_key": {
+      "kind": "clustering",
+      "position": 0,
+      "clustering_order": "asc",
+      "type": "text"
+    },
+    "iam_role_tags.tag_value": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "iam_roles.account_id": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "iam_roles.created_at": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "timestamp"
+    },
+    "iam_roles.permissions_boundary_arn": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "iam_roles.role_arn": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "iam_roles.role_name": {
+      "kind": "clustering",
+      "position": 0,
+      "clustering_order": "asc",
+      "type": "text"
+    },
+    "iam_roles.trust_policy": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "iam_sessions.access_key_id": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "iam_sessions.account_id": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "iam_sessions.created_at": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "timestamp"
+    },
+    "iam_sessions.expires_at": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "timestamp"
+    },
+    "iam_sessions.role_name": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "iam_sessions.secret_key_encrypted": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "blob"
+    },
+    "iam_sessions.session_name": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "iam_sessions.session_policy": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "iam_sessions.session_tags": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "iam_sessions.session_token": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "iam_user_tags.account_id": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "iam_user_tags.tag_key": {
+      "kind": "clustering",
+      "position": 0,
+      "clustering_order": "asc",
+      "type": "text"
+    },
+    "iam_user_tags.tag_value": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "iam_user_tags.user_name": {
+      "kind": "partition_key",
+      "position": 1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "iam_users.account_id": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "iam_users.created_at": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "timestamp"
+    },
+    "iam_users.password_hash": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "iam_users.user_arn": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "iam_users.user_name": {
+      "kind": "clustering",
+      "position": 0,
+      "clustering_order": "asc",
+      "type": "text"
+    },
+    "idempotency_tokens_by_account.account_id": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "idempotency_tokens_by_account.created_at": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "timestamp"
+    },
+    "idempotency_tokens_by_account.fingerprint": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "idempotency_tokens_by_account.token": {
+      "kind": "clustering",
+      "position": 0,
+      "clustering_order": "asc",
+      "type": "text"
+    },
+    "indexes.backfill_heartbeat": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "timestamp"
+    },
+    "indexes.index_id": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "indexes.index_name": {
+      "kind": "clustering",
+      "position": 0,
+      "clustering_order": "asc",
+      "type": "text"
+    },
+    "indexes.index_status": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "indexes.index_type": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "indexes.key_schema": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "indexes.projection": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "indexes.propagation_delay_ms": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "int"
+    },
+    "indexes.provisioned_throughput": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "indexes.table_id": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "login_attempts.attempted_at": {
+      "kind": "clustering",
+      "position": 0,
+      "clustering_order": "desc",
+      "type": "timestamp"
+    },
+    "login_attempts.principal": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "login_attempts.source_ip": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "login_attempts.success": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "boolean"
+    },
+    "metrics.bucket": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "timestamp"
+    },
+    "metrics.count": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "bigint"
+    },
+    "metrics.index_name": {
+      "kind": "partition_key",
+      "position": 3,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "metrics.max": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "double"
+    },
+    "metrics.metric": {
+      "kind": "partition_key",
+      "position": 1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "metrics.min": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "double"
+    },
+    "metrics.operation": {
+      "kind": "partition_key",
+      "position": 4,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "metrics.sum": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "double"
+    },
+    "metrics.table_name": {
+      "kind": "partition_key",
+      "position": 2,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "schema_history.applied_at": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "timestamp"
+    },
+    "schema_history.description": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "schema_history.version": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "int"
+    },
+    "settings.key": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "settings.value": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "tables.account_id": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "tables.attribute_definitions": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "tables.billing_mode": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "tables.created_at": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "timestamp"
+    },
+    "tables.deletion_protection_enabled": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "boolean"
+    },
+    "tables.item_count": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "bigint"
+    },
+    "tables.key_schema": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "tables.on_demand_throughput": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "tables.provisioned_throughput": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "tables.restore_date_time": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "timestamp"
+    },
+    "tables.restore_heartbeat": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "timestamp"
+    },
+    "tables.restore_owner": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "uuid"
+    },
+    "tables.restore_source_backup_arn": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "tables.restore_source_table_arn": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "tables.sse_specification": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "tables.status_transition_at": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "timestamp"
+    },
+    "tables.stream_label": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "tables.stream_specification": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "tables.table_arn": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "tables.table_class": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "tables.table_id": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "tables.table_name": {
+      "kind": "clustering",
+      "position": 0,
+      "clustering_order": "asc",
+      "type": "text"
+    },
+    "tables.table_size_bytes": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "bigint"
+    },
+    "tables.table_status": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "tables.ttl_attribute": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "tables.ttl_backfill_cursor": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "tables.ttl_cleanup_generation": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "uuid"
+    },
+    "tables.ttl_generation": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "uuid"
+    },
+    "tables.ttl_index_ready": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "boolean"
+    },
+    "tables.ttl_sweep_owner": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "uuid"
+    },
+    "tags.resource_arn": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "tags.tag_key": {
+      "kind": "clustering",
+      "position": 0,
+      "clustering_order": "asc",
+      "type": "text"
+    },
+    "tags.tag_value": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "text"
+    }
+  },
+  "indexes": {
+    "tables_table_id_idx": {
+      "table": "tables",
+      "kind": "COMPOSITES",
+      "target": "table_id"
+    }
+  }
+}

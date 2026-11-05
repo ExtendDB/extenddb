@@ -68,8 +68,10 @@ pub enum DynamoDbError {
     #[error("{0}")]
     TableInUseException(String),
     /// HTTP 400. `CreateBackup` on a table that does not exist or is not yet
-    /// `ACTIVE`. Measured on DynamoDB: `Table not found: <name>`. Distinct
-    /// from `ResourceNotFoundException`, which the data plane returns.
+    /// `ACTIVE`, and `DescribeContinuousBackups`, `UpdateContinuousBackups`
+    /// and `RestoreTableToPointInTime` on a table that does not exist.
+    /// Measured on DynamoDB: `Table not found: <name>`. Distinct from
+    /// `ResourceNotFoundException`, which the data plane returns.
     #[error("{0}")]
     TableNotFoundException(String),
     /// A per-table or per-account limit was exceeded.
@@ -130,6 +132,21 @@ pub enum DynamoDbError {
     /// description ([`TRIMMED_DATA_ACCESS_MESSAGE`]), not a captured response.
     #[error("{0}")]
     TrimmedDataAccessException(String),
+    /// SP-ERR-002: HTTP 400. Returned when continuous backups (point-in-time
+    /// recovery) cannot be enabled. The service models this exception on
+    /// `UpdateContinuousBackups`; ExtendDB returns it there for
+    /// `PointInTimeRecoveryEnabled: true`, because no storage backend
+    /// implements point-in-time recovery.
+    #[error("{0}")]
+    ContinuousBackupsUnavailableException(String),
+    /// SP-ERR-002: HTTP 400. Returned by `RestoreTableToPointInTime` when
+    /// point-in-time recovery is not enabled for the source table, which in
+    /// ExtendDB is always: no storage backend implements point-in-time
+    /// recovery. The service models this exception on the restore operation,
+    /// distinct from `ContinuousBackupsUnavailableException`, which it models
+    /// on `UpdateContinuousBackups`.
+    #[error("{0}")]
+    PointInTimeRecoveryUnavailableException(String),
     #[error("{0}")]
     ServiceUnavailable(String),
     /// SP-ERR-002: Concurrent modification of the same item in a transaction.
@@ -188,6 +205,8 @@ impl DynamoDbError {
             | Self::ExpiredTokenException(_)
             | Self::ExpiredIteratorException(_)
             | Self::TrimmedDataAccessException(_)
+            | Self::ContinuousBackupsUnavailableException(_)
+            | Self::PointInTimeRecoveryUnavailableException(_)
             | Self::TransactionConflictException(_)
             | Self::ProvisionedThroughputExceededException(_)
             | Self::ThrottlingException(_)
@@ -239,6 +258,12 @@ impl DynamoDbError {
             Self::ExpiredTokenException(_) => "ExpiredTokenException",
             Self::ExpiredIteratorException(_) => "ExpiredIteratorException",
             Self::TrimmedDataAccessException(_) => "TrimmedDataAccessException",
+            Self::ContinuousBackupsUnavailableException(_) => {
+                "ContinuousBackupsUnavailableException"
+            }
+            Self::PointInTimeRecoveryUnavailableException(_) => {
+                "PointInTimeRecoveryUnavailableException"
+            }
             Self::ServiceUnavailable(_) => "ServiceUnavailable",
             Self::TransactionConflictException(_) => "TransactionConflictException",
             Self::ProvisionedThroughputExceededException(_) => {
@@ -316,6 +341,8 @@ impl DynamoDbError {
             | Self::ExpiredTokenException(m)
             | Self::ExpiredIteratorException(m)
             | Self::TrimmedDataAccessException(m)
+            | Self::ContinuousBackupsUnavailableException(m)
+            | Self::PointInTimeRecoveryUnavailableException(m)
             | Self::ServiceUnavailable(m)
             | Self::TransactionConflictException(m)
             | Self::ProvisionedThroughputExceededException(m)
@@ -434,6 +461,15 @@ mod tests {
                 DynamoDbError::TrimmedDataAccessException(String::new()),
                 400,
             ),
+            (
+                DynamoDbError::ContinuousBackupsUnavailableException(String::new()),
+                400,
+            ),
+            (
+                DynamoDbError::PointInTimeRecoveryUnavailableException(String::new()),
+                400,
+            ),
+            (DynamoDbError::TableNotFoundException(String::new()), 400),
             (DynamoDbError::InvalidSignatureException(String::new()), 400),
         ];
         for (err, expected) in cases {

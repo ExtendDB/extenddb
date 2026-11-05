@@ -140,12 +140,30 @@ impl SqliteEngine {
         account_id: &str,
         table_name: &str,
     ) -> Result<TableDescription, StorageError> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        self.build_table_description_on(&mut conn, account_id, table_name)
+            .await
+    }
+
+    /// Build the description through one connection, so a caller holding a
+    /// read transaction (the snapshot engine) reads the catalog rows from the
+    /// same snapshot as everything else it reads.
+    pub(crate) async fn build_table_description_on(
+        &self,
+        conn: &mut sqlx::SqliteConnection,
+        account_id: &str,
+        table_name: &str,
+    ) -> Result<TableDescription, StorageError> {
         let row: Option<TableRow> = sqlx::query_as(&format!(
             "SELECT {TABLE_COLUMNS} FROM tables WHERE account_id = ? AND table_name = ?"
         ))
         .bind(account_id)
         .bind(table_name)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
@@ -155,7 +173,7 @@ impl SqliteEngine {
             "SELECT {INDEX_COLUMNS} FROM indexes WHERE table_id = ?"
         ))
         .bind(&row.table_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *conn)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
@@ -163,14 +181,15 @@ impl SqliteEngine {
             "SELECT {VECTOR_INDEX_COLUMNS} FROM vector_indexes WHERE table_id = ?"
         ))
         .bind(&row.table_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *conn)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let table_name_owned = row.table_name.clone();
         let table_id = row.table_id.clone();
         let mut desc = self.build_table_description_from_row(account_id, row, index_rows)?;
-        desc.restore_summary = self.restore_summary(&table_id, &desc.table_status).await?;
+        desc.restore_summary =
+            Self::restore_summary_on(conn, &table_id, &desc.table_status).await?;
         let catalog_rows = vector_rows
             .into_iter()
             .map(VectorIndexRow::into_catalog_row)
@@ -412,8 +431,10 @@ fn zero_throughput() -> ProvisionedThroughputDescription {
 impl SqliteEngine {
     /// The RestoreSummary of a table created by RestoreTableFromBackup, or
     /// `None` for any other table. In progress until the table is ACTIVE.
-    pub(crate) async fn restore_summary(
-        &self,
+    /// Takes the connection so a snapshot reads it inside the transaction
+    /// that pinned its WAL snapshot.
+    async fn restore_summary_on(
+        conn: &mut sqlx::SqliteConnection,
         table_id: &str,
         status: &extenddb_core::types::TableStatus,
     ) -> Result<Option<extenddb_core::types::RestoreSummary>, StorageError> {
@@ -422,7 +443,7 @@ impl SqliteEngine {
              FROM table_restores WHERE table_id = ?",
         )
         .bind(table_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
         Ok(row.map(
