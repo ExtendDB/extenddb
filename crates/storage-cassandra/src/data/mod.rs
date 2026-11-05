@@ -22,11 +22,13 @@ mod put_get_item;
 mod query;
 mod query_helpers;
 mod scan;
+mod sk_range;
 mod transact_stream;
 pub mod transaction_ledger;
 mod transactions;
 pub(crate) mod ttl;
 mod update_item;
+pub mod version;
 
 use condition::check_condition;
 use extenddb_core::expression;
@@ -242,59 +244,6 @@ pub(crate) async fn query_with_pk_sk_item_txnid_ts(
     .map_err(|e| StorageError::Internal(format!("Query failed: {e}")))
 }
 
-/// Execute a query with `(item_text, txn_timestamp, pk, sk, txn_id_bytes)` bound parameters.
-///
-/// Used for: commit PUT/UPDATE.
-pub(crate) async fn query_with_item_ts_pk_sk_txnid(
-    session: &CassandraSession,
-    query: &str,
-    item_text: &str,
-    txn_timestamp: i64,
-    pk: &str,
-    sk: &SortKeyValue,
-    txn_id: cdrs_tokio::types::value::Bytes,
-) -> Result<cdrs_tokio::frame::Envelope, StorageError> {
-    match sk {
-        SortKeyValue::S(s) => {
-            session
-                .query_with_values(
-                    query,
-                    cdrs_tokio::query_values!(item_text, txn_timestamp, pk, s.as_str(), txn_id),
-                )
-                .await
-        }
-        SortKeyValue::N(n) => {
-            session
-                .query_with_values(
-                    query,
-                    cdrs_tokio::query_values!(
-                        item_text,
-                        txn_timestamp,
-                        pk,
-                        decimal_to_value(n),
-                        txn_id
-                    ),
-                )
-                .await
-        }
-        SortKeyValue::B(b) => {
-            session
-                .query_with_values(
-                    query,
-                    cdrs_tokio::query_values!(
-                        item_text,
-                        txn_timestamp,
-                        pk,
-                        Blob::new(b.clone()),
-                        txn_id
-                    ),
-                )
-                .await
-        }
-    }
-    .map_err(|e| StorageError::Internal(format!("Query failed: {e}")))
-}
-
 /// Execute a SELECT query by primary key (pk only, or pk + sort key).
 ///
 /// Builds the appropriate query based on whether a sort key is present,
@@ -308,17 +257,47 @@ pub(crate) async fn select_by_pk(
     sk: Option<&SortKeyValue>,
     sk_col: Option<&str>,
 ) -> Result<Option<cdrs_tokio::types::rows::Row>, StorageError> {
-    let result = if let (Some(sk), Some(sk_col)) = (sk, sk_col) {
-        let query =
-            format!("SELECT {columns} FROM {keyspace}.{table} WHERE pk = ? AND {sk_col} = ?");
-        query_with_pk_sk(session, &query, pk, sk).await
+    select_by_pk_at(session, keyspace, table, columns, pk, sk, sk_col, None).await
+}
+
+/// [`select_by_pk`] at `consistency`, or at the driver's default (`ONE`) when
+/// it is `None`. A read at `LOCAL_SERIAL` sees every LWT that has committed,
+/// and completes one still in progress, before it answers.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn select_by_pk_at(
+    session: &CassandraSession,
+    keyspace: &str,
+    table: &str,
+    columns: &str,
+    pk: &str,
+    sk: Option<&SortKeyValue>,
+    sk_col: Option<&str>,
+    consistency: Option<cdrs_tokio::consistency::Consistency>,
+) -> Result<Option<cdrs_tokio::types::rows::Row>, StorageError> {
+    let (query, values) = if let (Some(sk), Some(sk_col)) = (sk, sk_col) {
+        let values = match sk {
+            SortKeyValue::S(s) => cdrs_tokio::query_values!(pk, s.as_str()),
+            SortKeyValue::N(n) => cdrs_tokio::query_values!(pk, decimal_to_value(n)),
+            SortKeyValue::B(b) => cdrs_tokio::query_values!(pk, Blob::new(b.clone())),
+        };
+        (
+            format!("SELECT {columns} FROM {keyspace}.{table} WHERE pk = ? AND {sk_col} = ?"),
+            values,
+        )
     } else {
-        let query = format!("SELECT {columns} FROM {keyspace}.{table} WHERE pk = ?");
-        session
-            .query_with_values(&query, cdrs_tokio::query_values!(pk))
-            .await
-            .map_err(|e| StorageError::Internal(format!("Query failed: {e}")))
-    }?;
+        (
+            format!("SELECT {columns} FROM {keyspace}.{table} WHERE pk = ?"),
+            cdrs_tokio::query_values!(pk),
+        )
+    };
+    let mut params = cdrs_tokio::statement::StatementParamsBuilder::new().with_values(values);
+    if let Some(consistency) = consistency {
+        params = params.with_consistency(consistency);
+    }
+    let result = session
+        .query_with_params(&query, params.build())
+        .await
+        .map_err(|e| StorageError::Internal(format!("Query failed: {e}")))?;
 
     let rows = result
         .response_body()

@@ -23,6 +23,7 @@ use crate::AppState;
 pub(crate) async fn metrics_endpoint(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     axum::extract::Query(params): axum::extract::Query<extenddb_core::metrics::MetricsQuery>,
 ) -> axum::response::Response {
     // `/metrics` returns per-table CloudWatch-style dimensions (TableName /
@@ -50,7 +51,7 @@ pub(crate) async fn metrics_endpoint(
         &headers,
         catalog_store.as_ref(),
         catalog_store.as_ref(),
-        None,
+        addr,
     )
     .await
     {
