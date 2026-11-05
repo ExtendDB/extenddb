@@ -15,7 +15,10 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::limits::LimitsConfig;
 use extenddb_storage_sqlite::SqliteEngine;
 
-use crate::{AuthorizedKeyInfo, ItemAccess, ItemAuthorization, ItemAuthorizer, OperationContext};
+use crate::{
+    AuthorizedKeyInfo, BackupRuntime, ItemAccess, ItemAuthorization, ItemAuthorizer,
+    OperationContext,
+};
 
 /// Run `future` to completion on a runtime of its own.
 pub(super) fn block_on<F: Future>(future: F) -> F::Output {
@@ -35,6 +38,7 @@ pub(super) async fn context(authorizer: Option<Arc<dyn ItemAuthorizer>>) -> Oper
     authorized_key_info.insert("t".to_owned(), None);
     OperationContext {
         storage: Arc::new(storage),
+        backup: Arc::new(BackupRuntime::new(1)),
         limits: Arc::new(LimitsConfig::default()),
         region: Arc::from("us-east-1"),
         account_id: Arc::from("000000000000"),

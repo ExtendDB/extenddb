@@ -8,7 +8,7 @@ Refreshed: v0.0.118 (P115)
 - ⬜ **Tagging rate limiting** — extenddb should implement `LimitExceededException` for rapid tag operations to match real DynamoDB behavior. 5 tagging tests fail against real DynamoDB due to this. (P114 follow-up)
 - ⬜ **Key-vs-item size gap** — batch/transact delete/update WCU uses key size, not old item size. Minor fidelity gap.
 - ⬜ **`f64` equality in `NumericEquals`/`NumericNotEquals`** — `policy/condition.rs` compares parsed numeric condition values with `f64` equality, violating the numeric-safety rule (and clippy `float_cmp`). Verify against AWS numeric-condition semantics (AWS treats these as arbitrary-precision decimals) and switch to `BigDecimal`/integer comparison. (BR-7085 follow-up)
-- ⬜ **Non-`2012-10-17` policy `Version` accepted with warning** — extenddb accepts policy documents with an unrecognized `Version` string and logs a warning; real AWS rejects them with a `MalformedPolicyDocument` error. Confirm intended behavior and align. (BR-7085 follow-up)
+- ⬜ **Policy `Version` refused at write, not compared with IAM**: the identity-policy, permissions-boundary and console writes refuse a `Version` other than the string `2012-10-17` or `2008-10-17`. Not yet compared with the service: whether IAM refuses such a document at write and with what message, and what STS does with one in an `AssumeRole` session policy, where ExtendDB checks only that the member exists. (BR-7085 follow-up)
 
 ## Test Gaps
 
@@ -40,7 +40,7 @@ Refreshed: v0.0.118 (P115)
 ## Standing Items (need human decision)
 
 - ⬜ **22 unapproved license dependencies** — Unicode-3.0, CDLA-Permissive-2.0, MPL-2.0. All pre-existing. Human approved as-is (P99 session).
-- ⬜ **Policy-variable expansion spec/code/AWS divergence** — `05-component-auth.md` §6.5 and `01-requirements.md` (REQ-ABAC-006) state variable substitution is deferred/literal, but `condition.rs::expand_policy_variables` **is** implemented and applied to Condition values only, not Resource ARNs (`evaluator.rs::resource_matches`/`arn_match` do not expand). AWS expands in both. Three-way inconsistent (spec vs code vs AWS). Fail-closed (a `${var}` in a Resource ARN silently fails to match), so not a leak. Resolve by either (a) documenting the implemented condition-value expansion and marking resource-ARN expansion deferred, or (b) completing REQ-ABAC-006. Needs human direction. (BR-7085)
+- ⬜ **Policy-variable gaps in condition values (#534)**: a condition value in a `2008-10-17` or no-`Version` document is still expanded, where IAM treats it as literal text, and `${*}` in a condition value is left as text, where IAM expands it to `*`. Variables in `Resource` and `NotResource` patterns expand as IAM does (PR #535), and `05-component-auth.md` and `01-requirements.md` (REQ-ABAC-006) describe the expansion. (BR-7085)
 
 
 ## Recently Completed

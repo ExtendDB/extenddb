@@ -20,6 +20,7 @@ pub(super) fn context_with_key_info(
 ) -> OperationContext {
     OperationContext {
         storage: Arc::clone(&ctx.storage),
+        backup: Arc::clone(&ctx.backup),
         limits: Arc::clone(&ctx.limits),
         region: Arc::clone(&ctx.region),
         account_id: Arc::clone(&ctx.account_id),

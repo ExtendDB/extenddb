@@ -10,13 +10,12 @@ mod migrations_support;
 use std::time::Duration;
 
 use bson::{Document, doc};
-use extenddb_storage::migrations::{CatalogStatus, MigrationBackend, Runner};
+use extenddb_storage::migrations::{CatalogStatus, MigrationBackend, MigrationId, Runner};
 use extenddb_storage_mongodb::migrations::{
     Definitions, MigrationLock, MongoMigrations, Timing, describe_store, lock,
 };
 use migrations_support::{Deployment, fixture, server};
 
-const CATALOG_EXPECTED: &str = include_str!("../migrations/catalog/0001_baseline.expected.json");
 const DATA_EXPECTED: &str = include_str!("../migrations/data/0001_baseline.expected.json");
 
 async fn index_names(db: &mongodb::Database, collection: &str) -> Vec<String> {
@@ -65,9 +64,7 @@ async fn assert_fresh_definitions(d: &Deployment) {
         .await
         .expect("data");
     migrations.close().await;
-    let mut expected_catalog: Definitions = serde_json::from_str(CATALOG_EXPECTED).expect("json");
-    // Migration 5 drops continuous_backups, which migration 1 creates.
-    expected_catalog.remove("continuous_backups");
+    let expected_catalog = migrations_support::expected_catalog();
     assert!(!catalog.contains_key("continuous_backups"));
     let expected_data: Definitions = serde_json::from_str(DATA_EXPECTED).expect("json");
     for (name, want) in &expected_catalog {
@@ -207,7 +204,12 @@ async fn migrate_creates_the_indexes_a_deployment_lacks() {
             .await
             .contains(&"table_id_1".to_owned())
     );
-    assert_eq!(d.status().await, CatalogStatus::Current { version: 5 });
+    assert_eq!(
+        d.status().await,
+        CatalogStatus::Current {
+            version: MigrationId::LATEST.number()
+        }
+    );
     assert_fresh_definitions(&d).await;
     d.drop_databases().await;
 }
@@ -232,7 +234,9 @@ async fn stop_at_every_request(uri: &str, state: Option<&str>) -> usize {
         }
         assert_eq!(
             d.status().await,
-            CatalogStatus::Current { version: 5 },
+            CatalogStatus::Current {
+                version: MigrationId::LATEST.number()
+            },
             "{requests}"
         );
         assert_fresh_definitions(&d).await;

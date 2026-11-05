@@ -21,6 +21,7 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 tokio = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]
 # A storage engine for the tests that need an `OperationContext`.
