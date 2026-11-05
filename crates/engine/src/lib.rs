@@ -33,6 +33,7 @@ mod read_helpers;
 mod request_limits;
 mod scan;
 mod search_vectors;
+mod start_key;
 pub mod stream_capture;
 mod streams;
 mod tagging;

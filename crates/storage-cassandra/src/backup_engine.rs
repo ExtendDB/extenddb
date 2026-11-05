@@ -63,10 +63,9 @@ use cdrs_tokio::query::BatchQueryBuilder;
 use cdrs_tokio::types::map::Map;
 use cdrs_tokio::types::{AsRust, IntoRustByName, rows::Row};
 use extenddb_core::types::{
-    AttributeDefinition, BackupDescription, BackupDetails, BackupSummary,
-    ContinuousBackupsDescription, DeleteTableInput, GsiInput, KeySchemaElement, LsiInput,
-    PointInTimeRecoveryDescription, ProvisionedThroughput, SourceTableDetails, TableDescription,
-    TableKeyInfo,
+    AttributeDefinition, BackupDescription, BackupDetails, BackupSummary, DeleteTableInput,
+    GsiInput, KeySchemaElement, LsiInput, ProvisionedThroughput, SourceTableDetails,
+    TableDescription, TableKeyInfo,
 };
 use extenddb_storage::backup_definition::{
     BACKUP_DEFINITION_VERSION, BackupTableDefinition, throughput_from_catalog,
@@ -140,15 +139,6 @@ fn registration_exhausted(
     }
 }
 
-/// See [`CassandraEngine::require_migrated_catalog`].
-fn unmigrated_catalog_refusal(pending: &[&str]) -> StorageError {
-    StorageError::Unsupported(format!(
-        "Backups are unavailable until the ExtendDB catalog is migrated: it does not record \
-         catalog migration {}. Run `extenddb migrate --yes` with the admin credentials.",
-        pending.join(", ")
-    ))
-}
-
 #[derive(Debug)]
 struct StoredBackup {
     backup_arn: String,
@@ -181,7 +171,8 @@ impl StoredBackup {
                 .as_rust::<HashMap<String, String>>()
                 .map_err(|e| StorageError::Internal(format!("Parse active_restores: {e}")))?
                 .unwrap_or_default(),
-            // Absent before V005 has been applied, and null when empty.
+            // Null when empty. Every catalog this release serves has the
+            // column (catalog migration 1 creates it).
             Ok(None) | Err(_) => HashMap::new(),
         };
         Ok(Self {
@@ -399,29 +390,6 @@ struct HeartbeatTarget {
 }
 
 impl CassandraEngine {
-    /// Refuse a backup operation on a catalog that has not run every catalog
-    /// migration this binary carries. Catalog migration V005 adds the columns
-    /// CreateBackup, DeleteBackup and RestoreTableFromBackup write; without
-    /// it they failed with an internal error (`Undefined column name ...`),
-    /// which SDKs retry. `Unsupported` reaches the client as
-    /// `ValidationException` with this message. Table, item, ListBackups and
-    /// DescribeBackup operations do not call this: they work on such a
-    /// catalog.
-    pub(crate) async fn require_migrated_catalog(&self) -> Result<(), StorageError> {
-        use std::sync::atomic::Ordering;
-        if self.catalog_migrated.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        let pending =
-            crate::migrations::pending_catalog_migrations(&self.session, &self.catalog_keyspace())
-                .await?;
-        if pending.is_empty() {
-            self.catalog_migrated.store(true, Ordering::Release);
-            return Ok(());
-        }
-        Err(unmigrated_catalog_refusal(&pending))
-    }
-
     async fn load_backup(
         &self,
         account_id: &str,
@@ -603,27 +571,6 @@ impl CassandraEngine {
             time_to_live: Some(time_to_live),
             stream_specification: table.stream_specification.clone(),
         })
-    }
-
-    async fn table_exists_for_backup(
-        &self,
-        account_id: &str,
-        table_name: &str,
-    ) -> Result<bool, StorageError> {
-        let query = format!(
-            "SELECT table_name FROM {}.tables WHERE account_id = ? AND table_name = ?",
-            self.catalog_keyspace()
-        );
-        let rows = self
-            .session
-            .query_with_values(&query, cdrs_tokio::query_values!(account_id, table_name))
-            .await
-            .map_err(|e| StorageError::Internal(format!("Query table: {e}")))?
-            .response_body()
-            .map_err(|e| StorageError::Internal(format!("Parse table response: {e}")))?
-            .into_rows()
-            .unwrap_or_default();
-        Ok(!rows.is_empty())
     }
 
     // ── Restore registration ────────────────────────────────────────────────
@@ -1427,7 +1374,6 @@ impl BackupEngine for CassandraEngine {
         let backup_name = backup_name.to_owned();
         Box::pin(async move {
             Self::validate_account_id(&account_id)?;
-            self.require_migrated_catalog().await?;
 
             // fetch_table_key_info enforces the DynamoDB requirement that only
             // ACTIVE tables can be backed up.
@@ -1740,7 +1686,6 @@ impl BackupEngine for CassandraEngine {
             /// the registration check and the DELETING claim.
             const CLAIM_ATTEMPTS: usize = 3;
 
-            self.require_migrated_catalog().await?;
             let mut backup = self.load_backup(&account_id, &backup_arn).await?;
             if backup.backup_status != "AVAILABLE" && backup.backup_status != "DELETING" {
                 return Err(backup_not_found(&backup_arn));
@@ -1889,10 +1834,6 @@ impl BackupEngine for CassandraEngine {
             tokio::spawn(async move {
                 // Inside the task, like the registration, so the first poll
                 // still spawns before any await.
-                if let Err(error) = engine.require_migrated_catalog().await {
-                    let _ = registered_tx.send(Err(error));
-                    return;
-                }
                 match engine.register_restore_target(&account_id, request).await {
                     Ok((description, job, heartbeat)) => {
                         // The receiver is gone if the request was dropped;
@@ -1908,100 +1849,6 @@ impl BackupEngine for CassandraEngine {
             registered_rx.await.map_err(|_| {
                 StorageError::Internal("restore task ended before registering".to_owned())
             })?
-        })
-    }
-
-    fn describe_continuous_backups(
-        &self,
-        account_id: &str,
-        table_name: &str,
-    ) -> BoxFuture<'_, Result<ContinuousBackupsDescription, StorageError>> {
-        let account_id = account_id.to_owned();
-        let table_name = table_name.to_owned();
-        Box::pin(async move {
-            if !self
-                .table_exists_for_backup(&account_id, &table_name)
-                .await?
-            {
-                return Err(StorageError::TableNotFound(format!(
-                    "Table not found: {table_name}"
-                )));
-            }
-            let query = format!(
-                "SELECT pitr_enabled FROM {}.continuous_backups WHERE account_id = ? AND table_name = ?",
-                self.catalog_keyspace()
-            );
-            let rows = self
-                .session
-                .query_with_values(
-                    &query,
-                    cdrs_tokio::query_values!(account_id.as_str(), table_name.as_str()),
-                )
-                .await
-                .map_err(|e| StorageError::Internal(format!("Query continuous backups: {e}")))?
-                .response_body()
-                .map_err(|e| StorageError::Internal(format!("Parse continuous backups: {e}")))?
-                .into_rows()
-                .unwrap_or_default();
-            let pitr_enabled = rows
-                .first()
-                .and_then(|row| {
-                    let value: Result<bool, _> = row.get_r_by_name("pitr_enabled");
-                    value.ok()
-                })
-                .unwrap_or(false);
-            let now =
-                crate::cassandra_util::millis_to_seconds_f64(crate::cassandra_util::now_millis());
-            Ok(ContinuousBackupsDescription {
-                continuous_backups_status: "ENABLED".to_owned(),
-                point_in_time_recovery_description: Some(PointInTimeRecoveryDescription {
-                    point_in_time_recovery_status: if pitr_enabled {
-                        "ENABLED".to_owned()
-                    } else {
-                        "DISABLED".to_owned()
-                    },
-                    earliest_restorable_date_time: pitr_enabled
-                        .then_some(now - 35.0 * 24.0 * 3_600.0),
-                    latest_restorable_date_time: pitr_enabled.then_some(now),
-                }),
-            })
-        })
-    }
-
-    fn update_continuous_backups(
-        &self,
-        account_id: &str,
-        table_name: &str,
-        pitr_enabled: bool,
-    ) -> BoxFuture<'_, Result<ContinuousBackupsDescription, StorageError>> {
-        let account_id = account_id.to_owned();
-        let table_name = table_name.to_owned();
-        Box::pin(async move {
-            if !self
-                .table_exists_for_backup(&account_id, &table_name)
-                .await?
-            {
-                return Err(StorageError::TableNotFound(format!(
-                    "Table not found: {table_name}"
-                )));
-            }
-            let query = format!(
-                "INSERT INTO {}.continuous_backups (account_id, table_name, pitr_enabled) VALUES (?, ?, ?)",
-                self.catalog_keyspace()
-            );
-            self.session
-                .query_with_values(
-                    &query,
-                    cdrs_tokio::query_values!(
-                        account_id.as_str(),
-                        table_name.as_str(),
-                        pitr_enabled
-                    ),
-                )
-                .await
-                .map_err(|e| StorageError::Internal(format!("Update continuous backups: {e}")))?;
-            self.describe_continuous_backups(&account_id, &table_name)
-                .await
         })
     }
 }

@@ -112,9 +112,22 @@ impl Scratch {
     }
 }
 
+/// The server's base URL, or `None` to skip. With `EXTENDDB_TEST_PG_REQUIRED`
+/// set to any value but `0`, a job that must reach a server fails here
+/// instead.
 fn base_conn() -> Option<String> {
-    let conn = std::env::var("EXTENDDB_TEST_PG_CONNECTION_STRING").ok()?;
-    (!conn.trim().is_empty()).then(|| conn.trim_end_matches('/').to_owned())
+    let conn = std::env::var("EXTENDDB_TEST_PG_CONNECTION_STRING").unwrap_or_default();
+    if conn.trim().is_empty() {
+        let required =
+            std::env::var("EXTENDDB_TEST_PG_REQUIRED").is_ok_and(|v| !v.is_empty() && v != "0");
+        assert!(
+            !required,
+            "EXTENDDB_TEST_PG_CONNECTION_STRING is not set, and EXTENDDB_TEST_PG_REQUIRED says \
+             this job must reach a PostgreSQL server"
+        );
+        return None;
+    }
+    Some(conn.trim_end_matches('/').to_owned())
 }
 
 /// Every `.sql` file under `migrations/` and `data_migrations/`, each
@@ -192,17 +205,23 @@ async fn scratch(pgvector: Pgvector) -> Scratch {
     // Zero control-plane delay so CreateTable and DeleteTable complete inline:
     // these tests run no background workers, so a scheduled transition would
     // never happen and every table would sit in CREATING.
-    sqlx::query("UPDATE settings SET value = '0' WHERE key = 'control_plane_delay_seconds'")
-        .execute(&catalog)
-        .await
-        .expect("pin the control-plane delay to zero");
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0') \
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .execute(&catalog)
+    .await
+    .expect("pin the control-plane delay to zero");
     // And the propagation delay, for the same reason and the same way
     // devtools/run-tests does it: these tests run no queue workers, so anything
     // enqueued would never be applied. A test that wants the queue sets this itself.
-    sqlx::query("UPDATE settings SET value = '0' WHERE key = 'index_propagation_delay_ms'")
-        .execute(&catalog)
-        .await
-        .expect("pin the propagation delay to zero");
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ('index_propagation_delay_ms', '0') \
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .execute(&catalog)
+    .await
+    .expect("pin the propagation delay to zero");
     sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES ($1, $2)")
         .bind(ACCOUNT)
         .bind(format!("acct-{db_name}"))

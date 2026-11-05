@@ -1,19 +1,14 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Version literals in the documentation must match the compiled constants.
+//! Binary version literals in the documentation must match the compiled version.
 //!
-//! The documentation carries sample output containing the binary version and the
-//! catalog version. Those literals go stale silently: nothing fails, nothing warns,
-//! and the next reader trusts them. This stage found five such blocks still showing
-//! catalog `0.0.2` long after `0.0.3` shipped, and the binary version wrong in the
-//! same lines, so the fix has to leave a check behind rather than five fresh
-//! literals that expire at the next release.
-//!
-//! The same guard pattern already exists for the schema side: the migration runner
-//! asserts the final migration writes the expected version, and the SQLite schema
-//! asserts its seeded literal matches the constant. This is that pattern applied to
-//! prose.
+//! The documentation carries sample output containing the binary version. Those
+//! literals go stale silently: nothing fails, nothing warns, and the next reader
+//! trusts them, so the check stays behind rather than literals that expire at the
+//! next release. Sample lines show the catalog as `catalog migration <n>`, the
+//! highest migration id the binary carries; that number is not checked, so adding a
+//! migration needs no edit here.
 //!
 //! Two escapes are deliberate. Files that document a past version, an upgrade
 //! between versions, or another backend's version are exempt by path, each with a
@@ -75,9 +70,9 @@ fn markdown_files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// How far past a keyword a version literal may sit and still be about it.
 ///
-/// Wide enough for the real forms, `Catalog version 0.0.3` and
-/// `catalog 0.0.3 (postgres)`, and narrow enough that an unrelated number later in a
-/// sentence is not attributed to the keyword.
+/// Wide enough for the real forms, `extenddb 0.1.14` and
+/// `ExtendDB 0.1.14 needs migration 4`, and narrow enough that an unrelated number
+/// later in a sentence is not attributed to the keyword.
 const LOOKAHEAD: usize = 24;
 
 /// Pull version literals that belong to `keyword` out of one line.
@@ -153,14 +148,7 @@ fn exact_version(text: &str) -> Option<String> {
     }
 }
 
-/// Which literal a finding is about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Keyword {
-    Catalog,
-    Binary,
-}
-
-/// Every stale literal in one document, as `(line number, which, value)`.
+/// Every stale binary version literal in one document, as `(line number, value)`.
 ///
 /// Extracted from the corpus test so the rules below can be fed the forms they claim
 /// to cover. The reason is a finding against this file: it had been "verified failing
@@ -170,11 +158,7 @@ enum Keyword {
 /// enumerated in `the_matcher_sees_every_form_it_claims_to_cover` and
 /// `a_marker_above_a_fence_covers_the_block` rather than left to a corpus that happens
 /// to contain them today.
-fn stale_literals(
-    text: &str,
-    expected_catalog: &str,
-    expected_binary: &str,
-) -> Vec<(usize, Keyword, String)> {
+fn stale_literals(text: &str, expected_binary: &str) -> Vec<(usize, String)> {
     // A marker inside a fenced block would render as sample output rather than as a
     // comment, and one did: it shipped in a manual as part of an error message an
     // operator would try to match. So a marker on the line immediately before a fence
@@ -207,14 +191,9 @@ fn stale_literals(
         if in_marked_fence {
             continue;
         }
-        for found in versions_near(line, "catalog") {
-            if found != expected_catalog {
-                out.push((number, Keyword::Catalog, found));
-            }
-        }
         for found in versions_near(line, "extenddb") {
             if found != expected_binary {
-                out.push((number, Keyword::Binary, found));
+                out.push((number, found));
             }
         }
     }
@@ -230,14 +209,13 @@ fn stale_literals(
 fn the_matcher_sees_every_form_it_claims_to_cover() {
     // Must be seen: a stale value on each of these lines has to be reported.
     let seen = [
-        "  OK: Catalog version 0.0.2",
-        "# extenddb 0.1.5 (catalog 0.0.2) starting on 127.0.0.1:18443",
-        "# catalog 0.0.2 (postgres)",
-        "The catalog version is 0.0.2 on PostgreSQL and SQLite, stored in the `settings` table",
+        "# extenddb 0.1.5 (catalog migration 4) starting on 127.0.0.1:18443",
+        "# extenddb 0.1.5",
+        "ExtendDB 0.1.5 needs migration 4.",
     ];
     for line in seen {
         assert!(
-            !stale_literals(line, "0.0.3", "0.1.6").is_empty(),
+            !stale_literals(line, "0.1.6").is_empty(),
             "the matcher must see a stale literal in this form: {line}"
         );
     }
@@ -247,11 +225,12 @@ fn the_matcher_sees_every_form_it_claims_to_cover() {
         "| crc-catalog | 2.4.0 | MIT OR Apache-2.0 | Yes |",
         "./target/release/extenddb init --bind-addr 10.0.1.5",
         "connection_string = \"postgresql://extenddb:***@localhost:5432/extenddb_catalog\"",
-        "under the key `catalog_version` and checked at startup.",
+        "  OK: Catalog version 0.0.2",
+        "# catalog 0.0.2 (postgres)",
     ];
     for line in ignored {
         assert_eq!(
-            stale_literals(line, "0.0.3", "0.1.6"),
+            stale_literals(line, "0.1.6"),
             vec![],
             "the matcher must ignore this line: {line}"
         );
@@ -269,26 +248,26 @@ fn the_matcher_sees_every_form_it_claims_to_cover() {
 /// one the matcher does see, so breaking the fence rule breaks these assertions.
 #[test]
 fn a_marker_above_a_fence_covers_the_block() {
-    let marked = "<!-- version-literal-ok: an example -->\n```\ncatalog 0.0.2\n```\n";
+    let marked = "<!-- version-literal-ok: an example -->\n```\nextenddb 0.1.5\n```\n";
     assert_eq!(
-        stale_literals(marked, "0.0.3", "0.1.6"),
+        stale_literals(marked, "0.1.6"),
         vec![],
         "a marker on the line before a fence must cover the whole block"
     );
 
-    let unmarked = "```\ncatalog 0.0.2\n```\n";
+    let unmarked = "```\nextenddb 0.1.5\n```\n";
     assert_eq!(
-        stale_literals(unmarked, "0.0.3", "0.1.6"),
-        vec![(2, Keyword::Catalog, "0.0.2".to_owned())],
+        stale_literals(unmarked, "0.1.6"),
+        vec![(2, "0.1.5".to_owned())],
         "an unmarked fence must still be checked, or the escape becomes a blanket"
     );
 
     // The marker must stop at the closing fence. Asserting the exact finding rather
     // than "not empty" is what makes this fail if the exemption leaks past the block.
-    let leaky = "<!-- version-literal-ok: covers the block below -->\n```\ncatalog 0.0.2\n```\ncatalog 0.0.1\n";
+    let leaky = "<!-- version-literal-ok: covers the block below -->\n```\nextenddb 0.1.5\n```\nextenddb 0.1.4\n";
     assert_eq!(
-        stale_literals(leaky, "0.0.3", "0.1.6"),
-        vec![(5, Keyword::Catalog, "0.0.1".to_owned())],
+        stale_literals(leaky, "0.1.6"),
+        vec![(5, "0.1.4".to_owned())],
         "exactly the line after the fence is reported: the block is covered, the rest is not"
     );
 
@@ -297,17 +276,16 @@ fn a_marker_above_a_fence_covers_the_block() {
     // code block inserted after that sentence would have been silenced with no marker
     // visible above it and nothing to fail.
     let inline =
-        "Some prose. <!-- version-literal-ok: about this sentence -->\n```\ncatalog 0.0.2\n```\n";
+        "Some prose. <!-- version-literal-ok: about this sentence -->\n```\nextenddb 0.1.5\n```\n";
     assert_eq!(
-        stale_literals(inline, "0.0.3", "0.1.6"),
-        vec![(3, Keyword::Catalog, "0.0.2".to_owned())],
+        stale_literals(inline, "0.1.6"),
+        vec![(3, "0.1.5".to_owned())],
         "a marker at the end of a sentence covers that sentence, not the next block"
     );
 }
 
 #[test]
-fn documentation_version_literals_match_the_compiled_constants() {
-    let expected_catalog = extenddb_storage_postgres::CATALOG_VERSION.to_string();
+fn documentation_version_literals_match_the_compiled_version() {
     let expected_binary = env!("CARGO_PKG_VERSION"); // inherited from the workspace
     let root = repo_root();
 
@@ -335,13 +313,9 @@ fn documentation_version_literals_match_the_compiled_constants() {
             continue;
         }
         let text = std::fs::read_to_string(&file).expect("read a documentation file");
-        for (number, kind, found) in stale_literals(&text, &expected_catalog, expected_binary) {
-            let (label, expected) = match kind {
-                Keyword::Catalog => ("catalog", expected_catalog.as_str()),
-                Keyword::Binary => ("extenddb", expected_binary),
-            };
+        for (number, found) in stale_literals(&text, expected_binary) {
             stale.push(format!(
-                "{rel}:{number}: {label} {found}, compiled constant is {expected}"
+                "{rel}:{number}: extenddb {found}, the compiled version is {expected_binary}"
             ));
         }
     }

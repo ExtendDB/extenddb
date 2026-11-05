@@ -6,8 +6,8 @@
 //! Builds the canonical request string from the HTTP method, URI path,
 //! query string, signed headers, and body hash per the AWS `SigV4` spec.
 
+use aws_lc_rs::digest;
 use axum::http::HeaderMap;
-use sha2::{Digest, Sha256};
 
 /// Build the canonical request string.
 ///
@@ -105,9 +105,7 @@ fn build_canonical_headers(headers: &HeaderMap, signed_headers: &str) -> String 
 
 /// Lowercase hex-encoded SHA-256 hash.
 pub(crate) fn sha256_hex(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hex::encode(hasher.finalize())
+    hex::encode(digest::digest(&digest::SHA256, data))
 }
 
 #[cfg(test)]

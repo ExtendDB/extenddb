@@ -7,7 +7,10 @@
 //! as the underlying database. It provides a DynamoDB-compatible API backed
 //! by Cassandra's distributed architecture.
 
-pub const CATALOG_VERSION: &str = "0.0.4";
+/// Default control-plane delay (seconds) when the `control_plane_delay_seconds`
+/// setting is absent or unparseable: CreateTable, the control-plane worker
+/// and the console's default all read this one value.
+pub(crate) const DEFAULT_CONTROL_PLANE_DELAY_SECONDS: f64 = 0.25;
 
 mod admin_store;
 mod authorization_store;
@@ -44,12 +47,8 @@ pub use config::CassandraStorageConfig;
 pub use engine::{CassandraEngine, CassandraSession};
 pub use metadata_engine::TtlBackfillCursor;
 
-use cdrs_tokio::authenticators::StaticPasswordAuthenticatorProvider;
-use cdrs_tokio::cluster::NodeTcpConfigBuilder;
-use cdrs_tokio::cluster::session::{SessionBuilder, TcpSessionBuilder};
-use cdrs_tokio::load_balancing::RoundRobinLoadBalancingStrategy;
 use cdrs_tokio::types::IntoRustByName;
-use extenddb_storage::hooks::{ServerRuntimeHooks, WorkerContext};
+use extenddb_storage::hooks::{ServerRuntimeHooks, ServingRegistrar, WorkerContext};
 use extenddb_storage::server_components::{BackendError, ServerComponents};
 use std::sync::Arc;
 
@@ -61,73 +60,75 @@ use std::sync::Arc;
 struct CassandraRuntimeHooks {
     engine: Arc<CassandraEngine>,
     control_plane_notify: Arc<tokio::sync::Notify>,
-    gsi_worker_guard: std::sync::OnceLock<workers::GsiWorkerGuard>,
+    /// The registration this server holds while it serves, which the
+    /// server takes again when it is lost and releases after its workers
+    /// stop.
+    registration: Arc<migrations::ServerRegistration>,
 }
 
 #[async_trait::async_trait]
 impl ServerRuntimeHooks for CassandraRuntimeHooks {
     async fn spawn_workers(&self, ctx: &WorkerContext) -> Vec<tokio::task::JoinHandle<()>> {
-        // Backend-specific workers that need Cassandra internals.
-        // Each handle is returned so `serve` can drain them on shutdown.
+        // Backend-specific workers that need Cassandra internals. Each one
+        // returns once `ctx.shutdown` fires, and its handle is returned so
+        // `serve` can drain it.
 
         let storage_for_poller = self.engine.clone();
         let cp_notify = self.control_plane_notify.clone();
         let catalog_store = ctx.catalog_store.clone();
+        let token = ctx.shutdown.clone();
         let control_plane = tokio::spawn(async move {
-            workers::poll_control_plane_transitions(storage_for_poller, cp_notify, catalog_store)
-                .await;
+            workers::poll_control_plane_transitions(
+                storage_for_poller,
+                cp_notify,
+                catalog_store,
+                token,
+            )
+            .await;
         });
 
         let engine_for_recovery = self.engine.clone();
+        let token = ctx.shutdown.clone();
         let transaction_recovery = tokio::spawn(async move {
             workers::poll_transaction_recovery(
                 engine_for_recovery,
                 std::time::Duration::from_secs(60),
                 std::time::Duration::from_secs(30),
+                token,
             )
             .await;
         });
 
-        // Read the initial GSI delay immediately so the atomic is correct from
-        // the first request, not after the first 30s sleep.
+        // Read the GSI delay before requests are admitted, so the atomic is
+        // correct from the first request and not from the poller's first
+        // read 5 s later. Bounded by `INITIAL_GSI_DELAY_READ`; past it the
+        // atomic keeps its value until the poller's read.
         let gsi_delay = self.engine.gsi_default_delay_ms.clone();
-        let initial_delay = match ctx
-            .catalog_store
-            .get_setting("index_propagation_delay_ms")
-            .await
-        {
-            Ok(Some(v)) => Some(v),
-            _ => ctx
-                .catalog_store
-                .get_setting("gsi_propagation_delay_ms")
-                .await
-                .ok()
-                .flatten(),
-        };
-        if let Some(val) = initial_delay
-            && let Ok(ms) = val.parse::<u64>()
+        if let Some(ms) =
+            workers::read_gsi_delay(&*ctx.catalog_store, workers::INITIAL_GSI_DELAY_READ).await
         {
             gsi_delay.store(ms, std::sync::atomic::Ordering::Relaxed);
         }
         let catalog_store_for_gsi = ctx.catalog_store.clone();
-        let gsi_delay_poller =
-            tokio::spawn(
-                async move { workers::poll_gsi_delay(catalog_store_for_gsi, gsi_delay).await },
-            );
+        let token = ctx.shutdown.clone();
+        let gsi_delay_poller = tokio::spawn(async move {
+            workers::poll_gsi_delay(catalog_store_for_gsi, gsi_delay, token).await;
+        });
 
         // GSI propagation workers (one per partition).
-        let guard = workers::spawn_gsi_workers(self.engine.clone());
-        let _ = self.gsi_worker_guard.set(guard);
+        let gsi_propagation = workers::spawn_gsi_workers_until(self.engine.clone(), &ctx.shutdown);
 
         // GSI backfill recovery worker.
         let engine_for_gsi_recovery = self.engine.clone();
         let gsi_backfill_notify = self.engine.gsi_backfill_notify.clone();
+        let token = ctx.shutdown.clone();
         let gsi_backfill_recovery = tokio::spawn(async move {
             workers::poll_gsi_backfill_recovery(
                 engine_for_gsi_recovery,
                 gsi_backfill_notify,
                 std::time::Duration::from_secs(120), // stale threshold
                 std::time::Duration::from_secs(60),  // scan interval backstop
+                token,
             )
             .await;
         });
@@ -167,7 +168,7 @@ impl ServerRuntimeHooks for CassandraRuntimeHooks {
                 .await;
         });
 
-        vec![
+        let mut handles = vec![
             control_plane,
             transaction_recovery,
             gsi_delay_poller,
@@ -176,11 +177,19 @@ impl ServerRuntimeHooks for CassandraRuntimeHooks {
             ttl_repair,
             ttl_audit,
             restore_sweep,
-        ]
+        ];
+        handles.extend(gsi_propagation);
+        handles
     }
 
     fn backend_info(&self) -> Option<String> {
         Some(format!("keyspace_prefix={}", self.engine.keyspace_prefix))
+    }
+
+    /// The registration's row is lost when it cannot be renewed for 30 s;
+    /// the server then registers again or stops.
+    fn serving_registrar(&self) -> Option<Arc<dyn ServingRegistrar>> {
+        Some(self.registration.clone() as Arc<dyn ServingRegistrar>)
     }
 }
 
@@ -253,55 +262,37 @@ pub fn backend() -> extenddb_storage::Backend {
             })
         },
         server_components: server_components_factory,
+        catalog_migrations: &migrations::CassandraCatalogMigrations,
     }
 }
 
 /// Build a `CassandraCatalogStore` from a bare connection string.
 ///
-/// Used by the `settings_store` and `diagnostics_store` factories, which
-/// receive only a connection string (no full config object).
+/// Used by the `settings_store`, `management_store` and `diagnostics_store`
+/// factories, which receive only a connection string (no full config
+/// object): `extenddb settings`, `verify` and the diagnostics. The string
+/// carries the role the config file names, so they connect as the server
+/// does, with its 10 s bound on the connect.
 async fn make_catalog_store_from_connection_string(
     connection_string: &str,
 ) -> Result<CassandraCatalogStore, String> {
-    let (contact_points, keyspace_prefix) =
-        CassandraStorageConfig::parse_connection_string(connection_string);
-
-    if contact_points.is_empty() {
-        return Err("No contact points provided".to_string());
-    }
-
-    let mut node_builder = NodeTcpConfigBuilder::new();
-    for contact_point in &contact_points {
-        node_builder = node_builder.with_contact_point(contact_point.clone().into());
-    }
-    let auth_provider = Arc::new(StaticPasswordAuthenticatorProvider::new(
-        "cassandra",
-        "cassandra",
-    ));
-    node_builder = node_builder.with_authenticator_provider(auth_provider);
-
-    let cluster_config = node_builder
-        .build()
-        .await
-        .map_err(|e| format!("Failed to build cluster config: {e}"))?;
-
-    let session = TcpSessionBuilder::new(RoundRobinLoadBalancingStrategy::new(), cluster_config)
-        .build()
-        .await
-        .map_err(|e| format!("Failed to create session: {e}"))?;
-
-    Ok(CassandraCatalogStore::new(
-        Arc::new(session),
-        keyspace_prefix,
-        "datacenter1".to_string(),
-        1,
+    let deployment = migrations::Deployment::from_target(
+        &extenddb_storage::migrations::Target::at(connection_string),
+    )
+    .map_err(|e| e.to_string())?;
+    let session = deployment.connect().await.map_err(|e| e.to_string())?;
+    Ok(CassandraCatalogStore::catalog_only(
+        session,
+        deployment.keyspace_prefix,
     ))
 }
 
 fn server_components_factory(
     config: &dyn extenddb_storage::config::StorageConfig,
     region: &str,
-    _options: extenddb_storage::server_components::ServerComponentsOptions,
+    // `bootstrap_if_uninitialized` is not honored: an uninitialized catalog
+    // fails with the explicit-`init` guidance, as on PostgreSQL.
+    options: extenddb_storage::server_components::ServerComponentsOptions,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<ServerComponents, BackendError>> + Send>,
 > {
@@ -316,12 +307,42 @@ fn server_components_factory(
                 BackendError::InitializationFailed("Expected CassandraStorageConfig".to_string())
             })?;
 
-        let engine = CassandraEngine::new(cassandra_config, &region)
-            .await
-            .map_err(|e| BackendError::ConnectionFailed {
-                backend: "cassandra".to_string(),
-                details: e.to_string(),
-            })?;
+        // Register and read the catalog's status before the engine starts:
+        // creating it runs the control-plane recovery, which writes to the
+        // catalog. The status session uses the engine's role and settings.
+        let deployment = migrations::Deployment::from_config(cassandra_config);
+        let status_session =
+            deployment
+                .connect()
+                .await
+                .map_err(|e| BackendError::ConnectionFailed {
+                    backend: "cassandra".to_string(),
+                    details: e.to_string(),
+                })?;
+        let host = cassandra_config
+            .instance_id
+            .clone()
+            .unwrap_or_else(|| "unknown".to_owned());
+        let registration = migrations::register_server(
+            status_session,
+            &cassandra_config.keyspace_prefix,
+            &host,
+            options.release,
+        )
+        .await
+        .map_err(BackendError::Catalog)?;
+        let registration = Arc::new(registration);
+
+        let engine = match CassandraEngine::new(cassandra_config, &region).await {
+            Ok(engine) => engine,
+            Err(e) => {
+                ServingRegistrar::release(registration.as_ref()).await;
+                return Err(BackendError::ConnectionFailed {
+                    backend: "cassandra".to_string(),
+                    details: e.to_string(),
+                });
+            }
+        };
 
         let control_plane_notify = engine.control_plane_notify.clone();
         let engine = Arc::new(engine);
@@ -359,13 +380,16 @@ fn server_components_factory(
             BackendError::InitializationFailed(format!("Failed to parse encryption key: {e}"))
         })?;
 
-        let catalog_store = Arc::new(CassandraCatalogStore::with_encryption_key(
-            engine.session.clone(),
-            cassandra_config.keyspace_prefix.clone(),
-            cassandra_config.datacenter.clone(),
-            cassandra_config.replication_factor,
-            enc_key.clone(),
-        ));
+        let catalog_store = Arc::new(
+            CassandraCatalogStore::with_encryption_key(
+                engine.session.clone(),
+                cassandra_config.keyspace_prefix.clone(),
+                cassandra_config.datacenter.clone(),
+                cassandra_config.replication_factor,
+                enc_key.clone(),
+            )
+            .recording_release(options.release),
+        );
 
         let credential_store: Arc<dyn extenddb_auth::CredentialStore> =
             Arc::new(credential_store::CassandraCredentialStore::new(
@@ -377,7 +401,7 @@ fn server_components_factory(
         let runtime_hooks = Box::new(CassandraRuntimeHooks {
             engine: engine.clone(),
             control_plane_notify,
-            gsi_worker_guard: std::sync::OnceLock::new(),
+            registration,
         });
 
         Ok(ServerComponents {
