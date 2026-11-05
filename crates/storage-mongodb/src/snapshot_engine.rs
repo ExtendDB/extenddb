@@ -483,9 +483,10 @@ mod tests {
             restore_server_slots: Arc::new(tokio::sync::Semaphore::new(slots)),
             restore_account_slots: crate::backup_engine::RestoreAccountSlots::default(),
         };
-        let worker = tokio::spawn(crate::ttl_worker::gsi_backfill_worker(Arc::new(
-            engine.clone(),
-        )));
+        let worker = tokio::spawn(crate::ttl_worker::gsi_backfill_worker(
+            Arc::new(engine.clone()),
+            extenddb_storage::CancellationToken::new(),
+        ));
         Fixture {
             engine: Some(engine),
             worker,

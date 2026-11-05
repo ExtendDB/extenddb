@@ -3,7 +3,7 @@
 
 //! IAM policy CRUD and permissions boundaries for `SqliteCatalogStore`.
 
-use extenddb_storage::management_store::{OpError, OpResult};
+use extenddb_storage::management_store::{OpError, OpResult, StoredDocument};
 use time::OffsetDateTime;
 
 use crate::catalog_store::SqliteCatalogStore;
@@ -105,6 +105,59 @@ impl SqliteCatalogStore {
                 ))
             })
             .collect()
+    }
+
+    /// A principal's policies for the resource-tag migration, each document
+    /// decoded on its own: one that does not decode comes back as its decode
+    /// error, and the others are still read.
+    pub(crate) async fn list_policy_documents_impl(
+        &self,
+        account_id: &str,
+        principal_type: &str,
+        principal_name: &str,
+    ) -> OpResult<Vec<(String, StoredDocument)>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT policy_name, policy_document FROM iam_policies \
+             WHERE account_id = ? AND principal_type = ? AND principal_name = ? \
+             ORDER BY policy_name",
+        )
+        .bind(account_id)
+        .bind(principal_type)
+        .bind(principal_name)
+        .fetch_all(self.pool())
+        .await
+        .map_err(|e| {
+            tracing::error!("list_policy_documents: {e}");
+            OpError::Internal("Database error".to_owned())
+        })?;
+        Ok(rows
+            .into_iter()
+            .map(|(name, doc)| (name, serde_json::from_str(&doc).map_err(|e| e.to_string())))
+            .collect())
+    }
+
+    /// A principal's permissions boundary for the resource-tag migration:
+    /// the decoded document, or its decode error.
+    pub(crate) async fn boundary_document_impl(
+        &self,
+        account_id: &str,
+        principal_type: &str,
+        principal_name: &str,
+    ) -> OpResult<Option<StoredDocument>> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT policy_document FROM iam_permissions_boundaries \
+             WHERE account_id = ? AND principal_type = ? AND principal_name = ?",
+        )
+        .bind(account_id)
+        .bind(principal_type)
+        .bind(principal_name)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(|e| {
+            tracing::error!("boundary_document: {e}");
+            OpError::Internal("Database error".to_owned())
+        })?;
+        Ok(row.map(|(doc,)| serde_json::from_str(&doc).map_err(|e| e.to_string())))
     }
 
     // ── Permissions boundaries ─────────────────────────────────────

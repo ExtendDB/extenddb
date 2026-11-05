@@ -33,15 +33,20 @@ uuid = { workspace = true }
 time = { workspace = true }
 base64 = { workspace = true }
 bcrypt = { workspace = true }
-aes-gcm = { workspace = true }
 rand = { workspace = true }
 bigdecimal = { workspace = true }
 crc32fast = { workspace = true }
 zeroize = { workspace = true }
 libc = { workspace = true }
+libsqlite3-sys = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+extenddb-storage = { workspace = true, features = ["test-util"] }
+# The slow-statement test sets sqlx's threshold, a `log` level, and prints
+# every tracing event of a child process.
+log = "0.4"
+tracing-subscriber = { workspace = true }
 # The crate's own tests need `test-hooks`; a dev-dependency on itself turns
 # the feature on for test builds only.
 extenddb-storage-sqlite = { path = ".", features = ["test-hooks"] }

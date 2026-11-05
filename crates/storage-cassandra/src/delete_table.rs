@@ -164,19 +164,6 @@ impl CassandraEngine {
             .await
             .map_err(|e| StorageError::Internal(format!("Delete indexes: {e}")))?;
 
-        // Delete table-scoped continuous-backup configuration so recreating the
-        // same table name does not inherit stale PITR state.
-        let delete_continuous_backup_query = format!(
-            "DELETE FROM {catalog_keyspace}.continuous_backups WHERE account_id = ? AND table_name = ?"
-        );
-        self.session
-            .query_with_values(
-                &delete_continuous_backup_query,
-                cdrs_tokio::query_values!(account_id, input.table_name.as_str()),
-            )
-            .await
-            .map_err(|e| StorageError::Internal(format!("Delete continuous backup state: {e}")))?;
-
         // Delete tags for this table so they don't survive recreation under the same name.
         let delete_tags_query =
             format!("DELETE FROM {catalog_keyspace}.tags WHERE resource_arn = ?");

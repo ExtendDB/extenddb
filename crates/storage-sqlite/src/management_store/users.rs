@@ -223,12 +223,7 @@ impl SqliteCatalogStore {
             // User absent or has no console password.
             return Ok(false);
         };
-        let password = password.to_owned();
-        let verified = tokio::task::spawn_blocking(move || bcrypt::verify(&password, &hash))
-            .await
-            .map_err(|e| OpError::Internal(format!("bcrypt task: {e}")))?
-            .unwrap_or(false);
-        Ok(verified)
+        extenddb_storage::password::verify_password(password.to_owned(), hash).await
     }
 
     pub(crate) async fn change_user_password_impl(

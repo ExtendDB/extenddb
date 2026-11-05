@@ -81,7 +81,9 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    /// Install this binary's backend once for the test process.
+    /// Install this binary's backend once for the test process. Only the
+    /// postgres and sqlite builds have tests that need it.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     fn install_backend() {
         #[cfg(feature = "cassandra")]
         let _ = extenddb_storage::set_backend(extenddb_storage_cassandra::backend());
@@ -130,5 +132,90 @@ mod tests {
             .expect("postgres storage config defaults to a local dev connection");
         assert_eq!(cfg.server.bind_addr, "127.0.0.1");
         assert!(cfg.server.tls.enabled);
+    }
+
+    /// No PostgreSQL migration is declared additive until CI runs the
+    /// previous release against a catalog this binary migrated; the PR that
+    /// adds that job deletes this test. It lives here because the backend's
+    /// table is public and this crate builds with the postgres feature in
+    /// `cargo test --workspace`.
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn no_postgres_migration_is_additive_before_the_old_binary_job() {
+        extenddb_storage::migrations::refuse_additive(
+            "postgres",
+            extenddb_storage_postgres::migrations::migration,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// `migrate --yes` on PostgreSQL, as the command runs it (the lock, then
+    /// the status under it), refuses two empty databases (a DBA created
+    /// them ahead of `init`) as `Uninitialized`, exit 1, and writes nothing
+    /// to either. Needs `EXTENDDB_TEST_PG_CONNECTION_STRING` (a base URL
+    /// with no database, for a role that may create databases); skips
+    /// without it.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn migrate_yes_refuses_empty_postgres_databases() {
+        use extenddb_storage::migrations::{
+            CatalogStatus, MigrationError, RunKind, Target, exit, installed, run_locked,
+        };
+
+        let Some(base) = std::env::var("EXTENDDB_TEST_PG_CONNECTION_STRING")
+            .ok()
+            .map(|s| s.trim().trim_end_matches('/').to_owned())
+            .filter(|s| !s.is_empty())
+        else {
+            eprintln!("skipped: EXTENDDB_TEST_PG_CONNECTION_STRING not set");
+            return;
+        };
+        install_backend();
+        let stem = format!(
+            "eddb_bin_{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        );
+        let databases = [format!("{stem}_catalog"), stem.clone()];
+        let admin = sqlx::PgPool::connect(&format!("{base}/postgres"))
+            .await
+            .expect("admin connection");
+        for name in &databases {
+            sqlx::query(&format!("CREATE DATABASE \"{name}\""))
+                .execute(&admin)
+                .await
+                .expect("create database");
+        }
+        let target = Target::at(format!("{base}/{}", databases[0]));
+        let migrations = installed().expect("the postgres backend migrates on the runner");
+        let result = async {
+            let lock = migrations
+                .lock(&target, std::time::Duration::from_secs(10))
+                .await?;
+            run_locked(migrations, &target, &lock, "test", RunKind::Migrate).await
+        }
+        .await;
+        let mut written = Vec::new();
+        for name in &databases {
+            let pool = sqlx::PgPool::connect(&format!("{base}/{name}"))
+                .await
+                .expect("database connection");
+            let tables: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM pg_tables WHERE schemaname = 'public'")
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count tables");
+            pool.close().await;
+            written.push(tables);
+        }
+        for name in &databases {
+            let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
+                .execute(&admin)
+                .await;
+        }
+        admin.close().await;
+        let err = result.expect_err("an empty catalog database is not a catalog");
+        assert_eq!(err, MigrationError::Status(CatalogStatus::Uninitialized));
+        assert_eq!(err.exit_code(), exit::ERROR);
+        assert_eq!(written, [0, 0], "tables written to the empty databases");
     }
 }

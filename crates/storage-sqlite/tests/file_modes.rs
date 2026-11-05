@@ -17,13 +17,23 @@
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use extenddb_storage::bootstrapper::Bootstrapper;
+use extenddb_storage::bootstrapper::{Bootstrapper, write_bootstrap_rows};
+use extenddb_storage::migrations::{
+    CatalogMigrations, CatalogStatus, RunKind, run_locked, run_with_status,
+};
 use extenddb_storage::server_components::{ServerComponents, ServerComponentsOptions};
 use extenddb_storage::{MetadataEngine, TableEngine};
+use extenddb_storage_sqlite::migrations::SqliteCatalogMigrations;
 use extenddb_storage_sqlite::{SqliteBootstrapper, SqliteConfig, SqliteEngine};
 
 const ACCOUNT: &str = "000000000000";
+
+/// The release the migration ledger records for these runs.
+const RELEASE: &str = "1.0.0-test";
+
+const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A fresh directory for one test, with the process umask set to 022.
 fn deployment_dir() -> PathBuf {
@@ -90,7 +100,9 @@ fn set_every_mode(dir: &Path, mode: u32) {
     }
 }
 
-/// What `extenddb init --backend sqlite` does through the bootstrapper.
+/// What `extenddb init --backend sqlite` does: the bootstrapper's steps, then
+/// under the migration lock the catalog's migrations, the rows a server needs
+/// and the data connection.
 async fn init(path: &str) {
     let bootstrapper = SqliteBootstrapper::new(path);
     bootstrapper
@@ -106,69 +118,37 @@ async fn init(path: &str) {
         .await
         .expect("create_catalog_db");
     bootstrapper.create_data_db().await.expect("create_data_db");
-    bootstrapper
-        .acquire_migration_lock()
+    let migrations = SqliteCatalogMigrations;
+    let target = bootstrapper.init_target();
+    let lock = migrations.lock(&target, LOCK_TIMEOUT).await.expect("lock");
+    let status = migrations
+        .status_under_lock(&lock, &target)
         .await
-        .expect("acquire_migration_lock");
-    assert!(
-        !bootstrapper
-            .is_catalog_initialized()
-            .await
-            .expect("is_catalog_initialized")
-    );
-    bootstrapper
-        .run_catalog_migrations()
+        .expect("status");
+    assert_eq!(status, CatalogStatus::Uninitialized);
+    run_with_status(&migrations, &status, &lock, RELEASE, RunKind::Create)
         .await
-        .expect("run_catalog_migrations");
+        .expect("catalog migrations");
+    bootstrapper.hold(&lock);
+    write_bootstrap_rows(&bootstrapper, None, None)
+        .await
+        .expect("bootstrap rows");
     bootstrapper
         .record_data_connection()
         .await
         .expect("record_data_connection");
-    bootstrapper
-        .run_data_migrations()
-        .await
-        .expect("run_data_migrations");
-    bootstrapper
-        .bootstrap_encryption_key()
-        .await
-        .expect("bootstrap_encryption_key");
-    bootstrapper
-        .bootstrap_default_account()
-        .await
-        .expect("bootstrap_default_account");
-    bootstrapper
-        .bootstrap_admin_user(None, None)
-        .await
-        .expect("bootstrap_admin_user");
-    bootstrapper
-        .release_migration_lock()
-        .await
-        .expect("release_migration_lock");
+    migrations.release(lock).await;
 }
 
-/// What `extenddb migrate` opens on a database with nothing pending: the lock,
-/// then the bootstrapper's pool for the catalog state and the pending data
-/// migrations.
-async fn migrate_reads(path: &str) {
-    let bootstrapper = SqliteBootstrapper::new(path);
-    bootstrapper
-        .acquire_migration_lock()
-        .await
-        .expect("acquire_migration_lock");
-    assert!(
-        bootstrapper
-            .is_catalog_initialized()
-            .await
-            .expect("is_catalog_initialized")
-    );
-    bootstrapper
-        .pending_data_migrations()
-        .await
-        .expect("pending_data_migrations");
-    bootstrapper
-        .release_migration_lock()
-        .await
-        .expect("release_migration_lock");
+/// What `extenddb migrate --yes` opens on a catalog with nothing pending: the
+/// lock, the status under it, then the runner's connection.
+async fn migrate(path: &str) {
+    let migrations = SqliteCatalogMigrations;
+    let target = SqliteBootstrapper::new(path).init_target();
+    let lock = migrations.lock(&target, LOCK_TIMEOUT).await.expect("lock");
+    let report = run_locked(&migrations, &target, &lock, RELEASE, RunKind::Migrate).await;
+    migrations.release(lock).await;
+    assert!(report.expect("migrate").applied.is_empty());
 }
 
 /// What `extenddb serve` does to open the database.
@@ -290,7 +270,7 @@ async fn a_bootstrapping_serve_creates_owner_only_files() {
 }
 
 /// Files left at 0644 by an earlier version are set to 0600 by the next
-/// `serve`, and by the next `migrate`, before anything reads them.
+/// `serve`, and by the next `migrate --yes`, before anything reads them.
 #[tokio::test]
 async fn serve_and_migrate_restrict_files_left_at_0644() {
     let dir = deployment_dir();
@@ -307,7 +287,7 @@ async fn serve_and_migrate_restrict_files_left_at_0644() {
     drop(components);
 
     set_every_mode(&dir, 0o644);
-    migrate_reads(&path).await;
+    migrate(&path).await;
     assert_owner_only(&dir, "migrate over 0644 files", &[]);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -316,15 +296,18 @@ async fn serve_and_migrate_restrict_files_left_at_0644() {
 // any other pool opens the file: a later opener's narrowing cannot hide one
 // that skipped its own.
 
-/// The bootstrapper's pool, which `init` and `migrate` open for each step.
+/// The bootstrapper's pool, which `init` opens for the rows a server needs
+/// and `destroy` opens to list the tables. On a path with no catalog the
+/// listing finds no table.
 #[tokio::test]
 async fn the_bootstrapper_pool_alone_creates_owner_only_files() {
     let dir = deployment_dir();
     let path = database_path(&dir);
-    SqliteBootstrapper::new(&path)
-        .run_catalog_migrations()
+    let tables = SqliteBootstrapper::new(&path)
+        .list_table_names()
         .await
-        .expect("run_catalog_migrations");
+        .expect("list_table_names");
+    assert!(tables.is_empty(), "{tables:?}");
     assert_owner_only(&dir, "the bootstrapper's pool", &[]);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -341,6 +341,7 @@ mod tests {
         fn count_principal_failures(
             &self,
             _principal: &str,
+            _source_ip: &str,
             _window_seconds: i64,
         ) -> BoxFuture<'_, OpResult<i64>> {
             Box::pin(async { Ok(0) })
