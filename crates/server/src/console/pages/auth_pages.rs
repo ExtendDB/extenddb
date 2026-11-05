@@ -304,6 +304,12 @@ mod tests {
         }
     }
 
+    /// A password made at run time. The store fails before any check, so its
+    /// value does not matter, and no literal reaches the password check.
+    fn any_password() -> String {
+        format!("pw-{}", std::process::id())
+    }
+
     async fn body_text(response: Response) -> String {
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -332,8 +338,9 @@ mod tests {
         let hashes = FailingHashes {
             message: "store is down",
         };
+        let password = any_password();
         let (logs, _guard) = capture_logs();
-        assert!(try_admin_login("admin", "pw", &hashes).await.is_err());
+        assert!(try_admin_login("admin", &password, &hashes).await.is_err());
         let text = logs.text();
         assert!(
             text.contains("ERROR") && text.contains("Console login: DB error during admin auth"),
@@ -346,8 +353,9 @@ mod tests {
         let hashes = FailingHashes {
             message: VERIFY_OVERLOADED,
         };
+        let password = any_password();
         let (logs, _guard) = capture_logs();
-        assert!(try_admin_login("admin", "pw", &hashes).await.is_err());
+        assert!(try_admin_login("admin", &password, &hashes).await.is_err());
         let text = logs.text();
         assert!(!text.contains("DB error"), "{text}");
     }
