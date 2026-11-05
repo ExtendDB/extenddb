@@ -77,12 +77,6 @@ pub enum StorageError {
     /// nothing read so far may be combined with a fresh snapshot.
     #[error("snapshot expired: {0}")]
     SnapshotExpired(String),
-    #[error(
-        "Catalog version mismatch: expected {expected}, found {found}. Run 'extenddb migrate' to update."
-    )]
-    CatalogVersionMismatch { expected: String, found: String },
-    #[error("Catalog not initialized. Run 'extenddb init' to set up the catalog.")]
-    CatalogNotInitialized,
     #[error("Connection error: {0}")]
     Connection(String),
     /// The backend does not implement the requested feature. Distinct from

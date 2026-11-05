@@ -265,12 +265,15 @@ You should see all checks pass:
 
 ```
 === extenddb verify ===
+Config:           extenddb.toml
+Catalog database: extenddb_catalog
+
+--- Checking catalog migrations...
+  OK: Current: the catalog is at migration 5
 --- Checking catalog connection...
   OK: Connected to catalog.
---- Checking catalog version...
-  OK: Catalog version 0.0.4
 --- Checking data database...
-  OK: Connected to data database 'extenddb_catalog_data'.
+  OK: Connected to data database 'extenddb'.
 --- Enumerating tables...
   Tables: 0
   Indexes: 0
@@ -284,7 +287,7 @@ extenddb runs as a daemon (background process) and logs to syslog. On startup it
 
 ```bash
 ./target/release/extenddb serve --config extenddb.toml
-# extenddb 0.1.14 (catalog 0.0.4) starting on 127.0.0.1:18443
+# extenddb 0.1.14 (catalog migration 5) starting on 127.0.0.1:18443
 #   storage: postgres (postgresql://extenddb:***@localhost:5432/extenddb_catalog)
 ```
 
@@ -1267,7 +1270,7 @@ Navigate to `https://127.0.0.1:18443/console/` in your browser (adjust the host 
 
 ### Features
 
-- **Dashboard:** Overview of accounts and admin users.
+- **Dashboard:** Overview of accounts and admin users (admin sessions only; an IAM-user session gets a link to its own account).
 - **Account management:** Create, view, and delete accounts (admin only).
 - **User management:** Create and delete IAM users, view access keys, policies, tags, and group memberships.
 - **Access key management:** Create and delete access keys. The secret key is shown once at creation time.
@@ -1364,7 +1367,7 @@ Each runner requires its tools to be installed. The runner checks prerequisites 
 ```bash
 ./target/release/extenddb version
 # extenddb 0.1.14
-# catalog 0.0.4 (postgres)
+# catalog migration 5 (postgres)
 # commit abc1234
 # built 2026-04-17T12:00:00Z
 ```
@@ -1424,12 +1427,12 @@ ttl_seconds        = 60     # hard TTL — entries older than this are full miss
 soft_ttl_seconds   = 30     # entries older than this serve cached AND trigger
                             #   a background refresh (request does not block)
 negative_ttl_seconds = 5    # how long "not found" results are remembered
-max_entries        = 10000  # per-cache LRU cap
+max_entries        = 10000  # maximum entries per cache
 ```
 
 **Self-induced changes** (admin API and console mutations: `CreateAccessKey`, `PutUserPolicy`, `TagResource`, `CreateTable`, etc.) propagate instantly via write-through invalidation on the local instance.
 
-**Fanout invalidations** (`DeleteAccount`, `DeleteRole` session sweep, `DeleteGroup` member fanout) complete asynchronously; there is a brief (~ms) window between the API responding success and the eviction landing. For hard cutover, prefer single-key invalidations (`DeleteAccessKey`) over cascades.
+**Fanout invalidations** (`DeleteAccount`, `DeleteRole` session sweep, `DeleteGroup` member fanout) also take effect when the API returns. If a group change cannot list the group's members, those members' entries wait for `ttl_seconds`.
 
 **Off-instance changes** (multi-node deployments, or direct DB writes outside the management API) take up to `ttl_seconds` to propagate.
 

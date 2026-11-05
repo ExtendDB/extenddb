@@ -268,18 +268,21 @@ impl RateLimitStore for SqliteCatalogStore {
     fn count_principal_failures(
         &self,
         principal: &str,
+        source_ip: &str,
         window_seconds: i64,
     ) -> BoxFuture<'_, OpResult<i64>> {
         let principal = principal.to_owned();
+        let source_ip = source_ip.to_owned();
         Box::pin(async move {
             let cutoff = format_timestamp(
                 OffsetDateTime::now_utc() - time::Duration::seconds(window_seconds),
             );
             let row: (i64,) = sqlx::query_as(
                 "SELECT COUNT(*) FROM login_attempts \
-                 WHERE principal = ? AND success = 0 AND attempted_at > ?",
+                 WHERE principal = ? AND source_ip = ? AND success = 0 AND attempted_at > ?",
             )
             .bind(&principal)
+            .bind(&source_ip)
             .bind(&cutoff)
             .fetch_one(&self.pool)
             .await
