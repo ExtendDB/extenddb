@@ -26,6 +26,11 @@ mod connect;
 mod cql;
 mod guarded;
 mod locks;
+// Frozen once released: neither rustfmt nor a later clippy lint may require
+// an edit that changes its checksum.
+#[rustfmt::skip]
+#[allow(clippy::all, deprecated)]
+mod m0006_backup_catalog_index;
 pub mod postcheck;
 mod registrar;
 mod registrations;
@@ -125,6 +130,24 @@ pub fn migration(id: MigrationId) -> Migration<CassandraStores> {
                 StoreKind::Catalog,
                 "migrations/catalog",
                 "0005_drop_continuous_backups.cql"
+            )],
+        },
+        // Breaking: a binary without it neither reads the index nor writes
+        // the job record on the restore registrations it creates, so a
+        // restore it ran would be owned by nobody. Convergent: every
+        // statement is `IF NOT EXISTS`, the backfill writes only a
+        // registration whose job status is unset, which no registration
+        // this release writes is (each is inserted with its job record), and
+        // the catalog id is inserted only when absent; so a second run over
+        // data written since changes nothing but a registration a release
+        // before it wrote, which is the repair `--reconverge` is for.
+        MigrationId::BackupCatalogIndex => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![StoreBody::code(
+                StoreKind::Catalog,
+                &m0006_backup_catalog_index::BackupCatalogIndex,
+                m0006_backup_catalog_index::SOURCE,
             )],
         },
         MigrationId::StreamPending => Migration::NotApplicable(
@@ -278,12 +301,38 @@ pub async fn migrate_catalog_keyspace(
     release: &str,
     timeout: std::time::Duration,
 ) -> Result<RunReport, MigrationError> {
+    migrate_catalog_keyspace_through(
+        session,
+        keyspace_prefix,
+        release,
+        timeout,
+        MigrationId::LATEST,
+    )
+    .await
+}
+
+/// [`migrate_catalog_keyspace`] stopping after migration `through`: for
+/// tests of a catalog a later migration has not reached.
+///
+/// # Errors
+///
+/// As [`migrate_catalog_keyspace`].
+#[cfg(any(test, feature = "test-util"))]
+pub async fn migrate_catalog_keyspace_through(
+    session: Arc<CassandraSession>,
+    keyspace_prefix: &str,
+    release: &str,
+    timeout: std::time::Duration,
+    through: MigrationId,
+) -> Result<RunReport, MigrationError> {
     let catalog = format!("{keyspace_prefix}_catalog");
     create_lock_table(&session, &catalog).await?;
     let lock = MigrationLock::acquire(session, &catalog, LeaseTimes::DEFAULT, timeout).await?;
     let result = {
         let migrations = CassandraMigrations::locked_catalog_only(&lock, keyspace_prefix);
-        Runner::new(&migrations, release).migrate().await
+        Runner::new(&migrations, release)
+            .migrate_through(through)
+            .await
     };
     lock.release().await;
     result

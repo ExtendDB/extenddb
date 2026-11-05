@@ -21,6 +21,9 @@ pub(crate) struct RestoreRegistration<'a> {
     /// Reported as `RestoreSummary.RestoreDateTime`, epoch seconds: the value
     /// the engine passes (the source backup's creation time), not "now".
     pub(crate) restore_date_time: f64,
+    /// The job claim's fencing token, written on the job record (RUNNING,
+    /// `kind = legacy`) with the target.
+    pub(crate) owner_generation: u64,
 }
 
 impl PostgresEngine {
@@ -167,18 +170,10 @@ impl PostgresEngine {
             // One restore of a backup at a time, as the service: while a
             // target restored from it is CREATING the backup is in use. Same
             // predicate as DeleteBackup's.
-            let restoring: Option<String> = sqlx::query_scalar(
-                "SELECT t.table_name FROM table_restores r JOIN tables t ON t.table_id = r.table_id \
-                 WHERE r.source_backup_arn = $1 AND t.table_status = 'CREATING' LIMIT 1",
-            )
-            .bind(backup_arn)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-            if let Some(table) = restoring {
-                return Err(StorageError::BackupInUse(format!(
-                    "Backup is being used to restore table {table}: {backup_arn}"
-                )));
+            if let Some(table) =
+                crate::backup_catalog::creating_restore_target(&mut *tx, backup_arn).await?
+            {
+                return Err(crate::backup_catalog::backup_in_use(&table, backup_arn));
             }
         }
 
@@ -242,15 +237,20 @@ impl PostgresEngine {
         };
 
         if let Some(r) = restore {
+            // The job record: RUNNING under the claim's generation, with a
+            // heartbeat on the catalog's clock, so no CREATING target ever
+            // exists without an owned record.
             sqlx::query(
                 "INSERT INTO table_restores \
-                 (table_id, source_backup_arn, source_table_arn, restore_date_time) \
-                 VALUES ($1, $2, $3, to_timestamp($4))",
+                 (table_id, source_backup_arn, source_table_arn, restore_date_time, \
+                  status, kind, owner_generation, heartbeat_at) \
+                 VALUES ($1, $2, $3, to_timestamp($4), 'RUNNING', 'legacy', $5, now())",
             )
             .bind(&table_id)
             .bind(r.backup_arn)
             .bind(r.source_table_arn)
             .bind(r.restore_date_time)
+            .bind(crate::backup_engine::generation_column(r.owner_generation))
             .execute(&mut *tx)
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;

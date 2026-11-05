@@ -139,7 +139,7 @@ Policy sources collected for evaluation:
 - **Auth before JSON parse**: SigV4 signature verification runs before the request body is parsed. Invalid signatures are rejected with constant-time comparison before any business logic executes.
 - **Concurrent policy fetching**: Identity policies, group policies, and permissions boundaries are fetched concurrently from the catalog when they are not in the server's cache (see Credential and Policy Caching). All must succeed for evaluation to proceed.
 - **Constant-time rejection for inactive keys**: Inactive or expired access keys are rejected without timing differences that could reveal key existence.
-- **Policy document validation on write**: Policy documents are validated for JSON structure and size-capped (6,144 bytes) when attached via the management API. Invalid documents are rejected before storage.
+- **Policy document validation on write**: Policy documents are validated for JSON structure and size-capped (6,144 bytes) when attached via the management API. Invalid documents are rejected before storage. A `Version` other than the string `2012-10-17` or `2008-10-17` is refused; only a `2012-10-17` document expands policy variables.
 - **Expression depth and token limits**: Expression parsing enforces configurable depth (default 150) and token limits (default 4,096) to prevent resource exhaustion.
 
 ### Supported Condition Operators
@@ -173,7 +173,7 @@ Set operators and `IfExists` can be combined: `ForAllValues:StringEqualsIfExists
 | `dynamodb:FullTableScan` | Boolean | `true` for Scan operations |
 | `dynamodb:EnclosingOperation` | String | The enclosing operation for batch/transact sub-operations |
 
-Policy variables (e.g., `${aws:PrincipalTag/Team}`) are expanded in condition values.
+Policy variables (e.g., `${aws:PrincipalTag/Team}`) are expanded in condition values. In a `2012-10-17` document, under a string or ARN operator (with or without `ForAnyValue:`, `ForAllValues:` or `IfExists`), the `${key, 'default'}` form expands to `default` when the request does not carry `key`, and code points up to U+0020 around the key name are ignored. Elsewhere the text between the braces is read as the key name as written, so `${key, 'default'}` is compared as written; IAM does not read the default form there either. A role trust policy follows its own `Version`. A multivalued key such as `dynamodb:LeadingKeys` is not expanded.
 
 ### Access Control Patterns
 
@@ -197,7 +197,7 @@ Resources are identified by ARN: `arn:aws:dynamodb:<region>:<account-id>:table/<
 
 - `Effect`: Allow, Deny
 - `Action` / `NotAction`: DynamoDB actions (e.g., `dynamodb:PutItem`, `dynamodb:*`)
-- `Resource` / `NotResource`: ARN patterns with wildcards
+- `Resource` / `NotResource`: ARN patterns with wildcards. In a `2012-10-17` document, `${key}` policy variables in the pattern are expanded from the request before matching (for example `arn:aws:dynamodb:*:*:table/${aws:username}`); a wildcard written after a variable still matches; `${key, 'default'}` falls back to `default`; `${*}`, `${?}` and `${$}` stand for literal characters; a variable whose key the request does not carry, or that names a multivalued key such as `dynamodb:LeadingKeys` that the request carries, makes the pattern match nothing (a written default is used only when the key is absent); a `:` inside a substituted value does not separate ARN fields. A `2008-10-17` document, or one with no `Version`, matches the pattern as written, as IAM does. Code points up to U+0020 around the key name, around the comma of the default form and before the closing brace are ignored, as in IAM, and a space inside the quotes of a default is kept. A tag whose value is the empty string expands to no characters, as in IAM: `table/${aws:PrincipalTag/team}*` matches every table for a caller tagged `team=""`, while with no `team` tag it matches nothing. To refuse such a caller, add a condition such as `StringLike` on `aws:PrincipalTag/team` with the value `?*` to the `Allow` statement (measured with the IAM policy simulator). A `Deny NotResource` statement on such a pattern spares every table for that caller (also measured), and that condition on it does not change this.
 - `Condition`: Full condition block support (see operators and keys above)
 
 ## Transport Security
@@ -222,13 +222,17 @@ Replace the certificate and key files, then restart extenddb. There is no hot-re
 
 ## Web Console Security
 
+An admin session can read and change every account. Every page and form under `/console/accounts/{account_id}` serves an IAM-user session its own account only. When `{account_id}` is not the session's own account, the handler redirects the session to `/console`. The handler makes this comparison before it looks up the account in the path, so another account's ID and an ID that no account has get the same answer. The accounts list shows an IAM-user session its own account alone, and the console home page shows the deployment's account count and admin count to admin sessions only. In its own account an IAM-user session currently reads every user, group and role page, including other users' access key IDs, policy names and tags, which the management API refuses the same user. Issue #731 tracks this. An IAM-user session can create and delete access keys for its own user, and every other change in the console needs an admin session.
+
 The management web console (`/console/*`) implements:
 
 - **CSRF protection**: Unique tokens generated per session, injected into all forms via JavaScript, validated on every POST handler
-- **Session management**: Server-side sessions with 8-hour expiry, HttpOnly cookies with `SameSite=Strict` and `Path=/console`
+- **Session management**: Server-side sessions that expire after 8 hours of inactivity, HttpOnly and `Secure` cookies with `SameSite=Strict` and `Path=/console` (a dev-mode build serves plain HTTP and leaves `Secure` off)
+- **Session revocation**: A session is bound to the password hash its admin or IAM user logged in with. Every console request reads that hash from the catalog again. When the principal has been deleted, or its password has been changed, the session is removed and the request is redirected to the login page. This happens at the session's next request on every server that shares the catalog, because no server keeps a copy of the hash between requests. On Cassandra the read and the writes that change the hash use `LOCAL_QUORUM`, so a server in another datacenter sees the change once it has replicated there. If the catalog cannot be read, the request gets HTTP 503 and the session is kept. A refused request does not count as activity, so the 8 hour idle timeout keeps running during a catalog outage.
 - **Security headers**: X-Content-Type-Options (nosniff), X-Frame-Options (DENY), Referrer-Policy (strict-origin-when-cross-origin)
 - **HSTS**: Sent automatically (TLS is always enabled)
 - **Login rate limiting**: Failed login attempts are counted per user and source address, and per source address, as described under [Login Rate Limiting](#login-rate-limiting).
+- **Admin-only metrics**: The metrics dashboard (`/console/metrics`) and its data feed (`/console/metrics-data`) serve admin sessions only. The metrics table has no account column, so the feed carries the table names, index names and traffic of every account. An IAM-user session is redirected from the page and gets HTTP 403 with no metric data from the feed.
 
 ## Login Rate Limiting
 

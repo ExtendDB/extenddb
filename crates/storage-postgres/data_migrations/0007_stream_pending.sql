@@ -1,7 +1,7 @@
 -- Copyright 2026 ExtendDB contributors
 -- SPDX-License-Identifier: Apache-2.0
 --
--- Migration 6, stream_pending, PostgreSQL data database: the table a write
+-- Migration 7, stream_pending, PostgreSQL data database: the table a write
 -- stores its stream record in, inside the write's own transaction. The record
 -- gets its sequence number only after the write commits, when a numbering
 -- step moves the shard's committed records into stream_records in `id` order

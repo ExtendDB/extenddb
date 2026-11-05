@@ -46,7 +46,6 @@ base64 = { workspace = true }
 crc32fast = { workspace = true }
 rand = { workspace = true }
 bcrypt = { workspace = true }
-aes-gcm = { workspace = true }
 async-trait = { workspace = true }
 zeroize = { workspace = true }
 urlencoding = { workspace = true }

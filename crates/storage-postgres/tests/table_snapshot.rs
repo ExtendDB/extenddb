@@ -1227,16 +1227,18 @@ on_both_layouts!(an_open_held_with_deletes_queued_completes);
 
 /// A restored table's snapshot description carries the same
 /// `restore_summary` as `describe_table`'s (both read the `table_restores`
-/// row). The record is written directly, as `RestoreTableFromBackup` leaves
-/// it.
+/// row). The record is written directly, as a finished
+/// `RestoreTableFromBackup` leaves it: a DONE legacy job record.
 async fn a_restored_table_describes_its_restore(shared: bool) {
     let s = scratch_with(shared).await;
     create_active(&s, snapshot_conformance::table_input("restored")).await;
     snapshot_conformance::populate(&s.engine, ACCOUNT, "restored", 5).await;
     sqlx::query(
         "INSERT INTO table_restores \
-         (table_id, source_backup_arn, source_table_arn, restore_date_time) \
-         SELECT table_id, $1, $2, '2026-10-01T12:00:00.250Z' FROM tables \
+         (table_id, source_backup_arn, source_table_arn, restore_date_time, \
+          status, kind, owner_generation, heartbeat_at, completed_at) \
+         SELECT table_id, $1, $2, '2026-10-01T12:00:00.250Z', \
+                'DONE', 'legacy', 0, now(), now() FROM tables \
          WHERE table_name = 'restored'",
     )
     .bind("arn:aws:dynamodb:us-east-1:123456789012:table/src/backup/01759320000250-0a1b2c3d")
@@ -1569,7 +1571,7 @@ on_both_layouts!(cancelling_an_open_wakes_the_active_poller);
 /// first drop attempt, and its end wakes the poller, which drops the table
 /// within 3 s rather than at its next timed attempt about 9.5 s later.
 async fn the_in_catalog_backup_wakes_the_active_poller(shared: bool) {
-    use extenddb_storage::BackupEngine as _;
+    use extenddb_storage::{JobPermit, LegacyBackupReader as _};
     let s = scratch_with(shared).await;
     create_active(&s, snapshot_conformance::table_input("backed")).await;
     snapshot_conformance::populate(&s.engine, ACCOUNT, "backed", 20).await;
@@ -1585,7 +1587,9 @@ async fn the_in_catalog_backup_wakes_the_active_poller(shared: bool) {
         .await
         .expect("hold backups");
 
-    let backup = s.engine.create_backup(ACCOUNT, "backed", "held");
+    let backup = s
+        .engine
+        .create(ACCOUNT, "backed", "held", JobPermit::detached());
     let controller = async {
         let mut watcher = PgConnection::connect(&format!("{}/postgres", s.base))
             .await

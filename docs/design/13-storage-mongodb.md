@@ -994,7 +994,6 @@ uuid.workspace = true
 base64.workspace = true
 rand.workspace = true
 bcrypt.workspace = true
-aes-gcm.workspace = true
 zeroize.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true

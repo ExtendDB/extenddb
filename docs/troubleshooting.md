@@ -854,9 +854,15 @@ The error log line names the exact relations for one leaked table and gives this
 
 ### Console redirects to login page on every request
 
-**Cause:** The session cookie has expired (sessions last 8 hours) or cookies are blocked by the browser.
+**Cause:** The session cookie has expired (sessions last 8 hours of inactivity), the user's password was changed or the user was deleted after the session began, or cookies are blocked by the browser.
 
-**Fix:** Log in again. Ensure cookies are enabled for the extenddb server address. If using a reverse proxy, ensure it forwards the `Cookie` and `Set-Cookie` headers.
+**Fix:** Log in again, with the new password if it was changed. Ensure cookies are enabled for the extenddb server address. If using a reverse proxy, ensure it forwards the `Cookie` and `Set-Cookie` headers.
+
+### Console pages return HTTP 503 "The catalog is unavailable"
+
+**Cause:** The console checks every session against the catalog database, and that read failed. The session is kept.
+
+**Fix:** Check that the catalog database is reachable from the server, then reload the page. After a PostgreSQL restart the first reloads can still answer 503: each pooled catalog connection that the restart closed fails once and is then replaced.
 
 ### Console shows "Encryption key not found" when creating access keys
 

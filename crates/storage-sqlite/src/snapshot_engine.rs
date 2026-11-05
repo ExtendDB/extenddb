@@ -30,10 +30,10 @@
 //! pool free for requests counts snapshots too; when no slot is free the
 //! open returns `LimitExceeded` at once rather than queueing. The slot count
 //! is stated once, in `SqliteConfig`'s doc (`config.rs`). The other side of
-//! sharing: a `CreateBackup` waits 30 s for a slot, so snapshots holding
-//! every slot make every `CreateBackup` wait and then fail with the shared
-//! refusal (`backup::slots_exhausted`), which names table snapshots for that
-//! reason.
+//! sharing: a `CreateBackup` tries the same slots without waiting
+//! (`backup::acquire_backup_permit`), so snapshots holding every slot make
+//! every `CreateBackup` fail at once with the one `LimitExceededException`
+//! text, with no backup running.
 //!
 //! In-memory databases are pinned to a single connection (a second connection
 //! would open a different database), so a stream that held its transaction
@@ -120,9 +120,10 @@ impl SqliteEngine {
         // would hold every connection and every writer would wait out the
         // pool's acquire timeout under the engine write lock. Refuse rather
         // than queue; the caller bounds concurrency.
-        let permit = std::sync::Arc::clone(&self.backup_server_slots)
-            .try_acquire_owned()
-            .map_err(|_| crate::backup::slots_exhausted(self.backup_server_slot_count))?;
+        let permit = crate::backup::acquire_backup_permit(
+            &self.backup_server_slots,
+            self.backup_server_slot_count,
+        )?;
 
         let mut tx: Transaction<'static, Sqlite> =
             self.pool.begin().await.map_err(|e| db_err(&e))?;
@@ -696,19 +697,21 @@ mod tests {
             .await
             .expect_err("no slot left");
         assert!(matches!(err, StorageError::LimitExceeded(_)), "{err}");
-        // CreateBackup's admission on the same slots, with its 30 s wait
-        // shortened: with snapshots holding every slot and no backup running,
-        // the refusal must name snapshots.
+        // CreateBackup's admission on the same slots: with snapshots holding
+        // every slot and no backup running, it is refused at once with the
+        // one text.
         match crate::backup::acquire_backup_permit(
-            std::sync::Arc::clone(&engine.backup_server_slots),
+            &engine.backup_server_slots,
             engine.backup_server_slot_count,
-            std::time::Duration::from_millis(50),
-        )
-        .await
-        {
-            Err(StorageError::LimitExceeded(m)) => assert!(
-                m.contains("backups or table snapshots") && m.contains(&format!("at most {slots}")),
-                "{m}"
+        ) {
+            Err(StorageError::LimitExceeded(m)) => assert_eq!(
+                m,
+                extenddb_storage::backup_catalog::limit_exceeded_message(
+                    extenddb_storage::backup_catalog::JobBound::Counted {
+                        name: crate::backup::BACKUP_SERVER_SLOTS_NAME,
+                        limit: slots,
+                    }
+                )
             ),
             other => panic!(
                 "CreateBackup is refused while snapshots hold every slot: {:?}",

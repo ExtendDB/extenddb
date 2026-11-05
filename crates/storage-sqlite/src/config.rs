@@ -21,14 +21,14 @@ use serde::Deserialize;
 /// of 10, and 1 for every `pool_size` of 5 or less; this is the one statement
 /// of the formula, `backup::backup_server_slot_count` computes it), shared by
 /// backups and table snapshots: each running backup and each open snapshot
-/// stream (file-backed or in-memory) holds one. A snapshot that finds no slot
-/// free is refused at once; a `CreateBackup` waits 30 s for one and then
-/// answers `LimitExceededException`, with no backup running if snapshots hold
-/// every slot. With one slot, one held snapshot blocks every `CreateBackup`
-/// for as long as it is open. Running backups hold one connection each for
-/// their read snapshot plus one shared writer (`n` backups hold `n + 1`), so
-/// from `pool_size` 4 up a flood of backups leaves at least half the pool to
-/// other requests; with 2 or 3 the one admitted backup holds two of them.
+/// stream (file-backed or in-memory) holds one. A snapshot or a `CreateBackup`
+/// that finds no slot free is refused at once with `LimitExceededException`,
+/// so no backup runs while snapshots hold every slot. With one slot, one held
+/// snapshot refuses every `CreateBackup` for as long as it is open. Running
+/// backups hold one connection each for their read snapshot plus one shared
+/// writer (`n` backups hold `n + 1`), so from `pool_size` 4 up a flood of
+/// backups leaves at least half the pool to other requests; with 2 or 3 the
+/// one admitted backup holds two of them.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SqliteConfig {

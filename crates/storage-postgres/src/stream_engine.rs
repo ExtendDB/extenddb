@@ -132,7 +132,7 @@ impl PostgresEngine {
     /// (#808). The transaction holds the shard's row `FOR NO KEY UPDATE` until
     /// it commits, so the numberings of one shard run one after another, each
     /// after the previous one committed. `stream_seq` keeps no values cached
-    /// per session (CACHE 1, which migration 6 sets), so it hands out values
+    /// per session (CACHE 1, which migration 7 sets), so it hands out values
     /// in the order of the calls across all sessions, and every number drawn
     /// here is higher than every number an earlier numbering of the shard
     /// committed. The batch holds the records committed when the statement

@@ -67,17 +67,23 @@ migration_ids! {
     /// it.
     DropContinuousBackups = 5, "drop_continuous_backups",
         "drop the continuous_backups table, which no request reads or writes since #335";
+    /// Creates the catalog index of backups (`backup_index`), the restore
+    /// job fields on the restore registrations, the maintenance claim record
+    /// and the catalog id.
+    BackupCatalogIndex = 6, "backup_catalog_index",
+        "create the backup catalog index, the restore job fields, the maintenance claim \
+         record and the catalog id";
     /// Adds the PostgreSQL `stream_pending` table. A write stores its stream
     /// record there, and the record gets its sequence number after the write
     /// commits, so a reader never passes a number that a later commit fills
     /// in (#808).
-    StreamPending = 6, "stream_pending",
+    StreamPending = 7, "stream_pending",
         "add stream_pending, which holds a PostgreSQL stream record until its write commits";
 }
 
 /// Highest id that has shipped in a release. Bodies at or below it are frozen:
 /// each backend pins their checksums, kinds and convergent flags, and
-/// `forget` refuses them. The v1.0 release PR raises it to 6.
+/// `forget` refuses them. The v1.0 release PR raises it to 7.
 pub const RELEASED_THROUGH: u32 = 0;
 
 impl MigrationId {
