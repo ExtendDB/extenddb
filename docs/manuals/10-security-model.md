@@ -222,7 +222,7 @@ Replace the certificate and key files, then restart extenddb. There is no hot-re
 
 ## Web Console Security
 
-An admin session can read and change every account. Every page and form under `/console/accounts/{account_id}` serves an IAM-user session its own account only. When `{account_id}` is not the session's own account, the handler redirects the session to `/console`. The handler makes this comparison before it looks up the account in the path, so another account's ID and an ID that no account has get the same answer. The accounts list shows an IAM-user session its own account alone, and the console home page shows the deployment's account count and admin count to admin sessions only. In its own account an IAM-user session currently reads every user, group and role page, including other users' access key IDs, policy names and tags, which the management API refuses the same user. Issue #731 tracks this. An IAM-user session can create and delete access keys for its own user, and every other change in the console needs an admin session. Until pull request #727 merges, `/console/metrics-data` serves every console session the table names, index names and traffic metrics of every account, because the metrics table has no account column.
+An admin session can read and change every account. Every page and form under `/console/accounts/{account_id}` serves an IAM-user session its own account only. When `{account_id}` is not the session's own account, the handler redirects the session to `/console`. The handler makes this comparison before it looks up the account in the path, so another account's ID and an ID that no account has get the same answer. The accounts list shows an IAM-user session its own account alone, and the console home page shows the deployment's account count and admin count to admin sessions only. In its own account an IAM-user session currently reads every user, group and role page, including other users' access key IDs, policy names and tags, which the management API refuses the same user. Issue #731 tracks this. An IAM-user session can create and delete access keys for its own user, and every other change in the console needs an admin session.
 
 The management web console (`/console/*`) implements:
 
@@ -231,6 +231,7 @@ The management web console (`/console/*`) implements:
 - **Security headers**: X-Content-Type-Options (nosniff), X-Frame-Options (DENY), Referrer-Policy (strict-origin-when-cross-origin)
 - **HSTS**: Sent automatically (TLS is always enabled)
 - **Login rate limiting**: Failed login attempts are counted per user and source address, and per source address, as described under [Login Rate Limiting](#login-rate-limiting).
+- **Admin-only metrics**: The metrics dashboard (`/console/metrics`) and its data feed (`/console/metrics-data`) serve admin sessions only. The metrics table has no account column, so the feed carries the table names, index names and traffic of every account. An IAM-user session is redirected from the page and gets HTTP 403 with no metric data from the feed.
 
 ## Login Rate Limiting
 

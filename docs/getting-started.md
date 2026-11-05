@@ -1277,6 +1277,7 @@ Navigate to `https://127.0.0.1:18443/console/` in your browser (adjust the host 
 - **Group management:** Create and delete groups, add and remove members.
 - **Role management:** Create and delete roles, view trust policies.
 - **Policy management:** Add and delete inline policies for users, groups, and roles. Includes a JSON editor with a default policy template.
+- **Metrics dashboard:** Operation metrics for every account, with charts (admin only).
 
 Admin users have full access to all management operations. IAM users can view their own details and manage their own access keys.
 

@@ -777,6 +777,16 @@ This change needs no catalog migration of its own. Before upgrading a deployment
 
 ---
 
+### v0.1.15: the console metrics dashboard is admin only, and admin-only console pages redirect IAM users
+
+**What changed.** The console metrics dashboard (`/console/metrics`) and its data feed (`/console/metrics-data`) now serve admin sessions only. An IAM-user session that opens the dashboard is redirected to `/console`, the data feed answers it with HTTP 403 and no metric data, and the navigation bar no longer shows IAM users the Metrics link. Before this release any console session could read the feed. The metrics table has no account column, so the feed held the table names, index names, operations, request counts and latencies of every account. The page put an IAM user's account id in a script variable that no script read, and the server sent every row. The Settings and Cache pages already served admin sessions only. They now redirect an IAM-user session to `/console` instead of answering HTTP 403, and the navigation bar no longer shows IAM users the Settings and Cache links.
+
+**Who is affected.** IAM users who opened the console's metrics dashboard. They lose the dashboard. A client that expected HTTP 403 from the Settings page, the Cache page or the cache form for an IAM-user session now gets a redirect to `/console`. Admin sessions get the same dashboard and data as before, and the admin-authenticated `/metrics` endpoint is unchanged.
+
+No catalog migration is required.
+
+---
+
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
