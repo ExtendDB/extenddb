@@ -94,7 +94,7 @@ impl PostgresEngine {
         // filled by RestoreTableFromBackup. The service refuses to delete a
         // table it is still creating, and deleting this one would make the
         // restore fail part-way; refuse until the restore finishes. An
-        // abandoned target is removed by the restore sweep, not here.
+        // abandoned target is removed by the reconciler, not here.
         if row.table_status == "CREATING" {
             let restoring: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM tables WHERE table_id = $1 \

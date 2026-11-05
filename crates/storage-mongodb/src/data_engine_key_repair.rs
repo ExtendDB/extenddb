@@ -28,11 +28,13 @@
 //! write conflict and runs again.
 //!
 //! [`spawn_key_repair`] runs the whole pass as a background task, so `serve`
-//! opens its listener without waiting for it (see `server_components_factory`
-//! in `lib.rs`). Until the repair reaches a given document, requests on that
-//! document's key answer as they did before this repair existed. Progress is
-//! logged every [`PROGRESS_EVERY`] documents and once at the end. A failure
-//! on one document is logged and skipped; the summary reports it.
+//! opens its listener without waiting for it (see `build_components` in
+//! `lib.rs`, which spawns it only once `migrations::register_and_check` has
+//! accepted the catalog). Until the repair reaches a given document,
+//! requests on that document's key answer as they did before this repair
+//! existed. Progress is logged every [`PROGRESS_EVERY`] documents and once
+//! at the end. A failure on one document is logged and skipped; the summary
+//! reports it.
 //!
 //! A scan that stops on an error, as it does when a table is dropped while the
 //! pass runs, is logged, and the pass goes on to the next table. The summary

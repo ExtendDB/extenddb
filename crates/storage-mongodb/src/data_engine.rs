@@ -379,7 +379,7 @@ impl MongoEngine {
         transaction_options(self.transaction_read_concern(), TransactionKind::ReadOnly)
     }
 
-    fn write_transaction_options(&self) -> mongodb::options::TransactionOptions {
+    pub(crate) fn write_transaction_options(&self) -> mongodb::options::TransactionOptions {
         transaction_options(self.transaction_read_concern(), TransactionKind::Write)
     }
 
@@ -2871,6 +2871,16 @@ impl MongoEngine {
                     })?;
                 }
 
+                // REMOVE and DELETE on a key that holds no document change
+                // nothing: the service writes no item and emits no stream
+                // record (issue #510). The actions ran above so that their
+                // validation errors surface the same way as on an existing
+                // document, and the condition was evaluated above, so a
+                // failing condition still cancels the transaction.
+                if is_creating && expression::removes_only(actions) {
+                    return Ok(());
+                }
+
                 let new_doc =
                     item_to_document(&item, &key_info.key_schema, &key_info.attribute_definitions)
                         .map_err(TransactOpError::Storage)?;
@@ -3553,7 +3563,7 @@ impl MongoEngine {
     /// `gate_table` names the table for the unknown-commit test gate and
     /// is only passed by UpdateItem, the operation the gate is specified
     /// for. It is ignored in builds without the `test-hooks` feature.
-    async fn commit_write_transaction(
+    pub(crate) async fn commit_write_transaction(
         &self,
         session: &mut mongodb::ClientSession,
         gate_table: Option<&str>,
@@ -3668,7 +3678,7 @@ pub(crate) struct GsiBackfillProgress {
 /// sustained hot-key contention; large enough to absorb ordinary
 /// snapshot-isolation aborts. Matches the OCC retry ceiling elsewhere
 /// in this file.
-const TRANSIENT_RETRY_ATTEMPTS: u32 = 50;
+pub(crate) const TRANSIENT_RETRY_ATTEMPTS: u32 = 50;
 
 /// Return type of `try_build_native_update`. Distinguishes an
 /// operator-document update (`{$set, $unset, $inc}`) from an
@@ -3693,7 +3703,7 @@ enum NativeUpdate {
 /// Error signal used inside per-attempt transaction bodies. Lets the
 /// body use `?` for control flow while distinguishing "retry this
 /// whole transaction" from "return this error to the caller."
-enum TxErr {
+pub(crate) enum TxErr {
     /// MongoDB aborted the transaction as a transient conflict. Carries the
     /// driver's error text, which the exhaustion message reports.
     Transient(String),
@@ -3782,7 +3792,7 @@ fn classify_commit_error(e: &mongodb::error::Error) -> CommitErrorClass {
 }
 
 /// Result of `commit_write_transaction` for the caller's retry loop.
-enum CommitOutcome {
+pub(crate) enum CommitOutcome {
     /// The transaction committed. Return the attempt's success value.
     Committed,
     /// The transaction aborted without committing. The caller may re-run
@@ -3794,7 +3804,7 @@ enum CommitOutcome {
 /// conditional-insert sites — a duplicate is the manifestation of a
 /// conditional-put race, so it must be surfaced as
 /// `ConditionalCheckFailedException` rather than a 500.
-fn is_duplicate_key(e: &mongodb::error::Error) -> bool {
+pub(crate) fn is_duplicate_key(e: &mongodb::error::Error) -> bool {
     matches!(
         *e.kind,
         mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(
@@ -3826,7 +3836,7 @@ pub(crate) fn synthetic_error_with_labels(message: &str, labels: &[&str]) -> mon
 /// Exponential-backoff sleep with random jitter. Used inside the OCC
 /// / WriteConflict retry loops so competing writers don't lock-step
 /// re-retry into the same conflict window.
-async fn backoff_sleep(attempt: u32) {
+pub(crate) async fn backoff_sleep(attempt: u32) {
     let base_us = 50u64.saturating_mul(1u64 << attempt.min(8));
     let jitter = rand::random_range(0..=base_us);
     tokio::time::sleep(std::time::Duration::from_micros(jitter)).await;
@@ -4404,9 +4414,6 @@ mod tests {
             gsi_cache: Default::default(),
             tx_read_concern: mongodb::options::ReadConcern::snapshot(),
             backup_liveness: Default::default(),
-            restore_server_slot_count: 1,
-            restore_server_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
-            restore_account_slots: Default::default(),
         };
         let base_coll = engine.data_db.collection::<Document>("base");
         let key_schema = vec![KeySchemaElement {
