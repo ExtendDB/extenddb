@@ -51,6 +51,11 @@ pub enum BackendError {
     /// Encryption key not found in settings table
     MissingEncryptionKey,
 
+    /// The encryption key in the settings table is one the secret cipher
+    /// refuses: it is not base64, or it does not decode to 32 bytes. Carries
+    /// the cipher's reason.
+    InvalidEncryptionKey(String),
+
     /// Generic initialization failure
     InitializationFailed(String),
 
@@ -75,6 +80,12 @@ impl std::fmt::Display for BackendError {
                 f,
                 "Encryption key not found in settings table. Run 'extenddb init'"
             ),
+            Self::InvalidEncryptionKey(reason) => write!(
+                f,
+                "Encryption key in settings table is not valid: {reason}. Restore the \
+                 original key: every stored access key and session secret is encrypted \
+                 under it"
+            ),
             Self::InitializationFailed(msg) => write!(f, "Backend initialization failed: {msg}"),
             Self::Catalog(e) => write!(f, "{e}"),
         }
@@ -82,6 +93,20 @@ impl std::fmt::Display for BackendError {
 }
 
 impl std::error::Error for BackendError {}
+
+/// Refuse a catalog encryption key that the secret cipher would refuse.
+///
+/// Each backend calls this on the key it loads at startup, beside its
+/// [`BackendError::MissingEncryptionKey`] check. Without it a damaged key
+/// starts a server that fails every signed request with a 500.
+///
+/// # Errors
+///
+/// Returns [`BackendError::InvalidEncryptionKey`] when `key_b64` is not
+/// base64 or does not decode to 32 bytes.
+pub fn check_encryption_key(key_b64: &str) -> Result<(), BackendError> {
+    crate::secret_cipher::check_key(key_b64).map_err(BackendError::InvalidEncryptionKey)
+}
 
 /// Options for server-component creation, beyond the storage config itself.
 #[derive(Debug, Clone, Copy)]
@@ -238,5 +263,23 @@ mod tests {
             "{warnings:?}"
         );
         assert!(warnings_for("us-east-1").await.is_empty());
+    }
+
+    #[test]
+    fn a_key_the_cipher_refuses_is_an_invalid_encryption_key() {
+        // 32 zero bytes, and 16 zero bytes.
+        assert!(check_encryption_key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").is_ok());
+        let err = check_encryption_key("AAAAAAAAAAAAAAAAAAAAAA==").unwrap_err();
+        assert!(
+            matches!(&err, BackendError::InvalidEncryptionKey(reason)
+                if reason == "encryption key must be 32 bytes"),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Encryption key in settings table is not valid: encryption key must be 32 \
+             bytes. Restore the original key: every stored access key and session \
+             secret is encrypted under it"
+        );
     }
 }
