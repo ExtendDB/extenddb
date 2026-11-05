@@ -14,7 +14,7 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 thiserror = { workspace = true }
 axum = { workspace = true }
-hmac = "0.12"
+aws-lc-rs = { workspace = true }
 sha2 = "0.10"
 hex = "0.4"
 serde_json = { workspace = true }

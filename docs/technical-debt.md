@@ -90,7 +90,6 @@ See `docs/dynamodb-limits.md` for the full catalog. The following are the highes
 |---|-------|---------------|----------|--------|
 | L-2 | Expression aggregate size (attribute names/values, 2 MB total) | 2 MB | Low | P42 |
 | L-3 | Batch/transaction aggregate request size | 4–16 MB | Low | P42 |
-| L-4 | GetRecords max per call | 1,000 records | Low | P42 |
 | L-5 | Shard iterator lifetime | 15 minutes | Medium | P42 |
 | L-6 | Tag count per resource | 50 | Low | P42 |
 | L-7 | Tag key/value length limits | 128/256 chars | Low | P42 |

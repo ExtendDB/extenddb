@@ -44,6 +44,9 @@ pub type RoleListEntry = (
     serde_json::Value,
     time::OffsetDateTime,
 );
+/// A stored policy document as the resource-tag migration reads it: the
+/// decoded document, or the text of the error the store met decoding it.
+pub type StoredDocument = Result<serde_json::Value, String>;
 
 // ── Settings store ─────────────────────────────────────────────────────
 
@@ -87,12 +90,15 @@ pub trait MetricsStore: Send + Sync {
 
 // ── Rate limit store ───────────────────────────────────────────────────
 
-/// Login rate limiting and account lockout storage.
+/// Storage for login rate limiting per user and source address.
 pub trait RateLimitStore: Send + Sync {
-    /// Count failed login attempts for a principal within the lookback window.
+    /// Count failed login attempts for a principal from one source IP within
+    /// the lookback window. Failures from other sources do not count, so a
+    /// third party cannot lock the principal out of its own address.
     fn count_principal_failures(
         &self,
         principal: &str,
+        source_ip: &str,
         window_seconds: i64,
     ) -> BoxFuture<'_, OpResult<i64>>;
 
@@ -137,6 +143,29 @@ pub trait AdminStore: Send + Sync {
         admin_name: &str,
         password: &str,
     ) -> BoxFuture<'_, OpResult<Option<bool>>>;
+}
+
+// ── Password hashes ────────────────────────────────────────────────────
+
+/// Reads the stored password hash of a console principal.
+///
+/// The console reads the hash once at login, verifies the password against
+/// it, and binds the session to that hash. Every later console request reads
+/// the hash again and ends the session when the principal is gone or its hash
+/// differs. Implementations must return the latest acknowledged value: the
+/// read must see any password change or deletion that has already returned
+/// to its caller, on any server sharing the catalog.
+pub trait PasswordHashStore: Send + Sync {
+    /// The stored password hash of an admin, or `None` if the admin does not exist.
+    fn get_admin_password_hash(&self, admin_name: &str) -> BoxFuture<'_, OpResult<Option<String>>>;
+
+    /// The stored console password hash of an IAM user, or `None` if the user
+    /// does not exist or has no console password.
+    fn get_user_password_hash(
+        &self,
+        account_id: &str,
+        user_name: &str,
+    ) -> BoxFuture<'_, OpResult<Option<String>>>;
 }
 
 // ── Management store (IAM) ─────────────────────────────────────────────
@@ -350,6 +379,36 @@ pub trait ManagementStore: Send + Sync {
         principal_name: &str,
     ) -> BoxFuture<'_, OpResult<Vec<(String, serde_json::Value, time::OffsetDateTime)>>>;
 
+    /// List a principal's policies for the resource-tag migration as
+    /// `(policy_name, document)`, decoding each document on its own: a
+    /// document the store cannot decode comes back as its decode error, and
+    /// the principal's other policies are still read.
+    ///
+    /// The default reads [`list_policies`](Self::list_policies), which fails
+    /// the whole list on a document it cannot decode. A backend that stores
+    /// documents as text overrides this.
+    fn list_policy_documents(
+        &self,
+        account_id: &str,
+        principal_type: &str,
+        principal_name: &str,
+    ) -> BoxFuture<'_, OpResult<Vec<(String, StoredDocument)>>> {
+        let (account_id, principal_type, principal_name) = (
+            account_id.to_owned(),
+            principal_type.to_owned(),
+            principal_name.to_owned(),
+        );
+        Box::pin(async move {
+            let policies = self
+                .list_policies(&account_id, &principal_type, &principal_name)
+                .await?;
+            Ok(policies
+                .into_iter()
+                .map(|(name, document, _created)| (name, Ok(document)))
+                .collect())
+        })
+    }
+
     // ── Permissions boundaries ─────────────────────────────────────
 
     /// Set (upsert) a permissions boundary on a user.
@@ -395,6 +454,38 @@ pub trait ManagementStore: Send + Sync {
         account_id: &str,
         role_name: &str,
     ) -> BoxFuture<'_, OpResult<()>>;
+
+    /// The permissions boundary of a user or a role (`principal_type`
+    /// `user` or `role`) for the resource-tag migration: `None` when it has
+    /// none, else the decoded document or the text of the error the store
+    /// met decoding it.
+    ///
+    /// The default reads [`get_user_boundary`](Self::get_user_boundary) or
+    /// [`get_role_boundary`](Self::get_role_boundary), which fail on a
+    /// document they cannot decode. A backend that stores documents as text
+    /// overrides this.
+    fn boundary_document(
+        &self,
+        account_id: &str,
+        principal_type: &str,
+        principal_name: &str,
+    ) -> BoxFuture<'_, OpResult<Option<StoredDocument>>> {
+        let (account_id, principal_type, principal_name) = (
+            account_id.to_owned(),
+            principal_type.to_owned(),
+            principal_name.to_owned(),
+        );
+        Box::pin(async move {
+            let boundary = match principal_type.as_str() {
+                "user" => self.get_user_boundary(&account_id, &principal_name).await,
+                "role" => self.get_role_boundary(&account_id, &principal_name).await,
+                other => Err(OpError::Validation(format!(
+                    "a permissions boundary belongs to a user or a role, not a {other}"
+                ))),
+            }?;
+            Ok(boundary.map(Ok))
+        })
+    }
 
     // ── Access keys ────────────────────────────────────────────────
 

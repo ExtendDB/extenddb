@@ -174,6 +174,46 @@ fn tokenize_underscore_ident() {
 }
 
 #[test]
+fn tokenize_multibyte_utf8_near_an_invalid_byte_does_not_panic() {
+    // Each input has an invalid byte whose five-byte context window ends
+    // inside a two-, three- or four-byte character. In the second and
+    // fourth the invalid byte starts a multi-byte character itself.
+    for input in [
+        "\0\0\u{7}#\u{41f}",
+        "\u{41f}\u{41f}\u{41f}",
+        "a ; \u{1f600}",
+        "\u{65e5}\u{65e5}",
+        "$  \u{65e5}",
+    ] {
+        let err = tokenize_with_limit(input, 4096).unwrap_err();
+        assert!(
+            matches!(err, DynamoDbError::ValidationException(ref msg) if msg.contains("Syntax error")),
+            "{input:?}: {err:?}"
+        );
+    }
+
+    // The window ends at the end of the character it would have split.
+    let err = tokenize_with_limit("$  \u{65e5}", 4096).unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::ValidationException(ref msg)
+            if msg.contains("token: \"$\", near: \"$  \u{65e5}\"")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn tokenize_reports_the_whole_invalid_character() {
+    // The window starts at the previous token, `=`, as the service answers
+    // for `#v = é` in `UNKNOWN_CHARACTER_ROWS`.
+    let err = tokenize("a = \u{e9}").unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::ValidationException(ref msg)
+            if msg.contains("token: \"\u{e9}\", near: \"= \u{e9}\"")),
+        "{err:?}"
+    );
+}
+
+#[test]
 fn tokenize_for_multibyte_utf8_does_not_panic() {
     // Emoji (4-byte UTF-8) should produce a validation error, not a panic.
     let err = tokenize_for("a = 😀", 4096, super::super::ExpressionKind::Condition).unwrap_err();
