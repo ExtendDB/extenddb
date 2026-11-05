@@ -255,7 +255,7 @@ cargo build --no-default-features --bin extenddb
 
 ### Release model
 
-ExtendDB will move to a release model that includes releases through <a href="https://crates.io/">Crates.io</a>. All crates follow <a href="https://semver.org/">semantic versioning</a>. Breaking changes to `extenddb-storage` trigger coordinated releases. Binaries will also be available as GitHub releases. The project will also prioritize releasing images through Docker Hub.
+ExtendDB will move to a release model that includes releases through <a href="https://crates.io/">Crates.io</a>. All crates follow <a href="https://semver.org/">semantic versioning</a>. Breaking changes to `extenddb-storage` trigger coordinated releases. Variants may be added to `StorageError` in a minor release; a backend crate that matches on it exhaustively must carry a catch-all arm. Binaries will also be available as GitHub releases. The project will also prioritize releasing images through Docker Hub.
 
 ### Third-party backends outside ExtendDB organization
 
