@@ -2532,10 +2532,7 @@ impl MongoEngine {
                     let _ = session.abort_transaction().await;
                     // The request passed the key checks, so its token stays
                     // used, as the service keeps it.
-                    if let Some((account_id, token, fingerprint)) = idem_owned.as_ref() {
-                        self.record_cancelled_token(account_id, token, fingerprint)
-                            .await?;
-                    }
+                    self.keep_cancelled_token(idem_owned.as_ref()).await;
                     // Key faults left the members as internal reasons; the
                     // shared resolver applies the service's cross-member
                     // precedence and decides between a cancellation and a
@@ -2571,14 +2568,35 @@ impl MongoEngine {
                 item: None,
             })
             .collect();
+        // A cancellation after the key checks keeps the token used, also a
+        // `TransactionConflict` (measured 2026-11-05). Every attempt's session
+        // transaction was aborted, so no token document of this request is
+        // stored.
+        self.keep_cancelled_token(idem_owned.as_ref()).await;
         Err(StorageError::TransactionCanceled(reasons))
+    }
+
+    /// [`Self::record_cancelled_token`] for the request's owned token, if it
+    /// has one. A failed write is logged: nothing was applied, so the request
+    /// still answers its cancellation, and the token is left unused.
+    async fn keep_cancelled_token(&self, idempotency: Option<&(String, String, String)>) {
+        if let Some((account_id, token, fingerprint)) = idempotency
+            && let Err(e) = self
+                .record_cancelled_token(account_id, token, fingerprint)
+                .await
+        {
+            tracing::warn!("record_cancelled_token failed (the token stays unused): {e}");
+        }
     }
 
     /// Keep a token used after its request was cancelled past the
     /// request-level key checks, once the session transaction has aborted:
-    /// store it with [`extenddb_storage::cancelled_token_fingerprint`] unless
-    /// a token is already stored (the same request's earlier cancellation, or
-    /// a request that took the token meanwhile).
+    /// store it with [`extenddb_storage::cancelled_token_fingerprint`] and the
+    /// time now, so the token stays used for 10 minutes from the last
+    /// cancellation (measured 2026-11-05). A document older than the
+    /// 10-minute read window is replaced, as the SQL backends replace an
+    /// expired row; a document another request or another send stored less
+    /// than 10 minutes ago is kept.
     async fn record_cancelled_token(
         &self,
         account_id: &str,
@@ -2586,18 +2604,28 @@ impl MongoEngine {
         fingerprint: &str,
     ) -> Result<(), StorageError> {
         let idem_coll = self.data_db.collection::<Document>("idempotency_tokens");
+        let cancelled = extenddb_storage::cancelled_token_fingerprint(fingerprint);
+        let now = mongodb::bson::DateTime::now();
+        let expired_before =
+            mongodb::bson::DateTime::from_millis(now.timestamp_millis().saturating_sub(600_000));
         let stored = idem_coll
             .update_one(
-                doc! { "account_id": account_id, "token": token },
-                doc! { "$setOnInsert": {
-                    "fingerprint": extenddb_storage::cancelled_token_fingerprint(fingerprint),
-                    "created_at": mongodb::bson::DateTime::now(),
-                } },
+                doc! {
+                    "account_id": account_id,
+                    "token": token,
+                    "$or": [
+                        { "created_at": { "$lte": expired_before } },
+                        { "fingerprint": cancelled.as_str() },
+                    ],
+                },
+                doc! { "$set": { "fingerprint": cancelled.as_str(), "created_at": now } },
             )
             .upsert(true)
             .await;
         match stored {
-            // A concurrent upsert of the same token inserted it first.
+            // No document matched and the upsert met the unique index: a
+            // document younger than 10 minutes of another request or another
+            // send holds the token, and stays.
             Err(e) if !is_duplicate_key(&e) => Err(StorageError::Internal(e.to_string())),
             _ => Ok(()),
         }

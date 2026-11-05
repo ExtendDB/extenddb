@@ -30,6 +30,14 @@ use crate::data::{
     query_with_pk_sk_item_txnid_ts, query_with_pk_sk_txnid, query_with_txnid_ts_pk_sk, select_by_pk,
 };
 
+/// How long a `ClientRequestToken` row lives after the reservation, the
+/// take or the cancellation that last wrote it: the service keeps a
+/// cancelled token used 9 minutes after the cancellation and treats it as
+/// new 11 minutes after (measured 2026-11-05), as the 10 minutes the other
+/// backends read through `created_at`. A send that fails after the
+/// reservation or the take leaves its running row for as long.
+const IDEMPOTENCY_TOKEN_TTL_SECONDS: u32 = 600;
+
 /// What the transaction paths read from one base row.
 #[derive(Debug, Default)]
 struct TransactionRow {
@@ -549,7 +557,9 @@ impl CassandraEngine {
                     txn_id,
                     started_at,
                 )
-                .await
+                .await?;
+                self.mark_token_committed(idempotency).await;
+                Ok(())
             }
             Err(reasons) => {
                 // T4.4: ROLLBACK phase
@@ -1287,8 +1297,15 @@ impl CassandraEngine {
 
     /// Check and reserve an account-scoped idempotency token.
     ///
-    /// Returns `Ok(())` when the token is freshly reserved.
+    /// Returns `Ok(())` when the token is freshly reserved, or taken back from
+    /// a cancellation of the same request. The row then holds the request's
+    /// fingerprint after [`RUNNING_TOKEN_PREFIX`] until the request commits
+    /// ([`Self::mark_token_committed`]) or is cancelled
+    /// ([`Self::record_cancelled_token`]).
     /// Returns `Err(IdempotentReplay)` / `Err(IdempotentMismatch)` when already present.
+    /// Returns `Err(TransactionInProgress)` when another send of the same
+    /// request holds the token and still runs, or won the reservation or the
+    /// take.
     async fn check_idempotency_token(
         &self,
         keyspace: &str,
@@ -1311,51 +1328,40 @@ impl CassandraEngine {
         .await?
         {
             let stored_fp: String = get_column(&row, "fingerprint", "check_idempotency_token")?;
-            return match extenddb_storage::StoredToken::of(&stored_fp, fingerprint) {
-                extenddb_storage::StoredToken::Replay => Err(StorageError::IdempotentReplay),
-                extenddb_storage::StoredToken::Mismatch => Err(StorageError::IdempotentMismatch),
-                extenddb_storage::StoredToken::Rerun => {
-                    // The same request left the token cancelled: take it for
-                    // this run, so only one rerun proceeds.
-                    let take_query = format!(
-                        "UPDATE {keyspace}.idempotency_tokens_by_account \
-                         SET fingerprint = ?, created_at = ? \
-                         WHERE account_id = ? AND \"token\" = ? IF fingerprint = ?"
-                    );
-                    let now = crate::cassandra_util::now_millis();
-                    let taken = crate::cassandra_util::apply_lwt(
-                        &self.session,
-                        &take_query,
-                        cdrs_tokio::query_values!(fingerprint, now, account_id, token, stored_fp),
-                        "check_idempotency_token rerun",
-                    )
-                    .await?;
-                    if taken {
-                        Ok(())
-                    } else {
-                        // A concurrent rerun of the same request took it.
-                        Err(StorageError::IdempotentReplay)
-                    }
-                }
-            };
+            return self
+                .answer_token_row(keyspace, account_id, token, fingerprint, &stored_fp)
+                .await;
         }
 
         // Reserve with LWT to handle concurrent requests racing on the same token.
+        // The row expires IDEMPOTENCY_TOKEN_TTL_SECONDS after this write, so
+        // a send that fails before it commits or is cancelled leaves its
+        // running row for 10 minutes (#837).
         let insert_query = format!(
             "INSERT INTO {keyspace}.idempotency_tokens_by_account \
-             (account_id, \"token\", fingerprint, created_at) VALUES (?, ?, ?, ?) IF NOT EXISTS"
+             (account_id, \"token\", fingerprint, created_at) VALUES (?, ?, ?, ?) \
+             IF NOT EXISTS USING TTL {IDEMPOTENCY_TOKEN_TTL_SECONDS}"
         );
         let now = crate::cassandra_util::now_millis();
         let result = crate::cassandra_util::apply_lwt(
             &self.session,
             &insert_query,
-            cdrs_tokio::query_values!(account_id, token, fingerprint, now),
+            cdrs_tokio::query_values!(
+                account_id,
+                token,
+                running_token_fingerprint(fingerprint),
+                now
+            ),
             "check_idempotency_token insert",
         )
         .await?;
 
         if !result {
-            // Lost the LWT race — read back to return the right error.
+            // Lost the LWT race: another send reserved the token between the
+            // read above and the insert. Read it back to answer as the
+            // service does (measured 2026-11-05): the same request still
+            // running answers TransactionInProgressException, the same
+            // request cancelled runs again, another request is the mismatch.
             let row = query_optional::<StorageError>(
                 &self.session,
                 &select_query,
@@ -1363,18 +1369,119 @@ impl CassandraEngine {
                 "check_idempotency_token recheck",
             )
             .await?;
-            if let Some(row) = row {
-                let stored_fp: String =
-                    get_column(&row, "fingerprint", "check_idempotency_token recheck")?;
-                return if stored_fp == fingerprint {
-                    Err(StorageError::IdempotentReplay)
-                } else {
-                    Err(StorageError::IdempotentMismatch)
-                };
-            }
+            let Some(row) = row else {
+                // The winner's row is gone already: let the client send again.
+                return Err(StorageError::TransactionInProgress);
+            };
+            let stored_fp: String =
+                get_column(&row, "fingerprint", "check_idempotency_token recheck")?;
+            return self
+                .answer_token_row(keyspace, account_id, token, fingerprint, &stored_fp)
+                .await;
         }
 
         Ok(())
+    }
+
+    /// Answer a request with `fingerprint` from the token row that holds
+    /// `stored_fp` (see [`token_row`]): a running send of the same request
+    /// answers `TransactionInProgress`, a committed one a replay, a
+    /// cancelled one is taken back to run again, and another request is the
+    /// mismatch.
+    async fn answer_token_row(
+        &self,
+        keyspace: &str,
+        account_id: &str,
+        token: &str,
+        fingerprint: &str,
+        stored_fp: &str,
+    ) -> Result<(), StorageError> {
+        match token_row(stored_fp, fingerprint) {
+            TokenRow::Replay => Err(StorageError::IdempotentReplay),
+            TokenRow::Mismatch => Err(StorageError::IdempotentMismatch),
+            TokenRow::InProgress => Err(StorageError::TransactionInProgress),
+            TokenRow::Rerun => {
+                self.take_cancelled_token(keyspace, account_id, token, fingerprint, stored_fp)
+                    .await
+            }
+        }
+    }
+
+    /// Take back a token that a cancellation of the same request left
+    /// (`stored_fp` is its `cancelled:` fingerprint) for this run. The take
+    /// restarts the token's window of [`IDEMPOTENCY_TOKEN_TTL_SECONDS`]. Of two
+    /// sends of the request at once one takes it, and the other answers
+    /// `TransactionInProgress`, as the service does.
+    async fn take_cancelled_token(
+        &self,
+        keyspace: &str,
+        account_id: &str,
+        token: &str,
+        fingerprint: &str,
+        stored_fp: &str,
+    ) -> Result<(), StorageError> {
+        let take_query = format!(
+            "UPDATE {keyspace}.idempotency_tokens_by_account \
+             USING TTL {IDEMPOTENCY_TOKEN_TTL_SECONDS} \
+             SET fingerprint = ?, created_at = ? \
+             WHERE account_id = ? AND \"token\" = ? IF fingerprint = ?"
+        );
+        let now = crate::cassandra_util::now_millis();
+        let taken = crate::cassandra_util::apply_lwt(
+            &self.session,
+            &take_query,
+            cdrs_tokio::query_values!(
+                running_token_fingerprint(fingerprint),
+                now,
+                account_id,
+                token,
+                stored_fp
+            ),
+            "check_idempotency_token rerun",
+        )
+        .await?;
+        if taken {
+            Ok(())
+        } else {
+            // Another send of the same request took it and is running.
+            Err(StorageError::TransactionInProgress)
+        }
+    }
+
+    /// Replace the running fingerprint of the request's token row with the
+    /// plain fingerprint once the request has committed, so a send of the
+    /// same request then answers as a replay. A failed write is logged: the
+    /// row keeps the running fingerprint, so the same request answers
+    /// `TransactionInProgress` until the row expires, 10 minutes after the
+    /// reservation or the take.
+    async fn mark_token_committed(&self, idempotency: Option<(&str, &str, &str)>) {
+        let Some((account_id, token, fingerprint)) = idempotency else {
+            return;
+        };
+        let keyspace = self.catalog_keyspace();
+        let mark_query = format!(
+            "UPDATE {keyspace}.idempotency_tokens_by_account \
+             SET fingerprint = ? WHERE account_id = ? AND \"token\" = ? IF fingerprint = ?"
+        );
+        let marked: Result<bool, StorageError> = crate::cassandra_util::apply_lwt(
+            &self.session,
+            &mark_query,
+            cdrs_tokio::query_values!(
+                fingerprint,
+                account_id,
+                token,
+                running_token_fingerprint(fingerprint)
+            ),
+            "mark_token_committed",
+        )
+        .await;
+        match marked {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!(
+                "mark_token_committed: the token row no longer holds the running fingerprint"
+            ),
+            Err(e) => tracing::warn!("mark_token_committed failed (the token stays running): {e}"),
+        }
     }
 
     /// Keep a reserved token used after its request was cancelled past the
@@ -1382,7 +1489,9 @@ impl CassandraEngine {
     /// [`extenddb_storage::cancelled_token_fingerprint`], so a different
     /// request with the token answers `IdempotentParameterMismatchException`
     /// and the same request runs again (B5: a retry is not answered as a
-    /// replay of a write that never happened).
+    /// replay of a write that never happened). The row expires
+    /// [`IDEMPOTENCY_TOKEN_TTL_SECONDS`] after this write, so the token stays
+    /// used for 10 minutes from the last cancellation (measured 2026-11-05).
     async fn record_cancelled_token(&self, idempotency: Option<(&str, &str, &str)>) {
         let Some((account_id, token, fingerprint)) = idempotency else {
             return;
@@ -1390,7 +1499,8 @@ impl CassandraEngine {
         let keyspace = self.catalog_keyspace();
         let upsert_query = format!(
             "INSERT INTO {keyspace}.idempotency_tokens_by_account \
-             (account_id, \"token\", fingerprint, created_at) VALUES (?, ?, ?, ?)"
+             (account_id, \"token\", fingerprint, created_at) VALUES (?, ?, ?, ?) \
+             USING TTL {IDEMPOTENCY_TOKEN_TTL_SECONDS}"
         );
         let cancelled = extenddb_storage::cancelled_token_fingerprint(fingerprint);
         let now = crate::cassandra_util::now_millis();
@@ -1402,11 +1512,14 @@ impl CassandraEngine {
         )
         .await
         {
-            // Non-fatal: the reserved token stays, so a different request
-            // still answers the mismatch; the same request is then answered
-            // as a replay until the token expires via Cassandra TTL. Log so
-            // it is visible in ops, but do not replace the original error.
-            tracing::warn!("record_cancelled_token failed (token will expire): {e}");
+            // Non-fatal: the reserved row keeps the request's running
+            // fingerprint, so a different request still answers the mismatch
+            // and the same request answers TransactionInProgress (#837),
+            // until the row expires 10 minutes after the reservation or the
+            // take.
+            // Log so it is visible in ops, but do not replace the original
+            // error.
+            tracing::warn!("record_cancelled_token failed (the reserved token stays): {e}");
         }
     }
 
@@ -3007,5 +3120,43 @@ fn ledger_sk_to_sort_key(sk_col: &str, sk_val: &str) -> Result<SortKeyValue, Sto
         other => Err(StorageError::Internal(format!(
             "unknown sk_col in ledger: {other}"
         ))),
+    }
+}
+
+/// Prefix of the fingerprint a token row holds while the send that reserved
+/// or took the token runs. The send replaces it with the plain fingerprint
+/// when it commits, and with the cancelled fingerprint when it is cancelled.
+/// A request fingerprint is hex, so no request fingerprint carries it.
+const RUNNING_TOKEN_PREFIX: &str = "running:";
+
+fn running_token_fingerprint(fingerprint: &str) -> String {
+    format!("{RUNNING_TOKEN_PREFIX}{fingerprint}")
+}
+
+/// What a token row answers a request with `fingerprint`.
+enum TokenRow {
+    /// The request committed: answer as a replay.
+    Replay,
+    /// Another request holds the token: answer the mismatch.
+    Mismatch,
+    /// The request was cancelled: take the token back and run again.
+    Rerun,
+    /// Another send of the request holds the token and still runs: answer
+    /// `TransactionInProgress`, as the service does (measured 2026-11-05).
+    InProgress,
+}
+
+fn token_row(stored_fp: &str, fingerprint: &str) -> TokenRow {
+    if let Some(running) = stored_fp.strip_prefix(RUNNING_TOKEN_PREFIX) {
+        return if running == fingerprint {
+            TokenRow::InProgress
+        } else {
+            TokenRow::Mismatch
+        };
+    }
+    match extenddb_storage::StoredToken::of(stored_fp, fingerprint) {
+        extenddb_storage::StoredToken::Replay => TokenRow::Replay,
+        extenddb_storage::StoredToken::Mismatch => TokenRow::Mismatch,
+        extenddb_storage::StoredToken::Rerun => TokenRow::Rerun,
     }
 }

@@ -165,17 +165,21 @@ impl PostgresEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        // A conflict abort outside the per-op loop cannot be tied to one item.
+        // A conflict abort outside the per-op loop cannot be tied to one item:
+        // `after_token_error` cancels every member and keeps the token used.
         // Unreachable at READ COMMITTED, where the ops already hold every row
         // lock; a stricter operator isolation can raise 40001 at commit.
-        let cancel_all = |e: StorageError| conflict_cancels_all(e, ops.len());
 
         // Check the idempotency token within the transaction so token storage
         // and data writes commit together. The token is scoped to its account.
-        if let Some(key) = idempotency {
-            check_idempotency_token_in_tx(&mut tx, key.account_id, key.token, key.fingerprint)
-                .await
-                .map_err(cancel_all)?;
+        if let Some(key) = idempotency
+            && let Err(e) =
+                check_idempotency_token_in_tx(&mut tx, key.account_id, key.token, key.fingerprint)
+                    .await
+        {
+            return Err(
+                after_token_error(&self.data_pool, Some(tx), idempotency, e, ops.len()).await,
+            );
         }
 
         let mut reasons: Vec<CancellationReason> = vec![CancellationReason::none(); ops.len()];
@@ -230,15 +234,7 @@ impl PostgresEngine {
                 // End the aborted transaction first: its uncommitted token row
                 // would block the record below.
                 tx.rollback().await.map_err(db_error)?;
-                if let Some(key) = idempotency {
-                    record_cancelled_token(
-                        &self.data_pool,
-                        key.account_id,
-                        key.token,
-                        key.fingerprint,
-                    )
-                    .await?;
-                }
+                keep_cancelled_token(&self.data_pool, idempotency).await;
                 return Err(match CancellationReason::resolve_key_faults(reasons) {
                     Ok(reasons) => StorageError::TransactionCanceled(reasons),
                     Err(message) => StorageError::Validation(message),
@@ -257,10 +253,7 @@ impl PostgresEngine {
             // its token stays used, as the service keeps it: roll back the
             // writes, then record the token as cancelled.
             tx.rollback().await.map_err(db_error)?;
-            if let Some(key) = idempotency {
-                record_cancelled_token(&self.data_pool, key.account_id, key.token, key.fingerprint)
-                    .await?;
-            }
+            keep_cancelled_token(&self.data_pool, idempotency).await;
             return Err(match CancellationReason::resolve_key_faults(reasons) {
                 Ok(reasons) => StorageError::TransactionCanceled(reasons),
                 Err(message) => StorageError::Validation(message),
@@ -275,8 +268,8 @@ impl PostgresEngine {
                 | TransactWriteOp::Update { stream, .. } => stream.as_ref(),
                 TransactWriteOp::ConditionCheck { .. } => None,
             };
-            if let Some(capture) = capture {
-                write_stream_record_in_tx(
+            if let Some(capture) = capture
+                && let Err(e) = write_stream_record_in_tx(
                     &mut tx,
                     match op {
                         TransactWriteOp::Put { key_info, .. }
@@ -289,7 +282,15 @@ impl PostgresEngine {
                     new_item.as_ref(),
                 )
                 .await
-                .map_err(cancel_all)?;
+            {
+                return Err(after_token_error(
+                    &self.data_pool,
+                    Some(tx),
+                    idempotency,
+                    e,
+                    ops.len(),
+                )
+                .await);
             }
         }
 
@@ -300,13 +301,25 @@ impl PostgresEngine {
             for op in ops {
                 let name = transact_op_table_name(op);
                 if !missed.contains_key(name) {
-                    let found = super::gsi_build::missed_gsis(
+                    let found = match super::gsi_build::missed_gsis(
                         &self.pool,
                         transact_op_table_id(op),
                         &table_indexes[name],
                     )
                     .await
-                    .map_err(cancel_all)?;
+                    {
+                        Ok(found) => found,
+                        Err(e) => {
+                            return Err(after_token_error(
+                                &self.data_pool,
+                                Some(tx),
+                                idempotency,
+                                e,
+                                ops.len(),
+                            )
+                            .await);
+                        }
+                    };
                     missed.insert(name.to_owned(), found);
                 }
             }
@@ -327,7 +340,7 @@ impl PostgresEngine {
                 | TransactWriteOp::ConditionCheck { key_info, .. } => key_info,
             };
             // One row per async index, each honoring its own propagation delay.
-            let n = enqueue_async_indexes(
+            let n = match enqueue_async_indexes(
                 &mut tx,
                 key_info,
                 indexes,
@@ -336,14 +349,26 @@ impl PostgresEngine {
                 sys_delay,
             )
             .await
-            .map_err(cancel_all)?;
+            {
+                Ok(n) => n,
+                Err(e) => {
+                    return Err(after_token_error(
+                        &self.data_pool,
+                        Some(tx),
+                        idempotency,
+                        e,
+                        ops.len(),
+                    )
+                    .await);
+                }
+            };
 
             // Vector maintenance for all three write kinds in one place, rather
             // than in each branch above: this loop already visits exactly the ops
             // that changed an item, with both images in hand, and it runs inside
             // the same transaction. Three call sites would have been three chances
             // to diverge on which image is passed.
-            let vector_n = crate::data::vector_index::maintain_vector_indexes(
+            let vector_n = match crate::data::vector_index::maintain_vector_indexes(
                 &mut tx,
                 &table_vector_metas[transact_op_table_name(op)],
                 &key_info.table_id,
@@ -354,15 +379,37 @@ impl PostgresEngine {
                 sys_delay,
             )
             .await
-            .map_err(cancel_all)?;
+            {
+                Ok(n) => n,
+                Err(e) => {
+                    return Err(after_token_error(
+                        &self.data_pool,
+                        Some(tx),
+                        idempotency,
+                        e,
+                        ops.len(),
+                    )
+                    .await);
+                }
+            };
             let repair_n = match (
                 missed.get(transact_op_table_name(op)),
                 new_item.as_ref().or(old_item.as_ref()),
             ) {
                 (Some(m), Some(item)) if !m.is_empty() => {
-                    super::gsi_build::queue_repairs(&mut tx, key_info, m, item)
-                        .await
-                        .map_err(cancel_all)?
+                    match super::gsi_build::queue_repairs(&mut tx, key_info, m, item).await {
+                        Ok(n) => n,
+                        Err(e) => {
+                            return Err(after_token_error(
+                                &self.data_pool,
+                                Some(tx),
+                                idempotency,
+                                e,
+                                ops.len(),
+                            )
+                            .await);
+                        }
+                    }
                 }
                 _ => 0,
             };
@@ -371,7 +418,17 @@ impl PostgresEngine {
             }
         }
 
-        tx.commit().await.map_err(db_error).map_err(cancel_all)?;
+        if let Err(e) = tx.commit().await {
+            // A failed commit has ended the transaction already.
+            return Err(after_token_error(
+                &self.data_pool,
+                None,
+                idempotency,
+                db_error(e),
+                ops.len(),
+            )
+            .await);
+        }
 
         if needs_notify && let Some(ref q) = self.gsi_queue {
             q.notify_workers();
@@ -407,6 +464,45 @@ fn conflict_cancels_all(e: StorageError, n_ops: usize) -> StorageError {
     } else {
         e
     }
+}
+
+/// Keep the token of a request cancelled after the request-level key checks
+/// used, once its transaction has ended (`record_cancelled_token`). A failed
+/// write is logged: nothing was applied, so the request still answers its
+/// cancellation, and the token is left unused.
+async fn keep_cancelled_token(pool: &sqlx::PgPool, idempotency: Option<IdempotencyKey<'_>>) {
+    if let Some(key) = idempotency
+        && let Err(e) =
+            record_cancelled_token(pool, key.account_id, key.token, key.fingerprint).await
+    {
+        tracing::warn!("record_cancelled_token failed (the token stays unused): {e}");
+    }
+}
+
+/// An error after the token check, outside the member loop. A conflict abort
+/// cancels the request with `TransactionConflict` on every member and keeps
+/// its token used, as every cancellation after the key checks does (the
+/// service keeps a token used after `TransactionConflict`, measured
+/// 2026-11-05). `tx`, when the transaction has not ended yet, is rolled back
+/// first: its uncommitted token row would make the record wait. Any other
+/// error passes through, and `tx` rolls back when it is dropped.
+async fn after_token_error(
+    pool: &sqlx::PgPool,
+    tx: Option<sqlx::Transaction<'_, sqlx::Postgres>>,
+    idempotency: Option<IdempotencyKey<'_>>,
+    e: StorageError,
+    n_ops: usize,
+) -> StorageError {
+    if !is_conflict_abort(&e) {
+        return e;
+    }
+    if let Some(tx) = tx
+        && let Err(rollback) = tx.rollback().await
+    {
+        tracing::warn!("rollback after a conflict abort failed: {rollback}");
+    }
+    keep_cancelled_token(pool, idempotency).await;
+    conflict_cancels_all(e, n_ops)
 }
 
 /// Request positions of `ops`, sorted by table and primary key.

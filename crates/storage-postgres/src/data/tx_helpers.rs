@@ -444,9 +444,9 @@ pub(super) async fn check_idempotency_token_in_tx(
 
 /// Keep a token used after its request was cancelled past the request-level
 /// key checks, once the request's transaction has rolled back: store it with
-/// [`cancelled_token_fingerprint`], unless a token younger than 10 minutes is
-/// already stored (the same request's earlier cancellation, or a request that
-/// took the token meanwhile).
+/// [`cancelled_token_fingerprint`] and the time now, so the token stays used
+/// for 10 minutes from the last cancellation (measured 2026-11-05). A row
+/// another request or another send stored less than 10 minutes ago is kept.
 pub(super) async fn record_cancelled_token(
     pool: &sqlx::PgPool,
     account_id: &str,
@@ -458,7 +458,8 @@ pub(super) async fn record_cancelled_token(
           VALUES ($1, $2, $3)
           ON CONFLICT (account_id, token) DO UPDATE
               SET fingerprint = $3, created_at = NOW()
-              WHERE idempotency_tokens.created_at <= NOW() - INTERVAL '10 minutes'",
+              WHERE idempotency_tokens.created_at <= NOW() - INTERVAL '10 minutes'
+                 OR idempotency_tokens.fingerprint = $3",
     )
     .bind(account_id)
     .bind(token)
