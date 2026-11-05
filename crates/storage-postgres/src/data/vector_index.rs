@@ -865,10 +865,12 @@ async fn sweep_orphan_holds(
     engine: &crate::PostgresEngine,
     live: &[String],
 ) -> Result<(), StorageError> {
-    // A hold whose index_id is its own table_id is a DeleteTable stopping the
-    // queue while it drops the table (`drop_table_storage`). The drop can wait
-    // behind a long client transaction; sweeping its hold meanwhile only makes
-    // workers claim rows they then time out on, so such a hold gets longer.
+    // A hold whose index_id is its own table_id is the control plane stopping
+    // the queue while it drops a DELETING table (`drop_table_storage`). The
+    // drop runs within a one-second budget, so a hold that is still there
+    // after one was left by a process that died mid-drop; it gets the longer
+    // age all the same, since sweeping a live one only makes workers claim
+    // rows they then time out on.
     let swept = sqlx::query(
         "DELETE FROM vector_index_holds \
          WHERE NOT (index_id = ANY($1)) \

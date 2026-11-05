@@ -5,6 +5,7 @@
 
 use extenddb_storage::management_store::{AccountDetail, OpError, OpResult};
 
+use super::database_error;
 use crate::catalog_store::PostgresCatalogStore;
 use crate::pg_util::is_unique_violation;
 
@@ -93,10 +94,7 @@ impl PostgresCatalogStore {
         sqlx::query_as("SELECT account_id, account_name FROM accounts ORDER BY account_id")
             .fetch_all(self.pool())
             .await
-            .map_err(|e| {
-                tracing::error!("list_all_accounts: {e}");
-                OpError::Internal("Database error".to_owned())
-            })
+            .map_err(|e| database_error("list_all_accounts", &e))
     }
 
     pub(crate) async fn default_account_id_impl(&self) -> OpResult<Option<String>> {

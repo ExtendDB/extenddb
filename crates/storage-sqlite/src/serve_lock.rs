@@ -12,9 +12,11 @@
 //! the process, and refuses to start if another process holds it.
 //!
 //! The commands that replace or rewrite the file take the same lock for their
-//! duration: `init` and `migrate` (through the bootstrapper's migration lock)
-//! and `destroy` (before it unlinks the file). Read-only commands (`settings`,
-//! `manage`, `verify`, `status`, ...) do not, and run alongside a server.
+//! duration: `init` and `migrate --yes` (through the migration runner's
+//! `migrations::lock_for_migration`, which retries until its timeout) and
+//! `destroy` (before it unlinks the file). Read-only commands (`settings`,
+//! `manage`, `verify`, `status`, the `migrate` preview, ...) do not, and run
+//! alongside a server.
 //!
 //! The lock file is named after the file SQLite actually opens, not after the
 //! configured string: the location is parsed exactly as sqlx parses it
@@ -99,6 +101,15 @@ pub(crate) fn database_file(location: &str) -> Result<Option<PathBuf>, String> {
     Ok(Some(PathBuf::from(path)))
 }
 
+/// Why [`ServeLock::try_acquire`] did not take the lock.
+#[derive(Debug)]
+pub(crate) enum LockFailure {
+    /// Another process holds it.
+    Held(String),
+    /// The lock file could not be opened or locked.
+    Failed(String),
+}
+
 /// Holds the lock until dropped.
 #[derive(Debug)]
 pub(crate) struct ServeLock {
@@ -145,6 +156,14 @@ impl ServeLock {
     /// lock file cannot be opened (for example, the database's directory is
     /// not writable; the lock file lives next to the database).
     pub(crate) fn acquire(db_path: &Path) -> Result<Self, String> {
+        Self::try_acquire(db_path).map_err(|failure| match failure {
+            LockFailure::Held(m) | LockFailure::Failed(m) => m,
+        })
+    }
+
+    /// As [`ServeLock::acquire`], telling a lock another process holds from
+    /// any other failure.
+    pub(crate) fn try_acquire(db_path: &Path) -> Result<Self, LockFailure> {
         let path = Self::lock_path(db_path);
         let file = open_options_0600()
             .read(true)
@@ -153,11 +172,11 @@ impl ServeLock {
             .truncate(false)
             .open(&path)
             .map_err(|e| {
-                format!(
+                LockFailure::Failed(format!(
                     "cannot open lock file {}: {e} (the directory holding a SQLite database \
                      must be writable so the server can create its lock file)",
                     path.display()
-                )
+                ))
             })?;
         // The database and its sidecars are 0600 so other local users cannot
         // read secrets out of them. The lock file must match: flock needs
@@ -165,17 +184,17 @@ impl ServeLock {
         // user hold the lock and keep the server from starting. `create`
         // honours the umask, and the file may predate this rule, so set the
         // mode explicitly on every open.
-        restrict_to_owner(&file, &path)?;
+        restrict_to_owner(&file, &path).map_err(LockFailure::Failed)?;
         try_lock_exclusive(&file).map_err(|e| {
             if e.kind() == std::io::ErrorKind::WouldBlock {
-                format!(
+                LockFailure::Held(format!(
                     "another extenddb process is already using {} (lock held on {}); \
                      stop it first, or point this command at a different database",
                     db_path.display(),
                     path.display()
-                )
+                ))
             } else {
-                format!("cannot lock {}: {e}", path.display())
+                LockFailure::Failed(format!("cannot lock {}: {e}", path.display()))
             }
         })?;
         Ok(Self { _file: file, path })
@@ -191,6 +210,15 @@ impl ServeLock {
     pub(crate) fn acquire_for_location(location: &str) -> Result<Option<Self>, String> {
         match database_file(location)? {
             Some(path) => Self::acquire(&path).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// As [`ServeLock::acquire_for_location`], telling a lock another
+    /// process holds from any other failure.
+    pub(crate) fn try_acquire_for_location(location: &str) -> Result<Option<Self>, LockFailure> {
+        match database_file(location).map_err(LockFailure::Failed)? {
+            Some(path) => Self::try_acquire(&path).map(Some),
             None => Ok(None),
         }
     }

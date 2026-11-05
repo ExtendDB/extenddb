@@ -184,14 +184,8 @@ impl extenddb_storage::management_store::AdminStore for CassandraCatalogStore {
             let hash: String =
                 crate::cassandra_util::get_column(&row, "password_hash", "verify_admin_password")?;
 
-            Ok(Some(verify_bcrypt(password, hash).await))
+            let verified = extenddb_storage::password::verify_password(password, hash).await?;
+            Ok(Some(verified))
         })
     }
-}
-
-/// Verify a bcrypt password on a blocking thread (same logic as `server::password`).
-async fn verify_bcrypt(password: String, hash: String) -> bool {
-    tokio::task::spawn_blocking(move || bcrypt::verify(password, &hash).unwrap_or(false))
-        .await
-        .unwrap_or(false)
 }
