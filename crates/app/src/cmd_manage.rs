@@ -17,20 +17,19 @@ const PASSWORD_FLAG_WARNING: &str = "Warning: --password is visible in process l
                                      shell history. Omit it and set EXTENDDB_PASSWORD instead.";
 
 /// Choose the password from the `--password` value and the `EXTENDDB_PASSWORD`
-/// value. The flag takes precedence when both are set. The second element is
-/// the warning to print on stderr: `Some` when the password came from the
-/// flag, `None` when it came from the variable.
-fn choose_password(
-    flag: Option<String>,
-    env: Option<String>,
-) -> anyhow::Result<(String, Option<&'static str>)> {
-    match (flag, env) {
-        (Some(password), _) => Ok((password, Some(PASSWORD_FLAG_WARNING))),
-        (None, Some(password)) => Ok((password, None)),
-        (None, None) => Err(anyhow::anyhow!(
-            "No password provided. Use --password VALUE or set EXTENDDB_PASSWORD."
-        )),
-    }
+/// value. The flag takes precedence when both are set.
+fn choose_password(flag: Option<String>, env: Option<String>) -> anyhow::Result<String> {
+    flag.or(env).ok_or_else(|| {
+        anyhow::anyhow!("No password provided. Use --password VALUE or set EXTENDDB_PASSWORD.")
+    })
+}
+
+/// The warning to print on stderr: `Some` when `--password` was given, `None`
+/// when it was not. The flag takes precedence, so `Some` means the password
+/// came from the flag. The result depends only on `flag_given`, so the printed
+/// text never holds the password.
+fn flag_warning(flag_given: bool) -> Option<&'static str> {
+    flag_given.then_some(PASSWORD_FLAG_WARNING)
 }
 
 /// Resolve the password from the `--password` flag or the `EXTENDDB_PASSWORD`
@@ -38,8 +37,8 @@ fn choose_password(
 ///
 /// Never reads from stdin. Errors if no password source is available.
 fn resolve_password(cli_password: Option<String>) -> anyhow::Result<String> {
-    let (password, warning) =
-        choose_password(cli_password, std::env::var("EXTENDDB_PASSWORD").ok())?;
+    let warning = flag_warning(cli_password.is_some());
+    let password = choose_password(cli_password, std::env::var("EXTENDDB_PASSWORD").ok())?;
     if let Some(warning) = warning {
         eprintln!("{warning}");
     }
@@ -79,31 +78,40 @@ pub async fn run(args: ManageArgs) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PASSWORD_FLAG_WARNING, choose_password};
+    use super::{PASSWORD_FLAG_WARNING, choose_password, flag_warning};
 
     fn value(s: &str) -> Option<String> {
         Some(s.to_owned())
     }
 
     #[test]
-    fn a_password_from_the_flag_is_used_with_the_warning() {
-        let (password, warning) = choose_password(value("from-flag"), None).unwrap();
-        assert_eq!(password, "from-flag");
-        assert_eq!(warning, Some(PASSWORD_FLAG_WARNING));
+    fn a_password_from_the_flag_is_used() {
+        assert_eq!(
+            choose_password(value("from-flag"), None).unwrap(),
+            "from-flag"
+        );
     }
 
     #[test]
-    fn a_password_from_the_variable_is_used_without_a_warning() {
-        let (password, warning) = choose_password(None, value("from-env")).unwrap();
-        assert_eq!(password, "from-env");
-        assert_eq!(warning, None);
+    fn a_password_from_the_variable_is_used() {
+        assert_eq!(
+            choose_password(None, value("from-env")).unwrap(),
+            "from-env"
+        );
     }
 
     #[test]
-    fn the_flag_takes_precedence_over_the_variable_and_warns() {
-        let (password, warning) = choose_password(value("from-flag"), value("from-env")).unwrap();
-        assert_eq!(password, "from-flag");
-        assert_eq!(warning, Some(PASSWORD_FLAG_WARNING));
+    fn the_flag_takes_precedence_over_the_variable() {
+        assert_eq!(
+            choose_password(value("from-flag"), value("from-env")).unwrap(),
+            "from-flag"
+        );
+    }
+
+    #[test]
+    fn only_the_flag_gets_the_warning() {
+        assert_eq!(flag_warning(true), Some(PASSWORD_FLAG_WARNING));
+        assert_eq!(flag_warning(false), None);
     }
 
     #[test]
