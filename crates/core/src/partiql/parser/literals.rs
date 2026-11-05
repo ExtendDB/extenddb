@@ -225,11 +225,12 @@ impl Parser {
         if self.nesting.containers >= MAX_LITERAL_NESTING {
             self.defer(&literal_nesting_refusal(path));
         }
-        if let Some(n) = self.signed_number() {
-            self.walk_number(&n, path);
-            return Ok(AttributeValue::N(n));
+        if let Some(number) = self.signed_number() {
+            self.walk_number(&number.text, path);
+            return Ok(AttributeValue::N(number.text));
         }
         match self.peek().kind.clone() {
+            TokenKind::LParen => self.literal_in_parentheses(path),
             // A parameter inside a literal parses and is refused at its
             // position, naming where it sits in the value (measured
             // 2026-11-02 in INSERT values, SET values and WHERE literals:
@@ -267,6 +268,22 @@ impl Parser {
             }
             _ => Err(ParseError::well_formed("Expected a literal value")),
         }
+    }
+
+    /// A literal value in parentheses at `path`, with the current token on
+    /// the `(`. The parentheses only group it, and a comma of their own
+    /// makes a list (measured 2026-11-05: the INSERT value `{'pk': ('k'), 'x':
+    /// (5), 'l': [(5)], 'p': (1, 2)}` stores k, 5, [5] and [1, 2]).
+    fn literal_in_parentheses(&mut self, path: &str) -> PResult<AttributeValue> {
+        if self.list_in_parentheses_ahead() {
+            return Ok(AttributeValue::L(self.list_in_parentheses(path)?));
+        }
+        self.bump();
+        let value = self.nested(Nest::Group, |p| p.literal_value(path))?;
+        if !self.eat(&TokenKind::RParen) {
+            return Err(ParseError::well_formed("Expected RIGHT_PAREN"));
+        }
+        Ok(value)
     }
 
     /// Whether the current token, the word `word`, is a name standing alone

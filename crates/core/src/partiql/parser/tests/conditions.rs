@@ -256,18 +256,87 @@ fn an_operand_that_and_or_or_takes_is_refused() {
 }
 
 #[test]
-fn an_operand_in_a_group_or_after_a_not_keeps_the_syntax_error() {
-    for condition in [
-        "(a)",
-        "(a AND b = 1)",
-        "NOT a",
-        "a AND NOT b",
-        "a b",
-        "a LIMIT 1",
+fn an_operand_in_a_group_or_after_a_not_is_refused_for_its_place() {
+    for (condition, want) in [
+        ("(a)", NOT_A_CONDITION),
+        ("((a))", NOT_A_CONDITION),
+        ("pk = 'a' AND (a)", AND_OR_ARGUMENTS),
+        ("(a) OR pk = 'a'", AND_OR_ARGUMENTS),
+        ("(a AND b = 1)", AND_OR_ARGUMENTS),
+        ("(b = 1 AND a)", AND_OR_ARGUMENTS),
+        ("((a) AND b = 1)", AND_OR_ARGUMENTS),
+        ("NOT a", NOT_ARGUMENT),
+        ("NOT (a)", NOT_ARGUMENT),
+        ("NOT ((a))", NOT_ARGUMENT),
+        ("(NOT a)", NOT_ARGUMENT),
+        ("NOT (a) AND pk = 'a'", NOT_ARGUMENT),
+        // The NOT's refusal is met before the AND's, which comes after both
+        // of its arguments.
+        ("a AND NOT b", NOT_ARGUMENT),
     ] {
         assert_eq!(
             err(&format!("SELECT * FROM \"t\" WHERE {condition}")),
+            want,
+            "{condition}"
+        );
+    }
+    // Before anything else the operand keeps the syntax error.
+    for condition in ["a b", "a LIMIT 1", "(a b)"] {
+        assert_eq!(
+            err(&format!("SELECT * FROM \"t\" WHERE {condition}")),
             wf(NO_COMPARISON),
+            "{condition}"
+        );
+    }
+}
+
+#[test]
+fn an_operand_alone_in_parentheses_is_that_operand() {
+    for condition in [
+        "(pk) = 'a'",
+        "((pk)) = (('a'))",
+        "pk = ('a')",
+        "pk = (?)",
+        "(a) BETWEEN 0 AND 2",
+        "(a) IN [1]",
+        "(a) NOT IN [2]",
+        "(m) IS NOT MISSING",
+        "NOT (a) = 2",
+        "(a) = 1 = true",
+        "begins_with((sk), 'b')",
+        "attribute_exists((a))",
+        "(m).k = 1",
+        "(m)['k'] = 1",
+        "a = -(-1)",
+    ] {
+        let sql = format!("SELECT * FROM \"t\" WHERE {condition}");
+        assert!(parse(&sql).is_ok(), "{condition}: {:?}", parse(&sql));
+    }
+    assert_eq!(
+        where_of("SELECT * FROM \"t\" WHERE ((pk)) = ('a')"),
+        where_of("SELECT * FROM \"t\" WHERE pk = 'a'")
+    );
+    assert_eq!(
+        where_of("SELECT * FROM \"t\" WHERE (m)['k'] = -(1)"),
+        where_of("SELECT * FROM \"t\" WHERE m.k = -1")
+    );
+    assert_eq!(
+        err("SELECT * FROM \"t\" WHERE (a) IS INT4"),
+        "Unsupported data type for IS operator: Integer4Type. Supported data types are \
+         [MISSING, NULL, BOOLEAN, BLOB, STRING, NUMERIC, STRUCT, TUPLE, LIST] at 1:26:1"
+    );
+    for (condition, want) in [
+        ("a = (1", wf("Expected RIGHT_PAREN")),
+        ("a = (1))", wf("Unexpected token after expression")),
+        ("a = ()", wf("Unexpected term")),
+        (
+            "(a + 1) = 2",
+            "Unsupported operator in Condition Expression. Operator: +".to_owned(),
+        ),
+    ] {
+        assert_eq!(
+            err(&format!("SELECT * FROM \"t\" WHERE {condition}")),
+            want,
             "{condition}"
         );
     }

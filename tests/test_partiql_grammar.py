@@ -1158,3 +1158,146 @@ def test_a_path_into_a_key_in_brackets_is_refused(dynamodb_client, ctable):
         "Key attributes must be scalars; list random access '[]' and map lookup '.' are not "
         "allowed: Key sk"
     )
+
+
+# ---- one value or path in parentheses ------------------------------------------
+#
+# Measured 2026-11-05. Parentheses around one value or path only group it, in
+# a condition, a SET value, a call's argument and an INSERT value; a comma
+# inside them makes a list. A sign before a number in parentheses belongs to
+# the number. An operand alone in parentheses where a condition belongs is
+# refused as the operand alone is, also inside a group and after a NOT.
+
+
+@pytest.mark.parametrize(
+    ("condition", "sorts"),
+    [
+        ("pk = ('{p}')", ["b", "c"]),
+        ("(pk) = '{p}'", ["b", "c"]),
+        ("((pk)) = (('{p}'))", ["b", "c"]),
+        ("pk = '{p}' AND (a) = 1", ["b", "c"]),
+        ("pk = '{p}' AND (a) = (1)", ["b", "c"]),
+        ("pk = '{p}' AND ('x') = 'x'", ["b", "c"]),
+        ("pk = '{p}' AND a = -(-1)", ["b", "c"]),
+        ("pk = '{p}' AND x = (-0)", ["b", "c"]),
+        ("pk = '{p}' AND (a) BETWEEN 0 AND 2", ["b", "c"]),
+        ("pk = '{p}' AND (m) IS NOT MISSING", ["b", "c"]),
+        ("pk = '{p}' AND (a) IS MISSING", []),
+        ("pk = '{p}' AND (a) IN [1]", ["b", "c"]),
+        ("pk = '{p}' AND (a) NOT IN [2]", ["b", "c"]),
+        ("pk = '{p}' AND NOT (a) = 2", ["b", "c"]),
+        ("pk = '{p}' AND (a) = 1 = true", ["b", "c"]),
+        ("pk = '{p}' AND (a) > (b)", []),
+        ("pk = '{p}' AND begins_with((sk), 'b')", ["b"]),
+        ("pk = '{p}' AND size((m)) > 1", ["b", "c"]),
+        ("pk = '{p}' AND attribute_exists((a))", ["b", "c"]),
+        ("pk = '{p}' AND (m).k = 1", ["b", "c"]),
+        ("pk = '{p}' AND (m)['k'] = 1", ["b", "c"]),
+        ("(pk) = '{p}' AND (sk) > 'b'", ["c"]),
+        ("(pk = '{p}') AND (a) = 1", ["b", "c"]),
+    ],
+)
+def test_parentheses_around_one_value_or_path_group_it(dynamodb_client, ctable, pair, condition, sorts):
+    statement = f'SELECT * FROM "{ctable}" WHERE ' + condition.format(p=pair)
+    assert _sorts(dynamodb_client, statement) == sorts
+
+
+def test_a_parameter_in_parentheses_and_a_key_in_parentheses_read_by_key(dynamodb_client, ctable, pair):
+    statement = f'SELECT * FROM "{ctable}" WHERE pk = (?)'
+    assert _sorts(dynamodb_client, statement, Parameters=[{"S": pair}]) == ["b", "c"]
+    statement = f"SELECT * FROM \"{ctable}\" WHERE (pk) = '{pair}' ORDER BY sk DESC"
+    assert [i["sk"]["S"] for i in _select(dynamodb_client, statement)] == ["c", "b"]
+
+
+@pytest.mark.parametrize(
+    ("assignment", "stored"),
+    [
+        ("x = -(5)", {"N": "-5"}),
+        ("x = - (5)", {"N": "-5"}),
+        ("x = -(-(5))", {"N": "5"}),
+        ("x = (5)", {"N": "5"}),
+        ("x = (a + 1)", {"N": "2"}),
+        ("x = (a) + 1", {"N": "2"}),
+        ("x = (m).k", {"N": "1"}),
+        ("x = ('a', 'b')", {"L": [{"S": "a"}, {"S": "b"}]}),
+    ],
+)
+def test_a_set_value_in_parentheses(dynamodb_client, ctable, assignment, stored):
+    pk = f"pp-{uuid.uuid4().hex[:8]}"
+    dynamodb_client.put_item(
+        TableName=ctable,
+        Item={"pk": {"S": pk}, "sk": {"S": "b"}, "a": {"N": "1"}, "m": {"M": {"k": {"N": "1"}}}},
+    )
+    dynamodb_client.execute_statement(
+        Statement=f"UPDATE \"{ctable}\" SET {assignment} WHERE pk = '{pk}' AND sk = 'b'"
+    )
+    item = dynamodb_client.get_item(
+        TableName=ctable, Key={"pk": {"S": pk}, "sk": {"S": "b"}}, ConsistentRead=True
+    )["Item"]
+    assert item["x"] == stored
+
+
+def test_an_insert_value_in_parentheses(dynamodb_client, ctable):
+    pk = f"pp-{uuid.uuid4().hex[:8]}"
+    dynamodb_client.execute_statement(
+        Statement=(
+            f"INSERT INTO \"{ctable}\" VALUE {{'pk': ('{pk}'), 'sk': 'b', 'x': (5), "
+            "'l': [(5)], 'p': (1, 2)}"
+        )
+    )
+    item = dynamodb_client.get_item(
+        TableName=ctable, Key={"pk": {"S": pk}, "sk": {"S": "b"}}, ConsistentRead=True
+    )["Item"]
+    assert item["x"] == {"N": "5"}
+    assert item["l"] == {"L": [{"N": "5"}]}
+    assert item["p"] == {"L": [{"N": "1"}, {"N": "2"}]}
+
+
+@pytest.mark.parametrize(
+    ("statement", "message"),
+    [
+        ("UPDATE {t} SET x = -(a) WHERE pk = 'pp' AND sk = 'b'", "minus"),
+        ("UPDATE {t} SET x = -(?) WHERE pk = 'pp' AND sk = 'b'", "minus"),
+        ("SELECT * FROM {t} WHERE (a)", "WHERE clause must contain an expression that resolves to a boolean"),
+        ("SELECT * FROM {t} WHERE ((a))", "WHERE clause must contain an expression that resolves to a boolean"),
+        ("SELECT * FROM {t} WHERE pk = 'pp' AND (a)", "The arguments to AND/OR must be Expressions"),
+        ("SELECT * FROM {t} WHERE pk = 'pp' AND (a) OR pk = 'b'", "The arguments to AND/OR must be Expressions"),
+        ("SELECT * FROM {t} WHERE pk = 'pp' AND ((a) AND b = 2)", "The arguments to AND/OR must be Expressions"),
+        ("SELECT * FROM {t} WHERE pk = 'pp' AND (a AND b = 2)", "The arguments to AND/OR must be Expressions"),
+        ("SELECT * FROM {t} WHERE pk = 'pp' AND (b = 2 AND a)", "The arguments to AND/OR must be Expressions"),
+        ("SELECT * FROM {t} WHERE pk = 'pp' AND NOT (a)", "The argument to NOT must be a Type or Expression"),
+        ("SELECT * FROM {t} WHERE pk = 'pp' AND NOT a", "The argument to NOT must be a Type or Expression"),
+        ("SELECT * FROM {t} WHERE (NOT a)", "The argument to NOT must be a Type or Expression"),
+        ("SELECT * FROM {t} WHERE NOT ((a))", "The argument to NOT must be a Type or Expression"),
+        ("SELECT * FROM {t} WHERE NOT (a) AND pk = 'pp'", "The argument to NOT must be a Type or Expression"),
+        ("SELECT * FROM {t} WHERE pk = 'pp' AND (a) AND b = 1e126", "The arguments to AND/OR must be Expressions"),
+        ("SELECT * FROM {t} WHERE pk = 'pp' AND (a + 1) = 2", "Unsupported operator in Condition Expression. Operator: +"),
+        ("SELECT * FROM {t} WHERE pk = 'pp' AND (a) LIKE 'x'", "Unsupported operator in Condition Expression. Operator: like"),
+        ("SELECT * FROM {t} WHERE pk = 'pp' AND (a) = 1 IS NULL", "The left hand side argument to IS must be a Variable Reference, Literal, or Path"),
+        ("SELECT * FROM {t} WHERE pk = 'pp' AND (sk.x) = 1", "Key attributes must be scalars; list random access '[]' and map lookup '.' are not allowed: Key sk"),
+        ("SELECT * FROM {t} WHERE pk = 'pp' AND a = -(1e126)", OVERFLOW.format("root")),
+        ("SELECT * FROM {t} WHERE pk = 'pp' AND (1e126) = a", OVERFLOW.format("root")),
+        ("SELECT * FROM {t} WHERE pk = ('pp'", WF + "Expected RIGHT_PAREN"),
+        ("SELECT * FROM {t} WHERE pk = 'pp' AND a = (1", WF + "Expected RIGHT_PAREN"),
+        ("SELECT * FROM {t} WHERE pk = 'pp' AND a = (1))", WF + "Unexpected token after expression"),
+        ("SELECT * FROM {t} WHERE pk = 'pp' AND a = ()", WF + "Unexpected term"),
+    ],
+)
+def test_parentheses_around_one_operand_keep_its_refusals(dynamodb_client, ctable, statement, message):
+    statement = statement.format(t=f'"{ctable}"')
+    if message == "minus":
+        message = (
+            "Incorrect number of operands for operator or function; operator or function: -, "
+            "number of operands: 1"
+        )
+    kwargs = {"Parameters": [{"N": "5"}]} if "?" in statement else {}
+    assert _message(dynamodb_client, statement, **kwargs) == message
+
+
+def test_an_is_test_on_an_operand_in_parentheses_names_the_operand(dynamodb_client, ctable):
+    statement = f"SELECT * FROM \"{ctable}\" WHERE pk = 'pp' AND (a) IS INT4"
+    column = statement.index("(a)") + 2
+    assert _message(dynamodb_client, statement) == (
+        "Unsupported data type for IS operator: Integer4Type. Supported data types are [MISSING, "
+        f"NULL, BOOLEAN, BLOB, STRING, NUMERIC, STRUCT, TUPLE, LIST] at 1:{column}:1"
+    )

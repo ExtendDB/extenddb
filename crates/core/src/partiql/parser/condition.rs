@@ -5,8 +5,8 @@
 
 use super::limits::{MAX_OPERATORS, Nest};
 use super::{
-    AND_OR_ARGUMENTS, BARE_OPERAND, NO_COMPARISON, NOT_A_CONDITION, PResult, ParseError, Parser,
-    forms,
+    AND_OR_ARGUMENTS, BARE_OPERAND, GROUPED_OPERAND, NO_COMPARISON, NOT_A_CONDITION, NOT_ARGUMENT,
+    PResult, ParseError, Parser, forms,
 };
 use crate::partiql::ast::{CompareOp, Operand, TypeName, WhereExpr};
 use crate::partiql::lexer::{Token, TokenKind};
@@ -94,16 +94,34 @@ impl Parser {
     /// predicate of a term. Parentheses nest through here, so the rest is
     /// read in a function of its own, never inlined, and this frame stays
     /// small (see [`limits`]).
+    ///
+    /// A group that holds one operand and nothing else is that operand, and
+    /// the predicate goes on from it (measured 2026-11-05: `(pk) = 'a'`
+    /// reads by key, `((pk)) = 'a'`, `(a) BETWEEN 0 AND 2`, `(a) IN [1]`,
+    /// `(m) IS NOT MISSING` and `NOT (a) = 2` run, and `(a)` alone is
+    /// refused as `a` alone is).
     fn predicate(&mut self) -> PResult<WhereExpr> {
-        if !self.eat(&TokenKind::LParen) {
+        if !matches!(self.peek().kind, TokenKind::LParen) {
             return self.term_predicate();
         }
+        let open = self.pos;
+        let after_not = self.after_not;
+        let refused_operators = self.operator_refusals;
+        self.bump();
         let inner = self.nested(Nest::Group, Self::where_expr)?;
         // (measured 2026-11-02: `(a = 1 b)`, `(a = 1` and `((a = 1)`)
         if !self.eat(&TokenKind::RParen) {
             return Err(ParseError::well_formed("Expected RIGHT_PAREN"));
         }
-        self.after_predicate(inner)
+        match inner {
+            WhereExpr::Function(name, mut operand) if name == GROUPED_OPERAND => {
+                self.after_not = after_not;
+                let left = operand.pop().expect("a grouped operand holds one operand");
+                let left = self.steps_after_group(left, open)?;
+                self.after_operand(left, open, refused_operators)
+            }
+            inner => self.after_predicate(inner),
+        }
     }
 
     /// A predicate that is not in parentheses: a condition function, or an
@@ -156,7 +174,6 @@ impl Parser {
                 return self.after_predicate(WhereExpr::Function(lname, args));
             }
         }
-        let left_span = self.span();
         let left_start = self.pos;
         let exec = self.is_keyword("EXEC");
         let refused_operators = self.operator_refusals;
@@ -166,6 +183,24 @@ impl Parser {
             // deferred; this condition stands in for it and never runs.
             return Ok(WhereExpr::Function("exec".to_owned(), vec![left]));
         }
+        self.after_operand(left, left_start, refused_operators)
+    }
+
+    /// The rest of a predicate that starts with the operand `left`, read
+    /// from token `start` on, the operand itself or a group around it. The
+    /// condition operators read so far numbered `refused_operators` before
+    /// the operand was read.
+    #[inline(never)]
+    fn after_operand(
+        &mut self,
+        left: Operand,
+        start: usize,
+        refused_operators: usize,
+    ) -> PResult<WhereExpr> {
+        // A refusal of the operand names its first token inside any group
+        // around it (measured 2026-11-05: `(a) IS INT4` names the `a`).
+        let left_span = self.inner_span(start);
+        let left_start = start;
         if self.eat_keyword("IS") {
             // An IS after the test is refused for its left side (measured
             // 2026-11-02 with `a IS NULL IS NULL`). A comparison with a
@@ -190,6 +225,17 @@ impl Parser {
             return self.after_predicate(in_list);
         }
         if !self.at_comparison() {
+            // The operand is all the group around it holds: the group is
+            // the operand, and the predicate goes on after the group (see
+            // [`Parser::predicate`]).
+            if matches!(self.peek().kind, TokenKind::RParen)
+                && self.nesting.in_group()
+                && start
+                    .checked_sub(1)
+                    .is_some_and(|i| self.tokens[i].kind == TokenKind::LParen)
+            {
+                return Ok(WhereExpr::Function(GROUPED_OPERAND.to_owned(), vec![left]));
+            }
             // A call to a function a condition does not take, and MISSING,
             // are refused on their own once the statement is read (measured
             // 2026-11-02: `... AND EXISTS(ss)` is "Unrecognized function"),
@@ -209,15 +255,16 @@ impl Parser {
             if self.operator_refusals > refused_operators {
                 return Ok(WhereExpr::Function("operator".to_owned(), vec![left]));
             }
-            // Any other operand is refused, as the whole condition or as an
-            // argument of AND or OR (measured 2026-11-02 with names, paths,
-            // numbers, strings, lists, `true` and a parameter as the
-            // condition, and `a AND pk = 'a'`), after the walk (see
-            // [`walk`]). In a group, after a NOT and before anything else
-            // the answer is not measured, and the operand keeps the syntax
-            // error below. The check is made here, at the end of the
-            // recursion, so the frames each group nests stay small (see
-            // [`limits`]).
+            // Any other operand is refused, as the whole condition, as an
+            // argument of AND or OR or as the argument of a NOT (measured
+            // 2026-11-02 with names, paths, numbers, strings, lists, `true`
+            // and a parameter as the condition, and `a AND pk = 'a'`;
+            // measured 2026-11-05 in a group, `(a AND b = 2)` and `(b = 2 AND
+            // a)`, and after a NOT, `NOT a`, `(NOT a)` and `NOT (a) AND pk =
+            // 'a'`), after the walk (see [`walk`]). Before anything else the
+            // operand keeps the syntax error below. The check is made here,
+            // at the end of the recursion, so the frames each group nests
+            // stay small (see [`limits`]).
             if self.operand_ends_a_condition() {
                 self.refuse_bare_operand(left_start);
                 return Ok(WhereExpr::Function(BARE_OPERAND.to_owned(), vec![left]));
@@ -235,7 +282,16 @@ impl Parser {
     /// behind what the left argument met. As the left argument it is kept
     /// once the right argument has been read (see [`Parser::and_expr`]). An
     /// operand after OR and before AND is the left argument of the AND.
+    ///
+    /// After a NOT the operand is the NOT's argument, and its refusal is
+    /// kept now (measured 2026-11-05: `NOT (a) AND pk = 'a'` is refused for
+    /// the NOT's argument). A group around the operand counts as the
+    /// operand: `start` is then the token of its `(`.
     fn refuse_bare_operand(&mut self, start: usize) {
+        if self.after_not {
+            self.walk_after_operands(NOT_ARGUMENT);
+            return;
+        }
         let before = start.checked_sub(1).and_then(|i| self.tokens.get(i));
         let (after_and, after_or) = (is_word(before, "AND"), is_word(before, "OR"));
         let (before_and, before_or) = (self.is_keyword("AND"), self.is_keyword("OR"));
@@ -248,19 +304,19 @@ impl Parser {
         }
     }
 
-    /// Whether an operand just read ends the WHERE condition or an argument
-    /// of an AND or an OR, outside any group and not after a NOT: the end of
-    /// the statement, a semicolon that ends it, AND or OR follows.
+    /// Whether an operand just read ends the WHERE condition, a group, or
+    /// an argument of an AND or an OR: the end of the statement, a semicolon
+    /// that ends it, a `)` that closes a group, AND or OR follows.
     fn operand_ends_a_condition(&self) -> bool {
-        let ends = match &self.peek().kind {
+        match &self.peek().kind {
             TokenKind::Eof => true,
             TokenKind::Semicolon => matches!(
                 self.tokens.get(self.pos + 1).map(|t| &t.kind),
                 Some(TokenKind::Eof)
             ),
+            TokenKind::RParen => self.nesting.in_group(),
             _ => self.is_keyword("AND") || self.is_keyword("OR"),
-        };
-        ends && !self.after_not && !self.nesting.in_group()
+        }
     }
 
     /// Whether the current token is a comparison operator.

@@ -95,10 +95,19 @@ const NOT_A_CONDITION: &str = "WHERE clause must contain an expression that reso
 /// 2026-11-02: `a AND pk = 'a'`).
 const AND_OR_ARGUMENTS: &str = "The arguments to AND/OR must be Expressions";
 
+/// The refusal of an operand that is the argument of a NOT (measured
+/// 2026-11-05: `NOT a`, `NOT (a)` and `(NOT a)`).
+const NOT_ARGUMENT: &str = "The argument to NOT must be a Type or Expression";
+
 /// The name of the predicate that stands for an operand that is not a
 /// condition. It never runs: the operand is refused (see
 /// [`Parser::term_predicate`]). No call can have this name.
 const BARE_OPERAND: &str = "<operand>";
+
+/// The name of the predicate that stands for an operand that is all a group
+/// holds, until the group is read as that operand (see `Parser::predicate`).
+/// It never leaves the parser. No call can have this name.
+const GROUPED_OPERAND: &str = "<grouped operand>";
 
 /// The syntax error of an operand with no comparison after it, where the
 /// service's answer is not measured.

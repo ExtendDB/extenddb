@@ -9,6 +9,15 @@ use crate::partiql::ast::{ArithOp, Operand, Path, PathStep};
 use crate::partiql::lexer::{TokenKind, WordClass, is_function_keyword, word_class};
 use crate::types::AttributeValue;
 
+/// A number literal with the signs written before it folded in (see
+/// [`Parser::signed_number`]).
+pub(super) struct SignedNumber {
+    /// The number's text, with a `-` when the signs negate it.
+    pub text: String,
+    /// The `line:column:length` span of the number itself.
+    pub at: String,
+}
+
 impl Parser {
     // --- paths ---
 
@@ -230,17 +239,21 @@ impl Parser {
     }
 
     /// A number literal with any number of leading signs (`-7.3`, `+5`,
-    /// `- .5`, `- -7`): the service folds the signs written before a number
-    /// into the number. Returns `None`, consuming nothing, when no number
-    /// follows the signs. The signs are read in a loop, so a long run costs no
-    /// stack.
-    pub(super) fn signed_number(&mut self) -> Option<String> {
+    /// `- .5`, `- -7`), and in any number of parentheses with signs before
+    /// and inside them (measured 2026-11-05: `-(5)` and `- (5)` are -5,
+    /// `-(-(5))` is 5, `(-0)` is 0): the service folds the signs into the
+    /// number. Returns `None`, consuming nothing, when no number follows the
+    /// signs and parentheses or the parentheses do not close right after it.
+    /// The run is read in a loop, so its length costs no stack.
+    pub(super) fn signed_number(&mut self) -> Option<SignedNumber> {
         let start = self.pos;
         let mut negative = false;
+        let mut open = 0usize;
         loop {
             match self.peek().kind {
                 TokenKind::Minus => negative = !negative,
                 TokenKind::Plus => {}
+                TokenKind::LParen => open += 1,
                 TokenKind::Number(_) => break,
                 _ => {
                     self.pos = start;
@@ -249,23 +262,31 @@ impl Parser {
             }
             self.bump();
         }
+        let at = self.span();
         let TokenKind::Number(n) = self.bump().kind else {
             unreachable!("the loop stops on a number");
         };
-        if !negative {
-            return Some(n);
+        for _ in 0..open {
+            if !self.eat(&TokenKind::RParen) {
+                self.pos = start;
+                return None;
+            }
         }
-        Some(match n.strip_prefix('-') {
-            Some(positive) => positive.to_owned(),
-            None => format!("-{n}"),
-        })
+        let text = if negative {
+            match n.strip_prefix('-') {
+                Some(positive) => positive.to_owned(),
+                None => format!("-{n}"),
+            }
+        } else {
+            n
+        };
+        Some(SignedNumber { text, at })
     }
 
     fn operand_atom(&mut self) -> PResult<Operand> {
-        let at = self.span();
-        if let Some(n) = self.signed_number() {
-            self.walk_number(&n, LITERAL_ROOT);
-            return self.literal_steps(Operand::Literal(AttributeValue::N(n)), &at);
+        if let Some(number) = self.signed_number() {
+            self.walk_number(&number.text, LITERAL_ROOT);
+            return self.literal_steps(Operand::Literal(AttributeValue::N(number.text)), &number.at);
         }
         // A sign before anything but a number is an operator with one
         // operand, refused once the statement parses (measured 2026-11-02:
@@ -281,10 +302,10 @@ impl Parser {
             });
             self.bump();
         }
+        let at = self.span();
         let Some(op) = sign else {
             return self.unsigned_atom(&at);
         };
-        let at = self.span();
         // The sign is an operator of its own in the walk, met before its
         // operand.
         let before = self.walk_part();
@@ -302,9 +323,59 @@ impl Parser {
         inner
     }
 
+    /// An operand in parentheses, with the current token on the `(`. The
+    /// parentheses only group what they hold (measured 2026-11-05: `pk =
+    /// ('a')`, `pk = (?)`, `SET x = (a + 1)`, `SET x = (a) + 1` and
+    /// `begins_with((sk), 'b')` run as written without them), a path in them
+    /// takes the steps after them (measured 2026-11-05: `(m).k = 1` and
+    /// `(m)['k'] = 1` read `m.k`), and a literal followed by steps is
+    /// refused at the literal. A comma of their own makes a list (measured
+    /// 2026-11-05: `SET x = ('a', 'b')` stores a list).
+    fn operand_in_parentheses(&mut self) -> PResult<Operand> {
+        if self.list_in_parentheses_ahead() {
+            let list = self.list_in_parentheses(LITERAL_ROOT)?;
+            return Ok(Operand::Literal(AttributeValue::L(list)));
+        }
+        let open = self.pos;
+        self.bump();
+        let inner = self.nested(Nest::Group, Self::operand)?;
+        // (measured 2026-11-05: `a = (1` and `pk = ('a'`)
+        if !self.eat(&TokenKind::RParen) {
+            return Err(ParseError::well_formed("Expected RIGHT_PAREN"));
+        }
+        self.steps_after_group(inner, open)
+    }
+
+    /// The `line:column:length` span of the first token inside the group
+    /// that opens at token `open`, past any `(` of groups inside it.
+    pub(super) fn inner_span(&self, open: usize) -> String {
+        self.tokens[open..]
+            .iter()
+            .find(|t| t.kind != TokenKind::LParen)
+            .map(|t| format!("{}:{}:{}", t.line, t.column, t.length))
+            .unwrap_or_default()
+    }
+
+    /// The operand a group that opens at token `open` holds, with the path
+    /// steps written after the group: a path takes them (measured
+    /// 2026-11-05: `(m).k` and `(m)['k']` read `m.k`), and a literal is
+    /// refused for them at its first token (measured 2026-11-05: `('x').y`
+    /// names the `'x'`).
+    pub(super) fn steps_after_group(&mut self, operand: Operand, open: usize) -> PResult<Operand> {
+        match operand {
+            Operand::Path(path) => Ok(Operand::Path(self.path_steps(path)?)),
+            literal @ Operand::Literal(_) => {
+                let at = self.inner_span(open);
+                self.literal_steps(literal, &at)
+            }
+            other => Ok(other),
+        }
+    }
+
     /// An operand that does not start with a sign, at the span `at`.
     fn unsigned_atom(&mut self, at: &str) -> PResult<Operand> {
         match self.peek().kind.clone() {
+            TokenKind::LParen => self.operand_in_parentheses(),
             // A backtick literal parses and is refused at its position, by
             // its Ion type (measured 2026-11-02 with an integer).
             TokenKind::Ion(text) => {
