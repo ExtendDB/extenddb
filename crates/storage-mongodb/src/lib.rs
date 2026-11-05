@@ -43,7 +43,7 @@ use extenddb_storage::error::StorageError;
 // ============================================================================
 
 use extenddb_storage::hooks::{ServerRuntimeHooks, ServingRegistrar, WorkerContext};
-use extenddb_storage::server_components::{BackendError, ServerComponents};
+use extenddb_storage::server_components::{BackendError, ServerComponents, check_encryption_key};
 
 /// Backend-specific runtime hooks for `MongoDB`.
 struct MongoRuntimeHooks {
@@ -199,11 +199,10 @@ async fn build_components(
             details: format!("Failed to create catalog client: {e}"),
         })?;
 
-    // Load encryption key from settings collection. A missing key must be
-    // a hard failure: an empty key would base64-decode to zero bytes, and
-    // the secret cipher refuses any key that is not 32 bytes, so every
-    // credential lookup would fail. Refuse to start instead, matching the
-    // postgres backend.
+    // Load encryption key from settings collection. A missing key, or a key
+    // that is not base64 for 32 bytes, must be a hard failure: the secret
+    // cipher refuses such a key, so every credential lookup would fail with
+    // a 500. Refuse to start instead, as the other backends do.
     let catalog_db = catalog_client.database("extenddb_catalog");
     let settings_coll = catalog_db.collection::<mongodb::bson::Document>("settings");
     let enc_key = settings_coll
@@ -212,6 +211,7 @@ async fn build_components(
         .map_err(|e| BackendError::InitializationFailed(format!("Load encryption key: {e}")))?
         .and_then(|d| d.get_str("value").ok().map(std::borrow::ToOwned::to_owned))
         .ok_or(BackendError::MissingEncryptionKey)?;
+    check_encryption_key(&enc_key)?;
 
     let auth_client = catalog_client.clone();
     let catalog_store = Arc::new(MongoCatalogStore::with_encryption_key(

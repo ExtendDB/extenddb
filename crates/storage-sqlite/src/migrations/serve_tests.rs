@@ -6,7 +6,8 @@
 //! and writes nothing when it refuses; a dev build migrates `Uninitialized`
 //! and `Behind` first, and refuses the rest; an in-memory database is
 //! created by the runner every time. The lock that keeps a migrator, a
-//! second migrator and a server apart is tested here too.
+//! second migrator and a server apart is tested here too, and so is the
+//! refusal of an encryption key that the secret cipher refuses.
 
 use std::path::Path;
 use std::time::Duration;
@@ -214,6 +215,48 @@ async fn a_server_refuses_while_a_migration_holds_the_database() {
         start(&location, false)
             .await
             .expect("starts once the lock is free"),
+    );
+}
+
+/// A server refuses a catalog whose encryption key the secret cipher refuses,
+/// and names the reason. Without the check it started, and every signed
+/// request failed with a 500.
+#[tokio::test]
+async fn a_server_refuses_an_encryption_key_the_cipher_refuses() {
+    let db = temp_db("serve-bad-key");
+    let location = current_catalog(&db).await;
+    let set_key =
+        |key: &str| format!("UPDATE settings SET value = '{key}' WHERE key = 'encryption_key'");
+    for (key, reason) in [
+        // 16 bytes.
+        (
+            "AAAAAAAAAAAAAAAAAAAAAA==",
+            "encryption key must be 32 bytes",
+        ),
+        // 32 bytes and a trailing newline.
+        (
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
+            "decode encryption key: ",
+        ),
+    ] {
+        exec(&db, &set_key(key)).await;
+        match start(&location, false).await {
+            Err(BackendError::InvalidEncryptionKey(r)) => {
+                assert!(r.starts_with(reason), "{key:?}: {r}");
+            }
+            Err(other) => panic!("{key:?}: refused for another reason: {other}"),
+            Ok(_) => panic!("{key:?}: the server started"),
+        }
+    }
+    exec(
+        &db,
+        &set_key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+    )
+    .await;
+    drop(
+        start(&location, false)
+            .await
+            .expect("starts with a 32-byte key"),
     );
 }
 

@@ -652,7 +652,7 @@ impl PostgresEngine {
 
 use extenddb_auth::CredentialStore;
 use extenddb_storage::hooks::{ServerRuntimeHooks, ServingRegistrar, WorkerContext};
-use extenddb_storage::server_components::{BackendError, ServerComponents};
+use extenddb_storage::server_components::{BackendError, ServerComponents, check_encryption_key};
 
 /// Backend-specific runtime hooks for `PostgreSQL`.
 struct PostgresRuntimeHooks {
@@ -912,10 +912,12 @@ fn server_components_factory(
                     ))
                 })?;
 
-        let catalog_store = Arc::new(match enc_key {
-            Some(k) => PostgresCatalogStore::with_encryption_key(catalog_pool.clone(), k),
-            None => return Err(BackendError::MissingEncryptionKey),
-        }) as Arc<dyn extenddb_storage::CatalogStore>;
+        let enc_key = enc_key.ok_or(BackendError::MissingEncryptionKey)?;
+        check_encryption_key(&enc_key)?;
+        let catalog_store = Arc::new(PostgresCatalogStore::with_encryption_key(
+            catalog_pool.clone(),
+            enc_key,
+        )) as Arc<dyn extenddb_storage::CatalogStore>;
 
         // Create auth provider
         let enc_key = extenddb_storage::CatalogStore::cached_encryption_key(&*catalog_store)

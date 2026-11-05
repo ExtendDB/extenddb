@@ -196,7 +196,7 @@ use std::sync::Arc;
 
 use extenddb_auth::CredentialStore;
 use extenddb_storage::migrations::{MigrationError, Runner};
-use extenddb_storage::server_components::{BackendError, ServerComponents};
+use extenddb_storage::server_components::{BackendError, ServerComponents, check_encryption_key};
 
 use crate::hooks::SqliteRuntimeHooks;
 
@@ -350,6 +350,7 @@ fn sqlite_server_components_factory(
                     BackendError::InitializationFailed(format!("fetch encryption key: {e}"))
                 })?;
         let enc_key = enc_key.ok_or(BackendError::MissingEncryptionKey)?;
+        check_encryption_key(&enc_key)?;
 
         // The catalog store writes through the second pool over the same
         // file, so its writers must hold the SAME lock instance as the
