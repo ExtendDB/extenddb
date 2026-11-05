@@ -2,7 +2,7 @@
 
 # The runtime base is explicitly approved for this public OSS distribution.
 # Keep both references digest-pinned and update them only through reviewed CRs.
-FROM public.ecr.aws/docker/library/rust:1.88-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0 AS build
+FROM public.ecr.aws/docker/library/rust:1.91.1-bookworm@sha256:c1e5f19e773b7878c3f7a805dd00a495e747acbdc76fb2337a4ebf0418896b33 AS build
 ARG VCS_REF
 ARG BUILD_DATE
 WORKDIR /src
