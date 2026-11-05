@@ -223,7 +223,7 @@ Defined in `crates/storage/src/management_store/mod.rs`. Login rate limiting:
 | `record_failed_login` | Record a failed login attempt with its source address |
 | `cleanup_old_attempts` | Garbage-collect old login attempt records |
 
-Password verification in a backend's `AdminStore` and `ManagementStore` must go through `extenddb_storage::password::verify_password`, which bounds concurrent bcrypt work per process.
+Password verification in a backend's `AdminStore` and `ManagementStore` must go through `extenddb_storage::password`, which bounds concurrent bcrypt work per process. `verify_admin_password` checks an existing admin's hash with `verify_password` and returns `None` without a bcrypt check when no admin has the name. `verify_iam_user_password` passes the user's hash to `verify_stored_password`, or `None` when the account or the user does not exist or the user has no console password; with `None`, the helper checks the password against a fixed hash and refuses it. A login checks the admin first and the IAM user only when no admin has the name, and the server runs the fixed-hash check itself for a name without `/`, so every login runs one bcrypt check whether or not the name exists.
 
 ### AuthorizationStore
 

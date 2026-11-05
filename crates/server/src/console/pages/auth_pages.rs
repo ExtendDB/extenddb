@@ -213,26 +213,35 @@ async fn try_admin_login(
     })
 }
 
-/// `Ok(None)` is a wrong password or an unknown user; `Err(())` is a storage
-/// error, which the caller answers 500 and records as nothing.
+/// `Ok(None)` is a wrong password, an unknown user or a name without `/`;
+/// `Err(())` is a storage error, which the caller answers 500 and records as
+/// nothing. A name without `/` names no IAM user. It is checked against a
+/// fixed hash, so that it runs one bcrypt check, as a login for an existing
+/// admin or IAM user does.
 async fn try_iam_login(
     username: &str,
     password: &str,
     store: &dyn extenddb_storage::management_store::ManagementStore,
 ) -> Result<Option<CallerIdentity>, ()> {
-    let Some((acct_id, uname)) = username.split_once('/') else {
-        return Ok(None);
+    let user = username.split_once('/');
+    let checked = match user {
+        Some((acct_id, uname)) => {
+            store
+                .verify_iam_user_password(acct_id, uname, password)
+                .await
+        }
+        None => extenddb_storage::password::verify_stored_password(password.to_owned(), None).await,
     };
-    let ok = store
-        .verify_iam_user_password(acct_id, uname, password)
-        .await
-        .map_err(|e| {
-            log_password_check_error("Console login: DB error during IAM user auth", &e)
-        })?;
-    Ok(ok.then(|| CallerIdentity::IamUser {
-        account_id: acct_id.to_owned(),
-        user_name: uname.to_owned(),
-    }))
+    let ok = checked.map_err(|e| {
+        log_password_check_error("Console login: DB error during IAM user auth", &e)
+    })?;
+    Ok(match user {
+        Some((acct_id, uname)) if ok => Some(CallerIdentity::IamUser {
+            account_id: acct_id.to_owned(),
+            user_name: uname.to_owned(),
+        }),
+        _ => None,
+    })
 }
 
 #[cfg(test)]
@@ -322,5 +331,32 @@ mod tests {
         assert_eq!(page.status(), StatusCode::OK);
         assert!(body_text(page).await.contains("Invalid credentials"));
         assert_eq!(attempts.rows_for("admin", "198.51.100.91"), 1);
+    }
+
+    #[tokio::test]
+    async fn every_credential_check_runs_one_bcrypt_check() {
+        use extenddb_storage::password::count_verifications;
+
+        use crate::management::auth::tests::{LOGIN_CASES, Outcome, login_catalog};
+
+        let catalog = login_catalog().await;
+        for login in LOGIN_CASES {
+            let (checked, costs) =
+                count_verifications(check_credentials(login.username, login.password, &catalog))
+                    .await;
+            assert_eq!(
+                costs,
+                [login.cost],
+                "{}: bcrypt checks and their cost",
+                login.case
+            );
+            let identity = checked.unwrap_or_else(|()| panic!("{}: storage error", login.case));
+            assert_eq!(
+                Outcome::of(identity.as_ref()),
+                login.outcome,
+                "{}",
+                login.case
+            );
+        }
     }
 }

@@ -391,17 +391,12 @@ impl CassandraCatalogStore {
         )
         .await?;
 
-        let Some(row) = row else {
-            return Ok(false);
-        };
-
-        let hash_opt: Option<String> = row.get_by_name("password_hash").ok().flatten();
-
-        let Some(hash) = hash_opt else {
-            return Ok(false);
-        };
-
-        extenddb_storage::password::verify_password(password.to_owned(), hash).await
+        // `None` when the user is absent or has no console password, which
+        // still runs one bcrypt check (see `verify_stored_password`), as a
+        // wrong password does.
+        let hash: Option<String> =
+            row.and_then(|row| row.get_by_name("password_hash").ok().flatten());
+        extenddb_storage::password::verify_stored_password(password.to_owned(), hash).await
     }
 
     pub(crate) async fn change_user_password_impl(

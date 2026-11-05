@@ -138,6 +138,9 @@ pub trait AdminStore: Send + Sync {
 
     /// Verify an admin password. Returns `None` if the admin does not exist,
     /// `Some(true)` if the password matches, `Some(false)` if it does not.
+    /// An unknown name returns `None` without a bcrypt check. Every login
+    /// path then runs the IAM user step, which runs one bcrypt check for any
+    /// name, so a login runs one check whether or not an admin has the name.
     fn verify_admin_password(
         &self,
         admin_name: &str,
@@ -206,7 +209,11 @@ pub trait ManagementStore: Send + Sync {
         user_name: &str,
     ) -> BoxFuture<'_, OpResult<Option<UserDetail>>>;
 
-    /// Verify an IAM user's console password.
+    /// Verify an IAM user's console password. Returns `false` for a wrong
+    /// password, an unknown user and a user without a console password.
+    /// Implementations check through
+    /// [`crate::password::verify_stored_password`] in all three cases, so
+    /// that they run the same bcrypt work.
     fn verify_iam_user_password(
         &self,
         account_id: &str,
