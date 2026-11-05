@@ -141,9 +141,10 @@ case "$BACKEND" in
         exit 1
         ;;
 esac
-# Tests that depend on the backend (tests/test_ttl.py) read this rather than
-# guess from a config file. Only exported when --backend was given: the
-# SQLite CI leg runs without it.
+# Tests that depend on the backend (tests/test_ttl.py, and the update-size
+# classes in tests/test_item_size_at_limit.py that apply only to the PostgreSQL
+# and SQLite storage layers) read this rather than guess from a config file.
+# Only exported when --backend was given: the SQLite CI leg runs without it.
 if [[ -n "${BACKEND_GIVEN:-}" ]]; then
     export EXTENDDB_TEST_BACKEND="$BACKEND"
 fi

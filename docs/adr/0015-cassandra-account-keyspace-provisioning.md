@@ -1,4 +1,4 @@
-# ADR-0005: Account Keyspace Provisioning Timing
+# ADR-0015: Account Keyspace Provisioning Timing
 
 - Status: Accepted
 - Date: 2026-06-05

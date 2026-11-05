@@ -1,4 +1,4 @@
-# ADR-0001: Foreign Key Constraint Emulation
+# ADR-0011: Foreign Key Constraint Emulation
 
 - Status: Accepted
 - Date: 2026-06-04

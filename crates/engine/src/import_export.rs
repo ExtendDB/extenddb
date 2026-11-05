@@ -139,7 +139,11 @@ pub async fn handle_import_table(
             error_count += 1;
             continue;
         }
-        if let Err(e) = validate_attribute_name_sizes(&item, &ctx.limits) {
+        if let Err(e) = validate_attribute_name_sizes(
+            &item,
+            &ctx.limits,
+            extenddb_core::validation::AttributeNameRequestForm::SingleItem,
+        ) {
             tracing::warn!(error = %e, "import: skipping item with oversized attribute name");
             error_count += 1;
             continue;
@@ -395,7 +399,11 @@ async fn wait_for_table_active(
 /// the service's message (measured live, `live-r2/arn-kinds-live.json`). An
 /// unparseable `TableArn` is refused earlier, before authorization, by
 /// `authz_resource::validate_operation_arns`.
-fn extract_table_name_from_arn(arn: &str) -> Result<String, DynamoDbError> {
+///
+/// `RestoreTableToPointInTime` reads its `SourceTableArn` through this too,
+/// with no check before authorization: an index ARN there is refused here
+/// with the same message (measured on DynamoDB).
+pub(crate) fn extract_table_name_from_arn(arn: &str) -> Result<String, DynamoDbError> {
     match extenddb_core::arn::parse(arn) {
         Some(extenddb_core::arn::TableResource {
             table, sub: None, ..

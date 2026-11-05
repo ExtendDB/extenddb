@@ -33,6 +33,7 @@ mod scan;
 mod search_vectors;
 #[cfg(test)]
 mod service_error_log_tests;
+mod start_key;
 pub mod stream_capture;
 mod streams;
 mod tagging;

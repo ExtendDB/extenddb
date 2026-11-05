@@ -144,8 +144,12 @@ fn discover_docs_dir() -> Option<String> {
     None
 }
 
+/// How long `init` waits for the catalog's migration lock, which another
+/// `init` or a `migrate` may hold.
+const INIT_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Returns exit code: 0 = success, 255 = existing config preserved.
-pub async fn run(args: InitArgs) -> anyhow::Result<u8> {
+pub async fn run(args: InitArgs, release: &str) -> anyhow::Result<u8> {
     // The installed backend is authoritative — there is exactly one compiled
     // into this binary. An explicit --backend (or a config file's backend key)
     // is validated against it rather than driving dispatch, so a mismatch is a
@@ -209,8 +213,8 @@ pub async fn run(args: InitArgs) -> anyhow::Result<u8> {
     )?;
 
     // Extract bind_addr from CLI args
-    let bind_addr =
-        extract_arg(&cli_args, "--bind-addr").unwrap_or_else(|| "127.0.0.1".to_string());
+    let bind_addr = extenddb_storage::bootstrapper::helpers::extract_arg(&cli_args, "--bind-addr")
+        .unwrap_or_else(|| "127.0.0.1".to_string());
 
     // Generate the self-signed TLS certificate if it isn't already present,
     // covering the bind address plus any --tls-san values so it matches the URLs
@@ -248,29 +252,12 @@ pub async fn run(args: InitArgs) -> anyhow::Result<u8> {
         .await
         .map_err(crate::cmd_migrate::op_err)?;
 
-    // Take the same lock `migrate` uses around the schema work below, so an
-    // init cannot race a migrate running on another replica and fail on a
-    // duplicate pg_type entry from concurrent `CREATE TABLE IF NOT EXISTS`.
-    // Two concurrent inits cannot get this far: the second aborts earlier, at
-    // `create_catalog_db`, because the database already exists. The catalog
-    // database does exist by this point, so the lock connection can be opened.
-    //
-    // The lock is held through the bootstrap rows as well, not just the
-    // schema: a server that starts after the schema exists but before the
-    // encryption key is written fails with MissingEncryptionKey, and on
-    // SQLite this same lock is what keeps `serve` out until init is done.
-    bootstrapper
-        .acquire_migration_lock()
-        .await
-        .map_err(crate::cmd_migrate::op_err)?;
-    let bootstrap_result = run_init_bootstrap(bootstrapper.as_ref()).await;
-    if let Err(e) = bootstrapper.release_migration_lock().await {
-        tracing::warn!(
-            "Failed to release migration lock: {}",
-            crate::cmd_migrate::op_err(e)
-        );
-    }
-    let admin_result = bootstrap_result?;
+    let migrations = extenddb_storage::migrations::installed()
+        .ok_or_else(|| anyhow::anyhow!("no storage backend is installed"))?;
+    let admin_result = init_on_runner(bootstrapper.as_ref(), migrations, release, &mut |line| {
+        println!("{line}");
+    })
+    .await?;
 
     if admin_result.already_existed {
         // Already printed by the bootstrap store.
@@ -324,72 +311,75 @@ pub async fn run(args: InitArgs) -> anyhow::Result<u8> {
     Ok(0)
 }
 
-/// Apply the catalog and data schema while the migration lock is held. Split out
-/// of `run` so that the lock is released on every path, including errors.
-/// Everything `init` does under the migration lock: the schema, then the
-/// rows a server needs before it can start (encryption key, default account,
-/// admin user).
-async fn run_init_bootstrap(
+/// `init` on a backend on the migration runner, all under the migration
+/// lock: the catalog's status, then every migration on a store that is not
+/// a catalog (`Uninitialized`), then the rows a server needs before it can
+/// start, then the data connection rows. A catalog whose migrations are all
+/// applied (`Current`) and that has no admin user, which an `init` that
+/// stopped after its migrations leaves, gets no migration and the rows it
+/// lacks; any other catalog is refused (another `init` may have created it
+/// while this one waited). Holding the lock through the rows keeps a server
+/// from starting on a catalog that has no encryption key yet. The target
+/// carries what the bootstrapper resolved from the command line, so the
+/// backend reads no flag itself. `say` prints this function's own lines:
+/// the one before the migrations, their notes, and the one that says a
+/// stopped `init` is being finished, before its rows.
+async fn init_on_runner(
     bootstrapper: &dyn extenddb_storage::bootstrapper::Bootstrapper,
+    migrations: &dyn extenddb_storage::migrations::CatalogMigrations,
+    release: &str,
+    say: &mut dyn FnMut(&str),
 ) -> anyhow::Result<extenddb_storage::bootstrapper::AdminBootstrapResult> {
-    run_init_migrations(bootstrapper).await?;
+    use extenddb_storage::bootstrapper::{finishes_a_stopped_init, write_bootstrap_rows};
+    use extenddb_storage::migrations::{RunKind, run_with_status};
 
-    bootstrapper
-        .bootstrap_encryption_key()
+    let target = bootstrapper.init_target();
+    let lock = migrations
+        .lock(&target, INIT_LOCK_TIMEOUT)
         .await
-        .map_err(crate::cmd_migrate::op_err)?; // REQ-AUTH-010
-
-    bootstrapper
-        .bootstrap_default_account()
-        .await
-        .map_err(crate::cmd_migrate::op_err)?;
-
-    // REQ-AUTH-003
-    let env_user = std::env::var("EXTENDDB_ADMIN_USER").ok();
-    let env_pass = std::env::var("EXTENDDB_ADMIN_PASSWORD").ok();
-    bootstrapper
-        .bootstrap_admin_user(env_user.as_deref(), env_pass.as_deref())
-        .await
-        .map_err(crate::cmd_migrate::op_err)
-}
-
-async fn run_init_migrations(
-    bootstrapper: &dyn extenddb_storage::bootstrapper::Bootstrapper,
-) -> anyhow::Result<()> {
-    // Check if catalog is already initialized.
-    let initialized = bootstrapper
-        .is_catalog_initialized()
-        .await
-        .map_err(crate::cmd_migrate::op_err)?;
-
-    if initialized {
-        println!("--- Catalog already initialized. Use 'extenddb migrate' for pending migrations.");
-    } else {
-        bootstrapper
-            .run_catalog_migrations()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let result = async {
+        let status = migrations
+            .status_under_lock(&lock, &target)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if finishes_a_stopped_init(bootstrapper, &status)
+            .await
+            .map_err(crate::cmd_migrate::op_err)?
+        {
+            say(&format!(
+                "--- Finishing a stopped init: {status} and has no admin user."
+            ));
+        } else {
+            say("--- Creating the catalog through its migrations...");
+            let report = run_with_status(migrations, &status, &lock, release, RunKind::Create)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            for note in &report.notes {
+                say(&format!("    {note}"));
+            }
+            crate::util::print_applied(&report, "    ", "Applied", "migration");
+        }
+        bootstrapper.hold(&lock);
+        let env_user = std::env::var("EXTENDDB_ADMIN_USER").ok();
+        let env_pass = std::env::var("EXTENDDB_ADMIN_PASSWORD").ok();
+        let admin = write_bootstrap_rows(bootstrapper, env_user.as_deref(), env_pass.as_deref())
             .await
             .map_err(crate::cmd_migrate::op_err)?;
+        bootstrapper
+            .record_data_connection()
+            .await
+            .map_err(crate::cmd_migrate::op_err)?;
+        Ok(admin)
     }
-
-    // Record data database connection in catalog.
-    bootstrapper
-        .record_data_connection()
-        .await
-        .map_err(crate::cmd_migrate::op_err)?;
-
-    // Initialize data database schema.
-    bootstrapper
-        .run_data_migrations()
-        .await
-        .map_err(crate::cmd_migrate::op_err)?;
-
-    Ok(())
+    .await;
+    migrations.release(lock).await;
+    result
 }
 
-/// Extract a CLI argument value by flag name.
-fn extract_arg(args: &[String], flag: &str) -> Option<String> {
-    args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
-}
+#[cfg(test)]
+#[path = "cmd_init_tests.rs"]
+mod runner_tests;
 
 #[cfg(test)]
 mod tests {
