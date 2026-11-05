@@ -72,6 +72,35 @@ pub(super) async fn run(
     }
 }
 
+/// Translate a parsed write statement into the request it runs as, without
+/// running it: the checks [`run`] makes before it authorizes the statement.
+///
+/// # Errors
+///
+/// The refusal [`run`] answers for a statement that fails one of them.
+pub(super) async fn check_translation(
+    ctx: &OperationContext,
+    stmt: &Statement,
+    params: &[AttributeValue],
+) -> Result<(), DynamoDbError> {
+    match stmt {
+        Statement::Insert(insert) => build_insert_parts(ctx, insert, params).await.map(drop),
+        Statement::Update(update) => build_update_parts(ctx, update, params).await.map(drop),
+        Statement::Delete(delete) => {
+            if let Some(returning) = delete.returning
+                && returning != Returning::AllOld
+            {
+                return Err(invalid_delete_returning(returning));
+            }
+            build_delete_parts(ctx, delete, params).await.map(drop)
+        }
+        Statement::Exists(_) => Err(exists_outside_transaction()),
+        Statement::Select(_) => Err(DynamoDbError::InternalServerError(
+            "SELECT routed to the write executor".to_owned(),
+        )),
+    }
+}
+
 /// `EXISTS(SELECT ...)` is a condition check for an `ExecuteTransaction`
 /// member. `ExecuteStatement` refuses it, and a `BatchExecuteStatement`
 /// member reports it as its error (measured 2026-11-02).

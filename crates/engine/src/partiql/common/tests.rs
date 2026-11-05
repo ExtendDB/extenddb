@@ -73,29 +73,35 @@ fn a_key_with_two_values_keeps_the_first_values() {
 }
 
 #[test]
-fn a_key_past_its_size_limit_names_the_batch_table() {
+fn an_error_of_the_item_operation_names_the_batch_table() {
     let size = DynamoDbError::ValidationException(
         "One or more parameter values were invalid: Size of hashkey has exceeded the \
          maximum size limit of2048 bytes"
             .to_owned(),
     );
+    let key_update = DynamoDbError::ValidationException(
+        "One or more parameter values were invalid: Cannot update attribute pk. This \
+         attribute is part of the key"
+            .to_owned(),
+    );
     let key_type = DynamoDbError::ValidationException(key_type_error("pk").message().to_owned());
-    assert_eq!(
-        StatementError::from_key_error(&size).into_entry(Some("t"))["TableName"],
-        json!("t")
-    );
-    assert!(
-        StatementError::from_key_error(&key_type)
-            .into_entry(Some("t"))
-            .get("TableName")
-            .is_none()
-    );
-    assert!(
-        StatementError::from_error(&size)
-            .into_entry(Some("t"))
-            .get("TableName")
-            .is_none()
-    );
+    for error in [&size, &key_update] {
+        assert_eq!(
+            StatementError::from_item_error(error).into_entry(Some("t")),
+            json!({
+                "Error": { "Code": "ValidationError", "Message": error.message() },
+                "TableName": "t",
+            })
+        );
+    }
+    for error in [&size, &key_type] {
+        assert!(
+            StatementError::from_error(error)
+                .into_entry(Some("t"))
+                .get("TableName")
+                .is_none()
+        );
+    }
 }
 
 #[test]

@@ -172,20 +172,6 @@ pub(super) fn key_names(schema: &[KeySchemaElement]) -> (Option<&str>, Option<&s
     (partition, sort)
 }
 
-/// Whether an error is the refusal of a key value past its size limit, in
-/// the words `validate_key_size_limits` gives it for a partition key and a
-/// sort key.
-pub(super) fn is_key_size_error(err: &DynamoDbError) -> bool {
-    const PREFIXES: [&str; 2] = [
-        "One or more parameter values were invalid: Size of hashkey has exceeded the maximum \
-         size limit of",
-        "One or more parameter values were invalid: Aggregated size of all range keys has \
-         exceeded the size limit of",
-    ];
-    matches!(err, DynamoDbError::ValidationException(message)
-        if PREFIXES.iter().any(|prefix| message.starts_with(prefix)))
-}
-
 /// The target table name of any parsed statement.
 pub(super) fn statement_table(stmt: &Statement) -> &str {
     match stmt {
@@ -438,11 +424,10 @@ pub(super) fn flatten_and_lossy<'a>(expr: &'a WhereExpr, out: &mut Vec<&'a Where
 ///
 /// Per-statement failures inside a batch surface as short Codes without the
 /// `Exception` suffix, and the call itself stays HTTP 200. `TableName` is echoed
-/// only for an authorization refusal and the failures that reached the item
-/// layer (`DuplicateItem`, `ConditionalCheckFailed`, and a key value past its
-/// size limit, see [`StatementError::from_key_error`]); other validation and
-/// resource-not-found errors carry the `Error` object alone, matching the
-/// service. A conditional failure on a
+/// only for an authorization refusal and the failures of the item operation a
+/// statement runs as (see [`StatementError::from_item_error`]); the errors of
+/// reading and translating a statement carry the `Error` object alone,
+/// matching the service. A conditional failure on a
 /// statement that set `ReturnValuesOnConditionCheckFailure` to `ALL_OLD`
 /// carries the existing item on the `Error` itself, never on the entry
 /// (measured 2026-11-02).
@@ -494,14 +479,17 @@ impl StatementError {
         }
     }
 
-    /// Map the error of a statement that reads or writes by key: as
-    /// [`Self::from_error`], except that a key value past its size limit
-    /// carries the statement's `TableName` (measured 2026-11-02 for SELECT,
-    /// INSERT, UPDATE and DELETE; a key value of the wrong type carries
-    /// none).
-    pub(super) fn from_key_error(err: &DynamoDbError) -> Self {
+    /// Map an error of the item operation a statement runs as: as
+    /// [`Self::from_error`], carrying the statement's `TableName`. The service
+    /// names the table on each of them: a key value past its size limit
+    /// (measured 2026-11-02 for SELECT, INSERT, UPDATE and DELETE), an
+    /// UPDATE of a key attribute, a secondary index key of the wrong type,
+    /// and an update the item cannot take (measured 2026-11-05). The errors
+    /// of reading and translating a statement name none: a key value of the
+    /// wrong type, a missing parameter, a WHERE without the full key.
+    pub(super) fn from_item_error(err: &DynamoDbError) -> Self {
         let mut error = Self::from_error(err);
-        error.include_table_name |= is_key_size_error(err);
+        error.include_table_name = true;
         error
     }
 

@@ -14,6 +14,10 @@
 //! statement committing independently, which is what makes partial success
 //! real). Nothing here re-implements statement translation.
 //!
+//! Only the statements that translate count as reads or writes, and only
+//! those whose request passes its checks count in the check for two
+//! statements on one item (see `translation`).
+//!
 //! Each statement is authorized at its place among its checks (see
 //! `authorize::gate`). Two statements that name one item fail the request
 //! before any statement is authorized, as a read without the full primary
@@ -27,7 +31,7 @@ use serde_json::{Map, Value, json};
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::partiql::Statement;
-use extenddb_core::partiql::ast::{FromSource, SelectStatement};
+use extenddb_core::partiql::ast::{FromSource, Projection, SelectStatement};
 use extenddb_core::partiql::parser::parse_for_request;
 use extenddb_core::types::TableKeyInfo;
 use extenddb_storage::error::StorageError;
@@ -37,6 +41,10 @@ use super::common::{self, StatementError};
 use super::{SingleRequest, write};
 use crate::create_table::storage_err_to_dynamo;
 use crate::{DispatchMetrics, DispatchResult, OperationContext, handle_get_item};
+
+use translation::Translation;
+
+mod translation;
 
 /// Per-statement request state after parsing.
 struct Parsed {
@@ -134,25 +142,6 @@ pub(super) async fn run(
         }
     }
 
-    // Classify over the statements that parsed. A batch is all reads or all
-    // writes; mixing fails the whole request.
-    let reads = parsed
-        .iter()
-        .filter_map(|p| p.stmt.as_ref())
-        .filter(|s| s.is_read())
-        .count();
-    let writes = parsed
-        .iter()
-        .filter_map(|p| p.stmt.as_ref())
-        .filter(|s| !s.is_read())
-        .count();
-    if reads > 0 && writes > 0 {
-        return Err(DynamoDbError::ValidationException(
-            "Read and write requests together in the same batch is not supported.".to_owned(),
-        ));
-    }
-    let is_write_batch = writes > 0;
-
     // Each statement's table key schema, from the read above (None when the
     // table is unknown; that statement's ResourceNotFound surfaces
     // per-statement).
@@ -167,18 +156,51 @@ pub(super) async fn run(
         }
     }
 
+    // Each statement that parsed is translated into the read or the write it
+    // runs as (see `translation`).
+    let mut translations: Vec<Option<Translation>> = Vec::with_capacity(parsed.len());
+    for (p, key_info) in parsed.iter().zip(&key_infos) {
+        translations.push(match &p.stmt {
+            Some(Statement::Select(select)) => {
+                Some(check_read(ctx, select, &p.req, key_info.as_ref()).await?)
+            }
+            Some(stmt) => {
+                Some(translation::translate_write(ctx, stmt, &p.req, key_info.as_ref()).await?)
+            }
+            None => None,
+        });
+    }
+
+    // Classify over the statements that translate. A batch is all reads or
+    // all writes; mixing fails the whole request.
+    let counted = || {
+        parsed
+            .iter()
+            .zip(&translations)
+            .filter(|(_, translation)| translation.as_ref().is_some_and(Translation::counts))
+            .filter_map(|(p, _)| p.stmt.as_ref())
+    };
+    let reads = counted().filter(|s| s.is_read()).count();
+    let writes = counted().filter(|s| !s.is_read()).count();
+    if reads > 0 && writes > 0 {
+        return Err(DynamoDbError::ValidationException(
+            "Read and write requests together in the same batch is not supported.".to_owned(),
+        ));
+    }
+
     // Two statements naming the same item fail the whole request.
-    detect_duplicate_keys(&parsed, &key_infos, is_write_batch)?;
+    detect_duplicate_keys(&parsed, &translations)?;
 
     // Execute positionally.
     let mut responses: Vec<Value> = Vec::with_capacity(parsed.len());
     let mut capacity = CapacityList::default();
-    for (i, p) in parsed.into_iter().enumerate() {
+    for ((p, translation), key_info) in parsed.into_iter().zip(translations).zip(&key_infos) {
         if let Some(msg) = p.parse_err {
             responses.push(StatementError::parse(msg).into_entry(None));
             continue;
         }
         let stmt = p.stmt.expect("non-parse-error statement is Some");
+        let translation = translation.expect("a statement that parsed is translated");
         let table = common::statement_table(&stmt).to_owned();
         let mut req = p.req;
         req.return_consumed_capacity = rcc.map(str::to_owned);
@@ -186,32 +208,46 @@ pub(super) async fn run(
         // Each statement is authorized at its place among its checks (see
         // `authorize::gate`). A refused statement's entry carries the
         // refusal and its table, and the others run (measured 2026-11-03).
-        let mut gate = Gate::new(ctx, &stmt, key_infos[i].as_ref(), &req, Surface::Batch);
-        let answer = if is_write_batch {
-            let result = write::run(ctx, &stmt, &req, &mut gate).await;
-            gate.settle(result).await?.map(|result| {
-                capacity.add(&result.body);
-                write_entry(&table, &result.body)
-            })
-        } else {
-            let Statement::Select(select) = &stmt else {
-                unreachable!("read batch holds only SELECT statements");
-            };
-            let read = ReadTarget {
-                select,
-                req: &req,
-                table: &table,
-                key_info: key_infos[i].as_ref(),
-            };
-            let result = execute_read(ctx, &read, &mut capacity, &mut gate).await?;
-            gate.settle(result).await?
+        let mut gate = Gate::new(ctx, &stmt, key_info.as_ref(), &req, Surface::Batch);
+        let key = match translation {
+            Translation::Runs { key } => key,
+            Translation::Untranslated(error) => {
+                let answer = gate.settle(Err::<Value, _>(error)).await?;
+                responses.push(refusal_entry(answer, false, &table));
+                continue;
+            }
+            Translation::Refused { error, names_table } => {
+                let answer = gate.settle(Err::<Value, _>(error)).await?;
+                responses.push(refusal_entry(answer, names_table, &table));
+                continue;
+            }
         };
-        // A key value past its size limit names the table, on every write
-        // and on a read (measured 2026-11-02 for SELECT, INSERT, UPDATE and
-        // DELETE).
-        responses.push(
-            answer.unwrap_or_else(|e| StatementError::from_key_error(&e).into_entry(Some(&table))),
-        );
+        let result = match &stmt {
+            Statement::Select(_) => {
+                let key = key.clone().expect("a read that runs names its item");
+                execute_read(ctx, &req, &table, key, &mut gate).await
+            }
+            _ => write::run(ctx, &stmt, &req, &mut gate).await,
+        };
+        // Every error of a statement that reached its item names the table:
+        // a failed condition, a duplicate key, a key value past its size
+        // limit, an update the item cannot take (measured 2026-11-02 for the
+        // key size, 2026-11-05 for the others).
+        let reached_item = result.is_err() && gate.decided();
+        let entry = match gate.settle(result).await? {
+            Ok(result) => {
+                capacity.add(&result.body);
+                match &stmt {
+                    Statement::Select(select) => read_entry(select, &table, &result.body),
+                    _ => write_entry(&table, &result.body),
+                }
+            }
+            Err(error) if reached_item => {
+                StatementError::from_item_error(&error).into_entry(Some(&table))
+            }
+            Err(error) => StatementError::from_error(&error).into_entry(Some(&table)),
+        };
+        responses.push(entry);
     }
 
     let mut out = Map::new();
@@ -263,35 +299,29 @@ async fn projected_call_error(
 pub(super) const PRIMARY_KEY_REQUIRED: &str = "Select statements within BatchExecuteStatement must specify the primary key in the where \
      clause.";
 
-/// One read statement of a batch and what it reads.
-struct ReadTarget<'r> {
-    select: &'r SelectStatement,
-    req: &'r SingleRequest,
-    table: &'r str,
-    key_info: Option<&'r TableKeyInfo>,
-}
-
-/// Execute one read statement, passing `gate` before the item is read: its
-/// `Responses[i]` entry, or the refusal its entry carries. The outer error
-/// is a fault that fails the request.
-async fn execute_read(
+/// How far the read statement `select` gets (see [`Translation`]), from the
+/// checks it gets before its item is read, in the service's order. A read
+/// that runs names its item. The outer error is a fault that fails the
+/// request.
+async fn check_read(
     ctx: &OperationContext,
-    read: &ReadTarget<'_>,
-    capacity: &mut CapacityList,
-    gate: &mut Gate<'_>,
-) -> Result<Result<Value, DynamoDbError>, DynamoDbError> {
-    let ReadTarget {
-        select,
-        req,
-        table,
-        key_info,
-    } = *read;
+    select: &SelectStatement,
+    req: &SingleRequest,
+    key_info: Option<&TableKeyInfo>,
+) -> Result<Translation, DynamoDbError> {
+    let untranslated = |error| Ok(Translation::Untranslated(error));
+    // A read that is not of one item by its full primary key translates, and
+    // counts as a read (measured 2026-11-05).
+    let primary_key_required = || {
+        Ok(Translation::Refused {
+            error: DynamoDbError::ValidationException(PRIMARY_KEY_REQUIRED.to_owned()),
+            names_table: false,
+        })
+    };
     // An unknown table is a per-statement ResourceNotFound (the call stays 200).
     let Some(key_info) = key_info else {
-        return Ok(Err(DynamoDbError::ResourceNotFoundException(String::new())));
+        return untranslated(DynamoDbError::ResourceNotFoundException(String::new()));
     };
-    let primary_key_required =
-        || DynamoDbError::ValidationException(PRIMARY_KEY_REQUIRED.to_owned());
 
     // A named index is resolved before the key check. Measured on the service:
     // a missing index is a per-statement ValidationError with the bare index
@@ -311,24 +341,24 @@ async fn execute_read(
             {
                 Ok(info) => {
                     if let Err(e) = common::ensure_single_attribute_keys(&info.key_schema) {
-                        return Ok(Err(e));
+                        return untranslated(e);
                     }
                 }
                 Err(StorageError::IndexNotFound(_)) => {
-                    return Ok(Err(DynamoDbError::ValidationException(
+                    return untranslated(DynamoDbError::ValidationException(
                         "The table does not have the specified index".to_owned(),
-                    )));
+                    ));
                 }
                 Err(e) => return Err(storage_err_to_dynamo(e)),
             }
         }
-        return Ok(Err(primary_key_required()));
+        return primary_key_required();
     }
 
     // A multi-part base table key (this engine's preview extension) is refused
     // per statement with the service's multi-attribute message.
     if let Err(e) = common::ensure_single_attribute_keys(&key_info.key_schema) {
-        return Ok(Err(e));
+        return untranslated(e);
     }
 
     let (pk, sk) = common::key_names(&key_info.key_schema);
@@ -341,17 +371,26 @@ async fn execute_read(
     // A batch SELECT must be a full-primary-key point read; a partial key is a
     // per-statement ValidationError.
     let Some(key) = common::point_read_key(select, pk, sk, &req.parameters)? else {
-        return Ok(Err(primary_key_required()));
+        return primary_key_required();
     };
     // A key value of the wrong type gets the message a single SELECT gets,
     // not the GetItem one (measured 2026-11-02).
     if let Err(e) = common::check_key_types(&key, key_info) {
-        return Ok(Err(e));
+        return untranslated(e);
     }
+    Ok(Translation::Runs { key: Some(key) })
+}
 
-    if let Err(e) = gate.pass().await {
-        return Ok(Err(e));
-    }
+/// Read the item `key` names in `table` for a read statement of `req`,
+/// passing `gate` first: the `GetItem` answer, or the statement's refusal.
+async fn execute_read(
+    ctx: &OperationContext,
+    req: &SingleRequest,
+    table: &str,
+    key: Map<String, Value>,
+    gate: &mut Gate<'_>,
+) -> Result<DispatchResult, DynamoDbError> {
+    gate.pass().await?;
     let mut get_body = json!({ "TableName": table, "Key": Value::Object(key) });
     // ConsistentRead is carried per member: a consistent member is charged a
     // full read unit where an eventual one is charged half (measured
@@ -362,56 +401,57 @@ async fn execute_read(
     if let Some(rcc) = &req.return_consumed_capacity {
         get_body["ReturnConsumedCapacity"] = json!(rcc);
     }
-    let result = match handle_get_item(get_body, ctx).await {
-        Ok(result) => result,
-        Err(e) => return Ok(Err(e)),
-    };
-    capacity.add(&result.body);
+    handle_get_item(get_body, ctx).await
+}
+
+/// A read member's `Responses[i]` entry: its table, plus the item `body`
+/// holds. A batch SELECT with a projection list projects the item, as the
+/// service does; SELECT * returns it whole.
+fn read_entry(select: &SelectStatement, table: &str, body: &Value) -> Value {
     let mut entry = Map::new();
     entry.insert("TableName".to_owned(), Value::String(table.to_owned()));
-    if let Some(item) = result.body.get("Item") {
-        // A batch SELECT with a projection list projects the item, as the
-        // service does; SELECT * returns it whole.
+    if let Some(item) = body.get("Item") {
         let shaped = match &select.projection {
-            extenddb_core::partiql::ast::Projection::All => item.clone(),
-            extenddb_core::partiql::ast::Projection::Paths(paths) => {
-                super::select::project_item(item, paths)
-            }
+            Projection::All => item.clone(),
+            Projection::Paths(paths) => super::select::project_item(item, paths),
         };
         entry.insert("Item".to_owned(), shaped);
     }
-    Ok(Ok(Value::Object(entry)))
+    Value::Object(entry)
 }
 
-/// Fail the request when two statements address the same item.
+/// The `Responses[i]` entry of a statement refused before it ran: `answer`
+/// is the refusal, or the statement's `AccessDenied`. The refusal carries
+/// the statement's table when `names_table`.
+fn refusal_entry(answer: Result<Value, DynamoDbError>, names_table: bool, table: &str) -> Value {
+    let error = match answer {
+        Err(error) => error,
+        Ok(_) => unreachable!("a refused statement is answered with an error"),
+    };
+    let entry = if names_table {
+        StatementError::from_item_error(&error)
+    } else {
+        StatementError::from_error(&error)
+    };
+    entry.into_entry(Some(table))
+}
+
+/// Fail the request when two statements that run address the same item.
 fn detect_duplicate_keys(
     parsed: &[Parsed],
-    key_infos: &[Option<TableKeyInfo>],
-    is_write_batch: bool,
+    translations: &[Option<Translation>],
 ) -> Result<(), DynamoDbError> {
     let mut seen: HashSet<String> = HashSet::with_capacity(parsed.len());
-    for (i, p) in parsed.iter().enumerate() {
-        let (Some(stmt), Some(key_info)) = (&p.stmt, &key_infos[i]) else {
+    for (p, translation) in parsed.iter().zip(translations) {
+        let (Some(stmt), Some(key)) = (&p.stmt, translation.as_ref().and_then(Translation::key))
+        else {
             continue;
         };
-        let (pk, sk) = common::key_names(&key_info.key_schema);
-        let Some(pk) = pk else {
-            continue;
-        };
-        let key = if is_write_batch {
-            common::write_key(stmt, pk, sk, &p.req.parameters)?
-        } else if let Statement::Select(select) = stmt {
-            common::point_read_key(select, pk, sk, &p.req.parameters)?
-        } else {
-            None
-        };
-        if let Some(key) = key {
-            let id = common::canonical_identity(common::statement_table(stmt), &key);
-            if !seen.insert(id) {
-                return Err(DynamoDbError::ValidationException(
-                    "Provided list of item keys contains duplicates".to_owned(),
-                ));
-            }
+        let id = common::canonical_identity(common::statement_table(stmt), key);
+        if !seen.insert(id) {
+            return Err(DynamoDbError::ValidationException(
+                "Provided list of item keys contains duplicates".to_owned(),
+            ));
         }
     }
     Ok(())

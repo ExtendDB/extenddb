@@ -25,6 +25,8 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from conftest import wait_for_active
+from partiql_gsi_table import get as _gget
+from partiql_gsi_table import gsi_table, item, key, put
 
 
 @pytest.fixture(scope="session")
@@ -458,3 +460,385 @@ def test_member_delete_missing_key_with_predicate_is_a_no_op(dynamodb_client, bt
         ],
     )
     assert resp["Responses"] == [{"TableName": btable}]
+
+
+# --- statements that fail before they run -----------------------------------
+# The service translates each statement into the read or the write it runs
+# as. A statement whose translation fails gets its own error and counts as
+# neither a read nor a write, nor in the check for two statements on one item.
+# A statement that translates and fails the check of its request counts as a
+# read or a write, and not in the check for two statements on one item. The
+# errors of the item operation a statement runs as name its table (measured
+# 2026-11-05 against a table with a global secondary index).
+
+MIXED = "Read and write requests together in the same batch is not supported."
+DUPLICATES = "Provided list of item keys contains duplicates"
+PARAMETERS = "Number of parameters in request and statement don't match."
+NOT_FOUND = {"Error": {"Code": "ResourceNotFound", "Message": "Requested resource not found"}}
+KEY_TYPE = "Key attribute's data type should match its data type in table's schema: Key sk"
+INDEX_KEY_TYPE = (
+    "One or more parameter values were invalid: Type mismatch for Index Key g Expected: S "
+    "Actual: N IndexName: gsi"
+)
+
+
+def _key_update(name):
+    return (
+        f"One or more parameter values were invalid: Cannot update attribute {name}. "
+        "This attribute is part of the key"
+    )
+
+
+def _validation(message, table=None):
+    entry = {"Error": {"Code": "ValidationError", "Message": message}}
+    if table is not None:
+        entry["TableName"] = table
+    return entry
+
+
+@pytest.fixture(scope="module")
+def gtable(dynamodb_client):
+    """The table with the index `gsi`, holding the item of the reads."""
+    with gsi_table(dynamodb_client, "extenddb-measure-2c-batchg") as name:
+        put(dynamodb_client, name, "seed")
+        yield name
+
+
+def _sql(template, table, **names):
+    """`template` with `{t}` as the quoted table and each other field as the
+    key that name takes in this run."""
+    return template.format(t=f'"{table}"', **{n: key(v) for n, v in names.items()})
+
+
+def _seed_read(table):
+    return _sql("SELECT * FROM {t} WHERE pk = '{s}' AND sk = 'b'", table, s="seed")
+
+
+def _seed_answer(table):
+    return {"TableName": table, "Item": item(key("seed"))}
+
+
+@pytest.mark.parametrize(
+    "statement, error",
+    [
+        ("SELECT * FROM nosuch_tbl WHERE pk = 'a' AND sk = 'b'", NOT_FOUND),
+        (
+            "SELECT * FROM {t}.\"nosuch\" WHERE g = 'a' AND gs = '1'",
+            _validation("The table does not have the specified index"),
+        ),
+        ("SELECT * FROM {t} WHERE pk = '{s}' AND sk = 1", _validation(KEY_TYPE)),
+        ("SELECT * FROM {t} WHERE pk = ? AND sk = 'b'", _validation(PARAMETERS)),
+    ],
+    ids=["missing-table", "missing-index", "key-type", "parameter"],
+)
+def test_a_read_that_does_not_translate_is_no_read(dynamodb_client, gtable, statement, error):
+    """A read that fails its translation leaves the batch to its writes."""
+    inserted = f"r-untranslated-{uuid.uuid4().hex[:6]}"
+    resp = _batch(
+        dynamodb_client,
+        [
+            {"Statement": _sql(statement, gtable, s="seed")},
+            {"Statement": _sql("INSERT INTO {t} VALUE {{'pk':'{k}','sk':'b','a':1}}", gtable,
+                               k=inserted)},
+        ],
+    )
+    assert resp["Responses"] == [error, {"TableName": gtable}]
+    assert _gget(dynamodb_client, gtable, key(inserted)) is not None
+
+
+@pytest.mark.parametrize(
+    "statement, error",
+    [
+        (
+            "INSERT INTO {t} VALUE {{'pk':'{k}'}}",
+            _validation("Key attribute should be present in the item: Key sk"),
+        ),
+        ("INSERT INTO {t} VALUE {{'pk':'{k}','sk':1}}", _validation(KEY_TYPE)),
+        (
+            "UPDATE {t} SET a = 9 WHERE pk = '{k}'",
+            _validation("Where clause does not contain a mandatory equality on all key attributes"),
+        ),
+        ("INSERT INTO {t} VALUE {{'pk':'{k}','sk':'b','x':?}}", _validation(PARAMETERS)),
+        (
+            "DELETE FROM {t} WHERE pk = '{k}' AND sk = 'b' RETURNING ALL NEW *",
+            _validation(
+                "Invalid returning clause: RETURNING ALL NEW *. Only RETURNING ALL OLD * is "
+                "allowed in DELETE statements."
+            ),
+        ),
+        ("UPDATE nosuch_tbl SET a = 9 WHERE pk = 'a' AND sk = 'b'", NOT_FOUND),
+        (
+            "UPDATE {t} SET a = 1, a = 2 WHERE pk = '{k}' AND sk = 'b'",
+            _validation(
+                "Two document paths overlap with each other; must remove or rewrite one of "
+                "these paths; path one: [a], path two: [a]"
+            ),
+        ),
+    ],
+    ids=[
+        "no-sort-key",
+        "key-type",
+        "partial-key",
+        "parameter",
+        "returning",
+        "missing-table",
+        "overlapping-paths",
+    ],
+)
+def test_a_write_that_does_not_translate_is_no_write(dynamodb_client, gtable, statement, error):
+    """A write that fails its translation leaves the batch to its reads, and
+    writes nothing."""
+    pk = put(dynamodb_client, gtable, "w-untranslated")
+    resp = _batch(
+        dynamodb_client,
+        [
+            {"Statement": _sql(statement, gtable, k="w-untranslated")},
+            {"Statement": _seed_read(gtable)},
+        ],
+    )
+    assert resp["Responses"] == [error, _seed_answer(gtable)]
+    assert _gget(dynamodb_client, gtable, pk) == item(pk)
+
+
+def test_a_failed_read_beside_a_write_lets_the_write_run(dynamodb_client, gtable):
+    resp = _batch(
+        dynamodb_client,
+        [
+            {"Statement": "SELECT * FROM nosuch_tbl WHERE pk = 'a' AND sk = 'b'"},
+            {"Statement": _sql("INSERT INTO {t} VALUE {{'pk':'{k}','sk':'b','a':1}}", gtable,
+                               k="cb1")},
+        ],
+    )
+    assert resp["Responses"] == [NOT_FOUND, {"TableName": gtable}]
+    pk = key("cb1")
+    assert _gget(dynamodb_client, gtable, pk) == {
+        "pk": {"S": pk},
+        "sk": {"S": "b"},
+        "a": {"N": "1"},
+    }
+
+
+@pytest.mark.parametrize(
+    "statements",
+    [
+        ["SELECT * FROM {t} WHERE pk = '{s}' AND sk = 'b'",
+         "UPDATE {t} SET a = 9 WHERE pk = '{k}' AND sk = 'b'"],
+        ["SELECT * FROM {t} WHERE pk = '{s}'",
+         "INSERT INTO {t} VALUE {{'pk':'{n}','sk':'b','a':1}}"],
+        ["SELECT * FROM {t}.\"gsi\" WHERE g = '{s}' AND gs = '1'",
+         "INSERT INTO {t} VALUE {{'pk':'{n}','sk':'b','a':1}}"],
+        ["SELECT * FROM {t} WHERE pk = '{s}' AND sk = 'b'",
+         "UPDATE {t} SET pk = 'z' WHERE pk = '{k}' AND sk = 'b'"],
+        ["SELECT * FROM {t} WHERE pk = '{s}' AND sk = 'b'",
+         "UPDATE {t} SET a = 9 WHERE pk = '{n}' AND sk = 'b'"],
+        ["SELECT * FROM {t} WHERE pk = '{s}' AND sk = 'b'",
+         "UPDATE {t} SET g = 1 WHERE pk = '{k}' AND sk = 'b'"],
+        ["SELECT * FROM {t} WHERE pk = '{s}' AND sk = 'b'",
+         "UPDATE {t} SET a.b = 1 WHERE pk = '{k}' AND sk = 'b'"],
+    ],
+    ids=[
+        "update",
+        "partial-key-read",
+        "index-read",
+        "key-update",
+        "missing-item",
+        "index-key-type",
+        "document-path",
+    ],
+)
+def test_a_statement_that_translates_counts_toward_the_mix(dynamodb_client, gtable, statements):
+    """A statement that translates is a read or a write, whatever its
+    request then answers."""
+    pk = put(dynamodb_client, gtable, "w-counted")
+    with pytest.raises(ClientError) as excinfo:
+        _batch(
+            dynamodb_client,
+            [{"Statement": _sql(s, gtable, s="seed", k="w-counted", n="w-counted-new")}
+             for s in statements],
+        )
+    assert _error(excinfo) == ("ValidationException", MIXED)
+    assert _gget(dynamodb_client, gtable, pk) == item(pk)
+    assert _gget(dynamodb_client, gtable, key("w-counted-new")) is None
+
+
+@pytest.mark.parametrize(
+    "first, error",
+    [
+        ("INSERT INTO {t} VALUE {{'pk':'{k}','sk':'b','x':?}}", _validation(PARAMETERS)),
+        ("UPDATE {t} SET a = ? WHERE pk = '{k}' AND sk = 'b'", _validation(PARAMETERS)),
+        ("UPDATE {t} SET a = 9 WHERE pk = '{k}' AND sk = 'b' AND a = ?", _validation(PARAMETERS)),
+        ("UPDATE {t} SET pk = 'z' WHERE pk = '{k}' AND sk = 'b'", "key-update:pk"),
+        ("UPDATE {t} REMOVE sk WHERE pk = '{k}' AND sk = 'b'", "key-update:sk"),
+        ("UPDATE {t} SET g = 1 WHERE pk = '{k}' AND sk = 'b'", "index-key-type"),
+        ("INSERT INTO {t} VALUE {{'pk':'{k}','sk':'b','g':1}}", "index-key-type"),
+        (
+            "UPDATE {t} SET a = 1, a = 2 WHERE pk = '{k}' AND sk = 'b'",
+            _validation(
+                "Two document paths overlap with each other; must remove or rewrite one of "
+                "these paths; path one: [a], path two: [a]"
+            ),
+        ),
+    ],
+    ids=[
+        "insert-parameter",
+        "set-parameter",
+        "condition-parameter",
+        "set-partition-key",
+        "remove-sort-key",
+        "set-index-key-type",
+        "insert-index-key-type",
+        "overlapping-paths",
+    ],
+)
+def test_a_write_refused_before_its_item_is_not_a_duplicate(
+    dynamodb_client, gtable, first, error
+):
+    """A write refused before it reaches its item leaves the item to the
+    other statement on it."""
+    pk = put(dynamodb_client, gtable, "dup-refused")
+    resp = _batch(
+        dynamodb_client,
+        [
+            {"Statement": _sql(first, gtable, k="dup-refused")},
+            {"Statement": _sql("DELETE FROM {t} WHERE pk = '{k}' AND sk = 'b'", gtable,
+                               k="dup-refused")},
+        ],
+    )
+    if error == "index-key-type":
+        error = _validation(INDEX_KEY_TYPE, gtable)
+    elif isinstance(error, str):
+        error = _validation(_key_update(error.split(":")[1]), gtable)
+    assert resp["Responses"] == [error, {"TableName": gtable}]
+    assert _gget(dynamodb_client, gtable, pk) is None
+
+
+def test_a_delete_with_another_returning_clause_is_not_a_duplicate(dynamodb_client, gtable):
+    pk = put(dynamodb_client, gtable, "dup-returning")
+    resp = _batch(
+        dynamodb_client,
+        [
+            {"Statement": _sql(
+                "DELETE FROM {t} WHERE pk = '{k}' AND sk = 'b' RETURNING ALL NEW *", gtable,
+                k="dup-returning")},
+            {"Statement": _sql("UPDATE {t} SET a = 9 WHERE pk = '{k}' AND sk = 'b'", gtable,
+                               k="dup-returning")},
+        ],
+    )
+    assert resp["Responses"] == [
+        _validation(
+            "Invalid returning clause: RETURNING ALL NEW *. Only RETURNING ALL OLD * is "
+            "allowed in DELETE statements."
+        ),
+        {"TableName": gtable},
+    ]
+    assert _gget(dynamodb_client, gtable, pk)["a"] == {"N": "9"}
+
+
+@pytest.mark.parametrize(
+    "first, error",
+    [
+        (
+            "SELECT * FROM {t}.\"nosuch\" WHERE pk = '{s}' AND sk = 'b'",
+            _validation("The table does not have the specified index"),
+        ),
+        (
+            "SELECT * FROM {t}.\"gsi\" WHERE pk = '{s}' AND sk = 'b'",
+            _validation(
+                "Select statements within BatchExecuteStatement must specify the primary key "
+                "in the where clause."
+            ),
+        ),
+    ],
+    ids=["missing-index", "index-read"],
+)
+def test_a_read_refused_before_its_item_is_not_a_duplicate(
+    dynamodb_client, gtable, first, error
+):
+    resp = _batch(
+        dynamodb_client,
+        [{"Statement": _sql(first, gtable, s="seed")}, {"Statement": _seed_read(gtable)}],
+    )
+    assert resp["Responses"] == [error, _seed_answer(gtable)]
+
+
+@pytest.mark.parametrize(
+    "first",
+    [
+        "UPDATE {t} SET a = 9 WHERE pk = '{k}' AND sk = 'b'",
+        "UPDATE {t} SET a = 9 WHERE pk = '{k}' AND sk = 'b' AND a = 99",
+        "UPDATE {t} SET b = m + 1 WHERE pk = '{k}' AND sk = 'b'",
+        "UPDATE {t} SET a.b = 1 WHERE pk = '{k}' AND sk = 'b'",
+    ],
+    ids=["update", "failed-condition", "operand-type", "document-path"],
+)
+def test_two_writes_that_reach_one_item_are_duplicates(dynamodb_client, gtable, first):
+    pk = put(dynamodb_client, gtable, "dup-reached")
+    with pytest.raises(ClientError) as excinfo:
+        _batch(
+            dynamodb_client,
+            [
+                {"Statement": _sql(first, gtable, k="dup-reached")},
+                {"Statement": _sql("DELETE FROM {t} WHERE pk = '{k}' AND sk = 'b'", gtable,
+                                   k="dup-reached")},
+            ],
+        )
+    assert _error(excinfo) == ("ValidationException", DUPLICATES)
+    assert _gget(dynamodb_client, gtable, pk) == item(pk)
+
+
+@pytest.mark.parametrize(
+    "statement, message",
+    [
+        ("UPDATE {t} SET pk = 'z' WHERE pk = '{k}' AND sk = 'b'", _key_update("pk")),
+        ("UPDATE {t} REMOVE sk WHERE pk = '{k}' AND sk = 'b'", _key_update("sk")),
+        (
+            "UPDATE {t} SET b = m + 1 WHERE pk = '{k}' AND sk = 'b'",
+            "An operand in the update expression has an incorrect data type",
+        ),
+        (
+            "UPDATE {t} SET a = set_add(a, <<'x'>>) WHERE pk = '{k}' AND sk = 'b'",
+            "An operand in the update expression has an incorrect data type",
+        ),
+        (
+            "UPDATE {t} SET a.b = 1 WHERE pk = '{k}' AND sk = 'b'",
+            "The document path provided in the update expression is invalid for update",
+        ),
+        (
+            "UPDATE {t} SET m[0] = 1 WHERE pk = '{k}' AND sk = 'b'",
+            "The document path provided in the update expression is invalid for update",
+        ),
+        ("UPDATE {t} SET g = 1 WHERE pk = '{k}' AND sk = 'b'", INDEX_KEY_TYPE),
+        ("INSERT INTO {t} VALUE {{'pk':'{n}','sk':'b','g':1}}", INDEX_KEY_TYPE),
+    ],
+    ids=[
+        "set-partition-key",
+        "remove-sort-key",
+        "operand-type",
+        "set-add-to-a-number",
+        "path-into-a-number",
+        "index-into-a-map",
+        "set-index-key-type",
+        "insert-index-key-type",
+    ],
+)
+def test_an_error_of_the_item_operation_names_the_table(
+    dynamodb_client, gtable, statement, message
+):
+    pk = put(dynamodb_client, gtable, "tn")
+    resp = _batch(
+        dynamodb_client, [{"Statement": _sql(statement, gtable, k="tn", n="tn-new")}]
+    )
+    assert resp["Responses"] == [_validation(message, gtable)]
+    assert _gget(dynamodb_client, gtable, pk) == item(pk)
+
+
+def test_an_error_of_reading_the_statement_names_no_table(dynamodb_client, gtable):
+    resp = _batch(
+        dynamodb_client,
+        [
+            {"Statement": _seed_read(gtable)},
+            {"Statement": _sql("SELECT * FROM {t} WHERE pk = ? AND sk = 'b'", gtable)},
+        ],
+    )
+    assert resp["Responses"] == [_seed_answer(gtable), _validation(PARAMETERS)]
+
