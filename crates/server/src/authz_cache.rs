@@ -23,8 +23,10 @@
 #![allow(clippy::module_name_repetitions)]
 
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 
+use extenddb_auth::policy::arn_value::is_arn_value_error;
 use extenddb_auth::policy::document::PolicyDocument;
 use extenddb_cache::{Loader, SwrCache, SwrCacheConfig};
 use extenddb_storage::authorization_store::{AuthorizationStore, SessionData};
@@ -752,7 +754,10 @@ fn make_user_policies_loader(inner: Arc<dyn AuthorizationStore>) -> PolDocsLoade
         let inner = inner.clone();
         async move {
             let raw = inner.fetch_user_policies(&account_id, &user_name).await?;
-            policy_list_if_nonempty(&raw)
+            policy_list_if_nonempty(
+                &raw,
+                &format_args!("an inline policy of user {user_name} in account {account_id}"),
+            )
         }
         .boxed()
     })
@@ -764,7 +769,20 @@ fn make_user_group_policies_loader(inner: Arc<dyn AuthorizationStore>) -> PolDoc
         let inner = inner.clone();
         async move {
             let raw = inner.fetch_user_group_policies(&account_id, &user_name).await?;
-            policy_list_if_nonempty(&raw)
+            if raw.is_empty() {
+                return Ok(None);
+            }
+            let mut docs = Vec::with_capacity(raw.len());
+            for (group_name, json) in &raw {
+                docs.push(parse_document(
+                    json,
+                    &format_args!(
+                        "an inline policy of group {group_name} in account {account_id} (user \
+                         {user_name} is a member)"
+                    ),
+                )?);
+            }
+            Ok(Some(Arc::new(docs)))
         }
         .boxed()
     })
@@ -776,7 +794,10 @@ fn make_role_policies_loader(inner: Arc<dyn AuthorizationStore>) -> PolDocsLoade
         let inner = inner.clone();
         async move {
             let raw = inner.fetch_role_policies(&account_id, &role_name).await?;
-            policy_list_if_nonempty(&raw)
+            policy_list_if_nonempty(
+                &raw,
+                &format_args!("an inline policy of role {role_name} in account {account_id}"),
+            )
         }
         .boxed()
     })
@@ -785,12 +806,15 @@ fn make_role_policies_loader(inner: Arc<dyn AuthorizationStore>) -> PolDocsLoade
 /// Parse `raw` JSON policy strings; return `Ok(None)` if `raw` is empty
 /// (so the SWR cache stores it as a negative entry with the short
 /// `negative_ttl`); otherwise wrap the parsed documents in `Some`.
-/// Parse errors propagate.
-fn policy_list_if_nonempty(raw: &[String]) -> OpResult<Option<PolicyList>> {
+/// Parse errors propagate. `owner` names whose policies these are.
+fn policy_list_if_nonempty(
+    raw: &[String],
+    owner: &dyn fmt::Display,
+) -> OpResult<Option<PolicyList>> {
     if raw.is_empty() {
         return Ok(None);
     }
-    parse_documents(raw).map(|v| Some(Arc::new(v)))
+    parse_documents(raw, owner).map(|v| Some(Arc::new(v)))
 }
 
 fn make_user_boundary_loader(inner: Arc<dyn AuthorizationStore>) -> BoundaryLoader {
@@ -799,7 +823,12 @@ fn make_user_boundary_loader(inner: Arc<dyn AuthorizationStore>) -> BoundaryLoad
         let inner = inner.clone();
         async move {
             match inner.fetch_user_boundary(&account_id, &user_name).await? {
-                Some(json_str) => Ok(Some(parse_document(&json_str)?)),
+                Some(json_str) => Ok(Some(parse_document(
+                    &json_str,
+                    &format_args!(
+                        "the permissions boundary of user {user_name} in account {account_id}"
+                    ),
+                )?)),
                 None => Ok(None),
             }
         }
@@ -813,7 +842,12 @@ fn make_role_boundary_loader(inner: Arc<dyn AuthorizationStore>) -> BoundaryLoad
         let inner = inner.clone();
         async move {
             match inner.fetch_role_boundary(&account_id, &role_name).await? {
-                Some(json_str) => Ok(Some(parse_document(&json_str)?)),
+                Some(json_str) => Ok(Some(parse_document(
+                    &json_str,
+                    &format_args!(
+                        "the permissions boundary of role {role_name} in account {account_id}"
+                    ),
+                )?)),
                 None => Ok(None),
             }
         }
@@ -918,7 +952,13 @@ fn make_session_data_loader(inner: Arc<dyn AuthorizationStore>) -> SessionLoader
             let Some(data) = raw else { return Ok(None) };
 
             let session_policy = match data.session_policy {
-                Some(json_str) => Some(parse_document(&json_str)?),
+                Some(json_str) => Some(parse_document(
+                    &json_str,
+                    &format_args!(
+                        "the session policy of role {role_name} session {session_name} in \
+                         account {account_id}"
+                    ),
+                )?),
                 None => None,
             };
             let session_tags: HashMap<String, String> = data.session_tags.into_iter().collect();
@@ -932,18 +972,31 @@ fn make_session_data_loader(inner: Arc<dyn AuthorizationStore>) -> SessionLoader
     })
 }
 
-fn parse_documents(jsons: &[String]) -> OpResult<Vec<Arc<PolicyDocument>>> {
+fn parse_documents(
+    jsons: &[String],
+    owner: &dyn fmt::Display,
+) -> OpResult<Vec<Arc<PolicyDocument>>> {
     let mut docs = Vec::with_capacity(jsons.len());
     for s in jsons {
-        docs.push(parse_document(s)?);
+        docs.push(parse_document(s, owner)?);
     }
     Ok(docs)
 }
 
-fn parse_document(s: &str) -> OpResult<Arc<PolicyDocument>> {
-    PolicyDocument::from_json(s)
-        .map(Arc::new)
-        .map_err(|e| OpError::Internal(format!("policy parse failed: {e}")))
+/// Parse one stored policy. The error names `owner`, the principal the policy
+/// belongs to, and `authorization.rs` logs it as the one line for the denied
+/// request, so an operator can find the policy and rewrite it. For a policy
+/// holding an Arn condition value that policy writes reject, the error says so.
+fn parse_document(s: &str, owner: &dyn fmt::Display) -> OpResult<Arc<PolicyDocument>> {
+    PolicyDocument::from_json(s).map(Arc::new).map_err(|e| {
+        let why = if is_arn_value_error(&e) {
+            " holds an Arn condition value that policy writes reject, so every request it \
+             governs is denied until it is rewritten"
+        } else {
+            ""
+        };
+        OpError::Internal(format!("policy parse failed: {owner}{why}: {e}"))
+    })
 }
 
 #[cfg(test)]
@@ -976,8 +1029,9 @@ pub(crate) mod tests {
         pub(crate) resource_tags_calls: AtomicUsize,
 
         pub(crate) user_policies: Mutex<HashMap<PrincipalKey, Vec<String>>>,
-        user_group_policies: Mutex<HashMap<PrincipalKey, Vec<String>>>,
-        user_boundary: Mutex<HashMap<PrincipalKey, Option<String>>>,
+        /// `(group_name, policy_document)` pairs per user.
+        pub(crate) user_group_policies: Mutex<HashMap<PrincipalKey, Vec<(String, String)>>>,
+        pub(crate) user_boundary: Mutex<HashMap<PrincipalKey, Option<String>>>,
         user_tags: Mutex<HashMap<PrincipalKey, TagPairs>>,
         pub(crate) role_policies: Mutex<HashMap<PrincipalKey, Vec<String>>>,
         role_boundary: Mutex<HashMap<PrincipalKey, Option<String>>>,
@@ -1008,7 +1062,7 @@ pub(crate) mod tests {
             &self,
             account_id: &str,
             user_name: &str,
-        ) -> BoxFuture<'_, OpResult<Vec<String>>> {
+        ) -> BoxFuture<'_, OpResult<Vec<(String, String)>>> {
             self.user_group_policies_calls
                 .fetch_add(1, Ordering::SeqCst);
             let key = (account_id.to_owned(), user_name.to_owned());

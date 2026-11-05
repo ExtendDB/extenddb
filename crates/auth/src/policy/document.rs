@@ -177,6 +177,7 @@ impl PolicyDocument {
         let version = raw["Version"].as_str().map(ToOwned::to_owned);
         let statements = parse_statements(&raw["Statement"])?;
         validate_statement_cidrs(&statements)?;
+        super::arn_value::validate_statement_arn_values(&statements)?;
         Ok(Self {
             version,
             statements,
@@ -209,7 +210,7 @@ impl PolicyDocument {
 
 /// Unwrap a condition operator to its base, dropping any `ForAllValues:` /
 /// `ForAnyValue:` prefix and `IfExists` suffix.
-fn base_operator(op: &ConditionOperator) -> &ConditionOperator {
+pub(super) fn base_operator(op: &ConditionOperator) -> &ConditionOperator {
     match op {
         ConditionOperator::ForAllValues(inner)
         | ConditionOperator::ForAnyValue(inner)
