@@ -781,15 +781,17 @@ class TestConsoleIamUserScoping:
             resp = iam_console.login(f"{self.account_id}/{user}", password)
             assert resp.status_code == 303
 
-            # Dashboard should be accessible.
+            # Dashboard should be accessible, with a link to the user's own
+            # page.
             resp = iam_console.get("")
             assert resp.status_code == 200
+            assert f"/console/accounts/{self.account_id}/users/{user}" in resp.text
 
-            # Account listing: IAM user should see limited view.
+            # The account list is for admins: an IAM user is redirected to
+            # the dashboard.
             resp = iam_console.get("/accounts")
-            assert resp.status_code == 200
-            # The IAM user's own account should be visible.
-            assert self.account_id in resp.text
+            assert resp.status_code == 303
+            assert resp.headers.get("location") == "/console"
         finally:
             self.admin_console.post(
                 f"/accounts/{self.account_id}/users/{user}/delete"

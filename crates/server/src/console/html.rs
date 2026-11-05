@@ -163,13 +163,26 @@ label{{display:block;margin:0.5rem 0 0.2rem;font-weight:500;font-size:0.9rem}}
     )
 }
 
-/// Build the navigation bar for an authenticated session.
-pub fn nav_bar(identity_label: &str) -> String {
+/// The caller a navigation bar is built for: the label shown at its right,
+/// and whether the caller is an admin.
+pub struct NavIdentity {
+    pub label: String,
+    pub is_admin: bool,
+}
+
+/// Build the navigation bar for an authenticated session. The Accounts link
+/// is left out for IAM users, because the account list and the account pages
+/// redirect an IAM-user session to the console dashboard.
+pub fn nav_bar(identity: &NavIdentity) -> String {
+    let accounts_link = if identity.is_admin {
+        "\n<a href=\"/console/accounts\">Accounts</a>"
+    } else {
+        ""
+    };
     format!(
         r#"<nav>
 <span class="brand">extenddb Console</span>
-<a href="/console">Dashboard</a>
-<a href="/console/accounts">Accounts</a>
+<a href="/console">Dashboard</a>{accounts_link}
 <a href="/console/metrics">Metrics</a>
 <a href="/console/settings">Settings</a>
 <a href="/console/cache">Cache</a>
@@ -179,7 +192,7 @@ pub fn nav_bar(identity_label: &str) -> String {
 <button class="btn btn-sm" type="submit">Logout</button>
 </form>
 </nav>"#,
-        identity = escape(identity_label),
+        identity = escape(&identity.label),
     )
 }
 
