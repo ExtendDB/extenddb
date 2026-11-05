@@ -74,6 +74,11 @@ pub(super) async fn run(
     let mut parsed: Vec<(SingleRequest, Statement)> = Vec::with_capacity(statements.len());
     for (i, obj) in statements.iter().enumerate() {
         let req = SingleRequest::from_body(obj)?;
+        if super::request_checks::is_blank_statement(&req.statement) {
+            return Err(DynamoDbError::ValidationException(
+                super::request_checks::EMPTY_TRANSACTION_STATEMENT.to_owned(),
+            ));
+        }
         super::check_parameters(obj.get("Parameters"))
             .map_err(DynamoDbError::ValidationException)?;
         let stmt = parse_for_request(&req.statement, req.parameters.len()).map_err(|e| {

@@ -74,9 +74,13 @@ pub(super) async fn run(
     let mut checked_all = Vec::with_capacity(statements.len());
     for obj in statements {
         let req = SingleRequest::from_body(obj)?;
-        let statement = super::check_parameters(obj.get("Parameters")).and_then(|()| {
-            parse_for_request(&req.statement, req.parameters.len()).map_err(|e| e.message)
-        });
+        let statement = if super::request_checks::is_blank_statement(&req.statement) {
+            Err(super::request_checks::EMPTY_BATCH_STATEMENT.to_owned())
+        } else {
+            super::check_parameters(obj.get("Parameters")).and_then(|()| {
+                parse_for_request(&req.statement, req.parameters.len()).map_err(|e| e.message)
+            })
+        };
         let projected_call = match &statement {
             Ok(Statement::Select(select)) => select
                 .projection_error

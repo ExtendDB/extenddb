@@ -630,3 +630,72 @@ def test_a_transaction_past_its_limit_echoes_a_map_in_the_service_order(client, 
     assert message == _errors(
         _list_part("ParameterizedStatement", members, "transactStatements", "Member must have length less than or equal to 100")
     )
+
+
+# ---- a statement of only whitespace -------------------------------------------
+#
+# Measured 2026-11-05. A statement that passes the length constraint and holds
+# only whitespace is refused as empty by BatchExecuteStatement, for that
+# member, and by ExecuteTransaction, for the whole request without the
+# member's position, ahead of the member's parameters and of the members
+# after it, and after the members before it. ExecuteStatement reads it as a
+# statement with nothing in it. A comment is not whitespace here.
+
+EMPTY_IN_A_BATCH = "The statement was empty."
+EMPTY_IN_A_TRANSACTION = "ExecuteTransaction can not have empty statement."
+WF = "Statement wasn't well formed, can't be processed: "
+
+BLANK = ["   ", "\t\n ", "\r", "\x0b", "\x0c", "\x1f", "\u2028", "\u3000"]
+
+
+@pytest.mark.parametrize("blank", BLANK, ids=[repr(b) for b in BLANK])
+def test_a_blank_statement_in_a_batch_fails_that_statement(client, table, blank):
+    responses = client.batch_execute_statement(
+        Statements=[{"Statement": _select(table)}, {"Statement": blank}]
+    )["Responses"]
+    assert responses[1] == {"Error": {"Code": "ValidationError", "Message": EMPTY_IN_A_BATCH}}
+    assert responses[0]["TableName"] == table
+
+
+@pytest.mark.parametrize("blank", BLANK, ids=[repr(b) for b in BLANK])
+def test_a_blank_statement_in_a_transaction_fails_the_request(client, table, blank):
+    message = _refusal(
+        client.execute_transaction,
+        TransactStatements=[{"Statement": _select(table)}, {"Statement": blank}],
+    )
+    assert message == EMPTY_IN_A_TRANSACTION
+
+
+@pytest.mark.parametrize(
+    ("statement", "reason"),
+    [("-- a note", "Unexpected term"), ("/* a note */", "Unexpected term"), ("\x01", "")],
+    ids=["line-comment", "block-comment", "control-character"],
+)
+def test_a_statement_that_is_not_blank(client, table, statement, reason):
+    responses = client.batch_execute_statement(Statements=[{"Statement": statement}])["Responses"]
+    assert responses == [{"Error": {"Code": "ValidationError", "Message": WF + reason}}]
+    message = _refusal(client.execute_transaction, TransactStatements=[{"Statement": statement}])
+    assert message == f"Validation failed in TransactStatements[0]: {WF}{reason}"
+
+
+def test_a_blank_statement_comes_before_its_parameters(client, table):
+    member = {"Statement": "   ", "Parameters": [{"N": "x"}]}
+    responses = client.batch_execute_statement(Statements=[member])["Responses"]
+    assert responses == [{"Error": {"Code": "ValidationError", "Message": EMPTY_IN_A_BATCH}}]
+    message = _refusal(client.execute_transaction, TransactStatements=[member])
+    assert message == EMPTY_IN_A_TRANSACTION
+
+
+def test_a_blank_transaction_member_comes_after_the_members_before_it(client, table):
+    broken = {"Statement": f'SELECT * FROM "{table}" WHERE'}
+    message = _refusal(client.execute_transaction, TransactStatements=[broken, {"Statement": "  "}])
+    assert message == f"Validation failed in TransactStatements[0]: {WF}Unexpected term"
+    missing = {"Statement": f"SELECT * FROM \"{table}-absent\" WHERE pk = 'a'"}
+    for statements in ([{"Statement": "  "}, missing], [missing, {"Statement": "  "}]):
+        message = _refusal(client.execute_transaction, TransactStatements=statements)
+        assert message == EMPTY_IN_A_TRANSACTION
+
+
+def test_execute_statement_reads_a_blank_statement_as_an_empty_one(client):
+    for blank in ["   ", "\t\n"]:
+        assert _refusal(client.execute_statement, Statement=blank) == WF + "Unexpected term"
