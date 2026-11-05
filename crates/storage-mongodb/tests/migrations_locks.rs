@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use bson::{Document, doc};
 use extenddb_storage::hooks::ServingRegistrar;
-use extenddb_storage::migrations::{CatalogStatus, MigrationError, Runner};
+use extenddb_storage::migrations::{CatalogStatus, MigrationError, MigrationId, Runner};
 use extenddb_storage_mongodb::migrations::{
     MigrationLock, MongoMigrations, ServingRegistration, Timing, lock, migrate_holding,
     register_and_check,
@@ -53,10 +53,15 @@ async fn two_migrators_started_together_apply_once_and_the_other_finds_nothing()
     applied.sort_unstable();
     assert_eq!(
         applied,
-        [0, 6],
+        [0, 8],
         "one applies every step and the other finds nothing"
     );
-    assert_eq!(d.status().await, CatalogStatus::Current { version: 5 });
+    assert_eq!(
+        d.status().await,
+        CatalogStatus::Current {
+            version: MigrationId::LATEST.number()
+        }
+    );
     d.drop_databases().await;
 }
 
@@ -204,7 +209,12 @@ async fn migrate_waits_for_a_running_server_and_a_server_refuses_while_a_migrati
             .is_none()
     );
     // The preview and verify read the status beside the server.
-    assert_eq!(d.status().await, CatalogStatus::Current { version: 5 });
+    assert_eq!(
+        d.status().await,
+        CatalogStatus::Current {
+            version: MigrationId::LATEST.number()
+        }
+    );
     serving.release().await;
     let (held, _) = lock(&d.target, false, Duration::from_secs(2), Timing::PRODUCTION)
         .await

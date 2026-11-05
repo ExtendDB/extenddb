@@ -325,7 +325,7 @@ extenddb implements a local IAM identity model that mirrors the structure of AWS
   - `dynamodb:FullTableScan` — restricts whether Scan operations are allowed (`Bool` condition).
   - `dynamodb:EnclosingOperation` — identifies the parent operation for batch/transact sub-operations.
 - REQ-ABAC-005: The policy engine must build a **request context** for each operation containing all applicable context keys. The request context is populated by the server middleware before policy evaluation.
-- REQ-ABAC-006: **Policy variables** (`${aws:PrincipalTag/key}`, `${aws:username}`, etc.) in Resource and NotResource ARNs and in Condition values are expanded from the request context, as AWS IAM expands them, so that one policy can grant access to resources that match the caller's own tags, for example `"Resource": "arn:aws:dynamodb:*:*:table/${aws:PrincipalTag/Team}-*"`. Expansion in `Resource` and `NotResource` applies to `2012-10-17` documents only, as in IAM. Two gaps in condition values remain and are filed as #534.
+- REQ-ABAC-006: **Policy variables** (`${aws:PrincipalTag/key}`, `${aws:username}`, etc.) in Resource and NotResource ARNs and in Condition values are expanded from the request context, as AWS IAM expands them, so that one policy can grant access to resources that match the caller's own tags, for example `"Resource": "arn:aws:dynamodb:*:*:table/${aws:PrincipalTag/Team}-*"`. Expansion in `Resource` and `NotResource` applies to `2012-10-17` documents only, as in IAM. Condition values follow the same `Version` rule, and only the string and ARN operators expand them (#534).
 
 ### 4.5 Authorization — Caching
 
