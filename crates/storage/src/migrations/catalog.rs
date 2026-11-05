@@ -185,6 +185,28 @@ pub trait CatalogMigrations: Send + Sync {
         false
     }
 
+    /// Whether the store at `target` exists only inside the server process
+    /// that opens it, as an in-memory SQLite database does: that server
+    /// creates the catalog when it starts, and no other process can read
+    /// its status, so `serve` reads none before it starts. Opens nothing;
+    /// `false` (the default) for every store another process can open.
+    fn in_process(&self, target: &Target) -> bool {
+        let _ = target;
+        false
+    }
+
+    /// Whether a dev build's server creates its catalog in the store at
+    /// `target`, whose status is `Uninitialized`. `true` (the default) when
+    /// the backend's server factory creates the catalog in any such store.
+    /// A backend whose factory refuses an uninitialized store that holds
+    /// another program's data, as `Uninitialized`, returns `false` for one
+    /// (SQLite: a database file with tables), so `serve` refuses it before
+    /// it forks with the refusal the factory gives after. Read-only.
+    async fn server_creates_catalog(&self, target: &Target) -> Result<bool, MigrationError> {
+        let _ = target;
+        Ok(true)
+    }
+
     /// The catalog status. Takes no lock and writes nothing, so it runs
     /// beside a server.
     async fn status(&self, target: &Target) -> Result<CatalogStatus, MigrationError>;
@@ -232,10 +254,11 @@ pub trait CatalogMigrations: Send + Sync {
     }
 
     /// Notes about the deployment that its status does not show, for the
-    /// preview and `verify` to print and `migrate --yes` to check before it
-    /// takes the lock ([`before_lock`]). On PostgreSQL: tables and sequences
-    /// the application role does not own. Read-only, like the status. None
-    /// by default.
+    /// preview and `verify` to print, and for `migrate --yes` and a server
+    /// under `catalog_upgrade = "apply"` to check before they take the lock
+    /// ([`before_lock`]). On PostgreSQL: tables and sequences the
+    /// application role does not own. Read-only, like the status. None by
+    /// default.
     async fn status_notes(&self, target: &Target) -> Result<Vec<StatusNote>, MigrationError> {
         let _ = target;
         Ok(Vec::new())
@@ -305,16 +328,19 @@ pub async fn policy_rewrite_lines(
 pub struct StatusNote {
     /// The line the preview and `verify` print.
     pub text: String,
-    /// Whether `migrate --yes` refuses before it takes the lock while the
-    /// note holds and the run would apply something.
+    /// Whether `migrate --yes`, and a server under `catalog_upgrade =
+    /// "apply"`, refuse before they take the lock while the note holds and
+    /// the run would apply something.
     pub refuses_runs: bool,
 }
 
-/// What `migrate --yes` checks before it takes the lock: the backend's
-/// status notes, returned for the operator to read, or a refusal (exit 1)
-/// when a note refuses runs and the run would apply something, which is
-/// every `--reconverge` and a `migrate` whose status is not `Current` or
-/// `AheadCompatible`. `init` creates its objects and checks nothing.
+/// What `migrate --yes`, and a server under `catalog_upgrade = "apply"`,
+/// check before they take the lock: the backend's status notes, returned
+/// for the operator to read, or a refusal (exit 1) when a note refuses runs
+/// and the run would apply something, which is every `--reconverge` and a
+/// `migrate` whose status is not `Current` or `AheadCompatible`. The
+/// refusal names `command`, the command that checks (`migrate --yes`).
+/// `init` creates its objects and checks nothing.
 ///
 /// # Errors
 ///
@@ -324,6 +350,7 @@ pub async fn before_lock(
     migrations: &dyn CatalogMigrations,
     target: &Target,
     kind: RunKind,
+    command: &str,
 ) -> Result<Vec<StatusNote>, MigrationError> {
     if kind == RunKind::Create {
         return Ok(Vec::new());
@@ -349,7 +376,7 @@ pub async fn before_lock(
     // One note per line, as the preview prints them, so the statements
     // each note ends with can be copied on their own.
     Err(MigrationError::Refused(format!(
-        "migrate --yes refuses to apply migrations while these notes hold:\n{}\nNothing was \
+        "{command} refuses to apply migrations while these notes hold:\n{}\nNothing was \
          changed and no lock was taken.",
         refusing
             .iter()
@@ -375,7 +402,47 @@ pub async fn run_locked(
     release: &str,
     kind: RunKind,
 ) -> Result<RunReport, MigrationError> {
+    locked_run(migrations, target, lock, release, kind, WhenCurrent::Run).await
+}
+
+/// What [`run_with_lock`] does with a `migrate` run when the status it
+/// reads under the lock is `Current` or `AheadCompatible`, so the run has
+/// nothing to apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WhenCurrent {
+    /// Call the backend's run, which records nothing and makes the steps
+    /// the backend takes beside the ledger on every run (PostgreSQL's
+    /// pgvector attempt): `migrate --yes`.
+    Run,
+    /// Release the lock without calling the backend's run, and return a
+    /// report with no step: a server starting under `catalog_upgrade =
+    /// "apply"`, which serves the catalog as it is.
+    Release,
+}
+
+/// [`run_locked`], returning a report with no step instead of calling the
+/// backend's run when `when_current` says so and the status under the lock
+/// leaves a `migrate` run nothing to apply.
+async fn locked_run(
+    migrations: &dyn CatalogMigrations,
+    target: &Target,
+    lock: &HeldLock,
+    release: &str,
+    kind: RunKind,
+    when_current: WhenCurrent,
+) -> Result<RunReport, MigrationError> {
     let status = migrations.status_under_lock(lock, target).await?;
+    if when_current == WhenCurrent::Release
+        && kind == RunKind::Migrate
+        && let CatalogStatus::Current { version } | CatalogStatus::AheadCompatible { version, .. } =
+            &status
+    {
+        return Ok(RunReport {
+            from: Some(*version),
+            to: Some(*version),
+            ..RunReport::default()
+        });
+    }
     run_with_status(migrations, &status, lock, release, kind).await
 }
 
@@ -397,6 +464,31 @@ pub async fn run_with_status(
         return Err(refusal);
     }
     migrations.run(lock, release, kind).await
+}
+
+/// Take the migration lock for `target`, waiting up to `timeout` for
+/// another migration and for running servers, run `kind` under it
+/// ([`run_locked`]), and release it on every exit path. `migrate --yes`
+/// and a server starting under `catalog_upgrade = "apply"` both run this;
+/// `when_current` says what a `migrate` run does when the status under the
+/// lock leaves it nothing to apply.
+///
+/// # Errors
+///
+/// [`MigrationError::Locked`] (exit 6) when the lock or a running server
+/// outlasted `timeout`, or as [`run_locked`].
+pub async fn run_with_lock(
+    migrations: &dyn CatalogMigrations,
+    target: &Target,
+    release: &str,
+    kind: RunKind,
+    timeout: Duration,
+    when_current: WhenCurrent,
+) -> Result<RunReport, MigrationError> {
+    let lock = migrations.lock(target, timeout).await?;
+    let report = locked_run(migrations, target, &lock, release, kind, when_current).await;
+    migrations.release(lock).await;
+    report
 }
 
 /// Delete the ledger rows of `id` under `lock`, which `migrations` took for

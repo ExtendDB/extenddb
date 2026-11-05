@@ -15,6 +15,9 @@
 //      if memory mode silently fell back to a file, it would fail.
 //   3. dbPath + memory together are refused: silently ignoring the path a
 //      caller asked to persist to would be data loss by configuration.
+//
+// The startup timeout and the reporting of a failed start are tested with a
+// stand-in server in test/start.test.js.
 
 "use strict";
 

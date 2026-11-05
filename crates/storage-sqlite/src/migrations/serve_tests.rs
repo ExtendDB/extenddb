@@ -2,24 +2,31 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The server factory reads the catalog status before it opens the
-//! database: a production build serves only `Current` and `AheadCompatible`
-//! and writes nothing when it refuses; a dev build migrates `Uninitialized`
-//! and `Behind` first, and refuses the rest; an in-memory database is
-//! created by the runner every time. The lock that keeps a migrator, a
-//! second migrator and a server apart is tested here too.
+//! database: it serves only `Current` and `AheadCompatible` and writes
+//! nothing when it refuses; a dev build creates a missing or empty
+//! database first; an in-memory database is created by the runner every
+//! time. The startup policy `serve` applies before the factory, which
+//! migrates a catalog behind the binary under `catalog_upgrade = "apply"`,
+//! and the lock that keeps a migrator, a second migrator and a server
+//! apart are tested here too.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use extenddb_storage::migrations::{CatalogStatus, MigrationError, MigrationId, exit};
+use async_trait::async_trait;
+use extenddb_storage::migrations::{
+    CatalogMigrations, CatalogStatus, HeldLock, LedgerRow, Listed, MigrationError, MigrationId,
+    Prepared, RunKind, RunReport, Startup, Target, exit, prepare_to_serve,
+};
 use extenddb_storage::server_components::{
     BackendError, ServerComponents, ServerComponentsOptions,
 };
 
-use super::migrate;
 use super::tests::{
     DEV_0_1_14, LATEST, RELEASE, copies, exec, load_dump, plain_pool, run, status, temp_db,
 };
+use super::{SqliteCatalogMigrations, migrate};
 
 const COLLIDING: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"dynamodb:*","Resource":"*","Condition":{"StringEquals":{"aws:ResourceTag/env":"prod","dynamodb:ResourceTag/env":"dev"}}}]}"#;
 
@@ -125,13 +132,27 @@ async fn a_production_server_refuses_a_released_catalog_and_writes_nothing() {
     assert!(copies(&db).is_empty());
 }
 
+/// A dev build defaults to `catalog_upgrade = "apply"`: `serve` migrates a
+/// released catalog through the startup policy, copy included, and the
+/// factory then serves it. The factory alone refuses it, as in a
+/// production build, so the policy is the one place that migrates.
 #[tokio::test]
 async fn a_dev_server_migrates_a_released_catalog_with_its_copy_and_serves() {
     let db = temp_db("serve-dev-released");
     load_dump(&db, DEV_0_1_14).await;
+    let before = bytes(&db);
+    let err = refusal(start(&db.to_string_lossy(), true).await);
+    assert_eq!(err.exit_code(), exit::PENDING, "{err:?}");
+    assert_eq!(bytes(&db), before, "the factory wrote to the database");
+    let dev = Startup {
+        creates_uninitialized: true,
+        ..startup(true, Duration::from_secs(5))
+    };
+    let prepared = prepare(&db, &dev).await.expect("the policy migrates");
+    assert!(!prepared.run.expect("a run").applied.is_empty());
     let components = start(&db.to_string_lossy(), true)
         .await
-        .expect("a dev server migrates and starts");
+        .expect("a dev server starts");
     drop(components);
     assert_eq!(
         status(&db).await,
@@ -142,6 +163,302 @@ async fn a_dev_server_migrates_a_released_catalog_with_its_copy_and_serves() {
         1,
         "the dev build copies before migrating"
     );
+}
+
+fn startup(apply: bool, lock_timeout: Duration) -> Startup<'static> {
+    Startup {
+        apply,
+        creates_uninitialized: false,
+        release: RELEASE,
+        lock_timeout,
+        heartbeat: Startup::HEARTBEAT,
+    }
+}
+
+/// The startup policy `serve` runs before the factory, on the file at `db`.
+async fn prepare(db: &Path, startup: &Startup<'_>) -> Result<Prepared, MigrationError> {
+    let target = Target::at(db.to_string_lossy());
+    prepare_to_serve(&SqliteCatalogMigrations, &target, startup, &|_| {}).await
+}
+
+/// `apply` migrates a released catalog before the server opens it, taking
+/// the copy first, and a production server then serves it; `refuse` exits
+/// 3 and writes nothing.
+#[tokio::test]
+async fn apply_migrates_a_released_catalog_before_the_server_opens_it() {
+    let db = temp_db("startup-apply");
+    load_dump(&db, DEV_0_1_14).await;
+    let before = bytes(&db);
+    let err = prepare(&db, &startup(false, Duration::from_secs(5)))
+        .await
+        .expect_err("refused");
+    assert_eq!(err.exit_code(), exit::PENDING, "{err:?}");
+    assert_eq!(bytes(&db), before, "refuse wrote to the database");
+    assert!(copies(&db).is_empty());
+
+    let prepared = prepare(&db, &startup(true, Duration::from_secs(5)))
+        .await
+        .expect("applied");
+    let report = prepared.run.expect("a run");
+    assert_eq!(report.from, None);
+    assert_eq!(report.to, Some(LATEST));
+    assert_eq!(report.applied.len(), MigrationId::ALL.len());
+    assert_eq!(copies(&db).len(), 1, "the copy is taken before the run");
+    drop(
+        start(&db.to_string_lossy(), false)
+            .await
+            .expect("a production server serves the migrated catalog"),
+    );
+    assert_eq!(
+        status(&db).await,
+        CatalogStatus::Current { version: LATEST }
+    );
+}
+
+#[tokio::test]
+async fn apply_on_a_current_catalog_writes_nothing() {
+    let db = temp_db("startup-current");
+    current_catalog(&db).await;
+    let before = bytes(&db);
+    let prepared = prepare(&db, &startup(true, Duration::from_secs(5)))
+        .await
+        .expect("served");
+    assert_eq!(prepared, Prepared::default());
+    assert_eq!(bytes(&db), before, "a current catalog was written to");
+    assert!(copies(&db).is_empty());
+}
+
+#[tokio::test]
+async fn apply_on_a_catalog_that_needs_attention_exits_5_and_writes_nothing() {
+    let db = temp_db("startup-attention");
+    load_dump(&db, DEV_0_1_14).await;
+    collide(&db).await;
+    let before = bytes(&db);
+    let err = prepare(&db, &startup(true, Duration::from_secs(5)))
+        .await
+        .expect_err("refused");
+    assert!(
+        matches!(
+            err,
+            MigrationError::Status(CatalogStatus::NeedsAttention { .. })
+        ),
+        "{err:?}"
+    );
+    assert_eq!(err.exit_code(), exit::ATTENTION);
+    assert_eq!(bytes(&db), before);
+    assert!(copies(&db).is_empty());
+}
+
+/// Another process holds the database's lock: `apply` waits for it up to
+/// the timeout, then exits 6 with the catalog still behind and unchanged.
+#[cfg(unix)]
+#[tokio::test]
+async fn apply_waits_for_a_held_lock_and_exits_6() {
+    let db = temp_db("startup-locked");
+    load_dump(&db, DEV_0_1_14).await;
+    let before = bytes(&db);
+    let holder = crate::serve_lock::ServeLock::acquire(&db).expect("another process's lock");
+    let started = std::time::Instant::now();
+    let err = prepare(&db, &startup(true, Duration::from_millis(800)))
+        .await
+        .expect_err("locked");
+    assert!(
+        started.elapsed() >= Duration::from_millis(700),
+        "it waited {:?}",
+        started.elapsed()
+    );
+    assert!(matches!(err, MigrationError::Locked(_)), "{err:?}");
+    assert_eq!(err.exit_code(), exit::LOCKED);
+    assert_eq!(bytes(&db), before);
+    assert!(copies(&db).is_empty());
+    drop(holder);
+}
+
+/// Two `prepare_to_serve` runs under `apply` on a released catalog, both
+/// waiting for a lock another process holds, as the checks of two servers
+/// started together do after their first status read: once it is free, one
+/// migrates the catalog, and the other takes the lock after it and applies
+/// nothing. The servers are not started here; one of two servers started
+/// together can exit 6 when it registers while the other holds the lock.
+#[cfg(unix)]
+#[tokio::test]
+async fn two_prepare_to_serve_runs_under_apply_migrate_once() {
+    let db = temp_db("startup-two");
+    load_dump(&db, DEV_0_1_14).await;
+    let holder = crate::serve_lock::ServeLock::acquire(&db).expect("another process's lock");
+    let waiting = AtomicUsize::new(0);
+    let progress = |line: &str| {
+        if line.starts_with("taking the migration lock") {
+            waiting.fetch_add(1, Ordering::SeqCst);
+        }
+    };
+    let target = Target::at(db.to_string_lossy());
+    let apply = startup(true, Duration::from_secs(60));
+    let free = async {
+        while waiting.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        drop(holder);
+    };
+    let (a, b, ()) = tokio::join!(
+        prepare_to_serve(&SqliteCatalogMigrations, &target, &apply, &progress),
+        prepare_to_serve(&SqliteCatalogMigrations, &target, &apply, &progress),
+        free,
+    );
+    let mut applied: Vec<usize> = [a.expect("first"), b.expect("second")]
+        .iter()
+        .map(|p| p.run.as_ref().expect("each took the lock").applied.len())
+        .collect();
+    applied.sort_unstable();
+    assert_eq!(
+        applied,
+        [0, MigrationId::ALL.len()],
+        "one migrates, and the other takes the lock after it and applies nothing"
+    );
+    assert_eq!(copies(&db).len(), 1);
+    assert_eq!(
+        status(&db).await,
+        CatalogStatus::Current { version: LATEST }
+    );
+}
+
+/// The SQLite backend, counting the runs it is asked to make.
+#[derive(Default)]
+struct CountingRuns {
+    runs: AtomicUsize,
+}
+
+#[async_trait]
+impl CatalogMigrations for CountingRuns {
+    fn listed(&self, id: MigrationId) -> Listed {
+        SqliteCatalogMigrations.listed(id)
+    }
+    fn backup_advice(&self, target: &Target) -> String {
+        SqliteCatalogMigrations.backup_advice(target)
+    }
+    fn in_process(&self, target: &Target) -> bool {
+        SqliteCatalogMigrations.in_process(target)
+    }
+    async fn server_creates_catalog(&self, target: &Target) -> Result<bool, MigrationError> {
+        SqliteCatalogMigrations.server_creates_catalog(target).await
+    }
+    async fn status(&self, target: &Target) -> Result<CatalogStatus, MigrationError> {
+        SqliteCatalogMigrations.status(target).await
+    }
+    async fn catalog_ledger(&self, target: &Target) -> Result<Vec<LedgerRow>, MigrationError> {
+        SqliteCatalogMigrations.catalog_ledger(target).await
+    }
+    async fn lock(&self, target: &Target, timeout: Duration) -> Result<HeldLock, MigrationError> {
+        SqliteCatalogMigrations.lock(target, timeout).await
+    }
+    async fn run(
+        &self,
+        lock: &HeldLock,
+        release: &str,
+        kind: RunKind,
+    ) -> Result<RunReport, MigrationError> {
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        SqliteCatalogMigrations.run(lock, release, kind).await
+    }
+    async fn forget(&self, lock: &HeldLock, id: u32) -> Result<(), MigrationError> {
+        SqliteCatalogMigrations.forget(lock, id).await
+    }
+}
+
+/// Another process migrates the catalog while this one waits for the lock:
+/// under the lock this one finds it current, and releases the lock and
+/// serves it without the backend's run, so it writes nothing to the
+/// database and takes no copy.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_catalog_migrated_during_the_wait_is_served_with_nothing_written() {
+    let db = temp_db("startup-migrated-meanwhile");
+    load_dump(&db, DEV_0_1_14).await;
+    let location = db.to_string_lossy().into_owned();
+    let other = crate::serve_lock::ServeLock::acquire(&db).expect("another process's lock");
+    let backend = CountingRuns::default();
+    let waiting = AtomicUsize::new(0);
+    let progress = |line: &str| {
+        if line.starts_with("taking the migration lock") {
+            waiting.fetch_add(1, Ordering::SeqCst);
+        }
+    };
+    let target = Target::at(location.as_str());
+    let apply = startup(true, Duration::from_secs(60));
+    let other_process = async {
+        while waiting.load(Ordering::SeqCst) < 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        super::migrate_holding(&location, RELEASE, &other)
+            .await
+            .expect("the other process migrates");
+        let written = (bytes(&db), copies(&db));
+        drop(other);
+        written
+    };
+    let (prepared, (after_other, copies_after_other)) = tokio::join!(
+        prepare_to_serve(&backend, &target, &apply, &progress),
+        other_process,
+    );
+    let report = prepared.expect("served").run.expect("a run under the lock");
+    assert!(report.applied.is_empty(), "{report:?}");
+    assert_eq!(report.to, Some(LATEST));
+    assert_eq!(backend.runs.load(Ordering::SeqCst), 0, "the backend ran");
+    assert_eq!(bytes(&db), after_other, "the waiting process wrote");
+    assert_eq!(copies(&db), copies_after_other);
+    assert_eq!(copies(&db).len(), 1, "only the other process's copy");
+    assert_eq!(
+        status(&db).await,
+        CatalogStatus::Current { version: LATEST }
+    );
+}
+
+/// A dev build's policy refuses, before the server starts, a file that
+/// holds another program's tables, with the refusal the server's factory
+/// gives it, and writes nothing; an empty file is left to the server, which
+/// creates the catalog in it.
+#[tokio::test]
+async fn a_dev_policy_refuses_a_file_that_holds_another_programs_tables() {
+    let db = temp_db("startup-dev-foreign");
+    exec(
+        &db,
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)",
+    )
+    .await;
+    let before = bytes(&db);
+    let dev = Startup {
+        creates_uninitialized: true,
+        ..startup(true, Duration::from_secs(5))
+    };
+    let err = prepare(&db, &dev).await.expect_err("refused");
+    assert_eq!(err, MigrationError::Status(CatalogStatus::Uninitialized));
+    assert_eq!(err.exit_code(), exit::ERROR);
+    assert_eq!(err, refusal(start(&db.to_string_lossy(), true).await));
+    assert_eq!(bytes(&db), before, "the policy wrote to the file");
+    assert!(copies(&db).is_empty());
+
+    let empty = temp_db("startup-dev-empty");
+    std::fs::write(&empty, b"").expect("an empty file");
+    let prepared = prepare(&empty, &dev).await.expect("left to the server");
+    assert_eq!(prepared, Prepared::default());
+}
+
+/// An in-memory database belongs to the server that opens it: the policy
+/// reads nothing, and the server creates the catalog.
+#[tokio::test]
+async fn an_in_memory_database_is_left_to_its_server() {
+    let target = Target::at(":memory:");
+    assert!(SqliteCatalogMigrations.in_process(&target));
+    assert!(!SqliteCatalogMigrations.in_process(&Target::at("/srv/x.sqlite")));
+    let prepared = prepare_to_serve(
+        &SqliteCatalogMigrations,
+        &target,
+        &startup(true, Duration::from_secs(5)),
+        &|_| {},
+    )
+    .await
+    .expect("left to the server");
+    assert_eq!(prepared, Prepared::default());
 }
 
 #[tokio::test]
@@ -164,11 +481,10 @@ async fn a_dev_server_creates_a_missing_catalog_and_its_rows() {
     assert!(copies(&db).is_empty(), "a new database has nothing to copy");
 }
 
-#[tokio::test]
-async fn a_dev_server_refuses_a_catalog_that_needs_attention() {
-    let db = temp_db("serve-dev-attention");
-    load_dump(&db, DEV_0_1_14).await;
-    let pool = plain_pool(&db).await;
+/// Give a released catalog's first IAM user a policy migration 2 cannot
+/// rewrite, so its status is `NeedsAttention`.
+async fn collide(db: &Path) {
+    let pool = plain_pool(db).await;
     let (account, user): (String, String) =
         sqlx::query_as("SELECT account_id, user_name FROM iam_users LIMIT 1")
             .fetch_one(&pool)
@@ -185,6 +501,13 @@ async fn a_dev_server_refuses_a_catalog_that_needs_attention() {
     .await
     .expect("policy");
     pool.close().await;
+}
+
+#[tokio::test]
+async fn a_dev_server_refuses_a_catalog_that_needs_attention() {
+    let db = temp_db("serve-dev-attention");
+    load_dump(&db, DEV_0_1_14).await;
+    collide(&db).await;
     let before = bytes(&db);
     let err = refusal(start(&db.to_string_lossy(), true).await);
     assert!(

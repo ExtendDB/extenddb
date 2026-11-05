@@ -9,7 +9,8 @@ license.workspace = true
 
 [features]
 # Developer mode: `is_tls_enabled` reports plain HTTP regardless of the
-# configured TLS state. Enabled only through the app crate's `dev-mode` feature.
+# configured TLS state, and `server.catalog_upgrade` defaults to "apply".
+# Enabled only through the app crate's `dev-mode` feature.
 dev-mode = []
 
 [dependencies]

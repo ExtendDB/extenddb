@@ -20,6 +20,12 @@ given as `--data-db=<name>`, so `init` has to create the database it names.
   exit 6, migrate --yes --lock-timeout 0 exits 6 within 10 s, and the
   preview exits 0;
 - once the lock is free, migrate --yes and serve run;
+- the startup policy on a catalog behind this binary: serve exits 3 and
+  names --migrate, and in daemon mode the invoking process exits 3 with the
+  message on its stderr; while another session holds the migration lock,
+  serve --migrate waits for catalog_upgrade_lock_timeout, 3 s here and not
+  the 60 s default, and exits 6; once the lock is free, serve --migrate
+  applies the migration and serves;
 - a server whose registration session the database ends registers again on
   a new session and goes on serving, and migrate --yes exits 6 naming it;
 - a server whose registration session ends while a migration holds both
@@ -45,7 +51,10 @@ import urllib.parse
 
 import psycopg2
 
-from catalog_checks import expect_exit, finish, healthy, report, run, start, stop
+from catalog_checks import (
+    expect_exit, finish, healthy, kill_daemon, report, run, run_split, start, stop,
+)
+from catalog_checks import pid_file as pid_file_for
 
 NAMESPACE = 0x0045_4442  # the advisory key namespace of crates/storage-postgres
 MIGRATION_KEY = 1
@@ -113,6 +122,68 @@ def just_renewed(admin_url: str, stem: str, seconds: float = 40) -> bool:
     finally:
         conn.close()
     return False
+
+MIGRATE_HINT = "or start this server with --migrate"
+
+
+def behind(admin_url: str, stem: str) -> None:
+    """Delete the catalog's last ledger row, so the catalog is behind this
+    binary."""
+    conn = psycopg2.connect(f"{admin_url.rstrip('/')}/{stem}_catalog")
+    conn.autocommit = True
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM extenddb_migrations WHERE id = (SELECT max(id) FROM extenddb_migrations)"
+        )
+    conn.close()
+
+
+def startup_policy(
+    binary: str, env: dict, config: str, port: int, admin_url: str, stem: str, servers: list
+) -> None:
+    """`serve`'s startup policy on a catalog behind this binary, in the
+    foreground and in daemon mode."""
+    serve = [binary, "serve", "--config", config, "--foreground", "--port", str(port)]
+    daemon = [binary, "serve", "--config", config, "--port", str(port)]
+    url = f"https://127.0.0.1:{port}/health"
+    behind(admin_url, stem)
+    expect_exit(3, "serve on a catalog behind this binary", serve, env, contains=MIGRATE_HINT)
+    # The parent reads the status before it forks, so the code and the
+    # message reach the invoking shell.
+    code, out, err = run_split(daemon, env)
+    kill_daemon(pid_file_for(config, env, port), binary)
+    report(
+        code == 3 and MIGRATE_HINT in err,
+        f"exit {code}: serve in daemon mode on a catalog behind this binary, the message on stderr",
+        out + err,
+    )
+    # Another session holds the migration lock: serve --migrate waits for
+    # catalog_upgrade_lock_timeout, then exits 6. Under 30 s tells the 3 s
+    # set here from the 60 s default.
+    holder = psycopg2.connect(f"{admin_url.rstrip('/')}/{stem}_catalog")
+    with holder.cursor() as cur:
+        cur.execute("SELECT pg_advisory_xact_lock(%s, %s)", (NAMESPACE, MIGRATION_KEY))
+    started = time.monotonic()
+    expect_exit(
+        6,
+        "serve --migrate while another session holds the migration lock",
+        serve + ["--migrate"],
+        dict(env, EXTENDDB__SERVER__CATALOG_UPGRADE_LOCK_TIMEOUT="3"),
+        contains="another migrator holds the migration lock",
+    )
+    waited = time.monotonic() - started
+    report(3 <= waited < 30, f"serve --migrate waited {waited:.1f} s for the lock, its 3 s timeout")
+    holder.rollback()
+    holder.close()
+    log = os.path.join(os.path.dirname(config), "serve-migrate.log")
+    server = start(serve + ["--migrate"], env, log)
+    servers.append(server)
+    up = healthy(url, server)
+    stop(server)
+    with open(log, encoding="utf-8") as f:
+        report(up, "serve --migrate applies the pending migration and serves", f.read())
+    expect_exit(0, "verify after serve --migrate", [binary, "verify", "--config", config], env,
+                contains="OK: Current")
 
 
 def main(binary: str, admin_url: str, port: int) -> int:
@@ -197,6 +268,7 @@ def main(binary: str, admin_url: str, port: int) -> int:
         holder = None
 
         expect_exit(0, "migrate --yes once the lock is free", migrate + ["--yes", "--lock-timeout", "5"], env)
+        startup_policy(binary, env, config, port, admin_url, stem, servers)
         server = start(serve, env, log)
         servers.append(server)
         report(healthy(f"https://127.0.0.1:{port}/health", server), "serve once the lock is free")
@@ -276,6 +348,7 @@ def main(binary: str, admin_url: str, port: int) -> int:
     finally:
         for server in servers:
             stop(server)
+        kill_daemon(pid_file_for(config, env, port), binary)
         if holder is not None:
             holder.close()
         cleanup(admin_url, stem)

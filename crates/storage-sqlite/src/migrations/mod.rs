@@ -242,11 +242,13 @@ pub(crate) async fn migrate_holding(
 /// Decide whether a server may open the file database at `location`, whose
 /// lock the server holds: `Current` and `AheadCompatible` serve (the second
 /// with a warning naming the migrations above this binary's), and in a dev
-/// build `Behind` and an `Uninitialized` file with no tables (missing or
-/// empty) are migrated first. An `Uninitialized` file that holds tables is
-/// another program's database, and is refused as the commands refuse it,
-/// naming `extenddb init`, before anything writes to it. Every other status
-/// refuses with [`MigrationError::Status`], in a dev build too.
+/// build an `Uninitialized` file with no tables (missing or empty) is
+/// created first. An `Uninitialized` file that holds tables is another
+/// program's database, and is refused as the commands refuse it, naming
+/// `extenddb init`, before anything writes to it. Every other status
+/// refuses with [`MigrationError::Status`], in a dev build too: `serve`
+/// applies a catalog behind this binary before it calls the factory, when
+/// its startup policy says to (`[server] catalog_upgrade`).
 ///
 /// # Errors
 ///
@@ -267,10 +269,6 @@ pub(crate) async fn prepare_for_serve(
             Ok(())
         }
         CatalogStatus::Uninitialized if dev && !holds_tables(location).await? => {
-            log_report(&migrate_holding(location, release, held).await?);
-            Ok(())
-        }
-        CatalogStatus::Behind { .. } if dev => {
             log_report(&migrate_holding(location, release, held).await?);
             Ok(())
         }

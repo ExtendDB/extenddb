@@ -5,10 +5,10 @@
 
 const { spawn } = require("node:child_process");
 const net = require("node:net");
-const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
 const fs = require("node:fs");
+const { waitForStartup } = require("./startup.js");
 
 // AWS's documented example credential: the dev server seeds it as the
 // well-known default signing credential (dev-mode builds only).
@@ -63,31 +63,6 @@ function freePort() {
   });
 }
 
-function waitHealthy(endpoint, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  return new Promise((resolve, reject) => {
-    const probe = () => {
-      const req = http.get(`${endpoint}/health`, (res) => {
-        res.resume();
-        if (res.statusCode === 200) return resolve();
-        retry();
-      });
-      req.on("error", retry);
-      req.setTimeout(1000, () => {
-        req.destroy();
-        retry();
-      });
-    };
-    const retry = () => {
-      if (Date.now() > deadline) {
-        return reject(new Error(`extenddb did not become healthy within ${timeoutMs}ms`));
-      }
-      setTimeout(probe, 100);
-    };
-    probe();
-  });
-}
-
 /**
  * Resolve the storage location from the options.
  *
@@ -114,6 +89,22 @@ function resolveStorage(options) {
 }
 
 /**
+ * Stop `child`: SIGTERM, then SIGKILL after 5 s. Resolves once it has
+ * exited, at once when it never started or has already exited.
+ */
+function stopChild(child) {
+  return new Promise((resolve) => {
+    if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) {
+      resolve();
+      return;
+    }
+    child.once("exit", () => resolve());
+    child.kill("SIGTERM");
+    setTimeout(() => child.kill("SIGKILL"), 5000).unref();
+  });
+}
+
+/**
  * Start an ExtendDB dev server.
  *
  * @param {object} [options]
@@ -123,9 +114,16 @@ function resolveStorage(options) {
  *   default ./.extenddb/data.db).
  * @param {number} [options.port]    Fixed port (default: ephemeral).
  * @param {string} [options.binary]  Path to the extenddb dev binary.
- * @param {number} [options.startupTimeoutMs]  Readiness timeout (default 15000).
+ * @param {number} [options.startupTimeoutMs]  Readiness timeout (default
+ *   15000), counted from the start or from the last catalog migration line
+ *   the server printed, whichever is later.
+ * @param {(line: string) => void} [options.onProgress]  Called with each
+ *   catalog migration line the server prints on stderr while it starts.
  * @returns {Promise<{endpoint: string, port: number, credentials: object,
  *                    region: string, storage: string, stop: () => Promise<void>}>}
+ *   Rejects when the server does not become healthy, after stopping it.
+ *   When the server exited first, the error's `exitCode` and `signal` are
+ *   the server's.
  */
 async function start(options = {}) {
   const binary = resolveBinary(options.binary);
@@ -144,10 +142,6 @@ async function start(options = {}) {
     env,
     cwd,
     stdio: ["ignore", "ignore", "pipe"],
-  });
-  let stderrTail = "";
-  child.stderr.on("data", (d) => {
-    stderrTail = (stderrTail + d.toString()).slice(-4000);
   });
 
   const endpoint = `http://127.0.0.1:${port}`;
@@ -169,22 +163,27 @@ async function start(options = {}) {
       }
       reject(err);
     });
-    child.on("exit", (code) =>
-      reject(new Error(`extenddb exited during startup (code ${code}): ${stderrTail}`))
-    );
   });
-  await Promise.race([waitHealthy(endpoint, options.startupTimeoutMs ?? 15000), spawned]);
-  child.removeAllListeners("exit");
+  // A dev server migrates an existing database before it serves; the
+  // timeout restarts at each progress line.
+  try {
+    await Promise.race([
+      waitForStartup(child, endpoint, options.startupTimeoutMs ?? 15000, options.onProgress),
+      spawned,
+    ]);
+  } catch (err) {
+    // The caller gets no handle to a server that failed to start, and one
+    // left running would go on migrating and then serve on its port.
+    await stopChild(child);
+    throw err;
+  }
 
   let stopped = false;
-  const stop = () =>
-    new Promise((resolve) => {
-      if (stopped || child.exitCode !== null) return resolve();
-      stopped = true;
-      child.once("exit", () => resolve());
-      child.kill("SIGTERM");
-      setTimeout(() => child.kill("SIGKILL"), 5000).unref();
-    });
+  const stop = () => {
+    if (stopped) return Promise.resolve();
+    stopped = true;
+    return stopChild(child);
+  };
   // Best effort: do not outlive the caller.
   process.once("exit", () => child.kill("SIGKILL"));
 

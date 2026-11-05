@@ -78,6 +78,17 @@ pub struct ServerConfig {
     /// Enable provisioned throughput throttling via token buckets.
     /// When `None` or `false`, all requests are allowed regardless of capacity.
     pub throttling_enabled: Option<bool>,
+    /// What `serve` does with a catalog that is behind this binary: refuse
+    /// it, or apply its pending migrations before it serves. `refuse` by
+    /// default, `apply` in a dev-mode build. `serve --migrate` sets `apply`
+    /// for one run.
+    #[serde(default = "catalog_upgrade::default_catalog_upgrade")]
+    pub catalog_upgrade: CatalogUpgrade,
+    /// Seconds `serve` waits under `catalog_upgrade = "apply"` for the
+    /// migration lock and for running servers before it exits 6 (default
+    /// 60, at most 86400).
+    #[serde(default = "catalog_upgrade::default_catalog_upgrade_lock_timeout")]
+    pub catalog_upgrade_lock_timeout: u64,
 }
 
 impl Default for ServerConfig {
@@ -89,6 +100,8 @@ impl Default for ServerConfig {
             run_dir: default_run_dir(),
             tls: TlsConfig::default(),
             throttling_enabled: None,
+            catalog_upgrade: catalog_upgrade::default_catalog_upgrade(),
+            catalog_upgrade_lock_timeout: catalog_upgrade::default_catalog_upgrade_lock_timeout(),
         }
     }
 }
@@ -505,6 +518,9 @@ pub fn pid_file_path_default(port: u16) -> PathBuf {
 }
 
 pub mod backup;
+mod catalog_upgrade;
+pub use catalog_upgrade::{CatalogUpgrade, MAX_CATALOG_UPGRADE_LOCK_TIMEOUT};
+
 mod display;
 pub use display::{MASK, build_config_entries, should_redact};
 

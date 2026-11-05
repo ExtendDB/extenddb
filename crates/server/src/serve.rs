@@ -377,7 +377,8 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
                 installed(),
                 &named,
                 config_path.as_deref(),
-            );
+            )
+            .for_server();
             return Err(CatalogRefusal {
                 exit_code: error.exit_code(),
                 message: advice::error_message(&error, &advice.advice()),

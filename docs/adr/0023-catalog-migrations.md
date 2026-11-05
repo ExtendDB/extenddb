@@ -279,11 +279,16 @@ that each backend implements, as follows.
    server that outlasted the timeout. `serve` reads the status before the
    backend creates its engine, because creating the engine writes to the
    catalog on several backends. It serves `Current` and `AheadCompatible`.
-   It refuses every other status with that status's exit code and a message
-   that lists the pending migrations with their kinds, says what to back up
-   on that backend, and gives the `migrate` command. A dev build applies an
-   `Uninitialized` or `Behind` catalog at startup through the same runner and
-   refuses the other statuses as a production build does.
+   What it does with a `Behind` catalog is its startup policy,
+   `[server] catalog_upgrade`. Under `refuse`, the default in a production
+   build, it exits 3 with a message that lists the pending migrations with
+   their kinds, says what to back up on that backend, and gives the
+   `migrate` command. Under `apply`, the default in a dev build, and for one
+   run under `serve --migrate` in any build, it applies them through the run
+   `migrate --yes` makes, under the migration lock, and then serves. Under
+   both values it refuses every other status with that status's exit code,
+   except that a dev build creates the catalog through the same runner in a
+   missing or empty database file.
 
    A binary serves a catalog ahead of it only when every id it does not know
    is additive, so a binary can be rolled back across additive migrations

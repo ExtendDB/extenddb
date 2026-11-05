@@ -24,12 +24,46 @@ use extenddb_storage::migrations::{
 
 use super::foreign::foreign_unless_a_catalog;
 use super::{
-    CATALOG_DATABASE, DATA_DATABASE, Lease, MigrationLock, MongoMigrations, MongoTarget, Timing,
-    catalog_status, status_holding,
+    Lease, MigrationLock, MongoMigrations, MongoTarget, Timing, catalog_status, status_holding,
 };
 
-/// The MongoDB backend's catalog migrations for the commands.
-pub struct MongoCatalogMigrations;
+/// The MongoDB backend's catalog migrations for the commands, on the
+/// databases `extenddb_catalog` and `extenddb_data` of the deployment a
+/// [`Target`] names.
+#[derive(Debug, Default)]
+pub struct MongoCatalogMigrations {
+    /// The catalog and data databases' names instead of those two, for
+    /// tests that share one server.
+    databases: Option<(String, String)>,
+}
+
+impl MongoCatalogMigrations {
+    /// The catalog migrations of a deployment's two databases.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { databases: None }
+    }
+
+    /// The catalog migrations of a deployment in databases of other names,
+    /// for tests that share one server.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn with_databases(catalog: impl Into<String>, data: impl Into<String>) -> Self {
+        Self {
+            databases: Some((catalog.into(), data.into())),
+        }
+    }
+
+    /// The deployment at `location`, in this value's databases.
+    fn target(&self, location: &str) -> MongoTarget {
+        let mut target = MongoTarget::new(location);
+        if let Some((catalog, data)) = &self.databases {
+            target.catalog.clone_from(catalog);
+            target.data.clone_from(data);
+        }
+        target
+    }
+}
 
 /// What the migration lock carries for [`CatalogMigrations::run`] and
 /// [`CatalogMigrations::forget`].
@@ -56,15 +90,16 @@ impl CatalogMigrations for MongoCatalogMigrations {
         Listed::of(&super::migration(id))
     }
 
-    fn backup_advice(&self, _target: &Target) -> String {
+    fn backup_advice(&self, target: &Target) -> String {
+        let MongoTarget { catalog, data, .. } = self.target(&target.location);
         format!(
-            "back up both MongoDB databases, the catalog database {CATALOG_DATABASE} and the data \
-             database {DATA_DATABASE}"
+            "back up both MongoDB databases, the catalog database {catalog} and the data \
+             database {data}"
         )
     }
 
     async fn status(&self, target: &Target) -> Result<CatalogStatus, MigrationError> {
-        catalog_status(&MongoTarget::new(&target.location)).await
+        catalog_status(&self.target(&target.location)).await
     }
 
     /// Read as the holder, so the requests of a long status read are
@@ -79,7 +114,7 @@ impl CatalogMigrations for MongoCatalogMigrations {
     }
 
     async fn catalog_ledger(&self, target: &Target) -> Result<Vec<LedgerRow>, MigrationError> {
-        let migrations = MongoMigrations::open(&MongoTarget::new(&target.location), None).await?;
+        let migrations = MongoMigrations::open(&self.target(&target.location), None).await?;
         let rows = Runner::new(&migrations, "").catalog_ledger().await;
         migrations.close().await;
         rows
@@ -87,7 +122,7 @@ impl CatalogMigrations for MongoCatalogMigrations {
 
     async fn lock(&self, target: &Target, timeout: Duration) -> Result<HeldLock, MigrationError> {
         lock(
-            &MongoTarget::new(&target.location),
+            &self.target(&target.location),
             target.data_connection.is_some(),
             timeout,
             Timing::PRODUCTION,
@@ -121,6 +156,15 @@ impl CatalogMigrations for MongoCatalogMigrations {
         let result = Runner::new(&migrations, "").forget(id).await;
         migrations.close().await;
         result
+    }
+
+    /// Delete the lock document with the lock's own client, on this
+    /// runtime, so the next migration or server need not wait for its
+    /// lease. Dropping the lock afterwards does nothing.
+    async fn release(&self, lock: HeldLock) {
+        if let Ok(held) = held(&lock) {
+            held.lock.release_held().await;
+        }
     }
 }
 
@@ -186,11 +230,17 @@ mod tests {
     #[test]
     fn the_backup_advice_names_both_databases_and_no_password() {
         let target = Target::at("mongodb://app:s3cret@localhost:27017/?replicaSet=rs0");
-        let advice = MongoCatalogMigrations.backup_advice(&target);
+        let advice = MongoCatalogMigrations::new().backup_advice(&target);
         assert_eq!(
             advice,
             "back up both MongoDB databases, the catalog database extenddb_catalog and the data \
              database extenddb_data"
+        );
+        let advice =
+            MongoCatalogMigrations::with_databases("t_catalog", "t_data").backup_advice(&target);
+        assert!(
+            advice.contains("t_catalog and the data database t_data"),
+            "{advice}"
         );
     }
 }
