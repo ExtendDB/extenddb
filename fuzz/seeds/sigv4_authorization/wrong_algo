@@ -1,0 +1,1 @@
+AWS4-HMAC-SHA512 Credential=AKID/20260415/us-east-1/dynamodb/aws4_request, SignedHeaders=host, Signature=abc

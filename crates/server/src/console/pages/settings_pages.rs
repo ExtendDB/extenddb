@@ -16,25 +16,34 @@ use axum::response::{Html, IntoResponse, Response};
 
 use crate::console::ConsoleState;
 use crate::console::html;
-// Redaction patterns live in `extenddb-config` so the console and the static
-// config display cannot drift apart.
-use extenddb_config::should_redact;
+// Redaction patterns and the mask live in `extenddb-config` so the console and
+// the static config display cannot drift apart.
+use extenddb_config::{MASK, should_redact};
 
 use super::{identity_label, is_admin, require_session};
 
-/// Known runtime settings with their default values.
-/// These are the settings that can be changed via `extenddb settings set`.
-const RUNTIME_DEFAULTS: &[(&str, &str)] = &[
-    ("allow_credential_import", "false"),
-    ("catalog_version", "—"),
-    ("control_plane_delay_seconds", "0.25"),
-    ("data_database_connection_string", "—"),
-    ("data_database_name", "—"),
-    ("index_propagation_delay_ms", "500"),
-    ("log_level", "info"),
-    ("sqlx_log_level", "warn"),
-    ("throttling_enabled", "false"),
+/// Runtime settings the page always lists, with the server's default for a
+/// key the server reads. A key the storage engine reads has no entry here:
+/// its default is the engine's ([`extenddb_storage::operations::setting_default`]),
+/// which differs by backend.
+const RUNTIME_KEYS: &[(&str, Option<&str>)] = &[
+    ("allow_credential_import", Some("false")),
+    ("catalog_version", None),
+    ("control_plane_delay_seconds", None),
+    ("data_database_connection_string", None),
+    ("data_database_name", None),
+    ("index_propagation_delay_ms", None),
+    ("log_level", Some("info")),
+    ("sqlx_log_level", Some("warn")),
+    ("throttling_enabled", Some("false")),
 ];
+
+/// What the page prints for `key` when the catalog has no row for it.
+fn default_value(key: &str, server_default: Option<&str>) -> String {
+    extenddb_storage::operations::setting_default(key)
+        .or_else(|| server_default.map(str::to_owned))
+        .unwrap_or_else(|| "—".to_owned())
+}
 
 /// GET /console/settings — read-only settings display (admin only).
 // Linear page-rendering function: auth check → build toml table → build runtime
@@ -72,7 +81,7 @@ pub async fn settings_page(State(state): State<Arc<ConsoleState>>, headers: Head
         for (key, value) in &state.config_entries {
             let ek = html::escape(key);
             let ev = if should_redact(key) {
-                "••••••••".to_owned()
+                MASK.to_owned()
             } else {
                 html::escape(value)
             };
@@ -107,15 +116,15 @@ pub async fn settings_page(State(state): State<Arc<ConsoleState>>, headers: Head
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
 
-    for &(key, default) in RUNTIME_DEFAULTS {
+    for &(key, server_default) in RUNTIME_KEYS {
         let ek = html::escape(key);
         let (value, source) = if let Some(&db_val) = db_map.get(key) {
             (db_val.to_owned(), "database")
         } else {
-            (default.to_owned(), "default")
+            (default_value(key, server_default), "default")
         };
         let ev = if should_redact(key) {
-            "••••••••".to_owned()
+            MASK.to_owned()
         } else {
             html::escape(&value)
         };
@@ -131,14 +140,14 @@ pub async fn settings_page(State(state): State<Arc<ConsoleState>>, headers: Head
         );
     }
 
-    // Show any DB settings not in RUNTIME_DEFAULTS (unexpected keys).
+    // Show any DB settings not in RUNTIME_KEYS (unexpected keys).
     for (key, value) in &db_rows {
-        if RUNTIME_DEFAULTS.iter().any(|&(k, _)| k == key) {
+        if RUNTIME_KEYS.iter().any(|&(k, _)| k == key) {
             continue;
         }
         let ek = html::escape(key);
         let ev = if should_redact(key) {
-            "••••••••".to_owned()
+            MASK.to_owned()
         } else {
             html::escape(value)
         };
