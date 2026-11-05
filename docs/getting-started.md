@@ -1281,7 +1281,7 @@ Navigate to `https://127.0.0.1:18443/console/` in your browser (adjust the host 
 
 Admin users have full access to all management operations. IAM users can view their own details and manage their own access keys.
 
-Sessions expire after 8 hours of inactivity. Click "Logout" to end a session immediately.
+Sessions expire after 8 hours of inactivity. Click "Logout" to end a session immediately. Deleting a user or changing its password ends that user's sessions at their next request.
 
 ## 9. Audit logging
 

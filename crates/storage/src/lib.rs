@@ -754,6 +754,7 @@ impl<T> StorageEngine for T where
 pub trait CatalogStore:
     management_store::ManagementStore
     + management_store::AdminStore
+    + management_store::PasswordHashStore
     + management_store::SettingsStore
     + management_store::MetricsStore
     + management_store::RateLimitStore

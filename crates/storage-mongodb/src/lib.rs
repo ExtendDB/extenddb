@@ -21,6 +21,7 @@ mod management_store;
 mod metadata_engine;
 pub mod migrations;
 mod operations;
+mod password_hash_store;
 pub mod pushdown;
 mod snapshot_engine;
 mod stream_engine;

@@ -24,6 +24,7 @@ mod management_store;
 mod metadata_engine;
 pub mod migrations;
 mod operations;
+mod password_hash_store;
 mod pg_util;
 mod snapshot_engine;
 #[doc(hidden)]
