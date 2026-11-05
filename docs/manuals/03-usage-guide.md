@@ -575,8 +575,8 @@ ExtendDB returns the DynamoDB error types and, where measured against the servic
 | PartiQL (ExecuteStatement, BatchExecuteStatement, ExecuteTransaction) | ✗ (not implemented; returns UnknownOperationException) |
 | DAX | ✗ (not applicable) |
 | Global Tables | ✗ (not implemented; returns UnknownOperationException) |
-| On-demand backups (CreateBackup, RestoreTableFromBackup, DescribeBackup, ListBackups, DeleteBackup) | ✓ (see the backup rows on the differences page) |
-| Point-in-time recovery | ✗ (RestoreTableToPointInTime is refused with ValidationException) |
+| On-demand backups (CreateBackup / RestoreTableFromBackup) | ✓ |
+| Point-in-time recovery | ✗ (`UpdateContinuousBackups` refuses to enable it; see differences-from-dynamodb.md) |
 | Import/Export (local filesystem) | ✓ (FileSource instead of S3) |
 
 ---

@@ -107,9 +107,19 @@ file and never creates `run_dir`, so the root filesystem can be read-only. Use
 #!/bin/sh
 # entrypoint.sh
 set -e
-# Safe to run on every start: already-applied migrations are skipped.
-extenddb migrate --yes --config /etc/extenddb/extenddb.toml
-exec extenddb serve --foreground --config /etc/extenddb/extenddb.toml
+CONFIG=/etc/extenddb/extenddb.toml
+# The preview takes no lock and exits 3 when migrations are pending. Only then
+# does migrate --yes run, which waits for every running server of the catalog
+# to stop, so a start beside another server with nothing to apply does not
+# wait for it.
+rc=0
+extenddb migrate --config "$CONFIG" || rc=$?
+if [ "$rc" -eq 3 ]; then
+  extenddb migrate --yes --config "$CONFIG"
+elif [ "$rc" -ne 0 ]; then
+  exit "$rc"
+fi
+exec extenddb serve --foreground --config "$CONFIG"
 ```
 
 `extenddb stop` cannot stop a foreground server, because there is no PID file to
@@ -210,7 +220,7 @@ extenddb init \
 
 - [ ] Set `bind_addr` to the interface your clients reach, not `0.0.0.0`
 - [ ] Firewall: allow only necessary ports (the ExtendDB port, the storage backend port)
-- [ ] Consider a reverse proxy (nginx, HAProxy) for rate limiting and access logging. The proxy re-encrypts to the server, which always serves TLS; see [Multi-Instance Considerations](#multi-instance-considerations) before putting more than one instance behind it
+- [ ] Consider a reverse proxy (nginx, HAProxy) for TLS termination, rate limiting, and access logging. Unless the proxy preserves the client address, login limits count the proxy's address as the source for every caller behind it (see the security model manual).
 
 ### Database (PostgreSQL)
 
@@ -291,6 +301,22 @@ pool_size = 50  # Increase for higher concurrency
 Ensure PostgreSQL `max_connections` accommodates the total pool size plus overhead.
 
 Backup and restore work is admitted against the pool so it cannot take every connection from ordinary requests. On PostgreSQL and MongoDB one server runs at most 4 `RestoreTableFromBackup` copies per account and `min(16, pool/2)` in total (PostgreSQL: `pool_size`; MongoDB: the engine's driver pool, `maxPoolSize` in the connection string or `max_connections`, default 10, so 5 restores); a restore that waits more than 30 seconds for a slot is refused with `LimitExceededException` and creates nothing. On SQLite one server runs at most `pool_size / 2 - 1` `CreateBackup` copies at once (between 1 and 16; 4 for the default `pool_size` of 10), each holding its snapshot connection for its duration, and refuses a backup that waited 30 seconds with `LimitExceededException`. A MongoDB restore request that is not registered within 60 seconds answers an internal error while the restore goes on in the background; the MongoDB driver does not enforce `waitQueueTimeoutMS`, so the admission bound is what keeps a flood of restores from holding every pooled connection.
+
+### Cassandra Connection Pool
+
+The Cassandra backend opens `max_connections` connections per node (default 10)
+and scatters requests across them:
+
+```toml
+[storage.cassandra]
+max_connections = 10  # connections per node
+```
+
+Keep this above 1. A single connection serializes every request's protocol
+stream id onto one socket and leaves no headroom if that socket drops. Spreading
+requests over several connections also divides the stream-id space, which eases a
+driver-level stream-id reuse hazard seen under sustained load with a slow
+statement in flight.
 
 ### PostgreSQL Tuning
 

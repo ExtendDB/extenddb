@@ -189,7 +189,12 @@ done
 [[ "$(docker inspect "$APP_CONTAINER" --format '{{(index (index .NetworkSettings.Ports "18443/tcp") 0).HostIp}}')" == "127.0.0.1" ]]
 
 docker exec "$APP_CONTAINER" /bin/sh -ec '
-    ! command -v postgres >/dev/null 2>&1
+    for tool in postgres; do
+        if command -v "$tool" >/dev/null 2>&1; then
+            echo "error: the image contains $tool" >&2
+            exit 1
+        fi
+    done
     test "$(stat -c %u:%g /var/lib/extenddb)" = 10001:10001
     test "$(stat -c %a /var/lib/extenddb/extenddb.toml)" = 600
     test "$(stat -c %a /var/lib/extenddb/.extenddb/tls/key.pem)" = 600

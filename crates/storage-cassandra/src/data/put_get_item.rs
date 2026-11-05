@@ -160,16 +160,9 @@ impl CassandraEngine {
 
         // Validate index key types and emptiness before any write work.
         if !indexes.is_empty() {
-            let index_refs: Vec<extenddb_core::validation::IndexKeyRef<'_>> = indexes
-                .iter()
-                .map(|idx| extenddb_core::validation::IndexKeyRef {
-                    index_name: &idx.index_name,
-                    key_schema: &idx.key_schema,
-                })
-                .collect();
             extenddb_core::validation::validate_index_keys(
                 &item,
-                &index_refs,
+                &super::index::index_key_refs(&indexes),
                 &key_info.attribute_definitions,
             )
             .map_err(|e| StorageError::Validation(e.to_string()))?;
@@ -242,7 +235,7 @@ impl CassandraEngine {
             let (old_item_opt, version, has_prepared_txn) = if let Some(rows) = body.into_rows() {
                 if let Some(row) = rows.into_iter().next() {
                     let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
-                    let version: i64 = row.get_by_name("version").ok().flatten().unwrap_or(0);
+                    let version: Option<i64> = row.get_by_name("version").ok().flatten();
                     let prepared_txn_id: Option<uuid::Uuid> =
                         row.get_by_name("prepared_txn_id").ok().flatten();
                     (
@@ -251,10 +244,10 @@ impl CassandraEngine {
                         prepared_txn_id.is_some(),
                     )
                 } else {
-                    (None, 0, false)
+                    (None, None, false)
                 }
             } else {
-                (None, 0, false)
+                (None, None, false)
             };
 
             // Reject if item is part of an in-flight transaction
@@ -355,7 +348,7 @@ impl CassandraEngine {
 
             let (old_item_opt, version, has_prepared_txn) = if let Some(row) = row {
                 let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
-                let version: i64 = row.get_by_name("version").ok().flatten().unwrap_or(0);
+                let version: Option<i64> = row.get_by_name("version").ok().flatten();
                 let prepared_txn_id: Option<uuid::Uuid> =
                     row.get_by_name("prepared_txn_id").ok().flatten();
                 (
@@ -364,7 +357,7 @@ impl CassandraEngine {
                     prepared_txn_id.is_some(),
                 )
             } else {
-                (None, 0, false)
+                (None, None, false)
             };
 
             // Reject if item is part of an in-flight transaction
@@ -476,6 +469,10 @@ impl CassandraEngine {
     ) -> Result<Option<Item>, StorageError> {
         use cdrs_tokio::types::IntoRustByName as _;
 
+        // A fresh row: its version is the clock, and the index rows written
+        // below carry it as their write timestamp (see `data::version`).
+        let version = super::version::next_row_version(None)?;
+
         let (insert_cql, insert_qv) = if let Some((sk_name, sk_type)) =
             sk_info(&key_info.key_schema, &key_info.attribute_definitions)
         {
@@ -485,23 +482,25 @@ impl CassandraEngine {
             let sk = parse_sk(sk_value, sk_type)?;
             let sk_col = sk_column(sk_type);
             let cql = format!(
-                "UPDATE {data_keyspace}.{ddb_table} SET item_data = ?, version = 1 \
+                "UPDATE {data_keyspace}.{ddb_table} SET item_data = ?, version = ? \
                  WHERE pk = ? AND {sk_col} = ? \
                  IF item_data = null AND prepared_txn_id = null"
             );
             let qv = cdrs_tokio::query::QueryValues::SimpleValues(vec![
                 item_text.into(),
+                version.into(),
                 cdrs_tokio::types::value::Value::from(pk_text),
                 super::index::sk_to_value(&sk),
             ]);
             (cql, qv)
         } else {
             let cql = format!(
-                "UPDATE {data_keyspace}.{ddb_table} SET item_data = ?, version = 1 \
+                "UPDATE {data_keyspace}.{ddb_table} SET item_data = ?, version = ? \
                  WHERE pk = ? IF item_data = null AND prepared_txn_id = null"
             );
             let qv = cdrs_tokio::query::QueryValues::SimpleValues(vec![
                 item_text.into(),
+                version.into(),
                 cdrs_tokio::types::value::Value::from(pk_text),
             ]);
             (cql, qv)
@@ -554,10 +553,12 @@ impl CassandraEngine {
         if indexes.is_empty() && stream_stmt.is_none() {
             return Ok(None);
         }
+        // The index statements carry the version; the queue rows and the
+        // stream record keep Cassandra's timestamp (`data::version`).
         let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
 
         if !indexes.is_empty() {
-            super::index::sync_indexes(
+            super::index::sync_indexes_at(
                 &mut batch,
                 data_keyspace,
                 &key_info.key_schema,
@@ -566,6 +567,7 @@ impl CassandraEngine {
                 None,
                 Some(&item),
                 sys_delay,
+                Some(version),
             )?;
         }
 
@@ -581,6 +583,7 @@ impl CassandraEngine {
                 None,
                 Some(&item),
                 sys_delay,
+                version,
             )
             .await?
         };
