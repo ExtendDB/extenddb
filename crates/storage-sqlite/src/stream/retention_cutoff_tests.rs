@@ -53,7 +53,7 @@ async fn sweep_on_a_whole_second_keeps_same_second_rows() {
     let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
         .await
         .expect("engine");
-    crate::schema::apply(&engine.pool).await.expect("schema");
+    crate::migrations::apply_for_tests(&engine.pool).await;
     sqlx::query(
         "INSERT INTO accounts (account_id, account_name) VALUES ('000000000000', 'default')",
     )

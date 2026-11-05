@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
@@ -25,9 +25,10 @@ use super::auth::authenticate_admin;
 pub async fn auth_cache_metrics(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
 ) -> Response {
     if let Err(e) =
-        authenticate_admin(&headers, &*state.catalog_store, &*state.catalog_store, None).await
+        authenticate_admin(&headers, &*state.catalog_store, &*state.catalog_store, addr).await
     {
         return e;
     }
