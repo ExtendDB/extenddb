@@ -47,7 +47,7 @@ ExtendDB defines **13 traits** across three categories:
 - `AdminStore`: admin user management
 - `SettingsStore`: runtime settings (key-value store)
 - `MetricsStore`: historical metrics persistence and query
-- `RateLimitStore`: login rate limiting and account lockout
+- `RateLimitStore`: login rate limiting per user and source address
 - `AuthorizationStore`: policy lookups for authorization decisions
 
 **Initialization and Lifecycle** (defined in `storage/src/bootstrapper.rs`):
@@ -210,12 +210,14 @@ storage.
 
 ### RateLimitStore
 
-Login rate limiting and account lockout:
+Login rate limiting per user and source address:
 - `count_principal_failures`, `count_ip_failures`, `record_failed_login`,
   `cleanup_old_attempts`
 
-Tracks failed login attempts by principal and source IP to mitigate clients
-sending excessive traffic.
+Records failed login attempts with the principal and the source address, and
+counts them per (principal, source address) pair and per source address, so
+the server can refuse an address that has failed too often for one principal
+or overall without locking the principal out of other addresses.
 
 ### AuthorizationStore
 
@@ -570,13 +572,17 @@ The ops run in table and key order. A ConditionCheck or Delete that finds no row
 
 ### 5.6 Migrations
 
-Migrations are embedded in the binary at compile time via `include_str!` and applied in order by the
-`catalog::run_migrations` helper. Each migration is tracked in the `schema_history` table.
+The catalog migrations are the numbered list every backend shares
+([ADR-0023](../adr/0023-catalog-migrations.md)). PostgreSQL's bodies are SQL files embedded in the
+binary at compile time via `include_str!`. The shared runner applies them in id order and records
+each body in the `extenddb_migrations` ledger of the database it changed, and every id in the
+catalog's ledger. The
+`schema_history` table of a 0.1.x catalog stays in place and is not read.
 
-Migration files are numbered sequentially:
+Migration files are named by id:
 ```
 migrations/
-└── 001_initial_schema.sql
+└── 0001_baseline.sql
 ```
 
 ## 6. GSI Consistency Model

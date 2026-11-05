@@ -113,7 +113,6 @@ const sidebars: SidebarsConfig = {
           description: 'Filing issues, the pull request process and the review rules, on GitHub.',
         },
         {type: 'doc', id: 'manuals/developer-test-guide', label: 'Developer and test guide'},
-        {type: 'doc', id: 'manuals/writing-migrations', label: 'Writing a catalog migration'},
         {type: 'ref', id: 'design/testing', label: 'Test strategy'},
         {
           type: 'category',

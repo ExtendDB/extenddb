@@ -44,7 +44,7 @@ A new backend must implement **13 storage traits** plus the `CredentialStore` tr
 7. `AdminStore`: admin user management
 8. `SettingsStore`: runtime settings
 9. `MetricsStore`: historical metrics persistence and query
-10. `RateLimitStore`: login rate limiting and account lockout
+10. `RateLimitStore`: login rate limiting per user and source address
 11. `AuthorizationStore`: policy lookups for authorization decisions
 12. `BackupEngine`: backup and restore operations
 13. `Bootstrapper`: database initialization, destruction, migration, verification
@@ -222,9 +222,12 @@ Defined in `crates/storage/src/management_store/mod.rs`. Login rate limiting:
 
 | Method | Purpose |
 |--------|---------|
-| `record_login_attempt` | Record a login attempt (success or failure) |
-| `recent_failed_attempts` | Count recent failed attempts for lockout decisions |
+| `count_principal_failures` | Count recent failed attempts for one principal from one source address |
+| `count_ip_failures` | Count recent failed attempts from one source address, over all principals |
+| `record_failed_login` | Record a failed login attempt with its source address |
 | `cleanup_old_attempts` | Garbage-collect old login attempt records |
+
+Password verification in a backend's `AdminStore` and `ManagementStore` must go through `extenddb_storage::password::verify_password`, which bounds concurrent bcrypt work per process.
 
 ### AuthorizationStore
 
@@ -409,7 +412,7 @@ The PostgreSQL implementation makes backend-specific choices. These are implemen
 
 5. **Dual-database architecture**: catalog and data are separate PostgreSQL databases. Your backend might use a single database with keyspace separation, or a different topology entirely.
 
-6. **SQL migrations**: migration files are raw SQL. Your backend needs its own schema initialization mechanism, exposed through `Bootstrapper`.
+6. **SQL migrations**: migration files are raw SQL. Your backend applies the numbered catalog migrations through the shared runner: it implements `CatalogMigrations` (`crates/storage/src/migrations/catalog.rs`), installs it in its `Backend`, and declares a body or a reason for every id. Its `Bootstrapper` keeps database creation and the rows `init` writes after the migrations. [ADR-0023](../adr/0023-catalog-migrations.md) records the design and the [catalog migration section](https://github.com/ExtendDB/extenddb/blob/main/CONTRIBUTING.md#adding-a-catalog-migration) of `CONTRIBUTING.md` the procedure.
 
 ## Summary of Traits and Implementations
 

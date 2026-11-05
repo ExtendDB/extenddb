@@ -329,8 +329,8 @@ Or use the web console at `https://127.0.0.1:18443/console/`.
 # Health check
 curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/health
 
-# JSON metrics (DynamoDB CloudWatch-style)
-curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/metrics
+# JSON metrics (DynamoDB CloudWatch-style), admin credentials required
+curl --cacert ~/.extenddb/tls/cert.pem -u admin:<admin-password> https://127.0.0.1:18443/metrics
 
 # Syslog (Linux)
 journalctl -t extenddb -f

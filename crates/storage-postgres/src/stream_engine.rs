@@ -177,15 +177,25 @@ impl StreamEngine for PostgresEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
+            // created_at follows the record's own timestamp rather than a
+            // second clock read (NOW() would be the transaction start time).
+            // A timestamp outside the range `time` can represent, which a
+            // SystemTime reading never is, is stamped with the current time,
+            // as the SQLite engine stamps it.
+            let created_at = time::OffsetDateTime::from_unix_timestamp(
+                record.dynamodb.approximate_creation_date_time,
+            )
+            .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
             sqlx::query(
-                "INSERT INTO stream_records (sequence_number, shard_id, table_id, event_name, record_data) \
-                 VALUES ($1, $2, $3, $4, $5)",
+                "INSERT INTO stream_records (sequence_number, shard_id, table_id, event_name, record_data, created_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6)",
             )
             .bind(&record.dynamodb.sequence_number)
             .bind(&shard_id)
             .bind(&table_id)
             .bind(format!("{:?}", record.event_name))
             .bind(&record_json)
+            .bind(created_at)
             .execute(&self.data_pool)
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;

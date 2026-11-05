@@ -719,7 +719,7 @@ mod tests {
         let engine = crate::SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
+        crate::migrations::apply_for_tests(&engine.pool).await;
 
         let ks = vec![
             KeySchemaElement {
@@ -834,7 +834,7 @@ mod tests {
         let engine = crate::SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
+        crate::migrations::apply_for_tests(&engine.pool).await;
 
         let ks = vec![KeySchemaElement {
             attribute_name: "pk".to_owned(),
@@ -937,7 +937,7 @@ mod tests {
         let engine = crate::SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
+        crate::migrations::apply_for_tests(&engine.pool).await;
 
         let ks = vec![KeySchemaElement {
             attribute_name: "pk".to_owned(),
@@ -1059,7 +1059,7 @@ mod tests {
         let engine = crate::SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
+        crate::migrations::apply_for_tests(&engine.pool).await;
 
         let build = || SqliteVectorBuild {
             pool: engine.pool.clone(),

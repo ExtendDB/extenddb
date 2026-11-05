@@ -7,6 +7,7 @@
 //! field added to a struct without a sample line fails here before the page
 //! can go stale.
 
+use crate::backup::BackupConfig;
 use crate::sample_toml_support as support;
 use crate::{
     AuthCacheConfigToml, AuthConfig, ImportExportPathConfig, LoggingConfig, ServerConfig, TlsConfig,
@@ -31,7 +32,7 @@ fn root_sections_are_the_app_config_tables() {
     assert_eq!(
         support::table_keys(&root),
         [
-            "auth", "export", "import", "limits", "logging", "server", "storage"
+            "auth", "backup", "export", "import", "limits", "logging", "server", "storage"
         ]
     );
 }
@@ -51,6 +52,7 @@ fn no_default_marker_matches_the_example_keys() {
         "storage.mongodb.max_catalog_connections",
         "storage.cassandra.username",
         "storage.cassandra.password",
+        "backup.spool_path",
         // No struct default.
         "storage.backend",
         "docs_dir",
@@ -118,6 +120,14 @@ fn limits_section_matches_limits_config() {
 fn logging_section_matches_logging_config() {
     let root = support::sample();
     support::pin(&root, "logging", &[], &LoggingConfig::default());
+}
+
+#[test]
+fn backup_section_matches_backup_config() {
+    let root = support::sample();
+    // `spool_path` is `Option<String>` with no default; the sample shows an
+    // example path and its value is not compared.
+    support::pin(&root, "backup", &["spool_path"], &BackupConfig::default());
 }
 
 #[test]

@@ -94,9 +94,9 @@ Every key of `extenddb.toml`, its default and what it controls is listed on the 
 
 The `pool_size` key of `[storage.postgres]` sizes two pools, one against the catalog database and one against the data database; the Configuration page gives the connection arithmetic. Restores draw on the same pool.
 
-Restores on PostgreSQL are bounded per server process: at most 4 per account and at most half of `pool_size` in total (after its minimum of 10 is applied, capped at 16; 10 with the default `pool_size` of 20). A restore that cannot get both within 30 seconds is refused with `LimitExceededException`. Each running restore holds one connection from this pool for its whole copy, plus one dedicated connection outside the pool for its lock.
+Backup and restore jobs are bounded per server process by `[backup] max_concurrent_jobs` (default 4, on the [Configuration](../configuration.md) page), not per account; a request that finds every slot held waits up to 30 s for one and is then refused with `LimitExceededException`. The server raises `pool_size` and `catalog_pool_size` to at least `2 * max_concurrent_jobs + 10` and logs the raise with both numbers, so every job the bound admits has a connection. Each running restore holds one connection from this pool for its whole copy, plus one dedicated connection outside the pool for its claim.
 
-`RestoreTableFromBackup` on PostgreSQL holds a session-level advisory lock for the whole copy, so ExtendDB must reach the catalog database directly or through a session-mode pooler. Behind a transaction-mode pooler (for example PgBouncer with `pool_mode = transaction`) restore locks are not released and the abandoned-restore sweep can remove a restore that is still running; do not run restores through one.
+`RestoreTableFromBackup` on PostgreSQL holds a session-level advisory lock (the job's claim) for the whole copy, so ExtendDB must reach the catalog database directly or through a session-mode pooler. Behind a transaction-mode pooler (for example PgBouncer with `pool_mode = transaction`) the lock lands on a pooled server connection and is not released with the job, so later jobs can be refused as already claimed; do not run backups or restores through one.
 
 #### Auth cache statistics and invalidation timing
 
@@ -105,7 +105,7 @@ Statistics are exposed at `/management/auth-cache-metrics` (JSON, admin-authenti
 **Invalidation timing**:
 
 - **Single-key invalidations** (e.g. `DeleteAccessKey`, `PutUserPolicy`) drop the cached entry immediately; the next request sees the post-mutation state.
-- **Fanout invalidations** (e.g. `DeleteAccount`, `DeleteRole` session sweep, `DeleteGroup` member fanout) are **asynchronous**: there is a small window (~ms) between the API returning success and the matching entries being evicted. For hard cutover (e.g. revoking a compromised key), prefer the single-key path (`DeleteAccessKey`) over the cascade.
+- **Fanout invalidations** (e.g. `DeleteAccount`, `DeleteRole` session sweep, `DeleteGroup` member fanout) also take effect when the API returns. The account and role sweeps register a predicate with moka, and moka's `get` applies it, so matching entries are not served once the call returns; moka removes them from its map during later cache operations. The group fanout drops each member's entries in turn. If a group change cannot list the group's members, the server logs a warning and those members' entries wait for `ttl_seconds`.
 - **Off-instance changes** (multi-node deployments, or direct catalog writes) wait up to `ttl_seconds` to be observed locally.
 
 ### Runtime Settings
@@ -991,13 +991,15 @@ Navigate to `https://127.0.0.1:18443/console/` in your browser (adjust the host 
 
 ### Features
 
-- **Dashboard**: Account and admin user counts, version info
-- **Account management**: Create, view, delete accounts
+- **Dashboard**: Account and admin user counts (admin sessions only; an IAM-user session gets a link to its own account), version info
+- **Account management**: Create, view, delete accounts (an IAM-user session views its own account only and is redirected to `/console` from the pages of any other account)
 - **User management**: Create, delete users; view access keys, policies, tags, group memberships
 - **Access key management**: Create and delete access keys (secret shown once)
 - **Group management**: Create, delete groups; add/remove members
 - **Role management**: Create, delete roles; view trust policies
 - **Policy management**: Add, delete inline policies with JSON editor
+- **Metrics dashboard**: Operation metrics for every account, with charts (admin only; an IAM-user session is redirected to the console home page, `/console`)
+- **Settings and Cache**: The read-only settings viewer and the auth cache invalidation form (admin only; an IAM-user session is redirected to `/console`)
 
 ### Authentication
 
@@ -1006,7 +1008,7 @@ Navigate to `https://127.0.0.1:18443/console/` in your browser (adjust the host 
 
 Admin users have full access to all management operations. IAM users can view their own details and create and delete their own access keys.
 
-Sessions expire after 8 hours of inactivity. Click "Logout" to end a session immediately.
+Sessions expire after 8 hours of inactivity. Click "Logout" to end a session immediately. Deleting an admin or IAM user, or changing its password, ends its console sessions on every server at their next request.
 
 ## Monitoring
 
@@ -1116,14 +1118,9 @@ Error: error communicating with database
 
 Check that PostgreSQL is running and the connection string in `extenddb.toml` is correct.
 
-**Catalog version mismatch:**
+**The catalog has pending migrations, or is ahead of the binary:**
 
-<!-- version-literal-ok: the block below is an example mismatch error; 1.0.0 is the value found on disk, not a version claim -->
-```
-Error: catalog version mismatch: found 1.0.0, expected 0.0.4
-```
-
-Run `extenddb migrate --config extenddb.toml` to upgrade the catalog schema. The check is exact equality in both directions, so this also appears when a binary meets a catalog a newer build already migrated; in that case upgrade the binary rather than the catalog. `extenddb migrate` refuses a catalog newer than the binary (`catalog version X is newer than this binary's Y`) instead of stamping the older version onto it. See the Upgrade Manual for the version history and the stop / migrate / start sequence.
+On PostgreSQL, SQLite, Cassandra and MongoDB, `serve` reads the catalog's migration status before it opens the engine and refuses a catalog it cannot serve, printing the status and the command that resolves it. A catalog with pending migrations exits 3, for example `the catalog is at migration 4, and ExtendDB <release> needs migration 5`, followed by the pending migrations and `extenddb migrate --config extenddb.toml --yes`. A catalog that a newer release migrated with a breaking migration exits 4 and names that release's migrations; upgrade the binary rather than the catalog. The [Upgrade Manual](07-upgrade-manual.md#the-catalog-status) lists every status with its exit code and the stop / migrate / start sequence.
 
 ### Authentication Errors
 

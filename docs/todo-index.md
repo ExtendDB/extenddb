@@ -7,7 +7,6 @@ Regenerated: v0.1.6 (BR-7085)
 - `crates/core/src/types/item.rs:176` — Route ConsistentRead to read replica when replica support is added.
 - `crates/engine/src/batch_write_item.rs:181` — DynamoDB charges WCU based on old item size for deletes.
 - `crates/engine/src/transact_write_helpers.rs:121` — DynamoDB charges WCU based on old item size for deletes.
-- `crates/engine/src/backup.rs:233` — Implement real PITR using PostgreSQL temporal/history tables.
 - `crates/storage-postgres/src/table_helpers.rs:141` — Two queries not in a transaction under concurrent access.
 
 ## TODO(cleanup)

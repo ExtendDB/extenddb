@@ -71,17 +71,17 @@ See [Install from source](install-from-source.md#install-postgresql) for the Pos
 
 **Fix:** Check the PostgreSQL logs (`~/pgdata/server.log`). Ensure the `extenddb` user has CREATE TABLE permissions on the `extenddb` database.
 
-### `Catalog version mismatch: expected X, found Y. Run 'extenddb migrate' to update.`
+### `serve`, `migrate` or `verify` exits 3, 4, 5 or 6 naming the catalog
 
-**Cause:** The catalog database was initialized with a different version of ExtendDB. The binary expects catalog version X but the database has version Y.
+**Cause:** The catalog's status, read from its migration ledgers, is not one this binary serves: exit 3 means migrations are pending, 4 that the catalog has a breaking migration this binary does not know, 5 that a person must act, and 6 that the migration lock or a running server outlasted `--lock-timeout`. The [status table](manuals/07-upgrade-manual.md#the-catalog-status) of the upgrade manual lists each status with its exit codes.
 
-**Fix:** Run `extenddb migrate` to apply schema migrations and update the catalog version. Back up the database first.
+**Fix:** Run the command the message prints. For pending migrations that is `extenddb migrate --config extenddb.toml --yes`, after the backup the message names.
 
-### `Catalog not initialized. Run 'extenddb init' to set up the catalog.`
+### `the catalog at <location> is not initialized; create it with 'extenddb init'`
 
-**Cause:** The server connected to the database but the catalog tables don't exist. The database hasn't been initialized with `extenddb init`.
+**Cause:** The database holds no catalog: no migration ledger and no `catalog_version` row. `serve`, `migrate` and `verify` exit 1 and change nothing.
 
-**Fix:** Run `extenddb init` to create the catalog schema and data database. See [Install from source](install-from-source.md#3-initialize-the-deployment).
+**Fix:** Check that the config names the right database. For a new deployment, run `extenddb init` to create the catalog and data databases. See [Install from source](install-from-source.md#3-initialize-the-deployment).
 
 ### `Database '<name>' already exists. Run 'extenddb destroy --config <config>' first, then re-run 'extenddb init'.`
 
@@ -101,7 +101,7 @@ extenddb serve --port 19443 --config extenddb.toml  # use a different port
 
 ### `another extenddb process is already using <database> (lock held on <database>.lock)`
 
-**Cause:** A SQLite database file has one owner at a time. `extenddb serve` takes an exclusive lock on `<database>.lock` (next to the file SQLite opens, after resolving any `sqlite:` or `file:` form, relative path, or symlink) before it opens the database and holds it until it exits. `init` (through to the admin user being written), `migrate`, and `destroy` take the same lock for as long as they run, because they rewrite or remove the file. The backend serializes writers inside one process and recovers interrupted work at startup, so a second server, or a migration or destroy under a running server, would corrupt the first one's work. Read-only commands (`settings`, `manage`, `verify`, `status`) take no lock and run alongside a server.
+**Cause:** A SQLite database file has one owner at a time. `extenddb serve` takes an exclusive lock on `<database>.lock` (next to the file SQLite opens, after resolving any `sqlite:` or `file:` form, relative path, or symlink) before it opens the database and holds it until it exits. `init` (through to the admin user being written), `migrate --yes`, and `destroy` take the same lock for as long as they run, because they rewrite or remove the file; `migrate --yes` waits for it for up to `--lock-timeout` seconds (60 by default) and then exits 6. The backend serializes writers inside one process and recovers interrupted work at startup, so a second server, or a migration or destroy under a running server, would corrupt the first one's work. Read-only commands (`settings`, `manage`, `verify`, `status`, and `migrate` without `--yes`) take no lock and run alongside a server.
 
 **Fix:** Stop the other process (`extenddb stop --config <config>` for a server), or point this command at a different database (`--sqlite-path` at `init` time). The lock is released by the operating system when the holder exits, including after a crash, so a leftover `<database>.lock` file is harmless and needs no cleanup.
 
@@ -854,9 +854,15 @@ The error log line names the exact relations for one leaked table and gives this
 
 ### Console redirects to login page on every request
 
-**Cause:** The session cookie has expired (sessions last 8 hours) or cookies are blocked by the browser.
+**Cause:** The session cookie has expired (sessions last 8 hours of inactivity), the user's password was changed or the user was deleted after the session began, or cookies are blocked by the browser.
 
-**Fix:** Log in again. Ensure cookies are enabled for the ExtendDB server address. If using a reverse proxy, ensure it forwards the `Cookie` and `Set-Cookie` headers.
+**Fix:** Log in again, with the new password if it was changed. Ensure cookies are enabled for the ExtendDB server address. If using a reverse proxy, ensure it forwards the `Cookie` and `Set-Cookie` headers.
+
+### Console pages return HTTP 503 "The catalog is unavailable"
+
+**Cause:** The console checks every session against the catalog database, and that read failed. The session is kept.
+
+**Fix:** Check that the catalog database is reachable from the server, then reload the page. After a PostgreSQL restart the first reloads can still answer 503: each pooled catalog connection that the restart closed fails once and is then replaced.
 
 ### Console shows "Encryption key not found" when creating access keys
 
