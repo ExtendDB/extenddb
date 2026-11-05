@@ -158,6 +158,10 @@ pub(crate) fn resolve_paths(
                 }
             }
         }
+        // The length after the path's names, as the service checks it.
+        if let Some(msg) = super::path_length::too_many_levels(path) {
+            return Err(DynamoDbError::ValidationException(msg));
+        }
         resolved.push(elems);
     }
     Ok(resolved)

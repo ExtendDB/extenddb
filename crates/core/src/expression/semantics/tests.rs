@@ -432,3 +432,25 @@ fn key_condition_function_names() {
     }
     assert_eq!(key_condition_err("pk = :p AND begins_with(sk, :v)"), "OK");
 }
+
+/// The BETWEEN bounds are checked at request time (measured 2026-10-26,
+/// HBTW-1: refused on a missing key and after a false AND).
+#[test]
+fn between_bounds_are_checked_in_the_walk() {
+    let m = maps(
+        &[],
+        &[
+            (":hi", AttributeValue::N("5".to_owned())),
+            (":lo", AttributeValue::N("1".to_owned())),
+        ],
+    );
+    assert_eq!(
+        condition_err("a BETWEEN :hi AND :lo", &m),
+        format!(
+            "{C}The BETWEEN operator requires upper bound to be greater than or equal to lower \
+             bound; lower bound operand: AttributeValue: {{N:5}}, upper bound operand: \
+             AttributeValue: {{N:1}}"
+        )
+    );
+    assert!(condition_err("attribute_exists(b) AND a BETWEEN :hi AND :lo", &m).contains("BETWEEN"));
+}

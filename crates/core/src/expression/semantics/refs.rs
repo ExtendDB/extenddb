@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The name and value usage checks shared by both passes: every `#name`
-//! element of a document path, and every `:value` placeholder, is defined.
+//! element of a document path, and every `:value` placeholder, is defined,
+//! and a document path has at most 32 elements.
 
 use super::super::ast::PathElement;
 use super::super::kind::ExpressionKind;
@@ -28,7 +29,12 @@ pub(super) fn check_path_refs(
             ));
         }
     }
-    Ok(())
+    // The service checks the length after the path's names (measured
+    // 2026-10-26).
+    match super::super::path_length::too_many_levels(path) {
+        Some(msg) => Err(validation(kind, &msg)),
+        None => Ok(()),
+    }
 }
 
 pub(super) fn check_value_defined(
