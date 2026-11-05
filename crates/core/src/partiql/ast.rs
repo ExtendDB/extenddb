@@ -511,6 +511,9 @@ pub struct OrderBy {
 pub struct OrderTerm {
     pub path: Path,
     pub descending: bool,
+    /// The `line:column:length` span of the path's first token, where the
+    /// refusal of a path with steps names it.
+    pub at: String,
 }
 
 impl OrderBy {

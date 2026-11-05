@@ -238,7 +238,7 @@ impl Parser {
 
     /// Whether the parentheses opening at the current token hold a comma of
     /// their own, outside any bracket, brace or parenthesis inside them.
-    fn list_in_parentheses_ahead(&self) -> bool {
+    pub(super) fn list_in_parentheses_ahead(&self) -> bool {
         let mut depth = 0usize;
         for token in &self.tokens[self.pos..] {
             match token.kind {
@@ -265,7 +265,7 @@ impl Parser {
 
     /// A list literal written in parentheses, at `path` inside the value
     /// being read: its elements are read as those of a list in brackets.
-    fn list_in_parentheses(&mut self, path: &str) -> PResult<Vec<AttributeValue>> {
+    pub(super) fn list_in_parentheses(&mut self, path: &str) -> PResult<Vec<AttributeValue>> {
         self.nested(Nest::Literal, |p| {
             p.nesting.containers += 1;
             let list = p.elements_in_parentheses(path);

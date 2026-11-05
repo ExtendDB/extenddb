@@ -33,6 +33,13 @@ pub(super) async fn run_update(
     let parts = build_update_parts(ctx, update, &req.parameters).await?;
     // The item check below reads the item.
     gate.pass().await?;
+    // A SET or REMOVE of a key attribute is refused first, by the update
+    // below (measured 2026-11-05).
+    if let Some(refusal) = &parts.condition_key_refusal
+        && !targets_a_key(update, &parts.key)
+    {
+        return Err(DynamoDbError::ValidationException(refusal.clone()));
+    }
     if item_depth::sets_a_value_past_the_item_limit(update, &req.parameters)
         && let Some(err) = item_depth::unwritable_update_error(ctx, &parts, req).await
     {
@@ -81,6 +88,22 @@ pub(crate) struct UpdateParts {
     pub condition: String,
     pub names: Map<String, Value>,
     pub values: Map<String, Value>,
+    /// The refusal of a path into a key attribute among the WHERE's other
+    /// conditions (see `common::condition_key_refusal`), which the
+    /// statement gets once it is authorized.
+    pub condition_key_refusal: Option<String>,
+}
+
+/// Whether an `UPDATE` sets, removes or changes the members of an attribute
+/// of the key `key`.
+fn targets_a_key(update: &UpdateStatement, key: &Map<String, Value>) -> bool {
+    update
+        .sets
+        .iter()
+        .map(|action| &action.path)
+        .chain(update.set_members.iter().map(|action| &action.path))
+        .chain(&update.removes)
+        .any(|path| key.contains_key(&path.root))
 }
 
 /// Translate an `UPDATE` into its `UpdateItem` pieces. Does not dispatch.
@@ -105,6 +128,8 @@ pub(crate) async fn build_update_parts(
 
     let (key, residual) = split_key_where(where_clause, pk_name, sk_name, params)?;
     common::check_key_types(&key, &key_info)?;
+    let condition_key_refusal =
+        common::condition_key_refusal(where_clause, pk_name, sk_name, params);
 
     let mut builder = ExprBuilder::default();
 
@@ -147,6 +172,7 @@ pub(crate) async fn build_update_parts(
         condition,
         names: builder.names,
         values: builder.values,
+        condition_key_refusal,
     })
 }
 

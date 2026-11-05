@@ -126,7 +126,9 @@ pub(super) async fn run(
 /// Read and parse the member at position `i`, and make the checks its
 /// statement gets before its table is read.
 ///
-/// A malformed statement fails the whole request, its message prefixed
+/// A statement of only whitespace fails the whole request without the
+/// statement's position, ahead of its parameters (measured 2026-11-05). A
+/// malformed statement fails the whole request, its message prefixed
 /// with the statement's position (measured 2026-11-02 on an empty WHERE). A
 /// parameter that cannot be converted is reported without the statement's
 /// position (measured 2026-11-02); the checks on a parsed statement name it.
@@ -141,6 +143,11 @@ fn parse_member(i: usize, obj: &Value) -> Result<(SingleRequest, Statement), Dyn
         ))
     };
     let req = SingleRequest::from_body(obj)?;
+    if super::request_checks::is_blank_statement(&req.statement) {
+        return Err(DynamoDbError::ValidationException(
+            super::request_checks::EMPTY_TRANSACTION_STATEMENT.to_owned(),
+        ));
+    }
     super::check_parameters(obj.get("Parameters")).map_err(DynamoDbError::ValidationException)?;
     let stmt = parse_for_request(&req.statement, req.parameters.len())
         .map_err(|e| positional(&e.message))?;

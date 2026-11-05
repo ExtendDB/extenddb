@@ -571,3 +571,24 @@ fn a_transaction_reports_the_token_then_the_count_then_each_statement() {
         )
     );
 }
+
+#[test]
+fn a_statement_of_whitespace_alone_is_blank() {
+    for blank in [
+        " ", "   ", "\t\n ", "\r", "\u{b}", "\u{c}", "\u{1f}", "\u{2028}", "\u{3000}",
+    ] {
+        assert!(is_blank_statement(blank), "{blank:?}");
+    }
+    for statement in [
+        "\u{0}",
+        "\u{1}",
+        "\u{85}",
+        "\u{a0}",
+        "-- a note",
+        "/* a note */",
+        " ;",
+        HEAD,
+    ] {
+        assert!(!is_blank_statement(statement), "{statement:?}");
+    }
+}

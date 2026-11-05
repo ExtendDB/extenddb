@@ -39,6 +39,8 @@ service (2026-11-02).
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
 from botocore.exceptions import ClientError
 
@@ -754,3 +756,331 @@ def test_a_projected_call_is_refused_before_the_index_lookup(
 ):
     message = _message(dynamodb_client, statement.format(t=htable))
     assert message == f"Unexpected path component at {position}"
+
+
+# ---- a path into a key attribute in the WHERE of a write ---------------------
+#
+# Measured 2026-11-05. A condition that tests a path into a key attribute
+# against values (a comparison either way round, BETWEEN, IN, begins_with,
+# contains, attribute_type, an IS type test, one of these compared with a
+# boolean) is refused naming the key, in statement order with the refusal
+# of two values for one key, ahead of the full key and the key type. Any
+# other condition with a path into a key attribute (OR, NOT, a function of
+# the path, IS MISSING, the path compared with a path) is refused later,
+# after the key type and the SET of a key attribute, with "Key:" before the
+# name, which is the sort key when a path into it is among the conditions.
+
+KEY_PATH_CONDITION = (
+    "Key attributes must be scalars; list random access '[]' and map lookup '.' are not "
+    "allowed: Key: {}"
+)
+FULL_KEY = "Where clause does not contain a mandatory equality on all key attributes"
+KEY_UPDATE = (
+    "One or more parameter values were invalid: Cannot update attribute pk. This attribute "
+    "is part of the key"
+)
+
+
+def _write_item(client, table):
+    """The partition key of a fresh item k/b with x = 0."""
+    pk = f"w-{uuid.uuid4().hex[:8]}"
+    client.put_item(
+        TableName=table, Item={"pk": {"S": pk}, "sk": {"S": "b"}, "x": {"N": "0"}}
+    )
+    return pk
+
+
+def _stored_x(client, table, pk):
+    item = client.get_item(
+        TableName=table, Key={"pk": {"S": pk}, "sk": {"S": "b"}}, ConsistentRead=True
+    )["Item"]
+    return item["x"]["N"]
+
+
+@pytest.mark.parametrize(
+    ("template", "key"),
+    [
+        ("DELETE FROM {t} WHERE pk = '{k}' AND sk = 'b' AND pk.c = 1", "pk"),
+        ("UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 'b' AND sk[0] = 'z'", "sk"),
+        ("UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 'b' AND 1 = pk.c", "pk"),
+        ("UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 'b' AND pk.c <> 1", "pk"),
+        ("UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 'b' AND pk.c BETWEEN 1 AND 2", "pk"),
+        ("UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 'b' AND pk.c IN [1]", "pk"),
+        ("UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 'b' AND begins_with(pk.c, 'x')", "pk"),
+        ("UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 'b' AND contains(pk.c, 'x')", "pk"),
+        ("UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 'b' AND pk.c IS NULL", "pk"),
+        ("UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 'b' AND pk.c = 1 = false", "pk"),
+        ("UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 'b' AND (pk.c = 1)", "pk"),
+        ("UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 'b' AND pk['c'] = 1", "pk"),
+        ("UPDATE {t} SET x = 1 WHERE pk = '{k}' AND pk.c = 1", "pk"),
+        ("UPDATE {t} SET x = 1 WHERE pk = 1 AND sk = 'b' AND pk.c = 1", "pk"),
+        ("UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 1 AND sk.c = 1", "sk"),
+        ("UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 'b' AND sk.c = 1 AND pk.d = 1", "sk"),
+        ("UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 'b' AND NOT pk.c = 1 AND sk.d = 1", "sk"),
+        ("UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 'b' AND pk.c = 1 AND pk = 'zz'", "pk"),
+    ],
+    ids=[
+        "delete-map-lookup",
+        "update-list-index",
+        "value-on-the-left",
+        "not-equal",
+        "between",
+        "in",
+        "begins-with",
+        "contains",
+        "is-null",
+        "compared-with-false",
+        "in-parentheses",
+        "subscript",
+        "ahead-of-the-full-key",
+        "ahead-of-the-key-type",
+        "ahead-of-the-sort-key-type",
+        "first-in-statement-order",
+        "ahead-of-a-later-refusal",
+        "ahead-of-a-later-second-value",
+    ],
+)
+def test_a_write_refuses_a_path_into_a_key_tested_against_values(
+    dynamodb_client, ctable, template, key
+):
+    pk = _write_item(dynamodb_client, ctable)
+    statement = template.format(t=f'"{ctable}"', k=pk)
+    assert _message(dynamodb_client, statement) == SCALAR_KEY.format(key)
+    assert _stored_x(dynamodb_client, ctable, pk) == "0"
+
+
+def test_a_second_value_for_a_key_ahead_of_a_path_into_one(dynamodb_client, ctable):
+    pk = _write_item(dynamodb_client, ctable)
+    statement = (
+        f"UPDATE \"{ctable}\" SET x = 1 WHERE pk = '{pk}' AND pk = 'zz' AND sk = 'b' "
+        "AND sk.c = 1"
+    )
+    assert _message(dynamodb_client, statement) == MULTIPLE.format("pk")
+    assert _stored_x(dynamodb_client, ctable, pk) == "0"
+
+
+@pytest.mark.parametrize(
+    ("template", "key"),
+    [
+        ("UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 'b' AND (a = 1 OR pk.c = 1)", "pk"),
+        ("UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 'b' AND NOT pk.c = 1", "pk"),
+        ("UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 'b' AND attribute_exists(pk.c)", "pk"),
+        ("UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 'b' AND size(sk.c) > 1", "sk"),
+        ("UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 'b' AND pk.c IS MISSING", "pk"),
+        ("UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 'b' AND pk.c IS NOT NULL", "pk"),
+        ("UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 'b' AND pk.c NOT IN [1]", "pk"),
+        ("UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 'b' AND pk.c IN [a]", "pk"),
+        ("UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 'b' AND pk.c = a", "pk"),
+        ("DELETE FROM {t} WHERE pk = '{k}' AND sk = 'b' AND NOT pk.c = 1", "pk"),
+        (
+            "UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 'b' AND NOT pk.c = 1 AND NOT sk.d = 1",
+            "sk",
+        ),
+        ("UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 'b' AND pk.c = sk.d", "sk"),
+        ("UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 'b' AND (pk.c = 1 OR sk = 'b')", "pk"),
+    ],
+    ids=[
+        "or",
+        "not",
+        "attribute-exists",
+        "size",
+        "is-missing",
+        "is-not-null",
+        "not-in",
+        "in-with-a-path",
+        "compared-with-a-path",
+        "delete",
+        "the-sort-key-anywhere",
+        "the-sort-key-in-one-condition",
+        "a-bare-sort-key",
+    ],
+)
+def test_a_write_refuses_a_path_into_a_key_in_its_condition(
+    dynamodb_client, ctable, template, key
+):
+    pk = _write_item(dynamodb_client, ctable)
+    statement = template.format(t=f'"{ctable}"', k=pk)
+    assert _message(dynamodb_client, statement) == KEY_PATH_CONDITION.format(key)
+    assert _stored_x(dynamodb_client, ctable, pk) == "0"
+
+
+@pytest.mark.parametrize(
+    ("template", "message"),
+    [
+        ("UPDATE {t} SET x = 1 WHERE pk = '{k}' AND NOT pk.c = 1", FULL_KEY),
+        ("UPDATE {t} SET x = 1 WHERE pk = 1 AND sk = 'b' AND NOT pk.c = 1", KEY_TYPE.format("pk")),
+        ("UPDATE {t} SET pk = 'z' WHERE pk = '{k}' AND sk = 'b' AND NOT pk.c = 1", KEY_UPDATE),
+        (
+            "UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 'b' AND NOT pk.c = 1 AND sk = 'zz'",
+            MULTIPLE.format("sk"),
+        ),
+    ],
+    ids=["full-key", "key-type", "set-of-a-key", "second-value"],
+)
+def test_the_refusals_ahead_of_a_path_into_a_key_in_a_condition(
+    dynamodb_client, ctable, template, message
+):
+    pk = _write_item(dynamodb_client, ctable)
+    statement = template.format(t=f'"{ctable}"', k=pk)
+    assert _message(dynamodb_client, statement) == message
+    assert _stored_x(dynamodb_client, ctable, pk) == "0"
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "DELETE FROM {t} WHERE pk = '{k}' AND sk = 'b' AND NOT pk.c = 1",
+        "UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 'b' AND NOT pk.c = 1",
+    ],
+    ids=["delete", "update"],
+)
+def test_a_path_into_a_key_in_a_condition_is_refused_for_a_missing_item(
+    dynamodb_client, ctable, template
+):
+    statement = template.format(t=f'"{ctable}"', k=f"w-absent-{uuid.uuid4().hex[:8]}")
+    assert _message(dynamodb_client, statement) == KEY_PATH_CONDITION.format("pk")
+
+
+def test_a_batch_names_the_table_only_for_a_path_in_the_condition(dynamodb_client, ctable):
+    first = _write_item(dynamodb_client, ctable)
+    second = _write_item(dynamodb_client, ctable)
+    t = f'"{ctable}"'
+    responses = dynamodb_client.batch_execute_statement(
+        Statements=[
+            {"Statement": f"UPDATE {t} SET x = 1 WHERE pk = '{first}' AND sk = 'b' AND pk.c = 1"},
+            {
+                "Statement": (
+                    f"UPDATE {t} SET x = 1 WHERE pk = '{second}' AND sk = 'b' AND NOT pk.c = 1"
+                )
+            },
+        ]
+    )["Responses"]
+    assert responses == [
+        {"Error": {"Code": "ValidationError", "Message": SCALAR_KEY.format("pk")}},
+        {
+            "Error": {"Code": "ValidationError", "Message": KEY_PATH_CONDITION.format("pk")},
+            "TableName": ctable,
+        },
+    ]
+    assert _stored_x(dynamodb_client, ctable, first) == "0"
+    assert _stored_x(dynamodb_client, ctable, second) == "0"
+
+
+# Measured 2026-11-05. In a batch, a write that tests a path into a key
+# attribute against values counts neither as a write nor in the check for
+# two statements on one item. A write with a path into a key attribute among
+# its other conditions counts as a write, and not in that check.
+
+MIXED = "Read and write requests together in the same batch is not supported."
+
+
+def test_a_batch_leaves_a_path_into_a_key_tested_against_values_out_of_its_checks(
+    dynamodb_client, ctable
+):
+    first = _write_item(dynamodb_client, ctable)
+    second = _write_item(dynamodb_client, ctable)
+    t = f'"{ctable}"'
+    read = {"Statement": f"SELECT x FROM {t} WHERE pk = '{first}' AND sk = 'b'"}
+    refused = {
+        "Statement": f"UPDATE {t} SET x = 1 WHERE pk = '{second}' AND sk = 'b' AND pk.c = 1"
+    }
+    again = {"Statement": f"UPDATE {t} SET x = 2 WHERE pk = '{second}' AND sk = 'b'"}
+    refusal = {"Error": {"Code": "ValidationError", "Message": SCALAR_KEY.format("pk")}}
+    responses = dynamodb_client.batch_execute_statement(Statements=[read, refused])["Responses"]
+    assert responses == [{"TableName": ctable, "Item": {"x": {"N": "0"}}}, refusal]
+    responses = dynamodb_client.batch_execute_statement(Statements=[refused, again])["Responses"]
+    assert responses == [refusal, {"TableName": ctable}]
+    assert _stored_x(dynamodb_client, ctable, second) == "2"
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 'b' AND NOT pk.c = 1",
+        "DELETE FROM {t} WHERE pk = '{k}' AND sk = 'b' AND NOT pk.c = 1",
+    ],
+    ids=["update", "delete"],
+)
+def test_a_batch_counts_a_path_into_a_key_in_a_condition_as_a_write_of_no_item(
+    dynamodb_client, ctable, template
+):
+    first = _write_item(dynamodb_client, ctable)
+    second = _write_item(dynamodb_client, ctable)
+    t = f'"{ctable}"'
+    read = {"Statement": f"SELECT * FROM {t} WHERE pk = '{first}' AND sk = 'b'"}
+    refused = {"Statement": template.format(t=t, k=second)}
+    with pytest.raises(ClientError) as e:
+        dynamodb_client.batch_execute_statement(Statements=[read, refused])
+    assert e.value.response["Error"] == {"Code": "ValidationException", "Message": MIXED}
+    again = {"Statement": f"UPDATE {t} SET x = 2 WHERE pk = '{second}' AND sk = 'b'"}
+    refusal = {
+        "Error": {"Code": "ValidationError", "Message": KEY_PATH_CONDITION.format("pk")},
+        "TableName": ctable,
+    }
+    for statements, answers in (
+        ([refused, again], [refusal, {"TableName": ctable}]),
+        ([again, refused], [{"TableName": ctable}, refusal]),
+    ):
+        responses = dynamodb_client.batch_execute_statement(Statements=statements)["Responses"]
+        assert responses == answers
+    assert _stored_x(dynamodb_client, ctable, second) == "2"
+
+
+@pytest.mark.parametrize(
+    ("template", "reason"),
+    [
+        ("UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 'b' AND pk.c = 1", KEY_SCHEMA_MISMATCH),
+        ("DELETE FROM {t} WHERE pk = '{k}' AND sk = 'b' AND sk[0] = 'z'", KEY_SCHEMA_MISMATCH),
+        (
+            "UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 'b' AND NOT pk.c = 1",
+            {"Code": "ValidationError", "Message": KEY_PATH_CONDITION.format("pk")},
+        ),
+    ],
+    ids=["update-tested-against-a-value", "delete-tested-against-a-value", "in-the-condition"],
+)
+def test_a_transaction_write_with_a_path_into_a_key_is_cancelled(
+    dynamodb_client, ctable, template, reason
+):
+    pk = _write_item(dynamodb_client, ctable)
+    statement = template.format(t=f'"{ctable}"', k=pk)
+    with pytest.raises(ClientError) as e:
+        dynamodb_client.execute_transaction(TransactStatements=[{"Statement": statement}])
+    response = e.value.response
+    assert response["Error"] == {
+        "Code": "TransactionCanceledException",
+        "Message": f"{CANCELLED} [ValidationError]",
+    }
+    assert response["CancellationReasons"] == [reason]
+    assert _stored_x(dynamodb_client, ctable, pk) == "0"
+
+
+def test_an_exists_check_with_a_path_into_a_key(dynamodb_client, ctable):
+    pk = _write_item(dynamodb_client, ctable)
+    t = f'"{ctable}"'
+    update = {"Statement": f"UPDATE {t} SET x = 1 WHERE pk = '{pk}' AND sk = 'b'"}
+    against_a_value = {
+        "Statement": f"EXISTS(SELECT * FROM {t} WHERE pk = '{pk}' AND sk = 'b' AND pk.c = 1)"
+    }
+    assert _transaction_message(dynamodb_client, [update, against_a_value]) == (
+        "Validation failed in TransactStatements[1]: " + SCALAR_KEY.format("pk")
+    )
+    in_the_condition = {
+        "Statement": f"EXISTS(SELECT * FROM {t} WHERE pk = '{pk}' AND sk = 'b' AND NOT pk.c = 1)"
+    }
+    with pytest.raises(ClientError) as e:
+        dynamodb_client.execute_transaction(TransactStatements=[update, in_the_condition])
+    response = e.value.response
+    assert response["Error"]["Message"] == f"{CANCELLED} [None, ValidationError]"
+    assert response["CancellationReasons"] == [
+        {"Code": "None"},
+        {"Code": "ValidationError", "Message": KEY_PATH_CONDITION.format("pk")},
+    ]
+    assert _stored_x(dynamodb_client, ctable, pk) == "0"
+
+
+def _transaction_message(client, statements):
+    with pytest.raises(ClientError) as e:
+        client.execute_transaction(TransactStatements=statements)
+    err = e.value.response["Error"]
+    assert err["Code"] == "ValidationException", err
+    return err["Message"]

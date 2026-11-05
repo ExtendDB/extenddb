@@ -12,15 +12,17 @@
 //! neither as a read nor as a write, nor in the check for two statements on
 //! one item: a missing table or index, a key value of the wrong type, an
 //! INSERT without a key attribute, a write whose WHERE does not give the full
-//! key, a `?` with no parameter, and a DELETE returning clause other than
-//! `RETURNING ALL OLD *`.
+//! key or tests a path into a key attribute against values, a `?` with no
+//! parameter, and a DELETE returning clause other than `RETURNING ALL OLD *`.
 //!
 //! A statement that translates and fails the check of its request counts as a
 //! read or a write, and not in the check for two statements on one item: a
 //! read that is not of one item by its full primary key, an UPDATE that sets
-//! or removes a key attribute, and a write that gives a secondary index key a
-//! value of the wrong type. The two write refusals name the table, as the
-//! errors of a write that reached its item do.
+//! or removes a key attribute, a write that gives a secondary index key a
+//! value of the wrong type, and, after those two, a write whose WHERE reads a
+//! path into a key attribute among its other conditions (measured 2026-11-05
+//! on UPDATE and DELETE). The write refusals name the table, as the errors of
+//! a write that reached its item do.
 
 use std::collections::HashMap;
 
@@ -28,7 +30,7 @@ use serde_json::{Map, Value};
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::partiql::Statement;
-use extenddb_core::partiql::ast::{InsertStatement, UpdateStatement};
+use extenddb_core::partiql::ast::{InsertStatement, UpdateStatement, WhereExpr};
 use extenddb_core::types::{AttributeValue, Item, TableKeyInfo};
 use extenddb_core::validation::{
     IndexKeyRef, validate_index_key_literal_operands, validate_index_key_types,
@@ -89,9 +91,15 @@ pub(super) async fn translate_write(
             DynamoDbError::ResourceNotFoundException(String::new()),
         ));
     };
+    let params = &req.parameters;
     let refusal = match stmt {
-        Statement::Update(update) => update_refusal(ctx, update, &req.parameters, key_info).await?,
-        Statement::Insert(insert) => insert_refusal(ctx, insert, &req.parameters, key_info).await?,
+        Statement::Update(update) => update_refusal(ctx, update, params, key_info)
+            .await?
+            .or_else(|| condition_key_refusal(update.where_clause.as_ref(), key_info, params)),
+        Statement::Insert(insert) => insert_refusal(ctx, insert, params, key_info).await?,
+        Statement::Delete(delete) => {
+            condition_key_refusal(Some(&delete.where_clause), key_info, params)
+        }
         _ => None,
     };
     if let Some(error) = refusal {
@@ -156,6 +164,23 @@ async fn insert_refusal(
         &key_info.attribute_definitions,
     )
     .err())
+}
+
+/// The refusal of a write whose WHERE pins its item and reads a path into a
+/// key attribute among its other conditions (see
+/// `common::condition_key_refusal`). An UPDATE gets it after the refusals
+/// of its `UpdateItem` request (measured 2026-11-05: `SET pk = 'z'` and a
+/// `SET` of an index key to a value of the wrong type are refused first).
+fn condition_key_refusal(
+    where_clause: Option<&WhereExpr>,
+    key_info: &TableKeyInfo,
+    params: &[AttributeValue],
+) -> Option<DynamoDbError> {
+    let (Some(pk), sk) = common::key_names(&key_info.key_schema) else {
+        return None;
+    };
+    common::condition_key_refusal(where_clause?, pk, sk, params)
+        .map(DynamoDbError::ValidationException)
 }
 
 /// The key schema of each secondary index of the table.

@@ -368,3 +368,106 @@ def test_an_order_by_on_a_table_keyed_on_its_partition_key(
 def test_an_order_by_on_an_index_takes_the_index_keys(dynamodb_client, indexed, order, result):
     statement = f"SELECT * FROM \"{indexed}\".\"gix\" WHERE g = 'a' ORDER BY {order}"
     assert _read(dynamodb_client, statement) == result
+
+
+# ---- ORDER BY on an index, and a path in the list -------------------------------
+#
+# Measured 2026-11-05. An index read takes the refusals of the WHERE an ORDER
+# BY reads that a table read takes. A statement with no WHERE is refused for
+# it ahead of the list, on a table and on an index. A path with steps in the
+# list is refused at its first token, in list order with a name that is not a
+# key attribute, after a path into a key attribute in the WHERE and ahead of
+# the key values.
+
+PATH_TERM = "Argument to ORDER BY must be of type VariableReference. Type: PATH at 1:{}:{}"
+
+
+@pytest.mark.parametrize(
+    ("clause", "result"),
+    [
+        ("ORDER BY g", NO_WHERE),
+        ("ORDER BY n", NO_WHERE),
+        ("ORDER BY m.x", NO_WHERE),
+        ("WHERE g > 'a' ORDER BY g", NOT_KEYED),
+        ("WHERE g = 'a' OR n = 1 ORDER BY gs", NOT_KEYED),
+        ("WHERE gs = 'x' ORDER BY gs", NOT_KEYED),
+        ("WHERE g = 'a' AND gs <> 'x' ORDER BY gs", NOT_KEYED),
+        ("WHERE g IN ['a', 'b'] ORDER BY gs", HASH_KEY),
+        ("WHERE g > 'a' ORDER BY n", _attribute("n")),
+    ],
+)
+def test_an_order_by_on_an_index_needs_a_where_that_reads_it_by_key(
+    dynamodb_client, indexed, clause, result
+):
+    statement = f'SELECT * FROM "{indexed}"."gix" {clause}'
+    assert _read(dynamodb_client, statement) == result
+
+
+def test_an_order_by_on_an_index_over_two_partitions_names_its_partition_key(
+    dynamodb_client, indexed
+):
+    statement = f"SELECT * FROM \"{indexed}\".\"gix\" WHERE g IN ['a', 'b'] ORDER BY g, gs"
+    assert _read(dynamodb_client, statement) == ["p1", "p2", "p3"]
+
+
+def test_an_order_by_with_no_where_is_refused_ahead_of_its_list(dynamodb_client, five):
+    for order in ("n", "m.x", "pk"):
+        assert _read(dynamodb_client, f'SELECT * FROM "{five}" ORDER BY {order}') == NO_WHERE
+
+
+@pytest.mark.parametrize(
+    ("clause", "term"),
+    [
+        ("WHERE pk = 'a' ORDER BY m.x", "m"),
+        ("WHERE pk = 'a' ORDER BY m[0]", "m"),
+        ("WHERE pk = 'a' ORDER BY m['k']", "m"),
+        ("WHERE pk = 'a' ORDER BY pk.x", "pk"),
+        ("WHERE pk = 'a' ORDER BY \"m\".\"x\"", '"m"'),
+        ("WHERE pk = 'a' ORDER BY m.x DESC", "m"),
+        ("WHERE pk = 'a' ORDER BY m.x, n", "m"),
+        ("WHERE pk = 'a' ORDER BY sk, m.x", "m"),
+        ("WHERE pk = 1 ORDER BY m.x", "m"),
+        ("WHERE pk = 'a' AND sk = 1 ORDER BY m.x", "m"),
+        ("WHERE pk > 'a' ORDER BY m.x", "m"),
+    ],
+    ids=[
+        "map-member",
+        "list-element",
+        "member-in-brackets",
+        "into-a-key",
+        "quoted",
+        "with-a-direction",
+        "ahead-of-a-name",
+        "after-a-key",
+        "ahead-of-the-key-type",
+        "ahead-of-the-sort-key-type",
+        "ahead-of-a-scan",
+    ],
+)
+def test_a_path_in_the_order_by_list_is_refused_at_its_first_token(
+    dynamodb_client, five, clause, term
+):
+    statement = f'SELECT * FROM "{five}" {clause}'
+    column = statement.index(term, statement.index("ORDER BY") + len("ORDER BY")) + 1
+    assert _read(dynamodb_client, statement) == PATH_TERM.format(column, len(term))
+
+
+@pytest.mark.parametrize(
+    ("clause", "result"),
+    [
+        ("WHERE pk = 'a' ORDER BY n, m.x", _attribute("n")),
+        ("WHERE pk = 'a' AND sk.x = 1 ORDER BY m.x", SCALAR.replace("Key pk", "Key sk")),
+    ],
+)
+def test_a_path_in_the_order_by_list_after_other_refusals(dynamodb_client, five, clause, result):
+    assert _read(dynamodb_client, f'SELECT * FROM "{five}" {clause}') == result
+
+
+@pytest.mark.parametrize(
+    "clause",
+    ["WHERE g = 'a' ORDER BY m.x", "WHERE g > 'a' ORDER BY m.x", "WHERE g = 'a' ORDER BY g, m.x"],
+)
+def test_a_path_in_the_order_by_list_of_an_index_read(dynamodb_client, indexed, clause):
+    statement = f'SELECT * FROM "{indexed}"."gix" {clause}'
+    column = statement.index("m.x") + 1
+    assert _read(dynamodb_client, statement) == PATH_TERM.format(column, 1)

@@ -64,6 +64,42 @@ const ON_FAILURE_VALUES: &[&str] = &["ALL_OLD", "NONE"];
 /// The values of `ReturnConsumedCapacity`, as the service lists them.
 const CONSUMED_CAPACITY_VALUES: &[&str] = &["INDEXES", "TOTAL", "NONE"];
 
+/// The refusal a `BatchExecuteStatement` member gets for a statement that
+/// holds only whitespace (see [`is_blank_statement`]).
+pub(super) const EMPTY_BATCH_STATEMENT: &str = "The statement was empty.";
+
+/// The refusal of an `ExecuteTransaction` with a member whose statement holds
+/// only whitespace (see [`is_blank_statement`]). It names no member.
+pub(super) const EMPTY_TRANSACTION_STATEMENT: &str =
+    "ExecuteTransaction can not have empty statement.";
+
+/// Whether a statement that passed the length constraint holds only
+/// whitespace. `BatchExecuteStatement` refuses such a member and
+/// `ExecuteTransaction` the whole request, each ahead of the member's
+/// parameters and of the members after it, after the members before it;
+/// `ExecuteStatement` reads it as a statement with nothing in it (measured
+/// 2026-11-05). Measured as whitespace: space, tab, line feed, the vertical
+/// tab, form feed, carriage return, U+001F, U+2028 and U+3000. Measured as
+/// not: U+0000, U+0001, U+0085, U+00A0 and a comment. The other information
+/// separators (U+001C to U+001E), the paragraph separator and the Unicode
+/// spaces other than the no-break ones are taken as whitespace with them.
+pub(super) fn is_blank_statement(statement: &str) -> bool {
+    statement.chars().all(|c| {
+        matches!(
+            c,
+            '\t'..='\r'
+                | '\u{1c}'..='\u{20}'
+                | '\u{1680}'
+                | '\u{2000}'..='\u{2006}'
+                | '\u{2008}'..='\u{200a}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{205f}'
+                | '\u{3000}'
+        )
+    })
+}
+
 /// Check an `ExecuteStatement` request.
 ///
 /// # Errors

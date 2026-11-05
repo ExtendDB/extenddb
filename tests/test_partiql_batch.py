@@ -817,6 +817,13 @@ def test_two_writes_that_reach_one_item_are_duplicates(dynamodb_client, gtable, 
         ),
         ("UPDATE {t} SET g = 1 WHERE pk = '{k}' AND sk = 'b'", INDEX_KEY_TYPE),
         ("INSERT INTO {t} VALUE {{'pk':'{n}','sk':'b','g':1}}", INDEX_KEY_TYPE),
+        # Both come ahead of a path into a key attribute among the other
+        # conditions (measured 2026-11-05).
+        (
+            "UPDATE {t} SET pk = 'z' WHERE pk = '{k}' AND sk = 'b' AND NOT pk.c = 1",
+            _key_update("pk"),
+        ),
+        ("UPDATE {t} SET g = 1 WHERE pk = '{k}' AND sk = 'b' AND NOT pk.c = 1", INDEX_KEY_TYPE),
     ],
     ids=[
         "set-partition-key",
@@ -827,6 +834,8 @@ def test_two_writes_that_reach_one_item_are_duplicates(dynamodb_client, gtable, 
         "index-into-a-map",
         "set-index-key-type",
         "insert-index-key-type",
+        "set-partition-key-ahead-of-a-path-into-a-key",
+        "set-index-key-type-ahead-of-a-path-into-a-key",
     ],
 )
 def test_an_error_of_the_item_operation_names_the_table(

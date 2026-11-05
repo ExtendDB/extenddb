@@ -366,6 +366,47 @@ pub fn scalar_key_refusal(filter: &[&WhereExpr], keys: KeyNames<'_>) -> Option<S
 pub const SCALAR_KEY_REFUSAL: &str = "Key attributes must be scalars; list random access '[]' and map lookup '.' are not \
      allowed: Key ";
 
+/// The refusal of a path into a key attribute among the conditions a write
+/// checks against its item, before the key's name (see
+/// [`condition_key_path`]).
+pub const CONDITION_KEY_REFUSAL: &str = "Key attributes must be scalars; list random access '[]' and map lookup '.' are \
+     not allowed: Key: ";
+
+/// The key attribute of a condition of a write's WHERE that tests a path
+/// into it against values alone: a comparison with a value on either side,
+/// BETWEEN with values, IN with a list of values, begins_with, contains or
+/// attribute_type with a value as the second argument, an IS test of a
+/// type, or one of these compared with a boolean (measured 2026-11-05 on
+/// UPDATE and DELETE: `pk.c = 1`, `1 = pk.c`, `sk[0] = 'z'`, `pk.c BETWEEN 1
+/// AND 2`, `pk.c IN [1]`, `begins_with(pk.c, 'x')`, `pk.c IS NULL` and `pk.c
+/// = 1 = false` are refused with [`SCALAR_KEY_REFUSAL`]). `None` for any
+/// other condition.
+#[must_use]
+pub fn path_tested_against_values<'a>(expr: &'a WhereExpr, keys: KeyNames<'_>) -> Option<&'a str> {
+    roles::value_test_of_path_into_key(expr, keys)
+}
+
+/// The key attribute the refusal of a path into a key attribute among a
+/// write's other conditions names: the sort key when any of `conditions`
+/// reads a path into it, else the partition key when one reads a path into
+/// that (measured 2026-11-05: `NOT pk.c = 1 AND NOT sk.d = 1`, either way
+/// round, and `pk.c = sk.d` name sk; `pk.c = 1 OR sk = 'b'` names pk).
+/// These are the conditions [`path_tested_against_values`] does not take:
+/// OR, NOT, a function of the path, IS MISSING, IS NOT, and the path
+/// compared with another path.
+#[must_use]
+pub fn condition_key_path<'a>(conditions: &[&'a WhereExpr], keys: KeyNames<'_>) -> Option<&'a str> {
+    let mut named = Vec::new();
+    for condition in conditions {
+        roles::keys_with_paths_into_them(condition, keys, &mut named);
+    }
+    named
+        .iter()
+        .find(|name| keys.sort == Some(**name))
+        .or_else(|| named.first())
+        .copied()
+}
+
 /// The refusal of a path into the key attribute `key`.
 fn scalar_message(key: &str) -> String {
     format!("{SCALAR_KEY_REFUSAL}{key}")

@@ -844,6 +844,7 @@ def _members(table, templates, **names):
         ("a.b", "seed", {"Item": {}}),
         ("l[7]", "lst", {"Item": {}}),
         ("a", "no-such-item", {}),
+        ("m['k'], a", "seed", {"Item": {"a": {"N": "1"}, "m": {"M": {"k": {"N": "1"}}}}}),
     ],
     ids=[
         "path",
@@ -855,6 +856,7 @@ def _members(table, templates, **names):
         "path-into-a-number",
         "element-past-the-list",
         "missing-item",
+        "member-in-brackets",
     ],
 )
 def test_a_read_member_honours_its_projection(dynamodb_client, gtable, projection, name, expected):
@@ -928,6 +930,10 @@ def _overlap(one, two):
         (["INSERT INTO {t} VALUE {{'pk':'{n}','sk':'b','a':1}}",
           "SELECT a, a FROM {t} WHERE pk = '{s2}' AND sk = 'b'"], 1, _REPEATED),
         (["SELECT a, a FROM {t} WHERE pk = '{s}' AND sk = 'b'", "SELECT * FROM"], 0, _REPEATED),
+        (["SELECT m['k'], m.k FROM {t} WHERE pk = '{s}' AND sk = 'b'"], 0,
+         "Duplicate identifiers in select clause: k"),
+        (["SELECT m['k'], m FROM {t} WHERE pk = '{s}' AND sk = 'b'"], 0,
+         _overlap("[m]", "[m, k]")),
     ],
     ids=[
         "repeated",
@@ -943,6 +949,8 @@ def _overlap(one, two):
         "second-member",
         "ahead-of-the-mix",
         "ahead-of-a-later-syntax-error",
+        "repeated-member-in-brackets",
+        "overlap-member-in-brackets",
     ],
 )
 def test_a_projection_refusal_names_its_member(dynamodb_client, gtable, templates, index, message):
@@ -992,6 +1000,12 @@ _EXISTS_FORM = "EXISTS() must contain a single item read with additional conditi
 _EXISTS_INDEX = "Operations on indices are not supported in transactions"
 _UNBOUND = "Number of parameters in request and statement don't match."
 _UNEXPECTED_TERM = "Statement wasn't well formed, can't be processed: Unexpected term"
+_BLANK = "   "
+_INTO_KEY_EXISTS = "EXISTS(SELECT * FROM {t} WHERE pk = '{s}' AND sk = 'b' AND pk.c = 1)"
+_INTO_KEY = (
+    "Key attributes must be scalars; list random access '[]' and map lookup '.' are not "
+    "allowed: Key pk"
+)
 
 
 @pytest.mark.parametrize(
@@ -1032,6 +1046,16 @@ _UNEXPECTED_TERM = "Statement wasn't well formed, can't be processed: Unexpected
         ([_INSERT, _MISSING_READ], _MIXED),
         (["UPDATE nosuch_tbl SET x = 1 WHERE pk = 'a' AND sk = 'b' RETURNING ALL NEW *",
           _SEED_READ], _MIXED),
+        ([_PARTIAL_READ, _BLANK], _positional(0, _PARTIAL_KEY)),
+        ([_RETURNING_UPDATE, _BLANK], _positional(0, _RETURNING)),
+        ([_SEED_READ, _INSERT, _BLANK], _MIXED),
+        ([_INDEX_READ, _BLANK], _positional(0, _INDEX)),
+        ([_INTO_KEY_EXISTS, _BLANK], _positional(0, _INTO_KEY)),
+        ([_INTO_KEY_EXISTS, _SYNTAX], _positional(0, _INTO_KEY)),
+        ([_RETURNING_UPDATE, "INSERT INTO {t} VALUE {{'pk':'{n}','sk':'b','x':-0.0}}"],
+         _positional(0, _RETURNING)),
+        (["UPDATE {t} SET x = 1 WHERE pk = '{r}' AND sk = 'b' AND pk.c = 1", _PARTIAL_READ],
+         _positional(1, _PARTIAL_KEY)),
     ],
     ids=[
         "read-write-then-syntax",
@@ -1060,6 +1084,14 @@ _UNEXPECTED_TERM = "Statement wasn't well formed, can't be processed: Unexpected
         "read-then-write-on-a-missing-table",
         "write-then-read-of-a-missing-table",
         "returning-on-a-missing-table-then-read",
+        "partial-key-then-blank",
+        "returning-then-blank",
+        "read-write-then-blank",
+        "index-read-then-blank",
+        "exists-into-a-key-then-blank",
+        "exists-into-a-key-then-syntax",
+        "returning-then-negative-zero",
+        "write-into-a-key-then-partial-key",
     ],
 )
 def test_the_first_member_that_fails_is_reported(dynamodb_client, gtable, templates, message):

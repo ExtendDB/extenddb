@@ -22,6 +22,12 @@
 //! A literal that converts but breaks a number rule gets the rule's message
 //! with the position inside the value appended (`under root`, `under root.x`,
 //! `under root[1]`); a parameter gets the bare message.
+//!
+//! A zero written with a decimal point or an exponent (`0.0`, `.0`, `0e0`)
+//! with a minus sign before it is a negative zero decimal. The service
+//! refuses it as a literal and takes it as a parameter, which it stores as 0
+//! (measured 2026-11-05). The parser reports the literal, since it knows
+//! the signs (see [`is_zero_decimal`]).
 
 use crate::types::AttributeValue;
 
@@ -41,6 +47,10 @@ pub const TOO_MANY_DIGITS_MESSAGE: &str =
 /// appended after `": "` unless it is empty.
 pub const UNCONVERTIBLE_PARAMETER_MESSAGE: &str =
     "The parameter cannot be converted to a numeric value";
+/// A number literal that is a negative zero decimal. The position inside the
+/// value and the span of the number are appended (see
+/// [`negative_zero_refusal`]).
+pub const NEGATIVE_ZERO_MESSAGE: &str = "Negative zero decimal is not supported";
 
 const MAX_SIGNIFICANT_DIGITS: usize = 38;
 /// Largest precision minus scale a number may have (`9.99...E+125`).
@@ -183,6 +193,39 @@ pub fn check_number(text: &str) -> Result<(), NumberProblem> {
         return Err(NumberProblem::Underflow);
     }
     Ok(())
+}
+
+/// Whether `text`, a number with an optional sign, is a zero written with a
+/// decimal point or an exponent: `0.0`, `.0`, `0.`, `00.0`, `0e0`, `0E-3`.
+/// With a minus sign among the signs before it, the service refuses such a
+/// literal, even when two signs cancel (measured 2026-11-05: `-0.0`, `- -0.0`,
+/// `+-0.0`, `-(0.0)` and `-0E-3` are refused). A zero written as an integer
+/// (`-0`) and `+0.0` are taken as 0.
+#[must_use]
+pub(crate) fn is_zero_decimal(text: &str) -> bool {
+    let unsigned = text.strip_prefix(['+', '-']).unwrap_or(text);
+    let (mantissa, exponent) = match unsigned.find(['e', 'E']) {
+        Some(at) => (&unsigned[..at], true),
+        None => (unsigned, false),
+    };
+    let mut zeros = 0usize;
+    let mut point = false;
+    for c in mantissa.chars() {
+        match c {
+            '0' => zeros += 1,
+            '.' => point = true,
+            _ => return false,
+        }
+    }
+    zeros > 0 && (point || exponent)
+}
+
+/// The refusal of a negative zero decimal at `path` inside its value
+/// (`root`, `root[0]`, `root.y`; a bag member is `root`), at `at`, the
+/// `line:column:length` span of the number after its signs (measured
+/// 2026-11-05).
+pub(crate) fn negative_zero_refusal(path: &str, at: &str) -> String {
+    format!("{NEGATIVE_ZERO_MESSAGE} under key {path} at {at}")
 }
 
 /// The message for a parameter's `N` text that fails [`check_number`].
