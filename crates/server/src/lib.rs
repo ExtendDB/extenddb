@@ -58,6 +58,8 @@ use tower_http::timeout::RequestBodyTimeoutLayer;
 /// Application state shared across all handlers.
 pub struct AppState {
     pub storage: Arc<dyn extenddb_storage::StorageEngine>,
+    /// The job slots and configured backup store the backup operations read.
+    pub backup_runtime: Arc<extenddb_engine::BackupRuntime>,
     pub auth: Arc<dyn AuthProvider>,
     pub limits: Arc<LimitsConfig>,
     // Fix #9: Use Arc<str> to avoid per-request cloning
@@ -210,6 +212,7 @@ pub async fn start_server(
             docs_store: docs_store.clone(),
             auth_cache: auth_cache_for_console,
             metrics: metrics_for_console,
+            secure_cookies: tls_enabled,
         });
         let console_router = console::router().with_state(console_state);
         app = app
