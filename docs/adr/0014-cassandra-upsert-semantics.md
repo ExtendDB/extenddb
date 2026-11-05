@@ -14,11 +14,11 @@ Operations like `put_policy` must be idempotent: Calling the operation multiple 
 
 ## Options Considered
 
-1. **Natural INSERT behavior** — Use plain `INSERT` statements and rely on Cassandra's built-in overwrite semantics. Simpler code, same idempotent result.
+1. **Natural INSERT behavior**: Use plain `INSERT` statements and rely on Cassandra's built-in overwrite semantics. Simpler code, same idempotent result.
 
-2. **Explicit UPDATE with conditional INSERT** — Check if row exists via SELECT, then execute UPDATE or INSERT accordingly. Mimics PostgreSQL logic exactly but adds unnecessary complexity.
+2. **Explicit UPDATE with conditional INSERT**: Check if row exists via SELECT, then execute UPDATE or INSERT accordingly. Mimics PostgreSQL logic exactly but adds unnecessary complexity.
 
-3. **Lightweight transaction with IF EXISTS** — Use `UPDATE ... IF EXISTS` to make the upsert explicit. Adds LWT overhead for no behavioral benefit.
+3. **Lightweight transaction with IF EXISTS**: Use `UPDATE ... IF EXISTS` to make the upsert explicit. Adds LWT overhead for no behavioral benefit.
 
 ## Decision
 
@@ -54,6 +54,6 @@ Use natural INSERT behavior for operations requiring UPSERT semantics.
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is
-a trademark of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is maintained by
+engineers at Amazon Web Services. It is not Amazon DynamoDB and contains no DynamoDB source
+code. "DynamoDB" is a trademark of Amazon.com, Inc.

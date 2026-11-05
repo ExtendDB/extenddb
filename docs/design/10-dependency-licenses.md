@@ -441,6 +441,6 @@ This file is a human-controlled policy input and must not be modified by agents.
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is maintained by
+engineers at Amazon Web Services. It is not Amazon DynamoDB and contains no DynamoDB source
+code. "DynamoDB" is a trademark of Amazon.com, Inc.

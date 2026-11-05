@@ -11,18 +11,18 @@ The Cassandra backend uses a keyspace-per-account isolation model. Each ExtendDB
 The PostgreSQL backend uses a single database with all accounts sharing the same schema. Account creation in PostgreSQL is a simple catalog INSERT with no storage initialization. This raises the question: when should Cassandra create the account-specific keyspace?
 
 Two natural timing points exist:
-1. **During account creation** — Create keyspace in `ManagementStore::create_account()`
-2. **On first table creation** — Lazy keyspace creation in `TableEngine::create_table()`
+1. **During account creation**: Create keyspace in `ManagementStore::create_account()`
+2. **On first table creation**: Lazy keyspace creation in `TableEngine::create_table()`
 
 Existing code in `create_table_impl` validates that the account keyspace exists and returns an error if it doesn't, requiring an explicit choice.
 
 ## Options Considered
 
-1. **Keyspace creation during account creation** — `ManagementStore::create_account_impl()` creates both the catalog entry and the account keyspace in a single operation.
+1. **Keyspace creation during account creation**: `ManagementStore::create_account_impl()` creates both the catalog entry and the account keyspace in a single operation.
 
-2. **Lazy keyspace creation on first table** — `TableEngine::create_table_impl()` checks if the account keyspace exists and creates it if missing (idempotent).
+2. **Lazy keyspace creation on first table**: `TableEngine::create_table_impl()` checks if the account keyspace exists and creates it if missing (idempotent).
 
-3. **Manual provisioning** — Require operators to explicitly create account keyspaces via separate API or CLI command before creating tables.
+3. **Manual provisioning**: Require operators to explicitly create account keyspaces via separate API or CLI command before creating tables.
 
 ## Decision
 
@@ -65,6 +65,6 @@ Create account keyspace during account creation (`ManagementStore::create_accoun
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is
-a trademark of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is maintained by
+engineers at Amazon Web Services. It is not Amazon DynamoDB and contains no DynamoDB source
+code. "DynamoDB" is a trademark of Amazon.com, Inc.

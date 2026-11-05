@@ -1,12 +1,11 @@
 ---
 description: "Change data capture for tables: stream records, shards, iterators and retention."
+version: "1.0"
+date: "2026-04-03"
+status: "Draft: high-level design choices only (detailed design deferred)"
 ---
 
 # Component design: DynamoDB Streams
-
-**Version:** 1.0
-**Date:** 2026-04-03
-**Status:** Draft — High-Level Design Choices Only (Detailed Design Deferred)
 
 ## 1. Purpose
 
@@ -25,7 +24,7 @@ Four operations, served on the same HTTP endpoint as DynamoDB operations:
 | `GetShardIterator` | Get an iterator for a shard (TRIM_HORIZON, LATEST, AT_SEQUENCE_NUMBER, AFTER_SEQUENCE_NUMBER) |
 | `GetRecords` | Read up to 1000 records (or 1 MB) from a shard using an iterator |
 
-**Note:** In real DynamoDB, Streams is a separate service with its own endpoint (`streams.dynamodb.<region>.amazonaws.com`) and its own SDK client (`boto3.client('dynamodbstreams')` in Python, `DynamoDbStreamsClient` in Java). extenddb serves both services on a single port. This works because SDK clients accept `endpoint_url` overrides — the user sets both `AWS_ENDPOINT_URL_DYNAMODB` and `AWS_ENDPOINT_URL_DYNAMODB_STREAMS` to the same extenddb address. The `X-Amz-Target` prefix distinguishes the two services: DynamoDB operations use `DynamoDB_20120810.<Op>`, Streams operations use `DynamoDBStreams_20120810.<Op>`. Both use `dynamodb` as the SigV4 signing name, so authentication is identical. See `01-requirements.md` §11 and `08-component-config.md` §10 for SDK configuration details.
+**Note:** In real DynamoDB, Streams is a separate service with its own endpoint (`streams.dynamodb.<region>.amazonaws.com`) and its own SDK client (`boto3.client('dynamodbstreams')` in Python, `DynamoDbStreamsClient` in Java). ExtendDB serves both services on a single port. This works because SDK clients accept `endpoint_url` overrides: the user sets both `AWS_ENDPOINT_URL_DYNAMODB` and `AWS_ENDPOINT_URL_DYNAMODB_STREAMS` to the same ExtendDB address. The `X-Amz-Target` prefix distinguishes the two services: DynamoDB operations use `DynamoDB_20120810.<Op>`, Streams operations use `DynamoDBStreams_20120810.<Op>`. Both use `dynamodb` as the SigV4 signing name, so authentication is identical. See `01-requirements.md` §11 and `08-component-config.md` §10 for SDK configuration details.
 
 ## 3. Stream Record Format
 
@@ -171,6 +170,6 @@ GetRecords handler:
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is maintained by
+engineers at Amazon Web Services. It is not Amazon DynamoDB and contains no DynamoDB source
+code. "DynamoDB" is a trademark of Amazon.com, Inc.

@@ -1,17 +1,16 @@
 ---
 description: "The core crate: DynamoDB types, expression parsing and evaluation, validation and the business logic shared by every backend."
+version: "1.0"
+date: "2026-04-03"
+status: "Draft"
+crate: "dynamodb-core"
 ---
 
 # Component design: Core
 
-**Version:** 1.0
-**Date:** 2026-04-03
-**Status:** Draft
-**Crate:** `dynamodb-core`
-
 ## 1. Purpose
 
-The `core` crate contains all DynamoDB-specific business logic that is independent of the storage backend, HTTP server, and async runtime. It is pure synchronous Rust — types, expression parsing/evaluation, validation, capacity calculation, and error types.
+The `core` crate contains all DynamoDB-specific business logic that is independent of the storage backend, HTTP server, and async runtime. It is pure synchronous Rust: types, expression parsing/evaluation, validation, capacity calculation, and error types.
 
 **Dependencies:** serde, serde_json, thiserror, time, uuid, base64, bigdecimal (no tokio, no sqlx, no axum, no async runtime)
 
@@ -129,7 +128,7 @@ impl<'de> Deserialize<'de> for AttributeValue {
 - `BTreeMap` for Map type and `BTreeSet` for Set types ensure deterministic serialization order (important for CRC32 checksums and test reproducibility).
 - Number stored as `String` to preserve arbitrary precision (up to 38 digits). Numeric operations in expressions use `bigdecimal::BigDecimal` for comparison and arithmetic, which supports DynamoDB's full 38-digit precision requirement.
 - Binary values stored as `Vec<u8>` internally; base64 encoding/decoding happens only at the serde boundary.
-- The `Null` variant carries no data — DynamoDB's `{"NULL": true}` is the only valid form, enforced by the Deserialize impl. `{"NULL": false}` must be rejected with `SerializationException`.
+- The `Null` variant carries no data; DynamoDB's `{"NULL": true}` is the only valid form, enforced by the Deserialize impl. `{"NULL": false}` must be rejected with `SerializationException`.
 
 ### 3.2 Key Schema Types
 
@@ -274,7 +273,7 @@ pub enum UpdateAction {
 
 The evaluator takes an AST and an `EvalContext` (the current item + attribute name/value maps) and returns a boolean (for conditions/filters) or a modified item (for updates).
 
-> **Important:** `ConditionExpression` evaluation for write operations (PutItem, UpdateItem, DeleteItem) must happen inside the storage backend's transaction, not in the core handler after a round-trip. The core crate provides the `evaluate_condition` function, but the storage backend calls it within its transaction after `SELECT FOR UPDATE` to prevent TOCTOU races. `FilterExpression` evaluation (for Query/Scan) happens in the core handler after items are returned from storage — this is safe because filters are read-only.
+> **Important:** `ConditionExpression` evaluation for write operations (PutItem, UpdateItem, DeleteItem) must happen inside the storage backend's transaction, not in the core handler after a round-trip. The core crate provides the `evaluate_condition` function, but the storage backend calls it within its transaction after `SELECT FOR UPDATE` to prevent TOCTOU races. `FilterExpression` evaluation (for Query/Scan) happens in the core handler after items are returned from storage; this is safe because filters are read-only.
 
 ```rust
 pub struct EvalContext<'a> {
@@ -310,7 +309,7 @@ The `engine` crate depends on `core` (for types, expressions, validation) and `s
 1. Deserialize and validate input (using `core::validation`)
 2. Parse expressions (using `core::expression`)
 3. Call the storage engine (async)
-4. Apply post-read processing (filter expressions, projections — using `core::expression`)
+4. Apply post-read processing (filter expressions and projections, using `core::expression`)
 5. Calculate consumed capacity (using `core::capacity`)
 6. Format the response
 
@@ -334,7 +333,7 @@ For `UpdateItem`, the storage backend must execute the following steps inside a 
 10. COMMIT
 ```
 
-Both `evaluate_condition` and `apply_update` are sync functions from `core` — they operate on in-memory data and are called by the storage backend inside its transaction.
+Both `evaluate_condition` and `apply_update` are sync functions from `core`; they operate on in-memory data and are called by the storage backend inside its transaction.
 
 ## 6. Validation
 
@@ -480,6 +479,6 @@ impl DynamoDbError {
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is maintained by
+engineers at Amazon Web Services. It is not Amazon DynamoDB and contains no DynamoDB source
+code. "DynamoDB" is a trademark of Amazon.com, Inc.

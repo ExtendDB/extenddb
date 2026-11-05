@@ -35,7 +35,7 @@ pub async fn docs_page(State(state): State<Arc<ConsoleState>>) -> Response {
     let mut content = String::with_capacity(4096);
     content.push_str(r#"<h1>Documentation</h1>
 <div class="card card-warning">
-<p style="margin:0;font-size:0.9rem"><strong>extenddb is not Amazon DynamoDB.</strong> It is an independent, clean-room implementation that speaks the DynamoDB wire protocol. It is not affiliated with, endorsed by, or sponsored by Amazon Web Services. &ldquo;DynamoDB&rdquo; is a trademark of Amazon.com, Inc.</p>
+<p style="margin:0;font-size:0.9rem"><strong>ExtendDB is not Amazon DynamoDB.</strong> It is a clean-room implementation that speaks the DynamoDB wire protocol and contains no DynamoDB source code, an open source project under the Apache License 2.0, maintained by engineers at Amazon Web Services. &ldquo;DynamoDB&rdquo; is a trademark of Amazon.com, Inc.</p>
 </div>"#);
 
     let categories = [

@@ -318,7 +318,7 @@ Fork entire ExtendDB repo for each backend. Each fork contains frontend + one ba
 
 ## Unresolved questions
 
-1. **Security review process.** Backend implementations handle database credentials, execute queries, and manage connections—all surfaces with security implications (SQL injection, connection security, credential leakage). Should we formalize security review as part of the PR process? If so, what does that look like? Do we need security-focused reviewers, automated scanning tools, or documented security patterns? This wasn't part of the original discussion but seems important for production deployments.
+1. **Security review process.** Backend implementations handle database credentials, execute queries, and manage connections, all surfaces with security implications (SQL injection, connection security, credential leakage). Should we formalize security review as part of the PR process? If so, what does that look like? Do we need security-focused reviewers, automated scanning tools, or documented security patterns? This wasn't part of the original discussion but seems important for production deployments.
 
 2. **Conformance test ownership.** Should conformance tests live in the main `extenddb` repo, or in a separate `extenddb-conformance` repo used by all backends? Leaning toward main repo for simplicity, but open to feedback.
 
@@ -349,6 +349,6 @@ Fork entire ExtendDB repo for each backend. Each fork contains frontend + one ba
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is
-a trademark of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is maintained by
+engineers at Amazon Web Services. It is not Amazon DynamoDB and contains no DynamoDB source
+code. "DynamoDB" is a trademark of Amazon.com, Inc.

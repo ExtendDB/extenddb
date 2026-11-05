@@ -91,10 +91,10 @@ function QuickStarts(): ReactNode {
         <div className="row">
           <div className="col col--6">
             <div className={styles.panel}>
-              <Heading as="h3">For local development and CI</Heading>
+              <Heading as="h3">For local development and continuous integration</Heading>
               <p>
                 One container over SQLite, plain HTTP, a seeded example credential. Nothing to initialize and no
-                certificate to trust. Bound to the loopback interface; not for anything reachable from other
+                certificate to trust. It listens only on the local machine and is not for anything reachable from other
                 machines.
               </p>
               <CodeBlock language="bash">{devImage}</CodeBlock>

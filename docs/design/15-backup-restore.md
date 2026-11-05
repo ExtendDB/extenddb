@@ -1,6 +1,11 @@
-# Design Spec: Off-Host Backup and Restore for ExtendDB
+---
+description: "Off-host backups: one portable format the engine writes to a local directory or an S3 bucket, and the backup and restore operations built on it."
+status: "Draft"
+target: "v1.0"
+base: "main `abf8082f` (which carries PR 0 = #384 as `9d13202`, the Cassandra backend, #338, and the PostgreSQL GSI build, #401) and the open series PR 2 = #396 (this document), PR 3 = #393 (supersedes #336, head `aef17ddd`), PR 4 = #394 (supersedes #337, head `3f7107dc`), PR 5 = #395 (stacked on #394, head `069c4b17`); PR 1 is #335 rebased"
+---
 
-Status: Draft for maintainer review. Written against main `abf8082f` (which carries PR 0 = #384 as `9d13202`, the Cassandra backend, #338, and the PostgreSQL GSI build, #401) and the open series PR 2 = #396 (this document), PR 3 = #393 (supersedes #336, head `aef17ddd`), PR 4 = #394 (supersedes #337, head `3f7107dc`), PR 5 = #395 (stacked on #394, head `069c4b17`); PR 1 is #335 rebased. The revision log at the end holds the dates of each revision. Target: v1.0.
+# Design spec: Off-host backup and restore for ExtendDB
 
 ## Summary
 

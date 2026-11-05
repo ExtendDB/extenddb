@@ -14,8 +14,8 @@ ExtendDB manages two kinds of stored state in every storage backend. The
 examples below name the PostgreSQL databases; other backends map the same two
 roles onto their own structures (see backend-specific documentation).
 
-- **Catalog** (e.g., the `extenddb_catalog` PostgreSQL database): All metadata — table definitions, indexes, accounts, IAM entities, settings, stream metadata, and schema history.
-- **Data** (e.g., the `extenddb_catalog_data` PostgreSQL database): User item data. Each DynamoDB table maps to a PostgreSQL table. GSI and LSI data are stored in separate PostgreSQL tables.
+- **Catalog** (e.g., the `extenddb_catalog` PostgreSQL database): All metadata, meaning table definitions, indexes, accounts, IAM entities, settings, stream metadata, and schema history.
+- **Data** (e.g., the `extenddb` PostgreSQL database): User item data. Each DynamoDB table maps to a PostgreSQL table. GSI and LSI data are stored in separate PostgreSQL tables.
 
 On PostgreSQL, the data database connection string is stored in the catalog's `settings` table under the key `data_database_url`. This allows the catalog and data databases to live on different PostgreSQL instances.
 
@@ -80,7 +80,7 @@ Condition evaluation happens inside the storage transaction (after `SELECT FOR U
 
 ### FilterExpression
 
-Applied after reads (Query/Scan) to exclude non-matching items. Same syntax as ConditionExpression. Filter expressions do not reduce consumed capacity — all scanned items count toward RCU.
+Applied after reads (Query/Scan) to exclude non-matching items. Same syntax as ConditionExpression. Filter expressions do not reduce consumed capacity; all scanned items count toward RCU.
 
 ### UpdateExpression
 
@@ -120,11 +120,11 @@ Full SigV4 signature verification:
 
 After authentication, the authorization layer evaluates IAM policies using a 5-phase algorithm:
 
-1. **Explicit Deny** — scan all policies (identity, permissions boundary, session). Any matching Deny → access denied.
-2. **Permissions Boundary** — if set, must contain a matching Allow → else denied.
-3. **Session Policy** — if set (AssumeRole), must contain a matching Allow → else denied.
-4. **Identity Allow** — scan identity policies (user, group, role). Any matching Allow → access granted.
-5. **Implicit Deny** — no matching Allow → access denied.
+1. **Explicit Deny**: scan all policies (identity, permissions boundary, session). Any matching Deny → access denied.
+2. **Permissions Boundary**: if set, must contain a matching Allow → else denied.
+3. **Session Policy**: if set (AssumeRole), must contain a matching Allow → else denied.
+4. **Identity Allow**: scan identity policies (user, group, role). Any matching Allow → access granted.
+5. **Implicit Deny**: no matching Allow → access denied.
 
 Policy conditions support all IAM condition operators: `StringEquals`, `StringNotEquals`, `StringEqualsIgnoreCase`, `StringLike`, `StringNotLike`, `NumericEquals`, `NumericNotEquals`, `NumericLessThan`, `NumericLessThanEquals`, `NumericGreaterThan`, `NumericGreaterThanEquals`, `DateEquals`, `DateNotEquals`, `DateLessThan`, `DateLessThanEquals`, `DateGreaterThan`, `DateGreaterThanEquals`, `Bool`, `Null`, `ArnEquals`, `ArnNotEquals`, `ArnLike`, `ArnNotLike`, plus `ForAllValues`, `ForAnyValue`, and `IfExists` modifiers. Supported condition keys include `aws:PrincipalTag/*`, `aws:ResourceTag/*`, `dynamodb:LeadingKeys`, `dynamodb:Attributes`, `dynamodb:Select`, `dynamodb:ReturnValues`, `dynamodb:ReturnConsumedCapacity`, `dynamodb:FullTableScan`, and `dynamodb:EnclosingOperation`.
 
@@ -185,7 +185,7 @@ Item size includes attribute names and values, matching DynamoDB's size calculat
 
 ## Caching Design
 
-extenddb caches a small set of operational settings in memory to avoid per-request database queries on hot paths; this section covers those settings and the risks of caching catalog state. Credentials, policies, boundaries, tags and table key definitions are cached separately by the auth/authz caches (see Credential and Policy Caching in the Security Model, and `docs/design/12-auth-authz-cache.md`).
+ExtendDB caches a small set of operational settings in memory to avoid per-request database queries on hot paths; this section covers those settings and the risks of caching catalog state. Credentials, policies, boundaries, tags and table key definitions are cached separately by the auth/authz caches (see Credential and Policy Caching in the Security Model, and `docs/design/12-auth-authz-cache.md`).
 
 ### What Is Cached
 
@@ -202,7 +202,7 @@ All cached values are operational tuning knobs where a briefly-stale value does 
 
 The settings cache above holds no catalog state. The auth/authz caches hold some (credentials, IAM policies, boundaries, tags, and table key definitions), and a stale copy can be wrong in the ways listed below. On the server that makes a change, they drop the affected entries before the call returns. For a change made elsewhere, the TTL (`auth.cache.ttl_seconds`) bounds how long a stale entry can be used (see `docs/design/12-auth-authz-cache.md`).
 
-- **Table metadata** (table ID, key schema, attribute definitions, indexes, stream specification): A stale cache could serve the wrong key schema after a table is deleted and recreated with the same name but different schema. The new table has a different `table_id`, different key schema, and different indexes — stale cache serves wrong schema, writes corrupt data, reads return garbage.
+- **Table metadata** (table ID, key schema, attribute definitions, indexes, stream specification): A stale cache could serve the wrong key schema after a table is deleted and recreated with the same name but different schema. The new table has a different `table_id`, different key schema, and different indexes: stale cache serves wrong schema, writes corrupt data, reads return garbage.
 - **IAM policies and credentials**: A revoked Deny policy still cached as absent creates a security gap. A deleted access key still cached as valid allows unauthorized access.
 - **Tags**: Tag-based authorization (`aws:ResourceTag/*`) requires current tag values.
 - **GSI definitions**: Stale GSI metadata could route writes to wrong index tables.
@@ -235,6 +235,6 @@ Caching of operational settings is currently unconditional. If issues arise (e.g
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is maintained by
+engineers at Amazon Web Services. It is not Amazon DynamoDB and contains no DynamoDB source
+code. "DynamoDB" is a trademark of Amazon.com, Inc.

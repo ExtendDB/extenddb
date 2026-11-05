@@ -12,13 +12,13 @@ Cassandra does not support multi-statement transactions. Logged batches provide 
 
 ## Options Considered
 
-1. **Check-then-batch pattern** — Execute a SELECT to check for duplicates, then use a logged BATCH for the atomic writes. Accept a small race condition window between check and write.
+1. **Check-then-batch pattern**: Execute a SELECT to check for duplicates, then use a logged BATCH for the atomic writes. Accept a small race condition window between check and write.
 
-2. **Sequential LWTs** — Execute each insert with `IF NOT EXISTS` sequentially, rolling back manually on failure. Not truly atomic.
+2. **Sequential LWTs**: Execute each insert with `IF NOT EXISTS` sequentially, rolling back manually on failure. Not truly atomic.
 
-3. **Compensation pattern** — Allow writes to proceed without duplicate checks, then clean up on failure. Leaves temporary inconsistent state.
+3. **Compensation pattern**: Allow writes to proceed without duplicate checks, then clean up on failure. Leaves temporary inconsistent state.
 
-4. **Single LWT** — Combine both operations into a single denormalized record. Breaks schema compatibility with PostgreSQL.
+4. **Single LWT**: Combine both operations into a single denormalized record. Breaks schema compatibility with PostgreSQL.
 
 ## Decision
 
@@ -51,6 +51,6 @@ Check-then-batch pattern for operations requiring both duplicate detection and a
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is
-a trademark of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is maintained by
+engineers at Amazon Web Services. It is not Amazon DynamoDB and contains no DynamoDB source
+code. "DynamoDB" is a trademark of Amazon.com, Inc.

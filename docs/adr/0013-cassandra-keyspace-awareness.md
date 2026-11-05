@@ -16,11 +16,11 @@ Early implementations hardcoded keyspace names like `extenddb_catalog` directly 
 
 ## Options Considered
 
-1. **Dynamic keyspace construction** — Store `keyspace_prefix` in config, construct keyspace names dynamically via helper methods like `catalog_keyspace()`. Pass keyspace prefix through initialization chain.
+1. **Dynamic keyspace construction**: Store `keyspace_prefix` in config, construct keyspace names dynamically via helper methods like `catalog_keyspace()`. Pass keyspace prefix through initialization chain.
 
-2. **USE statement per connection** — Execute `USE extenddb_catalog` on each session, then write queries without keyspace prefix. Mimics PostgreSQL behavior.
+2. **USE statement per connection**: Execute `USE extenddb_catalog` on each session, then write queries without keyspace prefix. Mimics PostgreSQL behavior.
 
-3. **Query-time keyspace override** — Allow each query to specify keyspace as a parameter, defaulting to config value.
+3. **Query-time keyspace override**: Allow each query to specify keyspace as a parameter, defaulting to config value.
 
 ## Decision
 
@@ -59,6 +59,6 @@ Dynamic keyspace construction with JDBC-style connection strings.
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is
-a trademark of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is maintained by
+engineers at Amazon Web Services. It is not Amazon DynamoDB and contains no DynamoDB source
+code. "DynamoDB" is a trademark of Amazon.com, Inc.

@@ -6,8 +6,8 @@
 
 ## Context
 
-Cassandra's LWT (Lightweight Transaction) mechanism — `INSERT ... IF NOT EXISTS`,
-`UPDATE ... IF ...`, `DELETE ... IF EXISTS` — uses Paxos under the hood. A
+Cassandra's LWT (Lightweight Transaction) mechanism, meaning `INSERT ... IF NOT EXISTS`,
+`UPDATE ... IF ...` and `DELETE ... IF EXISTS`, uses Paxos under the hood. A
 fundamental Cassandra constraint is that **LWT statements cannot appear inside a
 logged batch**. Attempting to do so is rejected by the coordinator at runtime.
 
@@ -25,10 +25,10 @@ must therefore use `DELETE ... IF EXISTS`, which cannot be batched.
 
 ### Concrete examples
 
-- `delete_user` — must cascade to `iam_users`, `iam_user_tags`, `access_keys`,
+- `delete_user`: must cascade to `iam_users`, `iam_user_tags`, `access_keys`,
   `iam_policies`, and `iam_group_members`. Each table uses LWT for creation.
-- `delete_group` — must cascade to `iam_groups` and `iam_group_members`.
-- `delete_account` — must cascade to `accounts`, `backups_by_arn`,
+- `delete_group`: must cascade to `iam_groups` and `iam_group_members`.
+- `delete_account`: must cascade to `accounts`, `backups_by_arn`,
   `backups_by_table`, `backups_by_account`, and `continuous_backups`.
 
 ### Current state (as of this ADR)
@@ -84,9 +84,9 @@ backend **must** either:
 - Implement the worker/saga pattern described above.
 
 Adding a plain multi-row delete against LWT-managed rows is not an acceptable
-shortcut — it causes `system.paxos` corruption that accumulates across
+shortcut; it causes `system.paxos` corruption that accumulates across
 operations and eventually stalls the entire node (observed: 29-minute test
-hangs, GC pauses of 4–11 seconds, `system.paxos` growing without bound).
+hangs, GC pauses of 4-11 seconds, `system.paxos` growing without bound).
 
 ## Consequences
 
@@ -113,6 +113,6 @@ hangs, GC pauses of 4–11 seconds, `system.paxos` growing without bound).
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is
-a trademark of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is maintained by
+engineers at Amazon Web Services. It is not Amazon DynamoDB and contains no DynamoDB source
+code. "DynamoDB" is a trademark of Amazon.com, Inc.

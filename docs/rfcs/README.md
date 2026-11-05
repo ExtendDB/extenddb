@@ -26,7 +26,7 @@ you whether an RFC, an ADR, or neither is needed.
 ## Process
 
 1. **Draft.** Copy `0000-template.md` to `docs/rfcs/0000-my-proposal.md` (keep `0000`
-   until accepted). Open a PR. The PR is the discussion thread for now —
+   until accepted). Open a PR. The PR is the discussion thread for now;
    if conversations grow long enough that the PR becomes hard to follow, a
    maintainer may move the broad design debate to GitHub Discussions and
    reserve the PR for line-level comments.
