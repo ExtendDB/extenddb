@@ -21,9 +21,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 
-from catalog_checks import docker, expect_exit, finish, healthy, report, run, start, stop
+from catalog_checks import docker, expect_exit, finish, healthy, initiate_replica_set, report, run, start, stop
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 SEED = os.path.join(HERE, "..", "crates", "storage-mongodb", "tests", "fixtures", "released", "seed.py")
@@ -47,17 +46,9 @@ def start_with_auth(container: str, port: int) -> bool:
     )
     if not report(started.returncode == 0, f"start {container} with access control", started.stderr):
         return False
-    for _ in range(60):
-        if shell(container, port, "db.runCommand({ping: 1}).ok", root=False)[1].strip().endswith("1"):
-            break
-        time.sleep(1)
     # The localhost exception allows the first user and the initiation.
-    shell(container, port, f"rs.initiate({{_id: 'rs0', members: [{{_id: 0, host: 'localhost:{port}'}}]}})",
-          root=False)
-    for _ in range(60):
-        if shell(container, port, "db.hello().isWritablePrimary", root=False)[1].strip().endswith("true"):
-            break
-        time.sleep(1)
+    if not initiate_replica_set(container, port):
+        return False
     code, out = shell(container, port, f"db.getSiblingDB('admin').createUser({{user: 'root', pwd: "
                                        f"'{ROOT_PASSWORD}', roles: ['root']}})", root=False)
     if not report(code == 0, "create the administrator", out):

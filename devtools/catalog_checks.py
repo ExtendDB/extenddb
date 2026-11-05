@@ -8,7 +8,9 @@ devtools/check-sqlite-catalog-lock, check-sqlite-older-binary,
 check-postgres-catalog-lock, check-postgres-older-binary,
 check-cassandra-catalog-lock, check-cassandra-older-binary,
 check-cassandra-authorizer and the check-mongodb-* scripts import it; the
-MongoDB ones start their replica sets with `start_mongo`. Each
+MongoDB ones start their replica sets with `start_mongo`, except
+check-mongodb-auth, which starts mongod with access control itself and
+initiates the set with `initiate_replica_set`. Each
 check prints one line, `ok` or `FAIL` and what was checked, with the
 command's output indented under a FAIL; `finish` prints the count of failed
 checks or `all checks passed` and returns the script's exit code.
@@ -140,7 +142,8 @@ def docker(*args: str, timeout: float = 120) -> subprocess.CompletedProcess:
 
 
 def mongosh(container: str, port: int, script: str, timeout: float = 60) -> tuple[int, str]:
-    """Run `script` with mongosh in a container `start_mongo` started."""
+    """Run `script` with mongosh, without credentials, in `container`, on the
+    mongod listening on `port`."""
     done = docker("exec", container, "mongosh", "--quiet", "--port", str(port), "--eval", script, timeout=timeout)
     return done.returncode, done.stdout + done.stderr
 
@@ -149,7 +152,8 @@ def start_mongo(container: str, port: int, mongod_args: tuple[str, ...] = (), mo
     """Start mongo:7 as a one-node replica set named rs0 in `container`,
     listening on `port` inside the container and published on 127.0.0.1
     only, so the same connection string works from the host and from a
-    container that shares its network. Waits for the member to be primary.
+    container that shares its network. Initiates the set and waits for the
+    member to be primary with `initiate_replica_set`.
     `mongod_args` are added to mongod's command line, `mounts` are `-v`
     arguments; a set started with `--keyFile` initiates through the
     localhost exception."""
@@ -161,13 +165,52 @@ def start_mongo(container: str, port: int, mongod_args: tuple[str, ...] = (), mo
     )
     if started.returncode != 0:
         return report(False, f"start {container}", started.stderr)
-    for _ in range(60):
-        if mongosh(container, port, "db.runCommand({ping: 1}).ok")[1].strip().endswith("1"):
-            break
-        time.sleep(1)
-    mongosh(container, port, f"rs.initiate({{_id: 'rs0', members: [{{_id: 0, host: 'localhost:{port}'}}]}})")
-    for _ in range(60):
-        if mongosh(container, port, "db.hello().isWritablePrimary")[1].strip().endswith("true"):
+    return initiate_replica_set(container, port)
+
+
+def _last_line(output: str) -> str:
+    lines = output.strip().splitlines()
+    return lines[-1].strip() if lines else ""
+
+
+# What `db.hello()` says about the member: `primary` once it is the writable
+# primary, `initiated` while the set has a configuration but no primary yet,
+# and `uninitiated` before any `rs.initiate` has taken effect (no `setName`).
+_MEMBER_STATE = (
+    "const h = db.hello(); print(h.isWritablePrimary ? 'primary' : h.setName ? 'initiated' : 'uninitiated')"
+)
+
+
+def initiate_replica_set(container: str, port: int) -> bool:
+    """Initiate the one-node replica set rs0 on the mongod listening on
+    `port` in `container`, and wait for its member to be primary.
+
+    Each poll runs `_MEMBER_STATE` and reads only the last line of its
+    output, which has to be one of the three states exactly. While mongod
+    refuses connections the poll prints `MongoNetworkError: connect
+    ECONNREFUSED 127.0.0.1:<port>`, and the wait goes on. `rs.initiate` is
+    sent after each poll that prints `uninitiated`, so it goes only to a
+    mongod that answered, and an initiate that returned an error is sent
+    again. Every call runs without credentials: `hello` needs none, and a
+    set started with `--keyFile` initiates through the localhost exception.
+    A member that is not primary after 120 polls, with 1 s between them, is
+    reported with the last poll's output, the last initiate's output and
+    the end of the container's log."""
+    initiate = f"rs.initiate({{_id: 'rs0', members: [{{_id: 0, host: 'localhost:{port}'}}]}})"
+    last_poll = ""
+    last_initiate = "(no rs.initiate sent: no poll printed `uninitiated`)"
+    for _ in range(120):
+        last_poll = mongosh(container, port, _MEMBER_STATE)[1]
+        state = _last_line(last_poll)
+        if state == "primary":
             return True
+        if state == "uninitiated":
+            last_initiate = mongosh(container, port, initiate)[1]
         time.sleep(1)
-    return report(False, f"{container} did not become primary", docker("logs", container).stdout[-2000:])
+    return report(
+        False,
+        f"{container} did not become primary",
+        f"last db.hello() poll output:\n{last_poll.strip()}\n"
+        f"last rs.initiate output:\n{last_initiate.strip()}\n"
+        "end of the container's log:\n" + docker("logs", container).stdout[-2000:],
+    )
