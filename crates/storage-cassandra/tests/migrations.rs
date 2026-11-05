@@ -110,9 +110,14 @@ async fn two_migrators_started_together_apply_a_legacy_catalog_once() {
         &format!("INSERT INTO {catalog}.settings (key, value) VALUES ('catalog_version', '0.0.4')"),
     )
     .await;
+    // The second migrator waits for the first's whole run, every schema
+    // statement of migrations 1 to 6 with an agreement wait after each:
+    // about 16 s on an idle node, and past 60 s beside the rest of this
+    // binary's tests on one node.
+    let wait = 4 * TIMEOUT;
     let (first, other) = tokio::join!(
-        migrate_catalog_keyspace(first_node.clone(), &prefix, "test", TIMEOUT),
-        migrate_catalog_keyspace(second_node.clone(), &prefix, "test", TIMEOUT),
+        migrate_catalog_keyspace(first_node.clone(), &prefix, "test", wait),
+        migrate_catalog_keyspace(second_node.clone(), &prefix, "test", wait),
     );
     let applied = [
         first.expect("the first migrator").applied.len(),
@@ -180,12 +185,7 @@ async fn migration_1_creates_the_expected_definitions() {
             std::fs::write(&path, text).expect("write the expected file");
             continue;
         }
-        let mut expected: postcheck::Definitions =
-            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
-        // Migration 5 drops continuous_backups, which migration 1 creates.
-        expected
-            .columns
-            .retain(|name, _| !name.starts_with("continuous_backups."));
+        let expected = migrations_support::expected_definitions(dir);
         assert_eq!(
             postcheck::compare(&expected, &actual),
             Vec::<String>::new(),

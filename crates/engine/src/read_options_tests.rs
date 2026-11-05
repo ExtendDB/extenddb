@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::limits::LimitsConfig;
 
-use crate::OperationContext;
+use crate::{BackupRuntime, OperationContext};
 use fixtures::{ACCOUNT, EVENTS, GSI, LSI, ORDERS, USERS};
 use recording::{ReadCall, RecordingStorage};
 
@@ -41,6 +41,7 @@ fn context_with_export_paths(
     let empty: Vec<Arc<PathBuf>> = Vec::new();
     OperationContext {
         storage: Arc::clone(storage) as Arc<dyn extenddb_storage::StorageEngine>,
+        backup: Arc::new(BackupRuntime::new(1)),
         limits: Arc::new(LimitsConfig::default()),
         region: Arc::from("us-east-1"),
         account_id: Arc::from(ACCOUNT),

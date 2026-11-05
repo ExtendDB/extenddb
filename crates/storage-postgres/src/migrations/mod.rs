@@ -127,6 +127,15 @@ pub fn migration(id: MigrationId) -> Migration<PostgresStores> {
                 "0005_drop_continuous_backups.sql"
             )],
         },
+        MigrationId::BackupCatalogIndex => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Catalog,
+                "migrations",
+                "0006_backup_catalog_index.sql"
+            )],
+        },
     }
 }
 
@@ -148,7 +157,8 @@ pub(crate) const fn runs_in(id: MigrationId) -> RunsIn {
         MigrationId::Baseline
         | MigrationId::ResourceTagConditionKeys
         | MigrationId::SortKeyDefinitions
-        | MigrationId::DropContinuousBackups => RunsIn::Transaction,
+        | MigrationId::DropContinuousBackups
+        | MigrationId::BackupCatalogIndex => RunsIn::Transaction,
         MigrationId::IndexTableBaseKey => RunsIn::Autocommit,
     }
 }
