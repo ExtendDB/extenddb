@@ -25,7 +25,7 @@ fn message(result: Result<(), DynamoDbError>) -> Option<String> {
 }
 
 fn check(body: &Value) -> Option<String> {
-    message(validate_scan_request_body(body, CheckOrder::of(body)))
+    message(validate_scan_request_body(body, CheckOrder::of(body), None))
 }
 
 /// A Scan whose filter reads `:n = {"N": "bob"}`.
@@ -316,7 +316,7 @@ fn a_shape_fault_anywhere_in_the_body_is_reported_first() {
     for body in shape_faults {
         assert!(
             matches!(
-                validate_scan_request_body(&body, CheckOrder::of(&body)),
+                validate_scan_request_body(&body, CheckOrder::of(&body), None),
                 Err(DynamoDbError::SerializationException(_))
             ),
             "{body}"

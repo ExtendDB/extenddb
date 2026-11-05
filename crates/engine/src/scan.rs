@@ -25,7 +25,9 @@ use crate::index_helpers::{
 };
 use crate::legacy_filter::desugar_filter;
 use crate::read_helpers::{PostRead, read_page};
-use crate::scan_request::{CheckOrder, ExpressionValuesBody, SelectBody, StartKeyBody};
+use crate::scan_request::{
+    CheckOrder, ExpressionValuesBody, ScanFilterBody, SelectBody, StartKeyBody, member_order,
+};
 use crate::serialize_output;
 use crate::{DispatchMetrics, DispatchResult};
 
@@ -33,8 +35,10 @@ use crate::{DispatchMetrics, DispatchResult};
 ///
 /// Reads all items from the table (or segment), applies `FilterExpression`
 /// post-read, applies `ProjectionExpression`, and enforces the 1 MB limit.
-/// `raw_body` is the request text `body` was parsed from; the checks on the
-/// `ExclusiveStartKey` read its member order from it (see `scan_request`).
+/// `raw_body` is the request text `body` was parsed from; the checks read the
+/// request's order of the `ExclusiveStartKey` members, the
+/// `ExpressionAttributeValues` entries and the `ScanFilter` conditions from it
+/// (see `scan_request::member_order`).
 ///
 /// # Errors
 ///
@@ -51,10 +55,14 @@ pub async fn handle_scan(
     //  - request-time, on the raw body: the AttributesToGet length and the
     //    Limit, Segment and TotalSegments ranges in one message, the
     //    ReturnConsumedCapacity enum, the expression and non-expression
-    //    parameter mix, every number in ExpressionAttributeValues, the nesting
-    //    depth of ExpressionAttributeValues;
+    //    parameter mix, every number in the ExpressionAttributeValues entries
+    //    that deserialize (the entries in the hash order of the key), the
+    //    first empty or duplicate set in ExpressionAttributeValues (the
+    //    entries in sorted name order), the nesting depth of the entries that
+    //    deserialize (the numbers of the ScanFilter lists are #507's check);
     //  - a field of the wrong JSON type anywhere in the body;
-    //  - an empty or duplicate set in ExpressionAttributeValues;
+    //  - a malformed number inside an ExpressionAttributeValues entry the
+    //    deserializer refuses;
     //  - the request parameter checks: ExpressionAttributeNames and
     //    ExpressionAttributeValues with no expression, ConditionalOperator with
     //    no ScanFilter, a ScanFilter condition's value count;
@@ -67,19 +75,28 @@ pub async fn handle_scan(
     //  - the table lookup, the index resolution and the index rules, the key
     //    schema.
     // Order U differs in these places: the constraint clauses take the older
-    // form and the Select enum joins them at request time; the nesting check
-    // leaves request time; after the request parameter checks come the
+    // form and the Select enum joins them at request time; the numbers of
+    // ExpressionAttributeValues and the nesting check leave request time; the
+    // ScanFilter list values (a value that is not one AttributeValue) are
+    // checked after the no-expression checks and ahead of
+    // ConditionalOperator; after the request parameter checks come the
     // ExclusiveStartKey's faults, shape and value together, then the
-    // ExpressionAttributeValues entries the deserializer refuses, then the
-    // nesting depth, then the expression and request checks and the table.
+    // faulty ExpressionAttributeValues entries in the same member order (an
+    // unreadable entry, a malformed number, a set fault, each in the
+    // invalid-value form), then the nesting depth, then the expression and
+    // request checks and the table.
     let order = CheckOrder::of(&body);
-    crate::scan_request::validate_scan_request_body(&body, order)?;
-    // A key, an ExpressionAttributeValues entry or a Select value that does
-    // not deserialize is held back here, so that the typed deserialization
-    // does not report it ahead of the checks the service makes first.
-    let key_order = crate::scan_request::start_key_member_order(raw_body);
+    let values_order = member_order(raw_body, "ExpressionAttributeValues");
+    crate::scan_request::validate_scan_request_body(&body, order, values_order.as_deref())?;
+    // A key, an ExpressionAttributeValues entry, a ScanFilter list value (order
+    // U) or a Select value (order R) that the service reports later is held
+    // back here, so that the typed deserialization does not report it ahead of
+    // the checks the service makes first.
+    let key_order = member_order(raw_body, "ExclusiveStartKey");
     let start_key = StartKeyBody::take(&mut body, key_order.as_deref());
-    let expression_values = ExpressionValuesBody::take(&mut body, order);
+    let expression_values = ExpressionValuesBody::take(&mut body, order, values_order.as_deref());
+    let filter_order = member_order(raw_body, "ScanFilter");
+    let scan_filter_values = ScanFilterBody::take(&mut body, order, filter_order.as_deref());
     let select = SelectBody::take(&mut body, order);
     let input: ScanInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
@@ -90,8 +107,9 @@ pub async fn handle_scan(
         input.expression_attribute_values.as_ref(),
     );
 
-    // Order R: an empty or duplicate set in ExpressionAttributeValues, ahead
-    // of the no-expression check (measured 2026-11-05).
+    // Order R: a malformed number inside an ExpressionAttributeValues entry
+    // the deserializer refuses, ahead of the no-expression check; the set
+    // faults are request-time checks (measured 2026-11-05).
     if order == CheckOrder::Readable {
         expression_values.validate()?;
     }
@@ -111,6 +129,12 @@ pub async fn handle_scan(
         has_filter_expr,
         &[ExpressionKind::Filter],
     )?;
+
+    // Order U: a ScanFilter list value that is not one AttributeValue, after
+    // the no-expression checks and ahead of ConditionalOperator, the value
+    // count and the key's faults (measured 2026-11-05; see
+    // `scan_request::ScanFilterBody`).
+    scan_filter_values.validate()?;
 
     // ConditionalOperator requires a ScanFilter with two or more conditions.
     extenddb_core::validation::validate_conditional_operator_usage(
@@ -132,10 +156,12 @@ pub async fn handle_scan(
 
     match order {
         CheckOrder::Unreadable => {
-            // The key's faults, shape and value together, then the
-            // ExpressionAttributeValues entries the deserializer refuses, then
-            // the nesting depth (measured 2026-10-31 and 2026-11-05; see
-            // `scan_request::StartKeyBody` and `ExpressionValuesBody`).
+            // The key's faults, shape and value together, then the faulty
+            // ExpressionAttributeValues entries in the fitted order (an
+            // unreadable entry, a malformed number in the invalid-value form,
+            // a set fault), then the nesting depth (measured 2026-10-31 and
+            // 2026-11-05; see `scan_request::StartKeyBody` and
+            // `ExpressionValuesBody`).
             start_key.validate(order)?;
             expression_values.validate()?;
             if let Some(ref values) = input.expression_attribute_values {

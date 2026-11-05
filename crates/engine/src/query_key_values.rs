@@ -322,7 +322,7 @@ pub fn validate_expression_attribute_value_numbers(
 
 /// Every number inside one attribute value (`N`, `NS` members, and the values
 /// nested in `L` and `M`), with Unicode decimal digits folded for the check.
-fn validate_value_numbers(value: &AttributeValue) -> Result<(), DynamoDbError> {
+pub(crate) fn validate_value_numbers(value: &AttributeValue) -> Result<(), DynamoDbError> {
     match value {
         AttributeValue::N(n) => validate_number_text(n),
         AttributeValue::NS(set) => set.iter().try_for_each(|n| validate_number_text(n)),

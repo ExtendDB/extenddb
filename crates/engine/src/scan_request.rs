@@ -27,16 +27,33 @@
 //!    object counts as present whether or not it is empty;
 //! 3. every number in `ExpressionAttributeValues`, `NS` members and values
 //!    nested in `L` and `M` included, whether an expression reads the value or
-//!    not; a Unicode decimal digit counts as the digit it stands for;
-//! 4. the nesting depth of `ExpressionAttributeValues`: a value nested 32
+//!    not; a Unicode decimal digit counts as the digit it stands for. The
+//!    entries are visited in the hash order of [`fitted_member_order`]
+//!    (2026-11-05: `{":n": {"N": "fred"}, ":a": {"N": "bob"}}` answers `fred`,
+//!    which sorted order would not). An entry the deserializer refuses (a set
+//!    fault anywhere in it) is skipped here: its set fault is reported at step
+//!    4, and a malformed number inside it after the typed deserialization
+//!    (2026-11-05: `{"NS": ["bob", "1", "1"]}` beside a value nested 32 levels
+//!    answers the nesting text; `{"L": [{"N": "bob"}, {"NS": []}]}` beside it
+//!    answered the number in one send and the nesting text in the other). The
+//!    numbers of the `ScanFilter` lists are #507's check (#564 item 3, measured
+//!    2026-11-05: the number text ahead of a number in the key) and are not
+//!    checked on this branch;
+//! 4. an empty or duplicate set in `ExpressionAttributeValues`, the entries in
+//!    sorted name order whatever order the backend's parsed body keeps
+//!    (2026-11-05: `{":e": {"NS": []}}` with no expression answers the set text
+//!    ahead of the no-expression check; beside a value nested 32 levels in
+//!    another entry the empty `NS` text comes ahead of the nesting text in both
+//!    sends and the `SS` duplicates text did in one of two; `{":n": {"NS": []},
+//!    ":a": {"SS": []}}` answered the `SS` text in one send and the `NS` text
+//!    in the other, so the sorted order matches one of the two), see
+//!    [`expression_values_set_fault`] and [`ExpressionValuesBody`];
+//! 5. the nesting depth of `ExpressionAttributeValues`: a value nested 32
 //!    levels deep answers `Nesting Levels have exceeded supported limits:
 //!    Attributes in the item have nested levels beyond supported limit`, 31
 //!    levels pass, read or unused, with or without an expression (2026-10-30
 //!    and 2026-10-31: ahead of the no-expression check, B4-5a; 2026-11-05:
 //!    ahead of the filter syntax, the `Select` enum and the key's number);
-//! 5. an empty or duplicate set in `ExpressionAttributeValues` (2026-11-05:
-//!    `{":e": {"NS": []}}` with no expression answers the set text ahead of
-//!    the no-expression check), see [`ExpressionValuesBody`];
 //! 6. the request parameter checks: `ExpressionAttributeNames` with no
 //!    expression, then `ExpressionAttributeValues` with no expression, then
 //!    `ConditionalOperator` with no `ScanFilter`, then a `ScanFilter`
@@ -48,8 +65,8 @@
 //!    three `Select` rules, the unused values, `COUNT` with `AttributesToGet`,
 //!    the `Segment` pairing (2026-11-05, where two were sent together: the
 //!    filter syntax first; an undefined value and an operand type ahead of the
-//!    unused values, the `Segment` pairing and `SPECIFIC_ATTRIBUTES`; `COUNT`
-//!    with `ProjectionExpression` ahead of the unused values; the unused
+//!    unused values, the `Segment` pairing and `SPECIFIC_ATTRIBUTES`; the
+//!    unused values ahead of `COUNT` with `ProjectionExpression`; the unused
 //!    values and `COUNT` with `AttributesToGet` ahead of the `Segment`
 //!    pairing);
 //! 9. the `ExclusiveStartKey` value faults: a number that does not parse, an
@@ -63,43 +80,71 @@
 //!    camel case, `totalSegments`, `segment`, `limit`), then the
 //!    `ReturnConsumedCapacity` enum, then the `Select` enum (2026-11-05: ahead
 //!    of the key's shape fault and of an unreadable expression value);
-//! 2. the parameter mix, then the request parameter checks of order R step 6,
-//!    with the mix first (2026-11-05: each ahead of the key's faults);
+//! 2. the parameter mix, then `ExpressionAttributeNames` and
+//!    `ExpressionAttributeValues` with no expression, then the `ScanFilter`
+//!    list values (see [`ScanFilterBody`]: a value that is not one
+//!    AttributeValue answers `Supplied AttributeValue is empty, must contain
+//!    exactly one of the supported datatypes` with no prefix, for `{}` and for
+//!    an unknown descriptor alike, 2026-11-05), then `ConditionalOperator`
+//!    with no `ScanFilter` and a `ScanFilter` condition's value count
+//!    (2026-11-05: each ahead of the key's faults). The numbers of
+//!    `ExpressionAttributeValues` are not checked at request time in this
+//!    order;
 //! 3. the `ExclusiveStartKey` faults, shape and value together, the first
 //!    faulty member in the member order of [`StartKeyBody`]: a shape fault
 //!    with the prefix `The provided starting key is invalid: `, a number with
 //!    the value check's text, a set fault with the texts of order U (the
-//!    members unquoted, the `NS` duplicate text bare, the empty `SS` text with
-//!    the key prefix);
-//! 4. the `ExpressionAttributeValues` entries the deserializer refuses, read by
-//!    an expression or not: `ExpressionAttributeValues contains invalid value:
-//!    Supplied AttributeValue is empty, must contain exactly one of the
-//!    supported datatypes for key :e` for an empty value and for an unknown
+//!    members unquoted, the `NS` duplicate text bare, the empty `SS` and `BS`
+//!    texts with the key prefix);
+//! 4. the `ExpressionAttributeValues` entries, in the same member order
+//!    ([`fitted_member_order`]), the first faulty one named, every fault in
+//!    the form `ExpressionAttributeValues contains invalid value: <text> for
+//!    key :e`: an entry that is not one AttributeValue, read by an expression
+//!    or not, `Supplied AttributeValue is empty, must contain exactly one of
+//!    the supported datatypes` for an empty value and for an unknown
 //!    descriptor, the more-than-one text for two descriptors (2026-10-31 B4-7
 //!    and 2026-11-05: ahead of the nesting check and after the key's faults);
+//!    a malformed number, `The parameter cannot be converted to a numeric
+//!    value: bob`, at the top of the entry or inside its `L` or `NS`, and the
+//!    38-digit text (2026-11-05: after the key's faults); a set fault with the
+//!    texts of order U, `One or more parameter values were invalid: An number
+//!    set  may not be empty` and `... Input collection [a, a] contains
+//!    duplicates.` (2026-11-05). Inside one entry the first fault in the
+//!    value's own element order is named, a number or a shape fault
+//!    (2026-11-05: `{"L": [{"N": "bob"}, {}]}` answers the number);
 //! 5. the nesting depth, then the expression and request checks of order R
 //!    step 8, then the table.
 //!
 //! Pairs never sent together keep the code's order: in order R the nesting
 //! check against `ExpressionAttributeNames` with no expression,
-//! `ConditionalOperator` and the `ScanFilter` value count, a set fault in
-//! `ExpressionAttributeValues` against the nesting check and against the
-//! `ExpressionAttributeNames` check, the `ProjectionExpression` syntax against
-//! an undefined value, an operand type and the unused values; in order U the
-//! `Select` enum against the mix, a malformed `ExpressionAttributeValues`
-//! number against the key's faults, a set fault in `ExpressionAttributeValues`
-//! against the key's faults (reported with the unreadable entries, step 4), an
-//! empty `BS` or a `BS` with duplicates in the key (no key prefix, the members
-//! unquoted), an empty `SS` in the key beside an unreadable expression value
-//! (the key prefix, as beside an unreadable key member). Which entry is named
-//! when several `ExpressionAttributeValues` entries are faulty is not measured:
-//! the first in sorted order.
+//! `ConditionalOperator` and the `ScanFilter` value count; a set fault in
+//! `ExpressionAttributeValues` against a malformed number in another entry
+//! (the number first, at request time; the service's two sends disagreed,
+//! 2026-11-05); which of two set faults in `ExpressionAttributeValues` is
+//! named (sorted name order; the service's two sends disagreed, 2026-11-05);
+//! the `ProjectionExpression` syntax against an undefined value, an operand
+//! type and the unused values. In order U the `Select` enum against the mix
+//! (the enum first; the mix beside `Select: "BAD"` and an empty entry answers
+//! the `Select` clause, 2026-11-05); an empty value ahead of a malformed
+//! number inside one `ExpressionAttributeValues` entry (the empty value, the
+//! element order; the other way round is measured); a set fault in a
+//! `ScanFilter` list value in order U (at the list's step, the deserializer's
+//! text in order R, 2026-11-05); a `BS` with duplicates in the key (no key
+//! prefix, the members unquoted); nine or more names in one hash bucket (see
+//! [`fitted_member_order`]). The service refuses a member or entry name written
+//! twice as a `SerializationException` (`Duplicate key found in payload`,
+//! 2026-11-05, #630); the parser here keeps the last value.
 //!
 //! A field of the wrong JSON type anywhere in the body is reported ahead of
 //! all of them, as a `SerializationException` (`"Limit": "5"` with `Select:
 //! "BAD"`, 2026-11-05; the service's texts differ from the deserializer's). The
 //! service reports a key shape fault ahead of `"ConsistentRead": "yes"`
-//! (2026-11-05); the code reads the whole body first and does not.
+//! (2026-11-05); the code reads the whole body first and does not. In order U
+//! the service reports an invalid `ScanFilter` `ComparisonOperator` as a
+//! constraint clause (`Value 'BAD' at 'scanFilter.a.member.comparisonOperator'
+//! failed to satisfy constraint: Member must satisfy enum value set: [...]`,
+//! 2026-11-05) ahead of the list's values; the legacy condition checks are
+//! #507's and the clause is not made here.
 //!
 //! The JSON parser accepts 128 levels of nesting, which is 62 `L` levels; a
 //! body nested deeper is a `SerializationException` from the parser, ahead of
@@ -118,7 +163,7 @@ use serde_json::Value;
 
 use crate::query_key_values::{
     SCAN_CONDITIONS, TYPE_DESCRIPTORS, has_unreadable_attribute_value, is_shape_fault, non_empty,
-    present, shape_fault_first, validate_expression_attribute_value_numbers, validate_number_text,
+    present, shape_fault_first, validate_number_text, validate_value_numbers,
 };
 
 /// Which of the service's two check orders a `Scan` request follows (see the
@@ -171,13 +216,21 @@ impl CheckOrder {
 pub(crate) fn validate_scan_request_body(
     body: &Value,
     order: CheckOrder,
+    values_order: Option<&[String]>,
 ) -> Result<(), DynamoDbError> {
-    scan_request_checks(body, order).map_err(|check| shape_fault_first::<ScanInput>(body, check))
+    scan_request_checks(body, order, values_order)
+        .map_err(|check| shape_fault_first::<ScanInput>(body, check))
 }
 
 /// The `Scan` checks in the service's order; see
-/// [`validate_scan_request_body`].
-fn scan_request_checks(body: &Value, order: CheckOrder) -> Result<(), DynamoDbError> {
+/// [`validate_scan_request_body`]. `values_order` is the
+/// `ExpressionAttributeValues` entry names as the request wrote them
+/// ([`member_order`]), for the hash order of the number check.
+fn scan_request_checks(
+    body: &Value,
+    order: CheckOrder,
+    values_order: Option<&[String]>,
+) -> Result<(), DynamoDbError> {
     validate_constraints(body, order)?;
 
     crate::validate_enum_fields(
@@ -210,10 +263,72 @@ fn scan_request_checks(body: &Value, order: CheckOrder) -> Result<(), DynamoDbEr
         ],
     )?;
 
-    if let Some(values) = attribute_value_map(body, "ExpressionAttributeValues") {
-        validate_expression_attribute_value_numbers(&values)?;
-        if order == CheckOrder::Readable {
-            extenddb_core::validation::validate_attribute_values_nesting_depth(values.values())?;
+    if order == CheckOrder::Readable {
+        // Every number in ExpressionAttributeValues, the entries in the hash
+        // order the key and the order-U step use (an entry the deserializer
+        // refuses, one with a set fault, is skipped here), then the set faults
+        // in sorted name order, then the nesting depth of the entries that
+        // deserialize. In order U the numbers and the set faults are reported
+        // at the map's own step (see the module doc). The numbers of the
+        // ScanFilter lists are #507's check (#564 item 3).
+        let values = readable_attribute_values(body, "ExpressionAttributeValues");
+        for name in fitted_order_of(body, "ExpressionAttributeValues", values_order) {
+            if let Some(value) = values.get(&name) {
+                validate_value_numbers(value)?;
+            }
+        }
+        expression_values_set_fault(body)?;
+        extenddb_core::validation::validate_attribute_values_nesting_depth(values.values())?;
+    }
+    Ok(())
+}
+
+/// The entries of the object `field` of the body that deserialize as one
+/// attribute value each; the others are left to [`ExpressionValuesBody`].
+fn readable_attribute_values(body: &Value, field: &str) -> HashMap<String, AttributeValue> {
+    body.get(field)
+        .and_then(Value::as_object)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|(name, value)| {
+                    serde_json::from_value::<AttributeValue>(value.clone())
+                        .ok()
+                        .map(|value| (name.clone(), value))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The first empty or duplicate set among the `ExpressionAttributeValues`
+/// entries, in sorted name order whatever order the backend's parsed body
+/// keeps, with the texts of order R (see [`ValueFault::text`]). Measured
+/// 2026-11-05: `{":d": <32 levels>, ":e": {"NS": []}}` answers the empty-set
+/// text ahead of the nesting text in both sends, and `{":d": <32 levels>, ":s":
+/// {"SS": ["a", "a"]}}` the duplicates text in one of two; beside a malformed
+/// number in another entry the service's two sends disagreed, and the number
+/// comes first here. With two set faults, `{":n": {"NS": []}, ":a": {"SS":
+/// []}}`, the service answered the `SS` text in one send and the `NS` text in
+/// the other; the sorted order names `:a`. An entry whose first fault, depth
+/// first, is a malformed number is left to [`ExpressionValuesBody`].
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` with the set text.
+fn expression_values_set_fault(body: &Value) -> Result<(), DynamoDbError> {
+    let Some(entries) = body
+        .get("ExpressionAttributeValues")
+        .and_then(Value::as_object)
+    else {
+        return Ok(());
+    };
+    let mut names: Vec<&String> = entries.keys().collect();
+    names.sort_unstable();
+    for name in names {
+        match value_fault(&entries[name.as_str()]) {
+            None | Some(ValueFault::Number(_)) => {}
+            Some(fault) => return Err(fault.text(CheckOrder::Readable, Place::ExpressionValue)),
         }
     }
     Ok(())
@@ -242,12 +357,6 @@ fn validate_select_enum(body: &Value) -> Result<(), DynamoDbError> {
     )
 }
 
-/// `field` of the body read as a map of attribute values, or `None` when the
-/// field is absent or is not one; [`shape_fault_first`] reports the shape.
-fn attribute_value_map(body: &Value, field: &str) -> Option<HashMap<String, AttributeValue>> {
-    serde_json::from_value(body.get(field)?.clone()).ok()
-}
-
 /// The service's prefix on a shape fault in an `ExclusiveStartKey` value
 /// (measured 2026-10-31 and 2026-11-05: `{"pk": {}, "sk": {"S": "x"}}` answers
 /// `The provided starting key is invalid: Supplied AttributeValue is empty,
@@ -269,12 +378,14 @@ const MORE_THAN_ONE_DESCRIPTOR: &str = "Supplied AttributeValue has more than on
 /// The prefix of the service's set texts.
 const INVALID_PARAMETER_VALUES: &str = "One or more parameter values were invalid: ";
 
-/// The member names of the body's `ExclusiveStartKey` object in the order the
-/// request wrote them, read from the raw request text, since the parsed body
-/// sorts object members on every build but the MongoDB one. `None` when the
-/// text does not parse, has no key, or the key is not an object; a name that
-/// appears twice keeps its first position.
-pub(crate) fn start_key_member_order(raw_body: &[u8]) -> Option<Vec<String>> {
+/// The member names of the body's object `field` (`ExclusiveStartKey`,
+/// `ExpressionAttributeValues` or `ScanFilter`) in the order the request wrote
+/// them, read from the raw request text, since the parsed body sorts object
+/// members on every build but the MongoDB one. `None` when the text does not
+/// parse, has no such field, or the field is not an object; a name that
+/// appears twice keeps its first position; a field that appears twice is read
+/// at its first position.
+pub(crate) fn member_order(raw_body: &[u8], field: &str) -> Option<Vec<String>> {
     /// The member names of one JSON object, in document order.
     struct MemberNames(Vec<String>);
 
@@ -308,41 +419,79 @@ pub(crate) fn start_key_member_order(raw_body: &[u8]) -> Option<Vec<String>> {
         }
     }
 
-    /// The body with only the key's member names read.
-    #[derive(Deserialize)]
-    struct KeyNames {
-        #[serde(rename = "ExclusiveStartKey", default)]
-        key: Option<MemberNames>,
+    /// The top-level object, with only the member names of `field` read.
+    struct FieldNames<'f>(&'f str);
+
+    impl<'de> serde::de::Visitor<'de> for FieldNames<'_> {
+        type Value = Option<Vec<String>>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("an object")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut found: Option<Vec<String>> = None;
+            while let Some(name) = map.next_key::<String>()? {
+                if name == self.0 && found.is_none() {
+                    found = Some(map.next_value::<MemberNames>()?.0);
+                } else {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+            Ok(found)
+        }
     }
 
-    serde_json::from_slice::<KeyNames>(raw_body)
-        .ok()?
-        .key
-        .map(|names| names.0)
+    let mut deserializer = serde_json::Deserializer::from_slice(raw_body);
+    serde::Deserializer::deserialize_map(&mut deserializer, FieldNames(field))
+        .ok()
+        .flatten()
 }
 
 /// The order in which the service visits the members of an `ExclusiveStartKey`
-/// with faults in more than one member, fitted to the measured rows: the order
-/// of a Java `HashMap` of capacity 4 over the member names, that is
-/// `String.hashCode()` of the name, spread as `h ^ (h >>> 16)`, masked to four
-/// buckets, the buckets in ascending order and the request's order inside a
-/// bucket. `sk` falls in bucket 0, `a` in 1, `b` in 2, `pk`, `gpk`, `id` and
-/// `ts` in 3.
+/// with faults in more than one member, and the entries of
+/// `ExpressionAttributeValues` in order U, fitted to the measured rows: the
+/// iteration order of a Java `HashMap` over the names, that is
+/// `String.hashCode()` of the name, spread as `h ^ (h >>> 16)`, masked to the
+/// table's buckets, the buckets in ascending order and the request's order
+/// inside a bucket. The table has four buckets for up to three names and
+/// doubles when it holds more than three quarters of its size
+/// ([`hash_table_mask`]): eight buckets for four to six names. With four
+/// buckets `sk` falls in bucket 0, `a` in 1, `b` in 2, `pk`, `gpk`, `id` and
+/// `ts` in 3; with eight, `sk` in 0, `gpk` and `pk` in 3, `gsk` in 6.
 ///
-/// Measured (2026-10-31, 2026-11-04 and 2026-11-05, five tables, every row
+/// Measured (2026-10-31, 2026-11-04 and 2026-11-05, six tables, every row
 /// with a shape fault in one of two faulty members, both request orders): on
 /// the `pk`, `sk` table the service names `sk`; on HASH `a`, RANGE `b` it
 /// names `a`; on HASH `pk`, RANGE `a` it names `a`; on `ts`, `id` and on `id`,
-/// `ts` it names the member first in the request; on the GSI `{"gpk": {},
-/// "pk": {"N": "bob"}, "sk": {"S": "x"}}` it names `gpk`. The rule is fitted
-/// to those rows, not documented by the service. With two value faults and no
-/// shape fault the service's own two sends disagreed on 8 of 22 rows, so no
-/// order is pinned there. Keys of four members (an index scan with a range key
-/// on the index and on the table) are not measured; the same rule applies.
+/// `ts` it names the member first in the request; on HASH `ä`, RANGE `é` it
+/// names `ä`; on the GSI `{"gpk": {}, "pk": {"N": "bob"}, "sk": {"S": "x"}}`
+/// it names `gpk`; on a GSI with a range key, where the key has four members,
+/// it names `gpk` ahead of `gsk` and `pk` ahead of `gsk`, which four buckets
+/// would reverse. In `ExpressionAttributeValues` (order U, 2026-11-05) it
+/// names `:n` ahead of `:e`, `:b` ahead of `:p` and `:a`, and `:a` ahead of
+/// `:e` when `:a` comes first in the request. The rule is fitted to those
+/// rows. The service does not document it. With two value faults and no shape
+/// fault the service's own two sends disagreed on 19 of 40 matrix cells, so no
+/// order is pinned there. Measured 2026-11-05 as well: a key of five members
+/// and one of seven on the same GSI (eight and sixteen buckets), four and
+/// seven `ExpressionAttributeValues` entries, two `ScanFilter` conditions, a
+/// key name outside the Basic Multilingual Plane (`𝄞`, hashed as its two
+/// UTF-16 code units) and the request's order inside one bucket for the
+/// entries (`:e` ahead of `:a` when `:e` comes first); each as the rule gives.
+/// Java's `HashMap` also doubles a table under 64 buckets when one bucket
+/// reaches nine names; the model sizes the table by the count of names alone
+/// and departs from the JDK there (not measured).
 fn fitted_member_order<'a>(names_in_request_order: impl Iterator<Item = &'a str>) -> Vec<String> {
-    let mut names: Vec<(u32, usize, &str)> = names_in_request_order
+    let names: Vec<&str> = names_in_request_order.collect();
+    let mask = hash_table_mask(names.len());
+    let mut names: Vec<(u32, usize, &str)> = names
+        .into_iter()
         .enumerate()
-        .map(|(position, name)| (java_hash_bucket(name), position, name))
+        .map(|(position, name)| (java_hash_bucket(name, mask), position, name))
         .collect();
     names.sort_unstable();
     names
@@ -351,14 +500,45 @@ fn fitted_member_order<'a>(names_in_request_order: impl Iterator<Item = &'a str>
         .collect()
 }
 
-/// The bucket of `name` in a Java `HashMap` of capacity 4:
+/// The bucket mask of a Java `HashMap` that starts with four buckets and
+/// doubles whenever it holds more than three quarters of its size: 3 for up to
+/// three names, 7 for four to six, 15 for seven to twelve, and so on.
+fn hash_table_mask(names: usize) -> u32 {
+    let mut buckets: usize = 4;
+    while names > buckets * 3 / 4 {
+        buckets *= 2;
+    }
+    u32::try_from(buckets - 1).unwrap_or(u32::MAX)
+}
+
+/// The bucket of `name` in a Java `HashMap` whose bucket mask is `mask`:
 /// `String.hashCode()` over the UTF-16 code units, spread as `h ^ (h >>> 16)`,
-/// masked with 3. The arithmetic wraps as Java's `int` does.
-fn java_hash_bucket(name: &str) -> u32 {
+/// masked. The arithmetic wraps as Java's `int` does.
+fn java_hash_bucket(name: &str, mask: u32) -> u32 {
     let hash = name.encode_utf16().fold(0u32, |h, unit| {
         h.wrapping_mul(31).wrapping_add(u32::from(unit))
     });
-    (hash ^ (hash >> 16)) & 3
+    (hash ^ (hash >> 16)) & mask
+}
+
+/// The names of the object `field` of the body in the fitted order
+/// ([`fitted_member_order`]): the request's order when `request_order` names
+/// exactly the object's members, else the parsed body's order.
+fn fitted_order_of(body: &Value, field: &str, request_order: Option<&[String]>) -> Vec<String> {
+    let Some(members) = body.get(field).and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let parsed: Vec<&str> = members.keys().map(String::as_str).collect();
+    let in_request: Vec<&str> = match request_order {
+        Some(names)
+            if names.len() == parsed.len()
+                && names.iter().all(|name| members.contains_key(name)) =>
+        {
+            names.iter().map(String::as_str).collect()
+        }
+        _ => parsed,
+    };
+    fitted_member_order(in_request.into_iter())
 }
 
 /// The `ExclusiveStartKey` of a `Scan` body as the request wrote it, with the
@@ -398,10 +578,11 @@ pub(crate) struct StartKeyBody {
 impl StartKeyBody {
     /// Reads the key from `body` and takes it out of the body when it does not
     /// deserialize for a reason that is not a shape fault. `request_order` is
-    /// the key's member names as the request wrote them
-    /// ([`start_key_member_order`]); when it is `None` or does not name the
-    /// key's members, the parsed body's order stands in for it.
+    /// the key's member names as the request wrote them ([`member_order`]);
+    /// when it is `None` or does not name the key's members, the parsed body's
+    /// order stands in for it.
     pub(crate) fn take(body: &mut Value, request_order: Option<&[String]>) -> Self {
+        let members = fitted_order_of(body, "ExclusiveStartKey", request_order);
         let raw = body.get("ExclusiveStartKey").cloned();
         let deferred = match raw
             .as_ref()
@@ -425,22 +606,6 @@ impl StartKeyBody {
         {
             fields.remove("ExclusiveStartKey");
         }
-        let members = match raw.as_ref().and_then(Value::as_object) {
-            Some(key) => {
-                let parsed: Vec<&str> = key.keys().map(String::as_str).collect();
-                let in_request: Vec<&str> = match request_order {
-                    Some(names)
-                        if names.len() == parsed.len()
-                            && names.iter().all(|name| key.contains_key(name)) =>
-                    {
-                        names.iter().map(String::as_str).collect()
-                    }
-                    _ => parsed,
-                };
-                fitted_member_order(in_request.into_iter())
-            }
-            None => Vec::new(),
-        };
         Self {
             raw,
             members,
@@ -535,8 +700,9 @@ impl ValueFault {
     ///   set  may not be empty` (the service's two spaces), both orders;
     /// - an empty `SS`: `... An string set  may not be empty`, with the key
     ///   prefix for a key member in order U;
-    /// - an empty `BS`: `... Binary sets should not be empty` (order R; order
-    ///   U not measured);
+    /// - an empty `BS`: `... Binary sets should not be empty`, with the key
+    ///   prefix for a key member in order U (2026-11-05, `{"pk": {}, "sk":
+    ///   {"BS": []}}`); an empty `NS` carries no prefix in either order;
     /// - an `NS` with duplicates: `... Input collection contains duplicates.`
     ///   in order R, `Input collection contains duplicates` in order U;
     /// - an `SS` with duplicates: `... Input collection ["a", "a"] contains
@@ -560,18 +726,16 @@ impl ValueFault {
         match self {
             Self::Number(fault) => fault.clone(),
             Self::NumberSetEmpty => invalid_parameter("An number set  may not be empty"),
-            Self::StringSetEmpty => {
-                let text = invalid_parameter("An string set  may not be empty");
-                match (order, place, text) {
-                    (
-                        CheckOrder::Unreadable,
-                        Place::Key,
-                        DynamoDbError::ValidationException(msg),
-                    ) => DynamoDbError::ValidationException(format!("{START_KEY_PREFIX}{msg}")),
-                    (_, _, text) => text,
-                }
-            }
-            Self::BinarySetEmpty => invalid_parameter("Binary sets should not be empty"),
+            Self::StringSetEmpty => key_prefixed_in_order_u(
+                invalid_parameter("An string set  may not be empty"),
+                order,
+                place,
+            ),
+            Self::BinarySetEmpty => key_prefixed_in_order_u(
+                invalid_parameter("Binary sets should not be empty"),
+                order,
+                place,
+            ),
             Self::NumberSetDuplicates => match order {
                 CheckOrder::Readable => invalid_parameter("Input collection contains duplicates."),
                 CheckOrder::Unreadable => DynamoDbError::ValidationException(
@@ -596,6 +760,18 @@ impl ValueFault {
     }
 }
 
+/// `text` with the key prefix when it is a key member's fault in order U
+/// (measured 2026-11-05 for an empty `SS` and an empty `BS` beside an
+/// unreadable key member), else as it is.
+fn key_prefixed_in_order_u(text: DynamoDbError, order: CheckOrder, place: Place) -> DynamoDbError {
+    match (order, place, text) {
+        (CheckOrder::Unreadable, Place::Key, DynamoDbError::ValidationException(msg)) => {
+            DynamoDbError::ValidationException(format!("{START_KEY_PREFIX}{msg}"))
+        }
+        (_, _, text) => text,
+    }
+}
+
 /// The first value fault in one raw AttributeValue, depth first: an `N` text,
 /// the members of an `NS` (every number first, then an empty set, then
 /// duplicates by numeric value: `["1", "1.0"]` has a duplicate), an empty `SS`
@@ -616,6 +792,37 @@ fn value_fault(value: &Value) -> Option<ValueFault> {
         ("L", Value::Array(members)) => members.iter().find_map(value_fault),
         ("M", Value::Object(members)) => members.values().find_map(value_fault),
         _ => None,
+    }
+}
+
+/// A shape fault ([`shape_fault`]) or a value fault ([`value_fault`]) in one
+/// raw AttributeValue.
+enum Fault {
+    Shape(&'static str),
+    Value(ValueFault),
+}
+
+/// The first fault of either kind in one raw AttributeValue, depth first in
+/// the value's own element order: at each value, a shape fault of the value
+/// itself (empty, an unknown descriptor, two descriptors), else the members of
+/// an `L` or `M` in turn, else the value's number or set fault. Measured
+/// 2026-11-05 (order U, `ExpressionAttributeValues`): `{"L": [{"N": "bob"},
+/// {}]}` answers the number, which [`shape_fault`] alone would pass over. The
+/// empty value ahead of the number is not measured.
+fn first_fault(value: &Value) -> Option<Fault> {
+    let fields = value.as_object()?;
+    let mut fields = fields.iter();
+    match (fields.next(), fields.next()) {
+        (None, _) => Some(Fault::Shape(EMPTY_VALUE)),
+        (Some(_), Some(_)) => Some(Fault::Shape(MORE_THAN_ONE_DESCRIPTOR)),
+        (Some((descriptor, inner)), None) => match (descriptor.as_str(), inner) {
+            ("L", Value::Array(members)) => members.iter().find_map(first_fault),
+            ("M", Value::Object(members)) => members.values().find_map(first_fault),
+            (descriptor, _) if TYPE_DESCRIPTORS.contains(&descriptor) => {
+                value_fault(value).map(Fault::Value)
+            }
+            _ => Some(Fault::Shape(EMPTY_VALUE)),
+        },
     }
 }
 
@@ -693,23 +900,36 @@ fn has_duplicates(texts: &[String]) -> bool {
     distinct.len() != texts.len()
 }
 
-/// The `ExpressionAttributeValues` of a `Scan` body whose entries do not all
-/// deserialize: in order U an entry that is not one AttributeValue (empty, an
-/// unknown or lower-case type descriptor, two descriptors, at the top or inside
-/// an `L` or `M`), in either order an empty or duplicate set. The service
-/// reports such an entry at its own stage: in order R the set faults ahead of
-/// the no-expression check (2026-11-05, `{":e": {"NS": []}}` with no
-/// expression answers `One or more parameter values were invalid: An number
-/// set  may not be empty`; `{":a": {"SS": ["a", "a"]}}` read by the filter
-/// answers `... Input collection ["a", "a"] contains duplicates.`); in order U
-/// the unreadable entries after the key's faults and ahead of the nesting
-/// check, read by an expression or not (2026-10-31 B4-7 and 2026-11-05):
-/// `ExpressionAttributeValues contains invalid value: Supplied AttributeValue
-/// is empty, must contain exactly one of the supported datatypes for key :e`
-/// for `{}` and for `{"X": "1"}`, and `... has more than one datatypes set,
-/// ... for key :a` for two descriptors. A set fault in order U is not measured
-/// and is reported with the unreadable entries. Which entry is named when
-/// several are faulty is not measured: the first in sorted order.
+/// The `ExpressionAttributeValues` of a `Scan` body whose entries the handler
+/// reports at the map's own step rather than at request time. In order R the
+/// numbers, the set faults and the nesting depth are request-time checks
+/// ([`scan_request_checks`]); an empty or duplicate set is reported there ahead
+/// of the no-expression check (2026-11-05, `{":e": {"NS": []}}` with no
+/// expression answers `One or more parameter values were invalid: An number set
+///  may not be empty`; `{":a": {"SS": ["a", "a"]}}` read by the filter answers
+/// `... Input collection ["a", "a"] contains duplicates.`), and here only an
+/// entry the request-time checks did not reach is held back, with the same
+/// texts: a malformed number inside an entry the deserializer refuses for a set
+/// fault (2026-11-05: `{"NS": ["bob", "1", "1"]}` beside a value nested 32
+/// levels answers the nesting text, so the number is reported after it). In
+/// order U, after the key's faults and ahead of the nesting check, read by an
+/// expression or not (2026-10-31 B4-7 and 2026-11-05), every fault in the form
+/// `ExpressionAttributeValues contains invalid value: <text> for key :e`: an
+/// entry that is not one AttributeValue (empty, an unknown or lower-case type
+/// descriptor, two descriptors, at the top or inside an `L` or `M`), `Supplied
+/// AttributeValue is empty, must contain exactly one of the supported datatypes`
+/// for `{}` and for `{"X": "1"}`, `... has more than one datatypes set, ...`
+/// for two descriptors; a malformed number, `The parameter cannot be converted
+/// to a numeric value: bob`, at the top or inside an `L` or `NS`, and the
+/// 38-digit text; a set fault with the set texts of order U (`One or more
+/// parameter values were invalid: An number set  may not be empty`, `... Input
+/// collection [a, a] contains duplicates.`). Inside one entry the first fault
+/// in the value's element order is named ([`first_fault`]). The entries are
+/// visited in the fitted order ([`fitted_member_order`]), and the first faulty
+/// one is named (2026-11-05: `:n` ahead of `:e`, `:b` ahead of `:p` and `:a`,
+/// `:a` ahead of `:e` when `:a` comes first in the request and `:e` ahead of
+/// `:a` when `:e` does, `:s` ahead of `:e`; with four and seven entries the
+/// eight and sixteen buckets).
 ///
 /// [`Self::take`] puts a readable stand-in in the body for each such entry, so
 /// that the typed deserialization and the expression checks run on the other
@@ -717,29 +937,48 @@ fn has_duplicates(texts: &[String]) -> bool {
 /// request is refused before the scan reads the stand-in. An entry of the wrong
 /// JSON shape stays in the body.
 pub(crate) struct ExpressionValuesBody {
-    /// The faults of the entries taken out, in sorted order of their names.
+    /// The faults of the entries taken out, in the fitted order of their names.
     faults: Vec<DynamoDbError>,
 }
 
 impl ExpressionValuesBody {
     /// Replaces each entry the checks here classify with a readable stand-in
-    /// and keeps its fault for `order`.
-    pub(crate) fn take(body: &mut Value, order: CheckOrder) -> Self {
+    /// and keeps its fault for `order`. `request_order` is the entry names as
+    /// the request wrote them ([`member_order`]).
+    pub(crate) fn take(
+        body: &mut Value,
+        order: CheckOrder,
+        request_order: Option<&[String]>,
+    ) -> Self {
+        let names = fitted_order_of(body, "ExpressionAttributeValues", request_order);
         let Some(Value::Object(entries)) = body.get_mut("ExpressionAttributeValues") else {
             return Self { faults: Vec::new() };
         };
-        let mut names: Vec<String> = entries.keys().cloned().collect();
-        names.sort_unstable();
         let mut faults = Vec::new();
         for name in names {
             let Some(value) = entries.get_mut(&name) else {
                 continue;
             };
-            let fault = match shape_fault(value) {
-                Some(text) => Some(DynamoDbError::ValidationException(format!(
-                    "ExpressionAttributeValues contains invalid value: {text} for key {name}"
-                ))),
-                None => value_fault(value).map(|fault| fault.text(order, Place::ExpressionValue)),
+            let fault = match (order, first_fault(value)) {
+                (_, None) => None,
+                (_, Some(Fault::Shape(text))) => Some(invalid_expression_value(text, &name)),
+                // In order R a number is reported here only when the request-time
+                // check skipped its entry (a set fault below it), with the plain
+                // text; the set faults were reported at request time.
+                (CheckOrder::Readable, Some(Fault::Value(ValueFault::Number(fault)))) => {
+                    Some(fault)
+                }
+                (CheckOrder::Readable, Some(Fault::Value(fault))) => {
+                    Some(fault.text(order, Place::ExpressionValue))
+                }
+                (CheckOrder::Unreadable, Some(Fault::Value(fault))) => {
+                    match fault.text(order, Place::ExpressionValue) {
+                        DynamoDbError::ValidationException(msg) => {
+                            Some(invalid_expression_value(&msg, &name))
+                        }
+                        other => Some(other),
+                    }
+                }
             };
             if let Some(fault) = fault {
                 *value = serde_json::json!({"S": ""});
@@ -753,7 +992,79 @@ impl ExpressionValuesBody {
     ///
     /// # Errors
     ///
-    /// Returns the fault of the first entry taken out, in sorted order.
+    /// Returns the fault of the first entry taken out, in the fitted order.
+    pub(crate) fn validate(&self) -> Result<(), DynamoDbError> {
+        match self.faults.first() {
+            Some(fault) => Err(fault.clone()),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The service's text for a faulty `ExpressionAttributeValues` entry at the
+/// map's own step: `ExpressionAttributeValues contains invalid value: <text>
+/// for key <name>`.
+fn invalid_expression_value(text: &str, name: &str) -> DynamoDbError {
+    DynamoDbError::ValidationException(format!(
+        "ExpressionAttributeValues contains invalid value: {text} for key {name}"
+    ))
+}
+
+/// The `ScanFilter` lists of a `Scan` body in order U, whose values the service
+/// checks after the no-expression checks and ahead of `ConditionalOperator`,
+/// the lists' value counts, the key's faults and the table (2026-11-05): a
+/// value that is not one AttributeValue answers `Supplied AttributeValue is
+/// empty, must contain exactly one of the supported datatypes` for `{}` and
+/// for `{"X": "1"}`, with no prefix. A malformed number in a list is #507's
+/// check (#564 item 3) and stays in the body. Two descriptors in a list value,
+/// a set fault in a list value, and which value is named when several are
+/// faulty (the conditions in the fitted order, the list in its order) are not
+/// measured. [`Self::take`] puts a readable stand-in in the body for each such
+/// value and keeps the fault; [`Self::validate`] reports it. In order R nothing
+/// is taken.
+pub(crate) struct ScanFilterBody {
+    faults: Vec<DynamoDbError>,
+}
+
+impl ScanFilterBody {
+    /// Replaces each list value that is not one AttributeValue with a readable
+    /// stand-in in order U and keeps its fault. `request_order` is the
+    /// condition names as the request wrote them ([`member_order`]).
+    pub(crate) fn take(
+        body: &mut Value,
+        order: CheckOrder,
+        request_order: Option<&[String]>,
+    ) -> Self {
+        if order == CheckOrder::Readable {
+            return Self { faults: Vec::new() };
+        }
+        let names = fitted_order_of(body, "ScanFilter", request_order);
+        let Some(Value::Object(conditions)) = body.get_mut("ScanFilter") else {
+            return Self { faults: Vec::new() };
+        };
+        let mut faults = Vec::new();
+        for name in names {
+            let Some(Value::Array(values)) = conditions
+                .get_mut(&name)
+                .and_then(|condition| condition.get_mut("AttributeValueList"))
+            else {
+                continue;
+            };
+            for value in values.iter_mut() {
+                if let Some(text) = shape_fault(value) {
+                    *value = serde_json::json!({"S": ""});
+                    faults.push(DynamoDbError::ValidationException(text.to_owned()));
+                }
+            }
+        }
+        Self { faults }
+    }
+
+    /// The first list value's fault, at the step of order U.
+    ///
+    /// # Errors
+    ///
+    /// Returns the fault of the first value taken out.
     pub(crate) fn validate(&self) -> Result<(), DynamoDbError> {
         match self.faults.first() {
             Some(fault) => Err(fault.clone()),

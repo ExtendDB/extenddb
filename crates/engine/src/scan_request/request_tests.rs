@@ -9,17 +9,19 @@
 //! a Scan of a table the probe created) with the answer it gave: on 2026-10-25
 //! at 10:38 and 10:55 UTC, on 2026-10-30 at 12:40 UTC, on 2026-10-31 between
 //! 23:54 and 23:56 UTC and on 2026-11-05 where a test says so. The tests of
-//! `StartKeyBody::take`, `ExpressionValuesBody::take` and `SelectBody::take`
-//! check which values they hold back, with no service answer; the test of the
-//! member order checks the fitted rule's buckets; the rows with two value
-//! faults in two key members accept either member's fault.
+//! `StartKeyBody::take` and `SelectBody::take` check which values they hold
+//! back, with no service answer; the tests of `ExpressionValuesBody::take` and
+//! `ScanFilterBody::take` also check the measured texts they keep; the tests of
+//! the member order check the fitted rule's buckets and masks; the rows with
+//! two value faults in two key members accept either member's fault.
 
 use extenddb_core::error::DynamoDbError;
 use serde_json::{Value, json};
 
 use super::{
-    CheckOrder, ExpressionValuesBody, SelectBody, StartKeyBody, fitted_member_order,
-    java_hash_bucket, start_key_member_order, validate_scan_request_body,
+    CheckOrder, ExpressionValuesBody, ScanFilterBody, SelectBody, StartKeyBody,
+    fitted_member_order, hash_table_mask, java_hash_bucket, member_order,
+    validate_scan_request_body,
 };
 
 const MIX: &str = "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {ScanFilter} Expression parameters: {FilterExpression}";
@@ -44,7 +46,7 @@ fn validation_message(result: Result<(), DynamoDbError>) -> Option<String> {
 
 /// The request-time checks on `body`, in the order of the body's class.
 fn check(body: &Value) -> Option<String> {
-    validation_message(validate_scan_request_body(body, CheckOrder::of(body)))
+    validation_message(validate_scan_request_body(body, CheckOrder::of(body), None))
 }
 
 /// A Scan body with the fields of `extra` added to the table name.
@@ -463,12 +465,15 @@ fn a_set_fault_in_a_key_value_answers_the_order_u_text() {
             assert_eq!(check_key(&body).as_deref(), Some(text.as_str()), "{body}");
         }
     }
-    // Not measured in order U, and reported without the key prefix and with
-    // the members unquoted: an empty BS and a BS with duplicates.
+    // Measured 2026-11-05 beside an unreadable key member: an empty BS with
+    // the key prefix, as the empty SS; a BS with duplicates with the members
+    // unquoted and no prefix.
     let bs_empty = with_key(json!({"pk": {}, "sk": {"BS": []}}));
     assert_eq!(
         check_key(&bs_empty),
-        Some(format!("{INVALID}Binary sets should not be empty"))
+        Some(format!(
+            "{KEY_PREFIX}{INVALID}Binary sets should not be empty"
+        ))
     );
     let bs_dup = with_key(json!({"pk": {}, "sk": {"BS": ["YQ==", "YQ=="]}}));
     assert_eq!(
@@ -492,8 +497,31 @@ fn the_fitted_member_order_follows_the_hash_buckets_then_the_request() {
         ("gpk", 3),
         ("id", 3),
         ("ts", 3),
+        ("\u{e4}", 0),
+        ("\u{e9}", 1),
+        (":n", 0),
+        (":b", 0),
+        (":p", 2),
+        (":a", 3),
+        (":e", 3),
     ] {
-        assert_eq!(java_hash_bucket(name), bucket, "{name}");
+        assert_eq!(java_hash_bucket(name, 3), bucket, "{name}");
+    }
+    // The table doubles when it holds more than three quarters of its size.
+    for (names, mask) in [
+        (0, 3),
+        (1, 3),
+        (3, 3),
+        (4, 7),
+        (6, 7),
+        (7, 15),
+        (12, 15),
+        (13, 31),
+    ] {
+        assert_eq!(hash_table_mask(names), mask, "{names} names");
+    }
+    for (name, bucket) in [("sk", 0), ("gpk", 3), ("pk", 3), ("gsk", 6)] {
+        assert_eq!(java_hash_bucket(name, 7), bucket, "{name}");
     }
     let order = |names: &[&str]| fitted_member_order(names.iter().copied());
     // The pk, sk table: sk first in both request orders.
@@ -509,32 +537,65 @@ fn the_fitted_member_order_follows_the_hash_buckets_then_the_request() {
     // The GSI key of three members: sk, then gpk and pk in the request's order.
     assert_eq!(order(&["gpk", "pk", "sk"]), ["sk", "gpk", "pk"]);
     assert_eq!(order(&["pk", "sk", "gpk"]), ["sk", "pk", "gpk"]);
+    // Four members (measured 2026-11-05 on a GSI with a range key): eight
+    // buckets, so gpk and pk (3) come ahead of gsk (6) in both request orders;
+    // with four buckets gsk (2) would come ahead of them.
+    assert_eq!(
+        order(&["gpk", "gsk", "pk", "sk"]),
+        ["sk", "gpk", "pk", "gsk"]
+    );
+    assert_eq!(
+        order(&["sk", "pk", "gsk", "gpk"]),
+        ["sk", "pk", "gpk", "gsk"]
+    );
+    // HASH \u{e4}, RANGE \u{e9}: \u{e4} first in both request orders.
+    assert_eq!(order(&["\u{e4}", "\u{e9}"]), ["\u{e4}", "\u{e9}"]);
+    assert_eq!(order(&["\u{e9}", "\u{e4}"]), ["\u{e4}", "\u{e9}"]);
+    // ExpressionAttributeValues entries (order U, 2026-11-05): :n ahead of :e,
+    // :b ahead of :p and :a, :a and :e in the request's order.
+    assert_eq!(order(&[":p", ":a", ":e"]), [":p", ":a", ":e"]);
+    assert_eq!(order(&[":p", ":n", ":e"]), [":n", ":p", ":e"]);
+    assert_eq!(order(&[":p", ":b", ":a"]), [":b", ":p", ":a"]);
+    // Seven names: sixteen buckets.
+    let seven = ["a", "b", "c", "d", "e", "f", "g"];
+    assert_eq!(order(&seven).len(), 7);
+    assert_eq!(hash_table_mask(seven.len()), 15);
 }
 
-/// `start_key_member_order` reads the key's member names from the request
+/// `member_order` reads a top-level object's member names from the request
 /// text in document order; a repeated name keeps its first position; a body
-/// with no key, a key that is not an object or text that does not parse gives
-/// `None`.
+/// without the field, a field that is not an object or text that does not
+/// parse gives `None`.
 #[test]
-fn the_request_order_of_the_key_members_is_read_from_the_raw_body() {
-    let raw = br#"{"TableName": "t", "ExclusiveStartKey": {"ts": {"N": "bob"}, "id": {}}}"#;
+fn the_request_order_of_the_members_is_read_from_the_raw_body() {
+    let raw = br#"{"TableName": "t", "ExclusiveStartKey": {"ts": {"N": "bob"}, "id": {}}, "ExpressionAttributeValues": {":p": {"S": "x"}, ":n": {"N": "bob"}}, "ScanFilter": {"b": {}, "a": {}}}"#;
+    let names = |names: &[&str]| Some(names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>());
+    assert_eq!(member_order(raw, "ExclusiveStartKey"), names(&["ts", "id"]));
     assert_eq!(
-        start_key_member_order(raw),
-        Some(vec!["ts".to_owned(), "id".to_owned()])
+        member_order(raw, "ExpressionAttributeValues"),
+        names(&[":p", ":n"])
     );
+    assert_eq!(member_order(raw, "ScanFilter"), names(&["b", "a"]));
     let repeated =
         br#"{"ExclusiveStartKey": {"b": {}, "a": {}, "b": {"S": "x"}}, "TableName": "t"}"#;
     assert_eq!(
-        start_key_member_order(repeated),
-        Some(vec!["b".to_owned(), "a".to_owned()])
+        member_order(repeated, "ExclusiveStartKey"),
+        names(&["b", "a"])
     );
-    assert_eq!(start_key_member_order(br#"{"TableName": "t"}"#), None);
+    assert_eq!(member_order(raw, "ProjectionExpression"), None);
     assert_eq!(
-        start_key_member_order(br#"{"TableName": "t", "ExclusiveStartKey": "x"}"#),
+        member_order(br#"{"TableName": "t"}"#, "ExclusiveStartKey"),
         None
     );
-    assert_eq!(start_key_member_order(b"not json"), None);
-    assert_eq!(start_key_member_order(b""), None);
+    assert_eq!(
+        member_order(
+            br#"{"TableName": "t", "ExclusiveStartKey": "x"}"#,
+            "ExclusiveStartKey"
+        ),
+        None
+    );
+    assert_eq!(member_order(b"not json", "ExclusiveStartKey"), None);
+    assert_eq!(member_order(b"", "ExclusiveStartKey"), None);
 }
 
 /// Faults in two members of one key: the first faulty member in the fitted
@@ -722,7 +783,7 @@ fn a_faulty_expression_value_is_held_back_and_a_stand_in_takes_its_place() {
         }));
         let order = CheckOrder::of(&body);
         assert_eq!(order, CheckOrder::Unreadable, "{value}");
-        let values = ExpressionValuesBody::take(&mut body, order);
+        let values = ExpressionValuesBody::take(&mut body, order, None);
         assert_eq!(body["ExpressionAttributeValues"], json!({":a": {"S": ""}}));
         assert_eq!(validation_message(values.validate()), Some(text), "{value}");
     }
@@ -736,7 +797,7 @@ fn a_faulty_expression_value_is_held_back_and_a_stand_in_takes_its_place() {
         let mut body = scan(json!({"ExpressionAttributeValues": {":a": value}}));
         let order = CheckOrder::of(&body);
         assert_eq!(order, CheckOrder::Readable, "{value}");
-        let values = ExpressionValuesBody::take(&mut body, order);
+        let values = ExpressionValuesBody::take(&mut body, order, None);
         assert_eq!(body["ExpressionAttributeValues"], json!({":a": {"S": ""}}));
         assert_eq!(
             validation_message(values.validate()),
@@ -744,21 +805,311 @@ fn a_faulty_expression_value_is_held_back_and_a_stand_in_takes_its_place() {
             "{value}"
         );
     }
-    // Two faulty entries: the first in sorted order is reported.
+    // Two faulty entries: the first in the fitted order is reported (measured
+    // 2026-11-05: `:b` ahead of `:a`, which sorted order would reverse).
     let mut body =
-        scan(json!({"ExpressionAttributeValues": {":b": {}, ":a": {"S": "x", "N": "1"}}}));
-    let values = ExpressionValuesBody::take(&mut body, CheckOrder::Unreadable);
+        scan(json!({"ExpressionAttributeValues": {":p": {"S": "x"}, ":b": {}, ":a": {"X": "1"}}}));
+    let values = ExpressionValuesBody::take(&mut body, CheckOrder::Unreadable, None);
     assert_eq!(
         validation_message(values.validate()),
-        Some(wrapper(MORE_THAN_ONE))
+        Some(wrapper(EMPTY_VALUE).replace(":a", ":b"))
     );
     // A readable value and a value of the wrong JSON shape stay as written.
     for value in [json!({"S": "x"}), json!({"N": 5})] {
         let mut body = scan(json!({"ExpressionAttributeValues": {":a": value}}));
-        let values = ExpressionValuesBody::take(&mut body, CheckOrder::Readable);
+        let values = ExpressionValuesBody::take(&mut body, CheckOrder::Readable, None);
         assert_eq!(body["ExpressionAttributeValues"], json!({":a": value}));
         assert!(values.validate().is_ok());
     }
+}
+
+/// Measured 2026-11-05 (order U): a malformed number in `ExpressionAttributeValues`
+/// is reported at the map's step in the invalid-value form, the entries visited
+/// in the fitted order: `{":p": {"S": "x"}, ":a": {"N": "bob"}, ":e": {}}`
+/// names `:a`, the same with `:n` names `:n`, and the request-time checks pass
+/// over the number. In order R the number is a request-time check with the
+/// plain text.
+#[test]
+fn a_malformed_expression_value_number_in_order_u_takes_the_invalid_value_form() {
+    let wrapper = |name: &str| {
+        format!("ExpressionAttributeValues contains invalid value: {NUMERIC_BOB} for key {name}")
+    };
+    for (name, request_order) in [(":a", [":p", ":a", ":e"]), (":n", [":p", ":n", ":e"])] {
+        let mut body = scan(json!({
+            "FilterExpression": "a = :p",
+            "ExpressionAttributeValues": {":p": {"S": "x"}, name: {"N": "bob"}, ":e": {}},
+        }));
+        assert_eq!(CheckOrder::of(&body), CheckOrder::Unreadable);
+        assert_eq!(check(&body), None, "{name}");
+        let names: Vec<String> = request_order.iter().map(|n| (*n).to_owned()).collect();
+        let values = ExpressionValuesBody::take(&mut body, CheckOrder::Unreadable, Some(&names));
+        assert_eq!(
+            validation_message(values.validate()),
+            Some(wrapper(name)),
+            "{name}"
+        );
+        assert_eq!(body["ExpressionAttributeValues"][name], json!({"S": ""}));
+    }
+    // With the unreadable value in the key, the number is still held back for
+    // the map's step, after the key's faults.
+    let mut body = scan(json!({
+        "FilterExpression": "a = :n",
+        "ExpressionAttributeValues": {":n": {"N": "bob"}},
+        "ExclusiveStartKey": {"pk": {}, "sk": {"S": "x"}},
+    }));
+    assert_eq!(check(&body), None);
+    let values = ExpressionValuesBody::take(&mut body, CheckOrder::Unreadable, None);
+    assert_eq!(validation_message(values.validate()), Some(wrapper(":n")));
+    // Order R: the request-time check, the plain text.
+    let body = scan(json!({"ExpressionAttributeValues": {":n": {"N": "bob"}}}));
+    assert_eq!(CheckOrder::of(&body), CheckOrder::Readable);
+    assert_eq!(check(&body).as_deref(), Some(NUMERIC_BOB));
+}
+
+/// Measured 2026-11-05 (order R): the request-time number check visits the
+/// `ExpressionAttributeValues` entries in the hash order the key and the
+/// order-U step use. `{":n": {"N": "fred"}, ":a": {"N": "bob"}}` answers
+/// `fred` (`:n` in bucket 0, `:a` in 3), whichever order the request wrote and
+/// whatever order the parsed body keeps; sorted name order would answer `bob`.
+#[test]
+fn the_order_r_number_check_visits_the_entries_in_the_hash_order() {
+    let numeric =
+        |text: &str| format!("The parameter cannot be converted to a numeric value: {text}");
+    let body = scan(json!({
+        "FilterExpression": "a = :a",
+        "ExpressionAttributeValues": {":n": {"N": "fred"}, ":a": {"N": "bob"}},
+    }));
+    assert_eq!(CheckOrder::of(&body), CheckOrder::Readable);
+    assert_eq!(check(&body), Some(numeric("fred")));
+    for request_order in [[":n", ":a"], [":a", ":n"]] {
+        let names: Vec<String> = request_order.iter().map(|n| (*n).to_owned()).collect();
+        assert_eq!(
+            validation_message(validate_scan_request_body(
+                &body,
+                CheckOrder::Readable,
+                Some(&names)
+            )),
+            Some(numeric("fred")),
+            "{request_order:?}"
+        );
+    }
+    // Two names in one bucket: the request's order decides (`:a` and `:e`
+    // share bucket 3).
+    let body = scan(json!({
+        "FilterExpression": "a = :p",
+        "ExpressionAttributeValues": {":p": {"S": "x"}, ":a": {"N": "bob"}, ":e": {"N": "fred"}},
+    }));
+    for (request_order, first) in [([":p", ":a", ":e"], "bob"), ([":p", ":e", ":a"], "fred")] {
+        let names: Vec<String> = request_order.iter().map(|n| (*n).to_owned()).collect();
+        assert_eq!(
+            validation_message(validate_scan_request_body(
+                &body,
+                CheckOrder::Readable,
+                Some(&names)
+            )),
+            Some(numeric(first)),
+            "{request_order:?}"
+        );
+    }
+}
+
+/// Measured 2026-11-05 (order R): with two set faults, `{":n": {"NS": []},
+/// ":a": {"SS": []}}` answered the empty `SS` text in one send and the empty
+/// `NS` text in the other. The set pass visits the entries in sorted name
+/// order, whatever order the backend's parsed body keeps, so that the answer
+/// does not depend on the backend: it names `:a`. A number in an entry is not
+/// the set pass's to report (`eavR-NSbobdup-and-nest`: the number inside a
+/// refused entry comes after the nesting check).
+#[test]
+fn the_order_r_set_pass_visits_the_entries_in_sorted_name_order() {
+    let body = scan(json!({"ExpressionAttributeValues": {":n": {"NS": []}, ":a": {"SS": []}}}));
+    assert_eq!(CheckOrder::of(&body), CheckOrder::Readable);
+    assert_eq!(
+        check(&body),
+        Some(format!("{INVALID}An string set  may not be empty"))
+    );
+    let body = scan(json!({"ExpressionAttributeValues": {":a": {"NS": []}, ":n": {"SS": []}}}));
+    assert_eq!(
+        check(&body),
+        Some(format!("{INVALID}An number set  may not be empty"))
+    );
+    // A malformed number inside an entry with a set fault below it: skipped by
+    // the request-time checks (the nesting check of another entry answers
+    // first), reported by `ExpressionValuesBody` with the plain text.
+    let one = json!({"N": "1"});
+    let mut body = scan(json!({
+        "FilterExpression": "a = :p",
+        "ExpressionAttributeValues": {":p": {"S": "x"}, ":d": nested(&one, 32), ":a": {"NS": ["bob", "1", "1"]}},
+    }));
+    assert_eq!(check(&body).as_deref(), Some(NESTING));
+    body["ExpressionAttributeValues"]
+        .as_object_mut()
+        .expect("an object")
+        .remove(":d");
+    assert_eq!(check(&body), None);
+    let values = ExpressionValuesBody::take(&mut body, CheckOrder::Readable, None);
+    assert_eq!(
+        validation_message(values.validate()).as_deref(),
+        Some(NUMERIC_BOB)
+    );
+}
+
+/// Measured 2026-11-05 (order U): a set fault in an `ExpressionAttributeValues`
+/// entry takes the invalid-value form at the map's step, with the set texts of
+/// order U, in the entries' hash order: `{":p": {"S": "x"}, ":s": {"NS": []},
+/// ":e": {}}` names `:s` (bucket 1, ahead of `:e` in 3); an `SS` with
+/// duplicates answers `... Input collection [a, a] contains duplicates. for key
+/// :s`. Inside one entry the first fault in the value's element order is named:
+/// `{"L": [{"N": "bob"}, {}]}` answers the number (measured), `{"L": [{},
+/// {"N": "bob"}]}` the empty value (not measured, the element order).
+#[test]
+fn an_order_u_set_fault_in_an_expression_value_takes_the_invalid_value_form() {
+    let wrapper = |text: &str, name: &str| {
+        format!("ExpressionAttributeValues contains invalid value: {text} for key {name}")
+    };
+    for (set, text) in [
+        (
+            json!({"NS": []}),
+            format!("{INVALID}An number set  may not be empty"),
+        ),
+        (
+            json!({"SS": ["a", "a"]}),
+            format!("{INVALID}Input collection [a, a] contains duplicates."),
+        ),
+        (
+            json!({"BS": []}),
+            format!("{INVALID}Binary sets should not be empty"),
+        ),
+    ] {
+        let mut body = scan(json!({
+            "FilterExpression": "a = :p",
+            "ExpressionAttributeValues": {":p": {"S": "x"}, ":s": set, ":e": {}},
+        }));
+        assert_eq!(CheckOrder::of(&body), CheckOrder::Unreadable);
+        assert_eq!(check(&body), None, "{set}");
+        let values = ExpressionValuesBody::take(&mut body, CheckOrder::Unreadable, None);
+        assert_eq!(
+            validation_message(values.validate()),
+            Some(wrapper(&text, ":s")),
+            "{set}"
+        );
+        assert_eq!(body["ExpressionAttributeValues"][":s"], json!({"S": ""}));
+        assert_eq!(body["ExpressionAttributeValues"][":e"], json!({"S": ""}));
+    }
+    // Inside one entry: the element order.
+    for (value, text) in [
+        (json!({"L": [{"N": "bob"}, {}]}), NUMERIC_BOB),
+        (json!({"L": [{}, {"N": "bob"}]}), EMPTY_VALUE),
+        (
+            json!({"L": [{"NS": []}, {}]}),
+            "One or more parameter values were invalid: An number set  may not be empty",
+        ),
+        (
+            json!({"L": [{"L": [{"N": "bob"}]}, {"S": "x", "N": "1"}]}),
+            NUMERIC_BOB,
+        ),
+    ] {
+        let mut body = scan(json!({
+            "FilterExpression": "a = :p",
+            "ExpressionAttributeValues": {":p": {"S": "x"}, ":l": value},
+        }));
+        assert_eq!(CheckOrder::of(&body), CheckOrder::Unreadable, "{value}");
+        let values = ExpressionValuesBody::take(&mut body, CheckOrder::Unreadable, None);
+        assert_eq!(
+            validation_message(values.validate()),
+            Some(wrapper(text, ":l")),
+            "{value}"
+        );
+    }
+}
+
+/// Measured 2026-11-05: in order U `ScanFilterBody::take` holds a `ScanFilter`
+/// list value back for the step after the no-expression checks: a value that is
+/// not one AttributeValue answers `Supplied AttributeValue is empty, must
+/// contain exactly one of the supported datatypes` with no prefix, for `{}` and
+/// for `{"X": "1"}`. In order R nothing is taken. A malformed number in a list
+/// is #507's check (#564 item 3): the request-time checks pass it and `take`
+/// leaves it in the body in both orders.
+#[test]
+fn a_scan_filter_list_value_is_checked_at_its_step() {
+    let list = |values: Value| {
+        scan(
+            json!({"ScanFilter": {"a": {"ComparisonOperator": "EQ", "AttributeValueList": values}}}),
+        )
+    };
+    // The numbers of the lists are #507's: not a request-time check here.
+    let mut bob = list(json!([{"N": "bob"}, {"NS": ["bob"]}]));
+    assert_eq!(CheckOrder::of(&bob), CheckOrder::Readable);
+    assert_eq!(check(&bob), None);
+    let beside_key = with(
+        list(json!([{"N": "bob"}])),
+        json!({"ExclusiveStartKey": {"pk": {"N": "fred"}, "sk": {"S": "x"}}}),
+    );
+    assert_eq!(check(&beside_key), None);
+    assert!(
+        ScanFilterBody::take(&mut bob, CheckOrder::Readable, None)
+            .validate()
+            .is_ok()
+    );
+    assert_eq!(
+        bob["ScanFilter"]["a"]["AttributeValueList"],
+        json!([{"N": "bob"}, {"NS": ["bob"]}])
+    );
+    // Order U: the list value is held back.
+    for value in [json!({}), json!({"X": "1"}), json!({"L": [{}]})] {
+        let mut body = list(json!([value]));
+        assert_eq!(CheckOrder::of(&body), CheckOrder::Unreadable, "{value}");
+        assert_eq!(check(&body), None, "{value}");
+        let filter = ScanFilterBody::take(&mut body, CheckOrder::Unreadable, None);
+        assert_eq!(
+            body["ScanFilter"]["a"]["AttributeValueList"],
+            json!([{"S": ""}]),
+            "{value}"
+        );
+        assert_eq!(
+            validation_message(filter.validate()).as_deref(),
+            Some(EMPTY_VALUE),
+            "{value}"
+        );
+        assert!(
+            serde_json::from_value::<extenddb_core::types::ScanInput>(body).is_ok(),
+            "{value}"
+        );
+    }
+    let mut two = list(json!([{"S": "x", "N": "1"}]));
+    let filter = ScanFilterBody::take(&mut two, CheckOrder::Unreadable, None);
+    assert_eq!(
+        validation_message(filter.validate()).as_deref(),
+        Some(MORE_THAN_ONE)
+    );
+    // A number beside an unreadable key member stays in the body in order U
+    // too (#507's check).
+    let mut number = with(
+        list(json!([{"N": "bob"}])),
+        json!({"ExclusiveStartKey": {"pk": {}, "sk": {"S": "x"}}}),
+    );
+    assert_eq!(check(&number), None);
+    let filter = ScanFilterBody::take(&mut number, CheckOrder::Unreadable, None);
+    assert!(filter.validate().is_ok());
+    assert_eq!(
+        number["ScanFilter"]["a"]["AttributeValueList"],
+        json!([{"N": "bob"}])
+    );
+    // Order R: nothing is taken, a readable list stays as written.
+    let mut readable = list(json!([{"N": "1"}]));
+    let filter = ScanFilterBody::take(&mut readable, CheckOrder::Readable, None);
+    assert_eq!(
+        readable["ScanFilter"]["a"]["AttributeValueList"],
+        json!([{"N": "1"}])
+    );
+    assert!(filter.validate().is_ok());
+    // No ScanFilter at all.
+    let mut none = scan(json!({}));
+    assert!(
+        ScanFilterBody::take(&mut none, CheckOrder::Unreadable, None)
+            .validate()
+            .is_ok()
+    );
 }
 
 #[test]
@@ -780,6 +1131,34 @@ fn a_value_nested_32_levels_deep_is_refused_and_31_levels_pass() {
     // ahead of the no-expression check.
     let no_expression = scan(json!({"ExpressionAttributeValues": {":d": nested(&one, 32)}}));
     assert_eq!(check(&no_expression).as_deref(), Some(NESTING));
+    // Measured 2026-11-05 (eavR-NSe-and-nest, both sends): an empty set in
+    // another entry answers the set text ahead of the nesting text, with the
+    // text of order R; a duplicate set too (not measured beside a nested
+    // value). A number in a third entry comes ahead of both.
+    let beside_empty_set = scan(
+        json!({"FilterExpression": "a = :p", "ExpressionAttributeValues":
+        {":p": {"S": "x"}, ":d": nested(&one, 32), ":e": {"NS": []}}}),
+    );
+    assert_eq!(CheckOrder::of(&beside_empty_set), CheckOrder::Readable);
+    assert_eq!(
+        check(&beside_empty_set).as_deref(),
+        Some("One or more parameter values were invalid: An number set  may not be empty")
+    );
+    let beside_duplicates = scan(
+        json!({"FilterExpression": "a = :p", "ExpressionAttributeValues":
+        {":p": {"S": "x"}, ":d": nested(&one, 32), ":a": {"SS": ["a", "a"]}}}),
+    );
+    assert_eq!(
+        check(&beside_duplicates).as_deref(),
+        Some(
+            "One or more parameter values were invalid: Input collection [\"a\", \"a\"] contains duplicates."
+        )
+    );
+    let number_first = scan(
+        json!({"FilterExpression": "a = :p", "ExpressionAttributeValues":
+        {":p": {"S": "x"}, ":d": nested(&one, 32), ":e": {"NS": []}, ":n": {"N": "bob"}}}),
+    );
+    assert_eq!(check(&number_first).as_deref(), Some(NUMERIC_BOB));
     // In order U the nesting check leaves request time: beside an unused
     // empty value (B4-7) or a key shape fault (2026-11-05) the request-time
     // checks pass and the handler reports those first.
