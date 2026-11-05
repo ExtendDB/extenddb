@@ -52,6 +52,29 @@ mod response;
 mod steps;
 mod visits;
 
+/// Refuse a projection list that names one output identifier twice, or
+/// whose paths overlap. The service refuses two projected paths with one
+/// identifier rather than collapsing them, ahead of two paths that overlap
+/// (measured 2026-11-05: `a, a`, `m.k, k` and `m.k, m` on all three
+/// operations).
+///
+/// # Errors
+///
+/// Returns the service's message for the first refusal.
+pub(super) fn check_projection(stmt: &SelectStatement) -> Result<(), String> {
+    let Projection::Paths(paths) = &stmt.projection else {
+        return Ok(());
+    };
+    let mut seen = std::collections::HashSet::new();
+    for path in paths {
+        let key = output_key(path);
+        if !seen.insert(key.clone()) {
+            return Err(format!("Duplicate identifiers in select clause: {key}"));
+        }
+    }
+    super::write::first_overlap(&paths.iter().collect::<Vec<_>>())
+}
+
 /// Execute a parsed `SELECT`, passing `gate` once the checks the service
 /// makes before authorization are done, ahead of the checks made when a
 /// disjunct is read (see `authorize::gate`). The disjuncts the caller may
@@ -86,19 +109,7 @@ pub(super) async fn run(
         Err(e) => return Err(storage_err_to_dynamo(e)),
     };
 
-    // Two projected paths that resolve to the same output identifier are
-    // rejected by the service rather than silently collapsed.
-    if let Projection::Paths(paths) = &stmt.projection {
-        let mut seen = std::collections::HashSet::new();
-        for path in paths {
-            let key = output_key(path);
-            if !seen.insert(key.clone()) {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "Duplicate identifiers in select clause: {key}"
-                )));
-            }
-        }
-    }
+    check_projection(stmt).map_err(DynamoDbError::ValidationException)?;
 
     // Resolve the key schema of the target: the index's when one is named,
     // otherwise the base table's. A named index that does not exist is the

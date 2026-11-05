@@ -527,9 +527,13 @@ def _seed_answer(table):
             _validation("The table does not have the specified index"),
         ),
         ("SELECT * FROM {t} WHERE pk = '{s}' AND sk = 1", _validation(KEY_TYPE)),
+        (
+            "SELECT a, a FROM {t} WHERE pk = '{s}' AND sk = 'b'",
+            _validation("Duplicate identifiers in select clause: a"),
+        ),
         ("SELECT * FROM {t} WHERE pk = ? AND sk = 'b'", _validation(PARAMETERS)),
     ],
-    ids=["missing-table", "missing-index", "key-type", "parameter"],
+    ids=["missing-table", "missing-index", "key-type", "repeated-identifier", "parameter"],
 )
 def test_a_read_that_does_not_translate_is_no_read(dynamodb_client, gtable, statement, error):
     """A read that fails its translation leaves the batch to its writes."""
@@ -738,6 +742,10 @@ def test_a_delete_with_another_returning_clause_is_not_a_duplicate(dynamodb_clie
     "first, error",
     [
         (
+            "SELECT a, a FROM {t} WHERE pk = '{s}' AND sk = 'b'",
+            _validation("Duplicate identifiers in select clause: a"),
+        ),
+        (
             "SELECT * FROM {t}.\"nosuch\" WHERE pk = '{s}' AND sk = 'b'",
             _validation("The table does not have the specified index"),
         ),
@@ -749,7 +757,7 @@ def test_a_delete_with_another_returning_clause_is_not_a_duplicate(dynamodb_clie
             ),
         ),
     ],
-    ids=["missing-index", "index-read"],
+    ids=["repeated-identifier", "missing-index", "index-read"],
 )
 def test_a_read_refused_before_its_item_is_not_a_duplicate(
     dynamodb_client, gtable, first, error
@@ -841,6 +849,47 @@ def test_an_error_of_reading_the_statement_names_no_table(dynamodb_client, gtabl
         ],
     )
     assert resp["Responses"] == [_seed_answer(gtable), _validation(PARAMETERS)]
+
+
+# --- projections ------------------------------------------------------------
+# A batch read flattens a projected path to its leaf, and refuses an
+# identifier named twice and two paths that overlap as the statement's own
+# error (measured 2026-11-05).
+
+
+def test_a_projected_read_keys_each_path_on_its_leaf(dynamodb_client, gtable):
+    resp = _batch(
+        dynamodb_client,
+        [{"Statement": _sql("SELECT a, m.k FROM {t} WHERE pk = '{s}' AND sk = 'b'", gtable,
+                            s="seed")}],
+    )
+    assert resp["Responses"] == [
+        {"TableName": gtable, "Item": {"a": {"N": "1"}, "k": {"N": "1"}}}
+    ]
+
+
+@pytest.mark.parametrize(
+    "projection, message",
+    [
+        ("a, a", "Duplicate identifiers in select clause: a"),
+        ("m.k, k", "Duplicate identifiers in select clause: k"),
+        (
+            "m.k, m",
+            "Two document paths overlap with each other; must remove or rewrite one of these "
+            "paths; path one: [m], path two: [m, k]",
+        ),
+    ],
+    ids=["repeated", "repeated-leaf", "overlapping"],
+)
+def test_a_projection_refusal_is_the_statement_error(
+    dynamodb_client, gtable, projection, message
+):
+    resp = _batch(
+        dynamodb_client,
+        [{"Statement": _sql(f"SELECT {projection} FROM {{t}} WHERE pk = '{{s}}' AND sk = 'b'",
+                            gtable, s="seed")}],
+    )
+    assert resp["Responses"] == [_validation(message)]
 
 
 # --- ConsumedCapacity with an index and with failed writes --------------------

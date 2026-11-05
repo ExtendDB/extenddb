@@ -93,8 +93,14 @@ pub(super) async fn run(
                 .map(|message| (select.from.clone(), message)),
             _ => None,
         };
+        // A projection list is checked with the statement: its refusal is the
+        // statement's own, and the statement counts as neither a read nor a
+        // write (measured 2026-11-05).
         let checked = statement.and_then(|stmt| {
             super::check_statement(&stmt, &req.parameters)?;
+            if let Statement::Select(select) = &stmt {
+                super::select::check_projection(select)?;
+            }
             Ok(stmt)
         });
         let projected = match (&checked, projected_call) {

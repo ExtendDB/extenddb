@@ -36,7 +36,7 @@ use update::run_update;
 pub(super) use delete::build_delete_parts;
 pub(super) use exists::build_exists_parts;
 pub(super) use insert::build_insert_parts;
-pub(super) use update::{UpdateParts, build_update_parts, check_overlapping_paths};
+pub(super) use update::{UpdateParts, build_update_parts, check_overlapping_paths, first_overlap};
 
 mod delete;
 mod exists;

@@ -177,6 +177,21 @@ pub(crate) fn check_overlapping_paths(update: &UpdateStatement) -> Result<(), St
         .chain(update.set_members.iter().map(|action| &action.path))
         .chain(&update.removes)
         .collect();
+    first_overlap(&paths)
+}
+
+/// Refuse the first of `paths` that names one document path with a path
+/// before it, a path inside it or around it, or one element both as a map
+/// member and as a list element, naming the later path first (see
+/// [`check_overlapping_paths`]). A SELECT's projected paths get this refusal
+/// too (measured 2026-11-05: `m.k, m` in `ExecuteStatement`,
+/// `BatchExecuteStatement` and `ExecuteTransaction`, `m, m.k` and `l[1], l`
+/// in `ExecuteTransaction`).
+///
+/// # Errors
+///
+/// Returns the service's message for the first such pair.
+pub(crate) fn first_overlap(paths: &[&Path]) -> Result<(), String> {
     for (i, later) in paths.iter().enumerate() {
         if let Some((earlier, meeting)) = paths[..i]
             .iter()

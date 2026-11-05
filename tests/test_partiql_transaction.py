@@ -27,7 +27,7 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from conftest import wait_for_active
-from partiql_gsi_table import gsi_table, key, put
+from partiql_gsi_table import gsi_table, item, key, put
 
 
 @pytest.fixture(scope="session")
@@ -818,6 +818,141 @@ def _sql(template, table, **names):
 
 def _members(table, templates, **names):
     return [{"Statement": _sql(t, table, **names)} for t in templates]
+
+
+# --- the projection of a read member ------------------------------------------
+# A read member honours its projection list, and the item keeps the shape of
+# the paths, as a ProjectionExpression gives it. An item that has none of the
+# paths is returned empty, and a missing item returns no item. A projection
+# list that names an identifier twice, or whose paths overlap, is refused with
+# the member's position before its table is read (measured 2026-11-05).
+
+
+@pytest.mark.parametrize(
+    "projection, name, expected",
+    [
+        ("a, m.k", "seed", {"Item": {"a": {"N": "1"}, "m": {"M": {"k": {"N": "1"}}}}}),
+        (
+            "m.k, m.\"my key\"",
+            "seed",
+            {"Item": {"m": {"M": {"k": {"N": "1"}, "my key": {"N": "1"}}}}},
+        ),
+        ("sk, pk", "seed", {"Item": {"pk": {"S": key("seed")}, "sk": {"S": "b"}}}),
+        ("l[1], m.k", "lst", {"Item": {"l": {"L": [{"N": "2"}]}, "m": {"M": {"k": {"N": "1"}}}}}),
+        ("nope", "seed", {"Item": {}}),
+        ("m.nope, a", "seed", {"Item": {"a": {"N": "1"}}}),
+        ("a.b", "seed", {"Item": {}}),
+        ("l[7]", "lst", {"Item": {}}),
+        ("a", "no-such-item", {}),
+    ],
+    ids=[
+        "path",
+        "quoted-name",
+        "key-attributes",
+        "list-element",
+        "absent-attribute",
+        "absent-member",
+        "path-into-a-number",
+        "element-past-the-list",
+        "missing-item",
+    ],
+)
+def test_a_read_member_honours_its_projection(dynamodb_client, gtable, projection, name, expected):
+    resp = _txn(
+        dynamodb_client,
+        _members(gtable, [f"SELECT {projection} FROM {{t}} WHERE pk = '{{k}}' AND sk = 'b'"],
+                 k=name),
+    )
+    assert resp["Responses"] == [expected]
+
+
+def test_each_read_member_takes_its_own_projection(dynamodb_client, gtable):
+    resp = _txn(
+        dynamodb_client,
+        _members(
+            gtable,
+            [
+                "SELECT pk, a FROM {t} WHERE pk = '{s}' AND sk = 'b'",
+                "SELECT * FROM {t} WHERE pk = '{s2}' AND sk = 'b'",
+            ],
+            s="seed",
+            s2="seed2",
+        ),
+    )
+    assert resp["Responses"] == [
+        {"Item": {"pk": {"S": key("seed")}, "a": {"N": "1"}}},
+        {"Item": item(key("seed2"), gs="2")},
+    ]
+
+
+def test_a_projection_does_not_change_the_read_units(dynamodb_client, gtable):
+    resp = _txn(
+        dynamodb_client,
+        _members(gtable, ["SELECT a FROM {t} WHERE pk = '{s}' AND sk = 'b'"], s="seed"),
+        ReturnConsumedCapacity="TOTAL",
+    )
+    assert resp["Responses"] == [{"Item": {"a": {"N": "1"}}}]
+    assert resp["ConsumedCapacity"] == [
+        {"TableName": gtable, "CapacityUnits": 2.0, "ReadCapacityUnits": 2.0}
+    ]
+
+
+_REPEATED = "Duplicate identifiers in select clause: a"
+
+
+def _overlap(one, two):
+    return (
+        "Two document paths overlap with each other; must remove or rewrite one of these "
+        f"paths; path one: {one}, path two: {two}"
+    )
+
+
+@pytest.mark.parametrize(
+    "templates, index, message",
+    [
+        (["SELECT a, a FROM {t} WHERE pk = '{s}' AND sk = 'b'"], 0, _REPEATED),
+        (["SELECT m.k, k FROM {t} WHERE pk = '{s}' AND sk = 'b'"], 0,
+         "Duplicate identifiers in select clause: k"),
+        (["SELECT a, \"a\" FROM {t} WHERE pk = '{s}' AND sk = 'b'"], 0, _REPEATED),
+        (["SELECT m.k, m FROM {t} WHERE pk = '{s}' AND sk = 'b'"], 0, _overlap("[m]", "[m, k]")),
+        (["SELECT m, m.k FROM {t} WHERE pk = '{s}' AND sk = 'b'"], 0, _overlap("[m, k]", "[m]")),
+        (["SELECT l[1], l FROM {t} WHERE pk = '{l}' AND sk = 'b'"], 0,
+         _overlap("[l]", "[l, [1]]")),
+        (["SELECT a, a FROM nosuch_tbl WHERE pk = 'a' AND sk = 'b'"], 0, _REPEATED),
+        (["SELECT a, a FROM {t} WHERE pk = '{s}'"], 0, _REPEATED),
+        (["SELECT a, a FROM {t}.\"gsi\" WHERE g = 'a' AND gs = '1'"], 0, _REPEATED),
+        (["SELECT m.k, m FROM nosuch_tbl WHERE pk = 'a' AND sk = 'b'"], 0,
+         _overlap("[m]", "[m, k]")),
+        (["SELECT * FROM {t} WHERE pk = '{s}' AND sk = 'b'",
+          "SELECT a, a FROM {t} WHERE pk = '{s2}' AND sk = 'b'"], 1, _REPEATED),
+        (["INSERT INTO {t} VALUE {{'pk':'{n}','sk':'b','a':1}}",
+          "SELECT a, a FROM {t} WHERE pk = '{s2}' AND sk = 'b'"], 1, _REPEATED),
+        (["SELECT a, a FROM {t} WHERE pk = '{s}' AND sk = 'b'", "SELECT * FROM"], 0, _REPEATED),
+    ],
+    ids=[
+        "repeated",
+        "repeated-leaf",
+        "repeated-quoted",
+        "overlap",
+        "overlap-reversed",
+        "overlap-list",
+        "ahead-of-a-missing-table",
+        "ahead-of-a-partial-key",
+        "ahead-of-an-index",
+        "overlap-ahead-of-a-missing-table",
+        "second-member",
+        "ahead-of-the-mix",
+        "ahead-of-a-later-syntax-error",
+    ],
+)
+def test_a_projection_refusal_names_its_member(dynamodb_client, gtable, templates, index, message):
+    with pytest.raises(ClientError) as excinfo:
+        _txn(dynamodb_client, _members(gtable, templates, s="seed", s2="seed2", l="lst",
+                                       n=f"tq-{uuid.uuid4().hex[:6]}"))
+    assert _error(excinfo) == (
+        "ValidationException",
+        f"Validation failed in TransactStatements[{index}]: {message}",
+    )
 
 
 # --- which refusal a transaction with several faults reports -----------------

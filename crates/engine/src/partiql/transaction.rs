@@ -30,13 +30,16 @@
 use serde_json::{Map, Value, json};
 
 use extenddb_core::error::DynamoDbError;
+use extenddb_core::expression::Projection as ItemProjection;
 use extenddb_core::partiql::Statement;
-use extenddb_core::partiql::ast::{Returning, SelectStatement};
+use extenddb_core::partiql::ast::{Projection, Returning, SelectStatement};
 use extenddb_core::partiql::parser::parse_for_request;
-use extenddb_core::types::CancellationReason;
+use extenddb_core::types::{CancellationReason, Item};
 
 use super::common;
+use super::expr_bridge::ExprBridge;
 use super::{SingleRequest, authorize, item_depth, write};
+use crate::expression_helpers::{build_expression_maps, parse_projection_expr};
 use crate::{
     DispatchResult, OperationContext, handle_transact_get_items, handle_transact_write_items,
 };
@@ -128,8 +131,9 @@ pub(super) async fn run(
 /// parameter that cannot be converted is reported without the statement's
 /// position (measured 2026-11-02); the checks on a parsed statement name it.
 /// A projected call (`COUNT(*)`) is among those checks, so it is refused
-/// ahead of every table lookup (measured 2026-11-02), and so is a `?`
-/// without a parameter (measured 2026-11-05).
+/// ahead of every table lookup (measured 2026-11-02), and so are a
+/// projection list that names an identifier twice or two paths that
+/// overlap, and a `?` without a parameter (measured 2026-11-05).
 fn parse_member(i: usize, obj: &Value) -> Result<(SingleRequest, Statement), DynamoDbError> {
     let positional = |message: &str| {
         DynamoDbError::ValidationException(format!(
@@ -141,13 +145,17 @@ fn parse_member(i: usize, obj: &Value) -> Result<(SingleRequest, Statement), Dyn
     let stmt = parse_for_request(&req.statement, req.parameters.len())
         .map_err(|e| positional(&e.message))?;
     super::check_statement(&stmt, &req.parameters).map_err(|message| positional(&message))?;
+    if let Statement::Select(select) = &stmt {
+        super::select::check_projection(select).map_err(|message| positional(&message))?;
+    }
     check_parameter_count(&stmt, req.parameters.len(), i)?;
     Ok((req, stmt))
 }
 
 /// The refusals the member at position `i` gets against its table, before
-/// any member is authorized. A member on a missing table gets none of them:
-/// the missing table cancels the request once every member is checked.
+/// any member is authorized. A member on a missing table gets none of them
+/// but the refusal of an EXISTS through an index: the missing table cancels
+/// the request once every member is checked.
 ///
 /// A read is refused when it reads an index, then when its WHERE does not
 /// give the full primary key; a key value of the wrong type cancels the
@@ -232,6 +240,7 @@ async fn run_read(
     // schema, in one cancellation (measured 2026-11-05 with the two in either
     // order); every other member reports `None`.
     let mut transact_items: Vec<Value> = Vec::with_capacity(parsed.len());
+    let mut projections: Vec<Option<ItemProjection>> = Vec::with_capacity(parsed.len());
     let mut reasons: Vec<CancellationReason> = Vec::with_capacity(parsed.len());
     let mut multi_attribute = None;
     for (req, stmt) in parsed {
@@ -260,6 +269,7 @@ async fn run_read(
             Ok(()) => CancellationReason::none(),
             Err(_) => CancellationReason::validation_error(common::KEY_SCHEMA_MISMATCH),
         });
+        projections.push(member_projection(ctx, select)?);
         transact_items.push(json!({
             "Get": { "TableName": select.from.table, "Key": Value::Object(key) }
         }));
@@ -283,9 +293,59 @@ async fn run_read(
         tbody["ReturnConsumedCapacity"] = json!(rcc);
     }
 
-    // The handler's output is already the transaction read shape: Responses as a
-    // positional list of `{Item}` / `{}`, plus a ConsumedCapacity list.
-    handle_transact_get_items(tbody, ctx).await
+    // The handler's output is the transaction read shape: Responses as a
+    // positional list of `{Item}` / `{}`, plus a ConsumedCapacity list. The
+    // items are read whole and projected here, since `TransactGetItems` drops
+    // an item that its projection leaves empty.
+    project_items(handle_transact_get_items(tbody, ctx).await?, &projections)
+}
+
+/// The projection a read member's projection list makes, or `None` for
+/// `SELECT *`. The item keeps the shape of the paths, as a
+/// `ProjectionExpression` gives it: `SELECT a, m.k` returns `{a, m: {k}}`
+/// (measured 2026-11-05).
+///
+/// # Errors
+///
+/// A refusal of the projection, which the statement checks make first.
+fn member_projection(
+    ctx: &OperationContext,
+    select: &SelectStatement,
+) -> Result<Option<ItemProjection>, DynamoDbError> {
+    let Projection::Paths(paths) = &select.projection else {
+        return Ok(None);
+    };
+    let mut bridge = ExprBridge::new(&[]);
+    let rendered: Vec<String> = paths.iter().map(|path| bridge.path(path)).collect();
+    let maps = build_expression_maps(Some(&bridge.names_map()), None);
+    let paths = parse_projection_expr(&rendered.join(", "), &ctx.limits)?;
+    ItemProjection::compile(&paths, &maps, true).map(Some)
+}
+
+/// Give each item of a `TransactGetItems` answer its member's projection.
+/// An item that has none of the projected paths is returned empty, and a
+/// member whose item is missing returns no item (measured 2026-11-05).
+fn project_items(
+    mut result: DispatchResult,
+    projections: &[Option<ItemProjection>],
+) -> Result<DispatchResult, DynamoDbError> {
+    let Some(Value::Array(responses)) = result.body.get_mut("Responses") else {
+        return Ok(result);
+    };
+    for (entry, projection) in responses.iter_mut().zip(projections) {
+        let (Some(projection), Some(item)) = (projection, entry.get("Item")) else {
+            continue;
+        };
+        let projected = serde_json::from_value::<Item>(item.clone())
+            .map(|item| projection.apply(&item))
+            .and_then(serde_json::to_value)
+            .map_err(|e| {
+                tracing::error!(internal_error = %e, "failed to project a transaction read");
+                DynamoDbError::InternalServerError("Internal server error".to_owned())
+            })?;
+        entry["Item"] = projected;
+    }
+    Ok(result)
 }
 
 /// Execute an all-write transaction via `TransactWriteItems`.
