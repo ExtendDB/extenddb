@@ -1,0 +1,131 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Fuzz the request parsers that read untrusted input: the SigV4 authorization
+# header, timestamp and signature verification, the expression tokenizer and
+# parsers, the expression evaluator, and the IAM policy document parser.
+#
+# Pull requests that touch crates/core, crates/auth or the fuzz crate run each
+# target for a short time as a smoke test. A daily schedule runs each target
+# for longer. Each run starts from the committed seeds in fuzz/seeds and writes
+# the inputs it generates under $RUNNER_TEMP, outside the checkout. A crash or
+# a timeout uploads the reproducing input under fuzz/artifacts.
+name: Fuzz
+
+on:
+  schedule:
+    - cron: '23 5 * * *'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/core/**'
+      - 'crates/auth/**'
+      - 'crates/cache/**'
+      - 'fuzz/**'
+      - '.github/workflows/fuzz.yml'
+
+permissions:
+  contents: read
+
+# Supersede an in-flight run of the SAME pull request when a new push arrives,
+# so repeated pushes do not stack up on a capped pool. Non-PR runs get a group
+# unique to the run (run_id).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  fuzz:
+    # Dedicated ExtendDB runner group (Ubuntu 24.04, 4 vCPU / 16 GB, capped at
+    # 20 concurrent).
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - sigv4_authorization
+          - sigv4_timestamp
+          - sigv4_verify
+          - expression_parse
+          - expression_evaluate
+          - policy_document
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          # Pinned nightly: cargo-fuzz needs the sanitizer and coverage
+          # instrumentation that only nightly provides.
+          toolchain: nightly-2026-11-01
+
+      - name: Generate fuzz/Cargo.lock from Cargo.lock
+        # fuzz/ is its own workspace, and its lockfile is not committed. It
+        # starts as a copy of Cargo.lock, and cargo metadata adds the crates
+        # only fuzz/ uses, so the targets build each shared crate at the
+        # version the server builds. A version bump or dependency update in
+        # Cargo.lock needs no change here. For each crate that both lockfiles
+        # list, the awk check fails when fuzz/Cargo.lock has it at a version
+        # Cargo.lock does not have.
+        run: |
+          set -euo pipefail
+          cp Cargo.lock fuzz/Cargo.lock
+          cargo metadata --format-version 1 --manifest-path fuzz/Cargo.toml > /dev/null
+          versions() {
+            awk '/^\[\[package\]\]/ { p = 1; next }
+                 p && /^name = / { n = $3 }
+                 p && /^version = / { print n, $3; p = 0 }' "$1" | tr -d '"' | sort -u
+          }
+          versions Cargo.lock > "$RUNNER_TEMP/root-versions"
+          versions fuzz/Cargo.lock > "$RUNNER_TEMP/fuzz-versions"
+          awk 'NR == FNR { root[$0] = 1; name[$1] = 1; next }
+               ($1 in name) && !($0 in root) {
+                 print "fuzz/Cargo.lock has " $1 " " $2 ", which Cargo.lock does not have"
+                 bad = 1
+               }
+               END { exit bad }' "$RUNNER_TEMP/root-versions" "$RUNNER_TEMP/fuzz-versions"
+
+      - name: Install cargo-fuzz from its .crate with a sha256 check
+        # Download, extract and install outside the checkout. Inside it, cargo
+        # install finds the root [workspace], which does not list the crate,
+        # and stops.
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          version=0.13.2
+          sha256=5acfd01930e49823e58c30dd8012d3338a620377d7c7d4cc140ca4b2169400e2
+          curl -sSfL -o cargo-fuzz.crate \
+            "https://static.crates.io/crates/cargo-fuzz/cargo-fuzz-${version}.crate"
+          echo "${sha256}  cargo-fuzz.crate" | sha256sum -c -
+          mkdir -p cargo-fuzz-src
+          tar -xzf cargo-fuzz.crate -C cargo-fuzz-src
+          cargo install --locked --path "cargo-fuzz-src/cargo-fuzz-${version}"
+
+      - name: Fuzz ${{ matrix.target }}
+        # libFuzzer writes the inputs it generates to the first corpus
+        # directory and only reads the second, so the committed seeds are not
+        # modified. The first directory has to exist before libFuzzer starts.
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            seconds=60
+          else
+            seconds=600
+          fi
+          corpus="$RUNNER_TEMP/corpus/${{ matrix.target }}"
+          mkdir -p "$corpus"
+          cargo fuzz run "${{ matrix.target }}" "$corpus" "fuzz/seeds/${{ matrix.target }}" -- \
+            -max_total_time="${seconds}" \
+            -rss_limit_mb=4096 \
+            -timeout=25
+
+      - name: Upload the reproducing input on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts
+          if-no-files-found: ignore

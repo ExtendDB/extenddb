@@ -14,8 +14,8 @@ use extenddb_core::types::{
     WriteRequest, extract_key, item_size_bytes,
 };
 use extenddb_core::validation::{
-    validate_attribute_name_sizes, validate_batch_item_keys, validate_batch_key_only,
-    validate_item_nesting_depth, validate_item_size, validate_key_sizes,
+    AttributeNameRequestForm, validate_attribute_name_sizes, validate_batch_item_keys,
+    validate_batch_key_only, validate_item_nesting_depth, validate_item_size, validate_key_sizes,
 };
 
 use crate::OperationContext;
@@ -66,6 +66,20 @@ pub async fn handle_batch_write_item(
         }
     }
 
+    // Attribute names over the size limit are request-shape validation: every
+    // PutRequest item is checked before any table lookup and before the key
+    // checks, so a request naming a missing table, or an item missing its key,
+    // answers with the name refusal.
+    for reqs in input.request_items.values() {
+        for put in reqs.iter().filter_map(|wr| wr.put_request.as_ref()) {
+            validate_attribute_name_sizes(
+                &put.item,
+                &ctx.limits,
+                AttributeNameRequestForm::BatchRequest,
+            )?;
+        }
+    }
+
     let empty_maps = ExpressionMaps::default();
     let mut all_icm: HashMap<String, Vec<extenddb_core::types::ItemCollectionMetrics>> =
         HashMap::new();
@@ -99,7 +113,6 @@ pub async fn handle_batch_write_item(
                 )?;
                 validate_item_nesting_depth(&put.item)?;
                 validate_item_size(&put.item, ctx.limits.max_item_size_bytes)?;
-                validate_attribute_name_sizes(&put.item, &ctx.limits)?;
                 validate_key_sizes(&put.item, &key_info.key_schema, &ctx.limits)?;
                 extenddb_core::validation::validate_vector_write(
                     &put.item,

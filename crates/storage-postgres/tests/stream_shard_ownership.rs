@@ -140,9 +140,22 @@ impl Scratch {
     }
 }
 
+/// The server's base URL, or `None` to skip. With `EXTENDDB_TEST_PG_REQUIRED`
+/// set to any value but `0`, a job that must reach a server fails here
+/// instead.
 fn base_conn() -> Option<String> {
-    let conn = std::env::var("EXTENDDB_TEST_PG_CONNECTION_STRING").ok()?;
-    (!conn.trim().is_empty()).then(|| conn.trim_end_matches('/').to_owned())
+    let conn = std::env::var("EXTENDDB_TEST_PG_CONNECTION_STRING").unwrap_or_default();
+    if conn.trim().is_empty() {
+        let required =
+            std::env::var("EXTENDDB_TEST_PG_REQUIRED").is_ok_and(|v| !v.is_empty() && v != "0");
+        assert!(
+            !required,
+            "EXTENDDB_TEST_PG_CONNECTION_STRING is not set, and EXTENDDB_TEST_PG_REQUIRED says \
+             this job must reach a PostgreSQL server"
+        );
+        return None;
+    }
+    Some(conn.trim_end_matches('/').to_owned())
 }
 
 /// Every `.sql` file under `migrations/` and `data_migrations/`, each
@@ -195,10 +208,13 @@ async fn scratch() -> Scratch {
         .execute(&db)
         .await
         .expect("match the two-database layout");
-    sqlx::query("UPDATE settings SET value = '0' WHERE key = 'control_plane_delay_seconds'")
-        .execute(&db)
-        .await
-        .expect("pin the control-plane delay to zero");
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0') \
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .execute(&db)
+    .await
+    .expect("pin the control-plane delay to zero");
     for account in [ACCOUNT, OTHER_ACCOUNT] {
         sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES ($1, $2)")
             .bind(account)

@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+"""Serve and migrate on one SQLite catalog, with a release binary:
+
+    devtools/check-sqlite-catalog-lock <extenddb binary> [port]
+
+- the migrate preview and verify run beside a server and exit 0;
+- migrate --yes waits for the server's lock and exits 6 when it outlasts
+  --lock-timeout;
+- a server refuses with exit 6 while a migration holds the database (the
+  holder here is this script, with flock(2) on the lock file the migration
+  takes);
+- once the database is free, migrate --yes and serve run;
+- on a catalog behind this binary, verify and the preview exit 3, and
+  migrate --yes applies what is missing;
+- on a config whose database does not exist, migrate --yes exits 1, names
+  extenddb init, and creates neither the database nor its directory.
+
+Everything runs in a new temporary directory, with init's HOME pointed into
+it so its TLS certificate is not written to the caller's home. The server
+binds 127.0.0.1 only.
+"""
+import fcntl
+import os
+import re
+import shutil
+import sqlite3
+import sys
+import tempfile
+
+from catalog_checks import expect_exit, finish, healthy, report, run, start, stop
+
+
+def with_path(config: str, database: str, out: str) -> None:
+    """Write `config` to `out` with its `path = ` line naming `database`."""
+    with open(config, encoding="utf-8") as f:
+        text = f.read()
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(re.sub(r"(?m)^path = .*$", f'path = "{database}"', text))
+
+
+def main(binary: str, port: int) -> int:
+    binary = os.path.realpath(binary)
+    work = tempfile.mkdtemp()
+    servers = []
+    holder = None
+    try:
+        os.chdir(work)
+        env = dict(os.environ, HOME=os.path.join(work, "home"))
+        database = os.path.join(work, "db.sqlite")
+        code, output = run(
+            [binary, "init", "--backend", "sqlite", "--config", "extenddb.toml",
+             "--sqlite-path", database],
+            env,
+        )
+        if code != 0:
+            report(False, f"exit {code}: init", output)
+            return finish()
+        lock_file = os.path.realpath(database) + ".lock"
+        migrate = [binary, "migrate", "--config", "extenddb.toml"]
+        serve = [binary, "serve", "--config", "extenddb.toml", "--foreground", "--port", str(port)]
+        url = f"https://127.0.0.1:{port}/health"
+
+        server = start(serve, None, "serve.log")
+        servers.append(server)
+        if not healthy(url, server, 30):
+            stop(server)
+            with open("serve.log", encoding="utf-8") as f:
+                report(False, "the server did not become healthy", f.read())
+            return finish()
+        expect_exit(0, "migrate preview beside a server", migrate)
+        expect_exit(0, "verify beside a server", [binary, "verify", "--config", "extenddb.toml"])
+        expect_exit(6, "migrate --yes while a server runs", migrate + ["--yes", "--lock-timeout", "1"])
+        stop(server)
+
+        holder = open(lock_file, "a+b")
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        expect_exit(6, "serve while a migration holds the database", serve)
+        expect_exit(
+            6,
+            "a second migrate --yes while a migration holds the database",
+            migrate + ["--yes", "--lock-timeout", "1"],
+        )
+        expect_exit(0, "migrate preview while a migration holds the database", migrate)
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        holder.close()
+        holder = None
+
+        expect_exit(0, "migrate --yes once the database is free", migrate + ["--yes", "--lock-timeout", "5"])
+        server = start(serve, None, "serve.log")
+        servers.append(server)
+        up = healthy(url, server, 30)
+        stop(server)
+        with open("serve.log", encoding="utf-8") as f:
+            report(up, "serve once the database is free", f.read())
+
+        # A catalog behind this binary: verify and the preview exit 3, and
+        # migrate --yes applies what is missing.
+        conn = sqlite3.connect(database)
+        conn.execute(
+            "DELETE FROM extenddb_migrations WHERE id = (SELECT MAX(id) FROM extenddb_migrations)"
+        )
+        conn.commit()
+        conn.close()
+        expect_exit(3, "verify on a catalog behind this binary", [binary, "verify", "--config", "extenddb.toml"])
+        expect_exit(3, "migrate preview on a catalog behind this binary", migrate)
+        expect_exit(0, "migrate --yes applies what is missing", migrate + ["--yes", "--lock-timeout", "5"])
+
+        # A config whose database does not exist: migrate --yes refuses with
+        # 1, names init, and creates neither the database nor its directory.
+        missing = os.path.join(work, "missing")
+        with_path("extenddb.toml", os.path.join(missing, "db.sqlite"), "missing.toml")
+        output = expect_exit(
+            1,
+            "migrate --yes on a path with no database",
+            [binary, "migrate", "--config", "missing.toml", "--yes", "--lock-timeout", "1"],
+        )
+        if "extenddb init" not in output:
+            report(False, "the refusal does not name extenddb init", output)
+        report(not os.path.exists(missing), "nothing was created for the missing database")
+    finally:
+        for server in servers:
+            stop(server)
+        if holder is not None:
+            holder.close()
+        os.chdir("/")
+        shutil.rmtree(work, ignore_errors=True)
+    return finish()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) not in (2, 3):
+        sys.exit(__doc__)
+    sys.exit(main(sys.argv[1], int(sys.argv[2]) if len(sys.argv) == 3 else 18450))

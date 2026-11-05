@@ -23,7 +23,7 @@ mod tokenizer;
 mod update_evaluator;
 mod update_parser;
 
-pub use ast::{ArithOp, CompareOp, Expr, PathElement, UpdateAction};
+pub use ast::{ArithOp, CompareOp, Expr, PathElement, UpdateAction, removes_only};
 pub use evaluator::{compare_orderable, evaluate_condition};
 pub use key_condition::{
     KeyClauseOperand, KeyCondition, SortKeyCondition, key_condition_clause_operands,
