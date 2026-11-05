@@ -397,11 +397,6 @@ def test_transactions_on_a_stream_table_all_commit(
         assert item["c"]["N"] == str(TXN_ROUNDS), item
     # The setup puts, then a put, a delete and an update per transaction.
     want = TXN_WRITERS * TXN_ROUNDS * (1 + 3)
-    if _backend() == "cassandra":
-        # Cassandra writes no stream record for a transacted write until
-        # PR #576 lands, so only the setup puts are recorded there. The
-        # commit and counter assertions above still hold on every backend.
-        want = TXN_WRITERS * TXN_ROUNDS
     got = _wait_for_record_count(dynamodb_client, streams_client, stream_table, prefix, want)
     assert got == want, f"stream records {got}, writes that changed an item {want}"
 
