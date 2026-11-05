@@ -234,7 +234,18 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
             // before daemonizing so startup verification reads the new daemon's
             // PID rather than a dead one from a previous run.
             let _ = std::fs::remove_file(pid_file);
-            let daemon = Daemonize::new().pid_file(pid_file);
+            // The daemon keeps the directory `serve` was started in as its
+            // working directory (the daemonize crate's default is `/`), so a
+            // relative path resolves as it does in the foreground: the bulk
+            // store path and its dev-mode default, the import and export
+            // paths, the run directory and PID file, and the files the AWS SDK
+            // reads from its environment. A start directory that cannot be
+            // read leaves the default.
+            let start_dir =
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+            let daemon = Daemonize::new()
+                .pid_file(pid_file)
+                .working_directory(&start_dir);
             match daemon.execute() {
                 daemonize::Outcome::Parent(Ok(_)) => {
                     // Parent process: wait for the PID file to appear (written by
@@ -373,8 +384,8 @@ fn render_startup_warnings(warnings: &[extenddb_storage::config::StartupWarning]
 }
 
 /// Print the developer-mode banner lines: the mode notice, the credentials to
-/// sign with, and an advisory when an ambient `AWS_ACCESS_KEY_ID` would not
-/// verify.
+/// sign with, the bulk store path when dev mode substitutes the default, and
+/// an advisory when an ambient `AWS_ACCESS_KEY_ID` would not verify.
 ///
 /// Resolving here (not just in `serve()`) fails fast on a misconfigured
 /// `EXTENDDB_DEV_*` pair before daemonizing, and gives the invoking user the
@@ -396,6 +407,20 @@ fn print_dev_mode_banner(app_config: &config::AppConfig, foreground: bool) -> an
             dev_credentials::describe(&dev_creds)
         ),
     ];
+    if app_config.bulk.is_none() {
+        // Dev mode substitutes the default store when [bulk] is absent. The
+        // banner prints before the server canonicalizes the root, so it
+        // names the configured value; the startup log carries the canonical
+        // path.
+        lines.push(format!(
+            "  Bulk store: {} (dev-mode default; the startup log names the canonical path)",
+            config::DEV_DEFAULT_BULK_PATH
+        ));
+    } else if let Some(line) =
+        dev_mode_s3_line(app_config.bulk.as_ref(), &app_config.server.region)?
+    {
+        lines.push(line);
+    }
     if let Some(ignored) = dev_credentials::ignored_aws_env_key(&dev_creds) {
         lines.push(format!(
             "  Note: AWS_ACCESS_KEY_ID is set but not adopted; requests signed with \
@@ -415,9 +440,37 @@ fn print_dev_mode_banner(app_config: &config::AppConfig, foreground: bool) -> an
     Ok(())
 }
 
+/// The dev-mode banner line of an explicit S3 store, which is honoured in dev
+/// mode (every caller has the reach of the server's own AWS credentials);
+/// `None` for any other `[bulk]` section. A `[bulk.s3]` section is checked
+/// first, so a value the startup checks refuse never reaches the banner.
+///
+/// # Errors
+///
+/// The startup refusal of the `[bulk.s3]` section, which never repeats the
+/// value.
+fn dev_mode_s3_line(
+    bulk: Option<&config::BulkConfig>,
+    server_region: &str,
+) -> anyhow::Result<Option<String>> {
+    let Some(bulk) = bulk else {
+        return Ok(None);
+    };
+    if let Some(s3) = &bulk.s3 {
+        s3.validate().map_err(anyhow::Error::msg)?;
+    }
+    if bulk.store != config::BulkStoreKind::S3 {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "  Bulk store: {} with the server's AWS credentials",
+        bulk.s3.clone().unwrap_or_default().describe(server_region)
+    )))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ServeArgs, render_startup_warnings};
+    use super::{ServeArgs, dev_mode_s3_line, render_startup_warnings};
     use clap::Parser;
     use extenddb_storage::config::StartupWarning;
 
@@ -495,5 +548,49 @@ mod tests {
         assert!(rendered.contains("below DynamoDB isolation"));
         assert!(rendered.contains("Writes remain atomic and durable"));
         assert!(rendered.contains("restore full DynamoDB transaction semantics"));
+    }
+
+    fn bulk(section: serde_json::Value) -> extenddb_config::BulkConfig {
+        serde_json::from_value(section).expect("a [bulk] section")
+    }
+
+    #[test]
+    fn the_dev_mode_banner_checks_the_s3_section_before_naming_it() {
+        for store in ["s3", "filesystem"] {
+            let section = bulk(serde_json::json!({
+                "store": store,
+                "filesystem": {"path": "/srv/bulk"},
+                "s3": {"endpoint_url": "http://AKIDEXAMPLE:SECRETEXAMPLE@127.0.0.1:17070"},
+            }));
+            let error = dev_mode_s3_line(Some(&section), "us-east-1")
+                .expect_err("user information is refused before the banner")
+                .to_string();
+            assert_eq!(
+                error, "[bulk.s3] endpoint_url must not carry user information",
+                "{store}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_dev_mode_banner_names_the_endpoint_by_scheme_host_and_port() {
+        let section = bulk(serde_json::json!({
+            "store": "s3",
+            "s3": {"endpoint_url": "http://127.0.0.1:17070/base/path", "force_path_style": true},
+        }));
+        assert_eq!(
+            dev_mode_s3_line(Some(&section), "us-east-1").unwrap(),
+            Some(
+                "  Bulk store: s3 (region us-east-1, endpoint http://127.0.0.1:17070, path-style) \
+                 with the server's AWS credentials"
+                    .to_owned()
+            )
+        );
+        let filesystem = bulk(serde_json::json!({"filesystem": {"path": "/srv/bulk"}}));
+        assert_eq!(
+            dev_mode_s3_line(Some(&filesystem), "us-east-1").unwrap(),
+            None
+        );
+        assert_eq!(dev_mode_s3_line(None, "us-east-1").unwrap(), None);
     }
 }

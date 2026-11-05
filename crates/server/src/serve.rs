@@ -272,9 +272,9 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     // Filter with: `journalctl -t extenddb | grep -v sqlx` (exclude) or
     // `journalctl -t extenddb | grep sqlx` (include only).
     //
-    // The EnvFilter encodes both levels: `{app_level},sqlx={sqlx_level}`.
+    // The EnvFilter encodes both levels (`workers::log_filter`).
     // The poll_log_level worker reloads the filter when either setting changes.
-    let filter_str = format!("{},sqlx=warn", app_config.logging.level);
+    let filter_str = crate::workers::log_filter(&app_config.logging.level, "warn");
     // CB-29: Always use the config file log level, never RUST_LOG. The runtime
     // settings poller handles dynamic level changes. RUST_LOG silently
     // overriding the config is an operational surprise.
@@ -390,6 +390,8 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     let storage = components.engine;
     let catalog_store = components.catalog_store;
     let cred_store = components.credential_store;
+    // The bulk store's startup check looks its own key up past the cache.
+    let bulk_cred_store = Arc::clone(&cred_store);
     let runtime_hooks = components.runtime_hooks;
     let registrar = runtime_hooks
         .as_ref()
@@ -599,6 +601,15 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         }
     }
 
+    let bulk_store = crate::bulk_store::resolve_bulk_store(
+        &app_config,
+        dev_mode,
+        &catalog_store,
+        &storage,
+        &bulk_cred_store,
+    )
+    .await?;
+
     // D9: Build static config entries for the console settings page.
     // Must be called before `app_config.limits` is moved.
     let config_entries = config::build_config_entries(&app_config);
@@ -664,6 +675,7 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         dev_mode,
         import_paths,
         export_paths,
+        bulk: bulk_store,
         throttle: throttle.clone(),
         auth_cache,
         authz_cache,
@@ -697,6 +709,12 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         let reload_handle = reload_handle.clone();
         let config_log_level = app_config.logging.level.clone();
         let metrics = metrics.clone();
+        // The bulk put workers' dependencies, taken from the state once.
+        let bulk_storage = state.storage.clone();
+        let bulk_limits = state.limits.clone();
+        let bulk_region = state.region.clone();
+        let bulk_store = state.bulk.clone();
+        let bulk_authorizer = crate::bulk_authorizer::ServerBulkAuthorizer::for_state(&state);
         let storage = storage.clone();
         Box::new(move |token: CancellationToken| {
             let catalog_store = catalog_store.clone();
@@ -705,6 +723,11 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
             let throttle = throttle.clone();
             let metrics = metrics.clone();
             let hooks = hooks.clone();
+            let bulk_storage = bulk_storage.clone();
+            let bulk_limits = bulk_limits.clone();
+            let bulk_region = bulk_region.clone();
+            let bulk_store = bulk_store.clone();
+            let bulk_authorizer = bulk_authorizer.clone();
             let storage = storage.clone();
             let reconciler_state = reconciler_state.clone();
             futures::FutureExt::boxed(async move {
@@ -740,6 +763,25 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
                     )),
                     // Phase 11a: Warn about approximate consumed capacity.
                     tokio::spawn(workers::capacity_warning_worker(token.clone())),
+                    // Claim and run bulk put operations, and purge terminal
+                    // records past the retention window. The loops live in the
+                    // engine crate because the runner they drive is private
+                    // to it.
+                    tokio::spawn(extenddb_engine::bulk_operation_worker(
+                        bulk_storage.clone(),
+                        bulk_limits.clone(),
+                        bulk_region,
+                        bulk_store,
+                        bulk_authorizer,
+                        metrics.clone(),
+                        token.clone(),
+                    )),
+                    tokio::spawn(extenddb_engine::bulk_operation_retention_worker(
+                        bulk_storage,
+                        bulk_limits,
+                        metrics.clone(),
+                        token.clone(),
+                    )),
                     // The backup reconciler: backend-agnostic, so it runs
                     // here beside the backends' workers rather than in each
                     // backend's `spawn_workers`, and stops and starts with

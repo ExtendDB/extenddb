@@ -107,6 +107,11 @@ pub(crate) fn find(operation: &str, input: &Value, account_id: &str) -> Option<O
         }
         "ListStreams" | "ImportTable" | "ListTables" | "DescribeLimits" | "DescribeEndpoints"
         | "GetRecords" => None,
+        // `request_helpers/bulk.rs` answers another account's ARN itself, before any policy.
+        "StartBulkPutItems"
+        | "DescribeBulkOperation"
+        | "CancelBulkOperation"
+        | "ListBulkOperations" => None,
         // An index query names the index ARN, built from the table ARN as
         // written (measured: `.../table/<T>/index/<I>`).
         "Query" | "Scan" => {

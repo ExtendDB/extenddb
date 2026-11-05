@@ -281,7 +281,7 @@ fn one_index_write_units(
 
 /// Project an item into one index, or return `None` when the item is not a
 /// member of the sparse index.
-fn sparse_index_projection(
+pub(crate) fn sparse_index_projection(
     item: &Item,
     index_key_schema: &[KeySchemaElement],
     base_keys: &[&str],

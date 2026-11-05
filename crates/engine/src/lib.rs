@@ -11,6 +11,7 @@ mod backup;
 pub use backup::{BackupRuntime, reconciler};
 mod batch_get_item;
 mod batch_write_item;
+pub mod bulk_put;
 pub mod capacity_helpers;
 mod create_table;
 mod delete_item;
@@ -46,6 +47,7 @@ mod vector_gate;
 
 pub use batch_get_item::handle_batch_get_item;
 pub use batch_write_item::handle_batch_write_item;
+pub use bulk_put::worker::{bulk_operation_retention_worker, bulk_operation_worker};
 pub use create_table::handle_create_table;
 pub use create_table::storage_err_to_dynamo;
 pub use delete_item::handle_delete_item;
@@ -118,6 +120,10 @@ pub fn is_known_operation(operation: &str) -> bool {
             | "GetRecords"
             | "ImportTable"
             | "ExportTableToPointInTime"
+            | "StartBulkPutItems"
+            | "DescribeBulkOperation"
+            | "ListBulkOperations"
+            | "CancelBulkOperation"
             | "CreateBackup"
             | "DescribeBackup"
             | "ListBackups"
@@ -355,6 +361,20 @@ pub struct OperationContext {
     /// Allowed directories for export file operations. Empty means exports
     /// are disabled (secure default).
     pub export_paths: Arc<[Arc<PathBuf>]>,
+    /// The `[bulk]` store, resolved once at startup. Bulk operations read
+    /// inputs and write reports through it; on the filesystem store they
+    /// live beneath `{root}/{account id}/{S3Bucket}/...`. `None` means bulk
+    /// operations are disabled (secure default). Independent of
+    /// `import_paths` and `export_paths`, which serve `ImportTable` and
+    /// `ExportTableToPointInTime` only.
+    pub bulk: Option<Arc<bulk_put::store::BulkStore>>,
+    /// Evaluates the S3 actions a bulk operation performs as its caller.
+    /// `None` in developer mode, where every such check is skipped.
+    pub bulk_authorizer: Option<Arc<dyn bulk_put::authorize::BulkAuthorizer>>,
+    /// The caller of a `StartBulkPutItems` request, captured by the server
+    /// and recorded on the operation; `None` for other operations and in
+    /// developer mode.
+    pub bulk_principal: Option<bulk_put::authorize::BulkPrincipal>,
     /// The `TableKeyInfo` the auth layer read for this request (P118
     /// optimization #2). Populated for single-table item operations, `Query`,
     /// `Scan`, and the batch and transaction operations; empty for table-level
@@ -370,6 +390,10 @@ pub struct OperationContext {
     /// read. When unset (e.g. unit tests), the engine falls back to direct
     /// storage lookups.
     pub table_key_info_lookup: Option<Arc<dyn extenddb_storage::TableKeyInfoLookup>>,
+    /// Metrics collector for handler-recorded counters that the server layer
+    /// cannot derive from the response body, such as `BulkOperationsStarted`,
+    /// which only the start handler can tell apart from an idempotent replay.
+    pub metrics: Arc<extenddb_core::metrics::MetricsCollector>,
 }
 
 impl OperationContext {
@@ -503,6 +527,18 @@ pub async fn dispatch(
             .await
             .map(DispatchResult::body_only),
         "ExportTableToPointInTime" => handle_export_table(body, ctx)
+            .await
+            .map(DispatchResult::body_only),
+        "StartBulkPutItems" => bulk_put::handlers::handle_start_bulk_put_items(body, ctx)
+            .await
+            .map(DispatchResult::body_only),
+        "DescribeBulkOperation" => bulk_put::handlers::handle_describe_bulk_operation(body, ctx)
+            .await
+            .map(DispatchResult::body_only),
+        "ListBulkOperations" => bulk_put::handlers::handle_list_bulk_operations(body, ctx)
+            .await
+            .map(DispatchResult::body_only),
+        "CancelBulkOperation" => bulk_put::handlers::handle_cancel_bulk_operation(body, ctx)
             .await
             .map(DispatchResult::body_only),
         "CreateBackup" => backup::handle_create_backup(body, ctx)
